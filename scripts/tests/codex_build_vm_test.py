@@ -53,6 +53,66 @@ class SnapshotValidationTests(unittest.TestCase):
             self.assertEqual(secret.read_text(), 'SYNTHETIC_PRIVATE')
 
 
+class BuildScratchPlacementTests(unittest.TestCase):
+    """#1036: the VM's private control files live under the caller's scratch."""
+
+    class Stop(Exception):
+        pass
+
+    def runtime(self, root):
+        artifact = root / 'artifact'; artifact.write_bytes(b'synthetic')
+        runtime = vm.Runtime()
+        runtime.config = {name: str(artifact) for name in ('qemu', 'kernel', 'busybox', 'firmware',
+                          'data_dir', 'library_dir', 'module_dir')}
+        runtime.config.update(modules=[str(artifact)], memory_mb=512)
+        return runtime
+
+    def test_private_directory_is_created_under_the_scratch_dir(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / 'workspace'; workspace.mkdir()
+            scratch = root / 'scratch'; scratch.mkdir()
+            seen = []
+            original = vm.tempfile.TemporaryDirectory
+            def record(*args, **kwargs):
+                seen.append(kwargs.get('dir'))
+                raise self.Stop()
+            vm.tempfile.TemporaryDirectory = record
+            try:
+                with self.assertRaises(self.Stop):
+                    vm.run(self.runtime(root), workspace, ['true'], {}, scratch_dir=str(scratch))
+            finally:
+                vm.tempfile.TemporaryDirectory = original
+            self.assertEqual(seen, [str(scratch)])
+
+    def test_scratch_dir_and_build_cache_are_validated_before_a_vm_starts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / 'workspace'; workspace.mkdir()
+            image = root / 'cache.img'; image.write_bytes(b''); image.chmod(0o600)
+            runtime = self.runtime(root)
+            with self.assertRaisesRegex(vm.Unavailable, 'scratch'):
+                vm.run(runtime, workspace, ['true'], {}, scratch_dir='relative')
+            with self.assertRaisesRegex(vm.Unavailable, 'scratch'):
+                vm.run(runtime, workspace, ['true'], {}, scratch_dir=str(root / 'absent'))
+            link = root / 'link.img'; link.symlink_to(image)
+            shared = root / 'shared.img'; shared.write_bytes(b''); shared.chmod(0o644)
+            alias = root / 'alias.img'; os.link(image, alias)
+            for cache in ['relative.img', str(root / 'absent.img'), str(link), str(shared), str(alias), str(workspace)]:
+                with self.subTest(cache=cache), self.assertRaisesRegex(vm.Unavailable, 'build cache'):
+                    vm.run(runtime, workspace, ['true'], {}, scratch_dir=str(root), build_cache=cache)
+
+
+class QemuCommandTests(unittest.TestCase):
+    def test_build_cache_drive_reports_io_errors_instead_of_pausing_the_guest(self):
+        config = {name: '/synthetic/' + name for name in ('qemu', 'kernel', 'firmware', 'data_dir')}
+        config['memory_mb'] = 512
+        command = vm.qemu_command(config, Path('/synthetic/initrd.gz'), [], '/synthetic/session/build-cache.img')
+        drive = command[command.index('-drive') + 1]
+        self.assertIn('werror=report', drive.split(','))
+        self.assertIn('rerror=report', drive.split(','))
+        self.assertIn('file=/synthetic/session/build-cache.img', drive)
+        self.assertNotIn('-drive', vm.qemu_command(config, Path('/synthetic/initrd.gz'), [], None))
+
+
 @unittest.skipUnless(os.environ.get('JARVIS_TEST_VM_CONFIG'), 'requires a provisioned private KVM runtime')
 class BuildVmTests(unittest.TestCase):
     def test_output_limit_stops_a_running_command_before_its_deadline(self):

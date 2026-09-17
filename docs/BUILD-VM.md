@@ -44,6 +44,73 @@ access comes only from a per-user ACL entry such as the login-seat grant, not
 from the owner, the `kvm` group entry under the ACL mask, or other bits), or `ok`.
 With the opt-out set it warns that builds run on the host.
 
+### Build scratch, persistence and timeout (#1036)
+
+Every VM build file lives under the scratch root, never the root disk:
+`AUGMENTAGENT_BUILD_SCRATCH_DIR` in the daemon environment, default
+`/mnt/build/codex-vm`. Codex runs with a cleared environment, so the daemon
+passes the root to the bridge in its policy (`build_scratch_dir`). A root inside a
+model-writable directory (resolved through its nearest existing ancestor) is withheld
+from the policy, so only build commands become unavailable while other tools keep
+working. The root must be a real directory (not a symlink), owned by the daemon user,
+with mode exactly 0700; the bridge checks this on an `O_NOFOLLOW` descriptor and creates
+sessions relative to it. Otherwise every VM build fails closed with
+`JARVIS_READINESS:build_scratch_unavailable` naming the path, and nothing runs on the
+host. Provision it once:
+
+```sh
+install -d -m 700 /mnt/build/codex-vm
+```
+
+Each bridge session creates `<root>/jarvis-vm-session-*` holding:
+
+- `owner.json`: the bridge pid and its kernel start time.
+- `build-cache.img`: a sparse 12 GiB ext4 image, mode 0600, attached to each
+  `cargo` guest as a virtio disk at `/build-cache`. It holds the Cargo target
+  directory and Cargo home for the whole session, so a second `cargo` command is
+  incremental. Snapshots keep source mtimes. The host never mounts it. It is a disk
+  image, not a 9p share, because the guest's 9p client stores timestamps to the
+  second, and Cargo then treats every dependency as rebuilt. On first use the guest
+  seeds the Cargo home from the read-only operator registry and Git cache mounts.
+  Nothing is copied on the host, and the registry is never copied per command.
+  12 GiB covers one checkout's debug target for a couple of workspace crates
+  (the burn-down target with the channel-core and cli test builds is 9.4 GiB) plus
+  about 0.8 GiB of Cargo home.
+- `tmp/`: each command's source snapshot, VM control files and initrd, and the
+  session's npm install copy.
+
+Disk safety: the scratch volume is shared with the daemon's own build caches.
+A new session is admitted only when both of these hold:
+
+- Free space covers the whole new image, the unallocated remainder of every
+  other session's image, and 20 GiB of headroom.
+- The allocated blocks of all images, plus the new image's cap, stay within a
+  24 GiB budget.
+
+Otherwise builds fail with `JARVIS_READINESS:build_scratch_space`, naming the
+path and the numbers, before any file is created. The image is attached with
+`werror=report,rerror=report`, so a host ENOSPC fails the guest's writes instead
+of pausing the VM until its deadline. When the image or the volume fills, the
+build reports `JARVIS_READINESS:build_cache_full` naming the image or the scratch
+root.
+
+Closing the bridge removes the session. A bridge killed without cleanup (the
+reasoner watchdog kills the whole process group) leaves its session behind. The
+daemon's hourly sweep loop, which also runs at start, removes sessions whose owner
+pid and start time no longer match a running process. Before removing a session
+it kills that session's VM processes. A process is one only if its executable is
+`qemu-system-*` or `python3` (the supervisor) and one of its arguments starts with
+the session path or is a qemu `path=`/`file=` option inside it. A shell that merely
+mentions the path is never killed. Each kill goes through `pidfd_open` and
+re-checks the start time first, so a reused pid is never signalled. Codex starts
+the bridge with a plain `Command` in a new process group, not a pid namespace, so
+the bridge's own pid is the one the daemon sees.
+
+A `cargo`, `npm` or `npx` command with no explicit `timeout` gets
+`AUGMENTAGENT_BUILD_TIMEOUT_SECS` (default 600 s, the longest a Claude-lane Bash
+call runs), passed as `build_timeout_secs` and capped at the tool maximum of
+900 s. Other commands default to 120 s. An explicit timeout is honoured.
+
 ### Host provisioning: KVM access that survives logout (operator step)
 
 On desktop hosts `/dev/kvm` is usually `root:kvm 0660` plus a logind `uaccess`
@@ -152,6 +219,7 @@ Run the real isolation and bridge contracts with the provisioned configuration:
 
 ```sh
 export JARVIS_TEST_VM_CONFIG="$HOME/.local/share/augmentagent/build-vm/runtime.json"
+export JARVIS_TEST_BUILD_SCRATCH=/mnt/build/codex-vm   # an existing 0700 directory
 python3 scripts/tests/codex_build_vm_test.py
 python3 scripts/tests/codex_tool_bridge_test.py
 cargo test -p augmentagent-channel-core live_codex_builds_and_tests_with_the_vm_bridge --lib -- --ignored
@@ -174,7 +242,8 @@ safely infer that an unrecognized receipt means an operation did not occur.
 Verify saved binary hashes and configuration permissions before replacement,
 then verify the running executable and service health after restart.
 
-Build artifacts and writable package caches are private to a bridge session.
+Build artifacts and writable package caches are private to a bridge session and
+live under the scratch root (see above).
 Disk quotas are not supplied by this runtime; provision host capacity separately. Binary source updates and file deletions reconcile in
 the source-build profile; profiles with text-only Write hooks reject those
 changes explicitly. Full fallback rollout and controlled auto-ship acceptance
@@ -198,13 +267,14 @@ build deadline and are bounded to 20 seconds per request, 32 MiB per response,
 Private registries and arbitrary Git dependency hosts require provisioned caches;
 the gateway does not forward authentication credentials.
 
-Cargo uses a private writable copy of the provisioned registry/git cache when
-fetching, preserves canonical crates.io identities, and can reuse newly downloaded
-crates on a subsequent offline build. Those copies never reconcile into source or
-replace the operator's cache. Session reuse keeps registry archives and index data,
-not extracted source directories or guest-modified Git checkouts. Cargo re-extracts
-archives on each invocation; Git dependencies start from the provisioned operator
-cache. Explicit `--offline` and `--frozen` flags retain their offline behavior.
+Cargo uses the session's private writable Cargo home in the build-cache image,
+seeded in the guest once per session with the provisioned registry archives, index
+and Git cache. It preserves canonical crates.io
+identities and can reuse newly downloaded crates on a subsequent offline build.
+Those copies never reconcile into source or replace the operator's cache. Within
+a session, extracted sources, Git checkouts and build outputs persist, including any
+changes a guest build made to them. Every new session starts again from the
+provisioned operator cache. Explicit `--offline` and `--frozen` flags retain their offline behavior.
 The executable toolchain directory must be owned by
 root or the daemon user and must not be group/world writable; provision a private
 copy when the ordinary Rust installation uses shared permissions.

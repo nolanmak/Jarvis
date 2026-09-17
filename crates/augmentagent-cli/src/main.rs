@@ -2810,7 +2810,11 @@ async fn main() -> Result<()> {
                 augmentagent_channel_core::handoff::retention_from_env(),
                 augmentagent_channel_core::handoff::SWEEP_INTERVAL,
                 shutdown.clone(),
+                // #1036 — also reap Codex VM build sessions left by a killed
+                // bridge (and any VM still running for them), hourly.
+                Some(std::sync::Arc::new(augmentagent_channel_core::build_scratch::sweep_and_log)),
             )));
+
 
             // Voice-capture listener (#80): long-poll the capture bot. Inert
             // unless a token is in the keyring AND the chat allowlist is

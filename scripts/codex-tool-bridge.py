@@ -32,10 +32,189 @@ class Readiness(Denied):
         'mcp_tools': 'Configured MCP server is missing a required tool; check the server version and tool profile.',
         'build_vm_unavailable': 'Build commands require the private build VM, but its runtime configuration is missing; '
                                 'run `augmentagent doctor`, or set AUGMENTAGENT_BUILD_VM=host in the daemon environment to opt out.',
+        'build_scratch_unavailable': 'VM build scratch directory {path} is missing, inside a model-writable directory, '
+                                     'or not a mode-0700 directory owned by the daemon user; create it with '
+                                     '`install -d -m 700` or set AUGMENTAGENT_BUILD_SCRATCH_DIR in the daemon environment.',
+        'build_scratch_space': 'VM build scratch {path} has too little space for a new build cache ({detail}); '
+                               'free space on that volume or wait for other build sessions to finish.',
+        'build_cache_full': 'VM build cache ran out of space at {path} ({detail}); the build did not complete. '
+                            'Free space on that volume, or narrow the build, before retrying.',
     }
 
-    def __init__(self, category):
-        super().__init__('JARVIS_READINESS:' + category + ' ' + self.MESSAGES[category])
+    def __init__(self, category, path=None, detail=''):
+        # Only operator-provisioned paths and sizes are substituted, never secrets.
+        message = self.MESSAGES[category].format(path=path if path is not None else '(not configured)', detail=detail)
+        super().__init__('JARVIS_READINESS:' + category + ' ' + message)
+
+
+# #1036: default Bash timeout for cargo/npm/npx when the policy names none. The
+# Claude lane's longest Bash call is ten minutes; the tool maximum stays 900 s.
+BUILD_TIMEOUT_DEFAULT = 600
+COMMAND_TIMEOUT_DEFAULT = 120
+COMMAND_TIMEOUT_MAX = 900
+
+
+def process_start_time(pid):
+    """Kernel start time (clock ticks since boot) of pid, or None if it is gone.
+
+    Paired with the pid it identifies one process: pids are reused, start
+    times of a reused pid differ.
+    """
+    try:
+        stat_line = Path(f'/proc/{pid}/stat').read_text()
+    except OSError:
+        return None
+    return stat_line.rsplit(')', 1)[1].split()[19]
+
+
+class BuildScratch:
+    """One bridge session's VM build files under the configured scratch root (#1036).
+
+    Nothing here uses the default temp directory. A session directory holds
+    the owner record (for the daemon's stale-session sweep), a sparse ext4
+    build-cache image that the guest mounts for the Cargo target directory and
+    Cargo home (so a session's later builds are incremental), and `tmp/` for
+    each command's snapshot and VM control files. Closing the session removes it.
+
+    Disk safety: a new session is admitted only if the volume keeps
+    HEADROOM_BYTES free after reserving its whole image and every other
+    session's unallocated growth, and if all images' allocated blocks plus the
+    new cap stay within BUDGET_BYTES. The scratch volume is shared with the
+    daemon's own build caches.
+    """
+    SESSION_PREFIX = 'jarvis-vm-session-'
+    IMAGE_NAME = 'build-cache.img'
+    # One checkout's debug target for a couple of workspace crates is ~9-10 GiB
+    # (the burn-down target holding channel-core and cli test builds is 9.4 GiB),
+    # plus ~0.8 GiB of Cargo home.
+    CACHE_BYTES = 12 * 1024**3
+    HEADROOM_BYTES = 20 * 1024**3
+    BUDGET_BYTES = 24 * 1024**3
+    # Below this after a failed build, the volume (not the build) is the cause.
+    FULL_BYTES = 1024**3
+
+    def __init__(self, root, refused=False):
+        self.root = Path(root) if root else None
+        self.refused = refused
+        self.cache_bytes = self.CACHE_BYTES
+        self.headroom_bytes = self.HEADROOM_BYTES
+        self.budget_bytes = self.BUDGET_BYTES
+        self.statvfs = os.statvfs
+        self.session = None
+
+    def _open_root(self):
+        """An O_NOFOLLOW directory fd for the root: owner-only (exactly 0700)."""
+        if self.root is None or self.refused or not self.root.is_absolute():
+            raise Readiness('build_scratch_unavailable', self.root)
+        try:
+            descriptor = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            raise Readiness('build_scratch_unavailable', self.root) from None
+        info = os.fstat(descriptor)
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            os.close(descriptor)
+            raise Readiness('build_scratch_unavailable', self.root)
+        return descriptor
+
+    def _require_space(self, root_fd):
+        gib = 1024**3
+        allocated = outstanding = 0
+        for name in os.listdir(root_fd):
+            if not name.startswith(self.SESSION_PREFIX):
+                continue
+            try:
+                info = os.stat(f'{name}/{self.IMAGE_NAME}', dir_fd=root_fd, follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                used = info.st_blocks * 512
+                allocated += used
+                outstanding += max(info.st_size - used, 0)
+        vfs = self.statvfs(root_fd)
+        free = vfs.f_bavail * vfs.f_frsize
+        if allocated + self.cache_bytes > self.budget_bytes:
+            raise Readiness('build_scratch_space', self.root,
+                f'build caches hold {allocated / gib:.1f} GiB; a new {self.cache_bytes / gib:.0f} GiB cache '
+                f'would exceed the {self.budget_bytes / gib:.0f} GiB budget')
+        needed = self.headroom_bytes + outstanding + self.cache_bytes
+        if free < needed:
+            raise Readiness('build_scratch_space', self.root,
+                f'{free / gib:.1f} GiB free; needs {needed / gib:.1f} GiB: {self.headroom_bytes / gib:.0f} GiB '
+                f'headroom, {outstanding / gib:.1f} GiB other sessions may still grow, '
+                f'{self.cache_bytes / gib:.0f} GiB for this cache')
+
+    def open(self):
+        import secrets
+        import shutil
+        root_fd = self._open_root()
+        try:
+            if self.session is not None:
+                if not self.cache.is_file():
+                    raise Readiness('build_scratch_unavailable', self.session)
+                return self.session
+            import fcntl
+            # One admission at a time across bridges: the space check and the
+            # new image must not interleave with another session's. Released
+            # when root_fd closes.
+            fcntl.flock(root_fd, fcntl.LOCK_EX)
+            self._require_space(root_fd)
+            name = self.SESSION_PREFIX + secrets.token_hex(8)
+            os.mkdir(name, 0o700, dir_fd=root_fd)
+            session = self.root / name
+            try:
+                session_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root_fd)
+                try:
+                    owner = os.open('owner.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600,
+                                    dir_fd=session_fd)
+                    with os.fdopen(owner, 'w') as stream:
+                        json.dump({'pid': os.getpid(), 'start_time': process_start_time(os.getpid())}, stream)
+                    os.mkdir('tmp', 0o700, dir_fd=session_fd)
+                    image = os.open(self.IMAGE_NAME, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600,
+                                    dir_fd=session_fd)
+                    try:
+                        os.ftruncate(image, self.cache_bytes)
+                    finally:
+                        os.close(image)
+                finally:
+                    os.close(session_fd)
+                mke2fs = shutil.which('mke2fs', path='/usr/sbin:/sbin:/usr/bin:/bin')
+                if not mke2fs:
+                    raise Denied('build cache filesystem tool (mke2fs) is not installed')
+                # Sparse and lazily initialised: disk use grows with the build.
+                subprocess.run([mke2fs, '-q', '-F', '-t', 'ext4', '-m', '0',
+                                '-E', f'root_owner={os.getuid()}:{os.getgid()},lazy_itable_init=1,nodiscard',
+                                str(session / self.IMAGE_NAME)], env={'PATH': '/usr/sbin:/sbin:/usr/bin:/bin'},
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=60, check=True)
+            except (OSError, subprocess.SubprocessError, Denied):
+                shutil.rmtree(session, ignore_errors=True)
+                raise Readiness('build_scratch_unavailable', self.root) from None
+            self.session = session
+            return session
+        finally:
+            os.close(root_fd)
+
+    def volume_full(self):
+        """Whether the scratch volume is (nearly) out of space."""
+        try:
+            vfs = self.statvfs(self.root)
+        except OSError:
+            return False
+        return vfs.f_bavail * vfs.f_frsize < self.FULL_BYTES
+
+    @property
+    def cache(self):
+        return self.session / self.IMAGE_NAME
+
+    @property
+    def tmp(self):
+        return self.session / 'tmp'
+
+    def close(self):
+        import shutil
+        if self.session is not None:
+            shutil.rmtree(self.session, ignore_errors=True)
+            self.session = None
 
 
 class ReconciliationRequired(Denied):
@@ -604,8 +783,18 @@ class Policy:
         # #1045: single files outside the roots that Read alone may open.
         self.read_allowances = self._allowances(config.get('read_allowances', []))
         self._node_install_cache = None
-        self._cargo_cache = None
         self.build_vm_config = config.get('build_vm_config')
+        # #1036: VM build scratch root and default build timeout, from the
+        # daemon's policy (codex runs with a cleared environment).
+        # A root the model could write through makes builds unavailable; the
+        # bridge and its other tools still start.
+        scratch = config.get('build_scratch_dir')
+        refused = scratch is not None and (not Path(scratch).is_absolute() or any(
+            Path(scratch).resolve() == root or root in Path(scratch).resolve().parents for root in self.write_roots))
+        self._scratch = BuildScratch(scratch, refused=refused)
+        configured_timeout = config.get('build_timeout_secs')
+        self.build_timeout = min(max(int(configured_timeout), 1), COMMAND_TIMEOUT_MAX) \
+            if configured_timeout is not None else BUILD_TIMEOUT_DEFAULT
         # #1041: which runner executes cargo/npm/npx. A VM configuration
         # selects the VM; only the explicit operator opt-out selects the host.
         # Anything else (no configuration found) leaves builds unavailable.
@@ -1199,7 +1388,7 @@ class Policy:
         """The command's process (host or VM) is about to start."""
         self._command_started = True
 
-    def run_command(self, command, timeout=120):
+    def run_command(self, command, timeout=None):
         # #1041: the runner is decided before anything executes. It leads the
         # outcome, so truncation cannot drop it, and it is attached to any
         # failure raised after the process started (a timeout, a broker
@@ -1210,6 +1399,8 @@ class Policy:
         if build and self.build_runner is None:
             raise Readiness('build_vm_unavailable')
         runner = self.build_runner if build else 'host'
+        if timeout is None:
+            timeout = self.build_timeout if build else COMMAND_TIMEOUT_DEFAULT
         try:
             outcome = (self.run_vm_build(argv, timeout) if runner == 'vm'
                        else self._run_host_command(argv, build, timeout))
@@ -1347,15 +1538,22 @@ class Policy:
                         pass
                     process.wait()
 
-    def run_vm_build(self, argv, timeout):
+    def _vm_helper(self):
         import importlib.util
-        import tempfile
         helper = Path(__file__).with_name('codex-build-vm.py')
         if not helper.is_file():
             raise Denied('VM build runner is unavailable')
         spec = importlib.util.spec_from_file_location('jarvis_build_vm', helper)
         vm = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(vm)
+        return vm
+
+    def run_vm_build(self, argv, timeout):
+        import tempfile
+        # Refused before any process starts: never fall back to /tmp or the host.
+        scratch = self._scratch
+        scratch.open()
+        vm = self._vm_helper()
         try:
             runtime = vm.Runtime.load(Path(self.build_vm_config))
             artifacts = [runtime.config[key] for key in ('qemu', 'kernel', 'busybox', 'firmware',
@@ -1391,7 +1589,7 @@ class Policy:
                     # An install can repair a missing or changed dependency tree;
                     # do not require a matching linked-checkout lock first.
                     dependencies = self.local_node_dependencies(self.cwd)
-            with tempfile.TemporaryDirectory(prefix='jarvis-vm-build-') as temporary:
+            with tempfile.TemporaryDirectory(prefix='jarvis-vm-build-', dir=scratch.tmp) as temporary:
                 snapshot = BuildSnapshot(self, Path(temporary) / 'workspace')
                 view = Policy({'cwd': str(snapshot.root), 'read_roots': [str(snapshot.root)],
                     'allowed_tools': ['Read']})
@@ -1402,43 +1600,28 @@ class Policy:
                     for relative, source in dependencies:
                         copy_dependency_tree(source, snapshot.root / relative)
                 build_environment = {}
-                cargo_home = None
-                if name == 'cargo' and (self._cargo_cache or '--offline' not in guest):
-                    cargo_home = snapshot.root / '.cargo-home'
-                    cargo_home.mkdir(mode=0o700)
-                    for cache_name, config_key in [('registry', 'registry'), ('git', 'cargo_git')]:
-                        source = (Path(self._cargo_cache.name) / cache_name if self._cargo_cache and cache_name == 'registry'
-                            else Path(runtime.config[config_key]) if config_key in runtime.config else None)
-                        if source is not None and source.exists():
-                            copy_dependency_tree(source, cargo_home / cache_name)
-                    build_environment = {'CARGO_HOME': '/workspace/.cargo-home',
+                build_cache = None
+                if name == 'cargo':
+                    # The session's build-cache image carries the Cargo home
+                    # (seeded in the guest from the read-only operator registry
+                    # once per session) and the target directory across its
+                    # commands, so later builds are incremental.
+                    build_cache = str(scratch.cache)
+                    build_environment = {
                         'CARGO_NET_OFFLINE': 'true' if {'--offline', '--frozen'} & set(guest) else 'false'}
                 downloads = {}
                 self.mark_command_started()
                 result = vm.run(runtime, snapshot.root, guest, build_environment, timeout=timeout,
-                    node_workspaces=[] if install else dependencies, download_info=downloads)
+                    node_workspaces=[] if install else dependencies, download_info=downloads,
+                    scratch_dir=str(scratch.tmp), build_cache=build_cache)
                 if initial_manifests is not None and initial_manifests != self.node_manifest_state():
                     raise Denied('dependency manifests changed during build; retry before syncing sources')
                 snapshot.sync()
-                if cargo_home is not None:
-                    owner = tempfile.TemporaryDirectory(prefix='jarvis-cargo-cache-')
-                    try:
-                        copy_cargo_downloads(cargo_home, Path(owner.name))
-                        previous = self._cargo_cache
-                        self._cargo_cache = None
-                        if previous:
-                            previous.cleanup()
-                        import weakref
-                        weakref.finalize(self, owner.cleanup)
-                        self._cargo_cache = owner
-                    except Exception:
-                        owner.cleanup()
-                        raise
                 if install and result['exit_code'] == 0:
                     # Never install guest-produced executables into the host
                     # checkout. Retain this bridge's private dependency copy and
                     # mount it read-only for subsequent build/test commands.
-                    owner = tempfile.TemporaryDirectory(prefix='jarvis-node-install-')
+                    owner = tempfile.TemporaryDirectory(prefix='jarvis-node-install-', dir=scratch.tmp)
                     try:
                         roots = []
                         for relative, source in self.local_node_dependencies(snapshot.root):
@@ -1462,19 +1645,27 @@ class Policy:
                         raise
                 return result
         except vm.Unavailable as exc:
+            if str(exc) == 'VM build cache is full':
+                raise Readiness('build_cache_full', scratch.cache, 'the session build cache image is full') from exc
+            if scratch.volume_full():
+                raise Readiness('build_cache_full', scratch.root, 'the scratch volume is full') from exc
             raise Denied(str(exc)) from exc
+        except Readiness:
+            raise
         except Denied:
+            if scratch.volume_full():
+                raise Readiness('build_cache_full', scratch.root, 'the scratch volume is full')
             raise
         except (OSError, ValueError, KeyError) as exc:
+            if scratch.volume_full():
+                raise Readiness('build_cache_full', scratch.root, 'the scratch volume is full') from exc
             raise Denied('VM runtime or source reconciliation is unavailable') from exc
 
     def close(self):
-        if self._cargo_cache:
-            self._cargo_cache.cleanup()
-            self._cargo_cache = None
         if self._node_install_cache:
             self._node_install_cache[2].cleanup()
             self._node_install_cache = None
+        self._scratch.close()
 
     def node_manifest_state(self):
         return {name: self._read_bytes(name) for name in self.dependency_manifests(self.cwd)}
@@ -1616,24 +1807,6 @@ def npm_subcommand(argv):
     return None
 
 
-def copy_cargo_downloads(source, destination):
-    """Retain package archives/index data, never guest-modified extracted code.
-
-    Each invocation re-extracts archives through Cargo's checksum validation.
-    Git dependencies are always seeded from the provisioned operator cache.
-    The retained cache remains untrusted data confined to the build guest.
-    """
-    source, destination = Path(source), Path(destination)
-    registry = source / 'registry'
-    if registry.is_symlink():
-        raise Denied('Cargo registry cache must be a regular directory')
-    for name in ('cache', 'index'):
-        path = registry / name
-        if path.exists() or path.is_symlink():
-            (destination / 'registry').mkdir(mode=0o700, exist_ok=True)
-            copy_dependency_tree(path, destination / 'registry' / name)
-
-
 def copy_dependency_tree(source, destination):
     """Copy untrusted package data without following links or copying devices.
 
@@ -1688,7 +1861,11 @@ class BuildSnapshot:
             destination = root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(data)
-            destination.chmod(os.stat(absolute, follow_symlinks=False).st_mode & 0o777)
+            info = os.stat(absolute, follow_symlinks=False)
+            destination.chmod(info.st_mode & 0o777)
+            # #1036: keep source mtimes so a session's persistent Cargo target
+            # sees unchanged files as fresh and rebuilds incrementally.
+            os.utime(destination, ns=(info.st_atime_ns, info.st_mtime_ns))
             self.original[relative] = data
 
     def sync(self):
@@ -2025,7 +2202,7 @@ class Server:
 
     def execute(self, name, arguments):
         if name == 'Bash':
-            outcome = self.policy.run_command(arguments['command'], arguments.get('timeout', 120))
+            outcome = self.policy.run_command(arguments['command'], arguments.get('timeout'))
             return {'isError': outcome['exit_code'] != 0,
                     'content': [{'type': 'text', 'text': json.dumps(outcome)}]}
         if name.startswith('mcp__'):

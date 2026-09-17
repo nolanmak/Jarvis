@@ -237,6 +237,7 @@ impl BridgeLaunch {
         }
         environment.extend(opts.env.iter().cloned());
         let runner = build_runner();
+        let scratch = crate::build_scratch::policy_scratch_dir(crate::build_scratch::scratch_dir(), &write_roots);
         if let BuildRunner::Unavailable { reason } = &runner {
             if opts.allowed_tools.iter().any(|tool| is_build_tool_pattern(tool)) {
                 tracing::warn!(reason, "codex build commands will fail closed: no build VM (#1041)");
@@ -256,6 +257,9 @@ impl BridgeLaunch {
             // Operator configuration, deliberately not sourced from opts.env.
             "build_vm_config": runner.vm_config(),
             "build_runner": runner.label(),
+            // #1036: VM build scratch root and default build timeout.
+            "build_scratch_dir": scratch,
+            "build_timeout_secs": crate::build_scratch::build_timeout_secs(),
         });
         fn private_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
             let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
@@ -390,6 +394,10 @@ mod tests {
         assert_ne!(policy["build_vm_config"], "untrusted-profile-override");
         assert_eq!(policy["build_runner"], build_runner().label(), "policy names the runner the bridge must use");
         assert!(matches!(policy["build_runner"].as_str(), Some("vm" | "host" | "unavailable")));
+        // #1036: scratch root and build timeout reach the bridge through the
+        // policy (codex runs with a cleared environment), never opts.env.
+        assert_eq!(policy["build_scratch_dir"], serde_json::json!(crate::build_scratch::scratch_dir()));
+        assert_eq!(policy["build_timeout_secs"], crate::build_scratch::build_timeout_secs());
         for helper in ["codex-build-vm.py", "build-dependency-proxy.py", "provider-supervisor.py"] {
             assert_eq!(std::fs::metadata(launch_dir.join(helper)).unwrap().permissions().mode() & 0o777, 0o600);
         }
