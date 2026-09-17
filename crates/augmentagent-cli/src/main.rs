@@ -1875,6 +1875,14 @@ enum GmailOp {
         /// the old draft is NOT carried over (Composio can't read it back).
         #[arg(long)]
         attach: Option<PathBuf>,
+        /// #994 — the recipient's own message, so the register check can hold
+        /// this body to THEIR casing rather than trusting the drafter's
+        /// receipt. Same flags as `gmail compose`; omitting them leaves the
+        /// deterministic recipient check off for this call, exactly as before.
+        #[arg(long)]
+        reply_to_body: Option<String>,
+        #[arg(long)]
+        reply_to_body_file: Option<String>,
     },
     /// Send an existing draft.
     Send {
@@ -1915,6 +1923,14 @@ enum GmailOp {
         /// Attach a local file (#417).
         #[arg(long)]
         attach: Option<PathBuf>,
+        /// #994 — the recipient's own message, so the register check can hold
+        /// this body to THEIR casing rather than trusting the drafter's
+        /// receipt. Same flags as `gmail compose`; omitting them leaves the
+        /// deterministic recipient check off for this call, exactly as before.
+        #[arg(long)]
+        reply_to_body: Option<String>,
+        #[arg(long)]
+        reply_to_body_file: Option<String>,
     },
 }
 
@@ -3277,6 +3293,7 @@ async fn main() -> Result<()> {
             }
             GmailOp::UpdateDraft {
                 account, draft_id, to, cc, bcc, subject, body, body_file, thread_id, attach,
+                reply_to_body, reply_to_body_file,
             } => {
                 run_gmail_update_draft(
                     store,
@@ -3290,6 +3307,8 @@ async fn main() -> Result<()> {
                     body_file.clone(),
                     thread_id.clone(),
                     attach.clone(),
+                    reply_to_body.clone(),
+                    reply_to_body_file.clone(),
                 )
                 .await
             }
@@ -3301,6 +3320,7 @@ async fn main() -> Result<()> {
             }
             GmailOp::SendNow {
                 account, to, cc, bcc, subject, body, body_file, thread_id, attach,
+                reply_to_body, reply_to_body_file,
             } => {
                 run_gmail_send_now(
                     store,
@@ -3313,6 +3333,8 @@ async fn main() -> Result<()> {
                     body_file.clone(),
                     thread_id.clone(),
                     attach.clone(),
+                    reply_to_body.clone(),
+                    reply_to_body_file.clone(),
                 )
                 .await
             }
@@ -4924,7 +4946,6 @@ async fn run_gmail_accounts(store: Arc<Store>, json: bool) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 /// #417 — Upload `--attach` (when given) to Composio's attachment store,
 /// printing what was attached so the operator can SEE it happened. Fails
 /// loudly on a missing/unreadable file before any draft is created.
@@ -5118,6 +5139,27 @@ fn body_without_leaked_subject(
         );
     }
     Ok((rest, Some(dropped)))
+}
+
+/// #994 — the recipient's own message, from `--reply-to-body` or
+/// `--reply-to-body-file`.
+///
+/// Shared by compose, update-draft and send-now. Review of this PR: compose
+/// passed the sample and the other two passed `None`, so the deterministic
+/// recipient check was silently off on two live mail paths. One reader means
+/// they cannot drift apart again.
+fn read_optional_body(
+    reply_to_body: Option<String>,
+    reply_to_body_file: Option<String>,
+) -> Result<Option<String>> {
+    match (reply_to_body, reply_to_body_file) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("--reply-to-body and --reply-to-body-file are mutually exclusive")
+        }
+        (Some(b), None) => Ok(Some(b)),
+        (None, Some(p)) => Ok(Some(read_body(None, Some(p))?)),
+        (None, None) => Ok(None),
+    }
 }
 
 /// CLI adapter for [`body_without_leaked_subject`]: a body-level `Subject:`
@@ -5438,12 +5480,7 @@ async fn run_gmail_compose(
     let body = read_body(body, body_file)?;
     // #994 — the inbound is read here, ahead of the body gate, so a reply
     // is held to the recipient's own casing before any Gmail write.
-    let inbound = match (reply_to_body, reply_to_body_file) {
-        (Some(_), Some(_)) => anyhow::bail!("--reply-to-body and --reply-to-body-file are mutually exclusive"),
-        (Some(b), None) => Some(b),
-        (None, Some(p)) => Some(read_body(None, Some(p))?),
-        (None, None) => None,
-    };
+    let inbound = read_optional_body(reply_to_body, reply_to_body_file)?;
     let body_str = body_for_gmail_write(body, &subject, inbound.as_deref())?;
     // Validate the --post flag pairing BEFORE any Gmail write, so a usage
     // error can't strand an orphan draft in the mailbox (#412).
@@ -6292,13 +6329,20 @@ async fn run_gmail_update_draft(
     body_file: Option<String>,
     thread_id: Option<String>,
     attach: Option<PathBuf>,
+    reply_to_body: Option<String>,
+    reply_to_body_file: Option<String>,
 ) -> Result<()> {
     let to = normalize_recipients("--to", &to)?;
     anyhow::ensure!(!to.is_empty(), "--to requires at least one email address");
     let to = to.join(", ");
     let cc = normalize_recipients("--cc", &cc)?;
     let bcc = normalize_recipients("--bcc", &bcc)?;
-    let body_str = body_for_gmail_write(read_body(body, body_file)?, &subject, None)?;
+    // #994 — the recipient's own message gates this write too. Review of this
+    // PR: compose passed the inbound sample and these two passed `None`, so an
+    // existing reply to a standard-casing recipient could still be updated or
+    // sent in lowercase behind a matching-but-misclassified receipt.
+    let inbound = read_optional_body(reply_to_body, reply_to_body_file)?;
+    let body_str = body_for_gmail_write(read_body(body, body_file)?, &subject, inbound.as_deref())?;
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     // #500 — refuse while a send of exactly this draft is in flight: update
     // is create-replacement + DELETE-old, which would yank the draft out
@@ -6467,13 +6511,20 @@ async fn run_gmail_send_now(
     body_file: Option<String>,
     thread_id: Option<String>,
     attach: Option<PathBuf>,
+    reply_to_body: Option<String>,
+    reply_to_body_file: Option<String>,
 ) -> Result<()> {
     let to = normalize_recipients("--to", &to)?;
     anyhow::ensure!(!to.is_empty(), "--to requires at least one email address");
     let to = to.join(", ");
     let cc = normalize_recipients("--cc", &cc)?;
     let bcc = normalize_recipients("--bcc", &bcc)?;
-    let body_str = body_for_gmail_write(read_body(body, body_file)?, &subject, None)?;
+    // #994 — the recipient's own message gates this write too. Review of this
+    // PR: compose passed the inbound sample and these two passed `None`, so an
+    // existing reply to a standard-casing recipient could still be updated or
+    // sent in lowercase behind a matching-but-misclassified receipt.
+    let inbound = read_optional_body(reply_to_body, reply_to_body_file)?;
+    let body_str = body_for_gmail_write(read_body(body, body_file)?, &subject, inbound.as_deref())?;
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
@@ -8993,6 +9044,53 @@ mod unescape_body_tests {
 
 #[cfg(test)]
 mod approval_body_tests {
+    use super::read_optional_body;
+
+    /// #994 review: compose passed the recipient's own message into the
+    /// register gate and update-draft and send-now passed `None`, so an
+    /// existing reply to a standard-casing recipient could still be updated or
+    /// sent in lowercase behind a matching-but-misclassified receipt. The
+    /// protection has to hold on every path that writes mail, not just the one
+    /// the issue was reported against.
+    #[test]
+    fn every_gmail_write_path_gates_on_the_recipients_own_casing() {
+        let src = include_str!("main.rs");
+        for f in [
+            "async fn run_gmail_compose(",
+            "async fn run_gmail_update_draft(",
+            "async fn run_gmail_send_now(",
+        ] {
+            let start = src.find(f).unwrap_or_else(|| panic!("{f} must exist"));
+            let body = &src[start..start + src[start..].find("\n}\n").expect("fn end")];
+            assert!(
+                body.contains("read_optional_body("),
+                "{f} must read the recipient sample through the shared reader"
+            );
+            let gate = body
+                .find("body_for_gmail_write(")
+                .unwrap_or_else(|| panic!("{f} must go through the body gate"));
+            let call = &body[gate..gate + 200];
+            assert!(
+                call.contains("inbound.as_deref()"),
+                "{f} must PASS the sample to the gate, not None: {call:?}"
+            );
+        }
+    }
+
+    /// One reader for all three, so they cannot drift apart again — which is
+    /// exactly how two of them ended up passing `None`.
+    #[test]
+    fn the_inbound_sample_has_one_reader() {
+        assert_eq!(read_optional_body(None, None).unwrap(), None);
+        assert_eq!(
+            read_optional_body(Some("their mail".into()), None).unwrap(),
+            Some("their mail".to_string())
+        );
+        let err = read_optional_body(Some("a".into()), Some("b".into()))
+            .expect_err("both at once is a usage error");
+        assert!(format!("{err:#}").contains("mutually exclusive"));
+    }
+
     /// #994 review, finding 1: `strip_register_receipt` dropped ANY first
     /// line that parsed as a receipt, including from a hand-composed email
     /// that happens to open by discussing a register. There is no drafter flag
