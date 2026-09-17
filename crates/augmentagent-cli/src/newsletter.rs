@@ -82,6 +82,53 @@ pub enum Command {
         #[arg(long)]
         newsletter_id: String,
     },
+    /// Create a Jarvis-owned daily research or draft schedule.
+    ScheduleCreate {
+        #[arg(long)]
+        newsletter_id: String,
+        #[arg(long)]
+        brief_revision: u32,
+        #[arg(long, value_parser = ["research", "draft"])]
+        kind: String,
+        #[arg(long)]
+        local_time: String,
+        #[arg(long)]
+        timezone: String,
+    },
+    /// List active and paused schedules.
+    ScheduleList {
+        #[arg(long)]
+        newsletter_id: String,
+    },
+    /// Read a schedule including its current version.
+    ScheduleGet {
+        #[arg(long)]
+        newsletter_id: String,
+        #[arg(long)]
+        schedule_id: String,
+    },
+    /// Edit, pause, resume or soft-delete a schedule with optimistic locking.
+    ScheduleEdit {
+        #[arg(long)]
+        newsletter_id: String,
+        #[arg(long)]
+        schedule_id: String,
+        #[arg(long)]
+        expected_version: u32,
+        #[arg(long)]
+        local_time: String,
+        #[arg(long)]
+        timezone: String,
+        #[arg(long, value_parser = ["active", "paused", "deleted"])]
+        status: String,
+    },
+    /// Fire the latest due occurrence from a trusted Discord or loop event.
+    ScheduleRun {
+        #[arg(long)]
+        newsletter_id: String,
+        #[arg(long)]
+        schedule_id: String,
+    },
     /// Generate a cited draft from stored evidence.
     Generate {
         #[arg(long)]
@@ -100,6 +147,10 @@ pub enum Command {
 
 fn request_key(event_id: &str, operation: &str) -> String {
     format!("newsletterbuddy:v1:{event_id}:{operation}")
+}
+
+fn schedule_create_operation(newsletter_id: &str, brief_revision: u32, kind: &str) -> String {
+    format!("schedule-create:{newsletter_id}:{brief_revision}:{kind}")
 }
 
 fn event_request_key(operation: &str) -> Result<String> {
@@ -389,6 +440,80 @@ pub async fn run(command: &Command) -> Result<()> {
             )
             .await?
         }
+        Command::ScheduleCreate {
+            newsletter_id,
+            brief_revision,
+            kind,
+            local_time,
+            timezone,
+        } => {
+            let id = uuid(newsletter_id)?;
+            let key = event_request_key(&schedule_create_operation(id, *brief_revision, kind))?;
+            api.call(Method::POST, &format!("v1/newsletters/{id}/schedules"),
+                Some(json!({ "briefRevision": brief_revision, "kind": kind, "schedulerOwner": "jarvis",
+                    "localTime": local_time, "timezone": timezone })), Some(&key)).await?
+        }
+        Command::ScheduleList { newsletter_id } => {
+            let id = uuid(newsletter_id)?;
+            api.call(
+                Method::GET,
+                &format!("v1/newsletters/{id}/schedules"),
+                None,
+                None,
+            )
+            .await?
+        }
+        Command::ScheduleGet {
+            newsletter_id,
+            schedule_id,
+        } => {
+            let id = uuid(newsletter_id)?;
+            let schedule = uuid(schedule_id)?;
+            api.call(
+                Method::GET,
+                &format!("v1/newsletters/{id}/schedules/{schedule}"),
+                None,
+                None,
+            )
+            .await?
+        }
+        Command::ScheduleEdit {
+            newsletter_id,
+            schedule_id,
+            expected_version,
+            local_time,
+            timezone,
+            status,
+        } => {
+            let id = uuid(newsletter_id)?;
+            let schedule = uuid(schedule_id)?;
+            let key = event_request_key(&format!("schedule-edit:{schedule}"))?;
+            api.call(
+                Method::PUT,
+                &format!("v1/newsletters/{id}/schedules/{schedule}"),
+                Some(
+                    json!({ "expectedVersion": expected_version, "localTime": local_time,
+                    "timezone": timezone, "status": status }),
+                ),
+                Some(&key),
+            )
+            .await?
+        }
+        Command::ScheduleRun {
+            newsletter_id,
+            schedule_id,
+        } => {
+            let id = uuid(newsletter_id)?;
+            let schedule = uuid(schedule_id)?;
+            let key = event_request_key(&format!("occurrence:{schedule}"))?;
+            api.call(
+                Method::POST,
+                &format!("v1/newsletters/{id}/schedules/{schedule}/occurrences"),
+                Some(json!({})),
+                Some(&key),
+            )
+            .await?
+        }
         Command::Generate {
             newsletter_id,
             brief_revision,
@@ -434,6 +559,15 @@ mod tests {
         assert_ne!(
             request_key("123:456", "research"),
             request_key("123:456", "draft")
+        );
+    }
+
+    #[test]
+    fn same_discord_event_can_create_separate_research_and_draft_schedules() {
+        let id = "123e4567-e89b-12d3-a456-426614174000";
+        assert_ne!(
+            request_key("123:456", &schedule_create_operation(id, 2, "research")),
+            request_key("123:456", &schedule_create_operation(id, 2, "draft")),
         );
     }
 
