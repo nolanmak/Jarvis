@@ -80,13 +80,30 @@ fn request_key(event_id: &str, operation: &str) -> String {
 fn event_request_key(operation: &str) -> Result<String> {
     let event_id = std::env::var("NEWSLETTERBUDDY_REQUEST_ID")
         .context("NewsletterBuddy requires a trusted Discord request ID")?;
-    if event_id.is_empty()
-        || event_id.len() > 100
-        || !event_id.chars().all(|c| c.is_ascii_digit() || c == ':')
-    {
+    if !trusted_request_id(&event_id) {
         bail!("NewsletterBuddy request ID is invalid");
     }
     Ok(request_key(&event_id, operation))
+}
+
+pub fn trusted_request_id(value: &str) -> bool {
+    if value.is_empty() || value.len() > 100 {
+        return false;
+    }
+    if let Some((channel, message)) = value.split_once(':') {
+        if !channel.is_empty()
+            && channel.chars().all(|c| c.is_ascii_digit())
+            && !message.is_empty()
+            && message.chars().all(|c| c.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    value.starts_with("loop:")
+        && value.len() > 5
+        && value[5..]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '-')
 }
 
 fn validated_url(raw: &str) -> Result<Url> {
@@ -330,6 +347,15 @@ mod tests {
             request_key("123:456", "research"),
             request_key("123:456", "draft")
         );
+    }
+
+    #[test]
+    fn trusted_request_id_accepts_discord_and_loop_occurrences_only() {
+        assert!(trusted_request_id("123:456"));
+        assert!(trusted_request_id("loop:abc-123:after:456"));
+        assert!(!trusted_request_id("123:456; evil"));
+        assert!(!trusted_request_id("loop:"));
+        assert!(!trusted_request_id("person:123"));
     }
 
     #[test]

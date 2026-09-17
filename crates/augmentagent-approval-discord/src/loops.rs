@@ -68,7 +68,7 @@ pub fn pause_after_failures() -> i64 {
 #[async_trait]
 pub trait LoopRunner: Send + Sync {
     /// `request_id` identifies this occurrence across scheduler restarts.
-    async fn run_prompt(&self, request_id: &str, prompt: &str) -> anyhow::Result<String>;
+    async fn run_prompt(&self, request_id: &str, owner: &str, prompt: &str) -> anyhow::Result<String>;
 }
 
 fn loop_request_id(id: &str, created_at_ms: i64, last_run_ms: Option<i64>) -> String {
@@ -657,7 +657,7 @@ impl LoopScheduler {
         info!(loop_id = %l.id, "running loop");
         let pause_after = pause_after_failures();
         let request_id = loop_request_id(&l.id, l.created_at_ms, l.last_run_ms);
-        match self.runner.run_prompt(&request_id, &l.prompt).await {
+        match self.runner.run_prompt(&request_id, &l.owner, &l.prompt).await {
             Ok(answer) => {
                 let header = format!("🔁 loop `{}` · _{}_", l.id, truncate(&l.prompt, 80));
                 let body = loop_result_body(&header, &answer);
@@ -946,7 +946,7 @@ mod tests {
         }
         #[async_trait]
         impl LoopRunner for Runner {
-            async fn run_prompt(&self, request_id: &str, _prompt: &str) -> anyhow::Result<String> {
+            async fn run_prompt(&self, request_id: &str, _owner: &str, _prompt: &str) -> anyhow::Result<String> {
                 self.ids.lock().unwrap().push(request_id.into());
                 self.started.notify_one();
                 if !self.complete.load(std::sync::atomic::Ordering::SeqCst) {

@@ -3178,6 +3178,7 @@ async fn main() -> Result<()> {
                             reasoner: build_reasoner(),
                             wiki_root,
                             repo_root,
+                            allowed_owner_id: std::env::var("DISCORD_ALLOWED_USER_ID").ok(),
                         });
                         let poster = Arc::new(DiscordLoopPoster {
                             http: Arc::new(serenity::http::Http::new(&token)),
@@ -8908,7 +8909,7 @@ fn configure_newsletter_tools(
     if !ctx.owner_authorized { return; }
     let Some(url) = url else { return; };
     if newsletter::validated_url_for_agent(url).is_err() { return; }
-    if ctx.session_id.is_empty() || !ctx.session_id.chars().all(|c| c.is_ascii_digit() || c == ':') { return; }
+    if !newsletter::trusted_request_id(&ctx.session_id) { return; }
     opts.env.push(("NEWSLETTERBUDDY_URL".into(), url.to_string()));
     opts.env.push(("NEWSLETTERBUDDY_REQUEST_ID".into(), ctx.session_id.clone()));
     let bin = std::env::current_exe().ok();
@@ -8939,6 +8940,16 @@ mod newsletter_agent_tests {
         assert!(opts.allowed_tools.iter().any(|tool| tool == "Bash(augmentagent newsletter research *)"));
         assert!(!opts.allowed_tools.iter().any(|tool| tool.contains("newsletter configure")));
         assert!(opts.env.iter().any(|(key, value)| key == "NEWSLETTERBUDDY_REQUEST_ID" && value == "123:456"));
+    }
+
+    #[test]
+    fn owner_scheduled_occurrence_has_a_stable_newsletter_request_id() {
+        let mut opts = ask_opts("wiki".into(), "repo".into());
+        let mut ctx = augmentagent_approval_discord::AuditCtx::empty();
+        ctx.session_id = "loop:abc-123:after:456".into();
+        ctx.owner_authorized = true;
+        configure_newsletter_tools(&mut opts, &ctx, Some("https://newsletter.example"));
+        assert!(opts.env.iter().any(|(key, value)| key == "NEWSLETTERBUDDY_REQUEST_ID" && value == "loop:abc-123:after:456"));
     }
 }
 
@@ -9111,13 +9122,18 @@ struct LoopReasonerRunner {
     reasoner: Arc<FallbackReasoner>,
     wiki_root: PathBuf,
     repo_root: PathBuf,
+    allowed_owner_id: Option<String>,
 }
 
 #[async_trait]
 impl LoopRunner for LoopReasonerRunner {
-    async fn run_prompt(&self, request_id: &str, prompt: &str) -> anyhow::Result<String> {
+    async fn run_prompt(&self, request_id: &str, owner: &str, prompt: &str) -> anyhow::Result<String> {
         let mut opts = ask_opts(self.wiki_root.clone(), self.repo_root.clone());
         opts.session_id = Some(request_id.to_string());
+        let mut newsletter_ctx = augmentagent_approval_discord::AuditCtx::empty();
+        newsletter_ctx.session_id = request_id.to_string();
+        newsletter_ctx.owner_authorized = self.allowed_owner_id.as_deref() == Some(owner);
+        enable_newsletter_tools(&mut opts, &newsletter_ctx);
         // #389 — loops fire through the same query toolbelt, so they carry
         // the same owner-rules preamble as interactive asks.
         let prompt = match owner_rules_block(&self.wiki_root) {
