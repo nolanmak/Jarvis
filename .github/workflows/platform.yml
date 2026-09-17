@@ -1,0 +1,68 @@
+name: Platform (Linux + macOS)
+
+# #1079 — the daemon runs under systemd on Linux and launchd on macOS. This
+# builds and tests the host-dependent surface on both so neither side can
+# silently regress: service/status/logs/installers/doctor probes, the
+# process walker, sidecar socket paths, and the updater's restart library.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  platform:
+    name: platform (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: platform
+      - name: Build the CLI
+        run: cargo build -p augmentagent-cli --bin augmentagent
+      - name: Process walker + sidecar clients
+        run: cargo test -p augmentagent-loops -p augmentagent-browser-client -p augmentagent-renderer-client
+      - name: Host-dependent CLI surface
+        run: >-
+          cargo test -p augmentagent-cli --bin augmentagent --
+          platform:: service:: logs:: status:: installers:: handoff_prune::
+          doctor:: autopr_eval:: autopr_health::
+      - name: CLI smoke on this host
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=target/debug/augmentagent
+          # Nothing is installed on the runner: these must answer cleanly,
+          # not crash on a missing /proc or service manager.
+          "$bin" loops list --json >/dev/null
+          if [ "$(uname -s)" = Darwin ]; then
+            # launchd is always reachable on macOS; an uninstalled daemon
+            # reports "not installed" and exits 0.
+            "$bin" service --unit daemon status
+            "$bin" service --unit daemon --json status
+          fi
+      - name: Updater + installer shell suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          for t in service-restart install-autostart install-autoupdate updater-stamp updater-restart-hygiene; do
+            echo "::group::$t"
+            bash "scripts/tests/$t.test.sh"
+            echo "::endgroup::"
+          done

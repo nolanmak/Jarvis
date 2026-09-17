@@ -34,9 +34,9 @@
 //!  30  → dashboard_down
 //!  40  → config_invalid
 //!
-//! Linux-only by design — the entire surface assumes systemd-user (the
-//! daemon is shipped via `augmentagent.service`). There is no macOS
-//! counterpart.
+//! Service probes use systemd-user on Linux and launchd on macOS (#1079);
+//! jobs keep their systemd unit names in the JSON either way, so the
+//! document shape does not depend on the host.
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -304,6 +304,12 @@ struct UnitProps {
 /// (everything reads as inactive). Never errors — a missing systemd is a
 /// real production state on a freshly cloned dev box.
 async fn show_unit(unit: &str) -> UnitProps {
+    if crate::platform::ServiceManager::detect().is_launchd() {
+        let unit = unit.to_string();
+        return tokio::task::spawn_blocking(move || show_launchd_unit(&unit))
+            .await
+            .unwrap_or_default();
+    }
     let out = Command::new("systemctl")
         .args([
             "--user",
@@ -323,6 +329,24 @@ async fn show_unit(unit: &str) -> UnitProps {
         return UnitProps::default();
     }
     parse_systemctl_show(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// #1079 — the launchd reading of the same three properties. A running job
+/// is `active`; a timer's job counts as active once loaded, since launchd
+/// keeps a scheduled job loaded but idle between runs. The start time comes
+/// from the process itself (launchd does not report one).
+fn show_launchd_unit(unit: &str) -> UnitProps {
+    use crate::platform::{is_timer, launchd_job, launchd_label, process_start_unix};
+    let Some(label) = launchd_label(unit) else {
+        return UnitProps::default();
+    };
+    let job = launchd_job(&label);
+    let active = if is_timer(unit) { job.loaded } else { job.running() };
+    UnitProps {
+        active_state: if active { "active" } else { "inactive" }.to_string(),
+        sub_state: job.state.clone(),
+        active_enter_timestamp_unix: job.pid.and_then(process_start_unix).unwrap_or(0),
+    }
 }
 
 /// Parse `KEY=value` lines. `ActiveEnterTimestamp` is systemd's local-time

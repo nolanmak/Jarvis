@@ -22,6 +22,8 @@ trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin" "$TMP/home"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/bin/systemctl"
 chmod +x "$TMP/bin/systemctl"
+# Exercise the Linux (systemd) branch on any host (#1079: CI runs macOS too).
+printf '#!/usr/bin/env bash\necho Linux\n' > "$TMP/bin/uname" && chmod +x "$TMP/bin/uname"
 
 if PATH="$TMP/bin:$PATH" HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/home/.config" \
    XDG_STATE_HOME="$TMP/home/.local/state" USER="${USER:-tester}" \

@@ -31,10 +31,11 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# #1079 — macOS logs to the same state dir as Linux, so `autopr-health` and
+# the restart library find update.log and the stamps in one place.
 case "$(uname -s)" in
-  Darwin) LOG_DIR="$HOME/Library/Logs/augmentagent" ;;
-  Linux)  LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/augmentagent" ;;
-  *)      LOG_DIR="$HOME/.augmentagent/logs" ;;
+  Darwin|Linux) LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/augmentagent" ;;
+  *)            LOG_DIR="$HOME/.augmentagent/logs" ;;
 esac
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/update.log"
@@ -116,10 +117,20 @@ apply_update() {
   case "$(uname -s)" in
     Darwin)
       if [ "$NEEDS_REBUILD" -eq 1 ]; then
-        if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
-          log "restarting daemon via launchctl kickstart"
-          launchctl kickstart -k "gui/$(id -u)/$LABEL" >> "$LOG" 2>&1 \
-            || { log "kickstart failed"; RESTART_FAILURES=$((RESTART_FAILURES + 1)); }
+        # #1079 — the Linux guarantees, on launchd: defer under an in-flight
+        # auto-PR build (#844) or the restart budget (#903), and only count a
+        # restart that verifiably bounced the agent (#826).
+        if maybe_defer_restart; then
+          RESTART_FAILURES=$((RESTART_FAILURES + 1))
+        elif ! memory_pressure_ok || ! restart_budget_ok; then
+          RESTART_FAILURES=$((RESTART_FAILURES + 1))
+        elif launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+          log "restarting daemon via launchctl kickstart -k $LABEL"
+          if restart_agent "$LABEL"; then
+            record_restart
+          else
+            RESTART_FAILURES=$((RESTART_FAILURES + 1))
+          fi
         else
           log "daemon not registered under launchd ($LABEL) — run install-autostart.sh manually"
           RESTART_FAILURES=$((RESTART_FAILURES + 1))

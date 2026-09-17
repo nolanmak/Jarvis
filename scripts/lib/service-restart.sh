@@ -89,6 +89,55 @@ restart_unit() {
   return 0
 }
 
+# --- #1079: the same proof for a launchd agent (macOS) ----------------------
+#
+# `launchctl kickstart -k` is the launchd restart. Same evidence as
+# restart_unit: the job must be loaded, the kick must succeed, its pid must
+# change, and it must be running afterwards.
+
+# `pid = N` of a loaded job, or 0.
+agent_pid() {
+  local pid
+  pid=$(launchctl print "gui/$(id -u)/$1" 2>/dev/null \
+    | awk -F' = ' '/^\tpid = /{print $2; exit}' | tr -dc '0-9')
+  printf '%s' "${pid:-0}"
+}
+
+agent_is_running() {
+  launchctl print "gui/$(id -u)/$1" 2>/dev/null | grep -q $'^\tstate = running$'
+}
+
+restart_agent() {
+  local label="$1" before after i
+  if ! launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+    _sr_log "agent $label is not loaded in gui/$(id -u)"
+    return 1
+  fi
+  before=$(agent_pid "$label")
+  if ! launchctl kickstart -k "gui/$(id -u)/$label" >>"${LOG:-/dev/null}" 2>&1; then
+    _sr_log "launchctl kickstart -k $label failed"
+    return 1
+  fi
+  # kickstart returns once the old process is signalled; give launchd a
+  # moment to spawn the new one before judging.
+  after=0
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    after=$(agent_pid "$label")
+    [ "$after" != "0" ] && [ "$after" != "$before" ] && break
+    sleep "${AUGMENTAGENT_RESTART_POLL_SECS:-0.5}"
+  done
+  if [ "$before" != "0" ] && [ "$before" = "$after" ]; then
+    _sr_log "restart of $label did not bounce the process (pid still $after)"
+    return 1
+  fi
+  if ! agent_is_running "$label"; then
+    _sr_log "agent $label is not running after restart"
+    return 1
+  fi
+  _sr_log "restarted $label (pid $before -> $after)"
+  return 0
+}
+
 # May the build stamp be advanced? Only when no required restart failed.
 # Writing it regardless is what turned one skipped bounce into a permanently
 # stale daemon.
@@ -128,10 +177,27 @@ SELF_IMPROVE_LOCK="${AUGMENTAGENT_SELFIMPROVE_LOCK:-$AUGMENTAGENT_STATE_DIR/self
 RESTART_DEFER_STAMP="${AUGMENTAGENT_RESTART_DEFER_STAMP:-${LOG_DIR:-$AUGMENTAGENT_STATE_DIR}/restart-deferred-since}"
 RESTART_DEFER_MAX_SECS="${AUGMENTAGENT_RESTART_DEFER_MAX_SECS:-2400}"
 
+# Is `$1` flock(2)-held by another process? 0 = held. Uses flock(1) where it
+# exists (Linux); macOS ships no flock(1), so fall back to python3's
+# fcntl.flock — the same flock(2) the Rust loop takes (#1079). Without
+# either tool the lock cannot be read and reads as free.
+lock_is_held() {
+  if command -v flock >/dev/null 2>&1; then
+    ! flock -n "$1" -c true 2>/dev/null
+    return
+  fi
+  command -v python3 >/dev/null 2>&1 || return 1
+  ! python3 - "$1" <<'PY' 2>/dev/null
+import fcntl, sys
+with open(sys.argv[1], "rb") as f:
+    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+PY
+}
+
 # Is a self-improve run holding the lock right now?
 self_improve_run_in_flight() {
   [ -e "$SELF_IMPROVE_LOCK" ] || return 1
-  ! flock -n "$SELF_IMPROVE_LOCK" -c true 2>/dev/null
+  lock_is_held "$SELF_IMPROVE_LOCK"
 }
 
 # Should this restart be deferred? 0 = defer (a run is in flight and the
@@ -249,7 +315,7 @@ RESUME_LANE_LOCK="${RESUME_LANE_LOCK%.lock}-resume.lock"
 any_lane_building() {
   for l in "$SELF_IMPROVE_LOCK" "$RESUME_LANE_LOCK"; do
     [ -e "$l" ] || continue
-    flock -n "$l" -c true 2>/dev/null || return 0
+    lock_is_held "$l" && return 0
   done
   return 1
 }

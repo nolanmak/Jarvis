@@ -35,4 +35,8 @@ fi
 
 echo
 echo "browser sidecar venv ready at: $(pwd)/.venv"
-echo "next step: install systemd units (systemd/augmentagent-{xvfb,chromium,browser-sidecar}.service)"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    echo "next step: augmentagent install browser-sidecar (launchd agents for Chrome + this sidecar)"
+else
+    echo "next step: install systemd units (systemd/augmentagent-{xvfb,chromium,browser-sidecar}.service)"
+fi

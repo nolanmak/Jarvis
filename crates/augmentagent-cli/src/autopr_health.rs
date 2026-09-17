@@ -523,17 +523,24 @@ fn state_dir() -> PathBuf {
 }
 
 fn free_gb(path: &Path) -> Option<f64> {
+    // `-P` is the POSIX layout both GNU and BSD df print (#1079: macOS df has
+    // no `--output`): the fourth column of the data line is available KB.
     let out = std::process::Command::new("df")
-        .args(["-k", "--output=avail"])
+        .args(["-P", "-k"])
         .arg(path)
         .output()
         .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let kb: f64 = text.lines().nth(1)?.trim().parse().ok()?;
-    Some(kb / 1024.0 / 1024.0)
+    parse_df_avail_kb(&String::from_utf8_lossy(&out.stdout)).map(|kb| kb / 1024.0 / 1024.0)
+}
+
+fn parse_df_avail_kb(text: &str) -> Option<f64> {
+    text.lines().nth(1)?.split_whitespace().nth(3)?.parse().ok()
 }
 
 fn daemon_active() -> bool {
+    if crate::platform::ServiceManager::detect().is_launchd() {
+        return crate::platform::unit_is_active("augmentagent.service") == Some(true);
+    }
     std::process::Command::new("systemctl")
         .args(["--user", "is-active", "--quiet", "augmentagent.service"])
         .status()
@@ -752,6 +759,19 @@ async fn notify_discord(text: &str) {
 mod tests {
     // (tests continue below; the #1030 case is appended at the end)
     use super::*;
+
+    #[test]
+    fn df_avail_parses_gnu_and_bsd_posix_layouts() {
+        // GNU `df -P -k`
+        let gnu = "Filesystem     1024-blocks      Used Available Capacity Mounted on\n\
+                   /dev/nvme0n1p2   479079112 301111228 153560140      67% /\n";
+        assert_eq!(parse_df_avail_kb(gnu), Some(153_560_140.0));
+        // macOS `df -P -k`
+        let bsd = "Filesystem   1024-blocks      Used Available Capacity  Mounted on\n\
+                   /dev/disk3s5   971350180 612345678 311234567    67%    /System/Volumes/Data\n";
+        assert_eq!(parse_df_avail_kb(bsd), Some(311_234_567.0));
+        assert_eq!(parse_df_avail_kb(""), None);
+    }
     use chrono::Duration;
 
     fn t0() -> DateTime<Utc> {

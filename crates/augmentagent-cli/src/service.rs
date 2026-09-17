@@ -1,7 +1,9 @@
-//! `augmentagent service …` — thin wrapper around `systemctl --user`.
+//! `augmentagent service …` — thin wrapper around `systemctl --user`, or
+//! `launchctl` on macOS (#1079).
 //!
-//! Linux-only by design: AugmentAgent is deployed as a set of user-scope
-//! systemd units (`systemctl --user`). This subcommand hides the unit-name
+//! On Linux AugmentAgent is deployed as a set of user-scope systemd units
+//! (`systemctl --user`); on macOS the same jobs are launchd agents under
+//! `~/Library/LaunchAgents` (see [`crate::platform`]). This subcommand hides the unit-name
 //! sprawl so the `/setup` skill (and humans) can say `service restart
 //! --unit dashboard` instead of remembering `augmentagent-dashboard.service`.
 //!
@@ -27,6 +29,8 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use serde_json::json;
 use tokio::process::Command;
+
+use crate::platform::ServiceManager;
 
 /// The verbs we forward to `systemctl --user`.
 #[derive(Subcommand, Clone, Copy, Debug)]
@@ -66,6 +70,9 @@ impl ServiceOp {
 /// the concrete service/timer pair. Anything containing a `.` is forwarded
 /// verbatim so power users can target a specific unit file.
 pub async fn run_service(op: ServiceOp, unit: &str, json: bool) -> Result<()> {
+    if ServiceManager::detect().is_launchd() {
+        return launchd::run(op, unit, json).await;
+    }
     let units = resolve_units(unit).await?;
     if units.is_empty() {
         anyhow::bail!(
@@ -251,6 +258,219 @@ async fn show_one(unit: &str) -> Result<serde_json::Value> {
     Ok(serde_json::Value::Object(obj))
 }
 
+/// #1079 — the same verbs against launchd agents. Units are still named by
+/// their systemd unit (so every alias above works unchanged) and mapped to
+/// the installers' launchd labels; a timer and its service collapse to one
+/// job.
+mod launchd {
+    use anyhow::{Context, Result};
+    use serde_json::json;
+
+    use crate::platform::{
+        self, gui_domain, launchd_job, launchd_label, plist_path, service_target, LABEL_PREFIX,
+    };
+
+    use super::{resolve_alias, ServiceOp};
+
+    pub async fn run(op: ServiceOp, unit: &str, json: bool) -> Result<()> {
+        let labels = resolve_labels(unit)?;
+        if labels.is_empty() {
+            anyhow::bail!(
+                "no augmentagent launchd agents matched `--unit {unit}` (try `--unit all` or \
+                 one of: daemon, dashboard, updater, digest, tone-refresh, \
+                 browser-sidecar, tenant:<name>)"
+            );
+        }
+        if matches!(op, ServiceOp::Status) {
+            if json {
+                let units: Vec<_> = labels.iter().map(|l| status_json(l)).collect();
+                println!("{}", serde_json::to_string_pretty(&json!({ "units": units }))?);
+            } else {
+                for label in &labels {
+                    print_status(label);
+                }
+            }
+            return Ok(());
+        }
+        let mut failed = Vec::new();
+        for label in &labels {
+            if let Err(e) = apply(op, label) {
+                eprintln!("{label}: {e:#}");
+                failed.push(label.as_str());
+            }
+        }
+        if !failed.is_empty() {
+            anyhow::bail!("launchctl {} failed for {}", verb(op), failed.join(" "));
+        }
+        Ok(())
+    }
+
+    fn verb(op: ServiceOp) -> &'static str {
+        match op {
+            ServiceOp::Start => "start",
+            ServiceOp::Stop => "stop",
+            ServiceOp::Restart => "restart",
+            ServiceOp::Status => "status",
+            ServiceOp::Enable => "enable",
+            ServiceOp::Disable => "disable",
+        }
+    }
+
+    /// `--unit` → launchd labels, deduplicated in order.
+    pub(super) fn resolve_labels(unit: &str) -> Result<Vec<String>> {
+        let trimmed = unit.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("all") {
+            return installed_labels();
+        }
+        // A label passed verbatim.
+        if trimmed.starts_with(LABEL_PREFIX) {
+            return Ok(vec![trimmed.to_string()]);
+        }
+        let mut out: Vec<String> = Vec::new();
+        for u in resolve_alias(trimmed) {
+            let Some(label) = launchd_label(&u) else {
+                anyhow::bail!("`{u}` has no launchd agent on macOS");
+            };
+            if !out.contains(&label) {
+                out.push(label);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every `com.nolanmak.augmentagent*.plist` in `~/Library/LaunchAgents`.
+    fn installed_labels() -> Result<Vec<String>> {
+        let Some(dir) = platform::launch_agents_dir() else {
+            anyhow::bail!("HOME unset — cannot find ~/Library/LaunchAgents");
+        };
+        let mut labels: Vec<String> = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .filter_map(|n| n.strip_suffix(".plist").map(str::to_string))
+                .filter(|n| n.starts_with(LABEL_PREFIX))
+                .collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+        };
+        labels.sort();
+        Ok(labels)
+    }
+
+    fn bootstrap(label: &str) -> Result<()> {
+        let plist = plist_path(label).context("HOME unset")?;
+        if !plist.exists() {
+            anyhow::bail!(
+                "not installed: no {} (run the matching `augmentagent install …`)",
+                plist.display()
+            );
+        }
+        let plist = plist.to_string_lossy().to_string();
+        let (ok, err) = platform::launchctl(&["bootstrap", &gui_domain(), &plist])
+            .context("spawning launchctl bootstrap")?;
+        if !ok {
+            anyhow::bail!("launchctl bootstrap {label}: {err}");
+        }
+        Ok(())
+    }
+
+    fn run_launchctl(args: &[&str]) -> Result<()> {
+        let (ok, err) = platform::launchctl(args)
+            .with_context(|| format!("spawning launchctl {}", args.join(" ")))?;
+        if !ok {
+            anyhow::bail!("launchctl {}: {err}", args.join(" "));
+        }
+        Ok(())
+    }
+
+    fn apply(op: ServiceOp, label: &str) -> Result<()> {
+        let target = service_target(label);
+        let loaded = launchd_job(label).loaded;
+        match op {
+            // Loading a RunAtLoad agent starts it; an already-loaded one is
+            // kicked (a no-op when it is already running).
+            ServiceOp::Start => {
+                if loaded {
+                    run_launchctl(&["kickstart", &target])
+                } else {
+                    bootstrap(label)
+                }
+            }
+            ServiceOp::Stop => {
+                if loaded {
+                    run_launchctl(&["bootout", &target])
+                } else {
+                    Ok(())
+                }
+            }
+            ServiceOp::Restart => {
+                if loaded {
+                    run_launchctl(&["kickstart", "-k", &target])
+                } else {
+                    bootstrap(label)
+                }
+            }
+            ServiceOp::Enable => {
+                run_launchctl(&["enable", &target])?;
+                if loaded {
+                    Ok(())
+                } else {
+                    bootstrap(label)
+                }
+            }
+            ServiceOp::Disable => {
+                if loaded {
+                    run_launchctl(&["bootout", &target])?;
+                }
+                run_launchctl(&["disable", &target])
+            }
+            ServiceOp::Status => unreachable!("status is handled by the caller"),
+        }
+    }
+
+    fn print_status(label: &str) {
+        let job = launchd_job(label);
+        let installed = plist_path(label).is_some_and(|p| p.exists());
+        let state = if job.loaded {
+            job.state.as_str()
+        } else if installed {
+            "not loaded"
+        } else {
+            "not installed"
+        };
+        match job.pid {
+            Some(pid) => println!("{label}: {state} (pid {pid})"),
+            None => println!("{label}: {state}"),
+        }
+    }
+
+    /// Same keys as the systemd report so consumers need no branching.
+    fn status_json(label: &str) -> serde_json::Value {
+        let job = launchd_job(label);
+        let installed = plist_path(label).is_some_and(|p| p.exists());
+        let active = if job.running() {
+            "active"
+        } else {
+            "inactive"
+        };
+        let sub = if job.loaded {
+            job.state.clone()
+        } else {
+            "dead".to_string()
+        };
+        json!({
+            "unit": label,
+            "ActiveState": active,
+            "SubState": sub,
+            "LoadState": if job.loaded { "loaded" } else if installed { "not-loaded" } else { "not-found" },
+            "MainPID": job.pid.unwrap_or(0),
+            "ActiveEnterTimestamp": job.pid.and_then(platform::process_start_unix)
+                .map(|t| t.to_string()).unwrap_or_default(),
+            "UnitFileState": if installed { "enabled" } else { "not-found" },
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,5 +539,28 @@ mod tests {
     #[test]
     fn alias_unknown_returns_empty() {
         assert!(resolve_alias("totally-bogus").is_empty());
+    }
+
+    #[test]
+    fn launchd_aliases_collapse_timer_pairs_to_one_label() {
+        assert_eq!(
+            launchd::resolve_labels("updater").unwrap(),
+            vec!["com.nolanmak.augmentagent.updater"]
+        );
+        assert_eq!(
+            launchd::resolve_labels("daemon").unwrap(),
+            vec!["com.nolanmak.augmentagent"]
+        );
+        assert_eq!(
+            launchd::resolve_labels("tenant:acme").unwrap(),
+            vec!["com.nolanmak.augmentagent.tenant-acme"]
+        );
+        // A label passes through verbatim.
+        assert_eq!(
+            launchd::resolve_labels("com.nolanmak.augmentagent.digest").unwrap(),
+            vec!["com.nolanmak.augmentagent.digest"]
+        );
+        // Non-augmentagent units have no macOS job.
+        assert!(launchd::resolve_labels("nginx.service").is_err());
     }
 }

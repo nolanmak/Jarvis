@@ -63,6 +63,30 @@ teardown_stub() { rm -rf "$SR_STUB_DIR"; }
 
 set_stub() { printf '%s' "$2" > "$SR_STUB_DIR/$1"; }
 
+# Hold an exclusive flock(2) on $1 for $2 seconds. flock(1) where it exists;
+# macOS has none, so python3's fcntl.flock takes the same lock (#1079).
+hold_lock() {
+  if command -v flock >/dev/null 2>&1; then
+    exec flock -x "$1" -c "sleep $2"
+  else
+    exec python3 -c 'import fcntl, sys, time
+f = open(sys.argv[1], "a")
+fcntl.flock(f, fcntl.LOCK_EX)
+time.sleep(float(sys.argv[2]))' "$1" "$2"
+  fi
+}
+
+# The holder is a background process; poll (up to ~5s) until its lock is
+# really taken instead of guessing how long interpreter start-up takes.
+wait_until_held() {
+  local i
+  for i in $(seq 1 50); do
+    lock_is_held "$1" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
 # shellcheck source=/dev/null
 . "$REPO_ROOT/scripts/lib/service-restart.sh" 2>/dev/null || {
   echo "FATAL: scripts/lib/service-restart.sh not found (this is the red state)"; exit 1;
@@ -110,6 +134,66 @@ restart_unit augmentagent.service >/dev/null 2>&1
 check "succeeds when the process actually bounced" "$?" "0"
 teardown_stub
 
+echo "restart_agent (launchd, #1079):"
+
+# Stub launchctl: `print` reports the job from files in $SR_STUB_DIR, and
+# `kickstart -k` swaps in the "after" pid.
+setup_launchd_stub() {
+  setup_stub
+  cat > "$STUB_BIN/launchctl" <<'STUB'
+#!/usr/bin/env bash
+d="$SR_STUB_DIR"
+r() { cat "$d/$1" 2>/dev/null || printf '%s' "$2"; }
+case "$1" in
+  print)
+    [ "$(r loaded 1)" = 1 ] || { echo "Could not find service" >&2; exit 113; }
+    if [ -e "$d/kicked" ]; then pid=$(r pid_after 222); state=$(r state_after running)
+    else pid=$(r pid_before 111); state=running; fi
+    printf '%s = {\n\tstate = %s\n' "$2" "$state"
+    [ "$pid" != 0 ] && printf '\tpid = %s\n' "$pid"
+    printf '}\n'
+    exit 0 ;;
+  kickstart)
+    rc=$(r kick_rc 0)
+    [ "$rc" = 0 ] && touch "$d/kicked"
+    exit "$rc" ;;
+esac
+exit 0
+STUB
+  chmod +x "$STUB_BIN/launchctl"
+}
+export AUGMENTAGENT_RESTART_POLL_SECS=0
+
+setup_launchd_stub
+restart_agent com.nolanmak.augmentagent >/dev/null 2>&1
+check "launchd: succeeds when the agent's pid changed and it is running" "$?" "0"
+teardown_stub
+
+setup_launchd_stub
+set_stub loaded 0
+restart_agent com.nolanmak.augmentagent >/dev/null 2>&1
+check "launchd: refuses when the agent is not loaded" "$?" "1"
+teardown_stub
+
+setup_launchd_stub
+set_stub kick_rc 5
+restart_agent com.nolanmak.augmentagent >/dev/null 2>&1
+check "launchd: reports failure when kickstart fails" "$?" "1"
+teardown_stub
+
+setup_launchd_stub
+set_stub pid_after 111
+restart_agent com.nolanmak.augmentagent >/dev/null 2>&1
+check "launchd: reports failure when the pid did not change" "$?" "1"
+teardown_stub
+
+setup_launchd_stub
+set_stub state_after "not running"
+set_stub pid_after 0
+restart_agent com.nolanmak.augmentagent >/dev/null 2>&1
+check "launchd: reports failure when the agent is not running afterwards" "$?" "1"
+teardown_stub
+
 echo "maybe_defer_restart (#844):"
 
 DEFER_DIR=$(mktemp -d)
@@ -131,9 +215,9 @@ maybe_defer_restart >/dev/null 2>&1
 check "proceeds when the lock file exists but nothing holds it" "$?" "1"
 
 # Held lock -> defer, and record when the deferral started.
-flock -x "$AUGMENTAGENT_SELFIMPROVE_LOCK" -c 'sleep 30' &
+hold_lock "$AUGMENTAGENT_SELFIMPROVE_LOCK" 30 &
 HOLDER=$!
-sleep 0.3
+wait_until_held "$AUGMENTAGENT_SELFIMPROVE_LOCK"
 maybe_defer_restart >/dev/null 2>&1
 check "defers while a run holds the lock" "$?" "0"
 [ -s "$AUGMENTAGENT_RESTART_DEFER_STAMP" ] \
@@ -174,8 +258,8 @@ mkdir -p "$GATE_CACHE_DIR/debug"; dd if=/dev/zero of="$GATE_CACHE_DIR/debug/blob
 touch "$RESUME_LANE_LOCK"
 # Short hold, then WAIT for it: `flock -c` hands the locked fd to its child,
 # so killing the flock pid does not release the lock.
-flock -x "$RESUME_LANE_LOCK" -c 'sleep 3' & HOLDER=$!
-sleep 0.3
+hold_lock "$RESUME_LANE_LOCK" 3 & HOLDER=$!
+wait_until_held "$RESUME_LANE_LOCK"
 trim_gate_cache_if_idle >/dev/null 2>&1
 check "leaves the cache alone while a lane holds its lock" "$?" "1"
 [ -d "$GATE_CACHE_DIR/debug" ] && ok "debug/ survives while a build may be using it" \

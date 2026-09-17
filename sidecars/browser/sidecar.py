@@ -68,7 +68,8 @@ except ImportError:  # pragma: no cover — surfaced at startup, not at import-t
 
 CDP_URL = os.environ.get("AUGMENTAGENT_BROWSER_CDP", "http://127.0.0.1:9223")
 
-_DEFAULT_RUNTIME = f"/run/user/{os.getuid()}"
+# #1079 — macOS has no /run/user; match augmentagent-browser-client's fallback.
+_DEFAULT_RUNTIME = f"/run/user/{os.getuid()}" if sys.platform.startswith("linux") else "/tmp"
 _RUNTIME = os.environ.get("XDG_RUNTIME_DIR", _DEFAULT_RUNTIME)
 SOCK_PATH = os.environ.get(
     "AUGMENTAGENT_BROWSER_SOCK",

@@ -6,7 +6,11 @@
 //! Pattern mirrors `invoice.rs`: env-resolved script dir, `tokio::process::Command`,
 //! `Stdio::inherit()` for live stream, anyhow errors with stderr inlined.
 //!
-//! Linux-only by design (single deploy target).
+//! The shell installers branch on `uname -s` themselves (systemd user units
+//! on Linux, launchd agents on macOS). The browser-sidecar stack is the one
+//! component installed from Rust: systemd unit templates on Linux, generated
+//! launchd agents on macOS (#1079), where there is a real display and so no
+//! Xvfb.
 //!
 //! Install logic is NOT reimplemented in Rust — every component delegates to
 //! the existing shell installer, which owns argument validation, idempotency,
@@ -326,9 +330,231 @@ async fn run_script(
         .with_context(|| format!("running {path}"))
 }
 
+/// Append a progress line to the live stream or the JSON capture.
+fn note(json: bool, cap: &mut Captured, tag: &str, msg: String) {
+    if json {
+        cap.stdout.push_str(&msg);
+        cap.stdout.push('\n');
+    } else {
+        eprintln!("[{tag}] {msg}");
+    }
+}
+
+/// #1079 — the macOS browser stack: a headed Chrome/Chromium on the real
+/// display plus the Python sidecar, each a launchd agent. Paths are absolute
+/// because launchd has no `%h`.
+mod macos_browser {
+    use std::path::{Path, PathBuf};
+
+    use anyhow::{Context, Result};
+
+    use crate::platform::{self, gui_domain, launchd_job, plist_path, service_target, AgentPlist};
+
+    pub const CHROMIUM_LABEL: &str = "com.nolanmak.augmentagent.chromium";
+    pub const SIDECAR_LABEL: &str = "com.nolanmak.augmentagent.browser-sidecar";
+
+    const CHROME_CANDIDATES: &[&str] = &[
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ];
+
+    /// `AUGMENTAGENT_CHROMIUM_BIN`, else the first installed Chrome/Chromium.
+    fn chromium_bin() -> Result<String> {
+        if let Ok(p) = std::env::var("AUGMENTAGENT_CHROMIUM_BIN") {
+            if !p.is_empty() {
+                return Ok(p);
+            }
+        }
+        CHROME_CANDIDATES
+            .iter()
+            .find(|p| Path::new(p).exists())
+            .map(|p| p.to_string())
+            .context(
+                "no Chrome or Chromium in /Applications — install one or set AUGMENTAGENT_CHROMIUM_BIN",
+            )
+    }
+
+    fn state_dir() -> Result<PathBuf> {
+        augmentagent_channel_core::state_dir::state_dir()
+            .context("cannot resolve the state dir (HOME unset)")
+    }
+
+    /// Both plists, rendered. Pure apart from path lookups, so it is testable.
+    pub fn render(repo_root: &Path, chromium: &str, state: &Path, home: &str) -> Vec<(&'static str, String)> {
+        let path_env = format!("{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
+        let profile = state.join("browser-profile").to_string_lossy().to_string();
+        let log = |name: &str| state.join(name).to_string_lossy().to_string();
+        let chromium_args: Vec<String> = [
+            chromium,
+            "--remote-debugging-port=9223",
+            "--remote-debugging-address=127.0.0.1",
+            &format!("--user-data-dir={profile}"),
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--window-size=1600,1200",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let chromium_env = [("PATH", path_env.clone())];
+        let chromium_log = log("chromium.log");
+        let chromium_plist = AgentPlist {
+            label: CHROMIUM_LABEL,
+            program_arguments: &chromium_args,
+            working_directory: None,
+            environment: &chromium_env,
+            stdout_path: &chromium_log,
+            stderr_path: &chromium_log,
+        }
+        .render();
+
+        let sidecar_dir = repo_root.join("sidecars/browser");
+        let sidecar_args = vec![
+            sidecar_dir.join(".venv/bin/python").to_string_lossy().to_string(),
+            sidecar_dir.join("sidecar.py").to_string_lossy().to_string(),
+        ];
+        let sock = augmentagent_browser_client::default_socket_path()
+            .to_string_lossy()
+            .to_string();
+        let sidecar_env = [
+            ("PATH", path_env),
+            ("PYTHONUNBUFFERED", "1".to_string()),
+            ("AUGMENTAGENT_BROWSER_CDP", "http://127.0.0.1:9223".to_string()),
+            ("AUGMENTAGENT_BROWSER_SOCK", sock),
+        ];
+        let sidecar_log = log("browser-sidecar.log");
+        let sidecar_dir_s = sidecar_dir.to_string_lossy().to_string();
+        let sidecar_plist = AgentPlist {
+            label: SIDECAR_LABEL,
+            program_arguments: &sidecar_args,
+            working_directory: Some(&sidecar_dir_s),
+            environment: &sidecar_env,
+            stdout_path: &sidecar_log,
+            stderr_path: &sidecar_log,
+        }
+        .render();
+        vec![(CHROMIUM_LABEL, chromium_plist), (SIDECAR_LABEL, sidecar_plist)]
+    }
+
+    fn launchctl_ok(args: &[&str], notes: &mut Vec<String>) -> bool {
+        match platform::launchctl(args) {
+            Ok((true, _)) => true,
+            Ok((false, err)) => {
+                notes.push(format!("launchctl {} failed: {err}", args.join(" ")));
+                false
+            }
+            Err(e) => {
+                notes.push(format!("spawning launchctl failed: {e}"));
+                false
+            }
+        }
+    }
+
+    pub fn install(notes: &mut Vec<String>) -> Result<bool> {
+        let repo_root = std::env::current_dir().context("resolving the repo root (cwd)")?;
+        let python = repo_root.join("sidecars/browser/.venv/bin/python");
+        if !python.exists() {
+            anyhow::bail!(
+                "{} missing — run sidecars/browser/setup.sh first",
+                python.display()
+            );
+        }
+        let home = std::env::var("HOME").context("HOME unset")?;
+        let state = state_dir()?;
+        std::fs::create_dir_all(state.join("browser-profile"))
+            .with_context(|| format!("creating {}", state.display()))?;
+        let chromium = chromium_bin()?;
+        let dir = platform::launch_agents_dir().context("HOME unset")?;
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let mut ok = true;
+        for (label, body) in render(&repo_root, &chromium, &state, &home) {
+            let plist = plist_path(label).context("HOME unset")?;
+            if launchd_job(label).loaded {
+                launchctl_ok(&["bootout", &service_target(label)], notes);
+            }
+            std::fs::write(&plist, body).with_context(|| format!("writing {}", plist.display()))?;
+            notes.push(format!("wrote {}", plist.display()));
+            let plist_s = plist.to_string_lossy().to_string();
+            ok &= launchctl_ok(&["bootstrap", &gui_domain(), &plist_s], notes);
+        }
+        Ok(ok)
+    }
+
+    pub fn uninstall(notes: &mut Vec<String>) -> Result<bool> {
+        let mut ok = true;
+        for label in [SIDECAR_LABEL, CHROMIUM_LABEL] {
+            if launchd_job(label).loaded {
+                ok &= launchctl_ok(&["bootout", &service_target(label)], notes);
+            }
+            let plist = plist_path(label).context("HOME unset")?;
+            if plist.exists() {
+                match std::fs::remove_file(&plist) {
+                    Ok(()) => notes.push(format!("removed {}", plist.display())),
+                    Err(e) => notes.push(format!("failed to remove {}: {e}", plist.display())),
+                }
+            }
+        }
+        Ok(ok)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn renders_chromium_and_sidecar_agents_without_xvfb() {
+            let plists = render(
+                Path::new("/Users/op/AugmentAgent"),
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                Path::new("/Users/op/.local/state/augmentagent"),
+                "/Users/op",
+            );
+            let labels: Vec<_> = plists.iter().map(|(l, _)| *l).collect();
+            assert_eq!(labels, vec![CHROMIUM_LABEL, SIDECAR_LABEL]);
+            let (_, chromium) = &plists[0];
+            assert!(chromium.contains("<string>--remote-debugging-port=9223</string>"));
+            assert!(chromium.contains(
+                "--user-data-dir=/Users/op/.local/state/augmentagent/browser-profile"
+            ));
+            assert!(!chromium.contains("DISPLAY"));
+            let (_, sidecar) = &plists[1];
+            assert!(sidecar.contains(
+                "<string>/Users/op/AugmentAgent/sidecars/browser/.venv/bin/python</string>"
+            ));
+            assert!(sidecar.contains("<key>AUGMENTAGENT_BROWSER_SOCK</key>"));
+            assert!(sidecar.contains("/Users/op/.local/state/augmentagent/browser-sidecar.log"));
+        }
+    }
+}
+
+async fn install_browser_sidecar(json: bool, cap: &mut Captured) -> Result<bool> {
+    if crate::platform::ServiceManager::detect().is_launchd() {
+        let mut notes = Vec::new();
+        let res = macos_browser::install(&mut notes);
+        for n in notes {
+            note(json, cap, "install browser-sidecar", n);
+        }
+        return res;
+    }
+    install_browser_sidecar_systemd(json, cap).await
+}
+
+async fn uninstall_browser_sidecar(json: bool, cap: &mut Captured) -> Result<bool> {
+    if crate::platform::ServiceManager::detect().is_launchd() {
+        let mut notes = Vec::new();
+        let res = macos_browser::uninstall(&mut notes);
+        for n in notes {
+            note(json, cap, "uninstall browser-sidecar", n);
+        }
+        return res;
+    }
+    uninstall_browser_sidecar_systemd(json, cap).await
+}
+
 /// Copy the three browser-sidecar unit files into `~/.config/systemd/user/`,
 /// reload systemd, then enable + start them. Mirrors `systemd/README.md`.
-async fn install_browser_sidecar(json: bool, cap: &mut Captured) -> Result<bool> {
+async fn install_browser_sidecar_systemd(json: bool, cap: &mut Captured) -> Result<bool> {
     let dest = user_unit_dir()?;
     std::fs::create_dir_all(&dest)
         .with_context(|| format!("creating {}", dest.display()))?;
@@ -362,7 +588,7 @@ async fn install_browser_sidecar(json: bool, cap: &mut Captured) -> Result<bool>
 /// Inverse of `install_browser_sidecar`: disable + stop, remove unit files,
 /// reload. Safe to re-run on a system that was never installed (systemctl
 /// no-ops on missing units; we tolerate copy-removal failures).
-async fn uninstall_browser_sidecar(json: bool, cap: &mut Captured) -> Result<bool> {
+async fn uninstall_browser_sidecar_systemd(json: bool, cap: &mut Captured) -> Result<bool> {
     let mut disable = Command::new("systemctl");
     disable.arg("--user").arg("disable").arg("--now");
     for unit in BROWSER_SIDECAR_UNITS {
@@ -499,11 +725,18 @@ pub async fn run_uninstall(component: UninstallComponent) -> Result<()> {
             // No uninstall-dashboard.sh exists upstream. Surface the gap
             // explicitly rather than silently no-op or scope-creep a new
             // script in this change.
-            let msg = "no `scripts/uninstall-dashboard.sh` exists — \
-                       remove the dashboard unit manually \
-                       (`systemctl --user disable --now augmentagent-dashboard.service && \
-                       rm ~/.config/systemd/user/augmentagent-dashboard.service && \
-                       systemctl --user daemon-reload`)";
+            let msg = if crate::platform::ServiceManager::detect().is_launchd() {
+                "no `scripts/uninstall-dashboard.sh` exists — \
+                 remove the dashboard agent manually \
+                 (`launchctl bootout gui/$(id -u)/com.nolanmak.augmentagent-dashboard && \
+                 rm ~/Library/LaunchAgents/com.nolanmak.augmentagent-dashboard.plist`)"
+            } else {
+                "no `scripts/uninstall-dashboard.sh` exists — \
+                 remove the dashboard unit manually \
+                 (`systemctl --user disable --now augmentagent-dashboard.service && \
+                 rm ~/.config/systemd/user/augmentagent-dashboard.service && \
+                 systemctl --user daemon-reload`)"
+            };
             if json {
                 cap.stderr.push_str(msg);
                 emit_summary(&label, "uninstall", false, &cap);

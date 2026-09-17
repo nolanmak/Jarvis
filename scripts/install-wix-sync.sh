@@ -32,7 +32,7 @@ case "$MINUTE" in ''|*[!0-9]*) die "minute must be 0-59 (got '$MINUTE')";; esac
 
 install_macos() {
   local PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-  local LOG_DIR="$HOME/Library/Logs/augmentagent"
+  local LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/augmentagent"  # #1079: same dir as Linux
   mkdir -p "$LOG_DIR" "$(dirname "$PLIST")"
 
   log "Writing plist: $PLIST (daily at ${HOUR}:$(printf '%02d' "$MINUTE"))"

@@ -8,7 +8,8 @@
 //! behind both `augmentagent loops list|stop` (#175) and the Discord
 //! `!loops` command (#176).
 //!
-//! Linux-only by design — walks `/proc` directly.
+//! Walks `/proc` directly on Linux; on macOS (#1079), which has no procfs,
+//! the same view comes from `ps` (and `lsof` for the working directory).
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -45,7 +46,7 @@ pub trait ProcSource: Send + Sync {
     fn parent_of(&self, pid: i32) -> Option<i32>;
 }
 
-/// Real `/proc` walker. Linux-only.
+/// Real process walker: `/proc` on Linux, `ps` elsewhere.
 pub struct ProcFs;
 
 impl Default for ProcFs {
@@ -60,6 +61,110 @@ impl ProcFs {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+impl ProcSource for ProcFs {
+    fn list(&self) -> Result<Vec<ClaudeProc>> {
+        let out = std::process::Command::new("ps")
+            .args(["-axww", "-o", "pid=,ppid=,etime=,command="])
+            .env("LC_ALL", "C")
+            .output()?;
+        if !out.status.success() {
+            return Err(anyhow!("ps exited with {}", out.status));
+        }
+        let mut procs = parse_ps_listing(&String::from_utf8_lossy(&out.stdout));
+        for p in &mut procs {
+            p.cwd = ps_cwd(p.pid);
+        }
+        procs.sort_by_key(|p| p.pid);
+        Ok(procs)
+    }
+
+    fn self_pid(&self) -> i32 {
+        std::process::id() as i32
+    }
+
+    fn parent_of(&self, pid: i32) -> Option<i32> {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "ppid=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    }
+}
+
+/// `ps -axww -o pid=,ppid=,etime=,command=` lines → the `claude` processes.
+/// argv0 is the first whitespace-separated word of `command`, which is exact
+/// for the CLI (its path has no spaces).
+pub fn parse_ps_listing(text: &str) -> Vec<ClaudeProc> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(pid), Some(ppid), Some(etime)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        let (Ok(pid), Ok(ppid)) = (pid.parse::<i32>(), ppid.parse::<i32>()) else {
+            continue;
+        };
+        let argv: Vec<&str> = it.collect();
+        let Some(argv0) = argv.first() else {
+            continue;
+        };
+        if !looks_like_claude(argv0) {
+            continue;
+        }
+        let mut cmdline = argv.join(" ");
+        const MAX: usize = 200;
+        if cmdline.len() > MAX {
+            let mut cut = MAX;
+            while !cmdline.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            cmdline.truncate(cut);
+            cmdline.push('…');
+        }
+        out.push(ClaudeProc {
+            pid,
+            ppid,
+            elapsed_secs: parse_etime(etime).unwrap_or(0),
+            cwd: None,
+            cmdline,
+        });
+    }
+    out
+}
+
+/// `ps` elapsed time: `[[dd-]hh:]mm:ss`.
+pub fn parse_etime(s: &str) -> Option<u64> {
+    let (days, rest) = match s.split_once('-') {
+        Some((d, r)) => (d.parse::<u64>().ok()?, r),
+        None => (0, s),
+    };
+    let parts: Vec<u64> = rest
+        .split(':')
+        .map(|p| p.parse::<u64>().ok())
+        .collect::<Option<_>>()?;
+    let (h, m, sec) = match parts.as_slice() {
+        [m, s] => (0, *m, *s),
+        [h, m, s] => (*h, *m, *s),
+        _ => return None,
+    };
+    Some(days * 86_400 + h * 3_600 + m * 60 + sec)
+}
+
+/// Working directory of `pid` via `lsof -Fn` (the `n` field of the cwd fd).
+#[cfg(not(target_os = "linux"))]
+fn ps_cwd(pid: i32) -> Option<PathBuf> {
+    let out = std::process::Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix('n'))
+        .map(PathBuf::from)
+}
+
+#[cfg(target_os = "linux")]
 impl ProcSource for ProcFs {
     fn list(&self) -> Result<Vec<ClaudeProc>> {
         let uptime = read_uptime_secs();
@@ -154,6 +259,7 @@ pub fn format_cmdline(bytes: &[u8]) -> String {
     s
 }
 
+#[cfg(target_os = "linux")]
 /// Returns `(ppid, start_time_ticks)` parsed from `/proc/<pid>/stat`. The
 /// comm field (`(name)`) is parenthesised and may contain spaces, so we
 /// split on the *last* `)` rather than naively splitting on whitespace.
@@ -170,6 +276,7 @@ fn read_stat_ppid_start(pid: i32) -> Option<(i32, u64)> {
     Some((ppid, start))
 }
 
+#[cfg(target_os = "linux")]
 fn read_uptime_secs() -> f64 {
     std::fs::read_to_string("/proc/uptime")
         .ok()
@@ -181,6 +288,7 @@ fn read_uptime_secs() -> f64 {
         .unwrap_or(0.0)
 }
 
+#[cfg(target_os = "linux")]
 fn clock_ticks_per_sec() -> f64 {
     // SAFETY: `sysconf` is documented to be thread-safe and has no
     // pre-conditions on its argument constant.
@@ -343,6 +451,28 @@ pub fn require_pid_or_all_but_current(pid: Option<i32>, all_but_current: bool) -
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ps_etime_formats() {
+        assert_eq!(parse_etime("00:07"), Some(7));
+        assert_eq!(parse_etime("12:34"), Some(754));
+        assert_eq!(parse_etime("01:02:03"), Some(3_723));
+        assert_eq!(parse_etime("2-01:00:00"), Some(176_400));
+        assert_eq!(parse_etime("garbage"), None);
+    }
+
+    #[test]
+    fn ps_listing_keeps_only_claude() {
+        let text = "  101     1   01:00 /opt/homebrew/bin/claude -p --output-format stream-json\n\
+                    \x20 202   101   00:05 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --claude\n\
+                    \x20 303     1 1-00:00:01 claude --resume\n";
+        let procs = parse_ps_listing(text);
+        assert_eq!(procs.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![101, 303]);
+        assert_eq!(procs[0].ppid, 1);
+        assert_eq!(procs[0].elapsed_secs, 60);
+        assert_eq!(procs[0].cmdline, "/opt/homebrew/bin/claude -p --output-format stream-json");
+        assert_eq!(procs[1].elapsed_secs, 86_401);
+    }
+
     use super::*;
     use std::sync::Mutex;
 

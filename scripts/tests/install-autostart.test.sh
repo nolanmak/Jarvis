@@ -27,6 +27,8 @@ make_case() {
   printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/repo/scripts/run-rs.sh"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/repo/target/release/augmentagent"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/bin/systemctl"
+  # The unit cases render the Linux branch on any host (#1079: CI runs macOS too).
+  printf '#!/usr/bin/env bash\necho Linux\n' > "$TMP/bin/uname"
   printf '#!/usr/bin/env bash\necho Linger=yes\n' > "$TMP/bin/loginctl"
   chmod +x "$TMP/repo/scripts/"*.sh "$TMP/repo/target/release/augmentagent" "$TMP/bin/"*
   UNIT="$TMP/home/.config/systemd/user/augmentagent.service"
@@ -89,6 +91,53 @@ for d in "MemoryHigh=9G" "MemoryMax=12G" "TasksMax=1024" "LimitNOFILE=8192"; do
 done
 has_line "$UNIT" "MemoryMax=10G" && bad "override replaces the default (no duplicate MemoryMax)" "default still present" \
   || ok "override replaces the default (no duplicate MemoryMax)"
+rm -rf "$TMP"
+
+# --- dry-run override (#1079) ------------------------------------------------
+make_case
+run_installer install-autostart.sh
+has_line "$UNIT" "ExecStart=$TMP/repo/scripts/run-rs.sh --wiki-dir ./wiki serve --dry-run false" \
+  && ok "default unit still serves live (--dry-run false)" \
+  || bad "default unit still serves live (--dry-run false)" "$(grep ExecStart "$UNIT")"
+rm -rf "$TMP"
+make_case
+( export AUGMENTAGENT_AUTOSTART_DRY_RUN=true; run_installer install-autostart.sh )
+has_line "$UNIT" "ExecStart=$TMP/repo/scripts/run-rs.sh --wiki-dir ./wiki serve --dry-run true" \
+  && ok "AUGMENTAGENT_AUTOSTART_DRY_RUN=true renders --dry-run true" \
+  || bad "AUGMENTAGENT_AUTOSTART_DRY_RUN=true renders --dry-run true" "$(grep ExecStart "$UNIT")"
+rm -rf "$TMP"
+make_case
+( export AUGMENTAGENT_AUTOSTART_DRY_RUN=maybe; run_installer install-autostart.sh ) \
+  && bad "rejects a dry-run value that is not true/false" "installer exited 0" \
+  || ok "rejects a dry-run value that is not true/false"
+rm -rf "$TMP"
+
+# --- macOS launchd agent (#1079) ---------------------------------------------
+echo "install-autostart.sh launchd plist (#1079):"
+make_case
+printf '#!/usr/bin/env bash\necho Darwin\n' > "$TMP/bin/uname"
+printf '#!/usr/bin/env bash\necho "$*" >> "%s/launchctl.calls"\n[ "$1" = print ] && exit 113\nexit 0\n' "$TMP" > "$TMP/bin/launchctl"
+chmod +x "$TMP/bin/uname" "$TMP/bin/launchctl"
+PLIST="$TMP/home/Library/LaunchAgents/com.nolanmak.augmentagent.plist"
+if ( export AUGMENTAGENT_AUTOSTART_DRY_RUN=true; run_installer install-autostart.sh ); then
+  ok "installer runs on (stubbed) Darwin"
+else
+  bad "installer runs on (stubbed) Darwin" "$(tail -3 "$TMP/install.out")"
+fi
+[ -s "$PLIST" ] && ok "renders the launchd plist" || bad "renders the launchd plist" "no file at $PLIST"
+grep -q "<string>$TMP/home/.local/state/augmentagent/stderr.log</string>" "$PLIST" \
+  && ok "plist logs to the shared state dir (autopr-health reads it there)" \
+  || bad "plist logs to the shared state dir (autopr-health reads it there)" "$(grep -A1 StandardErrorPath "$PLIST")"
+awk '/<string>--dry-run<\/string>/{getline; print; exit}' "$PLIST" | grep -q '<string>true</string>' \
+  && ok "plist carries the dry-run override" || bad "plist carries the dry-run override" "not true"
+grep -q "^bootstrap gui/" "$TMP/launchctl.calls" && ok "bootstraps the agent" \
+  || bad "bootstraps the agent" "calls: $(cat "$TMP/launchctl.calls" 2>/dev/null)"
+if command -v plutil >/dev/null 2>&1; then
+  plutil -lint "$PLIST" >/dev/null 2>&1 && ok "plutil -lint accepts the plist" \
+    || bad "plutil -lint accepts the plist" "$(plutil -lint "$PLIST" 2>&1)"
+else
+  printf '  skip plutil not installed; lint step skipped\n'
+fi
 rm -rf "$TMP"
 
 # --- tenant unit ------------------------------------------------------------

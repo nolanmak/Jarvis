@@ -22,11 +22,20 @@
 # leaving the desktop ~5 GB on a 15 GB laptop. Override per host at install:
 #   AUGMENTAGENT_UNIT_MEMORY_HIGH (8G)  AUGMENTAGENT_UNIT_MEMORY_MAX (10G)
 #   AUGMENTAGENT_UNIT_TASKS_MAX (2048)  AUGMENTAGENT_UNIT_NOFILE (4096)
+#
+# AUGMENTAGENT_AUTOSTART_DRY_RUN (false) — `serve --dry-run` value baked into
+# the unit/plist. Set to `true` to register the service without it ever
+# sending (#1079: how the launchd path is exercised on a fresh Mac).
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LABEL="com.nolanmak.augmentagent"
+DRY_RUN="${AUGMENTAGENT_AUTOSTART_DRY_RUN:-false}"
+case "$DRY_RUN" in
+  true|false) ;;
+  *) printf 'AUGMENTAGENT_AUTOSTART_DRY_RUN must be true or false (got: %s)\n' "$DRY_RUN" >&2; exit 1 ;;
+esac
 
 log() { printf '\033[1;36m[install-autostart]\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31m[install-autostart ERR]\033[0m %s\n' "$*" >&2; exit 1; }
@@ -37,7 +46,7 @@ die() { printf '\033[1;31m[install-autostart ERR]\033[0m %s\n' "$*" >&2; exit 1;
 
 install_macos() {
   local PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-  local LOG_DIR="$HOME/Library/Logs/augmentagent"
+  local LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/augmentagent"  # #1079: same dir as Linux
   mkdir -p "$LOG_DIR"
   mkdir -p "$(dirname "$PLIST")"
 
@@ -64,7 +73,7 @@ install_macos() {
         <string>./wiki</string>
         <string>serve</string>
         <string>--dry-run</string>
-        <string>false</string>
+        <string>$DRY_RUN</string>
     </array>
 
     <key>EnvironmentVariables</key>
@@ -153,7 +162,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=$REPO_ROOT
-ExecStart=$REPO_ROOT/scripts/run-rs.sh --wiki-dir ./wiki serve --dry-run false
+ExecStart=$REPO_ROOT/scripts/run-rs.sh --wiki-dir ./wiki serve --dry-run $DRY_RUN
 Environment=PATH=$SERVICE_PATH
 Environment=RUST_LOG=info
 # Deft channel still inert until a token is stored via 'augmentagent deft login'

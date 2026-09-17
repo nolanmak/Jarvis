@@ -75,6 +75,8 @@ esac
 exit 0
 STUB
   chmod +x "$TMP/bin/cargo" "$TMP/bin/systemctl"
+  # Exercise the Linux (systemd) branch on any host (#1079: CI runs macOS too).
+  printf '#!/usr/bin/env bash\necho Linux\n' > "$TMP/bin/uname" && chmod +x "$TMP/bin/uname"
 }
 
 # Exit 0 when the updater invoked `cargo build`, 1 otherwise.

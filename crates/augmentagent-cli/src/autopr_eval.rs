@@ -629,7 +629,7 @@ fn repo_slug(repo_root: &Path) -> String {
 
 /// Is a process with this id still running?
 fn pid_alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
+    crate::platform::pid_alive(pid)
 }
 
 /// Remove what previous runs left behind, then drop any worktree
