@@ -597,7 +597,7 @@ What it never touches, and for how long:
   turns are never dispatched again (calls without a turn id get a fresh
   request), and the receipt lives in a temporary directory that may be gone.
   Those journals stay on disk until a marker-clearing mechanism exists,
-  tracked in a follow-up.
+  tracked in #1071.
 
 Do not delete handoff state by hand.
 
