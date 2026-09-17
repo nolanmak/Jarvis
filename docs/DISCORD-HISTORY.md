@@ -51,6 +51,8 @@ don't want that risk, leave the settings below unset.
 - For a channel with an active `priority` subscription, history stops at the
   newest message the live channel has already processed, so new messages
   still get live triage.
+- Subjects are `Discord DM: <person> [<speaker>]`, `Discord group DM: <people> [<speaker>]`, or
+  `Discord: <server> #<channel> [<speaker>]`, so keyword search can target DMs.
 - Stored fields: speaker (`me` for you), text, attachment name/type/URL (files
   aren't downloaded), timestamp. Rows use `platform = "discord"` and `kind`
   `dm`, `group`, or `guild_channel`.

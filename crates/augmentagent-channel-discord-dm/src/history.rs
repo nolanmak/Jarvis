@@ -195,6 +195,10 @@ pub async fn sync_once(
     config: &HistoryConfig,
 ) -> Result<HistoryReport> {
     ensure_tables(store)?;
+    let migrated = migrate_dm_subjects(store)?;
+    if migrated > 0 {
+        info!(migrated, "discord history: prefixed DM subjects");
+    }
     let mut report = HistoryReport::default();
     let mut pacer = Pacer::new(config.request_pause);
 
@@ -405,6 +409,18 @@ async fn sync_channel(
             after = n.clone();
         }
         if hit_cap || !full_page || newest.is_none() {
+            if !hit_cap {
+                // Caught up. When the conversation's reported last message
+                // wasn't returned (deleted), advance to it anyway so later
+                // runs see the conversation as unchanged instead of
+                // re-fetching an empty page every time.
+                let reported = target.last_message_id.as_deref().map_or(0, snowflake);
+                let reported = live_cap.map_or(reported, |cap| reported.min(cap));
+                if reported > snowflake(&after) {
+                    set_cursor(store, &target.channel_id, &reported.to_string())
+                        .map_err(store_err)?;
+                }
+            }
             break;
         }
     }
@@ -441,13 +457,42 @@ fn history_email(msg: &Message, target: &Target, my_user_id: &str) -> Email {
         to: String::new(),
         cc: String::new(),
         attachments: Vec::new(),
-        subject: format!("Discord: {} [{speaker}]", target.title),
+        subject: format!(
+            "{} {} [{speaker}]",
+            subject_prefix(target.kind),
+            target.title
+        ),
         body,
         date: msg.timestamp.clone(),
         account_entity_id: Some(format!("{ACCOUNT_ENTITY_ID_PREFIX}:{my_user_id}")),
         platform: PLATFORM.to_string(),
         kind: target.kind.to_string(),
     }
+}
+
+/// Search matches subject text, so the prefix is how the agent tells DMs from
+/// server channels (`keyword: "Discord DM"`).
+fn subject_prefix(kind: &str) -> &'static str {
+    match kind {
+        "dm" => "Discord DM:",
+        "group" => "Discord group DM:",
+        _ => "Discord:",
+    }
+}
+
+/// Rows written before DM subjects carried a prefix. Idempotent: rewritten
+/// subjects no longer match `Discord: %`.
+fn migrate_dm_subjects(store: &Store) -> Result<usize> {
+    Ok(store.with_conn(|c| {
+        c.execute(
+            "UPDATE emails SET subject = CASE kind \
+                WHEN 'dm' THEN 'Discord DM: ' || substr(subject, 10) \
+                ELSE 'Discord group DM: ' || substr(subject, 10) END \
+             WHERE platform = 'discord' AND kind IN ('dm', 'group') \
+               AND subject LIKE 'Discord: %'",
+            [],
+        )
+    })?)
 }
 
 fn parse_ts_ms(ts: &str) -> i64 {
@@ -576,7 +621,7 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(subject, "Discord: Alice [me]");
+        assert_eq!(subject, "Discord DM: Alice [me]");
         assert_eq!(from, "me <discord:900>");
         assert_eq!(processed.as_deref(), Some("digest_only"));
         assert_eq!(kind, "dm");
@@ -587,6 +632,40 @@ mod tests {
         assert_eq!(report.inserted, 0);
         assert_eq!(report.requests, 1);
         assert_eq!(row_count(&store), 151);
+    }
+
+    #[tokio::test]
+    async fn deleted_last_message_does_not_refetch_every_run() {
+        let mut server = mockito::Server::new_async().await;
+        // Discord still reports 99 as last_message_id, but 99 was deleted.
+        let _dms = server
+            .mock("GET", "/users/@me/channels")
+            .with_body(dm_list("99"))
+            .expect(2)
+            .create_async()
+            .await;
+        let _p = server
+            .mock("GET", "/channels/10/messages?limit=100&after=0")
+            .with_body(json!([msg(50, "500", "still here")]).to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let _stuck = server
+            .mock("GET", "/channels/10/messages?limit=100&after=50")
+            .with_body("[]")
+            .expect(0)
+            .create_async()
+            .await;
+        let client = DiscordClient::with_base_url(auth(), server.url());
+        let (_d, store) = store();
+        let first = sync_once(&client, &store, "900", &cfg_dms()).await.unwrap();
+        assert_eq!((first.inserted, first.requests), (1, 2));
+        assert_eq!(cursor(&store, "10").unwrap().as_deref(), Some("99"));
+        let second = sync_once(&client, &store, "900", &cfg_dms()).await.unwrap();
+        assert_eq!(
+            (second.unchanged, second.fetched, second.requests),
+            (1, 0, 1)
+        );
     }
 
     #[tokio::test]
@@ -724,6 +803,43 @@ mod tests {
             .unwrap();
         assert_eq!(subject, "Discord: Allowed #general [user500]");
         assert_eq!(kind, "guild_channel");
+    }
+
+    #[test]
+    fn legacy_dm_subjects_are_migrated_once() {
+        let (_d, store) = store();
+        for (id, kind, subject) in [
+            ("1", "dm", "Discord: Alice [me]"),
+            ("2", "group", "Discord: Alice, Bob [Bob]"),
+            ("3", "guild_channel", "Discord: Server #general [Bob]"),
+        ] {
+            store
+                .with_conn(|c| {
+                    c.execute(
+                        "INSERT INTO emails (messageId, fromEmail, subject, firstSeenAt, platform, kind) \
+                         VALUES (?1, 'x', ?2, 1, 'discord', ?3)",
+                        [id, subject, kind],
+                    )
+                })
+                .unwrap();
+        }
+        assert_eq!(migrate_dm_subjects(&store).unwrap(), 2);
+        assert_eq!(migrate_dm_subjects(&store).unwrap(), 0);
+        let subjects: Vec<String> = store
+            .with_conn(|c| {
+                let mut st = c.prepare("SELECT subject FROM emails ORDER BY messageId")?;
+                let rows = st.query_map([], |r| r.get(0))?;
+                rows.collect()
+            })
+            .unwrap();
+        assert_eq!(
+            subjects,
+            [
+                "Discord DM: Alice [me]",
+                "Discord group DM: Alice, Bob [Bob]",
+                "Discord: Server #general [Bob]"
+            ]
+        );
     }
 
     #[test]
