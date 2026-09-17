@@ -1,0 +1,24 @@
+[package]
+name = "augmentagent-channel-apple-notes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+augmentagent-channel-core = { path = "../augmentagent-channel-core" }
+augmentagent-channel-imessage = { path = "../augmentagent-channel-imessage" }
+augmentagent-store = { path = "../augmentagent-store" }
+
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+sha2 = "0.10"
+
+[dev-dependencies]
+augmentagent-mcp-memory = { path = "../augmentagent-mcp-memory" }
+tempfile = "3"

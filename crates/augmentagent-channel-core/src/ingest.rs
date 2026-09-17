@@ -61,6 +61,9 @@ pub enum IngestTrigger {
     ImessageHistory,
     /// New exported WhatsApp messages; no outbound or initial-history fan-out.
     WhatsappHistory,
+    /// A new or edited Apple Note from the exported bundle (#1062). Pairs with
+    /// `DecisionKind::Capture`; never fired on the first full-bundle pass.
+    AppleNotes,
 }
 
 impl IngestTrigger {
@@ -76,6 +79,7 @@ impl IngestTrigger {
             Self::Journal => "journal",
             Self::ImessageHistory => "imessage-history",
             Self::WhatsappHistory => "whatsapp-history",
+            Self::AppleNotes => "apple-notes",
         }
     }
 }

@@ -54,6 +54,7 @@ use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
 mod whatsapp_history;
+mod apple_notes;
 mod autopr_eval;
 mod autopr_health;
 mod channel_router;
@@ -289,6 +290,11 @@ enum Cmd {
     WhatsappHistory {
         #[command(subcommand)]
         op: whatsapp_history::Op,
+    },
+    /// Read-only Apple Notes bundle ingestion (see docs/APPLE-NOTES.md).
+    AppleNotes {
+        #[command(subcommand)]
+        op: apple_notes::Op,
     },
     /// Person-page maintenance (identity-merge groundwork).
     Person {
@@ -2978,6 +2984,26 @@ async fn main() -> Result<()> {
                 }
                 Err(e) => warn!("WhatsApp history disabled: {e:#}"),
             }
+            // #1062 — Apple Notes bundle → emails + wiki capture. Same gate
+            // shape as WhatsApp history above.
+            match augmentagent_channel_apple_notes::Config::load() {
+                Ok(Some(config)) => {
+                    let store_c = Arc::clone(&store);
+                    let reasoner = build_reasoner();
+                    let root = cli.wiki_dir.clone();
+                    let schema = root
+                        .as_ref()
+                        .and_then(|_| std::fs::read_to_string("schema/wiki-skill.md").ok());
+                    let sd = shutdown.clone();
+                    tasks.push(tokio::spawn(async move {
+                        apple_notes::run_loop(config, store_c, reasoner, root, schema, sd).await
+                    }));
+                }
+                Ok(None) => {
+                    info!("Apple Notes disabled: AUGMENTAGENT_APPLE_NOTES_REPO_DIR not set")
+                }
+                Err(e) => warn!("Apple Notes disabled: {e:#}"),
+            }
             // #886 — iMessage bundle → emails + wiki ingest. Self-gates on
             // AUGMENTAGENT_IMESSAGE_REPO_DIR; an unconfigured box logs and
             // moves on, same as the journal gate above.
@@ -3611,6 +3637,9 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::WhatsappHistory { .. } => whatsapp_history::poll_command(store).await,
+        Cmd::AppleNotes { op } => match op {
+            apple_notes::Op::PollOnce { dry_run } => apple_notes::poll_command(store, dry_run).await,
+        },
         Cmd::Imessage { ref op } => match op {
             ImessageOp::Sync { apply } => {
                 run_imessage_sync(&cli, store, *apply)?;
