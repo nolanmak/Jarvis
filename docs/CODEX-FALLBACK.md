@@ -52,7 +52,8 @@ it is the address the service CLIs use to reach the Secret Service keyring.
 
 The policy also carries non-secret but private paths: `settings` (hooks and
 MCP server definitions, including each server's `env`), `session_id`,
-`handoff_path` and `build_vm_config`. Model provider credentials
+`handoff_path`, `build_vm_config` and `build_runner` (`vm`, `host` or
+`unavailable`, #1041). Model provider credentials
 (`CODEX_API_KEY`, Codex `auth.json`) are never in the policy.
 
 A required stdio MCP bridge exposes the operations declared by `ReasonerOpts`.
