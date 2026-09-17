@@ -12,7 +12,7 @@ use crate::handles::{self, ME};
 
 /// Bump when extraction output changes; `enqueue_stale` re-extracts rows
 /// indexed by an older version.
-pub const EXTRACTOR_VERSION: i64 = 1;
+pub const EXTRACTOR_VERSION: i64 = 2;
 
 /// The columns of an `emails` row the extractor reads.
 #[derive(Debug, Clone, Default)]

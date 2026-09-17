@@ -44,11 +44,13 @@ pub struct IndexHealth {
     pub missing: i64,
     pub stale: i64,
     pub queued: i64,
+    /// Index rows with no full-text entry.
+    pub fts_missing: i64,
 }
 
 impl IndexHealth {
     pub fn is_complete(&self) -> bool {
-        self.missing == 0 && self.stale == 0 && self.queued == 0
+        self.missing == 0 && self.stale == 0 && self.queued == 0 && self.fts_missing == 0
     }
 }
 
@@ -113,6 +115,9 @@ pub fn enqueue_stale(
 /// the lock (their backoff tops out around 100 ms).
 pub const YIELD_PAUSE: std::time::Duration = std::time::Duration::from_millis(120);
 
+/// Body bytes read per drain transaction before the batch ends early.
+pub const BATCH_BODY_BUDGET: usize = 2 * 1024 * 1024;
+
 /// Rows scanned per enqueue statement.
 pub const ENQUEUE_CHUNK: i64 = 2_000;
 
@@ -168,6 +173,7 @@ fn drain_in_tx(c: &Connection, batch: usize) -> augmentagent_store::rusqlite::Re
         rows.collect::<Result<_, _>>()?
     };
     let mut report = DrainReport::default();
+    let mut body_bytes = 0usize;
     let mut load = c.prepare(
         "SELECT messageId, threadId, fromEmail, subject, COALESCE(body, ''), receivedAt, \
                 accountEntityId, firstSeenAt, platform, kind \
@@ -188,9 +194,15 @@ fn drain_in_tx(c: &Connection, batch: usize) -> augmentagent_store::rusqlite::Re
             extractor_version = excluded.extractor_version",
     )?;
     let mut delete_index = c.prepare("DELETE FROM message_index WHERE message_id = ?1")?;
+    let mut rowid_of = c.prepare("SELECT rowid FROM message_index WHERE message_id = ?1")?;
     let mut dequeue = c.prepare("DELETE FROM message_index_queue WHERE seq = ?1")?;
 
     for (seq, id) in queued {
+        // Large HTML mail makes a row-count batch hold the write lock far
+        // longer; stop early once the batch has read enough text.
+        if body_bytes >= BATCH_BODY_BUDGET {
+            break;
+        }
         let row = load
             .query_row([&id], |r| {
                 Ok(EmailRowView {
@@ -209,10 +221,17 @@ fn drain_in_tx(c: &Connection, batch: usize) -> augmentagent_store::rusqlite::Re
             .optional()?;
         match row {
             None => {
+                if let Some(rowid) = rowid_of
+                    .query_row([&id], |r| r.get::<_, i64>(0))
+                    .optional()?
+                {
+                    crate::fts::delete(c, rowid)?;
+                }
                 delete_index.execute([&id])?;
                 report.removed += 1;
             }
             Some(row) => {
+                body_bytes += row.body.len();
                 let f = extract(&row, &owner);
                 upsert.execute(params![
                     row.message_id,
@@ -230,6 +249,15 @@ fn drain_in_tx(c: &Connection, batch: usize) -> augmentagent_store::rusqlite::Re
                     f.has_attachment,
                     EXTRACTOR_VERSION,
                 ])?;
+                let rowid: i64 = rowid_of.query_row([&row.message_id], |r| r.get(0))?;
+                let doc = crate::fts::prepare(
+                    &row.platform,
+                    f.conversation_title.as_deref(),
+                    f.container.as_deref(),
+                    &row.subject,
+                    &row.body,
+                );
+                crate::fts::upsert(c, rowid, &doc)?;
                 report.indexed += 1;
                 if f.ts_fallback {
                     report.ts_fallback += 1;
@@ -261,6 +289,12 @@ pub fn check(store: &Store) -> anyhow::Result<IndexHealth> {
                 |r| r.get(0),
             )?,
             queued: c.query_row("SELECT COUNT(*) FROM message_index_queue", [], |r| r.get(0))?,
+            fts_missing: c.query_row(
+                "SELECT COUNT(*) FROM message_index mi \
+                 WHERE NOT EXISTS (SELECT 1 FROM message_fts f WHERE f.rowid = mi.rowid)",
+                [],
+                |r| r.get(0),
+            )?,
         })
     })?)
 }
@@ -271,6 +305,26 @@ mod tests {
     use augmentagent_store::Email;
 
     const Z: std::time::Duration = std::time::Duration::ZERO;
+
+    #[test]
+    fn large_bodies_end_a_batch_early_without_losing_rows() {
+        let (_d, s) = store();
+        // Each body is just over half the budget: two rows exhaust it.
+        let big = "x ".repeat(BATCH_BODY_BUDGET / 4 + 10);
+        for i in 0..5 {
+            let mut e = email(&format!("m{i}"), "gmail", "a@example.com", "t", "s");
+            e.body = big.clone();
+            s.upsert_email(&e).unwrap();
+        }
+        let first = drain_batch(&s, 100).unwrap();
+        assert_eq!(
+            (first.indexed, first.remaining),
+            (2, 3),
+            "budget ends the batch after 2 big rows"
+        );
+        drain(&s, 100, Z).unwrap();
+        assert!(check(&s).unwrap().is_complete());
+    }
 
     #[test]
     fn enqueue_covers_every_rowid_chunk_boundary() {
@@ -354,6 +408,11 @@ mod tests {
         assert_eq!(one(&s, "SELECT COUNT(*) FROM message_index_queue"), 0);
         // Triage marking doesn't touch indexed columns → not re-queued.
         s.mark_email_processed("a", augmentagent_store::TriageResult::DigestOnly)
+            .unwrap();
+        assert_eq!(one(&s, "SELECT COUNT(*) FROM message_index_queue"), 0);
+        // Re-writing identical content (the email poller re-upserts unread
+        // mail every tick) must not re-queue.
+        s.upsert_email(&email("a", "gmail", "x@example.com", "t", "s"))
             .unwrap();
         assert_eq!(one(&s, "SELECT COUNT(*) FROM message_index_queue"), 0);
         // Content update re-queues.
