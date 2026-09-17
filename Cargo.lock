@@ -964,6 +964,7 @@ dependencies = [
  "augmentagent-docs",
  "augmentagent-finance",
  "augmentagent-loops",
+ "augmentagent-messages",
  "augmentagent-proactive",
  "augmentagent-renderer-client",
  "augmentagent-store",
@@ -1069,6 +1070,20 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "augmentagent-messages"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "augmentagent-store",
+ "chrono",
+ "phonenumber",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

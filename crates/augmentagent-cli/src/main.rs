@@ -54,6 +54,7 @@ use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
 mod whatsapp_history;
+mod messages_cmd;
 mod apple_notes;
 mod autopr_eval;
 mod autopr_health;
@@ -286,6 +287,11 @@ enum Cmd {
     Imessage {
         #[command(subcommand)]
         op: ImessageOp,
+    },
+    /// Structured cross-channel message index (#1095): backfill and health.
+    Messages {
+        #[command(subcommand)]
+        op: messages_cmd::Op,
     },
     /// Read-only WhatsApp archive ingestion (independent of the live channel).
     WhatsappHistory {
@@ -2939,6 +2945,16 @@ async fn main() -> Result<()> {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { sdm.run(sd).await }));
             }
+            // #1103 — keep the structured message index current from the
+            // trigger-fed queue. Pure SQLite work; no model calls.
+            {
+                let store_mi = Arc::clone(&store);
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move {
+                    messages_cmd::drain_loop(store_mi, sd).await;
+                    Ok(())
+                }));
+            }
             // #1054 — Discord history → searchable history. Opt-in via env,
             // needs Discord auth; never calls a model.
             match build_discord_history() {
@@ -3736,6 +3752,7 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::WhatsappHistory { .. } => whatsapp_history::poll_command(store).await,
+        Cmd::Messages { op } => messages_cmd::run(store, op).await,
         Cmd::AppleNotes { op } => match op {
             apple_notes::Op::PollOnce { dry_run } => apple_notes::poll_command(store, dry_run).await,
         },

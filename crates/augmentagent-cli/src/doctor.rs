@@ -176,6 +176,7 @@ pub async fn run(store: Arc<Store>, json: Option<bool>, deep: bool) -> Result<i3
     findings.push(check_env_file_present());
     // 11. socialapi — key present? accounts active? (#245)
     findings.push(check_socialapi(&store));
+    findings.push(check_message_index(&store));
     // 12. calendar — configured (Composio + gmail entities) but unscheduled? (#376)
     findings.push(check_calendar_scheduled(&store));
     // 13. reasoner chain — configured providers + the model each tier runs (#658)
@@ -723,6 +724,30 @@ fn socialapi_key_present() -> bool {
         |r| r.get(0),
     );
     matches!(val, Ok(v) if !v.trim().is_empty())
+}
+
+/// #1102 — structured message index coverage. Warn-only: search still
+/// works from `emails` when the index lags.
+fn check_message_index(store: &Store) -> Finding {
+    match augmentagent_messages::check(store) {
+        Ok(h) if h.is_complete() => Finding::ok(
+            "message_index",
+            format!("{} messages indexed", h.indexed),
+        ),
+        Ok(h) => Finding::warn(
+            "message_index",
+            format!(
+                "message index incomplete: {} missing, {} stale, {} queued of {} messages",
+                h.missing, h.stale, h.queued, h.emails
+            ),
+            Some("augmentagent messages reindex"),
+        ),
+        Err(e) => Finding::warn(
+            "message_index",
+            format!("message index check failed: {e:#}"),
+            Some("augmentagent messages reindex"),
+        ),
+    }
 }
 
 /// #376 — the calendar channel is deliberately not spawned by `serve`; an
