@@ -99,7 +99,11 @@ class CliTests(unittest.TestCase):
     # -- git commit flow --
 
     def init_repo(self):
+        # sync.py commits as whoever the repo says; CI runners have no global identity.
         git(self.root, "init", "-q", "-b", "main", str(self.out))
+        git(self.out, "config", "user.email", "t@example.com")
+        git(self.out, "config", "user.name", "t")
+        git(self.out, "config", "commit.gpgsign", "false")
 
     def test_commit_creates_descriptive_commit(self):
         self.init_repo()
