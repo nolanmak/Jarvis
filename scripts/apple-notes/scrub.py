@@ -18,8 +18,8 @@ from pathlib import Path
 
 Finding = namedtuple("Finding", "kind line")
 
-_PEM_BEGIN = re.compile(r"^-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----")
-_PEM_END = re.compile(r"^-----END (?:[A-Z ]+ )?PRIVATE KEY-----")
+_PEM_BEGIN = re.compile(r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----")
+_PEM_END = re.compile(r"-----END (?:[A-Z ]+ )?PRIVATE KEY-----")
 _AWS_SECRET_HINT = re.compile(r"aws_secret|secret_access|aws secret", re.I)
 _AWS_SECRET_VALUE = re.compile(r"(?<![A-Za-z0-9/+=])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])")
 _JWT = re.compile(r"\b(eyJ[A-Za-z0-9_-]{4,})\.([A-Za-z0-9_-]{4,})\.([A-Za-z0-9_-]{4,})\b")
@@ -37,8 +37,20 @@ _PATTERNS = [
 ]
 # Value-only redaction: keep the keyword so the note still reads sensibly.
 _ASSIGNMENT = re.compile(
-    r"(?P<key>\b(?:password|passwd|pwd|secret|token|api[_-]?key)\b\s*[:=]\s*)(?P<val>\S{6,})", re.I
+    r"(?P<key>\b(?:password|passwd|pwd|secret|token|api[_-]?key)\b\s*[:=]\s*)(?P<val>\S{6,})"
+    r"|(?P<pkey>\b(?:pin|passcode)\b\s*[:=]\s*)(?P<pval>\d{4,})", re.I
 )
+# 13–19 digits, optionally grouped by spaces or dashes, Luhn-valid. A bare
+# run with no separators also needs a card word on the line, so Luhn-valid
+# ids (snowflakes, order numbers) are left alone.
+_CARD = re.compile(
+    r"(?<![\d-])(?:"
+    r"\d{4}[ -]\d{4}[ -]\d{4}[ -]\d{4}(?:[ -]\d{1,3})?"   # 4-4-4-4(-3): Visa, MC, Discover, JCB
+    r"|\d{4}[ -]\d{6}[ -]\d{5}"                       # 4-6-5: Amex
+    r"|\d{13,19}"                                     # contiguous
+    r")(?![\d-])"
+)
+_CARD_HINT = re.compile(r"\b(?:card|visa|mastercard|amex|discover|cc|cvv|credit|debit)\b", re.I)
 
 
 def _is_jwt(match):
@@ -50,27 +62,59 @@ def _is_jwt(match):
     return raw.startswith(b'{"alg"')
 
 
+def _luhn(digits):
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = int(ch)
+        if i % 2:
+            d = d * 2 - 9 if d > 4 else d * 2
+        total += d
+    return total % 10 == 0
+
+
+def _card_sub(match, hinted):
+    raw = match.group(0)
+    digits = re.sub(r"\D", "", raw)
+    grouped = raw != digits
+    if 13 <= len(digits) <= 19 and _luhn(digits) and (grouped or hinted):
+        return "[REDACTED:credit-card]"
+    return raw
+
+
+def _assignment_sub(match):
+    if match.group("key") is not None:
+        key, val = match.group("key"), match.group("val")
+    else:
+        key, val = match.group("pkey"), match.group("pval")
+    if val.startswith("[REDACTED:"):
+        return match.group(0)
+    return key + "[REDACTED:password-assignment]"
+
+
 def _scrub_line(line, prev_line):
-    """Return (new_line, kinds_found) for one line without PEM handling."""
+    """Return (new_line, kinds_found) for one line; PEM blocks handled by caller."""
     kinds = []
     for kind, pat in _PATTERNS:
         line, n = pat.subn(f"[REDACTED:{kind}]", line)
         if n:
             kinds.append(kind)
-    line, n = _JWT.subn(lambda m: "[REDACTED:jwt]" if _is_jwt(m) else m.group(0), line)
-    if "[REDACTED:jwt]" in line and "jwt" not in kinds:
+    before = line
+    line = _JWT.sub(lambda m: "[REDACTED:jwt]" if _is_jwt(m) else m.group(0), line)
+    if line != before:
         kinds.append("jwt")
     hinted = _AWS_SECRET_HINT.search(line) or (prev_line is not None and _AWS_SECRET_HINT.search(prev_line))
     if hinted:
         line, n = _AWS_SECRET_VALUE.subn("[REDACTED:aws-secret-key]", line)
         if n:
             kinds.append("aws-secret-key")
-    line, n = _ASSIGNMENT.subn(
-        lambda m: m.group("key") + "[REDACTED:password-assignment]"
-        if not m.group("val").startswith("[REDACTED:") else m.group(0),
-        line,
-    )
-    if n and "[REDACTED:password-assignment]" in line:
+    before = line
+    hinted = bool(_CARD_HINT.search(line))
+    line = _CARD.sub(lambda m: _card_sub(m, hinted), line)
+    if line != before:
+        kinds.append("credit-card")
+    before = line
+    line = _ASSIGNMENT.sub(_assignment_sub, line)
+    if line != before:
         kinds.append("password-assignment")
     return line, kinds
 
@@ -84,13 +128,23 @@ def scrub(text):
     prev = None
     while i < len(lines):
         line = lines[i]
-        if _PEM_BEGIN.match(line):
-            start = i + 1
+        begin = _PEM_BEGIN.search(line)
+        if begin:
+            # Everything from BEGIN through the matching END (same line, a
+            # later line, or EOF) collapses to one marker; text before BEGIN
+            # and after END on their lines is kept.
+            head = line[:begin.start()]
+            end = _PEM_END.search(line, begin.end())
             j = i
-            while j < len(lines) and not _PEM_END.match(lines[j]):
+            while end is None and j + 1 < len(lines):
                 j += 1
-            out.append("[REDACTED:private-key]")
-            findings.append(Finding("private-key", start))
+                end = _PEM_END.search(lines[j])
+            tail = lines[j][end.end():] if end else ""
+            # A trailing escaped newline inside a quoted value belongs to the key.
+            if tail.startswith("\\n"):
+                tail = tail[2:]
+            out.append(head + "[REDACTED:private-key]" + tail)
+            findings.append(Finding("private-key", i + 1))
             i = j + 1
             prev = None
             continue

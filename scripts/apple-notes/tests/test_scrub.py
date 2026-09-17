@@ -68,7 +68,7 @@ class KindTests(unittest.TestCase):
         out = self.check("password: hunter22", "password-assignment")
         self.assertEqual(out, "password: [REDACTED:password-assignment]")
         for form in ("passwd=abcdef1", "PWD = abcdef1", "api_key: abcdef1", "api-key=abcdef1",
-                     "secret = abcdef1", "token: abcdef1"):
+                     "secret = abcdef1", "token: abcdef1", "pin = 1234", "PIN: 123456", "passcode = 9999"):
             with self.subTest(form=form):
                 self.check(form, "password-assignment")
 
@@ -93,6 +93,80 @@ class PrivateKeyTests(unittest.TestCase):
         out, findings = scrub("x\n-----BEGIN RSA PRIVATE KEY-----\nline1\nline2")
         self.assertEqual(out, "x\n[REDACTED:private-key]")
         self.assertEqual(findings[0].line, 2)
+
+
+class InlinePemTests(unittest.TestCase):
+    """Seen in the wild: keys pasted as env values with literal \\n escapes."""
+
+    def test_inline_pem_in_quoted_env_value(self):
+        line = 'FIREBASE_KEY="-----BEGIN PRIVATE KEY-----\\nMIIEvQIBADANBg\\n-----END PRIVATE KEY-----\\n"\nNEXT=1'
+        out, findings = scrub(line)
+        self.assertEqual(out, 'FIREBASE_KEY="[REDACTED:private-key]"\nNEXT=1')
+        self.assertEqual([(f.kind, f.line) for f in findings], [("private-key", 1)])
+
+    def test_pem_starting_mid_line_and_ending_later(self):
+        text = 'key: -----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY----- trailing\nafter'
+        out, findings = scrub(text)
+        self.assertEqual(out, "key: [REDACTED:private-key] trailing\nafter")
+        self.assertEqual(findings[0].line, 1)
+
+
+class CreditCardTests(unittest.TestCase):
+    def test_luhn_valid_numbers_redacted_in_common_layouts(self):
+        for form in ("4111111111111111", "4111 1111 1111 1111", "4111-1111-1111-1111", "5500 0000 0000 0004", "3400 000000 00009"):
+            with self.subTest(form=form):
+                out, findings = scrub(f"card {form} exp 12/29")
+                self.assertEqual(out, "card [REDACTED:credit-card] exp 12/29")
+                self.assertEqual(kinds(findings), ["credit-card"])
+
+    def test_luhn_invalid_or_wrong_length_left_alone(self):
+        for form in ("4111111111111112", "1234 5678 9012 3456", "123456789012", "12345678901234567890"):
+            with self.subTest(form=form):
+                out, findings = scrub(form)
+                self.assertEqual(out, form)
+                self.assertEqual(findings, [])
+
+    def test_uuid_with_digit_only_segments_is_not_a_card(self):
+        # Seen on real data: --check flagged `identifier:` frontmatter lines.
+        for uuid in ("62055243-3164-4990-9107-064185390612", "A1B2C3D4-1234-5678-9012-345678901234",
+                     "12345678-1234-5678-9012-34567890abcd"):
+            with self.subTest(uuid=uuid):
+                line = f'identifier: "{uuid}"'
+                self.assertEqual(scrub(line), (line, []))
+
+    def test_bare_luhn_valid_id_needs_a_card_keyword(self):
+        snowflake = "1234567890123452"  # Luhn-valid by construction, no separators
+        self.assertEqual(scrub(f"message id {snowflake}"), (f"message id {snowflake}", []))
+        out, findings = scrub(f"visa {snowflake}")
+        self.assertEqual(out, "visa [REDACTED:credit-card]")
+        self.assertEqual(kinds(findings), ["credit-card"])
+
+    def test_phone_and_timestamps_untouched(self):
+        for form in ("+1 215 555 0100", "1782475200", "2026-09-16 18:22:12"):
+            with self.subTest(form=form):
+                self.assertEqual(scrub(form), (form, []))
+
+
+class IdempotenceTests(unittest.TestCase):
+    """A written bundle re-scanned by --check must be clean: markers are not secrets."""
+
+    SAMPLES = [
+        "password: hunter22",
+        "api_key: sk-" + "A" * 24,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----",
+        "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "card 4111 1111 1111 1111",
+        "pin = 123456",
+    ]
+
+    def test_scrubbing_twice_finds_nothing_new(self):
+        for sample in self.SAMPLES:
+            with self.subTest(sample=sample):
+                once, findings = scrub(sample)
+                self.assertTrue(findings)
+                twice, again = scrub(once)
+                self.assertEqual(twice, once)
+                self.assertEqual(again, [])
 
 
 class FalsePositiveTests(unittest.TestCase):
