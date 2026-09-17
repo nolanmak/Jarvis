@@ -82,6 +82,11 @@ pub enum Command {
         #[arg(long)]
         newsletter_id: String,
     },
+    /// Reset learned source preferences while retaining feedback history.
+    RankReset {
+        #[arg(long)]
+        newsletter_id: String,
+    },
     /// Create a Jarvis-owned daily research or draft schedule.
     ScheduleCreate {
         #[arg(long)]
@@ -437,6 +442,17 @@ pub async fn run(command: &Command) -> Result<()> {
                 &format!("v1/newsletters/{id}/rank"),
                 None,
                 None,
+            )
+            .await?
+        }
+        Command::RankReset { newsletter_id } => {
+            let id = uuid(newsletter_id)?;
+            let key = event_request_key(&format!("rank-reset:{id}"))?;
+            api.call(
+                Method::POST,
+                &format!("v1/newsletters/{id}/rank/reset"),
+                Some(json!({})),
+                Some(&key),
             )
             .await?
         }
