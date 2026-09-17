@@ -64,6 +64,7 @@ mod env_cfg;
 mod gmail_attach;
 mod repo_docs;
 mod finance;
+mod handoff_prune;
 mod installers;
 mod logs;
 mod loop_cmd;
@@ -474,6 +475,31 @@ enum Cmd {
         /// Machine-readable output.
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+    /// Remove finished reasoner handoff journals idle past the retention
+    /// grace (#1035): `AUGMENTAGENT_HANDOFF_RETENTION_HOURS`, default 24.
+    /// The daemon sweeps at start and hourly with a confirming pass; this
+    /// on-demand pass removes immediately, so it needs `--yes` and refuses
+    /// while augmentagent.service runs. Journals with a lifecycle marker or
+    /// an uncertain row are never removed.
+    HandoffPrune {
+        /// Count what would be removed; take no locks and change nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Confirm a removing pass. Without the daemon's confirming pass, a
+        /// turn replayed after an outage would find no receipts.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+        /// Remove even while augmentagent.service is active, or when
+        /// `systemctl --user is-active` cannot tell.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Machine-readable output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Journal root. Default: ~/.local/state/augmentagent/reasoner-handoffs
+        #[arg(long)]
+        root: Option<PathBuf>,
     },
     /// Token usage per day (#1001). Reads the append-only log the reasoner
     /// writes on every call (`~/.local/state/augmentagent/token-usage.jsonl`,
@@ -2264,6 +2290,27 @@ async fn main() -> Result<()> {
     if let Cmd::RepoDocs { ref op } = cli.cmd {
         return repo_docs::run(op, cli.wiki_dir.as_deref()).await;
     }
+    // Journal housekeeping needs no database.
+    if let Cmd::HandoffPrune {
+        dry_run,
+        yes,
+        force,
+        json,
+        ref root,
+    } = cli.cmd
+    {
+        let root = root
+            .clone()
+            .or_else(augmentagent_channel_core::handoff::journal_root)
+            .context("no --root and no HOME to locate the handoff journal root")?;
+        return handoff_prune::run(
+            handoff_prune::Options { dry_run, yes, force, json },
+            &augmentagent_channel_core::handoff::retention_setting_from_env(),
+            &root,
+            &handoff_prune::daemon_state,
+            &mut std::io::stdout().lock(),
+        );
+    }
     let db_path = cli
         .db
         .clone()
@@ -2678,6 +2725,16 @@ async fn main() -> Result<()> {
             });
             // Collect the enabled channels' runners + optional digest scheduler.
             let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
+
+            // #1035 — reasoner handoff journals: remove finished ones idle past
+            // the grace period, at start and hourly, on the blocking pool.
+            // Never in-flight or uncertain ones; failures only log.
+            tasks.push(tokio::spawn(augmentagent_channel_core::handoff::run_sweep_loop(
+                augmentagent_channel_core::handoff::journal_root(),
+                augmentagent_channel_core::handoff::retention_from_env(),
+                augmentagent_channel_core::handoff::SWEEP_INTERVAL,
+                shutdown.clone(),
+            )));
 
             // Voice-capture listener (#80): long-poll the capture bot. Inert
             // unless a token is in the keyring AND the chat allowlist is
@@ -3157,6 +3214,7 @@ async fn main() -> Result<()> {
             max_issues,
         } => research::run_research(store, since_hours, post_discord, dry_run, max_issues).await,
         Cmd::RepoDocs { .. } => unreachable!("handled before database initialization"),
+        Cmd::HandoffPrune { .. } => unreachable!("handled before database initialization"),
         Cmd::Gmail { ref op } => match op {
             GmailOp::Search { query, limit, full, account } => {
                 run_gmail_search(store, query.clone(), *limit, *full, account.clone()).await
