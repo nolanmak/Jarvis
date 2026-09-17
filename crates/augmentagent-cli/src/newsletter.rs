@@ -80,6 +80,13 @@ pub enum Command {
         #[arg(long)]
         url: String,
     },
+    /// List task IDs and statuses for one research run, including automatic fallbacks.
+    BrowserTasks {
+        #[arg(long)]
+        newsletter_id: String,
+        #[arg(long)]
+        run_id: String,
+    },
     /// Read a browser capture status and its normalized result.
     BrowserTaskGet {
         #[arg(long)]
@@ -523,6 +530,20 @@ pub async fn run(command: &Command) -> Result<()> {
                 &format!("v1/newsletters/{id}/research-runs/{run}/worker-tasks"),
                 Some(body),
                 Some(&key),
+            )
+            .await?
+        }
+        Command::BrowserTasks {
+            newsletter_id,
+            run_id,
+        } => {
+            let id = uuid(newsletter_id)?;
+            let run = uuid(run_id)?;
+            api.call(
+                Method::GET,
+                &format!("v1/newsletters/{id}/research-runs/{run}/worker-tasks"),
+                None,
+                None,
             )
             .await?
         }
