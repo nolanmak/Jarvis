@@ -4829,12 +4829,8 @@ fn unreviewable_path() -> PathBuf {
             return PathBuf::from(p);
         }
     }
-    std::env::var_os("HOME")
-        .map(|h| {
-            PathBuf::from(h)
-                .join(".local/state/augmentagent")
-                .join("autopr-unreviewable.json")
-        })
+    augmentagent_channel_core::state_dir::state_dir()
+        .map(|dir| dir.join("autopr-unreviewable.json"))
         .unwrap_or_else(|| PathBuf::from("autopr-unreviewable.json"))
 }
 
@@ -15571,6 +15567,7 @@ else:
             .args(["--exact", name, "--nocapture"])
             .env("JARVIS_1037_ROOT", root)
             .env("HOME", root.join("home"))
+            .env(augmentagent_channel_core::state_dir::STATE_HOME_ENV, root.join("state"))
             .env("GH_BIN", fake_gh_1037(root))
             .env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS", "synthetic-owner")
             .env("AUGMENTAGENT_GH_OWNER", "synthetic-owner")
@@ -15775,7 +15772,8 @@ else:
         let corrupt = format!("{BRANCH_PREFIX}70998");
         let exposed = format!("{BRANCH_PREFIX}70999");
         let repo = fixture_repo_1037(&root, &[&corrupt, &exposed]);
-        let history = root.join("home/.local/state/augmentagent/review-history");
+        // The child's state dir is `XDG_STATE_HOME/augmentagent` (see run_1037_child).
+        let history = root.join("state").join("augmentagent").join("review-history");
         let records = || -> std::collections::BTreeSet<PathBuf> {
             std::fs::read_dir(&history)
                 .map(|d| {
