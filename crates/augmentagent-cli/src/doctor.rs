@@ -182,6 +182,8 @@ pub async fn run(store: Arc<Store>, json: Option<bool>, deep: bool) -> Result<i3
     findings.push(check_reasoner_gate());
     // 15. handoff journals — is the retention sweep keeping them bounded? (#1035)
     findings.push(check_handoff_journals());
+    // 16. build VM — Codex cargo/npm/npx runner readiness (#1041)
+    findings.push(check_build_vm());
 
     // --- Deep checks (off by default).
     if deep {
@@ -868,6 +870,123 @@ fn handoff_journal_finding(report: Result<handoff::SweepReport>, grace: Duration
     Finding::ok(NAME, msg)
 }
 
+/// What doctor observed about `/dev/kvm` (injected in tests).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KvmProbe {
+    exists: bool,
+    /// `access(R_OK|W_OK)` for this process: owner, group, mode or ACL.
+    read_write: bool,
+    /// Access granted by owner, group membership or other bits alone — i.e.
+    /// it does not depend on a logind seat ACL that a logout revokes.
+    durable: bool,
+}
+
+/// What doctor observed about the VM runtime configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VmConfigProbe {
+    Missing,
+    Invalid(String),
+    /// Names of required artifacts (`qemu`, `kernel`) that do not exist.
+    Loaded { missing: Vec<&'static str> },
+}
+
+const KVM_DEVICE: &str = "/dev/kvm";
+
+fn check_build_vm() -> Finding {
+    use augmentagent_channel_core::codex_tools::{build_runner, BuildRunner};
+    let runner = build_runner();
+    let config = match &runner {
+        BuildRunner::Vm(path) => probe_vm_config(path),
+        _ => VmConfigProbe::Missing,
+    };
+    let user = std::env::var("USER").unwrap_or_else(|_| "$USER".into());
+    build_vm_finding(&runner, &config, &probe_kvm(std::path::Path::new(KVM_DEVICE)), &user)
+}
+
+fn probe_vm_config(path: &std::path::Path) -> VmConfigProbe {
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return VmConfigProbe::Missing,
+        Err(e) => return VmConfigProbe::Invalid(format!("unreadable: {e}")),
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&raw) else {
+        return VmConfigProbe::Invalid("not valid JSON".into());
+    };
+    let missing = ["qemu", "kernel"].into_iter()
+        .filter(|key| !value.get(*key).and_then(Value::as_str).is_some_and(|p| std::path::Path::new(p).is_file()))
+        .collect();
+    VmConfigProbe::Loaded { missing }
+}
+
+fn probe_kvm(path: &std::path::Path) -> KvmProbe {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return KvmProbe { exists: false, read_write: false, durable: false };
+    };
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return KvmProbe { exists: true, read_write: false, durable: false };
+    };
+    // SAFETY: `c_path` is a valid NUL-terminated string for the call.
+    let read_write = unsafe { libc::access(c_path.as_ptr(), libc::R_OK | libc::W_OK) } == 0;
+    // SAFETY: getuid/getgid/getgroups have no preconditions; the buffer is sized by the first call.
+    let (uid, gid, groups) = unsafe {
+        let count = libc::getgroups(0, std::ptr::null_mut());
+        let mut groups = vec![0 as libc::gid_t; count.max(0) as usize];
+        let filled = libc::getgroups(count.max(0), groups.as_mut_ptr());
+        groups.truncate(filled.max(0) as usize);
+        (libc::getuid(), libc::getgid(), groups)
+    };
+    let mode = meta.mode();
+    let durable = (meta.uid() == uid && mode & 0o600 == 0o600)
+        || ((meta.gid() == gid || groups.contains(&meta.gid())) && mode & 0o060 == 0o060)
+        || mode & 0o006 == 0o006;
+    KvmProbe { exists: true, read_write, durable }
+}
+
+fn build_vm_finding(runner: &augmentagent_channel_core::codex_tools::BuildRunner, config: &VmConfigProbe,
+                    kvm: &KvmProbe, user: &str) -> Finding {
+    use augmentagent_channel_core::codex_tools::BuildRunner;
+    const NAME: &str = "build_vm";
+    const DOCS: &str = "see docs/BUILD-VM.md";
+    let group_cmd = format!("sudo usermod -aG kvm {user}  # then log out fully (or reboot) and restart augmentagent.service");
+    match runner {
+        BuildRunner::Host => return Finding::warn(NAME,
+            "AUGMENTAGENT_BUILD_VM=host: Codex cargo/npm/npx commands run in the host command sandbox, not the VM",
+            Some("unset AUGMENTAGENT_BUILD_VM once the build VM is provisioned")),
+        BuildRunner::Unavailable { reason } => return Finding::error(NAME,
+            format!("config missing: {reason}; Codex build commands fail closed (JARVIS_READINESS:build_vm_unavailable)"),
+            Some("provision ~/.local/share/augmentagent/build-vm/runtime.json (docs/BUILD-VM.md), or set AUGMENTAGENT_BUILD_VM=host to opt out")),
+        BuildRunner::Vm(_) => {}
+    }
+    match config {
+        VmConfigProbe::Missing => return Finding::error(NAME,
+            "config missing: the configured build VM runtime file does not exist; Codex builds will be denied",
+            Some("check AUGMENTAGENT_BUILD_VM_CONFIG; see docs/BUILD-VM.md")),
+        VmConfigProbe::Invalid(why) => return Finding::error(NAME,
+            format!("config invalid: build VM runtime configuration is {why}"), Some(DOCS)),
+        VmConfigProbe::Loaded { missing } if !missing.is_empty() => return Finding::error(NAME,
+            format!("qemu or kernel missing: configured {} not found", missing.join(" and ")), Some(DOCS)),
+        VmConfigProbe::Loaded { .. } => {}
+    }
+    if !kvm.exists {
+        return Finding::error(NAME, "kvm not accessible: /dev/kvm does not exist (KVM disabled or kvm module not loaded)",
+            Some("sudo modprobe kvm_intel || sudo modprobe kvm_amd"));
+    }
+    if !kvm.read_write {
+        return Finding::error(NAME,
+            "kvm not accessible: this user cannot open /dev/kvm read-write; every Codex build is denied",
+            Some(&group_cmd));
+    }
+    if !kvm.durable {
+        return Finding::warn(NAME,
+            "kvm not accessible after logout: /dev/kvm is reachable only through the login-seat (logind uaccess) ACL, \
+             not kvm group membership; builds fail once the seat session ends",
+            Some(&group_cmd));
+    }
+    Finding::ok(NAME, "ok: VM runtime configured, qemu and kernel present, /dev/kvm read-write via group or owner")
+}
+
 // ---------------------------------------------------------------------------
 // `--deep` checks.
 // ---------------------------------------------------------------------------
@@ -1321,6 +1440,76 @@ mod tests {
             assert_eq!(finding.severity, Severity::Warn, "{}", finding.message);
             assert_eq!(finding.suggested_cmd.as_deref(), Some("augmentagent handoff-prune --dry-run"));
         }
+    }
+
+    /// #1041 — doctor names each build-VM readiness state, with injected probes.
+    #[test]
+    fn build_vm_finding_distinguishes_every_readiness_state() {
+        use augmentagent_channel_core::codex_tools::BuildRunner;
+        let vm = BuildRunner::Vm(PathBuf::from("/synthetic/runtime.json"));
+        let loaded = VmConfigProbe::Loaded { missing: vec![] };
+        let durable = KvmProbe { exists: true, read_write: true, durable: true };
+        let ok = build_vm_finding(&vm, &loaded, &durable, "synthetic-user");
+        assert_eq!(ok.severity, Severity::Ok, "{}", ok.message);
+        assert!(ok.message.starts_with("ok"), "{}", ok.message);
+
+        let unavailable = BuildRunner::Unavailable { reason: "build VM runtime configuration is missing" };
+        for finding in [build_vm_finding(&unavailable, &VmConfigProbe::Missing, &durable, "u"),
+                        build_vm_finding(&vm, &VmConfigProbe::Missing, &durable, "u")] {
+            assert_eq!(finding.severity, Severity::Error);
+            assert!(finding.message.starts_with("config missing"), "{}", finding.message);
+        }
+        let host = build_vm_finding(&BuildRunner::Host, &VmConfigProbe::Missing, &durable, "u");
+        assert_eq!(host.severity, Severity::Warn);
+        assert!(host.message.contains("AUGMENTAGENT_BUILD_VM=host"), "{}", host.message);
+
+        let no_qemu = build_vm_finding(&vm, &VmConfigProbe::Loaded { missing: vec!["qemu"] }, &durable, "u");
+        assert_eq!(no_qemu.severity, Severity::Error);
+        assert!(no_qemu.message.starts_with("qemu or kernel missing") && no_qemu.message.contains("qemu"));
+        let no_kernel = build_vm_finding(&vm, &VmConfigProbe::Loaded { missing: vec!["kernel"] }, &durable, "u");
+        assert!(no_kernel.message.starts_with("qemu or kernel missing") && no_kernel.message.contains("kernel"));
+
+        for kvm in [KvmProbe { exists: false, read_write: false, durable: false },
+                    KvmProbe { exists: true, read_write: false, durable: false }] {
+            let finding = build_vm_finding(&vm, &loaded, &kvm, "u");
+            assert_eq!(finding.severity, Severity::Error, "{kvm:?}");
+            assert!(finding.message.starts_with("kvm not accessible"), "{}", finding.message);
+        }
+    }
+
+    #[test]
+    fn build_vm_finding_warns_when_kvm_depends_on_the_login_seat_acl() {
+        use augmentagent_channel_core::codex_tools::BuildRunner;
+        let vm = BuildRunner::Vm(PathBuf::from("/synthetic/runtime.json"));
+        let acl_only = KvmProbe { exists: true, read_write: true, durable: false };
+        let finding = build_vm_finding(&vm, &VmConfigProbe::Loaded { missing: vec![] }, &acl_only, "synthetic-user");
+        assert_eq!(finding.severity, Severity::Warn);
+        assert!(finding.message.contains("ACL") && finding.message.contains("logout"), "{}", finding.message);
+        assert!(finding.suggested_cmd.as_deref().unwrap().starts_with("sudo usermod -aG kvm synthetic-user"));
+    }
+
+    #[test]
+    fn kvm_probe_reads_owner_and_group_bits_of_a_synthetic_device() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("kvm");
+        std::fs::write(&device, "").unwrap();
+        std::fs::set_permissions(&device, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(probe_kvm(&device), KvmProbe { exists: true, read_write: true, durable: true });
+        assert!(!probe_kvm(&dir.path().join("absent")).exists);
+    }
+
+    #[test]
+    fn vm_config_probe_reports_missing_invalid_and_absent_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(probe_vm_config(&dir.path().join("runtime.json")), VmConfigProbe::Missing);
+        let config = dir.path().join("runtime.json");
+        std::fs::write(&config, "not json").unwrap();
+        assert!(matches!(probe_vm_config(&config), VmConfigProbe::Invalid(_)));
+        let kernel = dir.path().join("vmlinuz");
+        std::fs::write(&kernel, "").unwrap();
+        std::fs::write(&config, serde_json::json!({"qemu": dir.path().join("absent-qemu"), "kernel": kernel}).to_string()).unwrap();
+        assert_eq!(probe_vm_config(&config), VmConfigProbe::Loaded { missing: vec!["qemu"] });
     }
 
     #[test]

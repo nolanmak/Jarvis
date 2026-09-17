@@ -79,6 +79,24 @@ pub struct AuditRecord {
     pub stdout_truncated: Option<String>,
     /// Captured stderr, truncated to [`MAX_STREAM_BYTES`] if longer.
     pub stderr_truncated: Option<String>,
+    /// Build commands only (`cargo`/`npm`/`npx`, #1041): `vm` or `host`, or
+    /// `none` when the bridge refused the build before running it. Absent on
+    /// every other record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<String>,
+}
+
+/// Whether a shell command runs a build tool (`cargo`, `npm`, `npx`),
+/// judged by the first word's file name exactly as the Codex bridge does.
+pub fn is_build_command(command: &str) -> bool {
+    command.split_whitespace().next()
+        .and_then(|word| std::path::Path::new(word).file_name())
+        .is_some_and(|name| matches!(name.to_str(), Some("cargo" | "npm" | "npx")))
+}
+
+/// Whether an allowed-tools entry such as `Bash(cargo *)` permits a build.
+pub fn is_build_tool_pattern(tool: &str) -> bool {
+    tool.strip_prefix("Bash(").and_then(|rest| rest.strip_suffix(')')).is_some_and(is_build_command)
 }
 
 /// A tool call extracted from the stream-json output of the claude CLI.
@@ -429,6 +447,11 @@ pub fn build_audit_record(
     } else {
         (Some(captured), None)
     };
+    // The Claude lane runs Bash on the host; the Codex caller overrides this
+    // with the runner its bridge reports.
+    let runner = (tool == "Bash"
+        && args.get("command").and_then(|c| c.as_str()).is_some_and(is_build_command))
+        .then(|| "host".to_string());
     AuditRecord {
         provider: None,
         ts,
@@ -438,6 +461,7 @@ pub fn build_audit_record(
         exit_code: None,
         stdout_truncated,
         stderr_truncated,
+        runner,
     }
 }
 
@@ -614,6 +638,7 @@ mod tests {
             exit_code: None,
             stdout_truncated: None,
             stderr_truncated: None,
+            runner: None,
         };
         let notice = format_notice(&rec);
         assert!(notice.contains("Write"));
@@ -633,6 +658,7 @@ mod tests {
             exit_code: Some(0),
             stdout_truncated: Some("a\nb".into()),
             stderr_truncated: None,
+            runner: None,
         };
         let notice = format_notice(&rec);
         assert!(notice.contains("Bash"));
@@ -679,6 +705,37 @@ mod tests {
         assert_eq!(body.len(), MAX_STREAM_BYTES);
     }
 
+    #[test]
+    fn build_commands_are_recognised_by_executable_name() {
+        for command in ["cargo test -p x", "npm ci", "npx tsc", "/usr/bin/cargo build", "  npm   test"] {
+            assert!(is_build_command(command), "{command}");
+        }
+        for command in ["printf cargo", "git status", "cargo-watch", "", "ls npm"] {
+            assert!(!is_build_command(command), "{command}");
+        }
+        assert!(is_build_tool_pattern("Bash(cargo *)"));
+        assert!(is_build_tool_pattern("Bash(npx tsc:*)"));
+        assert!(!is_build_tool_pattern("Bash(git status*)"));
+        assert!(!is_build_tool_pattern("Read"));
+    }
+
+    #[test]
+    fn every_build_audit_record_names_its_runner() {
+        // The Claude lane runs Bash directly on the host.
+        let build = build_audit_record("ts".into(), "s".into(), "Bash".into(),
+            serde_json::json!({"command": "cargo test"}), "ok", false);
+        assert_eq!(build.runner.as_deref(), Some("host"));
+        let line = serde_json::to_value(&build).unwrap();
+        assert_eq!(line["runner"], "host");
+        let other = build_audit_record("ts".into(), "s".into(), "Bash".into(),
+            serde_json::json!({"command": "git status"}), "ok", false);
+        assert!(other.runner.is_none());
+        assert!(serde_json::to_value(&other).unwrap().get("runner").is_none(), "non-build rows stay unchanged");
+        let write = build_audit_record("ts".into(), "s".into(), "Write".into(),
+            serde_json::json!({"command": "cargo test"}), "ok", false);
+        assert!(write.runner.is_none());
+    }
+
     #[tokio::test]
     async fn audit_logger_writes_and_appends_ndjson() {
         let tmp = tempfile::tempdir().unwrap();
@@ -693,6 +750,7 @@ mod tests {
             exit_code: None,
             stdout_truncated: None,
             stderr_truncated: None,
+            runner: None,
         };
         let rec2 = AuditRecord {
         provider: None,
@@ -703,6 +761,7 @@ mod tests {
             exit_code: Some(0),
             stdout_truncated: Some("a".into()),
             stderr_truncated: None,
+            runner: None,
         };
         logger.record(&rec1).await;
         logger.record(&rec2).await;

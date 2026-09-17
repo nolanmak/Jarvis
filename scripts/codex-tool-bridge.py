@@ -30,6 +30,8 @@ class Readiness(Denied):
         'mcp_start': 'Configured MCP server could not start or initialize; check its binary, authentication and transport.',
         'mcp_timeout': 'Configured MCP server timed out; check its availability and timeout setting.',
         'mcp_tools': 'Configured MCP server is missing a required tool; check the server version and tool profile.',
+        'build_vm_unavailable': 'Build commands require the private build VM, but its runtime configuration is missing; '
+                                'run `augmentagent doctor`, or set AUGMENTAGENT_BUILD_VM=host in the daemon environment to opt out.',
     }
 
     def __init__(self, category):
@@ -604,6 +606,14 @@ class Policy:
         self._node_install_cache = None
         self._cargo_cache = None
         self.build_vm_config = config.get('build_vm_config')
+        # #1041: which runner executes cargo/npm/npx. A VM configuration
+        # selects the VM; only the explicit operator opt-out selects the host.
+        # Anything else (no configuration found) leaves builds unavailable.
+        requested = config.get('build_runner')
+        if requested not in (None, 'vm', 'host', 'unavailable'):
+            raise Denied('unsupported build runner')
+        self.build_runner = ('vm' if self.build_vm_config
+                             else 'host' if requested == 'host' else None)
         if self.build_vm_config:
             path = Path(self.build_vm_config)
             if not path.is_absolute() or any(path.resolve() == root or root in path.resolve().parents
@@ -1193,8 +1203,10 @@ class Policy:
         import sys
         argv = self.command_argv(command)
         build = Path(argv[0]).name in ('cargo', 'npm', 'npx')
-        if build and self.build_vm_config:
-            return self.run_vm_build(argv, timeout)
+        if build and self.build_runner is None:
+            raise Readiness('build_vm_unavailable')
+        if build and self.build_runner == 'vm':
+            return dict(self.run_vm_build(argv, timeout), runner='vm')
         executable = shutil.which(argv[0], path=self.environment.get('PATH', os.defpath))
         if not executable:
             raise Denied('configured command is not installed')
@@ -1303,9 +1315,12 @@ class Policy:
                     if snapshot:
                         snapshot.sync()
                     stdout.seek(0); stderr.seek(0)
-                    return {'exit_code': process.returncode,
-                            'stdout': stdout.read(MAX_FILE_BYTES).decode(errors='replace'),
-                            'stderr': stderr.read(MAX_FILE_BYTES).decode(errors='replace')}
+                    outcome = {'exit_code': process.returncode,
+                               'stdout': stdout.read(MAX_FILE_BYTES).decode(errors='replace'),
+                               'stderr': stderr.read(MAX_FILE_BYTES).decode(errors='replace')}
+                    if build:
+                        outcome['runner'] = 'host'
+                    return outcome
                 finally:
                     # A child may exit after launching background descendants.
                     # The sandbox forbids setsid/setpgid, so group cleanup covers

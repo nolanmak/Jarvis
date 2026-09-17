@@ -85,8 +85,14 @@ async fn record_tool_item(opts: &ReasonerOpts, item: &serde_json::Value) {
     let mut record = build_audit_record(chrono::Utc::now().to_rfc3339(), session.into(), tool.clone(), args, &content, failed);
     record.provider = Some("codex".into());
     if tool == "Bash" {
-        record.exit_code = serde_json::from_str::<serde_json::Value>(&content).ok()
+        let outcome = serde_json::from_str::<serde_json::Value>(&content).ok();
+        record.exit_code = outcome.as_ref()
             .and_then(|v| v.get("exit_code").and_then(|c| c.as_i64())).and_then(|c| i32::try_from(c).ok());
+        if record.runner.is_some() {
+            // #1041: the bridge names the runner it used; a build it refused never ran.
+            record.runner = Some(outcome.as_ref().and_then(|v| v.get("runner")).and_then(|r| r.as_str())
+                .filter(|r| matches!(*r, "vm" | "host")).unwrap_or("none").to_string());
+        }
     }
     if let Some(logger) = &opts.audit_logger { logger.record(&record).await; }
     if is_high_risk(&tool) {
@@ -655,7 +661,7 @@ exit 1
     #[tokio::test]
     #[ignore = "requires Codex login and a configured VM runtime; builds synthetic code only"]
     async fn live_codex_builds_and_tests_with_the_vm_bridge() {
-        assert!(crate::codex_tools::build_vm_config_path().is_some());
+        assert_eq!(crate::codex_tools::build_runner().label(), "vm");
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("Cargo.toml"),
@@ -736,6 +742,31 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
         assert_eq!(row["tool"], "Write");
         assert_eq!(row["session_id"], "synthetic-session");
         assert_eq!(row["stdout_truncated"], "written");
+    }
+
+    #[tokio::test]
+    async fn codex_build_audit_records_name_the_bridge_runner() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        let bin = stub(&dir, "fake-codex-build-audit", r#"
+cat >/dev/null
+echo '{"type":"item.completed","item":{"type":"mcp_tool_call","server":"jarvis","tool":"Bash","arguments":{"command":"cargo test"},"result":{"content":[{"type":"text","text":"{\"exit_code\": 0, \"stdout\": \"\", \"stderr\": \"\", \"runner\": \"vm\"}"}]},"status":"completed"}}'
+echo '{"type":"item.completed","item":{"type":"mcp_tool_call","server":"jarvis","tool":"Bash","arguments":{"command":"npm test"},"result":{"isError":true,"content":[{"type":"text","text":"JARVIS_READINESS:build_vm_unavailable synthetic"}]},"status":"completed"}}'
+echo '{"type":"item.completed","item":{"type":"mcp_tool_call","server":"jarvis","tool":"Bash","arguments":{"command":"git status"},"result":{"content":[{"type":"text","text":"{\"exit_code\": 0, \"stdout\": \"\", \"stderr\": \"\"}"}]},"status":"completed"}}'
+echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
+"#);
+        let mut options = opts();
+        options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(log.clone())));
+        CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global() }
+            .call(&options, "synthetic build audit probe").await.unwrap();
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(log).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["runner"], "vm");
+        assert_eq!(rows[0]["exit_code"], 0);
+        // A fail-closed build never ran: it must not be attributed to the host.
+        assert_eq!(rows[1]["runner"], "none");
+        assert!(rows[2].get("runner").is_none());
     }
 
     #[tokio::test]

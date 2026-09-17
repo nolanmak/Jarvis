@@ -13,6 +13,67 @@ default. Set `AUGMENTAGENT_BUILD_VM_CONFIG` in the daemon environment to overrid
 it. An explicit invalid path fails; it does not fall back to the default.
 Task/profile environment variables cannot select a different runtime.
 
+### Runner selection and readiness (#1041)
+
+The daemon resolves one build runner for Codex `cargo`, `npm` and `npx` commands:
+
+| Daemon environment | Runner |
+| --- | --- |
+| `AUGMENTAGENT_BUILD_VM_CONFIG=<path>` | `vm` (an invalid path fails; the opt-out does not override it) |
+| `AUGMENTAGENT_BUILD_VM=host` | `host` (explicit opt-out: the host command sandbox) |
+| default `runtime.json` present | `vm` |
+| none of the above | unavailable |
+
+There is no silent host fallback. When the runner is unavailable, every build
+command returns the tool error `JARVIS_READINESS:build_vm_unavailable` and nothing
+runs; other commands are unaffected. The daemon logs a warning at launch when a
+build-capable profile starts without a runner.
+
+Every build row in `tool-audit.log` carries `runner`: `vm` or `host` for commands
+that ran, `none` for a build the bridge refused. Claude-lane builds run on the host
+and record `host`. Non-build rows have no `runner` field.
+
+`augmentagent doctor` reports the `build_vm` check as one of: `config missing`,
+`config invalid`, `qemu or kernel missing`, `kvm not accessible` (error: no
+read-write access, or no device), `kvm not accessible after logout` (warning:
+access comes only from the login-seat ACL), or `ok`. With the opt-out set it warns
+that builds run on the host.
+
+### Host provisioning: KVM access that survives logout (operator step)
+
+On desktop hosts `/dev/kvm` is usually `root:kvm 0660` plus a logind `uaccess`
+ACL for the user at the active seat. That ACL is removed when the seat session
+ends, after which qemu cannot open `/dev/kvm` and every VM build is denied. Doctor
+detects this state (`getfacl /dev/kvm` shows `user:<you>:rw-` while `id -nG` does
+not list `kvm`). Grant access through group membership instead. This needs sudo:
+
+```sh
+sudo usermod -aG kvm "$USER"
+# Group membership applies to new logins only. Log out completely (or reboot),
+# then restart the user manager's services so the daemon inherits the group:
+systemctl --user restart augmentagent.service
+```
+
+The daemon's user services stop at logout unless lingering is enabled. To keep
+the daemon, and its VM builds, running with no one logged in:
+
+```sh
+sudo loginctl enable-linger "$USER"
+```
+
+Verify, then confirm doctor reports `build_vm` as `ok`:
+
+```sh
+id -nG | tr ' ' '\n' | grep -x kvm
+loginctl show-user "$USER" -p Linger
+augmentagent doctor
+```
+
+Alternative to group membership, for a dedicated build user: a udev rule such as
+`KERNEL=="kvm", GROUP="kvm", MODE="0660"` in `/etc/udev/rules/65-kvm.rules`
+(then `sudo udevadm trigger --name-match=kvm`) keeps the group ownership explicit;
+the user must still be in `kvm`. Record the change in the private provisioning record.
+
 Keep the directory mode 0700 and configuration mode 0600, owned by the daemon
 user. All paths must be absolute. Host executable artifacts must be owned by root
 or the daemon user and must not be group/world writable. Example schema (replace
@@ -42,7 +103,8 @@ every example path with a provisioned local artifact):
 Provision QEMU with KVM, virtio-9p and seccomp support, a compatible Linux kernel,
 its matching uncompressed modules in dependency order, and a static BusyBox.
 The module list depends on which drivers the kernel includes; virtio PCI must be
-available before loading 9p. The daemon user needs access to `/dev/kvm`.
+available before loading 9p. The daemon user needs read-write access to `/dev/kvm`
+through the `kvm` group, not only a login-seat ACL (see above).
 On Debian/Ubuntu, distribution packages and their shared-library dependencies
 can be extracted into a private directory using `dpkg-deb -x`; system installation
 is not required. Keep package versions and hashes in a private provisioning record.

@@ -259,6 +259,7 @@ mod tests {
                 exit_code: None,
                 stdout_truncated: None,
                 stderr_truncated: None,
+                runner: None,
             })
             .await;
         crate::token_usage::UsageLogger::global().append(&crate::token_usage::UsageRecord {

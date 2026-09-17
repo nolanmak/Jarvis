@@ -2,20 +2,65 @@
 use std::path::{Path, PathBuf};
 use crate::reasoner::ReasonerOpts;
 
-fn configured_vm_path(override_path: Option<std::ffi::OsString>, home: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    if let Some(path) = override_path.filter(|p| !p.is_empty()) {
-        // A broken explicit override must fail, never silently select another runtime.
-        return Some(PathBuf::from(path));
+/// Explicit runtime configuration path (daemon environment only).
+pub const BUILD_VM_CONFIG_ENV: &str = "AUGMENTAGENT_BUILD_VM_CONFIG";
+/// Operator opt-out: `host` runs build commands in the host command sandbox.
+pub const BUILD_VM_MODE_ENV: &str = "AUGMENTAGENT_BUILD_VM";
+/// Default runtime configuration, relative to `$HOME`.
+pub const BUILD_VM_DEFAULT_CONFIG: &str = ".local/share/augmentagent/build-vm/runtime.json";
+
+/// Which runner executes Codex `cargo`/`npm`/`npx` commands (#1041).
+///
+/// One definition consumed by the bridge policy, the tool audit and doctor.
+/// There is no implicit host fallback: without a VM configuration builds are
+/// `Unavailable` unless the operator sets `AUGMENTAGENT_BUILD_VM=host`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildRunner {
+    Vm(PathBuf),
+    Host,
+    Unavailable { reason: &'static str },
+}
+
+impl BuildRunner {
+    /// Stable label written to the bridge policy and to audit records.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Vm(_) => "vm",
+            Self::Host => "host",
+            Self::Unavailable { .. } => "unavailable",
+        }
     }
-    let path = PathBuf::from(home?).join(".local/share/augmentagent/build-vm/runtime.json");
-    match std::fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        _ => Some(path), // unreadable/symlinked configuration is checked by the broker
+
+    pub fn vm_config(&self) -> Option<&Path> {
+        match self { Self::Vm(path) => Some(path), _ => None }
     }
 }
 
-pub(crate) fn build_vm_config_path() -> Option<PathBuf> {
-    configured_vm_path(std::env::var_os("AUGMENTAGENT_BUILD_VM_CONFIG"), std::env::var_os("HOME"))
+fn configured_build_runner(override_path: Option<std::ffi::OsString>, mode: Option<std::ffi::OsString>,
+                           home: Option<std::ffi::OsString>) -> BuildRunner {
+    if let Some(path) = override_path.filter(|p| !p.is_empty()) {
+        // A broken explicit override must fail, never silently select another runtime.
+        return BuildRunner::Vm(PathBuf::from(path));
+    }
+    if mode.as_deref().is_some_and(|mode| mode.eq_ignore_ascii_case("host")) {
+        return BuildRunner::Host;
+    }
+    let Some(home) = home.filter(|h| !h.is_empty()) else {
+        return BuildRunner::Unavailable { reason: "HOME is unset; the default VM configuration cannot be located" };
+    };
+    let path = PathBuf::from(home).join(BUILD_VM_DEFAULT_CONFIG);
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound =>
+            BuildRunner::Unavailable { reason: "build VM runtime configuration is missing" },
+        _ => BuildRunner::Vm(path), // unreadable/symlinked configuration is checked by the broker
+    }
+}
+
+/// The daemon's build runner, from the daemon's own environment. Task or
+/// profile environment (`ReasonerOpts::env`) can never select it.
+pub fn build_runner() -> BuildRunner {
+    configured_build_runner(std::env::var_os(BUILD_VM_CONFIG_ENV), std::env::var_os(BUILD_VM_MODE_ENV),
+                            std::env::var_os("HOME"))
 }
 
 // #1045 — single-file Read exceptions outside the read roots.
@@ -181,6 +226,12 @@ impl BridgeLaunch {
             if let Ok(value) = std::env::var(key) { environment.insert(key.into(), value); }
         }
         environment.extend(opts.env.iter().cloned());
+        let runner = build_runner();
+        if let BuildRunner::Unavailable { reason } = &runner {
+            if opts.allowed_tools.iter().any(|tool| crate::tool_audit::is_build_tool_pattern(tool)) {
+                tracing::warn!(reason, "codex build commands will fail closed: no build VM (#1041)");
+            }
+        }
         let policy = json!({
             "cwd": cwd,
             "read_roots": roots,
@@ -193,7 +244,8 @@ impl BridgeLaunch {
             "session_id": opts.session_id,
             "handoff_path": opts.handoff_path,
             // Operator configuration, deliberately not sourced from opts.env.
-            "build_vm_config": build_vm_config_path(),
+            "build_vm_config": runner.vm_config(),
+            "build_runner": runner.label(),
         });
         fn private_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
             let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
@@ -276,14 +328,28 @@ mod tests {
     fn vm_configuration_uses_durable_default_and_preserves_explicit_overrides() {
         let home = tempfile::tempdir().unwrap();
         let home_arg = Some(home.path().as_os_str().to_owned());
-        assert_eq!(configured_vm_path(None, home_arg.clone()), None);
         let default = home.path().join(".local/share/augmentagent/build-vm/runtime.json");
         std::fs::create_dir_all(default.parent().unwrap()).unwrap();
         std::fs::write(&default, "{}").unwrap();
-        assert_eq!(configured_vm_path(None, home_arg.clone()), Some(default));
+        assert_eq!(configured_build_runner(None, None, home_arg.clone()), BuildRunner::Vm(default));
         let explicit = home.path().join("missing-explicit.json");
-        assert_eq!(configured_vm_path(Some(explicit.as_os_str().to_owned()), home_arg), Some(explicit));
-        assert_eq!(configured_vm_path(None, None), None);
+        assert_eq!(configured_build_runner(Some(explicit.as_os_str().to_owned()), Some("host".into()), home_arg),
+                   BuildRunner::Vm(explicit), "an explicit configuration beats the opt-out");
+    }
+
+    #[test]
+    fn missing_vm_configuration_is_unavailable_not_a_silent_host_runner() {
+        let home = tempfile::tempdir().unwrap();
+        let home_arg = Some(home.path().as_os_str().to_owned());
+        let runner = configured_build_runner(None, None, home_arg.clone());
+        assert!(matches!(runner, BuildRunner::Unavailable { .. }), "{runner:?}");
+        assert_eq!(runner.label(), "unavailable");
+        assert!(runner.vm_config().is_none());
+        assert!(matches!(configured_build_runner(None, None, None), BuildRunner::Unavailable { .. }));
+        assert!(matches!(configured_build_runner(Some("".into()), Some("vm".into()), home_arg.clone()),
+                         BuildRunner::Unavailable { .. }), "only `host` opts out");
+        assert_eq!(configured_build_runner(None, Some("host".into()), home_arg), BuildRunner::Host);
+        assert_eq!(BuildRunner::Host.label(), "host");
     }
 
     #[test]
@@ -312,6 +378,8 @@ mod tests {
         let policy: serde_json::Value = serde_json::from_slice(&std::fs::read(&launch.policy_path).unwrap()).unwrap();
         assert_eq!(policy["handoff_path"], serde_json::json!(opts.handoff_path));
         assert_ne!(policy["build_vm_config"], "untrusted-profile-override");
+        assert_eq!(policy["build_runner"], build_runner().label(), "policy names the runner the bridge must use");
+        assert!(matches!(policy["build_runner"].as_str(), Some("vm" | "host" | "unavailable")));
         for helper in ["codex-build-vm.py", "build-dependency-proxy.py", "provider-supervisor.py"] {
             assert_eq!(std::fs::metadata(launch_dir.join(helper)).unwrap().permissions().mode() & 0o777, 0o600);
         }
