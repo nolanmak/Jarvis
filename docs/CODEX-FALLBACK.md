@@ -291,9 +291,10 @@ with the empty audit placeholder) get distinct journals and still need
 caller-owned restart identity if they resume work. Claude receives pre-tool,
 post-tool and failed-tool hooks using the documented [hook event contract](https://code.claude.com/docs/en/hooks).
 The pre-tool hook persists started state; successful post-tool events normalize
-results for Codex. The generated command turns script startup failures into exit
-2. Tests execute that command, including quoted paths and blocking results, and
-exercise receipt forwarding through the dispatcher.
+results for Codex. Tests execute the generated command, including quoted paths
+and blocking results, and exercise receipt forwarding through the dispatcher.
+A stalled or failed checkpoint blocks the call within a fixed bound; see
+[Claude-side checkpoint guarantee](#claude-side-checkpoint-guarantee-1039).
 
 Primary hooks now also block a new tool-call id from repeating a completed
 MCP or broker service action in the same request. Both providers compare parsed
@@ -355,6 +356,60 @@ were reaped. A lifecycle lock and invocation-specific receipt path keep an older
 invocation from retiring a newer invocation's marker. Tests kill a real parent
 process and verify detached work stops before recovery. Production query and loop callers supply stable turn identities; markers are
 never cleared by age.
+
+### Claude-side checkpoint guarantee (#1039)
+
+**Guarantee:** a Claude tool call runs only after its pre-tool checkpoint has
+exited 0, which for a mutating call means its `started` receipt is on disk
+(file and directory fsync). Otherwise the hook blocks the call (exit 2) within
+**33 seconds** of starting. A normal checkpoint takes about 60 ms.
+
+Why the wrapper is needed. Claude Code cancels a hook that outlives its own
+`timeout` and then runs the tool anyway. A live probe on Claude Code 2.1.273
+confirmed this: a stalled pre-tool checkpoint under the old 10-second hook let
+`Write` create its marker. Claude Code also waits for the hook's stdout and
+stderr to close, not for its shell to exit (measured: 1.6 s when a leftover
+process held only stdin, 13.7 s when it held stdout and stderr). A checkpoint
+stuck in fsync can be uninterruptible, so even SIGKILL may not end it until the
+I/O returns, and a plain `timeout` prefix would not bound it.
+
+How the generated command works (`journal_hook_command` in
+`channel-core/src/handoff.rs`, one command for all three events, run by
+`/bin/sh -c`):
+
+- The checkpoint runs under `timeout -k 2 30`. Its stdout goes to `/dev/null`
+  and its stderr to an inner pipe, so it never holds the hook's own output.
+  SIGKILL also ends `timeout` itself, so a stuck checkpoint cannot delay the
+  exit status.
+- A relay under `timeout 33` copies the inner pipe to the hook's stderr, capped
+  at 64 KiB.
+- The checkpoint's exit status travels on its own descriptor, which only the
+  shell writes and the checkpoint never inherits, so nothing the checkpoint
+  prints can forge it. The shell exits 0 only on status 0.
+- Status 2 exits 2 with the relayed message: a bridge refusal, or Python's own
+  "can't open file" message (naming the temporary script path) when the script
+  is missing. A timeout, a missing interpreter or wrapper, any other status, or
+  no status exits 2 with a fixed message.
+- Claude Code's own hook `timeout` is 60 seconds. It still fails open, so the
+  guarantee assumes `sh`, `timeout` and `head` start within the 27-second
+  margin.
+
+After the fix, the same live probe showed the call blocked and no marker
+(`handoff::tests::live_stalled_journal_checkpoint_blocks_the_tool_call`,
+ignored by default). A checkpoint stopped after its atomic replace but before
+the directory fsync can leave a `started` row for a call that was blocked.
+That row needs operator reconciliation like any other uncertain effect. A stuck
+checkpoint that holds the journal lock also makes later checkpoints refuse
+until it ends.
+
+A post-tool or failed-tool checkpoint that fails, times out or cannot run leaves
+the row `started`, never `completed`. Claude's next call and the Codex broker
+both refuse to repeat it, `resume_message` forwards it as uncertain, and
+retention keeps it. `failed_post_tool_checkpoint_leaves_the_operation_uncertain`
+(Rust, through the generated command) and
+`test_failed_post_tool_checkpoint_stays_uncertain_and_is_never_replayed` (the
+bridge's `--handoff-hook` entry point) between them cover a held lock, an
+unwritable journal, a missing interpreter and a failed tool.
 
 ## Capability inventory
 
