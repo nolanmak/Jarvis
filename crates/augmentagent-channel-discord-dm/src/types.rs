@@ -51,6 +51,8 @@ pub struct GuildChannel {
     pub channel_type: u8,
     #[serde(default)]
     pub parent_id: Option<String>,
+    #[serde(default)]
+    pub last_message_id: Option<String>,
 }
 
 impl GuildChannel {
