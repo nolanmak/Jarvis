@@ -937,11 +937,67 @@ fn probe_kvm(path: &std::path::Path) -> KvmProbe {
         groups.truncate(filled.max(0) as usize);
         (libc::getuid(), libc::getgid(), groups)
     };
-    let mode = meta.mode();
-    let durable = (meta.uid() == uid && mode & 0o600 == 0o600)
-        || ((meta.gid() == gid || groups.contains(&meta.gid())) && mode & 0o060 == 0o060)
-        || mode & 0o006 == 0o006;
+    let mut gids = groups;
+    gids.push(gid);
+    let acl = read_posix_acl(&c_path);
+    let durable = durable_kvm_access(meta.uid(), meta.gid(), meta.mode(), acl.as_deref(), uid, &gids);
     KvmProbe { exists: true, read_write, durable }
+}
+
+// Linux POSIX ACL xattr (`system.posix_acl_access`) entry tags.
+const ACL_USER_OBJ: u16 = 0x01;
+const ACL_USER: u16 = 0x02;
+const ACL_GROUP_OBJ: u16 = 0x04;
+const ACL_GROUP: u16 = 0x08;
+const ACL_MASK: u16 = 0x10;
+const ACL_OTHER: u16 = 0x20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AclEntry {
+    tag: u16,
+    perm: u16,
+    id: u32,
+}
+
+/// Version-2 little-endian xattr: a u32 header, then 8-byte entries.
+fn parse_posix_acl(raw: &[u8]) -> Option<Vec<AclEntry>> {
+    let (header, body) = raw.split_at_checked(4)?;
+    if u32::from_le_bytes(header.try_into().ok()?) != 2 || body.len() % 8 != 0 {
+        return None;
+    }
+    Some(body.chunks_exact(8).map(|e| AclEntry {
+        tag: u16::from_le_bytes([e[0], e[1]]),
+        perm: u16::from_le_bytes([e[2], e[3]]),
+        id: u32::from_le_bytes([e[4], e[5], e[6], e[7]]),
+    }).collect())
+}
+
+fn read_posix_acl(path: &std::ffi::CStr) -> Option<Vec<AclEntry>> {
+    let name = c"system.posix_acl_access";
+    let mut buffer = vec![0u8; 4096];
+    // SAFETY: both strings are NUL-terminated; the buffer length is passed.
+    let size = unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), buffer.as_mut_ptr().cast(), buffer.len()) };
+    (size > 0).then(|| parse_posix_acl(&buffer[..size as usize])).flatten()
+}
+
+/// Read-write access that does not come from a per-user ACL entry (the
+/// logind seat grant): owner bits, group membership or other bits. With an
+/// ACL, st_mode's group bits are the mask, so group access is the `group::`
+/// or a named-group entry, limited by the mask.
+fn durable_kvm_access(owner: u32, group: u32, mode: u32, acl: Option<&[AclEntry]>, uid: u32, gids: &[u32]) -> bool {
+    const RW: u16 = 6;
+    let rw = |perm: u16| perm & RW == RW;
+    if owner == uid {
+        return mode & 0o600 == 0o600;
+    }
+    let Some(acl) = acl.filter(|entries| entries.iter().any(|e| e.tag == ACL_MASK)) else {
+        return if gids.contains(&group) { mode & 0o060 == 0o060 } else { mode & 0o006 == 0o006 };
+    };
+    let mask = acl.iter().find(|e| e.tag == ACL_MASK).map_or(0, |e| e.perm);
+    let other = acl.iter().find(|e| e.tag == ACL_OTHER).map_or(0, |e| e.perm);
+    let groups: Vec<u16> = acl.iter().filter(|e| (e.tag == ACL_GROUP_OBJ && gids.contains(&group))
+        || (e.tag == ACL_GROUP && gids.contains(&e.id))).map(|e| e.perm).collect();
+    if groups.is_empty() { rw(other) } else { groups.iter().any(|perm| rw(perm & mask)) }
 }
 
 fn build_vm_finding(runner: &augmentagent_channel_core::codex_tools::BuildRunner, config: &VmConfigProbe,
@@ -1497,6 +1553,45 @@ mod tests {
         std::fs::set_permissions(&device, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(probe_kvm(&device), KvmProbe { exists: true, read_write: true, durable: true });
         assert!(!probe_kvm(&dir.path().join("absent")).exists);
+    }
+
+    /// With an ACL, st_mode's group bits are the mask, not the owning group.
+    #[test]
+    fn durable_kvm_access_reads_the_group_acl_entry_not_the_mask() {
+        const UID: u32 = 4242;
+        const KVM: u32 = 993;
+        let entry = |tag, perm, id| AclEntry { tag, perm, id };
+        // root:kvm, st_mode 0660 where the group bits are the ACL mask (rw-).
+        let seat_acl = vec![entry(ACL_USER_OBJ, 6, 0), entry(ACL_USER, 6, UID), entry(ACL_GROUP_OBJ, 0, 0),
+                            entry(ACL_MASK, 6, 0), entry(ACL_OTHER, 0, 0)];
+        assert!(!durable_kvm_access(0, KVM, 0o20660, Some(&seat_acl), UID, &[KVM]),
+                "mask=rw- with group::--- grants the kvm group nothing");
+        let group_acl = vec![entry(ACL_USER_OBJ, 6, 0), entry(ACL_USER, 6, UID), entry(ACL_GROUP_OBJ, 6, 0),
+                             entry(ACL_MASK, 6, 0), entry(ACL_OTHER, 0, 0)];
+        assert!(durable_kvm_access(0, KVM, 0o20660, Some(&group_acl), UID, &[KVM]));
+        assert!(!durable_kvm_access(0, KVM, 0o20660, Some(&group_acl), UID, &[]), "seat ACL alone is not durable");
+        let masked = vec![entry(ACL_USER_OBJ, 6, 0), entry(ACL_GROUP_OBJ, 6, 0), entry(ACL_MASK, 4, 0), entry(ACL_OTHER, 0, 0)];
+        assert!(!durable_kvm_access(0, KVM, 0o20640, Some(&masked), UID, &[KVM]), "the mask limits group::rw-");
+        let named_group = vec![entry(ACL_USER_OBJ, 6, 0), entry(ACL_GROUP_OBJ, 0, 0), entry(ACL_GROUP, 6, 77),
+                               entry(ACL_MASK, 6, 0), entry(ACL_OTHER, 0, 0)];
+        assert!(durable_kvm_access(0, KVM, 0o20660, Some(&named_group), UID, &[77]));
+        // No ACL: plain mode bits decide.
+        assert!(durable_kvm_access(0, KVM, 0o20660, None, UID, &[KVM]));
+        assert!(!durable_kvm_access(0, KVM, 0o20660, None, UID, &[]));
+        assert!(durable_kvm_access(UID, KVM, 0o20600, None, UID, &[]));
+    }
+
+    #[test]
+    fn posix_acl_xattr_parses_entries_and_rejects_garbage() {
+        let mut raw = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in [(ACL_USER_OBJ, 6u16, u32::MAX), (ACL_USER, 6, 1000), (ACL_GROUP_OBJ, 6, u32::MAX)] {
+            raw.extend(tag.to_le_bytes()); raw.extend(perm.to_le_bytes()); raw.extend(id.to_le_bytes());
+        }
+        let entries = parse_posix_acl(&raw).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[1], AclEntry { tag: ACL_USER, perm: 6, id: 1000 });
+        assert!(parse_posix_acl(&raw[..7]).is_none());
+        assert!(parse_posix_acl(&[1, 0, 0, 0]).is_none(), "unknown version");
     }
 
     #[test]

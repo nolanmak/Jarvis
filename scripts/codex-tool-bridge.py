@@ -1195,18 +1195,36 @@ class Policy:
                 self._relative(str(resolved), writing=flag in outputs)
             index += 1
 
+    def mark_command_started(self):
+        """The command's process (host or VM) is about to start."""
+        self._command_started = True
+
     def run_command(self, command, timeout=120):
+        # #1041: the runner is decided before anything executes. It leads the
+        # outcome, so truncation cannot drop it, and it is attached to any
+        # failure raised after the process started (a timeout, a broker
+        # failure mid-build). Refusals before that carry no runner.
+        self._command_started = False
+        argv = self.command_argv(command)
+        build = Path(argv[0]).name in ('cargo', 'npm', 'npx')
+        if build and self.build_runner is None:
+            raise Readiness('build_vm_unavailable')
+        runner = self.build_runner if build else 'host'
+        try:
+            outcome = (self.run_vm_build(argv, timeout) if runner == 'vm'
+                       else self._run_host_command(argv, build, timeout))
+        except BaseException as error:
+            if self._command_started:
+                error.jarvis_runner = runner
+            raise
+        return {'runner': runner, **outcome}
+
+    def _run_host_command(self, argv, build, timeout):
         import shutil
         import tempfile
         import signal
         import time
         import sys
-        argv = self.command_argv(command)
-        build = Path(argv[0]).name in ('cargo', 'npm', 'npx')
-        if build and self.build_runner is None:
-            raise Readiness('build_vm_unavailable')
-        if build and self.build_runner == 'vm':
-            return dict(self.run_vm_build(argv, timeout), runner='vm')
         executable = shutil.which(argv[0], path=self.environment.get('PATH', os.defpath))
         if not executable:
             raise Denied('configured command is not installed')
@@ -1291,6 +1309,7 @@ class Policy:
             policy_file.chmod(0o600)
             with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
                 launch = argv if service else [sys.executable, '-I', str(helper), str(policy_file), *argv]
+                self.mark_command_started()
                 process = subprocess.Popen(launch,
                     cwd=run_cwd, env=run_env, stdin=subprocess.DEVNULL,
                     stdout=stdout, stderr=stderr, start_new_session=True)
@@ -1315,12 +1334,9 @@ class Policy:
                     if snapshot:
                         snapshot.sync()
                     stdout.seek(0); stderr.seek(0)
-                    outcome = {'exit_code': process.returncode,
-                               'stdout': stdout.read(MAX_FILE_BYTES).decode(errors='replace'),
-                               'stderr': stderr.read(MAX_FILE_BYTES).decode(errors='replace')}
-                    if build:
-                        outcome['runner'] = 'host'
-                    return outcome
+                    return {'exit_code': process.returncode,
+                            'stdout': stdout.read(MAX_FILE_BYTES).decode(errors='replace'),
+                            'stderr': stderr.read(MAX_FILE_BYTES).decode(errors='replace')}
                 finally:
                     # A child may exit after launching background descendants.
                     # The sandbox forbids setsid/setpgid, so group cleanup covers
@@ -1398,6 +1414,7 @@ class Policy:
                     build_environment = {'CARGO_HOME': '/workspace/.cargo-home',
                         'CARGO_NET_OFFLINE': 'true' if {'--offline', '--frozen'} & set(guest) else 'false'}
                 downloads = {}
+                self.mark_command_started()
                 result = vm.run(runtime, snapshot.root, guest, build_environment, timeout=timeout,
                     node_workspaces=[] if install else dependencies, download_info=downloads)
                 if initial_manifests is not None and initial_manifests != self.node_manifest_state():
@@ -2062,12 +2079,18 @@ class Server:
                     'An earlier operation has an uncertain outcome. Use read-only tools to inspect current state. '
                     'Do not repeat or start external changes until that outcome is reconciled.'}]}
             except (Readiness, SearchLimit) as error:
-                return {'isError': True, 'content': [{'type': 'text', 'text': str(error)}]}
+                return {'isError': True, 'content': [{'type': 'text', 'text': runner_prefix(error) + str(error)}]}
             except (Denied, KeyError, TypeError, UnicodeError, OSError, ValueError,
-                    RecursionError, MemoryError):
+                    RecursionError, MemoryError) as error:
                 return {'isError': True, 'content': [{'type': 'text',
-                        'text': 'Operation denied or invalid for the configured profile.'}]}
+                        'text': runner_prefix(error) + 'Operation denied or invalid for the configured profile.'}]}
         raise Denied('unsupported protocol method')
+
+
+def runner_prefix(error):
+    """`[runner=vm] ` for a command that failed after its process started (#1041)."""
+    runner = getattr(error, 'jarvis_runner', None)
+    return f'[runner={runner}] ' if runner in ('vm', 'host') else ''
 
 
 class InvalidParams(Exception):

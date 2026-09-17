@@ -56,6 +56,16 @@ fn configured_build_runner(override_path: Option<std::ffi::OsString>, mode: Opti
     }
 }
 
+/// Whether an allowed-tools entry such as `Bash(cargo *)` can run a build.
+/// Used only to warn at launch; the bridge's own shlex parse gates commands.
+fn is_build_tool_pattern(tool: &str) -> bool {
+    tool.strip_prefix("Bash(").and_then(|rest| rest.strip_suffix(')'))
+        .and_then(|pattern| pattern.split_whitespace().next())
+        .map(|word| word.trim_matches(|c| c == '"' || c == '\''))
+        .and_then(|word| Path::new(word).file_name())
+        .is_some_and(|name| matches!(name.to_str(), Some("cargo" | "npm" | "npx")))
+}
+
 /// The daemon's build runner, from the daemon's own environment. Task or
 /// profile environment (`ReasonerOpts::env`) can never select it.
 pub fn build_runner() -> BuildRunner {
@@ -228,7 +238,7 @@ impl BridgeLaunch {
         environment.extend(opts.env.iter().cloned());
         let runner = build_runner();
         if let BuildRunner::Unavailable { reason } = &runner {
-            if opts.allowed_tools.iter().any(|tool| crate::tool_audit::is_build_tool_pattern(tool)) {
+            if opts.allowed_tools.iter().any(|tool| is_build_tool_pattern(tool)) {
                 tracing::warn!(reason, "codex build commands will fail closed: no build VM (#1041)");
             }
         }

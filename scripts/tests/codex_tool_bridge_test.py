@@ -2153,7 +2153,9 @@ class BuildRunnerReadinessTests(unittest.TestCase):
     def test_non_build_commands_are_unaffected_by_a_missing_vm(self):
         outcome = self.policy().run_command('printf synthetic')
         self.assertEqual(outcome['exit_code'], 0, outcome)
-        self.assertNotIn('runner', outcome)
+        # Non-build commands always run in the host command sandbox.
+        self.assertEqual(list(outcome)[0], 'runner')
+        self.assertEqual(outcome['runner'], 'host')
 
     @requires_sandbox
     def test_host_opt_out_runs_builds_on_the_host_and_names_the_runner(self):
@@ -2161,11 +2163,52 @@ class BuildRunnerReadinessTests(unittest.TestCase):
         self.assertEqual(outcome['exit_code'], 0, outcome)
         self.assertIn('SYNTHETIC_HOST_RUN', outcome['stdout'])
         self.assertEqual(outcome['runner'], 'host')
+        # First key, so a truncated serialisation still names the runner.
+        self.assertTrue(json.dumps(outcome).startswith('{"runner": "host"'))
 
     def test_vm_runner_outcome_names_the_runner(self):
         policy = self.policy(build_vm_config=str(Path(self.temp.name) / 'runtime.json'))
         policy.run_vm_build = lambda argv, timeout: {'exit_code': 0, 'stdout': '', 'stderr': ''}
-        self.assertEqual(policy.run_command('cargo test')['runner'], 'vm')
+        outcome = policy.run_command('cargo test')
+        self.assertEqual(outcome['runner'], 'vm')
+        self.assertEqual(list(outcome)[0], 'runner')
+
+    def call_bash(self, policy, command, timeout=120):
+        return bridge.Server(policy).dispatch({'method': 'tools/call', 'params': {
+            'name': 'Bash', 'arguments': {'command': command, 'timeout': timeout}}})
+
+    def test_quoted_build_command_is_gated_and_names_the_runner(self):
+        policy = self.policy(build_vm_config=str(Path(self.temp.name) / 'runtime.json'))
+        policy.run_vm_build = lambda argv, timeout: {'exit_code': 0, 'stdout': '', 'stderr': ''}
+        response = self.call_bash(policy, '"cargo" test')
+        self.assertTrue(response['content'][0]['text'].startswith('{"runner": "vm"'), response)
+
+    def test_vm_denial_after_the_build_started_keeps_the_runner(self):
+        policy = self.policy(build_vm_config=str(Path(self.temp.name) / 'runtime.json'))
+        def broker_fails_mid_build(argv, timeout):
+            policy.mark_command_started()
+            raise bridge.Denied('VM execution or cleanup failed')
+        policy.run_vm_build = broker_fails_mid_build
+        response = self.call_bash(policy, 'cargo test')
+        self.assertTrue(response['isError'])
+        self.assertTrue(response['content'][0]['text'].startswith('[runner=vm] '), response)
+
+    def test_refusal_before_any_process_starts_carries_no_runner(self):
+        policy = self.policy(build_runner='host', environment={'PATH': str(Path(self.temp.name) / 'empty')})
+        response = self.call_bash(policy, 'cargo test')
+        self.assertTrue(response['isError'])
+        self.assertNotIn('[runner=', response['content'][0]['text'])
+        policy = self.policy(build_vm_config=str(Path(self.temp.name) / 'runtime.json'))
+        policy.run_vm_build = lambda argv, timeout: (_ for _ in ()).throw(bridge.Denied('VM runtime is unavailable'))
+        self.assertNotIn('[runner=', self.call_bash(policy, 'cargo test')['content'][0]['text'])
+
+    @requires_sandbox
+    def test_host_build_timeout_after_start_keeps_the_runner(self):
+        slow = self.fakebin / 'cargo'
+        slow.write_text('#!/bin/sh\nexec sleep 30\n')
+        response = self.call_bash(self.policy(build_runner='host'), 'cargo test', timeout=1)
+        self.assertTrue(response['isError'])
+        self.assertTrue(response['content'][0]['text'].startswith('[runner=host] '), response)
 
 
 class TransportTests(unittest.TestCase):

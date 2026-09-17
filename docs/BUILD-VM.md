@@ -29,15 +29,20 @@ command returns the tool error `JARVIS_READINESS:build_vm_unavailable` and nothi
 runs; other commands are unaffected. The daemon logs a warning at launch when a
 build-capable profile starts without a runner.
 
-Every build row in `tool-audit.log` carries `runner`: `vm` or `host` for commands
-that ran, `none` for a build the bridge refused. Claude-lane builds run on the host
-and record `host`. Non-build rows have no `runner` field.
+Every `Bash` row in `tool-audit.log` carries `runner`: `vm` or `host` for a command
+whose process started, `none` for one refused before any process started (a
+readiness error, a policy denial, or a Claude permission refusal). The bridge
+decides the runner before execution and reports it as the first key of the
+result, or as a `[runner=vm]` / `[runner=host]` prefix on a failure raised after
+the process started (for example a timeout), so truncation cannot drop it.
+Non-build commands and every Claude-lane command run on the host.
 
 `augmentagent doctor` reports the `build_vm` check as one of: `config missing`,
 `config invalid`, `qemu or kernel missing`, `kvm not accessible` (error: no
 read-write access, or no device), `kvm not accessible after logout` (warning:
-access comes only from the login-seat ACL), or `ok`. With the opt-out set it warns
-that builds run on the host.
+access comes only from a per-user ACL entry such as the login-seat grant, not
+from the owner, the `kvm` group entry under the ACL mask, or other bits), or `ok`.
+With the opt-out set it warns that builds run on the host.
 
 ### Host provisioning: KVM access that survives logout (operator step)
 
@@ -49,30 +54,28 @@ not list `kvm`). Grant access through group membership instead. This needs sudo:
 
 ```sh
 sudo usermod -aG kvm "$USER"
-# Group membership applies to new logins only. Log out completely (or reboot),
-# then restart the user manager's services so the daemon inherits the group:
-systemctl --user restart augmentagent.service
+sudo reboot
 ```
 
-The daemon's user services stop at logout unless lingering is enabled. To keep
-the daemon, and its VM builds, running with no one logged in:
-
-```sh
-sudo loginctl enable-linger "$USER"
-```
-
-Verify, then confirm doctor reports `build_vm` as `ok`:
+Group membership applies only to processes started after a new login. A user
+manager that survives (any remaining SSH, tmux, remote-desktop or other session)
+keeps the old groups, and so does every service it restarts, so reboot, or at
+minimum end every session of the user, including SSH, tmux and remote desktop,
+before starting the daemon again. Then verify:
 
 ```sh
 id -nG | tr ' ' '\n' | grep -x kvm
-loginctl show-user "$USER" -p Linger
-augmentagent doctor
+augmentagent doctor   # build_vm: ok, not the ACL warning
 ```
 
-Alternative to group membership, for a dedicated build user: a udev rule such as
-`KERNEL=="kvm", GROUP="kvm", MODE="0660"` in `/etc/udev/rules/65-kvm.rules`
-(then `sudo udevadm trigger --name-match=kvm`) keeps the group ownership explicit;
-the user must still be in `kvm`. Record the change in the private provisioning record.
+**Not recommended: `loginctl enable-linger`.** Lingering is not needed for this
+step (group membership already removes the dependency on the seat ACL). Side
+effects: every enabled user unit (the daemon, the updater, auto-PR and wiki-sync
+timers, remote-desktop units) starts at boot with no one logged in, spending the
+Claude subscription quota unattended while gnome-keyring stays locked, so secrets
+read from the keyring fail.
+
+Record the change in the private provisioning record.
 
 Keep the directory mode 0700 and configuration mode 0600, owned by the daemon
 user. All paths must be absolute. Host executable artifacts must be owned by root

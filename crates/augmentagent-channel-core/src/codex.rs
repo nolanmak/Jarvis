@@ -62,6 +62,21 @@ pub struct CodexCliReasoner {
     gate: std::sync::Arc<crate::cli_gate::CliGate>,
 }
 
+/// The runner the bridge reported for a Bash call (#1041). It leads a result
+/// (`{"runner": "vm", ...}`, surviving truncation) or a failure raised after
+/// the process started (`[runner=host] ...`). Anything else was refused
+/// before a process started.
+fn bridge_runner(content: &str) -> &'static str {
+    static LEADING: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let leading = LEADING.get_or_init(|| regex::Regex::new(
+        r#"\A(?:\[runner=(vm|host)\] |\{"runner": "(vm|host)")"#).expect("static regex"));
+    match leading.captures(content).and_then(|c| c.get(1).or_else(|| c.get(2))).map(|m| m.as_str()) {
+        Some("vm") => "vm",
+        Some("host") => "host",
+        _ => "none",
+    }
+}
+
 async fn record_tool_item(opts: &ReasonerOpts, item: &serde_json::Value) {
     use crate::tool_audit::{build_audit_record, is_high_risk};
     let native_web = item.get("type").and_then(|v| v.as_str()) == Some("web_search");
@@ -88,11 +103,7 @@ async fn record_tool_item(opts: &ReasonerOpts, item: &serde_json::Value) {
         let outcome = serde_json::from_str::<serde_json::Value>(&content).ok();
         record.exit_code = outcome.as_ref()
             .and_then(|v| v.get("exit_code").and_then(|c| c.as_i64())).and_then(|c| i32::try_from(c).ok());
-        if record.runner.is_some() {
-            // #1041: the bridge names the runner it used; a build it refused never ran.
-            record.runner = Some(outcome.as_ref().and_then(|v| v.get("runner")).and_then(|r| r.as_str())
-                .filter(|r| matches!(*r, "vm" | "host")).unwrap_or("none").to_string());
-        }
+        record.runner = Some(bridge_runner(&content).to_string());
     }
     if let Some(logger) = &opts.audit_logger { logger.record(&record).await; }
     if is_high_risk(&tool) {
@@ -750,9 +761,12 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
         let log = dir.path().join("audit.jsonl");
         let bin = stub(&dir, "fake-codex-build-audit", r#"
 cat >/dev/null
-echo '{"type":"item.completed","item":{"type":"mcp_tool_call","server":"jarvis","tool":"Bash","arguments":{"command":"cargo test"},"result":{"content":[{"type":"text","text":"{\"exit_code\": 0, \"stdout\": \"\", \"stderr\": \"\", \"runner\": \"vm\"}"}]},"status":"completed"}}'
+echo '{"type":"item.completed","item":{"type":"mcp_tool_call","server":"jarvis","tool":"Bash","arguments":{"command":"\"cargo\" test"},"result":{"content":[{"type":"text","text":"{\"runner\": \"vm\", \"exit_code\": 0, \"stdout\": \"\", \"stderr\": \"\"}"}]},"status":"completed"}}'
 echo '{"type":"item.completed","item":{"type":"mcp_tool_call","server":"jarvis","tool":"Bash","arguments":{"command":"npm test"},"result":{"isError":true,"content":[{"type":"text","text":"JARVIS_READINESS:build_vm_unavailable synthetic"}]},"status":"completed"}}'
-echo '{"type":"item.completed","item":{"type":"mcp_tool_call","server":"jarvis","tool":"Bash","arguments":{"command":"git status"},"result":{"content":[{"type":"text","text":"{\"exit_code\": 0, \"stdout\": \"\", \"stderr\": \"\"}"}]},"status":"completed"}}'
+echo '{"type":"item.completed","item":{"type":"mcp_tool_call","server":"jarvis","tool":"Bash","arguments":{"command":"git status"},"result":{"content":[{"type":"text","text":"{\"runner\": \"host\", \"exit_code\": 0, \"stdout\": \"\", \"stderr\": \"\"}"}]},"status":"completed"}}'
+echo '{"type":"item.completed","item":{"type":"mcp_tool_call","server":"jarvis","tool":"Bash","arguments":{"command":"cargo test"},"result":{"isError":true,"content":[{"type":"text","text":"[runner=host] Operation denied or invalid for the configured profile."}]},"status":"completed"}}'
+echo '{"type":"item.completed","item":{"type":"mcp_tool_call","server":"jarvis","tool":"Bash","arguments":{"command":"cargo test"},"result":{"content":[{"type":"text","text":"{\"runner\": \"vm\", \"exit_code\": 0, \"stdout\": \"synthetic output cut mid-str"}]},"status":"completed"}}'
+echo '{"type":"item.completed","item":{"type":"mcp_tool_call","server":"jarvis","tool":"Bash","arguments":{"command":"cargo test"},"result":{"isError":true,"content":[{"type":"text","text":"Operation denied or invalid for the configured profile."}]},"status":"completed"}}'
 echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
 "#);
         let mut options = opts();
@@ -761,12 +775,15 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
             .call(&options, "synthetic build audit probe").await.unwrap();
         let rows: Vec<serde_json::Value> = std::fs::read_to_string(log).unwrap().lines()
             .map(|line| serde_json::from_str(line).unwrap()).collect();
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0]["runner"], "vm");
+        assert_eq!(rows.len(), 6);
+        // The runner comes from the bridge, never from re-parsing the command.
+        assert_eq!(rows[0]["runner"], "vm", "quoted build command");
         assert_eq!(rows[0]["exit_code"], 0);
-        // A fail-closed build never ran: it must not be attributed to the host.
-        assert_eq!(rows[1]["runner"], "none");
-        assert!(rows[2].get("runner").is_none());
+        assert_eq!(rows[1]["runner"], "none", "refused before any process started");
+        assert_eq!(rows[2]["runner"], "host");
+        assert_eq!(rows[3]["runner"], "host", "denied after the process started (timeout)");
+        assert_eq!(rows[4]["runner"], "vm", "truncated result keeps its leading runner");
+        assert_eq!(rows[5]["runner"], "none");
     }
 
     #[tokio::test]
