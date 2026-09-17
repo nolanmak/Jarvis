@@ -1897,6 +1897,39 @@ sys.stdin.readline()
         self.assertIn('2 files', note)
         self.assertIn('narrow the path', note)
 
+    def matching_timeout_text(self, child_cpu_seconds):
+        """Force a matching timeout; report `child_cpu_seconds` over 1.5 s of wall clock."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        self.write_tree()
+        policy = bridge.Policy(json.loads(self.config.read_text()))
+        clock = iter([100.0, 101.5])
+        usage = iter([SimpleNamespace(ru_utime=4.0, ru_stime=1.0),
+                      SimpleNamespace(ru_utime=4.0 + child_cpu_seconds * 0.9, ru_stime=1.0 + child_cpu_seconds * 0.1)])
+        # A zero wall bound times out before the (plain literal) matcher can
+        # finish, without generating any real CPU load.
+        with patch.object(bridge, 'GREP_MATCH_SECONDS', 0), \
+                patch.object(bridge, 'MATCH_CLOCK', lambda: next(clock)), \
+                patch.object(bridge, 'CHILD_RUSAGE', lambda: next(usage)):
+            response = bridge.Server(policy).dispatch({'method': 'tools/call', 'params': {
+                'name': 'Grep', 'arguments': {'pattern': 'beta', 'ignore_case': True}}})
+        self.assertTrue(response['isError'], response)
+        return response['content'][0]['text']
+
+    def test_cpu_bound_matching_timeout_advises_simplifying_the_pattern(self):
+        text = self.matching_timeout_text(1.4)
+        self.assertIn('time limit', text)
+        self.assertIn('simplify the pattern', text)
+        self.assertNotIn('busy', text)
+
+    def test_matching_timeout_while_waiting_for_cpu_reports_a_busy_host(self):
+        text = self.matching_timeout_text(0.2)
+        self.assertIn('time limit', text)
+        self.assertIn('busy', text)
+        self.assertIn('retry', text)
+        self.assertIn('narrow the path', text)
+        self.assertNotIn('simplify the pattern', text)
+
     def test_walk_entry_limit_returns_partial_grep_results_but_still_denies_glob(self):
         from unittest.mock import patch
         self.write_tree()

@@ -11,6 +11,7 @@ import math
 import subprocess
 import fnmatch
 import re
+import resource
 import shlex
 import stat
 import time
@@ -149,15 +150,39 @@ MAX_REQUEST_BYTES = 24 * 1024 * 1024
 #    bytes, or MAX_WALK_ENTRIES entries, whichever comes first. Running out
 #    returns the hits so far with a note telling the model to narrow the path.
 # 2. Match: Python's re has no timeout, so matching runs in a disposable child
-#    that is killed after GREP_MATCH_SECONDS. The error advises simplifying
-#    the pattern. 1.5 s plus kill/reap keeps a pathological match under 2 s.
+#    that is killed after GREP_MATCH_SECONDS of wall clock (1.5 s plus kill and
+#    reap keeps a pathological match under 2 s). The wall clock includes child
+#    startup and time spent waiting for a CPU, so the error is worded by the
+#    child's CPU time. If it used at least GREP_CPU_BOUND_SHARE of the wall time,
+#    the pattern is at fault. Otherwise the host was busy: retry or narrow the path.
 GREP_READ_SECONDS = 10
 GREP_MATCH_SECONDS = 1.5
 MAX_SEARCH_BYTES = 64 * 1024 * 1024
 MAX_WALK_ENTRIES = 10000
 MAX_GREP_RESULTS = 1000
+GREP_CPU_BOUND_SHARE = 0.5
 # Clock for the walk/read budget; tests substitute it to simulate a slow walk.
 SEARCH_CLOCK = time.monotonic
+# Wall clock and reaped-children CPU accounting for the match phase; tests
+# substitute them to exercise both timeout messages without real CPU load.
+MATCH_CLOCK = time.monotonic
+
+
+def _reaped_children_rusage():
+    return resource.getrusage(resource.RUSAGE_CHILDREN)
+
+
+CHILD_RUSAGE = _reaped_children_rusage
+
+
+def matching_timeout_message(before, after, wall_seconds):
+    """Word a matching timeout by how much CPU the killed matcher actually got."""
+    cpu_seconds = (after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)
+    if cpu_seconds >= GREP_CPU_BOUND_SHARE * wall_seconds:
+        return ('Grep matching stopped at its time limit while the pattern was consuming CPU; '
+                'simplify the pattern, for example avoid nested repetition such as (a+)+.')
+    return ('Grep matching stopped at its time limit, but the matcher spent most of it waiting '
+            'for CPU on a busy host; retry the search, or narrow the path so there is less to match.')
 
 
 _FILE_VERIFICATION = None
@@ -994,13 +1019,20 @@ class Policy:
                 if close:
                     close()
             os.lseek(source, 0, os.SEEK_SET)
+            started = MATCH_CLOCK()
             process = subprocess.Popen([sys.executable, '-I', '-S', '-c', GREP_MATCHER, str(os.getpid())],
                 stdin=source, stdout=output, stderr=subprocess.DEVNULL, cwd='/', env={})
+            # Snapshot after Popen, whose own cleanup may reap older children.
+            # Dispatch is serial, so the only child reaped before the second
+            # snapshot is this matcher.
+            usage_before = CHILD_RUSAGE()
             try:
                 status = process.wait(timeout=GREP_MATCH_SECONDS)
             except subprocess.TimeoutExpired:
-                raise SearchLimit('Grep matching stopped at its time limit; simplify the pattern, '
-                                  'for example avoid nested repetition such as (a+)+.') from None
+                process.kill()
+                process.wait()
+                raise SearchLimit(matching_timeout_message(
+                    usage_before, CHILD_RUSAGE(), MATCH_CLOCK() - started)) from None
             if status != 0:
                 raise Denied('search expression could not be evaluated')
             os.lseek(output, 0, os.SEEK_SET)

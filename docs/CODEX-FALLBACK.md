@@ -81,9 +81,13 @@ watchdog. Grep therefore runs in two phases with separate bounds.
 2. **Match.** Only the regular expression runs, in a short-lived `python3 -I -S`
    child. The child gets the pattern and the collected bytes on stdin, never a
    path. It has an empty environment, a 1 GiB address-space limit, a 3 s CPU
-   limit and a parent-death signal. It is killed after 1.5 s, and the model gets
-   a tool error advising it to simplify the pattern. The matching phase therefore
-   ends within 2 s, and the bridge answers the next request normally.
+   limit and a parent-death signal. It is killed after 1.5 s of wall clock, so
+   the matching phase ends within 2 s, and the bridge answers the next request
+   normally. That wall clock also counts child startup and time spent waiting for
+   a CPU, so the tool error is worded by the child's own CPU time
+   (`RUSAGE_CHILDREN` delta). If the child used at least half the wall time, the
+   model is told to simplify the pattern. Otherwise it is told the host is busy
+   and to retry or narrow the path.
 
 Keeping the budgets separate matters on this host, which often runs builds. With
 one shared 1.5 s budget, a literal search of a 27 MB, 7,000-file tree timed out
@@ -442,7 +446,9 @@ cannot stand in for any tool-using profile.
   table. With an injected clock and a slow-read hook, they check that slow
   reading never counts against the matching bound, and that running out of read
   time, scan bytes or walk entries returns partial results with a note to narrow
-  the path. The live-gate
+  the path. Injected CPU-usage and clock hooks check both matching-timeout
+  messages: pattern advice when the matcher was using the CPU, and a busy-host
+  retry note when it mostly waited for one. The live-gate
   unit test
   `codex::tests::pathological_bridge_grep_releases_the_cli_gate_slot_within_its_bound`
   drives the real packaged bridge through a Codex stand-in under a one-slot
