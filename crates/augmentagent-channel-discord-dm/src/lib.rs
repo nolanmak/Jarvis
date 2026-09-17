@@ -14,6 +14,7 @@ pub mod api;
 pub mod auth;
 pub mod channel;
 pub mod digest;
+pub mod history;
 pub mod types;
 
 pub use api::{DiscordClient, DiscordError};

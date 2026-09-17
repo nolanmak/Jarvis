@@ -1647,6 +1647,14 @@ enum DiscordOp {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
     },
+    /// Sync opted-in Discord history (AUGMENTAGENT_DISCORD_EXPORT_DMS /
+    /// AUGMENTAGENT_DISCORD_EXPORT_GUILDS) into searchable conversation
+    /// history now. No model calls. Resumes from saved cursors.
+    HistorySync {
+        /// Pages (100 messages each) per conversation for this run.
+        #[arg(long)]
+        max_pages_per_channel: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2882,6 +2890,23 @@ async fn main() -> Result<()> {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { sdm.run(sd).await }));
             }
+            // #1054 — Discord history → searchable history. Opt-in via env,
+            // needs Discord auth; never calls a model.
+            match build_discord_history() {
+                Ok(Some((client, my_user_id, config))) => {
+                    let store_h = Arc::clone(&store);
+                    let sd = shutdown.clone();
+                    tasks.push(tokio::spawn(async move {
+                        discord_history_loop(client, store_h, my_user_id, config, sd).await;
+                        Ok(())
+                    }));
+                }
+                Ok(None) => info!(
+                    "discord history disabled: AUGMENTAGENT_DISCORD_EXPORT_DMS / \
+                     AUGMENTAGENT_DISCORD_EXPORT_GUILDS not set"
+                ),
+                Err(e) => warn!("discord history disabled: {e:#}"),
+            }
             if let Some(dc) = discord_ch {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { dc.run(sd).await }));
@@ -3528,6 +3553,9 @@ async fn main() -> Result<()> {
             }
             DiscordOp::Subscriptions { json } => run_discord_subscriptions(store, *json),
             DiscordOp::Unsubscribe { id } => run_discord_unsubscribe(store, id.clone()),
+            DiscordOp::HistorySync {
+                max_pages_per_channel,
+            } => run_discord_history_sync(store, *max_pages_per_channel).await,
             DiscordOp::PollOnce { dry_run } => {
                 let (broker, _) = build_broker(&cli, Arc::clone(&store), *dry_run).await?;
                 let ch = build_discord_channel(&cli, store, broker, *dry_run)?;
@@ -14747,6 +14775,106 @@ fn dms_to_json(dms: &[augmentagent_channel_discord_dm::types::DmChannel]) -> Vec
             })
         })
         .collect()
+}
+
+/// `Ok(None)` when the operator hasn't opted into any Discord history.
+fn build_discord_history() -> Result<
+    Option<(
+        augmentagent_channel_discord_dm::DiscordClient,
+        String,
+        augmentagent_channel_discord_dm::history::HistoryConfig,
+    )>,
+> {
+    use augmentagent_channel_discord_dm::{history::HistoryConfig, DiscordAuth, DiscordClient};
+    let Some(config) = HistoryConfig::from_env() else {
+        return Ok(None);
+    };
+    let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let auth = DiscordAuth::load_with_migration(&repo_root)
+        .context("load discord auth — run `augmentagent discord login --creds-json <file>`")?;
+    let my_user_id = auth.user_id.clone();
+    let client = DiscordClient::new(auth).context("build discord client")?;
+    Ok(Some((client, my_user_id, config)))
+}
+
+async fn run_discord_history_sync(
+    store: Arc<Store>,
+    max_pages_per_channel: Option<usize>,
+) -> Result<()> {
+    use augmentagent_channel_discord_dm::history;
+    let (client, my_user_id, mut config) = build_discord_history()?.context(
+        "set AUGMENTAGENT_DISCORD_EXPORT_DMS=1 and/or AUGMENTAGENT_DISCORD_EXPORT_GUILDS=<ids>",
+    )?;
+    if let Some(n) = max_pages_per_channel {
+        config.max_pages_per_channel = n.max(1);
+    }
+    let report = history::sync_once(&client, &store, &my_user_id, &config).await?;
+    // A manual run counts as this cycle's sync for the daemon's schedule.
+    history::schedule_next(&store, discord_history_next_run_ms())?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+/// Now + the live channel's 4 h cadence ± 30 min jitter.
+fn discord_history_next_run_ms() -> i64 {
+    use augmentagent_channel_discord_dm::{channel::JITTER_SECS, history::DEFAULT_INTERVAL};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let jitter_ms = (nanos.subsec_nanos() as u64 % (2 * JITTER_SECS * 1000 + 1)) as i64
+        - (JITTER_SECS * 1000) as i64;
+    nanos.as_millis() as i64 + DEFAULT_INTERVAL.as_millis() as i64 + jitter_ms
+}
+
+async fn discord_history_loop(
+    client: augmentagent_channel_discord_dm::DiscordClient,
+    store: Arc<Store>,
+    my_user_id: String,
+    config: augmentagent_channel_discord_dm::history::HistoryConfig,
+    shutdown: CancellationToken,
+) {
+    use augmentagent_channel_discord_dm::history;
+    info!(dms = config.dms, guilds = config.guilds.len(), "discord history sync armed");
+    // Cheap schedule check; the persisted next-run time keeps daemon restarts
+    // from adding requests.
+    let mut tick = tokio::time::interval(Duration::from_secs(5 * 60));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tick.tick() => {}
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        match history::is_due(&store, now_ms) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                warn!("discord history schedule check failed: {e:#}");
+                continue;
+            }
+        }
+        // Schedule first so a crashing run can't retry in a tight loop.
+        if let Err(e) = history::schedule_next(&store, discord_history_next_run_ms()) {
+            warn!("discord history schedule write failed: {e:#}");
+            continue;
+        }
+        let result = tokio::select! {
+            _ = shutdown.cancelled() => return,
+            r = history::sync_once(&client, &store, &my_user_id, &config) => r,
+        };
+        match result {
+            Ok(r) => info!(
+                inserted = r.inserted,
+                requests = r.requests,
+                incomplete = r.incomplete,
+                "discord history poll complete"
+            ),
+            Err(e) => warn!("discord history poll failed: {e:#}"),
+        }
+    }
 }
 
 fn build_discord_channel(
