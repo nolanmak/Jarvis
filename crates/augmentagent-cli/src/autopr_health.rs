@@ -161,7 +161,7 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
             severity: Severity::Alert,
             code: "daemon-down",
             detail: "augmentagent.service is not active".into(),
-            fix: "systemctl --user start augmentagent.service".into(),
+            fix: crate::platform::daemon_start_hint().into(),
         });
         // Everything below measures a running daemon; don't pile on.
         return out;
@@ -178,10 +178,11 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
                      Email triage is stopped, not just the loop.",
                     last.format("%Y-%m-%d %H:%MZ")
                 ),
-                fix: "Check for a leaked CLI-gate permit (no children under the \
-                      daemon PID, no watchdog warning), then \
-                      `systemctl --user restart augmentagent.service`."
-                    .into(),
+                fix: format!(
+                    "Check for a leaked CLI-gate permit (no children under the \
+                     daemon PID, no watchdog warning), then `{}`.",
+                    crate::platform::daemon_restart_hint()
+                ),
             });
         }
     }
@@ -958,7 +959,7 @@ mod tests {
         };
         let f = analyze(&i, &Thresholds::default());
         assert_eq!(codes(&f), vec!["daemon-down"], "no pile-on once it is down");
-        assert!(f[0].fix.contains("systemctl --user start"));
+        assert_eq!(f[0].fix, crate::platform::daemon_start_hint());
     }
 
     #[test]

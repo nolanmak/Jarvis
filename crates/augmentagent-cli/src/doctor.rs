@@ -155,7 +155,7 @@ pub async fn run(store: Arc<Store>, json: Option<bool>, deep: bool) -> Result<i3
         check_which(
             "python3_in_path",
             "python3",
-            Some("apt-get install -y python3"),
+            Some(&crate::platform::package_install_hint("python3", "python")),
         )
         .await,
     );
@@ -300,7 +300,7 @@ async fn check_sqlite_migrated() -> Finding {
         Finding::error(
             "sqlite_migrated",
             format!("missing core tables: {}", missing.join(", ")),
-            Some("augmentagent service restart --unit daemon"),
+            Some("augmentagent service --unit daemon restart"),
         )
     }
 }
@@ -417,7 +417,7 @@ fn check_launchd_agents() -> Finding {
         (true, false, _) => Finding::warn(
             "launchd_agents",
             format!("{LABEL_PREFIX}.plist is installed but not loaded"),
-            Some("augmentagent service start --unit daemon"),
+            Some("augmentagent service --unit daemon start"),
         ),
         (false, false, _) => Finding::warn(
             "launchd_agents",
@@ -747,10 +747,17 @@ fn check_calendar_scheduled(store: &Store) -> Finding {
     if cfg!(target_os = "macos") {
         // #1079 — install-calendar.sh writes a launchd agent on macOS.
         let label = "com.nolanmak.augmentagent.calendar";
-        return if crate::platform::plist_path(label).is_some_and(|p| p.exists()) {
+        let installed = crate::platform::plist_path(label).is_some_and(|p| p.exists());
+        return if installed && crate::platform::launchd_job(label).loaded {
             Finding::ok(
                 "calendar_scheduled",
-                format!("{label} installed ({gmail_accounts} gmail entity(ies))"),
+                format!("{label} loaded ({gmail_accounts} gmail entity(ies))"),
+            )
+        } else if installed {
+            Finding::warn(
+                "calendar_scheduled",
+                format!("{label}.plist is installed but not loaded, so nothing schedules calendar ingest"),
+                Some("augmentagent install calendar"),
             )
         } else {
             Finding::warn(

@@ -250,14 +250,30 @@ pub fn has_desktop() -> bool {
 pub fn daemon_stop_hint() -> &'static str {
     match ServiceManager::detect() {
         ServiceManager::Systemd => "systemctl --user stop augmentagent.service",
-        ServiceManager::Launchd => "augmentagent service stop --unit daemon",
+        ServiceManager::Launchd => "augmentagent service --unit daemon stop",
     }
 }
 
 pub fn daemon_start_hint() -> &'static str {
     match ServiceManager::detect() {
         ServiceManager::Systemd => "systemctl --user start augmentagent.service",
-        ServiceManager::Launchd => "augmentagent service start --unit daemon",
+        ServiceManager::Launchd => "augmentagent service --unit daemon start",
+    }
+}
+
+pub fn daemon_restart_hint() -> &'static str {
+    match ServiceManager::detect() {
+        ServiceManager::Systemd => "systemctl --user restart augmentagent.service",
+        ServiceManager::Launchd => "augmentagent service --unit daemon restart",
+    }
+}
+
+/// How to install a missing tool on this host, for doctor hints.
+pub fn package_install_hint(apt_package: &'static str, brew_formula: &'static str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("brew install {brew_formula}")
+    } else {
+        format!("apt-get install -y {apt_package}")
     }
 }
 
