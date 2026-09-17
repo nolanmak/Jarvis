@@ -26,7 +26,29 @@ fn private_directory(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn lock(path: &Path) -> anyhow::Result<std::fs::File> {
+/// An exclusive `flock` on a history's lock file, released explicitly.
+///
+/// A child forked by any thread of this process inherits a copy of the
+/// descriptor and keeps it until it execs, and `flock` locks belong to the
+/// shared open file description. Closing our copy alone would leave the lock
+/// held by that child for the rest of the fork-to-exec window, and the next
+/// `record` would fail as if a concurrent builder held the history.
+/// `LOCK_UN` releases the lock for every copy at once.
+struct HistoryLock(std::fs::File);
+
+impl Drop for HistoryLock {
+    fn drop(&mut self) {
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+impl AsRawFd for HistoryLock {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
+fn lock(path: &Path) -> anyhow::Result<HistoryLock> {
     private_directory(
         path.parent()
             .ok_or_else(|| anyhow::anyhow!("invalid review history path"))?,
@@ -48,7 +70,7 @@ fn lock(path: &Path) -> anyhow::Result<std::fs::File> {
             "review history is in use; retry before invoking a builder"
         ));
     }
-    Ok(file)
+    Ok(HistoryLock(file))
 }
 
 fn load(path: &Path) -> anyhow::Result<History> {
@@ -212,6 +234,33 @@ mod tests {
         )
         .is_err());
         assert!(authors(&path).is_err());
+    }
+
+    /// A child forked by another thread holds an inherited copy of the lock
+    /// descriptor until it execs (this one keeps it for its whole life). When
+    /// our guard is released the history must be free at once: waiting for
+    /// the child is not an option, and would block an async worker.
+    #[test]
+    fn a_lock_released_while_a_child_holds_an_inherited_copy_is_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = initialize(
+            &dir.path().join("state"),
+            "synthetic-repository",
+            "synthetic-branch",
+            false,
+        )
+        .unwrap();
+        let held = lock(&path).unwrap();
+        assert_eq!(unsafe { libc::fcntl(held.as_raw_fd(), libc::F_SETFD, 0) }, 0);
+        let mut child = std::process::Command::new("sleep").arg("1").spawn().unwrap();
+        drop(held);
+        let started = std::time::Instant::now();
+        let recorded = record(&path, ProviderKind::Codex);
+        child.kill().ok();
+        child.wait().unwrap();
+        recorded.unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(200), "no waiting for the child");
+        assert_eq!(authors(&path).unwrap(), Some(vec![ProviderKind::Codex]));
     }
 
     #[test]

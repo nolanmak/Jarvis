@@ -20,6 +20,7 @@ pub mod fallback;
 pub mod gemini;
 pub mod governor;
 pub mod handoff;
+mod handoff_outcome;
 mod review_history;
 mod process_tree;
 pub mod images;
@@ -39,6 +40,7 @@ pub mod log_retention;
 pub mod token_usage;
 pub mod tool_audit;
 pub mod trigger;
+pub mod turn_failure;
 
 pub use decision::{Decision, DecisionKind};
 pub use engagement::{
@@ -62,6 +64,9 @@ pub use reasoner::{ClaudeCliReasoner, Reasoner, ReasonerError, ReasonerOpts};
 // #655 — multi-provider failover: one Reasoner seam, N provider adapters.
 pub use cooldown::CooldownLatch;
 pub use fallback::{build_pinned, build_reasoner, ineligible_reason, FallbackReasoner, LaneAvailability};
+// #1040 — content-level endings and the completed-work re-dispatch guard.
+pub use handoff_outcome::CompletedWithoutSummary;
+pub use turn_failure::{FailureClass, TurnFailure};
 pub use images::{extract_image_markers, image_marker_line, IMAGE_MARKER_PREFIX};
 pub use providers::{CapabilityClass, ModelTier, ProviderKind};
 pub use skills::{SkillEntry, SkillRegistry};

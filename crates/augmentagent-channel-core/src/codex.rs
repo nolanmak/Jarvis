@@ -14,6 +14,10 @@
 //! The adapter captures final or all assistant blocks and normalizes bridge
 //! tool events into the common audit log. Routing eligibility remains a separate
 //! capability gate; adapter smoke tests alone do not establish full parity.
+//!
+//! Failed and empty turns are routed by the table in `crate::turn_failure`
+//! (#1040): quota, transport, auth and binary failures are provider-side, and
+//! so is a failure the table does not recognise on a text or read call.
 
 use std::process::Stdio;
 
@@ -23,9 +27,8 @@ use tokio::process::Command;
 use tracing::{debug, warn};
 
 use crate::providers::{model_for, tier_of, ProviderKind};
-use crate::reasoner::{
-    caller_tag, parse_reset_hint, reasoner_timeout, Reasoner, ReasonerError, ReasonerOpts,
-};
+use crate::reasoner::{caller_tag, reasoner_timeout, Reasoner, ReasonerError, ReasonerOpts};
+use crate::turn_failure::{turn_error, FailureClass, TurnFailure};
 
 /// Codex binary override (`CODEX_CLI`, mirroring `CLAUDE_CLI`) — also how
 /// the fault-injection test rig (#666) points the adapter at a stub script.
@@ -99,6 +102,12 @@ impl CodexCliReasoner {
         }
     }
 
+    /// Adapter bound to an explicit binary (fault-injection stubs in tests).
+    #[cfg(test)]
+    pub(crate) fn with_bin(bin: String) -> Self {
+        Self { bin, gate: crate::cli_gate::CliGate::global() }
+    }
+
     fn provider_name(&self) -> &'static str {
         ProviderKind::Codex.name()
     }
@@ -124,8 +133,9 @@ impl CodexCliReasoner {
         match outcome {
             // Post-classify any untyped failure (stdin EPIPE, read/wait IO)
             // as provider-side Unavailable (#655 review) — an untyped error
-            // would abort the whole chain instead of failing over.
-            Ok(Err(e)) if ReasonerError::find_in(&e).is_none() => {
+            // would abort the whole chain instead of failing over. A
+            // TurnFailure is untyped on purpose (#1040) and passes through.
+            Ok(Err(e)) if ReasonerError::find_in(&e).is_none() && e.downcast_ref::<TurnFailure>().is_none() => {
                 Err(crate::reasoner::classify_other(provider, e))
             }
             Ok(r) => r,
@@ -151,6 +161,7 @@ impl CodexCliReasoner {
     ) -> anyhow::Result<String> {
         let provider = self.provider_name();
         let model = model_for(ProviderKind::Codex, tier_of(opts));
+        let capability = crate::providers::classify(opts);
 
         // `IMAGE:` markers → native `-i` attachments (see crate::images).
         // The marker lines are stripped from the stdin prompt; codex embeds
@@ -297,10 +308,16 @@ impl CodexCliReasoner {
             .ok_or_else(|| anyhow::anyhow!("{provider} stdout missing"))?;
         let mut lines = BufReader::new(stdout).lines();
 
-        // Final assistant text = agent_message items, in order. Failure text
-        // = turn.failed / stream error events.
+        // Final assistant text = agent_message items, in order. `turn_failed`
+        // = the turn's own failure event. `stream_error` = the last
+        // stream-level error notice ("Reconnecting…" included), which only
+        // explains a failed exit, never a turn that went on to complete.
+        // `turn_began` = any turn/item event: from then on tools may have run
+        // (#1040 — it decides the fail-safe default in crate::turn_failure).
         let mut messages: Vec<String> = Vec::new();
-        let mut failure: Option<String> = None;
+        let mut turn_failed: Option<String> = None;
+        let mut stream_error: Option<String> = None;
+        let mut turn_began = false;
         while let Some(line) = lines.next_line().await? {
             let line = line.trim();
             if line.is_empty() {
@@ -310,12 +327,16 @@ impl CodexCliReasoner {
                 debug!("{provider} jsonl parse skip: {line}");
                 continue;
             };
-            if v.get("type").and_then(|t| t.as_str()) == Some("item.completed") {
+            let kind = v.get("type").and_then(|t| t.as_str());
+            if kind.is_some_and(|k| k.starts_with("turn.") || k.starts_with("item.")) {
+                turn_began = true;
+            }
+            if kind == Some("item.completed") {
                 if let Some(item) = v.get("item") {
                     record_tool_item(opts, item).await;
                 }
             }
-            match v.get("type").and_then(|t| t.as_str()) {
+            match kind {
                 Some("item.completed") => {
                     let item = v.get("item");
                     if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
@@ -331,7 +352,7 @@ impl CodexCliReasoner {
                     }
                 }
                 Some("turn.failed") => {
-                    failure = v
+                    turn_failed = v
                         .get("error")
                         .and_then(|e| e.get("message"))
                         .and_then(|m| m.as_str())
@@ -339,13 +360,8 @@ impl CodexCliReasoner {
                         .or(Some("turn.failed with no message".into()));
                 }
                 Some("error") => {
-                    // Stream-level errors include transient "Reconnecting…"
-                    // notices; only keep as failure if nothing succeeds.
-                    if failure.is_none() {
-                        failure = v
-                            .get("message")
-                            .and_then(|m| m.as_str())
-                            .map(str::to_string);
+                    if let Some(message) = v.get("message").and_then(|m| m.as_str()) {
+                        stream_error = Some(message.to_string());
                     }
                 }
                 _ => {}
@@ -369,69 +385,39 @@ impl CodexCliReasoner {
             // Defensive: some limiter builds have surfaced the refusal as
             // ordinary text (the claude failure shape). Catch it here too.
             if crate::reasoner::is_rate_limited(&final_text) {
-                return Err(rate_limit_err(provider, final_text));
+                return Err(turn_error(provider, FailureClass::Quota, capability, final_text));
             }
             return Ok(final_text);
         }
 
-        let detail = failure
-            .or_else(|| {
-                stderr_buf
-                    .lines()
-                    .find(|l| !l.trim().is_empty())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| format!("{provider} exited {status:?} with no output"));
-        for (category, message) in [
-            ("mcp_start", "required MCP server could not start or initialize; check its binary, authentication and transport"),
-            ("mcp_timeout", "required MCP server timed out; check its availability and timeout setting"),
-            ("mcp_tools", "required MCP tool is missing; check the server version and tool profile"),
-        ] {
-            if detail.contains(&format!("JARVIS_READINESS:{category} ")) {
-                return Err(ReasonerError::Local { message: format!("codex: {message}") }.into());
-            }
+        // #1040 — which failure this is decides latching and failover, so it
+        // goes through one table (crate::turn_failure), not ad-hoc checks.
+        let detail = match turn_failed {
+            Some(message) => message,
+            // The turn finished and said nothing. Content-level, exactly like
+            // claude's EmptyOutput: untyped, so no latch and no chain advance
+            // (the call's writes may already have happened). Without any turn
+            // event no turn ran, so a silent exit 0 falls through to the
+            // pre-turn classification below: a binary failure (#1069 M2).
+            None if status.success() && turn_began => return Err(TurnFailure::empty_output(provider).into()),
+            None => stream_error
+                .or_else(|| {
+                    stderr_buf
+                        .lines()
+                        .find(|l| !l.trim().is_empty())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| format!("{provider} exited {status:?} with no output")),
+        };
+        let class = crate::turn_failure::classify(&detail, turn_began);
+        if class == FailureClass::Readiness {
+            // Native readiness text can carry private configuration.
+            warn!("{provider} exec failed ({})", class.label());
+        } else {
+            warn!("{provider} exec failed ({}): {detail}", class.label());
         }
-        warn!("{provider} exec failed: {detail}");
-        if looks_rate_limited(&detail) {
-            return Err(rate_limit_err(provider, detail));
-        }
-        Err(anyhow::Error::new(ReasonerError::Unavailable {
-            provider: provider.into(),
-            message: detail.chars().take(300).collect(),
-        }))
+        Err(turn_error(provider, class, capability, detail))
     }
-}
-
-/// Quota-shaped failure text across both backends: ChatGPT-plan usage-limit
-/// wording, platform 429/insufficient_quota, and Cerebras' 429 RateLimitError
-/// / 402 credits-exhausted (a spend wall latches exactly like a rate wall).
-fn looks_rate_limited(detail: &str) -> bool {
-    let d = detail.to_ascii_lowercase();
-    // Status codes match as standalone digit tokens only (#655 review):
-    // bare substring "429" fired inside unrelated numbers like request ids.
-    let has_code = |code: &str| {
-        d.split(|c: char| !c.is_ascii_digit())
-            .any(|tok| tok == code)
-    };
-    d.contains("usage limit")
-        || d.contains("rate limit")
-        || d.contains("rate_limit")
-        || d.contains("insufficient_quota")
-        || d.contains("resource_exhausted")
-        || d.contains("payment required")
-        || d.contains("quota exceeded")
-        || d.contains("quota exhausted")
-        || has_code("429")
-        || has_code("402")
-}
-
-fn rate_limit_err(provider: &str, message: String) -> anyhow::Error {
-    let reset_at = parse_reset_hint(&message);
-    anyhow::Error::new(ReasonerError::RateLimited {
-        provider: provider.into(),
-        message,
-        reset_at,
-    })
 }
 
 #[async_trait]
@@ -772,6 +758,152 @@ exit 1
         match ReasonerError::find_in(&err) {
             Some(ReasonerError::RateLimited { provider, .. }) => assert_eq!(provider, "codex"),
             other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    /// #1040 C1 — a finished turn with no final `agent_message` is
+    /// content-level, like claude's `EmptyOutput`: untyped, so the chain
+    /// neither latches codex nor re-runs the call elsewhere. A transient
+    /// reconnect notice on a turn that then completed changes nothing.
+    #[tokio::test]
+    async fn empty_successful_output_is_content_level_not_a_provider_outage() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(&dir, "fake-codex-empty", r#"
+cat >/dev/null
+echo '{"type":"thread.started","thread_id":"t1"}'
+echo '{"type":"error","message":"Reconnecting... 1/5 (stream disconnected before completion)"}'
+echo '{"type":"item.completed","item":{"type":"mcp_tool_call","server":"jarvis","tool":"Write","arguments":{"file_path":"synthetic.md"},"result":{"content":[{"type":"text","text":"written"}]},"status":"completed"}}'
+echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
+"#);
+        let reasoner = CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global() };
+        for transcript in [false, true] {
+            let err = if transcript {
+                reasoner.call_transcript(&opts(), "synthetic request").await.unwrap_err()
+            } else {
+                reasoner.call(&opts(), "synthetic request").await.unwrap_err()
+            };
+            assert!(ReasonerError::find_in(&err).is_none(), "must stay untyped: {err:#}");
+            assert_eq!(err.to_string(), "codex produced no assistant text");
+            assert_eq!(err.downcast_ref::<TurnFailure>().map(|f| f.class), Some(FailureClass::Content));
+        }
+    }
+
+    /// #1040 C2 — one `turn.failed` per failure class, end to end through a
+    /// stub CLI on a text-only call, pins the adapter's wiring into
+    /// `crate::turn_failure`. Each wording is pinned without a spawn in
+    /// `turn_failure::tests`. `None` = untyped (no latch, no chain advance);
+    /// `Some(true)` = RateLimited; `Some(false)` = Unavailable.
+    #[tokio::test]
+    async fn turn_failed_routing_is_pinned_per_failure_class() {
+        let cases: &[(&str, Option<bool>)] = &[
+            // Content-level: the provider is healthy, the turn is not.
+            ("Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying.", None),
+            // Unrecognised on a text-only call: an outage (#1069 review H1).
+            // The write-class fail-safe is pinned in
+            // `unexplained_failures_after_the_turn_began_route_by_capability`.
+            ("synthetic unrecognised failure 7F3A", Some(false)),
+            // Quota walls (the pre-#1040 behaviour, kept), and the plan wall.
+            ("exceeded retry limit, last status: 429 Too Many Requests", Some(true)),
+            ("To use Codex with your ChatGPT plan, upgrade to Plus: https://chatgpt.com/explore/plus.", Some(true)),
+            // Transport and auth: still provider outages.
+            ("stream disconnected before completion: error sending request", Some(false)),
+            ("unexpected status 520 <html>cloudflare</html>", Some(false)),
+            ("unexpected status 401 Unauthorized: missing bearer", Some(false)),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        for (index, (message, want)) in cases.iter().enumerate() {
+            let events = dir.path().join(format!("events-{index}.jsonl"));
+            let lines = [
+                serde_json::json!({"type": "thread.started", "thread_id": "t1"}),
+                serde_json::json!({"type": "turn.started"}),
+                serde_json::json!({"type": "turn.failed", "error": {"message": message}}),
+            ];
+            std::fs::write(&events, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+            let bin = stub(&dir, &format!("fake-codex-{index}"),
+                &format!("cat >/dev/null\ncat '{}'\nexit 1\n", events.display()));
+            let reasoner = CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global() };
+            let err = reasoner.call(&opts(), "synthetic request").await.unwrap_err();
+            match (want, ReasonerError::find_in(&err)) {
+                (None, None) => {}
+                (Some(true), Some(ReasonerError::RateLimited { provider, .. })) => assert_eq!(provider, "codex"),
+                (Some(false), Some(ReasonerError::Unavailable { provider, .. })) => assert_eq!(provider, "codex"),
+                (want, got) => panic!("{message:?}: wanted {want:?}, got {got:?} ({err:#})"),
+            }
+        }
+    }
+
+    /// A write-capable request for the adapter (ingest-shaped: WriteTools).
+    fn write_opts(dir: &tempfile::TempDir) -> ReasonerOpts {
+        let options = crate::reasoner::ingest_opts("Synthetic ingestion".into(), dir.path().into());
+        assert_eq!(crate::providers::classify(&options), crate::providers::CapabilityClass::WriteTools);
+        options
+    }
+
+    /// #1040 — once the turn began, a failure nothing explains is not
+    /// evidence of an outage: a message-less `turn.failed`, or a process
+    /// that died mid-turn without a word (the supervisor reports a signal
+    /// death as a plain exit 1, so it is indistinguishable from any other
+    /// silent exit). For a write-capable call tools may already have run, so
+    /// fail safe: untyped. #1069 review H1: a text-only or read-only call
+    /// cannot repeat a write, and an untyped ending there would respawn codex
+    /// on every call during an outage the table does not know, so it is an
+    /// outage (latch and fail over).
+    #[tokio::test]
+    async fn unexplained_failures_after_the_turn_began_route_by_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut read_opts = opts();
+        read_opts.allowed_tools = vec!["Read".into(), "Grep".into()];
+        for (name, body) in [
+            ("fake-codex-bare-failure", "cat >/dev/null\necho '{\"type\":\"turn.started\"}'\necho '{\"type\":\"turn.failed\",\"error\":{}}'\nexit 1\n"),
+            ("fake-codex-killed", "cat >/dev/null\necho '{\"type\":\"turn.started\"}'\nkill -9 $$\n"),
+            ("fake-codex-model", "cat >/dev/null\necho '{\"type\":\"turn.started\"}'\necho '{\"type\":\"turn.failed\",\"error\":{\"message\":\"unexpected status 404 Not Found: model_not_found\"}}'\nexit 1\n"),
+        ] {
+            let reasoner = CodexCliReasoner { bin: stub(&dir, name, body), gate: crate::cli_gate::CliGate::global() };
+            let err = reasoner.call(&write_opts(&dir), "synthetic request").await.unwrap_err();
+            assert!(ReasonerError::find_in(&err).is_none(), "{name} (write): {err:#}");
+            assert_eq!(err.downcast_ref::<TurnFailure>().map(|f| f.class), Some(FailureClass::Unrecognised), "{name}");
+            for (label, options) in [("text", opts()), ("read", read_opts.clone())] {
+                let err = reasoner.call(&options, "synthetic request").await.unwrap_err();
+                assert!(matches!(ReasonerError::find_in(&err), Some(ReasonerError::Unavailable { .. })),
+                    "{name} ({label}): {err:#}");
+            }
+        }
+    }
+
+    /// #1069 review M2 — exit 0 with no turn event at all is not "the turn
+    /// finished and said nothing": no turn ran, so it is the binary failing
+    /// before the turn (fail over), whatever the capability class.
+    #[tokio::test]
+    async fn exit_zero_before_any_turn_event_is_a_binary_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("fake-codex-silent", "cat >/dev/null\n"),
+            ("fake-codex-thread-only", "cat >/dev/null\necho '{\"type\":\"thread.started\",\"thread_id\":\"t1\"}'\n"),
+        ] {
+            let reasoner = CodexCliReasoner { bin: stub(&dir, name, body), gate: crate::cli_gate::CliGate::global() };
+            for options in [opts(), write_opts(&dir)] {
+                let err = reasoner.call(&options, "synthetic request").await.unwrap_err();
+                assert!(matches!(ReasonerError::find_in(&err), Some(ReasonerError::Unavailable { .. })),
+                    "{name}: {err:#}");
+            }
+        }
+    }
+
+    /// #1040 — binary failures keep latching: a codex that exits non-zero
+    /// before any turn event (nothing can have run), or one that panicked,
+    /// is the provider's process failing, not the request's content.
+    #[tokio::test]
+    async fn binary_failures_still_map_to_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("fake-codex-startup", "cat >/dev/null\necho 'Error: synthetic startup failure' >&2\nexit 1\n"),
+            ("fake-codex-panic", "cat >/dev/null\necho '{\"type\":\"turn.started\"}'\necho \"thread 'main' panicked at core/src/synthetic.rs:1:1:\" >&2\nexit 101\n"),
+        ] {
+            let bin = stub(&dir, name, body);
+            let err = CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global() }
+                .call(&opts(), "synthetic request").await.unwrap_err();
+            assert!(matches!(ReasonerError::find_in(&err), Some(ReasonerError::Unavailable { .. })),
+                "{name}: {err:#}");
         }
     }
 
