@@ -1,5 +1,6 @@
 //! `augmentagent messages …` — structured message index maintenance (#1095).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,6 +66,24 @@ pub enum Op {
         #[arg(long, default_value_t = augmentagent_messages::stats::DEFAULT_LIMIT)]
         limit: usize,
     },
+    /// Score retrieval against a labelled question set (#1096). The set holds
+    /// private message ids and must live OUTSIDE this repo. Prints metrics,
+    /// per-question misses by rubric class, and the embeddings verdict — ids
+    /// and numbers only, never message text.
+    Eval {
+        /// Path to the JSON question set (outside the repo).
+        #[arg(long)]
+        questions: PathBuf,
+        /// Hits considered per question.
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        /// Drive the real ask agent (one model call per question) instead of
+        /// running the tools directly from each question's `query`.
+        #[arg(long)]
+        agent: bool,
+    },
+    /// Print an empty question-set template to stdout.
+    EvalTemplate,
     /// Rebuild the handle → person cache from the wiki's person pages
     /// (`identities:` front matter). Needs `--wiki-dir`. Prints counts only.
     ResolvePeople,
@@ -108,7 +127,9 @@ pub async fn run(store: Arc<Store>, op: Op, wiki_dir: Option<std::path::PathBuf>
             Ok(())
         }
         Op::ResolvePeople => {
-            let wiki = wiki_dir.ok_or_else(|| anyhow::anyhow!("--wiki-dir is required"))?;
+            let wiki = wiki_dir
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--wiki-dir is required"))?;
             let report = augmentagent_messages::people::resolve_people(&store, &wiki)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
@@ -172,6 +193,49 @@ pub async fn run(store: Arc<Store>, op: Op, wiki_dir: Option<std::path::PathBuf>
             };
             let resp = store.with_conn(|c| Ok(augmentagent_messages::stats::stats(c, &req)))??;
             println!("{}", serde_json::to_string_pretty(&resp)?);
+            Ok(())
+        }
+        Op::EvalTemplate => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&vec![augmentagent_messages::eval::Question {
+                    id: "q1".into(),
+                    question: "what restaurant did someone recommend in June?".into(),
+                    relevant: vec!["<message_id from `messages search`>".into()],
+                    query: Some("restaurant after:2026-06-01".into()),
+                }])?
+            );
+            Ok(())
+        }
+        Op::Eval {
+            questions,
+            k,
+            agent,
+        } => {
+            use augmentagent_messages::eval;
+            let repo_root = std::env::current_dir()?;
+            let set = eval::load_questions(&questions, &repo_root)?;
+            if set.is_empty() {
+                anyhow::bail!("question set is empty");
+            }
+            // The agent retriever blocks on model calls, so the whole run goes
+            // on a blocking thread rather than the async worker.
+            let agent_retriever = agent
+                .then(|| AgentRetriever::new(wiki_dir.clone()))
+                .transpose()?;
+            let store_e = Arc::clone(&store);
+            let report = tokio::task::spawn_blocking(move || -> Result<eval::EvalReport> {
+                let mut agent_retriever = agent_retriever;
+                let mut tool_retriever = eval::ToolRetriever;
+                let retriever: &mut dyn eval::Retriever = match agent_retriever.as_mut() {
+                    Some(a) => a,
+                    None => &mut tool_retriever,
+                };
+                store_e.with_conn(|c| Ok(eval::run(c, &set, k, retriever)))?
+            })
+            .await??;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            eprintln!("verdict: {}", eval::embeddings_verdict(&report));
             Ok(())
         }
         Op::Check => {
@@ -299,5 +363,61 @@ pub async fn people_loop(
             Ok(Err(e)) => warn!("message people refresh failed: {e:#}"),
             Err(e) => warn!("message people refresh task failed: {e}"),
         }
+    }
+}
+
+/// #1096 — retrieval through the real ask agent: one model call per question,
+/// the agent picks its own tool calls, and we score the ids it surfaced.
+struct AgentRetriever {
+    wiki_dir: PathBuf,
+    runtime: tokio::runtime::Handle,
+}
+
+impl AgentRetriever {
+    fn new(wiki_dir: Option<PathBuf>) -> Result<Self> {
+        Ok(Self {
+            wiki_dir: wiki_dir
+                .ok_or_else(|| anyhow::anyhow!("--wiki-dir is required with --agent"))?,
+            runtime: tokio::runtime::Handle::current(),
+        })
+    }
+}
+
+impl augmentagent_messages::eval::Retriever for AgentRetriever {
+    fn retrieve(
+        &mut self,
+        _conn: &augmentagent_store::rusqlite::Connection,
+        question: &augmentagent_messages::eval::Question,
+        k: usize,
+    ) -> Result<augmentagent_messages::eval::Retrieval> {
+        use augmentagent_channel_core::reasoner::{ask_opts, Reasoner};
+        let started = std::time::Instant::now();
+        let repo_root = std::env::current_dir()?;
+        let opts = ask_opts(self.wiki_dir.clone(), repo_root);
+        let prompt = format!(
+            "Retrieval only — do NOT answer the question and do not summarize.\n\n\
+             Question: {}\n\n\
+             Use the message tools to find the stored messages that would answer it. \
+             Then reply with ONE line and nothing else:\n\
+             IDS: [\"<message_id>\", …]  (at most {k}, best first, from the `message_id` \
+             field of search hits; empty list if you find nothing)",
+            question.question
+        );
+        let reasoner = crate::build_reasoner();
+        let out: String = self
+            .runtime
+            .block_on(async { reasoner.call(&opts, &prompt).await })?;
+        let ids = out
+            .lines()
+            .rev()
+            .find_map(|l| l.trim().strip_prefix("IDS:"))
+            .and_then(|json| serde_json::from_str::<Vec<String>>(json.trim()).ok())
+            .unwrap_or_default();
+        Ok(augmentagent_messages::eval::Retrieval {
+            message_ids: ids,
+            // The agent's own tool usage isn't visible here; count the turn.
+            tool_calls: 1,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        })
     }
 }
