@@ -1,8 +1,13 @@
-name: Apple Notes exporter
+name: Apple Notes
 on:
   pull_request:
     paths:
       - 'scripts/apple-notes/**'
+      - 'crates/augmentagent-channel-apple-notes/**'
+      - 'crates/augmentagent-mcp-memory/**'
+      - 'crates/augmentagent-cli/**'
+      - 'crates/augmentagent-channel-core/**'
+      - 'Cargo.*'
       - '.github/workflows/apple-notes.yml'
 permissions:
   contents: read
@@ -15,3 +20,22 @@ jobs:
         with:
           python-version: '3.9'
       - run: python3 -m unittest discover -s scripts/apple-notes/tests -v
+  notes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p augmentagent-channel-apple-notes
+      - run: cargo test -p augmentagent-cli --test apple_notes_cli
+      - run: cargo clippy -p augmentagent-channel-apple-notes --all-targets --no-deps -- -D warnings
