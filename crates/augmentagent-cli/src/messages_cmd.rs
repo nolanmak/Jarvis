@@ -29,6 +29,42 @@ pub enum Op {
     },
     /// Index health: exits non-zero when rows are missing, stale or queued.
     Check,
+    /// Structured search over stored messages, same grammar as the agent's
+    /// `search_messages` tool (`with:`, `from:`, `in:`, `is:`, `after:`, …).
+    Search {
+        /// The query, e.g. `with:alex from:me is:latest`.
+        query: String,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    /// Counts and rankings: who you message most, first/last contact, busiest
+    /// channels or months. Never prints message text.
+    Stats {
+        /// person | conversation | platform | kind | day | week | month
+        #[arg(long, default_value = "person")]
+        group_by: String,
+        #[arg(long)]
+        platform: Vec<String>,
+        #[arg(long)]
+        kind: Vec<String>,
+        #[arg(long)]
+        with: Option<String>,
+        #[arg(long)]
+        from_me: Option<bool>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        until: Option<String>,
+        #[arg(long)]
+        container: Option<String>,
+        /// messages | last_contact | first_contact
+        #[arg(long, default_value = "messages")]
+        order_by: String,
+        #[arg(long, default_value_t = augmentagent_messages::stats::DEFAULT_LIMIT)]
+        limit: usize,
+    },
     /// Rebuild the handle → person cache from the wiki's person pages
     /// (`identities:` front matter). Needs `--wiki-dir`. Prints counts only.
     ResolvePeople,
@@ -75,6 +111,67 @@ pub async fn run(store: Arc<Store>, op: Op, wiki_dir: Option<std::path::PathBuf>
             let wiki = wiki_dir.ok_or_else(|| anyhow::anyhow!("--wiki-dir is required"))?;
             let report = augmentagent_messages::people::resolve_people(&store, &wiki)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        Op::Search {
+            query,
+            limit,
+            offset,
+        } => {
+            let resp = store.with_conn(|c| {
+                Ok(augmentagent_messages::query::search(
+                    c, &query, limit, offset,
+                ))
+            })??;
+            println!("{}", serde_json::to_string_pretty(&resp)?);
+            Ok(())
+        }
+        Op::Stats {
+            group_by,
+            platform,
+            kind,
+            with,
+            from_me,
+            since,
+            until,
+            container,
+            order_by,
+            limit,
+        } => {
+            use augmentagent_messages::stats::{GroupBy, OrderBy, StatsRequest};
+            let day_ms = |s: &str, end: bool| -> Option<i64> {
+                chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                    .ok()
+                    .and_then(|d| {
+                        if end {
+                            d.and_hms_opt(23, 59, 59)
+                        } else {
+                            d.and_hms_opt(0, 0, 0)
+                        }
+                    })
+                    .map(|t| t.and_utc().timestamp_millis())
+                    .or_else(|| {
+                        chrono::DateTime::parse_from_rfc3339(s)
+                            .ok()
+                            .map(|t| t.timestamp_millis())
+                    })
+            };
+            let req = StatsRequest {
+                group_by: GroupBy::parse(&group_by)
+                    .ok_or_else(|| anyhow::anyhow!("unknown --group-by `{group_by}`"))?,
+                platforms: platform,
+                kinds: kind,
+                with,
+                from_me,
+                since_ms: since.as_deref().and_then(|s| day_ms(s, false)),
+                until_ms: until.as_deref().and_then(|s| day_ms(s, true)),
+                container,
+                order_by: OrderBy::parse(&order_by)
+                    .ok_or_else(|| anyhow::anyhow!("unknown --order-by `{order_by}`"))?,
+                limit,
+            };
+            let resp = store.with_conn(|c| Ok(augmentagent_messages::stats::stats(c, &req)))??;
+            println!("{}", serde_json::to_string_pretty(&resp)?);
             Ok(())
         }
         Op::Check => {
