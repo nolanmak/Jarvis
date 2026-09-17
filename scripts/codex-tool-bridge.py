@@ -32,14 +32,18 @@ class Readiness(Denied):
         'mcp_tools': 'Configured MCP server is missing a required tool; check the server version and tool profile.',
         'build_vm_unavailable': 'Build commands require the private build VM, but its runtime configuration is missing; '
                                 'run `augmentagent doctor`, or set AUGMENTAGENT_BUILD_VM=host in the daemon environment to opt out.',
-        'build_scratch_unavailable': 'VM build scratch directory {path} is missing, not a private directory owned by the '
-                                     'daemon user, or not writable; create it with mode 0700 or set '
-                                     'AUGMENTAGENT_BUILD_SCRATCH_DIR in the daemon environment.',
+        'build_scratch_unavailable': 'VM build scratch directory {path} is missing, inside a model-writable directory, '
+                                     'or not a mode-0700 directory owned by the daemon user; create it with '
+                                     '`install -d -m 700` or set AUGMENTAGENT_BUILD_SCRATCH_DIR in the daemon environment.',
+        'build_scratch_space': 'VM build scratch {path} has too little space for a new build cache ({detail}); '
+                               'free space on that volume or wait for other build sessions to finish.',
+        'build_cache_full': 'VM build cache ran out of space at {path} ({detail}); the build did not complete. '
+                            'Free space on that volume, or narrow the build, before retrying.',
     }
 
-    def __init__(self, category, path=None):
-        # Only operator-provisioned paths are ever substituted, never secrets.
-        message = self.MESSAGES[category].format(path=path if path is not None else '(not configured)')
+    def __init__(self, category, path=None, detail=''):
+        # Only operator-provisioned paths and sizes are substituted, never secrets.
+        message = self.MESSAGES[category].format(path=path if path is not None else '(not configured)', detail=detail)
         super().__init__('JARVIS_READINESS:' + category + ' ' + message)
 
 
@@ -71,60 +75,131 @@ class BuildScratch:
     build-cache image that the guest mounts for the Cargo target directory and
     Cargo home (so a session's later builds are incremental), and `tmp/` for
     each command's snapshot and VM control files. Closing the session removes it.
+
+    Disk safety: a new session is admitted only if the volume keeps
+    HEADROOM_BYTES free after reserving its whole image and every other
+    session's unallocated growth, and if all images' allocated blocks plus the
+    new cap stay within BUDGET_BYTES. The scratch volume is shared with the
+    daemon's own build caches.
     """
     SESSION_PREFIX = 'jarvis-vm-session-'
-    CACHE_BYTES = 24 * 1024**3
+    IMAGE_NAME = 'build-cache.img'
+    # One checkout's debug target for a couple of workspace crates is ~9-10 GiB
+    # (the burn-down target holding channel-core and cli test builds is 9.4 GiB),
+    # plus ~0.8 GiB of Cargo home.
+    CACHE_BYTES = 12 * 1024**3
+    HEADROOM_BYTES = 20 * 1024**3
+    BUDGET_BYTES = 24 * 1024**3
+    # Below this after a failed build, the volume (not the build) is the cause.
+    FULL_BYTES = 1024**3
 
-    def __init__(self, root, cache_bytes=None):
+    def __init__(self, root, refused=False):
         self.root = Path(root) if root else None
-        self.cache_bytes = cache_bytes or self.CACHE_BYTES
+        self.refused = refused
+        self.cache_bytes = self.CACHE_BYTES
+        self.headroom_bytes = self.HEADROOM_BYTES
+        self.budget_bytes = self.BUDGET_BYTES
+        self.statvfs = os.statvfs
         self.session = None
 
-    def _require_root(self):
-        root = self.root
+    def _open_root(self):
+        """An O_NOFOLLOW directory fd for the root: owner-only (exactly 0700)."""
+        if self.root is None or self.refused or not self.root.is_absolute():
+            raise Readiness('build_scratch_unavailable', self.root)
         try:
-            info = os.lstat(root) if root is not None else None
+            descriptor = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         except OSError:
-            info = None
-        if (info is None or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
-                or info.st_mode & 0o022 or not os.access(root, os.W_OK | os.X_OK)):
-            raise Readiness('build_scratch_unavailable', root)
+            raise Readiness('build_scratch_unavailable', self.root) from None
+        info = os.fstat(descriptor)
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            os.close(descriptor)
+            raise Readiness('build_scratch_unavailable', self.root)
+        return descriptor
+
+    def _require_space(self, root_fd):
+        gib = 1024**3
+        allocated = outstanding = 0
+        for name in os.listdir(root_fd):
+            if not name.startswith(self.SESSION_PREFIX):
+                continue
+            try:
+                info = os.stat(f'{name}/{self.IMAGE_NAME}', dir_fd=root_fd, follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                used = info.st_blocks * 512
+                allocated += used
+                outstanding += max(info.st_size - used, 0)
+        vfs = self.statvfs(root_fd)
+        free = vfs.f_bavail * vfs.f_frsize
+        if allocated + self.cache_bytes > self.budget_bytes:
+            raise Readiness('build_scratch_space', self.root,
+                f'build caches hold {allocated / gib:.1f} GiB; a new {self.cache_bytes / gib:.0f} GiB cache '
+                f'would exceed the {self.budget_bytes / gib:.0f} GiB budget')
+        needed = self.headroom_bytes + outstanding + self.cache_bytes
+        if free < needed:
+            raise Readiness('build_scratch_space', self.root,
+                f'{free / gib:.1f} GiB free; needs {needed / gib:.1f} GiB: {self.headroom_bytes / gib:.0f} GiB '
+                f'headroom, {outstanding / gib:.1f} GiB other sessions may still grow, '
+                f'{self.cache_bytes / gib:.0f} GiB for this cache')
 
     def open(self):
+        import secrets
         import shutil
-        import tempfile
-        self._require_root()
-        if self.session is not None:
-            if not self.cache.is_file():
-                raise Readiness('build_scratch_unavailable', self.session)
-            return self.session
-        session = Path(tempfile.mkdtemp(prefix=self.SESSION_PREFIX, dir=self.root))
+        root_fd = self._open_root()
         try:
-            (session / 'owner.json').write_text(json.dumps(
-                {'pid': os.getpid(), 'start_time': process_start_time(os.getpid())}))
-            (session / 'tmp').mkdir(mode=0o700)
-            mke2fs = shutil.which('mke2fs', path='/usr/sbin:/sbin:/usr/bin:/bin')
-            if not mke2fs:
-                raise Denied('build cache filesystem tool (mke2fs) is not installed')
-            image = session / 'build-cache.img'
-            with open(image, 'xb') as handle:
-                handle.truncate(self.cache_bytes)
-            image.chmod(0o600)
-            # Sparse and lazily initialised: disk use grows with the build.
-            subprocess.run([mke2fs, '-q', '-F', '-t', 'ext4', '-m', '0',
-                            '-E', f'root_owner={os.getuid()}:{os.getgid()},lazy_itable_init=1,nodiscard',
-                            str(image)], env={'PATH': '/usr/sbin:/sbin:/usr/bin:/bin'},
-                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=60, check=True)
-        except (OSError, subprocess.SubprocessError, Denied):
-            shutil.rmtree(session, ignore_errors=True)
-            raise Readiness('build_scratch_unavailable', self.root)
-        self.session = session
-        return session
+            if self.session is not None:
+                if not self.cache.is_file():
+                    raise Readiness('build_scratch_unavailable', self.session)
+                return self.session
+            self._require_space(root_fd)
+            name = self.SESSION_PREFIX + secrets.token_hex(8)
+            os.mkdir(name, 0o700, dir_fd=root_fd)
+            session = self.root / name
+            try:
+                session_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root_fd)
+                try:
+                    owner = os.open('owner.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600,
+                                    dir_fd=session_fd)
+                    with os.fdopen(owner, 'w') as stream:
+                        json.dump({'pid': os.getpid(), 'start_time': process_start_time(os.getpid())}, stream)
+                    os.mkdir('tmp', 0o700, dir_fd=session_fd)
+                    image = os.open(self.IMAGE_NAME, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600,
+                                    dir_fd=session_fd)
+                    try:
+                        os.ftruncate(image, self.cache_bytes)
+                    finally:
+                        os.close(image)
+                finally:
+                    os.close(session_fd)
+                mke2fs = shutil.which('mke2fs', path='/usr/sbin:/sbin:/usr/bin:/bin')
+                if not mke2fs:
+                    raise Denied('build cache filesystem tool (mke2fs) is not installed')
+                # Sparse and lazily initialised: disk use grows with the build.
+                subprocess.run([mke2fs, '-q', '-F', '-t', 'ext4', '-m', '0',
+                                '-E', f'root_owner={os.getuid()}:{os.getgid()},lazy_itable_init=1,nodiscard',
+                                str(session / self.IMAGE_NAME)], env={'PATH': '/usr/sbin:/sbin:/usr/bin:/bin'},
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=60, check=True)
+            except (OSError, subprocess.SubprocessError, Denied):
+                shutil.rmtree(session, ignore_errors=True)
+                raise Readiness('build_scratch_unavailable', self.root) from None
+            self.session = session
+            return session
+        finally:
+            os.close(root_fd)
+
+    def volume_full(self):
+        """Whether the scratch volume is (nearly) out of space."""
+        try:
+            vfs = self.statvfs(self.root)
+        except OSError:
+            return False
+        return vfs.f_bavail * vfs.f_frsize < self.FULL_BYTES
 
     @property
     def cache(self):
-        return self.session / 'build-cache.img'
+        return self.session / self.IMAGE_NAME
 
     @property
     def tmp(self):
@@ -706,13 +781,12 @@ class Policy:
         self.build_vm_config = config.get('build_vm_config')
         # #1036: VM build scratch root and default build timeout, from the
         # daemon's policy (codex runs with a cleared environment).
+        # A root the model could write through makes builds unavailable; the
+        # bridge and its other tools still start.
         scratch = config.get('build_scratch_dir')
-        if scratch is not None:
-            path = Path(scratch)
-            if not path.is_absolute() or any(path.resolve() == root or root in path.resolve().parents
-                                             for root in self.write_roots):
-                raise Denied('build scratch must be outside model-writable scopes')
-        self._scratch = BuildScratch(scratch)
+        refused = scratch is not None and (not Path(scratch).is_absolute() or any(
+            Path(scratch).resolve() == root or root in Path(scratch).resolve().parents for root in self.write_roots))
+        self._scratch = BuildScratch(scratch, refused=refused)
         configured_timeout = config.get('build_timeout_secs')
         self.build_timeout = min(max(int(configured_timeout), 1), COMMAND_TIMEOUT_MAX) \
             if configured_timeout is not None else BUILD_TIMEOUT_DEFAULT
@@ -1566,10 +1640,20 @@ class Policy:
                         raise
                 return result
         except vm.Unavailable as exc:
+            if str(exc) == 'VM build cache is full':
+                raise Readiness('build_cache_full', scratch.cache, 'the session build cache image is full') from exc
+            if scratch.volume_full():
+                raise Readiness('build_cache_full', scratch.root, 'the scratch volume is full') from exc
             raise Denied(str(exc)) from exc
+        except Readiness:
+            raise
         except Denied:
+            if scratch.volume_full():
+                raise Readiness('build_cache_full', scratch.root, 'the scratch volume is full')
             raise
         except (OSError, ValueError, KeyError) as exc:
+            if scratch.volume_full():
+                raise Readiness('build_cache_full', scratch.root, 'the scratch volume is full') from exc
             raise Denied('VM runtime or source reconciliation is unavailable') from exc
 
     def close(self):

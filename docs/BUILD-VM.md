@@ -50,10 +50,13 @@ Every VM build file lives under the scratch root, never the root disk:
 `AUGMENTAGENT_BUILD_SCRATCH_DIR` in the daemon environment, default
 `/mnt/build/codex-vm`. Codex runs with a cleared environment, so the daemon
 passes the root to the bridge in its policy (`build_scratch_dir`). A root inside a
-model-writable directory is refused. The root must exist, be a real directory owned by
-the daemon user, not group/world writable, and writable. Otherwise every VM build
-fails closed with `JARVIS_READINESS:build_scratch_unavailable` naming the path, and
-nothing runs on the host. Provision it once:
+model-writable directory (resolved through its nearest existing ancestor) is withheld
+from the policy, so only build commands become unavailable while other tools keep
+working. The root must be a real directory (not a symlink), owned by the daemon user,
+with mode exactly 0700; the bridge checks this on an `O_NOFOLLOW` descriptor and creates
+sessions relative to it. Otherwise every VM build fails closed with
+`JARVIS_READINESS:build_scratch_unavailable` naming the path, and nothing runs on the
+host. Provision it once:
 
 ```sh
 install -d -m 700 /mnt/build/codex-vm
@@ -62,7 +65,7 @@ install -d -m 700 /mnt/build/codex-vm
 Each bridge session creates `<root>/jarvis-vm-session-*` holding:
 
 - `owner.json`: the bridge pid and its kernel start time.
-- `build-cache.img`: a sparse 24 GiB ext4 image, mode 0600, attached to each
+- `build-cache.img`: a sparse 12 GiB ext4 image, mode 0600, attached to each
   `cargo` guest as a virtio disk at `/build-cache`. It holds the Cargo target
   directory and Cargo home for the whole session, so a second `cargo` command is
   incremental. Snapshots keep source mtimes. The host never mounts it. It is a disk
@@ -70,13 +73,38 @@ Each bridge session creates `<root>/jarvis-vm-session-*` holding:
   second, and Cargo then treats every dependency as rebuilt. On first use the guest
   seeds the Cargo home from the read-only operator registry and Git cache mounts.
   Nothing is copied on the host, and the registry is never copied per command.
+  12 GiB covers one checkout's debug target for a couple of workspace crates
+  (the burn-down target with the channel-core and cli test builds is 9.4 GiB) plus
+  about 0.8 GiB of Cargo home.
 - `tmp/`: each command's source snapshot, VM control files and initrd, and the
   session's npm install copy.
 
-Closing the bridge removes the session. At start the daemon removes sessions
-whose bridge is gone (pid and start time no longer match). Before removing a
-session, it SIGKILLs any of the user's processes, such as a qemu or its supervisor,
-whose arguments name a path inside that session.
+Disk safety: the scratch volume is shared with the daemon's own build caches.
+A new session is admitted only when both of these hold:
+
+- Free space covers the whole new image, the unallocated remainder of every
+  other session's image, and 20 GiB of headroom.
+- The allocated blocks of all images, plus the new image's cap, stay within a
+  24 GiB budget.
+
+Otherwise builds fail with `JARVIS_READINESS:build_scratch_space`, naming the
+path and the numbers, before any file is created. The image is attached with
+`werror=report,rerror=report`, so a host ENOSPC fails the guest's writes instead
+of pausing the VM until its deadline. When the image or the volume fills, the
+build reports `JARVIS_READINESS:build_cache_full` naming the image or the scratch
+root.
+
+Closing the bridge removes the session. A bridge killed without cleanup (the
+reasoner watchdog kills the whole process group) leaves its session behind. The
+daemon's hourly sweep loop, which also runs at start, removes sessions whose owner
+pid and start time no longer match a running process. Before removing a session
+it kills that session's VM processes. A process is one only if its executable is
+`qemu-system-*` or `python3` (the supervisor) and one of its arguments starts with
+the session path or is a qemu `path=`/`file=` option inside it. A shell that merely
+mentions the path is never killed. Each kill goes through `pidfd_open` and
+re-checks the start time first, so a reused pid is never signalled. Codex starts
+the bridge with a plain `Command` in a new process group, not a pid namespace, so
+the bridge's own pid is the one the daemon sees.
 
 A `cargo`, `npm` or `npx` command with no explicit `timeout` gets
 `AUGMENTAGENT_BUILD_TIMEOUT_SECS` (default 600 s, the longest a Claude-lane Bash

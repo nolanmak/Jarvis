@@ -2246,8 +2246,16 @@ class BuildScratchTests(unittest.TestCase):
         policy = bridge.Policy(config)
         policy._vm_helper = lambda: self.fake_vm
         policy._scratch.cache_bytes = 64 * 1024**2  # keep the synthetic image small
+        policy._scratch.statvfs = self.fake_statvfs(free_bytes=500 * 1024**3)
         self.addCleanup(policy.close)
         return policy
+
+    @staticmethod
+    def fake_statvfs(free_bytes):
+        import os
+        def statvfs(target):
+            return os.statvfs_result((4096, 4096, 0, 0, free_bytes // 4096, 0, 0, 0, 0, 255))
+        return statvfs
 
     def under(self, path, root):
         return Path(path).resolve().is_relative_to(Path(root).resolve())
@@ -2274,9 +2282,10 @@ class BuildScratchTests(unittest.TestCase):
         response = bridge.Server(policy).dispatch({'method': 'tools/call', 'params': {
             'name': 'Bash', 'arguments': {'command': 'cargo build'}}})
         self.assertTrue(response['content'][0]['text'].startswith('JARVIS_READINESS:build_scratch_unavailable'))
-        self.scratch.chmod(0o777)
-        with self.assertRaises(bridge.Readiness):
-            self.policy().run_command('cargo build')
+        for mode in (0o777, 0o755, 0o750, 0o500):
+            self.scratch.chmod(mode)
+            with self.subTest(mode=oct(mode)), self.assertRaises(bridge.Readiness):
+                self.policy().run_command('cargo build')
         self.scratch.chmod(0o700)
         link = Path(self.temp.name) / 'scratch-link'; link.symlink_to(self.scratch)
         with self.assertRaises(bridge.Readiness):
@@ -2285,12 +2294,85 @@ class BuildScratchTests(unittest.TestCase):
             self.policy(build_scratch_dir=None).run_command('cargo build')
         self.assertEqual(self.calls, [])
 
-    def test_scratch_root_inside_a_write_root_is_refused(self):
+    def test_scratch_root_inside_a_write_root_makes_only_builds_unavailable(self):
         inside = self.root / 'scratch'; inside.mkdir(mode=0o700)
-        with self.assertRaises(bridge.Denied):
-            self.policy(build_scratch_dir=str(inside))
-        with self.assertRaises(bridge.Denied):
-            self.policy(build_scratch_dir='relative/scratch')
+        (self.root / 'note.md').write_text('synthetic')
+        for scratch in (str(inside), 'relative/scratch'):
+            policy = self.policy(build_scratch_dir=scratch)  # the bridge still starts
+            self.assertEqual(policy.read('note.md'), 'synthetic')
+            with self.subTest(scratch=scratch), self.assertRaises(bridge.Readiness) as raised:
+                policy.run_command('cargo build')
+            self.assertIn('JARVIS_READINESS:build_scratch_unavailable', str(raised.exception))
+        self.assertEqual(list(inside.iterdir()), [])
+        self.assertEqual(self.calls, [])
+
+    def test_low_free_space_is_refused_before_any_file_is_created(self):
+        policy = self.policy()
+        policy._scratch.cache_bytes = 12 * 1024**3
+        policy._scratch.headroom_bytes = 20 * 1024**3
+        policy._scratch.statvfs = self.fake_statvfs(free_bytes=31 * 1024**3)
+        with self.assertRaises(bridge.Readiness) as raised:
+            policy.run_command('cargo build')
+        self.assertIn('JARVIS_READINESS:build_scratch_space', str(raised.exception))
+        self.assertIn(str(self.scratch), str(raised.exception))
+        self.assertEqual(list(self.scratch.iterdir()), [], 'nothing is created when space is short')
+        self.assertEqual(self.calls, [])
+        policy._scratch.statvfs = self.fake_statvfs(free_bytes=32 * 1024**3)
+        policy._scratch.cache_bytes = 64 * 1024**2
+        policy.run_command('cargo build')
+        self.assertEqual(len(self.calls), 1)
+
+    def test_concurrent_sessions_share_one_budget_and_reserve_unallocated_growth(self):
+        import os
+        cap = 64 * 1024**2
+        first = self.policy()
+        first.run_command('cargo build')
+        image = first._scratch.cache
+        with open(image, 'r+b') as handle:  # the first session's build wrote 8 MiB
+            handle.seek(1024**2); handle.write(os.urandom(8 * 1024**2))
+        allocated = os.stat(image).st_blocks * 512
+        second = self.policy()
+        second._scratch.headroom_bytes = 0
+        # Budget: allocated blocks of existing images plus the new cap.
+        second._scratch.budget_bytes = allocated + cap - 1
+        with self.assertRaises(bridge.Readiness) as raised:
+            second.run_command('cargo build')
+        self.assertIn('build_scratch_space', str(raised.exception))
+        second._scratch.budget_bytes = allocated + cap
+        # Free space must also cover the first image's unallocated growth.
+        second._scratch.statvfs = self.fake_statvfs(free_bytes=(cap - allocated) + cap - 4096)
+        with self.assertRaises(bridge.Readiness):
+            second.run_command('cargo build')
+        second._scratch.statvfs = self.fake_statvfs(free_bytes=(cap - allocated) + cap + 4096)
+        second.run_command('cargo build')
+        self.assertEqual(len([p for p in self.scratch.iterdir()]), 2)
+
+    def test_default_space_limits_are_documented_values(self):
+        self.assertEqual(bridge.BuildScratch.CACHE_BYTES, 12 * 1024**3)
+        self.assertEqual(bridge.BuildScratch.HEADROOM_BYTES, 20 * 1024**3)
+        self.assertEqual(bridge.BuildScratch.BUDGET_BYTES, 24 * 1024**3)
+
+    def test_host_volume_full_after_a_build_is_a_named_readiness_error(self):
+        policy = self.policy()
+        def fills_the_volume(*args, **kwargs):
+            policy._scratch.statvfs = self.fake_statvfs(free_bytes=0)
+            raise self.fake_vm.Unavailable('VM did not produce a trusted command result')
+        self.fake_vm.run = staticmethod(fills_the_volume)
+        response = bridge.Server(policy).dispatch({'method': 'tools/call', 'params': {
+            'name': 'Bash', 'arguments': {'command': 'cargo build'}}})
+        text = response['content'][0]['text']
+        self.assertTrue(text.startswith('[runner=vm] JARVIS_READINESS:build_cache_full'), text)
+        self.assertIn(str(self.scratch), text)
+
+    def test_guest_reporting_a_full_cache_image_is_a_named_readiness_error(self):
+        policy = self.policy()
+        def image_full(*args, **kwargs):
+            raise self.fake_vm.Unavailable('VM build cache is full')
+        self.fake_vm.run = staticmethod(image_full)
+        with self.assertRaises(bridge.Readiness) as raised:
+            policy.run_command('cargo build')
+        self.assertIn('JARVIS_READINESS:build_cache_full', str(raised.exception))
+        self.assertIn('build-cache.img', str(raised.exception))
 
     def test_two_cargo_calls_in_a_session_reuse_the_target_directory(self):
         import os

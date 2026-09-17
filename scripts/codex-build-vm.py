@@ -95,7 +95,7 @@ Path('/etc/group').write_text(f'root:x:0:\nworker:x:{gid}:\n')
 Path('/etc/hosts').write_text('127.0.0.1 localhost registry.npmjs.org index.crates.io static.crates.io\n::1 localhost\n')
 environment={'PATH':'/toolchain/bin:/usr/bin:/bin','HOME':'/home/worker','USER':'worker','LOGNAME':'worker',
     'LANG':'C.UTF-8','TMPDIR':'/tmp','CARGO_HOME':'/cargo','CARGO_NET_OFFLINE':'true','CARGO_TARGET_DIR':'/workspace/target'}
-if job.get('build_cache'):
+def seed_build_cache():
     # Session build cache (#1036): persistent target and Cargo home. Seed the
     # Cargo home once per image from the read-only operator caches.
     import shutil
@@ -111,6 +111,7 @@ if job.get('build_cache'):
             for name in [*dirs,*files]:
                 os.lchown(os.path.join(base,name),uid,gid)
         (home/'.jarvis-seeded').touch(); os.chown(home/'.jarvis-seeded',uid,gid)
+if job.get('build_cache'):
     environment.update({'CARGO_HOME':'/build-cache/cargo-home','CARGO_TARGET_DIR':'/build-cache/target'})
 environment.update(job['environment'])
 registry=make_proxy('/root/control')
@@ -137,6 +138,8 @@ def worker():
     os.setgroups([]); os.setgid(gid); os.setuid(uid)
     os.umask(0o022)
 try:
+    if job.get('build_cache'):
+        seed_build_cache()
     process=subprocess.Popen(job['argv'],cwd='/workspace',env=environment,
         stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
         start_new_session=True,preexec_fn=worker)
@@ -166,8 +169,11 @@ try:
         result={'exit_code':process.wait(),**{key:value.decode('utf-8','replace') for key,value in outputs.items()}}
         if len(result['stdout'].encode())+len(result['stderr'].encode())>8*1024*1024:
             result={'error':'VM command exceeded output limit'}
-except OSError:
-    result={'error':'VM command could not start'}
+except OSError as error:
+    import errno
+    # copytree aggregates per-file failures into shutil.Error without an errno.
+    full=error.errno in (errno.ENOSPC,errno.EDQUOT) or 'No space left on device' in str(error)
+    result={'error':'VM build cache is full' if full else 'VM command could not start'}
 path=Path('/root/control/outcome.json')
 with path.open('w') as receipt:
     os.chmod(path,0o600);json.dump(result,receipt);receipt.flush();os.fsync(receipt.fileno())
@@ -180,6 +186,27 @@ with path.open('w') as receipt:
 # not a 9p share: the guest's 9p client stores timestamps to the second, which
 # makes Cargo rebuild every dependency. The host never mounts the image.
 BUILD_CACHE_MOUNT = '/build-cache'
+
+
+def qemu_command(config, image, shares, build_cache):
+    """The qemu argv for one build VM."""
+    command = [config['qemu'], '-no-user-config', '-nodefaults', '-machine', 'pc,accel=kvm',
+        '-cpu', 'host', '-m', str(config['memory_mb']), '-smp', '2', '-nographic', '-serial', 'stdio',
+        '-monitor', 'none', '-nic', 'none', '-no-reboot', '-L', config['data_dir'], '-bios', config['firmware'],
+        '-kernel', config['kernel'], '-initrd', str(image), '-append', 'rdinit=/init console=ttyS0 panic=-1 loglevel=3',
+        '-sandbox', 'on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny']
+    if build_cache is not None:
+        escaped = str(build_cache).replace(',', ',,')
+        # werror/rerror=report: a host ENOSPC or I/O error fails the guest's
+        # write. QEMU's default (werror=enospc) pauses the VM, and with no
+        # monitor nothing resumes it, so the build would hang to its deadline.
+        command.extend(['-drive', f'if=none,id=buildcache,format=raw,discard=unmap,werror=report,rerror=report,file={escaped}',
+            '-device', 'virtio-blk-pci,drive=buildcache'])
+    for tag, path, readonly in shares:
+        escaped = str(path).replace(',', ',,')
+        command.extend(['-fsdev', f'local,id={tag},path={escaped},security_model=none,readonly={"on" if readonly else "off"}',
+            '-device', f'virtio-9p-pci,fsdev={tag},mount_tag={tag}'])
+    return command
 
 
 def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, node_workspaces=(), download_info=None,
@@ -315,19 +342,7 @@ poweroff -f
             ('job.json', stat.S_IFREG | 0o400, json.dumps({'argv': argv, 'environment': environment,
                 'uid': os.getuid(), 'gid': os.getgid(), 'build_cache': build_cache is not None}).encode(), 0, 0)])
         image = private / 'initrd.gz'; image.write_bytes(initrd(entries))
-        command = [config['qemu'], '-no-user-config', '-nodefaults', '-machine', 'pc,accel=kvm',
-            '-cpu', 'host', '-m', str(config['memory_mb']), '-smp', '2', '-nographic', '-serial', 'stdio',
-            '-monitor', 'none', '-nic', 'none', '-no-reboot', '-L', config['data_dir'], '-bios', config['firmware'],
-            '-kernel', config['kernel'], '-initrd', str(image), '-append', 'rdinit=/init console=ttyS0 panic=-1 loglevel=3',
-            '-sandbox', 'on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny']
-        if build_cache is not None:
-            escaped = str(build_cache).replace(',', ',,')
-            command.extend(['-drive', f'if=none,id=buildcache,format=raw,discard=unmap,file={escaped}',
-                '-device', 'virtio-blk-pci,drive=buildcache'])
-        for tag, path, readonly in shares:
-            escaped = str(path).replace(',', ',,')
-            command.extend(['-fsdev', f'local,id={tag},path={escaped},security_model=none,readonly={"on" if readonly else "off"}',
-                '-device', f'virtio-9p-pci,fsdev={tag},mount_tag={tag}'])
+        command = qemu_command(config, image, shares, build_cache)
         host_environment = {'PATH': os.defpath, 'LD_LIBRARY_PATH': config['library_dir'], 'QEMU_MODULE_DIR': config['module_dir']}
         supervisor = Path(__file__).with_name('provider-supervisor.py')
         cleanup = private / 'cleanup-complete'

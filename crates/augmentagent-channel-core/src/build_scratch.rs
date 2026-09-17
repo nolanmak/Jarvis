@@ -1,14 +1,21 @@
 //! Codex VM build scratch root, build timeout, and the stale-session sweep (#1036).
 //!
 //! The bridge (`scripts/codex-tool-bridge.py`, `BuildScratch`) keeps every VM
-//! build file for one bridge session in `<root>/jarvis-vm-session-*`: the
-//! persistent Cargo target and home, each command's snapshot and VM control
-//! directory, and an `owner.json` naming the bridge process. Codex runs with a
-//! cleared environment, so the root and timeout reach the bridge through its
-//! policy, never through the environment. A bridge killed without cleanup
-//! leaves its session behind; the daemon sweeps those at start.
+//! build file for one bridge session in `<root>/jarvis-vm-session-*`: its
+//! build-cache image, each command's snapshot and VM control directory, and an
+//! `owner.json` naming the bridge process. Codex runs with a cleared
+//! environment, so the root and timeout reach the bridge through its policy,
+//! never through the environment. A bridge killed without cleanup (the
+//! reasoner watchdog SIGKILLs the whole process group) leaves its session
+//! behind; the daemon's hourly sweep loop removes those.
+//!
+//! Owner identity: Codex (0.154, `codex-rs/rmcp-client/src/stdio_server_launcher.rs`)
+//! starts a local stdio MCP server with a plain `Command` in a new process
+//! group (`process_group(0)`); there is no pid namespace. The bridge's
+//! `os.getpid()` is therefore the pid this daemon sees in `/proc`, and a live
+//! session's owner record matches it.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 /// Daemon environment override for the scratch root.
@@ -47,17 +54,49 @@ pub fn build_timeout_secs() -> u64 {
     configured_timeout(std::env::var(TIMEOUT_ENV).ok())
 }
 
+/// Resolve an absolute path whose tail may not exist yet: canonicalize the
+/// nearest existing ancestor (following its symlinks) and append the rest.
+/// Paths with `..` are refused rather than resolved lexically.
+fn resolve_through_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return None;
+    }
+    let mut existing = path;
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(resolved) = existing.canonicalize() {
+            return Some(rest.iter().rev().fold(resolved, |acc: PathBuf, part| acc.join(part)));
+        }
+        rest.push(existing.file_name()?.to_os_string());
+        existing = existing.parent()?;
+    }
+}
+
 /// Refuse a scratch root the model could write through: it must be absolute
-/// and must not lie inside (or equal) any write root.
+/// and must not lie inside (or equal) any write root, after resolving both.
 pub fn check_outside_write_roots(scratch: &Path, write_roots: &[PathBuf]) -> anyhow::Result<()> {
-    anyhow::ensure!(scratch.is_absolute(), "build scratch directory must be absolute");
-    let resolved = scratch.canonicalize().unwrap_or_else(|_| scratch.to_path_buf());
+    let resolved = resolve_through_existing_ancestor(scratch)
+        .ok_or_else(|| anyhow::anyhow!("build scratch directory must be an absolute path without `..`"))?;
     for root in write_roots {
-        let root = root.canonicalize().unwrap_or_else(|_| root.clone());
-        anyhow::ensure!(!resolved.starts_with(&root) && !scratch.starts_with(&root),
+        let root = resolve_through_existing_ancestor(root)
+            .ok_or_else(|| anyhow::anyhow!("write root cannot be resolved"))?;
+        anyhow::ensure!(!resolved.starts_with(&root),
             "build scratch directory must be outside model-writable scopes");
     }
     Ok(())
+}
+
+/// The scratch root to put in a bridge policy. A refused root is withheld, so
+/// build commands report `build_scratch_unavailable` while every other tool
+/// of the launch keeps working.
+pub fn policy_scratch_dir(scratch: PathBuf, write_roots: &[PathBuf]) -> Option<PathBuf> {
+    match check_outside_write_roots(&scratch, write_roots) {
+        Ok(()) => Some(scratch),
+        Err(error) => {
+            tracing::warn!(scratch = %scratch.display(), %error, "codex VM builds unavailable: scratch root refused (#1036)");
+            None
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -66,7 +105,7 @@ pub struct SweepReport {
     pub removed: usize,
     /// Sessions whose bridge is still running.
     pub kept_live: usize,
-    /// Processes (VM supervisor, qemu) still using a stale session, killed.
+    /// VM processes (qemu, its python3 supervisor) of stale sessions, killed.
     pub killed: usize,
 }
 
@@ -74,9 +113,27 @@ pub struct SweepReport {
 pub trait ProcessTable {
     /// Kernel start time of `pid` (field 22 of `/proc/<pid>/stat`), if running.
     fn start_time(&self, pid: u32) -> Option<String>;
-    /// This user's processes with an argument naming a path inside `dir`.
-    fn processes_using(&self, dir: &Path) -> Vec<u32>;
-    fn kill(&self, pid: u32);
+    /// This user's VM processes for the session `dir`, with their start times
+    /// (see [`is_session_vm_process`]).
+    fn vm_processes_using(&self, dir: &Path) -> Vec<(u32, String)>;
+    /// SIGKILL `pid` only if it is still the process that had `start_time`.
+    fn kill_if_same(&self, pid: u32, start_time: &str) -> bool;
+}
+
+/// Whether a process belongs to a session's VM: its executable is qemu or
+/// python3 (the supervisor), and an argument starts with the session path or
+/// is a qemu option naming a file inside it (`path=` / `file=`). A process
+/// that only mentions the path, such as a shell running `du`, never matches.
+pub fn is_session_vm_process(exe_name: &str, args: &[String], dir: &Path) -> bool {
+    if !(exe_name.starts_with("qemu-system-") || exe_name.starts_with("python3")) {
+        return false;
+    }
+    let prefix = format!("{}/", dir.display());
+    args.iter().any(|arg| {
+        arg.starts_with(&prefix)
+            || arg.split(',').any(|option| option.strip_prefix("path=").or_else(|| option.strip_prefix("file="))
+                .is_some_and(|value| value.starts_with(&prefix)))
+    })
 }
 
 /// The real `/proc`.
@@ -88,9 +145,8 @@ impl ProcessTable for ProcFs {
         stat.rsplit_once(')')?.1.split_whitespace().nth(19).map(str::to_string)
     }
 
-    fn processes_using(&self, dir: &Path) -> Vec<u32> {
+    fn vm_processes_using(&self, dir: &Path) -> Vec<(u32, String)> {
         use std::os::unix::fs::MetadataExt;
-        let needle = format!("{}/", dir.display());
         // SAFETY: getuid has no preconditions.
         let uid = unsafe { libc::getuid() };
         let me = std::process::id();
@@ -98,15 +154,34 @@ impl ProcessTable for ProcFs {
         entries.flatten().filter_map(|entry| {
             let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
             if pid == me || entry.metadata().ok()?.uid() != uid { return None; }
+            let exe = std::fs::read_link(entry.path().join("exe")).ok()?;
+            let exe_name = exe.file_name()?.to_string_lossy().into_owned();
             let cmdline = std::fs::read(entry.path().join("cmdline")).ok()?;
-            cmdline.split(|b| *b == 0).any(|arg| String::from_utf8_lossy(arg).contains(&needle)).then_some(pid)
+            let args: Vec<String> = cmdline.split(|b| *b == 0).filter(|a| !a.is_empty())
+                .map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+            if !is_session_vm_process(&exe_name, &args, dir) { return None; }
+            Some((pid, self.start_time(pid)?))
         }).collect()
     }
 
-    fn kill(&self, pid: u32) {
-        let Ok(pid) = libc::pid_t::try_from(pid) else { return };
+    fn kill_if_same(&self, pid: u32, start_time: &str) -> bool {
+        let Ok(raw) = libc::pid_t::try_from(pid) else { return false };
+        // SAFETY: pidfd_open takes a pid and flags; a negative result is an error.
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, raw, 0) };
+        if pidfd >= 0 {
+            // The pidfd pins one process. Checking the start time after
+            // opening it proves it is the recorded one, not a reused pid.
+            let signalled = self.start_time(pid).as_deref() == Some(start_time)
+                // SAFETY: a valid pidfd, a signal number, no siginfo, no flags.
+                && unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd as libc::c_int, libc::SIGKILL,
+                                          std::ptr::null::<libc::siginfo_t>(), 0) } == 0;
+            // SAFETY: closing the descriptor this function opened.
+            unsafe { libc::close(pidfd as libc::c_int) };
+            return signalled;
+        }
+        // Kernels without pidfd: re-check immediately before signalling.
         // SAFETY: plain signal delivery to a pid owned by this user.
-        unsafe { libc::kill(pid, libc::SIGKILL) };
+        self.start_time(pid).as_deref() == Some(start_time) && unsafe { libc::kill(raw, libc::SIGKILL) } == 0
     }
 }
 
@@ -127,9 +202,11 @@ fn owner_is_live(dir: &Path, procs: &dyn ProcessTable, now: SystemTime) -> bool 
     }
 }
 
-/// Remove sessions whose bridge is gone, killing any VM still using them.
+/// Remove sessions whose bridge is gone, killing their VM processes first.
 /// Only this user's real directories named `jarvis-vm-session-*` directly
 /// under `root` are touched; symlinks and everything else are left alone.
+/// The qemu and its supervisor each lead their own process group (both are
+/// started with a new session) and both match, so each is killed directly.
 pub fn sweep_with(root: &Path, procs: &dyn ProcessTable, now: SystemTime) -> SweepReport {
     use std::os::unix::fs::MetadataExt;
     let mut report = SweepReport::default();
@@ -146,9 +223,10 @@ pub fn sweep_with(root: &Path, procs: &dyn ProcessTable, now: SystemTime) -> Swe
             report.kept_live += 1;
             continue;
         }
-        for pid in procs.processes_using(&dir) {
-            procs.kill(pid);
-            report.killed += 1;
+        for (pid, start) in procs.vm_processes_using(&dir) {
+            if procs.kill_if_same(pid, &start) {
+                report.killed += 1;
+            }
         }
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => report.removed += 1,
@@ -158,13 +236,13 @@ pub fn sweep_with(root: &Path, procs: &dyn ProcessTable, now: SystemTime) -> Swe
     report
 }
 
-/// Daemon start: sweep the configured scratch root once, on the blocking pool.
-pub async fn sweep_at_start() -> anyhow::Result<()> {
+/// One blocking sweep of the configured scratch root, logged as one INFO
+/// line. Called from the daemon's hourly sweep loop on the blocking pool.
+pub fn sweep_and_log() {
     let root = scratch_dir();
-    let report = tokio::task::spawn_blocking(move || sweep_with(&root, &ProcFs, SystemTime::now())).await?;
+    let report = sweep_with(&root, &ProcFs, SystemTime::now());
     tracing::info!(removed = report.removed, kept_live = report.kept_live, killed = report.killed,
-        "build scratch sweep (#1036)");
-    Ok(())
+        root = %root.display(), "build scratch sweep (#1036)");
 }
 
 #[cfg(test)]
@@ -176,16 +254,20 @@ mod tests {
     #[derive(Default)]
     struct FakeProcs {
         running: HashMap<u32, String>,
-        users: Vec<(u32, PathBuf)>,
+        vms: Vec<(u32, String, PathBuf)>,
         killed: RefCell<Vec<u32>>,
     }
 
     impl ProcessTable for FakeProcs {
         fn start_time(&self, pid: u32) -> Option<String> { self.running.get(&pid).cloned() }
-        fn processes_using(&self, dir: &Path) -> Vec<u32> {
-            self.users.iter().filter(|(_, path)| path.starts_with(dir)).map(|(pid, _)| *pid).collect()
+        fn vm_processes_using(&self, dir: &Path) -> Vec<(u32, String)> {
+            self.vms.iter().filter(|(_, _, path)| path.starts_with(dir))
+                .map(|(pid, start, _)| (*pid, start.clone())).collect()
         }
-        fn kill(&self, pid: u32) { self.killed.borrow_mut().push(pid); }
+        fn kill_if_same(&self, pid: u32, _start_time: &str) -> bool {
+            self.killed.borrow_mut().push(pid);
+            true
+        }
     }
 
     fn session(root: &Path, name: &str, owner: Option<serde_json::Value>) -> PathBuf {
@@ -196,6 +278,45 @@ mod tests {
             std::fs::write(dir.join("owner.json"), owner.to_string()).unwrap();
         }
         dir
+    }
+
+    /// A real child process, killed and reaped when dropped.
+    struct Child(std::process::Child);
+
+    impl Child {
+        fn spawn(program: &str, args: &[&str]) -> Self {
+            let child = std::process::Command::new(program).args(args)
+                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()).spawn().unwrap();
+            let pid = child.id();
+            // Wait until exec has replaced the forked test binary.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+                .and_then(|exe| exe.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .is_none_or(|name| !name.starts_with(program)) {
+                assert!(std::time::Instant::now() < deadline, "{program} did not start");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Self(child)
+        }
+        fn pid(&self) -> u32 { self.0.id() }
+        fn killed_by_sigkill(&mut self) -> bool {
+            use std::os::unix::process::ExitStatusExt;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = self.0.try_wait().unwrap() { return status.signal() == Some(libc::SIGKILL); }
+                if std::time::Instant::now() > deadline { return false; }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        fn alive(&mut self) -> bool { self.0.try_wait().unwrap().is_none() }
+    }
+
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     #[test]
@@ -233,6 +354,36 @@ mod tests {
         assert!(check_outside_write_roots(&temp.path().join("scratch"), &[]).is_ok());
     }
 
+    /// L3: a root that does not exist yet is resolved through its nearest
+    /// existing ancestor, never compared as a raw path.
+    #[test]
+    fn a_not_yet_created_root_resolves_through_its_existing_ancestors() {
+        let temp = tempfile::tempdir().unwrap();
+        let write_root = temp.path().join("checkout");
+        std::fs::create_dir_all(&write_root).unwrap();
+        let link = temp.path().join("volume-link");
+        std::os::unix::fs::symlink(&write_root, &link).unwrap();
+        let roots = vec![write_root.clone()];
+        assert!(check_outside_write_roots(&link.join("later/scratch"), &roots).is_err(),
+                "a missing root below a symlink into a write root is inside it");
+        assert!(check_outside_write_roots(&temp.path().join("elsewhere/../checkout/scratch"), &roots).is_err(),
+                "parent components are refused");
+        assert!(check_outside_write_roots(&temp.path().join("later/scratch"), &roots).is_ok());
+        // A write root that does not exist resolves the same way.
+        let missing_root = vec![link.join("nested")];
+        assert!(check_outside_write_roots(&write_root.join("nested/scratch"), &missing_root).is_err());
+    }
+
+    /// L1: a refused root makes builds unavailable; it never fails the launch.
+    #[test]
+    fn a_refused_scratch_root_is_withheld_from_the_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = temp.path().join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        assert_eq!(policy_scratch_dir(checkout.join("scratch"), &[checkout.clone()]), None);
+        assert_eq!(policy_scratch_dir(temp.path().join("scratch"), &[checkout]), Some(temp.path().join("scratch")));
+    }
+
     #[test]
     fn sweep_reaps_stale_sessions_and_their_vms_but_keeps_live_ones() {
         let temp = tempfile::tempdir().unwrap();
@@ -249,8 +400,8 @@ mod tests {
         let procs = FakeProcs {
             // 4102 is running but is a different process (pid reused).
             running: HashMap::from([(4102, "999".into()), (4103, "333".into())]),
-            users: vec![(5001, stale.join("tmp/jarvis-vm-build-synthetic/initrd.gz")),
-                        (5002, live.join("tmp/jarvis-vm-build-synthetic/initrd.gz"))],
+            vms: vec![(5001, "51".into(), stale.join("tmp/jarvis-vm-build-synthetic/initrd.gz")),
+                      (5002, "52".into(), live.join("tmp/jarvis-vm-build-synthetic/initrd.gz"))],
             ..Default::default()
         };
         let report = sweep_with(root, &procs, SystemTime::now());
@@ -272,6 +423,71 @@ mod tests {
         assert_eq!(sweep_with(temp.path(), &procs, later).removed, 1);
         assert!(!starting.exists());
         assert_eq!(sweep_with(&temp.path().join("absent"), &procs, later), SweepReport::default());
+    }
+
+    #[test]
+    fn only_qemu_or_python_with_an_argument_rooted_in_the_session_matches() {
+        let dir = Path::new("/scratch/jarvis-vm-session-x");
+        let arg = |a: &str| a.to_string();
+        let initrd = arg("/scratch/jarvis-vm-session-x/tmp/jarvis-build-vm-1/initrd.gz");
+        assert!(is_session_vm_process("qemu-system-x86_64", &[arg("-initrd"), initrd.clone()], dir));
+        assert!(is_session_vm_process("python3.12", &[arg("-I"), arg("/launch/supervisor.py"), initrd.clone()], dir));
+        assert!(is_session_vm_process("qemu-system-x86_64",
+            &[arg("local,id=workspace,path=/scratch/jarvis-vm-session-x/tmp/w,security_model=none")], dir));
+        assert!(is_session_vm_process("qemu-system-x86_64",
+            &[arg("if=none,id=buildcache,werror=report,file=/scratch/jarvis-vm-session-x/build-cache.img")], dir));
+        // Other executables never match, even with the exact argument.
+        assert!(!is_session_vm_process("bash", &[initrd.clone()], dir));
+        assert!(!is_session_vm_process("du", &[initrd.clone()], dir));
+        // An argument that merely mentions the path does not match.
+        assert!(!is_session_vm_process("python3", &[arg("-c"), arg("print('/scratch/jarvis-vm-session-x/')")], dir));
+        assert!(!is_session_vm_process("qemu-system-x86_64", &[arg("-name=/scratch/jarvis-vm-session-x/")], dir));
+        // A sibling session whose name extends this one is a different session.
+        assert!(!is_session_vm_process("qemu-system-x86_64", &[arg("/scratch/jarvis-vm-session-xy/build-cache.img")], dir));
+    }
+
+    /// M1 with real processes: a stale session's VM-like python3 is killed; a
+    /// shell or a python3 that only mentions the path is not.
+    #[test]
+    fn real_sweep_kills_only_vm_processes_of_a_stale_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let stale = session(temp.path(), "jarvis-vm-session-stale", Some(serde_json::json!({"pid": u32::MAX, "start_time": "1"})));
+        let vm_arg = format!("{}/tmp/jarvis-build-vm-synthetic/cleanup-complete", stale.display());
+        let mut vm_like = Child::spawn("python3", &["-c", "import time; time.sleep(60)", &vm_arg]);
+        let mut shell = Child::spawn("bash", &["-c", &format!("sleep 60; : {}/", stale.display())]);
+        let mut mention = Child::spawn("python3", &["-c", &format!("import time; time.sleep(60) # {}/", stale.display())]);
+        let report = sweep_with(temp.path(), &ProcFs, SystemTime::now());
+        assert_eq!((report.removed, report.killed), (1, 1), "{report:?}");
+        assert!(vm_like.killed_by_sigkill(), "the stale session's VM process must be killed");
+        assert!(shell.alive(), "a shell mentioning the session path must survive");
+        assert!(mention.alive(), "a python3 that only mentions the path must survive");
+        assert!(!stale.exists());
+    }
+
+    /// M2: a live session (owner = a real running process) survives a real sweep.
+    #[test]
+    fn real_sweep_keeps_a_live_session_and_its_processes() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("jarvis-vm-session-live");
+        let arg = format!("{}/tmp/jarvis-build-vm-synthetic/cleanup-complete", dir.display());
+        let mut owner = Child::spawn("python3", &["-c", "import time; time.sleep(60)"]);
+        let start = ProcFs.start_time(owner.pid()).unwrap();
+        session(temp.path(), "jarvis-vm-session-live", Some(serde_json::json!({"pid": owner.pid(), "start_time": start})));
+        let mut vm_like = Child::spawn("python3", &["-c", "import time; time.sleep(60)", &arg]);
+        let report = sweep_with(temp.path(), &ProcFs, SystemTime::now());
+        assert_eq!(report, SweepReport { removed: 0, kept_live: 1, killed: 0 });
+        assert!(dir.join("tmp/jarvis-vm-build-synthetic/initrd.gz").exists());
+        assert!(owner.alive() && vm_like.alive());
+    }
+
+    #[test]
+    fn kill_if_same_refuses_a_mismatched_start_time() {
+        let mut child = Child::spawn("python3", &["-c", "import time; time.sleep(60)"]);
+        assert!(!ProcFs.kill_if_same(child.pid(), "0"), "a reused pid (other start time) is never signalled");
+        assert!(child.alive());
+        let start = ProcFs.start_time(child.pid()).unwrap();
+        assert!(ProcFs.kill_if_same(child.pid(), &start));
+        assert!(child.killed_by_sigkill());
     }
 
     /// Owner-run receipt for C6: point it at a scratch root holding a session

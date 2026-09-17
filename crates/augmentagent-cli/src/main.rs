@@ -2810,11 +2810,11 @@ async fn main() -> Result<()> {
                 augmentagent_channel_core::handoff::retention_from_env(),
                 augmentagent_channel_core::handoff::SWEEP_INTERVAL,
                 shutdown.clone(),
+                // #1036 — also reap Codex VM build sessions left by a killed
+                // bridge (and any VM still running for them), hourly.
+                Some(std::sync::Arc::new(augmentagent_channel_core::build_scratch::sweep_and_log)),
             )));
 
-            // #1036 — Codex VM build scratch: remove sessions left by a killed
-            // bridge (and any VM still using them), once at start.
-            tasks.push(tokio::spawn(augmentagent_channel_core::build_scratch::sweep_at_start()));
 
             // Voice-capture listener (#80): long-poll the capture bot. Inert
             // unless a token is in the keyring AND the chat allowlist is

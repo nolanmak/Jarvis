@@ -237,8 +237,7 @@ impl BridgeLaunch {
         }
         environment.extend(opts.env.iter().cloned());
         let runner = build_runner();
-        let scratch = crate::build_scratch::scratch_dir();
-        crate::build_scratch::check_outside_write_roots(&scratch, &write_roots)?;
+        let scratch = crate::build_scratch::policy_scratch_dir(crate::build_scratch::scratch_dir(), &write_roots);
         if let BuildRunner::Unavailable { reason } = &runner {
             if opts.allowed_tools.iter().any(|tool| is_build_tool_pattern(tool)) {
                 tracing::warn!(reason, "codex build commands will fail closed: no build VM (#1041)");

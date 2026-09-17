@@ -626,15 +626,20 @@ fn unlink_at(directory: &std::fs::File, name: &OsStr, flags: libc::c_int) -> std
     Ok(())
 }
 
+/// Another blocking sweep run on the same ticks (#1036: build scratch).
+pub type SweepHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 /// The daemon's sweep: a pass at start, then every `interval`, each on the
-/// blocking pool. A removal needs two consecutive passes to agree (see
+/// blocking pool; `also` runs first on every tick, on the blocking pool too. A removal needs two consecutive passes to agree (see
 /// [`Pass::Confirm`]). Failures only log; shutdown stops the loop.
 pub async fn run_sweep_loop(root: Option<PathBuf>, grace: Duration, interval: Duration,
-    shutdown: tokio_util::sync::CancellationToken) -> anyhow::Result<()> {
-    let Some(root) = root else {
+    shutdown: tokio_util::sync::CancellationToken, also: Option<SweepHook>) -> anyhow::Result<()> {
+    if root.is_none() {
         tracing::warn!("handoff journal sweep disabled: no HOME to locate the journal root");
-        return Ok(());
-    };
+        if also.is_none() {
+            return Ok(());
+        }
+    }
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut previous = HashMap::new();
@@ -642,7 +647,13 @@ pub async fn run_sweep_loop(root: Option<PathBuf>, grace: Duration, interval: Du
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
             _ = ticker.tick() => {
-                let root = root.clone();
+                if let Some(hook) = also.clone() {
+                    // #1036: build-scratch sweep, on the blocking pool; it logs itself.
+                    if let Err(error) = tokio::task::spawn_blocking(move || hook()).await {
+                        tracing::warn!("build scratch sweep task failed: {error}");
+                    }
+                }
+                let Some(root) = root.clone() else { continue };
                 let mut carried = std::mem::take(&mut previous);
                 let pass = tokio::task::spawn_blocking(move || {
                     let result = sweep(&root, grace, Pass::Confirm(&mut carried));
@@ -1624,6 +1635,31 @@ for line in sys.stdin:
         assert!(recent.exists());
     }
 
+    /// #1036 H2: the hourly loop also runs the build-scratch sweep, off the
+    /// async runtime, even when the journal root is unknown.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sweep_loop_also_runs_the_build_scratch_sweep_on_every_tick() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runtime_thread = std::thread::current().id();
+        let seen = std::sync::Arc::clone(&calls);
+        let off_runtime = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = std::sync::Arc::clone(&off_runtime);
+        let also: SweepHook = std::sync::Arc::new(move || {
+            flag.fetch_and(std::thread::current().id() != runtime_thread, std::sync::atomic::Ordering::SeqCst);
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(run_sweep_loop(None, GRACE, Duration::from_millis(20), shutdown.clone(), Some(also)));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while calls.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            assert!(std::time::Instant::now() < deadline, "the scratch sweep did not run on consecutive ticks");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(off_runtime.load(std::sync::atomic::Ordering::SeqCst), "the scratch sweep must run on the blocking pool");
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn sweep_loop_runs_at_start_and_stops_on_shutdown() {
         assert!(SWEEP_INTERVAL <= Duration::from_secs(3600), "C2: at least hourly");
@@ -1631,7 +1667,7 @@ for line in sys.stdin:
         let journal = request(&root, "synthetic-startup-sweep", Some(json!([completed_row()])));
         age(&journal, TWO_DAYS);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let task = tokio::spawn(run_sweep_loop(Some(root.clone()), GRACE, Duration::from_millis(50), shutdown.clone()));
+        let task = tokio::spawn(run_sweep_loop(Some(root.clone()), GRACE, Duration::from_millis(50), shutdown.clone(), None));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !gone(&journal) {
             assert!(std::time::Instant::now() < deadline, "startup sweep did not run");

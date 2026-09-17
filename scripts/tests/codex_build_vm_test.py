@@ -101,6 +101,18 @@ class BuildScratchPlacementTests(unittest.TestCase):
                     vm.run(runtime, workspace, ['true'], {}, scratch_dir=str(root), build_cache=cache)
 
 
+class QemuCommandTests(unittest.TestCase):
+    def test_build_cache_drive_reports_io_errors_instead_of_pausing_the_guest(self):
+        config = {name: '/synthetic/' + name for name in ('qemu', 'kernel', 'firmware', 'data_dir')}
+        config['memory_mb'] = 512
+        command = vm.qemu_command(config, Path('/synthetic/initrd.gz'), [], '/synthetic/session/build-cache.img')
+        drive = command[command.index('-drive') + 1]
+        self.assertIn('werror=report', drive.split(','))
+        self.assertIn('rerror=report', drive.split(','))
+        self.assertIn('file=/synthetic/session/build-cache.img', drive)
+        self.assertNotIn('-drive', vm.qemu_command(config, Path('/synthetic/initrd.gz'), [], None))
+
+
 @unittest.skipUnless(os.environ.get('JARVIS_TEST_VM_CONFIG'), 'requires a provisioned private KVM runtime')
 class BuildVmTests(unittest.TestCase):
     def test_output_limit_stops_a_running_command_before_its_deadline(self):
