@@ -1121,6 +1121,53 @@ class HandoffTests(unittest.TestCase):
                 fresh.observe_hook(retry)
                 self.assertEqual(len(fresh.load()['operations']),1)
 
+    def test_failed_post_tool_checkpoint_stays_uncertain_and_is_never_replayed(self):
+        # #1039 C3, through the shipped --handoff-hook entry point.
+        import fcntl
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'operations.json'
+            def hook(event):
+                return subprocess.run([sys.executable,'-I',str(Path(bridge.__file__)),'--handoff-hook',str(path)],
+                    input=json.dumps(event),text=True,capture_output=True)
+            def status():
+                return [row['status'] for row in json.loads(path.read_text())['operations']]
+            event={'hook_event_name':'PreToolUse','tool_use_id':'synthetic-call-1',
+                'tool_name':'mcp__fixture__send','tool_input':{'to':'synthetic'}}
+            self.assertEqual(hook(event).returncode,0)
+            finished=dict(event,hook_event_name='PostToolUse',
+                tool_response={'content':[{'type':'text','text':'synthetic-receipt'}]})
+            # The journal lock is held elsewhere.
+            with open(str(path)+'.lock','a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                busy=hook(finished)
+            self.assertEqual(busy.returncode,2)
+            self.assertIn('reconciliation required',busy.stderr)
+            self.assertNotIn('synthetic',busy.stderr)
+            self.assertEqual(status(),['started'])
+            # The completion receipt cannot be written (root ignores directory modes).
+            if os.geteuid()!=0:
+                os.chmod(tmp,0o500)
+                try:
+                    unwritable=hook(finished)
+                finally:
+                    os.chmod(tmp,0o700)
+                self.assertEqual(unwritable.returncode,2)
+                self.assertEqual(status(),['started'])
+            # A failed tool is not evidence that its effect is absent.
+            self.assertEqual(hook(dict(event,hook_event_name='PostToolUseFailure',error='synthetic')).returncode,0)
+            self.assertEqual(status(),['started'])
+            before=path.read_bytes()
+            # Neither provider replays it: Claude's retry is blocked...
+            self.assertEqual(hook(dict(event,tool_use_id='synthetic-retry')).returncode,2)
+            # ...and Codex's broker refuses before running the effect.
+            def forbidden():
+                self.fail('an uncertain operation must not be replayed')
+            with self.assertRaises(bridge.ReconciliationRequired):
+                bridge.HandoffJournal(path).execute(event['tool_name'],event['tool_input'],forbidden)
+            self.assertEqual(path.read_bytes(),before)
+            self.assertEqual([row['status'] for row in bridge.HandoffJournal(path).inspect()],['started'])
+
     def test_primary_can_rerun_a_local_build_after_editing_source(self):
         with tempfile.TemporaryDirectory() as tmp:
             journal=bridge.HandoffJournal(Path(tmp)/'handoff.json')

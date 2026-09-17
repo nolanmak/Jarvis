@@ -103,21 +103,72 @@ impl ClaudeHooks {
             .ok_or_else(|| anyhow::anyhow!("invalid primary settings"))?;
         let hooks = object.entry("hooks").or_insert_with(|| json!({})).as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("invalid primary hooks"))?;
-        fn shell_quote(value: &str) -> String {
-            format!("'{}'", value.replace('\'', "'\\''"))
-        }
-        // Also turn interpreter/loader failures into a blocking hook result.
-        let command = format!("python3 -I {} --handoff-hook {} || exit 2",
-            shell_quote(&script.to_string_lossy()), shell_quote(&journal.to_string_lossy()));
+        let command = journal_hook_command(&script, journal, HOOK_CHECKPOINT_SECS, HOOK_KILL_GRACE_SECS);
         for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
             let groups = hooks.entry(event).or_insert_with(|| json!([])).as_array_mut()
                 .ok_or_else(|| anyhow::anyhow!("invalid primary hook groups"))?;
             groups.push(json!({"matcher": ".*", "hooks": [{
-                "type": "command", "command": command, "timeout": 10
+                "type": "command", "command": command, "timeout": HOOK_CLAUDE_TIMEOUT_SECS
             }]}));
         }
         Ok(Some(Self { _directory: directory, settings_json: serde_json::to_string(&settings)? }))
     }
+}
+
+// ---- Fail-closed journal hook (#1039) ----
+//
+// Claude Code cancels a hook that outlives its `timeout` and then runs the
+// tool anyway, so its own timeout fails open. It also waits for the hook's
+// stdout and stderr to close, not for the hook's shell to exit (both measured
+// against Claude Code 2.1.273). A checkpoint stuck in fsync can be
+// uninterruptible, so even SIGKILL may not end it until the I/O returns. The
+// checkpoint must therefore never hold the hook's output, and a bounded
+// wrapper must answer on its behalf.
+//
+// The checkpoint (normally ~60 ms: interpreter start, flock, two fsyncs) runs
+// under `timeout` with its stdout discarded and its stderr on an inner pipe.
+// A relay, itself under `timeout`, copies that pipe out. The shell exits 0
+// only when it reads the checkpoint's own exit status 0. Everything else
+// blocks with exit 2: a refusal from the bridge (whose message is passed on),
+// a timeout, a missing interpreter or wrapper, or a status the relay never
+// saw. A stuck checkpoint that holds the journal lock also keeps later
+// checkpoints refused until it ends. Hooks run under `/bin/sh -c` (dash on
+// this host), so the command is POSIX sh only.
+
+/// Deadline for one checkpoint. Several hundred times its normal duration,
+/// so a slow fsync under heavy writeback still completes and the tool runs.
+const HOOK_CHECKPOINT_SECS: u64 = 30;
+/// SIGTERM, then SIGKILL this much later. `timeout` sends SIGKILL to its own
+/// process group, which ends `timeout` itself even while the checkpoint is
+/// uninterruptible, so its exit status is never held up.
+const HOOK_KILL_GRACE_SECS: u64 = 2;
+/// Claude Code's own deadline. It fails open, so it sits well above
+/// [`hook_answer_secs`] to cover process start-up on a busy machine.
+const HOOK_CLAUDE_TIMEOUT_SECS: u64 = 60;
+const HOOK_EXIT_MARK: &str = "jarvis-handoff-hook-exit:";
+
+/// The wrapper answers by this bound: the relay outlasts the checkpoint's
+/// deadline and kill grace by a second, so it reads the status line whenever
+/// `timeout` reports one.
+const fn hook_answer_secs(checkpoint_secs: u64, kill_grace_secs: u64) -> u64 {
+    checkpoint_secs + kill_grace_secs + 1
+}
+
+const _: () = assert!(hook_answer_secs(HOOK_CHECKPOINT_SECS, HOOK_KILL_GRACE_SECS) + 20 <= HOOK_CLAUDE_TIMEOUT_SECS);
+
+/// One command for every journal hook event.
+fn journal_hook_command(script: &Path, journal: &Path, checkpoint_secs: u64, kill_grace_secs: u64) -> String {
+    fn shell_quote(path: &Path) -> String {
+        format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+    }
+    let (script, journal) = (shell_quote(script), shell_quote(journal));
+    let answer_secs = hook_answer_secs(checkpoint_secs, kill_grace_secs);
+    let mark = HOOK_EXIT_MARK;
+    format!("out=$( {{ timeout -k {kill_grace_secs} {checkpoint_secs} python3 -I {script} --handoff-hook {journal} \
+        2>&1 >/dev/null; echo \"{mark}$?\"; }} | timeout {answer_secs} head -c 65536 ); \
+        case $out in *{mark}0) exit 0;; \
+        *{mark}2) printf '%s' \"${{out%{mark}*}}\" >&2; exit 2;; esac; \
+        echo 'Handoff checkpoint failed or did not finish in time; reconciliation required.' >&2; exit 2")
 }
 
 // ---- Journal retention (#1035) ----
@@ -632,6 +683,84 @@ mod tests {
         live_external_handoff(true).await;
     }
 
+    /// Stands in for a journal checkpoint stuck in an uninterruptible fsync:
+    /// it never finishes, and a descendant outside the hook's process group
+    /// keeps the hook's output open the way an unkillable process would.
+    fn write_stalled_checkpoint(script: &Path, stall_secs: u64) {
+        std::fs::write(script, format!("import os, sys, time\n\
+            sys.stdin.read()\n\
+            if os.fork() == 0:\n    os.setsid()\n    time.sleep({stall_secs})\n    os._exit(0)\n\
+            time.sleep({stall_secs})\n")).unwrap();
+    }
+
+    /// C1 receipt (#1039). Run once before and once after a hook change:
+    /// `cargo test -p augmentagent-channel-core --lib -- --ignored --nocapture
+    ///  handoff::tests::live_stalled_journal_checkpoint_blocks_the_tool_call`
+    #[test]
+    #[ignore = "requires Claude login; one tiny Haiku call; writes a synthetic marker in a temp dir"]
+    fn live_stalled_journal_checkpoint_blocks_the_tool_call() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+        let scratch = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let workspace = scratch.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let mut opts = crate::reasoner::loop_parse_opts();
+        opts.handoff_path = Some(scratch.path().join("operations.json"));
+        let hooks = ClaudeHooks::prepare(&opts).unwrap().unwrap();
+        // Outlasts every hook bound, so a cancelled hook shows as a written marker.
+        write_stalled_checkpoint(&hooks._directory.path().join("handoff-hook.py"), 90);
+        let settings: Value = serde_json::from_str(&hooks.settings_json).unwrap();
+        let hook = &settings["hooks"]["PreToolUse"][0]["hooks"][0];
+        println!("hook timeout (s): {}", hook["timeout"]);
+        println!("hook command shape: {}", hook["command"].as_str().unwrap()
+            .replace(&*hooks._directory.path().to_string_lossy(), "<hook-dir>")
+            .replace(&*scratch.path().to_string_lossy(), "<scratch>"));
+        // Same flags the reasoner passes (reasoner.rs call_once), cheapest model.
+        let started = std::time::Instant::now();
+        let mut child = Command::new(std::env::var("CLAUDE_CLI").unwrap_or_else(|_| "claude".into()))
+            .args(["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits",
+                "--allowedTools", "Write", "--system-prompt",
+                "You are a test harness. Follow the instruction exactly and keep replies to one word.",
+                "--model", "claude-haiku-4-5-20251001", "--settings", &hooks.settings_json])
+            .current_dir(&workspace)
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().unwrap();
+        child.stdin.take().unwrap().write_all(b"Use the Write tool once to create marker.txt in the \
+            current directory containing the word synthetic. If the tool call is blocked or fails, \
+            do not retry; reply BLOCKED. Otherwise reply WRITTEN.").unwrap();
+        let output = child.wait_with_output().unwrap();
+        let elapsed = started.elapsed();
+        let marker = workspace.join("marker.txt");
+        println!("claude exit: {:?}; wall time: {:.1}s", output.status.code(), elapsed.as_secs_f64());
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let Ok(event) = serde_json::from_str::<Value>(line) else { continue };
+            let clip = |text: &str| text.chars().take(240).collect::<String>()
+                .replace(&*scratch.path().to_string_lossy(), "<scratch>");
+            match event["type"].as_str() {
+                Some("assistant") => for block in event["message"]["content"].as_array().into_iter().flatten() {
+                    match block["type"].as_str() {
+                        Some("tool_use") => println!("tool_use: {}", block["name"]),
+                        Some("text") => println!("assistant: {}", clip(block["text"].as_str().unwrap_or(""))),
+                        _ => {}
+                    }
+                },
+                Some("user") => for block in event["message"]["content"].as_array().into_iter().flatten() {
+                    if block["type"] == "tool_result" {
+                        println!("tool_result (is_error={}): {}", block["is_error"], clip(&block["content"].to_string()));
+                    }
+                },
+                Some("system") if event["subtype"] != "init" => println!("system {}: {}", event["subtype"],
+                    clip(&event.get("content").map(Value::to_string).unwrap_or_default())),
+                Some("result") => println!("result: subtype={} turns={} text={}", event["subtype"],
+                    event["num_turns"], clip(event["result"].as_str().unwrap_or(""))),
+                _ => {}
+            }
+        }
+        println!("marker written: {}", marker.exists());
+        assert!(!marker.exists(), "the tool ran although its journal checkpoint never completed");
+    }
+
     async fn live_external_handoff(disconnect: bool) {
         use crate::reasoner::{ClaudeCliReasoner, Reasoner};
         use crate::codex::CodexCliReasoner;
@@ -806,7 +935,7 @@ for line in sys.stdin:
         for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
             let groups = settings["hooks"][event].as_array().unwrap();
             let command = groups.last().unwrap()["hooks"][0]["command"].as_str().unwrap();
-            assert!(command.ends_with("|| exit 2"));
+            assert!(command.ends_with("exit 2"));
             assert!(command.contains("'\\''"));
         }
         let command = settings["hooks"]["PreToolUse"][1]["hooks"][0]["command"].as_str().unwrap();
@@ -831,6 +960,172 @@ for line in sys.stdin:
         assert!(run(finished).status.success());
         let state: Value = serde_json::from_slice(&std::fs::read(opts.handoff_path.as_ref().unwrap()).unwrap()).unwrap();
         assert_eq!(state["operations"][0]["status"], "completed");
+    }
+
+    // ---- #1039 fail-closed journal hook ----
+
+    fn shell_quoted(path: &Path) -> String {
+        format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+    }
+
+    /// Runs a hook command the way Claude Code 2.1.273 does (`/bin/sh -c`,
+    /// event on stdin) and, like it, waits for stdout and stderr to close.
+    fn run_hook(command: &str, event: &Value, path_env: Option<&std::ffi::OsStr>)
+        -> (Option<i32>, Duration, String) {
+        use std::process::{Command, Stdio};
+        let mut shell = Command::new("/bin/sh");
+        shell.args(["-c", command]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if let Some(path) = path_env { shell.env("PATH", path); }
+        let started = std::time::Instant::now();
+        let mut child = shell.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(event.to_string().as_bytes()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        (output.status.code(), started.elapsed(), String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+
+    fn primary_event(phase: &str, id: &str) -> Value {
+        json!({"hook_event_name": phase, "tool_use_id": id,
+            "tool_name": "mcp__fixture__send", "tool_input": {"to": "synthetic"}})
+    }
+
+    #[test]
+    fn journal_hook_is_one_pinned_fail_closed_command_for_every_event() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let journal = temp.path().join("private journal's state.json");
+        let mut opts = crate::reasoner::loop_parse_opts();
+        opts.handoff_path = Some(journal.clone());
+        let launch = ClaudeHooks::prepare(&opts).unwrap().unwrap();
+        let script = launch._directory.path().join("handoff-hook.py");
+        let expected = format!("out=$( {{ timeout -k 2 30 python3 -I {} --handoff-hook {} 2>&1 >/dev/null; \
+            echo \"jarvis-handoff-hook-exit:$?\"; }} | timeout 33 head -c 65536 ); \
+            case $out in *jarvis-handoff-hook-exit:0) exit 0;; \
+            *jarvis-handoff-hook-exit:2) printf '%s' \"${{out%jarvis-handoff-hook-exit:*}}\" >&2; exit 2;; esac; \
+            echo 'Handoff checkpoint failed or did not finish in time; reconciliation required.' >&2; exit 2",
+            shell_quoted(&script), shell_quoted(&journal));
+        let settings: Value = serde_json::from_str(&launch.settings_json).unwrap();
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+            assert_eq!(settings["hooks"][event], json!([{"matcher": ".*", "hooks": [{
+                "type": "command", "command": expected, "timeout": 60}]}]), "{event}");
+        }
+    }
+
+    /// C1 without a model: the hook answers "block" within its bound however the
+    /// checkpoint stalls, and whenever the checkpoint cannot run at all.
+    #[test]
+    fn journal_hook_blocks_within_its_bound_when_the_checkpoint_stalls_or_cannot_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let journal = temp.path().join("operations.json");
+        let event = primary_event("PreToolUse", "synthetic-1");
+        // Small injected bounds: 1 s deadline and 1 s kill grace answer in 3 s.
+        let bound = Duration::from_secs(hook_answer_secs(1, 1)) + Duration::from_millis(1500);
+        let stub = |name: &str, body: &str| {
+            let path = temp.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            path
+        };
+        let killable = stub("slow.py", "import sys, time\nsys.stdin.read()\ntime.sleep(6)\n");
+        let ignores_term = stub("ignores-term.py",
+            "import signal, sys, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\nsys.stdin.read()\ntime.sleep(6)\n");
+        let unkillable = temp.path().join("unkillable.py");
+        write_stalled_checkpoint(&unkillable, 6);
+        for script in [&killable, &ignores_term, &unkillable] {
+            let (code, elapsed, stderr) = run_hook(&journal_hook_command(script, &journal, 1, 1), &event, None);
+            assert_eq!(code, Some(2), "{script:?}: {stderr}");
+            assert!(elapsed < bound, "{script:?} answered after {elapsed:?}");
+            assert!(stderr.contains("did not finish in time"), "{script:?}: {stderr}");
+        }
+
+        // The checkpoint cannot start: missing script, interpreter or wrapper.
+        let missing = temp.path().join("missing.py");
+        let (code, _, _) = run_hook(&journal_hook_command(&missing, &journal, 1, 1), &event, None);
+        assert_eq!(code, Some(2));
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let (code, _, _) = run_hook(&journal_hook_command(&killable, &journal, 1, 1), &event, Some(bin.as_os_str()));
+        assert_eq!(code, Some(2), "no timeout, head or python3");
+        for tool in ["timeout", "head"] {
+            let found = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+                .map(|dir| dir.join(tool)).find(|path| path.is_file()).unwrap();
+            std::os::unix::fs::symlink(found, bin.join(tool)).unwrap();
+        }
+        let (code, _, stderr) = run_hook(&journal_hook_command(&killable, &journal, 1, 1), &event, Some(bin.as_os_str()));
+        assert_eq!(code, Some(2), "no python3");
+        assert!(stderr.contains("reconciliation required"), "{stderr}");
+
+        // A real checkpoint answers promptly, and a bridge refusal keeps its message.
+        let bridge = stub("bridge.py", include_str!("../../../scripts/codex-tool-bridge.py"));
+        let command = journal_hook_command(&bridge, &journal, 1, 1);
+        let (code, _, stderr) = run_hook(&command, &event, None);
+        assert_eq!((code, stderr.as_str()), (Some(0), ""));
+        let (code, _, stderr) = run_hook(&command, &primary_event("PreToolUse", "synthetic-retry"), None);
+        assert_eq!((code, stderr.as_str()),
+            (Some(2), "Handoff checkpoint unavailable or uncertain; reconciliation required.\n"));
+    }
+
+    /// C3: a post-tool checkpoint that fails leaves the operation uncertain;
+    /// nothing replays it and nothing records it as completed.
+    #[test]
+    fn failed_post_tool_checkpoint_leaves_the_operation_uncertain() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let journal = temp.path().join("operations.json");
+        let mut opts = crate::reasoner::loop_parse_opts();
+        opts.handoff_path = Some(journal.clone());
+        let launch = ClaudeHooks::prepare(&opts).unwrap().unwrap();
+        let settings: Value = serde_json::from_str(&launch.settings_json).unwrap();
+        let command = |event: &str| settings["hooks"][event][0]["hooks"][0]["command"].as_str().unwrap().to_owned();
+        let status = || -> Value {
+            serde_json::from_slice::<Value>(&std::fs::read(&journal).unwrap()).unwrap()["operations"][0]["status"].clone()
+        };
+        let (code, _, stderr) = run_hook(&command("PreToolUse"), &primary_event("PreToolUse", "synthetic-1"), None);
+        assert_eq!(code, Some(0), "{stderr}");
+        assert_eq!(status(), "started");
+        let mut finished = primary_event("PostToolUse", "synthetic-1");
+        finished["tool_response"] = json!({"content": [{"type": "text", "text": "synthetic-receipt"}]});
+
+        // The journal is busy (another checkpoint holds its lock).
+        let lock = hold_lock(&temp.path().join("operations.json.lock"));
+        let (code, _, stderr) = run_hook(&command("PostToolUse"), &finished, None);
+        drop(lock);
+        assert_eq!(code, Some(2));
+        assert!(stderr.contains("reconciliation required") && !stderr.contains("synthetic"), "{stderr}");
+        assert_eq!(status(), "started");
+
+        // The checkpoint cannot be written (root ignores directory modes).
+        if euid() != 0 {
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+            let (code, _, stderr) = run_hook(&command("PostToolUse"), &finished, None);
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(code, Some(2), "{stderr}");
+            assert_eq!(status(), "started");
+        }
+
+        // The interpreter is unavailable.
+        let (code, _, _) = run_hook(&command("PostToolUse"), &finished,
+            Some(std::ffi::OsStr::new("/nonexistent")));
+        assert_eq!(code, Some(2));
+        assert_eq!(status(), "started");
+
+        // A failed tool is not evidence that its effect is absent.
+        let (code, _, stderr) = run_hook(&command("PostToolUseFailure"),
+            &primary_event("PostToolUseFailure", "synthetic-1"), None);
+        assert_eq!(code, Some(0), "{stderr}");
+        assert_eq!(status(), "started");
+
+        // Replay is refused: a retried call is blocked and the receipt is unchanged.
+        let before = std::fs::read(&journal).unwrap();
+        let (code, _, stderr) = run_hook(&command("PreToolUse"), &primary_event("PreToolUse", "synthetic-retry"), None);
+        assert_eq!(code, Some(2));
+        assert!(stderr.contains("reconciliation required"), "{stderr}");
+        assert_eq!(std::fs::read(&journal).unwrap(), before);
+        // The fallback provider receives it as uncertain, and retention keeps it.
+        assert!(resume_message(&journal, "synthetic request").unwrap().contains("\"status\":\"started\""));
+        assert!(!request_finished(&journal).unwrap());
     }
 
     // ---- #1035 retention ----
