@@ -328,9 +328,89 @@ mod tests {
         assert_eq!(isolate_for_tests(), dir, "idempotent per process");
     }
 
+    /// Hand-built state path literals in production code of one source file.
+    /// String literals inside `#[cfg(test)]` items are fixtures (expected
+    /// rendered output, scratch layouts) and are ignored, as are comments.
+    fn hand_built_state_paths(source: &str) -> Vec<String> {
+        use syn::visit::Visit;
+        struct Scan(Vec<String>);
+        fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+            attrs.iter().any(|attr| {
+                attr.path().is_ident("cfg")
+                    && attr.parse_args::<syn::Meta>().is_ok_and(|meta| meta.path().is_ident("test"))
+            })
+        }
+        impl<'ast> Visit<'ast> for Scan {
+            fn visit_item(&mut self, item: &'ast syn::Item) {
+                let attrs: &[syn::Attribute] = match item {
+                    syn::Item::Mod(m) => &m.attrs,
+                    syn::Item::Fn(f) => &f.attrs,
+                    syn::Item::Impl(i) => &i.attrs,
+                    syn::Item::Const(c) => &c.attrs,
+                    syn::Item::Static(s) => &s.attrs,
+                    syn::Item::Struct(s) => &s.attrs,
+                    syn::Item::Use(u) => &u.attrs,
+                    _ => &[],
+                };
+                if !is_cfg_test(attrs) {
+                    syn::visit::visit_item(self, item);
+                }
+            }
+            fn visit_attribute(&mut self, _attr: &'ast syn::Attribute) {
+                // `///` and `//!` docs are `#[doc = "..."]` attributes; prose
+                // naming the default location is not path resolution.
+            }
+            fn visit_lit_str(&mut self, lit: &'ast syn::LitStr) {
+                let value = lit.value();
+                if value.contains(".local/state/augmentagent") {
+                    self.0.push(value);
+                }
+            }
+            fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+                // format!/concat!/println! arguments are tokens, not parsed
+                // expressions: parse them as a comma-separated expression list
+                // so their string literals are checked too.
+                type Args = syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>;
+                if let Ok(args) = mac.parse_body_with(Args::parse_terminated) {
+                    for arg in &args {
+                        self.visit_expr(arg);
+                    }
+                }
+            }
+        }
+        let file = syn::parse_file(source).expect("workspace source parses");
+        let mut scan = Scan(Vec::new());
+        scan.visit_file(&file);
+        scan.0
+    }
+
+    #[test]
+    fn state_path_scan_ignores_test_fixtures_and_comments_but_not_production() {
+        let production = r#"
+            fn log_path(home: &str) -> String { format!("{home}/.local/state/augmentagent/x.log") }
+            fn joined(home: &std::path::Path) -> std::path::PathBuf { home.join(".local/state/augmentagent") }
+        "#;
+        assert_eq!(hand_built_state_paths(production).len(), 2, "production literals, including format! args, are flagged");
+        let fixtures = r#"
+            // docs: ~/.local/state/augmentagent is resolved by state_dir
+            /// Writes `~/.local/state/augmentagent/x.log` by default.
+            fn render(state: &std::path::Path) -> String { state.display().to_string() }
+            #[cfg(test)]
+            mod tests {
+                #[test]
+                fn renders() { assert!(super::render(std::path::Path::new("/Users/op/.local/state/augmentagent")).contains("augmentagent")); }
+            }
+            #[cfg(test)]
+            fn helper() -> &'static str { "/home/op/.local/state/augmentagent" }
+        "#;
+        assert!(hand_built_state_paths(fixtures).is_empty(), "comments and #[cfg(test)] fixtures are not state resolution");
+    }
+
     /// Structural pin: no crate resolves `~/.local/state/augmentagent` by
-    /// hand. A new state file must go through [`state_dir`], or a test run
-    /// with `XDG_STATE_HOME` set would still write the owner's live state.
+    /// hand in production code. A new state file must go through
+    /// [`state_dir`], or a test run with `XDG_STATE_HOME` set would still
+    /// write the owner's live state. Test fixtures that assert rendered
+    /// output (#1088's launchd plists) are not resolution and are ignored.
     #[test]
     fn no_state_path_bypasses_the_shared_resolver() {
         // augmentagent-tools cannot link this crate (it stays out of the
@@ -358,10 +438,8 @@ mod tests {
                 if EXEMPT.contains(&relative.as_str()) {
                     continue;
                 }
-                for (number, line) in std::fs::read_to_string(&path).unwrap().lines().enumerate() {
-                    if line.contains(".local/state/augmentagent") && !line.trim_start().starts_with("//") {
-                        offenders.push(format!("{relative}:{}", number + 1));
-                    }
+                for literal in hand_built_state_paths(&std::fs::read_to_string(&path).unwrap()) {
+                    offenders.push(format!("{relative}: {literal:?}"));
                 }
             }
         }
