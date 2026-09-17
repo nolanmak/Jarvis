@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -422,6 +423,43 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(result["skipped"], 1)
         self.assertEqual(self.state_json()["skipped"][uuid]["reason"], "title-secret")
         self.assertEqual(list(self.out.glob("notes/*/*.md")), [])
+
+    def test_first_line_quarantine_persists_across_unchanged_runs(self):
+        # Regression: a note quarantined by the first-line scan was exported on
+        # the next run because the cached skip entry short-circuited the scan
+        # without carrying its reason forward.
+        token = "eyJhbGciOiJIUzI1NiJ9.eyJ1c2VySWQiOiJ1c2VyXzAxIn0.c2lnbmF0dXJlc2lnbmF0dXJl"
+        uuid = add_note(self.con, 10, token[:30], f"{token}\n\nmore text")
+        self.run_sync()
+        for _ in range(2):
+            result = self.run_sync()
+            self.assertEqual((result["skipped"], result["new"]), (1, 0))
+            self.assertEqual(self.state_json()["skipped"][uuid]["reason"], "title-secret")
+            self.assertEqual(list(self.out.glob("notes/*/*.md")), [])
+
+    def test_secret_far_down_a_long_first_line_is_redacted_not_quarantined(self):
+        # A 500 KB single-line HTML dump with a card number deep inside cannot
+        # leak into the filename (the title is a short prefix), so it exports
+        # with the body redacted instead of vanishing from the bundle.
+        first = "<html lang=en>" + "x" * 5000 + " card 4111 1111 1111 1111 " + "y" * 5000
+        uuid = add_note(self.con, 10, first[:60], first + "\nsecond line")
+        result = self.run_sync()
+        self.assertEqual((result["skipped"], result["new"]), (0, 1))
+        md = self.read("notes/notes/html-lang-en-" + "x" * 46 + ".md")
+        self.assertIn("[REDACTED:credit-card]", md)
+        self.assertEqual(self.index()[uuid]["redactions"], ["credit-card"])
+
+    def test_quarantine_re_evaluated_when_scrub_rules_change(self):
+        import apple_notes_sync
+        uuid = add_note(self.con, 10, "AKIAIOSFODNN7EXAMPLE", "AKIAIOSFODNN7EXAMPLE\nbody")  # pii-ok: synthetic fixture
+        self.run_sync()
+        self.assertEqual(self.state_json()["skipped"][uuid]["rules"], apple_notes_sync.SCRUB_RULES)
+        # Simulate a scrubber release whose rules no longer flag this title.
+        with unittest.mock.patch.object(apple_notes_sync, "SCRUB_RULES", "test-next"), \
+             unittest.mock.patch.object(apple_notes_sync, "scrub", lambda text: (text, [])):
+            result = self.run_sync()
+        self.assertEqual((result["skipped"], result["new"]), (0, 1))
+        self.assertNotIn(uuid, self.state_json()["skipped"])
 
     def test_skip_folders_and_skip_notes_config(self):
         a = add_note(self.con, 10, "Work thing", "x", folder=FOLDER_WORK)

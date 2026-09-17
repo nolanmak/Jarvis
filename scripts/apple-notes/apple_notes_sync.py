@@ -27,13 +27,14 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from scrub import scrub
+from scrub import RULES_VERSION as SCRUB_RULES, scrub
 
 VERSION = "0.1"
 APPLE_EPOCH = 978307200  # 2001-01-01 00:00:00 UTC in unix seconds
 TOMBSTONE_DAYS = 30
 FOLDER_TYPE_TRASH = 1
 NOTE_TYPE = "Apple Note"
+TITLE_SCAN_SLACK = 512  # longest secret that could begin inside the title region
 PLACEHOLDER = "￼"
 
 _UTI_MIME = {
@@ -337,18 +338,24 @@ def sync(db_path, out_dir, state_path, config=None, touched=None):
                 reason = "skip-note"
             elif scrub(title)[1]:
                 reason = "title-secret"
-            prior = state["skipped"].get(uuid) if reason is None else None
-            if reason is None and not (prior and prior.get("modified") == modified):
-                # The stored title is a truncated first line; a secret cut
-                # mid-way escapes the title scan but its prefix would still
-                # name the file. Scan the real first line of the body.
-                first = _first_line(con, pk)
-                if first and scrub(first)[1]:
-                    reason = "title-secret"
+            if reason is None:
+                prior_skip = state["skipped"].get(uuid)
+                if prior_skip and prior_skip.get("modified") == modified and prior_skip.get("rules") == SCRUB_RULES:
+                    reason = prior_skip["reason"]  # unchanged since quarantine: stay out
+                else:
+                    # The stored title is a truncated first line; a secret cut
+                    # mid-way escapes the title scan but its prefix would still
+                    # name the file. Scan the first line of the body, but only
+                    # the stretch that can reach the filename: the title region
+                    # plus room for a token that starts inside it.
+                    first = _first_line(con, pk)[: len(title) + TITLE_SCAN_SLACK]
+                    if first and scrub(first)[1]:
+                        reason = "title-secret"
             if reason:
                 prior = state["skipped"].get(uuid)
-                if not prior or prior.get("modified") != modified or prior.get("reason") != reason:
-                    state["skipped"][uuid] = {"reason": reason, "modified": modified}
+                entry = {"reason": reason, "modified": modified, "rules": SCRUB_RULES}
+                if prior != entry:
+                    state["skipped"][uuid] = entry
                 if uuid in state["notes"]:
                     _remove(out_dir, state["notes"].pop(uuid).get("path"))
                 index.pop(uuid, None)
