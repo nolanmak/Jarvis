@@ -151,6 +151,10 @@ const JOURNAL_LOCK: &str = "operations.json.lock";
 /// `process_tree::lifecycle_lock_path`.
 const LIFECYCLE_LOCK: &str = "operations.lifecycle-lock";
 const MARKER: &str = "operations.active";
+/// `handoff_outcome`'s completed-without-summary verdict (#1040). Removed
+/// after the journal, so an interrupted sweep never lets a finished request
+/// be dispatched again while its receipts are gone.
+pub(crate) const VERDICT_FILE: &str = "operations.completed-without-summary";
 /// The bridge's atomic-save temp files (`mkstemp(prefix='.handoff-')`).
 const SAVE_PREFIX: &str = ".handoff-";
 const MAX_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
@@ -360,7 +364,7 @@ impl Snapshot {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
             };
-            let known = matches!(name.to_str(), Some(JOURNAL | JOURNAL_LOCK | LIFECYCLE_LOCK | MARKER))
+            let known = matches!(name.to_str(), Some(JOURNAL | JOURNAL_LOCK | LIFECYCLE_LOCK | MARKER | VERDICT_FILE))
                 || name.to_str().is_some_and(|name| name.starts_with(SAVE_PREFIX));
             if !known || !entry.file_type().is_file() || entry.mode() & 0o077 != 0 || entry.uid() != euid() {
                 return Ok(None);
@@ -533,8 +537,12 @@ fn remove_request(root: &Path, name: &OsStr, before: &Snapshot) -> std::io::Resu
     // Receipts first and locks last, so an interrupted sweep never leaves
     // receipts behind without their locks.
     let mut names: Vec<&OsString> = both.entries.keys().collect();
+    // The verdict (#1040) goes after the journal: a sweep interrupted between
+    // them leaves a verdict that still refuses dispatch, never a journal-less
+    // request that could run again inside grace.
     names.sort_by_key(|name| match name.to_str() {
         Some(JOURNAL) => 0,
+        Some(VERDICT_FILE) => 1,
         Some(JOURNAL_LOCK) => 2,
         Some(LIFECYCLE_LOCK) => 3,
         _ => 1,
@@ -1249,6 +1257,31 @@ for line in sys.stdin:
         assert!(uncertain.exists() && public.exists() && linked.exists());
         assert!(public_temp.exists());
         assert_eq!((report.removed, report.kept_unfinished, report.kept_untrusted), (1, 1, 2));
+    }
+
+    /// #1069 review M1(c) — a request that finished without a summary keeps a
+    /// verdict file beside its journal. Once idle past grace the whole request,
+    /// verdict included, is removed like any other finished one; the verdict
+    /// never makes it untrusted (and so kept forever).
+    #[test]
+    fn a_completed_without_summary_verdict_follows_its_request() {
+        let (_temp, root) = private_root();
+        let finished = request(&root, "synthetic-verdict-finished", Some(json!([completed_row()])));
+        write_private(&finished.parent().unwrap().join(VERDICT_FILE),
+            &json!({"version": 1, "completed": 1}).to_string());
+        let young = request(&root, "synthetic-verdict-young", Some(json!([completed_row()])));
+        write_private(&young.parent().unwrap().join(VERDICT_FILE),
+            &json!({"version": 1, "completed": 1}).to_string());
+        age(&finished, TWO_DAYS);
+
+        let dry = sweep_finished(&root, GRACE, true).unwrap();
+        assert_eq!((dry.removed, dry.kept_recent, dry.kept_untrusted), (1, 1, 0));
+        let report = sweep_finished(&root, GRACE, false).unwrap();
+
+        assert!(gone(&finished), "an expired verdict must not pin its request");
+        assert!(young.parent().unwrap().join(VERDICT_FILE).exists(),
+            "inside grace the verdict still refuses a retry");
+        assert_eq!((report.removed, report.kept_recent, report.kept_untrusted), (1, 1, 0));
     }
 
     /// #1035 review — doctor's dead-sweep signal comes from this classification.

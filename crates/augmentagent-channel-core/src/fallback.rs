@@ -1357,6 +1357,31 @@ exit 1
         assert!(latch.active().is_empty(), "a content-level ending latches nothing");
     }
 
+    /// #1069 review M1(b) — the journal sweep removes a request's journal
+    /// before its verdict, so an interrupted sweep can leave a verdict without
+    /// its journal. That request must still refuse dispatch. Only when the
+    /// verdict is gone too (grace passed) does a replay start over in full.
+    #[tokio::test]
+    async fn a_verdict_that_outlives_its_journal_still_refuses_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = Journaling::new(completed_operation(), no_summary);
+        let mut chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Codex, primary.clone() as Arc<dyn Reasoner>),
+        ], latch_in(&dir));
+        chain.handoff_root = Some(dir.path().join("private/handoffs"));
+        let opts = write_request(&dir);
+        let first = chain.call(&opts, "Synthetic ingest request").await.unwrap_err();
+        assert!(first.downcast_ref::<crate::handoff_outcome::CompletedWithoutSummary>().is_some(), "{first:#}");
+        let journal = crate::handoff::request_path(chain.handoff_root.as_ref().unwrap(), &opts).unwrap();
+        std::fs::remove_file(&journal).unwrap();
+        let replay = chain.call(&opts, "Synthetic ingest request").await.unwrap_err();
+        assert!(replay.downcast_ref::<crate::handoff_outcome::CompletedWithoutSummary>().is_some(), "{replay:#}");
+        assert_eq!(primary.count(), 1, "a half-swept request is not dispatched again");
+        std::fs::remove_file(journal.with_file_name(crate::handoff::VERDICT_FILE)).unwrap();
+        let _ = chain.call(&opts, "Synthetic ingest request").await;
+        assert_eq!(primary.count(), 2, "with the verdict gone too, a replay runs the request again in full");
+    }
+
     /// #1040 C3 negative control: with no completed operation there is
     /// nothing to protect, so the error stays the provider's own and a caller
     /// retry is dispatched normally.

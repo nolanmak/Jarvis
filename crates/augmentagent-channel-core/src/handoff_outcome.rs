@@ -68,8 +68,9 @@ pub(crate) enum Settlement {
 /// Same bound the journal writer and `handoff::resume_message` enforce.
 const MAX_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Beside the journal, under the name the journal sweep recognises (#1068).
 fn verdict_path(journal: &Path) -> PathBuf {
-    journal.with_extension("completed-without-summary")
+    journal.with_file_name(crate::handoff::VERDICT_FILE)
 }
 
 /// Read a private regular file owned by this user, without following a

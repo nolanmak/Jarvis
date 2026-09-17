@@ -743,6 +743,46 @@ Limit: a turn first re-dispatched more than the grace period after it last ran,
 and more than one sweep interval after the daemon started, is treated as a new
 request with an empty journal.
 
+### Completed without summary (#1040)
+
+A write or agentic call can do its work and still end content-level: codex
+or claude returns no final message, or codex's turn fails on its own content
+(for example a context-window overflow). That ending never latches the
+provider and never advances the chain. When the request's journal holds
+completed operations and no uncertain ones, dispatch writes
+`operations.completed-without-summary` next to the journal and returns the
+typed `CompletedWithoutSummary` outcome. Every later dispatch of the same
+request returns that outcome without starting a provider.
+
+A few endings deliberately do not produce a verdict:
+
+- **An uncertain row** (`started`). The request stays on the reconciliation
+  path above, and the error says reconciliation is needed.
+- **A provider-side interruption** (quota, timeout, outage). The turn did not
+  finish, so the next provider resumes from the receipts.
+- **A failure the classifier does not recognise**, such as a provider killed
+  mid-turn. A retry resumes from the receipts.
+
+**Scope.** "The same request" means the same turn identity
+(`ReasonerOpts::session_id`), because that is what addresses the same journal.
+Only callers with a stable per-turn id get this retry protection: channel
+queries through the Discord broker (`WikiQuerier`) and `/loop` runs. Wiki
+ingest, digests and the auto-PR builder get a random id per call, so a retry
+from them is a new request with a new journal and runs in full. Deriving
+stable turn ids for those callers is a follow-up.
+
+**Retention.** The verdict is part of its request directory. The sweep
+treats it as a known entry and removes it with the journal once the request
+has been idle past the grace period. The journal goes first, so an
+interrupted sweep leaves a verdict that still refuses dispatch. Once the
+verdict is gone too, a replay of that turn is a new request and **runs the
+request again in full**, under the same retention policy as any other
+expired journal. Within the grace period, a replay is refused.
+
+The verdict is written atomically (a private temp file renamed into place).
+An empty or damaged verdict reads as absent and is logged. A linked,
+non-private or foreign-owned one blocks dispatch until it is inspected.
+
 
 The recovery change passed all 73 bridge tests, including both provider hook
 paths, real CLI status/decision submission, concurrent lifecycle locking, stale
