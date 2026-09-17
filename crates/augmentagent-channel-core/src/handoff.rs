@@ -204,14 +204,9 @@ pub fn retention_setting_from_env() -> RetentionSetting {
 /// exists but has no lifecycle marker. Taken from the reasoner's own
 /// per-class gate budgets, so a changed timeout or class policy moves it.
 fn longest_gate_wait() -> Duration {
-    let text = crate::reasoner::loop_parse_opts();
-    let with_tools = |tool: &str| {
-        let mut opts = text.clone();
-        opts.allowed_tools = vec![tool.into()];
-        opts
-    };
-    [with_tools("Read"), with_tools("Write"), with_tools("Bash(true)"), text.clone()]
-        .iter().map(crate::reasoner::reasoner_timeout_for).max().unwrap_or_default()
+    use crate::providers::CapabilityClass::{FullAgentic, ReadTools, TextOnly, WriteTools};
+    [TextOnly, ReadTools, WriteTools, FullAgentic]
+        .into_iter().map(crate::reasoner::reasoner_timeout_for_class).max().unwrap_or_default()
 }
 
 /// Slack between the longest gate wait and the shortest accepted grace.
