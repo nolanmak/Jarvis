@@ -120,14 +120,28 @@ Set in the agent's `.env`:
 AUGMENTAGENT_APPLE_NOTES_REPO_DIR=/absolute/path/to/AppleNotesSync
 ```
 
-The daemon pulls the checkout and imports new and edited notes into
-searchable history; see the tracking issue (#1062) for the ingest pieces.
+Restart the daemon. It pulls the checkout and imports new, edited and deleted
+notes on startup and every 30 minutes into searchable history (memory-tool
+`channel: "apple_notes"`, one row per note, always the latest version). LLM
+wiki capture of new and edited notes is off by default; enable it with
+`AUGMENTAGENT_HISTORY_WIKI_CAPTURE=1`. The first pass over a bundle never
+fans out to the model. Preview or run an import by hand:
+
+```sh
+./target/release/augmentagent apple-notes poll-once --dry-run
+./target/release/augmentagent apple-notes poll-once
+```
 
 ## Tests
 
 ```sh
 python3 -m unittest discover -s scripts/apple-notes/tests -v
+cargo test -p augmentagent-channel-apple-notes
+cargo test -p augmentagent-cli --test apple_notes_cli
 ```
+
+The Rust suite includes a test that runs the real Python exporter over a
+synthetic database and reads the result, so the two halves cannot drift.
 
 Tests build a synthetic `NoteStore.sqlite` with the subset of Apple's schema
 the sync reads and encode note bodies with a tiny protobuf writer, so they
