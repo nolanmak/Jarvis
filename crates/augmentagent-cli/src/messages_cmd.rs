@@ -29,9 +29,12 @@ pub enum Op {
     },
     /// Index health: exits non-zero when rows are missing, stale or queued.
     Check,
+    /// Rebuild the handle → person cache from the wiki's person pages
+    /// (`identities:` front matter). Needs `--wiki-dir`. Prints counts only.
+    ResolvePeople,
 }
 
-pub async fn run(store: Arc<Store>, op: Op) -> Result<()> {
+pub async fn run(store: Arc<Store>, op: Op, wiki_dir: Option<std::path::PathBuf>) -> Result<()> {
     match op {
         Op::Reindex {
             platform,
@@ -66,6 +69,12 @@ pub async fn run(store: Arc<Store>, op: Op) -> Result<()> {
                     "health": health,
                 }))?
             );
+            Ok(())
+        }
+        Op::ResolvePeople => {
+            let wiki = wiki_dir.ok_or_else(|| anyhow::anyhow!("--wiki-dir is required"))?;
+            let report = augmentagent_messages::people::resolve_people(&store, &wiki)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
         Op::Check => {
@@ -160,6 +169,38 @@ pub async fn drain_loop(store: Arc<Store>, shutdown: CancellationToken) {
         }
         if indexed > 0 {
             info!(indexed, "message index drained");
+        }
+    }
+}
+
+/// Daemon loop: refresh the handle → person cache from the wiki. Cheap (a
+/// walk of person pages); a stale cache only delays new identities.
+pub async fn people_loop(
+    store: Arc<Store>,
+    wiki_root: std::path::PathBuf,
+    shutdown: CancellationToken,
+) {
+    let mut tick = tokio::time::interval(Duration::from_secs(15 * 60));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tick.tick() => {}
+        }
+        let (s, w) = (Arc::clone(&store), wiki_root.clone());
+        match tokio::task::spawn_blocking(move || {
+            augmentagent_messages::people::resolve_people(&s, &w)
+        })
+        .await
+        {
+            Ok(Ok(r)) => info!(
+                people = r.people_with_handles,
+                handles = r.handles,
+                conflicts = r.conflicts,
+                "message people cache refreshed"
+            ),
+            Ok(Err(e)) => warn!("message people refresh failed: {e:#}"),
+            Err(e) => warn!("message people refresh task failed: {e}"),
         }
     }
 }

@@ -1078,6 +1078,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "augmentagent-store",
+ "augmentagent-wiki",
  "chrono",
  "phonenumber",
  "serde",

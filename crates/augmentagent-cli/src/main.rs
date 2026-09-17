@@ -2954,6 +2954,15 @@ async fn main() -> Result<()> {
                     messages_cmd::drain_loop(store_mi, sd).await;
                     Ok(())
                 }));
+                // #1101 — handle → person cache for cross-platform `with:`.
+                if let Some(wiki_root) = cli.wiki_dir.clone() {
+                    let store_mp = Arc::clone(&store);
+                    let sd = shutdown.clone();
+                    tasks.push(tokio::spawn(async move {
+                        messages_cmd::people_loop(store_mp, wiki_root, sd).await;
+                        Ok(())
+                    }));
+                }
             }
             // #1054 — Discord history → searchable history. Opt-in via env,
             // needs Discord auth; never calls a model.
@@ -3752,7 +3761,7 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::WhatsappHistory { .. } => whatsapp_history::poll_command(store).await,
-        Cmd::Messages { op } => messages_cmd::run(store, op).await,
+        Cmd::Messages { op } => messages_cmd::run(store, op, cli.wiki_dir.clone()).await,
         Cmd::AppleNotes { op } => match op {
             apple_notes::Op::PollOnce { dry_run } => apple_notes::poll_command(store, dry_run).await,
         },
