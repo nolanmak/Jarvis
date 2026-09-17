@@ -47,8 +47,8 @@ Copy the prompt below into a terminal coding agent such as Codex or Claude Code.
 It guides setup from a fresh machine to a verified running assistant, asks you
 which providers and integrations you want, and pauses for you to sign in when
 needed. Codex can be your primary provider without installing Claude Code.
-This is an agent-guided setup recipe, not an unattended installer; Linux is the
-supported deployment target.
+This is an agent-guided setup recipe, not an unattended installer; Linux and
+macOS are the supported deployment targets.
 
 ```text
 Help me install and configure https://github.com/nolanmak/Jarvis from scratch.
@@ -58,8 +58,8 @@ source of truth; do not invent commands or report unverified success.
 
 1. Discover and plan
    Check my OS, available disk/RAM, installed tools, and any existing Jarvis
-   checkout or services. Use Linux for the daemon; if this machine is unsupported,
-   help me choose a Linux host before proceeding. Ask where to install, whether
+   checkout or services. Use Linux or macOS for the daemon; if this machine is
+   unsupported, help me choose a Linux or macOS host before proceeding. Ask where to install, whether
    I want Codex or Claude as primary (and an optional fallback), which control
    surface/integrations to connect first, and whether to enable startup at login.
    Reuse an existing installation safely; preserve local config and data.
@@ -128,7 +128,7 @@ Dual implementation with shared behavior:
   `augmentagent-channel-*` channels, `augmentagent-channel-core` (the
   `Trigger`/`ChannelRunner` contract, reasoner, prompts, RateGovernor),
   `augmentagent-store` (SQLite), `augmentagent-wiki`, `augmentagent-proactive`,
-  `augmentagent-approval-discord`, `augmentagent-auth` (Linux Secret Service),
+  `augmentagent-approval-discord`, `augmentagent-auth` (OS keyring),
   `augmentagent-browser-client`, and the content/render helpers.
 - **Node/TypeScript (`src/`)** — the Express dashboard (port 3000), a versioned
   JSON API (`src/apiV1.ts`) for split deployment, and the original polling
@@ -143,7 +143,9 @@ Other top-level dirs: `schema/` (prompt + wiki schemas), `skills/`
 
 ## Release status
 
-Jarvis is an experimental, Linux-first assistant built for a single operator.
+Jarvis is an experimental assistant built for a single operator. It runs on
+Linux (systemd user units) and macOS (launchd agents); Linux is the
+longest-running deployment.
 Self-hosting the daemon does not make model inference local: configured model
 providers and integrations receive the context needed for their requests.
 See [security notes](docs/SECURITY.md) and the
@@ -158,7 +160,10 @@ bot.
 **Prerequisites**
 
 - Linux with gnome-keyring (Secret Service) unlocked, and `python3`, `node`,
-  `secret-tool` (libsecret-tools), and `jq` (wiki mode) on `PATH`.
+  `secret-tool` (libsecret-tools), and `jq` (wiki mode) on `PATH`; **or**
+  macOS with the Xcode command-line tools (`xcode-select --install`) and
+  Homebrew `node`, `deno`, and `jq` — secrets go to the login Keychain. For an
+  always-on Mac mini, stop it sleeping: `sudo pmset -c sleep 0`.
 - Rust via rustup (the pinned toolchain in `rust-toolchain.toml` installs
   itself), a C toolchain with `perl`/`make` (OpenSSL and SQLite build from
   source), and a few GB of RAM for the release build.
@@ -253,13 +258,19 @@ check — never point the auto-updater at upstream.
 
 ## Process management
 
-Both services run as **systemd user units** (not pm2):
+On Linux both services run as **systemd user units**; on macOS they are
+**launchd agents** in `~/Library/LaunchAgents` (`com.nolanmak.augmentagent`,
+`com.nolanmak.augmentagent-dashboard`). The CLI detects which one the host has,
+so the same commands work on both:
 
-- Rust daemon: `systemctl --user {start,stop,restart,status} augmentagent.service`
-- Node dashboard: `systemctl --user {start,stop,restart,status} augmentagent-dashboard.service`
+- `augmentagent service --unit daemon {start,stop,restart,status}`
+- `augmentagent service --unit dashboard {start,stop,restart,status}`
+- `augmentagent status`, `augmentagent logs --unit daemon [-f]`, `augmentagent doctor`
 
 `scripts/install-autostart.sh` and `scripts/install-dashboard.sh` write these
-units. The daemon unit runs **live** with the wiki on
+units (or plists); `scripts/install-autostart.sh` accepts
+`AUGMENTAGENT_AUTOSTART_DRY_RUN=true` to register the daemon without it ever
+sending. Logs land under `~/.local/state/augmentagent*/` on both. The daemon unit runs **live** with the wiki on
 (`--wiki-dir ./wiki serve --dry-run false`), which also needs `jq` on `PATH`,
 the bot's Message Content intent, and more Claude calls per email — finish
 the [Quickstart](#quickstart) first.
@@ -273,9 +284,8 @@ branch.
 ## Configuration
 
 Runtime secrets and integration tokens live in environment variables
-(`.env`) and the Linux Secret Service (gnome-keyring), accessed via the
-`keyring` crate. This is a Linux-only deployment; there is no macOS
-counterpart.
+(`.env`) and the OS keyring, accessed via the `keyring` crate: the Secret
+Service (gnome-keyring) on Linux, the login Keychain on macOS.
 
 Which model answers a given call is config, not code: the "Reasoner provider
 chain & model tiers" block in `.env.example` documents the provider chain
