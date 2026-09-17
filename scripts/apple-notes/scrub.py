@@ -18,6 +18,9 @@ from pathlib import Path
 
 Finding = namedtuple("Finding", "kind line")
 
+# Bump when a pattern changes so cached quarantine decisions are re-made.
+RULES_VERSION = "2026-09-16.2"
+
 _PEM_BEGIN = re.compile(r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----")
 _PEM_END = re.compile(r"-----END (?:[A-Z ]+ )?PRIVATE KEY-----")
 _AWS_SECRET_HINT = re.compile(r"aws_secret|secret_access|aws secret", re.I)
