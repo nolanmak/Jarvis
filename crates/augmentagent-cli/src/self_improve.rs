@@ -1621,10 +1621,7 @@ fn opened_prs_path() -> PathBuf {
             return PathBuf::from(p);
         }
     }
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".local/state/augmentagent/autopr-opened-prs.json")
+    augmentagent_channel_core::state_dir::state_dir_or(".").join("autopr-opened-prs.json")
 }
 
 /// What the loop recorded when it opened a PR: which PR, and the head its
@@ -3507,12 +3504,8 @@ fn baseline_cache_path() -> PathBuf {
             return PathBuf::from(p);
         }
     }
-    std::env::var_os("HOME")
-        .map(|h| {
-            PathBuf::from(h)
-                .join(".local/state/augmentagent")
-                .join("autopr-baseline.json")
-        })
+    augmentagent_channel_core::state_dir::state_dir()
+        .map(|dir| dir.join("autopr-baseline.json"))
         .unwrap_or_else(|| PathBuf::from("autopr-baseline.json"))
 }
 
@@ -5626,8 +5619,8 @@ fn run_lock_path() -> PathBuf {
         }
     }
     let name = format!("self-improve{}.lock", lane_from_env().lock_suffix());
-    std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join(".local/state/augmentagent").join(&name))
+    augmentagent_channel_core::state_dir::state_dir()
+        .map(|dir| dir.join(&name))
         .unwrap_or_else(|| PathBuf::from(format!(".{name}")))
 }
 
@@ -8120,12 +8113,8 @@ fn attempt_ledger_path() -> PathBuf {
             return PathBuf::from(p);
         }
     }
-    std::env::var_os("HOME")
-        .map(|h| {
-            PathBuf::from(h)
-                .join(".local/state/augmentagent")
-                .join("autopr-attempted.json")
-        })
+    augmentagent_channel_core::state_dir::state_dir()
+        .map(|dir| dir.join("autopr-attempted.json"))
         .unwrap_or_else(|| PathBuf::from("autopr-attempted.json"))
 }
 
@@ -8493,12 +8482,8 @@ fn attempt_history_path() -> PathBuf {
             return PathBuf::from(p);
         }
     }
-    std::env::var_os("HOME")
-        .map(|h| {
-            PathBuf::from(h)
-                .join(".local/state/augmentagent")
-                .join("autopr-attempt-history.json")
-        })
+    augmentagent_channel_core::state_dir::state_dir()
+        .map(|dir| dir.join("autopr-attempt-history.json"))
         .unwrap_or_else(|| PathBuf::from("autopr-attempt-history.json"))
 }
 
@@ -8581,12 +8566,8 @@ fn daily_counter_path() -> PathBuf {
             return PathBuf::from(p);
         }
     }
-    std::env::var_os("HOME")
-        .map(|h| {
-            PathBuf::from(h)
-                .join(".local/state/augmentagent")
-                .join("autopr-daily-runs.json")
-        })
+    augmentagent_channel_core::state_dir::state_dir()
+        .map(|dir| dir.join("autopr-daily-runs.json"))
         .unwrap_or_else(|| PathBuf::from("autopr-daily-runs.json"))
 }
 
@@ -8834,6 +8815,7 @@ for tool, arguments in [
     #[ignore = "requires Codex login; synthetic read-only scope and rejecting review"]
     async fn live_codex_scopes_source_and_rejects_an_incomplete_fix() {
         use augmentagent_channel_core::{codex::CodexCliReasoner, Reasoner};
+        augmentagent_channel_core::state_dir::isolate_for_tests(); // #1048
         let fixture = tempfile::tempdir().unwrap();
         let repo = fixture.path();
         std::fs::create_dir(repo.join("src")).unwrap();
@@ -8897,10 +8879,15 @@ for tool, arguments in [
                 .env("JARVIS_BUILDER_REVIEW_CHILD", "1")
                 .env("AUGMENTAGENT_REASONER_CHAIN", "claude,codex")
                 .env("AUGMENTAGENT_COOLDOWN_FILE", isolated.path().join("cooldown.json"))
+                // #1048: review history, journals and logs stay in the fixture.
+                .env("XDG_STATE_HOME", isolated.path().join("state"))
+                .env_remove("AUGMENTAGENT_TOOL_AUDIT_LOG")
+                .env_remove("AUGMENTAGENT_TOKEN_USAGE_LOG")
                 .output().unwrap();
             assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
             return;
         }
+        augmentagent_channel_core::state_dir::isolate_for_tests();
         let fixture = tempfile::tempdir().unwrap();
         let repo = fixture.path();
         std::fs::create_dir(repo.join("src")).unwrap();
@@ -8995,6 +8982,50 @@ for tool, arguments in [
         assert_eq!(builder.calls(), 0);
     }
     use super::*;
+
+    /// #1048 C2 pin: the auto-PR ledgers, lock and baseline follow the one
+    /// state-dir override, so a lifecycle run with `XDG_STATE_HOME` set cannot
+    /// touch the owner's live ledgers. Checked in a child process with a
+    /// synthetic HOME so no env mutation races the parallel tests.
+    #[test]
+    fn autopr_state_paths_follow_the_state_home_override() {
+        const CHILD: &str = "AUGMENTAGENT_AUTOPR_STATE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let fixture = tempfile::tempdir().unwrap();
+            let home = fixture.path().join("home");
+            std::fs::create_dir(&home).unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", "self_improve::tests::autopr_state_paths_follow_the_state_home_override", "--nocapture"])
+                .env(CHILD, "1")
+                .env("HOME", &home)
+                .env("XDG_STATE_HOME", fixture.path().join("scratch"));
+            for key in [
+                LOCK_FILE_ENV,
+                COUNTER_FILE_ENV,
+                "AUGMENTAGENT_AUTOPR_BASELINE_FILE",
+                "AUGMENTAGENT_AUTOPR_ATTEMPTED_FILE",
+                "AUGMENTAGENT_AUTOPR_HISTORY_FILE",
+                "AUGMENTAGENT_AUTOPR_OPENED_FILE",
+                "AUGMENTAGENT_COOLDOWN_FILE",
+            ] {
+                child.env_remove(key);
+            }
+            let output = child.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let state = std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap()).join("augmentagent");
+        assert_eq!(baseline_cache_path(), state.join("autopr-baseline.json"));
+        assert_eq!(attempt_ledger_path(), state.join("autopr-attempted.json"));
+        assert_eq!(attempt_history_path(), state.join("autopr-attempt-history.json"));
+        assert_eq!(daily_counter_path(), state.join("autopr-daily-runs.json"));
+        assert_eq!(opened_prs_path(), state.join("autopr-opened-prs.json"));
+        assert_eq!(run_lock_path().parent(), Some(state.as_path()));
+        assert_eq!(augmentagent_channel_core::CooldownLatch::system().path(), state.join("reasoner-cooldowns.json"));
+    }
 
     #[test]
     fn blast_radius_catches_deploy_and_auth() {
@@ -9788,6 +9819,7 @@ CODEX-REVIEW: lgtm").0);
     #[tokio::test]
     #[ignore]
     async fn live_codex_review_returns_a_parseable_verdict() {
+        augmentagent_channel_core::state_dir::isolate_for_tests(); // #1048
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .canonicalize()
@@ -9824,6 +9856,7 @@ CODEX-REVIEW: lgtm").0);
     #[tokio::test]
     #[ignore]
     async fn live_codex_system_pass_reasons_from_supplied_evidence() {
+        augmentagent_channel_core::state_dir::isolate_for_tests(); // #1048
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .canonicalize()

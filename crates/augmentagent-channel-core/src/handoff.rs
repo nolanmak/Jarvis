@@ -8,8 +8,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 pub(crate) fn system_root() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home)
-        .join(".local/state/augmentagent/reasoner-handoffs"))
+    crate::state_dir::state_dir().map(|dir| dir.join("reasoner-handoffs"))
 }
 
 /// A channel turn id makes a replay after restart address the same journal.
@@ -156,7 +155,9 @@ const MARKER: &str = "operations.active";
 const SAVE_PREFIX: &str = ".handoff-";
 const MAX_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
 
-/// The daemon's journal root (`~/.local/state/augmentagent/reasoner-handoffs`).
+/// The daemon's journal root: `reasoner-handoffs` in the shared
+/// [`state_dir`](crate::state_dir) (`~/.local/state/augmentagent` unless
+/// `XDG_STATE_HOME` is set).
 pub fn journal_root() -> Option<PathBuf> {
     system_root()
 }

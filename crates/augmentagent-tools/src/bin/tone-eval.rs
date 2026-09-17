@@ -177,10 +177,17 @@ fn append_history_csv(
 ) -> Result<()> {
     let path = match explicit_path {
         Some(p) => p.to_path_buf(),
-        None => {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            PathBuf::from(home).join(".local/state/augmentagent/tone-eval-history.csv")
-        }
+        // Same rule as augmentagent_channel_core::state_dir::resolve (this
+        // crate stays out of the daemon's dependency graph, so it is inlined).
+        None => std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join("augmentagent"))
+            .unwrap_or_else(|| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+                PathBuf::from(home).join(".local/state/augmentagent")
+            })
+            .join("tone-eval-history.csv"),
     };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);

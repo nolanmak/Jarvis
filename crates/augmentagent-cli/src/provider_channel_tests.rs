@@ -17,6 +17,7 @@ impl Reasoner for Observed {
 }
 
 async fn contracts(provider: Arc<dyn Reasoner>) {
+    augmentagent_channel_core::state_dir::isolate_for_tests(); // #1048
     let observed = Arc::new(Observed { inner: provider, successes: AtomicUsize::new(0) });
     let signature = augmentagent_channel_email::sigextract::SignatureExtractor::new(observed.as_ref())
         .extract("Fixture Author\nTest Engineer\nExample Organization\nhttps://example.com").await.unwrap();

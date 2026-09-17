@@ -110,10 +110,7 @@ pub fn default_usage_log_path() -> PathBuf {
             return PathBuf::from(explicit);
         }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home)
-        .join(".local/state/augmentagent")
-        .join("token-usage.jsonl")
+    crate::state_dir::state_dir_or("/tmp").join("token-usage.jsonl")
 }
 
 /// Append-only NDJSON writer, mirroring `tool_audit::AuditLogger`: cheap to
@@ -484,7 +481,7 @@ mod tests {
         std::env::remove_var("AUGMENTAGENT_TOKEN_USAGE_LOG");
         let p = default_usage_log_path();
         assert!(
-            p.to_string_lossy().contains(".local/state/augmentagent"),
+            p.parent().is_some_and(|dir| dir.ends_with("augmentagent")),
             "must live in the state dir, never the repo: {p:?}"
         );
         assert!(p.to_string_lossy().ends_with("token-usage.jsonl"));

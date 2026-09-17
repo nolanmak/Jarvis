@@ -497,7 +497,8 @@ enum Cmd {
         /// Machine-readable output.
         #[arg(long, default_value_t = false)]
         json: bool,
-        /// Journal root. Default: ~/.local/state/augmentagent/reasoner-handoffs
+        /// Journal root. Default: reasoner-handoffs in the daemon state dir
+        /// ($XDG_STATE_HOME/augmentagent, else ~/.local/state/augmentagent)
         #[arg(long)]
         root: Option<PathBuf>,
     },
@@ -8646,10 +8647,14 @@ mod query_delivery_contract_tests {
                 .env_remove("AUGMENTAGENT_DB")
                 .env_remove("AUGMENTAGENT_TRANSCRIPTS_DIR")
                 .env("AUGMENTAGENT_TOOL_AUDIT_LOG", isolated.path().join("audit.jsonl"))
+                // #1048: cooldowns, journals and usage stay in the fixture.
+                .env("XDG_STATE_HOME", isolated.path().join("state"))
+                .env_remove("AUGMENTAGENT_TOKEN_USAGE_LOG")
                 .output().unwrap();
             assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
             return;
         }
+        augmentagent_channel_core::state_dir::isolate_for_tests();
         let memory = PathBuf::from(std::env::var_os("JARVIS_TEST_MEMORY_BIN").expect("set memory binary"));
         assert!(memory.is_absolute() && memory.is_file());
         let fixture = tempfile::tempdir().unwrap();

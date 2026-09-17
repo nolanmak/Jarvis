@@ -79,6 +79,11 @@ else:
             .env("AUGMENTAGENT_GIT_AUTHOR_EMAIL", "fixture@example.com")
             .env("AUGMENTAGENT_GATE_TARGET_DIR", root.join("target"))
             .env("CARGO_TARGET_DIR", root.join("target"))
+            // #1048: handoff journals, review history and the provider logs
+            // resolve under the fixture, never the owner's live state dir.
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env_remove("AUGMENTAGENT_TOOL_AUDIT_LOG")
+            .env_remove("AUGMENTAGENT_TOKEN_USAGE_LOG")
             .env_remove("DISCORD_WEBHOOK_URL");
         for (key, file) in [
             ("AUGMENTAGENT_SELFIMPROVE_LOCK", "pipeline.lock"),
@@ -93,6 +98,7 @@ else:
         return;
     }
     let root = PathBuf::from(std::env::var_os(CHILD).unwrap());
+    assert!(augmentagent_channel_core::state_dir::isolate_for_tests().starts_with(&root), "lifecycle state must stay in the fixture");
     let repo = root.join("repo");
     let remote = root.join("remote.git");
     std::fs::create_dir_all(repo.join("src")).unwrap();
