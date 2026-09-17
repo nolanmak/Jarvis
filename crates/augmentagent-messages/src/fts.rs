@@ -240,7 +240,8 @@ pub(crate) fn delete(c: &Connection, rowid: i64) -> augmentagent_store::rusqlite
 }
 
 /// One full-text term from a parsed query.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Term {
     Word(String),
     Phrase(String),

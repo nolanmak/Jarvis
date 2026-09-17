@@ -1061,6 +1061,7 @@ name = "augmentagent-mcp-memory"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "augmentagent-messages",
  "augmentagent-store",
  "chrono",
  "rusqlite",
