@@ -18,24 +18,30 @@ configuration, never command-line arguments or model-visible policy text.
 ### Bridge policy file and the secrets it holds (#1044)
 
 `BridgeLaunch::prepare` writes the bridge policy, `tool-policy.json` (mode
-0600), into its own randomly named `jarvis-policy-*` directory (mode 0700).
-That directory is created under `$XDG_RUNTIME_DIR` when the session has one,
+0600), into its own randomly named `jarvis-policy-*` directory (mode 0700,
+set atomically at creation). That directory is created under `$XDG_RUNTIME_DIR` when the session has one,
 otherwise under the temporary directory. It is never the launch directory
 that holds `native-workspace`, Codex's cwd, so no path relative to the cwd
 names the policy. The directory is removed when the launch is dropped, after
-the Codex child exits. The bridge receives the absolute path as its only
+the Codex child exits. A SIGKILL or abort of the daemon skips that cleanup, so
+a `jarvis-policy-*` directory holding live tokens can remain in the owner-only
+0700 runtime tmpfs until logout or reboot (or in the temp dir on the fallback).
+That is the same exposure the old launch directory had. The bridge receives the absolute path as its only
 argument and refuses a policy file that is not a private regular file owned by
 the daemon user. Bridge tools cannot open it, because it is outside every read
 root. Native Codex has no file-reading tool under the `jarvis_bridge` profile.
-`live_codex_native_read_of_the_policy_is_denied` probes this against real
-Codex.
+`live_codex_native_read_of_the_policy_is_denied` is a smoke test of that
+`:minimal` profile against real Codex. It cannot show the path is underivable,
+since the prompt supplies the absolute path; the unit test
+`policy_path_is_not_derivable_from_the_native_cwd` pins that.
 
 The policy's `environment` map holds the fixed OS variables (`HOME`, `PATH`,
 `USER`, `LOGNAME`, `LANG`, `TERM`, `DBUS_SESSION_BUS_ADDRESS`,
 `XDG_RUNTIME_DIR`, `XDG_CONFIG_HOME`, `CARGO_HOME`, `RUSTUP_HOME`,
 `RUSTUP_TOOLCHAIN`) plus everything in `ReasonerOpts.env`. That map is
 passed to hooks, service CLIs and MCP children. The integration secrets it can
-carry are:
+carry are listed below. `DBUS_SESSION_BUS_ADDRESS` is not a secret itself, but
+it is the address the service CLIs use to reach the Secret Service keyring.
 
 | Secret | Set by | Consumer |
 | --- | --- | --- |

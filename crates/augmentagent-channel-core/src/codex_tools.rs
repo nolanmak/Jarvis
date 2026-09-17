@@ -125,7 +125,11 @@ pub struct BridgeLaunch {
 /// directory (owner-only, memory-backed) when the session has one, else the
 /// temporary directory.
 fn policy_base_dir() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)
+    choose_policy_base_dir(std::env::var_os("XDG_RUNTIME_DIR"))
+}
+
+fn choose_policy_base_dir(runtime_dir: Option<std::ffi::OsString>) -> PathBuf {
+    runtime_dir.map(PathBuf::from)
         .filter(|dir| dir.is_absolute() && dir.is_dir())
         .unwrap_or_else(std::env::temp_dir)
 }
@@ -197,12 +201,13 @@ impl BridgeLaunch {
             Ok(())
         }
         let directory = directory.canonicalize()?;
-        // #1044: never beside native-workspace; owner-only regardless of umask.
-        let policy_dir = tempfile::Builder::new().prefix("jarvis-policy-").tempdir_in(policy_base_dir())?;
-        {
+        // #1044: never beside native-workspace; created owner-only atomically.
+        let policy_dir = {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(policy_dir.path(), std::fs::Permissions::from_mode(0o700))?;
-        }
+            tempfile::Builder::new().prefix("jarvis-policy-")
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir_in(policy_base_dir())?
+        };
         let policy_path = policy_dir.path().canonicalize()?.join("tool-policy.json");
         anyhow::ensure!(!policy_path.starts_with(&directory), "policy directory must be outside the launch directory");
         let server_path = directory.join("tool-bridge.py");
@@ -369,6 +374,28 @@ mod tests {
         let (path, directory) = (launch.policy_path.clone(), policy_dir);
         drop(launch);
         assert!(!path.exists() && !directory.exists(), "policy must not outlive the launch");
+    }
+
+    /// #1044: the policy base falls back to the temp dir when the runtime dir
+    /// is unset, relative or missing; the launch's directory is 0700 as created
+    /// (no chmod follows `Builder::permissions`, so this mode is the creation mode).
+    #[test]
+    fn policy_base_dir_falls_back_to_the_temp_dir() {
+        let runtime = tempfile::tempdir().unwrap();
+        assert_eq!(choose_policy_base_dir(Some(runtime.path().as_os_str().to_owned())), runtime.path());
+        for value in [None, Some("relative/run".into()), Some(runtime.path().join("missing").into_os_string())] {
+            assert_eq!(choose_policy_base_dir(value.clone()), std::env::temp_dir(), "{value:?}");
+        }
+        let fallback = std::env::temp_dir();
+        let temp = tempfile::tempdir().unwrap();
+        let launch_dir = temp.path().join("launch");
+        std::fs::create_dir(&launch_dir).unwrap();
+        let opts = crate::reasoner::triage_opts(Some(temp.path().into()));
+        let launch = BridgeLaunch::prepare(&opts, &launch_dir).unwrap();
+        let policy_dir = launch.policy_path.parent().unwrap();
+        assert!(policy_dir.starts_with(choose_policy_base_dir(std::env::var_os("XDG_RUNTIME_DIR")).canonicalize().unwrap())
+            || policy_dir.starts_with(fallback.canonicalize().unwrap()));
+        assert_eq!(std::fs::metadata(policy_dir).unwrap().permissions().mode() & 0o777, 0o700);
     }
 
     /// #1044 C2: real Codex, launched with the production permission profile
