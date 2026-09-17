@@ -93,7 +93,7 @@ impl DiscordAuth {
             }
         }
         let raw = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, raw)?;
+        write_owner_only(path, raw.as_bytes())?;
         Ok(())
     }
 
@@ -116,9 +116,10 @@ impl DiscordAuth {
                 let path = default_creds_path(repo_root);
                 let auth = Self::load(&path)?;
                 match auth.save_to_keychain() {
-                    Ok(()) => tracing::info!(
+                    Ok(()) => tracing::warn!(
                         from = %path.display(),
-                        "discord auth migrated to keychain from file",
+                        "discord auth migrated to keychain from a plaintext file; \
+                         delete the file — it holds a live user token",
                     ),
                     Err(e) => tracing::warn!(
                         error = %e,
@@ -148,6 +149,97 @@ pub fn default_creds_path(repo_root: &Path) -> PathBuf {
         return vault.join("discord-creds.json");
     }
     repo_root.join("discord-creds.json")
+}
+
+/// Where `discord login` may additionally write a plaintext creds file, if
+/// anywhere. The keyring is the store of record; a file copy only exists
+/// when the operator asks for one out of tree:
+/// 1. `AUGMENTAGENT_DISCORD_CREDS`, unless it resolves inside `repo_root`
+/// 2. `/Volumes/augmentagent/discord-creds.json` if that vault is mounted
+///
+/// Never `<repo_root>/discord-creds.json`: a live user token must not sit in
+/// a source checkout guarded only by `.gitignore`.
+pub fn mirror_creds_path(repo_root: &Path) -> Option<PathBuf> {
+    if let Ok(custom) = std::env::var("AUGMENTAGENT_DISCORD_CREDS") {
+        let custom = PathBuf::from(custom);
+        if is_within(&custom, repo_root) {
+            tracing::warn!(
+                path = %custom.display(),
+                "AUGMENTAGENT_DISCORD_CREDS points inside the repo; not writing a creds file there",
+            );
+            return None;
+        }
+        return Some(custom);
+    }
+    let vault = PathBuf::from("/Volumes/augmentagent");
+    vault.is_dir().then(|| vault.join("discord-creds.json"))
+}
+
+/// Resolve `path` as far as it exists on disk, then compare prefixes, so a
+/// not-yet-created file or a relative path still lands on the right side.
+fn is_within(path: &Path, root: &Path) -> bool {
+    let Ok(root) = root.canonicalize() else {
+        return false;
+    };
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => return false,
+        }
+    };
+    // Fold `.`/`..` lexically first; a missing `sub/..` has no file name to
+    // peel off and would otherwise slip past the prefix check.
+    let mut normalized = PathBuf::new();
+    for part in abs.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other),
+        }
+    }
+    let mut existing = normalized.as_path();
+    let mut rest = Vec::new();
+    while !existing.exists() {
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return false,
+        }
+    }
+    let Ok(mut resolved) = existing.canonicalize() else {
+        return false;
+    };
+    for name in rest.into_iter().rev() {
+        resolved.push(name);
+    }
+    resolved.starts_with(&root)
+}
+
+/// Write `bytes` readable by the owner only (0600 on unix), tightening the
+/// mode of a file that already exists with looser permissions.
+fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        opts.mode(0o600);
+        let mut file = opts.open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(bytes)?;
+    }
+    #[cfg(not(unix))]
+    {
+        opts.open(path)?.write_all(bytes)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -233,6 +325,61 @@ mod tests {
                 repo.path().join("discord-creds.json"),
             );
         }
+    }
+
+    #[test]
+    fn mirror_path_is_none_without_env_or_vault() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("AUGMENTAGENT_DISCORD_CREDS");
+        let repo = tempfile::tempdir().unwrap();
+        if !PathBuf::from("/Volumes/augmentagent").is_dir() {
+            assert_eq!(mirror_creds_path(repo.path()), None);
+        }
+    }
+
+    #[test]
+    fn mirror_path_honors_env_outside_repo() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let repo = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("creds/discord-creds.json");
+        std::env::set_var("AUGMENTAGENT_DISCORD_CREDS", &target);
+        assert_eq!(mirror_creds_path(repo.path()), Some(target));
+        std::env::remove_var("AUGMENTAGENT_DISCORD_CREDS");
+    }
+
+    #[test]
+    fn mirror_path_refuses_env_inside_repo() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let repo = tempfile::tempdir().unwrap();
+        for inside in [
+            repo.path().join("discord-creds.json"),
+            repo.path().join("not-yet/nested/discord-creds.json"),
+            repo.path().join("sub/../discord-creds.json"),
+        ] {
+            std::env::set_var("AUGMENTAGENT_DISCORD_CREDS", &inside);
+            assert_eq!(mirror_creds_path(repo.path()), None, "{}", inside.display());
+        }
+        std::env::remove_var("AUGMENTAGENT_DISCORD_CREDS");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_owner_only_and_tightens_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("discord-creds.json");
+        std::fs::write(&path, "stale").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        sample().save(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let fresh = dir.path().join("fresh.json");
+        sample().save(&fresh).unwrap();
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
