@@ -25,6 +25,10 @@ personal wiki, and social/posting integrations.
 - **WhatsApp history.** Export WhatsApp Desktop conversations into searchable
   history and incremental wiki capture, with local or SSH setup and support for
   existing private Git feeds. See [WhatsApp history setup](docs/WHATSAPP-HISTORY.md).
+- **Apple Notes.** A bundled Mac exporter turns your notes into a private,
+  git-versioned Markdown bundle (edits show as diffs, secrets are scrubbed
+  before anything is written) that the agent ingests. See
+  [Apple Notes setup](docs/APPLE-NOTES.md).
 - **SocialAPI.ai backend.** An official unified REST integration for
   cross-posting and reading/replying to comments + DMs across connected
   social accounts. See [SocialAPI.ai integration](#socialapiai-integration).
