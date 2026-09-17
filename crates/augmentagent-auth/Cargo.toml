@@ -9,6 +9,6 @@ repository.workspace = true
 [dependencies]
 # macOS Keychain via the `apple-native` backend. `crypto-rust` keeps the
 # transitive dep tree pure-Rust and avoids pulling OpenSSL.
-keyring = { version = "3", features = ["apple-native", "linux-native-sync-persistent", "crypto-rust"] }
+keyring = { version = "3", features = ["apple-native", "linux-native", "crypto-rust"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }

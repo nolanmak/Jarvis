@@ -8,7 +8,7 @@ On the Jarvis host, set `NEWSLETTERBUDDY_URL` to the NewsletterBuddy HTTPS origi
 printf '%s' "$NEWSLETTERBUDDY_TOKEN" | augmentagent newsletter configure
 ```
 
-Do not put the token in a CLI argument or Jarvis's model-facing environment. Unset the shell variable after configuration. On Linux, this build enables the persistent kernel keyring/Secret Service backend; the service account must have a functioning keyring session. A missing credential returns a setup error rather than silently using a mock store.
+Do not put the token in a CLI argument or Jarvis's model-facing environment. Unset the shell variable after configuration. On Linux, this build enables kernel keyutils without a DBus dependency. Kernel keyrings do not survive reboot, so the service operator must re-provision the token before Jarvis resumes newsletter work after a host reboot. A missing credential returns a setup error rather than silently using a mock store.
 
 The owner can ask Jarvis in Discord to create a newsletter desk, save a prompt/topic brief, start and inspect research, list citable evidence, and generate/read a draft. The bridge derives `Idempotency-Key` from the trusted Discord channel/message ID plus operation and target, so retrying the same event does not create a second research run or draft. The CLI accepts no caller-supplied actor ID and NewsletterBuddy derives ownership from its bearer token. A remote HTTP URL is rejected; use HTTPS. The bridge does not approve or send an edition.
 
