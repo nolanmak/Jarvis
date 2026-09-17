@@ -418,6 +418,7 @@ dependencies = [
  "async-trait",
  "augmentagent-approval-discord",
  "augmentagent-auth",
+ "augmentagent-messages",
  "augmentagent-store",
  "augmentagent-wiki",
  "chrono",

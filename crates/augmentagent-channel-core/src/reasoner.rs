@@ -149,7 +149,10 @@ pub fn socialapi_draft_opts(system_prompt: String, wiki_root: Option<PathBuf>) -
     with_socialapi_readonly_mcp(opts, &repo_root)
 }
 
-pub fn with_socialapi_readonly_mcp(mut opts: ReasonerOpts, repo_root: &std::path::Path) -> ReasonerOpts {
+pub fn with_socialapi_readonly_mcp(
+    mut opts: ReasonerOpts,
+    repo_root: &std::path::Path,
+) -> ReasonerOpts {
     if !socialapi_mcp_readonly_enabled() {
         // Strict no-op: unchanged opts ⇒ unchanged spawn args.
         return opts;
@@ -277,7 +280,10 @@ pub enum ReasonerError {
 
 impl From<crate::cli_gate::GateWaitTimeout> for ReasonerError {
     fn from(e: crate::cli_gate::GateWaitTimeout) -> Self {
-        ReasonerError::GateTimeout { provider: e.provider, waited_secs: e.waited_secs }
+        ReasonerError::GateTimeout {
+            provider: e.provider,
+            waited_secs: e.waited_secs,
+        }
     }
 }
 
@@ -335,7 +341,9 @@ pub(crate) fn reasoner_timeout_for(opts: &ReasonerOpts) -> std::time::Duration {
 /// (the handoff retention floor, #1035) asks it directly instead of building
 /// throwaway `ReasonerOpts`, which the capability inventory would count as a
 /// production call site.
-pub(crate) fn reasoner_timeout_for_class(class: crate::providers::CapabilityClass) -> std::time::Duration {
+pub(crate) fn reasoner_timeout_for_class(
+    class: crate::providers::CapabilityClass,
+) -> std::time::Duration {
     use crate::providers::CapabilityClass;
     let base = reasoner_timeout();
     match class {
@@ -420,7 +428,9 @@ pub fn parse_reset_hint(message: &str) -> Option<chrono::DateTime<chrono::Utc>> 
 /// exits, empty output — is `Unavailable`, the "provider might be down"
 /// bucket. The original error stays in the chain for diagnostics.
 pub(crate) fn classify_other(provider: &str, e: anyhow::Error) -> anyhow::Error {
-    if ReasonerError::find_in(&e).is_some() { return e; }
+    if ReasonerError::find_in(&e).is_some() {
+        return e;
+    }
     let not_found = e.chain().any(|c| {
         c.downcast_ref::<std::io::Error>()
             .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
@@ -721,9 +731,12 @@ impl ClaudeCliReasoner {
                 provider: "claude".into(),
                 secs,
             })),
-            Err(CallError::GateTimeout { waited_secs }) => Err(anyhow::Error::new(
-                ReasonerError::GateTimeout { provider: "claude".into(), waited_secs },
-            )),
+            Err(CallError::GateTimeout { waited_secs }) => {
+                Err(anyhow::Error::new(ReasonerError::GateTimeout {
+                    provider: "claude".into(),
+                    waited_secs,
+                }))
+            }
             // Untyped on purpose — content-level, neither latches nor fails
             // over (#655 review). A Content TurnFailure (#1040), so the chain
             // can tell a finished-but-silent turn from any other untyped error.
@@ -759,10 +772,16 @@ impl ClaudeCliReasoner {
                         }
                         Err(CallError::GateTimeout { waited_secs }) => {
                             let provider = "claude".into();
-                            return Err(ReasonerError::GateTimeout { provider, waited_secs }.into());
+                            return Err(ReasonerError::GateTimeout {
+                                provider,
+                                waited_secs,
+                            }
+                            .into());
                         }
                         Err(CallError::EmptyOutput) => {
-                            return Err(crate::turn_failure::TurnFailure::empty_output("claude").into());
+                            return Err(
+                                crate::turn_failure::TurnFailure::empty_output("claude").into()
+                            );
                         }
                         Err(CallError::Other(e)) => return Err(classify_other("claude", e)),
                     }
@@ -792,12 +811,22 @@ impl ClaudeCliReasoner {
         // carries the same budget: unbounded, it froze the daemon for 15 h.
         let caller = caller_tag(opts);
         let acquire = self.gate.acquire_timed("claude", &caller, dur);
-        let _permit =
-            acquire.await.map_err(|e| CallError::GateTimeout { waited_secs: e.waited_secs })?;
+        let _permit = acquire.await.map_err(|e| CallError::GateTimeout {
+            waited_secs: e.waited_secs,
+        })?;
         let clean = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let outcome = tokio::time::timeout(dur, self.call_once(opts, user_message, capture, clean.clone())).await;
+        let outcome = tokio::time::timeout(
+            dur,
+            self.call_once(opts, user_message, capture, clean.clone()),
+        )
+        .await;
         if !clean.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(CallError::Other(ReasonerError::CleanupUncertain { provider: "claude".into() }.into()));
+            return Err(CallError::Other(
+                ReasonerError::CleanupUncertain {
+                    provider: "claude".into(),
+                }
+                .into(),
+            ));
         }
         match outcome {
             Ok(r) => r,
@@ -993,7 +1022,9 @@ impl ClaudeCliReasoner {
         // picks up the host's global MCP config), and the remaining
         // settings (hooks, etc.) go to `--settings`.
         let handoff_hooks = crate::handoff::ClaudeHooks::prepare(opts)?;
-        let effective_settings = handoff_hooks.as_ref().map(|launch| &launch.settings_json)
+        let effective_settings = handoff_hooks
+            .as_ref()
+            .map(|launch| &launch.settings_json)
             .or(opts.settings_json.as_ref());
         if let Some(settings) = effective_settings {
             let (settings_only, mcp_config) = split_mcp_from_settings(settings);
@@ -1050,10 +1081,24 @@ impl ClaudeCliReasoner {
                 cmd.env_remove(key);
             }
         }
-        let (mut child, process_group) = crate::process_tree::spawn_supervised(&cmd, opts.restrict_env, clean, opts.handoff_path.as_deref())
-            .map_err(|error| if error.kind() == std::io::ErrorKind::WouldBlock {
-                CallError::Other(ReasonerError::CleanupUncertain { provider: "claude".into() }.into())
-            } else { CallError::from(error) })?;
+        let (mut child, process_group) = crate::process_tree::spawn_supervised(
+            &cmd,
+            opts.restrict_env,
+            clean,
+            opts.handoff_path.as_deref(),
+        )
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                CallError::Other(
+                    ReasonerError::CleanupUncertain {
+                        provider: "claude".into(),
+                    }
+                    .into(),
+                )
+            } else {
+                CallError::from(error)
+            }
+        })?;
 
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(user_message.as_bytes()).await?;
@@ -1074,15 +1119,9 @@ impl ClaudeCliReasoner {
         // (the auto-PR builder) was the one producing no record of what it
         // read, wrote or ran. A preset may still pass its own logger; this is
         // only the default when it passes none.
-        let audit_logger = opts
-            .audit_logger
-            .clone()
-            .or_else(default_audit_logger);
+        let audit_logger = opts.audit_logger.clone().or_else(default_audit_logger);
         let audit_active = audit_logger.is_some() || opts.audit_notifier.is_some();
-        let audit_session = opts
-            .session_id
-            .clone()
-            .unwrap_or_else(|| "-".to_string());
+        let audit_session = opts.session_id.clone().unwrap_or_else(|| "-".to_string());
         let mut pending_tool_uses: HashMap<String, (String, serde_json::Value)> = HashMap::new();
 
         // Every non-empty text block the model emitted, in stream order, plus
@@ -1139,13 +1178,15 @@ impl ClaudeCliReasoner {
         // logger swallows its own IO errors, so accounting can never fail a
         // call the model already answered.
         if let Some(usage) = observed_usage {
-            crate::token_usage::UsageLogger::global().append(&crate::token_usage::UsageRecord::for_call(
-                crate::providers::ProviderKind::Claude,
-                opts.model.clone().unwrap_or_else(|| "(inherited)".into()),
-                crate::providers::classify(opts),
-                usage,
-                call_started,
-            ));
+            crate::token_usage::UsageLogger::global().append(
+                &crate::token_usage::UsageRecord::for_call(
+                    crate::providers::ProviderKind::Claude,
+                    opts.model.clone().unwrap_or_else(|| "(inherited)".into()),
+                    crate::providers::classify(opts),
+                    usage,
+                    call_started,
+                ),
+            );
         }
 
         let status = child.wait().await?;
@@ -1529,12 +1570,14 @@ pub fn draft_opts(system_prompt: String, wiki_root: Option<PathBuf>) -> Reasoner
 pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
     // The shared maintenance schema draws a conceptual `wiki/` tree. During
     // lint the tool workspace is already that tree, not its parent directory.
-    let system_prompt = format!("{system_prompt}\n\nCurrent invocation: read-only wiki lint. \
+    let system_prompt = format!(
+        "{system_prompt}\n\nCurrent invocation: read-only wiki lint. \
         The configured wiki root is `{}`. The schema's `wiki/` denotes that root, \
         not an additional subdirectory. Resolve index.md and page links against \
         this root; use its absolute paths with Read, Grep and Glob. Report findings \
         without changing files. Write and Edit are not available in this invocation.",
-        wiki_root.display());
+        wiki_root.display()
+    );
     ReasonerOpts {
         system_prompt,
         model: Some(opus_model()), // Opus — lint is reasoning-heavy, low volume
@@ -1631,20 +1674,16 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     // (defaults to the next 7 days) is the common one.
     let bash_calendar_list_abs = format!("Bash({} calendar list-events *)", bin.display());
     let bash_calendar_list_bare = "Bash(augmentagent calendar list-events *)".to_string();
-    let bash_calendar_list_abs_noargs =
-        format!("Bash({} calendar list-events)", bin.display());
-    let bash_calendar_list_bare_noargs =
-        "Bash(augmentagent calendar list-events)".to_string();
+    let bash_calendar_list_abs_noargs = format!("Bash({} calendar list-events)", bin.display());
+    let bash_calendar_list_bare_noargs = "Bash(augmentagent calendar list-events)".to_string();
     // #398 — `calendar create-event` PROPOSES an event: it writes a pending
     // action row and posts a Discord approval card; the event is created
     // (and invites sent) only when the operator clicks Approve. Safe to
     // allowlist for the same reason `gmail compose --post` is (#352): the
     // command's only externally visible effect is one card in the existing
     // approval channel. Args are always required, so no no-arg form.
-    let bash_calendar_create_abs =
-        format!("Bash({} calendar create-event *)", bin.display());
-    let bash_calendar_create_bare =
-        "Bash(augmentagent calendar create-event *)".to_string();
+    let bash_calendar_create_abs = format!("Bash({} calendar create-event *)", bin.display());
+    let bash_calendar_create_bare = "Bash(augmentagent calendar create-event *)".to_string();
     // #571 / #572 — operator-initiated social drafts. Same safety argument
     // as `gmail compose --post` and `calendar create-event`: these verbs
     // touch no social API at all. They write a pending action row and post
@@ -1732,7 +1771,10 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     ];
     // Honor the operator's private document-source configuration location.
     if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
-        env.push(("XDG_CONFIG_HOME".into(), config_home.to_string_lossy().into_owned()));
+        env.push((
+            "XDG_CONFIG_HOME".into(),
+            config_home.to_string_lossy().into_owned(),
+        ));
     }
     // #915/#922 — the scope guard allows the READ tools under the transcript
     // clone, but only if it can see the same variable the daemon used to
@@ -1834,6 +1876,10 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             // here — durable-fact persistence is a separate, deliberate surface.
             "mcp__memory__search_conversation_history".into(),
             "mcp__memory__read_conversation_thread".into(),
+            // #1099 / #1098 — structured cross-channel search + aggregates.
+            // Both are read-only surfaces over the same db.
+            "mcp__memory__search_messages".into(),
+            "mcp__memory__conversation_stats".into(),
             "mcp__memory__memory_search".into(),
             "mcp__memory__memory_recent".into(),
             "Bash(augmentagent finance status)".into(),
@@ -1959,9 +2005,9 @@ fn split_mcp_from_settings(raw: &str) -> (Option<String>, Option<String>) {
     let serde_json::Value::Object(mut map) = parsed else {
         return (Some(raw.to_string()), None);
     };
-    let mcp_config = map.remove("mcpServers").map(|servers| {
-        serde_json::json!({ "mcpServers": servers }).to_string()
-    });
+    let mcp_config = map
+        .remove("mcpServers")
+        .map(|servers| serde_json::json!({ "mcpServers": servers }).to_string());
     let settings_only = if map.is_empty() {
         None
     } else {
@@ -2163,7 +2209,6 @@ Every response, including missing-timezone failures, must be one JSON object.
     }
 }
 
-
 /// Preset for the archetype picker (#36). A single fast structured-output
 /// classification: email + triage label in, one archetype id (or `none`) +
 /// confidence out. Haiku for cost/latency — the issue specifies a fast,
@@ -2213,7 +2258,8 @@ pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
             .map(|d| d.join(&wiki_root))
             .unwrap_or(wiki_root)
     });
-    let system_prompt = format!("{system_prompt}\n\nCurrent invocation: ingest into the \
+    let system_prompt = format!(
+        "{system_prompt}\n\nCurrent invocation: ingest into the \
         configured wiki root `{}`. The schema's `wiki/` denotes this root, not an \
         additional subdirectory. Resolve page and log paths against this root. \
         `journal/` under this root is machine-managed — never create or edit \
@@ -2221,7 +2267,9 @@ pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
         cite the message id instead (#1094). \
         After completing the updates, return a short final acknowledgement naming \
         the changed relative paths. If an operation fails, report the failure; \
-        do not silently finish or claim that failed updates were completed.", wiki_root.display());
+        do not silently finish or claim that failed updates were completed.",
+        wiki_root.display()
+    );
     // #1094 — hard-block Write/Edit under journal/ regardless of what the
     // model decides. Missing script (stripped deploy) degrades to the
     // prompt rule alone, with a warning.
@@ -2297,7 +2345,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
-
     /// #1004 — every preset audits now. The regression this guards is the one
     /// that existed for months: the agent that edits the repo and pushes
     /// branches produced no tool record, because its preset passed `None`.
@@ -2305,10 +2352,17 @@ mod tests {
     fn query_document_commands_are_read_only_and_explicit() {
         let root = tempfile::tempdir().unwrap();
         let opts = ask_opts(root.path().to_path_buf(), root.path().to_path_buf());
-        for command in ["Bash(augmentagent repo-docs sources)", "Bash(augmentagent repo-docs list *)", "Bash(augmentagent repo-docs get *)"] {
+        for command in [
+            "Bash(augmentagent repo-docs sources)",
+            "Bash(augmentagent repo-docs list *)",
+            "Bash(augmentagent repo-docs get *)",
+        ] {
             assert!(opts.allowed_tools.contains(&command.to_string()));
         }
-        assert!(!opts.allowed_tools.iter().any(|s| s == "Bash(augmentagent repo-docs *)" || s == "Bash(gh *)"));
+        assert!(!opts
+            .allowed_tools
+            .iter()
+            .any(|s| s == "Bash(augmentagent repo-docs *)" || s == "Bash(gh *)"));
     }
 
     #[test]
@@ -2324,11 +2378,17 @@ mod tests {
 
         for off in ["0", "false", "off", "no", "OFF", " False "] {
             std::env::set_var("AUGMENTAGENT_TOOL_AUDIT", off);
-            assert!(default_audit_logger().is_none(), "{off:?} must disable auditing");
+            assert!(
+                default_audit_logger().is_none(),
+                "{off:?} must disable auditing"
+            );
         }
         for on in ["1", "true", "yes", "anything-else"] {
             std::env::set_var("AUGMENTAGENT_TOOL_AUDIT", on);
-            assert!(default_audit_logger().is_some(), "{on:?} must keep auditing");
+            assert!(
+                default_audit_logger().is_some(),
+                "{on:?} must keep auditing"
+            );
         }
 
         // One shared instance, so the hourly retention check is rate-limited
@@ -2386,16 +2446,42 @@ mod tests {
 
         let log_arc = logger.clone();
         let notifier_arc = notifier.clone();
-        audit_stream_line(write_use, &mut pending, session, Some(&log_arc), Some(&notifier_arc));
-        audit_stream_line(write_res, &mut pending, session, Some(&log_arc), Some(&notifier_arc));
-        audit_stream_line(read_use, &mut pending, session, Some(&log_arc), Some(&notifier_arc));
-        audit_stream_line(read_res, &mut pending, session, Some(&log_arc), Some(&notifier_arc));
+        audit_stream_line(
+            write_use,
+            &mut pending,
+            session,
+            Some(&log_arc),
+            Some(&notifier_arc),
+        );
+        audit_stream_line(
+            write_res,
+            &mut pending,
+            session,
+            Some(&log_arc),
+            Some(&notifier_arc),
+        );
+        audit_stream_line(
+            read_use,
+            &mut pending,
+            session,
+            Some(&log_arc),
+            Some(&notifier_arc),
+        );
+        audit_stream_line(
+            read_res,
+            &mut pending,
+            session,
+            Some(&log_arc),
+            Some(&notifier_arc),
+        );
 
         // Both record + notify spawn background tasks; give them a moment.
         for _ in 0..20 {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             if log_path.exists() {
-                let body = tokio::fs::read_to_string(&log_path).await.unwrap_or_default();
+                let body = tokio::fs::read_to_string(&log_path)
+                    .await
+                    .unwrap_or_default();
                 if body.lines().count() >= 2 && typed.calls.load(Ordering::SeqCst) >= 1 {
                     break;
                 }
@@ -2438,7 +2524,6 @@ mod tests {
         // audit_active is true. The contract here is "no panics, no IO".
         assert_eq!(pending.len(), 1);
     }
-
 
     /// Test double that records the args of the last `call` and returns a
     /// canned string. Used to verify `call_code_mode` extracts the fenced
@@ -2673,7 +2758,10 @@ mod tests {
         let wiki = std::env::temp_dir().join("aa-guard-test-wiki");
         std::fs::create_dir_all(&wiki).unwrap();
         let opts = ingest_opts("sys".into(), wiki.clone());
-        let settings = opts.settings_json.as_deref().expect("ingest must ship a settings hook");
+        let settings = opts
+            .settings_json
+            .as_deref()
+            .expect("ingest must ship a settings hook");
         assert!(settings.contains("aa-journal-guard.sh"), "{settings}");
         assert!(settings.contains("Write|Edit"), "{settings}");
         let wiki_root = opts
@@ -2682,7 +2770,10 @@ mod tests {
             .find(|(k, _)| k == "WIKI_ROOT")
             .map(|(_, v)| v.clone())
             .expect("WIKI_ROOT env for the guard");
-        assert!(std::path::Path::new(&wiki_root).is_absolute(), "{wiki_root}");
+        assert!(
+            std::path::Path::new(&wiki_root).is_absolute(),
+            "{wiki_root}"
+        );
     }
 
     #[test]
@@ -2829,6 +2920,8 @@ mod tests {
         for needle in [
             "mcp__memory__search_conversation_history",
             "mcp__memory__read_conversation_thread",
+            "mcp__memory__search_messages",
+            "mcp__memory__conversation_stats",
             "mcp__memory__memory_search",
             "mcp__memory__memory_recent",
         ] {
@@ -2838,7 +2931,10 @@ mod tests {
             );
         }
         assert!(
-            !opts.allowed_tools.iter().any(|t| t == "mcp__memory__memory_write"),
+            !opts
+                .allowed_tools
+                .iter()
+                .any(|t| t == "mcp__memory__memory_write"),
             "memory_write must NOT be exposed in ask mode allowlist"
         );
 
@@ -3037,28 +3133,70 @@ mod tests {
 
         std::env::remove_var("AWS_CONFIG_FILE");
         let joined = opts.allowed_tools.join("\n");
-        let abs = format!("Bash({} imessage fetch-attachment *)", repo.path().join("target/release/augmentagent").display());
-        for needle in ["Bash(augmentagent imessage fetch-attachment *)".to_string(), abs] {
-            assert!(opts.allowed_tools.contains(&needle), "missing {needle}; got:\n{joined}");
+        let abs = format!(
+            "Bash({} imessage fetch-attachment *)",
+            repo.path().join("target/release/augmentagent").display()
+        );
+        for needle in [
+            "Bash(augmentagent imessage fetch-attachment *)".to_string(),
+            abs,
+        ] {
+            assert!(
+                opts.allowed_tools.contains(&needle),
+                "missing {needle}; got:\n{joined}"
+            );
         }
-        assert!(!joined.contains("imessage *"), "no imessage wildcard (sync writes pages): {joined}");
-        let env = |o: &ReasonerOpts, k: &str| o.env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
-        assert_eq!(env(&opts, "AUGMENTAGENT_IMESSAGE_S3_BUCKET").as_deref(), Some("imsg-bundle"));
-        assert_eq!(env(&opts, "AWS_CONFIG_FILE").as_deref(), Some("/tmp/aa-test-aws-config"));
+        assert!(
+            !joined.contains("imessage *"),
+            "no imessage wildcard (sync writes pages): {joined}"
+        );
+        let env = |o: &ReasonerOpts, k: &str| {
+            o.env
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            env(&opts, "AUGMENTAGENT_IMESSAGE_S3_BUCKET").as_deref(),
+            Some("imsg-bundle")
+        );
+        assert_eq!(
+            env(&opts, "AWS_CONFIG_FILE").as_deref(),
+            Some("/tmp/aa-test-aws-config")
+        );
         let dir = env(&opts, "AUGMENTAGENT_IMESSAGE_TMP_DIR").expect("session dir minted");
         assert!(dir.starts_with("/tmp/aa-imsg/"), "{dir}");
-        assert_ne!(Some(dir), env(&again, "AUGMENTAGENT_IMESSAGE_TMP_DIR"), "one dir per session");
+        assert_ne!(
+            Some(dir),
+            env(&again, "AUGMENTAGENT_IMESSAGE_TMP_DIR"),
+            "one dir per session"
+        );
     }
 
     /// #888 — the session-dir Read carve-out's cases live in `scripts/tests/aa-wiki-scope-guard.test.sh` (needs jq).
     #[test]
     fn wiki_scope_guard_shell_tests_pass() {
-        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/tests/aa-wiki-scope-guard.test.sh");
-        if std::process::Command::new("jq").arg("--version").output().is_err() {
+        let script = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/tests/aa-wiki-scope-guard.test.sh"
+        );
+        if std::process::Command::new("jq")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             return;
         }
-        let out = std::process::Command::new("bash").arg(script).output().expect("bash runs");
-        assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let out = std::process::Command::new("bash")
+            .arg(script)
+            .output()
+            .expect("bash runs");
+        assert!(
+            out.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// Regression test for the PR #199 follow-up: `aa-gh` must be
@@ -3089,12 +3227,13 @@ mod tests {
                 "expected bare-form allowlist entry {bare}; got:\n{joined}"
             );
         }
-        let aa_gh_abs = repo
-            .path()
-            .join("scripts/aa-gh")
-            .display()
-            .to_string();
-        for sub in ["issue create *", "issue list *", "issue view *", "issue comment *"] {
+        let aa_gh_abs = repo.path().join("scripts/aa-gh").display().to_string();
+        for sub in [
+            "issue create *",
+            "issue list *",
+            "issue view *",
+            "issue comment *",
+        ] {
             let needle = format!("Bash({aa_gh_abs} {sub})");
             assert!(
                 opts.allowed_tools.iter().any(|e| e == &needle),
@@ -3267,10 +3406,19 @@ mod tests {
         let after = with_socialapi_readonly_mcp(base, std::path::Path::new("/repo"));
         let after_fp = opts_fingerprint(&after);
 
-        assert_eq!(before, after_fp, "flag-off must not change spawn-relevant opts");
-        assert!(after.settings_json.is_none(), "no settings_json when flag off");
+        assert_eq!(
+            before, after_fp,
+            "flag-off must not change spawn-relevant opts"
+        );
         assert!(
-            !after.allowed_tools.iter().any(|t| t.starts_with("mcp__socialapi__")),
+            after.settings_json.is_none(),
+            "no settings_json when flag off"
+        );
+        assert!(
+            !after
+                .allowed_tools
+                .iter()
+                .any(|t| t.starts_with("mcp__socialapi__")),
             "no socialapi MCP tools when flag off"
         );
         assert!(
@@ -3339,7 +3487,10 @@ mod tests {
             .pointer("/headers/Authorization")
             .and_then(|x| x.as_str())
             .unwrap_or_default();
-        assert_eq!(auth, "Bearer ${SOCIALAPI_API_KEY}", "raw key must not be baked into settings");
+        assert_eq!(
+            auth, "Bearer ${SOCIALAPI_API_KEY}",
+            "raw key must not be baked into settings"
+        );
 
         let matcher = v
             .pointer("/hooks/PreToolUse/0/matcher")
@@ -3384,7 +3535,11 @@ mod tests {
             eprintln!("guard script not found at {guard:?}; skipping script e2e");
             return;
         }
-        if std::process::Command::new("jq").arg("--version").output().is_err() {
+        if std::process::Command::new("jq")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             eprintln!("jq not available; skipping guard script e2e");
             return;
         }
@@ -3414,7 +3569,8 @@ mod tests {
                 })
                 .expect("guard script runs");
             let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-            let denied = stdout.contains("\"deny\"") || stdout.contains("\"decision\":\"block\"")
+            let denied = stdout.contains("\"deny\"")
+                || stdout.contains("\"decision\":\"block\"")
                 || stdout.contains("\"decision\": \"block\"");
             (denied, stdout)
         };
@@ -3444,7 +3600,10 @@ mod tests {
 
         // Unknown socialapi verb → DENIED fail-closed.
         let (denied, out) = run("mcp__socialapi__frobnicate");
-        assert!(denied, "unknown socialapi tool must be denied fail-closed; got: {out}");
+        assert!(
+            denied,
+            "unknown socialapi tool must be denied fail-closed; got: {out}"
+        );
 
         // Non-socialapi tool → pass-through (allowed, empty stdout).
         let (denied, _out) = run("Read");
@@ -3522,7 +3681,9 @@ mod rate_limit_tests {
         assert!(is_rate_limited(
             "You've hit your session limit · resets 9:30am (America/New_York)"
         ));
-        assert!(is_rate_limited("You've reached your usage limit. Resets at 3pm."));
+        assert!(is_rate_limited(
+            "You've reached your usage limit. Resets at 3pm."
+        ));
         assert!(is_rate_limited(
             "Rate limit exceeded — resets in 12 minutes"
         ));
@@ -3605,9 +3766,18 @@ mod model_pin_tests {
             ("loop_parse", loop_parse_opts()),
             ("archetype_pick", archetype_pick_opts()),
             ("ingest", ingest_opts("sys".into(), wiki.clone())),
-            ("wiki_migrate", wiki_migrate_opts("sys".into(), wiki.clone())),
-            ("pinned(Quality)", ReasonerOpts::pinned(crate::providers::ModelTier::Quality, "sys")),
-            ("pinned(Fast)", ReasonerOpts::pinned(crate::providers::ModelTier::Fast, "sys")),
+            (
+                "wiki_migrate",
+                wiki_migrate_opts("sys".into(), wiki.clone()),
+            ),
+            (
+                "pinned(Quality)",
+                ReasonerOpts::pinned(crate::providers::ModelTier::Quality, "sys"),
+            ),
+            (
+                "pinned(Fast)",
+                ReasonerOpts::pinned(crate::providers::ModelTier::Fast, "sys"),
+            ),
         ];
         for (name, opts) in presets {
             let model = opts.model.as_deref().unwrap_or("");
@@ -3853,14 +4023,21 @@ mod ask_mode_social_card_allowlist_tests {
     #[test]
     fn both_bare_and_absolute_forms_are_present() {
         let tools = ask_allowlist();
-        assert!(tools.iter().any(|t| t == "Bash(augmentagent socialapi dm *)"));
-        assert!(tools.iter().any(|t| t == "Bash(augmentagent linkedin dm *)"));
+        assert!(tools
+            .iter()
+            .any(|t| t == "Bash(augmentagent socialapi dm *)"));
+        assert!(tools
+            .iter()
+            .any(|t| t == "Bash(augmentagent linkedin dm *)"));
         assert!(
-            tools.iter().filter(|t| t.contains("socialapi dm *")).count() >= 2,
+            tools
+                .iter()
+                .filter(|t| t.contains("socialapi dm *"))
+                .count()
+                >= 2,
             "expected both an absolute and a bare form"
         );
     }
-
 }
 
 /// #655/#656 — typed errors, reset-hint parsing, watchdog. Spawn-level tests
@@ -3967,10 +4144,12 @@ mod failover_error_tests {
         let bin = stub_cli(
             &dir,
             "fake-claude-slow",
-            &format!("cat >/dev/null
+            &format!(
+                "cat >/dev/null
 sleep 0.15
 {RESULT_OK}
-"),
+"
+            ),
         );
         let _env = TIMEOUT_ENV_LOCK.lock().await;
         let gate = Arc::new(CliGate::new(3));
@@ -4017,12 +4196,18 @@ sleep 0.15
     async fn empty_output_is_a_content_turn_failure() {
         let dir = tempfile::tempdir().unwrap();
         let bin = stub_cli(&dir, "fake-claude-empty", "cat >/dev/null\n");
-        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        let reasoner = ClaudeCliReasoner {
+            bin,
+            gate: Arc::new(CliGate::new(1)),
+        };
         let err = reasoner.call(&dummy_opts(), "x").await.unwrap_err();
         assert!(ReasonerError::find_in(&err).is_none(), "{err:#}");
         assert_eq!(err.to_string(), "claude produced no assistant text");
-        assert_eq!(err.downcast_ref::<crate::turn_failure::TurnFailure>().map(|f| f.class),
-            Some(crate::turn_failure::FailureClass::Content));
+        assert_eq!(
+            err.downcast_ref::<crate::turn_failure::TurnFailure>()
+                .map(|f| f.class),
+            Some(crate::turn_failure::FailureClass::Content)
+        );
     }
 
     /// A permit must go back on every exit path: non-zero exit, and the
@@ -4034,10 +4219,14 @@ sleep 0.15
         let dir = tempfile::tempdir().unwrap();
         let gate = Arc::new(CliGate::new(1));
 
-        let failing = stub_cli(&dir, "fake-claude-fail", "cat >/dev/null
+        let failing = stub_cli(
+            &dir,
+            "fake-claude-fail",
+            "cat >/dev/null
 echo boom >&2
 exit 1
-");
+",
+        );
         let fail = ClaudeCliReasoner {
             bin: failing,
             gate: Arc::clone(&gate),
@@ -4048,10 +4237,12 @@ exit 1
         let slow = stub_cli(
             &dir,
             "fake-claude-hang",
-            &format!("cat >/dev/null
+            &format!(
+                "cat >/dev/null
 sleep 5
 {RESULT_OK}
-"),
+"
+            ),
         );
         let hang = ClaudeCliReasoner {
             bin: slow,
@@ -4059,12 +4250,25 @@ sleep 5
         };
         let cancelled =
             tokio::time::timeout(Duration::from_millis(200), hang.call(&dummy_opts(), "x")).await;
-        assert!(cancelled.is_err(), "the slow call should have been cancelled");
-        assert_eq!(gate.in_flight(), 0, "a cancelled call must release its permit");
+        assert!(
+            cancelled.is_err(),
+            "the slow call should have been cancelled"
+        );
+        assert_eq!(
+            gate.in_flight(),
+            0,
+            "a cancelled call must release its permit"
+        );
 
-        let ok_bin = stub_cli(&dir, "fake-claude-ok", &format!("cat >/dev/null
+        let ok_bin = stub_cli(
+            &dir,
+            "fake-claude-ok",
+            &format!(
+                "cat >/dev/null
 {RESULT_OK}
-"));
+"
+            ),
+        );
         let ok = ClaudeCliReasoner {
             bin: ok_bin,
             gate: Arc::clone(&gate),
@@ -4086,13 +4290,24 @@ sleep 5
         let leaked = gate.acquire_timed("claude", "TextOnly", day).await.unwrap();
         let _env = TIMEOUT_ENV_LOCK.lock().await;
         std::env::set_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS", "1");
-        let reasoner = ClaudeCliReasoner { bin: "never-spawned".into(), gate: Arc::clone(&gate) };
-        let err = reasoner.call(&dummy_opts(), "hi").await.expect_err("the permit is held");
+        let reasoner = ClaudeCliReasoner {
+            bin: "never-spawned".into(),
+            gate: Arc::clone(&gate),
+        };
+        let err = reasoner
+            .call(&dummy_opts(), "hi")
+            .await
+            .expect_err("the permit is held");
         std::env::remove_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS");
         let typed = ReasonerError::find_in(&err).unwrap_or_else(|| panic!("untyped: {err:?}"));
-        let ReasonerError::GateTimeout { provider, .. } = typed else { panic!("{typed:?}") };
+        let ReasonerError::GateTimeout { provider, .. } = typed else {
+            panic!("{typed:?}")
+        };
         assert_eq!(provider, "claude");
-        assert!(!typed.is_provider_side(), "our gate is not a provider fault");
+        assert!(
+            !typed.is_provider_side(),
+            "our gate is not a provider fault"
+        );
         drop(leaked);
         assert_eq!((gate.waiting(), gate.in_flight()), (0, 0));
     }
@@ -4150,7 +4365,10 @@ echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30
             gate: CliGate::global(),
         };
         let started = std::time::Instant::now();
-        let err = reasoner.call(&dummy_opts(), "hi").await.expect_err("must time out");
+        let err = reasoner
+            .call(&dummy_opts(), "hi")
+            .await
+            .expect_err("must time out");
         std::env::remove_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(30),
@@ -4212,13 +4430,80 @@ mod finance_allowlist_tests {
         let dir = tempfile::tempdir().unwrap();
         let opts = super::ask_opts(dir.path().to_owned(), dir.path().to_owned());
         for verb in ["status", "transactions", "summary"] {
-            assert!(opts.allowed_tools.contains(&format!("Bash(augmentagent finance {verb})")));
-            assert!(opts.allowed_tools.contains(&format!("Bash(augmentagent finance {verb} *)")));
+            assert!(opts
+                .allowed_tools
+                .contains(&format!("Bash(augmentagent finance {verb})")));
+            assert!(opts
+                .allowed_tools
+                .contains(&format!("Bash(augmentagent finance {verb} *)")));
         }
         for verb in ["connect", "complete", "sync", "export"] {
-            assert!(!opts.allowed_tools.iter().any(|s| s.contains(&format!("finance {verb}"))));
+            assert!(!opts
+                .allowed_tools
+                .iter()
+                .any(|s| s.contains(&format!("finance {verb}"))));
         }
-        assert!(!opts.allowed_tools.contains(&"Bash(augmentagent finance *)".into()));
+        assert!(!opts
+            .allowed_tools
+            .contains(&"Bash(augmentagent finance *)".into()));
         assert!(!opts.env.iter().any(|(key, _)| key.starts_with("PLAID_")));
+    }
+}
+
+#[cfg(test)]
+mod message_tool_wiring {
+    use super::*;
+
+    /// #1097 — every preset that can reach conversation recall must expose the
+    /// structured tools too; otherwise the schema documents tools the model is
+    /// not allowed to call.
+    #[test]
+    fn presets_with_recall_also_allow_the_structured_message_tools() {
+        let repo = tempfile::tempdir().unwrap();
+        let wiki = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("data.db"), b"").unwrap();
+        let presets: Vec<(&str, ReasonerOpts)> = vec![(
+            "ask_opts",
+            ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf()),
+        )];
+        let mut checked = 0;
+        for (name, opts) in presets {
+            let has = |t: &str| opts.allowed_tools.iter().any(|a| a == t);
+            if !has("mcp__memory__search_conversation_history") {
+                continue;
+            }
+            checked += 1;
+            for tool in [
+                "mcp__memory__search_messages",
+                "mcp__memory__conversation_stats",
+            ] {
+                assert!(has(tool), "{name} allows recall but not {tool}");
+            }
+        }
+        assert!(checked > 0, "no preset carries the recall tools any more");
+    }
+
+    /// The operator table in the ask schema is locked to the parser: adding an
+    /// operator without documenting it (or vice versa) fails here.
+    #[test]
+    fn ask_schema_documents_every_search_operator() {
+        let schema = include_str!("../../../schema/wiki-ask.md");
+        for op in augmentagent_messages::query::OPERATORS {
+            assert!(
+                schema.contains(&format!("`{op}:")) || schema.contains(&format!("{op}:<")),
+                "operator `{op}:` is not documented in schema/wiki-ask.md"
+            );
+        }
+        for doc_only in [
+            "conversation_stats",
+            "search_messages",
+            "is:latest",
+            "ambiguous",
+        ] {
+            assert!(
+                schema.contains(doc_only),
+                "{doc_only} missing from the ask schema"
+            );
+        }
     }
 }
