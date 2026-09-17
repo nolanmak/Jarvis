@@ -1676,6 +1676,47 @@ impl Store {
              CREATE INDEX IF NOT EXISTS idx_drive_accounts_active ON drive_accounts(active);",
         )?;
 
+        // #1103 — structured message index. Rust-only derived data: every
+        // write to `emails` (from any process, including the Node dashboard)
+        // enqueues its messageId via triggers; `augmentagent-messages`
+        // drains the queue into `message_index`. The index is rebuildable
+        // from `emails` at any time, so it never sits on the triage write
+        // path itself. Additive and idempotent.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS message_index (\
+                 message_id         TEXT PRIMARY KEY,\
+                 platform           TEXT NOT NULL,\
+                 conv_kind          TEXT NOT NULL,\
+                 conversation_id    TEXT NOT NULL,\
+                 conversation_title TEXT,\
+                 container          TEXT,\
+                 sender_handle      TEXT NOT NULL,\
+                 sender_label       TEXT,\
+                 counterpart_handle TEXT,\
+                 from_me            INTEGER NOT NULL,\
+                 ts_ms              INTEGER NOT NULL,\
+                 ts_fallback        INTEGER NOT NULL DEFAULT 0,\
+                 has_attachment     INTEGER NOT NULL,\
+                 extractor_version  INTEGER NOT NULL\
+             );\
+             CREATE INDEX IF NOT EXISTS idx_mi_conv ON message_index(conversation_id, ts_ms);\
+             CREATE INDEX IF NOT EXISTS idx_mi_sender ON message_index(sender_handle, ts_ms);\
+             CREATE INDEX IF NOT EXISTS idx_mi_counterpart ON message_index(counterpart_handle, ts_ms);\
+             CREATE INDEX IF NOT EXISTS idx_mi_plat ON message_index(platform, conv_kind, ts_ms);\
+             CREATE INDEX IF NOT EXISTS idx_mi_ts ON message_index(ts_ms);\
+             CREATE TABLE IF NOT EXISTS message_index_queue (\
+                 seq        INTEGER PRIMARY KEY AUTOINCREMENT,\
+                 message_id TEXT NOT NULL UNIQUE\
+             );\
+             CREATE TRIGGER IF NOT EXISTS trg_emails_message_index_insert AFTER INSERT ON emails \
+             BEGIN INSERT OR REPLACE INTO message_index_queue(message_id) VALUES (NEW.messageId); END;\
+             CREATE TRIGGER IF NOT EXISTS trg_emails_message_index_update \
+             AFTER UPDATE OF messageId, threadId, fromEmail, subject, body, receivedAt, accountEntityId, platform, kind ON emails \
+             BEGIN INSERT OR REPLACE INTO message_index_queue(message_id) VALUES (NEW.messageId); END;\
+             CREATE TRIGGER IF NOT EXISTS trg_emails_message_index_delete AFTER DELETE ON emails \
+             BEGIN INSERT OR REPLACE INTO message_index_queue(message_id) VALUES (OLD.messageId); END;",
+        )?;
+
         Ok(())
     }
 

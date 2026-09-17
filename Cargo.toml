@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/augmentagent-finance",
     "crates/augmentagent-store",
+    "crates/augmentagent-messages",
     "crates/augmentagent-channel-core",
     "crates/augmentagent-channel-email",
     "crates/augmentagent-channel-linkedin",
