@@ -53,10 +53,14 @@ wrong `jsonrpc`/`method` gets `-32600` with that id. A `tools/call` whose params
 are not an object, whose `name` is not a string, or whose `arguments` are not an
 object gets `-32602`. Any other unexpected failure gets `-32603` with no details.
 Tool-level `RecursionError`/`MemoryError` become ordinary tool errors. A request
-line may be at most 24 MiB. That fits the largest legitimate request, an 8 MiB
-Write whose JSON escaping doubles its size, plus envelope and margin. It also
-bounds parse memory: a line of tiny JSON objects costs about 27 times its size
-in `json.loads`. The bridge reads at most 24 MiB of a longer line, skips the rest
+line may be at most 24 MiB. That admits a Write of up to 8 MiB of text whose
+JSON escaping needs at most two bytes per byte (quotes, backslashes, newlines,
+tabs; non-ASCII stays raw UTF-8), plus envelope and path. JSON escapes other
+control characters as six bytes each, so text dense with them can exceed the
+cap: a 4 MiB Write of such characters already does. That request is refused with
+`-32600` before parsing, and nothing is written. The cap also bounds parse
+memory: a line of tiny JSON objects costs about 27 times its size in
+`json.loads`. The bridge reads at most 24 MiB of a longer line, skips the rest
 in 1 MiB reads without keeping them, and answers `-32600`. The reply carries the
 id only when it is the compact request's leading field, in JSON integer or simple
 string form. Notifications

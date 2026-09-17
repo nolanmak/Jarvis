@@ -1613,8 +1613,8 @@ class BridgeResilienceTests(unittest.TestCase):
                 ])
 
     def test_request_line_cap_fits_a_maximal_write_but_nothing_much_larger(self):
-        # Largest legitimate request: a Write of MAX_FILE_BYTES whose JSON
-        # escaping doubles every byte ('"' and '\\' become two bytes each).
+        # The admitted bound: a Write of MAX_FILE_BYTES of text needing two bytes
+        # of escaping per byte ('"' and '\\' each become two bytes).
         self.assertLessEqual(bridge.MAX_REQUEST_BYTES, 24 * 1024 * 1024)
         content = '"\\' * (bridge.MAX_FILE_BYTES // 2)
         request = self.line({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {
@@ -1627,6 +1627,23 @@ class BridgeResilienceTests(unittest.TestCase):
         self.assertFalse(replies[0]['result'].get('isError', False), replies[0])
         self.assertEqual((self.root / 'maximal.txt').read_bytes(), content.encode())
         self.assertEqual(replies[1], {'jsonrpc': '2.0', 'id': 2, 'result': {}})
+
+    def test_write_of_dense_control_characters_can_exceed_the_cap_and_is_refused_cleanly(self):
+        # JSON escapes each such character as six bytes (), so 4 MiB of
+        # them already exceed the 24 MiB line cap: refused before parsing.
+        content = '\x01' * (4 * 1024 * 1024)
+        request = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {
+            'name': 'Write', 'arguments': {'file_path': 'control.txt', 'content': content}}},
+            separators=(',', ':')).encode() + b'\n'
+        self.assertGreater(len(request), bridge.MAX_REQUEST_BYTES)
+        run, replies = self.run_bridge([request, self.line({'jsonrpc': '2.0', 'id': 2, 'method': 'ping'})])
+        self.assertEqual(run.returncode, 0, run.stderr[-2000:])
+        self.assertEqual(replies, [
+            {'jsonrpc': '2.0', 'id': 1, 'error': {'code': -32600, 'message': 'Request exceeds size limit'}},
+            {'jsonrpc': '2.0', 'id': 2, 'result': {}},
+        ])
+        self.assertFalse((self.root / 'control.txt').exists())
+        self.assertEqual([path.name for path in self.root.iterdir()], [])
 
     def test_oversized_id_recovery_accepts_only_json_integers_and_cannot_raise_out(self):
         for head, expected in [(b'{"jsonrpc":"2.0","id":0,', 0), (b'{"jsonrpc":"2.0","id":-7,', -7),

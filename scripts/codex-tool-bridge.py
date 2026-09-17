@@ -138,11 +138,13 @@ MAX_FILE_BYTES = 8 * 1024 * 1024
 # (Linux PATH_MAX). Enforced for every read, write and search entry (#1042).
 MAX_PATH_DEPTH = 32
 MAX_PATH_BYTES = 4096
-# One JSON-RPC line. The largest legitimate request is a Write of
-# MAX_FILE_BYTES of text. JSON escaping at most doubles such text ('"', '\\',
-# newline and tab become two bytes; non-ASCII stays raw UTF-8 in serde_json),
-# giving 16 MiB. The other 8 MiB covers the envelope, the path and a margin
-# for occasional \uXXXX control-character escapes. The cap also bounds
+# One JSON-RPC line, at most 24 MiB. That admits a Write of up to
+# MAX_FILE_BYTES (8 MiB) of text whose JSON escaping needs at most two bytes per
+# byte: '"', '\\', newline and tab escape to two bytes, and serde_json leaves
+# non-ASCII as raw UTF-8. That is 16 MiB, plus envelope and path. JSON escapes
+# other control characters as six bytes (\u00XX), so text dense with them can
+# exceed the cap: a 4 MiB Write of them already does. Such a line is refused with
+# -32600 before parsing, so the Write has no side effects. The cap also bounds
 # json.loads memory: a line of tiny objects costs about 27x its size to parse.
 MAX_REQUEST_BYTES = 24 * 1024 * 1024
 # Grep (#1038) runs in two phases with separate bounds.
