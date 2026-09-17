@@ -30,6 +30,9 @@ pub enum Command {
         prompt: String,
         #[arg(long)]
         topic: String,
+        /// Public RSS/Atom feed URL; repeat to monitor multiple feeds.
+        #[arg(long = "feed-url")]
+        feed_urls: Vec<String>,
     },
     /// Start an idempotent research run for a brief revision.
     Research {
@@ -233,6 +236,10 @@ fn feedback_body(
     body
 }
 
+fn brief_body(prompt: &str, topic: &str, feed_urls: &[String]) -> Value {
+    json!({"prompt": prompt, "topic": topic, "feedUrls": feed_urls})
+}
+
 struct Api {
     base: Url,
     token: String,
@@ -336,13 +343,14 @@ pub async fn run(command: &Command) -> Result<()> {
             newsletter_id,
             prompt,
             topic,
+            feed_urls,
         } => {
             let id = uuid(newsletter_id)?;
             let key = event_request_key(&format!("brief:{id}"))?;
             api.call(
                 Method::POST,
                 &format!("v1/newsletters/{id}/briefs"),
-                Some(json!({"prompt": prompt, "topic": topic})),
+                Some(brief_body(prompt, topic, feed_urls)),
                 Some(&key),
             )
             .await?
@@ -584,6 +592,22 @@ mod tests {
         assert_ne!(
             request_key("123:456", &schedule_create_operation(id, 2, "research")),
             request_key("123:456", &schedule_create_operation(id, 2, "draft")),
+        );
+    }
+
+    #[test]
+    fn brief_payload_can_include_multiple_explicit_feed_urls() {
+        let body = brief_body(
+            "Find updates",
+            "robotics",
+            &[
+                "https://a.example/rss".into(),
+                "https://b.example/atom".into(),
+            ],
+        );
+        assert_eq!(
+            body["feedUrls"],
+            json!(["https://a.example/rss", "https://b.example/atom"])
         );
     }
 
