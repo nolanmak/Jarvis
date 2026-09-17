@@ -660,7 +660,7 @@ impl LoopScheduler {
         match self.runner.run_prompt(&request_id, &l.prompt).await {
             Ok(answer) => {
                 let header = format!("🔁 loop `{}` · _{}_", l.id, truncate(&l.prompt, 80));
-                let body = format!("{header}\n\n{answer}");
+                let body = loop_result_body(&header, &answer);
                 if let Err(e) = self.poster.post_to(&l.channel_ref, &body).await {
                     warn!(loop_id = %l.id, "loop post failed: {e:#}");
                     let _ = self.store.record_user_loop_run(
@@ -686,6 +686,19 @@ impl LoopScheduler {
             }
         }
     }
+}
+
+/// The posted text for one loop result. Loops draft through the wiki-ask
+/// toolbelt but post through [`LoopPoster`], not `prepare_answer_delivery`,
+/// so the #994 register audit runs here; it keys on a `register:` receipt,
+/// so a receiptless status report or code output posts exactly as before.
+fn loop_result_body(header: &str, answer: &str) -> String {
+    let mut body = format!("{header}\n\n{answer}");
+    for note in crate::register::audit_register_receipts(answer) {
+        body.push_str("\n\u{26a0}\u{fe0f} ");
+        body.push_str(&note);
+    }
+    body
 }
 
 fn now_millis() -> i64 {
@@ -913,6 +926,17 @@ mod cron_helpers_tests {
 mod tests {
     use super::*;
 
+    /// #994 — a loop-drafted message is audited like an interactive one;
+    /// a receiptless result (status text, a code fence) is posted as-is.
+    #[test]
+    fn loop_results_carry_the_register_audit() {
+        let answer = "register: standard (she capitalizes), mirroring\n```\nhey casey, thanks for checking in on the proposal.\n```";
+        let body = loop_result_body("🔁 loop `x`", answer);
+        assert!(body.starts_with("🔁 loop `x`\n\nregister:") && body.contains("\u{26a0}\u{fe0f} register mismatch"), "{body}");
+        let plain = "all quiet.\n```\n$ df -h /mnt/build\n```";
+        assert_eq!(loop_result_body("h", plain), format!("h\n\n{plain}"));
+    }
+
     #[tokio::test]
     async fn occurrence_identity_survives_restart_and_advances_after_recorded_run() {
         struct Runner {
@@ -964,8 +988,7 @@ mod tests {
         let ids = runner.ids.lock().unwrap();
         assert_eq!(ids.len(), 3);
         assert_eq!(ids[0], ids[1], "restarted occurrence must reuse its request identity");
-        assert_ne!(ids[1], ids[2], "next occurrence must not reuse prior receipts");
-    }
+        assert_ne!(ids[1], ids[2], "next occurrence must not reuse prior receipts");    }
 
     #[test]
     fn interval_parsing() {

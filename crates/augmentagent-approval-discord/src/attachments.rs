@@ -199,6 +199,12 @@ pub async fn prepare_answer_delivery(
     });
     let extracted = extract_attach_markers(answer, wiki_root);
     let mut notes = extracted.notes;
+    // #994 — a `register:` receipt that contradicts the draft under it is
+    // flagged in the same visible channel as a refused marker, not posted
+    // as if the draft matched. Receiptless answers pass through untouched.
+    // Both Discord posters of a wiki-ask answer (`event_handler.rs`, `wiki
+    // ask --post`) come through here; `/loop` results audit in `loops.rs`.
+    notes.extend(crate::register::audit_register_receipts(&extracted.text));
 
     let mut attachments = Vec::with_capacity(extracted.files.len());
     for path in &extracted.files {
@@ -453,5 +459,21 @@ mod tests {
         assert_eq!(files2.len(), 1);
         assert!(text2.starts_with("Summary here."));
         assert!(!text2.contains("ATTACH:"));
+    }
+
+    /// #994 — the posted reply carries a visible note when the draft
+    /// contradicts its receipt, and is byte-identical when it matches (the
+    /// receipt is owner-facing and kept) or has no receipt (a code example).
+    #[tokio::test]
+    async fn register_mismatch_is_posted_as_a_warning() {
+        let bad = "register: standard (she capitalizes), mirroring\n```\nhey casey, thanks for checking in. i'll send the proposal tonight.\n```";
+        let (text, _) = prepare_answer_delivery(bad, None).await;
+        assert!(text.starts_with(bad) && text.contains("\u{26a0}\u{fe0f} register mismatch"), "{text}");
+        for untouched in [
+            "register: standard (she capitalizes), mirroring\n```\nHey Casey, thanks for checking in. I'll send the proposal tonight.\n```",
+            "run it like this:\n```\ncargo test -p augmentagent-cli\n```\nthen check the log.",
+        ] {
+            assert_eq!(prepare_answer_delivery(untouched, None).await.0, untouched);
+        }
     }
 }
