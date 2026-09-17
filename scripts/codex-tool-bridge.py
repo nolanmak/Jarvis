@@ -231,6 +231,21 @@ def _refuse_writable_helper(helper, write_roots):
             raise Denied('file verification helper is in a model-writable directory')
 
 
+def allowance_file_permitted(info, uid, gid, write_roots=()):
+    """Whether a Read-allowance leaf may be read (#1045).
+
+    Allowances name single files in shared directories such as /tmp, where
+    another user can plant a file at an allowed name. The file must pass the
+    shared regular, single-link rule and belong to `uid`. It must not be
+    world-writable. Group write is accepted only for `gid`, the daemon's own
+    primary group: the daemon runs with umask 0002, so every attachment it
+    writes is 0664, and only the owner or root can give a file another group.
+    """
+    return (file_verification(write_roots).regular_private_file(info)
+            and info.st_uid == uid and not info.st_mode & stat.S_IWOTH
+            and (not info.st_mode & stat.S_IWGRP or info.st_gid == gid))
+
+
 def literal_command_argv(command):
     # Quotes may contain ordinary punctuation as literal argument data.
     # Reject expansion syntax even inside double quotes, and never invoke
@@ -584,6 +599,8 @@ class Policy:
                 self.hooks.append((matcher, command))
         self.read_roots = self._roots(config.get('read_roots', []))
         self.write_roots = self._roots(config.get('write_roots', []))
+        # #1045: single files outside the roots that Read alone may open.
+        self.read_allowances = self._allowances(config.get('read_allowances', []))
         self._node_install_cache = None
         self._cargo_cache = None
         self.build_vm_config = config.get('build_vm_config')
@@ -596,8 +613,9 @@ class Policy:
         if config.get('handoff_path'):
             path = Path(config['handoff_path'])
             resolved = path.resolve()
-            if not path.is_absolute() or any(resolved == root or root in resolved.parents
-                                             for root in self.read_roots + self.write_roots):
+            if (not path.is_absolute() or any(resolved == root or root in resolved.parents
+                                              for root in self.read_roots + self.write_roots)
+                    or self._read_allowance(str(path)) or self._read_allowance(str(resolved))):
                 raise Denied('handoff state must be outside model tool scopes')
             self.handoff = HandoffJournal(path)
         self.tools = frozenset(config.get('allowed_tools', []))
@@ -632,6 +650,71 @@ class Policy:
                 raise Denied('scope must be a specific directory')
             result.append(path)
         return result
+
+    @staticmethod
+    def _allowances(entries):
+        """Validate Read allowances: exactly Read, a normalized absolute directory, a name pattern."""
+        if not isinstance(entries, list):
+            raise Denied('read allowances must be a list')
+        result = []
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != {'tools', 'directory', 'name_pattern'}:
+                raise Denied('read allowance must declare tools, directory and name_pattern only')
+            if entry['tools'] != ['Read']:
+                raise Denied('read allowances grant Read only')
+            directory, pattern = entry['directory'], entry['name_pattern']
+            if (not isinstance(directory, str) or '\x00' in directory or not directory.startswith('/')
+                    or any(part in ('', '.', '..') for part in directory.split('/')[1:])):
+                raise Denied('read allowance directory must be absolute and normalized')
+            if not isinstance(pattern, str) or not pattern:
+                raise Denied('read allowance requires a name pattern')
+            try:
+                result.append((directory, re.compile(pattern)))
+            except re.error as exc:
+                raise Denied('invalid read allowance pattern') from exc
+        return result
+
+    def _read_allowance(self, name):
+        """(directory, leaf) when `name` is exactly one allowed file, else None.
+
+        The path must already be absolute and normalized: no `.`/`..` or empty
+        component, so the file checked is the file opened, and nothing nested
+        below the allowed directory matches.
+        """
+        if (not isinstance(name, str) or '\x00' in name or not name.startswith('/')
+                or len(os.fsencode(name)) > MAX_PATH_BYTES
+                or any(part in ('', '.', '..') for part in name.split('/')[1:])):
+            return None
+        directory, _, leaf = name.rpartition('/')
+        for allowed, expression in self.read_allowances:
+            if directory == allowed and expression.fullmatch(leaf):
+                return directory, leaf
+        return None
+
+    def _read_allowed(self, directory, leaf):
+        """Read one allowed file, typically in a shared directory such as /tmp.
+
+        Every directory component is opened with O_NOFOLLOW. The directory
+        must belong to root or this user and be writable by no one else unless
+        sticky, and the leaf must satisfy `allowance_file_permitted`.
+        """
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        uid = os.getuid()
+        descriptors = []
+        try:
+            try:
+                descriptors.append(os.open('/', flags))
+                for part in directory.split('/')[1:]:
+                    descriptors.append(os.open(part, flags, dir_fd=descriptors[-1]))
+                info = os.fstat(descriptors[-1])
+            except OSError as exc:
+                raise Denied('path cannot be accessed safely') from exc
+            if info.st_uid not in (0, uid) or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX):
+                raise Denied('read allowance directory is writable by other users')
+            return self._read_at(descriptors[-1], leaf, owner=(uid, os.getgid()))
+        finally:
+            for fd in reversed(descriptors):
+                os.close(fd)
 
     def before(self, tool, arguments):
         for matcher, command in self.hooks:
@@ -713,7 +796,8 @@ class Policy:
 
     def read(self, name, offset=None, limit=None, pages=None):
         self.require('Read')
-        data = self._read_bytes(name)
+        allowed = self._read_allowance(name)
+        data = self._read_allowed(*allowed) if allowed else self._read_bytes(name)
         if data.startswith(b'%PDF-'):
             if offset is not None or limit is not None:
                 raise Denied('use PDF page ranges instead of text line ranges')
@@ -835,8 +919,11 @@ class Policy:
         with self.parent(name) as (parent, leaf):
             return self._read_at(parent, leaf)
 
-    def _read_at(self, directory, leaf):
-        """Read `leaf` in an already verified, O_NOFOLLOW-opened directory."""
+    def _read_at(self, directory, leaf, owner=None):
+        """Read `leaf` in an already verified, O_NOFOLLOW-opened directory.
+
+        With `owner` (uid, gid), the file must also satisfy `allowance_file_permitted`.
+        """
         verification = file_verification(self.write_roots)
         try:
             fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
@@ -844,6 +931,9 @@ class Policy:
             with os.fdopen(fd, 'rb') as stream:
                 # Verified on the opened descriptor: regular, one hard link.
                 metadata = verification.verify_regular_private_file(stream.fileno())
+                if owner is not None and metadata is not None and not allowance_file_permitted(
+                        metadata, *owner, self.write_roots):
+                    metadata = None
                 if metadata is None or metadata.st_size > MAX_FILE_BYTES:
                     raise Denied('read requires a bounded regular file')
                 data = stream.read(MAX_FILE_BYTES + 1)
@@ -889,6 +979,8 @@ class Policy:
 
     def edit(self, name, old, new, replace_all=False):
         self.require('Edit')
+        # Edit stays inside write scopes; Read allowances never apply to it.
+        self._relative(name, writing=True)
         content = self.read(name)
         if not old or (content.count(old) != 1 and not replace_all) or old not in content:
             raise Denied('edit must identify exactly one match')

@@ -120,6 +120,42 @@ to continue. Another live probe confirmed that the restricted native permission
 profile rejected an edit while the bridge successfully read and wrote a synthetic
 file, preserving its bytes.
 
+The query preset's scope guard also lets Claude Read two kinds of inbound
+attachment file outside the wiki: Discord downloads named
+`/tmp/aa-{txt,img,doc}-<msg_id>-<idx>.<ext>`, and `imessage fetch-attachment`
+output directly inside the session's `$AUGMENTAGENT_IMESSAGE_TMP_DIR`
+(`/tmp/aa-imsg/<session>`). The bridge admits the same reads as policy
+`read_allowances`, never as read roots (#1045). Each allowance names one
+directory and one whole-name pattern and grants Read only; Glob, Grep, Write and
+Edit ignore it, and nested names never match. `codex_tools::read_allowances` is
+the single definition. A preset gets the exceptions only when it allows Read and
+runs the scope guard on Read, which is exactly when Claude has them. Because
+`/tmp` is shared, the bridge requires an absolute, already-normalized path and
+opens every directory component with `O_NOFOLLOW`. The directory must belong to
+root or the daemon user and must not be writable by others unless it is sticky.
+The leaf is opened with `O_NOFOLLOW` and must be a single-link regular file
+(`verify_regular_private_file`) owned by the daemon user. It must not be
+world-writable, and group write is accepted only through the daemon's own
+primary group: the unit runs with `UMask=0002`, so every attachment the daemon
+writes is 0664. The guard cannot see owners or link counts, so for planted
+hostile files the bridge is stricter. For files the daemon writes, both decide
+alike.
+
+The guard keeps its own regexes instead of reading them from the environment.
+On the Claude path it is the only check, and inside the bridge it is a second,
+independent one. `scope_guard_carve_outs_mirror_the_read_allowance_definition`
+renders the regexes from the Rust constants and fails if the guard drifts.
+`scope_guard_and_definition_agree_on_attachment_names` runs the real guard over a
+table of names. That table found a dialect gap: under the daemon's `en_US.UTF-8`
+locale, bash bracket ranges such as `[0-9]` also matched non-ASCII letters and
+digits, so the guard now pins `LC_ALL=C`. The paired test
+`query_attachments_read_identically_under_claude_guard_and_codex_bridge` gives
+the real guard and the packaged bridge the production query policy and one probe
+set. Attachment, iMessage and transcript reads succeed under both. Lookalike
+names, `..` escapes, another session's files, nested paths, searches and writes
+are denied under both. The transcript clone needed no change: `add_dirs` already
+makes it a read root.
+
 The bridge tracks its parent process with a Linux pidfd. A live builder probe
 exposed that the previous parent-death signal was tied to Codex's launching
 thread: when that thread retired, the bridge exited while Codex remained alive.
