@@ -9,6 +9,7 @@ use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use reqwest::{Client, Method, Url};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 const PLATFORM: &str = "newsletterbuddy";
 const ACCOUNT: &str = augmentagent_auth::DEFAULT_ACCOUNT;
@@ -63,6 +64,29 @@ pub enum Command {
         newsletter_id: String,
         #[arg(long)]
         run_id: String,
+    },
+    /// Queue an observe-only public browser capture for a research run.
+    BrowserTask {
+        #[arg(long)]
+        newsletter_id: String,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        url: String,
+    },
+    /// Read a browser capture status and its normalized result.
+    BrowserTaskGet {
+        #[arg(long)]
+        newsletter_id: String,
+        #[arg(long)]
+        task_id: String,
+    },
+    /// Cancel a queued or active browser capture.
+    BrowserTaskCancel {
+        #[arg(long)]
+        newsletter_id: String,
+        #[arg(long)]
+        task_id: String,
     },
     /// List citable evidence for a newsletter.
     Evidence {
@@ -170,6 +194,11 @@ fn schedule_create_operation(newsletter_id: &str, brief_revision: u32, kind: &st
     format!("schedule-create:{newsletter_id}:{brief_revision}:{kind}")
 }
 
+fn browser_task_operation(newsletter_id: &str, run_id: &str, url: &str) -> String {
+    let digest = Sha256::digest(format!("{newsletter_id}:{run_id}:{url}").as_bytes());
+    format!("browser-task:{digest:x}")
+}
+
 fn event_request_key(operation: &str) -> Result<String> {
     let event_id = std::env::var("NEWSLETTERBUDDY_REQUEST_ID")
         .context("NewsletterBuddy requires a trusted Discord request ID")?;
@@ -262,6 +291,39 @@ fn brief_body(
         body["undatedPolicy"] = json!(policy);
     }
     body
+}
+
+fn browser_task_body(raw: &str) -> Result<Value> {
+    let url = Url::parse(raw).context("expected a public HTTPS page URL")?;
+    let host = url.host_str().context("browser URL needs a host")?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.fragment().is_some()
+        || !host.contains('.')
+        || host.parse::<std::net::IpAddr>().is_ok()
+        || url.query_pairs().any(|(key, _)| {
+            let key = key.to_ascii_lowercase();
+            [
+                "token",
+                "secret",
+                "auth",
+                "key",
+                "session",
+                "cookie",
+                "signature",
+                "code",
+            ]
+            .iter()
+            .any(|part| key.contains(part))
+        })
+    {
+        bail!("browser task requires a public HTTPS URL without credentials");
+    }
+    Ok(json!({ "capability": "research.browser", "task": {
+        "startUrl": url.as_str(), "allowedHosts": [host], "steps": []
+    } }))
 }
 
 struct Api {
@@ -426,6 +488,54 @@ pub async fn run(command: &Command) -> Result<()> {
             api.call(
                 Method::DELETE,
                 &format!("v1/newsletters/{id}/research-runs/{run}"),
+                None,
+                None,
+            )
+            .await?
+        }
+        Command::BrowserTask {
+            newsletter_id,
+            run_id,
+            url,
+        } => {
+            let id = uuid(newsletter_id)?;
+            let run = uuid(run_id)?;
+            let body = browser_task_body(url)?;
+            let normalized_url = body["task"]["startUrl"]
+                .as_str()
+                .context("invalid browser task URL")?;
+            let key = event_request_key(&browser_task_operation(id, run, normalized_url))?;
+            api.call(
+                Method::POST,
+                &format!("v1/newsletters/{id}/research-runs/{run}/worker-tasks"),
+                Some(body),
+                Some(&key),
+            )
+            .await?
+        }
+        Command::BrowserTaskGet {
+            newsletter_id,
+            task_id,
+        } => {
+            let id = uuid(newsletter_id)?;
+            let task = uuid(task_id)?;
+            api.call(
+                Method::GET,
+                &format!("v1/newsletters/{id}/worker-tasks/{task}"),
+                None,
+                None,
+            )
+            .await?
+        }
+        Command::BrowserTaskCancel {
+            newsletter_id,
+            task_id,
+        } => {
+            let id = uuid(newsletter_id)?;
+            let task = uuid(task_id)?;
+            api.call(
+                Method::DELETE,
+                &format!("v1/newsletters/{id}/worker-tasks/{task}"),
                 None,
                 None,
             )
@@ -656,6 +766,42 @@ mod tests {
         let body = brief_body("Find updates", "robotics", &[], &[], None, None);
         assert!(body.get("freshnessDays").is_none());
         assert!(body.get("undatedPolicy").is_none());
+    }
+
+    #[test]
+    fn browser_task_payload_is_observe_only_and_bound_to_one_public_host() {
+        let body = browser_task_body("https://events.example/founders?day=friday").unwrap();
+        assert_eq!(body["capability"], "research.browser");
+        assert_eq!(
+            body["task"]["startUrl"],
+            "https://events.example/founders?day=friday"
+        );
+        assert_eq!(body["task"]["allowedHosts"], json!(["events.example"]));
+        assert_eq!(body["task"]["steps"], json!([]));
+        for url in [
+            "http://events.example/founders",
+            "https://127.0.0.1/private",
+            "https://events.example/path?access_token=secret",
+            "https://user:pass@events.example/",
+        ] {
+            assert!(browser_task_body(url).is_err(), "{url} should be refused");
+        }
+    }
+
+    #[test]
+    fn browser_task_request_key_is_stable_per_page_and_distinct_per_url() {
+        let id = "123e4567-e89b-12d3-a456-426614174000";
+        let first = browser_task_operation(id, id, "https://events.example/a");
+        assert_eq!(
+            first,
+            browser_task_operation(id, id, "https://events.example/a")
+        );
+        assert_ne!(
+            first,
+            browser_task_operation(id, id, "https://events.example/b")
+        );
+        assert!(request_key(&"1".repeat(100), &first).len() <= 200);
+        assert!(!first.contains("events.example"));
     }
 
     #[test]
