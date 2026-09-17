@@ -497,7 +497,8 @@ enum Cmd {
         /// Machine-readable output.
         #[arg(long, default_value_t = false)]
         json: bool,
-        /// Journal root. Default: ~/.local/state/augmentagent/reasoner-handoffs
+        /// Journal root. Default: reasoner-handoffs in the daemon state dir
+        /// ($XDG_STATE_HOME/augmentagent, else ~/.local/state/augmentagent)
         #[arg(long)]
         root: Option<PathBuf>,
     },

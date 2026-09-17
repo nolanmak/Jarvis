@@ -155,7 +155,9 @@ const MARKER: &str = "operations.active";
 const SAVE_PREFIX: &str = ".handoff-";
 const MAX_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
 
-/// The daemon's journal root (`~/.local/state/augmentagent/reasoner-handoffs`).
+/// The daemon's journal root: `reasoner-handoffs` in the shared
+/// [`state_dir`](crate::state_dir) (`~/.local/state/augmentagent` unless
+/// `XDG_STATE_HOME` is set).
 pub fn journal_root() -> Option<PathBuf> {
     system_root()
 }
