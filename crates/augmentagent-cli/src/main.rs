@@ -2812,6 +2812,10 @@ async fn main() -> Result<()> {
                 shutdown.clone(),
             )));
 
+            // #1036 — Codex VM build scratch: remove sessions left by a killed
+            // bridge (and any VM still using them), once at start.
+            tasks.push(tokio::spawn(augmentagent_channel_core::build_scratch::sweep_at_start()));
+
             // Voice-capture listener (#80): long-poll the capture bot. Inert
             // unless a token is in the keyring AND the chat allowlist is
             // non-empty — so prod (neither configured) never spawns it. The

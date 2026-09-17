@@ -379,21 +379,6 @@ else:
         with self.assertRaises((bridge.Denied, OSError)):
             bridge.copy_dependency_tree(source, Path(self.temp.name) / 'fifo-copy')
 
-    def test_cargo_cache_retains_downloads_but_not_guest_modified_sources(self):
-        source = Path(self.temp.name) / 'cargo-home'
-        for relative in ('registry/cache/example/pkg.crate', 'registry/index/example/config.json',
-                         'registry/src/example/pkg/lib.rs', 'git/checkouts/example/lib.rs'):
-            path = source / relative
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text('SYNTHETIC_PACKAGE_DATA')
-        target = Path(self.temp.name) / 'retained'
-        target.mkdir()
-        bridge.copy_cargo_downloads(source, target)
-        self.assertTrue((target / 'registry/cache/example/pkg.crate').is_file())
-        self.assertTrue((target / 'registry/index/example/config.json').is_file())
-        self.assertFalse((target / 'registry/src').exists())
-        self.assertFalse((target / 'git').exists())
-
     @requires_sandbox
     def test_real_cargo_can_build_and_test_a_dependency_free_fixture(self):
         import shutil
@@ -424,20 +409,13 @@ else:
         (self.root / 'src/lib.rs').write_text('#[test] fn formats_fixture() { assert_eq!(itoa::Buffer::new().format(42), "42"); }\n')
         policy = bridge.Policy({'cwd': str(self.root), 'read_roots': [str(self.root)],
             'write_roots': [str(self.root)], 'allowed_tools': ['Read', 'Write', 'Bash(cargo *)'],
-            'build_vm_config': str(config_file)})
+            'build_vm_config': str(config_file), 'build_scratch_dir': os.environ.get('JARVIS_TEST_BUILD_SCRATCH')})
         self.addCleanup(policy.close)
         first = policy.run_command('cargo test', timeout=90)
         self.assertEqual(first['exit_code'], 0, first)
         self.assertIn('1 passed', first['stdout'])
         second = policy.run_command('cargo test --offline', timeout=90)
         self.assertEqual(second['exit_code'], 0, second)
-        retained = Path(policy._cargo_cache.name)
-        self.assertFalse((retained / 'registry/src').exists())
-        archives = list((retained / 'registry/cache').glob('*/*.crate'))
-        self.assertTrue(archives)
-        archives[0].write_bytes(b'SYNTHETIC_CORRUPTED_ARCHIVE')
-        corrupt = policy.run_command('cargo test --offline', timeout=90)
-        self.assertNotEqual(corrupt['exit_code'], 0, corrupt)
         self.assertEqual(list(registry.iterdir()), [], 'operator cache must stay read-only')
         self.assertIn('registry+https://github.com/rust-lang/crates.io-index', (self.root / 'Cargo.lock').read_text())
         self.assertNotIn('127.0.0.1', (self.root / 'Cargo.lock').read_text())
@@ -469,7 +447,7 @@ Promise.all([direct,denied({method:'POST'},405),denied({servername:'registry.npm
  .then(()=>console.log('SYNTHETIC_PUBLIC_PACKAGE_OK_NETWORK_BLOCKED')).catch(error=>{console.error(error);process.exitCode=1;});""")
         policy = bridge.Policy({'cwd': str(self.root), 'read_roots': [str(self.root)],
             'write_roots': [str(self.root)], 'allowed_tools': ['Read', 'Write', 'Bash(npm *)'],
-            'build_vm_config': os.environ['JARVIS_TEST_VM_CONFIG']})
+            'build_vm_config': os.environ['JARVIS_TEST_VM_CONFIG'], 'build_scratch_dir': os.environ.get('JARVIS_TEST_BUILD_SCRATCH')})
         self.addCleanup(policy.close)
         installed = policy.run_command('npm install is-number@7.0.0 --no-audit --no-fund --fetch-retries=0 --fetch-timeout=10000', timeout=60)
         self.assertEqual(installed['exit_code'], 0, installed)
@@ -482,7 +460,7 @@ Promise.all([direct,denied({method:'POST'},405),denied({servername:'registry.npm
         self.assertFalse((self.root / 'node_modules').exists())
         fresh = bridge.Policy({'cwd': str(self.root), 'read_roots': [str(self.root)],
             'write_roots': [str(self.root)], 'allowed_tools': ['Read', 'Write', 'Bash(npm *)'],
-            'build_vm_config': os.environ['JARVIS_TEST_VM_CONFIG']})
+            'build_vm_config': os.environ['JARVIS_TEST_VM_CONFIG'], 'build_scratch_dir': os.environ.get('JARVIS_TEST_BUILD_SCRATCH')})
         self.addCleanup(fresh.close)
         restored = fresh.run_command('npm ci --no-audit --no-fund --fetch-retries=0 --fetch-timeout=10000', timeout=60)
         self.assertEqual(restored['exit_code'], 0, restored)
@@ -522,7 +500,7 @@ console.log('SYNTHETIC_INSTALL_BUILD_OK');""")
         (old / 'index.js').write_text("module.exports='SYNTHETIC_OLD';")
         policy = bridge.Policy({'cwd': str(self.root), 'read_roots': [str(self.root)],
             'write_roots': [str(self.root)], 'allowed_tools': ['Read', 'Write', 'Edit', 'Bash(npm *)'],
-            'build_vm_config': os.environ['JARVIS_TEST_VM_CONFIG']})
+            'build_vm_config': os.environ['JARVIS_TEST_VM_CONFIG'], 'build_scratch_dir': os.environ.get('JARVIS_TEST_BUILD_SCRATCH')})
         installed = policy.run_command('npm ci --offline --no-audit --no-fund', timeout=60)
         self.assertEqual(installed['exit_code'], 0, installed)
         built = policy.run_command('npm test --offline', timeout=60)
@@ -548,7 +526,7 @@ console.log('SYNTHETIC_INSTALL_BUILD_OK');""")
         (self.root / 'package.json').write_text(json.dumps({'name': 'synthetic-race', 'version': '1.0.0'}))
         policy = bridge.Policy({'cwd': str(self.root), 'read_roots': [str(self.root)],
             'write_roots': [str(self.root)], 'allowed_tools': ['Read', 'Write', 'Bash(npm *)'],
-            'build_vm_config': os.environ['JARVIS_TEST_VM_CONFIG']})
+            'build_vm_config': os.environ['JARVIS_TEST_VM_CONFIG'], 'build_scratch_dir': os.environ.get('JARVIS_TEST_BUILD_SCRATCH')})
         original_copy = bridge.BuildSnapshot.__init__
         def concurrent_owner_edit(snapshot, *args, **kwargs):
             original_copy(snapshot, *args, **kwargs)
@@ -579,7 +557,7 @@ const server=net.createServer(); server.listen(0,'127.0.0.1',()=>{
         config = {'cwd': str(self.root), 'read_roots': [str(self.root)], 'write_roots': [str(self.root)],
             'allowed_tools': ['Read', 'Write', 'Bash(npm *)'],
             'environment': {'PATH': '/nonexistent-synthetic-host-bin'},
-            'build_vm_config': os.environ['JARVIS_TEST_VM_CONFIG']}
+            'build_vm_config': os.environ['JARVIS_TEST_VM_CONFIG'], 'build_scratch_dir': os.environ.get('JARVIS_TEST_BUILD_SCRATCH')}
         outcome = bridge.Policy(config).run_command(f'npm --prefix={self.root} test --offline', timeout=30)
         self.assertEqual(outcome['exit_code'], 0, outcome)
         self.assertIn('SYNTHETIC_DEPENDENCY', outcome['stdout'])
@@ -613,7 +591,7 @@ fs.writeFileSync('result.txt','SYNTHETIC_WORKSPACE_OK');
 """)
         policy=bridge.Policy({'cwd':str(self.root),'read_roots':[str(self.root)],
             'write_roots':[str(self.root)],'allowed_tools':['Read','Write','Bash(npm *)'],
-            'build_vm_config':os.environ['JARVIS_TEST_VM_CONFIG']})
+            'build_vm_config':os.environ['JARVIS_TEST_VM_CONFIG'],'build_scratch_dir':os.environ.get('JARVIS_TEST_BUILD_SCRATCH')})
         outcome=policy.run_command("npm --prefix 'packages/worker space' test --offline",timeout=30)
         self.assertEqual(outcome['exit_code'],0,outcome)
         self.assertIn('SYNTHETIC_NESTED_DEPENDENCY',outcome['stdout'])
@@ -658,7 +636,8 @@ fs.writeFileSync('result.txt','SYNTHETIC_WORKSPACE_OK');
     def test_vm_build_in_fresh_worktree_uses_readonly_checkout_dependencies(self):
         import os
         main,linked,policy=self.linked_dependency_fixture()
-        policy.build_vm_config=os.environ['JARVIS_TEST_VM_CONFIG']
+        policy.build_vm_config=os.environ['JARVIS_TEST_VM_CONFIG'];policy.build_runner='vm'
+        policy._scratch=bridge.BuildScratch(os.environ.get('JARVIS_TEST_BUILD_SCRATCH'))
         (linked/'job.js').write_text("""const fs=require('node:fs');
 if(require('fixture')!=='SYNTHETIC_DEPENDENCY') throw new Error('missing dependency');
 let denied=false;
@@ -2209,6 +2188,208 @@ class BuildRunnerReadinessTests(unittest.TestCase):
         response = self.call_bash(self.policy(build_runner='host'), 'cargo test', timeout=1)
         self.assertTrue(response['isError'])
         self.assertTrue(response['content'][0]['text'].startswith('[runner=host] '), response)
+
+
+class BuildScratchTests(unittest.TestCase):
+    """#1036: VM build scratch lives under the configured root, never /tmp."""
+
+    def setUp(self):
+        import os
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        base = Path(self.temp.name)
+        self.root = base / 'workspace'; self.root.mkdir()
+        (self.root / 'Cargo.toml').write_text('[package]\nname="synthetic"\n')
+        self.scratch = base / 'scratch'; self.scratch.mkdir(mode=0o700)
+        # Anything that falls back to the default temp dir lands here.
+        self.default_tmp = base / 'default-tmp'; self.default_tmp.mkdir()
+        original = tempfile.tempdir
+        tempfile.tempdir = str(self.default_tmp)
+        self.addCleanup(setattr, tempfile, 'tempdir', original)
+        self.registry = base / 'operator-registry'
+        (self.registry / 'cache/index.crates.io-synthetic').mkdir(parents=True)
+        (self.registry / 'index/index.crates.io-synthetic').mkdir(parents=True)
+        (self.registry / 'cache/index.crates.io-synthetic/synthetic-1.0.0.crate').write_bytes(b'x' * 64)
+        (self.registry / 'src').mkdir()
+        (self.registry / 'src/extracted.rs').write_text('not copied')
+        artifact = base / 'runtime-artifact'; artifact.write_text('synthetic')
+        self.runtime_config = {key: str(artifact) for key in ('qemu', 'kernel', 'busybox', 'firmware',
+                               'data_dir', 'library_dir', 'module_dir')}
+        self.runtime_config.update(modules=[str(artifact)], memory_mb=512, registry=str(self.registry))
+        self.calls = []
+        test = self
+
+        class FakeVm:
+            class Unavailable(ValueError):
+                pass
+
+            class Runtime:
+                @staticmethod
+                def load(path):
+                    runtime = FakeVm.Runtime(); runtime.config = test.runtime_config
+                    return runtime
+
+            @staticmethod
+            def run(runtime, workspace, argv, environment, timeout=120, node_workspaces=(),
+                    download_info=None, scratch_dir=None, build_cache=None):
+                test.calls.append({'workspace': Path(workspace), 'argv': argv, 'environment': environment,
+                                   'timeout': timeout, 'scratch_dir': scratch_dir, 'build_cache': build_cache})
+                return {'exit_code': 0, 'stdout': '', 'stderr': ''}
+        self.fake_vm = FakeVm
+
+    def policy(self, **extra):
+        config = {'cwd': str(self.root), 'read_roots': [str(self.root)], 'write_roots': [str(self.root)],
+                  'allowed_tools': ['Read', 'Write', 'Bash(cargo *)', 'Bash(printf *)'],
+                  'build_vm_config': str(Path(self.temp.name) / 'runtime.json'),
+                  'build_scratch_dir': str(self.scratch), 'build_timeout_secs': 600}
+        config.update(extra)
+        policy = bridge.Policy(config)
+        policy._vm_helper = lambda: self.fake_vm
+        policy._scratch.cache_bytes = 64 * 1024**2  # keep the synthetic image small
+        self.addCleanup(policy.close)
+        return policy
+
+    def under(self, path, root):
+        return Path(path).resolve().is_relative_to(Path(root).resolve())
+
+    def test_snapshot_control_and_cache_paths_resolve_under_the_scratch_root(self):
+        policy = self.policy()
+        policy.run_command('cargo build')
+        call = self.calls[0]
+        self.assertTrue(self.under(call['workspace'], self.scratch), call)
+        self.assertTrue(self.under(call['scratch_dir'], self.scratch), call)
+        self.assertTrue(self.under(call['build_cache'], self.scratch), call)
+        self.assertNotIn('CARGO_HOME', call['environment'], 'the guest points Cargo at the build cache')
+        self.assertEqual(list(self.default_tmp.iterdir()), [], 'nothing may use the default temp dir')
+
+    def test_missing_or_unsafe_scratch_root_fails_closed_naming_the_path(self):
+        import os
+        missing = Path(self.temp.name) / 'absent-scratch'
+        policy = self.policy(build_scratch_dir=str(missing))
+        with self.assertRaises(bridge.Readiness) as raised:
+            policy.run_command('cargo build')
+        self.assertIn('JARVIS_READINESS:build_scratch_unavailable', str(raised.exception))
+        self.assertIn(str(missing), str(raised.exception))
+        self.assertEqual(self.calls, [], 'no build may run without scratch')
+        response = bridge.Server(policy).dispatch({'method': 'tools/call', 'params': {
+            'name': 'Bash', 'arguments': {'command': 'cargo build'}}})
+        self.assertTrue(response['content'][0]['text'].startswith('JARVIS_READINESS:build_scratch_unavailable'))
+        self.scratch.chmod(0o777)
+        with self.assertRaises(bridge.Readiness):
+            self.policy().run_command('cargo build')
+        self.scratch.chmod(0o700)
+        link = Path(self.temp.name) / 'scratch-link'; link.symlink_to(self.scratch)
+        with self.assertRaises(bridge.Readiness):
+            self.policy(build_scratch_dir=str(link)).run_command('cargo build')
+        with self.assertRaises(bridge.Readiness):
+            self.policy(build_scratch_dir=None).run_command('cargo build')
+        self.assertEqual(self.calls, [])
+
+    def test_scratch_root_inside_a_write_root_is_refused(self):
+        inside = self.root / 'scratch'; inside.mkdir(mode=0o700)
+        with self.assertRaises(bridge.Denied):
+            self.policy(build_scratch_dir=str(inside))
+        with self.assertRaises(bridge.Denied):
+            self.policy(build_scratch_dir='relative/scratch')
+
+    def test_two_cargo_calls_in_a_session_reuse_the_target_directory(self):
+        import os
+        policy = self.policy()
+        policy.run_command('cargo build')
+        policy.run_command('cargo test')
+        first, second = self.calls
+        # The target directory and Cargo home live in this one image.
+        self.assertEqual(first['build_cache'], second['build_cache'])
+        self.assertNotEqual(first['workspace'], second['workspace'], 'sources are still a fresh snapshot')
+        image = Path(first['build_cache'])
+        self.assertEqual(image.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(image.stat().st_size, 64 * 1024**2)
+        self.assertLess(image.stat().st_blocks * 512, image.stat().st_size, 'the image is sparse')
+        with open(image, 'rb') as handle:
+            handle.seek(1024 + 56)
+            self.assertEqual(handle.read(2), b'\x53\xef', 'an ext filesystem the guest can mount')
+
+    def test_session_close_removes_its_scratch_and_records_its_owner(self):
+        import os
+        policy = self.policy()
+        policy.run_command('cargo build')
+        sessions = [path for path in self.scratch.iterdir() if path.name.startswith('jarvis-vm-session-')]
+        self.assertEqual(len(sessions), 1)
+        owner = json.loads((sessions[0] / 'owner.json').read_text())
+        self.assertEqual(owner['pid'], os.getpid())
+        self.assertEqual(owner['start_time'], bridge.process_start_time(os.getpid()))
+        policy.close()
+        self.assertEqual(list(self.scratch.iterdir()), [])
+
+    def test_build_commands_default_to_the_configured_timeout(self):
+        server = bridge.Server(self.policy(build_timeout_secs=600))
+        server.execute('Bash', {'command': 'cargo build'})
+        self.assertEqual(self.calls[-1]['timeout'], 600)
+        server.execute('Bash', {'command': 'cargo build', 'timeout': 30})
+        self.assertEqual(self.calls[-1]['timeout'], 30, 'an explicit timeout is honoured')
+        policy = self.policy(build_timeout_secs=5000)
+        policy.run_command('cargo build')
+        self.assertEqual(self.calls[-1]['timeout'], 900, 'capped at the tool maximum')
+        del_config = self.policy(build_timeout_secs=None)
+        del_config.run_command('cargo build')
+        self.assertGreaterEqual(self.calls[-1]['timeout'], bridge.BUILD_TIMEOUT_DEFAULT)
+        self.assertGreaterEqual(bridge.BUILD_TIMEOUT_DEFAULT, 600)
+
+    def test_registry_is_never_copied_on_the_host(self):
+        policy = self.policy()
+        copies = []
+        original = bridge.copy_dependency_tree
+        bridge.copy_dependency_tree = lambda *args, **kwargs: copies.append(args)
+        self.addCleanup(setattr, bridge, 'copy_dependency_tree', original)
+        policy.run_command('cargo build')
+        policy.run_command('cargo test')
+        self.assertEqual(copies, [], 'the guest seeds its Cargo home from the read-only registry mount')
+        self.assertEqual(sorted(p.name for p in policy._scratch.session.iterdir()),
+                         ['build-cache.img', 'owner.json', 'tmp'])
+
+    def test_snapshot_preserves_source_mtimes_so_cargo_fingerprints_stay_fresh(self):
+        import os
+        source = self.root / 'lib.rs'; source.write_text('pub fn synthetic() {}\n')
+        os.utime(source, ns=(1_000_000_000_123, 1_000_000_000_456))
+        snapshot = bridge.BuildSnapshot(self.policy(), self.scratch / 'snapshot')
+        self.assertEqual((snapshot.root / 'lib.rs').stat().st_mtime_ns, 1_000_000_000_456)
+
+    def test_scratch_readiness_is_raised_before_the_command_starts(self):
+        policy = self.policy(build_scratch_dir=str(Path(self.temp.name) / 'absent'))
+        response = bridge.Server(policy).dispatch({'method': 'tools/call', 'params': {
+            'name': 'Bash', 'arguments': {'command': 'cargo build'}}})
+        self.assertNotIn('[runner=', response['content'][0]['text'])
+
+    @unittest.skipUnless(__import__('os').environ.get('JARVIS_TEST_VM_CONFIG')
+                         and __import__('os').environ.get('JARVIS_TEST_BUILD_SCRATCH'),
+                         'requires a provisioned private KVM runtime and a scratch root')
+    def test_real_vm_second_cargo_build_in_a_session_is_incremental(self):
+        import os, time
+        # A cached registry dependency makes a cold build visibly longer.
+        (self.root / 'Cargo.toml').write_text('[package]\nname="synthetic-incremental"\nversion="0.1.0"\nedition="2021"\n'
+                                              '[dependencies]\nserde={version="=1.0.228",features=["derive"]}\n')
+        (self.root / 'src').mkdir()
+        (self.root / 'src/lib.rs').write_text('#[derive(serde::Serialize)] pub struct Pair { pub a: u64, pub b: u64 }\n'
+                                              'pub fn add(pair: &Pair) -> u64 { pair.a + pair.b }\n'
+                                              '#[test] fn adds() { assert_eq!(add(&Pair { a: 2, b: 2 }), 4); }\n')
+        policy = bridge.Policy({'cwd': str(self.root), 'read_roots': [str(self.root)],
+            'write_roots': [str(self.root)], 'allowed_tools': ['Read', 'Write', 'Bash(cargo *)'],
+            'build_vm_config': os.environ['JARVIS_TEST_VM_CONFIG'],
+            'build_scratch_dir': os.environ['JARVIS_TEST_BUILD_SCRATCH'], 'build_timeout_secs': 600})
+        self.addCleanup(policy.close)
+        timings, outcomes = [], []
+        for command in ('cargo test --offline', 'cargo test --offline'):
+            started = time.monotonic()
+            outcome = policy.run_command(command)
+            timings.append(time.monotonic() - started)
+            outcomes.append(outcome)
+            self.assertEqual(outcome['exit_code'], 0, outcome)
+            self.assertIn('1 passed', outcome['stdout'])
+        print(f'\nSYNTHETIC_VM_TIMINGS first={timings[0]:.1f}s second={timings[1]:.1f}s')
+        self.assertIn('Compiling serde', outcomes[0]['stderr'])
+        self.assertNotIn('Compiling', outcomes[1]['stderr'], 'second build must reuse the session target')
+        self.assertLess(timings[1], timings[0])
+        self.assertEqual(list(self.default_tmp.iterdir()), [])
 
 
 class TransportTests(unittest.TestCase):

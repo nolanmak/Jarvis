@@ -95,6 +95,23 @@ Path('/etc/group').write_text(f'root:x:0:\nworker:x:{gid}:\n')
 Path('/etc/hosts').write_text('127.0.0.1 localhost registry.npmjs.org index.crates.io static.crates.io\n::1 localhost\n')
 environment={'PATH':'/toolchain/bin:/usr/bin:/bin','HOME':'/home/worker','USER':'worker','LOGNAME':'worker',
     'LANG':'C.UTF-8','TMPDIR':'/tmp','CARGO_HOME':'/cargo','CARGO_NET_OFFLINE':'true','CARGO_TARGET_DIR':'/workspace/target'}
+if job.get('build_cache'):
+    # Session build cache (#1036): persistent target and Cargo home. Seed the
+    # Cargo home once per image from the read-only operator caches.
+    import shutil
+    cache=Path('/build-cache')
+    for name in ('target','cargo-home'):
+        (cache/name).mkdir(exist_ok=True); os.chown(cache/name,uid,gid)
+    home=cache/'cargo-home'
+    if not (home/'.jarvis-seeded').exists():
+        for source,destination in (('/cargo/registry/cache','registry/cache'),('/cargo/registry/index','registry/index'),('/cargo/git','git')):
+            if Path(source).is_dir() and any(Path(source).iterdir()):
+                shutil.copytree(source,home/destination,symlinks=True,dirs_exist_ok=True)
+        for base,dirs,files in os.walk(home):
+            for name in [*dirs,*files]:
+                os.lchown(os.path.join(base,name),uid,gid)
+        (home/'.jarvis-seeded').touch(); os.chown(home/'.jarvis-seeded',uid,gid)
+    environment.update({'CARGO_HOME':'/build-cache/cargo-home','CARGO_TARGET_DIR':'/build-cache/target'})
 environment.update(job['environment'])
 registry=make_proxy('/root/control')
 environment.update({'NODE_EXTRA_CA_CERTS':'/etc/jarvis-registry-ca.pem',
@@ -158,8 +175,22 @@ with path.open('w') as receipt:
 '''
 
 
-def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, node_workspaces=(), download_info=None):
-    """Execute argv in a disposable source snapshot; return after verified VM exit."""
+# #1036: a session build cache is a raw ext4 image attached as a virtio disk
+# and mounted here. It holds the Cargo target directory and Cargo home. It is
+# not a 9p share: the guest's 9p client stores timestamps to the second, which
+# makes Cargo rebuild every dependency. The host never mounts the image.
+BUILD_CACHE_MOUNT = '/build-cache'
+
+
+def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, node_workspaces=(), download_info=None,
+        scratch_dir=None, build_cache=None):
+    """Execute argv in a disposable source snapshot; return after verified VM exit.
+
+    `scratch_dir` holds the VM's private control files (default temp dir when
+    omitted). `build_cache` is an ext4 image, owned by the caller, that outlives
+    this command: its target directory and Cargo home make later builds
+    incremental.
+    """
     workspace = Path(workspace)
     if os.getuid() == 0:
         raise Unavailable('VM builds require an unprivileged host account')
@@ -172,6 +203,19 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
         'NPM_CONFIG_USERCONFIG', 'NPM_CONFIG_GLOBALCONFIG'}
     if set(environment) - allowed_environment:
         raise Unavailable('unexpected VM environment variable')
+    if scratch_dir is not None:
+        scratch = Path(scratch_dir)
+        if not scratch.is_absolute() or scratch.is_symlink() or not scratch.is_dir():
+            raise Unavailable('VM scratch directory must be an absolute directory')
+    if build_cache is not None:
+        cache = Path(build_cache)
+        try:
+            info = cache.lstat()
+        except OSError:
+            info = None
+        if (not cache.is_absolute() or info is None or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_uid != os.getuid() or info.st_mode & 0o077):
+            raise Unavailable('invalid build cache image')
     for base, dirs, files in os.walk(workspace, followlinks=False):
         for name in files:
             info = (Path(base) / name).lstat()
@@ -196,7 +240,7 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
         if not source.is_absolute() or source.resolve() != source or not source.is_dir():
             raise Unavailable('invalid read-only npm dependency directory')
     config = runtime.config
-    with tempfile.TemporaryDirectory(prefix='jarvis-build-vm-') as temporary:
+    with tempfile.TemporaryDirectory(prefix='jarvis-build-vm-', dir=scratch_dir) as temporary:
         private = Path(temporary)
         control = private / 'control'; control.mkdir(mode=0o700)
         openssl = shutil.which('openssl', path=os.defpath)
@@ -237,6 +281,9 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
             module_commands.append(f'insmod /{name} || poweroff -f')
         dependency_mounts = []
         shares = [('runtime', Path('/usr'), True), ('workspace', workspace, False), ('control', control, False)]
+        if build_cache is not None:
+            dependency_mounts.append(f'/bootstrap/busybox mkdir -p {BUILD_CACHE_MOUNT} || poweroff -f')
+            dependency_mounts.append(f'mount -t ext4 -o nosuid,nodev,discard /dev/vda {BUILD_CACHE_MOUNT} || poweroff -f')
         for key, destination in [('toolchain', '/toolchain'), ('registry', '/cargo/registry'), ('cargo_git', '/cargo/git')]:
             if key in config:
                 shares.append((key, Path(config[key]), True))
@@ -259,18 +306,24 @@ mount -t 9p -o trans=virtio,version=9p2000.L,nosuid,nodev workspace /workspace |
 mount -t 9p -o trans=virtio,version=9p2000.L,nosuid,nodev,noexec control /root/control || poweroff -f
 ''' + '\n'.join(dependency_mounts) + '''
 /usr/bin/python3 -I /guest.py
+/bootstrap/busybox sync
+/bootstrap/busybox umount /build-cache 2>/dev/null
 poweroff -f
 '''
         entries.extend([('init', stat.S_IFREG | 0o755, boot.encode(), 0, 0),
             ('guest.py', stat.S_IFREG | 0o400, GUEST_RUNNER.encode(), 0, 0),
             ('job.json', stat.S_IFREG | 0o400, json.dumps({'argv': argv, 'environment': environment,
-                'uid': os.getuid(), 'gid': os.getgid()}).encode(), 0, 0)])
+                'uid': os.getuid(), 'gid': os.getgid(), 'build_cache': build_cache is not None}).encode(), 0, 0)])
         image = private / 'initrd.gz'; image.write_bytes(initrd(entries))
         command = [config['qemu'], '-no-user-config', '-nodefaults', '-machine', 'pc,accel=kvm',
             '-cpu', 'host', '-m', str(config['memory_mb']), '-smp', '2', '-nographic', '-serial', 'stdio',
             '-monitor', 'none', '-nic', 'none', '-no-reboot', '-L', config['data_dir'], '-bios', config['firmware'],
             '-kernel', config['kernel'], '-initrd', str(image), '-append', 'rdinit=/init console=ttyS0 panic=-1 loglevel=3',
             '-sandbox', 'on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny']
+        if build_cache is not None:
+            escaped = str(build_cache).replace(',', ',,')
+            command.extend(['-drive', f'if=none,id=buildcache,format=raw,discard=unmap,file={escaped}',
+                '-device', 'virtio-blk-pci,drive=buildcache'])
         for tag, path, readonly in shares:
             escaped = str(path).replace(',', ',,')
             command.extend(['-fsdev', f'local,id={tag},path={escaped},security_model=none,readonly={"on" if readonly else "off"}',
@@ -279,7 +332,7 @@ poweroff -f
         supervisor = Path(__file__).with_name('provider-supervisor.py')
         cleanup = private / 'cleanup-complete'
         broker = dependency_proxy.Broker(control)
-        with tempfile.TemporaryFile() as log:
+        with tempfile.TemporaryFile(dir=private) as log:
             process = subprocess.Popen([sys.executable, '-I', str(supervisor), str(cleanup), *command],
                 env=host_environment, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
             try:
