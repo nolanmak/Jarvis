@@ -150,6 +150,56 @@ pub(crate) fn initialize(
     Ok(path)
 }
 
+/// #1037 — bind a FRESH attempt: `(branch record, attempt record)`.
+///
+/// A fresh attempt builds from `main`, not from whatever the branch holds, so
+/// the authors of what it will publish are only the providers it dispatches.
+/// They go in a record of their own, reset here on every fresh attempt, and
+/// that record is what the attempt's independent review consults.
+///
+/// Every builder is ALSO added to the branch record, which keeps describing
+/// the remote branch. Until the attempt's push lands the earlier work may
+/// still be there, so that record stays the union and fails closed: an
+/// interrupted or failed publish can only ever exclude more reviewers.
+/// [`supersede`] replaces it once the push has landed.
+pub(crate) fn begin_attempt(
+    root: &Path,
+    repository: &str,
+    branch: &str,
+) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let branch_record = initialize(root, repository, branch, false)?;
+    let attempt = branch_record.with_extension("attempt.json");
+    let _lock = lock(&attempt)?;
+    save(
+        &attempt,
+        &History {
+            version: 1,
+            complete: true,
+            providers: vec![],
+        },
+    )?;
+    Ok((branch_record, attempt))
+}
+
+/// #1037 — the attempt's push replaced the branch on the remote, so the
+/// branch's authors are now exactly the attempt's.
+///
+/// The earlier authors wrote content that no longer exists. Keeping them, as
+/// the append-only record did, disqualified reviewers for work they never
+/// touched: one timed-out Claude build followed by a Codex one left
+/// `[claude, codex]` on the branch forever, and no reviewer for any later
+/// attempt. This is also the only way an unknown legacy record becomes
+/// complete: the work it could not vouch for is gone.
+pub(crate) fn supersede(branch_record: &Path, attempt: &Path) -> anyhow::Result<()> {
+    let history = {
+        let _lock = lock(attempt)?;
+        load(attempt)?
+    };
+    anyhow::ensure!(history.complete, "an attempt record is always complete");
+    let _lock = lock(branch_record)?;
+    save(branch_record, &history)
+}
+
 pub(crate) fn record(path: &Path, provider: ProviderKind) -> anyhow::Result<()> {
     let _lock = lock(path)?;
     let mut history = load(path)?;
@@ -193,6 +243,64 @@ mod tests {
         assert_eq!(authors(&path).unwrap(), authors(&resumed).unwrap());
         let other = initialize(&root, "synthetic-repository", "other-branch", false).unwrap();
         assert_eq!(authors(&other).unwrap(), Some(vec![]));
+    }
+
+    /// #1037 C4 — a fresh attempt builds from `main`, so the authors of what
+    /// it will publish are its own builders only. The branch's earlier authors
+    /// stay on the branch record (fail closed) until the attempt's push
+    /// actually replaces the branch, and then they are gone.
+    #[test]
+    fn a_published_fresh_attempt_replaces_the_branch_authors_it_superseded() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("state");
+        // An earlier attempt on this branch: Claude timed out mid-build and
+        // Codex finished, so both are recorded against the branch.
+        let earlier = initialize(&root, "synthetic-repository", "synthetic-branch", false).unwrap();
+        record(&earlier, ProviderKind::Claude).unwrap();
+        record(&earlier, ProviderKind::Codex).unwrap();
+
+        let (branch, attempt) =
+            begin_attempt(&root, "synthetic-repository", "synthetic-branch").unwrap();
+        assert_eq!(branch, earlier, "the branch record is the same file a resume reads");
+        assert_ne!(attempt, branch, "the attempt keeps its own record");
+        assert_eq!(authors(&attempt).unwrap(), Some(vec![]), "a fresh attempt starts with no builders");
+
+        // The dispatcher records every builder into both.
+        record(&branch, ProviderKind::Codex).unwrap();
+        record(&attempt, ProviderKind::Codex).unwrap();
+        assert_eq!(authors(&attempt).unwrap(), Some(vec![ProviderKind::Codex]));
+        assert_eq!(
+            authors(&branch).unwrap(),
+            Some(vec![ProviderKind::Claude, ProviderKind::Codex]),
+            "until the push lands the old content may still be on the remote: keep the union"
+        );
+
+        supersede(&branch, &attempt).unwrap();
+        assert_eq!(
+            authors(&branch).unwrap(),
+            Some(vec![ProviderKind::Codex]),
+            "published: the branch is exactly the attempt's work, so Claude may review it again"
+        );
+
+        // The next fresh attempt starts empty again, whatever the last one left.
+        let (_, again) = begin_attempt(&root, "synthetic-repository", "synthetic-branch").unwrap();
+        assert_eq!(authors(&again).unwrap(), Some(vec![]));
+    }
+
+    /// A draft with unknown legacy provenance is replaced wholesale by a
+    /// published fresh attempt: its record becomes complete for the first time.
+    #[test]
+    fn a_published_attempt_replaces_unknown_legacy_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("state");
+        let legacy = initialize(&root, "synthetic-repository", "legacy-draft", true).unwrap();
+        assert_eq!(authors(&legacy).unwrap(), None);
+        let (branch, attempt) = begin_attempt(&root, "synthetic-repository", "legacy-draft").unwrap();
+        record(&branch, ProviderKind::Claude).unwrap();
+        record(&attempt, ProviderKind::Claude).unwrap();
+        assert_eq!(authors(&branch).unwrap(), None, "unpublished: still unknown");
+        supersede(&branch, &attempt).unwrap();
+        assert_eq!(authors(&branch).unwrap(), Some(vec![ProviderKind::Claude]));
     }
 
     #[test]

@@ -20,6 +20,7 @@
 //! | `updater-stalled`| 2026-09-14: diverged checkout, updater quietly stopped|
 //! | `no-progress`    | the catch-all: nothing merged in N days             |
 //! | `draft-stale`    | a draft nobody will ever finish                     |
+//! | `review-held`    | #1037: a draft held, unbilled, waiting on a reviewer (was billed daily) |
 //!
 //! Analysis is pure over [`HealthInputs`] so every rule is unit-tested
 //! against the shape of the incident it exists for; collection is a thin
@@ -98,6 +99,9 @@ pub struct HealthInputs {
     pub open_prs: Option<Vec<u64>>,
     /// `(pr, age in days)` for open agent drafts.
     pub draft_ages_days: Vec<(u64, i64)>,
+    /// #1037 — drafts the resume lane is holding because no independent
+    /// review is possible: `(pr, reason code, reason, days without a review)`.
+    pub unreviewable_drafts: Vec<(u64, String, String, u32)>,
 }
 
 /// Thresholds, so a noisy box can be tuned without a rebuild.
@@ -312,9 +316,56 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         }
     }
 
+    // #1037 — drafts held because no independent review is possible. From
+    // outside this looks like a wedged loop: a draft that never moves, ticks
+    // that end with nothing. It is neither broken nor spending, and which of
+    // the three reasons holds it decides who does what, so each gets its fix.
+    let held: Vec<&(u64, String, String, u32)> = i
+        .unreviewable_drafts
+        .iter()
+        .filter(|(pr, ..)| i.open_prs.as_ref().is_none_or(|open| open.contains(pr)))
+        .collect();
+    if !held.is_empty() {
+        let budget = crate::self_improve::REVIEW_UNAVAILABLE_BUDGET_DAYS;
+        let which = held
+            .iter()
+            .map(|(pr, _, reason, days)| format!("#{pr} {reason} (day {days} of {budget})"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let mut fixes: Vec<&str> = Vec::new();
+        for (_, code, ..) in &held {
+            let fix = match code.as_str() {
+                "provenance-unknown" => {
+                    "provenance unknown: a human reviews it and merges or closes it, since the \
+                     loop cannot vouch for any model's review of it"
+                }
+                "reviewer-latched" => "reviewer latched: nothing to do, it retries after the reset",
+                _ => {
+                    "no reviewer capacity: check `augmentagent doctor` and \
+                     `augmentagent reasoner-selftest`"
+                }
+            };
+            if !fixes.contains(&fix) {
+                fixes.push(fix);
+            }
+        }
+        out.push(Finding {
+            severity: Severity::Warn,
+            code: "review-held",
+            detail: format!(
+                "the loop is not wedged: these drafts are held, unbilled, because no \
+                 independent review is possible: {which}. After {budget} days it gives up on \
+                 each and says why."
+            ),
+            fix: fixes.join(". "),
+        });
+    }
+
     let stale: Vec<String> = i
         .draft_ages_days
         .iter()
+        // A held draft is already reported, with its reason, just above.
+        .filter(|(pr, _)| !held.iter().any(|(h, ..)| h == pr))
         .filter(|(_, d)| *d >= t.draft_stale_days)
         .map(|(pr, d)| format!("#{pr} ({d}d)"))
         .collect();
@@ -636,6 +687,7 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
         repeated_refusals: scan_repeated_refusals(&log, now - chrono::Duration::days(3)),
         open_prs: open_pr_numbers(),
         draft_ages_days: open_draft_ages(now),
+        unreviewable_drafts: crate::self_improve::unreviewable_drafts(),
     }
 }
 
@@ -725,6 +777,7 @@ mod tests {
             repeated_refusals: vec![],
             open_prs: None,
             draft_ages_days: vec![(990, 0)],
+            unreviewable_drafts: vec![],
         }
     }
 
@@ -1067,5 +1120,59 @@ mod tests {
             !stale.iter().any(|f| f.code == "provider-hold"),
             "an old pause must not keep excusing a quiet loop"
         );
+    }
+
+    /// #1037 C6 — a draft the loop cannot get independently reviewed looks,
+    /// from outside, like a wedged loop: a PR that never moves and ticks that
+    /// end with nothing. It is neither wedged nor spending, and the watchdog
+    /// has to say which of the three reasons is holding it, because each one
+    /// is fixed by a different person doing a different thing.
+    #[test]
+    fn a_draft_held_for_review_is_reported_as_held_not_as_a_wedged_loop() {
+        let i = HealthInputs {
+            unreviewable_drafts: vec![
+                (1000, "provenance-unknown".into(),
+                 "provenance unknown: there is no complete record of which providers built this draft".into(), 1),
+                (1001, "reviewer-latched".into(),
+                 "reviewer latched until 2026-09-14 13:30 UTC (claude)".into(), 2),
+                (1002, "no-reviewer-capacity".into(),
+                 "no reviewer capacity: no independent reviewer (codex) is configured and able to serve".into(), 1),
+            ],
+            // All three are also old drafts: the specific finding explains
+            // them, so the generic one must not report them a second time.
+            draft_ages_days: vec![(1000, 9), (1001, 9), (1002, 9), (987, 9)],
+            ..healthy()
+        };
+        let f = analyze(&i, &Thresholds::default());
+        let held = f
+            .iter()
+            .find(|x| x.code == "review-held")
+            .expect("drafts held for review must be reported under their own code");
+        assert_eq!(held.severity, Severity::Warn, "held is not an outage");
+        for (pr, reason) in [
+            ("#1000", "provenance unknown"),
+            ("#1001", "reviewer latched until 2026-09-14 13:30 UTC"),
+            ("#1002", "no reviewer capacity"),
+        ] {
+            assert!(held.detail.contains(pr) && held.detail.contains(reason), "{}", held.detail);
+        }
+        assert!(held.detail.contains("day 2 of 3"), "the budget is visible: {}", held.detail);
+        assert!(
+            held.detail.contains("not wedged") && held.detail.contains("unbilled"),
+            "say plainly that nothing is broken or spent: {}",
+            held.detail
+        );
+        for fix in ["human", "reasoner-selftest"] {
+            assert!(held.fix.contains(fix), "each reason gets its own fix ({fix}): {}", held.fix);
+        }
+        assert!(!f.iter().any(|x| x.code == "loop-silent" || x.code == "reasoner-wedged"));
+        let stale = f.iter().find(|x| x.code == "draft-stale").expect("#987 is still stale");
+        assert!(!stale.detail.contains("#1000") && stale.detail.contains("#987"), "{}", stale.detail);
+
+        // A draft that has since closed or merged is history, not a hold.
+        let closed = HealthInputs { open_prs: Some(vec![987]), ..i.clone() };
+        assert!(!analyze(&closed, &Thresholds::default()).iter().any(|x| x.code == "review-held"));
+        // And with nothing held, nothing is said.
+        assert!(analyze(&healthy(), &Thresholds::default()).is_empty());
     }
 }

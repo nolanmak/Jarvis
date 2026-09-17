@@ -131,6 +131,9 @@ pub fn production_state_vars() -> &'static [(&'static str, &'static str)] {
         // below rediscovered it from `self_improve.rs` and failed until the
         // eval was taught about it, which is exactly what it is for.
         ("AUGMENTAGENT_AUTOPR_OPENED_FILE", "opened-prs.json"),
+        // #1037 — per-draft days without an independent review, the budget
+        // that decides when the loop gives up on an unreviewable draft.
+        ("AUGMENTAGENT_AUTOPR_UNREVIEWABLE_FILE", "unreviewable.json"),
         ("AUGMENTAGENT_SELFIMPROVE_LOCK", "self-improve.lock"),
     ]
 }
