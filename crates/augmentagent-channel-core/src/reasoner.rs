@@ -1130,14 +1130,13 @@ impl ClaudeCliReasoner {
         // logger swallows its own IO errors, so accounting can never fail a
         // call the model already answered.
         if let Some(usage) = observed_usage {
-            crate::token_usage::UsageLogger::global().append(&crate::token_usage::UsageRecord {
-                ts: chrono::Utc::now().to_rfc3339(),
-                provider: "claude".into(),
-                model: opts.model.clone().unwrap_or_else(|| "(inherited)".into()),
-                class: format!("{:?}", crate::providers::classify(opts)),
+            crate::token_usage::UsageLogger::global().append(&crate::token_usage::UsageRecord::for_call(
+                crate::providers::ProviderKind::Claude,
+                opts.model.clone().unwrap_or_else(|| "(inherited)".into()),
+                crate::providers::classify(opts),
                 usage,
-                duration_ms: call_started.elapsed().as_millis() as u64,
-            });
+                call_started,
+            ));
         }
 
         let status = child.wait().await?;
@@ -1187,7 +1186,7 @@ impl ClaudeCliReasoner {
 /// neither a slow disk nor a flaky Discord HTTP call ever blocks the
 /// reasoner's reply path — the swap-in semantics here have to match the
 /// inline loop, including the high-risk gate around the notifier.
-fn audit_stream_line(
+pub(crate) fn audit_stream_line(
     line: &str,
     pending: &mut HashMap<String, (String, serde_json::Value)>,
     session_id: &str,
@@ -1209,6 +1208,7 @@ fn audit_stream_line(
                     continue;
                 };
                 let record = build_audit_record(
+                    crate::providers::ProviderKind::Claude,
                     chrono::Utc::now().to_rfc3339(),
                     session_id.to_string(),
                     name.clone(),
@@ -1543,13 +1543,30 @@ pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
     }
 }
 
-/// Preset for ad-hoc wiki queries (CLI `wiki ask` + Discord DMs).
+/// Preset for ad-hoc wiki queries (CLI `wiki ask`, Discord DMs, `/loop`).
 ///
-/// Claude gets a broad toolbelt for this one — if the wiki doesn't answer, it
-/// can search the inbox via the `augmentagent gmail search` subcommand (scoped
-/// Bash allowlist), reach the web, and persist durable new facts back to the
-/// wiki via Write/Edit. The spawned CLI's cwd is pinned to `wiki_root` so
-/// Write/Edit cannot escape into the source tree.
+/// Not read-only (#1047). Whichever provider serves the call gets the same
+/// broad toolbelt:
+///
+/// - Read/Grep/Glob on the wiki, plus the meeting-transcripts clone when
+///   `AUGMENTAGENT_TRANSCRIPTS_DIR` names a directory.
+/// - Write/Edit, to persist durable new facts, inside the wiki only. The cwd
+///   is pinned to `wiki_root` and the PreToolUse path-scope guard
+///   (`aa-wiki-scope-guard.sh`) rejects Write/Edit paths outside it; the
+///   Codex bridge runs the same pre-tool guards and its own workspace scope.
+/// - WebSearch/WebFetch.
+/// - Recall through the memory MCP server: conversation history and memory
+///   search/recent. `memory_write` is deliberately not granted.
+/// - A scoped Bash allowlist of `augmentagent` subcommands (all of `gmail`,
+///   including `send` and `send-now`; `finance` status/transactions/summary;
+///   `calendar` list-events/create-event; `loop`; `loops`; `meetup events`;
+///   `socialapi`/`linkedin` dm and comment; `linkedin recent-dms`;
+///   `repo-docs`; `doc render-pdf`; `imessage fetch-attachment`) and
+///   `aa-gh issue` create/list/view/comment.
+///
+/// Several of those act outside the wiki: they can send email, post GitHub
+/// issues and comments, change scheduled loops and stop loop processes. Keep the CLI help for
+/// `wiki ask` in step with this list.
 pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     // #337 — WIKI_ROOT must be ABSOLUTE. The daemon launches with
     // `--wiki-dir ./wiki` (relative), and the scope guard resolves WIKI_ROOT
@@ -2340,6 +2357,11 @@ mod tests {
         assert_eq!(r1.tool, "Write");
         assert_eq!(r1.session_id, session);
         assert_eq!(r2.tool, "Read");
+        // #1047 C2 — the Claude path names its provider like codex does.
+        for line in &lines {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(row["provider"], "claude", "{line}");
+        }
 
         // Discord-side notifier fires for Write only, NOT Read.
         let seen = typed.seen.lock().unwrap();

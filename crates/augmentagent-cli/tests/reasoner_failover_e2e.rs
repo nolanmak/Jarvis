@@ -89,12 +89,17 @@ impl Rig {
     /// runs on. `fakes` maps a provider's CLI-override env var to the stub
     /// that should serve it.
     fn cmd(&self, chain: &str, fakes: &[(&str, &str)]) -> Command {
+        self.cmd_with(chain, fakes, &["reasoner-selftest"])
+    }
+
+    /// [`Rig::cmd`] for any subcommand, in the same isolated environment.
+    fn cmd_with(&self, chain: &str, fakes: &[(&str, &str)], args: &[&str]) -> Command {
         let mut cmd = Command::new(e2e_bin());
         cmd.args([
             "--db",
             self.path("data.db").to_str().expect("utf8 db path"),
-            "reasoner-selftest",
         ])
+        .args(args)
         // `main()` runs `dotenvy::dotenv()` against the cwd: anywhere but a
         // scratch dir and the repo's real `.env` joins the test.
         .current_dir(self.tmp.path())
@@ -105,6 +110,8 @@ impl Rig {
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("RUST_LOG", "info")
         .env("HOME", self.path("home"))
+        // Every state path (usage and audit logs included) follows this.
+        .env("XDG_STATE_HOME", self.path("state"))
         .env("AUGMENTAGENT_REASONER_CHAIN", chain)
         // LOAD-BEARING: without this the binary latches
         // `~/.local/state/augmentagent/reasoner-cooldowns.json` and the
@@ -155,6 +162,49 @@ fn stdout_of(out: &Output) -> String {
 
 fn stderr_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).to_string()
+}
+
+/// #1047 C1 — a call the fallback served is counted, under codex, by
+/// `augmentagent token-usage`, which splits its totals by provider. Before
+/// #1047 the codex adapter recorded nothing and the report showed no row.
+#[test]
+fn a_fallback_served_call_is_counted_under_codex_in_token_usage() {
+    let rig = Rig::new();
+    let fakes = [
+        ("CLAUDE_CLI", "fake-claude-quota.sh"),
+        ("CODEX_CLI", "fake-codex-ok.sh"),
+    ];
+    let out = rig.run("claude refuses on quota, codex serves", rig.cmd("claude,codex", &fakes));
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("response: PONG-FROM-FAKE-CODEX"));
+
+    // The rig's scratch XDG_STATE_HOME, never the owner's state dir.
+    let log = std::fs::read_to_string(rig.path("state/augmentagent/token-usage.jsonl"))
+        .expect("the served call wrote a usage row");
+    let rows: Vec<serde_json::Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(rows.len(), 1, "one served call, one row: {log}");
+    assert_eq!(rows[0]["provider"], "codex");
+    assert_eq!(rows[0]["class"], "TextOnly");
+    assert!(rows[0]["model"].as_str().is_some_and(|m| !m.is_empty()), "{log}");
+
+    let report = rig.run("token-usage", rig.cmd_with("claude,codex", &fakes, &["token-usage"]));
+    assert!(report.status.success(), "{}", stderr_of(&report));
+    let text = stdout_of(&report);
+    let section = text.split("by provider").nth(1).unwrap_or_else(|| panic!("no provider totals: {text}"));
+    let codex = section.lines().find(|l| l.trim_start().starts_with("codex"))
+        .unwrap_or_else(|| panic!("no codex row: {text}"));
+    // fake-codex-ok.sh reports 1200 input (800 cached) and 40 output.
+    assert!(codex.contains(" 1 calls") && codex.ends_with(" 1240"), "{codex}");
+
+    let json = rig.run("token-usage --json", rig.cmd_with("claude,codex", &fakes, &["token-usage", "--json"]));
+    let days: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json report");
+    let by_provider = &days.as_array().and_then(|d| d.last()).expect("one day")["by_provider"];
+    assert_eq!(by_provider[0]["provider"], "codex", "{days}");
+    assert_eq!(by_provider[0]["calls"], 1);
+    assert_eq!(by_provider[0]["usage"]["input"], 400);
+    assert_eq!(by_provider[0]["usage"]["cache_read"], 800);
+    assert_eq!(by_provider[0]["usage"]["output"], 40);
+    assert_eq!(by_provider[0]["usage"]["reasoning_output"], 16);
 }
 
 /// The headline scenario: the primary refuses on quota (as a *successful*

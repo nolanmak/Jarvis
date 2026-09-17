@@ -250,17 +250,15 @@ mod tests {
         opts.session_id = Some("synthetic-turn".into());
         let journal = crate::handoff::request_path(&crate::handoff::system_root().unwrap(), &opts).unwrap();
         crate::tool_audit::AuditLogger::global()
-            .record(&crate::tool_audit::AuditRecord {
-                provider: Some("codex".into()),
-                ts: "2026-01-01T00:00:00Z".into(),
-                session_id: "synthetic-session".into(),
-                tool: "Read".into(),
-                args: serde_json::json!({}),
-                exit_code: None,
-                stdout_truncated: None,
-                stderr_truncated: None,
-                runner: None,
-            })
+            .record(&crate::tool_audit::build_audit_record(
+                crate::providers::ProviderKind::Codex,
+                "2026-01-01T00:00:00Z".into(),
+                "synthetic-session".into(),
+                "Read".into(),
+                serde_json::json!({}),
+                "",
+                false,
+            ))
             .await;
         crate::token_usage::UsageLogger::global().append(&crate::token_usage::UsageRecord {
             ts: "2026-01-01T00:00:00Z".into(),

@@ -2148,6 +2148,34 @@ enum TranscriptsOp {
     },
 }
 
+/// #1047 C3 — `wiki ask --help` must describe the tool set `ask_opts`
+/// actually grants. It said "read-only access" while the preset let the
+/// agent write the wiki and run scoped commands, on either provider.
+#[cfg(test)]
+mod wiki_ask_help_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn wiki_ask_help() -> String {
+        let mut cli = Cli::command();
+        let ask = cli
+            .find_subcommand_mut("wiki")
+            .and_then(|wiki| wiki.find_subcommand_mut("ask"))
+            .expect("wiki ask subcommand");
+        ask.render_long_help().to_string()
+    }
+
+    #[test]
+    fn wiki_ask_help_describes_the_real_tool_set() {
+        let help = wiki_ask_help();
+        assert!(!help.contains("read-only access"), "stale claim: {help}");
+        for grant in ["Write", "Edit", "Bash", "WebFetch", "memory"] {
+            assert!(help.contains(grant), "help omits {grant}: {help}");
+        }
+        insta::assert_snapshot!("wiki_ask_help", help);
+    }
+}
+
 #[cfg(test)]
 mod transcripts_cli_args_tests {
     use super::*;
@@ -2200,7 +2228,23 @@ enum WikiOp {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Ask the wiki a question. Spawns Opus with read-only access and prints the answer.
+    /// Ask the wiki a question and print the answer. Not read-only: the agent can edit the wiki and run allowlisted commands.
+    ///
+    /// Runs the wiki-query preset (`ask_opts`) through the reasoner chain, on
+    /// the serving provider's quality-tier model (Opus on Claude). The same
+    /// tools are granted whichever provider serves the call:
+    ///
+    /// - Read, Grep and Glob inside the wiki, and the meeting-transcripts clone when AUGMENTAGENT_TRANSCRIPTS_DIR is set.
+    ///
+    /// - Write and Edit inside the wiki, to record durable facts.
+    ///
+    /// - WebSearch and WebFetch.
+    ///
+    /// - Conversation and memory recall through the memory MCP server (search and read only, no memory writes).
+    ///
+    /// - Bash limited to an allowlist: `augmentagent gmail` (every subcommand, including send), `finance` status/transactions/summary, `calendar` list-events/create-event, `loop`, `loops`, `meetup events`, `socialapi` and `linkedin` dm/comment, `linkedin recent-dms`, `repo-docs`, `doc render-pdf`, `imessage fetch-attachment`, and `aa-gh issue` create/list/view/comment.
+    ///
+    /// Some of these act outside the wiki: sending email, filing or commenting on GitHub issues, and changing or stopping loops.
     Ask {
         /// The question. Wrap in quotes if multi-word.
         question: String,

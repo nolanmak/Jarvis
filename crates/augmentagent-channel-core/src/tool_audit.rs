@@ -46,6 +46,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tracing::warn;
 
+use crate::providers::ProviderKind;
+
 /// Cap each captured stdout/stderr blob at 4 KB to keep the log file from
 /// ballooning when an audited `Bash` command emits megabytes of output. The
 /// truncation is recorded as a `*_truncated: true` flag so downstream
@@ -59,9 +61,18 @@ const MAX_STREAM_BYTES: usize = 4 * 1024;
 /// fields without a migration plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditRecord {
-    /// Serving provider. Absent on historical records.
+    /// Serving provider (`claude`, `codex`, ...). Absent on historical
+    /// records only.
+    ///
+    /// #1047 — private on purpose. The records are built by the provider
+    /// adapters, the only layer that knows who served the call (the fallback
+    /// wrapper sees a finished string, and some callers use an adapter
+    /// directly). With the field private, [`build_audit_record`] is the one
+    /// way to create a record outside this module, and it requires a
+    /// [`ProviderKind`], so a new writer cannot forget the provider: the
+    /// code would not compile. Read it with [`AuditRecord::provider`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
+    provider: Option<String>,
     /// RFC3339 timestamp at the moment of record creation.
     pub ts: String,
     /// Logical session id — typically `<channel_id>:<message_id>` so a
@@ -97,6 +108,13 @@ const CLAUDE_REFUSALS: &[&str] = &[
 fn is_claude_refusal(content: &str) -> bool {
     let content = content.trim_start();
     CLAUDE_REFUSALS.iter().any(|prefix| content.starts_with(prefix))
+}
+
+impl AuditRecord {
+    /// The provider that served the call; `None` only on historical rows.
+    pub fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
+    }
 }
 
 /// A tool call extracted from the stream-json output of the claude CLI.
@@ -422,13 +440,15 @@ pub trait AuditNotifier: Send + Sync + std::fmt::Debug {
 }
 
 /// Pair a captured `tool_use` block with its later `tool_result` and produce
-/// the [`AuditRecord`] both the log and the notifier consume.
+/// the [`AuditRecord`] both the log and the notifier consume. `provider` is
+/// the adapter that served the call (#1047).
 ///
 /// Extracted from the reasoner's stream loop so unit tests can verify the
 /// pairing + truncation logic without spawning the `claude` CLI. `ts` is
 /// taken as an argument so tests can pin it; production callers pass
 /// `chrono::Utc::now().to_rfc3339()`.
 pub fn build_audit_record(
+    provider: ProviderKind,
     ts: String,
     session_id: String,
     tool: String,
@@ -453,7 +473,7 @@ pub fn build_audit_record(
     let runner = (tool == "Bash")
         .then(|| if is_error && is_claude_refusal(result_content) { "none" } else { "host" }.to_string());
     AuditRecord {
-        provider: None,
+        provider: Some(provider.name().to_string()),
         ts,
         session_id,
         tool,
@@ -630,7 +650,7 @@ mod tests {
     #[test]
     fn format_notice_prefers_file_path_over_blob() {
         let rec = AuditRecord {
-        provider: None,
+            provider: Some("claude".into()),
             ts: "2026-05-27T00:00:00Z".into(),
             session_id: "ch:msg".into(),
             tool: "Write".into(),
@@ -650,7 +670,7 @@ mod tests {
     #[test]
     fn format_notice_includes_bash_exit_code() {
         let rec = AuditRecord {
-        provider: None,
+            provider: Some("claude".into()),
             ts: "2026-05-27T00:00:00Z".into(),
             session_id: "ch:msg".into(),
             tool: "Bash".into(),
@@ -669,6 +689,7 @@ mod tests {
     #[test]
     fn build_audit_record_routes_content_by_is_error() {
         let ok = build_audit_record(
+            ProviderKind::Claude,
             "2026-05-28T00:00:00Z".into(),
             "ch:1".into(),
             "Bash".into(),
@@ -679,6 +700,7 @@ mod tests {
         assert_eq!(ok.stdout_truncated.as_deref(), Some("a\nb"));
         assert!(ok.stderr_truncated.is_none());
         let err = build_audit_record(
+            ProviderKind::Claude,
             "2026-05-28T00:00:01Z".into(),
             "ch:1".into(),
             "Bash".into(),
@@ -694,6 +716,7 @@ mod tests {
     fn build_audit_record_truncates_huge_output() {
         let big = "x".repeat(10_000);
         let rec = build_audit_record(
+            ProviderKind::Claude,
             "ts".into(),
             "s".into(),
             "Bash".into(),
@@ -715,7 +738,7 @@ mod tests {
             ("timeout 60 cargo test", "Exit code 101\nerror", true),
             ("git status", "clean", false),
         ] {
-            let record = build_audit_record("ts".into(), "s".into(), "Bash".into(),
+            let record = build_audit_record(ProviderKind::Claude, "ts".into(), "s".into(), "Bash".into(),
                 serde_json::json!({"command": command}), content, is_error);
             assert_eq!(record.runner.as_deref(), Some("host"), "{command}");
             assert_eq!(serde_json::to_value(&record).unwrap()["runner"], "host");
@@ -726,14 +749,67 @@ mod tests {
             "Permission to use Bash with command cargo build has been denied.",
             "Hook PreToolUse:Bash denied this tool",
         ] {
-            let record = build_audit_record("ts".into(), "s".into(), "Bash".into(),
+            let record = build_audit_record(ProviderKind::Claude, "ts".into(), "s".into(), "Bash".into(),
                 serde_json::json!({"command": "cargo build"}), denial, true);
             assert_eq!(record.runner.as_deref(), Some("none"), "{denial}");
         }
-        let write = build_audit_record("ts".into(), "s".into(), "Write".into(),
+        let write = build_audit_record(ProviderKind::Claude, "ts".into(), "s".into(), "Write".into(),
             serde_json::json!({"command": "cargo test"}), "ok", false);
         assert!(write.runner.is_none());
         assert!(serde_json::to_value(&write).unwrap().get("runner").is_none(), "non-Bash rows stay unchanged");
+    }
+
+    /// #1047 C2 — every writer of `tool-audit.log` stamps the provider that
+    /// served the call. There are exactly two: the Claude adapter's
+    /// stream-json pairing and the Codex adapter's item recorder. Both run
+    /// against one log here, and no row may come out without a provider.
+    #[tokio::test]
+    async fn every_audit_writer_stamps_its_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tool-audit.log");
+        let logger = Arc::new(AuditLogger::new(path.clone()));
+
+        let mut pending = std::collections::HashMap::new();
+        for line in [
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_1","name":"Read","input":{"file_path":"note.md"}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu_1","content":"synthetic"}]}}"#,
+        ] {
+            crate::reasoner::audit_stream_line(line, &mut pending, "synthetic-claude", Some(&logger), None);
+        }
+        let mut options = crate::reasoner::lint_opts("synthetic".into(), tmp.path().into());
+        options.audit_logger = Some(logger.clone());
+        options.session_id = Some("synthetic-codex".into());
+        crate::codex::record_tool_item(&options, &serde_json::json!({
+            "type": "mcp_tool_call", "server": "jarvis", "tool": "Read",
+            "arguments": {"file_path": "note.md"},
+            "result": {"content": [{"type": "text", "text": "synthetic"}]}, "status": "completed"
+        })).await;
+
+        // The Claude writer records from a spawned task.
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+        for _ in 0..40 {
+            let body = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+            rows = body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+            if rows.len() >= 2 { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        for row in &rows {
+            assert!(row["provider"].is_string(), "audit row without a provider: {row}");
+        }
+        let by_session = |s: &str| rows.iter().find(|r| r["session_id"] == s).unwrap()["provider"].clone();
+        assert_eq!(by_session("synthetic-claude"), "claude");
+        assert_eq!(by_session("synthetic-codex"), "codex");
+    }
+
+    /// Rows written before providers were recorded still parse; the field
+    /// name and shape the dashboard and `jq` read are unchanged.
+    #[test]
+    fn historical_rows_without_a_provider_still_parse() {
+        let old = r#"{"ts":"2026-05-27T00:00:00Z","session_id":"ch:1","tool":"Read","args":{},"exit_code":null,"stdout_truncated":"x","stderr_truncated":null}"#;
+        let rec: AuditRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(rec.provider(), None);
+        assert_eq!(rec.tool, "Read");
     }
 
     #[tokio::test]
@@ -742,7 +818,7 @@ mod tests {
         let path = tmp.path().join("nested").join("tool-audit.log");
         let logger = AuditLogger::new(path.clone());
         let rec1 = AuditRecord {
-        provider: None,
+            provider: Some("claude".into()),
             ts: "2026-05-27T00:00:00Z".into(),
             session_id: "ch:1".into(),
             tool: "Write".into(),
@@ -753,7 +829,7 @@ mod tests {
             runner: None,
         };
         let rec2 = AuditRecord {
-        provider: None,
+            provider: Some("codex".into()),
             ts: "2026-05-27T00:00:01Z".into(),
             session_id: "ch:2".into(),
             tool: "Bash".into(),
