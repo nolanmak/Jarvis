@@ -40,6 +40,9 @@ pub enum Command {
         /// Public HTTPS page to capture with a remote browser on every run; repeat up to ten times.
         #[arg(long = "browser-url")]
         browser_urls: Vec<String>,
+        /// Queue a bounded browser capture when an HTTP result is script-only.
+        #[arg(long)]
+        browser_fallback: bool,
         /// Maximum age in days for dated research items (1–365).
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..=365))]
         freshness_days: Option<u16>,
@@ -283,12 +286,13 @@ fn brief_body(
     feed_urls: &[String],
     bluesky_profiles: &[String],
     browser_urls: &[String],
+    browser_fallback: bool,
     freshness_days: Option<u16>,
     undated_policy: Option<&str>,
 ) -> Value {
     let mut body = json!({"prompt": prompt, "topic": topic,
         "feedUrls": feed_urls, "socialProfiles": bluesky_profiles,
-        "browserUrls": browser_urls});
+        "browserUrls": browser_urls, "browserFallback": browser_fallback});
     if let Some(days) = freshness_days {
         body["freshnessDays"] = json!(days);
     }
@@ -437,6 +441,7 @@ pub async fn run(command: &Command) -> Result<()> {
             feed_urls,
             bluesky_profiles,
             browser_urls,
+            browser_fallback,
             freshness_days,
             undated_policy,
         } => {
@@ -451,6 +456,7 @@ pub async fn run(command: &Command) -> Result<()> {
                     feed_urls,
                     bluesky_profiles,
                     browser_urls,
+                    *browser_fallback,
                     *freshness_days,
                     undated_policy.as_deref(),
                 )),
@@ -757,6 +763,7 @@ mod tests {
             ],
             &["builder.bsky.social".into()],
             &[],
+            false,
             Some(14),
             Some("exclude"),
         );
@@ -777,6 +784,7 @@ mod tests {
             &[],
             &[],
             &["https://events.example/schedule".into()],
+            false,
             None,
             None,
         );
@@ -787,8 +795,14 @@ mod tests {
     }
 
     #[test]
+    fn brief_payload_can_opt_into_dynamic_page_browser_fallback() {
+        let body = brief_body("Find events", "events", &[], &[], &[], true, None, None);
+        assert_eq!(body["browserFallback"], true);
+    }
+
+    #[test]
     fn brief_payload_omits_unrequested_freshness_options() {
-        let body = brief_body("Find updates", "robotics", &[], &[], &[], None, None);
+        let body = brief_body("Find updates", "robotics", &[], &[], &[], false, None, None);
         assert!(body.get("freshnessDays").is_none());
         assert!(body.get("undatedPolicy").is_none());
     }
