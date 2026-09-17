@@ -152,6 +152,11 @@ class BuildScratch:
                 if not self.cache.is_file():
                     raise Readiness('build_scratch_unavailable', self.session)
                 return self.session
+            import fcntl
+            # One admission at a time across bridges: the space check and the
+            # new image must not interleave with another session's. Released
+            # when root_fd closes.
+            fcntl.flock(root_fd, fcntl.LOCK_EX)
             self._require_space(root_fd)
             name = self.SESSION_PREFIX + secrets.token_hex(8)
             os.mkdir(name, 0o700, dir_fd=root_fd)

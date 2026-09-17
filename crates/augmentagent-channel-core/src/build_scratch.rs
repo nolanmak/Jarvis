@@ -136,9 +136,11 @@ pub fn is_session_vm_process(exe_name: &str, args: &[String], dir: &Path) -> boo
     })
 }
 
-/// The real `/proc`.
+/// The real process table: `/proc` on Linux. The KVM build VM is Linux-only;
+/// elsewhere nothing is enumerated and nothing is ever killed.
 pub struct ProcFs;
 
+#[cfg(target_os = "linux")]
 impl ProcessTable for ProcFs {
     fn start_time(&self, pid: u32) -> Option<String> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -154,13 +156,16 @@ impl ProcessTable for ProcFs {
         entries.flatten().filter_map(|entry| {
             let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
             if pid == me || entry.metadata().ok()?.uid() != uid { return None; }
+            // Start time first, then exe and cmdline, then the start time
+            // again: all three reads describe one process, not a reused pid.
+            let start = self.start_time(pid)?;
             let exe = std::fs::read_link(entry.path().join("exe")).ok()?;
             let exe_name = exe.file_name()?.to_string_lossy().into_owned();
             let cmdline = std::fs::read(entry.path().join("cmdline")).ok()?;
             let args: Vec<String> = cmdline.split(|b| *b == 0).filter(|a| !a.is_empty())
                 .map(|a| String::from_utf8_lossy(a).into_owned()).collect();
             if !is_session_vm_process(&exe_name, &args, dir) { return None; }
-            Some((pid, self.start_time(pid)?))
+            (self.start_time(pid)? == start).then_some((pid, start))
         }).collect()
     }
 
@@ -183,6 +188,13 @@ impl ProcessTable for ProcFs {
         // SAFETY: plain signal delivery to a pid owned by this user.
         self.start_time(pid).as_deref() == Some(start_time) && unsafe { libc::kill(raw, libc::SIGKILL) } == 0
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl ProcessTable for ProcFs {
+    fn start_time(&self, _pid: u32) -> Option<String> { None }
+    fn vm_processes_using(&self, _dir: &Path) -> Vec<(u32, String)> { Vec::new() }
+    fn kill_if_same(&self, _pid: u32, _start_time: &str) -> bool { false }
 }
 
 fn owner_is_live(dir: &Path, procs: &dyn ProcessTable, now: SystemTime) -> bool {
@@ -210,6 +222,8 @@ fn owner_is_live(dir: &Path, procs: &dyn ProcessTable, now: SystemTime) -> bool 
 pub fn sweep_with(root: &Path, procs: &dyn ProcessTable, now: SystemTime) -> SweepReport {
     use std::os::unix::fs::MetadataExt;
     let mut report = SweepReport::default();
+    // Liveness comes from /proc; without it every owner would look dead.
+    if !cfg!(target_os = "linux") { return report; }
     let Ok(entries) = std::fs::read_dir(root) else { return report };
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
@@ -240,12 +254,19 @@ pub fn sweep_with(root: &Path, procs: &dyn ProcessTable, now: SystemTime) -> Swe
 /// line. Called from the daemon's hourly sweep loop on the blocking pool.
 pub fn sweep_and_log() {
     let root = scratch_dir();
+    if !cfg!(target_os = "linux") {
+        // No build VM off Linux, and no /proc to prove a bridge dead: never
+        // remove or kill anything here.
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::debug!(root = %root.display(), "build scratch sweep skipped: Linux only (#1036)"));
+        return;
+    }
     let report = sweep_with(&root, &ProcFs, SystemTime::now());
     tracing::info!(removed = report.removed, kept_live = report.kept_live, killed = report.killed,
         root = %root.display(), "build scratch sweep (#1036)");
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::cell::RefCell;

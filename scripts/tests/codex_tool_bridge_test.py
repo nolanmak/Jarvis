@@ -2322,6 +2322,30 @@ class BuildScratchTests(unittest.TestCase):
         policy.run_command('cargo build')
         self.assertEqual(len(self.calls), 1)
 
+    def test_admission_holds_an_exclusive_lock_on_the_scratch_root(self):
+        import fcntl, os
+        policy = self.policy()
+        observed = []
+        original = policy._scratch._require_space
+        def probe(root_fd):
+            other = os.open(self.scratch, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                observed.append('unlocked')
+            except BlockingIOError:
+                observed.append('locked')
+            finally:
+                os.close(other)
+            return original(root_fd)
+        policy._scratch._require_space = probe
+        policy.run_command('cargo build')
+        self.assertEqual(observed, ['locked'], 'space check and session creation must be one critical section')
+        other = os.open(self.scratch, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)  # released afterwards
+        finally:
+            os.close(other)
+
     def test_concurrent_sessions_share_one_budget_and_reserve_unallocated_growth(self):
         import os
         cap = 64 * 1024**2
