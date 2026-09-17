@@ -15,6 +15,40 @@ named minimal-read/no-write/no-command-network permission profile. Provider logi
 remains in the existing adapter; integration credentials belong to private bridge
 configuration, never command-line arguments or model-visible policy text.
 
+### Bridge policy file and the secrets it holds (#1044)
+
+`BridgeLaunch::prepare` writes the bridge policy, `tool-policy.json` (mode
+0600), into its own randomly named `jarvis-policy-*` directory (mode 0700).
+That directory is created under `$XDG_RUNTIME_DIR` when the session has one,
+otherwise under the temporary directory. It is never the launch directory
+that holds `native-workspace`, Codex's cwd, so no path relative to the cwd
+names the policy. The directory is removed when the launch is dropped, after
+the Codex child exits. The bridge receives the absolute path as its only
+argument and refuses a policy file that is not a private regular file owned by
+the daemon user. Bridge tools cannot open it, because it is outside every read
+root. Native Codex has no file-reading tool under the `jarvis_bridge` profile.
+`live_codex_native_read_of_the_policy_is_denied` probes this against real
+Codex.
+
+The policy's `environment` map holds the fixed OS variables (`HOME`, `PATH`,
+`USER`, `LOGNAME`, `LANG`, `TERM`, `DBUS_SESSION_BUS_ADDRESS`,
+`XDG_RUNTIME_DIR`, `XDG_CONFIG_HOME`, `CARGO_HOME`, `RUSTUP_HOME`,
+`RUSTUP_TOOLCHAIN`) plus everything in `ReasonerOpts.env`. That map is
+passed to hooks, service CLIs and MCP children. The integration secrets it can
+carry are:
+
+| Secret | Set by | Consumer |
+| --- | --- | --- |
+| `COMPOSIO_API_KEY` | `ask_opts` (keyring, just in time) | `augmentagent gmail` subcommands |
+| `DISCORD_BOT_TOKEN` (and `DISCORD_CHANNEL_ID`) | `ask_opts`, from the daemon environment | `augmentagent gmail compose --post` approval card |
+| Every `AWS_*` variable (and `AUGMENTAGENT_IMESSAGE_S3_*`) | `ask_opts`, only when an iMessage S3 bucket is configured | `imessage fetch-attachment` |
+| `SOCIALAPI_API_KEY` | SocialAPI MCP presets (keyring, just in time) | SocialAPI MCP server |
+
+The policy also carries non-secret but private paths: `settings` (hooks and
+MCP server definitions, including each server's `env`), `session_id`,
+`handoff_path` and `build_vm_config`. Model provider credentials
+(`CODEX_API_KEY`, Codex `auth.json`) are never in the policy.
+
 A required stdio MCP bridge exposes the operations declared by `ReasonerOpts`.
 The bridge enforces tool identity, workspace scope, argv validation and existing
 pre-tool guards. Every filesystem path component is opened without following
