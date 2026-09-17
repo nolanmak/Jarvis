@@ -576,6 +576,8 @@ fn query_preset_policy_carries_attachment_read_allowances_not_wider_roots() {
 struct QueryAttachmentFiles {
     files: Vec<PathBuf>,
     dirs: Vec<PathBuf>,
+    /// The attachment root, when this test created it: removed only if empty.
+    created_root: Option<PathBuf>,
 }
 
 impl Drop for QueryAttachmentFiles {
@@ -585,6 +587,9 @@ impl Drop for QueryAttachmentFiles {
         }
         for dir in &self.dirs {
             let _ = std::fs::remove_dir_all(dir);
+        }
+        if let Some(root) = &self.created_root {
+            let _ = std::fs::remove_dir(root);
         }
     }
 }
@@ -632,7 +637,7 @@ fn query_attachments_read_identically_under_claude_guard_and_codex_bridge() {
     let discord_doc = PathBuf::from(format!("/tmp/aa-doc-{unique}-1.txt"));
     let tmp_sibling = PathBuf::from(format!("/tmp/aa-note-{unique}.txt"));
     let other_session = PathBuf::from(format!("{}-other", session.display()));
-    let mut cleanup = QueryAttachmentFiles { files: vec![], dirs: vec![] };
+    let mut cleanup = QueryAttachmentFiles { files: vec![], dirs: vec![], created_root: None };
     for (file, text) in [(&discord_txt, "SYNTHETIC_DISCORD_TEXT\n"), (&discord_doc, "SYNTHETIC_DISCORD_DOCUMENT\n"),
                          (&tmp_sibling, "SYNTHETIC_OUTSIDE_SCOPE")] {
         cleanup.files.push(file.clone());
@@ -641,8 +646,9 @@ fn query_attachments_read_identically_under_claude_guard_and_codex_bridge() {
     let mut dirs = std::fs::DirBuilder::new();
     dirs.mode(0o700);
     match dirs.create(session.parent().unwrap()) {
+        Ok(()) => cleanup.created_root = Some(session.parent().unwrap().to_path_buf()),
         Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => panic!("create attachment root: {error}"),
-        _ => {}
+        Err(_) => {}
     }
     for dir in [&session, &other_session] {
         dirs.create(dir).unwrap();
