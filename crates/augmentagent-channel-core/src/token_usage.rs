@@ -421,11 +421,12 @@ pub fn format_report(days: &[DayTotals]) -> String {
         ));
         for p in &providers {
             s.push_str(&format!(
-                "  {:<10} {:>6} calls  input {:>10}  output {:>10}  cache_rd {:>10}  total {:>10}\n",
+                "  {:<10} {:>6} calls  input {:>10}  output {:>10}  cache_wr {:>10}  cache_rd {:>10}  total {:>10}\n",
                 p.provider,
                 p.calls,
                 p.usage.input,
                 p.usage.output,
+                p.usage.cache_creation,
                 p.usage.cache_read,
                 p.usage.total()
             ));
@@ -604,6 +605,8 @@ mod tests {
         let section = out.split("by provider").nth(1).unwrap_or_else(|| panic!("no provider section: {out}"));
         let line = |name: &str| section.lines().find(|l| l.trim_start().starts_with(name))
             .unwrap_or_else(|| panic!("no {name} line: {out}")).to_string();
+        // Every column that makes up the total is printed.
+        assert!(section.contains("cache_wr") && section.contains("cache_rd"), "{out}");
         // Totals over every day in the report, not just the last.
         let codex = line("codex");
         assert!(codex.contains(" 3 calls") && codex.ends_with(" 384"), "{codex}");

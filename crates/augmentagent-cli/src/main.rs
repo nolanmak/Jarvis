@@ -2244,7 +2244,7 @@ enum WikiOp {
     ///
     /// - Bash limited to an allowlist: `augmentagent gmail` (every subcommand, including send), `finance` status/transactions/summary, `calendar` list-events/create-event, `loop`, `loops`, `meetup events`, `socialapi` and `linkedin` dm/comment, `linkedin recent-dms`, `repo-docs`, `doc render-pdf`, `imessage fetch-attachment`, and `aa-gh issue` create/list/view/comment.
     ///
-    /// Some of these act outside the wiki: sending email, filing or commenting on GitHub issues, and changing or stopping loops.
+    /// Some of these act outside the wiki: sending email, filing or commenting on GitHub issues, and changing or stopping loops. Calendar events and social DMs and comments are raised as Discord approval cards and happen only when approved.
     Ask {
         /// The question. Wrap in quotes if multi-word.
         question: String,

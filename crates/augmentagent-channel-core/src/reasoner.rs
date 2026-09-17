@@ -466,6 +466,15 @@ pub fn default_audit_logger() -> Option<Arc<crate::tool_audit::AuditLogger>> {
     enabled.then(crate::tool_audit::AuditLogger::global)
 }
 
+/// Serialises every test that reads or writes `AUGMENTAGENT_TOOL_AUDIT`,
+/// across modules (the reasoner's own toggle test and the Codex adapter's
+/// default-log test, #1047).
+#[cfg(test)]
+pub(crate) fn audit_env_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Per-call options for a `Reasoner`. Each call type (triage, draft, ingest)
 /// gets a different preset — see `triage_opts`, `draft_opts`, `ingest_opts`.
 #[derive(Debug, Clone)]
@@ -2238,11 +2247,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
-    /// Serialises the env-var tests in this module against each other.
-    fn audit_env_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     /// #1004 — every preset audits now. The regression this guards is the one
     /// that existed for months: the agent that edits the repo and pushes

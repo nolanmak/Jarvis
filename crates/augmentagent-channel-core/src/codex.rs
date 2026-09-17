@@ -108,7 +108,12 @@ pub(crate) async fn record_tool_item(opts: &ReasonerOpts, item: &serde_json::Val
             .and_then(|v| v.get("exit_code").and_then(|c| c.as_i64())).and_then(|c| i32::try_from(c).ok());
         record.runner = Some(bridge_runner(&content).to_string());
     }
-    if let Some(logger) = &opts.audit_logger { logger.record(&record).await; }
+    // #1047 — same sink resolution as the Claude adapter (#1004): a preset
+    // that passes no logger still audits to the default log, so every
+    // Codex-served tool call leaves a trail, not only `ask_opts` calls.
+    if let Some(logger) = opts.audit_logger.clone().or_else(crate::reasoner::default_audit_logger) {
+        logger.record(&record).await;
+    }
     if is_high_risk(&tool) {
         if let Some(notifier) = &opts.audit_notifier { notifier.notify(session, &record).await; }
     }
@@ -844,6 +849,46 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
         assert_eq!(row["stdout_truncated"], "written");
     }
 
+    /// #1047 — a Codex-served call on a preset with no audit logger (every
+    /// preset but `ask_opts`) still writes a provider=codex row to the
+    /// default log, as the Claude adapter has since #1004. Holds the audit
+    /// env lock so the toggle test cannot switch auditing off mid-call.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn codex_tool_calls_reach_the_default_log_when_the_preset_passes_no_logger() {
+        let _env = crate::reasoner::audit_env_guard();
+        let prev = std::env::var("AUGMENTAGENT_TOOL_AUDIT").ok();
+        std::env::remove_var("AUGMENTAGENT_TOOL_AUDIT");
+        // The unit-test binary's state dir is a private scratch dir (or the
+        // caller's XDG_STATE_HOME), never the owner's live log.
+        let log = crate::tool_audit::default_audit_log_path();
+        let real = crate::state_dir::resolve(None, std::env::var_os("HOME"));
+        assert!(real.is_none_or(|real| !log.starts_with(real)), "{log:?}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let session = format!("synthetic-default-log-{}", std::process::id());
+        let bin = stub(&dir, "fake-codex-default-audit", r#"
+cat >/dev/null
+echo '{"type":"item.completed","item":{"type":"mcp_tool_call","server":"jarvis","tool":"Read","arguments":{"file_path":"note.md"},"result":{"content":[{"type":"text","text":"synthetic"}]},"status":"completed"}}'
+echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
+"#);
+        let mut options = crate::reasoner::triage_opts(None);
+        assert!(options.audit_logger.is_none(), "the scenario needs a preset without a logger");
+        options.session_id = Some(session.clone());
+        let result = CodexCliReasoner::with_bin(bin).call(&options, "synthetic request").await;
+        match prev {
+            Some(v) => std::env::set_var("AUGMENTAGENT_TOOL_AUDIT", v),
+            None => std::env::remove_var("AUGMENTAGENT_TOOL_AUDIT"),
+        }
+        result.unwrap();
+        let body = std::fs::read_to_string(&log).expect("default audit log written");
+        let rows: Vec<serde_json::Value> = body.lines().filter_map(|l| serde_json::from_str(l).ok())
+            .filter(|r: &serde_json::Value| r["session_id"] == session.as_str()).collect();
+        assert_eq!(rows.len(), 1, "{body}");
+        assert_eq!(rows[0]["provider"], "codex");
+        assert_eq!(rows[0]["tool"], "Read");
+    }
+
     #[tokio::test]
     async fn codex_build_audit_records_name_the_bridge_runner() {
         let dir = tempfile::tempdir().unwrap();
@@ -860,7 +905,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
 "#);
         let mut options = opts();
         options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(log.clone())));
-        CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global() }
+        CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global() }
             .call(&options, "synthetic build audit probe").await.unwrap();
         let rows: Vec<serde_json::Value> = std::fs::read_to_string(log).unwrap().lines()
             .map(|line| serde_json::from_str(line).unwrap()).collect();
