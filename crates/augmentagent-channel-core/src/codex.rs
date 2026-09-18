@@ -1298,8 +1298,13 @@ call(1, 'initialize', {})
 tools = sorted(tool['name'] for tool in call(2, 'tools/list', {})['tools'])
 read_args = {'file_path':str(workspace / 'seed.txt')}
 read = call(3, 'tools/call', {'name':'Read','arguments':read_args})
+denied_args = {'file_path':str(workspace / 'result.txt'),'content':'unapproved\n'}
+denied = call(13, 'tools/call', {'name':'Write','arguments':denied_args})
+denied_created = (workspace / 'result.txt').exists()
 write_args = {'file_path':str(workspace / 'result.txt'),'content':'8\n'}
 write = call(4, 'tools/call', {'name':'Write','arguments':write_args})
+test_args = {'command':'test -f result.txt'}
+test = call(14, 'tools/call', {'name':'Bash','arguments':test_args})
 outside_args = {'file_path':str(workspace.parent / 'outside.txt'),'content':'bad\n'}
 outside = call(5, 'tools/call', {'name':'Write','arguments':outside_args})
 bash_args = {'command':'printf NINE'}
@@ -1316,9 +1321,9 @@ image_args = {'file_path':str(workspace / 'fixture.png')}
 image = call(11, 'tools/call', {'name':'Read','arguments':image_args})
 image_exact = image['content'][0]['data'] == base64.b64encode((workspace / 'fixture.png').read_bytes()).decode()
 mcp = call(12, 'tools/call', {'name':'mcp__fixture__lookup','arguments':{}})
-for name, arguments, result in [('Read',read_args,read),('Write',write_args,write),('Write',outside_args,outside),('Bash',bash_args,bash),('Read',escape_args,escape),('Write',escape_write_args,escape_write),('UnknownTool',unknown_args,unknown),('Write',invalid_write_args,invalid_write),('Read',image_args,image),('mcp__fixture__lookup',{},mcp)]:
+for name, arguments, result in [('Read',read_args,read),('Write',denied_args,denied),('Write',write_args,write),('Bash',test_args,test),('Write',outside_args,outside),('Bash',bash_args,bash),('Read',escape_args,escape),('Write',escape_write_args,escape_write),('UnknownTool',unknown_args,unknown),('Write',invalid_write_args,invalid_write),('Read',image_args,image),('mcp__fixture__lookup',{},mcp)]:
     print(json.dumps({'type':'item.completed','item':{'type':'mcp_tool_call','server':'jarvis','tool':name,'arguments':arguments,'result':result}}),flush=True)
-report = {'tools':tools,'read':read,'write':write,'outside':outside,'bash':bash,'escape':escape,'escape_write':escape_write,'unknown':unknown,'invalid_write':invalid_write,'image':image,'image_exact':image_exact,'mcp':mcp}
+report = {'tools':tools,'read':read,'denied':denied,'denied_created':denied_created,'write':write,'test':test,'outside':outside,'bash':bash,'escape':escape,'escape_write':escape_write,'unknown':unknown,'invalid_write':invalid_write,'image':image,'image_exact':image_exact,'mcp':mcp}
 print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':json.dumps(report)}}),flush=True)
 bridge.stdin.close()
 bridge.wait(timeout=10)
@@ -1326,6 +1331,15 @@ PY
 "##;
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("outside.txt"), "outside fixture\n").unwrap();
+        let approval_guard = root.path().join("approval-guard.py");
+        std::fs::write(&approval_guard, r#"import json, sys
+request = json.load(sys.stdin)
+arguments = request.get('tool_input', {})
+if (request.get('tool_name') == 'Write'
+        and str(arguments.get('file_path', '')).endswith('/result.txt')
+        and arguments.get('content') != '8\n'):
+    print('{"decision":"block"}')
+"#).unwrap();
         let mcp_server = root.path().join("fixture-mcp.py");
         std::fs::write(&mcp_server, r#"import json, sys
 for line in sys.stdin:
@@ -1358,10 +1372,13 @@ for line in sys.stdin:
             reasoner.bin = bin;
             let mut options = opts();
             options.cwd = Some(workspace.clone());
-            options.allowed_tools = vec!["Read".into(), "Write".into(), "Bash(printf *)".into(), "mcp__fixture__lookup".into()];
-            options.settings_json = Some(serde_json::json!({"mcpServers":{"fixture":{
-                "command":"python3","args":[mcp_server]
-            }}}).to_string());
+            options.allowed_tools = vec!["Read".into(), "Write".into(), "Bash(printf *)".into(),
+                "Bash(test *)".into(), "mcp__fixture__lookup".into()];
+            options.settings_json = Some(serde_json::json!({
+                "mcpServers":{"fixture":{"command":"python3","args":[mcp_server]}},
+                "hooks":{"PreToolUse":[{"matcher":"Write","hooks":[{"type":"command",
+                    "command":format!("python3 {}",approval_guard.display())}]}]}
+            }).to_string());
             options.session_id = Some(format!("synthetic-{}", kind.name()));
             let audit = root.path().join(format!("audit-{}.jsonl", kind.name()));
             options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(audit.clone())));
@@ -1376,7 +1393,11 @@ for line in sys.stdin:
                 && tools.contains(&serde_json::json!("mcp__fixture__lookup")));
             inventories.push(tools);
             assert!(report["read"]["content"][0]["text"].as_str().unwrap().contains('7'));
+            assert_eq!(report["denied"]["isError"], true);
+            assert_eq!(report["denied_created"], false,
+                "the unapproved write changed the workspace for {}", kind.name());
             assert_ne!(report["write"]["isError"], true);
+            assert_ne!(report["test"]["isError"], true);
             assert_eq!(report["outside"]["isError"], true);
             assert_eq!(report["escape"]["isError"], true);
             assert_eq!(report["escape_write"]["isError"], true);
@@ -1392,7 +1413,7 @@ for line in sys.stdin:
             assert!(!workspace.join("invalid.txt").exists());
             assert_eq!(std::fs::read_to_string(root.path().join("outside.txt")).unwrap(), "outside fixture\n");
             let records = std::fs::read_to_string(audit).unwrap();
-            assert_eq!(records.lines().count(), 10);
+            assert_eq!(records.lines().count(), 12);
             assert!(records.lines().all(|line| {
                 serde_json::from_str::<serde_json::Value>(line).unwrap()["provider"] == kind.name()
             }));
