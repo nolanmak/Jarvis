@@ -55,6 +55,7 @@ use async_trait::async_trait;
 
 mod whatsapp_history;
 mod messages_cmd;
+mod embeddings_cmd;
 mod apple_notes;
 mod autopr_eval;
 mod autopr_health;
@@ -287,6 +288,11 @@ enum Cmd {
     Imessage {
         #[command(subcommand)]
         op: ImessageOp,
+    },
+    /// Local embedding model management (#1126): fetch, info, bench.
+    Embeddings {
+        #[command(subcommand)]
+        op: embeddings_cmd::Op,
     },
     /// Structured cross-channel message index (#1095): backfill and health.
     Messages {
@@ -3762,6 +3768,7 @@ async fn main() -> Result<()> {
         },
         Cmd::WhatsappHistory { .. } => whatsapp_history::poll_command(store).await,
         Cmd::Messages { op } => messages_cmd::run(store, op, cli.wiki_dir.clone()).await,
+        Cmd::Embeddings { op } => embeddings_cmd::run(op).await,
         Cmd::AppleNotes { op } => match op {
             apple_notes::Op::PollOnce { dry_run } => apple_notes::poll_command(store, dry_run).await,
         },
