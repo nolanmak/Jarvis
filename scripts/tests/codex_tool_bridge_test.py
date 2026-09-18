@@ -112,6 +112,22 @@ class ToolPolicyTests(unittest.TestCase):
         self.assertEqual((self.root / 'note.md').read_text(), 'known state')
         self.assertEqual(len(server.call_receipts), 1024)
 
+    def test_gmail_attachment_download_cannot_bypass_mutation_receipt_limit(self):
+        policy = bridge.Policy({'cwd': str(self.root), 'read_roots': [str(self.root)],
+            'write_roots': [str(self.root)],
+            'allowed_tools': ['Bash(augmentagent gmail get-attachment *)']})
+        server = bridge.Server(policy)
+        server.call_receipts = {(int, index): (b'synthetic', '{}') for index in range(1024)}
+        executed = []
+        server.dispatch = lambda request: executed.append(request) or {'content': []}
+        for index, suffix in enumerate(('', ' --out '+str(self.root / 'attachment.pdf'))):
+            request = {'jsonrpc': '2.0', 'id': 2000 + index, 'method': 'tools/call',
+                'params': {'name': 'Bash', 'arguments': {'command':
+                    'augmentagent gmail get-attachment --message-id synthetic'+suffix}}}
+            response = json.loads(bridge.safe_dispatch(server, json.dumps(request).encode()+b'\n'))
+            self.assertEqual(response['error']['code'], -32000)
+        self.assertEqual(executed, [])
+
     def test_scoped_image_read_returns_original_bytes_as_mcp_image(self):
         import base64
         # Synthetic eight-pixel-square PNG; no private fixture assets.
@@ -1113,6 +1129,27 @@ class HandoffTests(unittest.TestCase):
             self.assertIn('read-only tools',text)
             self.assertIn('uncertain outcome',text)
             self.assertNotIn('PRIVATE_SYNTHETIC_TITLE',text)
+
+    def test_gmail_attachment_download_waits_for_uncertain_mutation_reconciliation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); workspace = root / 'workspace'; workspace.mkdir()
+            journal = bridge.HandoffJournal(root / 'handoff.json')
+            with self.assertRaises(ConnectionError):
+                journal.execute('mcp__fixture__create', {},
+                    lambda: (_ for _ in ()).throw(ConnectionError('synthetic uncertain effect')))
+            policy = bridge.Policy({'cwd': str(workspace), 'read_roots': [str(workspace)],
+                'write_roots': [str(workspace)],
+                'allowed_tools': ['Bash(augmentagent gmail get-attachment *)'],
+                'handoff_path': str(journal.path)})
+            server = bridge.Server(policy)
+            executed = []
+            server.execute = lambda name, arguments: executed.append(arguments) or {'content': []}
+            for suffix in ('', ' --out '+str(workspace / 'attachment.pdf')):
+                with self.subTest(suffix=suffix), self.assertRaises(bridge.ReconciliationRequired):
+                    server.call('Bash', {'command':
+                        'augmentagent gmail get-attachment --message-id synthetic'+suffix})
+            self.assertEqual(executed, [])
+            self.assertEqual([row['status'] for row in journal.load()['operations']], ['started'])
 
     def test_primary_read_hooks_do_not_create_uncertain_mutation_receipts(self):
         with tempfile.TemporaryDirectory() as tmp:

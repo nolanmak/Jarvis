@@ -496,7 +496,7 @@ def read_only_operation(name, arguments):
     if program == 'augmentagent':
         return ((argv[1], argv[2]) in {
             ('gmail', 'search'), ('gmail', 'accounts'),
-            ('gmail', 'list-attachments'), ('gmail', 'get-attachment'),
+            ('gmail', 'list-attachments'),
             ('repo-docs', 'sources'), ('repo-docs', 'list'), ('repo-docs', 'get'),
             ('finance', 'status'), ('finance', 'transactions'), ('finance', 'summary'),
             ('calendar', 'list-events'), ('meetup', 'events'),
