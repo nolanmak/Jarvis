@@ -152,10 +152,14 @@ class JobLifecycleTests(unittest.TestCase):
     def test_existing_journal_rows_survive_endpoint_column_migration(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / 'jobs.sqlite3'
-            with sqlite3.connect(path) as db:
-                db.execute('''CREATE TABLE jobs (request_id TEXT PRIMARY KEY, model TEXT NOT NULL,
-                    route TEXT NOT NULL, job_id TEXT, state TEXT NOT NULL, updated_at INTEGER NOT NULL)''')
-                db.execute("INSERT INTO jobs VALUES ('old-request','qwen38-27b','queue','old-job','POLL_UNKNOWN',1)")
+            db = sqlite3.connect(path)
+            try:
+                with db:
+                    db.execute('''CREATE TABLE jobs (request_id TEXT PRIMARY KEY, model TEXT NOT NULL,
+                        route TEXT NOT NULL, job_id TEXT, state TEXT NOT NULL, updated_at INTEGER NOT NULL)''')
+                    db.execute("INSERT INTO jobs VALUES ('old-request','qwen38-27b','queue','old-job','POLL_UNKNOWN',1)")
+            finally:
+                db.close()
             path.chmod(0o600)
             journal = module.JobJournal(path)
             self.assertEqual(journal.get('old-request')['job_id'], 'old-job')

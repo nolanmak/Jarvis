@@ -37,6 +37,7 @@ coverage does not substitute for the live three-model Discord acceptance run.
 | Scheduled loops and explicit job pins | Loop runner, `FallbackReasoner` | Default snapshot and fallback tests | Durable job-pin precedence and restart fixture |
 | Independent review | `review_history.rs`, `self_improve.rs` | Native-only reviewer admission and dispatch tests | Actual reviewer/backend lineage receipt |
 | Runpod retry, cancellation and restart | `scripts/runpod-adapter/server.py` | `python3 -m unittest -q test_server.py` | Real queue cancel, restart and forwarded idempotency key |
+| Host deployment configuration | `scripts/runpod-adapter/verify_deployment.py` | `python3 -m unittest -q test_verify_deployment.py`; local catalog-only preflight | Repeat on actual daemon host, then run paid cold/warm inference |
 | Node Agents SDK entry point | `src/agent.ts`, dashboard router | Router and dashboard tests | Determine deployed path; remove or migrate any policy bypass |
 
 Model quality, context size and latency differ. Full feature parity is a release gate: every row needs deterministic fake-model tests and a live receipt from the actual Jarvis host for all three models. A text response or catalog entry does not establish tool execution. GLM is paused until live inference succeeds. Qwen passed a 9Router Responses text call, a function-call/result round trip, and a Codex CLI text probe on 2026-09-18. The full Jarvis bridge workflow and actual-host Discord test remain the release gate.
@@ -52,3 +53,20 @@ If Jarvis runs on another tailnet machine while the gateway remains on this Mac,
 The adapter stores prompt-free job state in `RUNPOD_ADAPTER_JOURNAL` (default `/app/state/jobs.sqlite3`). Mount `/app/state` on owner-private persistent storage so an adapter restart retains Runpod job IDs and unresolved submissions. A caller may send a stable `Idempotency-Key` for one logical turn; repeating it returns HTTP 409 without another Runpod submission. The adapter returns `X-Adapter-Request-Id`, and authenticated `GET /v1/jobs/REQUEST_ID` reports the recorded state. Authenticated `POST /v1/jobs/REQUEST_ID/reconcile` checks Runpod using the endpoint saved with the job, and updates the state only when Runpod returns the matching job ID. A submission with no known job ID remains unresolved and returns 409. Authenticated `POST /v1/jobs/REQUEST_ID/cancel` requests queue cancellation and reports `CANCELLED` only after Runpod confirms the matching job ID; an ambiguous submission reports `CANCELLATION_UNKNOWN`, and a load-balancer job reports `CANCELLATION_UNSUPPORTED`. If cancellation arrives while a queue submission is in flight, the journal records the intent, captures the eventual job ID, and immediately sends one cancellation request for it. `SUBMISSION_UNKNOWN`, `POLL_UNKNOWN`, `RESULT_UNKNOWN`, and `CANCELLATION_UNKNOWN` require operator reconciliation. Closing a load-balancer stream is also recorded as `CANCELLATION_UNSUPPORTED`. A client or 9Router path that does not forward the same idempotency key on retry does not yet have duplicate-submission protection.
 
 The adapter's authenticated Runpod client accepts only HTTPS URLs on `api.runpod.ai` or one endpoint subdomain of `api.runpod.ai`, with no URL credentials, nonstandard port, query or fragment. It rejects HTTP redirects. Local regression tests prove an unauthorized URL and a redirect target receive no request, so a changed upstream location cannot carry the Runpod key to a different host.
+
+Before enabling either profile on a host, run the read-only preflight with that
+host's owner-private `adapter.env` and `router-client.env` files:
+
+```sh
+python3 scripts/runpod-adapter/verify_deployment.py \
+  --adapter-env /private/path/adapter.env \
+  --router-env /private/path/router-client.env
+```
+
+It requires the Runpod/admin and client keys to be present, checks the adapter
+health and both authenticated model catalogs, and refuses redirects. It sends
+only GET requests to `/health` and `/models`; a passing result does not establish
+that the paused GPU endpoints can serve inference. A remote router host must
+be listed explicitly with `--allow-router-host HOST:PORT` (and in the daemon's
+router allowlist). The verifier's missing-secret, unreachable-router and healthy
+fake-service cases run in CI.
