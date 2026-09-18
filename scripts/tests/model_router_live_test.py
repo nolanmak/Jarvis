@@ -388,6 +388,9 @@ class RouterFailover(unittest.TestCase):
                            'content': [{'type': 'text', 'text': 'Describe this'},
                                        {'type': 'image_url', 'image_url': {
                                            'url': 'data:image/png;base64,iVBORw0KGgo='}}]}
+            document = {'role': 'user', 'content': [
+                {'type': 'file', 'file': {'filename': 'note.pdf',
+                 'file_data': 'data:application/pdf;base64,JVBERi0='}}]}
             audio = {'role': 'user', 'content': [
                 {'type': 'audio_url', 'audio_url': {'url': 'data:audio/wav;base64,UklGRg=='}}]}
             video = {'role': 'user', 'content': [
@@ -397,6 +400,10 @@ class RouterFailover(unittest.TestCase):
                 ('history image', [prior_image,
                                    {'role': 'assistant', 'content': 'Earlier response'},
                                    {'role': 'user', 'content': 'Recall the image'}]),
+                ('current document', [document]),
+                ('history document', [document,
+                                      {'role': 'assistant', 'content': 'Earlier response'},
+                                      {'role': 'user', 'content': 'Recall the document'}]),
                 ('current audio', [audio]),
                 ('current video', [video]),
             ]:
