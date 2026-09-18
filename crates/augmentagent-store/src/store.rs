@@ -8822,6 +8822,18 @@ mod tests {
     }
 
     #[test]
+    fn legacy_user_loop_json_without_model_profile_still_decodes() {
+        let (store, _file) = fresh_store();
+        store.create_user_loop("owner", "discord", "channel", 60, "old prompt", None, None, None)
+            .unwrap();
+        let row = store.list_user_loops("owner").unwrap().remove(0);
+        let mut old_json = serde_json::to_value(row).unwrap();
+        old_json.as_object_mut().unwrap().remove("model_profile");
+        let decoded: UserLoop = serde_json::from_value(old_json).unwrap();
+        assert!(decoded.model_profile.is_none());
+    }
+
+    #[test]
     fn user_loop_pauses_after_repeated_failures() {
         let (s, _f) = fresh_store();
         let id = s

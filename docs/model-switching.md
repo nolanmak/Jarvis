@@ -100,7 +100,9 @@ submitted one. Completed, failed, cancelled and timed-out journal states are
 terminal under concurrent poll/reconcile/cancel responses: a stale response
 cannot replace a confirmed outcome. If cancellation wins while a poll is in
 flight, the adapter returns a conflict instead of delivering stale model
-output; a mismatched status ID leaves `POLL_UNKNOWN` for inspection.
+output; a mismatched status ID leaves `POLL_UNKNOWN` for inspection. A stale
+queued/running status or poll error cannot erase an outstanding cancellation
+request or its unresolved result.
 
 Definite pre-submission Runpod HTTP rejections retain their 401/403
 authentication, 429 rate-limit or 400/404/422 request status with fixed redacted

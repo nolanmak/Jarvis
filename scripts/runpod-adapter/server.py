@@ -93,13 +93,17 @@ class JobJournal:
     def finish(self, request_id, state):
         with self._connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            db.execute('''UPDATE jobs SET state=?, updated_at=? WHERE request_id=?
-                AND state NOT IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT')''',
-                (state, int(time.time()), request_id))
             row = db.execute('SELECT state FROM jobs WHERE request_id=?', (request_id,)).fetchone()
             if row is None:
                 raise ValueError('job has no matching journal entry')
-            return row[0]
+            previous = row[0]
+            terminal = ('COMPLETED', 'FAILED', 'CANCELLED', 'TIMED_OUT')
+            cancelling = ('CANCELLATION_REQUESTED', 'CANCELLATION_UNKNOWN', 'CANCELLATION_UNSUPPORTED')
+            if previous in terminal or (previous in cancelling and state not in terminal + cancelling):
+                return previous
+            db.execute('UPDATE jobs SET state=?, updated_at=? WHERE request_id=?',
+                       (state, int(time.time()), request_id))
+            return state
 
     def get(self, request_id):
         with self._connect() as db:

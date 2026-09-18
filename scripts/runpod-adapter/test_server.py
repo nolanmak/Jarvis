@@ -165,6 +165,19 @@ class JobLifecycleTests(unittest.TestCase):
             self.assertEqual(module.reconcile_job(journal, 'request', stale_status), 'CANCELLED')
             self.assertEqual(journal.get('request')['state'], 'CANCELLED')
 
+    def test_stale_queue_status_cannot_clear_cancellation_intent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = module.JobJournal(pathlib.Path(tmp) / 'jobs.sqlite3')
+            journal.start('request', 'qwen38-27b', 'queue', 'https://api.runpod.ai/v2/endpoint')
+            journal.submitted('request', 'job-1')
+            def stale_status(url, payload=None):
+                self.assertEqual(journal.request_cancel('request')['state'], 'CANCELLATION_REQUESTED')
+                return {'id': 'job-1', 'status': 'IN_QUEUE'}
+            self.assertEqual(module.reconcile_job(journal, 'request', stale_status), 'CANCELLATION_REQUESTED')
+            self.assertEqual(journal.finish('request', 'CANCELLATION_UNKNOWN'), 'CANCELLATION_UNKNOWN')
+            self.assertEqual(journal.finish('request', 'POLL_UNKNOWN'), 'CANCELLATION_UNKNOWN')
+            self.assertEqual(journal.get('request')['state'], 'CANCELLATION_UNKNOWN')
+
     def test_cancel_ack_cannot_replace_already_recorded_completion(self):
         with tempfile.TemporaryDirectory() as tmp:
             journal = module.JobJournal(pathlib.Path(tmp) / 'jobs.sqlite3')
