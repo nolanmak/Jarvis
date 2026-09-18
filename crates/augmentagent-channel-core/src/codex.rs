@@ -1285,7 +1285,7 @@ exec python3 -I - "$@" <<'PY'
 import json, os, pathlib, select, subprocess, sys
 spec = next(arg for arg in sys.argv[1:] if arg.startswith('mcp_servers.jarvis='))
 args = json.loads('[' + spec.split('args=[', 1)[1].split(']', 1)[0] + ']')
-policy = json.loads(pathlib.Path(args[1]).read_text())
+policy = json.loads(pathlib.Path(args[2]).read_text())
 workspace = pathlib.Path(policy['cwd'])
 bridge = subprocess.Popen(['python3', *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 def call(identifier, method, params):
