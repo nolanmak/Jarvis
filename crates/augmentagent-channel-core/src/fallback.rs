@@ -147,6 +147,17 @@ pub struct FallbackReasoner {
 /// `doctor` (#658) reports the same verdict the chain builder reaches,
 /// instead of a second opinion that can drift from it.
 pub fn ineligible_reason(kind: ProviderKind) -> Option<String> {
+    match crate::model_router::current() {
+        Err(_) => Some("invalid model router configuration".into()),
+        Ok(Some(config)) if config.enabled() => {
+            if config.allows(kind) { gateway_ineligible_reason(kind) }
+            else { Some("excluded by selected model route".into()) }
+        }
+        _ => native_ineligible_reason(kind),
+    }
+}
+
+fn native_ineligible_reason(kind: ProviderKind) -> Option<String> {
     match kind {
         ProviderKind::Claude => None,
         ProviderKind::Codex => {
@@ -183,10 +194,28 @@ pub fn ineligible_reason(kind: ProviderKind) -> Option<String> {
 
 /// Construct the entry for one provider, or `None` when it is not eligible.
 fn entry_for(kind: ProviderKind) -> Option<Entry> {
-    if let Some(reason) = ineligible_reason(kind) {
+    if let Some(reason) = native_ineligible_reason(kind) {
         info!("reasoner chain: {} skipped ({reason})", kind.name());
         return None;
     }
+    Some(unchecked_entry(kind))
+}
+
+/// Gateway credentials authenticate inference; only the local CLI is required.
+fn gateway_entry_for(kind: ProviderKind) -> Option<Entry> {
+    gateway_ineligible_reason(kind).is_none().then(|| unchecked_entry(kind))
+}
+
+fn gateway_ineligible_reason(kind: ProviderKind) -> Option<String> {
+    let bin = match kind {
+        ProviderKind::Claude => std::env::var("CLAUDE_CLI").unwrap_or_else(|_| "claude".into()),
+        ProviderKind::Codex => crate::codex::codex_bin(),
+        _ => return Some("unsupported gateway adapter".into()),
+    };
+    (!bin_resolves(&bin)).then(|| format!("{bin:?} not installed"))
+}
+
+fn unchecked_entry(kind: ProviderKind) -> Entry {
     let reasoner: Arc<dyn Reasoner> = match kind {
         ProviderKind::Claude => Arc::new(ClaudeCliReasoner::new()),
         ProviderKind::Codex => Arc::new(crate::codex::CodexCliReasoner::openai()),
@@ -195,7 +224,7 @@ fn entry_for(kind: ProviderKind) -> Option<Entry> {
         // wire_api=chat and Cerebras has no Responses API).
         ProviderKind::Cerebras => Arc::new(crate::cerebras::CerebrasHttpReasoner::new()),
     };
-    Some(Entry { kind, reasoner })
+    Entry { kind, reasoner }
 }
 
 /// Build the production reasoner from `AUGMENTAGENT_REASONER_CHAIN`.
@@ -211,7 +240,7 @@ pub fn build_reasoner() -> Arc<FallbackReasoner> {
     if crate::model_router::load().ok().flatten().is_some() {
         for kind in [ProviderKind::Claude, ProviderKind::Codex] {
             if !entries.iter().any(|e| e.kind == kind) {
-                if let Some(entry) = entry_for(kind) { gateway_only.push(kind); entries.push(entry); }
+                if let Some(entry) = gateway_entry_for(kind) { gateway_only.push(kind); entries.push(entry); }
             }
         }
     }
@@ -250,10 +279,15 @@ pub fn build_reasoner() -> Arc<FallbackReasoner> {
 /// cannot get the provider it asked for must be able to tell, and must fail
 /// closed. There is no chain here, so failover cannot silently occur either.
 pub fn build_pinned(kind: ProviderKind) -> Option<Arc<FallbackReasoner>> {
-    entry_for(kind).map(|entry| {
+    let native = entry_for(kind);
+    let gateway_only = if native.is_none() { vec![kind] } else { Vec::new() };
+    native.or_else(|| {
+        let config = crate::model_router::load().ok().flatten()?;
+        (config.enabled() && config.allows(kind)).then(|| gateway_entry_for(kind)).flatten()
+    }).map(|entry| {
         Arc::new(FallbackReasoner {
             entries: vec![entry],
-            gateway_only: Vec::new(),
+            gateway_only,
             latch: CooldownLatch::system(),
             usage: std::sync::Mutex::new(Vec::new()),
             mutation_providers: std::sync::Mutex::new(Vec::new()),
@@ -687,7 +721,7 @@ impl FallbackReasoner {
                             },
                             // #1069 review H1: never re-dispatched, but a run
                             // of them is an outage the table does not know.
-                            Some(FailureClass::Unrecognised) => {
+                            Some(FailureClass::Unrecognised) if !routed => {
                                 let strikes = self.latch.strike(name, unrecognised_strike_window());
                                 if strikes >= UNRECOGNISED_STRIKE_LIMIT {
                                     let until = Utc::now() + default_unavailable_cooldown();
@@ -1220,6 +1254,22 @@ mod tests {
         crate::model_router::SNAPSHOT.scope(Some(config), async {
             assert_eq!(chain.lane_availability(crate::providers::CapabilityClass::TextOnly), LaneAvailability::Available);
         }).await;
+    }
+
+    #[tokio::test]
+    async fn unrecognised_router_failures_never_strike_or_latch_native_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let reasoner = Scripted::err(|| crate::turn_failure::turn_error("claude",
+            crate::turn_failure::FailureClass::Unrecognised,
+            crate::providers::CapabilityClass::WriteTools, "synthetic unknown failure".into()));
+        let chain = FallbackReasoner::for_tests(vec![(ProviderKind::Claude, reasoner)], latch_in(&dir));
+        let config = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+        for _ in 0..3 {
+            assert!(crate::model_router::SNAPSHOT.scope(Some(config.clone()),
+                chain.dispatch_snapshot(&text_only_opts(), "test", false, None)).await.is_err());
+        }
+        assert!(chain.latch.latched_until("claude").is_none());
+        assert_eq!(chain.latch.strike("claude", unrecognised_strike_window()), 1);
     }
 
     #[tokio::test]
