@@ -118,6 +118,11 @@ For Qwen, `tool_choice: none` removes tool definitions from the Ollama request.
 400 before any Runpod submission because [Ollama's chat API](https://docs.ollama.com/api/chat)
 defines `tools` but no `tool_choice` control. This restriction is explicit in
 the adapter fixture; a later upstream capability change needs a new live test.
+The Qwen adapter also requires each tool result to match one pending assistant
+call ID and tool name. It orders parallel results to match their calls before
+translation to Ollama and refuses missing, duplicate or forged results with
+HTTP 400 before creating a Runpod job. The three-profile live parity gate
+still has to prove the model can use those results correctly.
 
 Before enabling either profile on a host, run the read-only preflight with that
 host's owner-private `adapter.env` and `router-client.env` files:

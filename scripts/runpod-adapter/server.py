@@ -206,11 +206,17 @@ def normalize_messages(messages):
     """
     if not isinstance(messages, list):
         raise ValueError('messages must be an array')
-    names = {}
     result = []
+    pending_calls = []
+    pending_names = {}
+    pending_results = {}
     for message in messages:
         if not isinstance(message, dict) or message.get('role') not in ('system','developer','user','assistant','tool'):
             raise ValueError('unsupported message role')
+        if pending_calls and message['role'] != 'tool':
+            raise ValueError('assistant tool calls are missing results')
+        if message['role'] == 'tool' and not pending_calls:
+            raise ValueError('tool result has no pending call')
         content = message.get('content')
         images = []
         if content is None:
@@ -244,13 +250,16 @@ def normalize_messages(messages):
             normalized['images'] = images
         calls = message.get('tool_calls')
         if calls is not None:
-            if not isinstance(calls, list):
+            if message['role'] != 'assistant' or not isinstance(calls, list):
                 raise ValueError('tool_calls must be an array')
             normalized_calls = []
             for call in calls:
                 function = call.get('function') if isinstance(call, dict) else None
                 if not isinstance(function, dict) or not isinstance(function.get('name'), str):
                     raise ValueError('invalid tool call')
+                call_id = call.get('id')
+                if not isinstance(call_id, str) or not call_id or call_id in pending_names:
+                    raise ValueError('tool call ID is missing or repeated')
                 arguments = function.get('arguments', {})
                 if isinstance(arguments, str):
                     try:
@@ -260,14 +269,25 @@ def normalize_messages(messages):
                 if not isinstance(arguments, dict):
                     raise ValueError('tool arguments must be an object')
                 normalized_calls.append({'function':{'name':function['name'],'arguments':arguments}})
-                if isinstance(call.get('id'), str):
-                    names[call['id']] = function['name']
+                pending_calls.append(call_id)
+                pending_names[call_id] = function['name']
             normalized['tool_calls'] = normalized_calls
         if message['role'] == 'tool':
-            name = message.get('name') or names.get(message.get('tool_call_id'))
-            if not isinstance(name, str) or not name:
+            call_id = message.get('tool_call_id')
+            if (not isinstance(call_id, str) or call_id not in pending_names
+                    or call_id in pending_results):
                 raise ValueError('tool response has no matching tool call')
+            name = pending_names[call_id]
+            if message.get('name') is not None and message['name'] != name:
+                raise ValueError('tool response name does not match its call')
             normalized['tool_name'] = name
+            pending_results[call_id] = normalized
+            if len(pending_results) == len(pending_calls):
+                result.extend(pending_results[identifier] for identifier in pending_calls)
+                pending_calls = []
+                pending_names = {}
+                pending_results = {}
+            continue
         if role == 'system':
             if images or calls:
                 raise ValueError('system messages cannot contain images or tool calls')
@@ -279,6 +299,8 @@ def normalize_messages(messages):
                 result.append(normalized)
         else:
             result.append(normalized)
+    if pending_calls:
+        raise ValueError('assistant tool calls are missing results')
     return result
 
 def stream_chunks(response):
@@ -389,7 +411,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if route.get('enabled') is False:return self.reply(503,{'error':{'message':route.get('disabled_reason','Model is paused'),'type':'model_unavailable'}})
             if route['type'] == 'openai':
                 body=dict(body)
-                body['max_tokens']=predict_limit(body, route)
+                try:
+                    body['max_tokens']=predict_limit(body, route)
+                except ValueError as error:
+                    raise InvalidRequestError(str(error)) from error
                 body.pop('max_completion_tokens',None)
             else:
                 choice=body.get('tool_choice','auto')
@@ -399,9 +424,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if choice not in ('auto','none'):
                     raise InvalidRequestError('Qwen tool_choice supports only auto or none')
                 options={k:body[k] for k in ['temperature','top_p','seed'] if k in body}
-                options['num_predict']=predict_limit(body, route)
+                try:
+                    options['num_predict']=predict_limit(body, route)
+                    messages=normalize_messages(body.get('messages',[]))
+                except ValueError as error:
+                    raise InvalidRequestError(str(error)) from error
                 if 'stop' in body:options['stop']=body['stop']
-                payload={'messages':normalize_messages(body.get('messages',[])),'stream':False,'options':options}
+                payload={'messages':messages,'stream':False,'options':options}
                 if choice!='none' and 'tools' in body:payload['tools']=body['tools']
                 if 'think' in body:payload['think']=body['think']
                 fmt=body.get('response_format',{})

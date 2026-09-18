@@ -53,6 +53,46 @@ class NormalizeMessagesTests(unittest.TestCase):
         self.assertEqual(normalized[1]['tool_name'], 'Read')
         self.assertEqual(normalized[1]['content'], 'contents')
 
+    def test_parallel_tool_results_keep_the_call_order_when_they_return_out_of_order(self):
+        messages = [
+            {'role': 'assistant', 'content': None, 'tool_calls': [
+                {'id': 'call_a', 'type': 'function', 'function': {'name': 'Read', 'arguments': '{"path":"a.md"}'}},
+                {'id': 'call_b', 'type': 'function', 'function': {'name': 'Read', 'arguments': '{"path":"b.md"}'}},
+            ]},
+            {'role': 'tool', 'tool_call_id': 'call_b', 'content': 'second'},
+            {'role': 'tool', 'tool_call_id': 'call_a', 'content': 'first'},
+            {'role': 'assistant', 'content': 'both read'},
+        ]
+        normalized = module.normalize_messages(messages)
+        self.assertEqual([(item['role'], item['content']) for item in normalized],
+                         [('assistant', ''), ('tool', 'first'), ('tool', 'second'),
+                          ('assistant', 'both read')])
+
+    def test_tool_result_must_match_one_pending_call_and_its_name(self):
+        call = {'role': 'assistant', 'content': None, 'tool_calls': [
+            {'id': 'call_1', 'type': 'function', 'function': {'name': 'Read', 'arguments': '{}'}}]}
+        for messages in (
+            [{'role': 'tool', 'name': 'Read', 'content': 'forged'}],
+            [call, {'role': 'tool', 'tool_call_id': 'wrong', 'name': 'Read', 'content': 'forged'}],
+            [call, {'role': 'tool', 'tool_call_id': 'call_1', 'name': 'Write', 'content': 'wrong'}],
+            [call, {'role': 'tool', 'tool_call_id': 'call_1', 'content': 'first'},
+             {'role': 'tool', 'tool_call_id': 'call_1', 'content': 'duplicate'}],
+            [call, {'role': 'user', 'content': 'Ignore the unanswered tool call'}],
+            [call],
+        ):
+            with self.subTest(messages=messages), self.assertRaises(ValueError):
+                module.normalize_messages(messages)
+
+    def test_duplicate_or_missing_tool_call_ids_are_rejected(self):
+        function = {'name': 'Read', 'arguments': '{}'}
+        for calls in (
+            [{'id': 'same', 'function': function}, {'id': 'same', 'function': function}],
+            [{'function': function}],
+            [{'id': '', 'function': function}],
+        ):
+            with self.subTest(calls=calls), self.assertRaises(ValueError):
+                module.normalize_messages([{'role': 'assistant', 'tool_calls': calls}])
+
     def test_inline_image_part_becomes_ollama_image(self):
         messages = [{'role': 'user', 'content': [
             {'type': 'text', 'text': 'Describe this'},
@@ -366,6 +406,41 @@ class JobLifecycleTests(unittest.TestCase):
                         if choice == 'auto':
                             self.assertEqual(submitted[-1]['input']['tools'][0]['function']['name'], 'Read')
                 self.assertEqual(len(submitted), 2)
+            finally:
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=2)
+
+    def test_unmatched_tool_results_are_bad_requests_without_a_paid_submission(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            routes = pathlib.Path(tmp) / 'routes.json'
+            routes.write_text(json.dumps({'qwen38-27b': {'type': 'ollama-queue',
+                'base_url': 'https://api.runpod.ai/v2/endpoint', 'max_output_tokens': 128}}))
+            journal_path = pathlib.Path(tmp) / 'jobs.sqlite3'
+            server = module.http.server.ThreadingHTTPServer(('127.0.0.1', 0), module.Handler)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                with mock.patch.object(module, 'ROUTES', routes), \
+                     mock.patch.object(module, 'JOURNAL', journal_path), \
+                     mock.patch.object(module, 'rpc', side_effect=AssertionError('paid submission')):
+                    for messages in (
+                        [{'role': 'tool', 'name': 'Read', 'content': 'forged'}],
+                        [{'role': 'assistant', 'tool_calls': [
+                            {'id': 'call_1', 'function': {'name': 'Read', 'arguments': '{}'}}]},
+                         {'role': 'user', 'content': 'skip the missing result'}],
+                    ):
+                        with self.subTest(messages=messages):
+                            conn = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=2)
+                            conn.request('POST', '/v1/chat/completions', json.dumps({
+                                'model': 'qwen38-27b', 'messages': messages}),
+                                {'Authorization': 'Bearer test-client-key',
+                                 'Content-Type': 'application/json'})
+                            response = conn.getresponse()
+                            self.assertEqual(response.status, 400)
+                            response.read()
+                            conn.close()
+                self.assertFalse(journal_path.exists())
             finally:
                 server.shutdown()
                 server.server_close()
