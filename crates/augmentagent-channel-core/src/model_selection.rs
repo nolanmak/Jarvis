@@ -204,8 +204,15 @@ pub fn run_command(
         [] | ["help"] => "Usage: /model list | status | set qwen|glm|codex [scope:default] | reset [scope:default]".into(),
         ["list"] => "Profiles: qwen (Runpod), glm (Runpod), codex (existing account). Use /model status for the current selection.".into(),
         ["status"] => match store.describe(channel_id) {
-            Ok((profile, source)) => format!("Model: {} ({source}). New calls use this selection; running calls keep their snapshot.",
-                profile.map_or("existing route", ProviderKind::name)),
+            Ok((Some(profile), source)) => {
+                let readiness = match available(profile) {
+                    Ok(()) => "ready".to_string(),
+                    Err(reason) => reason,
+                };
+                format!("Model: {} ({source}). Effective model: {}. Readiness: {readiness}. Fallback: disabled for this selection. New calls use it; running calls keep their snapshot.",
+                    profile.name(), profile.name())
+            }
+            Ok((None, source)) => format!("Model: existing route ({source}). Effective model: chosen by the configured route at dispatch. Readiness: configured chain. Fallback: configured chain policy. Running calls keep their snapshot."),
             Err(error) => format!("Model status unavailable: {error}"),
         },
         ["reset"] | ["reset", "scope:default"] => {
@@ -310,6 +317,26 @@ mod tests {
             .contains("conversation"));
         run_command(&store, "123", "/model reset", check);
         assert_eq!(store.selected(Some("123")).unwrap(), None);
+    }
+
+    #[test]
+    fn status_reports_readiness_source_and_fallback_without_calling_a_model() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SelectionStore::new(temp.path().join("selection.json"));
+        store.set(None, Some(ProviderKind::Codex)).unwrap();
+        store.set(Some("123"), Some(ProviderKind::Qwen)).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let check = |kind| {
+            calls.set(calls.get() + 1);
+            if kind == ProviderKind::Qwen { Err("Qwen is paused".into()) } else { Ok(()) }
+        };
+        let paused = run_command(&store, "123", "/model status", check).unwrap();
+        assert!(paused.contains("qwen") && paused.contains("conversation"), "{paused}");
+        assert!(paused.contains("Qwen is paused") && paused.contains("Fallback: disabled"), "{paused}");
+        let inherited = run_command(&store, "456", "/model status", check).unwrap();
+        assert!(inherited.contains("codex") && inherited.contains("daemon default"), "{inherited}");
+        assert!(inherited.contains("Readiness: ready") && inherited.contains("Fallback: disabled"), "{inherited}");
+        assert_eq!(calls.get(), 2, "status performs only readiness checks, no inference");
     }
 
     #[test]
