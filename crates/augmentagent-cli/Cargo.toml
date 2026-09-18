@@ -38,6 +38,7 @@ augmentagent-channel-journal = { path = "../augmentagent-channel-journal" }
 augmentagent-channel-imessage = { path = "../augmentagent-channel-imessage" }
 augmentagent-channel-whatsapp-history = { path = "../augmentagent-channel-whatsapp-history" }
 augmentagent-messages = { path = "../augmentagent-messages" }
+augmentagent-embeddings = { path = "../augmentagent-embeddings" }
 augmentagent-channel-apple-notes = { path = "../augmentagent-channel-apple-notes" }
 augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
 augmentagent-auth = { path = "../augmentagent-auth" }
