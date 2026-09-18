@@ -472,6 +472,9 @@ mod tests {
         for untouched in [
             "register: standard (she capitalizes), mirroring\n```\nHey Casey, thanks for checking in. I'll send the proposal tonight.\n```",
             "run it like this:\n```\ncargo test -p augmentagent-cli\n```\nthen check the log.",
+            // #1107: an owner-dictated template under a `(you asked)` receipt.
+            "register: standard (you asked)\n```\nGroup X is back, and the momentum is real.\n\n\
+             Fri, Oct 3 - Coworking Day.\nhosted by Group X\n12-5 PM - Some Venue\n```",
         ] {
             assert_eq!(prepare_answer_delivery(untouched, None).await.0, untouched);
         }

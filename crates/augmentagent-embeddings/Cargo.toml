@@ -1,0 +1,40 @@
+[package]
+name = "augmentagent-embeddings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Semantic layer (#1126): the Embedder trait, a local ONNX provider, and the
+# model fetcher. Depends on augmentagent-messages for text preparation; the
+# messages crate must never depend back on this one.
+
+[features]
+default = []
+# Deterministic hash embedder for downstream tests; never in a release path.
+stub = []
+
+[dependencies]
+augmentagent-messages = { path = "../augmentagent-messages" }
+augmentagent-store = { path = "../augmentagent-store" }
+augmentagent-auth = { path = "../augmentagent-auth" }
+
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
+tokio = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+# ONNX Runtime bindings. The default `download-binaries` feature fetches a
+# prebuilt runtime at BUILD time (pinned by the crate version); CI and the
+# deployment box both have network at build time. Runtime never downloads.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "tls-rustls", "ndarray"] }
+ndarray = { version = "0.17", features = ["std"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+
+[dev-dependencies]
+tempfile = "3"
+mockito = "1"

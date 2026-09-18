@@ -935,6 +935,10 @@ mod tests {
         assert!(body.starts_with("🔁 loop `x`\n\nregister:") && body.contains("\u{26a0}\u{fe0f} register mismatch"), "{body}");
         let plain = "all quiet.\n```\n$ df -h /mnt/build\n```";
         assert_eq!(loop_result_body("h", plain), format!("h\n\n{plain}"));
+        // #1107: an owner-dictated template under a `(you asked)` receipt.
+        let asked = "register: standard (you asked)\n```\nGroup X is back.\n\n\
+                     Fri, Oct 3 - Coworking Day.\nhosted by Group X\n```";
+        assert_eq!(loop_result_body("h", asked), format!("h\n\n{asked}"));
     }
 
     #[tokio::test]

@@ -42,6 +42,7 @@ libc = "0.2"
 reqwest = { workspace = true }
 
 [dev-dependencies]
+augmentagent-messages = { path = "../augmentagent-messages" }
 syn = { version = "2", features = ["full", "visit"] }
 futures = { workspace = true }
 # #501 — timeparse DST fixture tests pin America/New_York (chrono::Local

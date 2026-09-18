@@ -1,0 +1,51 @@
+<%- include('partials/header', {page:'settings'}) %>
+<div class="space-y-6 max-w-4xl">
+  <div><a href="/settings" class="text-blue-400 text-sm">Settings</a><h1 class="text-xl font-semibold mt-2">Models & accounts</h1></div>
+  <p class="text-gray-400">Connect your subscriptions once, then choose which model answers. Account priorities and availability are managed by your local 9Router.</p>
+  <% if (error) { %><div role="alert" class="border border-red-800 rounded-lg p-4 text-red-300"><%= error %></div><% } %>
+  <% if (!config) { %>
+    <div class="bg-gray-900 border border-gray-800 rounded-lg p-6">9Router is not configured on this agent. Run <code>scripts/install-model-router.py</code> on the agent host, then refresh this page.</div>
+  <% } else { %>
+  <section class="bg-gray-900 border border-gray-800 rounded-lg p-6 space-y-4">
+    <h2 class="font-semibold">Connected accounts</h2>
+    <p class="text-sm text-gray-400">Add another account with the same button. Use a private browser window or switch accounts on the sign-in page. Lower priority numbers run first; 9Router tries the next enabled account when one is unavailable.</p>
+    <div class="flex gap-3 flex-wrap">
+      <% for (const provider of ['claude','codex']) { %>
+      <form action="/model-accounts/connect" method="post"><input type="hidden" name="provider" value="<%= provider %>" /><button class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-md">Connect <%= provider === 'claude' ? 'Claude' : 'Codex' %></button></form>
+      <% } %>
+    </div>
+    <% if (!accounts.length) { %><p class="text-sm text-gray-400">No accounts connected yet.</p><% } %>
+    <% for (const account of accounts) { %>
+    <form action="/model-accounts/accounts/<%= encodeURIComponent(account.id) %>" method="post" class="border-t border-gray-800 pt-4 flex gap-4 items-center flex-wrap">
+      <div class="flex-1 min-w-0"><p class="font-medium break-all"><%= account.name %></p><p class="text-sm text-gray-400"><%= account.provider %> · <%= account.status %></p></div>
+      <label class="text-sm"><input type="checkbox" name="active" <%= account.active ? 'checked' : '' %> /> Enabled</label>
+      <label class="text-sm">Priority <input type="number" name="priority" min="1" max="999" required value="<%= account.priority %>" class="w-20 bg-gray-800 rounded px-2 py-1" /></label>
+      <button class="px-3 py-2 bg-gray-800 rounded-md">Save account</button>
+    </form>
+    <% } %>
+  </section>
+  <section class="bg-gray-900 border border-gray-800 rounded-lg p-6 space-y-4">
+    <h2 class="font-semibold">Agent routing</h2>
+    <form action="/model-accounts/settings" method="post" class="space-y-4">
+      <label class="block">Use
+        <select name="mode" class="block mt-2 w-full bg-gray-800 rounded-md px-3 py-2">
+          <% for (const [value,label] of [['direct','Existing CLI accounts (9Router off)'],['auto','Auto — Claude, then Codex'],['claude','Claude accounts only'],['codex','Codex accounts only']]) { %>
+          <option value="<%= value %>" <%= config.mode === value ? 'selected' : '' %>><%= label %></option>
+          <% } %>
+        </select>
+      </label>
+      <p class="text-sm text-gray-400">Changes apply to the next call. Calls already running finish with their original route. To use one specific account, enable it and disable the other accounts for that provider.</p>
+      <div class="grid sm:grid-cols-2 gap-4">
+        <% for (const provider of ['claude','codex']) { for (const tier of ['quality','fast']) { %>
+        <label class="block text-sm"><%= provider === 'claude' ? 'Claude' : 'Codex' %> — <%= tier %>
+          <input name="<%= provider %>_<%= tier %>" required maxlength="160" value="<%= config.models[provider][tier] %>" class="block mt-1 w-full bg-gray-800 rounded-md px-3 py-2" />
+        </label>
+        <% }} %>
+      </div>
+      <p class="text-sm text-gray-400">Use a model available to your subscription, prefixed with <code>cc/</code> for Claude or <code>cx/</code> for Codex. Quality is used for drafting and reasoning; fast is used by lightweight tasks.</p>
+      <button class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-md">Save routing</button>
+    </form>
+  </section>
+  <% } %>
+</div>
+<%- include('partials/footer') %>

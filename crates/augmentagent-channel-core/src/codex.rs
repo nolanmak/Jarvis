@@ -186,7 +186,9 @@ impl CodexCliReasoner {
         clean: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> anyhow::Result<String> {
         let provider = self.provider_name();
-        let model = model_for(ProviderKind::Codex, tier_of(opts));
+        let router = crate::model_router::current()?.filter(|r| r.enabled());
+        let model = router.as_ref().and_then(|r| r.model(ProviderKind::Codex, tier_of(opts)))
+            .unwrap_or_else(|| model_for(ProviderKind::Codex, tier_of(opts)));
         let capability = crate::providers::classify(opts);
 
         // `IMAGE:` markers → native `-i` attachments (see crate::images).
@@ -258,6 +260,9 @@ impl CodexCliReasoner {
             "-m".into(),
             model.clone(),
         ];
+        if let Some(router) = &router {
+            for value in router.codex_overrides() { args.extend(["-c".into(), value]); }
+        }
         for img in &image_paths {
             args.push("-i".into());
             args.push(img.to_string_lossy().into_owned());
@@ -290,6 +295,7 @@ impl CodexCliReasoner {
         if let Some(key) = crate::secret_loader::load_provider_key("CODEX_API_KEY") {
             cmd.env("CODEX_API_KEY", key);
         }
+        if let Some(router) = &router { router.configure_codex(&mut cmd); }
         // else: auth.json under CODEX_HOME carries ChatGPT-plan auth.
         //
         // Integration environment is carried in the owner-private broker
@@ -514,6 +520,68 @@ mod tests {
             session_id: None,
             handoff_path: None,
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn router_file_is_not_native_codex_authentication() {
+        const CHILD: &str = "AUGMENTAGENT_TEST_NATIVE_AUTH_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(!codex_auth_available(), "a router key is not native Codex authentication");
+            assert!(crate::fallback::ineligible_reason(ProviderKind::Codex).is_some());
+            let chain = crate::fallback::build_reasoner();
+            let class = crate::providers::CapabilityClass::TextOnly;
+            assert_eq!(chain.lane_availability(class), crate::fallback::LaneAvailability::NoEligibleProvider);
+            let path = crate::model_router::config_path();
+            let mut config = crate::model_router::tests::fixture(); config["mode"] = "codex".into();
+            std::fs::write(&path, config.to_string()).unwrap();
+            assert_eq!(chain.lane_availability(class), crate::fallback::LaneAvailability::Available);
+            assert!(crate::fallback::ineligible_reason(ProviderKind::Codex).is_none(), "doctor and review admission must recognize gateway auth");
+            let pinned = crate::fallback::build_pinned(ProviderKind::Codex).unwrap();
+            config["mode"] = "direct".into(); std::fs::write(path, config.to_string()).unwrap();
+            assert_eq!(pinned.lane_availability(class), crate::fallback::LaneAvailability::NoEligibleProvider);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("router.json");
+        let mut value = crate::model_router::tests::fixture(); value["mode"] = "direct".into();
+        std::fs::write(&config, value.to_string()).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "codex::tests::router_file_is_not_native_codex_authentication", "--nocapture"])
+            .env(CHILD, "1").env_remove("CODEX_API_KEY")
+            .env("CODEX_CLI", "/bin/true").env("AUGMENTAGENT_REASONER_CHAIN", "codex")
+            .env("XDG_STATE_HOME", dir.path())
+            .env("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={}/no-dbus", dir.path().display()))
+            .env("AUGMENTAGENT_CODEX_HOME", dir.path())
+            .env("AUGMENTAGENT_MODEL_ROUTER_CONFIG", config)
+            .status().unwrap();
+        assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn router_reaches_spawn_with_model_auth_and_tool_restrictions() {
+        let dir = tempfile::tempdir().unwrap();
+        let argv = dir.path().join("argv");
+        let auth = dir.path().join("auth");
+        let bin = stub(&dir, "router-codex", &format!(r#"
+cat >/dev/null
+printf '%s\n' "$@" >{argv}
+printf '%s' "$AUGMENTAGENT_ROUTER_API_KEY" >{auth}
+echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"ok"}}}}'
+echo '{{"type":"turn.completed","usage":{{"input_tokens":10}}}}'
+"#, argv=argv.display(), auth=auth.display()));
+        let config = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+        let reasoner = CodexCliReasoner::with_bin(bin);
+        let mut options = opts(); options.restrict_env = true;
+        let answer = crate::model_router::SNAPSHOT.scope(Some(config), reasoner.call(&options, "test")).await.unwrap();
+        assert_eq!(answer, "ok");
+        let args = std::fs::read_to_string(argv).unwrap();
+        assert!(args.contains("cx/gpt-5.4"));
+        assert!(args.contains("wire_api=\"responses\""));
+        assert!(args.contains("--ignore-user-config") && args.contains("--strict-config"));
+        assert!(args.contains("mcp_servers.jarvis"), "the constrained tool bridge must remain configured");
+        assert!(!args.contains("router-secret"));
+        assert_eq!(std::fs::read_to_string(auth).unwrap(), "router-secret");
     }
 
     #[tokio::test]

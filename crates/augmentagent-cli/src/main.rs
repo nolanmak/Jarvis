@@ -54,6 +54,9 @@ use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
 mod whatsapp_history;
+mod messages_cmd;
+mod embeddings_cmd;
+mod triage_prefilter_cmd;
 mod apple_notes;
 mod autopr_eval;
 mod autopr_health;
@@ -292,6 +295,21 @@ enum Cmd {
     Imessage {
         #[command(subcommand)]
         op: ImessageOp,
+    },
+    /// Similarity triage pre-filter (#1127): calibrate, stats, reset.
+    TriagePrefilter {
+        #[command(subcommand)]
+        op: triage_prefilter_cmd::Op,
+    },
+    /// Local embedding model management (#1126): fetch, info, bench.
+    Embeddings {
+        #[command(subcommand)]
+        op: embeddings_cmd::Op,
+    },
+    /// Structured cross-channel message index (#1095): backfill and health.
+    Messages {
+        #[command(subcommand)]
+        op: messages_cmd::Op,
     },
     /// Read-only WhatsApp archive ingestion (independent of the live channel).
     WhatsappHistory {
@@ -2949,6 +2967,35 @@ async fn main() -> Result<()> {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { sdm.run(sd).await }));
             }
+            // #1103 — keep the structured message index current from the
+            // trigger-fed queue. Pure SQLite work; no model calls.
+            {
+                let store_mi = Arc::clone(&store);
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move {
+                    messages_cmd::drain_loop(store_mi, sd).await;
+                    Ok(())
+                }));
+                // #1130 — chunks + vectors for the semantic layer; inert
+                // unless AUGMENTAGENT_EMBEDDINGS=1 and weights are present.
+                {
+                    let store_e = Arc::clone(&store);
+                    let sd = shutdown.clone();
+                    tasks.push(tokio::spawn(async move {
+                        embeddings_cmd::worker_loop(store_e, sd).await;
+                        Ok(())
+                    }));
+                }
+                // #1101 — handle → person cache for cross-platform `with:`.
+                if let Some(wiki_root) = cli.wiki_dir.clone() {
+                    let store_mp = Arc::clone(&store);
+                    let sd = shutdown.clone();
+                    tasks.push(tokio::spawn(async move {
+                        messages_cmd::people_loop(store_mp, wiki_root, sd).await;
+                        Ok(())
+                    }));
+                }
+            }
             // #1054 — Discord history → searchable history. Opt-in via env,
             // needs Discord auth; never calls a model.
             match build_discord_history() {
@@ -3747,6 +3794,9 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::WhatsappHistory { .. } => whatsapp_history::poll_command(store).await,
+        Cmd::Messages { op } => messages_cmd::run(store, op, cli.wiki_dir.clone()).await,
+        Cmd::Embeddings { op } => embeddings_cmd::run(store, op).await,
+        Cmd::TriagePrefilter { op } => triage_prefilter_cmd::run(store, op).await,
         Cmd::AppleNotes { op } => match op {
             apple_notes::Op::PollOnce { dry_run } => apple_notes::poll_command(store, dry_run).await,
         },
@@ -5379,7 +5429,7 @@ fn strip_register_receipt(body: &str, inbound: Option<&str>) -> Result<(String, 
     } else {
         body
     };
-    let owner_override = receipt && first.to_ascii_lowercase().contains("you asked");
+    let owner_override = reg::is_owner_override_receipt(first);
     if let Some(note) = inbound
         .filter(|_| !owner_override)
         .and_then(|sample| reg::audit_draft_against_sample(sample, clean))
@@ -9444,6 +9494,25 @@ mod approval_body_tests {
         assert_eq!(strip_register_receipt(lower, None).unwrap(), (lower.to_string(), false));
     }
 
+    /// #1107 — an owner-dictated template (sentence-case headline, lowercase
+    /// "hosted by" subline) under a `(you asked)` receipt sends; the same
+    /// body under an ordinary receipt is still refused, and an override never
+    /// rescues a receipt that records no decision.
+    #[test]
+    fn issue_1107_owner_override_receipt_passes_the_gmail_gate() {
+        let template = "Group X is back, and the momentum is real.\n\n\
+                        Fri, Oct 3 - Coworking Day.\nhosted by Group X\n12-5 PM - Some Venue\n\
+                        Free coworking. Bring what you are building.\n";
+        let asked = format!("register: standard (you asked)\n{template}");
+        assert!(augmentagent_approval_discord::register::audit_register_receipts(&asked).is_empty());
+        assert_eq!(strip_register_receipt(&asked, None).unwrap(), (template.to_string(), true));
+        let mirrored = format!("register: standard (she capitalizes), mirroring\n{template}");
+        assert!(strip_register_receipt(&mirrored, None).is_err());
+        let undecided = format!("register: unknown (you asked)\n{template}");
+        let err = strip_register_receipt(&undecided, None).unwrap_err().to_string();
+        assert!(err.contains("records no decision"), "{err}");
+    }
+
     // #962 — who the card's From line (and the actions/emails rows) name.
     #[test]
     fn reply_cards_keep_the_replied_to_sender_as_their_identity() {
@@ -12609,7 +12678,13 @@ fn build_channel(
         wiki_schema_path,
         ..Default::default()
     };
-    Ok(GmailChannel::new(store, gmail, reasoner, broker, config))
+    let channel = GmailChannel::new(Arc::clone(&store), gmail, reasoner, broker, config);
+    // #1127 — similarity pre-filter; None unless AUGMENTAGENT_TRIAGE_PREFILTER=1
+    // and the configured embedder builds.
+    Ok(match triage_prefilter_cmd::EmbeddingPrefilter::build(store) {
+        Some(pf) => channel.with_prefilter(pf),
+        None => channel,
+    })
 }
 
 fn build_linkedin_channel(

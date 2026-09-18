@@ -1676,6 +1676,88 @@ impl Store {
              CREATE INDEX IF NOT EXISTS idx_drive_accounts_active ON drive_accounts(active);",
         )?;
 
+        // #1103 — structured message index. Rust-only derived data: every
+        // write to `emails` (from any process, including the Node dashboard)
+        // enqueues its messageId via triggers; `augmentagent-messages`
+        // drains the queue into `message_index`. The index is rebuildable
+        // from `emails` at any time, so it never sits on the triage write
+        // path itself. Additive and idempotent.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS message_index (\
+                 message_id         TEXT PRIMARY KEY,\
+                 platform           TEXT NOT NULL,\
+                 conv_kind          TEXT NOT NULL,\
+                 conversation_id    TEXT NOT NULL,\
+                 conversation_title TEXT,\
+                 container          TEXT,\
+                 sender_handle      TEXT NOT NULL,\
+                 sender_label       TEXT,\
+                 counterpart_handle TEXT,\
+                 from_me            INTEGER NOT NULL,\
+                 ts_ms              INTEGER NOT NULL,\
+                 ts_fallback        INTEGER NOT NULL DEFAULT 0,\
+                 has_attachment     INTEGER NOT NULL,\
+                 extractor_version  INTEGER NOT NULL\
+             );\
+             CREATE INDEX IF NOT EXISTS idx_mi_conv ON message_index(conversation_id, ts_ms);\
+             CREATE INDEX IF NOT EXISTS idx_mi_sender ON message_index(sender_handle, ts_ms);\
+             CREATE INDEX IF NOT EXISTS idx_mi_counterpart ON message_index(counterpart_handle, ts_ms);\
+             CREATE INDEX IF NOT EXISTS idx_mi_plat ON message_index(platform, conv_kind, ts_ms);\
+             CREATE INDEX IF NOT EXISTS idx_mi_ts ON message_index(ts_ms);\
+             CREATE TABLE IF NOT EXISTS message_index_queue (\
+                 seq        INTEGER PRIMARY KEY AUTOINCREMENT,\
+                 message_id TEXT NOT NULL UNIQUE\
+             );\
+             CREATE TRIGGER IF NOT EXISTS trg_emails_message_index_insert AFTER INSERT ON emails \
+             BEGIN INSERT OR REPLACE INTO message_index_queue(message_id) VALUES (NEW.messageId); END;\
+             DROP TRIGGER IF EXISTS trg_emails_message_index_update;\
+             CREATE TRIGGER trg_emails_message_index_update \
+             AFTER UPDATE OF messageId, threadId, fromEmail, subject, body, receivedAt, accountEntityId, platform, kind ON emails \
+             WHEN OLD.threadId IS NOT NEW.threadId OR OLD.fromEmail IS NOT NEW.fromEmail \
+               OR OLD.subject IS NOT NEW.subject OR OLD.body IS NOT NEW.body \
+               OR OLD.receivedAt IS NOT NEW.receivedAt OR OLD.accountEntityId IS NOT NEW.accountEntityId \
+               OR OLD.platform IS NOT NEW.platform OR OLD.kind IS NOT NEW.kind \
+             BEGIN INSERT OR REPLACE INTO message_index_queue(message_id) VALUES (NEW.messageId); END;\
+             CREATE TRIGGER IF NOT EXISTS trg_emails_message_index_delete AFTER DELETE ON emails \
+             BEGIN INSERT OR REPLACE INTO message_index_queue(message_id) VALUES (OLD.messageId); END;",
+        )?;
+
+        // #1101 — handle → person cache derived from the wiki identity index
+        // (rebuildable any time via `augmentagent messages resolve-people`),
+        // plus a participants view joining it onto the message index.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS message_people (\
+                 handle     TEXT PRIMARY KEY,\
+                 person_key TEXT NOT NULL\
+             );\
+             CREATE INDEX IF NOT EXISTS idx_message_people_person ON message_people(person_key);\
+             CREATE TABLE IF NOT EXISTS message_person_names (\
+                 person_key TEXT NOT NULL,\
+                 name       TEXT NOT NULL,\
+                 PRIMARY KEY (person_key, name)\
+             );\
+             CREATE INDEX IF NOT EXISTS idx_message_person_names_name ON message_person_names(name);\
+             CREATE TABLE IF NOT EXISTS message_people_meta (\
+                 key   TEXT PRIMARY KEY,\
+                 value TEXT NOT NULL\
+             );\
+             CREATE VIEW IF NOT EXISTS conversation_people AS \
+             SELECT h.conversation_id, h.handle, mp.person_key FROM ( \
+                 SELECT conversation_id, sender_handle AS handle FROM message_index WHERE from_me = 0 \
+                 UNION \
+                 SELECT conversation_id, counterpart_handle FROM message_index WHERE counterpart_handle IS NOT NULL \
+             ) h LEFT JOIN message_people mp ON mp.handle = h.handle;",
+        )?;
+
+        // #1100 — full-text index over prepared message text. rowid =
+        // message_index rowid; maintained by the same queue drain.
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(\
+                 title, subject, body, \
+                 tokenize = 'porter unicode61 remove_diacritics 2'\
+             );",
+        )?;
+
         Ok(())
     }
 
