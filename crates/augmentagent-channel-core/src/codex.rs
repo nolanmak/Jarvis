@@ -549,6 +549,28 @@ mod tests {
         }
     }
 
+    /// Paid, opt-in acceptance probe. Run with a private 9Router config and
+    /// `cargo test -- --ignored`; a text-only response cannot pass this test.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires live Qwen endpoint, local 9Router, and a paid inference call"]
+    async fn live_qwen_runs_the_jarvis_scoped_file_tools() {
+        let config = crate::model_router::load().unwrap().expect("set AUGMENTAGENT_MODEL_ROUTER_CONFIG");
+        let config = crate::model_router::select_profile(Some(config), Some(ProviderKind::Qwen)).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("seed.txt"), "7\n").unwrap();
+        let mut options = opts();
+        options.system_prompt = "Use only the jarvis MCP tools for file operations. Follow the user request exactly.".into();
+        options.cwd = Some(workspace.path().into());
+        options.allowed_tools = vec!["Read".into(), "Write".into()];
+        options.session_id = Some("live-qwen-scoped-tool-probe".into());
+        let reasoner = CodexCliReasoner::runpod(ProviderKind::Qwen);
+        let result = crate::model_router::SNAPSHOT.scope(config, reasoner.call(&options,
+            "Read seed.txt with jarvis Read. Add one to the number, then create result.txt with jarvis Write containing only the answer and a newline. Reply DONE after the write succeeds.")).await.unwrap();
+        assert!(result.contains("DONE"), "model did not confirm completion: {result}");
+        assert_eq!(std::fs::read_to_string(workspace.path().join("result.txt")).unwrap(), "8\n");
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn router_file_is_not_native_codex_authentication() {
