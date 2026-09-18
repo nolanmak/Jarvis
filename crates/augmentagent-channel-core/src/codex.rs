@@ -55,7 +55,6 @@ pub fn codex_home() -> std::path::PathBuf {
 pub fn codex_auth_available() -> bool {
     crate::secret_loader::load_provider_key("CODEX_API_KEY").is_some()
         || codex_home().join("auth.json").is_file()
-        || crate::model_router::load().ok().flatten().is_some()
 }
 
 pub struct CodexCliReasoner {
@@ -521,6 +520,42 @@ mod tests {
             session_id: None,
             handoff_path: None,
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn router_file_is_not_native_codex_authentication() {
+        const CHILD: &str = "AUGMENTAGENT_TEST_NATIVE_AUTH_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(!codex_auth_available(), "a router key is not native Codex authentication");
+            assert!(crate::fallback::ineligible_reason(ProviderKind::Codex).is_some());
+            let chain = crate::fallback::build_reasoner();
+            let class = crate::providers::CapabilityClass::TextOnly;
+            assert_eq!(chain.lane_availability(class), crate::fallback::LaneAvailability::NoEligibleProvider);
+            let path = crate::model_router::config_path();
+            let mut config = crate::model_router::tests::fixture(); config["mode"] = "codex".into();
+            std::fs::write(&path, config.to_string()).unwrap();
+            assert_eq!(chain.lane_availability(class), crate::fallback::LaneAvailability::Available);
+            assert!(crate::fallback::ineligible_reason(ProviderKind::Codex).is_none(), "doctor and review admission must recognize gateway auth");
+            let pinned = crate::fallback::build_pinned(ProviderKind::Codex).unwrap();
+            config["mode"] = "direct".into(); std::fs::write(path, config.to_string()).unwrap();
+            assert_eq!(pinned.lane_availability(class), crate::fallback::LaneAvailability::NoEligibleProvider);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("router.json");
+        let mut value = crate::model_router::tests::fixture(); value["mode"] = "direct".into();
+        std::fs::write(&config, value.to_string()).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "codex::tests::router_file_is_not_native_codex_authentication", "--nocapture"])
+            .env(CHILD, "1").env_remove("CODEX_API_KEY")
+            .env("CODEX_CLI", "/bin/true").env("AUGMENTAGENT_REASONER_CHAIN", "codex")
+            .env("XDG_STATE_HOME", dir.path())
+            .env("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={}/no-dbus", dir.path().display()))
+            .env("AUGMENTAGENT_CODEX_HOME", dir.path())
+            .env("AUGMENTAGENT_MODEL_ROUTER_CONFIG", config)
+            .status().unwrap();
+        assert!(status.success());
     }
 
     #[tokio::test]

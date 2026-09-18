@@ -32,6 +32,8 @@ After deploying this agent version, open **Settings → Models & accounts**:
    still contains the code needed here. No callback port needs to be exposed.
 4. Repeat for every account. Lower priority numbers are tried first. Disable other
    accounts for that provider if you want to use one specific account only.
+   Enable the replacement first: the dashboard rejects disabling the last active
+   account required by the current route. Switch to direct mode to disable them all.
 5. Select **Claude accounts only**, **Codex accounts only**, or **Auto — Claude,
    then Codex**, and save. Auto requires an enabled account for both providers.
 
@@ -64,7 +66,9 @@ Account tokens live in 9Router's private data directory under
 Our dashboard's existing login and Host/Origin checks protect all account routes.
 OAuth verifiers are held server-side for ten minutes, keyed by a random session
 ID. Each exchange validates provider, callback and state and consumes its session
-once. Restarting the dashboard requires restarting unfinished login flows.
+once. Restarting the dashboard requires restarting unfinished login flows. New flows
+resolve the current router configuration; pending flows retain their original
+gateway client so changing endpoints does not send an exchange to another server.
 
 The installer disables cloud sync, tunnels, prompt rewriting, compression and
 cross-provider capacity adapters. The CLI requests also set the token-saver

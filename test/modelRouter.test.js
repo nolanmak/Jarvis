@@ -143,3 +143,53 @@ test("two account logins preserve separate PKCE state and reject mismatches and 
     /expired/,
   );
 });
+
+test("filesystem write errors are sanitized without changing the old file", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "router-write-"));
+  try {
+    const parent = path.join(dir, "private-path");
+    fs.writeFileSync(parent, "unchanged");
+    const store = new ModelRouterStore(path.join(parent, "router.json"));
+    assert.throws(
+      () => store.write(fixture()),
+      (e) => e.message === "Cannot save model router configuration",
+    );
+    assert.equal(fs.readFileSync(parent, "utf8"), "unchanged");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+test("new OAuth sessions use current credentials while pending sessions retain their gateway", async () => {
+  let selected = "first";
+  const exchanges = [];
+  const auth = new AccountAuth(() => {
+    const gateway = selected;
+    return {
+      api: async (endpoint, method, body) => {
+        return endpoint.includes("/authorize")
+          ? {
+              authUrl: "https://auth.openai.com/oauth/authorize",
+              state: gateway,
+              codeVerifier: gateway,
+            }
+          : exchanges.push({ gateway, body });
+      },
+    };
+  });
+  // Each resolver result captures the selected gateway, rather than retaining the first client.
+  const first = await auth.start("codex");
+  selected = "second";
+  const second = await auth.start("codex");
+  await auth.finish(
+    second.id,
+    "http://localhost:1455/auth/callback?code=x&state=second",
+  );
+  await auth.finish(
+    first.id,
+    "http://localhost:1455/auth/callback?code=x&state=first",
+  );
+  assert.deepEqual(
+    exchanges.map((e) => e.gateway),
+    ["second", "first"],
+  );
+});

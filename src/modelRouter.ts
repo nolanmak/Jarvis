@@ -97,19 +97,24 @@ export class ModelRouterStore {
   }
   write(value: RouterConfig): void {
     const c = validateConfig(value);
-    fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
     const tmp = `${this.file}.${crypto.randomUUID()}.tmp`;
     try {
-      const fd = fs.openSync(tmp, "wx", 0o600);
+      fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
       try {
-        fs.writeFileSync(fd, JSON.stringify(c, null, 2) + "\n");
-        fs.fsyncSync(fd);
+        const fd = fs.openSync(tmp, "wx", 0o600);
+        try {
+          fs.writeFileSync(fd, JSON.stringify(c, null, 2) + "\n");
+          fs.fsyncSync(fd);
+        } finally {
+          fs.closeSync(fd);
+        }
+        fs.renameSync(tmp, this.file);
       } finally {
-        fs.closeSync(fd);
+        fs.rmSync(tmp, { force: true });
       }
-      fs.renameSync(tmp, this.file);
-    } finally {
-      fs.rmSync(tmp, { force: true });
+    } catch (error) {
+      console.error("[model-router] configuration write failed", error);
+      throw new Error("Cannot save model router configuration");
     }
   }
 }
@@ -189,6 +194,7 @@ export class RouterClient {
   }
 }
 interface Pending {
+  client: RouterClient;
   provider: Provider;
   state: string;
   codeVerifier: string;
@@ -197,7 +203,7 @@ interface Pending {
 }
 export class AccountAuth {
   private pending = new Map<string, Pending>();
-  constructor(private client: RouterClient) {}
+  constructor(private clientFor: RouterClient | (() => RouterClient)) {}
   async start(provider: Provider) {
     if (!["claude", "codex"].includes(provider))
       throw new Error("Unsupported provider");
@@ -209,7 +215,9 @@ export class AccountAuth {
       provider === "codex"
         ? "http://localhost:1455/auth/callback"
         : "https://console.anthropic.com/oauth/code/callback";
-    const data = await this.client.api(
+    const client =
+      typeof this.clientFor === "function" ? this.clientFor() : this.clientFor;
+    const data = await client.api(
       `/api/oauth/${provider}/authorize?redirect_uri=${encodeURIComponent(redirectUri)}`,
     );
     const url = new URL(data.authUrl);
@@ -223,6 +231,7 @@ export class AccountAuth {
       throw new Error("Invalid authorization response");
     const id = crypto.randomUUID();
     this.pending.set(id, {
+      client,
       provider,
       state: data.state,
       codeVerifier: data.codeVerifier,
@@ -253,11 +262,15 @@ export class AccountAuth {
       throw new Error("Callback state does not match this connection");
     // Single-use even on upstream failure; a fresh login avoids ambiguous exchanges.
     this.pending.delete(id);
-    await this.client.api(`/api/oauth/${pending.provider}/exchange`, "POST", {
-      code,
-      state,
-      redirectUri: pending.redirectUri,
-      codeVerifier: pending.codeVerifier,
-    });
+    await pending.client.api(
+      `/api/oauth/${pending.provider}/exchange`,
+      "POST",
+      {
+        code,
+        state,
+        redirectUri: pending.redirectUri,
+        codeVerifier: pending.codeVerifier,
+      },
+    );
   }
 }

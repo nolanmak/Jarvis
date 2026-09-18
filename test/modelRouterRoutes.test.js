@@ -123,3 +123,69 @@ test("account mutations require dashboard authentication and reject foreign orig
     await new Promise((r) => server.close(r));
   }
 });
+
+test("concurrent account disables cannot remove the last account required by the current route", async () => {
+  let saved = { ...structuredClone(config), mode: "codex" };
+  const accounts = [
+    { id: "a", provider: "codex", active: true },
+    { id: "b", provider: "codex", active: true },
+  ];
+  const client = {
+    accounts: async () => {
+      await new Promise((r) => setTimeout(r, 5));
+      return structuredClone(accounts);
+    },
+    updateAccount: async (id, active) => {
+      await new Promise((r) => setTimeout(r, 5));
+      accounts.find((a) => a.id === id).active = active;
+    },
+  };
+  const app = express();
+  app.use(express.urlencoded({ extended: false }));
+  app.set("view engine", "ejs");
+  app.set("views", path.join(__dirname, "../views"));
+  app.use(
+    createModelRouterRoutes(
+      {
+        read: () => saved,
+        write: (c) => {
+          saved = c;
+        },
+      },
+      () => client,
+    ),
+  );
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise((r) => server.once("listening", r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const results = await Promise.all(
+      ["a", "b"].map((id) =>
+        fetch(base + "/model-accounts/accounts/" + id, {
+          method: "POST",
+          body: new URLSearchParams({ priority: "1" }),
+          redirect: "manual",
+        }),
+      ),
+    );
+    assert.deepEqual(results.map((r) => r.status).sort(), [303, 400]);
+    assert.equal(accounts.filter((a) => a.active).length, 1);
+    saved.mode = "direct";
+    const remaining = accounts.find((a) => a.active).id;
+    const response = await fetch(
+      base + "/model-accounts/accounts/" + remaining,
+      {
+        method: "POST",
+        body: new URLSearchParams({ priority: "1" }),
+        redirect: "manual",
+      },
+    );
+    assert.equal(
+      response.status,
+      303,
+      "direct mode can disable all router accounts",
+    );
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
