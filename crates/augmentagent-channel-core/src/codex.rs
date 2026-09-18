@@ -1302,20 +1302,26 @@ write_args = {'file_path':str(workspace / 'result.txt'),'content':'8\n'}
 write = call(4, 'tools/call', {'name':'Write','arguments':write_args})
 outside_args = {'file_path':str(workspace.parent / 'outside.txt'),'content':'bad\n'}
 outside = call(5, 'tools/call', {'name':'Write','arguments':outside_args})
-for name, arguments, result in [('Read',read_args,read),('Write',write_args,write),('Write',outside_args,outside)]:
+bash_args = {'command':'printf NINE'}
+bash = call(6, 'tools/call', {'name':'Bash','arguments':bash_args})
+escape_args = {'file_path':str(workspace / 'escape.txt')}
+escape = call(7, 'tools/call', {'name':'Read','arguments':escape_args})
+for name, arguments, result in [('Read',read_args,read),('Write',write_args,write),('Write',outside_args,outside),('Bash',bash_args,bash),('Read',escape_args,escape)]:
     print(json.dumps({'type':'item.completed','item':{'type':'mcp_tool_call','server':'jarvis','tool':name,'arguments':arguments,'result':result}}),flush=True)
-report = {'tools':tools,'read':read,'write':write,'outside':outside}
+report = {'tools':tools,'read':read,'write':write,'outside':outside,'bash':bash,'escape':escape}
 print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':json.dumps(report)}}),flush=True)
 bridge.stdin.close()
 bridge.wait(timeout=10)
 PY
 "##;
         let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("outside.txt"), "outside fixture\n").unwrap();
         let mut inventories = Vec::new();
         for kind in [ProviderKind::Codex, ProviderKind::Qwen, ProviderKind::Glm] {
             let workspace = root.path().join(kind.name());
             std::fs::create_dir(&workspace).unwrap();
             std::fs::write(workspace.join("seed.txt"), "7\n").unwrap();
+            std::os::unix::fs::symlink(root.path().join("outside.txt"), workspace.join("escape.txt")).unwrap();
             let bin = stub(&root, &format!("fake-{}", kind.name()), SCRIPT);
             let mut reasoner = if kind == ProviderKind::Codex {
                 CodexCliReasoner::openai()
@@ -1325,7 +1331,7 @@ PY
             reasoner.bin = bin;
             let mut options = opts();
             options.cwd = Some(workspace.clone());
-            options.allowed_tools = vec!["Read".into(), "Write".into()];
+            options.allowed_tools = vec!["Read".into(), "Write".into(), "Bash(printf *)".into()];
             options.session_id = Some(format!("synthetic-{}", kind.name()));
             let audit = root.path().join(format!("audit-{}.jsonl", kind.name()));
             options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(audit.clone())));
@@ -1335,15 +1341,19 @@ PY
                 reasoner.call(&options, "Read seed.txt, write result.txt, and refuse an out-of-scope write")).await.unwrap();
             let report: serde_json::Value = serde_json::from_str(&answer).unwrap();
             let tools = report["tools"].as_array().unwrap().clone();
-            assert!(tools.contains(&serde_json::json!("Read")) && tools.contains(&serde_json::json!("Write")));
+            assert!(tools.contains(&serde_json::json!("Read")) && tools.contains(&serde_json::json!("Write"))
+                && tools.contains(&serde_json::json!("Bash")));
             inventories.push(tools);
             assert!(report["read"]["content"][0]["text"].as_str().unwrap().contains('7'));
             assert_ne!(report["write"]["isError"], true);
             assert_eq!(report["outside"]["isError"], true);
+            assert_eq!(report["escape"]["isError"], true);
+            assert_ne!(report["bash"]["isError"], true);
+            assert!(report["bash"]["content"][0]["text"].as_str().unwrap().contains("NINE"));
             assert_eq!(std::fs::read_to_string(workspace.join("result.txt")).unwrap(), "8\n");
             assert!(!root.path().join("outside.txt").exists());
             let records = std::fs::read_to_string(audit).unwrap();
-            assert_eq!(records.lines().count(), 3);
+            assert_eq!(records.lines().count(), 5);
             assert!(records.lines().all(|line| {
                 serde_json::from_str::<serde_json::Value>(line).unwrap()["provider"] == kind.name()
             }));
