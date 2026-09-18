@@ -2,9 +2,16 @@
 
 Tracking: #1136–#1143. The first implementation uses the Rust `FallbackReasoner` and its constrained Codex CLI bridge for Codex, Qwen and GLM. The selected model supplies turns; the bridge remains responsible for declared tools, workspace scope, approvals, handoff journals, audit and command isolation. Qwen and GLM have distinct `ProviderKind` identities even though they use the Codex CLI as transport.
 
-`/model` is currently a text command in a Discord DM or the configured query channel, intercepted after owner authorization and before history, attachment download or inference. It is not registered as a native Discord slash interaction. The equivalent `model` prefix is accepted. Commands are `/model list`, `/model status`, `/model set qwen|glm|codex`, `/model reset`, and `scope:default` on set/reset. The default scope is the current channel or thread. A call snapshots its model selection; switching affects subsequent calls. The persisted state is `~/.config/augmentagent/model-selection.json` or `AUGMENTAGENT_MODEL_SELECTION_CONFIG`, and it contains profile names only, never credentials. The existing `model-router.json` retains the 9Router inference key. `AUGMENTAGENT_MODEL_QWEN_ENABLED=1` and `AUGMENTAGENT_MODEL_GLM_ENABLED=1` allow their respective profiles to be selected after each endpoint passes live verification; leave them unset while the endpoints are paused.
+`/model` is currently a text command in a Discord DM or the configured query channel, intercepted after owner authorization and before history, attachment download or inference. It is not registered as a native Discord slash interaction. The equivalent `model` prefix is accepted. Commands are `/model list`, `/model status`, `/model set claude|codex|qwen|glm`, `/model reset`, and `scope:default` on set/reset. The default scope is the current channel or thread. A call snapshots its model selection; switching affects subsequent calls. The persisted state is `~/.config/augmentagent/model-selection.json` or `AUGMENTAGENT_MODEL_SELECTION_CONFIG`, and it contains profile names only, never credentials. The existing `model-router.json` retains the 9Router inference key. `AUGMENTAGENT_MODEL_QWEN_ENABLED=1` and `AUGMENTAGENT_MODEL_GLM_ENABLED=1` allow their respective profiles to be selected after each endpoint passes live verification; leave them unset while the endpoints are paused.
 
-Selecting `codex` uses the existing native Codex login when one is available, even when 9Router is configured for Runpod. A 9Router Codex account is used only when native Codex authentication is unavailable. Selection is refused if the active Jarvis process has no corresponding provider entry; configure it and restart the daemon first.
+Selecting `claude` uses Claude Code; selecting `codex` uses the Codex CLI.
+When dashboard routing is enabled for Claude/Codex (`auto`, `claude`, or
+`codex`), either selection uses that provider's connected 9Router account pool.
+When routing is direct or Runpod-only, Claude uses its native login and Codex
+prefers its native login, using a gateway account only when native Codex auth
+is unavailable. Selection is refused if the running process has no corresponding
+provider entry. `/model reset` returns the conversation to the daemon default
+or configured dashboard route. Independent reviewers still pin native transport.
 
 `/model status` reports the effective profile, whether it comes from the conversation or daemon default, its readiness or pause reason, and whether fallback is disabled. It checks configuration only; it does not start a Runpod worker.
 The same runtime pause flags are checked immediately before dispatch. If an operator pauses Qwen or GLM after a selection was persisted, the selected call fails before inference and cannot fall through to Codex. Unpinned automatic chains skip paused Runpod entries.
@@ -61,7 +68,7 @@ environment before enabling this route for operators.
 
 Model quality, context size and latency differ. Full feature parity is a release gate: every row needs deterministic fake-model tests and a live receipt from the actual Jarvis host for all three models. A text response or catalog entry does not establish tool execution. GLM is paused until live inference succeeds. Qwen passed a 9Router Responses text call, a function-call/result round trip, and a Codex CLI text probe on 2026-09-18. The full Jarvis bridge workflow and actual-host Discord test remain the release gate.
 
-For recurring tasks, `augmentagent loop create --model qwen|glm|codex` pins each
+For recurring tasks, `augmentagent loop create --model claude|codex|qwen|glm` pins each
 future occurrence to that profile. Omitting `--model` inherits the daemon
 default when the loop runs. A Discord `/loop` created under a conversation
 `/model` override captures that override; a loop created with only the daemon
@@ -124,6 +131,29 @@ paused Qwen/GLM routes, an authenticated catalog check and a private journal;
 container and test image. Run the authenticated `verify_deployment.py` preflight
 with the host's private adapter and router client files after 9Router is ready.
 Stopping this Compose service leaves its bind-mounted journal intact.
+
+### Native Linux adapter without Docker
+
+The standard-library Python adapter can also run as a systemd user service.
+After preparing the same private `runpod-adapter.env` and `runpod-routes.json`
+files above, keep both routes paused and install:
+
+```sh
+install -d -m 0700 "$HOME/.local/share/augmentagent/runpod-adapter/state"
+install -m 0600 scripts/runpod-adapter/server.py "$HOME/.local/share/augmentagent/runpod-adapter/server.py"
+install -m 0644 scripts/systemd/augmentagent-runpod-adapter.service "$HOME/.config/systemd/user/"
+systemctl --user daemon-reload
+systemctl --user enable --now augmentagent-runpod-adapter.service
+```
+
+The unit uses `/usr/bin/python3`, private persistent journal storage, and
+`127.0.0.1:20129`. It sets `RUNPOD_ADAPTER_ROUTES`, `RUNPOD_ADAPTER_JOURNAL`,
+`RUNPOD_ADAPTER_HOST`, and `RUNPOD_ADAPTER_PORT`; the Docker defaults remain
+unchanged. After changing credentials, restart this adapter service. Register
+one OpenAI-compatible Chat upstream in 9Router with prefix `runpod`, base URL
+`http://127.0.0.1:20129/v1`, and the private adapter key. Add `qwen38-27b` and
+`glm-5.3-flash` to its model catalog. Do not declare attachment capabilities
+until they have been verified for that route.
 
 If Jarvis runs on another tailnet machine while the gateway remains on this Mac, set its router `base_url` to the HTTPS `/v1` URL shown by `tailscale serve status` and set `AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS` to that exact host and port in the daemon environment (`host.ts.net:443` for default HTTPS). Every remote URL, including a `.ts.net` name, requires HTTPS and an exact host-and-port allowlist entry. The router key remains in the private router config. `python3 scripts/tests/verify_codex_redirect.py` runs the real Codex Responses client against two synthetic local servers: the configured origin must receive the throwaway key, while a redirect to a different host and port must receive no credential. Codex CLI 0.154.0 passed this probe locally on 2026-09-18; the pinned version also runs in model-router CI. The daemon host still needs the complete routing and tool workflow acceptance run.
 
@@ -192,7 +222,7 @@ fake-service cases run in CI.
 
 After activating an endpoint and setting its `AUGMENTAGENT_MODEL_*_ENABLED=1`
 flag on the Jarvis host, use `augmentagent reasoner-selftest --profile qwen
---prompt 'Reply READY'` (or `glm` or `codex`) to probe exactly that profile
+--prompt 'Reply READY'` (or `glm`, `claude`, or `codex`) to probe exactly that profile
 through the production reasoner. The option affects only this process and does
 not persist a Discord selection. It performs inference and can incur Runpod
 GPU time. Use it only after deliberate activation; the read-only preflight
@@ -209,3 +239,19 @@ tool audit log, or `AUGMENTAGENT_TOOL_AUDIT_LOG` when set. This performs paid
 inference for Runpod profiles. The Linux CI fixture runs a fake model through
 the packaged bridge and proves the command rejects an answer that bypassed
 the tool, but only a live run can prove the actual model chooses it.
+
+## Linux host verification, 2026-09-18
+
+Claude is now selectable alongside Codex, Qwen, and GLM in the Discord text
+command, one-call CLI profile, and scheduled-loop pin. The Linux Discord
+handler fixture covers Qwen → GLM → Codex → Claude → reset, retaining its
+three bridge-provider tool/audit checks. Live CLI probes on this host passed
+text and audited Read calls for Claude and Codex through the connected 9Router
+account pools. The Read probe permits Markdown around the exact nonce while
+still requiring the matching provider/session/file audit receipt.
+
+The Runpod setup inventory supplies endpoint IDs but no live Runpod key.
+The host adapter and registered routes are prepared with both GPU routes
+paused. Paid Qwen/GLM inference, scale-down/recovery, and actual Discord gateway
+acceptance are still outstanding. These receipts do not mark the full PR ready
+for rollout.

@@ -84,18 +84,21 @@ fn select_profile_with_auth(mut config: Option<RouterConfig>, selected: Option<P
         return Ok(config);
     }
     if let Some(profile) = selected {
-        anyhow::ensure!(matches!(profile, ProviderKind::Codex | ProviderKind::Qwen | ProviderKind::Glm), "unsupported model profile");
+        anyhow::ensure!(matches!(profile, ProviderKind::Claude | ProviderKind::Codex | ProviderKind::Qwen | ProviderKind::Glm), "unsupported model profile");
         if let Some(router) = config.as_mut() {
-            // Keep an existing Codex login on its subscription transport.
-            // A configured 9Router is needed for Runpod but does not imply
-            // consent to send Codex calls to a paid gateway account.
-            router.mode = if profile == ProviderKind::Codex && native_codex_available {
+            // An enabled subscription route keeps using the connected account
+            // pool. A direct or Runpod-only configuration retains native CLI
+            // transport for subscription profiles where available.
+            let subscription_route = matches!(router.mode.as_str(), "auto" | "claude" | "codex");
+            let native = profile == ProviderKind::Claude
+                || (profile == ProviderKind::Codex && native_codex_available);
+            router.mode = if native && !subscription_route {
                 "direct".into()
             } else {
                 profile.name().into()
             };
         } else {
-            anyhow::ensure!(profile == ProviderKind::Codex,
+            anyhow::ensure!(matches!(profile, ProviderKind::Claude | ProviderKind::Codex),
                 "Selected Runpod model requires a configured 9Router endpoint");
         }
     }
@@ -226,6 +229,20 @@ pub(crate) mod tests {
           "codex":{"quality":"cx/gpt-5.4","fast":"cx/gpt-5.4-mini"}}})
     }
     #[test]
+    fn account_profiles_respect_enabled_router_and_direct_mode() {
+        let original = parse(&fixture().to_string()).unwrap();
+        for kind in [ProviderKind::Claude, ProviderKind::Codex] {
+            let routed = select_profile_with_auth(Some(original.clone()), Some(kind), true).unwrap().unwrap();
+            assert_eq!(routed.mode, kind.name());
+            let mut direct = original.clone();
+            direct.mode = "direct".into();
+            assert_eq!(select_profile_with_auth(Some(direct), Some(kind), true).unwrap().unwrap().mode, "direct");
+            assert!(select_profile_with_auth(None, Some(kind), true).unwrap().is_none());
+        }
+        assert_eq!(original.mode, "auto");
+    }
+
+    #[test]
     fn missing_config_preserves_direct_mode_but_invalid_config_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("router.json");
@@ -326,14 +343,15 @@ pub(crate) mod tests {
 
     #[test]
     fn explicit_codex_uses_existing_account_when_available() {
-        let original = parse(&fixture().to_string()).unwrap();
+        let mut original = parse(&fixture().to_string()).unwrap();
+        original.mode = "qwen".into();
         let native = select_profile_with_auth(Some(original.clone()), Some(ProviderKind::Codex), true)
             .unwrap().unwrap();
         assert_eq!(native.mode, "direct");
         let gateway = select_profile_with_auth(Some(original.clone()), Some(ProviderKind::Codex), false)
             .unwrap().unwrap();
         assert_eq!(gateway.mode, "codex");
-        assert_eq!(original.mode, "auto");
+        assert_eq!(original.mode, "qwen");
     }
 
     #[tokio::test]

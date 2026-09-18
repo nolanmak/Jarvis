@@ -1,5 +1,6 @@
 ---
 source: crates/augmentagent-cli/src/main.rs
+assertion_line: 2217
 expression: help
 ---
 Ask the wiki a question and print the answer. Not read-only: the agent can edit the wiki and run allowlisted commands.
@@ -18,13 +19,16 @@ Runs the wiki-query preset (`ask_opts`) through the reasoner chain, on the servi
 
 Some of these act outside the wiki: sending email, filing or commenting on GitHub issues, and changing or stopping loops. Calendar events and social DMs and comments are raised as Discord approval cards and happen only when approved.
 
-Usage: ask [OPTIONS] <QUESTION>
+Usage: ask [OPTIONS] [QUESTION]
 
 Arguments:
-  <QUESTION>
-          The question. Wrap in quotes if multi-word
+  [QUESTION]
+          The question. Wrap in quotes if multi-word; use --stdin for private prompts
 
 Options:
+      --stdin
+          Read the question from stdin instead of exposing it in process arguments
+
       --post
           Also post the answer to the Discord approval channel via a one-shot HTTP client, honoring `ATTACH:` file markers (#440). Needs DISCORD_BOT_TOKEN + DISCORD_CHANNEL_ID in the env
 

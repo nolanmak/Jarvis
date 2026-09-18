@@ -91,7 +91,7 @@ pub enum LoopOp {
         expires_in: Option<String>,
         /// Pin each occurrence to a model. Omit to inherit the daemon
         /// default at execution time.
-        #[arg(long, value_parser = ["qwen", "glm", "codex"])]
+        #[arg(long, value_parser = ["claude", "qwen", "glm", "codex"])]
         model: Option<String>,
         /// Emit JSON `{"id":"<uuid>","interval_secs":N,...}` instead of
         /// plain `<uuid>` on stdout. Lets callers parse the loop id without
@@ -185,8 +185,8 @@ pub fn run_with(store: &Store, op: LoopOp) -> Result<i32> {
             json,
         } => {
             if let Some(model) = model.as_deref() {
-                if !matches!(model, "qwen" | "glm" | "codex") {
-                    return Err(anyhow!("--model must be qwen, glm, or codex"));
+                if !matches!(model, "claude" | "qwen" | "glm" | "codex") {
+                    return Err(anyhow!("--model must be claude, codex, qwen, or glm"));
                 }
             }
             let args = CreateArgs {
@@ -941,13 +941,13 @@ mod tests {
         run_with(&store, create("glm")).unwrap();
         let row = store.list_user_loops("test-owner").unwrap().remove(0);
         assert_eq!(row.model_profile.as_deref(), Some("glm"));
-        assert!(run_with(&store, create("claude")).is_err());
+        assert!(run_with(&store, create("gemini")).is_err());
         assert_eq!(store.list_user_loops("test-owner").unwrap().len(), 1);
     }
 
     #[test]
     fn create_cli_accepts_only_switchable_models() {
-        for name in ["qwen", "glm", "codex"] {
+        for name in ["claude", "qwen", "glm", "codex"] {
             let cli = crate::Cli::try_parse_from([
                 "augmentagent", "loop", "create", "--interval", "5m",
                 "--prompt", "ping", "--model", name,
@@ -956,7 +956,7 @@ mod tests {
         }
         assert!(crate::Cli::try_parse_from([
             "augmentagent", "loop", "create", "--interval", "5m",
-            "--prompt", "ping", "--model", "claude",
+            "--prompt", "ping", "--model", "gemini",
         ]).is_err());
     }
 

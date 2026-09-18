@@ -202,7 +202,7 @@ for line in sys.stdin:
     );
     assert!(home.join(".fake-cli/switch-entered").exists());
     assert!(home.join(".fake-cli/switch-release").exists());
-    assert!(!home.join(".fake-cli/claude.count").exists());
+    assert_eq!(std::fs::read_to_string(home.join(".fake-cli/claude.count")).unwrap().trim(), "1");
 }
 
 #[tokio::test]
@@ -270,4 +270,18 @@ async fn discord_model_switch_sequence_child() {
         assert_eq!(answer.trim(), NONCE);
         history.push_str(&format!("user: {question}\nassistant: {answer}\n"));
     }
+    let reply = handler.model_command(CHANNEL, "/model set claude").await.unwrap();
+    assert!(reply.contains("set to claude"), "{reply}");
+    assert_eq!(handler.selected_model(CHANNEL).await.unwrap().as_deref(), Some("claude"));
+    let ctx = augmentagent_approval_discord::AuditCtx {
+        session_id: format!("{CHANNEL}:4"),
+        http: None,
+        channel_id: Some(serenity::model::id::ChannelId::new(CHANNEL)),
+        owner_authorized: true,
+    };
+    let answer = handler.answer(&ctx, "Reply with the diagnostic response").await.unwrap();
+    assert_eq!(answer.trim(), "PONG-FROM-FAKE-CLAUDE");
+    handler.model_command(CHANNEL, "/model reset").await.unwrap();
+    assert_eq!(handler.selected_model(CHANNEL).await.unwrap(), None);
+
 }

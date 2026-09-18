@@ -5250,7 +5250,7 @@ impl Store {
         model_profile: Option<&str>,
     ) -> StoreResult<String> {
         if let Some(model) = model_profile {
-            if !matches!(model, "qwen" | "glm" | "codex") {
+            if !matches!(model, "claude" | "qwen" | "glm" | "codex") {
                 return Err(StoreError::InvalidInput(format!("unsupported loop model profile: {model}")));
             }
         }
@@ -8793,7 +8793,7 @@ mod tests {
             None
         );
         assert!(reopened.create_user_loop_with_model(
-            "u1", "discord", "chan", 60, "bad", None, None, None, Some("claude")
+            "u1", "discord", "chan", 60, "bad", None, None, None, Some("gemini")
         ).is_err());
     }
 

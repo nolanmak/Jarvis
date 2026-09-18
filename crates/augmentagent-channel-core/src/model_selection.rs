@@ -54,7 +54,7 @@ impl State {
 
 fn profile(name: &str) -> Option<ProviderKind> {
     match ProviderKind::parse(name) {
-        Some(kind @ (ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Codex)) => Some(kind),
+        Some(kind @ (ProviderKind::Claude | ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Codex)) => Some(kind),
         _ => None,
     }
 }
@@ -212,8 +212,8 @@ pub fn run_command(
     }
     let args: Vec<_> = words.collect();
     let reply = match args.as_slice() {
-        [] | ["help"] => "Usage: /model list | status | set qwen|glm|codex [scope:default] | reset [scope:default]".into(),
-        ["list"] => "Profiles: qwen (Runpod), glm (Runpod), codex (existing account). Use /model status for the current selection.".into(),
+        [] | ["help"] => "Usage: /model list | status | set claude|codex|qwen|glm [scope:default] | reset [scope:default]".into(),
+        ["list"] => "Profiles: claude (Claude Code), codex (Codex CLI), qwen (Runpod), glm (Runpod). Use /model status for the current selection.".into(),
         ["status"] => match store.describe(channel_id) {
             Ok((Some(profile), source)) => {
                 let readiness = match available(profile) {
@@ -236,7 +236,7 @@ pub fn run_command(
         ["set", name] | ["set", name, "scope:default"] => {
             let scope = if args.len() == 3 { None } else { Some(channel_id) };
             match profile(name) {
-                None => "Unknown model. Choose qwen, glm, or codex.".into(),
+                None => "Unknown model. Choose claude, codex, qwen, or glm.".into(),
                 Some(kind) => match available(kind) {
                     Err(reason) => format!("Model selection unchanged: {reason}"),
                     Ok(()) => match store.set(scope, Some(kind)) {
@@ -268,6 +268,19 @@ pub fn config_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_and_codex_commands_persist_and_reset() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SelectionStore::new(temp.path().join("selection.json"));
+        for kind in [ProviderKind::Claude, ProviderKind::Codex] {
+            let reply = run_command(&store, "123", &format!("/model set {}", kind.name()), |_| Ok(())).unwrap();
+            assert!(reply.contains(&format!("set to {}", kind.name())), "{reply}");
+            assert_eq!(SelectionStore::new(temp.path().join("selection.json")).selected(Some("123")).unwrap(), Some(kind));
+        }
+        run_command(&store, "123", "/model reset", |_| Ok(()));
+        assert_eq!(store.selected(Some("123")).unwrap(), None);
+    }
 
     #[test]
     fn conversation_override_survives_restart_and_reset_restores_default() {

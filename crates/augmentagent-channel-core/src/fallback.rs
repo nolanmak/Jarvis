@@ -253,12 +253,15 @@ pub fn build_reasoner() -> Arc<FallbackReasoner> {
                 if let Some(entry) = gateway_entry_for(kind) { gateway_only.push(kind); entries.push(entry); }
             }
         }
-    } else if !entries.iter().any(|entry| entry.kind == ProviderKind::Codex) {
-        // Keep a native Codex entry dormant for an explicit Discord /model
-        // selection without changing the pre-existing automatic chain.
-        if let Some(entry) = entry_for(ProviderKind::Codex) {
-            gateway_only.push(ProviderKind::Codex);
-            entries.push(entry);
+    } else {
+        // Keep native subscription adapters dormant for explicit selection.
+        for kind in [ProviderKind::Claude, ProviderKind::Codex] {
+            if !entries.iter().any(|entry| entry.kind == kind) {
+                if let Some(entry) = entry_for(kind) {
+                    gateway_only.push(kind);
+                    entries.push(entry);
+                }
+            }
         }
     }
     if entries.is_empty() {

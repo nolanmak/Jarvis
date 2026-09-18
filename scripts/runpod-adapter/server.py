@@ -3,7 +3,7 @@ from pathlib import Path
 
 API_KEY = os.environ['RUNPOD_API_KEY']
 CLIENT_KEY = os.environ['ADAPTER_API_KEY']
-ROUTES = Path('/app/routes.json')
+ROUTES = Path(os.environ.get('RUNPOD_ADAPTER_ROUTES', '/app/routes.json'))
 JOURNAL = Path(os.environ.get('RUNPOD_ADAPTER_JOURNAL', '/app/state/jobs.sqlite3'))
 MAX_IN_FLIGHT = threading.BoundedSemaphore(2)
 
@@ -599,4 +599,4 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 if __name__=='__main__':
     JobJournal(JOURNAL)
-    http.server.ThreadingHTTPServer(('0.0.0.0',8000),Handler).serve_forever()
+    http.server.ThreadingHTTPServer((os.environ.get('RUNPOD_ADAPTER_HOST', '0.0.0.0'), int(os.environ.get('RUNPOD_ADAPTER_PORT', '8000'))),Handler).serve_forever()

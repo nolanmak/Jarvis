@@ -1,0 +1,21 @@
+[Unit]
+Description=Jarvis local RunPod adapter
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/augmentagent/runpod-adapter
+EnvironmentFile=%h/.config/augmentagent/runpod-adapter.env
+Environment=RUNPOD_ADAPTER_ROUTES=%h/.config/augmentagent/runpod-routes.json
+Environment=RUNPOD_ADAPTER_JOURNAL=%h/.local/share/augmentagent/runpod-adapter/state/jobs.sqlite3
+Environment=RUNPOD_ADAPTER_HOST=127.0.0.1
+Environment=RUNPOD_ADAPTER_PORT=20129
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -u %h/.local/share/augmentagent/runpod-adapter/server.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

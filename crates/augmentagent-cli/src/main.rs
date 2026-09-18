@@ -604,7 +604,7 @@ enum Cmd {
         #[arg(long, default_value = "Reply with exactly one word: PONG")]
         prompt: String,
         /// Pin one Discord model profile for this probe, without persisting a selection.
-        #[arg(long, value_parser = ["qwen", "glm", "codex"])]
+        #[arg(long, value_parser = ["claude", "qwen", "glm", "codex"])]
         profile: Option<String>,
         /// Ask the selected model to read a synthetic file through the Jarvis
         /// bridge and require a matching tool audit receipt. Performs inference.
@@ -8746,6 +8746,21 @@ async fn run_wiki_sync(cli: &Cli, dry_run: bool, no_pull: bool) -> Result<()> {
 /// the production provider chain. Prints the chain, any active cooldown
 /// latches, and the answer. Exit non-zero when the whole chain fails, so a
 /// timer/doctor wrapper can alert on it.
+fn tool_probe_answer_matches(text: &str, nonce: &str) -> bool {
+    // Models may wrap a read result in Markdown. The independently checked
+    // Read audit receipt is the proof of tool execution; preserve nonce bytes.
+    text.lines().any(|line| line.trim() == nonce)
+}
+
+#[test]
+fn tool_probe_accepts_formatting_but_rejects_incorrect_file_contents() {
+    let nonce = "TOOL_PROBE_SYNTHETIC";
+    assert!(tool_probe_answer_matches(nonce, nonce));
+    assert!(tool_probe_answer_matches("File contents:\n```\nTOOL_PROBE_SYNTHETIC\n```", nonce));
+    assert!(!tool_probe_answer_matches("TOOL_PROBE_OTHER", nonce));
+    assert!(!tool_probe_answer_matches("TOOL_PROBE_SYNTHETIC_modified", nonce));
+}
+
 async fn run_reasoner_selftest(prompt: &str, profile: Option<&str>, tool_probe: bool) -> Result<()> {
     use augmentagent_channel_core::{CooldownLatch, ReasonerOpts};
     use augmentagent_channel_core::providers::ProviderKind;
@@ -8805,8 +8820,8 @@ async fn run_reasoner_selftest(prompt: &str, profile: Option<&str>, tool_probe: 
     let probe = if tool_probe {
         let kind = selected.ok_or_else(|| anyhow::anyhow!("--tool-probe requires --profile"))?;
         anyhow::ensure!(
-            matches!(kind, ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Codex),
-            "--tool-probe requires qwen, glm, or codex"
+            matches!(kind, ProviderKind::Claude | ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Codex),
+            "--tool-probe requires claude, codex, qwen, or glm"
         );
         let directory = tempfile::tempdir()?;
         let nonce = format!("TOOL_PROBE_{}", uuid::Uuid::new_v4());
@@ -8853,7 +8868,7 @@ async fn run_reasoner_selftest(prompt: &str, profile: Option<&str>, tool_probe: 
         Ok(text) => {
             if let (Some(probe), Some(kind)) = (&probe, selected) {
                 anyhow::ensure!(
-                    text.trim() == probe.nonce,
+                    tool_probe_answer_matches(&text, &probe.nonce),
                     "tool probe answer did not match the synthetic file"
                 );
                 let expected_path = probe.file.canonicalize()?;
@@ -8890,7 +8905,7 @@ async fn run_reasoner_selftest(prompt: &str, profile: Option<&str>, tool_probe: 
                     audited,
                     "tool probe has no successful selected-profile Read audit receipt"
                 );
-                println!("tool probe passed: {} used Read through the Jarvis bridge", kind.name());
+                println!("tool probe passed: {} used Read through the Jarvis tool policy", kind.name());
             }
             println!("response: {text}");
             Ok(())
@@ -9129,6 +9144,7 @@ impl QueryHandler for WikiQuerier {
                     } else if router.is_none() { Err("GLM requires a configured 9Router endpoint".into()) }
                     else { Ok(()) }
                 }
+                ProviderKind::Claude => Ok(()),
                 ProviderKind::Codex => {
                     if router.is_some() || augmentagent_channel_core::codex::codex_auth_available() { Ok(()) }
                     else { Err("Codex account is not configured".into()) }
@@ -9415,7 +9431,7 @@ impl LoopRunner for LoopReasonerRunner {
             use augmentagent_channel_core::providers::ProviderKind;
             let kind = ProviderKind::parse(name)
                 .filter(|kind| {
-                    matches!(kind, ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Codex)
+                    matches!(kind, ProviderKind::Claude | ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Codex)
                 })
                 .ok_or_else(|| anyhow::anyhow!("invalid stored loop model profile"))?;
             augmentagent_channel_core::model_selection::SELECTED_PROFILE
@@ -9448,7 +9464,7 @@ impl augmentagent_approval_discord::LoopCommandParser for LoopReasonerParser {
             use augmentagent_channel_core::providers::ProviderKind;
             let kind = ProviderKind::parse(name)
                 .filter(|kind| {
-                    matches!(kind, ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Codex)
+                    matches!(kind, ProviderKind::Claude | ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Codex)
                 })
                 .ok_or_else(|| "unsupported loop model profile".to_string())?;
             augmentagent_channel_core::model_selection::SELECTED_PROFILE
