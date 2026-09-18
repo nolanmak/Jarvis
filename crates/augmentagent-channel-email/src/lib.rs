@@ -8,6 +8,7 @@
 pub mod gmail;
 pub mod inbound;
 pub mod outbound;
+pub mod prefilter;
 pub mod scheduled;
 pub mod sigextract;
 pub mod tone;

@@ -92,3 +92,31 @@ Rules the code enforces:
 - Vectors record provider, model and dimension. Switching back to local means
   `embeddings backfill` re-embeds under the local model; the hosted vectors
   stay in their own space until you delete them.
+
+## Triage pre-filter (opt-in)
+
+With vectors in place, routine mail can be skipped without a reasoner call
+when its nearest already-triaged neighbours are unanimous `skip` and close
+enough. Only `skip` is ever emitted; the verdict type cannot express a reply,
+draft, flag or approval card.
+
+What it measures: **agreement with the reasoner's own past decisions**. There
+is no human-labelled triage corpus, so this preserves current behaviour more
+cheaply rather than proving correctness. History-import rows (chat stamped
+`digest_only`) are never eligible neighbours, and neither are rows the
+pre-filter itself decided.
+
+```sh
+augmentagent triage-prefilter calibrate        # time-ordered split, agreement/coverage per threshold
+augmentagent triage-prefilter stats            # decisions made, spot-check agreement, auto-disable state
+augmentagent triage-prefilter reset            # clear the auto-disable latch
+```
+
+Defaults: k=16 unanimous neighbours, similarity ≥ 0.90, no margin gate (from the
+reference store's calibration; yours may differ). Enable with
+`AUGMENTAGENT_TRIAGE_PREFILTER=1` after reading `calibrate`'s recommendation and setting `AUGMENTAGENT_TRIAGE_PREFILTER_MIN_SIM` (and
+optionally `_MIN_MARGIN`, `_K`, `_SPOT_PCT`). A sampled share of decidable
+messages (default 10%) still goes to the reasoner; if the recent spot-checks
+disagree more than 5%, the pre-filter disables itself and `doctor`/`stats`
+say so. Every decision records its neighbours, similarity and threshold
+version.
