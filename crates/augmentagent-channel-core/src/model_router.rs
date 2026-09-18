@@ -120,15 +120,22 @@ pub fn parse(raw: &str) -> anyhow::Result<RouterConfig> {
     );
     let url = reqwest::Url::parse(&config.base_url)
         .map_err(|_| anyhow::anyhow!("Invalid router endpoint"))?;
+    let host = url.host_str().unwrap_or_default();
+    let local = url.scheme() == "http"
+        && matches!(host, "127.0.0.1" | "localhost" | "[::1]");
+    let remote = url.port().is_some_and(|port| {
+        let authority = format!("{host}:{port}");
+        std::env::var("AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS")
+            .ok().is_some_and(|hosts| hosts.split(',').any(|entry| entry.trim().eq_ignore_ascii_case(&authority)))
+    }) && (url.scheme() == "https" || (url.scheme() == "http" && host.ends_with(".ts.net")));
     anyhow::ensure!(
-        url.scheme() == "http"
-            && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+        (local || remote)
             && url.username().is_empty()
             && url.password().is_none()
             && url.query().is_none()
             && url.fragment().is_none()
             && url.path() == "/v1",
-        "Router endpoint must be a loopback HTTP /v1 endpoint"
+        "Router endpoint must be loopback or an explicitly allowed remote /v1 endpoint"
     );
     anyhow::ensure!(
         !config.api_key.trim().is_empty() && !config.api_key.chars().any(char::is_control),
@@ -344,5 +351,39 @@ pub(crate) mod tests {
             select_profile_with_auth(config, None, false)
         }).await.unwrap().unwrap();
         assert_eq!(native_claude.mode, "direct");
+    }
+
+    #[test]
+    fn explicitly_allowed_tailnet_router_has_an_exact_host_boundary() {
+        const NAME: &str = "model_router::tests::explicitly_allowed_tailnet_router_has_an_exact_host_boundary";
+        if std::env::var_os("JARVIS_TAILNET_ROUTER_CHILD").is_some() {
+            let mut value = fixture();
+            value["base_url"] = "http://macbook-air-2.tailfdbc7f.ts.net:20128/v1".into();
+            assert!(parse(&value.to_string()).is_ok(), "the exact allowed tailnet router should parse");
+            for url in [
+                "http://other.tailfdbc7f.ts.net:20128/v1",
+                "http://macbook-air-2.tailfdbc7f.ts.net:20129/v1",
+                "http://user:pass@macbook-air-2.tailfdbc7f.ts.net:20128/v1",
+                "http://macbook-air-2.tailfdbc7f.ts.net:20128/v1?key=secret",
+                "http://evil.example:20128/v1",
+            ] {
+                value["base_url"] = url.into();
+                assert!(parse(&value.to_string()).is_err(), "unauthorized router URL {url}");
+            }
+            std::env::set_var("AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS",
+                "macbook-air-2.tailfdbc7f.ts.net:20128,evil.example:20128");
+            value["base_url"] = "http://evil.example:20128/v1".into();
+            assert!(parse(&value.to_string()).is_err(), "remote cleartext is limited to tailnet DNS");
+            value["base_url"] = "https://evil.example:20128/v1".into();
+            assert!(parse(&value.to_string()).is_ok(), "an explicitly allowed HTTPS router is valid");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env("JARVIS_TAILNET_ROUTER_CHILD", "1")
+            .env("AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS", "macbook-air-2.tailfdbc7f.ts.net:20128")
+            .output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr));
     }
 }
