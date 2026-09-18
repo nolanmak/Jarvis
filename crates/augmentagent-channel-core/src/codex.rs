@@ -1308,9 +1308,13 @@ escape_args = {'file_path':str(workspace / 'escape.txt')}
 escape = call(7, 'tools/call', {'name':'Read','arguments':escape_args})
 escape_write_args = {'file_path':str(workspace / 'escape.txt'),'content':'bad\n'}
 escape_write = call(8, 'tools/call', {'name':'Write','arguments':escape_write_args})
-for name, arguments, result in [('Read',read_args,read),('Write',write_args,write),('Write',outside_args,outside),('Bash',bash_args,bash),('Read',escape_args,escape),('Write',escape_write_args,escape_write)]:
+unknown_args = {'file_path':str(workspace / 'unknown.txt'),'content':'bad\n'}
+unknown = call(9, 'tools/call', {'name':'UnknownTool','arguments':unknown_args})
+invalid_write_args = {'file_path':str(workspace / 'invalid.txt')}
+invalid_write = call(10, 'tools/call', {'name':'Write','arguments':invalid_write_args})
+for name, arguments, result in [('Read',read_args,read),('Write',write_args,write),('Write',outside_args,outside),('Bash',bash_args,bash),('Read',escape_args,escape),('Write',escape_write_args,escape_write),('UnknownTool',unknown_args,unknown),('Write',invalid_write_args,invalid_write)]:
     print(json.dumps({'type':'item.completed','item':{'type':'mcp_tool_call','server':'jarvis','tool':name,'arguments':arguments,'result':result}}),flush=True)
-report = {'tools':tools,'read':read,'write':write,'outside':outside,'bash':bash,'escape':escape,'escape_write':escape_write}
+report = {'tools':tools,'read':read,'write':write,'outside':outside,'bash':bash,'escape':escape,'escape_write':escape_write,'unknown':unknown,'invalid_write':invalid_write}
 print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':json.dumps(report)}}),flush=True)
 bridge.stdin.close()
 bridge.wait(timeout=10)
@@ -1351,12 +1355,16 @@ PY
             assert_eq!(report["outside"]["isError"], true);
             assert_eq!(report["escape"]["isError"], true);
             assert_eq!(report["escape_write"]["isError"], true);
+            assert_eq!(report["unknown"]["isError"], true);
+            assert_eq!(report["invalid_write"]["isError"], true);
             assert_ne!(report["bash"]["isError"], true);
             assert!(report["bash"]["content"][0]["text"].as_str().unwrap().contains("NINE"));
             assert_eq!(std::fs::read_to_string(workspace.join("result.txt")).unwrap(), "8\n");
+            assert!(!workspace.join("unknown.txt").exists());
+            assert!(!workspace.join("invalid.txt").exists());
             assert_eq!(std::fs::read_to_string(root.path().join("outside.txt")).unwrap(), "outside fixture\n");
             let records = std::fs::read_to_string(audit).unwrap();
-            assert_eq!(records.lines().count(), 6);
+            assert_eq!(records.lines().count(), 8);
             assert!(records.lines().all(|line| {
                 serde_json::from_str::<serde_json::Value>(line).unwrap()["provider"] == kind.name()
             }));
