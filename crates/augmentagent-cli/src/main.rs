@@ -4,6 +4,8 @@
 mod provider_migration_tests;
 #[cfg(test)]
 mod provider_channel_tests;
+#[cfg(test)]
+mod model_switch_sequence_tests;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

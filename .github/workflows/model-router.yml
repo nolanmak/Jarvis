@@ -67,6 +67,8 @@ jobs:
       - run: cargo check -p augmentagent-cli
       - name: Pin each Discord model and exercise the audited tool probe
         run: cargo test -p augmentagent-cli --test reasoner_failover_e2e selftest_ -- --nocapture
+      - name: Switch one Discord channel through Qwen, GLM, and Codex
+        run: cargo test -p augmentagent-cli --bin augmentagent model_switch_sequence_tests::discord_model_switch_sequence_uses_one_audited_harness -- --nocapture
   pinned-gateway:
     runs-on: ubuntu-latest
     timeout-minutes: 30
