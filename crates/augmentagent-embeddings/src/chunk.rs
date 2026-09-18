@@ -243,6 +243,17 @@ fn load_conversation(
     Ok((kind, header, msgs))
 }
 
+/// Compute one conversation's chunks without writing anything (used to
+/// reconstruct chunk text for embedding; chunk text is not stored).
+pub fn compute_chunks(
+    c: &Connection,
+    conversation_id: &str,
+    p: &ChunkParams,
+) -> augmentagent_store::rusqlite::Result<Vec<Chunk>> {
+    let (kind, header, msgs) = load_conversation(c, conversation_id)?;
+    Ok(chunk_messages(conversation_id, &header, &kind, &msgs, p))
+}
+
 /// Re-chunk one conversation, replacing its rows. Returns the chunk ids that
 /// are new or whose text changed. Reads happen before the write transaction
 /// so a large conversation never holds the write lock while loading.

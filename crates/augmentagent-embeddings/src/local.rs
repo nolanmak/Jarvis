@@ -17,6 +17,33 @@ use crate::model::{thread_count, ModelSpec, DEFAULT_MODEL};
 /// Inputs per ONNX run. Small enough that padding waste stays bounded once
 /// the batch is sorted by length.
 pub const BATCH: usize = 32;
+/// Padded tokens per ONNX run. Attention buffers grow with
+/// batch × seq², and ONNX Runtime's arena keeps the peak: 32 max-length
+/// inputs took the process past 2 GB in QA. With this budget a batch of
+/// 512-token inputs is 8 items and the peak stays a few hundred MB.
+pub const TOKEN_BUDGET: usize = 4096;
+
+/// Group indices (already sorted by length) into batches bounded by item
+/// count and by padded tokens (`max_len × items`). Pure; order preserved.
+pub fn plan_batches(lengths: &[usize], max_items: usize, token_budget: usize) -> Vec<Vec<usize>> {
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    let mut cur: Vec<usize> = Vec::new();
+    let mut cur_max = 0usize;
+    for (i, &len) in lengths.iter().enumerate() {
+        let new_max = cur_max.max(len);
+        let would_be = new_max * (cur.len() + 1);
+        if !cur.is_empty() && (cur.len() >= max_items.max(1) || would_be > token_budget) {
+            out.push(std::mem::take(&mut cur));
+            cur_max = 0;
+        }
+        cur_max = cur_max.max(len);
+        cur.push(i);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
 
 pub struct LocalEmbedder {
     id: ModelId,
@@ -150,15 +177,25 @@ impl Embedder for LocalEmbedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        // Sort by length so each batch pads to a similar size (measured 2×
-        // throughput), then restore input order.
+        // Sort by token length so each batch pads to a similar size (measured
+        // 2× throughput), bound each batch by items and padded tokens, then
+        // restore input order.
+        let encodings = self
+            .tokenizer
+            .encode_batch(texts.iter().map(String::as_str).collect::<Vec<_>>(), true)
+            .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
         let mut order: Vec<usize> = (0..texts.len()).collect();
-        order.sort_by_key(|&i| texts[i].len());
+        order.sort_by_key(|&i| encodings[i].get_ids().len());
+        let lengths: Vec<usize> = order
+            .iter()
+            .map(|&i| encodings[i].get_ids().len())
+            .collect();
         let mut out: Vec<Option<Embedding>> = vec![None; texts.len()];
-        for chunk in order.chunks(BATCH) {
-            let batch: Vec<&str> = chunk.iter().map(|&i| texts[i].as_str()).collect();
+        for group in plan_batches(&lengths, BATCH, TOKEN_BUDGET) {
+            let idx: Vec<usize> = group.iter().map(|&g| order[g]).collect();
+            let batch: Vec<&str> = idx.iter().map(|&i| texts[i].as_str()).collect();
             let vectors = self.run_batch(&batch)?;
-            for (&i, v) in chunk.iter().zip(vectors) {
+            for (&i, v) in idx.iter().zip(vectors) {
                 out[i] = Some(v);
             }
         }
@@ -178,6 +215,37 @@ mod tests {
         // `AUGMENTAGENT_EMBEDDINGS_MODEL_DIR` or the default location.
         let d = DEFAULT_MODEL.dir();
         DEFAULT_MODEL.is_present(&d).then_some(d)
+    }
+
+    #[test]
+    fn long_inputs_form_small_batches_and_short_ones_fill_up() {
+        // 512-token inputs: 4096 / 512 = 8 per batch.
+        let long = vec![512usize; 20];
+        let b = plan_batches(&long, 32, 4096);
+        assert_eq!(b.iter().map(Vec::len).collect::<Vec<_>>(), [8, 8, 4]);
+        // Short inputs hit the item cap first.
+        let short = vec![16usize; 70];
+        let b = plan_batches(&short, 32, 4096);
+        assert_eq!(b.iter().map(Vec::len).collect::<Vec<_>>(), [32, 32, 6]);
+        // Mixed, sorted ascending: budget applies to the padded size.
+        let mixed = [10, 10, 100, 100, 500, 500, 500];
+        let b = plan_batches(&mixed, 32, 1000);
+        for g in &b {
+            let max = g.iter().map(|&i| mixed[i]).max().unwrap();
+            assert!(max * g.len() <= 1000 || g.len() == 1, "{b:?}");
+        }
+        let all: Vec<usize> = b.concat();
+        assert_eq!(
+            all,
+            (0..mixed.len()).collect::<Vec<_>>(),
+            "order preserved, nothing dropped"
+        );
+        assert!(plan_batches(&[], 32, 4096).is_empty());
+        assert_eq!(
+            plan_batches(&[9000], 32, 4096),
+            vec![vec![0]],
+            "an oversize single item still runs alone"
+        );
     }
 
     #[test]
