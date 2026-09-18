@@ -51,6 +51,11 @@ use crate::cooldown::CooldownLatch;
 use crate::providers::{allowed_for, bin_resolves, chain_from_env, classify, ProviderKind};
 use crate::reasoner::{ClaudeCliReasoner, Reasoner, ReasonerError, ReasonerOpts};
 
+#[cfg(test)]
+tokio::task_local! {
+    static AFTER_ROUTE_SELECTION: Arc<dyn Fn() + Send + Sync>;
+}
+
 /// Default cooldown when a rate-limit refusal carries no parseable reset
 /// hint. Claude session windows are 5-hourly; 30 minutes re-probes a few
 /// times per window without hammering.
@@ -529,8 +534,16 @@ impl FallbackReasoner {
         let config = crate::model_router::load().map_err(|_| ReasonerError::Local {
             message: "Invalid model router configuration; refusing dispatch".into(),
         })?;
-        let config = crate::model_router::select_profile(config, crate::model_selection::current()?)?;
-        crate::model_router::SNAPSHOT.scope(config, self.dispatch_snapshot(opts, user_message, transcript, revision_authors)).await
+        // Bind the selected profile and router mode together for this logical
+        // call. Unscoped callers can change the selection file after this
+        // read; dispatch_snapshot must not pick up their newer model.
+        let selected = crate::model_selection::current()?;
+        let config = crate::model_router::select_profile(config, selected)?;
+        #[cfg(test)]
+        let _ = AFTER_ROUTE_SELECTION.try_with(|hook| hook());
+        crate::model_selection::SELECTED_PROFILE.scope(selected,
+            crate::model_router::SNAPSHOT.scope(config,
+                self.dispatch_snapshot(opts, user_message, transcript, revision_authors))).await
     }
 
     async fn dispatch_snapshot(
@@ -819,6 +832,41 @@ impl Reasoner for FallbackReasoner {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn unscoped_dispatch_keeps_route_and_model_on_one_selection_snapshot() {
+        if std::env::var_os("FALLBACK_SNAPSHOT_CHILD").is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let selection = dir.path().join("selection.json");
+            let router = dir.path().join("router.json");
+            std::fs::write(&router, crate::model_router::tests::fixture().to_string()).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "fallback::tests::unscoped_dispatch_keeps_route_and_model_on_one_selection_snapshot", "--nocapture"])
+                .env("FALLBACK_SNAPSHOT_CHILD", "1")
+                .env("AUGMENTAGENT_MODEL_SELECTION_CONFIG", selection)
+                .env("AUGMENTAGENT_MODEL_ROUTER_CONFIG", router)
+                .output().unwrap();
+            assert!(output.status.success(), "{}\n{}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::model_selection::SelectionStore::new(
+            crate::model_selection::config_path());
+        store.set(None, Some(ProviderKind::Qwen)).unwrap();
+        let qwen = Scripted::ok("qwen answer");
+        let codex = Scripted::ok("codex answer");
+        let chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Qwen, qwen.clone()),
+            (ProviderKind::Codex, codex.clone()),
+        ], latch_in(&dir));
+        let answer = AFTER_ROUTE_SELECTION.scope(Arc::new(move || {
+            store.set(None, Some(ProviderKind::Codex)).unwrap();
+        }), chain.call(&text_only_opts(), "synthetic request")).await.unwrap();
+        assert_eq!(answer, "qwen answer");
+        assert_eq!(qwen.count(), 1);
+        assert_eq!(codex.count(), 0);
+    }
 
     #[tokio::test]
     async fn explicit_runpod_selection_uses_only_the_selected_harness_entry() {
