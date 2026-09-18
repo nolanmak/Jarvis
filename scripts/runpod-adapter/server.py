@@ -55,10 +55,14 @@ class JobJournal:
 
     def submitted(self, request_id, job_id):
         with self._connect() as db:
-            changed = db.execute('UPDATE jobs SET job_id=?, state=?, updated_at=? WHERE request_id=? AND state=?',
-                                 (job_id, 'SUBMITTED', int(time.time()), request_id, 'SUBMITTING')).rowcount
+            changed = db.execute('''UPDATE jobs SET job_id=?,
+                state=CASE WHEN state='CANCELLATION_UNKNOWN' THEN 'CANCELLATION_REQUESTED'
+                           ELSE 'SUBMITTED' END, updated_at=?
+                WHERE request_id=? AND state IN ('SUBMITTING','CANCELLATION_UNKNOWN')''',
+                                 (job_id, int(time.time()), request_id)).rowcount
             if changed != 1:
                 raise ValueError('job submission has no matching journal entry')
+            return db.execute('SELECT state FROM jobs WHERE request_id=?', (request_id,)).fetchone()[0]
 
     def finish(self, request_id, state):
         with self._connect() as db:
@@ -72,6 +76,22 @@ class JobJournal:
             row = db.execute('SELECT model, route, job_id, state, endpoint_url FROM jobs WHERE request_id=?',
                              (request_id,)).fetchone()
         return dict(zip(('model', 'route', 'job_id', 'state', 'endpoint_url'), row)) if row else None
+
+    def request_cancel(self, request_id):
+        """Atomically mark intent against submission, completion and a second cancel."""
+        with self._connect() as db:
+            changed = db.execute('''UPDATE jobs SET
+                state=CASE
+                    WHEN state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT') THEN state
+                    WHEN route!='queue' THEN 'CANCELLATION_UNSUPPORTED'
+                    WHEN job_id IS NULL THEN 'CANCELLATION_UNKNOWN'
+                    ELSE 'CANCELLATION_REQUESTED' END,
+                updated_at=? WHERE request_id=?''', (int(time.time()), request_id)).rowcount
+            if changed != 1:
+                raise ValueError('job has no matching journal entry')
+            row = db.execute('SELECT model, route, job_id, state, endpoint_url FROM jobs WHERE request_id=?',
+                             (request_id,)).fetchone()
+            return dict(zip(('model', 'route', 'job_id', 'state', 'endpoint_url'), row))
 
 def reconcile_job(journal, request_id, rpc_call=None):
     """Refresh a known queue job from the endpoint captured before submission."""
@@ -93,13 +113,11 @@ def reconcile_job(journal, request_id, rpc_call=None):
 def cancel_job(journal, request_id, base, rpc_call= None):
     """Only an explicit matching Runpod response confirms cancellation."""
     rpc_call = rpc if rpc_call is None else rpc_call
-    job = journal.get(request_id)
-    if not job or not job['job_id']:
-        journal.finish(request_id, 'CANCELLATION_UNKNOWN')
-        return 'CANCELLATION_UNKNOWN'
-    journal.finish(request_id, 'CANCELLATION_REQUESTED')
+    job = journal.request_cancel(request_id)
+    if job['state'] != 'CANCELLATION_REQUESTED':
+        return job['state']
     try:
-        result = rpc_call(base + '/cancel/' + job['job_id'], {})
+        result = rpc_call((job['endpoint_url'] or base) + '/cancel/' + job['job_id'], {})
         if result.get('id') == job['job_id'] and result.get('status') in ('CANCELLED', 'COMPLETED', 'FAILED', 'TIMED_OUT'):
             state = result['status']
         else:
@@ -286,6 +304,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.reply(404,{'error':{'message':'Unknown path'}})
     def do_POST(self):
         if not self.authorized():return
+        if self.path.startswith('/v1/jobs/') and self.path.endswith('/cancel'):
+            request_id=self.path.removeprefix('/v1/jobs/').removesuffix('/cancel').removesuffix('/')
+            if not re.fullmatch(r'[A-Za-z0-9._-]{1,128}',request_id):
+                return self.reply(400,{'error':{'message':'Invalid request id'}})
+            try:
+                journal=JobJournal(JOURNAL)
+                job=journal.get(request_id)
+                if not job:return self.reply(404,{'error':{'message':'Unknown request id'}})
+                if job['state'] in ('COMPLETED','FAILED','CANCELLED','TIMED_OUT'):
+                    state=job['state']
+                elif job['route']=='queue':
+                    state=cancel_job(journal,request_id,job['endpoint_url'])
+                else:
+                    state=journal.request_cancel(request_id)['state']
+                status=200 if state in ('COMPLETED','FAILED','CANCELLED','TIMED_OUT') else 202
+                return self.reply(status,{'request_id':request_id,'state':state})
+            except Exception as error:
+                print('job cancellation failed',type(error).__name__,flush=True)
+                return self.reply(502,{'error':{'message':'Runpod cancellation status unavailable','type':'upstream_error'}})
         if self.path.startswith('/v1/jobs/') and self.path.endswith('/reconcile'):
             request_id=self.path.removeprefix('/v1/jobs/').removesuffix('/reconcile').removesuffix('/')
             if not re.fullmatch(r'[A-Za-z0-9._-]{1,128}',request_id):
@@ -357,7 +394,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 journal.finish(self.request_id, 'SUBMISSION_UNKNOWN')
                 raise
-            journal.submitted(self.request_id, job);submitted=True
+            submit_state=journal.submitted(self.request_id, job);submitted=True
+            if submit_state=='CANCELLATION_REQUESTED':
+                state=cancel_job(journal,self.request_id,base)
+                return self.reply(409,{'error':{'message':'Request was cancelled during submission','type':'cancelled'},'state':state})
             streaming=bool(body.get('stream'))
             if streaming:
                 self.send_response(200);self.send_header('Content-Type','text/event-stream');self.send_header('Cache-Control','no-cache');self.send_header('Connection','close');self.send_header('X-Adapter-Request-Id',self.request_id);self.end_headers();self.close_connection=True

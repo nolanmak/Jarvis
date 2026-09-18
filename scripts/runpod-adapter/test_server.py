@@ -210,6 +210,110 @@ class JobLifecycleTests(unittest.TestCase):
                 server.server_close()
                 worker.join(timeout=2)
 
+    def test_authenticated_cancel_confirms_queue_job_and_marks_load_balancer_unsupported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal_path = pathlib.Path(tmp) / 'jobs.sqlite3'
+            journal = module.JobJournal(journal_path)
+            journal.start('queue-request', 'qwen38-27b', 'queue', 'https://api.runpod.ai/v2/old-endpoint')
+            journal.submitted('queue-request', 'job-1')
+            journal.start('lb-request', 'glm-5.3-flash', 'load_balancer',
+                          'https://g1eary963m1aym.api.runpod.ai/openai/v1')
+            journal.start('unknown-request', 'qwen38-27b', 'queue',
+                          'https://api.runpod.ai/v2/old-endpoint')
+            upstream = []
+            def confirmed(url, payload=None):
+                upstream.append((url, payload))
+                return {'id': 'job-1', 'status': 'CANCELLED'}
+            server = module.http.server.ThreadingHTTPServer(('127.0.0.1', 0), module.Handler)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                with mock.patch.object(module, 'JOURNAL', journal_path), \
+                     mock.patch.object(module, 'rpc', confirmed):
+                    for request_id, expected_status, expected_state in (
+                            ('queue-request', 200, 'CANCELLED'),
+                            ('lb-request', 202, 'CANCELLATION_UNSUPPORTED'),
+                            ('unknown-request', 202, 'CANCELLATION_UNKNOWN')):
+                        conn = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=2)
+                        conn.request('POST', f'/v1/jobs/{request_id}/cancel', '',
+                                     {'Authorization': 'Bearer test-client-key'})
+                        response = conn.getresponse()
+                        self.assertEqual(response.status, expected_status)
+                        self.assertEqual(json.load(response)['state'], expected_state)
+                        conn.close()
+                self.assertEqual(upstream,
+                                 [('https://api.runpod.ai/v2/old-endpoint/cancel/job-1', {})])
+                self.assertEqual(module.JobJournal(journal_path).get('queue-request')['state'], 'CANCELLED')
+                self.assertEqual(module.JobJournal(journal_path).get('lb-request')['state'],
+                                 'CANCELLATION_UNSUPPORTED')
+                self.assertEqual(module.JobJournal(journal_path).get('unknown-request')['state'],
+                                 'CANCELLATION_UNKNOWN')
+            finally:
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=2)
+
+    def test_cancel_during_submission_captures_job_id_and_cancels_it_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            routes = pathlib.Path(tmp) / 'routes.json'
+            routes.write_text(json.dumps({'qwen38-27b': {'type': 'ollama-queue',
+                'base_url': 'https://api.runpod.ai/v2/endpoint', 'max_output_tokens': 128}}))
+            journal_path = pathlib.Path(tmp) / 'jobs.sqlite3'
+            entered = threading.Event()
+            release = threading.Event()
+            calls = []
+            def upstream(url, payload=None):
+                calls.append(url)
+                if url.endswith('/run'):
+                    entered.set()
+                    release.wait(timeout=3)
+                    return {'id': 'job-1'}
+                if url.endswith('/cancel/job-1'):
+                    return {'id': 'job-1', 'status': 'CANCELLED'}
+                raise AssertionError('cancelled job must not be polled')
+            server = module.http.server.ThreadingHTTPServer(('127.0.0.1', 0), module.Handler)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            result = []
+            def submit():
+                conn = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=5)
+                conn.request('POST', '/v1/chat/completions', json.dumps({
+                    'model': 'qwen38-27b', 'messages': [{'role': 'user', 'content': 'hello'}]}),
+                    {'Authorization': 'Bearer test-client-key', 'Content-Type': 'application/json',
+                     'Idempotency-Key': 'turn-1'})
+                response = conn.getresponse()
+                result.append(response.status)
+                response.read()
+                conn.close()
+            sender = threading.Thread(target=submit)
+            try:
+                with mock.patch.object(module, 'ROUTES', routes), \
+                     mock.patch.object(module, 'JOURNAL', journal_path), \
+                     mock.patch.object(module, 'rpc', upstream):
+                    sender.start()
+                    self.assertTrue(entered.wait(timeout=2))
+                    conn = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=2)
+                    conn.request('POST', '/v1/jobs/turn-1/cancel', '',
+                                 {'Authorization': 'Bearer test-client-key'})
+                    response = conn.getresponse()
+                    self.assertEqual(response.status, 202)
+                    response.read()
+                    conn.close()
+                    release.set()
+                    sender.join(timeout=5)
+                self.assertEqual(result, [409])
+                self.assertEqual(calls, ['https://api.runpod.ai/v2/endpoint/run',
+                                         'https://api.runpod.ai/v2/endpoint/cancel/job-1'])
+                job = module.JobJournal(journal_path).get('turn-1')
+                self.assertEqual(job['job_id'], 'job-1')
+                self.assertEqual(job['state'], 'CANCELLED')
+            finally:
+                release.set()
+                sender.join(timeout=5)
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=2)
+
     def test_journal_refuses_a_shared_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = pathlib.Path(tmp) / 'state'
