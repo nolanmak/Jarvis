@@ -45,12 +45,16 @@ class JobJournal:
             db.execute('''CREATE TABLE IF NOT EXISTS jobs (
                 request_id TEXT PRIMARY KEY, model TEXT NOT NULL, route TEXT NOT NULL,
                 job_id TEXT, state TEXT NOT NULL, updated_at INTEGER NOT NULL,
-                endpoint_url TEXT, body_digest TEXT)''')
+                endpoint_url TEXT, body_digest TEXT, started_at_ms INTEGER,
+                observed_elapsed_ms INTEGER, queue_delay_ms INTEGER, execution_ms INTEGER)''')
             columns = {row[1] for row in db.execute('PRAGMA table_info(jobs)')}
             if 'endpoint_url' not in columns:
                 db.execute('ALTER TABLE jobs ADD COLUMN endpoint_url TEXT')
             if 'body_digest' not in columns:
                 db.execute('ALTER TABLE jobs ADD COLUMN body_digest TEXT')
+            for column in ('started_at_ms', 'observed_elapsed_ms', 'queue_delay_ms', 'execution_ms'):
+                if column not in columns:
+                    db.execute(f'ALTER TABLE jobs ADD COLUMN {column} INTEGER')
             db.execute('CREATE INDEX IF NOT EXISTS jobs_body_digest ON jobs(body_digest)')
 
     @contextlib.contextmanager
@@ -73,9 +77,10 @@ class JobJournal:
                 raise DuplicateRequestError('matching Runpod request already recorded; inspect job journal before retry')
             try:
                 db.execute('''INSERT INTO jobs
-                    (request_id, model, route, job_id, state, updated_at, endpoint_url, body_digest)
-                    VALUES (?, ?, ?, NULL, ?, ?, ?, ?)''',
-                           (request_id, model, route, 'SUBMITTING', int(time.time()), endpoint_url, body_digest))
+                    (request_id, model, route, job_id, state, updated_at, endpoint_url, body_digest, started_at_ms)
+                    VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?)''',
+                           (request_id, model, route, 'SUBMITTING', int(time.time()),
+                            endpoint_url, body_digest, time.time_ns() // 1_000_000))
             except sqlite3.IntegrityError as error:
                 raise DuplicateRequestError('request key already used; inspect job journal before retry') from error
 
@@ -90,10 +95,11 @@ class JobJournal:
                 raise ValueError('job submission has no matching journal entry')
             return db.execute('SELECT state FROM jobs WHERE request_id=?', (request_id,)).fetchone()[0]
 
-    def finish(self, request_id, state):
+    def finish(self, request_id, state, runpod_status=None):
         with self._connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            row = db.execute('SELECT state FROM jobs WHERE request_id=?', (request_id,)).fetchone()
+            row = db.execute('SELECT state, started_at_ms FROM jobs WHERE request_id=?',
+                             (request_id,)).fetchone()
             if row is None:
                 raise ValueError('job has no matching journal entry')
             previous = row[0]
@@ -101,15 +107,31 @@ class JobJournal:
             cancelling = ('CANCELLATION_REQUESTED', 'CANCELLATION_UNKNOWN', 'CANCELLATION_UNSUPPORTED')
             if previous in terminal or (previous in cancelling and state not in terminal + cancelling):
                 return previous
-            db.execute('UPDATE jobs SET state=?, updated_at=? WHERE request_id=?',
-                       (state, int(time.time()), request_id))
+            if state in terminal:
+                elapsed = max(0, time.time_ns() // 1_000_000 - row[1]) if row[1] is not None else None
+                status = runpod_status if isinstance(runpod_status, dict) else {}
+                def milliseconds(key):
+                    value = status.get(key)
+                    return value if type(value) is int and 0 <= value <= 7 * 24 * 60 * 60 * 1000 else None
+                db.execute('''UPDATE jobs SET state=?, updated_at=?, observed_elapsed_ms=?,
+                    queue_delay_ms=?, execution_ms=? WHERE request_id=?''',
+                    (state, int(time.time()), elapsed, milliseconds('delayTime'),
+                     milliseconds('executionTime'), request_id))
+            else:
+                db.execute('UPDATE jobs SET state=?, updated_at=? WHERE request_id=?',
+                           (state, int(time.time()), request_id))
             return state
 
     def get(self, request_id):
         with self._connect() as db:
-            row = db.execute('SELECT model, route, job_id, state, endpoint_url FROM jobs WHERE request_id=?',
+            row = db.execute('''SELECT model, route, job_id, state, endpoint_url,
+                observed_elapsed_ms, queue_delay_ms, execution_ms FROM jobs WHERE request_id=?''',
                              (request_id,)).fetchone()
-        return dict(zip(('model', 'route', 'job_id', 'state', 'endpoint_url'), row)) if row else None
+        if not row:
+            return None
+        job = dict(zip(('model', 'route', 'job_id', 'state', 'endpoint_url'), row[:5]))
+        job['timing'] = dict(zip(('observed_elapsed_ms', 'queue_delay_ms', 'execution_ms'), row[5:]))
+        return job
 
     def request_cancel(self, request_id):
         """Atomically mark intent against submission, completion and a second cancel."""
@@ -141,7 +163,7 @@ def reconcile_job(journal, request_id, rpc_call=None):
     if result.get('id') != job['job_id'] or result.get('status') not in (
         'IN_QUEUE', 'IN_PROGRESS', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED', 'TIMED_OUT'):
         raise ValueError('Runpod returned an unverified job status')
-    return journal.finish(request_id, result['status'])
+    return journal.finish(request_id, result['status'], result)
 
 def cancel_job(journal, request_id, base, rpc_call= None):
     """Only an explicit matching Runpod response confirms cancellation."""
@@ -519,13 +541,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if result.get('id') != job:
                     raise ValueError('Runpod returned an unverified job status')
                 if result['status']=='COMPLETED':
-                    recorded=journal.finish(self.request_id, 'COMPLETED')
+                    recorded=journal.finish(self.request_id, 'COMPLETED', result)
                     if recorded!='COMPLETED':
                         if streaming:return
                         return self.reply(409,{'error':{'message':'Runpod job outcome changed during polling; inspect recorded state','type':'job_conflict'},'state':recorded})
                     break
                 if result['status'] in ['FAILED','CANCELLED','TIMED_OUT']:
-                    recorded=journal.finish(self.request_id, result['status'])
+                    recorded=journal.finish(self.request_id, result['status'], result)
                     if recorded!=result['status']:
                         if streaming:return
                         return self.reply(409,{'error':{'message':'Runpod job outcome changed during polling; inspect recorded state','type':'job_conflict'},'state':recorded})

@@ -224,6 +224,74 @@ class UpstreamCredentialTests(unittest.TestCase):
 
 
 class JobLifecycleTests(unittest.TestCase):
+    def test_completed_queue_job_exposes_runpod_timing_separately_from_tokens(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            routes = pathlib.Path(tmp) / 'routes.json'
+            routes.write_text(json.dumps({'qwen38-27b': {
+                'type': 'ollama-queue', 'base_url': 'https://api.runpod.ai/v2/endpoint',
+                'max_output_tokens': 128}}))
+            journal_path = pathlib.Path(tmp) / 'jobs.sqlite3'
+            def upstream(url, payload=None):
+                if url.endswith('/run'):
+                    return {'id': 'job-1'}
+                if url.endswith('/status/job-1'):
+                    return {'id': 'job-1', 'status': 'COMPLETED',
+                            'delayTime': 250, 'executionTime': 750,
+                            'output': {'message': {'role': 'assistant', 'content': 'READY'},
+                                       'prompt_eval_count': 8, 'eval_count': 2}}
+                raise AssertionError(url)
+            server = module.http.server.ThreadingHTTPServer(('127.0.0.1', 0), module.Handler)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                with mock.patch.object(module, 'ROUTES', routes), \
+                     mock.patch.object(module, 'JOURNAL', journal_path), \
+                     mock.patch.object(module, 'rpc', upstream):
+                    conn = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=2)
+                    conn.request('POST', '/v1/chat/completions', json.dumps({
+                        'model': 'qwen38-27b', 'messages': [{'role': 'user', 'content': 'hello'}]}),
+                        {'Authorization': 'Bearer test-client-key', 'Content-Type': 'application/json',
+                         'Idempotency-Key': 'timed-turn'})
+                    response = conn.getresponse()
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(json.load(response)['usage']['total_tokens'], 10)
+                    conn.close()
+                    conn = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=2)
+                    conn.request('GET', '/v1/jobs/timed-turn', headers={
+                        'Authorization': 'Bearer test-client-key'})
+                    response = conn.getresponse()
+                    self.assertEqual(response.status, 200)
+                    job = json.load(response)
+                    self.assertEqual(job['timing']['queue_delay_ms'], 250)
+                    self.assertEqual(job['timing']['execution_ms'], 750)
+                    self.assertGreaterEqual(job['timing']['observed_elapsed_ms'], 0)
+                    self.assertNotIn('usage', job)
+                    conn.close()
+                self.assertEqual(module.JobJournal(journal_path).get('timed-turn')['timing'],
+                                 job['timing'])
+            finally:
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=2)
+
+    def test_old_job_journal_migrates_without_inventing_timing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / 'jobs.sqlite3'
+            with sqlite3.connect(path) as db:
+                db.execute('''CREATE TABLE jobs (
+                    request_id TEXT PRIMARY KEY, model TEXT NOT NULL, route TEXT NOT NULL,
+                    job_id TEXT, state TEXT NOT NULL, updated_at INTEGER NOT NULL,
+                    endpoint_url TEXT, body_digest TEXT)''')
+                db.execute('''INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                           ('old-turn', 'qwen38-27b', 'queue', 'job-old', 'COMPLETED',
+                            100, 'https://api.runpod.ai/v2/endpoint', None))
+            path.chmod(0o600)
+            job = module.JobJournal(path).get('old-turn')
+            self.assertEqual(job['state'], 'COMPLETED')
+            self.assertEqual(job['job_id'], 'job-old')
+            self.assertEqual(job['timing'], {'observed_elapsed_ms': None,
+                                             'queue_delay_ms': None, 'execution_ms': None})
+
     def test_stale_status_cannot_replace_confirmed_cancellation(self):
         with tempfile.TemporaryDirectory() as tmp:
             journal = module.JobJournal(pathlib.Path(tmp) / 'jobs.sqlite3')
@@ -233,9 +301,10 @@ class JobLifecycleTests(unittest.TestCase):
                 self.assertEqual(module.cancel_job(journal, 'request', None, lambda *_: {
                     'id': 'job-1', 'status': 'CANCELLED',
                 }), 'CANCELLED')
-                return {'id': 'job-1', 'status': 'COMPLETED'}
+                return {'id': 'job-1', 'status': 'COMPLETED', 'executionTime': 2000}
             self.assertEqual(module.reconcile_job(journal, 'request', stale_status), 'CANCELLED')
             self.assertEqual(journal.get('request')['state'], 'CANCELLED')
+            self.assertIsNone(journal.get('request')['timing']['execution_ms'])
 
     def test_stale_queue_status_cannot_clear_cancellation_intent(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -651,11 +720,16 @@ class JobLifecycleTests(unittest.TestCase):
             calls = []
             def completed(url, payload=None):
                 calls.append(url)
-                return {'id': 'job-1', 'status': 'COMPLETED'}
+                return {'id': 'job-1', 'status': 'COMPLETED',
+                        'delayTime': 1000, 'executionTime': 2000}
             state = module.reconcile_job(journal, 'request-1', completed)
             self.assertEqual(state, 'COMPLETED')
             self.assertEqual(calls, ['https://old-endpoint.test/status/job-1'])
-            self.assertEqual(module.JobJournal(journal.path).get('request-1')['state'], 'COMPLETED')
+            recovered = module.JobJournal(journal.path).get('request-1')
+            self.assertEqual(recovered['state'], 'COMPLETED')
+            self.assertGreaterEqual(recovered['timing']['observed_elapsed_ms'], 0)
+            self.assertEqual(recovered['timing']['queue_delay_ms'], 1000)
+            self.assertEqual(recovered['timing']['execution_ms'], 2000)
             journal.start('request-2', 'qwen38-27b', 'queue', 'https://old-endpoint.test')
             journal.submitted('request-2', 'job-2')
             with self.assertRaises(ValueError):
