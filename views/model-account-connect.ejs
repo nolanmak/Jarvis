@@ -1,0 +1,20 @@
+<%- include('partials/header', {page:'settings'}) %>
+<div class="max-w-2xl space-y-5">
+  <h1 class="text-xl font-semibold">Connect <%= connection.provider === 'claude' ? 'Claude' : 'Codex' %> account</h1>
+  <p>Open the sign-in page and choose the account you want to add. For another account, open the link in a private browser window.</p>
+  <a href="<%= connection.authUrl %>" target="_blank" rel="noopener noreferrer" class="inline-block px-4 py-2 bg-blue-600 rounded-md">Open sign-in page</a>
+  <% if(connection.provider === 'codex') { %>
+  <p class="text-gray-400">After signing in, copy the complete <code>http://localhost:1455/auth/callback?…</code> address from the browser and paste it below. The callback page may show a connection error when your browser is on another machine; copying its address still completes sign-in here.</p>
+  <% } else { %>
+  <p class="text-gray-400">After signing in, copy the authorization code (including its <code>#</code> suffix) and paste it below.</p>
+  <% } %>
+  <form action="/model-accounts/complete" method="post" class="space-y-3">
+    <input type="hidden" name="id" value="<%= connection.id %>" />
+    <label class="block" for="callback">Authorization code or callback URL</label>
+    <input id="callback" name="callback" type="password" required autocomplete="off" class="w-full bg-gray-800 rounded-md px-3 py-2" />
+    <button class="px-4 py-2 bg-blue-600 rounded-md">Finish connection</button>
+  </form>
+  <p class="text-sm text-gray-400">This connection expires in 10 minutes. Login tokens stay on the agent host.</p>
+  <a href="/model-accounts" class="text-blue-400">Back to accounts</a>
+</div>
+<%- include('partials/footer') %>

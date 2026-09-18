@@ -409,3 +409,5 @@ pending transactions and Plaid-classified transfers/loan payments, and may
 still include unclassified transfers. Bank descriptions are treated as data,
 not instructions. The agent is allowed only `finance status`, `transactions`,
 and `summary`, not connection or sync operations.
+
+Multiple model accounts and local 9Router routing: [setup and verification](docs/model-router.md).
