@@ -197,20 +197,28 @@ class RouterFailover(unittest.TestCase):
             api('/api/providers', {'provider': node['node']['id'],
                                    'name': 'Synthetic text-only account',
                                    'apiKey': 'synthetic-text-only-account'})
-            body = {'model': prefix + '/qa-model', 'messages': [{'role': 'user',
-                    'content': [{'type': 'text', 'text': 'Describe this'},
-                                {'type': 'image_url', 'image_url': {
-                                    'url': 'data:image/png;base64,iVBORw0KGgo='}}]}],
-                    'stream': False}
-            with self.assertRaises(urllib.error.HTTPError) as error:
-                api('/v1/chat/completions', body, inference=True)
-            try:
-                response_body = error.exception.read().decode('utf-8', errors='replace')
-                self.assertEqual(error.exception.code, 422,
-                                 'unsupported image must fail instead of being silently omitted: '
-                                 + response_body[:500])
-            finally:
-                error.exception.close()
+            prior_image = {'role': 'user',
+                           'content': [{'type': 'text', 'text': 'Describe this'},
+                                       {'type': 'image_url', 'image_url': {
+                                           'url': 'data:image/png;base64,iVBORw0KGgo='}}]}
+            for label, messages in [
+                ('current image', [prior_image]),
+                ('history image', [prior_image,
+                                   {'role': 'assistant', 'content': 'Earlier response'},
+                                   {'role': 'user', 'content': 'Recall the image'}]),
+            ]:
+                with self.subTest(label=label):
+                    body = {'model': prefix + '/qa-model', 'messages': messages,
+                            'stream': False}
+                    with self.assertRaises(urllib.error.HTTPError) as error:
+                        api('/v1/chat/completions', body, inference=True)
+                    try:
+                        response_body = error.exception.read().decode('utf-8', errors='replace')
+                        self.assertEqual(error.exception.code, 422,
+                                         'unsupported image must fail instead of being silently omitted: '
+                                         + response_body[:500])
+                    finally:
+                        error.exception.close()
             self.assertEqual(seen, [], 'unsupported image reached the text-only upstream')
         finally:
             if node:

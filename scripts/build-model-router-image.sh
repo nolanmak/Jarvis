@@ -26,4 +26,4 @@ if dockerfile.count(old) != 1:
 path.write_text(dockerfile.replace(old, new))
 PY
 
-docker build --tag jarvis-9router:0.5.75-runpod-3 "$source_dir"
+docker build --tag jarvis-9router:0.5.75-runpod-4 "$source_dir"

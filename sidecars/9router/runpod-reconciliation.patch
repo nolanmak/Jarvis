@@ -17,8 +17,39 @@ index 00f3e3d..4515a59 100644
      const desc = rt?.auth || AUTH_DESCRIPTORS[this.provider] || this.resolveAuthDescriptor();
      // Hooks run BEFORE auth so dynamic overlays can't clobber the token.
      for (const hook of desc.hooks || []) HEADER_HOOKS[hook]?.(headers, credentials);
+diff --git a/open-sse/services/combo.js b/open-sse/services/combo.js
+index e3b9a8e..11ed4ea 100644
+--- a/open-sse/services/combo.js
++++ b/open-sse/services/combo.js
+@@ -102,7 +102,7 @@ function trailingUserItems(arr) {
+ // Detect which capabilities a request needs. Modalities (vision/pdf) are scanned
+ // only on the current user turn; "search" is request-wide (lives in tools).
+ // Returns a Set of: "vision" | "pdf" | "search".
+-export function detectRequiredCapabilities(body) {
++export function detectRequiredCapabilities(body, { includeHistory = false } = {}) {
+   const required = new Set();
+   if (!body || typeof body !== "object") return required;
+ 
+@@ -172,11 +172,13 @@ export function detectRequiredCapabilities(body) {
+     }
+   };
+ 
+-  // Modalities: current user turn only (trailing user run across each known shape).
+-  for (const m of trailingUserItems(body.messages)) scanMessage(m);              // openai / claude / hermes / ollama
+-  for (const it of trailingUserItems(body.input)) scanContent(it.content);       // responses
++  // Capacity-adapter ordering uses the current turn by default. An explicitly
++  // pinned compatible node can request all turns to prevent history media loss.
++  const selected = (items) => includeHistory ? (Array.isArray(items) ? items : []) : trailingUserItems(items);
++  for (const m of selected(body.messages)) scanMessage(m);              // openai / claude / hermes / ollama
++  for (const it of selected(body.input)) scanContent(it.content);       // responses
+   const contents = body.contents || body.request?.contents;                      // gemini / antigravity
+-  for (const c of trailingUserItems(contents)) scanContent(c.parts);
++  for (const c of selected(contents)) scanContent(c.parts);
+ 
+   // search: temporarily disabled in auto-switch (feature not wired yet).
+ 
 diff --git a/src/sse/handlers/chat.js b/src/sse/handlers/chat.js
-index 7aa530d..0d10037 100644
+index 7aa530d..5b70156 100644
 --- a/src/sse/handlers/chat.js
 +++ b/src/sse/handlers/chat.js
 @@ -19,6 +19,7 @@ import { handleComboChat, handleFusionChat, detectRequiredCapabilities } from "o
@@ -50,7 +81,7 @@ index 7aa530d..0d10037 100644
 +  // An explicit compatible-model selection must never answer after silently
 +  // dropping a current-turn attachment it cannot read.
 +  if (provider.startsWith("openai-compatible-")) {
-+    const required = detectRequiredCapabilities(body);
++    const required = detectRequiredCapabilities(body, { includeHistory: true });
 +    const capabilities = getCapabilitiesForModel(provider, model);
 +    const unsupported = ["vision", "pdf", "audioInput", "videoInput"]
 +      .filter((capability) => required.has(capability) && capabilities[capability] !== true);

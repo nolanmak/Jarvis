@@ -52,7 +52,7 @@ def main():
         raise SystemExit('This installer uses systemd user services and requires Linux.')
     config_root = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'augmentagent'
     data_root = Path(os.environ.get('XDG_DATA_HOME', Path.home() / '.local/share')) / 'augmentagent/9router'
-    runtime = data_root / (REVISION + '-runpod-reconciliation-3')
+    runtime = data_root / (REVISION + '-runpod-reconciliation-4')
     runtime.mkdir(parents=True, exist_ok=True)
     if not (runtime / 'custom-server.js').exists():
         source = args.built_source or data_root / ('source-' + REVISION)

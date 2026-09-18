@@ -24,7 +24,7 @@ installer applies `sidecars/9router/runpod-reconciliation.patch` before building
 a supplied built source must already contain it. The service uses a distinct
 runtime directory for this patched version. For Docker, run
 `bash scripts/build-model-router-image.sh` to build
-`jarvis-9router:0.5.75-runpod-3` from the same source and dependency lock.
+`jarvis-9router:0.5.75-runpod-4` from the same source and dependency lock.
 
 After deploying this agent version, open **Settings → Models & accounts**:
 
@@ -120,9 +120,10 @@ when switching an existing router to the patched image.
 
 The patched build treats a direct OpenAI-compatible model selection as pinned:
 9Router will not switch it to a capacity-adapter provider. When the selected
-model's declared capabilities cannot read a current-turn image, document,
+model's declared capabilities cannot read an image, document,
 audio or video input, it returns 422 before contacting an upstream. This
-prevents a normal-looking answer after an attachment was removed. A capability
+checks every turn in the request and prevents a normal-looking answer after a
+current or historical attachment was removed. A capability
 declaration is not proof that the deployed model handles that input; the live
 attachment acceptance test remains required before enabling the profile.
 
