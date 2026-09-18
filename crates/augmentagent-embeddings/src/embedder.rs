@@ -21,6 +21,9 @@ pub type Embedding = Vec<f32>;
 
 pub trait Embedder: Send + Sync {
     fn id(&self) -> &ModelId;
+    /// For provider-specific reporting (e.g. hosted usage) without adding
+    /// those concerns to the trait.
+    fn as_any(&self) -> &dyn std::any::Any;
     fn dim(&self) -> usize {
         self.id().dim
     }
@@ -70,6 +73,10 @@ impl StubEmbedder {
 impl Embedder for StubEmbedder {
     fn id(&self) -> &ModelId {
         &self.id
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Embedding>> {

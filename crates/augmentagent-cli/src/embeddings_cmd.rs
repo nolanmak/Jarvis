@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use augmentagent_embeddings::{
-    chunk, fetch, model, vectors, Embedder, LocalEmbedder, DEFAULT_MODEL,
+    active_model_id, build_embedder, chunk, fetch, hosted, model, vectors, Embedder, LocalEmbedder,
+    Provider, DEFAULT_MODEL,
 };
 use augmentagent_store::Store;
 use serde_json::json;
@@ -68,6 +69,10 @@ pub enum Op {
         /// Skip the chunking pass (chunks already current).
         #[arg(long)]
         no_chunk: bool,
+        /// Hosted provider only: estimate tokens and cost, send nothing,
+        /// write nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Vector coverage for the local model: exits non-zero when incomplete.
     Check,
@@ -102,11 +107,19 @@ pub async fn run(store: Arc<Store>, op: Op) -> Result<()> {
         }
         Op::Info => {
             let bad = fetch::verify(spec, &dir).unwrap_or_default();
+            let provider = Provider::from_env()?;
+            let hosted_cfg = hosted::HostedConfig::default();
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
-                    "provider": "local",
-                    "model": spec.name,
+                    "provider": provider.name(),
+                    "active_model": active_model_id()?.to_string(),
+                    "hosted": {
+                        "model": hosted_cfg.model, "dim": hosted_cfg.dim,
+                        "key_present": hosted::load_key().is_some(),
+                        "sends_text_to_third_party": provider == Provider::Hosted,
+                    },
+                    "local_model": spec.name,
                     "dim": spec.dim,
                     "max_tokens": spec.max_tokens,
                     "dir": dir,
@@ -142,21 +155,37 @@ pub async fn run(store: Arc<Store>, op: Op) -> Result<()> {
         Op::Backfill {
             max_chunks,
             no_chunk,
+            dry_run,
         } => {
             let p = chunk::ChunkParams::default();
-            let e = LocalEmbedder::load(spec, &dir, model::thread_count())?;
+            let provider = Provider::from_env()?;
+            if dry_run && provider != Provider::Hosted {
+                anyhow::bail!("--dry-run estimates hosted cost; the local provider has none");
+            }
             let store_c = Arc::clone(&store);
             let report = tokio::task::spawn_blocking(move || -> Result<serde_json::Value> {
+                // The hosted client owns a blocking HTTP runtime: it must be
+                // created and dropped off the async threads.
+                let e = build_embedder(dry_run)?;
                 let chunked = if no_chunk {
                     None
                 } else {
                     Some(chunk::chunk_all(&store_c, &p, Duration::from_millis(120))?)
                 };
-                let embedded = vectors::embed_pending(&store_c, &e, &p, max_chunks, Duration::from_millis(120))?;
+                let embedded = if dry_run {
+                    vectors::estimate_pending(&store_c, e.as_ref(), &p, max_chunks)?
+                } else {
+                    vectors::embed_pending(&store_c, e.as_ref(), &p, max_chunks, Duration::from_millis(120))?
+                };
                 let health = store_c.with_conn(|c| Ok(vectors::check(c, e.id(), &p)))??;
+                let hosted_usage = e
+                    .as_any()
+                    .downcast_ref::<hosted::HostedEmbedder>()
+                    .map(|h| json!({"usage": h.usage(), "estimated_cost_usd": h.estimated_cost_usd()}));
                 Ok(json!({
+                    "provider": provider.name(), "model": e.id().to_string(), "dry_run": dry_run,
                     "chunked": chunked.map(|c| json!({"conversations": c.conversations, "chunks": c.chunks, "changed": c.changed.len()})),
-                    "embedded": embedded, "health": health, "threads": e.threads(),
+                    "embedded": embedded, "health": health, "hosted": hosted_usage,
                 }))
             })
             .await??;
@@ -165,11 +194,7 @@ pub async fn run(store: Arc<Store>, op: Op) -> Result<()> {
         }
         Op::Check => {
             let p = chunk::ChunkParams::default();
-            let id = augmentagent_embeddings::ModelId {
-                provider: "local".into(),
-                model: spec.name.into(),
-                dim: spec.dim,
-            };
+            let id = active_model_id()?;
             let health = store.with_conn(|c| Ok(vectors::check(c, &id, &p)))??;
             println!("{}", serde_json::to_string_pretty(&health)?);
             if !health.is_complete() {
@@ -181,37 +206,42 @@ pub async fn run(store: Arc<Store>, op: Op) -> Result<()> {
             Ok(())
         }
         Op::Knn { text, k, platform } => {
-            let e = LocalEmbedder::load(spec, &dir, model::thread_count())?;
-            let q = e.embed(&[text])?.remove(0);
-            let (cache, allowed) = store.with_conn(|c| {
-                let cache = vectors::VectorCache::load(c, e.id());
-                let allowed = match platform.as_deref() {
-                    Some(pl) => {
-                        vectors::chunk_ids_matching(c, Some(pl), None, None, None, None).map(Some)
+            let store_c = Arc::clone(&store);
+            let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value> {
+                let e = build_embedder(false)?;
+                let q = e.embed(&[text])?.remove(0);
+                let (cache, allowed) = store_c.with_conn(|c| {
+                    let cache = vectors::VectorCache::load(c, e.id());
+                    let allowed = match platform.as_deref() {
+                        Some(pl) => {
+                            vectors::chunk_ids_matching(c, Some(pl), None, None, None, None)
+                                .map(Some)
+                        }
+                        None => Ok(None),
+                    };
+                    Ok((cache, allowed))
+                })?;
+                let (cache, allowed) = (cache?, allowed?);
+                let t = std::time::Instant::now();
+                let hits = cache.knn(&q, k, allowed.as_ref())?;
+                let scan_ms = t.elapsed().as_millis() as u64;
+                let rows = store_c.with_conn(|c| {
+                    let mut rows = Vec::new();
+                    for h in &hits {
+                        let range = vectors::chunk_range(c, &h.chunk_id)?;
+                        rows.push(
+                            json!({"chunk_id": h.chunk_id, "score": h.score, "range": range}),
+                        );
                     }
-                    None => Ok(None),
-                };
-                Ok((cache, allowed))
-            })?;
-            let (cache, allowed) = (cache?, allowed?);
-            let t = std::time::Instant::now();
-            let hits = cache.knn(&q, k, allowed.as_ref())?;
-            let scan_ms = t.elapsed().as_millis() as u64;
-            let rows = store.with_conn(|c| {
-                let mut rows = Vec::new();
-                for h in &hits {
-                    let range = vectors::chunk_range(c, &h.chunk_id)?;
-                    rows.push(json!({"chunk_id": h.chunk_id, "score": h.score, "range": range}));
-                }
-                Ok(rows)
-            })?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "vectors": cache.len(), "cache_mb": cache.bytes() / 1_000_000,
-                    "scan_ms": scan_ms, "hits": rows,
-                }))?
-            );
+                    Ok(rows)
+                })?;
+                Ok(json!({
+                    "model": e.id().to_string(), "vectors": cache.len(),
+                    "cache_mb": cache.bytes() / 1_000_000, "scan_ms": scan_ms, "hits": rows,
+                }))
+            })
+            .await??;
+            println!("{}", serde_json::to_string_pretty(&out)?);
             Ok(())
         }
         Op::Bench { texts } => {
@@ -269,21 +299,19 @@ pub async fn worker_loop(store: Arc<Store>, shutdown: CancellationToken) {
         info!("embeddings disabled: {ENV_ENABLED} not set");
         return;
     }
-    let spec = &DEFAULT_MODEL;
-    let dir = spec.dir();
-    let embedder = match LocalEmbedder::load(spec, &dir, model::thread_count()) {
-        Ok(e) => Arc::new(e),
-        Err(e) => {
+    let embedder = match tokio::task::spawn_blocking(|| build_embedder(false)).await {
+        Ok(Ok(e)) => e,
+        Ok(Err(e)) => {
             warn!("embeddings disabled: {e:#}");
+            return;
+        }
+        Err(e) => {
+            warn!("embeddings disabled: {e}");
             return;
         }
     };
     let p = chunk::ChunkParams::default();
-    info!(
-        model = spec.name,
-        threads = embedder.threads(),
-        "embeddings worker armed"
-    );
+    info!(model = %embedder.id(), "embeddings worker armed");
     // Conversations with new index rows since this rowid get re-chunked.
     let mut watermark: i64 = store
         .with_conn(|c| {

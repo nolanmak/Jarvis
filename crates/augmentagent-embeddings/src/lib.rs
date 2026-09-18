@@ -10,14 +10,18 @@
 pub mod chunk;
 pub mod embedder;
 pub mod fetch;
+pub mod hosted;
 pub mod local;
 pub mod model;
 pub mod prepare;
+pub mod provider;
 pub mod vectors;
 
 pub use embedder::{Embedder, Embedding, ModelId};
+pub use hosted::HostedEmbedder;
 pub use local::LocalEmbedder;
 pub use model::{ModelSpec, DEFAULT_MODEL};
+pub use provider::{active_model_id, build_embedder, Provider, ENV_PROVIDER};
 
 #[cfg(any(test, feature = "stub"))]
 pub use embedder::StubEmbedder;

@@ -230,6 +230,40 @@ pub fn embed_pending(
     Ok(report)
 }
 
+/// Dry run: walk the same pending set and call the embedder (which, for a
+/// hosted provider in dry-run mode, counts tokens and sends nothing) but
+/// write no vectors.
+pub fn estimate_pending(
+    store: &Store,
+    embedder: &dyn Embedder,
+    p: &ChunkParams,
+    max_chunks: usize,
+) -> anyhow::Result<EmbedReport> {
+    let started = std::time::Instant::now();
+    store.with_conn(ensure_tables)?;
+    let id = embedder.id().clone();
+    let pending = store.with_conn(|c| pending_by_conversation(c, &id, max_chunks.max(1)))?;
+    let mut counted = 0usize;
+    for (cid, wanted) in &pending {
+        let chunks = store.with_conn(|c| chunk::compute_chunks(c, cid, p))?;
+        let texts: Vec<String> = chunks
+            .iter()
+            .filter(|k| wanted.contains(&k.chunk_id))
+            .map(|k| k.text.clone())
+            .collect();
+        if texts.is_empty() {
+            continue;
+        }
+        counted += embedder.embed(&texts)?.len();
+    }
+    Ok(EmbedReport {
+        conversations: pending.len(),
+        embedded: 0,
+        remaining: counted as i64,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
 fn chrono_now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -596,6 +630,9 @@ mod tests {
                 model: "slow".into(),
                 dim: 4,
             })
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
         fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
             std::thread::sleep(Duration::from_millis(300));
