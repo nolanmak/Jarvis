@@ -59,7 +59,7 @@ import {
   resolveAgentPrRun,
 } from "./db";
 import type { ActionStatus, SubscriptionMode } from "./types";
-import { runAgentQuery } from "./agent";
+import { runAgentQuery } from "./dashboardQuery";
 import { listDms, listGuilds, listGuildChannels, discordStatus } from "./discordApi";
 import {
   listConversations as listSlackConversations,
@@ -706,8 +706,8 @@ router.get("/api/config/status", async (_req, res) => {
   res.render("partials/config-status", { configStatus });
 });
 
-// Ad-hoc agent query. The agent answers with its tools (e.g. meetup_events)
-// instead of running email triage. Example:
+// Ad-hoc agent query through the same Rust harness used by the Discord bot.
+// Example:
 //   curl -sX POST localhost:<port>/api/ask -H 'content-type: application/json' \
 //     -d '{"question":"upcoming C&C events on meetup"}'
 router.post("/api/ask", async (req, res) => {
@@ -716,13 +716,20 @@ router.post("/api/ask", async (req, res) => {
     res.status(400).json({ error: "question is required" });
     return;
   }
+  const controller = new AbortController();
+  const onClose = () => controller.abort();
+  res.once("close", onClose);
   try {
-    const answer = await runAgentQuery(question);
+    const answer = await runAgentQuery(question, controller.signal);
     res.json({ answer });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error("/api/ask failed:", message);
-    res.status(500).json({ error: message });
+    if (!controller.signal.aborted) {
+      console.error("/api/ask failed:", message);
+      if (!res.headersSent) res.status(500).json({ error: message });
+    }
+  } finally {
+    res.off("close", onClose);
   }
 });
 

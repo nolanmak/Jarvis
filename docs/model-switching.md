@@ -46,7 +46,8 @@ remains a separate parity gate.
 | Independent review | `review_history.rs`, `self_improve.rs` | Native-only reviewer admission and dispatch tests | Actual reviewer/backend lineage receipt |
 | Runpod retry, cancellation and restart | `scripts/runpod-adapter/server.py` | `python3 -m unittest -q test_server.py`; unkeyed retry and legacy journal migration; pinned 9Router image account/key/409/media CI gate | Real queue cancel and restart; repeat gateway test on daemon host |
 | Host deployment configuration | `scripts/runpod-adapter/verify_deployment.py` | `python3 -m unittest -q test_verify_deployment.py`; local catalog-only preflight | Repeat on actual daemon host, then run paid cold/warm inference |
-| Node Agents SDK entry point | `src/index.ts` imports `src/agent.ts` for mail triage and dashboard query; dashboard router | Router and dashboard tests | Determine whether the Node process runs on the daemon host; migrate its separate tool/approval path if active |
+| Node dashboard query | `src/dashboard.ts` `/api/ask` invokes `augmentagent wiki ask` through `src/dashboardQuery.ts` | HTTP answer and cancellation tests | Verify the deployed dashboard has the new binary and revision |
+| Node email triage and revision | `src/index.ts` imports `src/agent.ts` for mail triage and revision | Existing Node tests | Determine whether this separate tool/approval path runs on the daemon host; migrate if active |
 
 Model quality, context size and latency differ. Full feature parity is a release gate: every row needs deterministic fake-model tests and a live receipt from the actual Jarvis host for all three models. A text response or catalog entry does not establish tool execution. GLM is paused until live inference succeeds. Qwen passed a 9Router Responses text call, a function-call/result round trip, and a Codex CLI text probe on 2026-09-18. The full Jarvis bridge workflow and actual-host Discord test remain the release gate.
 
