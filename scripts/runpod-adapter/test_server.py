@@ -137,7 +137,7 @@ class UpstreamCredentialTests(unittest.TestCase):
 
     def test_non_runpod_or_credential_bearing_upstream_never_receives_key(self):
         for url in ('http://127.0.0.1:8000/run',
-                    'https://user:pass@api.runpod.ai/v2/endpoint/run',
+                    'https://user:pass@api.runpod.ai/v2/endpoint/run',  # pii-ok synthetic URL credentials
                     'https://other.example/v2/endpoint/run',
                     'https://api.runpod.ai:444/v2/endpoint/run',
                     'https://api.runpod.ai/v2/endpoint/run?token=bad'):
