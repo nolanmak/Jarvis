@@ -207,6 +207,72 @@ fn selftest_can_pin_each_discord_profile_without_running_the_default_chain() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn selftest_tool_probe_requires_audited_read_for_each_profile() {
+    for profile in ["codex", "qwen", "glm"] {
+        let rig = Rig::new();
+        let router = rig.path("model-router.json");
+        std::fs::write(&router, serde_json::json!({
+            "version": 1,
+            "mode": "direct",
+            "base_url": "http://127.0.0.1:20128/v1",
+            "api_key": "synthetic-router-key",
+            "models": {
+                "claude": {"quality": "cc/claude-test", "fast": "cc/claude-fast"},
+                "codex": {"quality": "cx/codex-test", "fast": "cx/codex-fast"}
+            }
+        }).to_string()).unwrap();
+        let audit = rig.path("tool-audit.jsonl");
+        let mut cmd = rig.cmd_with("claude,codex", &[
+            ("CLAUDE_CLI", "fake-claude-ok.sh"),
+            ("CODEX_CLI", "fake-codex-read-probe.sh"),
+        ], &["reasoner-selftest", "--profile", profile, "--tool-probe"]);
+        cmd.env("AUGMENTAGENT_MODEL_ROUTER_CONFIG", router)
+            .env("AUGMENTAGENT_MODEL_QWEN_ENABLED", "1")
+            .env("AUGMENTAGENT_MODEL_GLM_ENABLED", "1")
+            .env("AUGMENTAGENT_TOOL_AUDIT_LOG", &audit);
+        let output = rig.run(profile, cmd);
+        assert!(output.status.success(), "{profile}: {}", stderr_of(&output));
+        assert!(stdout_of(&output).contains("tool probe passed"));
+        assert_eq!(rig.spawns("claude"), 0);
+        assert_eq!(rig.spawns("codex"), 1);
+        let records = std::fs::read_to_string(audit).unwrap();
+        let rows: Vec<serde_json::Value> = records.lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(rows.len(), 1, "{profile}: {records}");
+        assert_eq!(rows[0]["provider"], profile);
+        assert_eq!(rows[0]["tool"], "Read");
+        assert!(rows[0]["stdout_truncated"].as_str().unwrap().contains("TOOL_PROBE_"));
+        assert!(rows[0]["stderr_truncated"].is_null());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn selftest_tool_probe_rejects_an_answer_without_a_tool_receipt() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let rig = Rig::new();
+    let bypass = rig.path("fake-codex-bypass.sh");
+    std::fs::write(&bypass, r#"#!/usr/bin/env bash
+set -euo pipefail
+PROMPT=$(cat)
+FILE=$(printf '%s\n' "$PROMPT" | sed -n 's/^TOOL_PROBE_FILE: //p' | head -1)
+ANSWER=$(cat "$FILE")
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"%s"}}\n' "$ANSWER"
+"#).unwrap();
+    std::fs::set_permissions(&bypass, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut cmd = rig.cmd_with("claude,codex", &[("CLAUDE_CLI", "fake-claude-ok.sh")],
+        &["reasoner-selftest", "--profile", "codex", "--tool-probe"]);
+    cmd.env("CODEX_CLI", bypass)
+        .env("AUGMENTAGENT_TOOL_AUDIT_LOG", rig.path("tool-audit.jsonl"));
+    let output = rig.run("read bypass without audit", cmd);
+    assert!(!output.status.success());
+    assert!(stderr_of(&output).contains("no successful selected-profile Read audit receipt"),
+        "{}", stderr_of(&output));
+}
+
 /// #1047 C1 — a call the fallback served is counted, under codex, by
 /// `augmentagent token-usage`, which splits its totals by provider. Before
 /// #1047 the codex adapter recorded nothing and the report showed no row.

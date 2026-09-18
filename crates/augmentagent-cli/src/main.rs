@@ -604,6 +604,10 @@ enum Cmd {
         /// Pin one Discord model profile for this probe, without persisting a selection.
         #[arg(long, value_parser = ["qwen", "glm", "codex"])]
         profile: Option<String>,
+        /// Ask the selected model to read a synthetic file through the Jarvis
+        /// bridge and require a matching tool audit receipt. Performs inference.
+        #[arg(long, requires = "profile", conflicts_with = "prompt")]
+        tool_probe: bool,
     },
     /// Issue #12 — read/write the sqlite `config` table so the `/setup`
     /// skill never has to parse or rewrite `.env`. Reads merge config over
@@ -4315,8 +4319,8 @@ async fn main() -> Result<()> {
             std::process::exit(code);
         }
         Cmd::Env { ref op, json } => env_cfg::run_env(op, json),
-        Cmd::ReasonerSelftest { ref prompt, ref profile } =>
-            run_reasoner_selftest(prompt, profile.as_deref()).await,
+        Cmd::ReasonerSelftest { ref prompt, ref profile, tool_probe } =>
+            run_reasoner_selftest(prompt, profile.as_deref(), tool_probe).await,
         Cmd::Install { component } => installers::run_install(component).await,
         Cmd::Logs {
             unit,
@@ -8698,13 +8702,21 @@ async fn run_wiki_sync(cli: &Cli, dry_run: bool, no_pull: bool) -> Result<()> {
 }
 
 /// Adapter: bridges the Discord broker's `QueryHandler` trait to our
-/// #655/#667 — `reasoner-selftest`: one live text-only round-trip through
+/// #655/#667 — `reasoner-selftest`: one live round-trip through
 /// the production provider chain. Prints the chain, any active cooldown
 /// latches, and the answer. Exit non-zero when the whole chain fails, so a
 /// timer/doctor wrapper can alert on it.
-async fn run_reasoner_selftest(prompt: &str, profile: Option<&str>) -> Result<()> {
+async fn run_reasoner_selftest(prompt: &str, profile: Option<&str>, tool_probe: bool) -> Result<()> {
     use augmentagent_channel_core::{CooldownLatch, ReasonerOpts};
     use augmentagent_channel_core::providers::ProviderKind;
+
+    struct ToolProbe {
+        directory: tempfile::TempDir,
+        file: PathBuf,
+        nonce: String,
+        audit_path: PathBuf,
+        session_id: String,
+    }
 
     let selected = profile.map(|name| ProviderKind::parse(name)
         .ok_or_else(|| anyhow::anyhow!("unsupported model profile"))).transpose()?;
@@ -8730,7 +8742,7 @@ async fn run_reasoner_selftest(prompt: &str, profile: Option<&str>) -> Result<()
     // this is the widest possible probe of the chain. Quality tier keeps the
     // probe on the same models the important presets use: it resolves through
     // the same knob as `draft_opts` (#1046).
-    let opts = ReasonerOpts {
+    let mut opts = ReasonerOpts {
         system_prompt: "You are a diagnostic probe. Follow the user's instruction exactly, \
                         with no preamble."
             .into(),
@@ -8750,10 +8762,48 @@ async fn run_reasoner_selftest(prompt: &str, profile: Option<&str>) -> Result<()
         session_id: None,
         handoff_path: None,
     };
+    let probe = if tool_probe {
+        let kind = selected.ok_or_else(|| anyhow::anyhow!("--tool-probe requires --profile"))?;
+        anyhow::ensure!(
+            matches!(kind, ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Codex),
+            "--tool-probe requires qwen, glm, or codex"
+        );
+        let directory = tempfile::tempdir()?;
+        let nonce = format!("TOOL_PROBE_{}", uuid::Uuid::new_v4());
+        let file = directory.path().join("read-only-fixture.txt");
+        std::fs::write(&file, format!("{nonce}\n"))?;
+        let session_id = format!("reasoner-selftest:{}", uuid::Uuid::new_v4());
+        let audit_path = augmentagent_channel_core::tool_audit::default_audit_log_path();
+        opts.allowed_tools = vec!["Read".into()];
+        opts.cwd = Some(directory.path().to_path_buf());
+        opts.restrict_env = true;
+        opts.session_id = Some(session_id.clone());
+        opts.audit_logger = Some(Arc::new(
+            augmentagent_channel_core::tool_audit::AuditLogger::new(audit_path.clone()),
+        ));
+        opts.system_prompt = "You are a diagnostic probe. Call the Read tool on the file the user names. Return only the exact file contents. Do not guess."
+            .into();
+        Some(ToolProbe {
+            directory,
+            file,
+            nonce,
+            audit_path,
+            session_id,
+        })
+    } else {
+        None
+    };
+    let probe_prompt = probe.as_ref().map(|probe| {
+        format!(
+            "Read this exact file with the Read tool and return its contents verbatim.\nTOOL_PROBE_FILE: {}",
+            probe.file.display(),
+        )
+    });
+    let call_prompt = probe_prompt.as_deref().unwrap_or(prompt);
     let result = match selected {
         Some(kind) => augmentagent_channel_core::model_selection::SELECTED_PROFILE
-            .scope(Some(kind), reasoner.call(&opts, prompt)).await,
-        None => reasoner.call(&opts, prompt).await,
+            .scope(Some(kind), reasoner.call(&opts, call_prompt)).await,
+        None => reasoner.call(&opts, call_prompt).await,
     };
     // The latches the call itself took are the observable half of a failover
     // — without this line a fault-injection run (#666) can see WHICH
@@ -8761,6 +8811,47 @@ async fn run_reasoner_selftest(prompt: &str, profile: Option<&str>) -> Result<()
     print_cooldowns("cooldowns (after call)");
     match result {
         Ok(text) => {
+            if let (Some(probe), Some(kind)) = (&probe, selected) {
+                anyhow::ensure!(
+                    text.trim() == probe.nonce,
+                    "tool probe answer did not match the synthetic file"
+                );
+                let expected_path = probe.file.canonicalize()?;
+                let audited = std::fs::File::open(&probe.audit_path).ok().is_some_and(|file| {
+                    use std::io::BufRead;
+                    std::io::BufReader::new(file)
+                        .lines()
+                        .map_while(std::result::Result::ok)
+                        .filter_map(|line| {
+                            serde_json::from_str::<augmentagent_channel_core::tool_audit::AuditRecord>(&line).ok()
+                        })
+                        .any(|record| {
+                            let path = record.args.get("file_path")
+                                .and_then(|value| value.as_str())
+                                .map(Path::new)
+                                .map(|path| {
+                                    if path.is_absolute() {
+                                        path.to_path_buf()
+                                    } else {
+                                        probe.directory.path().join(path)
+                                    }
+                                });
+                            record.session_id == probe.session_id
+                                && record.provider() == Some(kind.name())
+                                && record.tool == "Read"
+                                && path.and_then(|path| path.canonicalize().ok())
+                                    == Some(expected_path.clone())
+                                && record.stdout_truncated.as_deref()
+                                    .is_some_and(|body| body.contains(&probe.nonce))
+                                && record.stderr_truncated.is_none()
+                        })
+                });
+                anyhow::ensure!(
+                    audited,
+                    "tool probe has no successful selected-profile Read audit receipt"
+                );
+                println!("tool probe passed: {} used Read through the Jarvis bridge", kind.name());
+            }
             println!("response: {text}");
             Ok(())
         }

@@ -37,7 +37,7 @@ remains a separate parity gate.
 | --- | --- | --- | --- |
 | Selection, restart persistence, pause and snapshot | `model_selection.rs`, `fallback.rs` | `model_selection::tests`, `paused_persisted_runpod_selection_never_reaches_inference_or_fallback` | Discord set/call race on the daemon host |
 | Owner-only Discord command and conversation history | `event_handler.rs`, `WikiQuerier` | Parser and store tests in `model_selection::tests`; model-control history exclusion test in `event_handler::tests` | Fake Discord sequence and live Qwen→GLM→Codex continuity |
-| File scope, shell, image bytes, unknown tools, malformed arguments and local MCP | `codex.rs`, `codex_tools.rs`, `scripts/codex-tool-bridge.py` | Linux `all_selected_profiles_share_scoped_file_tools_and_audit_identity`; bridge duplicate-call and lost-reply tests | Live model-selected tool use for each provider |
+| File scope, shell, image bytes, unknown tools, malformed arguments and local MCP | `codex.rs`, `codex_tools.rs`, `scripts/codex-tool-bridge.py` | Linux `all_selected_profiles_share_scoped_file_tools_and_audit_identity`; bridge duplicate-call and lost-reply tests; `selftest_tool_probe_requires_audited_read_for_each_profile` | Live model-selected tool use for each provider |
 | Document/PDF attachment and computer use | `images.rs`, bridge Read, remote worker tools | Ignored Codex-only opt-in fixtures in `codex.rs`; patched 9Router opt-in fixture refuses unsupported current/history images | Cross-profile deterministic and live attachment/computer-use fixtures; Qwen is currently declared text-only at the gateway and returns 422 for images |
 | Retrieval, wiki and memory MCP | `mcp.rs`, wiki and memory tools | Ignored Codex-only `live_wiki_query_profile_executes_files_and_memory_mcp`; no shared CI fixture | Three-profile fake and live memory continuity |
 | Approval, drafts and outbound delivery | Discord approval broker, tool audit and journals | Existing approval/broker suites | Three-profile denied/approved edit and delivery receipts |
@@ -145,3 +145,13 @@ GPU time. Use it only after deliberate activation; the read-only preflight
 above is the safe first check. The Linux fake-CLI CI test verifies that each
 choice bypasses the default chain and records its provider/model identity,
 but it does not certify live tools or quality.
+
+For a real tool-use probe, run `augmentagent reasoner-selftest --profile qwen
+--tool-probe` (and repeat with `glm` and `codex`). The command creates a
+temporary synthetic file, gives the selected model only the Jarvis `Read`
+tool, and requires both an exact file-content answer and a successful
+selected-provider `Read` audit receipt. It writes that receipt to the normal
+tool audit log, or `AUGMENTAGENT_TOOL_AUDIT_LOG` when set. This performs paid
+inference for Runpod profiles. The Linux CI fixture runs a fake model through
+the packaged bridge and proves the command rejects an answer that bypassed
+the tool, but only a live run can prove the actual model chooses it.
