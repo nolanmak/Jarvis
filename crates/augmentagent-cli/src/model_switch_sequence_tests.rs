@@ -134,13 +134,13 @@ for line in sys.stdin:
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(rows.len(), 7, "{audit}");
+    assert_eq!(rows.len(), 10, "{audit}");
     assert_eq!(rows[0]["provider"], "qwen");
     assert_eq!(rows[0]["tool"], "Write");
     assert_eq!(rows[0]["session_id"], format!("{CHANNEL}:1"));
     assert!(rows[0]["stderr_truncated"].is_null());
     for (index, profile) in ["qwen", "glm", "codex"].iter().enumerate() {
-        let read_index = if index == 0 { 1 } else { index * 2 + 1 };
+        let read_index = if index == 0 { 1 } else { index * 3 + 1 };
         let row = &rows[read_index];
         assert_eq!(row["provider"], *profile);
         assert_eq!(row["tool"], "Read");
@@ -156,10 +156,15 @@ for line in sys.stdin:
             .unwrap()
             .contains("MEMORY_FIXTURE_OK"));
         assert!(memory["stderr_truncated"].is_null());
+        let edit = &rows[read_index + 2];
+        assert_eq!(edit["provider"], *profile);
+        assert_eq!(edit["tool"], "Edit");
+        assert_eq!(edit["session_id"], format!("{CHANNEL}:{}", index + 1));
+        assert!(edit["stderr_truncated"].is_null());
     }
     assert_eq!(
         std::fs::read_to_string(wiki.join("probe.txt")).unwrap(),
-        NONCE
+        format!("{NONCE}|qwen|glm|codex")
     );
     assert_eq!(
         std::fs::read_to_string(home.join(".fake-cli/codex.count"))
