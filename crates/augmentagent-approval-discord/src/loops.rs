@@ -1121,11 +1121,18 @@ mod tests {
         assert!(reply.contains("created"), "{reply}");
         assert_eq!(store.list_user_loops("user-1").unwrap()[0].model_profile.as_deref(), Some("qwen"));
         assert_eq!(*parser.0.lock().unwrap(), vec![Some("qwen".into())]);
-        assert!(handle_loop_command_with_model(
+        let claude = handle_loop_command_with_model(
             Some(&store), Some(&parser), "user-1", "chan-1",
             "/loop ping every 10m", Some("claude"),
+        ).await;
+        assert!(claude.contains("created"), "{claude}");
+        assert!(store.list_user_loops("user-1").unwrap().iter()
+            .any(|row| row.model_profile.as_deref() == Some("claude")));
+        assert!(handle_loop_command_with_model(
+            Some(&store), Some(&parser), "user-1", "chan-1",
+            "/loop ping every 10m", Some("gemini"),
         ).await.contains("unsupported"));
-        assert_eq!(store.list_user_loops("user-1").unwrap().len(), 1);
+        assert_eq!(store.list_user_loops("user-1").unwrap().len(), 2);
     }
 
     #[tokio::test]
