@@ -14,6 +14,8 @@ on:
       - 'scripts/*model-router*'
       - 'scripts/tests/model_router*'
       - 'scripts/tests/run_model_router_image_fixture.py'
+      - 'scripts/tests/verify_codex_redirect.py'
+      - 'scripts/tests/test_verify_codex_redirect.py'
       - 'sidecars/9router/**'
       - '.github/workflows/model-router.yml'
   push:
@@ -31,6 +33,8 @@ on:
       - 'scripts/*model-router*'
       - 'scripts/tests/model_router*'
       - 'scripts/tests/run_model_router_image_fixture.py'
+      - 'scripts/tests/verify_codex_redirect.py'
+      - 'scripts/tests/test_verify_codex_redirect.py'
       - 'sidecars/9router/**'
       - '.github/workflows/model-router.yml'
 permissions:
@@ -72,3 +76,17 @@ jobs:
         run: bash scripts/build-model-router-image.sh
       - name: Exercise account failover, request identity and media refusal
         run: python3 scripts/tests/run_model_router_image_fixture.py
+  codex-redirect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install pinned Codex client
+        run: npm install --global @openai/codex@0.154.0
+      - name: Prove the gate detects credential forwarding
+        run: python3 -m unittest discover -s scripts/tests -p test_verify_codex_redirect.py
+      - name: Refuse router credential on a cross-origin redirect
+        run: python3 scripts/tests/verify_codex_redirect.py
