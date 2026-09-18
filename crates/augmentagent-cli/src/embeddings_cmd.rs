@@ -1,7 +1,11 @@
 //! `augmentagent embeddings …` — model management for the semantic layer (#1126).
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use anyhow::Result;
-use augmentagent_embeddings::{fetch, model, Embedder, LocalEmbedder, DEFAULT_MODEL};
+use augmentagent_embeddings::{chunk, fetch, model, Embedder, LocalEmbedder, DEFAULT_MODEL};
+use augmentagent_store::Store;
 use serde_json::json;
 
 #[derive(clap::Subcommand)]
@@ -18,9 +22,13 @@ pub enum Op {
         #[arg(long, default_value_t = 512)]
         texts: usize,
     },
+    /// (Re)build conversation-window chunks over the message index (#1129).
+    /// Deterministic, resumable, no model calls; prints chunk counts and how
+    /// many chunks changed text (i.e. need re-embedding).
+    Chunk,
 }
 
-pub async fn run(op: Op) -> Result<()> {
+pub async fn run(store: Arc<Store>, op: Op) -> Result<()> {
     let spec = &DEFAULT_MODEL;
     let dir = spec.dir();
     match op {
@@ -51,6 +59,28 @@ pub async fn run(op: Op) -> Result<()> {
                     "present": spec.is_present(&dir),
                     "verified": spec.is_present(&dir) && bad.is_empty(),
                     "threads": model::thread_count(),
+                }))?
+            );
+            Ok(())
+        }
+        Op::Chunk => {
+            let p = chunk::ChunkParams::default();
+            let store_c = Arc::clone(&store);
+            let started = std::time::Instant::now();
+            let r = tokio::task::spawn_blocking(move || {
+                chunk::chunk_all(&store_c, &p, Duration::from_millis(120))
+            })
+            .await??;
+            let messages: i64 = store.with_conn(|c| {
+                c.query_row("SELECT COUNT(*) FROM message_index", [], |r| r.get(0))
+            })?;
+            let stale = store.with_conn(|c| chunk::stale_params_count(c, &p))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "conversations": r.conversations, "chunks": r.chunks, "messages": messages,
+                    "changed": r.changed.len(), "removed": r.removed, "stale_params": stale,
+                    "params": p.version(), "elapsed_ms": started.elapsed().as_millis() as u64,
                 }))?
             );
             Ok(())
