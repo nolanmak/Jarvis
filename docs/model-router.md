@@ -63,7 +63,9 @@ The upstream dashboard password and JWT secret are in mode-0600 `9router.env`.
 Account tokens live in 9Router's private data directory under
 `$XDG_DATA_HOME/augmentagent/9router/data`.
 
-Our dashboard's existing login and Host/Origin checks protect all account routes.
+Local browsers open the dashboard without entering an API key. Remote browsers
+and machine clients still require authentication. Socket, browser Fetch Metadata,
+and Host/Origin checks protect local access; forwarded requests require login.
 OAuth verifiers are held server-side for ten minutes, keyed by a random session
 ID. Each exchange validates provider, callback and state and consumes its session
 once. Restarting the dashboard requires restarting unfinished login flows. New flows
