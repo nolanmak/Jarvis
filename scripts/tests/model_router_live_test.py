@@ -2,6 +2,7 @@
 JARVIS_TEST_MODEL_ROUTER_CONFIG=/path/model-router.json python3 -m unittest discover -s scripts/tests -p model_router_live_test.py -v
 """
 import http.server
+import importlib.util
 import json
 import os
 import threading
@@ -10,6 +11,7 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
+from unittest import mock
 
 
 @unittest.skipUnless(os.environ.get('JARVIS_TEST_MODEL_ROUTER_CONFIG'), 'requires explicitly selected local 9Router')
@@ -142,6 +144,131 @@ class RouterFailover(unittest.TestCase):
                                  '9Router must preserve the request key and reconciliation status')
             finally:
                 response.exception.close()
+        finally:
+            if node:
+                api('/api/provider-nodes/' + node['node']['id'], method='DELETE')
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_chat_and_responses_preserve_parallel_tool_call_ids_and_results(self):
+        """The pinned gateway must not sever Qwen's prior tool/result links."""
+        config = json.loads(Path(os.environ['JARVIS_TEST_MODEL_ROUTER_CONFIG']).read_text())
+        base = config['base_url'].removesuffix('/v1')
+        self.assertTrue(base.startswith('http://127.0.0.1:'))
+        upstream_host = config.get('upstream_host', '127.0.0.1')
+        seen = []
+
+        class Upstream(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                seen.append(json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0)))))
+                body = {'id': 'synthetic-tool-history', 'object': 'chat.completion',
+                        'created': 1, 'model': 'qa-model', 'choices': [{'index': 0,
+                        'message': {'role': 'assistant', 'content': 'TOOL_HISTORY_OK'},
+                        'finish_reason': 'stop'}]}
+                raw = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        bind_host = '0.0.0.0' if upstream_host == 'host.docker.internal' else '127.0.0.1'
+        server = http.server.ThreadingHTTPServer((bind_host, 0), Upstream)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        cookie = None
+
+        def api(endpoint, body=None, method=None, inference=False):
+            headers = {'Content-Type': 'application/json'}
+            if cookie:
+                headers['Cookie'] = cookie
+            if inference:
+                headers['Authorization'] = 'Bearer ' + config['api_key']
+            request = urllib.request.Request(base + endpoint,
+                    data=None if body is None else json.dumps(body).encode(),
+                    headers=headers, method=method)
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.load(response), response.headers.get('Set-Cookie', '').split(';')[0]
+
+        node = None
+        try:
+            _, cookie = api('/api/auth/login', {'password': config['admin_password']})
+            prefix = 'qa-' + uuid.uuid4().hex[:10]
+            node, _ = api('/api/provider-nodes', {'name': 'Synthetic tool history QA',
+                    'prefix': prefix, 'apiType': 'chat',
+                    'baseUrl': f'http://{upstream_host}:{server.server_port}/v1'})
+            api('/api/providers', {'provider': node['node']['id'],
+                'name': 'Synthetic tool history account', 'apiKey': 'synthetic-tool-history'})
+            messages = [
+                {'role': 'user', 'content': 'Read two files.'},
+                {'role': 'assistant', 'content': None, 'tool_calls': [
+                    {'id': 'call_a', 'type': 'function', 'function':
+                        {'name': 'Read', 'arguments': '{"file_path":"a.md"}'}},
+                    {'id': 'call_b', 'type': 'function', 'function':
+                        {'name': 'Read', 'arguments': '{"file_path":"b.md"}'}},
+                ]},
+                {'role': 'tool', 'tool_call_id': 'call_b', 'content': 'second result'},
+                {'role': 'tool', 'tool_call_id': 'call_a', 'content': 'first result'},
+                {'role': 'user', 'content': 'Use both results.'},
+            ]
+            response, _ = api('/v1/chat/completions', {'model': prefix + '/qa-model',
+                            'messages': messages, 'stream': False}, inference=True)
+            self.assertEqual(response['choices'][0]['message']['content'], 'TOOL_HISTORY_OK')
+            self.assertEqual(len(seen), 1)
+            forwarded = seen[0]['messages']
+            calls = next(item['tool_calls'] for item in forwarded if item['role'] == 'assistant')
+            results = [item for item in forwarded if item['role'] == 'tool']
+            self.assertEqual([call['id'] for call in calls], ['call_a', 'call_b'])
+            self.assertEqual([(item['tool_call_id'], item['content']) for item in results],
+                             [('call_b', 'second result'), ('call_a', 'first result')])
+
+            adapter_path = Path(__file__).resolve().parents[1] / 'runpod-adapter/server.py'
+            spec = importlib.util.spec_from_file_location('synthetic_runpod_adapter', adapter_path)
+            adapter = importlib.util.module_from_spec(spec)
+            with mock.patch.dict(os.environ, {'RUNPOD_API_KEY': 'synthetic-test-key',
+                                               'ADAPTER_API_KEY': 'synthetic-client-key'}):
+                spec.loader.exec_module(adapter)
+            normalized = adapter.normalize_messages(forwarded)
+            self.assertEqual([(item['tool_name'], item['content']) for item in normalized
+                              if item['role'] == 'tool'],
+                             [('Read', 'first result'), ('Read', 'second result')])
+
+            # The Codex CLI uses Responses, which 9Router converts to Chat
+            # Completions before the adapter sees it. The same call IDs must
+            # survive that conversion, including out-of-order parallel results.
+            responses_input = [
+                {'role': 'user', 'content': 'Read two files.'},
+                {'type': 'function_call', 'call_id': 'call_a', 'name': 'Read',
+                 'arguments': '{"file_path":"a.md"}'},
+                {'type': 'function_call', 'call_id': 'call_b', 'name': 'Read',
+                 'arguments': '{"file_path":"b.md"}'},
+                {'type': 'function_call_output', 'call_id': 'call_b', 'output': 'second result'},
+                {'type': 'function_call_output', 'call_id': 'call_a', 'output': 'first result'},
+                {'role': 'user', 'content': 'Use both results.'},
+            ]
+            api('/v1/responses', {'model': prefix + '/qa-model',
+                'input': responses_input, 'stream': False,
+                'tools': [{'type': 'function', 'name': 'Read',
+                           'description': 'Read one synthetic file',
+                           'parameters': {'type': 'object', 'properties': {
+                               'file_path': {'type': 'string'}}, 'required': ['file_path']}}]},
+                inference=True)
+            self.assertEqual(len(seen), 2)
+            forwarded = seen[1]['messages']
+            calls = [call for item in forwarded if item['role'] == 'assistant'
+                     for call in item.get('tool_calls', [])]
+            results = [item for item in forwarded if item['role'] == 'tool']
+            self.assertEqual([call['id'] for call in calls], ['call_a', 'call_b'])
+            self.assertEqual([(item['tool_call_id'], item['content']) for item in results],
+                             [('call_b', 'second result'), ('call_a', 'first result')])
+            normalized = adapter.normalize_messages(forwarded)
+            self.assertEqual([(item['tool_name'], item['content']) for item in normalized
+                              if item['role'] == 'tool'],
+                             [('Read', 'first result'), ('Read', 'second result')])
         finally:
             if node:
                 api('/api/provider-nodes/' + node['node']['id'], method='DELETE')
