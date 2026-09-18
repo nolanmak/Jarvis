@@ -111,7 +111,10 @@ def cancel_job(journal, request_id, base, rpc_call= None):
 
 def request(url, data=None, timeout=45):
     req = urllib.request.Request(url, data=None if data is None else json.dumps(data).encode(), headers={'Authorization': 'Bearer '+API_KEY, 'Content-Type':'application/json'})
-    return urllib.request.urlopen(req, timeout=timeout)
+    class RefuseRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+    return urllib.request.build_opener(RefuseRedirect).open(req, timeout=timeout)
 
 def rpc(url,data=None):
     with request(url,data) as r:return json.load(r)

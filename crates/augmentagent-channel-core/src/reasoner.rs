@@ -4404,7 +4404,7 @@ echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30
         assert!(matches!(
             ReasonerError::find_in(&err),
             Some(ReasonerError::Timeout { .. })
-        ));
+        ), "expected timeout, got {err:#}");
     }
 
     /// A missing binary is a Local fault (never latched, never mistaken for

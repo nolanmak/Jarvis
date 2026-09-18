@@ -8,6 +8,7 @@ import json
 import threading
 from unittest import mock
 import sqlite3
+import urllib.error
 
 ROOT = pathlib.Path(__file__).parent
 spec = importlib.util.spec_from_file_location('runpod_adapter', ROOT / 'server.py')
@@ -83,6 +84,49 @@ class NormalizeMessagesTests(unittest.TestCase):
         message = module.public_error(RuntimeError('worker failed: token=private-secret'))
         self.assertEqual(message, 'Runpod inference failed')
         self.assertNotIn('private-secret', message)
+
+
+class UpstreamCredentialTests(unittest.TestCase):
+    def test_redirect_cannot_send_runpod_key_to_another_host(self):
+        redirected = []
+
+        class Destination(module.http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                redirected.append(self.headers.get('Authorization'))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        destination = module.http.server.ThreadingHTTPServer(('127.0.0.1', 0), Destination)
+
+        class Source(module.http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header('Location', f'http://localhost:{destination.server_port}/stolen')
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        source = module.http.server.ThreadingHTTPServer(('127.0.0.1', 0), Source)
+        threads = [threading.Thread(target=server.serve_forever, daemon=True)
+                   for server in (source, destination)]
+        for thread in threads:
+            thread.start()
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as failure:
+                module.request(f'http://127.0.0.1:{source.server_port}/start')
+            self.assertEqual(failure.exception.code, 302)
+            failure.exception.close()
+            self.assertEqual(redirected, [])
+        finally:
+            for server in (source, destination):
+                server.shutdown()
+                server.server_close()
+            for thread in threads:
+                thread.join(timeout=2)
 
 
 class JobLifecycleTests(unittest.TestCase):
