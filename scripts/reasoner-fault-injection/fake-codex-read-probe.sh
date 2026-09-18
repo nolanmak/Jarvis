@@ -63,6 +63,26 @@ if os.environ.get('PROBE_MEMORY') == '1':
         raise RuntimeError('synthetic memory tool did not return its result')
 body = '\n'.join(part.get('text', '') for part in result.get('content', []))
 match = re.search(r'TOOL_PROBE_[0-9a-f-]+', body)
+if 'PROBE_SWITCH_TURN' in os.environ:
+    turn = int(os.environ['PROBE_SWITCH_TURN'])
+    profiles = ('qwen', 'glm', 'codex')
+    if turn not in range(len(profiles)) or not match:
+        raise RuntimeError('invalid model switch turn or missing artifact')
+    before = match.group(0) + ''.join('|' + p for p in profiles[:turn])
+    after = before + '|' + profiles[turn]
+    if before not in body:
+        raise RuntimeError('prior model edit was not visible through Read')
+    edit_arguments = {'file_path': path, 'old_string': before,
+                      'new_string': after}
+    edit = call(read_id + 2, 'tools/call', {
+        'name': 'Edit', 'arguments': edit_arguments,
+    })
+    print(json.dumps({'type': 'item.completed', 'item': {
+        'type': 'mcp_tool_call', 'server': 'jarvis', 'tool': 'Edit',
+        'arguments': edit_arguments, 'result': edit,
+    }}), flush=True)
+    if edit.get('isError'):
+        raise RuntimeError('synthetic artifact Edit was denied')
 print(json.dumps({'type': 'item.completed', 'item': {
     'type': 'agent_message', 'text': match.group(0) if match else 'READ_FAILED',
 }}), flush=True)
