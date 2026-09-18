@@ -55,6 +55,28 @@ test("routing cannot send credentials remotely or disguise a different provider"
   assert.throws(() => validateConfig(value));
   assert.throws(() => validateConfig({ ...fixture(), api_key: "" }));
 });
+test("Runpod modes and an exact Tailnet host round trip through the shared config", () => {
+  const previous = process.env.AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS;
+  process.env.AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS =
+    "macbook-air-2.tailfdbc7f.ts.net:20128";
+  try {
+    const remote = "http://macbook-air-2.tailfdbc7f.ts.net:20128/v1";
+    for (const mode of ["qwen", "glm"]) {
+      assert.equal(validateConfig({ ...fixture(), mode, base_url: remote }).mode, mode);
+    }
+    for (const base_url of [
+      "http://other.tailfdbc7f.ts.net:20128/v1",
+      "http://macbook-air-2.tailfdbc7f.ts.net:20129/v1",
+      "http://user:pass@macbook-air-2.tailfdbc7f.ts.net:20128/v1",
+      "http://macbook-air-2.tailfdbc7f.ts.net:20128/v1?token=secret",
+    ]) {
+      assert.throws(() => validateConfig({ ...fixture(), mode: "qwen", base_url }));
+    }
+  } finally {
+    if (previous === undefined) delete process.env.AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS;
+    else process.env.AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS = previous;
+  }
+});
 const { RouterClient, AccountAuth } = require("../dist/modelRouter");
 test("account list strips secrets and supports multiple same-provider accounts", async () => {
   const calls = [];

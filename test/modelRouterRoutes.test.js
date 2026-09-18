@@ -70,6 +70,21 @@ test("settings render without secrets, validate accounts, and switch routes", as
     });
     assert.equal(response.status, 400);
     assert.equal(saved.mode, "codex");
+    form.set("mode", "qwen");
+    response = await fetch(base + "/model-accounts/settings", {
+      method: "POST", body: form, redirect: "manual",
+    });
+    assert.equal(response.status, 400, "a paused Runpod route must not be activated");
+    process.env.AUGMENTAGENT_MODEL_QWEN_ENABLED = "1";
+    try {
+      response = await fetch(base + "/model-accounts/settings", {
+        method: "POST", body: form, redirect: "manual",
+      });
+      assert.equal(response.status, 303);
+      assert.equal(saved.mode, "qwen");
+    } finally {
+      delete process.env.AUGMENTAGENT_MODEL_QWEN_ENABLED;
+    }
   } finally {
     await new Promise((r) => server.close(r));
   }
