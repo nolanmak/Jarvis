@@ -182,6 +182,7 @@ impl SelectionStore {
         serde_json::to_writer(&mut temp, &state)?;
         temp.as_file().sync_all()?;
         temp.persist(&self.path)?;
+        std::fs::File::open(parent)?.sync_all()?;
         Ok(())
     }
 }
