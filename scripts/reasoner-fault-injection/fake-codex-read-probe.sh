@@ -47,6 +47,20 @@ print(json.dumps({'type': 'item.completed', 'item': {
     'type': 'mcp_tool_call', 'server': 'jarvis', 'tool': 'Read',
     'arguments': arguments, 'result': result,
 }}), flush=True)
+if os.environ.get('PROBE_MEMORY') == '1':
+    memory_arguments = {}
+    memory = call(read_id + 1, 'tools/call', {
+        'name': 'mcp__memory__memory_recent', 'arguments': memory_arguments,
+    })
+    print(json.dumps({'type': 'item.completed', 'item': {
+        'type': 'mcp_tool_call', 'server': 'jarvis',
+        'tool': 'mcp__memory__memory_recent',
+        'arguments': memory_arguments, 'result': memory,
+    }}), flush=True)
+    if memory.get('isError') or not any(
+        'MEMORY_FIXTURE_OK' in part.get('text', '') for part in memory.get('content', [])
+    ):
+        raise RuntimeError('synthetic memory tool did not return its result')
 body = '\n'.join(part.get('text', '') for part in result.get('content', []))
 match = re.search(r'TOOL_PROBE_[0-9a-f-]+', body)
 print(json.dumps({'type': 'item.completed', 'item': {
