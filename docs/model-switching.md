@@ -36,7 +36,7 @@ remains a separate parity gate.
 | Feature | Responsible code | Deterministic receipt | Remaining release gate |
 | --- | --- | --- | --- |
 | Selection, restart persistence, pause and snapshot | `model_selection.rs`, `fallback.rs` | `model_selection::tests`, `paused_persisted_runpod_selection_never_reaches_inference_or_fallback` | Discord set/call race on the daemon host |
-| Owner-only Discord command and conversation history | `event_handler.rs`, `WikiQuerier` | Parser and store tests in `model_selection::tests` | Fake Discord sequence and live Qwen→GLM→Codex continuity |
+| Owner-only Discord command and conversation history | `event_handler.rs`, `WikiQuerier` | Parser and store tests in `model_selection::tests`; model-control history exclusion test in `event_handler::tests` | Fake Discord sequence and live Qwen→GLM→Codex continuity |
 | File scope, shell, image bytes, unknown tools, malformed arguments and local MCP | `codex.rs`, `codex_tools.rs`, `scripts/codex-tool-bridge.py` | Linux `all_selected_profiles_share_scoped_file_tools_and_audit_identity`; bridge duplicate-call and lost-reply tests | Live model-selected tool use for each provider |
 | Document/PDF attachment and computer use | `images.rs`, bridge Read, remote worker tools | Ignored Codex-only opt-in fixtures in `codex.rs`; no shared CI fixture | Cross-profile deterministic and live attachment/computer-use fixtures |
 | Retrieval, wiki and memory MCP | `mcp.rs`, wiki and memory tools | Ignored Codex-only `live_wiki_query_profile_executes_files_and_memory_mcp`; no shared CI fixture | Three-profile fake and live memory continuity |

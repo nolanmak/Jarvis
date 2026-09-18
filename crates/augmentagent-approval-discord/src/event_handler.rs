@@ -1926,6 +1926,30 @@ const HISTORY_LIMIT: u8 = 30;
 const MAX_AGE_SECS: i64 = 2 * 60 * 60; // 2 hours
 const HISTORY_CHAR_CAP: usize = 10_000;
 
+struct HistoryTurn {
+    role: &'static str,
+    body: String,
+    id: u64,
+    reply_to: Option<u64>,
+}
+
+fn is_model_control_text(text: &str) -> bool {
+    matches!(text.split_whitespace().next(), Some("/model" | "model"))
+}
+
+fn history_without_model_controls(turns: &[HistoryTurn]) -> Vec<(&'static str, String)> {
+    let control_ids: std::collections::HashSet<u64> = turns.iter()
+        .filter(|turn| turn.role == "user" && is_model_control_text(&turn.body))
+        .map(|turn| turn.id)
+        .collect();
+    turns.iter()
+        .filter(|turn| !control_ids.contains(&turn.id)
+            && !(turn.role == "assistant"
+                && turn.reply_to.is_some_and(|id| control_ids.contains(&id))))
+        .map(|turn| (turn.role, turn.body.clone()))
+        .collect()
+}
+
 /// Pull recent messages from the channel/DM and format them as a role-tagged
 /// transcript. Empty string when there's nothing to include (first turn, or
 /// everything exceeded the age cap, or fetch failed).
@@ -1953,7 +1977,7 @@ async fn fetch_conversation_context(
 
     // Discord returns newest-first. Process newest → oldest but emit in
     // chronological order at the end.
-    let mut turns: Vec<(&'static str, String)> = Vec::with_capacity(messages.len());
+    let mut turns: Vec<HistoryTurn> = Vec::with_capacity(messages.len());
     for m in messages.into_iter() {
         if m.timestamp.unix_timestamp() < cutoff {
             continue;
@@ -1978,11 +2002,18 @@ async fn fetch_conversation_context(
         if body.is_empty() {
             continue;
         }
-        turns.push((role, body));
+        turns.push(HistoryTurn {
+            role,
+            body,
+            id: m.id.get(),
+            reply_to: m.message_reference.as_ref()
+                .and_then(|reference| reference.message_id)
+                .map(|id| id.get()),
+        });
     }
     // `messages` was newest-first; the Vec we built is therefore newest-first too.
     turns.reverse();
-    format_transcript(&turns, HISTORY_CHAR_CAP)
+    format_transcript(&history_without_model_controls(&turns), HISTORY_CHAR_CAP)
 }
 
 /// Pure renderer so unit tests don't need a live Discord connection.
@@ -2526,6 +2557,30 @@ mod tests {
         let i2 = out.find("first answer").unwrap();
         let i3 = out.find("follow-up").unwrap();
         assert!(i1 < i2 && i2 < i3);
+    }
+
+    #[test]
+    fn model_switch_controls_never_enter_later_conversation_history() {
+        let turns = vec![
+            HistoryTurn { role: "user", body: "Remember blue lantern".into(), id: 1, reply_to: None },
+            HistoryTurn { role: "assistant", body: "I remember blue lantern".into(), id: 2, reply_to: Some(1) },
+            HistoryTurn { role: "user", body: "/model set qwen".into(), id: 3, reply_to: None },
+            HistoryTurn { role: "assistant", body: "Model set to qwen".into(), id: 4, reply_to: Some(3) },
+            HistoryTurn { role: "user", body: "> /model set glm is quoted text".into(), id: 5, reply_to: None },
+            HistoryTurn { role: "user", body: "model status".into(), id: 6, reply_to: None },
+            HistoryTurn { role: "assistant", body: "Readiness: ready".into(), id: 7, reply_to: Some(6) },
+            HistoryTurn { role: "user", body: "/models is a different word".into(), id: 8, reply_to: None },
+            HistoryTurn { role: "user", body: "What did I ask you to remember?".into(), id: 9, reply_to: Some(3) },
+        ];
+        let history = format_transcript(&history_without_model_controls(&turns), HISTORY_CHAR_CAP);
+        assert!(!history.contains("/model set qwen"), "{history}");
+        assert!(!history.contains("Model set to qwen"), "{history}");
+        assert!(!history.contains("model status"), "{history}");
+        assert!(!history.contains("Readiness: ready"), "{history}");
+        assert!(history.contains("Remember blue lantern"), "{history}");
+        assert!(history.contains("> /model set glm is quoted text"), "{history}");
+        assert!(history.contains("/models is a different word"), "{history}");
+        assert!(history.contains("What did I ask you to remember?"), "{history}");
     }
 
     #[test]
