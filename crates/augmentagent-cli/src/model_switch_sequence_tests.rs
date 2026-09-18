@@ -58,7 +58,6 @@ for line in sys.stdin:
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&memory, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::write(codex_home.join("auth.json"), "{}").unwrap();
-    std::fs::write(wiki.join("probe.txt"), NONCE).unwrap();
     let router = scratch.path().join("model-router.json");
     std::fs::write(
         &router,
@@ -135,20 +134,23 @@ for line in sys.stdin:
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(rows.len(), 3, "{audit}");
+    assert_eq!(rows.len(), 4, "{audit}");
+    assert_eq!(rows[0]["provider"], "qwen");
+    assert_eq!(rows[0]["tool"], "Write");
+    assert_eq!(rows[0]["session_id"], format!("{CHANNEL}:1"));
+    assert!(rows[0]["stderr_truncated"].is_null());
     for (index, profile) in ["qwen", "glm", "codex"].iter().enumerate() {
-        assert_eq!(rows[index]["provider"], *profile);
-        assert_eq!(rows[index]["tool"], "Read");
-        assert_eq!(
-            rows[index]["session_id"],
-            format!("{CHANNEL}:{}", index + 1)
-        );
-        assert!(rows[index]["stdout_truncated"]
-            .as_str()
-            .unwrap()
-            .contains(NONCE));
-        assert!(rows[index]["stderr_truncated"].is_null());
+        let row = &rows[index + 1];
+        assert_eq!(row["provider"], *profile);
+        assert_eq!(row["tool"], "Read");
+        assert_eq!(row["session_id"], format!("{CHANNEL}:{}", index + 1));
+        assert!(row["stdout_truncated"].as_str().unwrap().contains(NONCE));
+        assert!(row["stderr_truncated"].is_null());
     }
+    assert_eq!(
+        std::fs::read_to_string(wiki.join("probe.txt")).unwrap(),
+        NONCE
+    );
     assert_eq!(
         std::fs::read_to_string(home.join(".fake-cli/codex.count"))
             .unwrap()
