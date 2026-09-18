@@ -149,6 +149,59 @@ class UpstreamCredentialTests(unittest.TestCase):
 
 
 class JobLifecycleTests(unittest.TestCase):
+    def test_glm_load_balancer_request_caps_output_before_upstream(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            routes = pathlib.Path(tmp) / 'routes.json'
+            routes.write_text(json.dumps({'glm-5.3-flash': {'type': 'openai',
+                'base_url': 'https://g1eary963m1aym.api.runpod.ai/openai/v1',
+                'max_output_tokens': 1024}}))
+            journal_path = pathlib.Path(tmp) / 'jobs.sqlite3'
+            forwarded = []
+
+            class Upstream:
+                status = 200
+                headers = {'Content-Type': 'application/json'}
+
+                def __init__(self):
+                    self.chunks = [b'{"choices":[{"message":{"content":"ok"}}]}', b'']
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    pass
+
+                def read1(self, size):
+                    return self.chunks.pop(0)
+
+            def upstream(url, data=None, timeout=45):
+                forwarded.append((url, data))
+                return Upstream()
+
+            server = module.http.server.ThreadingHTTPServer(('127.0.0.1', 0), module.Handler)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                with mock.patch.object(module, 'ROUTES', routes), \
+                     mock.patch.object(module, 'JOURNAL', journal_path), \
+                     mock.patch.object(module, 'request', upstream):
+                    conn = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=2)
+                    conn.request('POST', '/v1/chat/completions', json.dumps({
+                        'model': 'glm-5.3-flash', 'messages': [{'role': 'user', 'content': 'hello'}],
+                        'max_completion_tokens': 64000}),
+                        {'Authorization': 'Bearer test-client-key', 'Content-Type': 'application/json'})
+                    response = conn.getresponse()
+                    self.assertEqual(response.status, 200)
+                    response.read()
+                    conn.close()
+                self.assertEqual(len(forwarded), 1)
+                self.assertEqual(forwarded[0][1]['max_tokens'], 1024)
+                self.assertNotIn('max_completion_tokens', forwarded[0][1])
+            finally:
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=2)
+
     def test_existing_journal_rows_survive_endpoint_column_migration(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / 'jobs.sqlite3'

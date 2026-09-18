@@ -355,7 +355,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if model not in routes:return self.reply(404,{'error':{'message':'Unknown model: '+str(model)}})
             route=routes[model]
             if route.get('enabled') is False:return self.reply(503,{'error':{'message':route.get('disabled_reason','Model is paused'),'type':'model_unavailable'}})
-            if route['type'] != 'openai':
+            if route['type'] == 'openai':
+                body=dict(body)
+                body['max_tokens']=predict_limit(body, route)
+                body.pop('max_completion_tokens',None)
+            else:
                 options={k:body[k] for k in ['temperature','top_p','seed'] if k in body}
                 options['num_predict']=predict_limit(body, route)
                 if 'stop' in body:options['stop']=body['stop']
