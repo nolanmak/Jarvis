@@ -59,6 +59,17 @@ fn profile(name: &str) -> Option<ProviderKind> {
     }
 }
 
+/// The operator's runtime pause gate. It is checked at dispatch as well as
+/// selection time because a persisted choice can outlive a profile shutdown.
+pub fn runtime_profile_enabled(kind: ProviderKind) -> bool {
+    let flag = match kind {
+        ProviderKind::Qwen => "AUGMENTAGENT_MODEL_QWEN_ENABLED",
+        ProviderKind::Glm => "AUGMENTAGENT_MODEL_GLM_ENABLED",
+        _ => return true,
+    };
+    std::env::var(flag).ok().as_deref() == Some("1")
+}
+
 struct Lock(std::fs::File);
 impl Drop for Lock {
     fn drop(&mut self) {

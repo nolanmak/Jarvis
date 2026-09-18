@@ -8958,13 +8958,13 @@ impl QueryHandler for WikiQuerier {
                 .map_err(|_| "9Router configuration is invalid".to_string())?;
             match profile {
                 ProviderKind::Qwen => {
-                    if std::env::var("AUGMENTAGENT_MODEL_QWEN_ENABLED").ok().as_deref() != Some("1") {
+                    if !augmentagent_channel_core::model_selection::runtime_profile_enabled(profile) {
                         Err("Qwen is paused; enable it after Runpod scale-down and live tool verification".into())
                     } else if router.is_none() { Err("Qwen requires a configured 9Router endpoint".into()) }
                     else { Ok(()) }
                 }
                 ProviderKind::Glm => {
-                    if std::env::var("AUGMENTAGENT_MODEL_GLM_ENABLED").ok().as_deref() != Some("1") {
+                    if !augmentagent_channel_core::model_selection::runtime_profile_enabled(profile) {
                         Err("GLM is paused; enable it after live deployment verification".into())
                     } else if router.is_none() { Err("GLM requires a configured 9Router endpoint".into()) }
                     else { Ok(()) }

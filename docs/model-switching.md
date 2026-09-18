@@ -7,6 +7,7 @@ Tracking: #1136–#1143. The first implementation uses the Rust `FallbackReasone
 Selecting `codex` uses the existing native Codex login when one is available, even when 9Router is configured for Runpod. A 9Router Codex account is used only when native Codex authentication is unavailable. Selection is refused if the active Jarvis process has no corresponding provider entry; configure it and restart the daemon first.
 
 `/model status` reports the effective profile, whether it comes from the conversation or daemon default, its readiness or pause reason, and whether fallback is disabled. It checks configuration only; it does not start a Runpod worker.
+The same runtime pause flags are checked immediately before dispatch. If an operator pauses Qwen or GLM after a selection was persisted, the selected call fails before inference and cannot fall through to Codex. Unpinned automatic chains skip paused Runpod entries.
 
 ## Execution paths and parity gate
 

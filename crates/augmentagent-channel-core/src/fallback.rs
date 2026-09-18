@@ -127,6 +127,7 @@ struct ReviewLifecycle {
 /// channel generics swap from `ClaudeCliReasoner` with a one-word change.
 pub struct FallbackReasoner {
     entries: Vec<Entry>,
+    profile_enabled: fn(ProviderKind) -> bool,
     /// Adapters registered only for dashboard routing; direct mode excludes them.
     gateway_only: Vec<ProviderKind>,
     latch: CooldownLatch,
@@ -269,6 +270,7 @@ pub fn build_reasoner() -> Arc<FallbackReasoner> {
     }
     Arc::new(FallbackReasoner {
         entries,
+        profile_enabled: crate::model_selection::runtime_profile_enabled,
         gateway_only,
         latch: CooldownLatch::system(),
         usage: std::sync::Mutex::new(Vec::new()),
@@ -298,6 +300,7 @@ pub fn build_pinned(kind: ProviderKind) -> Option<Arc<FallbackReasoner>> {
     }).map(|entry| {
         Arc::new(FallbackReasoner {
             entries: vec![entry],
+            profile_enabled: crate::model_selection::runtime_profile_enabled,
             gateway_only,
             latch: CooldownLatch::system(),
             usage: std::sync::Mutex::new(Vec::new()),
@@ -328,6 +331,7 @@ impl FallbackReasoner {
     pub fn claude_only() -> Self {
         FallbackReasoner {
             gateway_only: Vec::new(),
+            profile_enabled: crate::model_selection::runtime_profile_enabled,
             entries: vec![Entry {
                 kind: ProviderKind::Claude,
                 reasoner: Arc::new(ClaudeCliReasoner::new()),
@@ -347,6 +351,7 @@ impl FallbackReasoner {
     ) -> Self {
         FallbackReasoner {
             gateway_only: Vec::new(),
+            profile_enabled: |_| true,
             entries: chain
                 .into_iter()
                 .map(|(kind, reasoner)| Entry { kind, reasoner })
@@ -379,6 +384,7 @@ impl FallbackReasoner {
         let mut eligible = 0usize;
         for entry in &self.entries {
             if selected.is_some_and(|profile| entry.kind != profile) { continue; }
+            if !(self.profile_enabled)(entry.kind) { continue; }
             if routing.as_ref().is_some_and(|r| !r.allows(entry.kind))
                 || (selected.is_none() && !routing.as_ref().is_some_and(|r| r.enabled()) && self.gateway_only.contains(&entry.kind)) {
                 continue;
@@ -533,6 +539,13 @@ impl FallbackReasoner {
     ) -> anyhow::Result<String> {
         let routing = crate::model_router::current()?;
         let selected = crate::model_selection::current()?;
+        if let Some(profile) = selected {
+            if !(self.profile_enabled)(profile) {
+                return Err(ReasonerError::Local {
+                    message: format!("{} is paused by the operator; no inference was started", profile.name()),
+                }.into());
+            }
+        }
         // Binding and admission share one lock. Once admitted, no caller can
         // retrofit a history that misses an earlier mutating dispatch.
         self.review_history.lock().unwrap_or_else(|e| e.into_inner()).admitted = true;
@@ -579,6 +592,10 @@ impl FallbackReasoner {
 
         for entry in dispatch_entries {
             let name = entry.kind.name();
+            if !(self.profile_enabled)(entry.kind) {
+                diagnostics.push(format!("{name}: paused by the operator"));
+                continue;
+            }
             if routing.as_ref().is_some_and(|r| !r.allows(entry.kind)) {
                 diagnostics.push(format!("{name}: excluded by selected model route"));
                 continue;
@@ -843,6 +860,32 @@ mod tests {
         assert_eq!(qwen.count(), 1);
         assert_eq!(codex.count(), 0);
         assert_eq!(chain.usage(), vec![("qwen", 1, 0)]);
+    }
+
+    #[tokio::test]
+    async fn paused_persisted_runpod_selection_never_reaches_inference_or_fallback() {
+        for profile in [ProviderKind::Qwen, ProviderKind::Glm] {
+            let dir = tempfile::tempdir().unwrap();
+            let paused = Scripted::ok("paused model was called");
+            let codex = Scripted::ok("silent fallback");
+            let mut chain = FallbackReasoner::for_tests(vec![
+                (profile, paused.clone()),
+                (ProviderKind::Codex, codex.clone()),
+            ], latch_in(&dir));
+            chain.profile_enabled = |kind| !matches!(kind, ProviderKind::Qwen | ProviderKind::Glm);
+            let mut config = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+            config.mode = profile.name().into();
+            let result = crate::model_selection::SELECTED_PROFILE.scope(Some(profile),
+                crate::model_router::SNAPSHOT.scope(Some(config), async {
+                    assert_eq!(chain.lane_availability(crate::providers::CapabilityClass::TextOnly),
+                        LaneAvailability::NoEligibleProvider);
+                    chain.dispatch_snapshot(&text_only_opts(), "question", false, None).await
+                })).await;
+            assert!(result.is_err(), "paused {profile:?} selection must fail before inference");
+            assert_eq!(paused.count(), 0);
+            assert_eq!(codex.count(), 0);
+            assert_eq!(chain.calls(), 0);
+        }
     }
 
     // ---- #828: single-provider pinning for the independent review ----
