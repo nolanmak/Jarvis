@@ -58,11 +58,24 @@ pub fn current() -> anyhow::Result<Option<RouterConfig>> {
 
 /// A Discord/default profile applies only to this call's cloned router
 /// configuration. The persisted account settings and other calls are intact.
-pub fn select_profile(mut config: Option<RouterConfig>, selected: Option<ProviderKind>) -> anyhow::Result<Option<RouterConfig>> {
+pub fn select_profile(config: Option<RouterConfig>, selected: Option<ProviderKind>) -> anyhow::Result<Option<RouterConfig>> {
+    let native_codex_available = selected == Some(ProviderKind::Codex)
+        && crate::codex::codex_auth_available();
+    select_profile_with_auth(config, selected, native_codex_available)
+}
+
+fn select_profile_with_auth(mut config: Option<RouterConfig>, selected: Option<ProviderKind>, native_codex_available: bool) -> anyhow::Result<Option<RouterConfig>> {
     if let Some(profile) = selected {
         anyhow::ensure!(matches!(profile, ProviderKind::Codex | ProviderKind::Qwen | ProviderKind::Glm), "unsupported model profile");
         if let Some(router) = config.as_mut() {
-            router.mode = profile.name().into();
+            // Keep an existing Codex login on its subscription transport.
+            // A configured 9Router is needed for Runpod but does not imply
+            // consent to send Codex calls to a paid gateway account.
+            router.mode = if profile == ProviderKind::Codex && native_codex_available {
+                "direct".into()
+            } else {
+                profile.name().into()
+            };
         } else {
             anyhow::ensure!(profile == ProviderKind::Codex,
                 "Selected Runpod model requires a configured 9Router endpoint");
@@ -284,5 +297,17 @@ pub(crate) mod tests {
         assert!(!selected.allows(ProviderKind::Glm));
         assert_eq!(original.mode, "auto");
         assert_eq!(original.models.codex.quality, selected.models.codex.quality);
+    }
+
+    #[test]
+    fn explicit_codex_uses_existing_account_when_available() {
+        let original = parse(&fixture().to_string()).unwrap();
+        let native = select_profile_with_auth(Some(original.clone()), Some(ProviderKind::Codex), true)
+            .unwrap().unwrap();
+        assert_eq!(native.mode, "direct");
+        let gateway = select_profile_with_auth(Some(original.clone()), Some(ProviderKind::Codex), false)
+            .unwrap().unwrap();
+        assert_eq!(gateway.mode, "codex");
+        assert_eq!(original.mode, "auto");
     }
 }

@@ -8916,6 +8916,9 @@ impl QueryHandler for WikiQuerier {
         use augmentagent_channel_core::providers::ProviderKind;
         let store = SelectionStore::new(config_path());
         run_command(&store, &channel_id.to_string(), text, |profile| {
+            if !self.reasoner.provider_names().contains(&profile.name()) {
+                return Err(format!("{} is not available in this Jarvis process; restart after configuring it", profile.name()));
+            }
             let router = augmentagent_channel_core::model_router::load()
                 .map_err(|_| "9Router configuration is invalid".to_string())?;
             match profile {
