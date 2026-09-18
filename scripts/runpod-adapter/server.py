@@ -10,6 +10,9 @@ MAX_IN_FLIGHT = threading.BoundedSemaphore(2)
 class DuplicateRequestError(ValueError):
     pass
 
+class InvalidRequestError(ValueError):
+    pass
+
 def request_fingerprint(body):
     """Private stable digest for a retry whose gateway discarded its request key."""
     canonical = json.dumps(body, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
@@ -375,12 +378,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 body['max_tokens']=predict_limit(body, route)
                 body.pop('max_completion_tokens',None)
             else:
+                choice=body.get('tool_choice','auto')
+                # Ollama /api/chat accepts tools, but has no tool_choice field.
+                # An explicit "none" must remove them; forced calls cannot be
+                # honored and must fail before a paid Runpod submission.
+                if choice not in ('auto','none'):
+                    raise InvalidRequestError('Qwen tool_choice supports only auto or none')
                 options={k:body[k] for k in ['temperature','top_p','seed'] if k in body}
                 options['num_predict']=predict_limit(body, route)
                 if 'stop' in body:options['stop']=body['stop']
                 payload={'messages':normalize_messages(body.get('messages',[])),'stream':False,'options':options}
-                for k in ['tools','think']:
-                    if k in body:payload[k]=body[k]
+                if choice!='none' and 'tools' in body:payload['tools']=body['tools']
+                if 'think' in body:payload['think']=body['think']
                 fmt=body.get('response_format',{})
                 if fmt.get('type')=='json_object':payload['format']='json'
                 if fmt.get('type')=='json_schema':payload['format']=fmt.get('json_schema',{}).get('schema')
@@ -447,6 +456,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 cancel_job(journal,self.request_id,base)
         except DuplicateRequestError as e:
             self.reply(409,{'error':{'message':str(e),'type':'duplicate_request'}})
+        except InvalidRequestError as e:
+            self.reply(400,{'error':{'message':str(e),'type':'invalid_request_error'}})
         except Exception as e:
             if submitted and journal and journal.get(self.request_id)['state']=='SUBMITTED':
                 journal.finish(self.request_id, 'POLL_UNKNOWN')

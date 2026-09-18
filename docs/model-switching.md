@@ -64,6 +64,11 @@ The adapter returns `X-Adapter-Request-Id`, and authenticated `GET /v1/jobs/REQU
 
 The adapter's authenticated Runpod client accepts only HTTPS URLs on `api.runpod.ai` or one endpoint subdomain of `api.runpod.ai`, with no URL credentials, nonstandard port, query or fragment. It rejects HTTP redirects. Local regression tests prove an unauthorized URL and a redirect target receive no request, so a changed upstream location cannot carry the Runpod key to a different host.
 Both Qwen queue requests and GLM load-balancer requests cap generated tokens to the route's `max_output_tokens` (default 2048) before reaching Runpod. This bounds output length, not GPU cost or wall time.
+For Qwen, `tool_choice: none` removes tool definitions from the Ollama request.
+`auto` leaves them available. Forced or required tool choices return a local
+400 before any Runpod submission because [Ollama's chat API](https://docs.ollama.com/api/chat)
+defines `tools` but no `tool_choice` control. This restriction is explicit in
+the adapter fixture; a later upstream capability change needs a new live test.
 
 Before enabling either profile on a host, run the read-only preflight with that
 host's owner-private `adapter.env` and `router-client.env` files:

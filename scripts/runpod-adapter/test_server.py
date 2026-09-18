@@ -151,6 +151,55 @@ class UpstreamCredentialTests(unittest.TestCase):
 
 
 class JobLifecycleTests(unittest.TestCase):
+    def test_qwen_tool_choice_none_omits_tools_and_required_fails_before_submission(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            routes = pathlib.Path(tmp) / 'routes.json'
+            routes.write_text(json.dumps({'qwen38-27b': {'type': 'ollama-queue',
+                'base_url': 'https://api.runpod.ai/v2/endpoint', 'max_output_tokens': 128}}))
+            journal_path = pathlib.Path(tmp) / 'jobs.sqlite3'
+            submitted = []
+
+            def upstream(url, payload=None):
+                if url.endswith('/run'):
+                    submitted.append(payload)
+                    return {'id': 'job-1'}
+                if url.endswith('/status/job-1'):
+                    return {'status': 'COMPLETED', 'output': {
+                        'message': {'role': 'assistant', 'content': 'done'}}}
+                raise AssertionError('unexpected Runpod call')
+
+            server = module.http.server.ThreadingHTTPServer(('127.0.0.1', 0), module.Handler)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                with mock.patch.object(module, 'ROUTES', routes), \
+                     mock.patch.object(module, 'JOURNAL', journal_path), \
+                     mock.patch.object(module, 'rpc', upstream):
+                    for choice, expected in (('none', 200), ('required', 400),
+                                             ({'type': 'function', 'function': {'name': 'Read'}}, 400),
+                                             ('auto', 200)):
+                        conn = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=2)
+                        conn.request('POST', '/v1/chat/completions', json.dumps({
+                            'model': 'qwen38-27b',
+                            'messages': [{'role': 'user', 'content': 'synthetic request'}],
+                            'tools': [{'type': 'function', 'function': {'name': 'Read'}}],
+                            'tool_choice': choice}),
+                            {'Authorization': 'Bearer test-client-key',
+                             'Content-Type': 'application/json'})
+                        response = conn.getresponse()
+                        self.assertEqual(response.status, expected)
+                        response.read()
+                        conn.close()
+                        if choice == 'none':
+                            self.assertNotIn('tools', submitted[0]['input'])
+                        if choice == 'auto':
+                            self.assertEqual(submitted[-1]['input']['tools'][0]['function']['name'], 'Read')
+                self.assertEqual(len(submitted), 2)
+            finally:
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=2)
+
     def test_glm_load_balancer_request_caps_output_before_upstream(self):
         with tempfile.TemporaryDirectory() as tmp:
             routes = pathlib.Path(tmp) / 'routes.json'
