@@ -50,6 +50,13 @@ remains a separate parity gate.
 
 Model quality, context size and latency differ. Full feature parity is a release gate: every row needs deterministic fake-model tests and a live receipt from the actual Jarvis host for all three models. A text response or catalog entry does not establish tool execution. GLM is paused until live inference succeeds. Qwen passed a 9Router Responses text call, a function-call/result round trip, and a Codex CLI text probe on 2026-09-18. The full Jarvis bridge workflow and actual-host Discord test remain the release gate.
 
+On 2026-09-18, a fresh 4×H200 CUDA 13.0 aggregate capacity read showed Low
+stock at $14.36/hour, but the Secure Cloud pool showed Out. One direct GLM
+inference probe waited about 90 seconds and allocated zero workers. The client
+request was interrupted; the endpoint was restored to min/max workers zero,
+CUDA minimum 12.8 and its prior idle timeout. A follow-up worker read showed
+zero workers. This attempt did not produce model output, so GLM remains paused.
+
 Independent automated review uses native Claude or Codex transport with a separate login; a 9Router account label is not evidence of a different backend. Reviewer calls pin direct routing for both passes. If native Codex authentication disappears before dispatch, review fails closed instead of using a gateway account.
 
 ## Operator notes
