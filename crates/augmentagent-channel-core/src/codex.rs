@@ -84,10 +84,11 @@ fn bridge_runner(content: &str) -> &'static str {
 
 #[cfg(test)]
 pub(crate) async fn record_tool_item(opts: &ReasonerOpts, item: &serde_json::Value) {
-    record_tool_item_for(ProviderKind::Codex, opts, item).await
+    let model = crate::providers::model_for(ProviderKind::Codex, tier_of(opts));
+    record_tool_item_for(ProviderKind::Codex, &model, opts, item).await
 }
 
-async fn record_tool_item_for(kind: ProviderKind, opts: &ReasonerOpts, item: &serde_json::Value) {
+async fn record_tool_item_for(kind: ProviderKind, model: &str, opts: &ReasonerOpts, item: &serde_json::Value) {
     use crate::tool_audit::{build_audit_record, is_high_risk};
     let native_web = item.get("type").and_then(|v| v.as_str()) == Some("web_search");
     if !native_web && item.get("type").and_then(|v| v.as_str()) != Some("mcp_tool_call") { return; }
@@ -108,6 +109,7 @@ async fn record_tool_item_for(kind: ProviderKind, opts: &ReasonerOpts, item: &se
         || result.is_some_and(|r| r.get("isError").or_else(|| r.get("is_error")).and_then(|b| b.as_bool()).unwrap_or(false));
     let session = opts.session_id.as_deref().unwrap_or("-");
     let mut record = build_audit_record(kind, chrono::Utc::now().to_rfc3339(), session.into(), tool.clone(), args, &content, failed);
+    record.set_model(model);
     if tool == "Bash" {
         let outcome = serde_json::from_str::<serde_json::Value>(&content).ok();
         record.exit_code = outcome.as_ref()
@@ -399,7 +401,7 @@ impl CodexCliReasoner {
             }
             if kind == Some("item.completed") {
                 if let Some(item) = v.get("item") {
-                    record_tool_item_for(self.kind, opts, item).await;
+                    record_tool_item_for(self.kind, &model, opts, item).await;
                 }
             }
             match kind {
