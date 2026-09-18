@@ -358,20 +358,20 @@ pub(crate) mod tests {
         const NAME: &str = "model_router::tests::explicitly_allowed_tailnet_router_has_an_exact_host_boundary";
         if std::env::var_os("JARVIS_TAILNET_ROUTER_CHILD").is_some() {
             let mut value = fixture();
-            value["base_url"] = "http://macbook-air-2.tailfdbc7f.ts.net:20128/v1".into();
+            value["base_url"] = "http://router.fixture.ts.net:20128/v1".into();
             assert!(parse(&value.to_string()).is_ok(), "the exact allowed tailnet router should parse");
             for url in [
-                "http://other.tailfdbc7f.ts.net:20128/v1",
-                "http://macbook-air-2.tailfdbc7f.ts.net:20129/v1",
-                "http://user:pass@macbook-air-2.tailfdbc7f.ts.net:20128/v1",
-                "http://macbook-air-2.tailfdbc7f.ts.net:20128/v1?key=secret",
+                "http://other.fixture.ts.net:20128/v1",
+                "http://router.fixture.ts.net:20129/v1",
+                "http://user:pass@router.fixture.ts.net:20128/v1", // pii-ok: synthetic credentials in a rejection fixture
+                "http://router.fixture.ts.net:20128/v1?key=secret",
                 "http://evil.example:20128/v1",
             ] {
                 value["base_url"] = url.into();
                 assert!(parse(&value.to_string()).is_err(), "unauthorized router URL {url}");
             }
             std::env::set_var("AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS",
-                "macbook-air-2.tailfdbc7f.ts.net:20128,evil.example:20128");
+                "router.fixture.ts.net:20128,evil.example:20128");
             value["base_url"] = "http://evil.example:20128/v1".into();
             assert!(parse(&value.to_string()).is_err(), "remote cleartext is limited to tailnet DNS");
             value["base_url"] = "https://evil.example:20128/v1".into();
@@ -381,7 +381,7 @@ pub(crate) mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", NAME, "--nocapture"])
             .env("JARVIS_TAILNET_ROUTER_CHILD", "1")
-            .env("AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS", "macbook-air-2.tailfdbc7f.ts.net:20128")
+            .env("AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS", "router.fixture.ts.net:20128")
             .output().unwrap();
         assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr));
