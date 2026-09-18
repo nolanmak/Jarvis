@@ -83,6 +83,38 @@ class NormalizeMessagesTests(unittest.TestCase):
             with self.subTest(messages=messages), self.assertRaises(ValueError):
                 module.normalize_messages(messages)
 
+    def test_malformed_model_tool_call_is_not_returned_as_executable_output(self):
+        for call in (
+            {'function': {'name': 'Read', 'arguments': '{"file_path":'}},
+            {'function': {'name': 'Read', 'arguments': '["a.md"]'}},
+            {'function': {'arguments': '{"file_path":"a.md"}'}},
+            {'function': {'name': 'Read', 'arguments': {'file_path': 'a.md'}},
+             'id': 'duplicate'},
+        ):
+            with self.subTest(call=call):
+                calls = [call, call] if call.get('id') == 'duplicate' else [call]
+                with self.assertRaises(ValueError):
+                    module.normalize({'message': {'role': 'assistant',
+                        'content': '', 'tool_calls': calls}}, 'qwen38-27b', 'synthetic-response')
+
+    def test_valid_parallel_model_tool_calls_keep_ids_and_object_arguments(self):
+        calls = [
+            {'id': 'call_first', 'function': {'name': 'Read',
+                'arguments': '{"file_path":"a.md"}'}},
+            {'id': 'call_second', 'function': {'name': 'Read',
+                'arguments': {'file_path': 'b.md'}}},
+        ]
+        response = module.normalize({'message': {'role': 'assistant',
+            'content': '', 'tool_calls': calls}}, 'qwen38-27b', 'synthetic-response')
+        choice = response['choices'][0]
+        self.assertEqual(choice['finish_reason'], 'tool_calls')
+        self.assertEqual([call['id'] for call in choice['message']['tool_calls']],
+                         ['call_first', 'call_second'])
+        self.assertEqual([json.loads(call['function']['arguments'])
+                          for call in choice['message']['tool_calls']],
+                         [{'file_path': 'a.md'}, {'file_path': 'b.md'}])
+        self.assertIsInstance(calls[1]['function']['arguments'], dict)
+
     def test_duplicate_or_missing_tool_call_ids_are_rejected(self):
         function = {'name': 'Read', 'arguments': '{}'}
         for calls in (
@@ -441,6 +473,49 @@ class JobLifecycleTests(unittest.TestCase):
                             response.read()
                             conn.close()
                 self.assertFalse(journal_path.exists())
+            finally:
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=2)
+
+    def test_malformed_worker_tool_call_never_becomes_an_executable_gateway_reply(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            routes = pathlib.Path(tmp) / 'routes.json'
+            routes.write_text(json.dumps({'qwen38-27b': {'type': 'ollama-queue',
+                'base_url': 'https://api.runpod.ai/v2/endpoint', 'max_output_tokens': 128}}))
+            journal_path = pathlib.Path(tmp) / 'jobs.sqlite3'
+            submitted = []
+
+            def upstream(url, payload=None):
+                if url.endswith('/run'):
+                    submitted.append(payload)
+                    return {'id': 'job-malformed'}
+                if url.endswith('/status/job-malformed'):
+                    return {'id': 'job-malformed', 'status': 'COMPLETED', 'output': {
+                        'message': {'role': 'assistant', 'content': '', 'tool_calls': [
+                            {'function': {'name': 'Read', 'arguments': '{"file_path":'}}]}}}
+                raise AssertionError('unexpected Runpod call')
+
+            server = module.http.server.ThreadingHTTPServer(('127.0.0.1', 0), module.Handler)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                with mock.patch.object(module, 'ROUTES', routes), \
+                     mock.patch.object(module, 'JOURNAL', journal_path), \
+                     mock.patch.object(module, 'rpc', upstream):
+                    conn = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=2)
+                    conn.request('POST', '/v1/chat/completions', json.dumps({
+                        'model': 'qwen38-27b', 'messages': [{'role': 'user',
+                        'content': 'synthetic request'}]}),
+                        {'Authorization': 'Bearer test-client-key', 'Content-Type': 'application/json'})
+                    response = conn.getresponse()
+                    payload = json.loads(response.read())
+                    self.assertEqual(response.status, 502)
+                    self.assertNotIn('choices', payload)
+                    conn.close()
+                self.assertEqual(len(submitted), 1)
+                with contextlib.closing(sqlite3.connect(journal_path)) as db:
+                    self.assertEqual(db.execute('SELECT state FROM jobs').fetchone()[0], 'COMPLETED')
             finally:
                 server.shutdown()
                 server.server_close()

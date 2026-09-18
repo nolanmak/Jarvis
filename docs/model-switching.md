@@ -123,6 +123,11 @@ call ID and tool name. It orders parallel results to match their calls before
 translation to Ollama and refuses missing, duplicate or forged results with
 HTTP 400 before creating a Runpod job. The three-profile live parity gate
 still has to prove the model can use those results correctly.
+On the return path, the Qwen adapter accepts tool calls only with a function
+name, unique call ID and JSON object arguments. It converts Ollama argument
+objects to JSON strings for the OpenAI response and rejects malformed model
+calls with HTTP 502 instead of returning a tool for Jarvis to execute. A job
+that already completed stays recorded as completed in the adapter journal.
 
 Before enabling either profile on a host, run the read-only preflight with that
 host's owner-private `adapter.env` and `router-client.env` files:

@@ -191,10 +191,35 @@ def normalize(output, model, request_id):
     message.pop('thinking',None)
     if output.get('message',{}).get('thinking'):message['reasoning_content']=output['message']['thinking']
     calls=message.get('tool_calls',[])
-    for c in calls:
-        c.setdefault('id','call_'+uuid.uuid4().hex[:16]);c.setdefault('type','function')
-        f=c.get('function',{})
-        if not isinstance(f.get('arguments'),str):f['arguments']=json.dumps(f.get('arguments',{}))
+    if not isinstance(calls,list):
+        raise ValueError('model tool calls must be an array')
+    normalized_calls=[]
+    seen_ids=set()
+    for call in calls:
+        if not isinstance(call,dict) or not isinstance(call.get('function'),dict):
+            raise ValueError('model tool call is invalid')
+        function=call['function']
+        name=function.get('name')
+        if not isinstance(name,str) or not name.strip():
+            raise ValueError('model tool name is invalid')
+        arguments=function.get('arguments')
+        if isinstance(arguments,str):
+            try:
+                parsed=json.loads(arguments)
+            except json.JSONDecodeError as error:
+                raise ValueError('model tool arguments are invalid JSON') from error
+        else:
+            parsed=arguments
+        if not isinstance(parsed,dict):
+            raise ValueError('model tool arguments must be an object')
+        call_id=call.get('id') if 'id' in call else 'call_'+uuid.uuid4().hex[:16]
+        if not isinstance(call_id,str) or not call_id or call_id in seen_ids:
+            raise ValueError('model tool call id is invalid')
+        seen_ids.add(call_id)
+        normalized_calls.append({'id':call_id,'type':'function','function':{
+            'name':name,'arguments':arguments if isinstance(arguments,str) else json.dumps(arguments)}})
+    if calls:
+        message['tool_calls']=normalized_calls
     prompt=output.get('prompt_eval_count',0);completion=output.get('eval_count',0)
     return {'id':request_id,'object':'chat.completion','created':int(time.time()),'model':model,'choices':[{'index':0,'message':message,'finish_reason':'tool_calls' if calls else ('length' if output.get('done_reason')=='length' else 'stop')}],'usage':{'prompt_tokens':prompt,'completion_tokens':completion,'total_tokens':prompt+completion}}
 
