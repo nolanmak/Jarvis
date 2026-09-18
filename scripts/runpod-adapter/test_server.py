@@ -73,6 +73,11 @@ class NormalizeMessagesTests(unittest.TestCase):
             with self.subTest(content=content), self.assertRaises(ValueError):
                 module.normalize_messages([{'role': 'user', 'content': content}])
 
+    def test_upstream_error_does_not_echo_secret_bearing_worker_text(self):
+        message = module.public_error(RuntimeError('worker failed: token=private-secret'))
+        self.assertEqual(message, 'Runpod inference failed')
+        self.assertNotIn('private-secret', message)
+
 
 if __name__ == '__main__':
     unittest.main()

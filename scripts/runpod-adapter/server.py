@@ -136,6 +136,11 @@ def predict_limit(body, route):
         raise ValueError('invalid output token limit')
     return min(requested, maximum)
 
+def public_error(error):
+    # Worker/provider errors may echo prompts, tool results or credentials.
+    # Only local validation messages are safe to return to the gateway.
+    return str(error) if isinstance(error, ValueError) else 'Runpod inference failed'
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version='HTTP/1.1'
     def log_message(self,fmt,*args):print(fmt%args,flush=True)
@@ -210,8 +215,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 try:rpc(base+'/cancel/'+job,{})
                 except Exception:pass
         except Exception as e:
-            print('chat failure', type(e).__name__, str(e)[:400], flush=True)
-            error={'error':{'message':str(e),'type':'upstream_error'}}
+            print('chat failure', type(e).__name__, 'job', job or '-', flush=True)
+            error={'error':{'message':public_error(e),'type':'upstream_error'}}
             if streaming:
                 self.wfile.write(('data: '+json.dumps(error)+'\n\ndata: [DONE]\n\n').encode());self.wfile.flush()
             else:self.reply(502,error)
