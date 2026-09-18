@@ -134,18 +134,28 @@ for line in sys.stdin:
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(rows.len(), 4, "{audit}");
+    assert_eq!(rows.len(), 7, "{audit}");
     assert_eq!(rows[0]["provider"], "qwen");
     assert_eq!(rows[0]["tool"], "Write");
     assert_eq!(rows[0]["session_id"], format!("{CHANNEL}:1"));
     assert!(rows[0]["stderr_truncated"].is_null());
     for (index, profile) in ["qwen", "glm", "codex"].iter().enumerate() {
-        let row = &rows[index + 1];
+        let read_index = if index == 0 { 1 } else { index * 2 + 1 };
+        let row = &rows[read_index];
         assert_eq!(row["provider"], *profile);
         assert_eq!(row["tool"], "Read");
         assert_eq!(row["session_id"], format!("{CHANNEL}:{}", index + 1));
         assert!(row["stdout_truncated"].as_str().unwrap().contains(NONCE));
         assert!(row["stderr_truncated"].is_null());
+        let memory = &rows[read_index + 1];
+        assert_eq!(memory["provider"], *profile);
+        assert_eq!(memory["tool"], "mcp__memory__memory_recent");
+        assert_eq!(memory["session_id"], format!("{CHANNEL}:{}", index + 1));
+        assert!(memory["stdout_truncated"]
+            .as_str()
+            .unwrap()
+            .contains("MEMORY_FIXTURE_OK"));
+        assert!(memory["stderr_truncated"].is_null());
     }
     assert_eq!(
         std::fs::read_to_string(wiki.join("probe.txt")).unwrap(),
