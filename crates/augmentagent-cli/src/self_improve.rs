@@ -12307,6 +12307,32 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
 
     const REVIEWED_HEAD: &str = "aaaa1111";
 
+    #[test]
+    fn independent_verdict_records_native_backend_and_requested_model() {
+        use augmentagent_channel_core::providers::{ModelTier, ProviderKind};
+        let review = IndependentReview {
+            provider: Some(ProviderKind::Codex),
+            available: true,
+            diff_ok: true,
+            system_ok: true,
+            notes: String::new(),
+            why_unavailable: None,
+        };
+        let persisted = serde_json::to_value(review.recorded_verdict().unwrap()).unwrap();
+        assert_eq!(persisted["backend"], "native");
+        assert_eq!(persisted["model"], serde_json::Value::String(
+            augmentagent_channel_core::providers::model_for(ProviderKind::Codex, ModelTier::Quality)
+        ));
+    }
+
+    #[test]
+    fn legacy_verdict_without_backend_identity_cannot_release_merge() {
+        let legacy: RecordedVerdict = serde_json::from_value(serde_json::json!({
+            "provider": "codex", "diff_ok": true, "system_ok": true
+        })).unwrap();
+        assert_eq!(approval_of(Some(&legacy)), Approval::default());
+    }
+
     /// A draft the sweep can vouch for in every other respect, touching a
     /// receipt-gated path with the owner's Codex-only override switched on —
     /// so the override is the only thing deciding. (The receipt override is
