@@ -473,7 +473,8 @@ def read_only_operation(name, arguments):
     # These are explicit query contracts in augmentagent-mcp-memory, not
     # arbitrary server annotations or a prefix-based read exemption.
     if name in ('mcp__memory__memory_search', 'mcp__memory__memory_recent',
-                'mcp__memory__search_conversation_history', 'mcp__memory__read_conversation_thread'):
+                'mcp__memory__search_conversation_history', 'mcp__memory__read_conversation_thread',
+                'mcp__memory__search_messages', 'mcp__memory__conversation_stats'):
         return True
     if name.startswith('mcp__socialapi__'):
         verb = re.split(r'[_-]', name[len('mcp__socialapi__'):].lower(), maxsplit=1)[0]
