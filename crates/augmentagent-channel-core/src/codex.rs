@@ -1282,7 +1282,7 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
         const SCRIPT: &str = r##"
 cat >/dev/null
 exec python3 -I - "$@" <<'PY'
-import json, os, pathlib, select, subprocess, sys
+import base64, json, os, pathlib, select, subprocess, sys
 spec = next(arg for arg in sys.argv[1:] if arg.startswith('mcp_servers.jarvis='))
 args = json.loads('[' + spec.split('args=[', 1)[1].split(']', 1)[0] + ']')
 policy = json.loads(pathlib.Path(args[2]).read_text())
@@ -1312,9 +1312,12 @@ unknown_args = {'file_path':str(workspace / 'unknown.txt'),'content':'bad\n'}
 unknown = call(9, 'tools/call', {'name':'UnknownTool','arguments':unknown_args})
 invalid_write_args = {'file_path':str(workspace / 'invalid.txt')}
 invalid_write = call(10, 'tools/call', {'name':'Write','arguments':invalid_write_args})
-for name, arguments, result in [('Read',read_args,read),('Write',write_args,write),('Write',outside_args,outside),('Bash',bash_args,bash),('Read',escape_args,escape),('Write',escape_write_args,escape_write),('UnknownTool',unknown_args,unknown),('Write',invalid_write_args,invalid_write)]:
+image_args = {'file_path':str(workspace / 'fixture.png')}
+image = call(11, 'tools/call', {'name':'Read','arguments':image_args})
+image_exact = image['content'][0]['data'] == base64.b64encode((workspace / 'fixture.png').read_bytes()).decode()
+for name, arguments, result in [('Read',read_args,read),('Write',write_args,write),('Write',outside_args,outside),('Bash',bash_args,bash),('Read',escape_args,escape),('Write',escape_write_args,escape_write),('UnknownTool',unknown_args,unknown),('Write',invalid_write_args,invalid_write),('Read',image_args,image)]:
     print(json.dumps({'type':'item.completed','item':{'type':'mcp_tool_call','server':'jarvis','tool':name,'arguments':arguments,'result':result}}),flush=True)
-report = {'tools':tools,'read':read,'write':write,'outside':outside,'bash':bash,'escape':escape,'escape_write':escape_write,'unknown':unknown,'invalid_write':invalid_write}
+report = {'tools':tools,'read':read,'write':write,'outside':outside,'bash':bash,'escape':escape,'escape_write':escape_write,'unknown':unknown,'invalid_write':invalid_write,'image':image,'image_exact':image_exact}
 print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':json.dumps(report)}}),flush=True)
 bridge.stdin.close()
 bridge.wait(timeout=10)
@@ -1327,6 +1330,7 @@ PY
             let workspace = root.path().join(kind.name());
             std::fs::create_dir(&workspace).unwrap();
             std::fs::write(workspace.join("seed.txt"), "7\n").unwrap();
+            std::fs::write(workspace.join("fixture.png"), &[137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 8, 0, 0, 0, 8, 8, 2, 0, 0, 0, 75, 109, 41, 220, 0, 0, 0, 16, 73, 68, 65, 84, 120, 156, 99, 96, 96, 248, 143, 3, 13, 41, 9, 0, 169, 112, 63, 193, 20, 202, 234, 115, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130]).unwrap();
             std::os::unix::fs::symlink(root.path().join("outside.txt"), workspace.join("escape.txt")).unwrap();
             let bin = stub(&root, &format!("fake-{}", kind.name()), SCRIPT);
             let mut reasoner = if kind == ProviderKind::Codex {
@@ -1357,6 +1361,8 @@ PY
             assert_eq!(report["escape_write"]["isError"], true);
             assert_eq!(report["unknown"]["isError"], true);
             assert_eq!(report["invalid_write"]["isError"], true);
+            assert_eq!(report["image"]["content"][0]["mimeType"], "image/png");
+            assert_eq!(report["image_exact"], true);
             assert_ne!(report["bash"]["isError"], true);
             assert!(report["bash"]["content"][0]["text"].as_str().unwrap().contains("NINE"));
             assert_eq!(std::fs::read_to_string(workspace.join("result.txt")).unwrap(), "8\n");
@@ -1364,7 +1370,7 @@ PY
             assert!(!workspace.join("invalid.txt").exists());
             assert_eq!(std::fs::read_to_string(root.path().join("outside.txt")).unwrap(), "outside fixture\n");
             let records = std::fs::read_to_string(audit).unwrap();
-            assert_eq!(records.lines().count(), 8);
+            assert_eq!(records.lines().count(), 9);
             assert!(records.lines().all(|line| {
                 serde_json::from_str::<serde_json::Value>(line).unwrap()["provider"] == kind.name()
             }));
