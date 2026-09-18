@@ -313,6 +313,24 @@ mod tests {
     }
 
     #[test]
+    fn discord_default_scope_applies_only_to_unpinned_conversations() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SelectionStore::new(temp.path().join("selection.json"));
+        let available = |_| Ok(());
+        assert!(run_command(&store, "123", "/model set qwen scope:default", available)
+            .unwrap().contains("daemon default"));
+        assert_eq!(store.selected(Some("123")).unwrap(), Some(ProviderKind::Qwen));
+        assert_eq!(store.selected(Some("456")).unwrap(), Some(ProviderKind::Qwen));
+        run_command(&store, "123", "/model set codex", available);
+        run_command(&store, "456", "/model set glm scope:default", available);
+        assert_eq!(store.selected(Some("123")).unwrap(), Some(ProviderKind::Codex));
+        assert_eq!(store.selected(Some("456")).unwrap(), Some(ProviderKind::Glm));
+        assert_eq!(store.selected(None).unwrap(), Some(ProviderKind::Glm));
+        run_command(&store, "123", "/model reset", available);
+        assert_eq!(store.selected(Some("123")).unwrap(), Some(ProviderKind::Glm));
+    }
+
+    #[test]
     fn concurrent_channel_updates_remain_valid_and_isolated() {
         let temp = tempfile::tempdir().unwrap();
         let store = std::sync::Arc::new(SelectionStore::new(temp.path().join("selection.json")));

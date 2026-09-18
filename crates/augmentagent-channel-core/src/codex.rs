@@ -1276,6 +1276,82 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn all_selected_profiles_share_scoped_file_tools_and_audit_identity() {
+        const SCRIPT: &str = r##"
+cat >/dev/null
+exec python3 -I - "$@" <<'PY'
+import json, os, pathlib, select, subprocess, sys
+spec = next(arg for arg in sys.argv[1:] if arg.startswith('mcp_servers.jarvis='))
+args = json.loads('[' + spec.split('args=[', 1)[1].split(']', 1)[0] + ']')
+policy = json.loads(pathlib.Path(args[1]).read_text())
+workspace = pathlib.Path(policy['cwd'])
+bridge = subprocess.Popen(['python3', *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+def call(identifier, method, params):
+    bridge.stdin.write((json.dumps({'jsonrpc':'2.0','id':identifier,'method':method,'params':params})+'\n').encode())
+    bridge.stdin.flush()
+    if not select.select([bridge.stdout], [], [], 30)[0]:
+        raise TimeoutError(method)
+    return json.loads(bridge.stdout.readline())['result']
+call(1, 'initialize', {})
+tools = sorted(tool['name'] for tool in call(2, 'tools/list', {})['tools'])
+read_args = {'file_path':str(workspace / 'seed.txt')}
+read = call(3, 'tools/call', {'name':'Read','arguments':read_args})
+write_args = {'file_path':str(workspace / 'result.txt'),'content':'8\n'}
+write = call(4, 'tools/call', {'name':'Write','arguments':write_args})
+outside_args = {'file_path':str(workspace.parent / 'outside.txt'),'content':'bad\n'}
+outside = call(5, 'tools/call', {'name':'Write','arguments':outside_args})
+for name, arguments, result in [('Read',read_args,read),('Write',write_args,write),('Write',outside_args,outside)]:
+    print(json.dumps({'type':'item.completed','item':{'type':'mcp_tool_call','server':'jarvis','tool':name,'arguments':arguments,'result':result}}),flush=True)
+report = {'tools':tools,'read':read,'write':write,'outside':outside}
+print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':json.dumps(report)}}),flush=True)
+bridge.stdin.close()
+bridge.wait(timeout=10)
+PY
+"##;
+        let root = tempfile::tempdir().unwrap();
+        let mut inventories = Vec::new();
+        for kind in [ProviderKind::Codex, ProviderKind::Qwen, ProviderKind::Glm] {
+            let workspace = root.path().join(kind.name());
+            std::fs::create_dir(&workspace).unwrap();
+            std::fs::write(workspace.join("seed.txt"), "7\n").unwrap();
+            let bin = stub(&root, &format!("fake-{}", kind.name()), SCRIPT);
+            let mut reasoner = if kind == ProviderKind::Codex {
+                CodexCliReasoner::openai()
+            } else {
+                CodexCliReasoner::runpod(kind)
+            };
+            reasoner.bin = bin;
+            let mut options = opts();
+            options.cwd = Some(workspace.clone());
+            options.allowed_tools = vec!["Read".into(), "Write".into()];
+            options.session_id = Some(format!("synthetic-{}", kind.name()));
+            let audit = root.path().join(format!("audit-{}.jsonl", kind.name()));
+            options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(audit.clone())));
+            let config = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+            let config = crate::model_router::select_profile(Some(config), Some(kind)).unwrap();
+            let answer = crate::model_router::SNAPSHOT.scope(config,
+                reasoner.call(&options, "Read seed.txt, write result.txt, and refuse an out-of-scope write")).await.unwrap();
+            let report: serde_json::Value = serde_json::from_str(&answer).unwrap();
+            let tools = report["tools"].as_array().unwrap().clone();
+            assert!(tools.contains(&serde_json::json!("Read")) && tools.contains(&serde_json::json!("Write")));
+            inventories.push(tools);
+            assert!(report["read"]["content"][0]["text"].as_str().unwrap().contains('7'));
+            assert_ne!(report["write"]["isError"], true);
+            assert_eq!(report["outside"]["isError"], true);
+            assert_eq!(std::fs::read_to_string(workspace.join("result.txt")).unwrap(), "8\n");
+            assert!(!root.path().join("outside.txt").exists());
+            let records = std::fs::read_to_string(audit).unwrap();
+            assert_eq!(records.lines().count(), 3);
+            assert!(records.lines().all(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["provider"] == kind.name()
+            }));
+        }
+        assert_eq!(inventories[0], inventories[1]);
+        assert_eq!(inventories[1], inventories[2]);
+    }
+
     /// `IMAGE:` markers become native `-i` attachments and the marker lines
     /// leave the stdin prompt (crate::images convention).
     #[tokio::test]
