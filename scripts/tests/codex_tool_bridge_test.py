@@ -1102,9 +1102,16 @@ class HandoffTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path=Path(tmp)/'handoff.json'
             journal=bridge.HandoffJournal(path)
-            journal.observe_hook({'hook_event_name':'PreToolUse','tool_use_id':'synthetic-read',
-                'tool_name':'Bash','tool_input':{'command':'augmentagent repo-docs sources'}})
-            self.assertFalse(path.exists())
+            for index, command in enumerate([
+                    'augmentagent repo-docs sources', 'augmentagent finance status',
+                    'augmentagent finance transactions --start 2026-01-01',
+                    'augmentagent finance summary', 'augmentagent calendar list-events --days 1',
+                    'augmentagent meetup events code-coffee-philly',
+                    'augmentagent linkedin recent-dms --limit 3']):
+                journal.observe_hook({'hook_event_name':'PreToolUse',
+                    'tool_use_id':f'synthetic-read-{index}', 'tool_name':'Bash',
+                    'tool_input':{'command':command}})
+                self.assertFalse(path.exists(), command)
 
     def test_claude_hook_records_before_execution_and_codex_reuses_result(self):
         with tempfile.TemporaryDirectory() as tmp:

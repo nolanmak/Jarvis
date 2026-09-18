@@ -494,8 +494,14 @@ def read_only_operation(name, arguments):
     if len(argv) < 3:
         return False
     if program == 'augmentagent':
-        return (argv[1] == 'gmail' and argv[2] in {'search', 'accounts', 'list-attachments', 'get-attachment'}
-            or argv[1] == 'repo-docs' and argv[2] in {'sources', 'list', 'get'})
+        return ((argv[1], argv[2]) in {
+            ('gmail', 'search'), ('gmail', 'accounts'),
+            ('gmail', 'list-attachments'), ('gmail', 'get-attachment'),
+            ('repo-docs', 'sources'), ('repo-docs', 'list'), ('repo-docs', 'get'),
+            ('finance', 'status'), ('finance', 'transactions'), ('finance', 'summary'),
+            ('calendar', 'list-events'), ('meetup', 'events'),
+            ('linkedin', 'recent-dms'),
+        })
     return program == 'aa-gh' and argv[1] in {'issue', 'pr'} and argv[2] in {'list', 'view', 'diff', 'checks'}
 
 
