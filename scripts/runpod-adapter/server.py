@@ -92,10 +92,14 @@ class JobJournal:
 
     def finish(self, request_id, state):
         with self._connect() as db:
-            changed = db.execute('UPDATE jobs SET state=?, updated_at=? WHERE request_id=?',
-                                 (state, int(time.time()), request_id)).rowcount
-            if changed != 1:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute('''UPDATE jobs SET state=?, updated_at=? WHERE request_id=?
+                AND state NOT IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT')''',
+                (state, int(time.time()), request_id))
+            row = db.execute('SELECT state FROM jobs WHERE request_id=?', (request_id,)).fetchone()
+            if row is None:
                 raise ValueError('job has no matching journal entry')
+            return row[0]
 
     def get(self, request_id):
         with self._connect() as db:
@@ -133,8 +137,7 @@ def reconcile_job(journal, request_id, rpc_call=None):
     if result.get('id') != job['job_id'] or result.get('status') not in (
         'IN_QUEUE', 'IN_PROGRESS', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED', 'TIMED_OUT'):
         raise ValueError('Runpod returned an unverified job status')
-    journal.finish(request_id, result['status'])
-    return result['status']
+    return journal.finish(request_id, result['status'])
 
 def cancel_job(journal, request_id, base, rpc_call= None):
     """Only an explicit matching Runpod response confirms cancellation."""
@@ -150,8 +153,7 @@ def cancel_job(journal, request_id, base, rpc_call= None):
             state = 'CANCELLATION_UNKNOWN'
     except Exception:
         state = 'CANCELLATION_UNKNOWN'
-    journal.finish(request_id, state)
-    return state
+    return journal.finish(request_id, state)
 
 def validate_upstream_url(url):
     parsed = urllib.parse.urlsplit(url)
@@ -456,10 +458,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             deadline=time.monotonic()+1800;heartbeat=0
             while time.monotonic()<deadline:
                 result=rpc(base+'/status/'+job)
+                if result.get('id') != job:
+                    raise ValueError('Runpod returned an unverified job status')
                 if result['status']=='COMPLETED':
-                    journal.finish(self.request_id, 'COMPLETED');break
+                    recorded=journal.finish(self.request_id, 'COMPLETED')
+                    if recorded!='COMPLETED':
+                        if streaming:return
+                        return self.reply(409,{'error':{'message':'Runpod job outcome changed during polling; inspect recorded state','type':'job_conflict'},'state':recorded})
+                    break
                 if result['status'] in ['FAILED','CANCELLED','TIMED_OUT']:
-                    journal.finish(self.request_id, result['status'])
+                    recorded=journal.finish(self.request_id, result['status'])
+                    if recorded!=result['status']:
+                        if streaming:return
+                        return self.reply(409,{'error':{'message':'Runpod job outcome changed during polling; inspect recorded state','type':'job_conflict'},'state':recorded})
                     raise RuntimeError(str(result.get('error',result['status'])))
                 if streaming and time.monotonic()-heartbeat>10:
                     self.wfile.write(b': waiting for Runpod\n\n');self.wfile.flush();heartbeat=time.monotonic()

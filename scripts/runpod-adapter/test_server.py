@@ -152,6 +152,110 @@ class UpstreamCredentialTests(unittest.TestCase):
 
 
 class JobLifecycleTests(unittest.TestCase):
+    def test_stale_status_cannot_replace_confirmed_cancellation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = module.JobJournal(pathlib.Path(tmp) / 'jobs.sqlite3')
+            journal.start('request', 'qwen38-27b', 'queue', 'https://api.runpod.ai/v2/endpoint')
+            journal.submitted('request', 'job-1')
+            def stale_status(url, payload=None):
+                self.assertEqual(module.cancel_job(journal, 'request', None, lambda *_: {
+                    'id': 'job-1', 'status': 'CANCELLED',
+                }), 'CANCELLED')
+                return {'id': 'job-1', 'status': 'COMPLETED'}
+            self.assertEqual(module.reconcile_job(journal, 'request', stale_status), 'CANCELLED')
+            self.assertEqual(journal.get('request')['state'], 'CANCELLED')
+
+    def test_cancel_ack_cannot_replace_already_recorded_completion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = module.JobJournal(pathlib.Path(tmp) / 'jobs.sqlite3')
+            journal.start('request', 'qwen38-27b', 'queue', 'https://api.runpod.ai/v2/endpoint')
+            journal.submitted('request', 'job-1')
+            def stale_cancel_ack(url, payload=None):
+                journal.finish('request', 'COMPLETED')
+                return {'id': 'job-1', 'status': 'CANCELLED'}
+            self.assertEqual(module.cancel_job(journal, 'request', None, stale_cancel_ack), 'COMPLETED')
+            self.assertEqual(journal.get('request')['state'], 'COMPLETED')
+
+    def test_queue_poll_does_not_deliver_stale_completion_after_cancel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            routes = pathlib.Path(tmp) / 'routes.json'
+            routes.write_text(json.dumps({'qwen38-27b': {
+                'type': 'ollama-queue', 'base_url': 'https://api.runpod.ai/v2/endpoint',
+                'max_output_tokens': 128,
+            }}))
+            journal_path = pathlib.Path(tmp) / 'jobs.sqlite3'
+            def upstream(url, payload=None):
+                if url.endswith('/run'):
+                    return {'id': 'job-1'}
+                if url.endswith('/status/job-1'):
+                    journal = module.JobJournal(journal_path)
+                    self.assertEqual(module.cancel_job(journal, 'request-1', None, lambda *_: {
+                        'id': 'job-1', 'status': 'CANCELLED',
+                    }), 'CANCELLED')
+                    return {'id': 'job-1', 'status': 'COMPLETED',
+                            'output': {'message': {'role': 'assistant', 'content': 'READY'}}}
+                raise AssertionError(url)
+            server = module.http.server.ThreadingHTTPServer(('127.0.0.1', 0), module.Handler)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                with mock.patch.object(module, 'ROUTES', routes), \
+                     mock.patch.object(module, 'JOURNAL', journal_path), \
+                     mock.patch.object(module, 'rpc', upstream):
+                    conn = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=2)
+                    conn.request('POST', '/v1/chat/completions', json.dumps({
+                        'model': 'qwen38-27b', 'messages': [{'role': 'user', 'content': 'hello'}]}),
+                        {'Authorization': 'Bearer test-client-key', 'Content-Type': 'application/json',
+                         'Idempotency-Key': 'request-1'})
+                    response = conn.getresponse()
+                    payload = response.read()
+                    self.assertEqual(response.status, 409)
+                    self.assertNotIn(b'READY', payload)
+                    conn.close()
+                self.assertEqual(module.JobJournal(journal_path).get('request-1')['state'], 'CANCELLED')
+            finally:
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=2)
+
+    def test_queue_poll_rejects_another_jobs_completion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            routes = pathlib.Path(tmp) / 'routes.json'
+            routes.write_text(json.dumps({'qwen38-27b': {
+                'type': 'ollama-queue', 'base_url': 'https://api.runpod.ai/v2/endpoint',
+                'max_output_tokens': 128,
+            }}))
+            journal_path = pathlib.Path(tmp) / 'jobs.sqlite3'
+            def upstream(url, payload=None):
+                if url.endswith('/run'):
+                    return {'id': 'job-1'}
+                if url.endswith('/status/job-1'):
+                    return {'id': 'different-job', 'status': 'COMPLETED',
+                            'output': {'message': {'role': 'assistant', 'content': 'READY'}}}
+                raise AssertionError(url)
+            server = module.http.server.ThreadingHTTPServer(('127.0.0.1', 0), module.Handler)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                with mock.patch.object(module, 'ROUTES', routes), \
+                     mock.patch.object(module, 'JOURNAL', journal_path), \
+                     mock.patch.object(module, 'rpc', upstream):
+                    conn = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=2)
+                    conn.request('POST', '/v1/chat/completions', json.dumps({
+                        'model': 'qwen38-27b', 'messages': [{'role': 'user', 'content': 'hello'}]}),
+                        {'Authorization': 'Bearer test-client-key', 'Content-Type': 'application/json',
+                         'Idempotency-Key': 'request-1'})
+                    response = conn.getresponse()
+                    payload = response.read()
+                    self.assertEqual(response.status, 409)
+                    self.assertNotIn(b'READY', payload)
+                    conn.close()
+                self.assertEqual(module.JobJournal(journal_path).get('request-1')['state'], 'POLL_UNKNOWN')
+            finally:
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=2)
+
     def test_runpod_rejections_keep_auth_rate_limit_and_ambiguous_errors_distinct(self):
         with tempfile.TemporaryDirectory() as tmp:
             routes = pathlib.Path(tmp) / 'routes.json'
@@ -218,7 +322,7 @@ class JobLifecycleTests(unittest.TestCase):
                     submitted.append(payload)
                     return {'id': 'job-1'}
                 if url.endswith('/status/job-1'):
-                    return {'status': 'COMPLETED', 'output': {
+                    return {'id': 'job-1', 'status': 'COMPLETED', 'output': {
                         'message': {'role': 'assistant', 'content': 'done'}}}
                 raise AssertionError('unexpected Runpod call')
 
