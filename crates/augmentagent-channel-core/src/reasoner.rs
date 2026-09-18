@@ -1000,7 +1000,9 @@ impl ClaudeCliReasoner {
         args.push("--system-prompt".into());
         args.push(effective_system.to_string());
 
-        if let Some(m) = &opts.model {
+        let router = crate::model_router::current()?.filter(|r| r.enabled());
+        let routed_model = router.as_ref().and_then(|r| r.model(crate::providers::ProviderKind::Claude, crate::providers::tier_of(opts)));
+        if let Some(m) = routed_model.as_ref().or(opts.model.as_ref()) {
             args.push("--model".into());
             args.push(m.clone());
         }
@@ -1075,6 +1077,7 @@ impl ClaudeCliReasoner {
         if !opts.env.is_empty() {
             cmd.envs(opts.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         }
+        if let Some(router) = &router { router.configure_claude(&mut cmd); }
         // Bank credentials belong to the importer, never to model subprocesses.
         for (key, _) in std::env::vars().chain(opts.env.iter().cloned()) {
             if key.starts_with("PLAID_") {
@@ -1181,7 +1184,7 @@ impl ClaudeCliReasoner {
             crate::token_usage::UsageLogger::global().append(
                 &crate::token_usage::UsageRecord::for_call(
                     crate::providers::ProviderKind::Claude,
-                    opts.model.clone().unwrap_or_else(|| "(inherited)".into()),
+                    routed_model.clone().or_else(|| opts.model.clone()).unwrap_or_else(|| "(inherited)".into()),
                     crate::providers::classify(opts),
                     usage,
                     call_started,
@@ -4192,6 +4195,29 @@ sleep 0.15
     /// ending as codex's: a `TurnFailure` of class Content, still untyped for
     /// the chain, so the fallback layer can tell it apart from any other
     /// untyped error before recording a completed-without-summary verdict.
+    #[tokio::test]
+    async fn router_reaches_claude_spawn_after_restricted_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let argv = dir.path().join("argv");
+        let auth = dir.path().join("auth");
+        let bin = stub_cli(&dir, "router-claude", &format!(r#"
+cat >/dev/null
+printf '%s\n' "$@" >{argv}
+printf '%s\n%s' "$ANTHROPIC_BASE_URL" "$ANTHROPIC_AUTH_TOKEN" >{auth}
+echo '{{"type":"result","result":"ok","is_error":false}}'
+"#,argv=argv.display(),auth=auth.display()));
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        let mut options = dummy_opts(); options.restrict_env = true;
+        let config = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+        let answer = crate::model_router::SNAPSHOT.scope(Some(config), reasoner.call(&options, "test")).await.unwrap();
+        assert_eq!(answer, "ok");
+        let args = std::fs::read_to_string(argv).unwrap();
+        assert!(args.contains("cc/claude-opus-4-6"));
+        assert!(args.contains("--allowedTools") && args.contains("--permission-mode"));
+        assert!(!args.contains("router-secret"));
+        assert_eq!(std::fs::read_to_string(auth).unwrap(), "http://127.0.0.1:20128\nrouter-secret");
+    }
+
     #[tokio::test]
     async fn empty_output_is_a_content_turn_failure() {
         let dir = tempfile::tempdir().unwrap();

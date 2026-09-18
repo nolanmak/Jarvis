@@ -127,6 +127,8 @@ struct ReviewLifecycle {
 /// channel generics swap from `ClaudeCliReasoner` with a one-word change.
 pub struct FallbackReasoner {
     entries: Vec<Entry>,
+    /// Adapters registered only for dashboard routing; direct mode excludes them.
+    gateway_only: Vec<ProviderKind>,
     latch: CooldownLatch,
     /// #803 — resource accounting for this instance: `(provider, calls
     /// attempted, calls that returned Ok)`, in chain order of first use. The
@@ -203,6 +205,16 @@ fn entry_for(kind: ProviderKind) -> Option<Entry> {
 /// log line instead of erroring on every call.
 pub fn build_reasoner() -> Arc<FallbackReasoner> {
     let mut entries: Vec<Entry> = chain_from_env().into_iter().filter_map(entry_for).collect();
+    let mut gateway_only = Vec::new();
+    // Pre-register gateway adapters while configured, even in direct mode,
+    // so the dashboard can enable routing without restarting the daemon.
+    if crate::model_router::load().ok().flatten().is_some() {
+        for kind in [ProviderKind::Claude, ProviderKind::Codex] {
+            if !entries.iter().any(|e| e.kind == kind) {
+                if let Some(entry) = entry_for(kind) { gateway_only.push(kind); entries.push(entry); }
+            }
+        }
+    }
     if entries.is_empty() {
         // Unreachable via chain_from_env (it always yields claude), but keep
         // the invariant explicit: the composite always has a primary.
@@ -217,6 +229,7 @@ pub fn build_reasoner() -> Arc<FallbackReasoner> {
     }
     Arc::new(FallbackReasoner {
         entries,
+        gateway_only,
         latch: CooldownLatch::system(),
         usage: std::sync::Mutex::new(Vec::new()),
         mutation_providers: std::sync::Mutex::new(Vec::new()),
@@ -240,6 +253,7 @@ pub fn build_pinned(kind: ProviderKind) -> Option<Arc<FallbackReasoner>> {
     entry_for(kind).map(|entry| {
         Arc::new(FallbackReasoner {
             entries: vec![entry],
+            gateway_only: Vec::new(),
             latch: CooldownLatch::system(),
             usage: std::sync::Mutex::new(Vec::new()),
             mutation_providers: std::sync::Mutex::new(Vec::new()),
@@ -268,6 +282,7 @@ impl FallbackReasoner {
     /// `ClaudeCliReasoner` construction it replaces.
     pub fn claude_only() -> Self {
         FallbackReasoner {
+            gateway_only: Vec::new(),
             entries: vec![Entry {
                 kind: ProviderKind::Claude,
                 reasoner: Arc::new(ClaudeCliReasoner::new()),
@@ -286,6 +301,7 @@ impl FallbackReasoner {
         latch: CooldownLatch,
     ) -> Self {
         FallbackReasoner {
+            gateway_only: Vec::new(),
             entries: chain
                 .into_iter()
                 .map(|(kind, reasoner)| Entry { kind, reasoner })
@@ -311,15 +327,20 @@ impl FallbackReasoner {
         &self,
         class: crate::providers::CapabilityClass,
     ) -> LaneAvailability {
+        let Ok(routing) = crate::model_router::current() else { return LaneAvailability::NoEligibleProvider; };
         let mut latched = Vec::new();
         let mut eligible = 0usize;
         for entry in &self.entries {
+            if routing.as_ref().is_some_and(|r| !r.allows(entry.kind))
+                || (!routing.as_ref().is_some_and(|r| r.enabled()) && self.gateway_only.contains(&entry.kind)) {
+                continue;
+            }
             if !allowed_for(entry.kind, class) {
                 continue;
             }
             eligible += 1;
             let name = entry.kind.name();
-            match self.latch.latched_until(name) {
+            match if routing.as_ref().is_some_and(|r| r.enabled()) { None } else { self.latch.latched_until(name) } {
                 None => return LaneAvailability::Available,
                 Some(until) => latched.push((name.to_string(), Some(until))),
             }
@@ -451,6 +472,17 @@ impl FallbackReasoner {
         transcript: bool,
         revision_authors: Option<&[ProviderKind]>,
     ) -> anyhow::Result<String> {
+        let config = crate::model_router::load().map_err(|_| ReasonerError::Local {
+            message: "Invalid model router configuration; refusing dispatch".into(),
+        })?;
+        crate::model_router::SNAPSHOT.scope(config, self.dispatch_snapshot(opts, user_message, transcript, revision_authors)).await
+    }
+
+    async fn dispatch_snapshot(
+        &self, opts: &ReasonerOpts, user_message: &str, transcript: bool,
+        revision_authors: Option<&[ProviderKind]>,
+    ) -> anyhow::Result<String> {
+        let routing = crate::model_router::current()?;
         // Binding and admission share one lock. Once admitted, no caller can
         // retrofit a history that misses an earlier mutating dispatch.
         self.review_history.lock().unwrap_or_else(|e| e.into_inner()).admitted = true;
@@ -476,7 +508,13 @@ impl FallbackReasoner {
                 }
             }
         }
-        let primary = self.entries.first().map(|e| e.kind);
+        let mut dispatch_entries: Vec<_> = self.entries.iter().collect();
+        if routing.as_ref().is_some_and(|r| r.enabled()) {
+            dispatch_entries.sort_by_key(|e| if e.kind == ProviderKind::Claude { 0 } else { 1 });
+        } else {
+            dispatch_entries.retain(|e| !self.gateway_only.contains(&e.kind));
+        }
+        let primary = dispatch_entries.iter().find(|e| routing.as_ref().is_none_or(|r| r.allows(e.kind))).map(|e| e.kind);
         // The PRIMARY's provider-side error is what callers must see when
         // the whole chain fails (#655 review): a trailing Local fault from a
         // misconfigured fallback would otherwise mask the rate limit and
@@ -486,8 +524,15 @@ impl FallbackReasoner {
         let mut skipped_latched = 0usize;
         let mut diagnostics = Vec::new();
 
-        for entry in &self.entries {
+        for entry in dispatch_entries {
             let name = entry.kind.name();
+            if routing.as_ref().is_some_and(|r| !r.allows(entry.kind)) {
+                diagnostics.push(format!("{name}: excluded by selected model route"));
+                continue;
+            }
+            // Account cooldowns belong to 9Router. Native-login cooldowns must
+            // neither block a fresh account pool nor be cleared by its success.
+            let routed = routing.as_ref().is_some_and(|r| r.enabled());
             if revision_authors.is_some_and(|authors| !authors.contains(&entry.kind)) {
                 diagnostics.push(format!("{name}: reserved for independent review"));
                 continue;
@@ -496,7 +541,7 @@ impl FallbackReasoner {
                 diagnostics.push(format!("{name}: skipped ({class:?} unsupported)"));
                 continue;
             }
-            if let Some(until) = self.latch.latched_until(name) {
+            if let Some(until) = if routed { None } else { self.latch.latched_until(name) } {
                 skipped_latched += 1;
                 diagnostics.push(format!("{name}: skipped (cooldown)"));
                 tracing::debug!(provider = name, %until, "provider latched; skipping");
@@ -539,7 +584,7 @@ impl FallbackReasoner {
                             primary.map(|p| p.name()).unwrap_or("primary")
                         );
                     }
-                    self.latch.clear(name);
+                    if !routed { self.latch.clear(name); }
                     return Ok(text);
                 }
                 Err(err) => match ReasonerError::find_in(&err) {
@@ -560,7 +605,7 @@ impl FallbackReasoner {
                                 crate::providers::CapabilityClass::TextOnly
                                     | crate::providers::CapabilityClass::ReadTools
                             );
-                        if latchworthy {
+                        if latchworthy && !routed {
                             let until = match re {
                                 ReasonerError::RateLimited {
                                     reset_at: Some(at), ..
@@ -580,7 +625,7 @@ impl FallbackReasoner {
                                 "provider failed provider-side ({re}); latched, trying next in chain"
                             );
                             self.latch.latch(name, until, &re.to_string());
-                        } else {
+                        } else if !latchworthy {
                             warn!(
                                 provider = name,
                                 "provider timed out on a long-running {class:?} call; \
@@ -1141,6 +1186,69 @@ mod tests {
         assert_eq!(got, "primary answer");
         assert_eq!(a.count(), 1);
         assert_eq!(b.count(), 0, "fallback must not be probed on success");
+    }
+
+    #[tokio::test]
+    async fn disabling_router_restores_exact_native_chain_and_preserves_pinned_reviewers() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = Scripted::err(rate_limited);
+        let codex = Scripted::ok("must not run in direct mode");
+        let mut chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, claude), (ProviderKind::Codex, codex.clone()),
+        ], latch_in(&dir));
+        chain.gateway_only.push(ProviderKind::Codex);
+        let mut config = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+        config.mode = "direct".into();
+        assert!(crate::model_router::SNAPSHOT.scope(Some(config.clone()),
+            chain.dispatch_snapshot(&text_only_opts(), "test", false, None)).await.is_err());
+        assert_eq!(codex.count(), 0);
+        assert!(chain.call(&text_only_opts(), "test").await.is_err(), "removing configuration also excludes gateway-only adapters");
+        assert_eq!(codex.count(), 0);
+        let pinned = FallbackReasoner::for_tests(vec![(ProviderKind::Codex, codex.clone())], latch_in(&tempfile::tempdir().unwrap()));
+        crate::model_router::SNAPSHOT.scope(Some(config),
+            pinned.dispatch_snapshot(&text_only_opts(), "test", false, None)).await.unwrap();
+        assert_eq!(codex.count(), 1, "an explicitly pinned reviewer is not filtered by the global native chain");
+    }
+
+    #[tokio::test]
+    async fn router_accounts_are_ready_even_when_native_login_is_latched() {
+        let dir = tempfile::tempdir().unwrap();
+        let latch = latch_in(&dir);
+        latch.latch("claude", Utc::now() + chrono::Duration::minutes(5), "native exhausted");
+        let chain = FallbackReasoner::for_tests(vec![(ProviderKind::Claude, Scripted::ok("ok"))], latch);
+        let config = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+        crate::model_router::SNAPSHOT.scope(Some(config), async {
+            assert_eq!(chain.lane_availability(crate::providers::CapabilityClass::TextOnly), LaneAvailability::Available);
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn router_selection_is_strict_and_auto_fails_over_without_native_cooldowns() {
+        let dir = tempfile::tempdir().unwrap();
+        let latch = latch_in(&dir);
+        latch.latch("claude", Utc::now() + chrono::Duration::minutes(5), "native account exhausted");
+        let claude = Scripted::err(rate_limited);
+        let codex = Scripted::ok("codex answer");
+        let chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Codex, codex.clone()), (ProviderKind::Claude, claude.clone()),
+        ], latch);
+        let config = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+        let opts = text_only_opts();
+        let answer = crate::model_router::SNAPSHOT.scope(Some(config.clone()),
+            chain.dispatch_snapshot(&opts, "test", false, None)).await.unwrap();
+        assert_eq!(answer, "codex answer");
+        assert_eq!(claude.count(), 1, "auto starts with Claude despite a native cooldown");
+        assert_eq!(codex.count(), 1);
+        let mut only_claude = config.clone(); only_claude.mode = "claude".into();
+        assert!(crate::model_router::SNAPSHOT.scope(Some(only_claude),
+            chain.dispatch_snapshot(&opts, "test", false, None)).await.is_err());
+        assert_eq!(codex.count(), 1, "Claude-only never silently switches provider");
+        let mut only_codex = config; only_codex.mode = "codex".into();
+        crate::model_router::SNAPSHOT.scope(Some(only_codex),
+            chain.dispatch_snapshot(&opts, "test", false, None)).await.unwrap();
+        assert_eq!(claude.count(), 2);
+        assert_eq!(codex.count(), 2);
+        assert!(chain.latch.latched_until("claude").is_some(), "routing must preserve the native login cooldown");
     }
 
     #[tokio::test]

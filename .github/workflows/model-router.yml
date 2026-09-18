@@ -1,0 +1,50 @@
+name: Model router
+on:
+  pull_request:
+    paths:
+      - 'crates/augmentagent-channel-core/**'
+      - 'src/modelRouter*'
+      - 'src/dashboard.ts'
+      - 'views/model-*'
+      - 'test/modelRouter*'
+      - 'scripts/*model-router*'
+      - 'scripts/tests/model_router*'
+      - 'sidecars/9router/**'
+      - '.github/workflows/model-router.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/augmentagent-channel-core/**'
+      - 'src/modelRouter*'
+      - 'src/dashboard.ts'
+      - 'views/model-*'
+      - 'test/modelRouter*'
+      - 'scripts/*model-router*'
+      - 'scripts/tests/model_router*'
+      - 'sidecars/9router/**'
+      - '.github/workflows/model-router.yml'
+permissions:
+  contents: read
+jobs:
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - run: python3 -m unittest discover -s scripts/tests -p model_router_install_test.py
+  adapters:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p augmentagent-channel-core --lib

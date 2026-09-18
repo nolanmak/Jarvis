@@ -84,3 +84,5 @@ pub use trigger::{
     kind as work_item_kind, ChannelRunner, DigestSource, FriendFeedSource, FriendFeedTrigger,
     InboundMessageTrigger, InboundSource, Trigger, WorkItem, WorkItemHandler,
 };
+
+pub mod model_router;
