@@ -8,6 +8,8 @@ import json
 import threading
 from unittest import mock
 import sqlite3
+import contextlib
+import concurrent.futures
 import urllib.error
 
 ROOT = pathlib.Path(__file__).parent
@@ -217,6 +219,9 @@ class JobLifecycleTests(unittest.TestCase):
             journal = module.JobJournal(path)
             self.assertEqual(journal.get('old-request')['job_id'], 'old-job')
             self.assertIsNone(journal.get('old-request')['endpoint_url'])
+            with contextlib.closing(sqlite3.connect(path)) as db:
+                columns = {row[1] for row in db.execute('PRAGMA table_info(jobs)')}
+            self.assertIn('body_digest', columns)
 
     def test_reconcile_uses_original_endpoint_and_requires_matching_job_id(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -400,6 +405,89 @@ class JobLifecycleTests(unittest.TestCase):
                 journal.start('request-1', 'qwen38-27b', 'queue')
             self.assertEqual(journal.get('request-1')['state'], 'SUBMISSION_UNKNOWN')
 
+    def test_unkeyed_retry_uses_request_fingerprint_across_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / 'jobs.sqlite3'
+            body = {'model': 'qwen38-27b', 'messages': [
+                {'role': 'user', 'content': 'same logical request'}]}
+            digest = module.request_fingerprint(body)
+            journal = module.JobJournal(path)
+            journal.start('first', 'qwen38-27b', 'queue', body_digest=digest)
+            journal.finish('first', 'SUBMISSION_UNKNOWN')
+            restarted = module.JobJournal(path)
+            with self.assertRaises(module.DuplicateRequestError):
+                restarted.start('retry', 'qwen38-27b', 'queue', body_digest=digest)
+            self.assertIsNone(restarted.get('retry'))
+            self.assertNotIn('same logical request', path.read_bytes().decode(errors='ignore'))
+            changed = {**body, 'messages': [{'role': 'user', 'content': 'different request'}]}
+            restarted.start('different', 'qwen38-27b', 'queue',
+                            body_digest=module.request_fingerprint(changed))
+            restarted.finish('different', 'COMPLETED')
+            with self.assertRaises(module.DuplicateRequestError):
+                restarted.start('lost-completion-retry', 'qwen38-27b', 'queue',
+                                body_digest=module.request_fingerprint(changed))
+
+    def test_concurrent_unkeyed_submissions_keep_one_journal_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / 'jobs.sqlite3'
+            module.JobJournal(path)
+            digest = module.request_fingerprint({'model': 'qwen38-27b',
+                'messages': [{'role': 'user', 'content': 'same request'}]})
+            barrier = threading.Barrier(2)
+
+            def submit(request_id):
+                barrier.wait(timeout=2)
+                try:
+                    module.JobJournal(path).start(request_id, 'qwen38-27b', 'queue',
+                                                  body_digest=digest)
+                    return 'submitted'
+                except module.DuplicateRequestError:
+                    return 'duplicate'
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(submit, ('first', 'second')))
+            self.assertCountEqual(results, ['submitted', 'duplicate'])
+            with contextlib.closing(sqlite3.connect(path)) as db:
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 1)
+
+    def test_unkeyed_gateway_retry_does_not_resubmit_unknown_queue_job(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            routes = pathlib.Path(tmp) / 'routes.json'
+            routes.write_text(json.dumps({'qwen38-27b': {'type': 'ollama-queue',
+                'base_url': 'https://api.runpod.ai/v2/endpoint', 'max_output_tokens': 128}}))
+            journal_path = pathlib.Path(tmp) / 'jobs.sqlite3'
+            calls = []
+
+            def lost_response(url, payload=None):
+                calls.append(url)
+                raise TimeoutError('Runpod may have accepted the job')
+
+            server = module.http.server.ThreadingHTTPServer(('127.0.0.1', 0), module.Handler)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                with mock.patch.object(module, 'ROUTES', routes), \
+                     mock.patch.object(module, 'JOURNAL', journal_path), \
+                     mock.patch.object(module, 'rpc', lost_response):
+                    for _ in range(2):
+                        conn = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=2)
+                        conn.request('POST', '/v1/chat/completions', json.dumps({
+                            'model': 'qwen38-27b', 'messages': [
+                                {'role': 'user', 'content': 'hello'}]}),
+                            {'Authorization': 'Bearer test-client-key',
+                             'Content-Type': 'application/json'})
+                        response = conn.getresponse()
+                        self.assertEqual(response.status, 409)
+                        response.read()
+                        conn.close()
+                self.assertEqual(calls, ['https://api.runpod.ai/v2/endpoint/run'])
+                with contextlib.closing(sqlite3.connect(journal_path)) as db:
+                    self.assertEqual(db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 1)
+            finally:
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=2)
+
     def test_cancel_acknowledgement_must_name_job_and_confirm_cancelled(self):
         with tempfile.TemporaryDirectory() as tmp:
             journal = module.JobJournal(pathlib.Path(tmp) / 'jobs.sqlite3')
@@ -448,7 +536,7 @@ class JobLifecycleTests(unittest.TestCase):
                 with mock.patch.object(module, 'ROUTES', routes), \
                      mock.patch.object(module, 'JOURNAL', journal_path), \
                      mock.patch.object(module, 'rpc', lost_response):
-                    for expected in (502, 409):
+                    for expected in (409, 409):
                         conn = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=2)
                         conn.request('POST', '/v1/chat/completions',
                                      json.dumps({'model': 'qwen38-27b', 'messages': [
@@ -494,7 +582,7 @@ class JobLifecycleTests(unittest.TestCase):
                 with mock.patch.object(module, 'ROUTES', routes), \
                      mock.patch.object(module, 'JOURNAL', journal_path), \
                      mock.patch.object(module, 'request', lost_response):
-                    for expected in (502, 409):
+                    for expected in (409, 409):
                         conn = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=2)
                         conn.request('POST', '/v1/chat/completions',
                                      json.dumps({'model': 'glm-5.3-flash', 'messages': [
@@ -558,7 +646,7 @@ class JobLifecycleTests(unittest.TestCase):
                     self.assertIsNone(module.JobJournal(journal_path).get('second'))
                     release.set()
                     first.join(timeout=3)
-                    self.assertEqual(first_status, [502])
+                    self.assertEqual(first_status, [409])
             finally:
                 release.set()
                 server.shutdown()

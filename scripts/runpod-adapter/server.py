@@ -1,4 +1,4 @@
-import base64, binascii, contextlib, http.server, json, os, re, secrets, sqlite3, stat, threading, time, urllib.request, urllib.error, urllib.parse, uuid
+import base64, binascii, contextlib, hashlib, hmac, http.server, json, os, re, secrets, sqlite3, stat, threading, time, urllib.request, urllib.error, urllib.parse, uuid
 from pathlib import Path
 
 API_KEY = os.environ['RUNPOD_API_KEY']
@@ -9,6 +9,11 @@ MAX_IN_FLIGHT = threading.BoundedSemaphore(2)
 
 class DuplicateRequestError(ValueError):
     pass
+
+def request_fingerprint(body):
+    """Private stable digest for a retry whose gateway discarded its request key."""
+    canonical = json.dumps(body, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+    return hmac.new(CLIENT_KEY.encode(), canonical.encode(), hashlib.sha256).hexdigest()
 
 class JobJournal:
     """Durable, prompt-free Runpod job lifecycle. A reused request key never resubmits."""
@@ -29,9 +34,13 @@ class JobJournal:
             db.execute('''CREATE TABLE IF NOT EXISTS jobs (
                 request_id TEXT PRIMARY KEY, model TEXT NOT NULL, route TEXT NOT NULL,
                 job_id TEXT, state TEXT NOT NULL, updated_at INTEGER NOT NULL,
-                endpoint_url TEXT)''')
-            if 'endpoint_url' not in {row[1] for row in db.execute('PRAGMA table_info(jobs)')}:
+                endpoint_url TEXT, body_digest TEXT)''')
+            columns = {row[1] for row in db.execute('PRAGMA table_info(jobs)')}
+            if 'endpoint_url' not in columns:
                 db.execute('ALTER TABLE jobs ADD COLUMN endpoint_url TEXT')
+            if 'body_digest' not in columns:
+                db.execute('ALTER TABLE jobs ADD COLUMN body_digest TEXT')
+            db.execute('CREATE INDEX IF NOT EXISTS jobs_body_digest ON jobs(body_digest)')
 
     @contextlib.contextmanager
     def _connect(self):
@@ -43,13 +52,19 @@ class JobJournal:
         finally:
             db.close()
 
-    def start(self, request_id, model, route, endpoint_url=None):
+    def start(self, request_id, model, route, endpoint_url=None, body_digest=None):
         with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if body_digest and db.execute('''SELECT 1 FROM jobs WHERE body_digest=?
+                AND (state NOT IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT')
+                     OR (state='COMPLETED' AND updated_at>=?)) LIMIT 1''',
+                (body_digest, int(time.time())-3600)).fetchone():
+                raise DuplicateRequestError('matching Runpod request already recorded; inspect job journal before retry')
             try:
                 db.execute('''INSERT INTO jobs
-                    (request_id, model, route, job_id, state, updated_at, endpoint_url)
-                    VALUES (?, ?, ?, NULL, ?, ?, ?)''',
-                           (request_id, model, route, 'SUBMITTING', int(time.time()), endpoint_url))
+                    (request_id, model, route, job_id, state, updated_at, endpoint_url, body_digest)
+                    VALUES (?, ?, ?, NULL, ?, ?, ?, ?)''',
+                           (request_id, model, route, 'SUBMITTING', int(time.time()), endpoint_url, body_digest))
             except sqlite3.IntegrityError as error:
                 raise DuplicateRequestError('request key already used; inspect job journal before retry') from error
 
@@ -369,12 +384,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 fmt=body.get('response_format',{})
                 if fmt.get('type')=='json_object':payload['format']='json'
                 if fmt.get('type')=='json_schema':payload['format']=fmt.get('json_schema',{}).get('schema')
+            digest=request_fingerprint(body)
             key=self.headers.get('Idempotency-Key')
             if key is not None and not re.fullmatch(r'[A-Za-z0-9._-]{1,128}', key):
                 raise ValueError('invalid idempotency key')
             self.request_id=key or uuid.uuid4().hex
             journal=JobJournal(JOURNAL)
-            journal.start(self.request_id, model, 'load_balancer' if route['type']=='openai' else 'queue', route['base_url'])
+            journal.start(self.request_id, model, 'load_balancer' if route['type']=='openai' else 'queue', route['base_url'], digest)
             if route['type']=='openai':
                 try:
                     with request(route['base_url']+'/chat/completions',body,timeout=340) as upstream:
@@ -435,6 +451,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if submitted and journal and journal.get(self.request_id)['state']=='SUBMITTED':
                 journal.finish(self.request_id, 'POLL_UNKNOWN')
             print('chat failure', type(e).__name__, 'job', job or '-', flush=True)
+            recorded=journal.get(self.request_id) if journal and getattr(self,'request_id',None) else None
+            state=recorded['state'] if recorded else None
+            uncertain=state in ('SUBMISSION_UNKNOWN','POLL_UNKNOWN','RESULT_UNKNOWN','CANCELLATION_UNKNOWN','CANCELLATION_UNSUPPORTED')
+            if uncertain and not streaming:
+                return self.reply(409,{'error':{'message':'Runpod request outcome is uncertain; reconcile the recorded request before retry',
+                                                 'type':'reconciliation_required'}})
             error={'error':{'message':public_error(e),'type':'upstream_error'}}
             if streaming:
                 self.wfile.write(('data: '+json.dumps(error)+'\n\ndata: [DONE]\n\n').encode());self.wfile.flush()

@@ -65,6 +65,85 @@ class RouterFailover(unittest.TestCase):
             if node: api('/api/provider-nodes/'+node['node']['id'],method='DELETE')
             server.shutdown();server.server_close();thread.join()
 
+    def test_chat_completion_forwards_idempotency_key(self):
+        config = json.loads(Path(os.environ['JARVIS_TEST_MODEL_ROUTER_CONFIG']).read_text())
+        base = config['base_url'].removesuffix('/v1')
+        self.assertTrue(base.startswith('http://127.0.0.1:'))
+        upstream_host = config.get('upstream_host', '127.0.0.1')
+        seen = []
+
+        class Upstream(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get('Content-Length', 0)))
+                seen.append((self.headers.get('Idempotency-Key'), sorted(self.headers.keys())))
+                body = ({'id': 'qa', 'object': 'chat.completion', 'created': 1,
+                         'model': 'qa-model', 'choices': [{'index': 0,
+                         'message': {'role': 'assistant', 'content': 'SYNTHETIC_OK'},
+                         'finish_reason': 'stop'}]} if len(seen) == 1 else
+                        {'error': {'message': 'synthetic reconciliation required',
+                                   'type': 'reconciliation_required'}})
+                data = json.dumps(body).encode()
+                self.send_response(200 if len(seen) == 1 else 409)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        bind_host = '0.0.0.0' if upstream_host == 'host.docker.internal' else '127.0.0.1'
+        server = http.server.ThreadingHTTPServer((bind_host, 0), Upstream)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        cookie = None
+
+        def api(endpoint, body=None, method=None, inference=False, idempotency_key=None):
+            headers = {'Content-Type': 'application/json'}
+            if cookie:
+                headers['Cookie'] = cookie
+            if inference:
+                headers['Authorization'] = 'Bearer ' + config['api_key']
+            if idempotency_key:
+                headers['Idempotency-Key'] = idempotency_key
+            request = urllib.request.Request(base + endpoint,
+                    data=None if body is None else json.dumps(body).encode(),
+                    headers=headers, method=method)
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.load(response), response.headers.get('Set-Cookie', '').split(';')[0]
+
+        node = None
+        try:
+            _, cookie = api('/api/auth/login', {'password': config['admin_password']})
+            prefix = 'qa-' + uuid.uuid4().hex[:10]
+            node, _ = api('/api/provider-nodes', {'name': 'Synthetic idempotency QA',
+                            'prefix': prefix, 'apiType': 'chat',
+                            'baseUrl': f'http://{upstream_host}:{server.server_port}/v1'})
+            provider = node['node']['id']
+            api('/api/providers', {'provider': provider, 'name': 'Synthetic idempotency account',
+                                   'apiKey': 'synthetic-idempotency-account'})
+            body = {'model': prefix + '/qa-model', 'messages': [{'role': 'user',
+                    'content': 'Synthetic idempotency test only'}], 'stream': False}
+            result, _ = api('/v1/chat/completions', body, inference=True,
+                            idempotency_key='synthetic-logical-turn-1')
+            self.assertEqual(result['choices'][0]['message']['content'], 'SYNTHETIC_OK')
+            body['messages'][0]['content'] = 'Synthetic 409 retry test only'
+            with self.assertRaises(urllib.error.HTTPError) as response:
+                api('/v1/chat/completions', body, inference=True)
+            try:
+                self.assertEqual(len(seen), 2, '9Router retried a reconciliation-required response')
+                self.assertEqual((seen[0][0], response.exception.code),
+                                 ('synthetic-logical-turn-1', 409),
+                                 '9Router must preserve the request key and reconciliation status')
+            finally:
+                response.exception.close()
+        finally:
+            if node:
+                api('/api/provider-nodes/' + node['node']['id'], method='DELETE')
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
 
 @unittest.skipUnless(os.environ.get('JARVIS_TEST_ROUTER_AGENT_BIN'), 'requires built agent and installed Claude/Codex CLIs')
 class RealCliTransport(unittest.TestCase):
