@@ -164,7 +164,41 @@ class RouterFailover(unittest.TestCase):
                 pass
 
             def do_POST(self):
-                seen.append(json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0)))))
+                payload = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))))
+                seen.append(payload)
+                if payload.get('stream'):
+                    pieces = [
+                        {'role': 'assistant'},
+                        {'tool_calls': [{'index': 0, 'id': 'call_stream_a',
+                          'type': 'function', 'function': {'name': 'Read',
+                          'arguments': '{"file_'}}]},
+                        {'tool_calls': [{'index': 0, 'function':
+                          {'arguments': 'path":"a.md"}'}}]},
+                        {'tool_calls': [{'index': 1, 'id': 'call_stream_b',
+                          'type': 'function', 'function': {'name': 'Read',
+                          'arguments': '{"file_'}}]},
+                        {'tool_calls': [{'index': 1, 'function':
+                          {'arguments': 'path":"b.md"}'}}]},
+                    ]
+                    chunks = [
+                        {'id': 'chatcmpl-synthetic-stream',
+                         'object': 'chat.completion.chunk', 'created': 1,
+                         'model': 'qa-model', 'choices': [{'index': 0,
+                         'delta': piece, 'finish_reason': None}]}
+                        for piece in pieces
+                    ]
+                    chunks.append({'id': 'chatcmpl-synthetic-stream',
+                                   'object': 'chat.completion.chunk', 'created': 1,
+                                   'model': 'qa-model', 'choices': [{'index': 0,
+                                   'delta': {}, 'finish_reason': 'tool_calls'}]})
+                    raw = (': synthetic heartbeat\n\n' + ''.join('data: ' + json.dumps(chunk)
+                        + '\n\n' for chunk in chunks) + 'data: [DONE]\n\n').encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.send_header('Content-Length', str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
                 body = {'id': 'synthetic-tool-history', 'object': 'chat.completion',
                         'created': 1, 'model': 'qa-model', 'choices': [{'index': 0,
                         'message': {'role': 'assistant', 'content': 'TOOL_HISTORY_OK'},
@@ -237,6 +271,32 @@ class RouterFailover(unittest.TestCase):
                               if item['role'] == 'tool'],
                              [('Read', 'first result'), ('Read', 'second result')])
 
+            # Fragmented Chat SSE tool arguments must emerge as complete
+            # Responses function calls; the heartbeat and [DONE] are framing.
+            stream_request = urllib.request.Request(base + '/v1/responses',
+                data=json.dumps({'model': prefix + '/qa-model',
+                    'input': 'Call Read for a.md and b.md.', 'stream': True,
+                    'tools': [{'type': 'function', 'name': 'Read',
+                        'parameters': {'type': 'object', 'properties': {
+                            'file_path': {'type': 'string'}}}}]}).encode(),
+                headers={'Authorization': 'Bearer ' + config['api_key'],
+                         'Content-Type': 'application/json'})
+            with urllib.request.urlopen(stream_request, timeout=30) as stream_response:
+                events = [json.loads(line[6:]) for line in stream_response.read().decode().splitlines()
+                          if line.startswith('data: {')]
+            added = [event['item'] for event in events
+                     if event.get('type') == 'response.output_item.added'
+                     and event.get('item', {}).get('type') == 'function_call']
+            deltas = {}
+            for event in events:
+                if event.get('type') == 'response.function_call_arguments.delta':
+                    deltas[event['item_id']] = deltas.get(event['item_id'], '') + event['delta']
+            self.assertEqual([(item['call_id'], item['name']) for item in added],
+                             [('call_stream_a', 'Read'), ('call_stream_b', 'Read')])
+            self.assertEqual([json.loads(deltas[item['id']]) for item in added],
+                             [{'file_path': 'a.md'}, {'file_path': 'b.md'}])
+            self.assertTrue(any(event.get('type') == 'response.completed' for event in events))
+
             # The Codex CLI uses Responses, which 9Router converts to Chat
             # Completions before the adapter sees it. The same call IDs must
             # survive that conversion, including out-of-order parallel results.
@@ -257,8 +317,8 @@ class RouterFailover(unittest.TestCase):
                            'parameters': {'type': 'object', 'properties': {
                                'file_path': {'type': 'string'}}, 'required': ['file_path']}}]},
                 inference=True)
-            self.assertEqual(len(seen), 2)
-            forwarded = seen[1]['messages']
+            self.assertEqual(len(seen), 3)
+            forwarded = seen[2]['messages']
             calls = [call for item in forwarded if item['role'] == 'assistant'
                      for call in item.get('tool_calls', [])]
             results = [item for item in forwarded if item['role'] == 'tool']
