@@ -1,5 +1,5 @@
 //! Narrow NewsletterBuddy API bridge for the Discord query agent.
-//! Credentials stay in the local OS keyring; the reasoner receives only a
+//! Credentials stay in a private host file or OS keyring; the reasoner receives only a
 //! request ID and an allowlisted command shape.
 
 use std::io::{self, Read};
@@ -190,6 +190,15 @@ pub enum Command {
         #[arg(long)]
         brief_revision: u32,
     },
+    /// Save a cited proposal written by the current Jarvis reasoner.
+    DraftSubmit {
+        #[arg(long)]
+        newsletter_id: String,
+        #[arg(long)]
+        brief_revision: u32,
+        #[arg(long)]
+        proposal_json: String,
+    },
     /// Read an immutable draft revision.
     Draft {
         #[arg(long)]
@@ -342,6 +351,27 @@ fn browser_task_body(raw: &str) -> Result<Value> {
     } }))
 }
 
+fn token_file(path: &std::path::Path) -> Result<String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut file = std::fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)
+        .context("NewsletterBuddy credential file cannot be opened")?;
+    let metadata = file.metadata().context("NewsletterBuddy credential file metadata unavailable")?;
+    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o600 || metadata.len() > 4096 {
+        bail!("NewsletterBuddy credential file must be owner-owned, regular, mode 0600 and at most 4096 bytes");
+    }
+    let mut bytes = Vec::new();
+    (&mut file).take(4097).read_to_end(&mut bytes)
+        .context("NewsletterBuddy credential file cannot be read")?;
+    if bytes.len() > 4096 { bail!("NewsletterBuddy credential file exceeds 4096 bytes"); }
+    if bytes.last() == Some(&b'\n') { bytes.pop(); }
+    if bytes.is_empty() || bytes.iter().any(|b| !b.is_ascii_graphic()) {
+        bail!("NewsletterBuddy credential file must contain one nonempty token");
+    }
+    Ok(String::from_utf8(bytes).context("NewsletterBuddy credential file must be ASCII")?)
+}
+
 struct Api {
     base: Url,
     token: String,
@@ -354,17 +384,28 @@ impl Api {
             &std::env::var("NEWSLETTERBUDDY_URL")
                 .context("NEWSLETTERBUDDY_URL is not configured")?,
         )?;
-        let token = String::from_utf8(augmentagent_auth::Auth::get(PLATFORM, ACCOUNT).context(
-            "NewsletterBuddy token missing; run `augmentagent newsletter configure` on this host",
-        )?)
-        .context("NewsletterBuddy token is not UTF-8")?;
-        if token.trim().is_empty() {
-            bail!("NewsletterBuddy token is empty");
+        let configured = std::env::var_os("NEWSLETTERBUDDY_TOKEN_FILE");
+        let default = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| std::env::var_os("HOME").map(|p| std::path::PathBuf::from(p).join(".config")))
+            .map(|p| p.join("augmentagent/newsletterbuddy.token"));
+        let selected = configured.map(std::path::PathBuf::from)
+            .or_else(|| default.filter(|p| std::fs::symlink_metadata(p).is_ok()));
+        let token = if let Some(path) = selected {
+            token_file(&path)?
+        } else {
+            String::from_utf8(augmentagent_auth::Auth::get(PLATFORM, ACCOUNT)
+                .context("NewsletterBuddy token missing; configure a private token file or the OS credential store")?)
+                .context("NewsletterBuddy token is not UTF-8")?
+        };
+        if token.is_empty() || token.bytes().any(|b| !b.is_ascii_graphic()) {
+            bail!("NewsletterBuddy token is invalid");
         }
         Ok(Self {
             base,
             token,
             client: Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(75))
                 .build()?,
@@ -730,6 +771,15 @@ pub async fn run(command: &Command) -> Result<()> {
             )
             .await?
         }
+        Command::DraftSubmit { newsletter_id, brief_revision, proposal_json } => {
+            let id = uuid(newsletter_id)?;
+            if proposal_json.len() > 65_536 { bail!("NewsletterBuddy proposal is too large"); }
+            let proposal: Value = serde_json::from_str(proposal_json)
+                .context("NewsletterBuddy proposal must be valid JSON")?;
+            let key = event_request_key(&format!("draft-submit:{id}:{brief_revision}"))?;
+            api.call(Method::POST, &format!("v1/newsletters/{id}/drafts"),
+                Some(json!({"briefRevision": brief_revision, "proposal": proposal})), Some(&key)).await?
+        }
         Command::Draft {
             newsletter_id,
             revision,
@@ -751,6 +801,31 @@ pub async fn run(command: &Command) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_token_file_survives_reopening_and_rejects_unsafe_inputs() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "synthetic-token\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(token_file(&path).unwrap(), "synthetic-token");
+        assert_eq!(token_file(&path).unwrap(), "synthetic-token");
+        let link = dir.path().join("link");
+        symlink(&path, &link).unwrap();
+        assert!(token_file(&link).is_err());
+        assert!(token_file(dir.path()).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(token_file(&path).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for invalid in ["", "\n", "one two", "one\ntwo", "token\n\n", " token", "token\r\n"] {
+            std::fs::write(&path, invalid).unwrap();
+            let error = token_file(&path).unwrap_err().to_string();
+            assert!(!error.contains("one two"));
+        }
+        std::fs::write(&path, "x".repeat(4097)).unwrap();
+        assert!(token_file(&path).is_err());
+    }
 
     #[test]
     fn stable_request_key_is_scoped_to_command_and_discord_event() {
