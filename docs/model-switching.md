@@ -42,13 +42,22 @@ remains a separate parity gate.
 | Retrieval, wiki and memory MCP | `mcp.rs`, wiki and memory tools | Ignored Codex-only `live_wiki_query_profile_executes_files_and_memory_mcp`; no shared CI fixture | Three-profile fake and live memory continuity |
 | Approval, drafts and outbound delivery | Discord approval broker, tool audit and journals | Existing approval/broker suites | Three-profile denied/approved edit and delivery receipts |
 | Code mode and build VM | `codex_tools.rs`, build runner | Ignored Codex-only VM fixture; no shared CI fixture | Three-profile approved edit/test through the VM |
-| Scheduled loops and explicit job pins | Loop runner, `FallbackReasoner` | Default snapshot and fallback tests | Durable job-pin precedence and restart fixture |
+| Scheduled loops and explicit job pins | Loop runner, `FallbackReasoner` | `user_loop_model_pin_survives_reopen_and_legacy_rows_inherit`, `legacy_user_loops_schema_adds_nullable_model_column`, `discord_loop_captures_selected_model_for_future_runs`, `occurrence_identity_survives_restart_and_advances_after_recorded_run`, `run_create_pins_model_and_rejects_other_profiles` | Live selected-model loop tool/approval run and daemon restart |
 | Independent review | `review_history.rs`, `self_improve.rs` | Native-only reviewer admission and dispatch tests | Actual reviewer/backend lineage receipt |
 | Runpod retry, cancellation and restart | `scripts/runpod-adapter/server.py` | `python3 -m unittest -q test_server.py`; unkeyed retry and legacy journal migration; pinned 9Router image account/key/409/media CI gate | Real queue cancel and restart; repeat gateway test on daemon host |
 | Host deployment configuration | `scripts/runpod-adapter/verify_deployment.py` | `python3 -m unittest -q test_verify_deployment.py`; local catalog-only preflight | Repeat on actual daemon host, then run paid cold/warm inference |
 | Node Agents SDK entry point | `src/index.ts` imports `src/agent.ts` for mail triage and dashboard query; dashboard router | Router and dashboard tests | Determine whether the Node process runs on the daemon host; migrate its separate tool/approval path if active |
 
 Model quality, context size and latency differ. Full feature parity is a release gate: every row needs deterministic fake-model tests and a live receipt from the actual Jarvis host for all three models. A text response or catalog entry does not establish tool execution. GLM is paused until live inference succeeds. Qwen passed a 9Router Responses text call, a function-call/result round trip, and a Codex CLI text probe on 2026-09-18. The full Jarvis bridge workflow and actual-host Discord test remain the release gate.
+
+For recurring tasks, `augmentagent loop create --model qwen|glm|codex` pins each
+future occurrence to that profile. Omitting `--model` inherits the daemon
+default when the loop runs. A Discord `/loop` created under a conversation
+`/model` override captures that override; a loop created with only the daemon
+default continues to inherit the default. The natural-language loop parser
+uses the selected profile for the creation turn. `loop list` shows a pin or
+`default`. Existing stored loops migrate with no pin and retain their prior
+default behavior. A pinned profile that is paused fails closed when due.
 
 On 2026-09-18, a fresh 4×H200 CUDA 13.0 aggregate capacity read showed Low
 stock at $14.36/hour, but the Secure Cloud pool showed Out. One direct GLM

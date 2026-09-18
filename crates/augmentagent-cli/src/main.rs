@@ -8917,6 +8917,20 @@ fn extract_md_section<'a>(md: &'a str, heading: &str) -> Option<&'a str> {
 
 #[async_trait]
 impl QueryHandler for WikiQuerier {
+    async fn selected_model(&self, channel_id: u64) -> Result<Option<String>, String> {
+        let store = augmentagent_channel_core::model_selection::SelectionStore::new(
+            augmentagent_channel_core::model_selection::config_path());
+        store
+            .describe(&channel_id.to_string())
+            .map(|(model, source)| {
+                if source == "conversation" {
+                    model.map(|kind| kind.name().to_string())
+                } else {
+                    None
+                }
+            })
+            .map_err(|error| error.to_string())
+    }
     async fn answer(
         &self,
         ctx: &augmentagent_approval_discord::AuditCtx,
@@ -9229,7 +9243,7 @@ impl augmentagent_channel_core::AuditNotifier for DiscordAuditNotifier {
 }
 
 /// `/loop` runner (#104): fires a stored loop prompt through the exact same
-/// `claude` reasoner + `ask_opts` toolbelt the wiki-ask path uses, so
+/// reasoner + `ask_opts` toolbelt the wiki-ask path uses, so
 /// `/loop 1h what's new in my inbox` behaves identically to asking the bot.
 struct LoopReasonerRunner {
     reasoner: Arc<FallbackReasoner>,
@@ -9240,7 +9254,13 @@ struct LoopReasonerRunner {
 
 #[async_trait]
 impl LoopRunner for LoopReasonerRunner {
-    async fn run_prompt(&self, request_id: &str, owner: &str, prompt: &str) -> anyhow::Result<String> {
+    async fn run_prompt(
+        &self,
+        request_id: &str,
+        owner: &str,
+        prompt: &str,
+        model_profile: Option<&str>,
+    ) -> anyhow::Result<String> {
         let mut opts = ask_opts(self.wiki_root.clone(), self.repo_root.clone());
         opts.session_id = Some(request_id.to_string());
         let mut newsletter_ctx = augmentagent_approval_discord::AuditCtx::empty();
@@ -9260,7 +9280,19 @@ impl LoopRunner for LoopReasonerRunner {
         // #236 — prepend the current time so loop-driven queries know "now".
         let prompt = format!("{}{prompt}", now_awareness_line());
         // #446 — loops render their output to Discord too; same reasoning.
-        let answer = self.reasoner.call_transcript(&opts, &prompt).await;
+        let answer = if let Some(name) = model_profile {
+            use augmentagent_channel_core::providers::ProviderKind;
+            let kind = ProviderKind::parse(name)
+                .filter(|kind| {
+                    matches!(kind, ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Codex)
+                })
+                .ok_or_else(|| anyhow::anyhow!("invalid stored loop model profile"))?;
+            augmentagent_channel_core::model_selection::SELECTED_PROFILE
+                .scope(Some(kind), self.reasoner.call_transcript(&opts, &prompt))
+                .await
+        } else {
+            self.reasoner.call_transcript(&opts, &prompt).await
+        };
         sweep_imessage_attachments(&opts.env);
         answer
     }
@@ -9277,14 +9309,28 @@ impl augmentagent_approval_discord::LoopCommandParser for LoopReasonerParser {
     async fn parse(
         &self,
         raw: &str,
+        model_profile: Option<&str>,
     ) -> std::result::Result<augmentagent_approval_discord::ParsedLoop, String> {
         use augmentagent_channel_core::Reasoner;
         let opts = augmentagent_channel_core::reasoner::loop_parse_opts();
-        let answer = match self.reasoner.call(&opts, raw).await {
+        let result = if let Some(name) = model_profile {
+            use augmentagent_channel_core::providers::ProviderKind;
+            let kind = ProviderKind::parse(name)
+                .filter(|kind| {
+                    matches!(kind, ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Codex)
+                })
+                .ok_or_else(|| "unsupported loop model profile".to_string())?;
+            augmentagent_channel_core::model_selection::SELECTED_PROFILE
+                .scope(Some(kind), self.reasoner.call(&opts, raw))
+                .await
+        } else {
+            self.reasoner.call(&opts, raw).await
+        };
+        let answer = match result {
             Ok(a) => a,
             Err(e) => {
-                tracing::warn!("loop parser claude call failed: {e:#}");
-                return Err(format!("couldn't reach claude to parse loop: {e}"));
+                tracing::warn!("loop parser reasoner call failed: {e:#}");
+                return Err(format!("couldn't reach selected model to parse loop: {e}"));
             }
         };
         parse_loop_json(&answer)

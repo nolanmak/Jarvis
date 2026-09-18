@@ -89,6 +89,10 @@ pub enum LoopOp {
         /// expected fire cadence).
         #[arg(long)]
         expires_in: Option<String>,
+        /// Pin each occurrence to a model. Omit to inherit the daemon
+        /// default at execution time.
+        #[arg(long, value_parser = ["qwen", "glm", "codex"])]
+        model: Option<String>,
         /// Emit JSON `{"id":"<uuid>","interval_secs":N,...}` instead of
         /// plain `<uuid>` on stdout. Lets callers parse the loop id without
         /// regex.
@@ -110,6 +114,7 @@ struct LoopRow {
     last_run_ms: Option<i64>,
     last_status: Option<String>,
     fail_count: i64,
+    model_profile: Option<String>,
 }
 
 pub async fn run(store: Arc<Store>, op: LoopOp) -> Result<()> {
@@ -176,8 +181,14 @@ pub fn run_with(store: &Store, op: LoopOp) -> Result<i32> {
             channel_ref,
             owner,
             expires_in,
+            model,
             json,
         } => {
+            if let Some(model) = model.as_deref() {
+                if !matches!(model, "qwen" | "glm" | "codex") {
+                    return Err(anyhow!("--model must be qwen, glm, or codex"));
+                }
+            }
             let args = CreateArgs {
                 interval,
                 cron,
@@ -188,7 +199,7 @@ pub fn run_with(store: &Store, op: LoopOp) -> Result<i32> {
                 expires_in,
             };
             let resolved = resolve_create_args(args, env_lookup)?;
-            let id = store.create_user_loop(
+            let id = store.create_user_loop_with_model(
                 &resolved.owner,
                 "discord",
                 &resolved.channel_ref,
@@ -197,6 +208,7 @@ pub fn run_with(store: &Store, op: LoopOp) -> Result<i32> {
                 resolved.expires_at_ms,
                 resolved.cron_expr.as_deref(),
                 resolved.tz.as_deref(),
+                model.as_deref(),
             )?;
             if json {
                 let payload = serde_json::json!({
@@ -207,6 +219,7 @@ pub fn run_with(store: &Store, op: LoopOp) -> Result<i32> {
                     "expires_at_ms": resolved.expires_at_ms,
                     "cron_expr": resolved.cron_expr,
                     "tz": resolved.tz,
+                    "model_profile": model,
                 });
                 println!("{}", serde_json::to_string(&payload)?);
             } else {
@@ -398,12 +411,12 @@ fn count_active_for(store: &Store, owner: &str) -> Result<i64> {
 fn list_rows(store: &Store, all: bool) -> Result<Vec<LoopRow>> {
     let sql = if all {
         "SELECT id, status, prompt, interval_secs, owner, channel, \
-                last_run_ms, last_status, fail_count \
+                last_run_ms, last_status, fail_count, model_profile \
            FROM user_loops \
           ORDER BY (status = 'active') DESC, updated_at_ms DESC"
     } else {
         "SELECT id, status, prompt, interval_secs, owner, channel, \
-                last_run_ms, last_status, fail_count \
+                last_run_ms, last_status, fail_count, model_profile \
            FROM user_loops \
           WHERE status = 'active' \
           ORDER BY updated_at_ms DESC"
@@ -422,6 +435,7 @@ fn list_rows(store: &Store, all: bool) -> Result<Vec<LoopRow>> {
                     last_run_ms: r.get(6)?,
                     last_status: r.get(7)?,
                     fail_count: r.get(8)?,
+                    model_profile: r.get(9)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -478,15 +492,16 @@ fn print_table(rows: &[LoopRow]) {
         return;
     }
     println!(
-        "{:<38}  {:<8}  {:>9}  {:<24}  {}",
-        "ID", "STATUS", "INTERVAL", "OWNER", "PROMPT"
+        "{:<38}  {:<8}  {:>9}  {:<9}  {:<24}  {}",
+        "ID", "STATUS", "INTERVAL", "MODEL", "OWNER", "PROMPT"
     );
     for r in rows {
         let prompt = truncate(&r.prompt, 60);
         let owner = truncate(&r.owner, 24);
         println!(
-            "{:<38}  {:<8}  {:>8}s  {:<24}  {}",
-            r.id, r.status, r.interval_secs, owner, prompt
+            "{:<38}  {:<8}  {:>8}s  {:<9}  {:<24}  {}",
+            r.id, r.status, r.interval_secs,
+            r.model_profile.as_deref().unwrap_or("default"), owner, prompt
         );
     }
 }
@@ -504,6 +519,7 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use augmentagent_store::Store;
     use rusqlite::params;
     use tempfile::NamedTempFile;
@@ -873,6 +889,7 @@ mod tests {
                 channel_ref: Some("test-channel".into()),
                 owner: Some("test-owner".into()),
                 expires_in: None,
+                model: None,
                 json: false,
             },
         )
@@ -905,6 +922,42 @@ mod tests {
         assert_eq!(row.2, "test-channel");
         assert_eq!(row.3, 1800);
         assert_eq!(row.4, "active");
+    }
+
+    #[test]
+    fn run_create_pins_model_and_rejects_other_profiles() {
+        let (_tmp, store) = seed_store();
+        let create = |model: &str| LoopOp::Create {
+            interval: Some("30m".into()),
+            cron: None,
+            tz: None,
+            prompt: "summarize".into(),
+            channel_ref: Some("test-channel".into()),
+            owner: Some("test-owner".into()),
+            expires_in: None,
+            model: Some(model.into()),
+            json: false,
+        };
+        run_with(&store, create("glm")).unwrap();
+        let row = store.list_user_loops("test-owner").unwrap().remove(0);
+        assert_eq!(row.model_profile.as_deref(), Some("glm"));
+        assert!(run_with(&store, create("claude")).is_err());
+        assert_eq!(store.list_user_loops("test-owner").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn create_cli_accepts_only_switchable_models() {
+        for name in ["qwen", "glm", "codex"] {
+            let cli = crate::Cli::try_parse_from([
+                "augmentagent", "loop", "create", "--interval", "5m",
+                "--prompt", "ping", "--model", name,
+            ]).unwrap();
+            assert!(matches!(cli.cmd, crate::Cmd::Loop { op: LoopOp::Create { model: Some(ref value), .. } } if value == name));
+        }
+        assert!(crate::Cli::try_parse_from([
+            "augmentagent", "loop", "create", "--interval", "5m",
+            "--prompt", "ping", "--model", "claude",
+        ]).is_err());
     }
 
     // ----- #231 cron-style scheduling -----

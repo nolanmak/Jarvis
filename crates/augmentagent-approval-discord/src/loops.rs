@@ -15,7 +15,7 @@
 //!
 //! The [`LoopScheduler`] ticks every 30s, finds loops whose `last_run +
 //! interval` is due, runs the stored prompt through an injected [`LoopRunner`]
-//! (the CLI wires the same `claude` reasoner the wiki-ask path uses), and posts
+//! (the CLI wires the same reasoner the wiki-ask path uses), and posts
 //! the result back to the originating channel/DM via an injected [`LoopPoster`].
 //! Repeated failures auto-pause the loop (handled in the store).
 
@@ -62,13 +62,19 @@ pub fn pause_after_failures() -> i64 {
 }
 
 /// Runs a loop's stored prompt and returns the agent's text answer. The CLI
-/// implements this against the same `ClaudeCliReasoner` + `ask_opts` used for
+/// implements this against the same `FallbackReasoner` + `ask_opts` used for
 /// wiki queries, so `/loop 1h what changed in my inbox` works exactly like
 /// asking the bot directly.
 #[async_trait]
 pub trait LoopRunner: Send + Sync {
     /// `request_id` identifies this occurrence across scheduler restarts.
-    async fn run_prompt(&self, request_id: &str, owner: &str, prompt: &str) -> anyhow::Result<String>;
+    async fn run_prompt(
+        &self,
+        request_id: &str,
+        owner: &str,
+        prompt: &str,
+        model_profile: Option<&str>,
+    ) -> anyhow::Result<String>;
 }
 
 fn loop_request_id(id: &str, created_at_ms: i64, last_run_ms: Option<i64>) -> String {
@@ -88,7 +94,7 @@ pub trait LoopPoster: Send + Sync {
 }
 
 /// Parses free-form `/loop <…>` create-text into a [`ParsedLoop`]. The CLI's
-/// concrete impl asks Claude (Haiku, no tools) to extract `{interval, prompt,
+/// concrete impl asks the selected model (no tools) to extract `{interval, prompt,
 /// duration?}` from arbitrary phrasing so we're not at the mercy of a
 /// hand-written regex. Unit tests inject a deterministic stub that delegates
 /// to the legacy [`parse_create_args`] regex parser — no `claude` spawn.
@@ -98,7 +104,7 @@ pub trait LoopCommandParser: Send + Sync {
     /// subcommand keyword have been stripped — e.g. `every 5m hello world 🙂`.
     /// Returns a user-facing error string on failure (surfaced verbatim in the
     /// channel reply).
-    async fn parse(&self, raw: &str) -> Result<ParsedLoop, String>;
+    async fn parse(&self, raw: &str, model_profile: Option<&str>) -> Result<ParsedLoop, String>;
 }
 
 /// If `text` starts with `/loop` or bare `loop` as a word, return everything
@@ -405,6 +411,19 @@ pub async fn handle_loop_command(
     channel_ref: &str,
     text: &str,
 ) -> String {
+    handle_loop_command_with_model(store, parser, owner, channel_ref, text, None).await
+}
+
+/// Create commands capture the conversation's selected model. The pin stays
+/// with the row when a later `/model` command changes the conversation.
+pub async fn handle_loop_command_with_model(
+    store: Option<&Store>,
+    parser: Option<&dyn LoopCommandParser>,
+    owner: &str,
+    channel_ref: &str,
+    text: &str,
+    model_profile: Option<&str>,
+) -> String {
     let Some(store) = store else {
         return "loop registry unavailable (store not wired)".to_string();
     };
@@ -436,7 +455,7 @@ pub async fn handle_loop_command(
             let Some(parser) = parser else {
                 return "loop parser unavailable (reasoner not wired)".to_string();
             };
-            let parsed = match parser.parse(rest).await {
+            let parsed = match parser.parse(rest, model_profile).await {
                 Ok(p) => p,
                 Err(e) => return e,
             };
@@ -467,7 +486,7 @@ pub async fn handle_loop_command(
                     d.saturating_add(grace).saturating_mul(1000),
                 )
             });
-            match store.create_user_loop(
+            match store.create_user_loop_with_model(
                 owner,
                 "discord",
                 channel_ref,
@@ -476,6 +495,7 @@ pub async fn handle_loop_command(
                 expires_at_ms,
                 parsed.cron_expr.as_deref(),
                 parsed.tz.as_deref(),
+                model_profile,
             ) {
                 Ok(id) => match parsed.duration_secs {
                     Some(dur) => format!(
@@ -530,11 +550,12 @@ fn render_list(loops: &[UserLoop]) -> String {
             None => String::new(),
         };
         out.push_str(&format!(
-            "• `{}` {} every {}{} — _{}_\n   {}\n",
+            "• `{}` {} every {}{} · model {} — _{}_\n   {}\n",
             l.id,
             status_badge,
             fmt_interval(l.interval_secs),
             expiry,
+            l.model_profile.as_deref().unwrap_or("default"),
             truncate(&l.prompt, 120),
             last,
         ));
@@ -657,7 +678,11 @@ impl LoopScheduler {
         info!(loop_id = %l.id, "running loop");
         let pause_after = pause_after_failures();
         let request_id = loop_request_id(&l.id, l.created_at_ms, l.last_run_ms);
-        match self.runner.run_prompt(&request_id, &l.owner, &l.prompt).await {
+        match self
+            .runner
+            .run_prompt(&request_id, &l.owner, &l.prompt, l.model_profile.as_deref())
+            .await
+        {
             Ok(answer) => {
                 let header = format!("🔁 loop `{}` · _{}_", l.id, truncate(&l.prompt, 80));
                 let body = loop_result_body(&header, &answer);
@@ -945,13 +970,15 @@ mod tests {
     async fn occurrence_identity_survives_restart_and_advances_after_recorded_run() {
         struct Runner {
             ids: std::sync::Mutex<Vec<String>>,
+            models: std::sync::Mutex<Vec<Option<String>>>,
             complete: std::sync::atomic::AtomicBool,
             started: tokio::sync::Notify,
         }
         #[async_trait]
         impl LoopRunner for Runner {
-            async fn run_prompt(&self, request_id: &str, _owner: &str, _prompt: &str) -> anyhow::Result<String> {
+            async fn run_prompt(&self, request_id: &str, _owner: &str, _prompt: &str, model_profile: Option<&str>) -> anyhow::Result<String> {
                 self.ids.lock().unwrap().push(request_id.into());
+                self.models.lock().unwrap().push(model_profile.map(str::to_string));
                 self.started.notify_one();
                 if !self.complete.load(std::sync::atomic::Ordering::SeqCst) {
                     std::future::pending::<()>().await;
@@ -965,9 +992,10 @@ mod tests {
             async fn post_to(&self, _channel: &str, _body: &str) -> anyhow::Result<()> { Ok(()) }
         }
         let (store, file) = tmp_store();
-        store.create_user_loop("synthetic-owner", "discord", "synthetic-channel", 60,
-            "synthetic task", None, None, None).unwrap();
+        store.create_user_loop_with_model("synthetic-owner", "discord", "synthetic-channel", 60,
+            "synthetic task", None, None, None, Some("glm")).unwrap();
         let runner = Arc::new(Runner { ids: std::sync::Mutex::new(Vec::new()),
+            models: std::sync::Mutex::new(Vec::new()),
             complete: std::sync::atomic::AtomicBool::new(false), started: tokio::sync::Notify::new() });
         {
             let row = store.list_active_user_loops().unwrap().remove(0);
@@ -992,7 +1020,9 @@ mod tests {
         let ids = runner.ids.lock().unwrap();
         assert_eq!(ids.len(), 3);
         assert_eq!(ids[0], ids[1], "restarted occurrence must reuse its request identity");
-        assert_ne!(ids[1], ids[2], "next occurrence must not reuse prior receipts");    }
+        assert_ne!(ids[1], ids[2], "next occurrence must not reuse prior receipts");
+        assert_eq!(*runner.models.lock().unwrap(), vec![Some("glm".into()); 3]);
+    }
 
     #[test]
     fn interval_parsing() {
@@ -1029,7 +1059,7 @@ mod tests {
 
     #[async_trait]
     impl LoopCommandParser for RegexParser {
-        async fn parse(&self, raw: &str) -> Result<ParsedLoop, String> {
+        async fn parse(&self, raw: &str, _model_profile: Option<&str>) -> Result<ParsedLoop, String> {
             parse_create_args(raw)
         }
     }
@@ -1054,6 +1084,7 @@ mod tests {
         .await;
         assert!(reply.contains("loop `"), "expected loop-created reply: {reply}");
         assert!(reply.contains("every 5m"), "should report cadence: {reply}");
+        assert!(store.list_user_loops("user-1").unwrap()[0].model_profile.is_none());
     }
 
     #[tokio::test]
@@ -1072,11 +1103,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discord_loop_captures_selected_model_for_future_runs() {
+        let (store, _file) = tmp_store();
+        struct Parser(std::sync::Mutex<Vec<Option<String>>>);
+        #[async_trait]
+        impl LoopCommandParser for Parser {
+            async fn parse(&self, raw: &str, model_profile: Option<&str>) -> Result<ParsedLoop, String> {
+                self.0.lock().unwrap().push(model_profile.map(str::to_string));
+                parse_create_args(raw)
+            }
+        }
+        let parser = Parser(std::sync::Mutex::new(Vec::new()));
+        let reply = handle_loop_command_with_model(
+            Some(&store), Some(&parser), "user-1", "chan-1",
+            "/loop ping every 10m", Some("qwen"),
+        ).await;
+        assert!(reply.contains("created"), "{reply}");
+        assert_eq!(store.list_user_loops("user-1").unwrap()[0].model_profile.as_deref(), Some("qwen"));
+        assert_eq!(*parser.0.lock().unwrap(), vec![Some("qwen".into())]);
+        assert!(handle_loop_command_with_model(
+            Some(&store), Some(&parser), "user-1", "chan-1",
+            "/loop ping every 10m", Some("claude"),
+        ).await.contains("unsupported"));
+        assert_eq!(store.list_user_loops("user-1").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn create_path_surfaces_parser_error_verbatim() {
         struct AlwaysErr;
         #[async_trait]
         impl LoopCommandParser for AlwaysErr {
-            async fn parse(&self, _raw: &str) -> Result<ParsedLoop, String> {
+            async fn parse(&self, _raw: &str, _model_profile: Option<&str>) -> Result<ParsedLoop, String> {
                 Err("nope, couldn't tell what you meant".to_string())
             }
         }

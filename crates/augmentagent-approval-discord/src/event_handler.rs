@@ -220,14 +220,28 @@ impl EventHandler for Handler {
         if crate::loops::match_loop_prefix(&user_text).is_some() {
             let owner = msg.author.id.get().to_string();
             let channel_ref = msg.channel_id.get().to_string();
-            let reply = crate::handle_loop_command(
-                self.state.store.as_deref(),
-                self.state.loop_parser.as_deref(),
-                &owner,
-                &channel_ref,
-                &user_text,
-            )
-            .await;
+            let subcommand = crate::loops::match_loop_prefix(&user_text)
+                .unwrap_or("")
+                .trim()
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            let model = if matches!(subcommand, "" | "help" | "list" | "stop") {
+                Ok(None)
+            } else {
+                handler.selected_model(msg.channel_id.get()).await
+            };
+            let reply = match model {
+                Ok(model) => crate::loops::handle_loop_command_with_model(
+                    self.state.store.as_deref(),
+                    self.state.loop_parser.as_deref(),
+                    &owner,
+                    &channel_ref,
+                    &user_text,
+                    model.as_deref(),
+                ).await,
+                Err(error) => format!("⚠️ couldn't read model selection: {error}"),
+            };
             send_chunks_reply_chain(
                 &ctx.http,
                 msg.channel_id,
