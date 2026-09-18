@@ -1643,6 +1643,10 @@ struct OpenedPr {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct RecordedVerdict {
     provider: String,
+    #[serde(default)]
+    backend: String,
+    #[serde(default)]
+    model: String,
     diff_ok: bool,
     system_ok: bool,
 }
@@ -1665,7 +1669,7 @@ struct Approval {
 /// carries model output that can say anything.
 fn approval_of(verdict: Option<&RecordedVerdict>) -> Approval {
     match verdict {
-        Some(v) if v.diff_ok && v.system_ok => Approval {
+        Some(v) if v.diff_ok && v.system_ok && v.backend == "native" && !v.model.is_empty() => Approval {
             reviewed: true,
             codex: v.provider == augmentagent_channel_core::ProviderKind::Codex.name(),
         },
@@ -2794,6 +2798,8 @@ fn resumable_from(
 /// Outcome of the independent stage (#828).
 struct IndependentReview {
     provider: Option<augmentagent_channel_core::ProviderKind>,
+    /// The model requested on the pinned native reviewer transport.
+    model: Option<String>,
     /// False when the reviewer could not be reached — NOT the same as a
     /// rejection, and must never be treated as an approval.
     available: bool,
@@ -2894,6 +2900,7 @@ impl IndependentReview {
     fn unavailable(why: ReviewUnavailable) -> Self {
         Self {
             provider: None,
+            model: None,
             available: false,
             diff_ok: false,
             system_ok: false,
@@ -2912,6 +2919,8 @@ impl IndependentReview {
         }
         Some(RecordedVerdict {
             provider: self.provider?.name().to_string(),
+            backend: "native".into(),
+            model: self.model.clone()?,
             diff_ok: self.diff_ok,
             system_ok: self.system_ok,
         })
@@ -3145,6 +3154,7 @@ async fn independent_review(
 
     let mut out = IndependentReview {
         provider: Some(provider),
+        model: None,
         available: true,
         diff_ok: false,
         system_ok: false,
@@ -3169,6 +3179,19 @@ async fn independent_review(
         if provider == augmentagent_channel_core::ProviderKind::Claude {
             opts.model = Some(build_model());
         }
+        let requested_model = if provider == augmentagent_channel_core::ProviderKind::Codex {
+            augmentagent_channel_core::providers::model_for(
+                provider, augmentagent_channel_core::providers::tier_of(&opts))
+        } else {
+            opts.model.clone().unwrap_or_default()
+        };
+        if requested_model.is_empty() || out.model.as_ref().is_some_and(|prior| prior != &requested_model) {
+            return IndependentReview::unavailable(ReviewUnavailable::NoCapacity {
+                reviewers: vec![provider],
+                detail: "independent reviewer model identity changed between passes".into(),
+            });
+        }
+        out.model = Some(requested_model);
         let review = augmentagent_channel_core::model_router::native_reviewer_scope(
             provider, reasoner.call(&opts, prompt)).await;
         match review {
@@ -10571,6 +10594,7 @@ CODEX-REVIEW: lgtm").0);
     fn independent_approval_requires_availability_and_both_passes() {
         let mk = |available, diff_ok, system_ok| IndependentReview {
             provider: Some(augmentagent_channel_core::ProviderKind::Codex),
+            model: Some("synthetic-native-model".into()),
             available,
             diff_ok,
             system_ok,
@@ -10581,6 +10605,7 @@ CODEX-REVIEW: lgtm").0);
         assert!(mk(true, true, true).codex_approved());
         let mut other = mk(true, true, true);
         other.provider = Some(augmentagent_channel_core::ProviderKind::Claude);
+        other.model = Some("synthetic-claude-model".into());
         assert!(other.approved());
         assert!(!other.codex_approved(), "Claude cannot inherit Codex-specific merge overrides");
         assert!(!mk(true, true, false).approved(), "system pass must count");
@@ -12302,7 +12327,10 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     }
 
     fn verdict(provider: &str, ok: bool) -> RecordedVerdict {
-        RecordedVerdict { provider: provider.into(), diff_ok: ok, system_ok: ok }
+        RecordedVerdict {
+            provider: provider.into(), backend: "native".into(),
+            model: "synthetic-native-model".into(), diff_ok: ok, system_ok: ok,
+        }
     }
 
     const REVIEWED_HEAD: &str = "aaaa1111";
@@ -12312,6 +12340,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         use augmentagent_channel_core::providers::{ModelTier, ProviderKind};
         let review = IndependentReview {
             provider: Some(ProviderKind::Codex),
+            model: Some(augmentagent_channel_core::providers::model_for(ProviderKind::Codex, ModelTier::Quality)),
             available: true,
             diff_ok: true,
             system_ok: true,
@@ -12379,6 +12408,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // The fresh lane holds the same facts and reaches the same answer.
         let claude = IndependentReview {
             provider: Some(Claude),
+            model: Some("synthetic-native-model".into()),
             available: true,
             diff_ok: true,
             system_ok: true,
@@ -12412,7 +12442,8 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // A rejection, a half approval, or any other provider never unlocks.
         for v in [
             verdict("codex", false),
-            RecordedVerdict { provider: "codex".into(), diff_ok: true, system_ok: false },
+            RecordedVerdict { provider: "codex".into(), backend: "native".into(),
+                model: "synthetic-native-model".into(), diff_ok: true, system_ok: false },
         ] {
             assert_eq!(approval_of(Some(&v)), Approval::default(), "{v:?}");
         }
@@ -12444,6 +12475,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
 
         let codex = IndependentReview {
             provider: Some(Codex),
+            model: Some("synthetic-native-model".into()),
             available: true,
             diff_ok: true,
             system_ok: true,
