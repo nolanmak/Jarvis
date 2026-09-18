@@ -164,6 +164,49 @@ fn stderr_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).to_string()
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn selftest_can_pin_each_discord_profile_without_running_the_default_chain() {
+    for (profile, expected_model) in [
+        ("codex", None),
+        ("qwen", Some("runpod/qwen38-27b")),
+        ("glm", Some("runpod/glm-5.3-flash")),
+    ] {
+        let rig = Rig::new();
+        let router = rig.path("model-router.json");
+        std::fs::write(&router, serde_json::json!({
+            "version": 1,
+            "mode": "direct",
+            "base_url": "http://127.0.0.1:20128/v1",
+            "api_key": "synthetic-router-key",
+            "models": {
+                "claude": {"quality": "cc/claude-test", "fast": "cc/claude-fast"},
+                "codex": {"quality": "cx/codex-test", "fast": "cx/codex-fast"}
+            }
+        }).to_string()).unwrap();
+        let fakes = [
+            ("CLAUDE_CLI", "fake-claude-ok.sh"),
+            ("CODEX_CLI", "fake-codex-ok.sh"),
+        ];
+        let mut cmd = rig.cmd_with("claude,codex", &fakes,
+            &["reasoner-selftest", "--profile", profile]);
+        cmd.env("AUGMENTAGENT_MODEL_ROUTER_CONFIG", router)
+            .env("AUGMENTAGENT_MODEL_QWEN_ENABLED", "1")
+            .env("AUGMENTAGENT_MODEL_GLM_ENABLED", "1");
+        let out = rig.run(profile, cmd);
+        assert!(out.status.success(), "{profile}: {}", stderr_of(&out));
+        assert!(stdout_of(&out).contains("response: PONG-FROM-FAKE-CODEX"));
+        assert_eq!(rig.spawns("claude"), 0, "{profile} reached the default chain");
+        assert_eq!(rig.spawns("codex"), 1, "{profile} missed the Codex CLI transport");
+        let log = std::fs::read_to_string(rig.path("state/augmentagent/token-usage.jsonl")).unwrap();
+        let usage: serde_json::Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+        assert_eq!(usage["provider"], profile, "{profile}: {log}");
+        if let Some(expected_model) = expected_model {
+            assert_eq!(usage["model"], expected_model, "{profile}: {log}");
+        }
+    }
+}
+
 /// #1047 C1 — a call the fallback served is counted, under codex, by
 /// `augmentagent token-usage`, which splits its totals by provider. Before
 /// #1047 the codex adapter recorded nothing and the report showed no row.

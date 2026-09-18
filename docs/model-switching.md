@@ -73,8 +73,8 @@ Definite pre-submission Runpod HTTP rejections retain their 401/403
 authentication, 429 rate-limit or 400/404/422 request status with fixed redacted
 messages. A 5xx or lost response may have accepted work and remains an
 unresolved 409 in the adapter journal. This distinction applies to both queue
-and load-balancer routes; 9Router's client-facing error translation is still
-covered by the live release gate.
+and load-balancer routes; the patched local 9Router preserves 409, and the
+daemon-host gateway still needs the same acceptance test.
 
 The adapter's authenticated Runpod client accepts only HTTPS URLs on `api.runpod.ai` or one endpoint subdomain of `api.runpod.ai`, with no URL credentials, nonstandard port, query or fragment. It rejects HTTP redirects. Local regression tests prove an unauthorized URL and a redirect target receive no request, so a changed upstream location cannot carry the Runpod key to a different host.
 Both Qwen queue requests and GLM load-balancer requests cap generated tokens to the route's `max_output_tokens` (default 2048) before reaching Runpod. This bounds output length, not GPU cost or wall time.
@@ -100,3 +100,13 @@ that the paused GPU endpoints can serve inference. A remote router host must
 be listed explicitly with `--allow-router-host HOST:PORT` (and in the daemon's
 router allowlist). The verifier's missing-secret, unreachable-router and healthy
 fake-service cases run in CI.
+
+After activating an endpoint and setting its `AUGMENTAGENT_MODEL_*_ENABLED=1`
+flag on the Jarvis host, use `augmentagent reasoner-selftest --profile qwen
+--prompt 'Reply READY'` (or `glm` or `codex`) to probe exactly that profile
+through the production reasoner. The option affects only this process and does
+not persist a Discord selection. It performs inference and can incur Runpod
+GPU time. Use it only after deliberate activation; the read-only preflight
+above is the safe first check. The Linux fake-CLI CI test verifies that each
+choice bypasses the default chain and records its provider/model identity,
+but it does not certify live tools or quality.

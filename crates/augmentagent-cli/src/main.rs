@@ -601,6 +601,9 @@ enum Cmd {
         /// Prompt to send (default asks for a one-word reply).
         #[arg(long, default_value = "Reply with exactly one word: PONG")]
         prompt: String,
+        /// Pin one Discord model profile for this probe, without persisting a selection.
+        #[arg(long, value_parser = ["qwen", "glm", "codex"])]
+        profile: Option<String>,
     },
     /// Issue #12 — read/write the sqlite `config` table so the `/setup`
     /// skill never has to parse or rewrite `.env`. Reads merge config over
@@ -4312,7 +4315,8 @@ async fn main() -> Result<()> {
             std::process::exit(code);
         }
         Cmd::Env { ref op, json } => env_cfg::run_env(op, json),
-        Cmd::ReasonerSelftest { ref prompt } => run_reasoner_selftest(prompt).await,
+        Cmd::ReasonerSelftest { ref prompt, ref profile } =>
+            run_reasoner_selftest(prompt, profile.as_deref()).await,
         Cmd::Install { component } => installers::run_install(component).await,
         Cmd::Logs {
             unit,
@@ -8698,11 +8702,18 @@ async fn run_wiki_sync(cli: &Cli, dry_run: bool, no_pull: bool) -> Result<()> {
 /// the production provider chain. Prints the chain, any active cooldown
 /// latches, and the answer. Exit non-zero when the whole chain fails, so a
 /// timer/doctor wrapper can alert on it.
-async fn run_reasoner_selftest(prompt: &str) -> Result<()> {
+async fn run_reasoner_selftest(prompt: &str, profile: Option<&str>) -> Result<()> {
     use augmentagent_channel_core::{CooldownLatch, ReasonerOpts};
+    use augmentagent_channel_core::providers::ProviderKind;
+
+    let selected = profile.map(|name| ProviderKind::parse(name)
+        .ok_or_else(|| anyhow::anyhow!("unsupported model profile"))).transpose()?;
 
     let reasoner = build_reasoner();
     println!("chain: {}", reasoner.provider_names().join(" → "));
+    if let Some(kind) = selected {
+        println!("selected profile: {} (one call, no selection persisted)", kind.name());
+    }
     let print_cooldowns = |label: &str| {
         let latches = CooldownLatch::system().active();
         if latches.is_empty() {
@@ -8739,7 +8750,11 @@ async fn run_reasoner_selftest(prompt: &str) -> Result<()> {
         session_id: None,
         handoff_path: None,
     };
-    let result = reasoner.call(&opts, prompt).await;
+    let result = match selected {
+        Some(kind) => augmentagent_channel_core::model_selection::SELECTED_PROFILE
+            .scope(Some(kind), reasoner.call(&opts, prompt)).await,
+        None => reasoner.call(&opts, prompt).await,
+    };
     // The latches the call itself took are the observable half of a failover
     // — without this line a fault-injection run (#666) can see WHICH
     // provider answered but not that the failed one was actually latched.
