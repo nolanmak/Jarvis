@@ -30,14 +30,12 @@ export function validateConfig(value: unknown): RouterConfig {
   const local =
     url.protocol === "http:" &&
     ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-  const authority = `${url.hostname}:${url.port}`;
+  const remotePort = url.port || (url.protocol === "https:" ? "443" : "");
+  const authority = `${url.hostname}:${remotePort}`;
   const allowed = (process.env.AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS || "")
     .split(",")
     .some((entry) => entry.trim().toLowerCase() === authority.toLowerCase());
-  const remote =
-    !!url.port && allowed &&
-    (url.protocol === "https:" ||
-      (url.protocol === "http:" && url.hostname.endsWith(".ts.net")));
+  const remote = !!remotePort && allowed && url.protocol === "https:";
   if (
     !(local || remote) ||
     url.username ||

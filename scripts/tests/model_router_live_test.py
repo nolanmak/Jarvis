@@ -336,7 +336,7 @@ class RouterFailover(unittest.TestCase):
             server.server_close()
             thread.join()
 
-    def test_unsupported_image_fails_before_reaching_upstream(self):
+    def test_unsupported_media_fails_before_reaching_upstream(self):
         config = json.loads(Path(os.environ['JARVIS_TEST_MODEL_ROUTER_CONFIG']).read_text())
         base = config['base_url'].removesuffix('/v1')
         self.assertTrue(base.startswith('http://127.0.0.1:'))
@@ -388,11 +388,17 @@ class RouterFailover(unittest.TestCase):
                            'content': [{'type': 'text', 'text': 'Describe this'},
                                        {'type': 'image_url', 'image_url': {
                                            'url': 'data:image/png;base64,iVBORw0KGgo='}}]}
+            audio = {'role': 'user', 'content': [
+                {'type': 'audio_url', 'audio_url': {'url': 'data:audio/wav;base64,UklGRg=='}}]}
+            video = {'role': 'user', 'content': [
+                {'type': 'video_url', 'video_url': {'url': 'data:video/mp4;base64,AAAA'}}]}
             for label, messages in [
                 ('current image', [prior_image]),
                 ('history image', [prior_image,
                                    {'role': 'assistant', 'content': 'Earlier response'},
                                    {'role': 'user', 'content': 'Recall the image'}]),
+                ('current audio', [audio]),
+                ('current video', [video]),
             ]:
                 with self.subTest(label=label):
                     body = {'model': prefix + '/qa-model', 'messages': messages,
@@ -402,11 +408,11 @@ class RouterFailover(unittest.TestCase):
                     try:
                         response_body = error.exception.read().decode('utf-8', errors='replace')
                         self.assertEqual(error.exception.code, 422,
-                                         'unsupported image must fail instead of being silently omitted: '
+                                         'unsupported media must fail instead of being silently omitted: '
                                          + response_body[:500])
                     finally:
                         error.exception.close()
-            self.assertEqual(seen, [], 'unsupported image reached the text-only upstream')
+            self.assertEqual(seen, [], 'unsupported media reached the text-only upstream')
         finally:
             if node:
                 api('/api/provider-nodes/' + node['node']['id'], method='DELETE')

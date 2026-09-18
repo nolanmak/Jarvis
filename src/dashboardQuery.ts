@@ -16,10 +16,10 @@ export function runAgentQuery(question: string, signal?: AbortSignal): Promise<s
     return Promise.reject(new Error("Jarvis query was cancelled"));
   }
   return new Promise((resolve, reject) => {
-    const child = spawn(binary, ["--wiki-dir", wiki, "wiki", "ask", question], {
+    const child = spawn(binary, ["--wiki-dir", wiki, "wiki", "ask", "--stdin"], {
       cwd: repo,
       env: process.env,
-      stdio: ["ignore", "pipe", "ignore"],
+      stdio: ["pipe", "pipe", "ignore"],
       detached: process.platform !== "win32",
     });
     const chunks: Buffer[] = [];
@@ -44,6 +44,8 @@ export function runAgentQuery(question: string, signal?: AbortSignal): Promise<s
     const abort = () => stop("cancelled");
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
+    child.stdin.on("error", () => { /* close reports the CLI failure */ });
+    child.stdin.end(question);
     const timeout = setTimeout(() => stop("timeout"), QUERY_TIMEOUT_MS);
     timeout.unref();
     const finish = (error?: Error, answer?: string) => {

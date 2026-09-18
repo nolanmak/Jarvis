@@ -96,6 +96,22 @@ class ToolPolicyTests(unittest.TestCase):
         self.assertEqual(calls, [42])
         self.assertEqual((self.root / 'note.md').read_text(), 'written once')
 
+    def test_receipt_limit_still_allows_fresh_reconciliation_reads(self):
+        (self.root / 'note.md').write_text('known state')
+        server = bridge.Server(self.policy)
+        server.call_receipts = {(int, index): (b'synthetic', '{}') for index in range(1024)}
+
+        def send(identifier, name, arguments):
+            request = {'jsonrpc': '2.0', 'id': identifier, 'method': 'tools/call',
+                       'params': {'name': name, 'arguments': arguments}}
+            return json.loads(bridge.safe_dispatch(server, json.dumps(request).encode() + b'\n'))
+
+        read = send(1025, 'Read', {'file_path': 'note.md'})
+        self.assertIn('known state', read['result']['content'][0]['text'])
+        self.assertEqual(send(1026, 'Write', {'file_path': 'note.md', 'content': 'changed'})['error']['code'], -32000)
+        self.assertEqual((self.root / 'note.md').read_text(), 'known state')
+        self.assertEqual(len(server.call_receipts), 1024)
+
     def test_scoped_image_read_returns_original_bytes_as_mcp_image(self):
         import base64
         # Synthetic eight-pixel-square PNG; no private fixture assets.

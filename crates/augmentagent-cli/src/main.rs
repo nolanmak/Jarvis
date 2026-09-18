@@ -2288,8 +2288,12 @@ enum WikiOp {
     ///
     /// Some of these act outside the wiki: sending email, filing or commenting on GitHub issues, and changing or stopping loops. Calendar events and social DMs and comments are raised as Discord approval cards and happen only when approved.
     Ask {
-        /// The question. Wrap in quotes if multi-word.
-        question: String,
+        /// The question. Wrap in quotes if multi-word; use --stdin for private prompts.
+        #[arg(required_unless_present = "stdin")]
+        question: Option<String>,
+        /// Read the question from stdin instead of exposing it in process arguments.
+        #[arg(long, conflicts_with = "question")]
+        stdin: bool,
         /// Also post the answer to the Discord approval channel via a
         /// one-shot HTTP client, honoring `ATTACH:` file markers (#440).
         /// Needs DISCORD_BOT_TOKEN + DISCORD_CHANNEL_ID in the env.
@@ -3364,7 +3368,11 @@ async fn main() -> Result<()> {
         },
         Cmd::Wiki { ref op } => match op {
             WikiOp::Lint { out } => run_wiki_lint(&cli, Arc::clone(&store), out.clone()).await,
-            WikiOp::Ask { question, post } => run_wiki_ask(&cli, question.clone(), *post).await,
+            WikiOp::Ask { question, stdin, post } => {
+                let question = if *stdin { read_wiki_question(std::io::stdin().lock())? }
+                    else { question.clone().context("question or --stdin is required")? };
+                run_wiki_ask(&cli, question, *post).await
+            },
             WikiOp::Migrate {
                 to,
                 dry_run,
@@ -7458,6 +7466,36 @@ mod now_awareness_tests {
         assert!(line.contains("11:35:00"));
         assert!(line.contains("-04:00"));
         assert!(line.ends_with("\n\n"));
+    }
+}
+
+fn read_wiki_question(mut reader: impl std::io::Read) -> Result<String> {
+    use std::io::Read;
+    const MAX_QUESTION_BYTES: u64 = 256 * 1024;
+    let mut question = String::new();
+    reader.by_ref().take(MAX_QUESTION_BYTES + 1).read_to_string(&mut question)?;
+    anyhow::ensure!(question.len() as u64 <= MAX_QUESTION_BYTES, "wiki question exceeds size limit");
+    anyhow::ensure!(!question.trim().is_empty(), "wiki question is required");
+    Ok(question)
+}
+
+#[cfg(test)]
+mod wiki_question_stdin_tests {
+    use super::*;
+
+    #[test]
+    fn stdin_question_is_bounded_and_required() {
+        assert_eq!(read_wiki_question("private prompt".as_bytes()).unwrap(), "private prompt");
+        assert!(read_wiki_question("  \n".as_bytes()).is_err());
+        assert!(read_wiki_question(vec![b'x'; 256 * 1024 + 1].as_slice()).is_err());
+    }
+
+    #[test]
+    fn wiki_ask_accepts_exactly_one_question_source() {
+        let cli = Cli::try_parse_from(["augmentagent", "wiki", "ask", "--stdin"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Wiki { op: WikiOp::Ask { question: None, stdin: true, .. } }));
+        assert!(Cli::try_parse_from(["augmentagent", "wiki", "ask"]).is_err());
+        assert!(Cli::try_parse_from(["augmentagent", "wiki", "ask", "private", "--stdin"]).is_err());
     }
 }
 

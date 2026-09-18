@@ -421,7 +421,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path!='/v1/chat/completions':return self.reply(404,{'error':{'message':'Use /v1/chat/completions'}})
         if not MAX_IN_FLIGHT.acquire(blocking=False):
             return self.reply(429,{'error':{'message':'Adapter is busy; retry later','type':'capacity_error'}})
-        streaming=False;job=None;base=None;journal=None;submitted=False
+        streaming=False;job=None;base=None;journal=None;submitted=False;response_started=False
         try:
             length=int(self.headers.get('Content-Length','0'))
             if length>4*1024*1024:return self.reply(413,{'error':{'message':'Request too large'}})
@@ -472,7 +472,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 try:
                     with request(route['base_url']+'/chat/completions',body,timeout=340) as upstream:
                         journal.finish(self.request_id, 'IN_PROGRESS')
-                        self.send_response(upstream.status);self.send_header('Content-Type',upstream.headers.get('Content-Type','application/json'));self.send_header('Connection','close');self.send_header('X-Adapter-Request-Id',self.request_id);self.end_headers();self.close_connection=True
+                        self.send_response(upstream.status);self.send_header('Content-Type',upstream.headers.get('Content-Type','application/json'));self.send_header('Connection','close');self.send_header('X-Adapter-Request-Id',self.request_id);self.end_headers();self.close_connection=True;response_started=True
                         while True:
                             chunk=upstream.read1(65536)
                             if not chunk:break
@@ -557,6 +557,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if submitted and journal and journal.get(self.request_id)['state']=='SUBMITTED':
                 journal.finish(self.request_id, 'POLL_UNKNOWN')
             print('chat failure', type(e).__name__, 'job', job or '-', flush=True)
+            if response_started and not streaming:
+                # Headers/body already reached the gateway. A second HTTP
+                # status line would corrupt that response; the journal keeps
+                # the uncertain outcome available for reconciliation.
+                return
             recorded=journal.get(self.request_id) if journal and getattr(self,'request_id',None) else None
             state=recorded['state'] if recorded else None
             uncertain=state in ('SUBMISSION_UNKNOWN','POLL_UNKNOWN','RESULT_UNKNOWN','CANCELLATION_UNKNOWN','CANCELLATION_UNSUPPORTED')

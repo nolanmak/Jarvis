@@ -123,11 +123,11 @@ pub fn parse(raw: &str) -> anyhow::Result<RouterConfig> {
     let host = url.host_str().unwrap_or_default();
     let local = url.scheme() == "http"
         && matches!(host, "127.0.0.1" | "localhost" | "[::1]");
-    let remote = url.port().is_some_and(|port| {
+    let remote = url.scheme() == "https" && url.port_or_known_default().is_some_and(|port| {
         let authority = format!("{host}:{port}");
         std::env::var("AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS")
             .ok().is_some_and(|hosts| hosts.split(',').any(|entry| entry.trim().eq_ignore_ascii_case(&authority)))
-    }) && (url.scheme() == "https" || (url.scheme() == "http" && host.ends_with(".ts.net")));
+    });
     anyhow::ensure!(
         (local || remote)
             && url.username().is_empty()
@@ -354,17 +354,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn explicitly_allowed_tailnet_router_has_an_exact_host_boundary() {
-        const NAME: &str = "model_router::tests::explicitly_allowed_tailnet_router_has_an_exact_host_boundary";
+    fn explicitly_allowed_remote_router_requires_https_and_exact_host() {
+        const NAME: &str = "model_router::tests::explicitly_allowed_remote_router_requires_https_and_exact_host";
         if std::env::var_os("JARVIS_TAILNET_ROUTER_CHILD").is_some() {
             let mut value = fixture();
-            value["base_url"] = "http://router.fixture.ts.net:20128/v1".into();
-            assert!(parse(&value.to_string()).is_ok(), "the exact allowed tailnet router should parse");
+            value["base_url"] = "https://router.fixture.ts.net:20128/v1".into();
+            assert!(parse(&value.to_string()).is_ok(), "the exact allowed HTTPS router should parse");
             for url in [
-                "http://other.fixture.ts.net:20128/v1",
-                "http://router.fixture.ts.net:20129/v1",
-                "http://user:pass@router.fixture.ts.net:20128/v1", // pii-ok: synthetic credentials in a rejection fixture
-                "http://router.fixture.ts.net:20128/v1?key=secret",
+                "http://router.fixture.ts.net:20128/v1",
+                "https://other.fixture.ts.net:20128/v1",
+                "https://router.fixture.ts.net:20129/v1",
+                "https://user:pass@router.fixture.ts.net:20128/v1", // pii-ok: synthetic credentials in a rejection fixture
+                "https://router.fixture.ts.net:20128/v1?key=secret",
                 "http://evil.example:20128/v1",
             ] {
                 value["base_url"] = url.into();
@@ -373,9 +374,14 @@ pub(crate) mod tests {
             std::env::set_var("AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS",
                 "router.fixture.ts.net:20128,evil.example:20128");
             value["base_url"] = "http://evil.example:20128/v1".into();
-            assert!(parse(&value.to_string()).is_err(), "remote cleartext is limited to tailnet DNS");
+            assert!(parse(&value.to_string()).is_err(), "remote cleartext is refused even for an allowed host");
             value["base_url"] = "https://evil.example:20128/v1".into();
             assert!(parse(&value.to_string()).is_ok(), "an explicitly allowed HTTPS router is valid");
+            std::env::set_var("AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS", "router.fixture.ts.net:443");
+            value["base_url"] = "https://router.fixture.ts.net/v1".into();
+            assert!(parse(&value.to_string()).is_ok(), "Tailscale Serve HTTPS should use the exact default port");
+            value["base_url"] = "http://router.fixture.ts.net:443/v1".into();
+            assert!(parse(&value.to_string()).is_err(), "port 443 does not make cleartext safe");
             return;
         }
         let output = std::process::Command::new(std::env::current_exe().unwrap())

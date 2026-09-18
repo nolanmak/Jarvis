@@ -574,6 +574,55 @@ class JobLifecycleTests(unittest.TestCase):
                 server.server_close()
                 worker.join(timeout=2)
 
+    def test_load_balancer_stream_failure_does_not_append_a_second_http_response(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            routes = pathlib.Path(tmp) / 'routes.json'
+            routes.write_text(json.dumps({'glm-5.3-flash': {'type': 'openai',
+                'base_url': 'https://g1eary963m1aym.api.runpod.ai/openai/v1',
+                'max_output_tokens': 128}}))
+            journal_path = pathlib.Path(tmp) / 'jobs.sqlite3'
+
+            class Upstream:
+                status = 200
+                headers = {'Content-Type': 'text/event-stream'}
+                reads = 0
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    pass
+
+                def read1(self, size):
+                    self.reads += 1
+                    if self.reads == 1:
+                        return b'data: {"partial":true}\n\n'
+                    raise TimeoutError('synthetic stream interruption')
+
+            server = module.http.server.ThreadingHTTPServer(('127.0.0.1', 0), module.Handler)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                with mock.patch.object(module, 'ROUTES', routes), \
+                     mock.patch.object(module, 'JOURNAL', journal_path), \
+                     mock.patch.object(module, 'request', return_value=Upstream()):
+                    conn = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=2)
+                    conn.request('POST', '/v1/chat/completions', json.dumps({
+                        'model': 'glm-5.3-flash', 'stream': True,
+                        'messages': [{'role': 'user', 'content': 'synthetic request'}]}),
+                        {'Authorization': 'Bearer test-client-key', 'Content-Type': 'application/json'})
+                    response = conn.getresponse()
+                    self.assertEqual(response.status, 200)
+                    request_id = response.getheader('X-Adapter-Request-Id')
+                    body = response.read()
+                    conn.close()
+                self.assertEqual(body, b'data: {"partial":true}\n\n')
+                self.assertEqual(module.JobJournal(journal_path).get(request_id)['state'], 'RESULT_UNKNOWN')
+            finally:
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=2)
+
     def test_existing_journal_rows_survive_endpoint_column_migration(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / 'jobs.sqlite3'

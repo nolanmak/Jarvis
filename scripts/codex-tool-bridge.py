@@ -2374,8 +2374,18 @@ def safe_dispatch(server, line):
                     'result': {'isError': True, 'content': [{'type': 'text',
                     'text': 'Earlier tool call outcome is uncertain; inspect current state before another change.'}]}})
             if len(server.call_receipts) >= 1024:
-                return json.dumps(rpc_error(identifier, -32000, 'Tool call limit reached'))
-            server.call_receipts[receipt_key] = (digest, None)
+                params_obj = request.get('params')
+                name = params_obj.get('name') if isinstance(params_obj, dict) else None
+                arguments = params_obj.get('arguments') if isinstance(params_obj, dict) else None
+                if (not isinstance(name, str) or not isinstance(arguments, dict)
+                        or not read_only_operation(name, arguments)):
+                    return json.dumps(rpc_error(identifier, -32000, 'Tool call limit reached'))
+                # A fresh read is needed to reconcile an uncertain mutation.
+                # Keep all earlier receipts; this extra read cannot repeat a
+                # write and is deliberately not cached by call ID.
+                receipt_key = None
+            else:
+                server.call_receipts[receipt_key] = (digest, None)
         try:
             response = {'jsonrpc': '2.0', 'id': identifier, 'result': server.dispatch(request)}
         except Readiness as error:

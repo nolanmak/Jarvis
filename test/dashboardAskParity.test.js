@@ -12,7 +12,8 @@ test("dashboard ask uses the shared Jarvis harness without separate LLM credenti
   const wiki = path.join(root, "wiki");
   fs.mkdirSync(wiki);
   fs.writeFileSync(cli, `#!/usr/bin/env node
-require("node:fs").writeFileSync(process.env.SYNTHETIC_ARGS_FILE, JSON.stringify(process.argv.slice(2)));
+const fs = require("node:fs");
+fs.writeFileSync(process.env.SYNTHETIC_ARGS_FILE, JSON.stringify({ args: process.argv.slice(2), stdin: fs.readFileSync(0, "utf8") }));
 process.stdout.write("SHARED_HARNESS_OK\\n");
 `, { mode: 0o700 });
   process.env.AUGMENTAGENT_BIN = cli;
@@ -37,8 +38,10 @@ process.stdout.write("SHARED_HARNESS_OK\\n");
     const body = await response.text();
     assert.equal(response.status, 200, body);
     assert.deepEqual(JSON.parse(body), { answer: "SHARED_HARNESS_OK" });
-    assert.deepEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")),
-      ["--wiki-dir", wiki, "wiki", "ask", "find the synthetic note"]);
+    assert.deepEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), {
+      args: ["--wiki-dir", wiki, "wiki", "ask", "--stdin"],
+      stdin: "find the synthetic note",
+    });
   } finally {
     await new Promise((resolve) => server.close(resolve));
     fs.rmSync(root, { recursive: true, force: true });
