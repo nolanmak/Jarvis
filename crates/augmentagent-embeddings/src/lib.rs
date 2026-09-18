@@ -13,6 +13,7 @@ pub mod fetch;
 pub mod local;
 pub mod model;
 pub mod prepare;
+pub mod vectors;
 
 pub use embedder::{Embedder, Embedding, ModelId};
 pub use local::LocalEmbedder;

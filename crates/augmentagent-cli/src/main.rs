@@ -2960,6 +2960,16 @@ async fn main() -> Result<()> {
                     messages_cmd::drain_loop(store_mi, sd).await;
                     Ok(())
                 }));
+                // #1130 — chunks + vectors for the semantic layer; inert
+                // unless AUGMENTAGENT_EMBEDDINGS=1 and weights are present.
+                {
+                    let store_e = Arc::clone(&store);
+                    let sd = shutdown.clone();
+                    tasks.push(tokio::spawn(async move {
+                        embeddings_cmd::worker_loop(store_e, sd).await;
+                        Ok(())
+                    }));
+                }
                 // #1101 — handle → person cache for cross-platform `with:`.
                 if let Some(wiki_root) = cli.wiki_dir.clone() {
                     let store_mp = Arc::clone(&store);
