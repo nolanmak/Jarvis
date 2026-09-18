@@ -157,7 +157,9 @@ pub fn ineligible_reason(kind: ProviderKind) -> Option<String> {
     }
 }
 
-fn native_ineligible_reason(kind: ProviderKind) -> Option<String> {
+/// A native login check for callers that must not count an opaque gateway
+/// alias as an independent model (for example, automated code review).
+pub fn native_ineligible_reason(kind: ProviderKind) -> Option<String> {
     match kind {
         ProviderKind::Claude => None,
         ProviderKind::Codex => {

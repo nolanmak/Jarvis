@@ -3017,7 +3017,13 @@ impl ReviewUnavailable {
 /// it: the same eligibility check `build_pinned` makes, then the cooldown
 /// latch the fallback chain writes.
 fn reviewer_status(kind: augmentagent_channel_core::ProviderKind) -> ReviewerStatus {
-    if let Some(why) = augmentagent_channel_core::ineligible_reason(kind) {
+    if augmentagent_channel_core::model_router::load().is_err() {
+        return ReviewerStatus::NotConfigured("invalid model router configuration".into());
+    }
+    // 9Router's account label cannot attest to its underlying model. An
+    // author model could appear again as `cx/...` or `cc/...` and falsely
+    // approve its own work. Automated review uses native identities only.
+    if let Some(why) = augmentagent_channel_core::fallback::native_ineligible_reason(kind) {
         return ReviewerStatus::NotConfigured(why);
     }
     match augmentagent_channel_core::CooldownLatch::system().latched_until(kind.name()) {
@@ -3163,7 +3169,9 @@ async fn independent_review(
         if provider == augmentagent_channel_core::ProviderKind::Claude {
             opts.model = Some(build_model());
         }
-        match reasoner.call(&opts, prompt).await {
+        let review = augmentagent_channel_core::model_router::native_reviewer_scope(
+            provider, reasoner.call(&opts, prompt)).await;
+        match review {
             Ok(raw) => {
                 let (ok, notes) = parse_codex_review(&raw);
                 info!(issue = issue.number, provider = provider.name(), pass = label, approved = ok, "independent review");
@@ -9708,6 +9716,43 @@ for tool, arguments in [
         assert_eq!(independent_reviewer_candidates(Some(&[Codex])), vec![Claude]);
         assert!(independent_reviewer_candidates(Some(&[Claude, Codex])).is_empty());
         assert!(independent_reviewer_candidates(None).is_empty());
+    }
+
+    #[test]
+    fn gateway_only_codex_alias_cannot_be_an_independent_reviewer() {
+        const NAME: &str = "self_improve::tests::gateway_only_codex_alias_cannot_be_an_independent_reviewer";
+        if std::env::var_os("JARVIS_REVIEW_ALIAS_CHILD").is_some() {
+            use augmentagent_channel_core::ProviderKind::Codex;
+            assert!(!augmentagent_channel_core::codex::codex_auth_available());
+            assert!(matches!(reviewer_status(Codex), ReviewerStatus::NotConfigured(_)),
+                "a gateway account can alias the author model; review needs a native Codex login");
+            let home = augmentagent_channel_core::codex::codex_home();
+            std::fs::write(home.join("auth.json"), b"{}").unwrap();
+            assert_eq!(reviewer_status(Codex), ReviewerStatus::Ready,
+                "a native Codex login should remain eligible even with 9Router configured");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("router.json");
+        std::fs::write(&config, serde_json::json!({
+            "version": 1, "mode": "auto", "base_url": "http://127.0.0.1:20128/v1",
+            "api_key": "synthetic-router-key",
+            "models": {
+                "claude": {"quality":"cc/claude-opus-4-6","fast":"cc/claude-haiku-4-5"},
+                "codex": {"quality":"cx/gpt-5.4","fast":"cx/gpt-5.4-mini"}
+            }
+        }).to_string()).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env("JARVIS_REVIEW_ALIAS_CHILD", "1")
+            .env("AUGMENTAGENT_MODEL_ROUTER_CONFIG", &config)
+            .env("AUGMENTAGENT_CODEX_HOME", dir.path())
+            .env("CODEX_CLI", "/usr/bin/true")
+            .env("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={}/no-dbus", dir.path().display()))
+            .env_remove("CODEX_API_KEY")
+            .output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr));
     }
 
     #[tokio::test]

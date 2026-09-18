@@ -26,6 +26,15 @@ pub struct RouterConfig {
 }
 
 tokio::task_local! { pub(crate) static SNAPSHOT: Option<RouterConfig>; }
+tokio::task_local! { static NATIVE_REVIEW: ProviderKind; }
+
+/// Pin an independent reviewer to its native CLI identity for one call.
+/// Gateway account aliases cannot establish that a reviewer differs from an
+/// author model, and an inherited Discord selection must not redirect it.
+pub async fn native_reviewer_scope<F: std::future::Future>(provider: ProviderKind, call: F) -> F::Output {
+    let selected = (provider == ProviderKind::Codex).then_some(provider);
+    NATIVE_REVIEW.scope(provider, crate::model_selection::SELECTED_PROFILE.scope(selected, call)).await
+}
 
 pub fn config_path() -> PathBuf {
     std::env::var_os("AUGMENTAGENT_MODEL_ROUTER_CONFIG")
@@ -65,6 +74,15 @@ pub fn select_profile(config: Option<RouterConfig>, selected: Option<ProviderKin
 }
 
 fn select_profile_with_auth(mut config: Option<RouterConfig>, selected: Option<ProviderKind>, native_codex_available: bool) -> anyhow::Result<Option<RouterConfig>> {
+    if let Ok(reviewer) = NATIVE_REVIEW.try_with(|provider| *provider) {
+        anyhow::ensure!(matches!(reviewer, ProviderKind::Codex | ProviderKind::Claude)
+            && selected == (reviewer == ProviderKind::Codex).then_some(reviewer),
+            "independent review must stay pinned to its native provider");
+        anyhow::ensure!(reviewer != ProviderKind::Codex || native_codex_available,
+            "native Codex authentication is required for independent review");
+        if let Some(router) = config.as_mut() { router.mode = "direct".into(); }
+        return Ok(config);
+    }
     if let Some(profile) = selected {
         anyhow::ensure!(matches!(profile, ProviderKind::Codex | ProviderKind::Qwen | ProviderKind::Glm), "unsupported model profile");
         if let Some(router) = config.as_mut() {
@@ -309,5 +327,22 @@ pub(crate) mod tests {
             .unwrap().unwrap();
         assert_eq!(gateway.mode, "codex");
         assert_eq!(original.mode, "auto");
+    }
+
+    #[tokio::test]
+    async fn independent_review_never_uses_an_opaque_gateway_alias() {
+        let config = Some(parse(&fixture().to_string()).unwrap());
+        let lost_login = native_reviewer_scope(ProviderKind::Codex, async {
+            select_profile_with_auth(config.clone(), Some(ProviderKind::Codex), false)
+        }).await;
+        assert!(lost_login.is_err(), "a lost native login must not fall through to 9Router");
+        let native_codex = native_reviewer_scope(ProviderKind::Codex, async {
+            select_profile_with_auth(config.clone(), Some(ProviderKind::Codex), true)
+        }).await.unwrap().unwrap();
+        assert_eq!(native_codex.mode, "direct");
+        let native_claude = native_reviewer_scope(ProviderKind::Claude, async {
+            select_profile_with_auth(config, None, false)
+        }).await.unwrap().unwrap();
+        assert_eq!(native_claude.mode, "direct");
     }
 }
