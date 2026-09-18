@@ -88,7 +88,31 @@ Independent automated review uses native Claude or Codex transport with a separa
 
 ## Operator notes
 
-The Runpod adapter source is in `scripts/runpod-adapter`. It normalizes 9Router Chat Completions content parts into Ollama requests and emits Chat Completions SSE. It is deployed separately from Jarvis; production packaging and actual-host acceptance are tracked in #1143. The local gateway on this Mac depends on that Mac staying awake and connected to Docker and Tailscale. Move the gateway to the actual always-on Jarvis host for unattended work.
+The Runpod adapter source is in `scripts/runpod-adapter`. It normalizes 9Router Chat Completions content parts into Ollama requests and emits Chat Completions SSE. It is deployed separately from Jarvis; its checked-in Compose packaging and actual-host acceptance are tracked in #1143. The local gateway on this Mac depends on that Mac staying awake and connected to Docker and Tailscale. Move the gateway to the actual always-on Jarvis host for unattended work.
+
+On a Linux gateway host with Docker Compose, provision an owner-private
+`adapter.env` containing `RUNPOD_API_KEY` and `ADAPTER_API_KEY`, and a routes
+JSON that keeps each model disabled until its live gate passes. Keep the state
+directory mode 0700. The Compose service builds the checked-in adapter,
+publishes only `127.0.0.1:20129`, runs as that directory's owner, and mounts
+the routes read-only and the journal persistently:
+
+```sh
+install -d -m 0700 "$HOME/.local/share/augmentagent/runpod-adapter/state"
+export RUNPOD_ADAPTER_UID="$(id -u)"
+export RUNPOD_ADAPTER_ENV_FILE="$HOME/.config/augmentagent/runpod-adapter.env"
+export RUNPOD_ADAPTER_ROUTES_FILE="$HOME/.config/augmentagent/runpod-routes.json"
+export RUNPOD_ADAPTER_STATE_DIR="$HOME/.local/share/augmentagent/runpod-adapter/state"
+docker compose -f scripts/runpod-adapter/compose.yaml config --quiet
+docker compose -f scripts/runpod-adapter/compose.yaml up -d --build
+```
+
+The opt-in deployment fixture runs this same Compose file with synthetic keys,
+paused Qwen/GLM routes, an authenticated catalog check and a private journal;
+`python3 scripts/runpod-adapter/test_compose_deployment.py` cleans up its own
+container and test image. Run the authenticated `verify_deployment.py` preflight
+with the host's private adapter and router client files after 9Router is ready.
+Stopping this Compose service leaves its bind-mounted journal intact.
 
 If Jarvis runs on another tailnet machine while the gateway remains on this Mac, set its router `base_url` to the `/v1` URL shown by `tailscale serve status` and set `AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS` to that exact host and port in the daemon environment. Remote URLs require this exact host and port; cleartext is accepted only for a `.ts.net` name. A separately allowlisted HTTPS host is also accepted. The router key remains in the private router config. `python3 scripts/tests/verify_codex_redirect.py` runs the real Codex Responses client against two synthetic local servers: the configured origin must receive the throwaway key, while a redirect to a different host and port must receive no credential. Codex CLI 0.154.0 passed this probe locally on 2026-09-18; the pinned version also runs in model-router CI. The daemon host still needs the complete routing and tool workflow acceptance run.
 

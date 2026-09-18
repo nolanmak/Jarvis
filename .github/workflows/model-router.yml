@@ -90,3 +90,10 @@ jobs:
         run: python3 -m unittest discover -s scripts/tests -p test_verify_codex_redirect.py
       - name: Refuse router credential on a cross-origin redirect
         run: python3 scripts/tests/verify_codex_redirect.py
+  adapter-compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Exercise private adapter deployment with paused synthetic routes
+        run: python3 scripts/runpod-adapter/test_compose_deployment.py
