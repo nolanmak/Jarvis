@@ -8899,9 +8899,43 @@ impl QueryHandler for WikiQuerier {
         let prompt = format!("{}{prompt}", now_awareness_line());
         // #446 — see `wiki ask`: the Discord reply must carry every text block
         // the model emitted, not just the trailing wiki-filing receipt.
-        let answer = self.reasoner.call_transcript(&opts, &prompt).await;
+        let selected = match ctx.channel_id {
+            Some(channel) => augmentagent_channel_core::model_selection::SelectionStore::new(
+                augmentagent_channel_core::model_selection::config_path())
+                .selected(Some(&channel.get().to_string()))?,
+            None => None,
+        };
+        let answer = augmentagent_channel_core::model_selection::SELECTED_PROFILE
+            .scope(selected, self.reasoner.call_transcript(&opts, &prompt)).await;
         sweep_imessage_attachments(&opts.env);
         answer
+    }
+
+    async fn model_command(&self, channel_id: u64, text: &str) -> Option<String> {
+        use augmentagent_channel_core::model_selection::{config_path, run_command, SelectionStore};
+        use augmentagent_channel_core::providers::ProviderKind;
+        let store = SelectionStore::new(config_path());
+        run_command(&store, &channel_id.to_string(), text, |profile| {
+            let router = augmentagent_channel_core::model_router::load()
+                .map_err(|_| "9Router configuration is invalid".to_string())?;
+            match profile {
+                ProviderKind::Qwen => {
+                    if router.is_none() { Err("Qwen requires a configured 9Router endpoint".into()) }
+                    else { Ok(()) }
+                }
+                ProviderKind::Glm => {
+                    if std::env::var("AUGMENTAGENT_MODEL_GLM_ENABLED").ok().as_deref() != Some("1") {
+                        Err("GLM is paused; enable it after live deployment verification".into())
+                    } else if router.is_none() { Err("GLM requires a configured 9Router endpoint".into()) }
+                    else { Ok(()) }
+                }
+                ProviderKind::Codex => {
+                    if router.is_some() || augmentagent_channel_core::codex::codex_auth_available() { Ok(()) }
+                    else { Err("Codex account is not configured".into()) }
+                }
+                _ => Err("Unsupported model profile".into()),
+            }
+        })
     }
 }
 

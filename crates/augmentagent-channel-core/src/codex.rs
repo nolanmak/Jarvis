@@ -59,6 +59,7 @@ pub fn codex_auth_available() -> bool {
 
 pub struct CodexCliReasoner {
     bin: String,
+    kind: ProviderKind,
     /// #898 — shared cap on concurrent CLI children.
     gate: std::sync::Arc<crate::cli_gate::CliGate>,
     /// #1047 — where this adapter's token usage goes. The process-global
@@ -81,7 +82,12 @@ fn bridge_runner(content: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn record_tool_item(opts: &ReasonerOpts, item: &serde_json::Value) {
+    record_tool_item_for(ProviderKind::Codex, opts, item).await
+}
+
+async fn record_tool_item_for(kind: ProviderKind, opts: &ReasonerOpts, item: &serde_json::Value) {
     use crate::tool_audit::{build_audit_record, is_high_risk};
     let native_web = item.get("type").and_then(|v| v.as_str()) == Some("web_search");
     if !native_web && item.get("type").and_then(|v| v.as_str()) != Some("mcp_tool_call") { return; }
@@ -101,7 +107,7 @@ pub(crate) async fn record_tool_item(opts: &ReasonerOpts, item: &serde_json::Val
     let failed = item.get("status").and_then(|s| s.as_str()) == Some("failed")
         || result.is_some_and(|r| r.get("isError").or_else(|| r.get("is_error")).and_then(|b| b.as_bool()).unwrap_or(false));
     let session = opts.session_id.as_deref().unwrap_or("-");
-    let mut record = build_audit_record(ProviderKind::Codex, chrono::Utc::now().to_rfc3339(), session.into(), tool.clone(), args, &content, failed);
+    let mut record = build_audit_record(kind, chrono::Utc::now().to_rfc3339(), session.into(), tool.clone(), args, &content, failed);
     if tool == "Bash" {
         let outcome = serde_json::from_str::<serde_json::Value>(&content).ok();
         record.exit_code = outcome.as_ref()
@@ -123,19 +129,27 @@ impl CodexCliReasoner {
     pub fn openai() -> Self {
         Self {
             bin: codex_bin(),
+            kind: ProviderKind::Codex,
             gate: crate::cli_gate::CliGate::global(),
             usage_log: crate::token_usage::UsageLogger::global(),
         }
     }
 
+    pub fn runpod(kind: ProviderKind) -> Self {
+        assert!(matches!(kind, ProviderKind::Qwen | ProviderKind::Glm));
+        let mut reasoner = Self::openai();
+        reasoner.kind = kind;
+        reasoner
+    }
+
     /// Adapter bound to an explicit binary (fault-injection stubs in tests).
     #[cfg(test)]
     pub(crate) fn with_bin(bin: String) -> Self {
-        Self { bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global() }
+        Self { bin, kind: ProviderKind::Codex, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global() }
     }
 
     fn provider_name(&self) -> &'static str {
-        ProviderKind::Codex.name()
+        self.kind.name()
     }
 
     async fn call_capture(
@@ -186,9 +200,14 @@ impl CodexCliReasoner {
         clean: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> anyhow::Result<String> {
         let provider = self.provider_name();
-        let router = crate::model_router::current()?.filter(|r| r.enabled());
-        let model = router.as_ref().and_then(|r| r.model(ProviderKind::Codex, tier_of(opts)))
-            .unwrap_or_else(|| model_for(ProviderKind::Codex, tier_of(opts)));
+        let router = crate::model_router::current()?.filter(|r| r.enabled() || self.kind != ProviderKind::Codex);
+        if matches!(self.kind, ProviderKind::Qwen | ProviderKind::Glm) && router.is_none() {
+            return Err(ReasonerError::Local { message: "Runpod model requires a configured 9Router endpoint".into() }.into());
+        }
+        let model = if self.kind == ProviderKind::Codex {
+            router.as_ref().and_then(|r| r.model(ProviderKind::Codex, tier_of(opts)))
+                .unwrap_or_else(|| model_for(ProviderKind::Codex, tier_of(opts)))
+        } else { model_for(self.kind, tier_of(opts)) };
         let capability = crate::providers::classify(opts);
 
         // `IMAGE:` markers → native `-i` attachments (see crate::images).
@@ -262,6 +281,14 @@ impl CodexCliReasoner {
         ];
         if let Some(router) = &router {
             for value in router.codex_overrides() { args.extend(["-c".into(), value]); }
+        }
+        if let Some((context, compact)) = match self.kind {
+            ProviderKind::Qwen => Some((16_384, 12_288)),
+            ProviderKind::Glm => Some((32_768, 24_576)),
+            _ => None,
+        } {
+            args.extend(["-c".into(), format!("model_context_window={context}")]);
+            args.extend(["-c".into(), format!("model_auto_compact_token_limit={compact}")]);
         }
         for img in &image_paths {
             args.push("-i".into());
@@ -372,7 +399,7 @@ impl CodexCliReasoner {
             }
             if kind == Some("item.completed") {
                 if let Some(item) = v.get("item") {
-                    record_tool_item(opts, item).await;
+                    record_tool_item_for(self.kind, opts, item).await;
                 }
             }
             match kind {
@@ -412,7 +439,7 @@ impl CodexCliReasoner {
         // Best effort, like the Claude path: the logger swallows IO errors.
         if let Some(usage) = observed_usage {
             self.usage_log.append(&crate::token_usage::UsageRecord::for_call(
-                ProviderKind::Codex,
+                self.kind,
                 model.as_str(),
                 capability,
                 usage,
@@ -599,7 +626,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"{\"decisio
 echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
 "#,
         );
-        let r = CodexCliReasoner {
+        let r = CodexCliReasoner { kind: ProviderKind::Codex,
             bin,
             gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(),
         };
@@ -628,7 +655,7 @@ echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"syntheti
 echo '{{"type":"turn.completed","usage":{{"input_tokens":3000,"cached_input_tokens":2000,"cache_write_input_tokens":200,"output_tokens":120,"reasoning_output_tokens":70}}}}'
 "#, argv = argv.display()));
         let log = dir.path().join("token-usage.jsonl");
-        let reasoner = CodexCliReasoner {
+        let reasoner = CodexCliReasoner { kind: ProviderKind::Codex,
             bin,
             gate: crate::cli_gate::CliGate::global(),
             usage_log: std::sync::Arc::new(crate::token_usage::UsageLogger::new(log.clone())),
@@ -660,7 +687,7 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":3000,"cached_input_toke
     async fn usage_is_recorded_whatever_the_outcome_and_only_when_reported() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("token-usage.jsonl");
-        let adapter = |name: &str, body: &str| CodexCliReasoner {
+        let adapter = |name: &str, body: &str| CodexCliReasoner { kind: ProviderKind::Codex,
             bin: stub(&dir, name, body),
             gate: crate::cli_gate::CliGate::global(),
             usage_log: std::sync::Arc::new(crate::token_usage::UsageLogger::new(log.clone())),
@@ -682,7 +709,7 @@ cat >/dev/null
 echo '{"type":"turn.failed","error":{"message":"required MCP server: JARVIS_READINESS:mcp_start PRIVATE_SYNTHETIC_CONFIGURATION"}}'
 exit 1
 "#);
-        let reasoner = CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
+        let reasoner = CodexCliReasoner { kind: ProviderKind::Codex, bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
         let error = reasoner.call(&opts(), "Synthetic request").await.unwrap_err();
         assert!(matches!(ReasonerError::find_in(&error), Some(ReasonerError::Local { .. })), "{error}");
         assert!(error.to_string().contains("MCP"));
@@ -715,7 +742,7 @@ exit 1
         ));
         let mut options = crate::reasoner::resume_opts(dir.path().into());
         options.env.push(("SYNTHETIC_TOKEN".into(), "private-fixture-only".into()));
-        let reasoner = CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
+        let reasoner = CodexCliReasoner { kind: ProviderKind::Codex, bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
         reasoner.call(&options, "Read a synthetic note").await.unwrap();
         let args = std::fs::read_to_string(record).unwrap();
         assert!(args.contains("mcp_servers.jarvis="));
@@ -908,7 +935,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
         let mut options = opts();
         options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(log.clone())));
         options.session_id = Some("synthetic-session".into());
-        CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), }
+        CodexCliReasoner { kind: ProviderKind::Codex, bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), }
             .call(&options, "synthetic audit probe").await.unwrap();
         let row: serde_json::Value = serde_json::from_str(std::fs::read_to_string(log).unwrap().trim()).unwrap();
         assert_eq!(row["provider"], "codex");
@@ -973,7 +1000,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
 "#);
         let mut options = opts();
         options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(log.clone())));
-        CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global() }
+        CodexCliReasoner { kind: ProviderKind::Codex, bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global() }
             .call(&options, "synthetic build audit probe").await.unwrap();
         let rows: Vec<serde_json::Value> = std::fs::read_to_string(log).unwrap().lines()
             .map(|line| serde_json::from_str(line).unwrap()).collect();
@@ -1000,7 +1027,7 @@ echo '{"type":"turn.failed","error":{"message":"You'\''ve hit your usage limit. 
 exit 1
 "#,
         );
-        let r = CodexCliReasoner {
+        let r = CodexCliReasoner { kind: ProviderKind::Codex,
             bin,
             gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(),
         };
@@ -1025,7 +1052,7 @@ echo '{"type":"error","message":"Reconnecting... 1/5 (stream disconnected before
 echo '{"type":"item.completed","item":{"type":"mcp_tool_call","server":"jarvis","tool":"Write","arguments":{"file_path":"synthetic.md"},"result":{"content":[{"type":"text","text":"written"}]},"status":"completed"}}'
 echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
 "#);
-        let reasoner = CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
+        let reasoner = CodexCliReasoner { kind: ProviderKind::Codex, bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
         for transcript in [false, true] {
             let err = if transcript {
                 reasoner.call_transcript(&opts(), "synthetic request").await.unwrap_err()
@@ -1071,7 +1098,7 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
             std::fs::write(&events, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
             let bin = stub(&dir, &format!("fake-codex-{index}"),
                 &format!("cat >/dev/null\ncat '{}'\nexit 1\n", events.display()));
-            let reasoner = CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
+            let reasoner = CodexCliReasoner { kind: ProviderKind::Codex, bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
             let err = reasoner.call(&opts(), "synthetic request").await.unwrap_err();
             match (want, ReasonerError::find_in(&err)) {
                 (None, None) => {}
@@ -1112,7 +1139,7 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
             ("fake-codex-killed", "cat >/dev/null\necho '{\"type\":\"turn.started\"}'\nkill -9 $$\n"),
             ("fake-codex-model", "cat >/dev/null\necho '{\"type\":\"turn.started\"}'\necho '{\"type\":\"turn.failed\",\"error\":{\"message\":\"unexpected status 404 Not Found: model_not_found\"}}'\nexit 1\n"),
         ] {
-            let reasoner = CodexCliReasoner { bin: stub(&dir, name, body), gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
+            let reasoner = CodexCliReasoner { kind: ProviderKind::Codex, bin: stub(&dir, name, body), gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
             let err = reasoner.call(&write_opts(&dir), "synthetic request").await.unwrap_err();
             assert!(ReasonerError::find_in(&err).is_none(), "{name} (write): {err:#}");
             assert_eq!(err.downcast_ref::<TurnFailure>().map(|f| f.class), Some(FailureClass::Unrecognised), "{name}");
@@ -1134,7 +1161,7 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
             ("fake-codex-silent", "cat >/dev/null\n"),
             ("fake-codex-thread-only", "cat >/dev/null\necho '{\"type\":\"thread.started\",\"thread_id\":\"t1\"}'\n"),
         ] {
-            let reasoner = CodexCliReasoner { bin: stub(&dir, name, body), gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
+            let reasoner = CodexCliReasoner { kind: ProviderKind::Codex, bin: stub(&dir, name, body), gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
             for options in [opts(), write_opts(&dir)] {
                 let err = reasoner.call(&options, "synthetic request").await.unwrap_err();
                 assert!(matches!(ReasonerError::find_in(&err), Some(ReasonerError::Unavailable { .. })),
@@ -1154,7 +1181,7 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
             ("fake-codex-panic", "cat >/dev/null\necho '{\"type\":\"turn.started\"}'\necho \"thread 'main' panicked at core/src/synthetic.rs:1:1:\" >&2\nexit 101\n"),
         ] {
             let bin = stub(&dir, name, body);
-            let err = CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), }
+            let err = CodexCliReasoner { kind: ProviderKind::Codex, bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), }
                 .call(&opts(), "synthetic request").await.unwrap_err();
             assert!(matches!(ReasonerError::find_in(&err), Some(ReasonerError::Unavailable { .. })),
                 "{name}: {err:#}");
@@ -1181,7 +1208,7 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
             );
             let mut o = opts();
             o.model = Some(preset_model.into());
-            CodexCliReasoner {
+            CodexCliReasoner { kind: ProviderKind::Codex,
             bin,
             gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(),
         }.call(&o, "hi").await.unwrap();
@@ -1195,6 +1222,35 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
                 argv.windows(2).any(|w| w[0] == "-m" && w[1] == want),
                 "codex must spawn with `-m {want}`, got {argv:?}"
             );
+        }
+    }
+
+    // The supervised CLI lifecycle is exercised on the daemon's Linux host;
+    // macOS cannot certify its descendant-reaping receipt.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn runpod_profiles_use_codex_bridge_with_distinct_model_ids() {
+        for (kind, expected) in [
+            (ProviderKind::Qwen, "runpod/qwen38-27b"),
+            (ProviderKind::Glm, "runpod/glm-5.3-flash"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let record = dir.path().join("argv.txt");
+            let bin = stub(&dir, "fake-codex", &format!(
+                "cat >/dev/null\nprintf '%s\\n' \"$@\" >{}\necho '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"ok\"}}}}'\n",
+                record.display()));
+            let mut reasoner = CodexCliReasoner::runpod(kind);
+            reasoner.bin = bin;
+            let config = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+            let answer = crate::model_router::SNAPSHOT.scope(Some(config), reasoner.call(&opts(), "hi")).await.unwrap();
+            assert_eq!(answer, "ok");
+            assert_eq!(reasoner.provider_name(), kind.name());
+            let argv = std::fs::read_to_string(&record).unwrap();
+            assert!(argv.contains(&format!("-m\n{expected}\n")), "wrong model: {argv}");
+            assert!(argv.contains("model_providers.augmentagent_router.wire_api=\"responses\""));
+            let context = if kind == ProviderKind::Qwen { 16_384 } else { 32_768 };
+            assert!(argv.contains(&format!("model_context_window={context}")));
+            assert!(!argv.contains("router-secret"));
         }
     }
 
@@ -1219,7 +1275,7 @@ echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"a red sq
                 record = record.display()
             ),
         );
-        let r = CodexCliReasoner {
+        let r = CodexCliReasoner { kind: ProviderKind::Codex,
             bin,
             gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(),
         };
@@ -1238,7 +1294,7 @@ echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"a red sq
 
     #[tokio::test]
     async fn missing_binary_is_local_not_failoverable_noise() {
-        let r = CodexCliReasoner {
+        let r = CodexCliReasoner { kind: ProviderKind::Codex,
             bin: "/nonexistent/codex-bin".into(),
             gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(),
         };
@@ -1301,7 +1357,7 @@ PY
         std::fs::write(workspace.join("bait.txt"), format!("{}b\n", "a".repeat(40))).unwrap();
         let bin = stub(&dir, "fake-codex-grep", FAKE_CODEX_PATHOLOGICAL_GREP);
         let gate = std::sync::Arc::new(crate::cli_gate::CliGate::new(1));
-        let reasoner = CodexCliReasoner { bin, gate: gate.clone(), usage_log: crate::token_usage::UsageLogger::global() };
+        let reasoner = CodexCliReasoner { kind: ProviderKind::Codex, bin, gate: gate.clone(), usage_log: crate::token_usage::UsageLogger::global() };
         let mut options = opts();
         options.allowed_tools = vec!["Grep".into()];
         options.cwd = Some(workspace);

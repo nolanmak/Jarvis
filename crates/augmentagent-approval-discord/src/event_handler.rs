@@ -96,6 +96,17 @@ impl EventHandler for Handler {
         }
 
         let user_text = msg.content.trim().to_string();
+        // Model selection is an owner control, never part of the model prompt.
+        // This runs after the existing fail-closed allowlist and before any
+        // attachment download or history collection.
+        if let Some(reply) = handler.model_command(msg.channel_id.get(), &user_text).await {
+            let builder = CreateMessage::new().content(reply)
+                .reference_message(MessageReference::from((msg.channel_id, msg.id)));
+            if let Err(error) = msg.channel_id.send_message(&ctx.http, builder).await {
+                warn!("failed to post model command reply: {error}");
+            }
+            return;
+        }
         let AttachmentPartition {
             images,
             text_files,

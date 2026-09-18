@@ -36,6 +36,10 @@ pub enum ProviderKind {
     /// (base_url + wire_api="chat") — same spawn/parse path as Codex, no
     /// second HTTP client (#663).
     Cerebras,
+    /// Runpod models use the same constrained Jarvis tool bridge as Codex,
+    /// while keeping their real model identity in audit and review history.
+    Qwen,
+    Glm,
 }
 
 impl ProviderKind {
@@ -45,6 +49,8 @@ impl ProviderKind {
             ProviderKind::Codex => "codex",
             ProviderKind::Gemini => "gemini",
             ProviderKind::Cerebras => "cerebras",
+            ProviderKind::Qwen => "qwen",
+            ProviderKind::Glm => "glm",
         }
     }
 
@@ -54,6 +60,8 @@ impl ProviderKind {
             "codex" => Some(ProviderKind::Codex),
             "gemini" | "google" => Some(ProviderKind::Gemini),
             "cerebras" => Some(ProviderKind::Cerebras),
+            "qwen" => Some(ProviderKind::Qwen),
+            "glm" => Some(ProviderKind::Glm),
             _ => None,
         }
     }
@@ -139,7 +147,7 @@ pub fn allowed_for(kind: ProviderKind, class: CapabilityClass) -> bool {
             class,
             CapabilityClass::TextOnly | CapabilityClass::ReadTools
         ),
-        ProviderKind::Codex => true,
+        ProviderKind::Codex | ProviderKind::Qwen | ProviderKind::Glm => true,
         ProviderKind::Cerebras => matches!(class, CapabilityClass::TextOnly),
     }
 }
@@ -161,6 +169,10 @@ pub const OPUS_MODEL_ENV: &str = "AUGMENTAGENT_OPUS_MODEL";
 /// reasoner selftest all resolve here, so a classic draft and the code-mode
 /// draft it falls back from can never run different models.
 pub fn model_for(kind: ProviderKind, tier: ModelTier) -> String {
+    // These profile names are user-facing identities. An environment override
+    // must not silently route "qwen" or "glm" to another backend.
+    if kind == ProviderKind::Qwen { return "runpod/qwen38-27b".into(); }
+    if kind == ProviderKind::Glm { return "runpod/glm-5.3-flash".into(); }
     let tier_name = match tier {
         ModelTier::Quality => "QUALITY",
         ModelTier::Fast => "FAST",
@@ -195,6 +207,8 @@ pub fn model_for(kind: ProviderKind, tier: ModelTier) -> String {
         (ProviderKind::Gemini, ModelTier::Fast) => "gemini-3.7-flash".into(),
         (ProviderKind::Cerebras, ModelTier::Quality) => "gpt-oss-120b".into(),
         (ProviderKind::Cerebras, ModelTier::Fast) => "gemma-4-31b".into(),
+        (ProviderKind::Qwen, _) => "runpod/qwen38-27b".into(),
+        (ProviderKind::Glm, _) => "runpod/glm-5.3-flash".into(),
     }
 }
 
@@ -374,5 +388,17 @@ mod tests {
 
         std::env::remove_var("AUGMENTAGENT_REASONER_CHAIN");
         assert_eq!(chain_from_env(), vec![ProviderKind::Claude]);
+    }
+
+    #[test]
+    fn runpod_profiles_are_distinct_full_agent_providers() {
+        for (name, model) in [("qwen", "runpod/qwen38-27b"), ("glm", "runpod/glm-5.3-flash")] {
+            let provider = ProviderKind::parse(name).expect("configured Runpod profile");
+            assert_eq!(provider.name(), name);
+            assert_eq!(model_for(provider, ModelTier::Quality), model);
+            assert!(allowed_for(provider, CapabilityClass::FullAgentic));
+        }
+        assert_ne!(ProviderKind::parse("qwen"), Some(ProviderKind::Codex));
+        assert_ne!(ProviderKind::parse("glm"), Some(ProviderKind::Codex));
     }
 }

@@ -338,6 +338,10 @@ pub trait ApprovalActionHandler: Send + Sync {
 #[async_trait]
 pub trait QueryHandler: Send + Sync {
     async fn answer(&self, ctx: &AuditCtx, question: &str) -> anyhow::Result<String>;
+
+    /// Owner-only deterministic control command, intercepted before history,
+    /// attachments or model inference. `None` means an ordinary message.
+    async fn model_command(&self, _channel_id: u64, _text: &str) -> Option<String> { None }
 }
 
 /// Per-request audit context handed to [`QueryHandler::answer`].

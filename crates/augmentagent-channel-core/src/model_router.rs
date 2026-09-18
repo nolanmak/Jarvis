@@ -56,6 +56,21 @@ pub fn current() -> anyhow::Result<Option<RouterConfig>> {
     }
 }
 
+/// A Discord/default profile applies only to this call's cloned router
+/// configuration. The persisted account settings and other calls are intact.
+pub fn select_profile(mut config: Option<RouterConfig>, selected: Option<ProviderKind>) -> anyhow::Result<Option<RouterConfig>> {
+    if let Some(profile) = selected {
+        anyhow::ensure!(matches!(profile, ProviderKind::Codex | ProviderKind::Qwen | ProviderKind::Glm), "unsupported model profile");
+        if let Some(router) = config.as_mut() {
+            router.mode = profile.name().into();
+        } else {
+            anyhow::ensure!(profile == ProviderKind::Codex,
+                "Selected Runpod model requires a configured 9Router endpoint");
+        }
+    }
+    Ok(config)
+}
+
 pub fn load_from(path: &Path) -> anyhow::Result<Option<RouterConfig>> {
     match std::fs::read_to_string(path) {
         Ok(raw) => parse(&raw).map(Some),
@@ -69,7 +84,7 @@ pub fn parse(raw: &str) -> anyhow::Result<RouterConfig> {
         .map_err(|_| anyhow::anyhow!("Invalid model router configuration"))?;
     anyhow::ensure!(
         config.version == 1
-            && ["direct", "auto", "claude", "codex"].contains(&config.mode.as_str()),
+            && ["direct", "auto", "claude", "codex", "qwen", "glm"].contains(&config.mode.as_str()),
         "Unsupported model router configuration"
     );
     let url = reqwest::Url::parse(&config.base_url)
@@ -117,6 +132,8 @@ impl RouterConfig {
                 "auto" => matches!(provider, ProviderKind::Claude | ProviderKind::Codex),
                 "claude" => provider == ProviderKind::Claude,
                 "codex" => provider == ProviderKind::Codex,
+                "qwen" => provider == ProviderKind::Qwen,
+                "glm" => provider == ProviderKind::Glm,
                 _ => false,
             }
     }
@@ -256,5 +273,16 @@ pub(crate) mod tests {
         assert!(!env
             .iter()
             .any(|(k, v)| *k == "ANTHROPIC_API_KEY" && v.is_some()));
+    }
+
+    #[test]
+    fn selected_profile_is_pinned_without_changing_router_accounts() {
+        let original = parse(&fixture().to_string()).unwrap();
+        let selected = select_profile(Some(original.clone()), Some(ProviderKind::Qwen)).unwrap().unwrap();
+        assert!(selected.allows(ProviderKind::Qwen));
+        assert!(!selected.allows(ProviderKind::Codex));
+        assert!(!selected.allows(ProviderKind::Glm));
+        assert_eq!(original.mode, "auto");
+        assert_eq!(original.models.codex.quality, selected.models.codex.quality);
     }
 }

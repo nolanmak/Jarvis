@@ -189,6 +189,7 @@ fn native_ineligible_reason(kind: ProviderKind) -> Option<String> {
             }
             None
         }
+        ProviderKind::Qwen | ProviderKind::Glm => Some("Runpod profile requires 9Router".into()),
     }
 }
 
@@ -209,7 +210,7 @@ fn gateway_entry_for(kind: ProviderKind) -> Option<Entry> {
 fn gateway_ineligible_reason(kind: ProviderKind) -> Option<String> {
     let bin = match kind {
         ProviderKind::Claude => std::env::var("CLAUDE_CLI").unwrap_or_else(|_| "claude".into()),
-        ProviderKind::Codex => crate::codex::codex_bin(),
+        ProviderKind::Codex | ProviderKind::Qwen | ProviderKind::Glm => crate::codex::codex_bin(),
         _ => return Some("unsupported gateway adapter".into()),
     };
     (!bin_resolves(&bin)).then(|| format!("{bin:?} not installed"))
@@ -219,6 +220,7 @@ fn unchecked_entry(kind: ProviderKind) -> Entry {
     let reasoner: Arc<dyn Reasoner> = match kind {
         ProviderKind::Claude => Arc::new(ClaudeCliReasoner::new()),
         ProviderKind::Codex => Arc::new(crate::codex::CodexCliReasoner::openai()),
+        ProviderKind::Qwen | ProviderKind::Glm => Arc::new(crate::codex::CodexCliReasoner::runpod(kind)),
         ProviderKind::Gemini => Arc::new(crate::gemini::GeminiCliReasoner::new()),
         // Thin chat-completions client (#663 plan B — codex ≥0.148 removed
         // wire_api=chat and Cerebras has no Responses API).
@@ -238,10 +240,17 @@ pub fn build_reasoner() -> Arc<FallbackReasoner> {
     // Pre-register gateway adapters while configured, even in direct mode,
     // so the dashboard can enable routing without restarting the daemon.
     if crate::model_router::load().ok().flatten().is_some() {
-        for kind in [ProviderKind::Claude, ProviderKind::Codex] {
+        for kind in [ProviderKind::Claude, ProviderKind::Codex, ProviderKind::Qwen, ProviderKind::Glm] {
             if !entries.iter().any(|e| e.kind == kind) {
                 if let Some(entry) = gateway_entry_for(kind) { gateway_only.push(kind); entries.push(entry); }
             }
+        }
+    } else if !entries.iter().any(|entry| entry.kind == ProviderKind::Codex) {
+        // Keep a native Codex entry dormant for an explicit Discord /model
+        // selection without changing the pre-existing automatic chain.
+        if let Some(entry) = entry_for(ProviderKind::Codex) {
+            gateway_only.push(ProviderKind::Codex);
+            entries.push(entry);
         }
     }
     if entries.is_empty() {
@@ -361,12 +370,15 @@ impl FallbackReasoner {
         &self,
         class: crate::providers::CapabilityClass,
     ) -> LaneAvailability {
-        let Ok(routing) = crate::model_router::current() else { return LaneAvailability::NoEligibleProvider; };
+        let Ok(selected) = crate::model_selection::current() else { return LaneAvailability::NoEligibleProvider; };
+        let Ok(config) = crate::model_router::current() else { return LaneAvailability::NoEligibleProvider; };
+        let Ok(routing) = crate::model_router::select_profile(config, selected) else { return LaneAvailability::NoEligibleProvider; };
         let mut latched = Vec::new();
         let mut eligible = 0usize;
         for entry in &self.entries {
+            if selected.is_some_and(|profile| entry.kind != profile) { continue; }
             if routing.as_ref().is_some_and(|r| !r.allows(entry.kind))
-                || (!routing.as_ref().is_some_and(|r| r.enabled()) && self.gateway_only.contains(&entry.kind)) {
+                || (selected.is_none() && !routing.as_ref().is_some_and(|r| r.enabled()) && self.gateway_only.contains(&entry.kind)) {
                 continue;
             }
             if !allowed_for(entry.kind, class) {
@@ -509,6 +521,7 @@ impl FallbackReasoner {
         let config = crate::model_router::load().map_err(|_| ReasonerError::Local {
             message: "Invalid model router configuration; refusing dispatch".into(),
         })?;
+        let config = crate::model_router::select_profile(config, crate::model_selection::current()?)?;
         crate::model_router::SNAPSHOT.scope(config, self.dispatch_snapshot(opts, user_message, transcript, revision_authors)).await
     }
 
@@ -517,6 +530,7 @@ impl FallbackReasoner {
         revision_authors: Option<&[ProviderKind]>,
     ) -> anyhow::Result<String> {
         let routing = crate::model_router::current()?;
+        let selected = crate::model_selection::current()?;
         // Binding and admission share one lock. Once admitted, no caller can
         // retrofit a history that misses an earlier mutating dispatch.
         self.review_history.lock().unwrap_or_else(|e| e.into_inner()).admitted = true;
@@ -545,8 +559,11 @@ impl FallbackReasoner {
         let mut dispatch_entries: Vec<_> = self.entries.iter().collect();
         if routing.as_ref().is_some_and(|r| r.enabled()) {
             dispatch_entries.sort_by_key(|e| if e.kind == ProviderKind::Claude { 0 } else { 1 });
-        } else {
+        } else if selected.is_none() {
             dispatch_entries.retain(|e| !self.gateway_only.contains(&e.kind));
+        }
+        if let Some(profile) = selected {
+            dispatch_entries.retain(|entry| entry.kind == profile);
         }
         let primary = dispatch_entries.iter().find(|e| routing.as_ref().is_none_or(|r| r.allows(e.kind))).map(|e| e.kind);
         // The PRIMARY's provider-side error is what callers must see when
@@ -783,6 +800,48 @@ impl Reasoner for FallbackReasoner {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn explicit_runpod_selection_uses_only_the_selected_harness_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = Scripted::ok("wrong provider");
+        let qwen = Scripted::ok("qwen answer");
+        let chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, claude.clone()),
+            (ProviderKind::Qwen, qwen.clone()),
+        ], latch_in(&dir));
+        let mut config = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+        config.mode = "qwen".into();
+        let answer = crate::model_selection::SELECTED_PROFILE.scope(Some(ProviderKind::Qwen),
+            crate::model_router::SNAPSHOT.scope(Some(config),
+                chain.dispatch_snapshot(&text_only_opts(), "question", false, None))).await.unwrap();
+        assert_eq!(answer, "qwen answer");
+        assert_eq!(claude.count(), 0);
+        assert_eq!(qwen.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn selected_runpod_failure_never_silently_falls_back_to_codex() {
+        let dir = tempfile::tempdir().unwrap();
+        let qwen = Scripted::err(|| anyhow::Error::new(ReasonerError::Unavailable {
+            provider: "qwen".into(),
+            message: "synthetic upstream failure".into(),
+        }));
+        let codex = Scripted::ok("wrong provider");
+        let chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Qwen, qwen.clone()),
+            (ProviderKind::Codex, codex.clone()),
+        ], latch_in(&dir));
+        let mut config = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+        config.mode = "qwen".into();
+        let result = crate::model_selection::SELECTED_PROFILE.scope(Some(ProviderKind::Qwen),
+            crate::model_router::SNAPSHOT.scope(Some(config),
+                chain.dispatch_snapshot(&text_only_opts(), "question", false, None))).await;
+        assert!(result.is_err());
+        assert_eq!(qwen.count(), 1);
+        assert_eq!(codex.count(), 0);
+        assert_eq!(chain.usage(), vec![("qwen", 1, 0)]);
+    }
 
     // ---- #828: single-provider pinning for the independent review ----
 

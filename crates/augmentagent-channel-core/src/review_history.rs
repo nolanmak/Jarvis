@@ -92,7 +92,7 @@ fn load(path: &Path) -> anyhow::Result<History> {
     let history: History = serde_json::from_slice(&bytes)?;
     anyhow::ensure!(
         history.version == 1
-            && history.providers.len() <= 4
+            && history.providers.len() <= 6
             && history
                 .providers
                 .iter()
@@ -225,6 +225,17 @@ pub(crate) fn authors(path: &Path) -> anyhow::Result<Option<Vec<ProviderKind>>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runpod_authors_keep_actual_model_identity_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = initialize(&dir.path().join("private-state"), "synthetic-repository", "runpod-model-swap", false).unwrap();
+        record(&path, ProviderKind::Qwen).unwrap();
+        record(&path, ProviderKind::Qwen).unwrap();
+        record(&path, ProviderKind::Glm).unwrap();
+        assert_eq!(authors(&path).unwrap(), Some(vec![ProviderKind::Qwen, ProviderKind::Glm]));
+        assert!(!authors(&path).unwrap().unwrap().contains(&ProviderKind::Codex));
+    }
 
     #[test]
     fn restart_retains_all_attempted_authors_and_never_resets_existing_history() {
