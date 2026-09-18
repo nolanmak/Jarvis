@@ -52,7 +52,7 @@ def main():
         raise SystemExit('This installer uses systemd user services and requires Linux.')
     config_root = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'augmentagent'
     data_root = Path(os.environ.get('XDG_DATA_HOME', Path.home() / '.local/share')) / 'augmentagent/9router'
-    runtime = data_root / REVISION
+    runtime = data_root / (REVISION + '-runpod-reconciliation-1')
     runtime.mkdir(parents=True, exist_ok=True)
     if not (runtime / 'custom-server.js').exists():
         source = args.built_source or data_root / ('source-' + REVISION)
@@ -62,6 +62,15 @@ def main():
         actual = subprocess.check_output(['git','rev-parse','HEAD'],cwd=source,text=True).strip()
         if actual != REVISION:
             raise SystemExit('Source checkout does not match the pinned revision')
+        router_patch = ROOT / 'sidecars/9router/runpod-reconciliation.patch'
+        already_applied = subprocess.run(['git','apply','--reverse','--check',str(router_patch)],
+                                         cwd=source,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode == 0
+        if args.built_source:
+            if not already_applied:
+                raise SystemExit('Built 9Router source is missing the Runpod reconciliation patch')
+        elif not already_applied:
+            subprocess.run(['git','apply','--check',str(router_patch)],cwd=source,check=True)
+            subprocess.run(['git','apply',str(router_patch)],cwd=source,check=True)
         if not args.built_source:
             shutil.copyfile(ROOT / 'sidecars/9router/package-lock.json',source / 'package-lock.json')
             subprocess.run(['npm','ci','--no-audit','--no-fund'],cwd=source,check=True)

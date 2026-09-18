@@ -18,6 +18,7 @@ class RouterFailover(unittest.TestCase):
         config = json.loads(Path(os.environ['JARVIS_TEST_MODEL_ROUTER_CONFIG']).read_text())
         base = config['base_url'].removesuffix('/v1')
         self.assertTrue(base.startswith('http://127.0.0.1:'))
+        upstream_host = config.get('upstream_host', '127.0.0.1')
         seen = []
         class Upstream(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -32,7 +33,8 @@ class RouterFailover(unittest.TestCase):
                     status,body=200,{'id':'qa','object':'chat.completion','created':1,'model':'qa-model','choices':[{'index':0,'message':{'role':'assistant','content':'ACCOUNT_TWO_OK'},'finish_reason':'stop'}],'usage':{'prompt_tokens':1,'completion_tokens':1,'total_tokens':2}}
                 data=json.dumps(body).encode()
                 self.send_response(status);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
-        server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Upstream)
+        bind_host = '0.0.0.0' if upstream_host == 'host.docker.internal' else '127.0.0.1'
+        server=http.server.ThreadingHTTPServer((bind_host,0),Upstream)
         thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
         cookie=None
         def api(endpoint, body=None, method=None, inference=False):
@@ -46,7 +48,7 @@ class RouterFailover(unittest.TestCase):
         try:
             _,cookie=api('/api/auth/login',{'password':config['admin_password']})
             prefix='qa-'+uuid.uuid4().hex[:10]
-            node,_=api('/api/provider-nodes',{'name':'Synthetic account failover QA','prefix':prefix,'apiType':'chat','baseUrl':f'http://127.0.0.1:{server.server_port}/v1'})
+            node,_=api('/api/provider-nodes',{'name':'Synthetic account failover QA','prefix':prefix,'apiType':'chat','baseUrl':f'http://{upstream_host}:{server.server_port}/v1'})
             provider=node['node']['id']
             api('/api/providers',{'provider':provider,'name':'Synthetic exhausted account','apiKey':'exhausted-synthetic-account','priority':1})
             second,_=api('/api/providers',{'provider':provider,'name':'Synthetic healthy account','apiKey':'healthy-synthetic-account','priority':2})
@@ -57,7 +59,10 @@ class RouterFailover(unittest.TestCase):
             api('/api/providers/'+second['connection']['id'],{'isActive':False},method='PUT')
             with self.assertRaises(urllib.error.HTTPError) as error:
                 api('/v1/chat/completions',request,inference=True)
-            self.assertIn(error.exception.code,[429,503])
+            try:
+                self.assertIn(error.exception.code,[429,503])
+            finally:
+                error.exception.close()
             api('/api/providers/'+second['connection']['id'],{'isActive':True},method='PUT')
             response,_=api('/v1/chat/completions',request,inference=True)
             self.assertEqual(response['choices'][0]['message']['content'],'ACCOUNT_TWO_OK')

@@ -19,7 +19,12 @@ using the committed lockfile, builds its standalone server, and starts
 `augmentagent-model-router.service` on **127.0.0.1:20128**. Install both the Claude
 and Codex CLIs for the corresponding routes. Re-running the installer preserves
 accounts, API keys and the selected route. `--built-source PATH` can reuse an
-already built checkout at the pinned commit during local development.
+already built checkout at the pinned commit during local development. The
+installer applies `sidecars/9router/runpod-reconciliation.patch` before building;
+a supplied built source must already contain it. The service uses a distinct
+runtime directory for this patched version. For Docker, run
+`bash scripts/build-model-router-image.sh` to build
+`jarvis-9router:0.5.75-runpod-1` from the same source and dependency lock.
 
 After deploying this agent version, open **Settings → Models & accounts**:
 
@@ -106,6 +111,12 @@ and disabling accounts. They do **not** prove that a particular subscription can
 access a model or complete a real provider login. Verify those after connecting
 each account. The existing provider output-contract suites are opt-in live
 fixtures for structured output and wiki/tool operations.
+
+For a Docker-hosted router, add `"upstream_host":"host.docker.internal"` to a
+private copy of the router test config before running the synthetic suite. The
+patched router must pass both quota failover and the request-key/409 test. The
+stock 0.5.75 image fails the latter. Keep the original data volume backed up
+when switching an existing router to the patched image.
 
 To roll back, select **Existing CLI accounts (9Router off)**. Then optionally stop
 `augmentagent-model-router.service`; stored accounts are retained. If the router

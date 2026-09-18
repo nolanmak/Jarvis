@@ -1,0 +1,36 @@
+diff --git a/open-sse/executors/default.js b/open-sse/executors/default.js
+index 00f3e3d..4515a59 100644
+--- a/open-sse/executors/default.js
++++ b/open-sse/executors/default.js
+@@ -149,6 +149,14 @@ export class DefaultExecutor extends BaseExecutor {
+   buildHeaders(credentials, stream = true, url, model) {
+     const rt = credentials?.runtimeTransport;
+     const headers = { "Content-Type": "application/json", ...(rt ? rt.headers : this.config.headers) };
++    // Preserve the caller's logical-turn key for compatible gateways. A retry
++    // without this key can submit the same paid Runpod job a second time.
++    if (this.provider?.startsWith?.("openai-compatible-")) {
++      const key = credentials?.rawHeaders?.["idempotency-key"];
++      if (typeof key === "string" && key.length > 0 && key.length <= 128) {
++        headers["Idempotency-Key"] = key;
++      }
++    }
+     const desc = rt?.auth || AUTH_DESCRIPTORS[this.provider] || this.resolveAuthDescriptor();
+     // Hooks run BEFORE auth so dynamic overlays can't clobber the token.
+     for (const hook of desc.hooks || []) HEADER_HOOKS[hook]?.(headers, credentials);
+diff --git a/src/sse/handlers/chat.js b/src/sse/handlers/chat.js
+index 7aa530d..9890f6b 100644
+--- a/src/sse/handlers/chat.js
++++ b/src/sse/handlers/chat.js
+@@ -309,6 +309,12 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+ 
+     if (result.success) return result.response;
+ 
++    // A compatible gateway's 409 requires caller reconciliation. Account
++    // failover would hide it as 503 and could submit the same work elsewhere.
++    if (provider.startsWith("openai-compatible-") && result.status === 409) {
++      return result.response;
++    }
++
+     // Antigravity 409/429: refresh live quota to get exact resetAt before locking
+     let quotaResetMs = null;
+     let resetsAtMs = result.resetsAtMs;
