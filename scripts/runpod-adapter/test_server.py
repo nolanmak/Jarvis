@@ -87,6 +87,12 @@ class NormalizeMessagesTests(unittest.TestCase):
 
 
 class UpstreamCredentialTests(unittest.TestCase):
+    def test_runpod_queue_and_load_balancer_hosts_are_allowed(self):
+        for url in ('https://api.runpod.ai/v2/endpoint/run',
+                    'https://g1eary963m1aym.api.runpod.ai/openai/v1/chat/completions'):
+            with self.subTest(url=url):
+                self.assertIsNone(module.validate_upstream_url(url))
+
     def test_redirect_cannot_send_runpod_key_to_another_host(self):
         redirected = []
 
@@ -116,8 +122,9 @@ class UpstreamCredentialTests(unittest.TestCase):
         for thread in threads:
             thread.start()
         try:
-            with self.assertRaises(urllib.error.HTTPError) as failure:
-                module.request(f'http://127.0.0.1:{source.server_port}/start')
+            with mock.patch.object(module, 'validate_upstream_url', return_value=None):
+                with self.assertRaises(urllib.error.HTTPError) as failure:
+                    module.request(f'http://127.0.0.1:{source.server_port}/start')
             self.assertEqual(failure.exception.code, 302)
             failure.exception.close()
             self.assertEqual(redirected, [])
@@ -127,6 +134,18 @@ class UpstreamCredentialTests(unittest.TestCase):
                 server.server_close()
             for thread in threads:
                 thread.join(timeout=2)
+
+    def test_non_runpod_or_credential_bearing_upstream_never_receives_key(self):
+        for url in ('http://127.0.0.1:8000/run',
+                    'https://user:pass@api.runpod.ai/v2/endpoint/run',
+                    'https://other.example/v2/endpoint/run',
+                    'https://api.runpod.ai:444/v2/endpoint/run',
+                    'https://api.runpod.ai/v2/endpoint/run?token=bad'):
+            with self.subTest(url=url), mock.patch.object(
+                    module.urllib.request, 'build_opener',
+                    side_effect=AssertionError('request reached network')):
+                with self.assertRaises(ValueError):
+                    module.request(url)
 
 
 class JobLifecycleTests(unittest.TestCase):

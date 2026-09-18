@@ -1,4 +1,4 @@
-import base64, binascii, contextlib, http.server, json, os, re, secrets, sqlite3, stat, threading, time, urllib.request, urllib.error, uuid
+import base64, binascii, contextlib, http.server, json, os, re, secrets, sqlite3, stat, threading, time, urllib.request, urllib.error, urllib.parse, uuid
 from pathlib import Path
 
 API_KEY = os.environ['RUNPOD_API_KEY']
@@ -109,7 +109,21 @@ def cancel_job(journal, request_id, base, rpc_call= None):
     journal.finish(request_id, state)
     return state
 
+def validate_upstream_url(url):
+    parsed = urllib.parse.urlsplit(url)
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError('Runpod upstream URL is not approved') from error
+    host = parsed.hostname or ''
+    if (url != url.strip() or parsed.scheme != 'https' or parsed.username is not None
+            or parsed.password is not None or port not in (None, 443)
+            or parsed.query or parsed.fragment
+            or not re.fullmatch(r'(?:api|[a-z0-9]+\.api)\.runpod\.ai', host)):
+        raise ValueError('Runpod upstream URL is not approved')
+
 def request(url, data=None, timeout=45):
+    validate_upstream_url(url)
     req = urllib.request.Request(url, data=None if data is None else json.dumps(data).encode(), headers={'Authorization': 'Bearer '+API_KEY, 'Content-Type':'application/json'})
     class RefuseRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, req, fp, code, msg, headers, newurl):
