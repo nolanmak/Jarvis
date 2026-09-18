@@ -1015,7 +1015,8 @@ class HandoffTests(unittest.TestCase):
                 calls.append(name)
                 return {'content':[{'type':'text','text':str(len(calls))}]}
             server.execute=read
-            for leaf in ['memory_search','memory_recent','search_conversation_history','read_conversation_thread']:
+            for leaf in ['memory_search','memory_recent','search_conversation_history',
+                         'read_conversation_thread','search_messages','conversation_stats']:
                 name='mcp__memory__'+leaf
                 self.assertNotEqual(server.call(name,{}),server.call(name,{}))
                 journal.observe_hook({'hook_event_name':'PreToolUse','tool_use_id':'read-'+leaf,
@@ -1023,7 +1024,7 @@ class HandoffTests(unittest.TestCase):
             for leaf in ['memory_write','memory_delete','memory_unknown']:
                 with self.assertRaises(bridge.ReconciliationRequired):
                     server.call('mcp__memory__'+leaf,{})
-            self.assertEqual(len(calls),8)
+            self.assertEqual(len(calls),12)
             self.assertEqual(len(journal.load()['operations']),1)
 
     def test_discovery_and_memory_reads_work_through_hook_with_uncertain_write(self):
