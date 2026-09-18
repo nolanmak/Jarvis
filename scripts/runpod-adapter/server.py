@@ -28,7 +28,10 @@ class JobJournal:
         with self._connect() as db:
             db.execute('''CREATE TABLE IF NOT EXISTS jobs (
                 request_id TEXT PRIMARY KEY, model TEXT NOT NULL, route TEXT NOT NULL,
-                job_id TEXT, state TEXT NOT NULL, updated_at INTEGER NOT NULL)''')
+                job_id TEXT, state TEXT NOT NULL, updated_at INTEGER NOT NULL,
+                endpoint_url TEXT)''')
+            if 'endpoint_url' not in {row[1] for row in db.execute('PRAGMA table_info(jobs)')}:
+                db.execute('ALTER TABLE jobs ADD COLUMN endpoint_url TEXT')
 
     @contextlib.contextmanager
     def _connect(self):
@@ -40,11 +43,13 @@ class JobJournal:
         finally:
             db.close()
 
-    def start(self, request_id, model, route):
+    def start(self, request_id, model, route, endpoint_url=None):
         with self._connect() as db:
             try:
-                db.execute('INSERT INTO jobs VALUES (?, ?, ?, NULL, ?, ?)',
-                           (request_id, model, route, 'SUBMITTING', int(time.time())))
+                db.execute('''INSERT INTO jobs
+                    (request_id, model, route, job_id, state, updated_at, endpoint_url)
+                    VALUES (?, ?, ?, NULL, ?, ?, ?)''',
+                           (request_id, model, route, 'SUBMITTING', int(time.time()), endpoint_url))
             except sqlite3.IntegrityError as error:
                 raise DuplicateRequestError('request key already used; inspect job journal before retry') from error
 
@@ -64,9 +69,26 @@ class JobJournal:
 
     def get(self, request_id):
         with self._connect() as db:
-            row = db.execute('SELECT model, route, job_id, state FROM jobs WHERE request_id=?',
+            row = db.execute('SELECT model, route, job_id, state, endpoint_url FROM jobs WHERE request_id=?',
                              (request_id,)).fetchone()
-        return dict(zip(('model', 'route', 'job_id', 'state'), row)) if row else None
+        return dict(zip(('model', 'route', 'job_id', 'state', 'endpoint_url'), row)) if row else None
+
+def reconcile_job(journal, request_id, rpc_call=None):
+    """Refresh a known queue job from the endpoint captured before submission."""
+    rpc_call = rpc if rpc_call is None else rpc_call
+    job = journal.get(request_id)
+    if not job:
+        raise ValueError('unknown request id')
+    if job['state'] in ('COMPLETED', 'FAILED', 'CANCELLED', 'TIMED_OUT'):
+        return job['state']
+    if job['route'] != 'queue' or not job['job_id'] or not job['endpoint_url']:
+        raise ValueError('job cannot be reconciled automatically; inspect the Runpod endpoint')
+    result = rpc_call(job['endpoint_url'] + '/status/' + job['job_id'])
+    if result.get('id') != job['job_id'] or result.get('status') not in (
+        'IN_QUEUE', 'IN_PROGRESS', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED', 'TIMED_OUT'):
+        raise ValueError('Runpod returned an unverified job status')
+    journal.finish(request_id, result['status'])
+    return result['status']
 
 def cancel_job(journal, request_id, base, rpc_call= None):
     """Only an explicit matching Runpod response confirms cancellation."""
@@ -247,6 +269,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.reply(404,{'error':{'message':'Unknown path'}})
     def do_POST(self):
         if not self.authorized():return
+        if self.path.startswith('/v1/jobs/') and self.path.endswith('/reconcile'):
+            request_id=self.path.removeprefix('/v1/jobs/').removesuffix('/reconcile').removesuffix('/')
+            if not re.fullmatch(r'[A-Za-z0-9._-]{1,128}',request_id):
+                return self.reply(400,{'error':{'message':'Invalid request id'}})
+            try:
+                journal=JobJournal(JOURNAL)
+                if not journal.get(request_id):
+                    return self.reply(404,{'error':{'message':'Unknown request id'}})
+                state=reconcile_job(journal,request_id)
+                status=200 if state in ('COMPLETED','FAILED','CANCELLED','TIMED_OUT') else 202
+                return self.reply(status,{'request_id':request_id,'state':state})
+            except ValueError as error:
+                return self.reply(409,{'error':{'message':str(error),'type':'reconciliation_required'}})
+            except Exception as error:
+                print('job reconciliation failed',type(error).__name__,flush=True)
+                return self.reply(502,{'error':{'message':'Runpod job status unavailable','type':'upstream_error'}})
         if self.path!='/v1/chat/completions':return self.reply(404,{'error':{'message':'Use /v1/chat/completions'}})
         if not MAX_IN_FLIGHT.acquire(blocking=False):
             return self.reply(429,{'error':{'message':'Adapter is busy; retry later','type':'capacity_error'}})
@@ -278,7 +316,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 raise ValueError('invalid idempotency key')
             self.request_id=key or uuid.uuid4().hex
             journal=JobJournal(JOURNAL)
-            journal.start(self.request_id, model, 'load_balancer' if route['type']=='openai' else 'queue')
+            journal.start(self.request_id, model, 'load_balancer' if route['type']=='openai' else 'queue', route['base_url'])
             if route['type']=='openai':
                 try:
                     with request(route['base_url']+'/chat/completions',body,timeout=340) as upstream:
@@ -343,4 +381,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             MAX_IN_FLIGHT.release()
 
-if __name__=='__main__':http.server.ThreadingHTTPServer(('0.0.0.0',8000),Handler).serve_forever()
+if __name__=='__main__':
+    JobJournal(JOURNAL)
+    http.server.ThreadingHTTPServer(('0.0.0.0',8000),Handler).serve_forever()

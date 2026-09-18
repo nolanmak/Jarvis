@@ -7,6 +7,7 @@ import http.client
 import json
 import threading
 from unittest import mock
+import sqlite3
 
 ROOT = pathlib.Path(__file__).parent
 spec = importlib.util.spec_from_file_location('runpod_adapter', ROOT / 'server.py')
@@ -85,6 +86,67 @@ class NormalizeMessagesTests(unittest.TestCase):
 
 
 class JobLifecycleTests(unittest.TestCase):
+    def test_existing_journal_rows_survive_endpoint_column_migration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / 'jobs.sqlite3'
+            with sqlite3.connect(path) as db:
+                db.execute('''CREATE TABLE jobs (request_id TEXT PRIMARY KEY, model TEXT NOT NULL,
+                    route TEXT NOT NULL, job_id TEXT, state TEXT NOT NULL, updated_at INTEGER NOT NULL)''')
+                db.execute("INSERT INTO jobs VALUES ('old-request','qwen38-27b','queue','old-job','POLL_UNKNOWN',1)")
+            path.chmod(0o600)
+            journal = module.JobJournal(path)
+            self.assertEqual(journal.get('old-request')['job_id'], 'old-job')
+            self.assertIsNone(journal.get('old-request')['endpoint_url'])
+
+    def test_reconcile_uses_original_endpoint_and_requires_matching_job_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = module.JobJournal(pathlib.Path(tmp) / 'jobs.sqlite3')
+            journal.start('request-1', 'qwen38-27b', 'queue', 'https://old-endpoint.test')
+            journal.submitted('request-1', 'job-1')
+            journal.finish('request-1', 'CANCELLATION_UNKNOWN')
+            calls = []
+            def completed(url, payload=None):
+                calls.append(url)
+                return {'id': 'job-1', 'status': 'COMPLETED'}
+            state = module.reconcile_job(journal, 'request-1', completed)
+            self.assertEqual(state, 'COMPLETED')
+            self.assertEqual(calls, ['https://old-endpoint.test/status/job-1'])
+            self.assertEqual(module.JobJournal(journal.path).get('request-1')['state'], 'COMPLETED')
+            journal.start('request-2', 'qwen38-27b', 'queue', 'https://old-endpoint.test')
+            journal.submitted('request-2', 'job-2')
+            with self.assertRaises(ValueError):
+                module.reconcile_job(journal, 'request-2',
+                    lambda url, payload=None: {'id': 'different-job', 'status': 'COMPLETED'})
+            self.assertEqual(journal.get('request-2')['state'], 'SUBMITTED')
+
+    def test_authenticated_http_reconcile_reports_confirmed_terminal_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal_path = pathlib.Path(tmp) / 'jobs.sqlite3'
+            journal = module.JobJournal(journal_path)
+            journal.start('request-1', 'qwen38-27b', 'queue', 'https://old-endpoint.test')
+            journal.submitted('request-1', 'job-1')
+            server = module.http.server.ThreadingHTTPServer(('127.0.0.1', 0), module.Handler)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                def completed(url, payload=None):
+                    self.assertEqual(url, 'https://old-endpoint.test/status/job-1')
+                    return {'id': 'job-1', 'status': 'COMPLETED'}
+                with mock.patch.object(module, 'JOURNAL', journal_path), \
+                     mock.patch.object(module, 'rpc', completed):
+                    conn = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=2)
+                    conn.request('POST', '/v1/jobs/request-1/reconcile', '',
+                                 {'Authorization': 'Bearer test-client-key'})
+                    response = conn.getresponse()
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(json.load(response)['state'], 'COMPLETED')
+                    conn.close()
+                self.assertEqual(module.JobJournal(journal_path).get('request-1')['state'], 'COMPLETED')
+            finally:
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=2)
+
     def test_journal_refuses_a_shared_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = pathlib.Path(tmp) / 'state'
