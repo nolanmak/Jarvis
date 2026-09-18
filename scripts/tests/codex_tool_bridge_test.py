@@ -1058,6 +1058,8 @@ class HandoffTests(unittest.TestCase):
                 journal.execute('Bash',{'command':'aa-gh issue create --title Synthetic'},uncertain)
             policy=bridge.Policy({'cwd':str(workspace),'read_roots':[str(workspace)],'write_roots':[],
                 'allowed_tools':['Bash(augmentagent gmail *)','Bash(augmentagent repo-docs *)',
+                                 'Bash(augmentagent finance *)','Bash(augmentagent calendar *)',
+                                 'Bash(augmentagent meetup *)','Bash(augmentagent linkedin *)',
                                  'Bash(aa-gh issue *)','mcp__socialapi__*'],
                 'handoff_path':str(root/'handoff.json')})
             server=bridge.Server(policy)
@@ -1067,7 +1069,13 @@ class HandoffTests(unittest.TestCase):
                 return {'content':[{'type':'text','text':str(len(calls))}]}
             server.execute=read_result
             commands=['augmentagent gmail search --query Synthetic','aa-gh issue list --search Synthetic',
-                      'augmentagent repo-docs list --source synthetic']
+                      'augmentagent repo-docs list --source synthetic',
+                      'augmentagent finance status',
+                      'augmentagent finance transactions --start 2026-01-01',
+                      'augmentagent finance summary',
+                      'augmentagent calendar list-events --days 1',
+                      'augmentagent meetup events code-coffee-philly',
+                      'augmentagent linkedin recent-dms --limit 3']
             for command in commands:
                 first=server.call('Bash',{'command':command})
                 second=server.call('Bash',{'command':command})
@@ -1075,10 +1083,13 @@ class HandoffTests(unittest.TestCase):
             server.call('mcp__socialapi__get_post',{'id':'synthetic'})
             for command in ['aa-gh issue create --title Another',
                             'augmentagent gmail compose --body Synthetic',
+                            'augmentagent finance connect --alias Synthetic',
+                            'augmentagent calendar create-event --summary Synthetic',
+                            'augmentagent linkedin dm --with Synthetic',
                             'augmentagent gmail search --query Synthetic; aa-gh issue create --title Another']:
                 with self.subTest(command=command), self.assertRaises(bridge.Denied):
                     server.call('Bash',{'command':command})
-            self.assertEqual(len(calls),7)
+            self.assertEqual(len(calls),19)
             response=server.dispatch({'method':'tools/call','params':{
                 'name':'Bash','arguments':{'command':'aa-gh issue create --title PRIVATE_SYNTHETIC_TITLE'}}})
             self.assertTrue(response['isError'])
