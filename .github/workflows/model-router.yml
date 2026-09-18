@@ -12,6 +12,7 @@ on:
       - 'test/modelRouter*'
       - 'scripts/*model-router*'
       - 'scripts/tests/model_router*'
+      - 'scripts/tests/run_model_router_image_fixture.py'
       - 'sidecars/9router/**'
       - '.github/workflows/model-router.yml'
   push:
@@ -27,6 +28,7 @@ on:
       - 'test/modelRouter*'
       - 'scripts/*model-router*'
       - 'scripts/tests/model_router*'
+      - 'scripts/tests/run_model_router_image_fixture.py'
       - 'sidecars/9router/**'
       - '.github/workflows/model-router.yml'
 permissions:
@@ -59,3 +61,12 @@ jobs:
       - run: cargo check -p augmentagent-cli
       - name: Pin each Discord model in the CLI diagnostic
         run: cargo test -p augmentagent-cli --test reasoner_failover_e2e selftest_can_pin_each_discord_profile_without_running_the_default_chain -- --nocapture
+  pinned-gateway:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build pinned 9Router with the reconciliation patch
+        run: bash scripts/build-model-router-image.sh
+      - name: Exercise account failover, request identity and media refusal
+        run: python3 scripts/tests/run_model_router_image_fixture.py
