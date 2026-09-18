@@ -13,6 +13,14 @@ class DuplicateRequestError(ValueError):
 class InvalidRequestError(ValueError):
     pass
 
+class UpstreamRejected(Exception):
+    """Runpod rejected inference before returning any job or response stream."""
+    def __init__(self, status):
+        self.status = status
+
+def definite_rejection(status):
+    return status in (400, 401, 403, 404, 422, 429)
+
 def request_fingerprint(body):
     """Private stable digest for a retry whose gateway discarded its request key."""
     canonical = json.dumps(body, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
@@ -412,6 +420,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     journal.finish(self.request_id, 'COMPLETED')
                 except (BrokenPipeError,ConnectionResetError):
                     journal.finish(self.request_id, 'CANCELLATION_UNSUPPORTED')
+                except urllib.error.HTTPError as error:
+                    state=journal.get(self.request_id)['state']
+                    error.close()
+                    if state=='SUBMITTING' and definite_rejection(error.code):
+                        journal.finish(self.request_id, 'FAILED')
+                        raise UpstreamRejected(error.code) from None
+                    journal.finish(self.request_id, 'SUBMISSION_UNKNOWN' if state=='SUBMITTING' else 'RESULT_UNKNOWN')
+                    raise
                 except Exception:
                     journal.finish(self.request_id, 'SUBMISSION_UNKNOWN' if journal.get(self.request_id)['state']=='SUBMITTING' else 'RESULT_UNKNOWN')
                     raise
@@ -420,6 +436,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             try:
                 submission=rpc(base+'/run',{'input':payload,'policy':{'executionTimeout':600000,'ttl':3600000}})
                 job=submission['id']
+            except urllib.error.HTTPError as error:
+                error.close()
+                if definite_rejection(error.code):
+                    journal.finish(self.request_id, 'FAILED')
+                    raise UpstreamRejected(error.code) from None
+                journal.finish(self.request_id, 'SUBMISSION_UNKNOWN')
+                raise
             except Exception:
                 journal.finish(self.request_id, 'SUBMISSION_UNKNOWN')
                 raise
@@ -458,6 +481,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(409,{'error':{'message':str(e),'type':'duplicate_request'}})
         except InvalidRequestError as e:
             self.reply(400,{'error':{'message':str(e),'type':'invalid_request_error'}})
+        except UpstreamRejected as e:
+            category='authentication_error' if e.status in (401,403) else 'rate_limit_error' if e.status==429 else 'invalid_request_error'
+            self.reply(e.status,{'error':{'message':'Runpod rejected the request before inference','type':category}})
         except Exception as e:
             if submitted and journal and journal.get(self.request_id)['state']=='SUBMITTED':
                 journal.finish(self.request_id, 'POLL_UNKNOWN')

@@ -11,6 +11,7 @@ import sqlite3
 import contextlib
 import concurrent.futures
 import urllib.error
+import io
 
 ROOT = pathlib.Path(__file__).parent
 spec = importlib.util.spec_from_file_location('runpod_adapter', ROOT / 'server.py')
@@ -151,6 +152,59 @@ class UpstreamCredentialTests(unittest.TestCase):
 
 
 class JobLifecycleTests(unittest.TestCase):
+    def test_runpod_rejections_keep_auth_rate_limit_and_ambiguous_errors_distinct(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            routes = pathlib.Path(tmp) / 'routes.json'
+            routes.write_text(json.dumps({
+                'qwen38-27b': {'type': 'ollama-queue',
+                    'base_url': 'https://api.runpod.ai/v2/endpoint', 'max_output_tokens': 128},
+                'glm-5.3-flash': {'type': 'openai',
+                    'base_url': 'https://g1eary963m1aym.api.runpod.ai/openai/v1',
+                    'max_output_tokens': 128}}))
+            journal_path = pathlib.Path(tmp) / 'jobs.sqlite3'
+            status = [401]
+            calls = []
+
+            def reject(url, *args, **kwargs):
+                calls.append((url, status[0]))
+                raise urllib.error.HTTPError(url, status[0], 'private upstream detail', {},
+                                             io.BytesIO(b'private response body'))
+
+            server = module.http.server.ThreadingHTTPServer(('127.0.0.1', 0), module.Handler)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                with mock.patch.object(module, 'ROUTES', routes), \
+                     mock.patch.object(module, 'JOURNAL', journal_path), \
+                     mock.patch.object(module, 'rpc', reject), \
+                     mock.patch.object(module, 'request', reject):
+                    for model in ('qwen38-27b', 'glm-5.3-flash'):
+                        for upstream_status, expected_status, expected_type in (
+                                (401, 401, 'authentication_error'),
+                                (429, 429, 'rate_limit_error'),
+                                (503, 409, 'reconciliation_required')):
+                            status[0] = upstream_status
+                            conn = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=2)
+                            conn.request('POST', '/v1/chat/completions', json.dumps({
+                                'model': model,
+                                'messages': [{'role': 'user', 'content': 'synthetic ' + str(upstream_status)}]}),
+                                {'Authorization': 'Bearer test-client-key',
+                                 'Content-Type': 'application/json'})
+                            response = conn.getresponse()
+                            self.assertEqual(response.status, expected_status)
+                            body = json.load(response)
+                            self.assertEqual(body['error']['type'], expected_type)
+                            self.assertNotIn('private', json.dumps(body))
+                            conn.close()
+                self.assertEqual(len(calls), 6)
+                with contextlib.closing(sqlite3.connect(journal_path)) as db:
+                    states = dict(db.execute('SELECT state, COUNT(*) FROM jobs GROUP BY state'))
+                self.assertEqual(states, {'FAILED': 4, 'SUBMISSION_UNKNOWN': 2})
+            finally:
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=2)
+
     def test_qwen_tool_choice_none_omits_tools_and_required_fails_before_submission(self):
         with tempfile.TemporaryDirectory() as tmp:
             routes = pathlib.Path(tmp) / 'routes.json'
