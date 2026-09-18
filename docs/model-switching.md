@@ -21,6 +21,24 @@ The same runtime pause flags are checked immediately before dispatch. If an oper
 | Self-improve and independent review | fallback and review history | Actual model identity and independent author/reviewer eligibility |
 | Node Agents SDK path | `src/agent.ts` | Confirm deployment use; route through shared policy if active |
 
+The executable gate inventory below records current evidence and names what
+still needs a test. An ignored opt-in fixture is not a CI receipt. Deterministic
+coverage does not substitute for the live three-model Discord acceptance run.
+
+| Feature | Responsible code | Deterministic receipt | Remaining release gate |
+| --- | --- | --- | --- |
+| Selection, restart persistence, pause and snapshot | `model_selection.rs`, `fallback.rs` | `model_selection::tests`, `paused_persisted_runpod_selection_never_reaches_inference_or_fallback` | Discord set/call race on the daemon host |
+| Owner-only Discord command and conversation history | `event_handler.rs`, `WikiQuerier` | Parser and store tests in `model_selection::tests` | Fake Discord sequence and live Qwen→GLM→Codex continuity |
+| File scope, shell, image bytes, unknown tools, malformed arguments and local MCP | `codex.rs`, `codex_tools.rs`, `scripts/codex-tool-bridge.py` | Linux `all_selected_profiles_share_scoped_file_tools_and_audit_identity` | Live model-selected tool use for each provider |
+| Document/PDF attachment and computer use | `images.rs`, bridge Read, remote worker tools | Ignored Codex-only opt-in fixtures in `codex.rs`; no shared CI fixture | Cross-profile deterministic and live attachment/computer-use fixtures |
+| Retrieval, wiki and memory MCP | `mcp.rs`, wiki and memory tools | Ignored Codex-only `live_wiki_query_profile_executes_files_and_memory_mcp`; no shared CI fixture | Three-profile fake and live memory continuity |
+| Approval, drafts and outbound delivery | Discord approval broker, tool audit and journals | Existing approval/broker suites | Three-profile denied/approved edit and delivery receipts |
+| Code mode and build VM | `codex_tools.rs`, build runner | Ignored Codex-only VM fixture; no shared CI fixture | Three-profile approved edit/test through the VM |
+| Scheduled loops and explicit job pins | Loop runner, `FallbackReasoner` | Default snapshot and fallback tests | Durable job-pin precedence and restart fixture |
+| Independent review | `review_history.rs`, `self_improve.rs` | Native-only reviewer admission and dispatch tests | Actual reviewer/backend lineage receipt |
+| Runpod retry, cancellation and restart | `scripts/runpod-adapter/server.py` | `python3 -m unittest -q test_server.py` | Real queue cancel, restart and forwarded idempotency key |
+| Node Agents SDK entry point | `src/agent.ts`, dashboard router | Router and dashboard tests | Determine deployed path; remove or migrate any policy bypass |
+
 Model quality, context size and latency differ. Full feature parity is a release gate: every row needs deterministic fake-model tests and a live receipt from the actual Jarvis host for all three models. A text response or catalog entry does not establish tool execution. GLM is paused until live inference succeeds. Qwen passed a 9Router Responses text call, a function-call/result round trip, and a Codex CLI text probe on 2026-09-18. The full Jarvis bridge workflow and actual-host Discord test remain the release gate.
 
 Independent automated review uses native Claude or Codex transport with a separate login; a 9Router account label is not evidence of a different backend. Reviewer calls pin direct routing for both passes. If native Codex authentication disappears before dispatch, review fails closed instead of using a gateway account.
