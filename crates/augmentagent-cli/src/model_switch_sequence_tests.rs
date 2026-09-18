@@ -134,7 +134,7 @@ for line in sys.stdin:
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(rows.len(), 10, "{audit}");
+    assert_eq!(rows.len(), 13, "{audit}");
     for row in &rows {
         let turn: usize = row["session_id"].as_str().unwrap()
             .rsplit(':').next().unwrap().parse().unwrap();
@@ -145,7 +145,7 @@ for line in sys.stdin:
     assert_eq!(rows[0]["session_id"], format!("{CHANNEL}:1"));
     assert!(rows[0]["stderr_truncated"].is_null());
     for (index, profile) in ["qwen", "glm", "codex"].iter().enumerate() {
-        let read_index = if index == 0 { 1 } else { index * 3 + 1 };
+        let read_index = if index == 0 { 1 } else { index * 4 + 1 };
         let row = &rows[read_index];
         assert_eq!(row["provider"], *profile);
         assert_eq!(row["tool"], "Read");
@@ -166,6 +166,12 @@ for line in sys.stdin:
         assert_eq!(edit["tool"], "Edit");
         assert_eq!(edit["session_id"], format!("{CHANNEL}:{}", index + 1));
         assert!(edit["stderr_truncated"].is_null());
+        let shell = &rows[read_index + 3];
+        assert_eq!(shell["provider"], *profile);
+        assert_eq!(shell["tool"], "Bash");
+        assert_eq!(shell["session_id"], format!("{CHANNEL}:{}", index + 1));
+        assert_eq!(shell["exit_code"], 0);
+        assert_eq!(shell["runner"], "host");
     }
     assert_eq!(
         std::fs::read_to_string(wiki.join("probe.txt")).unwrap(),
