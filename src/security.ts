@@ -13,7 +13,7 @@
 //   - getDashboardPort():   single source for the port.
 //   - resolveApiKey():      fail-closed local mode — load or generate+persist a
 //                           key on first run and log it once.
-//   - requireAuth:          Bearer header OR signed session cookie (browser).
+//   - requireAuth:          local browser access; key/session for other clients.
 //   - loginHandler:         exchanges a valid key for a session cookie.
 //   - hostOriginGuard:      Host allow-list (anti DNS-rebinding) + Origin/Referer
 //                           allow-list on state-changing methods (anti CSRF).
@@ -48,7 +48,7 @@ export function getBindHost(): string {
 //   2. Persisted key in the DB config table (generated on a prior run).
 //   3. Generate a fresh key, persist it, and log it once.
 //
-// The result is that auth is ALWAYS on. There is no no-op path.
+// Remote and machine clients use this key; local browsers are admitted below.
 let cachedApiKey: string | null = null;
 
 export function resolveApiKey(): string {
@@ -143,10 +143,37 @@ function bearerToken(req: Request): string | null {
   return x ? x.trim() : null;
 }
 
+/** Admit a browser on this machine without a manual key exchange. Check the
+ * actual socket, never Express's proxy-derived IP. Fetch Metadata cannot be
+ * supplied by scripts on another site. Host/Origin guards still run first. */
+function isLocalBrowser(req: Request): boolean {
+  if (MODE !== "local") return false;
+  const peer = req.socket?.remoteAddress;
+  if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(peer || "")) return false;
+  if (Object.keys(req.headers).some(h => h === "forwarded" || h.startsWith("x-forwarded-"))) return false;
+  const host = (req.header("host") || "").toLowerCase();
+  const port = getDashboardPort();
+  if (!["localhost", "127.0.0.1", "[::1]", `localhost:${port}`, `127.0.0.1:${port}`, `[::1]:${port}`].includes(host)) return false;
+  const site = req.header("sec-fetch-site");
+  if (site === "none") {
+    return req.method === "GET" && req.header("sec-fetch-mode") === "navigate" && req.header("sec-fetch-dest") === "document";
+  }
+  if (site !== "same-origin") return false;
+  const origin = req.header("origin");
+  if (origin && hostOf(origin) !== host) return false;
+  const referer = req.header("referer");
+  if (referer && hostOf(referer) !== host) return false;
+  return true;
+}
+
 /** Auth middleware applied to BOTH routers. Accepts a Bearer/x-api-key header
  *  (machine clients) OR a valid signed session cookie (browser). Fail-closed:
- *  there is always a key to match against. */
+ *  remote and machine requests always need credentials; local browsers do not. */
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
+  if (isLocalBrowser(req)) {
+    next();
+    return;
+  }
   const key = resolveApiKey();
 
   const token = bearerToken(req);
@@ -172,7 +199,11 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
 }
 
 /** GET /login — minimal form. POST /login — exchange key for a session cookie. */
-export function loginPageHandler(_req: Request, res: Response): void {
+export function loginPageHandler(req: Request, res: Response): void {
+  if (isLocalBrowser(req)) {
+    res.redirect("/");
+    return;
+  }
   res
     .status(200)
     .type("html")
