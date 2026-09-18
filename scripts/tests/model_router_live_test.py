@@ -149,6 +149,76 @@ class RouterFailover(unittest.TestCase):
             server.server_close()
             thread.join()
 
+    def test_unsupported_image_fails_before_reaching_upstream(self):
+        config = json.loads(Path(os.environ['JARVIS_TEST_MODEL_ROUTER_CONFIG']).read_text())
+        base = config['base_url'].removesuffix('/v1')
+        self.assertTrue(base.startswith('http://127.0.0.1:'))
+        upstream_host = config.get('upstream_host', '127.0.0.1')
+        seen = []
+
+        class Upstream(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                seen.append(self.rfile.read(int(self.headers.get('Content-Length', 0))))
+                body = b'{"choices":[{"message":{"role":"assistant","content":"SYNTHETIC_OK"}}]}'
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        bind_host = '0.0.0.0' if upstream_host == 'host.docker.internal' else '127.0.0.1'
+        server = http.server.ThreadingHTTPServer((bind_host, 0), Upstream)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        cookie = None
+
+        def api(endpoint, body=None, method=None, inference=False):
+            headers = {'Content-Type': 'application/json'}
+            if cookie:
+                headers['Cookie'] = cookie
+            if inference:
+                headers['Authorization'] = 'Bearer ' + config['api_key']
+            request = urllib.request.Request(base + endpoint,
+                    data=None if body is None else json.dumps(body).encode(),
+                    headers=headers, method=method)
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.load(response), response.headers.get('Set-Cookie', '').split(';')[0]
+
+        node = None
+        try:
+            _, cookie = api('/api/auth/login', {'password': config['admin_password']})
+            prefix = 'qa-' + uuid.uuid4().hex[:10]
+            node, _ = api('/api/provider-nodes', {'name': 'Synthetic no-silent-image QA',
+                            'prefix': prefix, 'apiType': 'chat',
+                            'baseUrl': f'http://{upstream_host}:{server.server_port}/v1'})
+            api('/api/providers', {'provider': node['node']['id'],
+                                   'name': 'Synthetic text-only account',
+                                   'apiKey': 'synthetic-text-only-account'})
+            body = {'model': prefix + '/qa-model', 'messages': [{'role': 'user',
+                    'content': [{'type': 'text', 'text': 'Describe this'},
+                                {'type': 'image_url', 'image_url': {
+                                    'url': 'data:image/png;base64,iVBORw0KGgo='}}]}],
+                    'stream': False}
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                api('/v1/chat/completions', body, inference=True)
+            try:
+                response_body = error.exception.read().decode('utf-8', errors='replace')
+                self.assertEqual(error.exception.code, 422,
+                                 'unsupported image must fail instead of being silently omitted: '
+                                 + response_body[:500])
+            finally:
+                error.exception.close()
+            self.assertEqual(seen, [], 'unsupported image reached the text-only upstream')
+        finally:
+            if node:
+                api('/api/provider-nodes/' + node['node']['id'], method='DELETE')
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
 
 @unittest.skipUnless(os.environ.get('JARVIS_TEST_ROUTER_AGENT_BIN'), 'requires built agent and installed Claude/Codex CLIs')
 class RealCliTransport(unittest.TestCase):

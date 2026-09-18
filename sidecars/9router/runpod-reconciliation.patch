@@ -18,10 +18,51 @@ index 00f3e3d..4515a59 100644
      // Hooks run BEFORE auth so dynamic overlays can't clobber the token.
      for (const hook of desc.hooks || []) HEADER_HOOKS[hook]?.(headers, credentials);
 diff --git a/src/sse/handlers/chat.js b/src/sse/handlers/chat.js
-index 7aa530d..9890f6b 100644
+index 7aa530d..0d10037 100644
 --- a/src/sse/handlers/chat.js
 +++ b/src/sse/handlers/chat.js
-@@ -309,6 +309,12 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+@@ -19,6 +19,7 @@ import { handleComboChat, handleFusionChat, detectRequiredCapabilities } from "o
+ import { augmentModelsWithCapacityAdapter, withCapacityAdapterStripping, getActiveAdapterStrategy } from "open-sse/services/capacityAdapter.js";
+ import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
+ import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
++import { getCapabilitiesForModel } from "open-sse/providers/capabilities.js";
+ import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
+ import * as log from "../utils/logger.js";
+ import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
+@@ -138,6 +139,13 @@ export async function handleChat(request, clientRawRequest = null) {
+     });
+   }
+ 
++  // An explicit compatible node is a pinned backend. A capacity adapter must
++  // not silently send its prompt or attachment to a different provider.
++  const explicitModel = await getModelInfo(modelStr);
++  if (explicitModel.provider?.startsWith("openai-compatible-")) {
++    return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey);
++  }
++
+   // Single model request — may still switch to a capacity-adapter model if the
+   // target lacks a capability the request needs (e.g. no vision, request has an image).
+   const soloAugmented = augmentModelsWithCapacityAdapter([modelStr], requiredCapabilities, settings);
+@@ -220,6 +228,18 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+ 
+   const { provider, model } = modelInfo;
+ 
++  // An explicit compatible-model selection must never answer after silently
++  // dropping a current-turn attachment it cannot read.
++  if (provider.startsWith("openai-compatible-")) {
++    const required = detectRequiredCapabilities(body);
++    const capabilities = getCapabilitiesForModel(provider, model);
++    const unsupported = ["vision", "pdf", "audioInput", "videoInput"]
++      .filter((capability) => required.has(capability) && capabilities[capability] !== true);
++    if (unsupported.length) {
++      return errorResponse(422, `Model cannot read requested input: ${unsupported.join(", ")}`);
++    }
++  }
++
+   // Routing shown in the unified "▶" line (client model → provider/model)
+ 
+   // Extract userAgent from request
+@@ -309,6 +329,12 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
  
      if (result.success) return result.response;
  

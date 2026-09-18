@@ -24,7 +24,7 @@ installer applies `sidecars/9router/runpod-reconciliation.patch` before building
 a supplied built source must already contain it. The service uses a distinct
 runtime directory for this patched version. For Docker, run
 `bash scripts/build-model-router-image.sh` to build
-`jarvis-9router:0.5.75-runpod-1` from the same source and dependency lock.
+`jarvis-9router:0.5.75-runpod-3` from the same source and dependency lock.
 
 After deploying this agent version, open **Settings → Models & accounts**:
 
@@ -114,9 +114,17 @@ fixtures for structured output and wiki/tool operations.
 
 For a Docker-hosted router, add `"upstream_host":"host.docker.internal"` to a
 private copy of the router test config before running the synthetic suite. The
-patched router must pass both quota failover and the request-key/409 test. The
-stock 0.5.75 image fails the latter. Keep the original data volume backed up
+patched router must pass quota failover, request-key/409 and unsupported-image
+tests. Stock 0.5.75 fails the latter two. Keep the original data volume backed up
 when switching an existing router to the patched image.
+
+The patched build treats a direct OpenAI-compatible model selection as pinned:
+9Router will not switch it to a capacity-adapter provider. When the selected
+model's declared capabilities cannot read a current-turn image, document,
+audio or video input, it returns 422 before contacting an upstream. This
+prevents a normal-looking answer after an attachment was removed. A capability
+declaration is not proof that the deployed model handles that input; the live
+attachment acceptance test remains required before enabling the profile.
 
 To roll back, select **Existing CLI accounts (9Router off)**. Then optionally stop
 `augmentagent-model-router.service`; stored accounts are retained. If the router
