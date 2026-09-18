@@ -8899,14 +8899,13 @@ impl QueryHandler for WikiQuerier {
         let prompt = format!("{}{prompt}", now_awareness_line());
         // #446 — see `wiki ask`: the Discord reply must carry every text block
         // the model emitted, not just the trailing wiki-filing receipt.
-        let selected = match ctx.channel_id {
-            Some(channel) => augmentagent_channel_core::model_selection::SelectionStore::new(
-                augmentagent_channel_core::model_selection::config_path())
-                .selected(Some(&channel.get().to_string()))?,
-            None => None,
-        };
-        let answer = augmentagent_channel_core::model_selection::SELECTED_PROFILE
-            .scope(selected, self.reasoner.call_transcript(&opts, &prompt)).await;
+        let answer = async {
+            let store = augmentagent_channel_core::model_selection::SelectionStore::new(
+                augmentagent_channel_core::model_selection::config_path());
+            let selected = store.selected(ctx.channel_id.as_ref().map(|channel| channel.get().to_string()).as_deref())?;
+            augmentagent_channel_core::model_selection::SELECTED_PROFILE
+                .scope(selected, self.reasoner.call_transcript(&opts, &prompt)).await
+        }.await;
         sweep_imessage_attachments(&opts.env);
         answer
     }
