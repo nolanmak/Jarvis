@@ -4,6 +4,16 @@ source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"
 count_file="$HOME/.fake-cli/codex.count"
 prior_count=$(cat "$count_file" 2>/dev/null || printf '0')
 prompt=$(cat)
+if (( prior_count == 1 )); then
+  # Hold the GLM turn inside the real query dispatch while Discord changes
+  # the channel selection. The later tool calls must keep GLM's snapshot.
+  touch "$HOME/.fake-cli/switch-entered"
+  for _ in {1..600}; do
+    [[ -e "$HOME/.fake-cli/switch-release" ]] && break
+    sleep 0.05
+  done
+  [[ -e "$HOME/.fake-cli/switch-release" ]] || { echo 'model switch was not released' >&2; exit 1; }
+fi
 if (( prior_count > 0 )); then
   [[ "$prompt" == *'<conversation_history>'* ]] || { echo 'missing conversation history' >&2; exit 1; }
   [[ "$prompt" == *'assistant: TOOL_PROBE_01234567-89ab-cdef-0123-456789abcdef'* ]] || {

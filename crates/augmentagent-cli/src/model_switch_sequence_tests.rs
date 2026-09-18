@@ -194,6 +194,8 @@ for line in sys.stdin:
             .trim(),
         "3"
     );
+    assert!(home.join(".fake-cli/switch-entered").exists());
+    assert!(home.join(".fake-cli/switch-release").exists());
     assert!(!home.join(".fake-cli/claude.count").exists());
 }
 
@@ -227,18 +229,32 @@ async fn discord_model_switch_sequence_child() {
         } else {
             format!("<conversation_history>\n{history}</conversation_history>\n\nuser's current message:\n{question}")
         };
-        let answer = handler
-            .answer(
-                &augmentagent_approval_discord::AuditCtx {
-                    session_id: format!("{CHANNEL}:{}", index + 1),
-                    http: None,
-                    channel_id: Some(serenity::model::id::ChannelId::new(CHANNEL)),
-                    owner_authorized: true,
-                },
-                &prompt,
-            )
-            .await
-            .unwrap();
+        let ctx = augmentagent_approval_discord::AuditCtx {
+            session_id: format!("{CHANNEL}:{}", index + 1),
+            http: None,
+            channel_id: Some(serenity::model::id::ChannelId::new(CHANNEL)),
+            owner_authorized: true,
+        };
+        let answer = if index == 1 {
+            let entered = root.join("home/.fake-cli/switch-entered");
+            let release = root.join("home/.fake-cli/switch-release");
+            let (answer, ()) = tokio::join!(handler.answer(&ctx, &prompt), async {
+                tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                    while !entered.exists() {
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    }
+                })
+                .await
+                .expect("GLM turn started before switch");
+                let switched = handler.model_command(CHANNEL, "/model set codex").await.unwrap();
+                assert!(switched.contains("codex"), "{switched}");
+                assert_eq!(handler.selected_model(CHANNEL).await.unwrap().as_deref(), Some("codex"));
+                std::fs::write(release, b"continue").unwrap();
+            });
+            answer.unwrap()
+        } else {
+            handler.answer(&ctx, &prompt).await.unwrap()
+        };
         assert_eq!(answer.trim(), NONCE);
         history.push_str(&format!("user: {question}\nassistant: {answer}\n"));
     }
