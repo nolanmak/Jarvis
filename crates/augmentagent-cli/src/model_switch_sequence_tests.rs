@@ -135,6 +135,11 @@ for line in sys.stdin:
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(rows.len(), 10, "{audit}");
+    for row in &rows {
+        let turn: usize = row["session_id"].as_str().unwrap()
+            .rsplit(':').next().unwrap().parse().unwrap();
+        assert_eq!(row["model"], usage_rows[turn - 1]["model"], "{row}");
+    }
     assert_eq!(rows[0]["provider"], "qwen");
     assert_eq!(rows[0]["tool"], "Write");
     assert_eq!(rows[0]["session_id"], format!("{CHANNEL}:1"));
