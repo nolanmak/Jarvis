@@ -1315,9 +1315,10 @@ invalid_write = call(10, 'tools/call', {'name':'Write','arguments':invalid_write
 image_args = {'file_path':str(workspace / 'fixture.png')}
 image = call(11, 'tools/call', {'name':'Read','arguments':image_args})
 image_exact = image['content'][0]['data'] == base64.b64encode((workspace / 'fixture.png').read_bytes()).decode()
-for name, arguments, result in [('Read',read_args,read),('Write',write_args,write),('Write',outside_args,outside),('Bash',bash_args,bash),('Read',escape_args,escape),('Write',escape_write_args,escape_write),('UnknownTool',unknown_args,unknown),('Write',invalid_write_args,invalid_write),('Read',image_args,image)]:
+mcp = call(12, 'tools/call', {'name':'mcp__fixture__lookup','arguments':{}})
+for name, arguments, result in [('Read',read_args,read),('Write',write_args,write),('Write',outside_args,outside),('Bash',bash_args,bash),('Read',escape_args,escape),('Write',escape_write_args,escape_write),('UnknownTool',unknown_args,unknown),('Write',invalid_write_args,invalid_write),('Read',image_args,image),('mcp__fixture__lookup',{},mcp)]:
     print(json.dumps({'type':'item.completed','item':{'type':'mcp_tool_call','server':'jarvis','tool':name,'arguments':arguments,'result':result}}),flush=True)
-report = {'tools':tools,'read':read,'write':write,'outside':outside,'bash':bash,'escape':escape,'escape_write':escape_write,'unknown':unknown,'invalid_write':invalid_write,'image':image,'image_exact':image_exact}
+report = {'tools':tools,'read':read,'write':write,'outside':outside,'bash':bash,'escape':escape,'escape_write':escape_write,'unknown':unknown,'invalid_write':invalid_write,'image':image,'image_exact':image_exact,'mcp':mcp}
 print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':json.dumps(report)}}),flush=True)
 bridge.stdin.close()
 bridge.wait(timeout=10)
@@ -1325,6 +1326,22 @@ PY
 "##;
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("outside.txt"), "outside fixture\n").unwrap();
+        let mcp_server = root.path().join("fixture-mcp.py");
+        std::fs::write(&mcp_server, r#"import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get('method')
+    if method == 'initialize':
+        result = {'protocolVersion':'2024-11-05','capabilities':{'tools':{}},'serverInfo':{'name':'fixture','version':'1'}}
+    elif method == 'tools/list':
+        result = {'tools':[{'name':'lookup','description':'Synthetic local lookup','inputSchema':{'type':'object','properties':{}}}]}
+    elif method == 'tools/call':
+        result = {'content':[{'type':'text','text':'MCP_FIXTURE_OK'}]}
+    else:
+        result = {}
+    if 'id' in request:
+        print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)
+"#).unwrap();
         let mut inventories = Vec::new();
         for kind in [ProviderKind::Codex, ProviderKind::Qwen, ProviderKind::Glm] {
             let workspace = root.path().join(kind.name());
@@ -1341,7 +1358,10 @@ PY
             reasoner.bin = bin;
             let mut options = opts();
             options.cwd = Some(workspace.clone());
-            options.allowed_tools = vec!["Read".into(), "Write".into(), "Bash(printf *)".into()];
+            options.allowed_tools = vec!["Read".into(), "Write".into(), "Bash(printf *)".into(), "mcp__fixture__lookup".into()];
+            options.settings_json = Some(serde_json::json!({"mcpServers":{"fixture":{
+                "command":"python3","args":[mcp_server]
+            }}}).to_string());
             options.session_id = Some(format!("synthetic-{}", kind.name()));
             let audit = root.path().join(format!("audit-{}.jsonl", kind.name()));
             options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(audit.clone())));
@@ -1352,7 +1372,8 @@ PY
             let report: serde_json::Value = serde_json::from_str(&answer).unwrap();
             let tools = report["tools"].as_array().unwrap().clone();
             assert!(tools.contains(&serde_json::json!("Read")) && tools.contains(&serde_json::json!("Write"))
-                && tools.contains(&serde_json::json!("Bash")));
+                && tools.contains(&serde_json::json!("Bash"))
+                && tools.contains(&serde_json::json!("mcp__fixture__lookup")));
             inventories.push(tools);
             assert!(report["read"]["content"][0]["text"].as_str().unwrap().contains('7'));
             assert_ne!(report["write"]["isError"], true);
@@ -1363,6 +1384,7 @@ PY
             assert_eq!(report["invalid_write"]["isError"], true);
             assert_eq!(report["image"]["content"][0]["mimeType"], "image/png");
             assert_eq!(report["image_exact"], true);
+            assert_eq!(report["mcp"]["content"][0]["text"], "MCP_FIXTURE_OK");
             assert_ne!(report["bash"]["isError"], true);
             assert!(report["bash"]["content"][0]["text"].as_str().unwrap().contains("NINE"));
             assert_eq!(std::fs::read_to_string(workspace.join("result.txt")).unwrap(), "8\n");
@@ -1370,7 +1392,7 @@ PY
             assert!(!workspace.join("invalid.txt").exists());
             assert_eq!(std::fs::read_to_string(root.path().join("outside.txt")).unwrap(), "outside fixture\n");
             let records = std::fs::read_to_string(audit).unwrap();
-            assert_eq!(records.lines().count(), 9);
+            assert_eq!(records.lines().count(), 10);
             assert!(records.lines().all(|line| {
                 serde_json::from_str::<serde_json::Value>(line).unwrap()["provider"] == kind.name()
             }));
