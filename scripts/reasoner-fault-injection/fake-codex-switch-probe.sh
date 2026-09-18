@@ -10,4 +10,9 @@ if (( prior_count > 0 )); then
     echo 'missing prior model answer' >&2; exit 1;
   }
 fi
-printf '%s' "$prompt" | "$(dirname "${BASH_SOURCE[0]}")/fake-codex-read-probe.sh" "$@"
+error_log="$HOME/.fake-cli/switch-error.log"
+mkdir -p "$(dirname "$error_log")"
+if ! printf '%s' "$prompt" | "$(dirname "${BASH_SOURCE[0]}")/fake-codex-read-probe.sh" "$@" 2>"$error_log"; then
+  cat "$error_log" >&2
+  exit 1
+fi

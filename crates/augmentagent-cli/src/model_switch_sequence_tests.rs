@@ -75,9 +75,10 @@ fn discord_model_switch_sequence_uses_one_audited_harness() {
         .expect("child test process");
     assert!(
         output.status.success(),
-        "child stdout:\n{}\nchild stderr:\n{}",
+        "child stdout:\n{}\nchild stderr:\n{}\nprobe stderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&output.stderr),
+        std::fs::read_to_string(home.join(".fake-cli/switch-error.log")).unwrap_or_default()
     );
 
     let usage =
