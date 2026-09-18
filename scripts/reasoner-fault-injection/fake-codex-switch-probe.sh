@@ -10,6 +10,9 @@ if (( prior_count > 0 )); then
     echo 'missing prior model answer' >&2; exit 1;
   }
 fi
+if (( prior_count == 0 )); then
+  export PROBE_CREATE_CONTENT='TOOL_PROBE_01234567-89ab-cdef-0123-456789abcdef'
+fi
 error_log="$HOME/.fake-cli/switch-error.log"
 mkdir -p "$(dirname "$error_log")"
 if ! printf '%s' "$prompt" | "$(dirname "${BASH_SOURCE[0]}")/fake-codex-read-probe.sh" "$@" 2>"$error_log"; then

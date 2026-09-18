@@ -30,8 +30,19 @@ def call(identifier, method, params):
     return reply['result']
 
 call(1, 'initialize', {})
+read_id = 2
+if 'PROBE_CREATE_CONTENT' in os.environ:
+    write_arguments = {'file_path': path, 'content': os.environ['PROBE_CREATE_CONTENT']}
+    write_result = call(2, 'tools/call', {'name': 'Write', 'arguments': write_arguments})
+    print(json.dumps({'type': 'item.completed', 'item': {
+        'type': 'mcp_tool_call', 'server': 'jarvis', 'tool': 'Write',
+        'arguments': write_arguments, 'result': write_result,
+    }}), flush=True)
+    if write_result.get('isError'):
+        raise RuntimeError('synthetic artifact Write was denied')
+    read_id = 3
 arguments = {'file_path': path}
-result = call(2, 'tools/call', {'name': 'Read', 'arguments': arguments})
+result = call(read_id, 'tools/call', {'name': 'Read', 'arguments': arguments})
 print(json.dumps({'type': 'item.completed', 'item': {
     'type': 'mcp_tool_call', 'server': 'jarvis', 'tool': 'Read',
     'arguments': arguments, 'result': result,
