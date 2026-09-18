@@ -1961,7 +1961,8 @@ impl Store {
     /// `(id, status, retry_count)`, or `None` when the message has never
     /// been actioned. Callers need the *status* (not just existence) to tell
     /// "a card is up / this is settled" from "triage errored with no card,
-    /// so this still needs another attempt".
+    /// so this still needs another attempt". Insertion order breaks ties
+    /// when two actions receive the same millisecond timestamp.
     pub fn latest_action_for_message(
         &self,
         message_id: &str,
@@ -1970,7 +1971,7 @@ impl Store {
         let row = guard
             .query_row(
                 "SELECT id, status, COALESCE(retryCount, 0) FROM actions \
-                 WHERE messageId = ?1 ORDER BY createdAt DESC LIMIT 1",
+                 WHERE messageId = ?1 ORDER BY createdAt DESC, rowid DESC LIMIT 1",
                 params![message_id],
                 |r| {
                     Ok((
@@ -7549,6 +7550,23 @@ mod tests {
             .unwrap();
         }
         (Store::open(&db).unwrap(), dir)
+    }
+
+    #[test]
+    fn latest_action_uses_insert_order_when_timestamps_match() {
+        let (store, _dir) = fresh_store();
+        let message_id = "merge:synthetic-stub->synthetic-target";
+        store.upsert_email(&sample_email(message_id)).unwrap();
+        let earlier = store.log_action(message_id, None, "a@b.example.com", "merge", None,
+            None, ActionStatus::Error).unwrap();
+        let later = store.log_action(message_id, None, "a@b.example.com", "merge", None,
+            None, ActionStatus::Pending).unwrap();
+        {
+            let guard = store.conn.lock().unwrap();
+            guard.execute("update actions set createdAt = 1000 where id in (?1, ?2)",
+                params![earlier, later]).unwrap();
+        }
+        assert_eq!(store.latest_action_for_message(message_id).unwrap().unwrap().0, later);
     }
 
     fn sample_email(message_id: &str) -> Email {
