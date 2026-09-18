@@ -7,6 +7,7 @@
 //!
 //! Nothing here calls a reasoner. Embedding text never executes it.
 
+pub mod chunk;
 pub mod embedder;
 pub mod fetch;
 pub mod local;

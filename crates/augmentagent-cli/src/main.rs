@@ -3768,7 +3768,7 @@ async fn main() -> Result<()> {
         },
         Cmd::WhatsappHistory { .. } => whatsapp_history::poll_command(store).await,
         Cmd::Messages { op } => messages_cmd::run(store, op, cli.wiki_dir.clone()).await,
-        Cmd::Embeddings { op } => embeddings_cmd::run(op).await,
+        Cmd::Embeddings { op } => embeddings_cmd::run(store, op).await,
         Cmd::AppleNotes { op } => match op {
             apple_notes::Op::PollOnce { dry_run } => apple_notes::poll_command(store, dry_run).await,
         },
