@@ -8922,7 +8922,9 @@ impl QueryHandler for WikiQuerier {
                 .map_err(|_| "9Router configuration is invalid".to_string())?;
             match profile {
                 ProviderKind::Qwen => {
-                    if router.is_none() { Err("Qwen requires a configured 9Router endpoint".into()) }
+                    if std::env::var("AUGMENTAGENT_MODEL_QWEN_ENABLED").ok().as_deref() != Some("1") {
+                        Err("Qwen is paused; enable it after Runpod scale-down and live tool verification".into())
+                    } else if router.is_none() { Err("Qwen requires a configured 9Router endpoint".into()) }
                     else { Ok(()) }
                 }
                 ProviderKind::Glm => {
