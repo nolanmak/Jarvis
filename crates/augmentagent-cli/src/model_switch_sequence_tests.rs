@@ -14,9 +14,49 @@ fn discord_model_switch_sequence_uses_one_audited_harness() {
     let home = scratch.path().join("home");
     let wiki = scratch.path().join("wiki");
     let codex_home = scratch.path().join("codex-home");
-    for path in [&home, &wiki, &codex_home] {
+    let repo = scratch.path().join("repo");
+    let scripts = repo.join("scripts");
+    let release = repo.join("target/release");
+    for path in [&home, &wiki, &codex_home, &scripts, &release] {
         std::fs::create_dir_all(path).unwrap();
     }
+    let source_repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    std::fs::copy(
+        source_repo.join("scripts/aa-wiki-scope-guard.sh"),
+        scripts.join("aa-wiki-scope-guard.sh"),
+    )
+    .unwrap();
+    let memory = release.join("augmentagent-mcp-memory");
+    std::fs::write(
+        &memory,
+        r#"#!/usr/bin/env python3
+import json, sys
+names = ('search_conversation_history', 'read_conversation_thread',
+         'search_messages', 'conversation_stats', 'memory_search', 'memory_recent')
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get('method')
+    if method == 'initialize':
+        result = {'protocolVersion': '2024-11-05', 'capabilities': {'tools': {}},
+                  'serverInfo': {'name': 'synthetic-memory', 'version': '1'}}
+    elif method == 'tools/list':
+        result = {'tools': [{'name': name, 'description': 'Synthetic memory',
+                            'inputSchema': {'type': 'object', 'properties': {}}}
+                           for name in names]}
+    elif method == 'tools/call':
+        result = {'content': [{'type': 'text', 'text': 'MEMORY_FIXTURE_OK'}]}
+    else:
+        result = {}
+    if 'id' in request:
+        print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+"#,
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&memory, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::write(codex_home.join("auth.json"), "{}").unwrap();
     std::fs::write(wiki.join("probe.txt"), NONCE).unwrap();
     let router = scratch.path().join("model-router.json");
@@ -35,11 +75,7 @@ fn discord_model_switch_sequence_uses_one_audited_harness() {
         .to_string(),
     )
     .unwrap();
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap();
-    let fakes = repo.join("scripts/reasoner-fault-injection");
+    let fakes = source_repo.join("scripts/reasoner-fault-injection");
     let output = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -131,10 +167,7 @@ async fn discord_model_switch_sequence_child() {
     let handler = WikiQuerier {
         reasoner: build_reasoner(),
         wiki_root: root.join("wiki"),
-        repo_root: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
-            .unwrap(),
+        repo_root: root.join("repo"),
     };
     let file = root.join("wiki/probe.txt");
     let mut history = String::new();
