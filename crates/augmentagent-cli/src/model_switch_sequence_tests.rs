@@ -143,8 +143,14 @@ for line in sys.stdin:
         .collect();
     assert_eq!(rows.len(), 13, "{audit}");
     for row in &rows {
-        let turn: usize = row["session_id"].as_str().unwrap()
-            .rsplit(':').next().unwrap().parse().unwrap();
+        let turn: usize = row["session_id"]
+            .as_str()
+            .unwrap()
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
         assert_eq!(row["model"], usage_rows[turn - 1]["model"], "{row}");
     }
     assert_eq!(rows[0]["provider"], "qwen");
@@ -246,9 +252,15 @@ async fn discord_model_switch_sequence_child() {
                 })
                 .await
                 .expect("GLM turn started before switch");
-                let switched = handler.model_command(CHANNEL, "/model set codex").await.unwrap();
+                let switched = handler
+                    .model_command(CHANNEL, "/model set codex")
+                    .await
+                    .unwrap();
                 assert!(switched.contains("codex"), "{switched}");
-                assert_eq!(handler.selected_model(CHANNEL).await.unwrap().as_deref(), Some("codex"));
+                assert_eq!(
+                    handler.selected_model(CHANNEL).await.unwrap().as_deref(),
+                    Some("codex")
+                );
                 std::fs::write(release, b"continue").unwrap();
             });
             answer.unwrap()
