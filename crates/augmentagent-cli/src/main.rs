@@ -56,6 +56,7 @@ use async_trait::async_trait;
 mod whatsapp_history;
 mod messages_cmd;
 mod embeddings_cmd;
+mod triage_prefilter_cmd;
 mod apple_notes;
 mod autopr_eval;
 mod autopr_health;
@@ -288,6 +289,11 @@ enum Cmd {
     Imessage {
         #[command(subcommand)]
         op: ImessageOp,
+    },
+    /// Similarity triage pre-filter (#1127): calibrate, stats, reset.
+    TriagePrefilter {
+        #[command(subcommand)]
+        op: triage_prefilter_cmd::Op,
     },
     /// Local embedding model management (#1126): fetch, info, bench.
     Embeddings {
@@ -3779,6 +3785,7 @@ async fn main() -> Result<()> {
         Cmd::WhatsappHistory { .. } => whatsapp_history::poll_command(store).await,
         Cmd::Messages { op } => messages_cmd::run(store, op, cli.wiki_dir.clone()).await,
         Cmd::Embeddings { op } => embeddings_cmd::run(store, op).await,
+        Cmd::TriagePrefilter { op } => triage_prefilter_cmd::run(store, op).await,
         Cmd::AppleNotes { op } => match op {
             apple_notes::Op::PollOnce { dry_run } => apple_notes::poll_command(store, dry_run).await,
         },
@@ -12584,7 +12591,13 @@ fn build_channel(
         wiki_schema_path,
         ..Default::default()
     };
-    Ok(GmailChannel::new(store, gmail, reasoner, broker, config))
+    let channel = GmailChannel::new(Arc::clone(&store), gmail, reasoner, broker, config);
+    // #1127 — similarity pre-filter; None unless AUGMENTAGENT_TRIAGE_PREFILTER=1
+    // and the configured embedder builds.
+    Ok(match triage_prefilter_cmd::EmbeddingPrefilter::build(store) {
+        Some(pf) => channel.with_prefilter(pf),
+        None => channel,
+    })
 }
 
 fn build_linkedin_channel(

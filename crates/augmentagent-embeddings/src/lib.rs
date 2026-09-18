@@ -15,6 +15,7 @@ pub mod local;
 pub mod model;
 pub mod prepare;
 pub mod provider;
+pub mod triage_prefilter;
 pub mod vectors;
 
 pub use embedder::{Embedder, Embedding, ModelId};

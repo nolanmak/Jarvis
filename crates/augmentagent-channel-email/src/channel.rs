@@ -110,6 +110,9 @@ pub struct GmailChannel<G: GmailApi, R: Reasoner> {
     /// the `gh issue create` invocation; production defaults to
     /// [`GhCliIssueRunner`] which shells out to the `gh` binary on PATH.
     gh_issue_runner: Arc<dyn GhIssueRunner>,
+    /// #1127 — optional similarity pre-filter consulted before the triage
+    /// reasoner call. `None` (the default) means every message is triaged.
+    prefilter: Option<Arc<dyn crate::prefilter::TriagePrefilter>>,
 }
 
 impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
@@ -155,7 +158,15 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             config,
             wiki_schema,
             gh_issue_runner: Arc::new(GhCliIssueRunner::new()),
+            prefilter: None,
         }
+    }
+
+    /// #1127 — install a triage pre-filter. Production wires the
+    /// embeddings-backed one when `AUGMENTAGENT_TRIAGE_PREFILTER=1`.
+    pub fn with_prefilter(mut self, prefilter: Arc<dyn crate::prefilter::TriagePrefilter>) -> Self {
+        self.prefilter = Some(prefilter);
+        self
     }
 
     /// Swap the gh-CLI runner used for I7 postmortem issues. Production
@@ -408,6 +419,39 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             return Ok(None);
         }
 
+        // --- 0. PRE-FILTER (#1127): a confident "routine, skip" from the
+        // similarity pre-filter costs no model call. Spot-checked messages
+        // still go through triage so agreement stays measured. The verdict
+        // type cannot express anything but Skip.
+        let mut spot_check: Option<crate::prefilter::PrefilterDecision> = None;
+        if let Some(pf) = self.prefilter.as_ref().filter(|pf| pf.enabled()) {
+            if let Some(decision) = pf.assess(&email).await {
+                if pf.is_spot_check(&email.message_id) {
+                    spot_check = Some(decision);
+                } else {
+                    let reason = format!("{} {}", crate::prefilter::REASON_PREFIX, decision.reason);
+                    self.store.log_action(
+                        &email.message_id,
+                        email.thread_id.as_deref(),
+                        &email.from,
+                        &email.subject,
+                        Some(&email.body),
+                        None,
+                        ActionStatus::Skipped,
+                    )?;
+                    self.store
+                        .mark_email_processed(&email.message_id, TriageResult::Skip)?;
+                    println!(
+                        "[skip:prefilter] {} from={} reason={}",
+                        email.message_id, email.from, reason
+                    );
+                    pf.record(&email.message_id, &decision, None).await;
+                    // No wiki ingest either: the point is zero model calls.
+                    return Ok(Some(DispatchOutcome::Skipped));
+                }
+            }
+        }
+
         // --- 1. TRIAGE call (Opus, wiki read-only, returns {decision, reason})
         let triage_opts = crate::reasoner::triage_opts(self.config.wiki_root.clone());
         let wiki_hint = self
@@ -446,6 +490,11 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 return Err(e.into());
             }
         };
+
+        if let (Some(pf), Some(pre)) = (self.prefilter.as_ref(), spot_check.as_ref()) {
+            pf.record(&email.message_id, pre, Some(decision.decision))
+                .await;
+        }
 
         match decision.decision {
             DecisionKind::Skip => {
@@ -595,10 +644,8 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                                 None,
                                 ActionStatus::Skipped,
                             )?;
-                            self.store.mark_email_processed(
-                                &email.message_id,
-                                TriageResult::Skip,
-                            )?;
+                            self.store
+                                .mark_email_processed(&email.message_id, TriageResult::Skip)?;
                             println!(
                                 "[skip:already-replied] {} thread={} from={}",
                                 email.message_id, thread_id, email.from,
@@ -1875,7 +1922,11 @@ mod tests {
         ) -> Result<String, crate::gmail::GmailError> {
             Ok("draft".into())
         }
-        async fn send_draft(&self, _e: &str, _d: &str) -> Result<Option<String>, crate::gmail::GmailError> {
+        async fn send_draft(
+            &self,
+            _e: &str,
+            _d: &str,
+        ) -> Result<Option<String>, crate::gmail::GmailError> {
             Ok(None)
         }
         async fn delete_draft(&self, _e: &str, _d: &str) -> Result<(), crate::gmail::GmailError> {
@@ -2385,7 +2436,10 @@ mod tests {
         assert_eq!(out.awaiting_approval, 0, "no approval card for event blast");
         assert_eq!(out.replied_dry_run, 0);
         assert_eq!(out.flagged, 0);
-        assert_eq!(out.skipped, 0, "did not fall through to is_human_sender skip");
+        assert_eq!(
+            out.skipped, 0,
+            "did not fall through to is_human_sender skip"
+        );
         // Discord broker is silent on BOTH rails — explicit user preference:
         // no notice for event blasts.
         assert_eq!(
@@ -2572,11 +2626,9 @@ Where: Microsoft Teams
         let (store, _f) = tmp_store();
         // Seed: user replied on T-already at a timestamp NEWER than the
         // inbound below. acc1 matches the entity_id in tmp_store().
-        let inbound_ms = chrono::DateTime::parse_from_rfc2822(
-            "Wed, 27 May 2026 12:00:00 +0000",
-        )
-        .unwrap()
-        .timestamp_millis();
+        let inbound_ms = chrono::DateTime::parse_from_rfc2822("Wed, 27 May 2026 12:00:00 +0000")
+            .unwrap()
+            .timestamp_millis();
         store
             .record_outbound_thread_event(
                 "acc1",
@@ -2698,7 +2750,8 @@ Where: Microsoft Teams
             emails: vec![Email {
                 attachments: Vec::new(),
                 to: "gwhitaker@example.com".into(),
-                cc: "Me <me@x.example.com>, Casey <casey@example.com>, Sam <sam@example.com>".into(), // pii-ok: synthetic test fixture
+                cc: "Me <me@x.example.com>, Casey <casey@example.com>, Sam <sam@example.com>"
+                    .into(), // pii-ok: synthetic test fixture
                 message_id: "m-cc-only".into(),
                 thread_id: Some("T-cc-only".into()),
                 from: "Priya <priya@example.com>".into(),
@@ -3179,7 +3232,10 @@ Where: Microsoft Teams
         // message's own To+Cc (minus self), never a crash or sender-only.
         assert_eq!(
             cc,
-            vec!["will@example.com".to_string(), "zack@example.com".to_string()]
+            vec![
+                "will@example.com".to_string(),
+                "zack@example.com".to_string()
+            ]
         );
     }
 
@@ -3222,7 +3278,11 @@ Where: Microsoft Teams
             }
             Ok("draft-abc".into())
         }
-        async fn send_draft(&self, _e: &str, _d: &str) -> Result<Option<String>, crate::gmail::GmailError> {
+        async fn send_draft(
+            &self,
+            _e: &str,
+            _d: &str,
+        ) -> Result<Option<String>, crate::gmail::GmailError> {
             Ok(None)
         }
         async fn delete_draft(&self, _e: &str, _d: &str) -> Result<(), crate::gmail::GmailError> {
@@ -3574,7 +3634,11 @@ Where: Microsoft Teams
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok("draft-once".into())
         }
-        async fn send_draft(&self, _e: &str, _d: &str) -> Result<Option<String>, crate::gmail::GmailError> {
+        async fn send_draft(
+            &self,
+            _e: &str,
+            _d: &str,
+        ) -> Result<Option<String>, crate::gmail::GmailError> {
             Ok(None)
         }
         async fn delete_draft(&self, _e: &str, _d: &str) -> Result<(), crate::gmail::GmailError> {
@@ -3739,7 +3803,10 @@ Where: Microsoft Teams
         // --- Pass 1: triage 529s. The parse failure surfaces as an error, but
         // NO action row is logged and the email stays incomplete (unread).
         let out1 = ch.poll_once().await.unwrap();
-        assert_eq!(out1.errors, 1, "triage parse failure should surface as an error");
+        assert_eq!(
+            out1.errors, 1,
+            "triage parse failure should surface as an error"
+        );
         assert_eq!(out1.awaiting_approval, 0);
         assert_eq!(out1.skipped, 0);
         // Core regression assertion: no open (pending/error) action row. Pre-fix
@@ -3754,7 +3821,10 @@ Where: Microsoft Teams
         // --- Retry tick: with no errored row, nothing is retryable, so the leak
         // path (retry_once -> dispatch_reply, ungated) never runs.
         let retried = ch.retry_once().await.unwrap();
-        assert_eq!(retried, 0, "a triage-stage failure must not be retried as a reply");
+        assert_eq!(
+            retried, 0,
+            "a triage-stage failure must not be retried as a reply"
+        );
         assert_eq!(
             broker.posts.lock().unwrap().len(),
             0,
@@ -3765,7 +3835,10 @@ Where: Microsoft Teams
         // 'reply', but is_human_sender skips the substack sender BEFORE drafting,
         // so still no card — and the email is now terminally processed (Skip).
         let out2 = ch.poll_once().await.unwrap();
-        assert_eq!(out2.skipped, 1, "re-triage routes the automated sender to the skip gate");
+        assert_eq!(
+            out2.skipped, 1,
+            "re-triage routes the automated sender to the skip gate"
+        );
         assert_eq!(out2.awaiting_approval, 0);
         assert_eq!(broker.posts.lock().unwrap().len(), 0);
         assert!(store.is_email_complete("m-529").unwrap());
@@ -3787,7 +3860,14 @@ Where: Microsoft Teams
             .upsert_tone_profile("global", "*", Some("acc1"), "GLOBAL", "[]", 50)
             .unwrap();
         store
-            .upsert_tone_profile("domain", "startup.example.com", Some("acc1"), "DOMAIN", "[]", 10)
+            .upsert_tone_profile(
+                "domain",
+                "startup.example.com",
+                Some("acc1"),
+                "DOMAIN",
+                "[]",
+                10,
+            )
             .unwrap();
         store
             .upsert_tone_profile(
@@ -3810,7 +3890,14 @@ Where: Microsoft Teams
             .upsert_tone_profile("global", "*", Some("acc1"), "GLOBAL", "[]", 50)
             .unwrap();
         store
-            .upsert_tone_profile("domain", "startup.example.com", Some("acc1"), "DOMAIN", "[]", 10)
+            .upsert_tone_profile(
+                "domain",
+                "startup.example.com",
+                Some("acc1"),
+                "DOMAIN",
+                "[]",
+                10,
+            )
             .unwrap();
         // sample_count=2 → below the 3-message recipient threshold.
         store
@@ -3835,7 +3922,14 @@ Where: Microsoft Teams
             .unwrap();
         // sample_count=3 → below the 5-message domain threshold.
         store
-            .upsert_tone_profile("domain", "startup.example.com", Some("acc1"), "DOMAIN", "[]", 3)
+            .upsert_tone_profile(
+                "domain",
+                "startup.example.com",
+                Some("acc1"),
+                "DOMAIN",
+                "[]",
+                3,
+            )
             .unwrap();
         let out = super::pick_tone_block(&store, "acc1", "alex@startup.example.com");
         assert_eq!(out, "GLOBAL");
@@ -4300,7 +4394,10 @@ Where: Microsoft Teams
         let _ = ch.approvals; // dry_run uses NoopBroker; broker var unused here
         let _ = broker;
         let out = ch.poll_once().await.unwrap();
-        assert_eq!(out.replied_dry_run, 1, "repair must produce a dry-run reply");
+        assert_eq!(
+            out.replied_dry_run, 1,
+            "repair must produce a dry-run reply"
+        );
         assert_eq!(out.errors, 0);
         // Action row: mode='code' (repair lands code-mode), trace carries
         // the repair_used marker, body is what the repaired program drafted.
@@ -4419,5 +4516,161 @@ Where: Microsoft Teams
         let flag_notices = broker.flag_posts.lock().unwrap();
         assert_eq!(flag_notices.len(), 1);
         assert!(flag_notices[0].1.contains("#500"));
+    }
+
+    // ---- #1127 pre-filter hook ------------------------------------------
+    mod prefilter_hook {
+        use super::*;
+        use crate::prefilter::{PrefilterDecision, PrefilterVerdict, TriagePrefilter};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        struct CountingReasoner(AtomicUsize);
+        #[async_trait]
+        impl Reasoner for CountingReasoner {
+            async fn call(&self, _o: &ReasonerOpts, _u: &str) -> anyhow::Result<String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(r#"{"decision":"reply","reason":"the model thinks it is actionable"}"#.into())
+            }
+        }
+
+        #[derive(Default)]
+        struct StubPrefilter {
+            enabled: bool,
+            opinion: bool,
+            spot: bool,
+            recorded: Mutex<Vec<(String, Option<DecisionKind>)>>,
+        }
+        #[async_trait]
+        impl TriagePrefilter for StubPrefilter {
+            fn enabled(&self) -> bool {
+                self.enabled
+            }
+            async fn assess(&self, _e: &Email) -> Option<PrefilterDecision> {
+                self.opinion.then(|| PrefilterDecision {
+                    verdict: PrefilterVerdict::Skip,
+                    reason: "k=8 unanimous skip sim=0.97".into(),
+                    audit: serde_json::json!({"k": 8}),
+                })
+            }
+            fn is_spot_check(&self, _m: &str) -> bool {
+                self.spot
+            }
+            async fn record(&self, m: &str, _d: &PrefilterDecision, r: Option<DecisionKind>) {
+                self.recorded.lock().unwrap().push((m.to_string(), r));
+            }
+        }
+
+        fn email(id: &str) -> Email {
+            Email {
+                attachments: vec![],
+                to: String::new(),
+                cc: String::new(),
+                message_id: id.into(),
+                thread_id: Some("t".into()),
+                from: "news@example.com".into(),
+                subject: "Weekly digest".into(),
+                body: "this week in things".into(),
+                date: "2026-04-13".into(),
+                account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            }
+        }
+
+        fn channel(
+            pf: Arc<StubPrefilter>,
+        ) -> (
+            Arc<CountingReasoner>,
+            GmailChannel<StubGmail, CountingReasoner>,
+            tempfile::NamedTempFile,
+        ) {
+            let (store, f) = tmp_store();
+            let reasoner = Arc::new(CountingReasoner(AtomicUsize::new(0)));
+            let ch = GmailChannel::dry_run(
+                store,
+                Arc::new(StubGmail { emails: vec![] }),
+                Arc::clone(&reasoner),
+                GmailChannelConfig {
+                    skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                    ..Default::default()
+                },
+            )
+            .with_prefilter(pf);
+            (reasoner, ch, f)
+        }
+
+        #[tokio::test]
+        async fn prefiltered_skip_makes_no_reasoner_call_and_is_audited() {
+            let pf = Arc::new(StubPrefilter {
+                enabled: true,
+                opinion: true,
+                ..Default::default()
+            });
+            let (reasoner, ch, _f) = channel(Arc::clone(&pf));
+            let out = ch.process_email("", "", "acc1", email("m1")).await.unwrap();
+            assert!(matches!(out, Some(DispatchOutcome::Skipped)), "{out:?}");
+            assert_eq!(reasoner.0.load(Ordering::SeqCst), 0, "no model call");
+            assert!(ch.store.is_email_complete("m1").unwrap());
+            let status: String = ch
+                .store
+                .with_conn(|c| {
+                    c.query_row("SELECT status FROM actions WHERE messageId='m1'", [], |r| {
+                        r.get(0)
+                    })
+                })
+                .unwrap();
+            assert_eq!(status, "skipped");
+            assert_eq!(
+                pf.recorded.lock().unwrap().as_slice(),
+                &[("m1".to_string(), None)]
+            );
+        }
+
+        #[tokio::test]
+        async fn spot_check_still_runs_the_reasoner_and_records_both_sides() {
+            let pf = Arc::new(StubPrefilter {
+                enabled: true,
+                opinion: true,
+                spot: true,
+                ..Default::default()
+            });
+            let (reasoner, ch, _f) = channel(Arc::clone(&pf));
+            let _ = ch.process_email("", "", "acc1", email("m2")).await;
+            assert_eq!(
+                reasoner.0.load(Ordering::SeqCst),
+                1,
+                "spot-check goes to triage"
+            );
+            let rec = pf.recorded.lock().unwrap();
+            assert_eq!(rec.len(), 1);
+            assert_eq!(
+                rec[0].1,
+                Some(DecisionKind::Reply),
+                "the reasoner's decision is recorded"
+            );
+        }
+
+        #[tokio::test]
+        async fn disabled_or_unopinionated_prefilter_changes_nothing() {
+            for pf in [
+                StubPrefilter {
+                    enabled: false,
+                    opinion: true,
+                    ..Default::default()
+                },
+                StubPrefilter {
+                    enabled: true,
+                    opinion: false,
+                    ..Default::default()
+                },
+            ] {
+                let pf = Arc::new(pf);
+                let (reasoner, ch, _f) = channel(Arc::clone(&pf));
+                let _ = ch.process_email("", "", "acc1", email("m3")).await;
+                assert_eq!(reasoner.0.load(Ordering::SeqCst), 1);
+                assert!(pf.recorded.lock().unwrap().is_empty());
+            }
+        }
     }
 }
