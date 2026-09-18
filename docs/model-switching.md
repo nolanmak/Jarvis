@@ -44,7 +44,7 @@ remains a separate parity gate.
 | Code mode and build VM | `codex_tools.rs`, build runner | Ignored Codex-only VM fixture; no shared CI fixture | Three-profile approved edit/test through the VM |
 | Scheduled loops and explicit job pins | Loop runner, `FallbackReasoner` | Default snapshot and fallback tests | Durable job-pin precedence and restart fixture |
 | Independent review | `review_history.rs`, `self_improve.rs` | Native-only reviewer admission and dispatch tests | Actual reviewer/backend lineage receipt |
-| Runpod retry, cancellation and restart | `scripts/runpod-adapter/server.py` | `python3 -m unittest -q test_server.py`; unkeyed retry and legacy journal migration; patched 9Router synthetic key/409 test | Real queue cancel and restart; repeat gateway test on daemon host |
+| Runpod retry, cancellation and restart | `scripts/runpod-adapter/server.py` | `python3 -m unittest -q test_server.py`; unkeyed retry and legacy journal migration; pinned 9Router image account/key/409/media CI gate | Real queue cancel and restart; repeat gateway test on daemon host |
 | Host deployment configuration | `scripts/runpod-adapter/verify_deployment.py` | `python3 -m unittest -q test_verify_deployment.py`; local catalog-only preflight | Repeat on actual daemon host, then run paid cold/warm inference |
 | Node Agents SDK entry point | `src/index.ts` imports `src/agent.ts` for mail triage and dashboard query; dashboard router | Router and dashboard tests | Determine whether the Node process runs on the daemon host; migrate its separate tool/approval path if active |
 
@@ -56,6 +56,18 @@ inference probe waited about 90 seconds and allocated zero workers. The client
 request was interrupted; the endpoint was restored to min/max workers zero,
 CUDA minimum 12.8 and its prior idle timeout. A follow-up worker read showed
 zero workers. This attempt did not produce model output, so GLM remains paused.
+
+A later 2026-09-18 capacity read showed Secure Cloud 4×H200 and 8×H100
+unavailable. Qwen's queue endpoint was changed from request-count to queue-delay
+scaling so Runpod v2 could store `workers.idleTimeout: 5` alongside min/max 0.
+For one bounded probe, max was raised to 1 and a direct async job returned
+`READY` on the selected GGUF (`delayTime: 77.2 s`, `executionTime: 7.3 s`).
+The endpoint nevertheless reported three A40 workers, then three IDLE workers
+more than 12 seconds after completion. A worker restarted and downloaded the
+16.8 GiB GGUF from Hugging Face again because no Runpod model-cache reference
+was attached. Max was restored to 0, and a follow-up read showed zero workers.
+Automatic scale-to-zero and cache-hit behavior therefore remain rollout gates;
+leave Qwen paused until those pass on the actual operational configuration.
 
 Independent automated review uses native Claude or Codex transport with a separate login; a 9Router account label is not evidence of a different backend. Reviewer calls pin direct routing for both passes. If native Codex authentication disappears before dispatch, review fails closed instead of using a gateway account.
 
