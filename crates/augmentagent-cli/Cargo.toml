@@ -38,6 +38,7 @@ augmentagent-channel-journal = { path = "../augmentagent-channel-journal" }
 augmentagent-channel-imessage = { path = "../augmentagent-channel-imessage" }
 augmentagent-channel-whatsapp-history = { path = "../augmentagent-channel-whatsapp-history" }
 augmentagent-messages = { path = "../augmentagent-messages" }
+augmentagent-embeddings = { path = "../augmentagent-embeddings" }
 augmentagent-channel-apple-notes = { path = "../augmentagent-channel-apple-notes" }
 augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
 augmentagent-auth = { path = "../augmentagent-auth" }
@@ -70,6 +71,7 @@ cron = { workspace = true }
 chrono-tz = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+sha2 = "0.10.9"
 # #1 — `status` subcommand probes the dashboard's `/api/v1/stats` for proof
 # of life. Workspace `reqwest` is `default-features = false` + `rustls-tls`,
 # so this pulls in no openssl. The dep is re-asserted here (rather than
