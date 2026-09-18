@@ -25,11 +25,19 @@ The executable gate inventory below records current evidence and names what
 still needs a test. An ignored opt-in fixture is not a CI receipt. Deterministic
 coverage does not substitute for the live three-model Discord acceptance run.
 
+The common MCP bridge keeps bounded receipts for JSON-RPC tool call IDs in one
+bridge process. Resending the same call returns its prior result when the reply
+fits the receipt bound; reusing an ID with different arguments is refused. If
+execution may have happened but the reply was lost or too large to retain, a
+repeat returns an inspection-required tool error. Restart
+recovery still depends on the persistent handoff and approval journals and
+remains a separate parity gate.
+
 | Feature | Responsible code | Deterministic receipt | Remaining release gate |
 | --- | --- | --- | --- |
 | Selection, restart persistence, pause and snapshot | `model_selection.rs`, `fallback.rs` | `model_selection::tests`, `paused_persisted_runpod_selection_never_reaches_inference_or_fallback` | Discord set/call race on the daemon host |
 | Owner-only Discord command and conversation history | `event_handler.rs`, `WikiQuerier` | Parser and store tests in `model_selection::tests` | Fake Discord sequence and live Qwen→GLM→Codex continuity |
-| File scope, shell, image bytes, unknown tools, malformed arguments and local MCP | `codex.rs`, `codex_tools.rs`, `scripts/codex-tool-bridge.py` | Linux `all_selected_profiles_share_scoped_file_tools_and_audit_identity` | Live model-selected tool use for each provider |
+| File scope, shell, image bytes, unknown tools, malformed arguments and local MCP | `codex.rs`, `codex_tools.rs`, `scripts/codex-tool-bridge.py` | Linux `all_selected_profiles_share_scoped_file_tools_and_audit_identity`; bridge duplicate-call and lost-reply tests | Live model-selected tool use for each provider |
 | Document/PDF attachment and computer use | `images.rs`, bridge Read, remote worker tools | Ignored Codex-only opt-in fixtures in `codex.rs`; no shared CI fixture | Cross-profile deterministic and live attachment/computer-use fixtures |
 | Retrieval, wiki and memory MCP | `mcp.rs`, wiki and memory tools | Ignored Codex-only `live_wiki_query_profile_executes_files_and_memory_mcp`; no shared CI fixture | Three-profile fake and live memory continuity |
 | Approval, drafts and outbound delivery | Discord approval broker, tool audit and journals | Existing approval/broker suites | Three-profile denied/approved edit and delivery receipts |

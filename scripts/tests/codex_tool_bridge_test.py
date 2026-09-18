@@ -47,6 +47,55 @@ class ToolPolicyTests(unittest.TestCase):
         self.policy.edit('note.md', 'beta', 'gamma')
         self.assertEqual(self.policy.read('note.md'), 'alpha\ngamma\n')
 
+    def test_repeated_protocol_call_id_cannot_repeat_or_change_a_write(self):
+        server = bridge.Server(self.policy)
+        original_write = self.policy.write
+        writes = []
+
+        def counted_write(path, content):
+            writes.append((path, content))
+            return original_write(path, content)
+
+        self.policy.write = counted_write
+        request = {'jsonrpc': '2.0', 'id': 41, 'method': 'tools/call',
+                   'params': {'name': 'Write', 'arguments': {
+                       'file_path': 'note.md', 'content': 'first'}}}
+
+        def send(value):
+            return json.loads(bridge.safe_dispatch(server, json.dumps(value).encode() + b'\n'))
+
+        first = send(request)
+        replay = send(request)
+        changed = send({**request, 'params': {'name': 'Write', 'arguments': {
+            'file_path': 'note.md', 'content': 'changed'}}})
+        self.assertEqual(replay, first)
+        self.assertEqual(changed['error']['code'], -32600)
+        self.assertEqual(writes, [('note.md', 'first')])
+        self.assertEqual((self.root / 'note.md').read_text(), 'first')
+
+    def test_lost_tool_reply_requires_inspection_without_replaying_the_write(self):
+        server = bridge.Server(self.policy)
+        original_dispatch = server.dispatch
+        calls = []
+
+        def lost_reply(request):
+            calls.append(request['id'])
+            original_dispatch(request)
+            raise LookupError('synthetic reply lost after write')
+
+        server.dispatch = lost_reply
+        request = {'jsonrpc': '2.0', 'id': 42, 'method': 'tools/call',
+                   'params': {'name': 'Write', 'arguments': {
+                       'file_path': 'note.md', 'content': 'written once'}}}
+        line = json.dumps(request).encode() + b'\n'
+        first = json.loads(bridge.safe_dispatch(server, line))
+        replay = json.loads(bridge.safe_dispatch(server, line))
+        self.assertEqual(first['error']['code'], -32603)
+        self.assertTrue(replay['result']['isError'])
+        self.assertIn('uncertain', replay['result']['content'][0]['text'])
+        self.assertEqual(calls, [42])
+        self.assertEqual((self.root / 'note.md').read_text(), 'written once')
+
     def test_scoped_image_read_returns_original_bytes_as_mcp_image(self):
         import base64
         # Synthetic eight-pixel-square PNG; no private fixture assets.
