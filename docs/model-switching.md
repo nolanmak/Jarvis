@@ -68,6 +68,12 @@ more than 12 seconds after completion. A worker restarted and downloaded the
 was attached. Max was restored to 0, and a follow-up read showed zero workers.
 Automatic scale-to-zero and cache-hit behavior therefore remain rollout gates;
 leave Qwen paused until those pass on the actual operational configuration.
+Runpod's model-cache reference was tested while the endpoint was paused. It
+pins the entire Hugging Face repository, which currently holds about 362 GiB
+across 27 files, rather than the chosen 16.8 GiB GGUF alone. The one queued
+cache probe was cancelled before inference; its reference was cleared, max
+workers restored to 0, and the worker list returned to zero. A single-file
+cache or persistent-volume plan needs a separate cost and cold-start check.
 
 Independent automated review uses native Claude or Codex transport with a separate login; a 9Router account label is not evidence of a different backend. Reviewer calls pin direct routing for both passes. If native Codex authentication disappears before dispatch, review fails closed instead of using a gateway account.
 
