@@ -36,7 +36,7 @@ remains a separate parity gate.
 | Feature | Responsible code | Deterministic receipt | Remaining release gate |
 | --- | --- | --- | --- |
 | Selection, restart persistence, pause and snapshot | `model_selection.rs`, `fallback.rs` | `model_selection::tests`, `paused_persisted_runpod_selection_never_reaches_inference_or_fallback` | Discord set/call race on the daemon host |
-| Owner-only Discord command and conversation history | `event_handler.rs`, `WikiQuerier` | Parser and store tests in `model_selection::tests`; model-control history exclusion test in `event_handler::tests`; Linux `discord_model_switch_sequence_uses_one_audited_harness` drives the query handler through Qwen→GLM→Codex commands and replies with persisted channel selection, prior-answer context, an audited Qwen Write, three cross-model Reads, three Edits of the same artifact, and three memory MCP calls | Real Discord gateway and live Qwen→GLM→Codex continuity on the daemon host |
+| Owner-only Discord command and conversation history | `event_handler.rs`, `WikiQuerier` | Parser and store tests in `model_selection::tests`; model-control history exclusion test in `event_handler::tests`; Linux `discord_model_switch_sequence_uses_one_audited_harness` drives the query handler through Qwen→GLM→Codex commands and replies with persisted channel selection, prior-answer context, an audited Qwen Write, three cross-model Reads, three Edits of the same artifact, three memory MCP calls, and three scoped shell calls | Real Discord gateway and live Qwen→GLM→Codex continuity on the daemon host |
 | File scope, shell, image bytes, unknown tools, malformed arguments and local MCP | `codex.rs`, `codex_tools.rs`, `scripts/codex-tool-bridge.py` | Linux `all_selected_profiles_share_scoped_file_tools_and_audit_identity` now includes a synthetic guard denial, allowed write, and Bash test for all three profiles; bridge duplicate-call and lost-reply tests; `selftest_tool_probe_requires_audited_read_for_each_profile`; pinned 9Router Chat and Responses parallel tool-result fixture | Live model-selected tool use for each provider |
 | Document/PDF attachment and computer use | `images.rs`, bridge Read, remote worker tools | Ignored Codex-only opt-in fixtures in `codex.rs`; patched 9Router opt-in fixture refuses unsupported current/history images | Cross-profile deterministic and live attachment/computer-use fixtures; Qwen is currently declared text-only at the gateway and returns 422 for images |
 | Retrieval, wiki and memory MCP | `mcp.rs`, wiki and memory tools | The Linux Discord switch fixture starts a synthetic memory MCP server and requires `memory_recent` results and audit rows for Qwen, GLM and Codex; ignored Codex-only `live_wiki_query_profile_executes_files_and_memory_mcp` | Real memory store continuity and live model-selected memory use |
@@ -48,6 +48,15 @@ remains a separate parity gate.
 | Host deployment configuration | `scripts/runpod-adapter/verify_deployment.py` | `python3 -m unittest -q test_verify_deployment.py`; local catalog-only preflight | Repeat on actual daemon host, then run paid cold/warm inference |
 | Node dashboard query | `src/dashboard.ts` `/api/ask` invokes `augmentagent wiki ask` through `src/dashboardQuery.ts` | HTTP answer and cancellation tests | Verify the deployed dashboard has the new binary and revision |
 | Node email triage and revision | `src/index.ts` imports `src/agent.ts` for mail triage and revision | Existing Node tests | Determine whether this separate tool/approval path runs on the daemon host; migrate if active |
+
+The dashboard `/api/ask` uses the daemon default model selection and the same
+Rust `wiki ask` tool policy as Discord. Install the release `augmentagent`
+binary in `target/release/augmentagent` beside the dashboard checkout, or set
+`AUGMENTAGENT_BIN` to its absolute path. The dashboard's
+`AUGMENTAGENT_WIKI_DIR` and model-selection configuration must point at the
+same files as the daemon. A disconnected dashboard client stops its CLI
+process; verify the actual host service environment before enabling this
+route for operators.
 
 Model quality, context size and latency differ. Full feature parity is a release gate: every row needs deterministic fake-model tests and a live receipt from the actual Jarvis host for all three models. A text response or catalog entry does not establish tool execution. GLM is paused until live inference succeeds. Qwen passed a 9Router Responses text call, a function-call/result round trip, and a Codex CLI text probe on 2026-09-18. The full Jarvis bridge workflow and actual-host Discord test remain the release gate.
 
