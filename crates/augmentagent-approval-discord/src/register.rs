@@ -16,7 +16,10 @@
 //! flagged ordinary answers). Where the recipient's own message is in hand —
 //! an email reply's `--reply-to-body*` — the draft is also held to *their*
 //! casing ([`audit_draft_against_sample`]), so a receipt that misclassifies
-//! them (the #994 failure) vouches for nothing.
+//! them (the #994 failure) vouches for nothing. A receipt marked `(you
+//! asked)` records an owner override — a dictated register or an exact
+//! template with deliberate per-line casing — and is not second-guessed
+//! ([`is_owner_override_receipt`], #1107).
 //!
 //! Call sites: Discord replies via `attachments::prepare_answer_delivery`
 //! and `/loop` results in `loops.rs`; email bodies via `gmail compose|
@@ -134,6 +137,15 @@ pub fn is_register_receipt(line: &str) -> bool {
 /// path must refuse it rather than drop it.
 pub fn is_undecided_receipt(line: &str) -> bool {
     matches!(parse_receipt(line), Some(None))
+}
+
+/// True when `line` is a receipt recording an owner override this turn
+/// (`register: standard (you asked)`): the owner dictated the register or an
+/// exact template, so the draft is not held to the receipt (#1107). Only the
+/// parenthesized `(you asked)` marker counts: a receipt whose explanation
+/// merely quotes the words is an ordinary receipt and stays audited.
+pub fn is_owner_override_receipt(line: &str) -> bool {
+    parse_receipt(line).is_some() && line.to_ascii_lowercase().contains("(you asked)")
 }
 
 fn is_fence(line: &str) -> bool {
@@ -311,7 +323,7 @@ pub fn audit_register_receipts(text: &str) -> Vec<String> {
     while i < lines.len() {
         if let Some(declared) = parse_receipt(lines[i]) {
             let (paragraphs, next) = draft_paragraphs(&lines, Some(i));
-            if let Some(declared) = declared {
+            if let Some(declared) = declared.filter(|_| !is_owner_override_receipt(lines[i])) {
                 notes.extend(contradiction("the receipt says", declared, &paragraphs));
             }
             i = next;
@@ -416,12 +428,54 @@ mod tests {
         for (reply, how) in [
             ("register: standard (she capitalizes), mirroring\n```\nhey Casey, thanks for checking in. I'll send it tonight.\n```", "in lowercase"),
             ("register: lowercase (he types all-lowercase), mirroring\n```\nhey sam, running late. I'll be there by eight.\n```", "with a capital"),
-            ("Register: lowercase (you asked)\n```\nHey Sam, running late. Order without me.\n```", "with a capital"),
         ] {
             let notes = audit_register_receipts(reply);
             assert_eq!(notes.len(), 1, "{notes:?}");
             assert!(notes[0].contains(&format!("starts a sentence {how}")), "{}", notes[0]);
         }
+    }
+
+    /// #1107: an owner-pasted template mixes a sentence-case headline with
+    /// intentionally lowercase detail lines. A `(you asked)` receipt records
+    /// that the owner dictated the format, so the audit stands down for that
+    /// draft — and only that draft.
+    const STYLIZED_TEMPLATE: &str = "```\nGroup X is back, and the momentum is real.\n\n\
+        Fri, Oct 3 - Coworking Day.\nhosted by Group X\n12-5 PM - Some Venue\n\
+        Free coworking. Bring what you are building.\n```";
+
+    #[test]
+    fn issue_1107_owner_override_receipt_is_not_second_guessed() {
+        for receipt in [
+            "register: standard (you asked)",
+            "Register: lowercase (You Asked)",
+        ] {
+            let notes = audit_register_receipts(&format!("{receipt}\n{STYLIZED_TEMPLATE}"));
+            assert!(notes.is_empty(), "{receipt}: {notes:?}");
+            assert!(is_owner_override_receipt(receipt));
+        }
+        let mirrored = audit_register_receipts(&format!(
+            "register: standard (she capitalizes), mirroring\n{STYLIZED_TEMPLATE}"
+        ));
+        assert_eq!(mirrored.len(), 1, "{mirrored:?}");
+        assert!(!is_owner_override_receipt("you asked me to send this, register: standard"));
+        assert!(!is_owner_override_receipt("register: standard (she capitalizes), mirroring"));
+        // Review finding: quoting the words in an ordinary explanation is not
+        // the override marker, so the mismatch is still reported.
+        let quoted = "register: standard (recipient wrote \u{201c}you asked\u{201d} in their message)";
+        assert!(!is_owner_override_receipt(quoted));
+        let notes = audit_register_receipts(&format!("{quoted}\n{STYLIZED_TEMPLATE}"));
+        assert_eq!(notes.len(), 1, "{notes:?}");
+    }
+
+    #[test]
+    fn issue_1107_override_is_scoped_to_its_own_receipt() {
+        let reply = format!(
+            "register: standard (you asked)\n{STYLIZED_TEMPLATE}\n\n\
+             register: standard (she capitalizes), mirroring\n```\nHi Casey,\n\nthanks for checking in.\n```"
+        );
+        let notes = audit_register_receipts(&reply);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("paragraph 2 of the draft starts a sentence in lowercase"), "{}", notes[0]);
     }
 
     /// Review finding: a wrong-register paragraph after a matching one must

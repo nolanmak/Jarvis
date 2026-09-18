@@ -5394,7 +5394,7 @@ fn strip_register_receipt(body: &str, inbound: Option<&str>) -> Result<(String, 
     } else {
         body
     };
-    let owner_override = receipt && first.to_ascii_lowercase().contains("you asked");
+    let owner_override = reg::is_owner_override_receipt(first);
     if let Some(note) = inbound
         .filter(|_| !owner_override)
         .and_then(|sample| reg::audit_draft_against_sample(sample, clean))
@@ -9381,6 +9381,25 @@ mod approval_body_tests {
         let asked = format!("register: lowercase (you asked)\n{lower}");
         assert_eq!(strip_register_receipt(&asked, Some(inbound)).unwrap(), (lower.to_string(), true));
         assert_eq!(strip_register_receipt(lower, None).unwrap(), (lower.to_string(), false));
+    }
+
+    /// #1107 — an owner-dictated template (sentence-case headline, lowercase
+    /// "hosted by" subline) under a `(you asked)` receipt sends; the same
+    /// body under an ordinary receipt is still refused, and an override never
+    /// rescues a receipt that records no decision.
+    #[test]
+    fn issue_1107_owner_override_receipt_passes_the_gmail_gate() {
+        let template = "Group X is back, and the momentum is real.\n\n\
+                        Fri, Oct 3 - Coworking Day.\nhosted by Group X\n12-5 PM - Some Venue\n\
+                        Free coworking. Bring what you are building.\n";
+        let asked = format!("register: standard (you asked)\n{template}");
+        assert!(augmentagent_approval_discord::register::audit_register_receipts(&asked).is_empty());
+        assert_eq!(strip_register_receipt(&asked, None).unwrap(), (template.to_string(), true));
+        let mirrored = format!("register: standard (she capitalizes), mirroring\n{template}");
+        assert!(strip_register_receipt(&mirrored, None).is_err());
+        let undecided = format!("register: unknown (you asked)\n{template}");
+        let err = strip_register_receipt(&undecided, None).unwrap_err().to_string();
+        assert!(err.contains("records no decision"), "{err}");
     }
 
     // #962 — who the card's From line (and the actions/emails rows) name.
