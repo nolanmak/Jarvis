@@ -83,6 +83,19 @@ if 'PROBE_SWITCH_TURN' in os.environ:
     }}), flush=True)
     if edit.get('isError'):
         raise RuntimeError('synthetic artifact Edit was denied')
+    shell_arguments = {'command': 'augmentagent finance status'}
+    shell = call(read_id + 3, 'tools/call', {
+        'name': 'Bash', 'arguments': shell_arguments,
+    })
+    print(json.dumps({'type': 'item.completed', 'item': {
+        'type': 'mcp_tool_call', 'server': 'jarvis', 'tool': 'Bash',
+        'arguments': shell_arguments, 'result': shell,
+    }}), flush=True)
+    if shell.get('isError') or not any(
+        'SHELL_FIXTURE_OK' in part.get('text', '')
+        for part in shell.get('content', [])
+    ):
+        raise RuntimeError('synthetic shell tool did not return its result')
 print(json.dumps({'type': 'item.completed', 'item': {
     'type': 'agent_message', 'text': match.group(0) if match else 'READ_FAILED',
 }}), flush=True)

@@ -57,6 +57,13 @@ for line in sys.stdin:
     .unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&memory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let finance = release.join("augmentagent");
+    std::fs::write(
+        &finance,
+        "#!/bin/sh\n[ \"$#\" -eq 2 ] && [ \"$1\" = finance ] && [ \"$2\" = status ] || exit 64\nprintf 'SHELL_FIXTURE_OK\\n'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&finance, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::write(codex_home.join("auth.json"), "{}").unwrap();
     let router = scratch.path().join("model-router.json");
     std::fs::write(
@@ -172,6 +179,10 @@ for line in sys.stdin:
         assert_eq!(shell["session_id"], format!("{CHANNEL}:{}", index + 1));
         assert_eq!(shell["exit_code"], 0);
         assert_eq!(shell["runner"], "host");
+        assert!(shell["stdout_truncated"]
+            .as_str()
+            .unwrap()
+            .contains("SHELL_FIXTURE_OK"));
     }
     assert_eq!(
         std::fs::read_to_string(wiki.join("probe.txt")).unwrap(),
