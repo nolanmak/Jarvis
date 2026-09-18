@@ -16,3 +16,4 @@ if ! printf '%s' "$prompt" | "$(dirname "${BASH_SOURCE[0]}")/fake-codex-read-pro
   cat "$error_log" >&2
   exit 1
 fi
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1200,"cached_input_tokens":800,"cache_write_input_tokens":0,"output_tokens":40,"reasoning_output_tokens":16}}'
