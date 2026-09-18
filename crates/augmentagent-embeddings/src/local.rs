@@ -173,6 +173,10 @@ impl Embedder for LocalEmbedder {
         &self.id
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Embedding>> {
         if texts.is_empty() {
             return Ok(Vec::new());

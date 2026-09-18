@@ -18,12 +18,13 @@ stub = []
 [dependencies]
 augmentagent-messages = { path = "../augmentagent-messages" }
 augmentagent-store = { path = "../augmentagent-store" }
+augmentagent-auth = { path = "../augmentagent-auth" }
 
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
 tokio = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }

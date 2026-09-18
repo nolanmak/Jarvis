@@ -60,6 +60,35 @@ that gained messages and embeds up to 500 pending chunks.
 
 ## Hosted provider (opt-in)
 
-A hosted embeddings API can replace the local model. It sends message text to
-a third party, so it is never selected implicitly. See the provider issue for
-configuration; switching providers re-embeds rather than mixing vector spaces.
+An OpenAI-compatible `/embeddings` API can replace the local model:
+
+```sh
+AUGMENTAGENT_EMBEDDINGS_PROVIDER=hosted          # default: local
+AUGMENTAGENT_EMBEDDINGS_HOSTED_MODEL=text-embedding-3-large   # default
+AUGMENTAGENT_EMBEDDINGS_HOSTED_DIM=1024          # default; recorded with every vector
+AUGMENTAGENT_EMBEDDINGS_HOSTED_URL=https://api.openai.com/v1  # default
+```
+
+The key is read just-in-time from the keyring slot `augmentagent/api-key` /
+`OPENAI_API_KEY` (`augmentagent migrate-secrets-to-keyring` seeds it), or from
+an `OPENAI_API_KEY` env var as a fallback. It is never logged and never added
+to the daemon's env safelist.
+
+**What leaves the machine:** the prepared text of every chunk you embed (chat
+windows, note bodies, email bodies), and every search query. The vendor's
+retention and training terms apply to that text; read them before turning
+this on. `augmentagent doctor` shows a warning whenever the hosted provider is
+selected, so this is never invisible.
+
+Rules the code enforces:
+
+- Selecting `hosted` without a key fails at startup with a message naming the
+  keyring slot. It never quietly embeds locally under the hosted label, which
+  would mix two vector spaces.
+- Requests are batched (64 inputs), retried with backoff on 429/5xx, capped per
+  run, and stop on an authentication error without retrying.
+- `augmentagent embeddings backfill --dry-run` walks the pending chunks,
+  estimates tokens and cost, and sends nothing.
+- Vectors record provider, model and dimension. Switching back to local means
+  `embeddings backfill` re-embeds under the local model; the hosted vectors
+  stay in their own space until you delete them.

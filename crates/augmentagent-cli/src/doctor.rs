@@ -30,8 +30,8 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use augmentagent_channel_core::{cli_gate, handoff};
 use augmentagent_channel_core::providers::{model_for, parse_chain, ModelTier, ProviderKind};
+use augmentagent_channel_core::{cli_gate, handoff};
 use augmentagent_store::{rusqlite, Store};
 
 use crate::status;
@@ -177,6 +177,7 @@ pub async fn run(store: Arc<Store>, json: Option<bool>, deep: bool) -> Result<i3
     // 11. socialapi — key present? accounts active? (#245)
     findings.push(check_socialapi(&store));
     findings.push(check_message_index(&store));
+    findings.push(check_embeddings_provider());
     // 12. calendar — configured (Composio + gmail entities) but unscheduled? (#376)
     findings.push(check_calendar_scheduled(&store));
     // 13. reasoner chain — configured providers + the model each tier runs (#658)
@@ -245,10 +246,7 @@ async fn check_sqlite_open() -> Finding {
     let integrity: rusqlite::Result<String> =
         conn.query_row("PRAGMA integrity_check", [], |r| r.get(0));
     match integrity {
-        Ok(v) if v == "ok" => Finding::ok(
-            "sqlite_open",
-            format!("{db_path}: integrity_check ok"),
-        ),
+        Ok(v) if v == "ok" => Finding::ok("sqlite_open", format!("{db_path}: integrity_check ok")),
         Ok(v) => Finding::error(
             "sqlite_open",
             format!("{db_path}: integrity_check returned {v}"),
@@ -307,9 +305,8 @@ async fn check_sqlite_migrated() -> Finding {
 }
 
 fn table_exists(conn: &rusqlite::Connection, name: &str) -> rusqlite::Result<bool> {
-    let mut stmt = conn.prepare(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?1 LIMIT 1",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?1 LIMIT 1")?;
     let mut rows = stmt.query([name])?;
     Ok(rows.next()?.is_some())
 }
@@ -371,7 +368,9 @@ async fn check_keychain_reachable() -> Finding {
             "keyring_reachable",
             format!(
                 "login Keychain reachable ({})",
-                String::from_utf8_lossy(&out.stdout).trim().trim_matches('"')
+                String::from_utf8_lossy(&out.stdout)
+                    .trim()
+                    .trim_matches('"')
             ),
         ),
         Ok(Ok(out)) => Finding::error(
@@ -411,7 +410,8 @@ fn check_launchd_agents() -> Finding {
             format!(
                 "{LABEL_PREFIX} loaded but {} (last exit {})",
                 job.state,
-                job.last_exit_code.map_or("n/a".to_string(), |c| c.to_string())
+                job.last_exit_code
+                    .map_or("n/a".to_string(), |c| c.to_string())
             ),
             Some("augmentagent logs --unit daemon"),
         ),
@@ -451,9 +451,7 @@ async fn check_dashboard_reachable(status_doc: &Option<status::StatusDoc>) -> Fi
     } else {
         Finding::error(
             "dashboard_reachable",
-            format!(
-                "no response from http://127.0.0.1:{port}/api/v1/stats (and /api/v1/health)"
-            ),
+            format!("no response from http://127.0.0.1:{port}/api/v1/stats (and /api/v1/health)"),
             Some("augmentagent service start --unit dashboard"),
         )
     }
@@ -540,11 +538,7 @@ async fn check_rust_binary_freshness() -> Finding {
     if days > 7 {
         Finding::warn(
             "rust_binary_freshness",
-            format!(
-                "{} is {} days old (> 7d)",
-                candidate.display(),
-                days
-            ),
+            format!("{} is {} days old (> 7d)", candidate.display(), days),
             Some("scripts/check-for-updates.sh"),
         )
     } else {
@@ -574,7 +568,10 @@ async fn resolve_release_binary() -> Option<PathBuf> {
         }
     }
     // Fallback — repo-relative.
-    for cand in ["target/release/augmentagent", "./target/release/augmentagent"] {
+    for cand in [
+        "target/release/augmentagent",
+        "./target/release/augmentagent",
+    ] {
         let p = PathBuf::from(cand);
         if p.exists() {
             return Some(p);
@@ -730,10 +727,9 @@ fn socialapi_key_present() -> bool {
 /// works from `emails` when the index lags.
 fn check_message_index(store: &Store) -> Finding {
     match augmentagent_messages::check(store) {
-        Ok(h) if h.is_complete() => Finding::ok(
-            "message_index",
-            format!("{} messages indexed", h.indexed),
-        ),
+        Ok(h) if h.is_complete() => {
+            Finding::ok("message_index", format!("{} messages indexed", h.indexed))
+        }
         Ok(h) => Finding::warn(
             "message_index",
             format!(
@@ -746,6 +742,49 @@ fn check_message_index(store: &Store) -> Finding {
             "message_index",
             format!("message index check failed: {e:#}"),
             Some("augmentagent messages reindex"),
+        ),
+    }
+}
+
+/// #1131 — which embeddings provider is active. Hosted means message text
+/// goes to a third party, so it is always surfaced; local is ok; off is
+/// simply off (never an error: embeddings are optional).
+fn check_embeddings_provider() -> Finding {
+    use augmentagent_embeddings::{hosted, Provider, ENV_PROVIDER};
+    let enabled = crate::embeddings_cmd::enabled();
+    match Provider::from_env() {
+        Err(e) => Finding::warn(
+            "embeddings",
+            format!("{e}"),
+            Some(&format!("set {ENV_PROVIDER}=local or hosted")),
+        ),
+        Ok(Provider::Hosted) => {
+            let cfg = hosted::HostedConfig::default();
+            if hosted::load_key().is_some() {
+                Finding::warn(
+                    "embeddings",
+                    format!(
+                        "HOSTED embeddings provider selected ({}): message text is sent to a third party{}",
+                        cfg.model,
+                        if enabled { "" } else { " (worker disabled: AUGMENTAGENT_EMBEDDINGS unset)" }
+                    ),
+                    Some(&format!("{ENV_PROVIDER}=local keeps text on this machine")),
+                )
+            } else {
+                Finding::warn(
+                    "embeddings",
+                    "hosted embeddings selected but no key in keyring/env; the provider refuses to start (no fallback to local)".to_string(),
+                    Some("augmentagent migrate-secrets-to-keyring"),
+                )
+            }
+        }
+        Ok(Provider::Local) => Finding::ok(
+            "embeddings",
+            if enabled {
+                "local embeddings provider (text stays on this machine)"
+            } else {
+                "embeddings off (local provider would be used)"
+            },
         ),
     }
 }
@@ -841,13 +880,21 @@ fn reasoner_chain_finding(raw: &str, ineligible: &[(ProviderKind, String)]) -> F
     let chain = if raw.trim().is_empty() {
         "claude (default; failover off)".to_string()
     } else {
-        parsed.providers.iter().map(|k| k.name()).collect::<Vec<_>>().join(" -> ")
+        parsed
+            .providers
+            .iter()
+            .map(|k| k.name())
+            .collect::<Vec<_>>()
+            .join(" -> ")
     };
     let models = parsed
         .providers
         .iter()
         .map(|k| {
-            let (q, f) = (model_for(*k, ModelTier::Quality), model_for(*k, ModelTier::Fast));
+            let (q, f) = (
+                model_for(*k, ModelTier::Quality),
+                model_for(*k, ModelTier::Fast),
+            );
             format!("{}: quality={q} fast={f}", k.name())
         })
         .collect::<Vec<_>>()
@@ -876,40 +923,78 @@ fn reasoner_chain_finding(raw: &str, ineligible: &[(ProviderKind, String)]) -> F
 fn check_reasoner_workloads() -> Vec<Finding> {
     let raw = std::env::var("AUGMENTAGENT_REASONER_CHAIN").unwrap_or_default();
     let providers = parse_chain(&raw).providers;
-    let unavailable = providers.iter().copied()
-        .filter(|kind| if *kind == ProviderKind::Claude {
-            !augmentagent_channel_core::providers::bin_resolves(
-                &std::env::var("CLAUDE_CLI").unwrap_or_else(|_| "claude".into()))
-        } else { augmentagent_channel_core::ineligible_reason(*kind).is_some() }).collect::<Vec<_>>();
+    let unavailable = providers
+        .iter()
+        .copied()
+        .filter(|kind| {
+            if *kind == ProviderKind::Claude {
+                !augmentagent_channel_core::providers::bin_resolves(
+                    &std::env::var("CLAUDE_CLI").unwrap_or_else(|_| "claude".into()),
+                )
+            } else {
+                augmentagent_channel_core::ineligible_reason(*kind).is_some()
+            }
+        })
+        .collect::<Vec<_>>();
     let latch = augmentagent_channel_core::CooldownLatch::system();
-    let latched = providers.iter().copied().filter(|kind| latch.latched_until(kind.name()).is_some()).collect::<Vec<_>>();
+    let latched = providers
+        .iter()
+        .copied()
+        .filter(|kind| latch.latched_until(kind.name()).is_some())
+        .collect::<Vec<_>>();
     reasoner_workload_findings(&raw, &unavailable, &latched)
 }
 
 /// Routing capacity is not a promise that a particular MCP server or sandbox
 /// is ready. The adapter must still validate that request's concrete policy.
-fn reasoner_workload_findings(raw: &str, unavailable: &[ProviderKind], latched: &[ProviderKind]) -> Vec<Finding> {
+fn reasoner_workload_findings(
+    raw: &str,
+    unavailable: &[ProviderKind],
+    latched: &[ProviderKind],
+) -> Vec<Finding> {
     use augmentagent_channel_core::providers::{allowed_for, CapabilityClass::*};
     let configured = parse_chain(raw).providers;
-    [("text", TextOnly), ("read", ReadTools), ("write", WriteTools), ("agentic", FullAgentic)]
-        .into_iter().map(|(label, class)| {
-            let mut candidates = 0;
-            let states = configured.iter().map(|kind| {
-                let state = if !allowed_for(*kind, class) { "capability excluded" }
-                    else if unavailable.contains(kind) { "binary/auth unavailable" }
-                    else if latched.contains(kind) { "cooldown" }
-                    else { candidates += 1; "candidate" };
+    [
+        ("text", TextOnly),
+        ("read", ReadTools),
+        ("write", WriteTools),
+        ("agentic", FullAgentic),
+    ]
+    .into_iter()
+    .map(|(label, class)| {
+        let mut candidates = 0;
+        let states = configured
+            .iter()
+            .map(|kind| {
+                let state = if !allowed_for(*kind, class) {
+                    "capability excluded"
+                } else if unavailable.contains(kind) {
+                    "binary/auth unavailable"
+                } else if latched.contains(kind) {
+                    "cooldown"
+                } else {
+                    candidates += 1;
+                    "candidate"
+                };
                 format!("{}: {state}", kind.name())
-            }).collect::<Vec<_>>().join("; ");
-            let (severity, capacity) = match candidates {
-                0 => (Severity::Error, "no usable provider"),
-                1 => (Severity::Warn, "no usable backup"),
-                _ => (Severity::Ok, "backup routing available"),
-            };
-            Finding { name: format!("reasoner_{label}_capacity"), severity,
-                message: format!("{states}; {capacity}. Tool/MCP/sandbox readiness is checked per invocation."),
-                suggested_cmd: None }
-        }).collect()
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let (severity, capacity) = match candidates {
+            0 => (Severity::Error, "no usable provider"),
+            1 => (Severity::Warn, "no usable backup"),
+            _ => (Severity::Ok, "backup routing available"),
+        };
+        Finding {
+            name: format!("reasoner_{label}_capacity"),
+            severity,
+            message: format!(
+                "{states}; {capacity}. Tool/MCP/sandbox readiness is checked per invocation."
+            ),
+            suggested_cmd: None,
+        }
+    })
+    .collect()
 }
 
 /// #954 — the #898 gate lives in the daemon, so doctor reads its snapshot: a
@@ -929,14 +1014,23 @@ fn gate_finding(snap: Option<cli_gate::GateSnapshot>, now: u64) -> Finding {
         return Finding::ok("reasoner_gate", "no reasoner CLI call yet this boot");
     };
     if !crate::platform::pid_alive(s.pid) {
-        return Finding::ok("reasoner_gate", format!("stale snapshot from pid {}", s.pid));
+        return Finding::ok(
+            "reasoner_gate",
+            format!("stale snapshot from pid {}", s.pid),
+        );
     }
-    let state = format!("in_flight {}/{}, waiting {}", s.in_flight, s.capacity, s.waiting);
+    let state = format!(
+        "in_flight {}/{}, waiting {}",
+        s.in_flight, s.capacity, s.waiting
+    );
     // The permit carries its own class-aware budget (#655), so "overdue" is one
     // timeout — the same threshold the daemon's own watchdog reports at (#954).
-    let (Some(provider), Some(since), Some(budget), Some(caller)) =
-        (s.oldest_provider, s.oldest_since_unix, s.oldest_budget_secs, s.oldest_caller)
-    else {
+    let (Some(provider), Some(since), Some(budget), Some(caller)) = (
+        s.oldest_provider,
+        s.oldest_since_unix,
+        s.oldest_budget_secs,
+        s.oldest_caller,
+    ) else {
         return Finding::ok("reasoner_gate", format!("{state} (idle)"));
     };
     let age = now.saturating_sub(since);
@@ -944,7 +1038,11 @@ fn gate_finding(snap: Option<cli_gate::GateSnapshot>, now: u64) -> Finding {
     if age <= budget {
         return Finding::ok("reasoner_gate", msg);
     }
-    Finding::warn("reasoner_gate", format!("{msg} — reasoning is wedged"), Some(hint))
+    Finding::warn(
+        "reasoner_gate",
+        format!("{msg} — reasoning is wedged"),
+        Some(hint),
+    )
 }
 
 /// #1035 — doctor warns when the journal root is past either bound.
@@ -1017,7 +1115,9 @@ enum VmConfigProbe {
     Missing,
     Invalid(String),
     /// Names of required artifacts (`qemu`, `kernel`) that do not exist.
-    Loaded { missing: Vec<&'static str> },
+    Loaded {
+        missing: Vec<&'static str>,
+    },
 }
 
 const KVM_DEVICE: &str = "/dev/kvm";
@@ -1030,7 +1130,12 @@ fn check_build_vm() -> Finding {
         _ => VmConfigProbe::Missing,
     };
     let user = std::env::var("USER").unwrap_or_else(|_| "$USER".into());
-    build_vm_finding(&runner, &config, &probe_kvm(std::path::Path::new(KVM_DEVICE)), &user)
+    build_vm_finding(
+        &runner,
+        &config,
+        &probe_kvm(std::path::Path::new(KVM_DEVICE)),
+        &user,
+    )
 }
 
 fn probe_vm_config(path: &std::path::Path) -> VmConfigProbe {
@@ -1042,8 +1147,14 @@ fn probe_vm_config(path: &std::path::Path) -> VmConfigProbe {
     let Ok(value) = serde_json::from_slice::<Value>(&raw) else {
         return VmConfigProbe::Invalid("not valid JSON".into());
     };
-    let missing = ["qemu", "kernel"].into_iter()
-        .filter(|key| !value.get(*key).and_then(Value::as_str).is_some_and(|p| std::path::Path::new(p).is_file()))
+    let missing = ["qemu", "kernel"]
+        .into_iter()
+        .filter(|key| {
+            !value
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(|p| std::path::Path::new(p).is_file())
+        })
         .collect();
     VmConfigProbe::Loaded { missing }
 }
@@ -1052,10 +1163,18 @@ fn probe_kvm(path: &std::path::Path) -> KvmProbe {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
     let Ok(meta) = std::fs::metadata(path) else {
-        return KvmProbe { exists: false, read_write: false, durable: false };
+        return KvmProbe {
+            exists: false,
+            read_write: false,
+            durable: false,
+        };
     };
     let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return KvmProbe { exists: true, read_write: false, durable: false };
+        return KvmProbe {
+            exists: true,
+            read_write: false,
+            durable: false,
+        };
     };
     // SAFETY: `c_path` is a valid NUL-terminated string for the call.
     let read_write = unsafe { libc::access(c_path.as_ptr(), libc::R_OK | libc::W_OK) } == 0;
@@ -1070,8 +1189,19 @@ fn probe_kvm(path: &std::path::Path) -> KvmProbe {
     let mut gids = groups;
     gids.push(gid);
     let acl = read_posix_acl(&c_path);
-    let durable = durable_kvm_access(meta.uid(), meta.gid(), meta.mode(), acl.as_deref(), uid, &gids);
-    KvmProbe { exists: true, read_write, durable }
+    let durable = durable_kvm_access(
+        meta.uid(),
+        meta.gid(),
+        meta.mode(),
+        acl.as_deref(),
+        uid,
+        &gids,
+    );
+    KvmProbe {
+        exists: true,
+        read_write,
+        durable,
+    }
 }
 
 // Linux POSIX ACL xattr (`system.posix_acl_access`) entry tags.
@@ -1095,11 +1225,15 @@ fn parse_posix_acl(raw: &[u8]) -> Option<Vec<AclEntry>> {
     if u32::from_le_bytes(header.try_into().ok()?) != 2 || body.len() % 8 != 0 {
         return None;
     }
-    Some(body.chunks_exact(8).map(|e| AclEntry {
-        tag: u16::from_le_bytes([e[0], e[1]]),
-        perm: u16::from_le_bytes([e[2], e[3]]),
-        id: u32::from_le_bytes([e[4], e[5], e[6], e[7]]),
-    }).collect())
+    Some(
+        body.chunks_exact(8)
+            .map(|e| AclEntry {
+                tag: u16::from_le_bytes([e[0], e[1]]),
+                perm: u16::from_le_bytes([e[2], e[3]]),
+                id: u32::from_le_bytes([e[4], e[5], e[6], e[7]]),
+            })
+            .collect(),
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1114,32 +1248,69 @@ fn read_posix_acl(path: &std::ffi::CStr) -> Option<Vec<AclEntry>> {
     let name = c"system.posix_acl_access";
     let mut buffer = vec![0u8; 4096];
     // SAFETY: both strings are NUL-terminated; the buffer length is passed.
-    let size = unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), buffer.as_mut_ptr().cast(), buffer.len()) };
-    (size > 0).then(|| parse_posix_acl(&buffer[..size as usize])).flatten()
+    let size = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+        )
+    };
+    (size > 0)
+        .then(|| parse_posix_acl(&buffer[..size as usize]))
+        .flatten()
 }
 
 /// Read-write access that does not come from a per-user ACL entry (the
 /// logind seat grant): owner bits, group membership or other bits. With an
 /// ACL, st_mode's group bits are the mask, so group access is the `group::`
 /// or a named-group entry, limited by the mask.
-fn durable_kvm_access(owner: u32, group: u32, mode: u32, acl: Option<&[AclEntry]>, uid: u32, gids: &[u32]) -> bool {
+fn durable_kvm_access(
+    owner: u32,
+    group: u32,
+    mode: u32,
+    acl: Option<&[AclEntry]>,
+    uid: u32,
+    gids: &[u32],
+) -> bool {
     const RW: u16 = 6;
     let rw = |perm: u16| perm & RW == RW;
     if owner == uid {
         return mode & 0o600 == 0o600;
     }
     let Some(acl) = acl.filter(|entries| entries.iter().any(|e| e.tag == ACL_MASK)) else {
-        return if gids.contains(&group) { mode & 0o060 == 0o060 } else { mode & 0o006 == 0o006 };
+        return if gids.contains(&group) {
+            mode & 0o060 == 0o060
+        } else {
+            mode & 0o006 == 0o006
+        };
     };
     let mask = acl.iter().find(|e| e.tag == ACL_MASK).map_or(0, |e| e.perm);
-    let other = acl.iter().find(|e| e.tag == ACL_OTHER).map_or(0, |e| e.perm);
-    let groups: Vec<u16> = acl.iter().filter(|e| (e.tag == ACL_GROUP_OBJ && gids.contains(&group))
-        || (e.tag == ACL_GROUP && gids.contains(&e.id))).map(|e| e.perm).collect();
-    if groups.is_empty() { rw(other) } else { groups.iter().any(|perm| rw(perm & mask)) }
+    let other = acl
+        .iter()
+        .find(|e| e.tag == ACL_OTHER)
+        .map_or(0, |e| e.perm);
+    let groups: Vec<u16> = acl
+        .iter()
+        .filter(|e| {
+            (e.tag == ACL_GROUP_OBJ && gids.contains(&group))
+                || (e.tag == ACL_GROUP && gids.contains(&e.id))
+        })
+        .map(|e| e.perm)
+        .collect();
+    if groups.is_empty() {
+        rw(other)
+    } else {
+        groups.iter().any(|perm| rw(perm & mask))
+    }
 }
 
-fn build_vm_finding(runner: &augmentagent_channel_core::codex_tools::BuildRunner, config: &VmConfigProbe,
-                    kvm: &KvmProbe, user: &str) -> Finding {
+fn build_vm_finding(
+    runner: &augmentagent_channel_core::codex_tools::BuildRunner,
+    config: &VmConfigProbe,
+    kvm: &KvmProbe,
+    user: &str,
+) -> Finding {
     use augmentagent_channel_core::codex_tools::BuildRunner;
     const NAME: &str = "build_vm";
     const DOCS: &str = "see docs/BUILD-VM.md";
@@ -1164,8 +1335,11 @@ fn build_vm_finding(runner: &augmentagent_channel_core::codex_tools::BuildRunner
         VmConfigProbe::Loaded { .. } => {}
     }
     if !kvm.exists {
-        return Finding::error(NAME, "kvm not accessible: /dev/kvm does not exist (KVM disabled or kvm module not loaded)",
-            Some("sudo modprobe kvm_intel || sudo modprobe kvm_amd"));
+        return Finding::error(
+            NAME,
+            "kvm not accessible: /dev/kvm does not exist (KVM disabled or kvm module not loaded)",
+            Some("sudo modprobe kvm_intel || sudo modprobe kvm_amd"),
+        );
     }
     if !kvm.read_write {
         return Finding::error(NAME,
@@ -1199,22 +1373,14 @@ async fn check_composio_api() -> Finding {
     {
         Ok(c) => c,
         Err(e) => {
-            return Finding::warn(
-                "composio_api",
-                format!("client build failed: {e}"),
-                None,
-            );
+            return Finding::warn("composio_api", format!("client build failed: {e}"), None);
         }
     };
     // Composio's whoami-equivalent. A 2xx (or 401 — key recognised, scope
     // wrong) is proof the API is reachable. Anything else is surfaced as
     // an error.
     let url = "https://backend.composio.dev/api/v1/client/auth/client_info";
-    let resp = client
-        .get(url)
-        .header("x-api-key", &key)
-        .send()
-        .await;
+    let resp = client.get(url).header("x-api-key", &key).send().await;
     match resp {
         Ok(r) => {
             let s = r.status();
@@ -1227,11 +1393,7 @@ async fn check_composio_api() -> Finding {
                     Some("re-issue COMPOSIO_API_KEY at https://app.composio.dev"),
                 )
             } else {
-                Finding::error(
-                    "composio_api",
-                    format!("Composio responded {s}"),
-                    None,
-                )
+                Finding::error("composio_api", format!("Composio responded {s}"), None)
             }
         }
         Err(e) => Finding::error(
@@ -1250,7 +1412,10 @@ async fn check_composio_api() -> Finding {
 /// inherit a 401 warning — from an otherwise unrelated deep run.
 async fn check_cerebras_models() -> Finding {
     let raw = std::env::var("AUGMENTAGENT_REASONER_CHAIN").unwrap_or_default();
-    if !parse_chain(&raw).providers.contains(&ProviderKind::Cerebras) {
+    if !parse_chain(&raw)
+        .providers
+        .contains(&ProviderKind::Cerebras)
+    {
         return Finding::ok(
             "cerebras_models",
             "cerebras is not in AUGMENTAGENT_REASONER_CHAIN — skipped".to_string(),
@@ -1387,8 +1552,19 @@ fn check_per_channel_validate(status_doc: &Option<status::StatusDoc>) -> Vec<Fin
 
 fn print_table(findings: &[Finding], ok: usize, warn: usize, error: usize) {
     // Compute the widest name for stable column alignment.
-    let name_w = findings.iter().map(|f| f.name.len()).max().unwrap_or(4).max(4);
-    println!("{:<3} {:<width$}  {}", "sev", "name", "message", width = name_w);
+    let name_w = findings
+        .iter()
+        .map(|f| f.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    println!(
+        "{:<3} {:<width$}  {}",
+        "sev",
+        "name",
+        "message",
+        width = name_w
+    );
     println!("{}", "-".repeat(3 + 1 + name_w + 2 + 40));
     for f in findings {
         println!(
@@ -1477,7 +1653,10 @@ mod tests {
             (ModelTier::Quality, "gpt-oss-120b".to_string()),
             (ModelTier::Fast, "gemma-4-31b".to_string()),
         ];
-        assert_eq!(cerebras_models_finding(&live, catalog()).severity, Severity::Ok);
+        assert_eq!(
+            cerebras_models_finding(&live, catalog()).severity,
+            Severity::Ok
+        );
 
         // An unreachable catalog is a network fact, not a config fault — an
         // offline box must not fail `doctor`.
@@ -1530,7 +1709,10 @@ mod tests {
 
         let dark = reasoner_chain_finding(
             "claude,codex",
-            &[(ProviderKind::Codex, "no CODEX_API_KEY and no auth.json".to_string())],
+            &[(
+                ProviderKind::Codex,
+                "no CODEX_API_KEY and no auth.json".to_string(),
+            )],
         );
         assert_eq!(dark.severity, Severity::Warn);
         assert!(dark.message.contains("codex"), "{}", dark.message);
@@ -1544,11 +1726,21 @@ mod tests {
         assert!(classes[3].message.contains("cerebras: capability excluded"));
         assert!(classes[3].message.contains("no usable backup"));
         let latched = reasoner_workload_findings("claude,codex", &[], &[ProviderKind::Claude]);
-        assert!(latched.iter().all(|finding| finding.severity == Severity::Warn
-            && finding.message.contains("claude: cooldown") && finding.message.contains("codex: candidate")));
-        let unavailable = reasoner_workload_findings("claude,codex", &[ProviderKind::Codex], &[ProviderKind::Claude]);
-        assert!(unavailable.iter().all(|finding| finding.severity == Severity::Error
-            && finding.message.contains("codex: binary/auth unavailable") && finding.message.contains("no usable provider")));
+        assert!(latched
+            .iter()
+            .all(|finding| finding.severity == Severity::Warn
+                && finding.message.contains("claude: cooldown")
+                && finding.message.contains("codex: candidate")));
+        let unavailable = reasoner_workload_findings(
+            "claude,codex",
+            &[ProviderKind::Codex],
+            &[ProviderKind::Claude],
+        );
+        assert!(unavailable
+            .iter()
+            .all(|finding| finding.severity == Severity::Error
+                && finding.message.contains("codex: binary/auth unavailable")
+                && finding.message.contains("no usable provider")));
     }
 
     #[test]
@@ -1556,19 +1748,32 @@ mod tests {
         if std::env::var_os("JARVIS_DOCTOR_CAPACITY_CHILD").is_none() {
             let state = tempfile::tempdir().unwrap();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "doctor::tests::workload_diagnostics_detect_missing_primary_binary"])
+                .args([
+                    "--exact",
+                    "doctor::tests::workload_diagnostics_detect_missing_primary_binary",
+                ])
                 .env("JARVIS_DOCTOR_CAPACITY_CHILD", "1")
                 .env("AUGMENTAGENT_REASONER_CHAIN", "claude")
                 .env("CLAUDE_CLI", "/nonexistent-synthetic-claude")
-                .env("AUGMENTAGENT_COOLDOWN_FILE", state.path().join("cooldown.json"))
-                .output().unwrap();
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+                .env(
+                    "AUGMENTAGENT_COOLDOWN_FILE",
+                    state.path().join("cooldown.json"),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
             return;
         }
         let findings = check_reasoner_workloads();
         assert_eq!(findings.len(), 4);
-        assert!(findings.iter().all(|finding| finding.severity == Severity::Error
-            && finding.message.contains("claude: binary/auth unavailable")));
+        assert!(findings
+            .iter()
+            .all(|finding| finding.severity == Severity::Error
+                && finding.message.contains("claude: binary/auth unavailable")));
     }
 
     /// #954 — name the wedge one timeout in, with the holder's caller preset.
@@ -1591,7 +1796,10 @@ mod tests {
         let want = "in_flight 4/4, waiting 7; oldest permit (claude, TextOnly:triage-42) held 901s";
         assert!(stuck.message.starts_with(want), "{}", stuck.message);
         // Inside budget, a dead daemon and a fresh box are all fine.
-        let dead = cli_gate::GateSnapshot { pid: u32::MAX, ..wedged(54_000) };
+        let dead = cli_gate::GateSnapshot {
+            pid: u32::MAX,
+            ..wedged(54_000)
+        };
         for ok in [Some(wedged(900)), Some(dead), None] {
             assert_eq!(gate_finding(ok, now).severity, Severity::Ok);
         }
@@ -1615,15 +1823,38 @@ mod tests {
         let ok = handoff_journal_finding(Ok(healthy), grace);
         assert_eq!(ok.severity, Severity::Ok, "{}", ok.message);
         // Counts only request dirs, and reports what needs an operator as information.
-        assert!(ok.message.contains("420 request dirs") && !ok.message.contains("423"), "{}", ok.message);
-        assert!(ok.message.contains("3 with lifecycle markers") && ok.message.contains("2 unfinished"), "{}", ok.message);
-        let many = handoff::SweepReport { requests: HANDOFF_WARN_REQUESTS + 1, ..healthy };
-        let large = handoff::SweepReport { bytes: HANDOFF_WARN_BYTES + 1, ..healthy };
+        assert!(
+            ok.message.contains("420 request dirs") && !ok.message.contains("423"),
+            "{}",
+            ok.message
+        );
+        assert!(
+            ok.message.contains("3 with lifecycle markers") && ok.message.contains("2 unfinished"),
+            "{}",
+            ok.message
+        );
+        let many = handoff::SweepReport {
+            requests: HANDOFF_WARN_REQUESTS + 1,
+            ..healthy
+        };
+        let large = handoff::SweepReport {
+            bytes: HANDOFF_WARN_BYTES + 1,
+            ..healthy
+        };
         // Past grace by more than two sweep intervals: a live sweep removes
         // every such journal, so even one means the sweep is not running.
-        let stalled = handoff::SweepReport { finished_overdue: 1, ..healthy };
+        let stalled = handoff::SweepReport {
+            finished_overdue: 1,
+            ..healthy
+        };
         let stalled_finding = handoff_journal_finding(Ok(stalled), grace);
-        assert!(stalled_finding.message.contains("sweep does not appear to be running"), "{}", stalled_finding.message);
+        assert!(
+            stalled_finding
+                .message
+                .contains("sweep does not appear to be running"),
+            "{}",
+            stalled_finding.message
+        );
         let refused = Err(anyhow::anyhow!("handoff directory is not private"));
         for finding in [
             handoff_journal_finding(Ok(many), grace),
@@ -1632,7 +1863,10 @@ mod tests {
             handoff_journal_finding(refused, grace),
         ] {
             assert_eq!(finding.severity, Severity::Warn, "{}", finding.message);
-            assert_eq!(finding.suggested_cmd.as_deref(), Some("augmentagent handoff-prune --dry-run"));
+            assert_eq!(
+                finding.suggested_cmd.as_deref(),
+                Some("augmentagent handoff-prune --dry-run")
+            );
         }
     }
 
@@ -1642,32 +1876,82 @@ mod tests {
         use augmentagent_channel_core::codex_tools::BuildRunner;
         let vm = BuildRunner::Vm(PathBuf::from("/synthetic/runtime.json"));
         let loaded = VmConfigProbe::Loaded { missing: vec![] };
-        let durable = KvmProbe { exists: true, read_write: true, durable: true };
+        let durable = KvmProbe {
+            exists: true,
+            read_write: true,
+            durable: true,
+        };
         let ok = build_vm_finding(&vm, &loaded, &durable, "synthetic-user");
         assert_eq!(ok.severity, Severity::Ok, "{}", ok.message);
         assert!(ok.message.starts_with("ok"), "{}", ok.message);
 
-        let unavailable = BuildRunner::Unavailable { reason: "build VM runtime configuration is missing" };
-        for finding in [build_vm_finding(&unavailable, &VmConfigProbe::Missing, &durable, "u"),
-                        build_vm_finding(&vm, &VmConfigProbe::Missing, &durable, "u")] {
+        let unavailable = BuildRunner::Unavailable {
+            reason: "build VM runtime configuration is missing",
+        };
+        for finding in [
+            build_vm_finding(&unavailable, &VmConfigProbe::Missing, &durable, "u"),
+            build_vm_finding(&vm, &VmConfigProbe::Missing, &durable, "u"),
+        ] {
             assert_eq!(finding.severity, Severity::Error);
-            assert!(finding.message.starts_with("config missing"), "{}", finding.message);
+            assert!(
+                finding.message.starts_with("config missing"),
+                "{}",
+                finding.message
+            );
         }
         let host = build_vm_finding(&BuildRunner::Host, &VmConfigProbe::Missing, &durable, "u");
         assert_eq!(host.severity, Severity::Warn);
-        assert!(host.message.contains("AUGMENTAGENT_BUILD_VM=host"), "{}", host.message);
+        assert!(
+            host.message.contains("AUGMENTAGENT_BUILD_VM=host"),
+            "{}",
+            host.message
+        );
 
-        let no_qemu = build_vm_finding(&vm, &VmConfigProbe::Loaded { missing: vec!["qemu"] }, &durable, "u");
+        let no_qemu = build_vm_finding(
+            &vm,
+            &VmConfigProbe::Loaded {
+                missing: vec!["qemu"],
+            },
+            &durable,
+            "u",
+        );
         assert_eq!(no_qemu.severity, Severity::Error);
-        assert!(no_qemu.message.starts_with("qemu or kernel missing") && no_qemu.message.contains("qemu"));
-        let no_kernel = build_vm_finding(&vm, &VmConfigProbe::Loaded { missing: vec!["kernel"] }, &durable, "u");
-        assert!(no_kernel.message.starts_with("qemu or kernel missing") && no_kernel.message.contains("kernel"));
+        assert!(
+            no_qemu.message.starts_with("qemu or kernel missing")
+                && no_qemu.message.contains("qemu")
+        );
+        let no_kernel = build_vm_finding(
+            &vm,
+            &VmConfigProbe::Loaded {
+                missing: vec!["kernel"],
+            },
+            &durable,
+            "u",
+        );
+        assert!(
+            no_kernel.message.starts_with("qemu or kernel missing")
+                && no_kernel.message.contains("kernel")
+        );
 
-        for kvm in [KvmProbe { exists: false, read_write: false, durable: false },
-                    KvmProbe { exists: true, read_write: false, durable: false }] {
+        for kvm in [
+            KvmProbe {
+                exists: false,
+                read_write: false,
+                durable: false,
+            },
+            KvmProbe {
+                exists: true,
+                read_write: false,
+                durable: false,
+            },
+        ] {
             let finding = build_vm_finding(&vm, &loaded, &kvm, "u");
             assert_eq!(finding.severity, Severity::Error, "{kvm:?}");
-            assert!(finding.message.starts_with("kvm not accessible"), "{}", finding.message);
+            assert!(
+                finding.message.starts_with("kvm not accessible"),
+                "{}",
+                finding.message
+            );
         }
     }
 
@@ -1675,11 +1959,28 @@ mod tests {
     fn build_vm_finding_warns_when_kvm_depends_on_the_login_seat_acl() {
         use augmentagent_channel_core::codex_tools::BuildRunner;
         let vm = BuildRunner::Vm(PathBuf::from("/synthetic/runtime.json"));
-        let acl_only = KvmProbe { exists: true, read_write: true, durable: false };
-        let finding = build_vm_finding(&vm, &VmConfigProbe::Loaded { missing: vec![] }, &acl_only, "synthetic-user");
+        let acl_only = KvmProbe {
+            exists: true,
+            read_write: true,
+            durable: false,
+        };
+        let finding = build_vm_finding(
+            &vm,
+            &VmConfigProbe::Loaded { missing: vec![] },
+            &acl_only,
+            "synthetic-user",
+        );
         assert_eq!(finding.severity, Severity::Warn);
-        assert!(finding.message.contains("ACL") && finding.message.contains("logout"), "{}", finding.message);
-        assert!(finding.suggested_cmd.as_deref().unwrap().starts_with("sudo usermod -aG kvm synthetic-user"));
+        assert!(
+            finding.message.contains("ACL") && finding.message.contains("logout"),
+            "{}",
+            finding.message
+        );
+        assert!(finding
+            .suggested_cmd
+            .as_deref()
+            .unwrap()
+            .starts_with("sudo usermod -aG kvm synthetic-user"));
     }
 
     #[test]
@@ -1689,7 +1990,14 @@ mod tests {
         let device = dir.path().join("kvm");
         std::fs::write(&device, "").unwrap();
         std::fs::set_permissions(&device, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(probe_kvm(&device), KvmProbe { exists: true, read_write: true, durable: true });
+        assert_eq!(
+            probe_kvm(&device),
+            KvmProbe {
+                exists: true,
+                read_write: true,
+                durable: true
+            }
+        );
         assert!(!probe_kvm(&dir.path().join("absent")).exists);
     }
 
@@ -1700,19 +2008,61 @@ mod tests {
         const KVM: u32 = 993;
         let entry = |tag, perm, id| AclEntry { tag, perm, id };
         // root:kvm, st_mode 0660 where the group bits are the ACL mask (rw-).
-        let seat_acl = vec![entry(ACL_USER_OBJ, 6, 0), entry(ACL_USER, 6, UID), entry(ACL_GROUP_OBJ, 0, 0),
-                            entry(ACL_MASK, 6, 0), entry(ACL_OTHER, 0, 0)];
-        assert!(!durable_kvm_access(0, KVM, 0o20660, Some(&seat_acl), UID, &[KVM]),
-                "mask=rw- with group::--- grants the kvm group nothing");
-        let group_acl = vec![entry(ACL_USER_OBJ, 6, 0), entry(ACL_USER, 6, UID), entry(ACL_GROUP_OBJ, 6, 0),
-                             entry(ACL_MASK, 6, 0), entry(ACL_OTHER, 0, 0)];
-        assert!(durable_kvm_access(0, KVM, 0o20660, Some(&group_acl), UID, &[KVM]));
-        assert!(!durable_kvm_access(0, KVM, 0o20660, Some(&group_acl), UID, &[]), "seat ACL alone is not durable");
-        let masked = vec![entry(ACL_USER_OBJ, 6, 0), entry(ACL_GROUP_OBJ, 6, 0), entry(ACL_MASK, 4, 0), entry(ACL_OTHER, 0, 0)];
-        assert!(!durable_kvm_access(0, KVM, 0o20640, Some(&masked), UID, &[KVM]), "the mask limits group::rw-");
-        let named_group = vec![entry(ACL_USER_OBJ, 6, 0), entry(ACL_GROUP_OBJ, 0, 0), entry(ACL_GROUP, 6, 77),
-                               entry(ACL_MASK, 6, 0), entry(ACL_OTHER, 0, 0)];
-        assert!(durable_kvm_access(0, KVM, 0o20660, Some(&named_group), UID, &[77]));
+        let seat_acl = vec![
+            entry(ACL_USER_OBJ, 6, 0),
+            entry(ACL_USER, 6, UID),
+            entry(ACL_GROUP_OBJ, 0, 0),
+            entry(ACL_MASK, 6, 0),
+            entry(ACL_OTHER, 0, 0),
+        ];
+        assert!(
+            !durable_kvm_access(0, KVM, 0o20660, Some(&seat_acl), UID, &[KVM]),
+            "mask=rw- with group::--- grants the kvm group nothing"
+        );
+        let group_acl = vec![
+            entry(ACL_USER_OBJ, 6, 0),
+            entry(ACL_USER, 6, UID),
+            entry(ACL_GROUP_OBJ, 6, 0),
+            entry(ACL_MASK, 6, 0),
+            entry(ACL_OTHER, 0, 0),
+        ];
+        assert!(durable_kvm_access(
+            0,
+            KVM,
+            0o20660,
+            Some(&group_acl),
+            UID,
+            &[KVM]
+        ));
+        assert!(
+            !durable_kvm_access(0, KVM, 0o20660, Some(&group_acl), UID, &[]),
+            "seat ACL alone is not durable"
+        );
+        let masked = vec![
+            entry(ACL_USER_OBJ, 6, 0),
+            entry(ACL_GROUP_OBJ, 6, 0),
+            entry(ACL_MASK, 4, 0),
+            entry(ACL_OTHER, 0, 0),
+        ];
+        assert!(
+            !durable_kvm_access(0, KVM, 0o20640, Some(&masked), UID, &[KVM]),
+            "the mask limits group::rw-"
+        );
+        let named_group = vec![
+            entry(ACL_USER_OBJ, 6, 0),
+            entry(ACL_GROUP_OBJ, 0, 0),
+            entry(ACL_GROUP, 6, 77),
+            entry(ACL_MASK, 6, 0),
+            entry(ACL_OTHER, 0, 0),
+        ];
+        assert!(durable_kvm_access(
+            0,
+            KVM,
+            0o20660,
+            Some(&named_group),
+            UID,
+            &[77]
+        ));
         // No ACL: plain mode bits decide.
         assert!(durable_kvm_access(0, KVM, 0o20660, None, UID, &[KVM]));
         assert!(!durable_kvm_access(0, KVM, 0o20660, None, UID, &[]));
@@ -1722,12 +2072,25 @@ mod tests {
     #[test]
     fn posix_acl_xattr_parses_entries_and_rejects_garbage() {
         let mut raw = 2u32.to_le_bytes().to_vec();
-        for (tag, perm, id) in [(ACL_USER_OBJ, 6u16, u32::MAX), (ACL_USER, 6, 1000), (ACL_GROUP_OBJ, 6, u32::MAX)] {
-            raw.extend(tag.to_le_bytes()); raw.extend(perm.to_le_bytes()); raw.extend(id.to_le_bytes());
+        for (tag, perm, id) in [
+            (ACL_USER_OBJ, 6u16, u32::MAX),
+            (ACL_USER, 6, 1000),
+            (ACL_GROUP_OBJ, 6, u32::MAX),
+        ] {
+            raw.extend(tag.to_le_bytes());
+            raw.extend(perm.to_le_bytes());
+            raw.extend(id.to_le_bytes());
         }
         let entries = parse_posix_acl(&raw).unwrap();
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[1], AclEntry { tag: ACL_USER, perm: 6, id: 1000 });
+        assert_eq!(
+            entries[1],
+            AclEntry {
+                tag: ACL_USER,
+                perm: 6,
+                id: 1000
+            }
+        );
         assert!(parse_posix_acl(&raw[..7]).is_none());
         assert!(parse_posix_acl(&[1, 0, 0, 0]).is_none(), "unknown version");
     }
@@ -1735,14 +2098,30 @@ mod tests {
     #[test]
     fn vm_config_probe_reports_missing_invalid_and_absent_artifacts() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(probe_vm_config(&dir.path().join("runtime.json")), VmConfigProbe::Missing);
+        assert_eq!(
+            probe_vm_config(&dir.path().join("runtime.json")),
+            VmConfigProbe::Missing
+        );
         let config = dir.path().join("runtime.json");
         std::fs::write(&config, "not json").unwrap();
-        assert!(matches!(probe_vm_config(&config), VmConfigProbe::Invalid(_)));
+        assert!(matches!(
+            probe_vm_config(&config),
+            VmConfigProbe::Invalid(_)
+        ));
         let kernel = dir.path().join("vmlinuz");
         std::fs::write(&kernel, "").unwrap();
-        std::fs::write(&config, serde_json::json!({"qemu": dir.path().join("absent-qemu"), "kernel": kernel}).to_string()).unwrap();
-        assert_eq!(probe_vm_config(&config), VmConfigProbe::Loaded { missing: vec!["qemu"] });
+        std::fs::write(
+            &config,
+            serde_json::json!({"qemu": dir.path().join("absent-qemu"), "kernel": kernel})
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            probe_vm_config(&config),
+            VmConfigProbe::Loaded {
+                missing: vec!["qemu"]
+            }
+        );
     }
 
     #[test]
@@ -1808,9 +2187,15 @@ mod tests {
         let v = check_per_channel_validate(&Some(doc));
         // Exactly two findings — one ok (gmail), one warn (slack not armed).
         assert_eq!(v.len(), 2);
-        let gmail = v.iter().find(|f| f.name == "channel.gmail.validate").unwrap();
+        let gmail = v
+            .iter()
+            .find(|f| f.name == "channel.gmail.validate")
+            .unwrap();
         assert_eq!(gmail.severity, Severity::Ok);
-        let slack = v.iter().find(|f| f.name == "channel.slack.validate").unwrap();
+        let slack = v
+            .iter()
+            .find(|f| f.name == "channel.slack.validate")
+            .unwrap();
         assert_eq!(slack.severity, Severity::Warn);
         assert_eq!(
             slack.suggested_cmd.as_deref(),
