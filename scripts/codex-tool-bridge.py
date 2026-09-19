@@ -594,7 +594,7 @@ class HandoffJournal:
             for row in state['operations']:
                 if (not isinstance(row, dict) or not isinstance(row.get('tool'), str)
                         or not isinstance(row.get('arguments'), dict)
-                        or row.get('status') not in ('started', 'completed', 'not_applied', 'refused')
+                        or row.get('status') not in ('started', 'completed', 'not_applied', 'refused', 'failed')
                         or (row['status'] == 'not_applied' and (
                             not isinstance(row.get('reconciliation'), dict)
                             or row['reconciliation'].get('outcome') != 'not_applied'
@@ -683,7 +683,7 @@ class HandoffJournal:
                 if index >= len(state['operations']):
                     raise Denied('unknown reconciliation operation')
                 row = state['operations'][index]
-                if row['status'] != 'started' or self.fingerprint(row) != decision['fingerprint']:
+                if row['status'] not in ('started', 'failed') or self.fingerprint(row) != decision['fingerprint']:
                     raise Denied('reconciliation is stale or operation already resolved')
                 row['status'] = decision['outcome']
                 if decision['outcome'] == 'completed':
@@ -753,6 +753,9 @@ class HandoffJournal:
             if phase == 'PreToolUse':
                 if matching or any(row['status'] == 'started' for row in state['operations']):
                     raise ReconciliationRequired('unfinished primary operation requires reconciliation')
+                if any(row['status'] == 'failed' and same_operation(row, name, arguments)
+                       for row in state['operations']):
+                    raise ReconciliationRequired('failed primary operation requires reconciliation before a retry')
                 if external_operation(name, arguments) and any(
                         same_operation(row, name, arguments)
                         and row['status'] == 'completed' for row in state['operations']):
@@ -768,12 +771,23 @@ class HandoffJournal:
                 raise Denied('late primary result conflicts with a refused permission request')
             if row['status'] == 'not_applied':
                 raise Denied('late primary result conflicts with operator reconciliation')
+            if row['status'] == 'failed':
+                raise Denied('late primary result conflicts with a recorded failure')
+            # A failure is not evidence of absence of an effect, so the row
+            # stays unresolved for handoff purposes ("failed": execute() will
+            # not re-run it without reconciliation). But the primary has seen
+            # the outcome, so it is no longer in flight and must not block the
+            # primary's other calls.
             if phase == 'PostToolUseFailure':
-                return  # failure is not evidence of absence of an effect
+                row['status'] = 'failed'
+                self.save(state)
+                return
             if 'tool_response' not in event:
                 raise Denied('missing primary result requires reconciliation')
             response = event['tool_response']
             if isinstance(response, dict) and response.get('isError'):
+                row['status'] = 'failed'
+                self.save(state)
                 return
             if not (isinstance(response, dict) and isinstance(response.get('content'), list)):
                 response = {'content': [{'type': 'text', 'text': json.dumps(response)}]}
