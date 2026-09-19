@@ -58,6 +58,7 @@ STUB
   cat > "$TMP/bin/systemctl" <<'STUB'
 #!/usr/bin/env bash
 d="$STUB_DIR"
+echo "$*" >> "$d/service-calls"
 for a in "$@"; do
   case "$a" in
     list-unit-files) mode=list ;; show) mode=show ;;
@@ -67,14 +68,19 @@ done
 pidfile="$d/mainpid"
 [ -s "$pidfile" ] || echo 100 > "$pidfile"
 case "${mode:-}" in
-  list)    echo "augmentagent.service enabled enabled"; exit 0 ;;
+  list)    printf "%s\n" "augmentagent.service enabled enabled" "augmentagent-computer-use.service enabled enabled"; exit 0 ;;
   show)    cat "$pidfile"; exit 0 ;;
   restart) echo $(( $(cat "$pidfile") + 1 )) > "$pidfile"; exit 0 ;;
   active)  exit 0 ;;
 esac
 exit 0
 STUB
-  chmod +x "$TMP/bin/cargo" "$TMP/bin/systemctl"
+  cat > "$TMP/bin/npm" <<'STUB'
+#!/usr/bin/env bash
+echo "$PWD $*" >> "$STUB_DIR/npm-calls"
+exit 0
+STUB
+  chmod +x "$TMP/bin/cargo" "$TMP/bin/systemctl" "$TMP/bin/npm"
   # Exercise the Linux (systemd) branch on any host (#1079: CI runs macOS too).
   printf '#!/usr/bin/env bash\necho Linux\n' > "$TMP/bin/uname" && chmod +x "$TMP/bin/uname"
 }
@@ -123,6 +129,14 @@ expect_no_rebuild eval/last-run.json
 
 # Drift guard: every include_str!/include_bytes! target outside crates/ in the
 # real tree is either classified test-only above or triggers a rebuild.
+make_case sidecars/computer-use/server.mjs
+updater_rebuilt || true
+if grep -q 'sidecars/computer-use ci' "$TMP/npm-calls" 2>/dev/null && grep -q 'restart augmentagent-computer-use.service' "$TMP/service-calls"; then
+  ok "deploys dependencies and restarts browser worker on sidecar changes"
+else
+  bad "deploys dependencies and restarts browser worker on sidecar changes" "sidecar would keep stale code/dependencies"
+fi
+rm -rf "$TMP"
 echo "include drift guard:"
 mapfile -t EMBEDS < <(
   cd "$REPO_ROOT" && grep -rnoE 'include_(str|bytes)!\("[^"]*"\)' crates/ \

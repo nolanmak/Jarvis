@@ -1,0 +1,19 @@
+[Unit]
+Description=Jarvis general browser research worker (existing Chrome)
+After=newsletterbuddy-chrome-bridge.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/AugmentAgent
+Environment=JARVIS_COMPUTER_STATE=%h/.local/state/augmentagent/computer-use
+Environment=JARVIS_COMPUTER_SOCKET=%h/.local/state/augmentagent/computer-use/worker.sock
+Environment=JARVIS_COMPUTER_CHROME_BRIDGE=%h/.local/share/newsletterbuddy/staging/chrome-bridge
+Environment=JARVIS_COMPUTER_LOCK_DIRECTORY=%h/.local/share/newsletterbuddy/staging/worker-tmp
+ExecStart=/usr/bin/node sidecars/computer-use/server.mjs
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

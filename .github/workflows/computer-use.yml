@@ -1,0 +1,25 @@
+name: General computer use
+on:
+  pull_request:
+    paths:
+      - 'sidecars/computer-use/**'
+      - 'scripts/codex-tool-bridge.py'
+      - 'scripts/tests/codex_tool_bridge_test.py'
+      - 'crates/augmentagent-cli/src/computer_tool.rs'
+      - '.github/workflows/computer-use.yml'
+jobs:
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: sidecars/computer-use/package-lock.json
+      - run: npm ci
+        working-directory: sidecars/computer-use
+      - run: npx playwright install --with-deps chrome
+        working-directory: sidecars/computer-use
+      - run: npm test
+        working-directory: sidecars/computer-use

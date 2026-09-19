@@ -113,6 +113,18 @@ apply_update() {
     log "no dashboard code changed; skipping dashboard rebuild"
   fi
 
+  # The browser worker is a separate long-running process with npm dependencies.
+  # Deploy it only on hosts where the optional unit is installed.
+  if [ "${NEEDS_COMPUTER_REBUILD:-1}" -eq 1 ] && [ -d "$REPO_ROOT/sidecars/computer-use" ] &&
+      [ "$(uname -s)" = Linux ] && systemctl --user cat augmentagent-computer-use.service >/dev/null 2>&1; then
+    if ! (cd "$REPO_ROOT/sidecars/computer-use" && npm ci >> "$LOG" 2>&1); then
+      log "COMPUTER WORKER INSTALL FAILED — withholding build stamp"
+      return 1
+    fi
+    systemctl --user daemon-reload >> "$LOG" 2>&1 || return 1
+    restart_unit augmentagent-computer-use.service || RESTART_FAILURES=$((RESTART_FAILURES + 1))
+  fi
+
   # Restart services so the new binary / config takes effect.
   case "$(uname -s)" in
     Darwin)
@@ -308,6 +320,10 @@ log "update available: $LOCAL -> $REMOTE"
 CHANGED_FILES=$(git diff --name-only "$LOCAL" "$REMOTE")
 NEEDS_REBUILD=0
 NEEDS_DASHBOARD_REBUILD=0
+NEEDS_COMPUTER_REBUILD=0
+if printf '%s\n' "$CHANGED_FILES" | grep -qE '^(sidecars/computer-use/|systemd/augmentagent-computer-use.service$)'; then
+  NEEDS_COMPUTER_REBUILD=1
+fi
 # Rust rebuild: crates/ and Cargo files, plus every file outside crates/ that
 # production code compiles in with include_str!/include_bytes! — agent prompts
 # under schema/, the embedded .env.example key list, and the Codex tool bridge,

@@ -470,6 +470,13 @@ def read_only_operation(name, arguments):
     # Their own permission hooks and operation contracts still apply on invocation.
     if name in ('Read', 'Glob', 'Grep', 'LS', 'WebSearch', 'WebFetch', 'ToolSearch'):
         return True
+    # Browser jobs are asynchronous. Caching a status read as an external
+    # mutation freezes the first "running" receipt forever. Keep the exact
+    # status contract live; start/cancel/resume retain mutation protection.
+    if name == 'mcp__computer__computer_task':
+        return (arguments.get('operation') == 'status'
+                and isinstance(arguments.get('taskId'), str)
+                and set(arguments) == {'operation', 'taskId'})
     # These are explicit query contracts in augmentagent-mcp-memory, not
     # arbitrary server annotations or a prefix-based read exemption.
     if name in ('mcp__memory__memory_search', 'mcp__memory__memory_recent',
