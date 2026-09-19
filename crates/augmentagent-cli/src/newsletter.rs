@@ -71,7 +71,7 @@ pub enum Command {
         #[arg(long)]
         run_id: String,
     },
-    /// Queue an observe-only public browser capture for a research run.
+    /// Queue an observe-only browser capture (optionally scrolling a feed) for a research run.
     BrowserTask {
         #[arg(long)]
         newsletter_id: String,
@@ -79,6 +79,9 @@ pub enum Command {
         run_id: String,
         #[arg(long)]
         url: String,
+        /// Scroll down this many screens (0–15), keeping every post seen, e.g. for feeds and search results.
+        #[arg(long, default_value_t = 0)]
+        scroll: u8,
     },
     /// List task IDs and statuses for one research run, including automatic fallbacks.
     BrowserTasks {
@@ -216,8 +219,8 @@ fn schedule_create_operation(newsletter_id: &str, brief_revision: u32, kind: &st
     format!("schedule-create:{newsletter_id}:{brief_revision}:{kind}")
 }
 
-fn browser_task_operation(newsletter_id: &str, run_id: &str, url: &str) -> String {
-    let digest = Sha256::digest(format!("{newsletter_id}:{run_id}:{url}").as_bytes());
+fn browser_task_operation(newsletter_id: &str, run_id: &str, url: &str, scroll: u8) -> String {
+    let digest = Sha256::digest(format!("{newsletter_id}:{run_id}:{url}:{scroll}").as_bytes());
     format!("browser-task:{digest:x}")
 }
 
@@ -318,7 +321,25 @@ fn brief_body(
     body
 }
 
-fn browser_task_body(raw: &str) -> Result<Value> {
+/// NewsletterBuddy allows 18 steps per browser task; scrolls stay well under it.
+const MAX_BROWSER_SCROLLS: u8 = 15;
+
+/// Query keys that look like credentials. Matched as whole `_`/`-`-separated
+/// words so search parameters such as `keywords` still pass.
+fn credential_query_key(key: &str) -> bool {
+    const WORDS: [&str; 12] = [
+        "token", "secret", "auth", "key", "apikey", "session", "sessionid", "cookie", "signature",
+        "sig", "code", "password",
+    ];
+    key.to_ascii_lowercase()
+        .split(|c: char| c == '_' || c == '-')
+        .any(|word| WORDS.contains(&word))
+}
+
+fn browser_task_body(raw: &str, scroll: u8) -> Result<Value> {
+    if scroll > MAX_BROWSER_SCROLLS {
+        bail!("browser task scroll must be between 0 and {MAX_BROWSER_SCROLLS}");
+    }
     let url = Url::parse(raw).context("expected a public HTTPS page URL")?;
     let host = url.host_str().context("browser URL needs a host")?;
     if url.scheme() != "https"
@@ -328,26 +349,15 @@ fn browser_task_body(raw: &str) -> Result<Value> {
         || url.fragment().is_some()
         || !host.contains('.')
         || host.parse::<std::net::IpAddr>().is_ok()
-        || url.query_pairs().any(|(key, _)| {
-            let key = key.to_ascii_lowercase();
-            [
-                "token",
-                "secret",
-                "auth",
-                "key",
-                "session",
-                "cookie",
-                "signature",
-                "code",
-            ]
-            .iter()
-            .any(|part| key.contains(part))
-        })
+        || url.query_pairs().any(|(key, _)| credential_query_key(&key))
     {
         bail!("browser task requires a public HTTPS URL without credentials");
     }
+    let steps: Vec<Value> = (0..scroll)
+        .map(|_| json!({ "kind": "scroll", "deltaY": 2000 }))
+        .collect();
     Ok(json!({ "capability": "research.browser", "task": {
-        "startUrl": url.as_str(), "allowedHosts": [host], "steps": []
+        "startUrl": url.as_str(), "allowedHosts": [host], "steps": steps
     } }))
 }
 
@@ -558,14 +568,15 @@ pub async fn run(command: &Command) -> Result<()> {
             newsletter_id,
             run_id,
             url,
+            scroll,
         } => {
             let id = uuid(newsletter_id)?;
             let run = uuid(run_id)?;
-            let body = browser_task_body(url)?;
+            let body = browser_task_body(url, *scroll)?;
             let normalized_url = body["task"]["startUrl"]
                 .as_str()
                 .context("invalid browser task URL")?;
-            let key = event_request_key(&browser_task_operation(id, run, normalized_url))?;
+            let key = event_request_key(&browser_task_operation(id, run, normalized_url, *scroll))?;
             api.call(
                 Method::POST,
                 &format!("v1/newsletters/{id}/research-runs/{run}/worker-tasks"),
@@ -905,7 +916,7 @@ mod tests {
 
     #[test]
     fn browser_task_payload_is_observe_only_and_bound_to_one_public_host() {
-        let body = browser_task_body("https://events.example/founders?day=friday").unwrap();
+        let body = browser_task_body("https://events.example/founders?day=friday", 0).unwrap();
         assert_eq!(body["capability"], "research.browser");
         assert_eq!(
             body["task"]["startUrl"],
@@ -919,21 +930,57 @@ mod tests {
             "https://events.example/path?access_token=secret",
             "https://user:pass@events.example/",
         ] {
-            assert!(browser_task_body(url).is_err(), "{url} should be refused");
+            assert!(browser_task_body(url, 0).is_err(), "{url} should be refused");
         }
+    }
+
+    #[test]
+    fn browser_task_scrolls_feeds_and_accepts_search_urls() {
+        let body = browser_task_body("https://www.linkedin.com/feed/", 3).unwrap();
+        assert_eq!(
+            body["task"]["steps"],
+            json!([
+                { "kind": "scroll", "deltaY": 2000 },
+                { "kind": "scroll", "deltaY": 2000 },
+                { "kind": "scroll", "deltaY": 2000 }
+            ])
+        );
+        assert!(browser_task_body("https://www.linkedin.com/feed/", MAX_BROWSER_SCROLLS + 1).is_err());
+        for url in [
+            "https://www.linkedin.com/search/results/content/?keywords=seed%20round&sortBy=%22date_posted%22",
+            "https://x.com/search?q=founder%20pricing&f=live",
+        ] {
+            assert!(browser_task_body(url, 0).is_ok(), "{url} should be accepted");
+        }
+        for url in [
+            "https://events.example/?api_key=abc",
+            "https://events.example/?code=abc",
+            "https://events.example/?sessionid=abc",
+        ] {
+            assert!(browser_task_body(url, 0).is_err(), "{url} should be refused");
+        }
+    }
+
+    #[test]
+    fn browser_task_request_key_distinguishes_scroll_depth() {
+        let id = "123e4567-e89b-12d3-a456-426614174000";
+        assert_ne!(
+            browser_task_operation(id, id, "https://www.linkedin.com/feed/", 0),
+            browser_task_operation(id, id, "https://www.linkedin.com/feed/", 5)
+        );
     }
 
     #[test]
     fn browser_task_request_key_is_stable_per_page_and_distinct_per_url() {
         let id = "123e4567-e89b-12d3-a456-426614174000";
-        let first = browser_task_operation(id, id, "https://events.example/a");
+        let first = browser_task_operation(id, id, "https://events.example/a", 0);
         assert_eq!(
             first,
-            browser_task_operation(id, id, "https://events.example/a")
+            browser_task_operation(id, id, "https://events.example/a", 0)
         );
         assert_ne!(
             first,
-            browser_task_operation(id, id, "https://events.example/b")
+            browser_task_operation(id, id, "https://events.example/b", 0)
         );
         assert!(request_key(&"1".repeat(100), &first).len() <= 200);
         assert!(!first.contains("events.example"));
