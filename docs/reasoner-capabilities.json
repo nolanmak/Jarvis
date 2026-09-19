@@ -77,6 +77,18 @@
         "Bash(git diff/status)",
         "Bash(ls)"
       ]
+    },
+    "newsletter-cli": {
+      "scope": "Owner-authorized Discord requests only: the wrapped preset plus narrow `augmentagent newsletter <subcommand>` Bash commands against a validated NewsletterBuddy URL, with a trusted request ID; no configure, audience approval or send commands",
+      "operations": [
+        "Bash(augmentagent newsletter <allowlisted subcommand>)"
+      ]
+    },
+    "model-switch-mcp": {
+      "scope": "Owner-authorized Discord requests with a channel only: the wrapped preset plus one MCP tool that switches this conversation's model among ready profiles",
+      "operations": [
+        "mcp__model__switch_model"
+      ]
     }
   },
   "presets": [
@@ -495,6 +507,30 @@
         "self_improve::tests::source_inspection_presets_enforce_read_only_bridge_access",
         "self_improve::tests::live_codex_scopes_source_and_rejects_an_incomplete_fix",
         "self_improve::lifecycle_tests::live_fallback_pipeline_resumes_after_independent_reviewer_recovers"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/main.rs::configure_newsletter_tools",
+      "permission_profile": "newsletter-cli",
+      "output_contract": "Preserve the wrapped preset output contract",
+      "model_tier": "preserved",
+      "tier_rationale": "Builds nothing itself: adds the owner-gated NewsletterBuddy CLI allowlist and environment to the wrapped Discord preset and keeps its model.",
+      "conformance": [
+        "newsletter_agent_tests::newsletter_commands_require_explicit_owner_allowlist_and_configured_url"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/model_tool.rs::configure",
+      "permission_profile": "model-switch-mcp",
+      "output_contract": "Preserve the wrapped preset output contract",
+      "model_tier": "preserved",
+      "tier_rationale": "Builds nothing itself: adds the owner-gated model-switch MCP tool to the wrapped Discord preset and keeps its model.",
+      "conformance": [
+        "model_tool::tests::model_tool_requires_an_owner_and_channel",
+        "model_tool::tests::model_tool_scopes_changes_refuses_paused_profiles_and_resets",
+        "model_switch_sequence_tests::discord_model_switch_sequence_uses_one_audited_harness"
       ],
       "provider_conformance": "verified"
     }
