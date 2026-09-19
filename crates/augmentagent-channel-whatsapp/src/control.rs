@@ -215,6 +215,14 @@ impl WhatsappControlSurface {
                     session_id: msg.stable_id(),
                     http: None,
                     channel_id: None,
+                    // #1110 added this field and updated the Discord and CLI
+                    // call sites but not this one, which broke the workspace
+                    // build. `false` is both the correct value and the safe
+                    // one: it means "Discord has an explicit owner allowlist
+                    // and this author matched it", which cannot be true off
+                    // Discord, and it gates the model-switch tool — so a
+                    // WhatsApp sender must not inherit that authority.
+                    owner_authorized: false,
                 };
                 match qh.answer(&audit_ctx, &q).await {
                     Ok(answer) => {
