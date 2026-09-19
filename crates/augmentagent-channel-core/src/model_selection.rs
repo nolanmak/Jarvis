@@ -233,7 +233,7 @@ pub fn run_command(
                 Err(error) => format!("Model selection unchanged: {error}"),
             }
         }
-        ["set", name] | ["set", name, "scope:default"] => {
+        [name] | ["set", name] | ["set", name, "scope:default"] => {
             let scope = if args.len() == 3 { None } else { Some(channel_id) };
             match profile(name) {
                 None => "Unknown model. Choose claude, codex, qwen, or glm.".into(),
@@ -268,6 +268,16 @@ pub fn config_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_profile_command_uses_the_same_pause_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SelectionStore::new(temp.path().join("selection.json"));
+        assert!(run_command(&store, "42", "model qwen", |_| Err("paused".into())).unwrap().contains("paused"));
+        assert_eq!(store.selected(Some("42")).unwrap(), None);
+        assert!(run_command(&store, "42", "/model codex", |_| Ok(())).unwrap().contains("Model set to codex"));
+        assert_eq!(store.selected(Some("42")).unwrap(), Some(ProviderKind::Codex));
+    }
 
     #[test]
     fn claude_and_codex_commands_persist_and_reset() {
