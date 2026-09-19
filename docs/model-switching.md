@@ -269,3 +269,31 @@ red against `runpod-4`; all five installed-router fixtures and three fragmented
 stream/schema unit tests pass with the fix. Claude/Codex live regression and
 Qwen's audited Read are checked again after installation. Full live parity and
 actual Discord gateway acceptance remain release gates.
+
+## Verify stopped workers, not empty health counters
+
+The RunPod health `ready`/`idle` counters can include stopped cache workers.
+Requiring every counter to become zero incorrectly kept this host's Qwen
+profile paused. During live verification on 2026-09-19 UTC, Qwen completed
+its response at 01:32:22, the worker reported `desiredStatus: EXITED` with
+`Exited by Runpod` at 01:32:28, and its system log recorded `stop container`
+at 01:32:29. The endpoint remained at min 0, max 1, idle timeout 5 seconds.
+Qwen was subsequently enabled in the local adapter and daemon.
+
+RunPod CLI 2.14.0 was installed on the host from its official release with
+SHA-256 verification. It uses the existing owner-private credentials. For
+future checks, inspect worker status and the system logs after the last job
+finishes; do not infer continuous GPU usage solely from a nonzero `ready`
+count. Do not print the full endpoint/worker object: it includes environment
+credentials. A filtered diagnostic is:
+
+```sh
+runpodctl serverless get "$ENDPOINT_ID" --include-workers |
+  jq '{workersMin, workersMax, idleTimeout,
+       workers: [.workers[]? | {id, desiredStatus, lastStatusChange}]}'
+runpodctl serverless logs "$ENDPOINT_ID" --source system --tail 20
+```
+
+The [RunPod CLI implementation notes](https://github.com/runpod/runpodctl/blob/main/AGENTS.md)
+document the distinction between cached ready workers and running containers.
+A passing inference probe and actual container shutdown are separate receipts.
