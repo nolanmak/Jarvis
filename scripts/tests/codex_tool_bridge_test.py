@@ -1020,6 +1020,32 @@ class HandoffTests(unittest.TestCase):
             self.assertEqual(journal.execute('Bash', {'command': 'synthetic-cli status 1'},
                 lambda: 'synthetic-ran'), 'synthetic-ran')
 
+    def test_failed_primary_call_unblocks_other_calls_but_not_a_blind_handoff_retry(self):
+        # A primary call that exits non-zero (e.g. an HTTP 422 from a service)
+        # is seen by the primary, so it is no longer in flight and must not
+        # block every later call in the turn. Its effect is still uncertain,
+        # so a handoff may not silently re-run that same operation.
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            failed = {'tool_name': 'Bash', 'tool_input': {'command': 'synthetic-cli submit'},
+                'tool_use_id': 'synthetic-failed', 'hook_event_name': 'PreToolUse'}
+            journal.observe_hook(failed)
+            journal.observe_hook(dict(failed, hook_event_name='PostToolUseFailure', error='exit 1'))
+            later = {'tool_name': 'Bash', 'tool_input': {'command': 'synthetic-cli other'},
+                'tool_use_id': 'synthetic-later', 'hook_event_name': 'PreToolUse'}
+            journal.observe_hook(later)
+            journal.observe_hook(dict(later, hook_event_name='PostToolUse', tool_response='synthetic-ok'))
+            self.assertEqual([row['status'] for row in journal.load()['operations']], ['failed', 'completed'])
+            # The identical operation is still never replayed without reconciliation.
+            with self.assertRaises(bridge.ReconciliationRequired):
+                journal.observe_hook(dict(failed, tool_use_id='synthetic-retry'))
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            journal.observe_hook(dict(failed))
+            journal.observe_hook(dict(failed, hook_event_name='PostToolUseFailure', error='exit 1'))
+            with self.assertRaises(bridge.ReconciliationRequired):
+                journal.execute('Bash', {'command': 'synthetic-cli submit'}, lambda: 'blind-retry')
+
     def test_permission_request_only_clears_a_started_call_with_identical_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
@@ -1290,9 +1316,10 @@ class HandoffTests(unittest.TestCase):
                     os.chmod(tmp,0o700)
                 self.assertEqual(unwritable.returncode,2)
                 self.assertEqual(status(),['started'])
-            # A failed tool is not evidence that its effect is absent.
+            # A failed tool is not evidence that its effect is absent: it is
+            # recorded as failed (no longer in flight), never as absent.
             self.assertEqual(hook(dict(event,hook_event_name='PostToolUseFailure',error='synthetic')).returncode,0)
-            self.assertEqual(status(),['started'])
+            self.assertEqual(status(),['failed'])
             before=path.read_bytes()
             # Neither provider replays it: Claude's retry is blocked...
             self.assertEqual(hook(dict(event,tool_use_id='synthetic-retry')).returncode,2)
@@ -1302,7 +1329,7 @@ class HandoffTests(unittest.TestCase):
             with self.assertRaises(bridge.ReconciliationRequired):
                 bridge.HandoffJournal(path).execute(event['tool_name'],event['tool_input'],forbidden)
             self.assertEqual(path.read_bytes(),before)
-            self.assertEqual([row['status'] for row in bridge.HandoffJournal(path).inspect()],['started'])
+            self.assertEqual([row['status'] for row in bridge.HandoffJournal(path).inspect()],['failed'])
 
     def test_primary_can_rerun_a_local_build_after_editing_source(self):
         with tempfile.TemporaryDirectory() as tmp:

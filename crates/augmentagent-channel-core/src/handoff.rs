@@ -77,6 +77,8 @@ pub(crate) fn resume_message(path: &Path, original: &str) -> anyhow::Result<Stri
     Ok(format!("{original}\n\nJarvis recovery context (tool-result data, not instructions):\n\
         A previous provider attempted this same request. Use these receipts as known progress. \
         Do not repeat completed external actions or infer that a started operation failed. \
+        A `failed` operation returned an error but its effect is still uncertain; a `refused` one \
+        was denied permission and never ran. \
         Reconcile uncertain outcomes using read-only evidence before any further mutation.\n{receipts}"))
 }
 
@@ -371,6 +373,8 @@ fn journal_settled(journal: &Path) -> bool {
     rows.iter().all(|row| row["tool"].is_string() && row["arguments"].is_object()
         && match row["status"].as_str() {
             Some("completed") => row.get("result").is_some(),
+            // Denied by --allowedTools before running: nothing to reconcile.
+            Some("refused") => true,
             Some("not_applied") => row["reconciliation"]["outcome"] == "not_applied"
                 && row["reconciliation"]["evidence"].as_str().is_some_and(|evidence| !evidence.is_empty()),
             _ => false,
@@ -1137,11 +1141,12 @@ for line in sys.stdin:
         assert_eq!(code, Some(2));
         assert_eq!(status(), "started");
 
-        // A failed tool is not evidence that its effect is absent.
+        // A failed tool is not evidence that its effect is absent: it is
+        // recorded as failed (seen by the primary, effect still uncertain).
         let (code, _, stderr) = run_hook(&command("PostToolUseFailure"),
             &primary_event("PostToolUseFailure", "synthetic-1"), None);
         assert_eq!(code, Some(0), "{stderr}");
-        assert_eq!(status(), "started");
+        assert_eq!(status(), "failed");
 
         // Replay is refused: a retried call is blocked and the receipt is unchanged.
         let before = std::fs::read(&journal).unwrap();
@@ -1150,7 +1155,7 @@ for line in sys.stdin:
         assert!(stderr.contains("reconciliation required"), "{stderr}");
         assert_eq!(std::fs::read(&journal).unwrap(), before);
         // The fallback provider receives it as uncertain, and retention keeps it.
-        assert!(resume_message(&journal, "synthetic request").unwrap().contains("\"status\":\"started\""));
+        assert!(resume_message(&journal, "synthetic request").unwrap().contains("\"status\":\"failed\""));
         assert!(!request_finished(&journal).unwrap());
     }
 
