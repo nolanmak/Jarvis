@@ -36,6 +36,17 @@ jobs:
           key: platform
       - name: Build the CLI
         run: cargo build -p augmentagent-cli --bin augmentagent
+      # Every workflow here builds a per-crate SUBSET, so a crate that nothing
+      # in CI compiles can break `main` while every check stays green. That is
+      # not hypothetical: `augmentagent-channel-whatsapp` was left uncompilable
+      # by #1110 and CI never noticed. The auto-PR loop did — its verification
+      # gate runs `cargo build --workspace` — and it spent its entire daily cap
+      # blaming its own builder for a breakage it did not cause.
+      #
+      # The daily scanner already runs a workspace build, but on a schedule, so
+      # main can sit broken for a day. This is the PR gate, so it belongs here.
+      - name: Whole workspace compiles
+        run: cargo build --workspace --locked
       - name: Process walker + sidecar clients
         run: cargo test -p augmentagent-loops -p augmentagent-browser-client -p augmentagent-renderer-client
       - name: Host-dependent CLI surface
