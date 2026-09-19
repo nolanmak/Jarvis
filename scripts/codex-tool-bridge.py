@@ -594,7 +594,7 @@ class HandoffJournal:
             for row in state['operations']:
                 if (not isinstance(row, dict) or not isinstance(row.get('tool'), str)
                         or not isinstance(row.get('arguments'), dict)
-                        or row.get('status') not in ('started', 'completed', 'not_applied')
+                        or row.get('status') not in ('started', 'completed', 'not_applied', 'refused')
                         or (row['status'] == 'not_applied' and (
                             not isinstance(row.get('reconciliation'), dict)
                             or row['reconciliation'].get('outcome') != 'not_applied'
@@ -702,8 +702,8 @@ class HandoffJournal:
             state = self.load()
             for row in reversed(state['operations']):
                 if same_operation(row, name, arguments):
-                    if row['status'] == 'not_applied':
-                        break  # operator proved absence; preserve this row and append a new attempt
+                    if row['status'] in ('not_applied', 'refused'):
+                        break  # proven not run; preserve this row and append a new attempt
                     if row['status'] != 'completed':
                         raise ReconciliationRequired('latest operation requires reconciliation')
                     return row['result']
@@ -723,6 +723,24 @@ class HandoffJournal:
         arguments = event.get('tool_input')
         identifier = event.get('tool_use_id')
         phase = event.get('hook_event_name')
+        if phase == 'PermissionRequest':
+            # Claude Code asks for permission after PreToolUse when a call is
+            # outside --allowedTools; the event has no tool_use_id. Primary
+            # calls run non-interactively, so nobody can grant it: the call is
+            # refused and never runs, and no Post hook follows. Mark the
+            # matching started row refused so it cannot block later calls.
+            if not isinstance(name, str) or not isinstance(arguments, dict):
+                raise Denied('invalid primary operation event')
+            if read_only_operation(name, arguments):
+                return
+            with self.locked():
+                state = self.load()
+                started = [row for row in state['operations'] if row['status'] == 'started'
+                           and row['tool'] == name and row['arguments'] == arguments]
+                if started:
+                    started[-1]['status'] = 'refused'
+                    self.save(state)
+            return
         if (not isinstance(name, str) or not isinstance(arguments, dict)
                 or not isinstance(identifier, str) or not identifier
                 or phase not in ('PreToolUse', 'PostToolUse', 'PostToolUseFailure')):
@@ -746,6 +764,8 @@ class HandoffJournal:
             if len(matching) != 1 or matching[0]['tool'] != name or matching[0]['arguments'] != arguments:
                 raise Denied('unmatched primary result requires reconciliation')
             row = matching[0]
+            if row['status'] == 'refused':
+                raise Denied('late primary result conflicts with a refused permission request')
             if row['status'] == 'not_applied':
                 raise Denied('late primary result conflicts with operator reconciliation')
             if phase == 'PostToolUseFailure':

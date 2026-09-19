@@ -996,6 +996,42 @@ class HandoffTests(unittest.TestCase):
             self.assertEqual(outside.read_text(), 'SYNTHETIC_UNCHANGED')
             self.assertEqual(journal.path.read_bytes(), before)
 
+    def test_permission_refused_primary_call_does_not_wedge_later_calls(self):
+        # Claude Code fires PreToolUse, then PermissionRequest (which carries no
+        # tool_use_id) for a call outside --allowedTools, and in -p mode the
+        # request is refused with no Post hook. The refused call never ran, so
+        # it must not leave a "started" row that blocks every later call.
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            refused = {'tool_name': 'Bash', 'tool_input': {'command': 'synthetic-cli status 1'},
+                'tool_use_id': 'synthetic-refused', 'hook_event_name': 'PreToolUse'}
+            journal.observe_hook(refused)
+            permission = {k: v for k, v in refused.items() if k != 'tool_use_id'}
+            journal.observe_hook(dict(permission, hook_event_name='PermissionRequest'))
+            later = {'tool_name': 'Bash', 'tool_input': {'command': 'synthetic-cli create'},
+                'tool_use_id': 'synthetic-later', 'hook_event_name': 'PreToolUse'}
+            journal.observe_hook(later)
+            journal.observe_hook(dict(later, hook_event_name='PostToolUse', tool_response='synthetic-created'))
+            self.assertEqual([row['status'] for row in journal.load()['operations']], ['refused', 'completed'])
+            # A late result for the refused call conflicts with the refusal.
+            with self.assertRaises(bridge.Denied):
+                journal.observe_hook(dict(refused, hook_event_name='PostToolUse', tool_response='late'))
+            # The refused call never ran, so a handoff may run it afresh.
+            self.assertEqual(journal.execute('Bash', {'command': 'synthetic-cli status 1'},
+                lambda: 'synthetic-ran'), 'synthetic-ran')
+
+    def test_permission_request_only_clears_a_started_call_with_identical_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            journal.observe_hook({'tool_name': 'Bash', 'tool_input': {'command': 'synthetic-cli create'},
+                'tool_use_id': 'synthetic-running', 'hook_event_name': 'PreToolUse'})
+            journal.observe_hook({'tool_name': 'Bash', 'tool_input': {'command': 'synthetic-cli other'},
+                'hook_event_name': 'PermissionRequest'})
+            self.assertEqual([row['status'] for row in journal.load()['operations']], ['started'])
+            with self.assertRaises(bridge.ReconciliationRequired):
+                journal.observe_hook({'tool_name': 'Bash', 'tool_input': {'command': 'synthetic-cli next'},
+                    'tool_use_id': 'synthetic-next', 'hook_event_name': 'PreToolUse'})
+
     def test_reconciled_absence_allows_primary_retry_but_blocks_late_old_receipt(self):
         with tempfile.TemporaryDirectory() as tmp:
             journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
