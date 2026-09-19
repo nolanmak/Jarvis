@@ -104,7 +104,9 @@ impl ClaudeHooks {
         let hooks = object.entry("hooks").or_insert_with(|| json!({})).as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("invalid primary hooks"))?;
         let command = journal_hook_command(&script, journal, HOOK_CHECKPOINT_SECS, HOOK_KILL_GRACE_SECS);
-        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+        // PermissionRequest marks a call refused by --allowedTools (non-interactive
+        // runs cannot grant it), so its PreToolUse row does not block later calls.
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest"] {
             let groups = hooks.entry(event).or_insert_with(|| json!([])).as_array_mut()
                 .ok_or_else(|| anyhow::anyhow!("invalid primary hook groups"))?;
             groups.push(json!({"matcher": ".*", "hooks": [{
@@ -945,7 +947,7 @@ for line in sys.stdin:
         let settings: Value = serde_json::from_str(&launch.settings_json).unwrap();
         assert_eq!(settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "existing-guard");
         assert_eq!(settings["mcpServers"]["fixture"]["command"], "synthetic-server");
-        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest"] {
             let groups = settings["hooks"][event].as_array().unwrap();
             let command = groups.last().unwrap()["hooks"][0]["command"].as_str().unwrap();
             assert!(command.ends_with("exit 2"));
@@ -1017,7 +1019,7 @@ for line in sys.stdin:
             echo 'Handoff checkpoint failed or did not finish in time; reconciliation required.' >&2; exit 2",
             shell_quoted(&script), shell_quoted(&journal));
         let settings: Value = serde_json::from_str(&launch.settings_json).unwrap();
-        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest"] {
             assert_eq!(settings["hooks"][event], json!([{"matcher": ".*", "hooks": [{
                 "type": "command", "command": expected, "timeout": 60}]}]), "{event}");
         }
