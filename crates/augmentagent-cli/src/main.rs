@@ -3,6 +3,7 @@
 #[cfg(test)]
 mod provider_migration_tests;
 mod model_tool;
+mod computer_tool;
 #[cfg(test)]
 mod provider_channel_tests;
 #[cfg(test)]
@@ -7520,7 +7521,14 @@ async fn run_wiki_ask(cli: &Cli, question: String, post: bool) -> Result<()> {
 
     let reasoner = build_reasoner();
     let repo_root = std::env::current_dir().context("current_dir")?;
-    let opts = augmentagent_channel_core::reasoner::ask_opts(wiki_root.clone(), repo_root);
+    let mut opts = augmentagent_channel_core::reasoner::ask_opts(wiki_root.clone(), repo_root.clone());
+    // Direct local CLI invocation carries the OS owner's authority. The model
+    // command allowlist does not expose `wiki ask` as a privilege escalation.
+    let mut computer_ctx = augmentagent_approval_discord::AuditCtx::empty();
+    computer_ctx.owner_authorized = true;
+    computer_ctx.channel_id = Some(serenity::model::id::ChannelId::new(1));
+    computer_ctx.session_id = format!("local:{}", uuid::Uuid::new_v4());
+    computer_tool::configure(&mut opts, &computer_ctx, &repo_root);
     info!(wiki = %wiki_root.display(), "wiki ask");
     // #389 — same owner-rules preamble the Discord query path injects, so
     // CLI asks behave identically (and the injection is testable headless).
@@ -9097,6 +9105,7 @@ impl QueryHandler for WikiQuerier {
     ) -> anyhow::Result<String> {
         let mut opts = ask_opts(self.wiki_root.clone(), self.repo_root.clone());
         enable_newsletter_tools(&mut opts, ctx);
+        computer_tool::configure(&mut opts, ctx, &self.repo_root);
         model_tool::configure(&mut opts, ctx, &self.reasoner, &self.repo_root.join("target/release/augmentagent"));
         // #132 / #201 — Stamp this request's session id onto every audit
         // record produced by the spawn, and (if we have the bits from the

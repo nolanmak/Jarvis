@@ -917,6 +917,21 @@ console.log('DEPENDENCY_FIXTURE_OK');
 
 
 class HandoffTests(unittest.TestCase):
+    def test_computer_status_polls_remain_live_while_mutations_keep_replay_protection(self):
+        name = 'mcp__computer__computer_task'
+        arguments = {'operation': 'status', 'taskId': 'synthetic-task'}
+        self.assertTrue(bridge.read_only_operation(name, arguments))
+        for operation in ('start', 'cancel', 'resume', 'unknown'):
+            self.assertFalse(bridge.read_only_operation(name, {'operation': operation, 'taskId': 'synthetic-task'}))
+        self.assertFalse(bridge.read_only_operation(name, {**arguments, 'goal': 'mutating payload'}))
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            for identifier in ('poll-1', 'poll-2'):
+                event = {'tool_name': name, 'tool_input': arguments, 'tool_use_id': identifier}
+                journal.observe_hook({**event, 'hook_event_name': 'PreToolUse'})
+                journal.observe_hook({**event, 'hook_event_name': 'PostToolUse', 'tool_response': 'running'})
+            self.assertEqual(journal.inspect(), [])
+
     def test_operator_reconciliation_records_observed_completion_without_replay(self):
         with tempfile.TemporaryDirectory() as tmp:
             journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')

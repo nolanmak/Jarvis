@@ -89,6 +89,12 @@
       "operations": [
         "mcp__model__switch_model"
       ]
+    },
+    "computer-task-mcp": {
+      "scope": "Owner-authorized conversation only: goal-driven browser tasks through a scoped service; existing Chrome, independent Astra worker, no generic CDP access",
+      "operations": [
+        "mcp__computer__computer_task"
+      ]
     }
   },
   "presets": [
@@ -531,6 +537,17 @@
         "model_tool::tests::model_tool_requires_an_owner_and_channel",
         "model_tool::tests::model_tool_scopes_changes_refuses_paused_profiles_and_resets",
         "model_switch_sequence_tests::discord_model_switch_sequence_uses_one_audited_harness"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/computer_tool.rs::configure",
+      "permission_profile": "computer-task-mcp",
+      "output_contract": "Preserve the wrapped preset output contract",
+      "model_tier": "preserved",
+      "tier_rationale": "Preserves the parent model; the delegated browser worker selects its own validated Astra model.",
+      "conformance": [
+        "computer_tool::tests::computer_tools_require_trusted_owner_and_bind_identity_outside_model_arguments"
       ],
       "provider_conformance": "verified"
     }
