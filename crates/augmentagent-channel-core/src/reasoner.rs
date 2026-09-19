@@ -1151,6 +1151,7 @@ impl ClaudeCliReasoner {
                     &line,
                     &mut pending_tool_uses,
                     &audit_session,
+                    routed_model.as_ref().or(opts.model.as_ref()).map(String::as_str),
                     audit_logger.as_ref(),
                     opts.audit_notifier.as_ref(),
                 );
@@ -1243,6 +1244,7 @@ pub(crate) fn audit_stream_line(
     line: &str,
     pending: &mut HashMap<String, (String, serde_json::Value)>,
     session_id: &str,
+    model: Option<&str>,
     logger: Option<&Arc<AuditLogger>>,
     notifier: Option<&Arc<dyn AuditNotifier>>,
 ) {
@@ -1260,7 +1262,7 @@ pub(crate) fn audit_stream_line(
                     debug!("tool-audit: unmatched tool_result id={id}");
                     continue;
                 };
-                let record = build_audit_record(
+                let mut record = build_audit_record(
                     crate::providers::ProviderKind::Claude,
                     chrono::Utc::now().to_rfc3339(),
                     session_id.to_string(),
@@ -1269,6 +1271,9 @@ pub(crate) fn audit_stream_line(
                     &content,
                     is_error,
                 );
+                if let Some(model) = model {
+                    record.set_model(model);
+                }
                 if let Some(logger) = logger.cloned() {
                     let rec = record.clone();
                     tokio::spawn(async move {
@@ -2453,6 +2458,7 @@ mod tests {
             write_use,
             &mut pending,
             session,
+            Some("synthetic-claude-model"),
             Some(&log_arc),
             Some(&notifier_arc),
         );
@@ -2460,6 +2466,7 @@ mod tests {
             write_res,
             &mut pending,
             session,
+            Some("synthetic-claude-model"),
             Some(&log_arc),
             Some(&notifier_arc),
         );
@@ -2467,6 +2474,7 @@ mod tests {
             read_use,
             &mut pending,
             session,
+            Some("synthetic-claude-model"),
             Some(&log_arc),
             Some(&notifier_arc),
         );
@@ -2474,6 +2482,7 @@ mod tests {
             read_res,
             &mut pending,
             session,
+            Some("synthetic-claude-model"),
             Some(&log_arc),
             Some(&notifier_arc),
         );
@@ -2504,6 +2513,7 @@ mod tests {
         for line in &lines {
             let row: serde_json::Value = serde_json::from_str(line).unwrap();
             assert_eq!(row["provider"], "claude", "{line}");
+            assert_eq!(row["model"], "synthetic-claude-model", "{line}");
         }
 
         // Discord-side notifier fires for Write only, NOT Read.
@@ -2521,7 +2531,7 @@ mod tests {
         // pay parse cost on the no-audit path.
         let mut pending: HashMap<String, (String, serde_json::Value)> = HashMap::new();
         let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_x","name":"Write","input":{}}]}}"#;
-        audit_stream_line(line, &mut pending, "s", None, None);
+        audit_stream_line(line, &mut pending, "s", None, None, None);
         // Pending gains one entry because the use was parsed; that's fine —
         // the call_once outer wrapper only invokes this helper when
         // audit_active is true. The contract here is "no panics, no IO".
@@ -4404,7 +4414,7 @@ echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30
         assert!(matches!(
             ReasonerError::find_in(&err),
             Some(ReasonerError::Timeout { .. })
-        ));
+        ), "expected timeout, got {err:#}");
     }
 
     /// A missing binary is a Local fault (never latched, never mistaken for

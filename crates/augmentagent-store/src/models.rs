@@ -537,6 +537,9 @@ pub struct UserLoop {
     /// IANA timezone (`America/New_York`, `UTC`, …) used as the anchor
     /// for `cron_expr` math. Required iff `cron_expr` is `Some`.
     pub tz: Option<String>,
+    /// Explicit model for every occurrence. `None` inherits the daemon
+    /// default, preserving behavior for rows created before this column.
+    pub model_profile: Option<String>,
 }
 
 /// #117 — an allowlisted repo the multi-repo agent-coding loop is permitted

@@ -73,6 +73,9 @@ pub struct AuditRecord {
     /// code would not compile. Read it with [`AuditRecord::provider`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     provider: Option<String>,
+    /// Model requested for this tool-bearing turn. Absent on historical rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
     /// RFC3339 timestamp at the moment of record creation.
     pub ts: String,
     /// Logical session id — typically `<channel_id>:<message_id>` so a
@@ -114,6 +117,16 @@ impl AuditRecord {
     /// The provider that served the call; `None` only on historical rows.
     pub fn provider(&self) -> Option<&str> {
         self.provider.as_deref()
+    }
+
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    pub(crate) fn set_model(&mut self, model: &str) {
+        if !model.is_empty() {
+            self.model = Some(model.to_string());
+        }
     }
 }
 
@@ -474,6 +487,7 @@ pub fn build_audit_record(
         .then(|| if is_error && is_claude_refusal(result_content) { "none" } else { "host" }.to_string());
     AuditRecord {
         provider: Some(provider.name().to_string()),
+        model: None,
         ts,
         session_id,
         tool,
@@ -651,6 +665,7 @@ mod tests {
     fn format_notice_prefers_file_path_over_blob() {
         let rec = AuditRecord {
             provider: Some("claude".into()),
+            model: None,
             ts: "2026-05-27T00:00:00Z".into(),
             session_id: "ch:msg".into(),
             tool: "Write".into(),
@@ -671,6 +686,7 @@ mod tests {
     fn format_notice_includes_bash_exit_code() {
         let rec = AuditRecord {
             provider: Some("claude".into()),
+            model: None,
             ts: "2026-05-27T00:00:00Z".into(),
             session_id: "ch:msg".into(),
             tool: "Bash".into(),
@@ -774,7 +790,7 @@ mod tests {
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_1","name":"Read","input":{"file_path":"note.md"}}]}}"#,
             r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu_1","content":"synthetic"}]}}"#,
         ] {
-            crate::reasoner::audit_stream_line(line, &mut pending, "synthetic-claude", Some(&logger), None);
+            crate::reasoner::audit_stream_line(line, &mut pending, "synthetic-claude", Some("synthetic-claude-model"), Some(&logger), None);
         }
         let mut options = crate::reasoner::lint_opts("synthetic".into(), tmp.path().into());
         options.audit_logger = Some(logger.clone());
@@ -800,6 +816,9 @@ mod tests {
         let by_session = |s: &str| rows.iter().find(|r| r["session_id"] == s).unwrap()["provider"].clone();
         assert_eq!(by_session("synthetic-claude"), "claude");
         assert_eq!(by_session("synthetic-codex"), "codex");
+        let model_by_session = |s: &str| rows.iter().find(|r| r["session_id"] == s).unwrap()["model"].clone();
+        assert_eq!(model_by_session("synthetic-claude"), "synthetic-claude-model");
+        assert!(model_by_session("synthetic-codex").is_string());
     }
 
     /// Rows written before providers were recorded still parse; the field
@@ -809,6 +828,7 @@ mod tests {
         let old = r#"{"ts":"2026-05-27T00:00:00Z","session_id":"ch:1","tool":"Read","args":{},"exit_code":null,"stdout_truncated":"x","stderr_truncated":null}"#;
         let rec: AuditRecord = serde_json::from_str(old).unwrap();
         assert_eq!(rec.provider(), None);
+        assert_eq!(rec.model(), None);
         assert_eq!(rec.tool, "Read");
     }
 
@@ -819,6 +839,7 @@ mod tests {
         let logger = AuditLogger::new(path.clone());
         let rec1 = AuditRecord {
             provider: Some("claude".into()),
+            model: None,
             ts: "2026-05-27T00:00:00Z".into(),
             session_id: "ch:1".into(),
             tool: "Write".into(),
@@ -830,6 +851,7 @@ mod tests {
         };
         let rec2 = AuditRecord {
             provider: Some("codex".into()),
+            model: None,
             ts: "2026-05-27T00:00:01Z".into(),
             session_id: "ch:2".into(),
             tool: "Bash".into(),

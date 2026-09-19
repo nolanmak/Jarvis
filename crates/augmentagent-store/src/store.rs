@@ -782,6 +782,9 @@ impl Store {
                 [],
             )?;
         }
+        if !column_exists(conn, "user_loops", "model_profile")? {
+            conn.execute("ALTER TABLE user_loops ADD COLUMN model_profile TEXT", [])?;
+        }
 
         // #47 — cross-surface state sync. `status_source` records which surface
         // resolved an action (discord / dashboard / telegram / cli / nudge) so
@@ -5226,6 +5229,31 @@ impl Store {
         cron_expr: Option<&str>,
         tz: Option<&str>,
     ) -> StoreResult<String> {
+        self.create_user_loop_with_model(
+            owner, channel, channel_ref, interval_secs, prompt, expires_at_ms,
+            cron_expr, tz, None,
+        )
+    }
+
+    /// Create a loop with an optional durable model pin. Legacy callers
+    /// inherit the daemon default through `create_user_loop`.
+    pub fn create_user_loop_with_model(
+        &self,
+        owner: &str,
+        channel: &str,
+        channel_ref: &str,
+        interval_secs: i64,
+        prompt: &str,
+        expires_at_ms: Option<i64>,
+        cron_expr: Option<&str>,
+        tz: Option<&str>,
+        model_profile: Option<&str>,
+    ) -> StoreResult<String> {
+        if let Some(model) = model_profile {
+            if !matches!(model, "claude" | "qwen" | "glm" | "codex") {
+                return Err(StoreError::InvalidInput(format!("unsupported loop model profile: {model}")));
+            }
+        }
         let guard = self.conn.lock().expect("store mutex poisoned");
         let id = Uuid::new_v4().to_string();
         let now = now_millis();
@@ -5233,8 +5261,8 @@ impl Store {
             "INSERT INTO user_loops \
                  (id, owner, channel, channel_ref, interval_secs, prompt, \
                   status, fail_count, created_at_ms, updated_at_ms, \
-                  expires_at_ms, cron_expr, tz) \
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 0, ?7, ?7, ?8, ?9, ?10)",
+                  expires_at_ms, cron_expr, tz, model_profile) \
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 0, ?7, ?7, ?8, ?9, ?10, ?11)",
             params![
                 id,
                 owner,
@@ -5246,6 +5274,7 @@ impl Store {
                 expires_at_ms,
                 cron_expr,
                 tz,
+                model_profile,
             ],
         )?;
         Ok(id)
@@ -5258,7 +5287,7 @@ impl Store {
             "SELECT id, owner, channel, channel_ref, interval_secs, prompt, \
                     status, last_run_ms, last_status, fail_count, \
                     created_at_ms, updated_at_ms, expires_at_ms, \
-                    cron_expr, tz \
+                    cron_expr, tz, model_profile \
                FROM user_loops \
               WHERE owner = ?1 AND status != 'stopped' \
               ORDER BY created_at_ms DESC",
@@ -5279,7 +5308,7 @@ impl Store {
             "SELECT id, owner, channel, channel_ref, interval_secs, prompt, \
                     status, last_run_ms, last_status, fail_count, \
                     created_at_ms, updated_at_ms, expires_at_ms, \
-                    cron_expr, tz \
+                    cron_expr, tz, model_profile \
                FROM user_loops \
               WHERE status = 'active' \
               ORDER BY created_at_ms ASC",
@@ -7165,6 +7194,7 @@ fn row_to_user_loop(r: &rusqlite::Row) -> rusqlite::Result<UserLoop> {
         expires_at_ms: r.get(12)?,
         cron_expr: r.get(13)?,
         tz: r.get(14)?,
+        model_profile: r.get(15)?,
     })
 }
 
@@ -8733,6 +8763,74 @@ mod tests {
         // stopped rows drop out of the owner listing
         assert!(s.list_user_loops("u1").unwrap().is_empty());
         assert_eq!(s.count_active_user_loops("u1").unwrap(), 0);
+    }
+
+    #[test]
+    fn user_loop_model_pin_survives_reopen_and_legacy_rows_inherit() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let pinned_id;
+        {
+            let store = Store::open(file.path()).unwrap();
+            pinned_id = store
+                .create_user_loop_with_model(
+                    "u1", "discord", "chan", 60, "pinned prompt", None, None, None,
+                    Some("qwen"),
+                )
+                .unwrap();
+            store
+                .create_user_loop("u1", "discord", "chan", 60, "legacy prompt", None, None, None)
+                .unwrap();
+        }
+        let reopened = Store::open(file.path()).unwrap();
+        let loops = reopened.list_active_user_loops().unwrap();
+        assert_eq!(loops.len(), 2);
+        assert_eq!(
+            loops.iter().find(|row| row.id == pinned_id).unwrap().model_profile.as_deref(),
+            Some("qwen")
+        );
+        assert_eq!(
+            loops.iter().find(|row| row.prompt == "legacy prompt").unwrap().model_profile,
+            None
+        );
+        assert!(reopened.create_user_loop_with_model(
+            "u1", "discord", "chan", 60, "bad", None, None, None, Some("gemini")
+        ).is_err());
+    }
+
+    #[test]
+    fn legacy_user_loops_schema_adds_nullable_model_column() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        {
+            let conn = rusqlite::Connection::open(file.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE user_loops (\
+                    id TEXT PRIMARY KEY, owner TEXT NOT NULL, channel TEXT NOT NULL, \
+                    channel_ref TEXT NOT NULL, interval_secs INTEGER NOT NULL, \
+                    prompt TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', \
+                    last_run_ms INTEGER, last_status TEXT, fail_count INTEGER NOT NULL DEFAULT 0, \
+                    created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL\
+                );\
+                INSERT INTO user_loops (id, owner, channel, channel_ref, interval_secs, prompt, \
+                    created_at_ms, updated_at_ms) \
+                VALUES ('legacy', 'owner', 'discord', 'channel', 60, 'old prompt', 1, 1);"
+            ).unwrap();
+        }
+        let store = Store::open(file.path()).unwrap();
+        let row = store.list_user_loops("owner").unwrap().remove(0);
+        assert_eq!(row.id, "legacy");
+        assert!(row.model_profile.is_none());
+    }
+
+    #[test]
+    fn legacy_user_loop_json_without_model_profile_still_decodes() {
+        let (store, _file) = fresh_store();
+        store.create_user_loop("owner", "discord", "channel", 60, "old prompt", None, None, None)
+            .unwrap();
+        let row = store.list_user_loops("owner").unwrap().remove(0);
+        let mut old_json = serde_json::to_value(row).unwrap();
+        old_json.as_object_mut().unwrap().remove("model_profile");
+        let decoded: UserLoop = serde_json::from_value(old_json).unwrap();
+        assert!(decoded.model_profile.is_none());
     }
 
     #[test]

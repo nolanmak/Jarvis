@@ -92,7 +92,7 @@ fn load(path: &Path) -> anyhow::Result<History> {
     let history: History = serde_json::from_slice(&bytes)?;
     anyhow::ensure!(
         history.version == 1
-            && history.providers.len() <= 4
+            && history.providers.len() <= 6
             && history
                 .providers
                 .iter()
@@ -225,6 +225,17 @@ pub(crate) fn authors(path: &Path) -> anyhow::Result<Option<Vec<ProviderKind>>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runpod_authors_keep_actual_model_identity_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = initialize(&dir.path().join("private-state"), "synthetic-repository", "runpod-model-swap", false).unwrap();
+        record(&path, ProviderKind::Qwen).unwrap();
+        record(&path, ProviderKind::Qwen).unwrap();
+        record(&path, ProviderKind::Glm).unwrap();
+        assert_eq!(authors(&path).unwrap(), Some(vec![ProviderKind::Qwen, ProviderKind::Glm]));
+        assert!(!authors(&path).unwrap().unwrap().contains(&ProviderKind::Codex));
+    }
 
     #[test]
     fn restart_retains_all_attempted_authors_and_never_resets_existing_history() {
@@ -360,14 +371,14 @@ mod tests {
         .unwrap();
         let held = lock(&path).unwrap();
         assert_eq!(unsafe { libc::fcntl(held.as_raw_fd(), libc::F_SETFD, 0) }, 0);
-        let mut child = std::process::Command::new("sleep").arg("1").spawn().unwrap();
+        let mut child = std::process::Command::new("sleep").arg("3").spawn().unwrap();
         drop(held);
-        let started = std::time::Instant::now();
         let recorded = record(&path, ProviderKind::Codex);
+        let child_still_running = child.try_wait().unwrap().is_none();
         child.kill().ok();
         child.wait().unwrap();
         recorded.unwrap();
-        assert!(started.elapsed() < std::time::Duration::from_millis(200), "no waiting for the child");
+        assert!(child_still_running, "record must succeed while the child still holds its descriptor");
         assert_eq!(authors(&path).unwrap(), Some(vec![ProviderKind::Codex]));
     }
 

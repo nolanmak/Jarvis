@@ -59,6 +59,7 @@ pub fn codex_auth_available() -> bool {
 
 pub struct CodexCliReasoner {
     bin: String,
+    kind: ProviderKind,
     /// #898 — shared cap on concurrent CLI children.
     gate: std::sync::Arc<crate::cli_gate::CliGate>,
     /// #1047 — where this adapter's token usage goes. The process-global
@@ -81,7 +82,13 @@ fn bridge_runner(content: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn record_tool_item(opts: &ReasonerOpts, item: &serde_json::Value) {
+    let model = crate::providers::model_for(ProviderKind::Codex, tier_of(opts));
+    record_tool_item_for(ProviderKind::Codex, &model, opts, item).await
+}
+
+async fn record_tool_item_for(kind: ProviderKind, model: &str, opts: &ReasonerOpts, item: &serde_json::Value) {
     use crate::tool_audit::{build_audit_record, is_high_risk};
     let native_web = item.get("type").and_then(|v| v.as_str()) == Some("web_search");
     if !native_web && item.get("type").and_then(|v| v.as_str()) != Some("mcp_tool_call") { return; }
@@ -101,7 +108,8 @@ pub(crate) async fn record_tool_item(opts: &ReasonerOpts, item: &serde_json::Val
     let failed = item.get("status").and_then(|s| s.as_str()) == Some("failed")
         || result.is_some_and(|r| r.get("isError").or_else(|| r.get("is_error")).and_then(|b| b.as_bool()).unwrap_or(false));
     let session = opts.session_id.as_deref().unwrap_or("-");
-    let mut record = build_audit_record(ProviderKind::Codex, chrono::Utc::now().to_rfc3339(), session.into(), tool.clone(), args, &content, failed);
+    let mut record = build_audit_record(kind, chrono::Utc::now().to_rfc3339(), session.into(), tool.clone(), args, &content, failed);
+    record.set_model(model);
     if tool == "Bash" {
         let outcome = serde_json::from_str::<serde_json::Value>(&content).ok();
         record.exit_code = outcome.as_ref()
@@ -123,19 +131,27 @@ impl CodexCliReasoner {
     pub fn openai() -> Self {
         Self {
             bin: codex_bin(),
+            kind: ProviderKind::Codex,
             gate: crate::cli_gate::CliGate::global(),
             usage_log: crate::token_usage::UsageLogger::global(),
         }
     }
 
+    pub fn runpod(kind: ProviderKind) -> Self {
+        assert!(matches!(kind, ProviderKind::Qwen | ProviderKind::Glm));
+        let mut reasoner = Self::openai();
+        reasoner.kind = kind;
+        reasoner
+    }
+
     /// Adapter bound to an explicit binary (fault-injection stubs in tests).
     #[cfg(test)]
     pub(crate) fn with_bin(bin: String) -> Self {
-        Self { bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global() }
+        Self { bin, kind: ProviderKind::Codex, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global() }
     }
 
     fn provider_name(&self) -> &'static str {
-        ProviderKind::Codex.name()
+        self.kind.name()
     }
 
     async fn call_capture(
@@ -186,9 +202,14 @@ impl CodexCliReasoner {
         clean: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> anyhow::Result<String> {
         let provider = self.provider_name();
-        let router = crate::model_router::current()?.filter(|r| r.enabled());
-        let model = router.as_ref().and_then(|r| r.model(ProviderKind::Codex, tier_of(opts)))
-            .unwrap_or_else(|| model_for(ProviderKind::Codex, tier_of(opts)));
+        let router = crate::model_router::current()?.filter(|r| r.enabled() || self.kind != ProviderKind::Codex);
+        if matches!(self.kind, ProviderKind::Qwen | ProviderKind::Glm) && router.is_none() {
+            return Err(ReasonerError::Local { message: "Runpod model requires a configured 9Router endpoint".into() }.into());
+        }
+        let model = if self.kind == ProviderKind::Codex {
+            router.as_ref().and_then(|r| r.model(ProviderKind::Codex, tier_of(opts)))
+                .unwrap_or_else(|| model_for(ProviderKind::Codex, tier_of(opts)))
+        } else { model_for(self.kind, tier_of(opts)) };
         let capability = crate::providers::classify(opts);
 
         // `IMAGE:` markers → native `-i` attachments (see crate::images).
@@ -262,6 +283,14 @@ impl CodexCliReasoner {
         ];
         if let Some(router) = &router {
             for value in router.codex_overrides() { args.extend(["-c".into(), value]); }
+        }
+        if let Some((context, compact)) = match self.kind {
+            ProviderKind::Qwen => Some((16_384, 12_288)),
+            ProviderKind::Glm => Some((32_768, 24_576)),
+            _ => None,
+        } {
+            args.extend(["-c".into(), format!("model_context_window={context}")]);
+            args.extend(["-c".into(), format!("model_auto_compact_token_limit={compact}")]);
         }
         for img in &image_paths {
             args.push("-i".into());
@@ -372,7 +401,7 @@ impl CodexCliReasoner {
             }
             if kind == Some("item.completed") {
                 if let Some(item) = v.get("item") {
-                    record_tool_item(opts, item).await;
+                    record_tool_item_for(self.kind, &model, opts, item).await;
                 }
             }
             match kind {
@@ -412,7 +441,7 @@ impl CodexCliReasoner {
         // Best effort, like the Claude path: the logger swallows IO errors.
         if let Some(usage) = observed_usage {
             self.usage_log.append(&crate::token_usage::UsageRecord::for_call(
-                ProviderKind::Codex,
+                self.kind,
                 model.as_str(),
                 capability,
                 usage,
@@ -522,6 +551,28 @@ mod tests {
         }
     }
 
+    /// Paid, opt-in acceptance probe. Run with a private 9Router config and
+    /// `cargo test -- --ignored`; a text-only response cannot pass this test.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires live Qwen endpoint, local 9Router, and a paid inference call"]
+    async fn live_qwen_runs_the_jarvis_scoped_file_tools() {
+        let config = crate::model_router::load().unwrap().expect("set AUGMENTAGENT_MODEL_ROUTER_CONFIG");
+        let config = crate::model_router::select_profile(Some(config), Some(ProviderKind::Qwen)).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("seed.txt"), "7\n").unwrap();
+        let mut options = opts();
+        options.system_prompt = "Use only the jarvis MCP tools for file operations. Follow the user request exactly.".into();
+        options.cwd = Some(workspace.path().into());
+        options.allowed_tools = vec!["Read".into(), "Write".into()];
+        options.session_id = Some("live-qwen-scoped-tool-probe".into());
+        let reasoner = CodexCliReasoner::runpod(ProviderKind::Qwen);
+        let result = crate::model_router::SNAPSHOT.scope(config, reasoner.call(&options,
+            "Read seed.txt with jarvis Read. Add one to the number, then create result.txt with jarvis Write containing only the answer and a newline. Reply DONE after the write succeeds.")).await.unwrap();
+        assert!(result.contains("DONE"), "model did not confirm completion: {result}");
+        assert_eq!(std::fs::read_to_string(workspace.path().join("result.txt")).unwrap(), "8\n");
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn router_file_is_not_native_codex_authentication() {
@@ -599,7 +650,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"{\"decisio
 echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
 "#,
         );
-        let r = CodexCliReasoner {
+        let r = CodexCliReasoner { kind: ProviderKind::Codex,
             bin,
             gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(),
         };
@@ -628,7 +679,7 @@ echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"syntheti
 echo '{{"type":"turn.completed","usage":{{"input_tokens":3000,"cached_input_tokens":2000,"cache_write_input_tokens":200,"output_tokens":120,"reasoning_output_tokens":70}}}}'
 "#, argv = argv.display()));
         let log = dir.path().join("token-usage.jsonl");
-        let reasoner = CodexCliReasoner {
+        let reasoner = CodexCliReasoner { kind: ProviderKind::Codex,
             bin,
             gate: crate::cli_gate::CliGate::global(),
             usage_log: std::sync::Arc::new(crate::token_usage::UsageLogger::new(log.clone())),
@@ -660,7 +711,7 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":3000,"cached_input_toke
     async fn usage_is_recorded_whatever_the_outcome_and_only_when_reported() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("token-usage.jsonl");
-        let adapter = |name: &str, body: &str| CodexCliReasoner {
+        let adapter = |name: &str, body: &str| CodexCliReasoner { kind: ProviderKind::Codex,
             bin: stub(&dir, name, body),
             gate: crate::cli_gate::CliGate::global(),
             usage_log: std::sync::Arc::new(crate::token_usage::UsageLogger::new(log.clone())),
@@ -682,7 +733,7 @@ cat >/dev/null
 echo '{"type":"turn.failed","error":{"message":"required MCP server: JARVIS_READINESS:mcp_start PRIVATE_SYNTHETIC_CONFIGURATION"}}'
 exit 1
 "#);
-        let reasoner = CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
+        let reasoner = CodexCliReasoner { kind: ProviderKind::Codex, bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
         let error = reasoner.call(&opts(), "Synthetic request").await.unwrap_err();
         assert!(matches!(ReasonerError::find_in(&error), Some(ReasonerError::Local { .. })), "{error}");
         assert!(error.to_string().contains("MCP"));
@@ -715,7 +766,7 @@ exit 1
         ));
         let mut options = crate::reasoner::resume_opts(dir.path().into());
         options.env.push(("SYNTHETIC_TOKEN".into(), "private-fixture-only".into()));
-        let reasoner = CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
+        let reasoner = CodexCliReasoner { kind: ProviderKind::Codex, bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
         reasoner.call(&options, "Read a synthetic note").await.unwrap();
         let args = std::fs::read_to_string(record).unwrap();
         assert!(args.contains("mcp_servers.jarvis="));
@@ -908,7 +959,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
         let mut options = opts();
         options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(log.clone())));
         options.session_id = Some("synthetic-session".into());
-        CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), }
+        CodexCliReasoner { kind: ProviderKind::Codex, bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), }
             .call(&options, "synthetic audit probe").await.unwrap();
         let row: serde_json::Value = serde_json::from_str(std::fs::read_to_string(log).unwrap().trim()).unwrap();
         assert_eq!(row["provider"], "codex");
@@ -973,7 +1024,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
 "#);
         let mut options = opts();
         options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(log.clone())));
-        CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global() }
+        CodexCliReasoner { kind: ProviderKind::Codex, bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global() }
             .call(&options, "synthetic build audit probe").await.unwrap();
         let rows: Vec<serde_json::Value> = std::fs::read_to_string(log).unwrap().lines()
             .map(|line| serde_json::from_str(line).unwrap()).collect();
@@ -1000,7 +1051,7 @@ echo '{"type":"turn.failed","error":{"message":"You'\''ve hit your usage limit. 
 exit 1
 "#,
         );
-        let r = CodexCliReasoner {
+        let r = CodexCliReasoner { kind: ProviderKind::Codex,
             bin,
             gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(),
         };
@@ -1025,7 +1076,7 @@ echo '{"type":"error","message":"Reconnecting... 1/5 (stream disconnected before
 echo '{"type":"item.completed","item":{"type":"mcp_tool_call","server":"jarvis","tool":"Write","arguments":{"file_path":"synthetic.md"},"result":{"content":[{"type":"text","text":"written"}]},"status":"completed"}}'
 echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
 "#);
-        let reasoner = CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
+        let reasoner = CodexCliReasoner { kind: ProviderKind::Codex, bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
         for transcript in [false, true] {
             let err = if transcript {
                 reasoner.call_transcript(&opts(), "synthetic request").await.unwrap_err()
@@ -1071,7 +1122,7 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
             std::fs::write(&events, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
             let bin = stub(&dir, &format!("fake-codex-{index}"),
                 &format!("cat >/dev/null\ncat '{}'\nexit 1\n", events.display()));
-            let reasoner = CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
+            let reasoner = CodexCliReasoner { kind: ProviderKind::Codex, bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
             let err = reasoner.call(&opts(), "synthetic request").await.unwrap_err();
             match (want, ReasonerError::find_in(&err)) {
                 (None, None) => {}
@@ -1112,7 +1163,7 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
             ("fake-codex-killed", "cat >/dev/null\necho '{\"type\":\"turn.started\"}'\nkill -9 $$\n"),
             ("fake-codex-model", "cat >/dev/null\necho '{\"type\":\"turn.started\"}'\necho '{\"type\":\"turn.failed\",\"error\":{\"message\":\"unexpected status 404 Not Found: model_not_found\"}}'\nexit 1\n"),
         ] {
-            let reasoner = CodexCliReasoner { bin: stub(&dir, name, body), gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
+            let reasoner = CodexCliReasoner { kind: ProviderKind::Codex, bin: stub(&dir, name, body), gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
             let err = reasoner.call(&write_opts(&dir), "synthetic request").await.unwrap_err();
             assert!(ReasonerError::find_in(&err).is_none(), "{name} (write): {err:#}");
             assert_eq!(err.downcast_ref::<TurnFailure>().map(|f| f.class), Some(FailureClass::Unrecognised), "{name}");
@@ -1134,7 +1185,7 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
             ("fake-codex-silent", "cat >/dev/null\n"),
             ("fake-codex-thread-only", "cat >/dev/null\necho '{\"type\":\"thread.started\",\"thread_id\":\"t1\"}'\n"),
         ] {
-            let reasoner = CodexCliReasoner { bin: stub(&dir, name, body), gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
+            let reasoner = CodexCliReasoner { kind: ProviderKind::Codex, bin: stub(&dir, name, body), gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
             for options in [opts(), write_opts(&dir)] {
                 let err = reasoner.call(&options, "synthetic request").await.unwrap_err();
                 assert!(matches!(ReasonerError::find_in(&err), Some(ReasonerError::Unavailable { .. })),
@@ -1154,7 +1205,7 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
             ("fake-codex-panic", "cat >/dev/null\necho '{\"type\":\"turn.started\"}'\necho \"thread 'main' panicked at core/src/synthetic.rs:1:1:\" >&2\nexit 101\n"),
         ] {
             let bin = stub(&dir, name, body);
-            let err = CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), }
+            let err = CodexCliReasoner { kind: ProviderKind::Codex, bin, gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), }
                 .call(&opts(), "synthetic request").await.unwrap_err();
             assert!(matches!(ReasonerError::find_in(&err), Some(ReasonerError::Unavailable { .. })),
                 "{name}: {err:#}");
@@ -1181,7 +1232,7 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
             );
             let mut o = opts();
             o.model = Some(preset_model.into());
-            CodexCliReasoner {
+            CodexCliReasoner { kind: ProviderKind::Codex,
             bin,
             gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(),
         }.call(&o, "hi").await.unwrap();
@@ -1196,6 +1247,181 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
                 "codex must spawn with `-m {want}`, got {argv:?}"
             );
         }
+    }
+
+    // The supervised CLI lifecycle is exercised on the daemon's Linux host;
+    // macOS cannot certify its descendant-reaping receipt.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn runpod_profiles_use_codex_bridge_with_distinct_model_ids() {
+        for (kind, expected) in [
+            (ProviderKind::Qwen, "runpod/qwen38-27b"),
+            (ProviderKind::Glm, "runpod/glm-5.3-flash"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let record = dir.path().join("argv.txt");
+            let bin = stub(&dir, "fake-codex", &format!(
+                "cat >/dev/null\nprintf '%s\\n' \"$@\" >{}\necho '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"ok\"}}}}'\n",
+                record.display()));
+            let mut reasoner = CodexCliReasoner::runpod(kind);
+            reasoner.bin = bin;
+            let config = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+            let answer = crate::model_router::SNAPSHOT.scope(Some(config), reasoner.call(&opts(), "hi")).await.unwrap();
+            assert_eq!(answer, "ok");
+            assert_eq!(reasoner.provider_name(), kind.name());
+            let argv = std::fs::read_to_string(&record).unwrap();
+            assert!(argv.contains(&format!("-m\n{expected}\n")), "wrong model: {argv}");
+            assert!(argv.contains("model_providers.augmentagent_router.wire_api=\"responses\""));
+            let context = if kind == ProviderKind::Qwen { 16_384 } else { 32_768 };
+            assert!(argv.contains(&format!("model_context_window={context}")));
+            assert!(!argv.contains("router-secret"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn all_selected_profiles_share_scoped_file_tools_and_audit_identity() {
+        const SCRIPT: &str = r##"
+cat >/dev/null
+exec python3 -I - "$@" <<'PY'
+import base64, json, os, pathlib, select, subprocess, sys
+spec = next(arg for arg in sys.argv[1:] if arg.startswith('mcp_servers.jarvis='))
+args = json.loads('[' + spec.split('args=[', 1)[1].split(']', 1)[0] + ']')
+policy = json.loads(pathlib.Path(args[2]).read_text())
+workspace = pathlib.Path(policy['cwd'])
+bridge = subprocess.Popen(['python3', *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+def call(identifier, method, params):
+    bridge.stdin.write((json.dumps({'jsonrpc':'2.0','id':identifier,'method':method,'params':params})+'\n').encode())
+    bridge.stdin.flush()
+    if not select.select([bridge.stdout], [], [], 30)[0]:
+        raise TimeoutError(method)
+    return json.loads(bridge.stdout.readline())['result']
+call(1, 'initialize', {})
+tools = sorted(tool['name'] for tool in call(2, 'tools/list', {})['tools'])
+read_args = {'file_path':str(workspace / 'seed.txt')}
+read = call(3, 'tools/call', {'name':'Read','arguments':read_args})
+denied_args = {'file_path':str(workspace / 'result.txt'),'content':'unapproved\n'}
+denied = call(13, 'tools/call', {'name':'Write','arguments':denied_args})
+denied_created = (workspace / 'result.txt').exists()
+write_args = {'file_path':str(workspace / 'result.txt'),'content':'8\n'}
+write = call(4, 'tools/call', {'name':'Write','arguments':write_args})
+test_args = {'command':'test -f result.txt'}
+test = call(14, 'tools/call', {'name':'Bash','arguments':test_args})
+outside_args = {'file_path':str(workspace.parent / 'outside.txt'),'content':'bad\n'}
+outside = call(5, 'tools/call', {'name':'Write','arguments':outside_args})
+bash_args = {'command':'printf NINE'}
+bash = call(6, 'tools/call', {'name':'Bash','arguments':bash_args})
+escape_args = {'file_path':str(workspace / 'escape.txt')}
+escape = call(7, 'tools/call', {'name':'Read','arguments':escape_args})
+escape_write_args = {'file_path':str(workspace / 'escape.txt'),'content':'bad\n'}
+escape_write = call(8, 'tools/call', {'name':'Write','arguments':escape_write_args})
+unknown_args = {'file_path':str(workspace / 'unknown.txt'),'content':'bad\n'}
+unknown = call(9, 'tools/call', {'name':'UnknownTool','arguments':unknown_args})
+invalid_write_args = {'file_path':str(workspace / 'invalid.txt')}
+invalid_write = call(10, 'tools/call', {'name':'Write','arguments':invalid_write_args})
+image_args = {'file_path':str(workspace / 'fixture.png')}
+image = call(11, 'tools/call', {'name':'Read','arguments':image_args})
+image_exact = image['content'][0]['data'] == base64.b64encode((workspace / 'fixture.png').read_bytes()).decode()
+mcp = call(12, 'tools/call', {'name':'mcp__fixture__lookup','arguments':{}})
+for name, arguments, result in [('Read',read_args,read),('Write',denied_args,denied),('Write',write_args,write),('Bash',test_args,test),('Write',outside_args,outside),('Bash',bash_args,bash),('Read',escape_args,escape),('Write',escape_write_args,escape_write),('UnknownTool',unknown_args,unknown),('Write',invalid_write_args,invalid_write),('Read',image_args,image),('mcp__fixture__lookup',{},mcp)]:
+    print(json.dumps({'type':'item.completed','item':{'type':'mcp_tool_call','server':'jarvis','tool':name,'arguments':arguments,'result':result}}),flush=True)
+report = {'tools':tools,'read':read,'denied':denied,'denied_created':denied_created,'write':write,'test':test,'outside':outside,'bash':bash,'escape':escape,'escape_write':escape_write,'unknown':unknown,'invalid_write':invalid_write,'image':image,'image_exact':image_exact,'mcp':mcp}
+print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':json.dumps(report)}}),flush=True)
+bridge.stdin.close()
+bridge.wait(timeout=10)
+PY
+"##;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("outside.txt"), "outside fixture\n").unwrap();
+        let approval_guard = root.path().join("approval-guard.py");
+        std::fs::write(&approval_guard, r#"import json, sys
+request = json.load(sys.stdin)
+arguments = request.get('tool_input', {})
+if (request.get('tool_name') == 'Write'
+        and str(arguments.get('file_path', '')).endswith('/result.txt')
+        and arguments.get('content') != '8\n'):
+    print('{"decision":"block"}')
+"#).unwrap();
+        let mcp_server = root.path().join("fixture-mcp.py");
+        std::fs::write(&mcp_server, r#"import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get('method')
+    if method == 'initialize':
+        result = {'protocolVersion':'2024-11-05','capabilities':{'tools':{}},'serverInfo':{'name':'fixture','version':'1'}}
+    elif method == 'tools/list':
+        result = {'tools':[{'name':'lookup','description':'Synthetic local lookup','inputSchema':{'type':'object','properties':{}}}]}
+    elif method == 'tools/call':
+        result = {'content':[{'type':'text','text':'MCP_FIXTURE_OK'}]}
+    else:
+        result = {}
+    if 'id' in request:
+        print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)
+"#).unwrap();
+        let mut inventories = Vec::new();
+        for kind in [ProviderKind::Codex, ProviderKind::Qwen, ProviderKind::Glm] {
+            let workspace = root.path().join(kind.name());
+            std::fs::create_dir(&workspace).unwrap();
+            std::fs::write(workspace.join("seed.txt"), "7\n").unwrap();
+            std::fs::write(workspace.join("fixture.png"), &[137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 8, 0, 0, 0, 8, 8, 2, 0, 0, 0, 75, 109, 41, 220, 0, 0, 0, 16, 73, 68, 65, 84, 120, 156, 99, 96, 96, 248, 143, 3, 13, 41, 9, 0, 169, 112, 63, 193, 20, 202, 234, 115, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130]).unwrap();
+            std::os::unix::fs::symlink(root.path().join("outside.txt"), workspace.join("escape.txt")).unwrap();
+            let bin = stub(&root, &format!("fake-{}", kind.name()), SCRIPT);
+            let mut reasoner = if kind == ProviderKind::Codex {
+                CodexCliReasoner::openai()
+            } else {
+                CodexCliReasoner::runpod(kind)
+            };
+            reasoner.bin = bin;
+            let mut options = opts();
+            options.cwd = Some(workspace.clone());
+            options.allowed_tools = vec!["Read".into(), "Write".into(), "Bash(printf *)".into(),
+                "Bash(test *)".into(), "mcp__fixture__lookup".into()];
+            options.settings_json = Some(serde_json::json!({
+                "mcpServers":{"fixture":{"command":"python3","args":[mcp_server]}},
+                "hooks":{"PreToolUse":[{"matcher":"Write","hooks":[{"type":"command",
+                    "command":format!("python3 {}",approval_guard.display())}]}]}
+            }).to_string());
+            options.session_id = Some(format!("synthetic-{}", kind.name()));
+            let audit = root.path().join(format!("audit-{}.jsonl", kind.name()));
+            options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(audit.clone())));
+            let config = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+            let config = crate::model_router::select_profile(Some(config), Some(kind)).unwrap();
+            let answer = crate::model_router::SNAPSHOT.scope(config,
+                reasoner.call(&options, "Read seed.txt, write result.txt, and refuse an out-of-scope write")).await.unwrap();
+            let report: serde_json::Value = serde_json::from_str(&answer).unwrap();
+            let tools = report["tools"].as_array().unwrap().clone();
+            assert!(tools.contains(&serde_json::json!("Read")) && tools.contains(&serde_json::json!("Write"))
+                && tools.contains(&serde_json::json!("Bash"))
+                && tools.contains(&serde_json::json!("mcp__fixture__lookup")));
+            inventories.push(tools);
+            assert!(report["read"]["content"][0]["text"].as_str().unwrap().contains('7'));
+            assert_eq!(report["denied"]["isError"], true);
+            assert_eq!(report["denied_created"], false,
+                "the unapproved write changed the workspace for {}", kind.name());
+            assert_ne!(report["write"]["isError"], true);
+            assert_ne!(report["test"]["isError"], true);
+            assert_eq!(report["outside"]["isError"], true);
+            assert_eq!(report["escape"]["isError"], true);
+            assert_eq!(report["escape_write"]["isError"], true);
+            assert_eq!(report["unknown"]["isError"], true);
+            assert_eq!(report["invalid_write"]["isError"], true);
+            assert_eq!(report["image"]["content"][0]["mimeType"], "image/png");
+            assert_eq!(report["image_exact"], true);
+            assert_eq!(report["mcp"]["content"][0]["text"], "MCP_FIXTURE_OK");
+            assert_ne!(report["bash"]["isError"], true);
+            assert!(report["bash"]["content"][0]["text"].as_str().unwrap().contains("NINE"));
+            assert_eq!(std::fs::read_to_string(workspace.join("result.txt")).unwrap(), "8\n");
+            assert!(!workspace.join("unknown.txt").exists());
+            assert!(!workspace.join("invalid.txt").exists());
+            assert_eq!(std::fs::read_to_string(root.path().join("outside.txt")).unwrap(), "outside fixture\n");
+            let records = std::fs::read_to_string(audit).unwrap();
+            assert_eq!(records.lines().count(), 12);
+            assert!(records.lines().all(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["provider"] == kind.name()
+            }));
+        }
+        assert_eq!(inventories[0], inventories[1]);
+        assert_eq!(inventories[1], inventories[2]);
     }
 
     /// `IMAGE:` markers become native `-i` attachments and the marker lines
@@ -1219,7 +1445,7 @@ echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"a red sq
                 record = record.display()
             ),
         );
-        let r = CodexCliReasoner {
+        let r = CodexCliReasoner { kind: ProviderKind::Codex,
             bin,
             gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(),
         };
@@ -1238,7 +1464,7 @@ echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"a red sq
 
     #[tokio::test]
     async fn missing_binary_is_local_not_failoverable_noise() {
-        let r = CodexCliReasoner {
+        let r = CodexCliReasoner { kind: ProviderKind::Codex,
             bin: "/nonexistent/codex-bin".into(),
             gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(),
         };
@@ -1301,7 +1527,7 @@ PY
         std::fs::write(workspace.join("bait.txt"), format!("{}b\n", "a".repeat(40))).unwrap();
         let bin = stub(&dir, "fake-codex-grep", FAKE_CODEX_PATHOLOGICAL_GREP);
         let gate = std::sync::Arc::new(crate::cli_gate::CliGate::new(1));
-        let reasoner = CodexCliReasoner { bin, gate: gate.clone(), usage_log: crate::token_usage::UsageLogger::global() };
+        let reasoner = CodexCliReasoner { kind: ProviderKind::Codex, bin, gate: gate.clone(), usage_log: crate::token_usage::UsageLogger::global() };
         let mut options = opts();
         options.allowed_tools = vec!["Grep".into()];
         options.cwd = Some(workspace);

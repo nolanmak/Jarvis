@@ -19,7 +19,12 @@ using the committed lockfile, builds its standalone server, and starts
 `augmentagent-model-router.service` on **127.0.0.1:20128**. Install both the Claude
 and Codex CLIs for the corresponding routes. Re-running the installer preserves
 accounts, API keys and the selected route. `--built-source PATH` can reuse an
-already built checkout at the pinned commit during local development.
+already built checkout at the pinned commit during local development. The
+installer applies `sidecars/9router/runpod-reconciliation.patch` before building;
+a supplied built source must already contain it. The service uses a distinct
+runtime directory for this patched version. For Docker, run
+`bash scripts/build-model-router-image.sh` to build
+`jarvis-9router:0.5.75-runpod-5` from the same source and dependency lock.
 
 After deploying this agent version, open **Settings → Models & accounts**:
 
@@ -109,6 +114,21 @@ access a model or complete a real provider login. Verify those after connecting
 each account. The existing provider output-contract suites are opt-in live
 fixtures for structured output and wiki/tool operations.
 
+For a Docker-hosted router, add `"upstream_host":"host.docker.internal"` to a
+private copy of the router test config before running the synthetic suite. The
+patched router must pass quota failover, request-key/409 and unsupported-image
+tests. Stock 0.5.75 fails the latter two. Keep the original data volume backed up
+when switching an existing router to the patched image.
+
+The patched build treats a direct OpenAI-compatible model selection as pinned:
+9Router will not switch it to a capacity-adapter provider. When the selected
+model's declared capabilities cannot read an image, document,
+audio or video input, it returns 422 before contacting an upstream. This
+checks every turn in the request and prevents a normal-looking answer after a
+current or historical attachment was removed. A capability
+declaration is not proof that the deployed model handles that input; the live
+attachment acceptance test remains required before enabling the profile.
+
 To roll back, select **Existing CLI accounts (9Router off)**. Then optionally stop
 `augmentagent-model-router.service`; stored accounts are retained. If the router
 is unavailable, the dashboard still lets you save the direct route. Malformed
@@ -119,3 +139,9 @@ account.
 
 - [9Router source at the pinned revision](https://github.com/decolua/9router/tree/17c4cc76877bd1755030a8414f8d0083f48dcccf)
 - [Codex custom model provider configuration](https://learn.chatgpt.com/docs/config-file/config-reference)
+
+The `runpod-5` patch also preserves Responses API namespace tools through Chat
+Completions backends. It forwards leaf schemas under stable aliases and restores
+namespace/name on returned calls, including streamed events and follow-up history.
+The installed gateway fixture tests two namespaces containing the same `Read`
+name, so schemas and identities cannot silently collapse into a group tool.

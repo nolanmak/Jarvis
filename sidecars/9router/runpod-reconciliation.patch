@@ -1,0 +1,231 @@
+diff --git a/open-sse/executors/default.js b/open-sse/executors/default.js
+index 00f3e3d..4515a59 100644
+--- a/open-sse/executors/default.js
++++ b/open-sse/executors/default.js
+@@ -149,6 +149,14 @@ export class DefaultExecutor extends BaseExecutor {
+   buildHeaders(credentials, stream = true, url, model) {
+     const rt = credentials?.runtimeTransport;
+     const headers = { "Content-Type": "application/json", ...(rt ? rt.headers : this.config.headers) };
++    // Preserve the caller's logical-turn key for compatible gateways. A retry
++    // without this key can submit the same paid Runpod job a second time.
++    if (this.provider?.startsWith?.("openai-compatible-")) {
++      const key = credentials?.rawHeaders?.["idempotency-key"];
++      if (typeof key === "string" && key.length > 0 && key.length <= 128) {
++        headers["Idempotency-Key"] = key;
++      }
++    }
+     const desc = rt?.auth || AUTH_DESCRIPTORS[this.provider] || this.resolveAuthDescriptor();
+     // Hooks run BEFORE auth so dynamic overlays can't clobber the token.
+     for (const hook of desc.hooks || []) HEADER_HOOKS[hook]?.(headers, credentials);
+diff --git a/open-sse/services/combo.js b/open-sse/services/combo.js
+index e3b9a8e..11ed4ea 100644
+--- a/open-sse/services/combo.js
++++ b/open-sse/services/combo.js
+@@ -102,7 +102,7 @@ function trailingUserItems(arr) {
+ // Detect which capabilities a request needs. Modalities (vision/pdf) are scanned
+ // only on the current user turn; "search" is request-wide (lives in tools).
+ // Returns a Set of: "vision" | "pdf" | "search".
+-export function detectRequiredCapabilities(body) {
++export function detectRequiredCapabilities(body, { includeHistory = false } = {}) {
+   const required = new Set();
+   if (!body || typeof body !== "object") return required;
+ 
+@@ -172,11 +172,13 @@ export function detectRequiredCapabilities(body) {
+     }
+   };
+ 
+-  // Modalities: current user turn only (trailing user run across each known shape).
+-  for (const m of trailingUserItems(body.messages)) scanMessage(m);              // openai / claude / hermes / ollama
+-  for (const it of trailingUserItems(body.input)) scanContent(it.content);       // responses
++  // Capacity-adapter ordering uses the current turn by default. An explicitly
++  // pinned compatible node can request all turns to prevent history media loss.
++  const selected = (items) => includeHistory ? (Array.isArray(items) ? items : []) : trailingUserItems(items);
++  for (const m of selected(body.messages)) scanMessage(m);              // openai / claude / hermes / ollama
++  for (const it of selected(body.input)) scanContent(it.content);       // responses
+   const contents = body.contents || body.request?.contents;                      // gemini / antigravity
+-  for (const c of trailingUserItems(contents)) scanContent(c.parts);
++  for (const c of selected(contents)) scanContent(c.parts);
+ 
+   // search: temporarily disabled in auto-switch (feature not wired yet).
+ 
+diff --git a/open-sse/translator/concerns/namespacedTools.js b/open-sse/translator/concerns/namespacedTools.js
+new file mode 100644
+index 0000000..6d8dfbe
+--- /dev/null
++++ b/open-sse/translator/concerns/namespacedTools.js
+@@ -0,0 +1,101 @@
++import { createHash } from "node:crypto";
++
++// Chat Completions has no namespace container. Give each leaf a stable,
++// collision-checked alias and restore its Responses identity at the boundary.
++export function flattenNamespaces(body) {
++  const identities = new Map();
++  const used = new Set((body.tools || []).filter(t => t.type !== "namespace")
++    .map(t => t.name || t.function?.name).filter(Boolean));
++  const aliasFor = (namespace, name) => {
++    if (typeof namespace !== "string" || !namespace || typeof name !== "string" || !name)
++      throw new Error("Invalid namespace tool");
++    const digest = createHash("sha256").update(JSON.stringify([namespace, name])).digest("hex").slice(0, 24);
++    const alias = `ns_${digest}_${name.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 30)}`;
++    if (used.has(alias)) throw new Error("Namespace tool name collision");
++    identities.set(alias, { namespace, name });
++    return alias;
++  };
++  const flatten = tools => tools.flatMap(tool => {
++    if (tool.type !== "namespace") return [tool];
++    if (!Array.isArray(tool.tools)) throw new Error("Invalid namespace tools");
++    return tool.tools.map(leaf => {
++      if (!["function", "custom"].includes(leaf.type)) throw new Error("Unsupported namespace tool");
++      const name = aliasFor(tool.name, leaf.name);
++      const result = { ...leaf, name, description: [tool.description, leaf.description].filter(Boolean).join("\n") };
++      delete result.defer_loading;
++      return result;
++    });
++  });
++  const tools = flatten(body.tools || []);
++  const input = Array.isArray(body.input) ? body.input.map(item => {
++    if (["function_call", "custom_tool_call"].includes(item.type) && item.namespace) {
++      const result = { ...item, name: aliasFor(item.namespace, item.name) };
++      delete result.namespace;
++      return result;
++    }
++    return item;
++  }) : body.input;
++  let choice = body.tool_choice;
++  if (choice && typeof choice === "object" && choice.namespace) {
++    choice = { ...choice, name: aliasFor(choice.namespace, choice.name) };
++    delete choice.namespace;
++  }
++  return { body: { ...body, tools, input, ...(choice ? { tool_choice: choice } : {}) }, identities };
++}
++
++export function restoreNamespaces(value, identities) {
++  if (Array.isArray(value)) return value.map(v => restoreNamespaces(v, identities));
++  if (!value || typeof value !== "object") return value;
++  const result = Object.fromEntries(Object.entries(value).map(([k, v]) => [k, restoreNamespaces(v, identities)]));
++  if (["function_call", "custom_tool_call"].includes(result.type) && identities.has(result.name))
++    Object.assign(result, identities.get(result.name));
++  return result;
++}
++
++function restoreSSE(identities) {
++  const decoder = new TextDecoder();
++  const encoder = new TextEncoder();
++  let pending = "";
++  const event = block => {
++    const lines = block.split(/\r?\n/);
++    const data = lines.filter(l => l.startsWith("data:")).map(l => l.slice(5).trimStart()).join("\n");
++    if (!data || data === "[DONE]") return block + "\n\n";
++    const value = restoreNamespaces(JSON.parse(data), identities);
++    return lines.filter(l => !l.startsWith("data:")).concat("data: " + JSON.stringify(value)).join("\n") + "\n\n";
++  };
++  const emit = controller => {
++    let match;
++    while ((match = /\r?\n\r?\n/.exec(pending))) {
++      controller.enqueue(encoder.encode(event(pending.slice(0, match.index))));
++      pending = pending.slice(match.index + match[0].length);
++    }
++  };
++  return new TransformStream({
++    transform(chunk, controller) { pending += decoder.decode(chunk, { stream: true }); emit(controller); },
++    flush(controller) {
++      pending += decoder.decode(); emit(controller);
++      if (pending.trim()) controller.enqueue(encoder.encode(event(pending)));
++    },
++  });
++}
++
++export async function handleNamespacedResponses(request, handler) {
++  let original;
++  try { original = await request.clone().json(); }
++  catch { return handler(request); }
++  if (!original.tools?.some(tool => tool.type === "namespace")) return handler(request);
++  let normalized;
++  try { normalized = flattenNamespaces(original); }
++  catch { return Response.json({ error: { message: "Invalid namespace tools" } }, { status: 400 }); }
++  const headers = new Headers(request.headers);
++  headers.delete("content-length");
++  const forwarded = new Request(request, { headers, body: JSON.stringify(normalized.body) });
++  const response = await handler(forwarded);
++  if (!response.ok || !response.body) return response;
++  const outgoing = new Headers(response.headers);
++  outgoing.delete("content-length");
++  const streaming = (outgoing.get("content-type") || "").includes("text/event-stream");
++  const body = streaming ? response.body.pipeThrough(restoreSSE(normalized.identities))
++    : JSON.stringify(restoreNamespaces(await response.json(), normalized.identities));
++  return new Response(body, { status: response.status, headers: outgoing });
++}
+diff --git a/src/app/api/v1/responses/route.js b/src/app/api/v1/responses/route.js
+index dbc38b5..2f9f4a3 100644
+--- a/src/app/api/v1/responses/route.js
++++ b/src/app/api/v1/responses/route.js
+@@ -1,3 +1,4 @@
++import { handleNamespacedResponses } from "open-sse/translator/concerns/namespacedTools.js";
+ import { handleChat } from "@/sse/handlers/chat.js";
+ import { initTranslators } from "open-sse/translator/index.js";
+ 
+@@ -26,5 +27,5 @@ export async function OPTIONS() {
+  */
+ export async function POST(request) {
+   await ensureInitialized();
+-  return await handleChat(request);
++  return await handleNamespacedResponses(request, handleChat);
+ }
+diff --git a/src/sse/handlers/chat.js b/src/sse/handlers/chat.js
+index 7aa530d..5b70156 100644
+--- a/src/sse/handlers/chat.js
++++ b/src/sse/handlers/chat.js
+@@ -19,6 +19,7 @@ import { handleComboChat, handleFusionChat, detectRequiredCapabilities } from "o
+ import { augmentModelsWithCapacityAdapter, withCapacityAdapterStripping, getActiveAdapterStrategy } from "open-sse/services/capacityAdapter.js";
+ import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
+ import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
++import { getCapabilitiesForModel } from "open-sse/providers/capabilities.js";
+ import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
+ import * as log from "../utils/logger.js";
+ import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
+@@ -138,6 +139,13 @@ export async function handleChat(request, clientRawRequest = null) {
+     });
+   }
+ 
++  // An explicit compatible node is a pinned backend. A capacity adapter must
++  // not silently send its prompt or attachment to a different provider.
++  const explicitModel = await getModelInfo(modelStr);
++  if (explicitModel.provider?.startsWith("openai-compatible-")) {
++    return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey);
++  }
++
+   // Single model request — may still switch to a capacity-adapter model if the
+   // target lacks a capability the request needs (e.g. no vision, request has an image).
+   const soloAugmented = augmentModelsWithCapacityAdapter([modelStr], requiredCapabilities, settings);
+@@ -220,6 +228,18 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+ 
+   const { provider, model } = modelInfo;
+ 
++  // An explicit compatible-model selection must never answer after silently
++  // dropping a current-turn attachment it cannot read.
++  if (provider.startsWith("openai-compatible-")) {
++    const required = detectRequiredCapabilities(body, { includeHistory: true });
++    const capabilities = getCapabilitiesForModel(provider, model);
++    const unsupported = ["vision", "pdf", "audioInput", "videoInput"]
++      .filter((capability) => required.has(capability) && capabilities[capability] !== true);
++    if (unsupported.length) {
++      return errorResponse(422, `Model cannot read requested input: ${unsupported.join(", ")}`);
++    }
++  }
++
+   // Routing shown in the unified "▶" line (client model → provider/model)
+ 
+   // Extract userAgent from request
+@@ -309,6 +329,12 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+ 
+     if (result.success) return result.response;
+ 
++    // A compatible gateway's 409 requires caller reconciliation. Account
++    // failover would hide it as 503 and could submit the same work elsewhere.
++    if (provider.startsWith("openai-compatible-") && result.status === 409) {
++      return result.response;
++    }
++
+     // Antigravity 409/429: refresh live quota to get exact resetAt before locking
+     let quotaResetMs = null;
+     let resetsAtMs = result.resetsAtMs;

@@ -1643,6 +1643,10 @@ struct OpenedPr {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct RecordedVerdict {
     provider: String,
+    #[serde(default)]
+    backend: String,
+    #[serde(default)]
+    model: String,
     diff_ok: bool,
     system_ok: bool,
 }
@@ -1665,7 +1669,7 @@ struct Approval {
 /// carries model output that can say anything.
 fn approval_of(verdict: Option<&RecordedVerdict>) -> Approval {
     match verdict {
-        Some(v) if v.diff_ok && v.system_ok => Approval {
+        Some(v) if v.diff_ok && v.system_ok && v.backend == "native" && !v.model.is_empty() => Approval {
             reviewed: true,
             codex: v.provider == augmentagent_channel_core::ProviderKind::Codex.name(),
         },
@@ -2794,6 +2798,8 @@ fn resumable_from(
 /// Outcome of the independent stage (#828).
 struct IndependentReview {
     provider: Option<augmentagent_channel_core::ProviderKind>,
+    /// The model requested on the pinned native reviewer transport.
+    model: Option<String>,
     /// False when the reviewer could not be reached — NOT the same as a
     /// rejection, and must never be treated as an approval.
     available: bool,
@@ -2894,6 +2900,7 @@ impl IndependentReview {
     fn unavailable(why: ReviewUnavailable) -> Self {
         Self {
             provider: None,
+            model: None,
             available: false,
             diff_ok: false,
             system_ok: false,
@@ -2912,6 +2919,8 @@ impl IndependentReview {
         }
         Some(RecordedVerdict {
             provider: self.provider?.name().to_string(),
+            backend: "native".into(),
+            model: self.model.clone()?,
             diff_ok: self.diff_ok,
             system_ok: self.system_ok,
         })
@@ -3017,7 +3026,13 @@ impl ReviewUnavailable {
 /// it: the same eligibility check `build_pinned` makes, then the cooldown
 /// latch the fallback chain writes.
 fn reviewer_status(kind: augmentagent_channel_core::ProviderKind) -> ReviewerStatus {
-    if let Some(why) = augmentagent_channel_core::ineligible_reason(kind) {
+    if augmentagent_channel_core::model_router::load().is_err() {
+        return ReviewerStatus::NotConfigured("invalid model router configuration".into());
+    }
+    // 9Router's account label cannot attest to its underlying model. An
+    // author model could appear again as `cx/...` or `cc/...` and falsely
+    // approve its own work. Automated review uses native identities only.
+    if let Some(why) = augmentagent_channel_core::fallback::native_ineligible_reason(kind) {
         return ReviewerStatus::NotConfigured(why);
     }
     match augmentagent_channel_core::CooldownLatch::system().latched_until(kind.name()) {
@@ -3139,6 +3154,7 @@ async fn independent_review(
 
     let mut out = IndependentReview {
         provider: Some(provider),
+        model: None,
         available: true,
         diff_ok: false,
         system_ok: false,
@@ -3163,7 +3179,22 @@ async fn independent_review(
         if provider == augmentagent_channel_core::ProviderKind::Claude {
             opts.model = Some(build_model());
         }
-        match reasoner.call(&opts, prompt).await {
+        let requested_model = if provider == augmentagent_channel_core::ProviderKind::Codex {
+            augmentagent_channel_core::providers::model_for(
+                provider, augmentagent_channel_core::providers::tier_of(&opts))
+        } else {
+            opts.model.clone().unwrap_or_default()
+        };
+        if requested_model.is_empty() || out.model.as_ref().is_some_and(|prior| prior != &requested_model) {
+            return IndependentReview::unavailable(ReviewUnavailable::NoCapacity {
+                reviewers: vec![provider],
+                detail: "independent reviewer model identity changed between passes".into(),
+            });
+        }
+        out.model = Some(requested_model);
+        let review = augmentagent_channel_core::model_router::native_reviewer_scope(
+            provider, reasoner.call(&opts, prompt)).await;
+        match review {
             Ok(raw) => {
                 let (ok, notes) = parse_codex_review(&raw);
                 info!(issue = issue.number, provider = provider.name(), pass = label, approved = ok, "independent review");
@@ -9710,6 +9741,43 @@ for tool, arguments in [
         assert!(independent_reviewer_candidates(None).is_empty());
     }
 
+    #[test]
+    fn gateway_only_codex_alias_cannot_be_an_independent_reviewer() {
+        const NAME: &str = "self_improve::tests::gateway_only_codex_alias_cannot_be_an_independent_reviewer";
+        if std::env::var_os("JARVIS_REVIEW_ALIAS_CHILD").is_some() {
+            use augmentagent_channel_core::ProviderKind::Codex;
+            assert!(!augmentagent_channel_core::codex::codex_auth_available());
+            assert!(matches!(reviewer_status(Codex), ReviewerStatus::NotConfigured(_)),
+                "a gateway account can alias the author model; review needs a native Codex login");
+            let home = augmentagent_channel_core::codex::codex_home();
+            std::fs::write(home.join("auth.json"), b"{}").unwrap();
+            assert_eq!(reviewer_status(Codex), ReviewerStatus::Ready,
+                "a native Codex login should remain eligible even with 9Router configured");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("router.json");
+        std::fs::write(&config, serde_json::json!({
+            "version": 1, "mode": "auto", "base_url": "http://127.0.0.1:20128/v1",
+            "api_key": "synthetic-router-key",
+            "models": {
+                "claude": {"quality":"cc/claude-opus-4-6","fast":"cc/claude-haiku-4-5"},
+                "codex": {"quality":"cx/gpt-5.4","fast":"cx/gpt-5.4-mini"}
+            }
+        }).to_string()).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env("JARVIS_REVIEW_ALIAS_CHILD", "1")
+            .env("AUGMENTAGENT_MODEL_ROUTER_CONFIG", &config)
+            .env("AUGMENTAGENT_CODEX_HOME", dir.path())
+            .env("CODEX_CLI", "/usr/bin/true")
+            .env("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={}/no-dbus", dir.path().display()))
+            .env_remove("CODEX_API_KEY")
+            .output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr));
+    }
+
     #[tokio::test]
     async fn independent_review_without_provenance_blocks_before_provider_or_repository_access() {
         let dir = tempfile::tempdir().unwrap();
@@ -10526,6 +10594,7 @@ CODEX-REVIEW: lgtm").0);
     fn independent_approval_requires_availability_and_both_passes() {
         let mk = |available, diff_ok, system_ok| IndependentReview {
             provider: Some(augmentagent_channel_core::ProviderKind::Codex),
+            model: Some("synthetic-native-model".into()),
             available,
             diff_ok,
             system_ok,
@@ -10536,6 +10605,7 @@ CODEX-REVIEW: lgtm").0);
         assert!(mk(true, true, true).codex_approved());
         let mut other = mk(true, true, true);
         other.provider = Some(augmentagent_channel_core::ProviderKind::Claude);
+        other.model = Some("synthetic-claude-model".into());
         assert!(other.approved());
         assert!(!other.codex_approved(), "Claude cannot inherit Codex-specific merge overrides");
         assert!(!mk(true, true, false).approved(), "system pass must count");
@@ -12257,10 +12327,40 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     }
 
     fn verdict(provider: &str, ok: bool) -> RecordedVerdict {
-        RecordedVerdict { provider: provider.into(), diff_ok: ok, system_ok: ok }
+        RecordedVerdict {
+            provider: provider.into(), backend: "native".into(),
+            model: "synthetic-native-model".into(), diff_ok: ok, system_ok: ok,
+        }
     }
 
     const REVIEWED_HEAD: &str = "aaaa1111";
+
+    #[test]
+    fn independent_verdict_records_native_backend_and_requested_model() {
+        use augmentagent_channel_core::providers::{ModelTier, ProviderKind};
+        let review = IndependentReview {
+            provider: Some(ProviderKind::Codex),
+            model: Some(augmentagent_channel_core::providers::model_for(ProviderKind::Codex, ModelTier::Quality)),
+            available: true,
+            diff_ok: true,
+            system_ok: true,
+            notes: String::new(),
+            why_unavailable: None,
+        };
+        let persisted = serde_json::to_value(review.recorded_verdict().unwrap()).unwrap();
+        assert_eq!(persisted["backend"], "native");
+        assert_eq!(persisted["model"], serde_json::Value::String(
+            augmentagent_channel_core::providers::model_for(ProviderKind::Codex, ModelTier::Quality)
+        ));
+    }
+
+    #[test]
+    fn legacy_verdict_without_backend_identity_cannot_release_merge() {
+        let legacy: RecordedVerdict = serde_json::from_value(serde_json::json!({
+            "provider": "codex", "diff_ok": true, "system_ok": true
+        })).unwrap();
+        assert_eq!(approval_of(Some(&legacy)), Approval::default());
+    }
 
     /// A draft the sweep can vouch for in every other respect, touching a
     /// receipt-gated path with the owner's Codex-only override switched on —
@@ -12308,6 +12408,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // The fresh lane holds the same facts and reaches the same answer.
         let claude = IndependentReview {
             provider: Some(Claude),
+            model: Some("synthetic-native-model".into()),
             available: true,
             diff_ok: true,
             system_ok: true,
@@ -12341,7 +12442,8 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // A rejection, a half approval, or any other provider never unlocks.
         for v in [
             verdict("codex", false),
-            RecordedVerdict { provider: "codex".into(), diff_ok: true, system_ok: false },
+            RecordedVerdict { provider: "codex".into(), backend: "native".into(),
+                model: "synthetic-native-model".into(), diff_ok: true, system_ok: false },
         ] {
             assert_eq!(approval_of(Some(&v)), Approval::default(), "{v:?}");
         }
@@ -12373,6 +12475,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
 
         let codex = IndependentReview {
             provider: Some(Codex),
+            model: Some("synthetic-native-model".into()),
             available: true,
             diff_ok: true,
             system_ok: true,

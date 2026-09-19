@@ -55,6 +55,34 @@ test("routing cannot send credentials remotely or disguise a different provider"
   assert.throws(() => validateConfig(value));
   assert.throws(() => validateConfig({ ...fixture(), api_key: "" }));
 });
+test("Runpod modes require HTTPS and an exact remote host", () => {
+  const previous = process.env.AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS;
+  process.env.AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS =
+    "router.fixture.ts.net:20128";
+  try {
+    const remote = "https://router.fixture.ts.net:20128/v1";
+    for (const mode of ["qwen", "glm"]) {
+      assert.equal(validateConfig({ ...fixture(), mode, base_url: remote }).mode, mode);
+    }
+    for (const base_url of [
+      "http://router.fixture.ts.net:20128/v1",
+      "https://other.fixture.ts.net:20128/v1",
+      "https://router.fixture.ts.net:20129/v1",
+      "https://user:pass@router.fixture.ts.net:20128/v1", // pii-ok: synthetic credentials in a rejection fixture
+      "https://router.fixture.ts.net:20128/v1?token=secret",
+    ]) {
+      assert.throws(() => validateConfig({ ...fixture(), mode: "qwen", base_url }));
+    }
+    process.env.AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS = "router.fixture.ts.net:443";
+    assert.equal(validateConfig({ ...fixture(), mode: "qwen",
+      base_url: "https://router.fixture.ts.net/v1" }).mode, "qwen");
+    assert.throws(() => validateConfig({ ...fixture(), mode: "qwen",
+      base_url: "http://router.fixture.ts.net:443/v1" }));
+  } finally {
+    if (previous === undefined) delete process.env.AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS;
+    else process.env.AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS = previous;
+  }
+});
 const { RouterClient, AccountAuth } = require("../dist/modelRouter");
 test("account list strips secrets and supports multiple same-provider accounts", async () => {
   const calls = [];

@@ -4,6 +4,8 @@
 mod provider_migration_tests;
 #[cfg(test)]
 mod provider_channel_tests;
+#[cfg(test)]
+mod model_switch_sequence_tests;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -601,6 +603,13 @@ enum Cmd {
         /// Prompt to send (default asks for a one-word reply).
         #[arg(long, default_value = "Reply with exactly one word: PONG")]
         prompt: String,
+        /// Pin one Discord model profile for this probe, without persisting a selection.
+        #[arg(long, value_parser = ["claude", "qwen", "glm", "codex"])]
+        profile: Option<String>,
+        /// Ask the selected model to read a synthetic file through the Jarvis
+        /// bridge and require a matching tool audit receipt. Performs inference.
+        #[arg(long, requires = "profile", conflicts_with = "prompt")]
+        tool_probe: bool,
     },
     /// Issue #12 — read/write the sqlite `config` table so the `/setup`
     /// skill never has to parse or rewrite `.env`. Reads merge config over
@@ -2279,8 +2288,12 @@ enum WikiOp {
     ///
     /// Some of these act outside the wiki: sending email, filing or commenting on GitHub issues, and changing or stopping loops. Calendar events and social DMs and comments are raised as Discord approval cards and happen only when approved.
     Ask {
-        /// The question. Wrap in quotes if multi-word.
-        question: String,
+        /// The question. Wrap in quotes if multi-word; use --stdin for private prompts.
+        #[arg(required_unless_present = "stdin")]
+        question: Option<String>,
+        /// Read the question from stdin instead of exposing it in process arguments.
+        #[arg(long, conflicts_with = "question")]
+        stdin: bool,
         /// Also post the answer to the Discord approval channel via a
         /// one-shot HTTP client, honoring `ATTACH:` file markers (#440).
         /// Needs DISCORD_BOT_TOKEN + DISCORD_CHANNEL_ID in the env.
@@ -3355,7 +3368,11 @@ async fn main() -> Result<()> {
         },
         Cmd::Wiki { ref op } => match op {
             WikiOp::Lint { out } => run_wiki_lint(&cli, Arc::clone(&store), out.clone()).await,
-            WikiOp::Ask { question, post } => run_wiki_ask(&cli, question.clone(), *post).await,
+            WikiOp::Ask { question, stdin, post } => {
+                let question = if *stdin { read_wiki_question(std::io::stdin().lock())? }
+                    else { question.clone().context("question or --stdin is required")? };
+                run_wiki_ask(&cli, question, *post).await
+            },
             WikiOp::Migrate {
                 to,
                 dry_run,
@@ -4312,7 +4329,8 @@ async fn main() -> Result<()> {
             std::process::exit(code);
         }
         Cmd::Env { ref op, json } => env_cfg::run_env(op, json),
-        Cmd::ReasonerSelftest { ref prompt } => run_reasoner_selftest(prompt).await,
+        Cmd::ReasonerSelftest { ref prompt, ref profile, tool_probe } =>
+            run_reasoner_selftest(prompt, profile.as_deref(), tool_probe).await,
         Cmd::Install { component } => installers::run_install(component).await,
         Cmd::Logs {
             unit,
@@ -7451,6 +7469,36 @@ mod now_awareness_tests {
     }
 }
 
+fn read_wiki_question(mut reader: impl std::io::Read) -> Result<String> {
+    use std::io::Read;
+    const MAX_QUESTION_BYTES: u64 = 256 * 1024;
+    let mut question = String::new();
+    reader.by_ref().take(MAX_QUESTION_BYTES + 1).read_to_string(&mut question)?;
+    anyhow::ensure!(question.len() as u64 <= MAX_QUESTION_BYTES, "wiki question exceeds size limit");
+    anyhow::ensure!(!question.trim().is_empty(), "wiki question is required");
+    Ok(question)
+}
+
+#[cfg(test)]
+mod wiki_question_stdin_tests {
+    use super::*;
+
+    #[test]
+    fn stdin_question_is_bounded_and_required() {
+        assert_eq!(read_wiki_question("private prompt".as_bytes()).unwrap(), "private prompt");
+        assert!(read_wiki_question("  \n".as_bytes()).is_err());
+        assert!(read_wiki_question(vec![b'x'; 256 * 1024 + 1].as_slice()).is_err());
+    }
+
+    #[test]
+    fn wiki_ask_accepts_exactly_one_question_source() {
+        let cli = Cli::try_parse_from(["augmentagent", "wiki", "ask", "--stdin"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Wiki { op: WikiOp::Ask { question: None, stdin: true, .. } }));
+        assert!(Cli::try_parse_from(["augmentagent", "wiki", "ask"]).is_err());
+        assert!(Cli::try_parse_from(["augmentagent", "wiki", "ask", "private", "--stdin"]).is_err());
+    }
+}
+
 async fn run_wiki_ask(cli: &Cli, question: String, post: bool) -> Result<()> {
     let wiki_root = cli
         .wiki_dir
@@ -8694,15 +8742,45 @@ async fn run_wiki_sync(cli: &Cli, dry_run: bool, no_pull: bool) -> Result<()> {
 }
 
 /// Adapter: bridges the Discord broker's `QueryHandler` trait to our
-/// #655/#667 — `reasoner-selftest`: one live text-only round-trip through
+/// #655/#667 — `reasoner-selftest`: one live round-trip through
 /// the production provider chain. Prints the chain, any active cooldown
 /// latches, and the answer. Exit non-zero when the whole chain fails, so a
 /// timer/doctor wrapper can alert on it.
-async fn run_reasoner_selftest(prompt: &str) -> Result<()> {
+fn tool_probe_answer_matches(text: &str, nonce: &str) -> bool {
+    // Models may wrap a read result in Markdown. The independently checked
+    // Read audit receipt is the proof of tool execution; preserve nonce bytes.
+    text.lines().any(|line| line.trim() == nonce)
+}
+
+#[test]
+fn tool_probe_accepts_formatting_but_rejects_incorrect_file_contents() {
+    let nonce = "TOOL_PROBE_SYNTHETIC";
+    assert!(tool_probe_answer_matches(nonce, nonce));
+    assert!(tool_probe_answer_matches("File contents:\n```\nTOOL_PROBE_SYNTHETIC\n```", nonce));
+    assert!(!tool_probe_answer_matches("TOOL_PROBE_OTHER", nonce));
+    assert!(!tool_probe_answer_matches("TOOL_PROBE_SYNTHETIC_modified", nonce));
+}
+
+async fn run_reasoner_selftest(prompt: &str, profile: Option<&str>, tool_probe: bool) -> Result<()> {
     use augmentagent_channel_core::{CooldownLatch, ReasonerOpts};
+    use augmentagent_channel_core::providers::ProviderKind;
+
+    struct ToolProbe {
+        directory: tempfile::TempDir,
+        file: PathBuf,
+        nonce: String,
+        audit_path: PathBuf,
+        session_id: String,
+    }
+
+    let selected = profile.map(|name| ProviderKind::parse(name)
+        .ok_or_else(|| anyhow::anyhow!("unsupported model profile"))).transpose()?;
 
     let reasoner = build_reasoner();
     println!("chain: {}", reasoner.provider_names().join(" → "));
+    if let Some(kind) = selected {
+        println!("selected profile: {} (one call, no selection persisted)", kind.name());
+    }
     let print_cooldowns = |label: &str| {
         let latches = CooldownLatch::system().active();
         if latches.is_empty() {
@@ -8719,7 +8797,7 @@ async fn run_reasoner_selftest(prompt: &str) -> Result<()> {
     // this is the widest possible probe of the chain. Quality tier keeps the
     // probe on the same models the important presets use: it resolves through
     // the same knob as `draft_opts` (#1046).
-    let opts = ReasonerOpts {
+    let mut opts = ReasonerOpts {
         system_prompt: "You are a diagnostic probe. Follow the user's instruction exactly, \
                         with no preamble."
             .into(),
@@ -8739,13 +8817,96 @@ async fn run_reasoner_selftest(prompt: &str) -> Result<()> {
         session_id: None,
         handoff_path: None,
     };
-    let result = reasoner.call(&opts, prompt).await;
+    let probe = if tool_probe {
+        let kind = selected.ok_or_else(|| anyhow::anyhow!("--tool-probe requires --profile"))?;
+        anyhow::ensure!(
+            matches!(kind, ProviderKind::Claude | ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Codex),
+            "--tool-probe requires claude, codex, qwen, or glm"
+        );
+        let directory = tempfile::tempdir()?;
+        let nonce = format!("TOOL_PROBE_{}", uuid::Uuid::new_v4());
+        let file = directory.path().join("read-only-fixture.txt");
+        std::fs::write(&file, format!("{nonce}\n"))?;
+        let session_id = format!("reasoner-selftest:{}", uuid::Uuid::new_v4());
+        let audit_path = augmentagent_channel_core::tool_audit::default_audit_log_path();
+        opts.allowed_tools = vec!["Read".into()];
+        opts.cwd = Some(directory.path().to_path_buf());
+        opts.restrict_env = true;
+        opts.session_id = Some(session_id.clone());
+        opts.audit_logger = Some(Arc::new(
+            augmentagent_channel_core::tool_audit::AuditLogger::new(audit_path.clone()),
+        ));
+        opts.system_prompt = "You are a diagnostic probe. Call the Read tool on the file the user names. Return only the exact file contents. Do not guess."
+            .into();
+        Some(ToolProbe {
+            directory,
+            file,
+            nonce,
+            audit_path,
+            session_id,
+        })
+    } else {
+        None
+    };
+    let probe_prompt = probe.as_ref().map(|probe| {
+        format!(
+            "Read this exact file with the Read tool and return its contents verbatim.\nTOOL_PROBE_FILE: {}",
+            probe.file.display(),
+        )
+    });
+    let call_prompt = probe_prompt.as_deref().unwrap_or(prompt);
+    let result = match selected {
+        Some(kind) => augmentagent_channel_core::model_selection::SELECTED_PROFILE
+            .scope(Some(kind), reasoner.call(&opts, call_prompt)).await,
+        None => reasoner.call(&opts, call_prompt).await,
+    };
     // The latches the call itself took are the observable half of a failover
     // — without this line a fault-injection run (#666) can see WHICH
     // provider answered but not that the failed one was actually latched.
     print_cooldowns("cooldowns (after call)");
     match result {
         Ok(text) => {
+            if let (Some(probe), Some(kind)) = (&probe, selected) {
+                anyhow::ensure!(
+                    tool_probe_answer_matches(&text, &probe.nonce),
+                    "tool probe answer did not match the synthetic file"
+                );
+                let expected_path = probe.file.canonicalize()?;
+                let audited = std::fs::File::open(&probe.audit_path).ok().is_some_and(|file| {
+                    use std::io::BufRead;
+                    std::io::BufReader::new(file)
+                        .lines()
+                        .map_while(std::result::Result::ok)
+                        .filter_map(|line| {
+                            serde_json::from_str::<augmentagent_channel_core::tool_audit::AuditRecord>(&line).ok()
+                        })
+                        .any(|record| {
+                            let path = record.args.get("file_path")
+                                .and_then(|value| value.as_str())
+                                .map(Path::new)
+                                .map(|path| {
+                                    if path.is_absolute() {
+                                        path.to_path_buf()
+                                    } else {
+                                        probe.directory.path().join(path)
+                                    }
+                                });
+                            record.session_id == probe.session_id
+                                && record.provider() == Some(kind.name())
+                                && record.tool == "Read"
+                                && path.and_then(|path| path.canonicalize().ok())
+                                    == Some(expected_path.clone())
+                                && record.stdout_truncated.as_deref()
+                                    .is_some_and(|body| body.contains(&probe.nonce))
+                                && record.stderr_truncated.is_none()
+                        })
+                });
+                anyhow::ensure!(
+                    audited,
+                    "tool probe has no successful selected-profile Read audit receipt"
+                );
+                println!("tool probe passed: {} used Read through the Jarvis tool policy", kind.name());
+            }
             println!("response: {text}");
             Ok(())
         }
@@ -8902,6 +9063,20 @@ fn extract_md_section<'a>(md: &'a str, heading: &str) -> Option<&'a str> {
 
 #[async_trait]
 impl QueryHandler for WikiQuerier {
+    async fn selected_model(&self, channel_id: u64) -> Result<Option<String>, String> {
+        let store = augmentagent_channel_core::model_selection::SelectionStore::new(
+            augmentagent_channel_core::model_selection::config_path());
+        store
+            .describe(&channel_id.to_string())
+            .map(|(model, source)| {
+                if source == "conversation" {
+                    model.map(|kind| kind.name().to_string())
+                } else {
+                    None
+                }
+            })
+            .map_err(|error| error.to_string())
+    }
     async fn answer(
         &self,
         ctx: &augmentagent_approval_discord::AuditCtx,
@@ -8935,9 +9110,48 @@ impl QueryHandler for WikiQuerier {
         let prompt = format!("{}{prompt}", now_awareness_line());
         // #446 — see `wiki ask`: the Discord reply must carry every text block
         // the model emitted, not just the trailing wiki-filing receipt.
-        let answer = self.reasoner.call_transcript(&opts, &prompt).await;
+        let answer = async {
+            let store = augmentagent_channel_core::model_selection::SelectionStore::new(
+                augmentagent_channel_core::model_selection::config_path());
+            let selected = store.selected(ctx.channel_id.as_ref().map(|channel| channel.get().to_string()).as_deref())?;
+            augmentagent_channel_core::model_selection::SELECTED_PROFILE
+                .scope(selected, self.reasoner.call_transcript(&opts, &prompt)).await
+        }.await;
         sweep_imessage_attachments(&opts.env);
         answer
+    }
+
+    async fn model_command(&self, channel_id: u64, text: &str) -> Option<String> {
+        use augmentagent_channel_core::model_selection::{config_path, run_command, SelectionStore};
+        use augmentagent_channel_core::providers::ProviderKind;
+        let store = SelectionStore::new(config_path());
+        run_command(&store, &channel_id.to_string(), text, |profile| {
+            if !self.reasoner.provider_names().contains(&profile.name()) {
+                return Err(format!("{} is not available in this Jarvis process; restart after configuring it", profile.name()));
+            }
+            let router = augmentagent_channel_core::model_router::load()
+                .map_err(|_| "9Router configuration is invalid".to_string())?;
+            match profile {
+                ProviderKind::Qwen => {
+                    if !augmentagent_channel_core::model_selection::runtime_profile_enabled(profile) {
+                        Err("Qwen is paused; enable it after Runpod scale-down and live tool verification".into())
+                    } else if router.is_none() { Err("Qwen requires a configured 9Router endpoint".into()) }
+                    else { Ok(()) }
+                }
+                ProviderKind::Glm => {
+                    if !augmentagent_channel_core::model_selection::runtime_profile_enabled(profile) {
+                        Err("GLM is paused; enable it after live deployment verification".into())
+                    } else if router.is_none() { Err("GLM requires a configured 9Router endpoint".into()) }
+                    else { Ok(()) }
+                }
+                ProviderKind::Claude => Ok(()),
+                ProviderKind::Codex => {
+                    if router.is_some() || augmentagent_channel_core::codex::codex_auth_available() { Ok(()) }
+                    else { Err("Codex account is not configured".into()) }
+                }
+                _ => Err("Unsupported model profile".into()),
+            }
+        })
     }
 }
 
@@ -9176,7 +9390,7 @@ impl augmentagent_channel_core::AuditNotifier for DiscordAuditNotifier {
 }
 
 /// `/loop` runner (#104): fires a stored loop prompt through the exact same
-/// `claude` reasoner + `ask_opts` toolbelt the wiki-ask path uses, so
+/// reasoner + `ask_opts` toolbelt the wiki-ask path uses, so
 /// `/loop 1h what's new in my inbox` behaves identically to asking the bot.
 struct LoopReasonerRunner {
     reasoner: Arc<FallbackReasoner>,
@@ -9187,7 +9401,13 @@ struct LoopReasonerRunner {
 
 #[async_trait]
 impl LoopRunner for LoopReasonerRunner {
-    async fn run_prompt(&self, request_id: &str, owner: &str, prompt: &str) -> anyhow::Result<String> {
+    async fn run_prompt(
+        &self,
+        request_id: &str,
+        owner: &str,
+        prompt: &str,
+        model_profile: Option<&str>,
+    ) -> anyhow::Result<String> {
         let mut opts = ask_opts(self.wiki_root.clone(), self.repo_root.clone());
         opts.session_id = Some(request_id.to_string());
         let mut newsletter_ctx = augmentagent_approval_discord::AuditCtx::empty();
@@ -9207,7 +9427,19 @@ impl LoopRunner for LoopReasonerRunner {
         // #236 — prepend the current time so loop-driven queries know "now".
         let prompt = format!("{}{prompt}", now_awareness_line());
         // #446 — loops render their output to Discord too; same reasoning.
-        let answer = self.reasoner.call_transcript(&opts, &prompt).await;
+        let answer = if let Some(name) = model_profile {
+            use augmentagent_channel_core::providers::ProviderKind;
+            let kind = ProviderKind::parse(name)
+                .filter(|kind| {
+                    matches!(kind, ProviderKind::Claude | ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Codex)
+                })
+                .ok_or_else(|| anyhow::anyhow!("invalid stored loop model profile"))?;
+            augmentagent_channel_core::model_selection::SELECTED_PROFILE
+                .scope(Some(kind), self.reasoner.call_transcript(&opts, &prompt))
+                .await
+        } else {
+            self.reasoner.call_transcript(&opts, &prompt).await
+        };
         sweep_imessage_attachments(&opts.env);
         answer
     }
@@ -9224,14 +9456,28 @@ impl augmentagent_approval_discord::LoopCommandParser for LoopReasonerParser {
     async fn parse(
         &self,
         raw: &str,
+        model_profile: Option<&str>,
     ) -> std::result::Result<augmentagent_approval_discord::ParsedLoop, String> {
         use augmentagent_channel_core::Reasoner;
         let opts = augmentagent_channel_core::reasoner::loop_parse_opts();
-        let answer = match self.reasoner.call(&opts, raw).await {
+        let result = if let Some(name) = model_profile {
+            use augmentagent_channel_core::providers::ProviderKind;
+            let kind = ProviderKind::parse(name)
+                .filter(|kind| {
+                    matches!(kind, ProviderKind::Claude | ProviderKind::Qwen | ProviderKind::Glm | ProviderKind::Codex)
+                })
+                .ok_or_else(|| "unsupported loop model profile".to_string())?;
+            augmentagent_channel_core::model_selection::SELECTED_PROFILE
+                .scope(Some(kind), self.reasoner.call(&opts, raw))
+                .await
+        } else {
+            self.reasoner.call(&opts, raw).await
+        };
+        let answer = match result {
             Ok(a) => a,
             Err(e) => {
-                tracing::warn!("loop parser claude call failed: {e:#}");
-                return Err(format!("couldn't reach claude to parse loop: {e}"));
+                tracing::warn!("loop parser reasoner call failed: {e:#}");
+                return Err(format!("couldn't reach selected model to parse loop: {e}"));
             }
         };
         parse_loop_json(&answer)

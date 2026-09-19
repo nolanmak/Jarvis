@@ -422,31 +422,6 @@ function createAgent(model: any, instructions: string = buildInstructions()): Ag
   });
 }
 
-// Ad-hoc query mode: same tools, but the agent answers a one-off request
-// instead of running the email-triage workflow. Used by POST /api/ask.
-function buildQueryInstructions(): string {
-  return `You are AugmentAgent answering a one-off request from the operator. Use the available tools to answer, then reply with the answer only — no triage, no email processing, no unsolicited Discord approval.
-
-## Meetup events
-Use the meetup_events tool for any request about Meetup events. Group name → urlname mapping:
-- "C&C", "Code & Coffee", "Coffee & Code", "code coffee", "the meetup" → urlname "code-coffee-philly"
-If the user names another group, use their slug from meetup.com/<urlname>/.
-
-When asked for events (e.g. "C&C events on meetup", "upcoming Code & Coffee meetups"):
-1. call meetup_events({ action: "list_events", params: { urlname: "code-coffee-philly", kind: "upcoming", limit: 10 } }) — default limit 10. Use the user's number if they ask for a specific count; omit limit only if they explicitly ask for "all" events. Use kind "past" only if the user explicitly asks for past events.
-2. Format the result as a clean Markdown list, one event per item, sorted by time (earliest first):
-   - **<title>** — <day, date, start time in a human-readable form>
-   - <location: venue name + city, or "Online" if isOnline> · <url>
-3. Start with a one-line header like "Upcoming Code & Coffee events (<count> of <totalCount>):". If there are no events, say so plainly. If the tool returns an { error }, report it briefly (a stale-hash error means the Meetup API hash needs refreshing via /intercept).
-Keep it concise — title, time, location, link. No descriptions unless asked.
-
-## Web fetching
-For ANY URL the operator asks you to read, summarize, or pull data from, use the web_fetch tool — never assume a URL's contents or make raw HTTP calls. It tries plain HTTPS first (free), escalates to a headless-Chromium render for JS-rendered SPAs, then to Firecrawl / Bright Data if API keys are configured. If the first response looks like an empty SPA shell or is unexpectedly short, retry with force_render: true. The returned markdown is what you should reason over; cite final_url when surfacing links.
-
-## Intercept (optional, debugging only)
-If a fetch fails repeatedly or you need to discover an undocumented API / extract auth from a captured browser session, use the intercept tool to query the local MITM proxy (status, export with mode "api-docs" | "auth" | "summary" | "full"). Read-only inspection: you can read captures the operator has already collected but cannot start/stop the proxy or install the CA cert — if the proxy is off, ask the operator to enable it via the /intercept skill. If the proxy isn't installed the tool reports it cleanly; don't retry.`;
-}
-
 // --- Run with retry + provider fallback ---
 
 function sleep(ms: number): Promise<void> {
@@ -531,14 +506,6 @@ async function runWithProviders(
 
 export async function runAgent(dynamicContext: string): Promise<string> {
   return runWithProviders(dynamicContext, buildInstructions());
-}
-
-/**
- * Answer a one-off operator request (e.g. "C&C events on meetup") using the
- * agent's tools, bypassing the email-triage workflow. Backs POST /api/ask.
- */
-export async function runAgentQuery(question: string): Promise<string> {
-  return runWithProviders(question, buildQueryInstructions());
 }
 
 /**

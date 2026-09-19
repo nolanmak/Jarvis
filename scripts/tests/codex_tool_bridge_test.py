@@ -47,6 +47,87 @@ class ToolPolicyTests(unittest.TestCase):
         self.policy.edit('note.md', 'beta', 'gamma')
         self.assertEqual(self.policy.read('note.md'), 'alpha\ngamma\n')
 
+    def test_repeated_protocol_call_id_cannot_repeat_or_change_a_write(self):
+        server = bridge.Server(self.policy)
+        original_write = self.policy.write
+        writes = []
+
+        def counted_write(path, content):
+            writes.append((path, content))
+            return original_write(path, content)
+
+        self.policy.write = counted_write
+        request = {'jsonrpc': '2.0', 'id': 41, 'method': 'tools/call',
+                   'params': {'name': 'Write', 'arguments': {
+                       'file_path': 'note.md', 'content': 'first'}}}
+
+        def send(value):
+            return json.loads(bridge.safe_dispatch(server, json.dumps(value).encode() + b'\n'))
+
+        first = send(request)
+        replay = send(request)
+        changed = send({**request, 'params': {'name': 'Write', 'arguments': {
+            'file_path': 'note.md', 'content': 'changed'}}})
+        self.assertEqual(replay, first)
+        self.assertEqual(changed['error']['code'], -32600)
+        self.assertEqual(writes, [('note.md', 'first')])
+        self.assertEqual((self.root / 'note.md').read_text(), 'first')
+
+    def test_lost_tool_reply_requires_inspection_without_replaying_the_write(self):
+        server = bridge.Server(self.policy)
+        original_dispatch = server.dispatch
+        calls = []
+
+        def lost_reply(request):
+            calls.append(request['id'])
+            original_dispatch(request)
+            raise LookupError('synthetic reply lost after write')
+
+        server.dispatch = lost_reply
+        request = {'jsonrpc': '2.0', 'id': 42, 'method': 'tools/call',
+                   'params': {'name': 'Write', 'arguments': {
+                       'file_path': 'note.md', 'content': 'written once'}}}
+        line = json.dumps(request).encode() + b'\n'
+        first = json.loads(bridge.safe_dispatch(server, line))
+        replay = json.loads(bridge.safe_dispatch(server, line))
+        self.assertEqual(first['error']['code'], -32603)
+        self.assertTrue(replay['result']['isError'])
+        self.assertIn('uncertain', replay['result']['content'][0]['text'])
+        self.assertEqual(calls, [42])
+        self.assertEqual((self.root / 'note.md').read_text(), 'written once')
+
+    def test_receipt_limit_still_allows_fresh_reconciliation_reads(self):
+        (self.root / 'note.md').write_text('known state')
+        server = bridge.Server(self.policy)
+        server.call_receipts = {(int, index): (b'synthetic', '{}') for index in range(1024)}
+
+        def send(identifier, name, arguments):
+            request = {'jsonrpc': '2.0', 'id': identifier, 'method': 'tools/call',
+                       'params': {'name': name, 'arguments': arguments}}
+            return json.loads(bridge.safe_dispatch(server, json.dumps(request).encode() + b'\n'))
+
+        read = send(1025, 'Read', {'file_path': 'note.md'})
+        self.assertIn('known state', read['result']['content'][0]['text'])
+        self.assertEqual(send(1026, 'Write', {'file_path': 'note.md', 'content': 'changed'})['error']['code'], -32000)
+        self.assertEqual((self.root / 'note.md').read_text(), 'known state')
+        self.assertEqual(len(server.call_receipts), 1024)
+
+    def test_gmail_attachment_download_cannot_bypass_mutation_receipt_limit(self):
+        policy = bridge.Policy({'cwd': str(self.root), 'read_roots': [str(self.root)],
+            'write_roots': [str(self.root)],
+            'allowed_tools': ['Bash(augmentagent gmail get-attachment *)']})
+        server = bridge.Server(policy)
+        server.call_receipts = {(int, index): (b'synthetic', '{}') for index in range(1024)}
+        executed = []
+        server.dispatch = lambda request: executed.append(request) or {'content': []}
+        for index, suffix in enumerate(('', ' --out '+str(self.root / 'attachment.pdf'))):
+            request = {'jsonrpc': '2.0', 'id': 2000 + index, 'method': 'tools/call',
+                'params': {'name': 'Bash', 'arguments': {'command':
+                    'augmentagent gmail get-attachment --message-id synthetic'+suffix}}}
+            response = json.loads(bridge.safe_dispatch(server, json.dumps(request).encode()+b'\n'))
+            self.assertEqual(response['error']['code'], -32000)
+        self.assertEqual(executed, [])
+
     def test_scoped_image_read_returns_original_bytes_as_mcp_image(self):
         import base64
         # Synthetic eight-pixel-square PNG; no private fixture assets.
@@ -966,7 +1047,8 @@ class HandoffTests(unittest.TestCase):
                 calls.append(name)
                 return {'content':[{'type':'text','text':str(len(calls))}]}
             server.execute=read
-            for leaf in ['memory_search','memory_recent','search_conversation_history','read_conversation_thread']:
+            for leaf in ['memory_search','memory_recent','search_conversation_history',
+                         'read_conversation_thread','search_messages','conversation_stats']:
                 name='mcp__memory__'+leaf
                 self.assertNotEqual(server.call(name,{}),server.call(name,{}))
                 journal.observe_hook({'hook_event_name':'PreToolUse','tool_use_id':'read-'+leaf,
@@ -974,7 +1056,7 @@ class HandoffTests(unittest.TestCase):
             for leaf in ['memory_write','memory_delete','memory_unknown']:
                 with self.assertRaises(bridge.ReconciliationRequired):
                     server.call('mcp__memory__'+leaf,{})
-            self.assertEqual(len(calls),8)
+            self.assertEqual(len(calls),12)
             self.assertEqual(len(journal.load()['operations']),1)
 
     def test_discovery_and_memory_reads_work_through_hook_with_uncertain_write(self):
@@ -1008,6 +1090,8 @@ class HandoffTests(unittest.TestCase):
                 journal.execute('Bash',{'command':'aa-gh issue create --title Synthetic'},uncertain)
             policy=bridge.Policy({'cwd':str(workspace),'read_roots':[str(workspace)],'write_roots':[],
                 'allowed_tools':['Bash(augmentagent gmail *)','Bash(augmentagent repo-docs *)',
+                                 'Bash(augmentagent finance *)','Bash(augmentagent calendar *)',
+                                 'Bash(augmentagent meetup *)','Bash(augmentagent linkedin *)',
                                  'Bash(aa-gh issue *)','mcp__socialapi__*'],
                 'handoff_path':str(root/'handoff.json')})
             server=bridge.Server(policy)
@@ -1017,7 +1101,13 @@ class HandoffTests(unittest.TestCase):
                 return {'content':[{'type':'text','text':str(len(calls))}]}
             server.execute=read_result
             commands=['augmentagent gmail search --query Synthetic','aa-gh issue list --search Synthetic',
-                      'augmentagent repo-docs list --source synthetic']
+                      'augmentagent repo-docs list --source synthetic',
+                      'augmentagent finance status',
+                      'augmentagent finance transactions --start 2026-01-01',
+                      'augmentagent finance summary',
+                      'augmentagent calendar list-events --days 1',
+                      'augmentagent meetup events code-coffee-philly',
+                      'augmentagent linkedin recent-dms --limit 3']
             for command in commands:
                 first=server.call('Bash',{'command':command})
                 second=server.call('Bash',{'command':command})
@@ -1025,10 +1115,13 @@ class HandoffTests(unittest.TestCase):
             server.call('mcp__socialapi__get_post',{'id':'synthetic'})
             for command in ['aa-gh issue create --title Another',
                             'augmentagent gmail compose --body Synthetic',
+                            'augmentagent finance connect --alias Synthetic',
+                            'augmentagent calendar create-event --summary Synthetic',
+                            'augmentagent linkedin dm --with Synthetic',
                             'augmentagent gmail search --query Synthetic; aa-gh issue create --title Another']:
                 with self.subTest(command=command), self.assertRaises(bridge.Denied):
                     server.call('Bash',{'command':command})
-            self.assertEqual(len(calls),7)
+            self.assertEqual(len(calls),19)
             response=server.dispatch({'method':'tools/call','params':{
                 'name':'Bash','arguments':{'command':'aa-gh issue create --title PRIVATE_SYNTHETIC_TITLE'}}})
             self.assertTrue(response['isError'])
@@ -1037,13 +1130,41 @@ class HandoffTests(unittest.TestCase):
             self.assertIn('uncertain outcome',text)
             self.assertNotIn('PRIVATE_SYNTHETIC_TITLE',text)
 
+    def test_gmail_attachment_download_waits_for_uncertain_mutation_reconciliation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); workspace = root / 'workspace'; workspace.mkdir()
+            journal = bridge.HandoffJournal(root / 'handoff.json')
+            with self.assertRaises(ConnectionError):
+                journal.execute('mcp__fixture__create', {},
+                    lambda: (_ for _ in ()).throw(ConnectionError('synthetic uncertain effect')))
+            policy = bridge.Policy({'cwd': str(workspace), 'read_roots': [str(workspace)],
+                'write_roots': [str(workspace)],
+                'allowed_tools': ['Bash(augmentagent gmail get-attachment *)'],
+                'handoff_path': str(journal.path)})
+            server = bridge.Server(policy)
+            executed = []
+            server.execute = lambda name, arguments: executed.append(arguments) or {'content': []}
+            for suffix in ('', ' --out '+str(workspace / 'attachment.pdf')):
+                with self.subTest(suffix=suffix), self.assertRaises(bridge.ReconciliationRequired):
+                    server.call('Bash', {'command':
+                        'augmentagent gmail get-attachment --message-id synthetic'+suffix})
+            self.assertEqual(executed, [])
+            self.assertEqual([row['status'] for row in journal.load()['operations']], ['started'])
+
     def test_primary_read_hooks_do_not_create_uncertain_mutation_receipts(self):
         with tempfile.TemporaryDirectory() as tmp:
             path=Path(tmp)/'handoff.json'
             journal=bridge.HandoffJournal(path)
-            journal.observe_hook({'hook_event_name':'PreToolUse','tool_use_id':'synthetic-read',
-                'tool_name':'Bash','tool_input':{'command':'augmentagent repo-docs sources'}})
-            self.assertFalse(path.exists())
+            for index, command in enumerate([
+                    'augmentagent repo-docs sources', 'augmentagent finance status',
+                    'augmentagent finance transactions --start 2026-01-01',
+                    'augmentagent finance summary', 'augmentagent calendar list-events --days 1',
+                    'augmentagent meetup events code-coffee-philly',
+                    'augmentagent linkedin recent-dms --limit 3']):
+                journal.observe_hook({'hook_event_name':'PreToolUse',
+                    'tool_use_id':f'synthetic-read-{index}', 'tool_name':'Bash',
+                    'tool_input':{'command':command}})
+                self.assertFalse(path.exists(), command)
 
     def test_claude_hook_records_before_execution_and_codex_reuses_result(self):
         with tempfile.TemporaryDirectory() as tmp:

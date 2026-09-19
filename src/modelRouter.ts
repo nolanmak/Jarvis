@@ -4,9 +4,10 @@ import path from "node:path";
 import crypto from "node:crypto";
 
 export type Provider = "claude" | "codex";
+export type RouteMode = "direct" | "auto" | Provider | "qwen" | "glm";
 export interface RouterConfig {
   version: 1;
-  mode: "direct" | "auto" | Provider;
+  mode: RouteMode;
   base_url: string;
   api_key: string;
   admin_password?: string;
@@ -17,7 +18,7 @@ export function validateConfig(value: unknown): RouterConfig {
   if (
     !c ||
     c.version !== 1 ||
-    !["direct", "auto", "claude", "codex"].includes(c.mode)
+    !["direct", "auto", "claude", "codex", "qwen", "glm"].includes(c.mode)
   )
     throw new Error("Invalid model route");
   let url: URL;
@@ -26,16 +27,24 @@ export function validateConfig(value: unknown): RouterConfig {
   } catch {
     throw new Error("Invalid router endpoint");
   }
+  const local =
+    url.protocol === "http:" &&
+    ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+  const remotePort = url.port || (url.protocol === "https:" ? "443" : "");
+  const authority = `${url.hostname}:${remotePort}`;
+  const allowed = (process.env.AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS || "")
+    .split(",")
+    .some((entry) => entry.trim().toLowerCase() === authority.toLowerCase());
+  const remote = !!remotePort && allowed && url.protocol === "https:";
   if (
-    url.protocol !== "http:" ||
-    !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) ||
+    !(local || remote) ||
     url.username ||
     url.password ||
     url.search ||
     url.hash ||
     url.pathname !== "/v1"
   )
-    throw new Error("Router endpoint must be a loopback HTTP /v1 endpoint");
+    throw new Error("Router endpoint must be loopback or an explicitly allowed remote /v1 endpoint");
   if (
     typeof c.api_key !== "string" ||
     !c.api_key.trim() ||

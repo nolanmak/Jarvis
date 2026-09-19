@@ -26,6 +26,15 @@ pub struct RouterConfig {
 }
 
 tokio::task_local! { pub(crate) static SNAPSHOT: Option<RouterConfig>; }
+tokio::task_local! { static NATIVE_REVIEW: ProviderKind; }
+
+/// Pin an independent reviewer to its native CLI identity for one call.
+/// Gateway account aliases cannot establish that a reviewer differs from an
+/// author model, and an inherited Discord selection must not redirect it.
+pub async fn native_reviewer_scope<F: std::future::Future>(provider: ProviderKind, call: F) -> F::Output {
+    let selected = (provider == ProviderKind::Codex).then_some(provider);
+    NATIVE_REVIEW.scope(provider, crate::model_selection::SELECTED_PROFILE.scope(selected, call)).await
+}
 
 pub fn config_path() -> PathBuf {
     std::env::var_os("AUGMENTAGENT_MODEL_ROUTER_CONFIG")
@@ -56,6 +65,46 @@ pub fn current() -> anyhow::Result<Option<RouterConfig>> {
     }
 }
 
+/// A Discord/default profile applies only to this call's cloned router
+/// configuration. The persisted account settings and other calls are intact.
+pub fn select_profile(config: Option<RouterConfig>, selected: Option<ProviderKind>) -> anyhow::Result<Option<RouterConfig>> {
+    let native_codex_available = selected == Some(ProviderKind::Codex)
+        && crate::codex::codex_auth_available();
+    select_profile_with_auth(config, selected, native_codex_available)
+}
+
+fn select_profile_with_auth(mut config: Option<RouterConfig>, selected: Option<ProviderKind>, native_codex_available: bool) -> anyhow::Result<Option<RouterConfig>> {
+    if let Ok(reviewer) = NATIVE_REVIEW.try_with(|provider| *provider) {
+        anyhow::ensure!(matches!(reviewer, ProviderKind::Codex | ProviderKind::Claude)
+            && selected == (reviewer == ProviderKind::Codex).then_some(reviewer),
+            "independent review must stay pinned to its native provider");
+        anyhow::ensure!(reviewer != ProviderKind::Codex || native_codex_available,
+            "native Codex authentication is required for independent review");
+        if let Some(router) = config.as_mut() { router.mode = "direct".into(); }
+        return Ok(config);
+    }
+    if let Some(profile) = selected {
+        anyhow::ensure!(matches!(profile, ProviderKind::Claude | ProviderKind::Codex | ProviderKind::Qwen | ProviderKind::Glm), "unsupported model profile");
+        if let Some(router) = config.as_mut() {
+            // An enabled subscription route keeps using the connected account
+            // pool. A direct or Runpod-only configuration retains native CLI
+            // transport for subscription profiles where available.
+            let subscription_route = matches!(router.mode.as_str(), "auto" | "claude" | "codex");
+            let native = profile == ProviderKind::Claude
+                || (profile == ProviderKind::Codex && native_codex_available);
+            router.mode = if native && !subscription_route {
+                "direct".into()
+            } else {
+                profile.name().into()
+            };
+        } else {
+            anyhow::ensure!(matches!(profile, ProviderKind::Claude | ProviderKind::Codex),
+                "Selected Runpod model requires a configured 9Router endpoint");
+        }
+    }
+    Ok(config)
+}
+
 pub fn load_from(path: &Path) -> anyhow::Result<Option<RouterConfig>> {
     match std::fs::read_to_string(path) {
         Ok(raw) => parse(&raw).map(Some),
@@ -69,20 +118,27 @@ pub fn parse(raw: &str) -> anyhow::Result<RouterConfig> {
         .map_err(|_| anyhow::anyhow!("Invalid model router configuration"))?;
     anyhow::ensure!(
         config.version == 1
-            && ["direct", "auto", "claude", "codex"].contains(&config.mode.as_str()),
+            && ["direct", "auto", "claude", "codex", "qwen", "glm"].contains(&config.mode.as_str()),
         "Unsupported model router configuration"
     );
     let url = reqwest::Url::parse(&config.base_url)
         .map_err(|_| anyhow::anyhow!("Invalid router endpoint"))?;
+    let host = url.host_str().unwrap_or_default();
+    let local = url.scheme() == "http"
+        && matches!(host, "127.0.0.1" | "localhost" | "[::1]");
+    let remote = url.scheme() == "https" && url.port_or_known_default().is_some_and(|port| {
+        let authority = format!("{host}:{port}");
+        std::env::var("AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS")
+            .ok().is_some_and(|hosts| hosts.split(',').any(|entry| entry.trim().eq_ignore_ascii_case(&authority)))
+    });
     anyhow::ensure!(
-        url.scheme() == "http"
-            && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+        (local || remote)
             && url.username().is_empty()
             && url.password().is_none()
             && url.query().is_none()
             && url.fragment().is_none()
             && url.path() == "/v1",
-        "Router endpoint must be a loopback HTTP /v1 endpoint"
+        "Router endpoint must be loopback or an explicitly allowed remote /v1 endpoint"
     );
     anyhow::ensure!(
         !config.api_key.trim().is_empty() && !config.api_key.chars().any(char::is_control),
@@ -117,6 +173,8 @@ impl RouterConfig {
                 "auto" => matches!(provider, ProviderKind::Claude | ProviderKind::Codex),
                 "claude" => provider == ProviderKind::Claude,
                 "codex" => provider == ProviderKind::Codex,
+                "qwen" => provider == ProviderKind::Qwen,
+                "glm" => provider == ProviderKind::Glm,
                 _ => false,
             }
     }
@@ -170,6 +228,20 @@ pub(crate) mod tests {
           "api_key":"router-secret","models":{"claude":{"quality":"cc/claude-opus-4-6","fast":"cc/claude-haiku-4-5"},
           "codex":{"quality":"cx/gpt-5.4","fast":"cx/gpt-5.4-mini"}}})
     }
+    #[test]
+    fn account_profiles_respect_enabled_router_and_direct_mode() {
+        let original = parse(&fixture().to_string()).unwrap();
+        for kind in [ProviderKind::Claude, ProviderKind::Codex] {
+            let routed = select_profile_with_auth(Some(original.clone()), Some(kind), true).unwrap().unwrap();
+            assert_eq!(routed.mode, kind.name());
+            let mut direct = original.clone();
+            direct.mode = "direct".into();
+            assert_eq!(select_profile_with_auth(Some(direct), Some(kind), true).unwrap().unwrap().mode, "direct");
+            assert!(select_profile_with_auth(None, Some(kind), true).unwrap().is_none());
+        }
+        assert_eq!(original.mode, "auto");
+    }
+
     #[test]
     fn missing_config_preserves_direct_mode_but_invalid_config_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
@@ -256,5 +328,86 @@ pub(crate) mod tests {
         assert!(!env
             .iter()
             .any(|(k, v)| *k == "ANTHROPIC_API_KEY" && v.is_some()));
+    }
+
+    #[test]
+    fn selected_profile_is_pinned_without_changing_router_accounts() {
+        let original = parse(&fixture().to_string()).unwrap();
+        let selected = select_profile(Some(original.clone()), Some(ProviderKind::Qwen)).unwrap().unwrap();
+        assert!(selected.allows(ProviderKind::Qwen));
+        assert!(!selected.allows(ProviderKind::Codex));
+        assert!(!selected.allows(ProviderKind::Glm));
+        assert_eq!(original.mode, "auto");
+        assert_eq!(original.models.codex.quality, selected.models.codex.quality);
+    }
+
+    #[test]
+    fn explicit_codex_uses_existing_account_when_available() {
+        let mut original = parse(&fixture().to_string()).unwrap();
+        original.mode = "qwen".into();
+        let native = select_profile_with_auth(Some(original.clone()), Some(ProviderKind::Codex), true)
+            .unwrap().unwrap();
+        assert_eq!(native.mode, "direct");
+        let gateway = select_profile_with_auth(Some(original.clone()), Some(ProviderKind::Codex), false)
+            .unwrap().unwrap();
+        assert_eq!(gateway.mode, "codex");
+        assert_eq!(original.mode, "qwen");
+    }
+
+    #[tokio::test]
+    async fn independent_review_never_uses_an_opaque_gateway_alias() {
+        let config = Some(parse(&fixture().to_string()).unwrap());
+        let lost_login = native_reviewer_scope(ProviderKind::Codex, async {
+            select_profile_with_auth(config.clone(), Some(ProviderKind::Codex), false)
+        }).await;
+        assert!(lost_login.is_err(), "a lost native login must not fall through to 9Router");
+        let native_codex = native_reviewer_scope(ProviderKind::Codex, async {
+            select_profile_with_auth(config.clone(), Some(ProviderKind::Codex), true)
+        }).await.unwrap().unwrap();
+        assert_eq!(native_codex.mode, "direct");
+        let native_claude = native_reviewer_scope(ProviderKind::Claude, async {
+            select_profile_with_auth(config, None, false)
+        }).await.unwrap().unwrap();
+        assert_eq!(native_claude.mode, "direct");
+    }
+
+    #[test]
+    fn explicitly_allowed_remote_router_requires_https_and_exact_host() {
+        const NAME: &str = "model_router::tests::explicitly_allowed_remote_router_requires_https_and_exact_host";
+        if std::env::var_os("JARVIS_TAILNET_ROUTER_CHILD").is_some() {
+            let mut value = fixture();
+            value["base_url"] = "https://router.fixture.ts.net:20128/v1".into();
+            assert!(parse(&value.to_string()).is_ok(), "the exact allowed HTTPS router should parse");
+            for url in [
+                "http://router.fixture.ts.net:20128/v1",
+                "https://other.fixture.ts.net:20128/v1",
+                "https://router.fixture.ts.net:20129/v1",
+                "https://user:pass@router.fixture.ts.net:20128/v1", // pii-ok: synthetic credentials in a rejection fixture
+                "https://router.fixture.ts.net:20128/v1?key=secret",
+                "http://evil.example:20128/v1",
+            ] {
+                value["base_url"] = url.into();
+                assert!(parse(&value.to_string()).is_err(), "unauthorized router URL {url}");
+            }
+            std::env::set_var("AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS",
+                "router.fixture.ts.net:20128,evil.example:20128");
+            value["base_url"] = "http://evil.example:20128/v1".into();
+            assert!(parse(&value.to_string()).is_err(), "remote cleartext is refused even for an allowed host");
+            value["base_url"] = "https://evil.example:20128/v1".into();
+            assert!(parse(&value.to_string()).is_ok(), "an explicitly allowed HTTPS router is valid");
+            std::env::set_var("AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS", "router.fixture.ts.net:443");
+            value["base_url"] = "https://router.fixture.ts.net/v1".into();
+            assert!(parse(&value.to_string()).is_ok(), "Tailscale Serve HTTPS should use the exact default port");
+            value["base_url"] = "http://router.fixture.ts.net:443/v1".into();
+            assert!(parse(&value.to_string()).is_err(), "port 443 does not make cleartext safe");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env("JARVIS_TAILNET_ROUTER_CHILD", "1")
+            .env("AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS", "router.fixture.ts.net:20128")
+            .output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr));
     }
 }

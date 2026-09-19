@@ -1,0 +1,34 @@
+services:
+  adapter:
+    build:
+      context: .
+    image: ${RUNPOD_ADAPTER_IMAGE:-runpod-openai-adapter:local}
+    user: "${RUNPOD_ADAPTER_UID:?set RUNPOD_ADAPTER_UID to the owner of the private state directory}"
+    env_file:
+      - ${RUNPOD_ADAPTER_ENV_FILE:?set RUNPOD_ADAPTER_ENV_FILE to the owner-private credential file}
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      RUNPOD_ADAPTER_JOURNAL: /app/state/jobs.sqlite3
+    volumes:
+      - type: bind
+        source: ${RUNPOD_ADAPTER_ROUTES_FILE:?set RUNPOD_ADAPTER_ROUTES_FILE to the routes JSON}
+        target: /app/routes.json
+        read_only: true
+      - type: bind
+        source: ${RUNPOD_ADAPTER_STATE_DIR:?set RUNPOD_ADAPTER_STATE_DIR to the private journal directory}
+        target: /app/state
+    ports:
+      - "127.0.0.1:${RUNPOD_ADAPTER_PORT:-20129}:8000"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()"]
+      interval: 15s
+      timeout: 3s
+      retries: 3

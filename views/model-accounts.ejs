@@ -29,12 +29,12 @@
     <form action="/model-accounts/settings" method="post" class="space-y-4">
       <label class="block">Use
         <select name="mode" class="block mt-2 w-full bg-gray-800 rounded-md px-3 py-2">
-          <% for (const [value,label] of [['direct','Existing CLI accounts (9Router off)'],['auto','Auto — Claude, then Codex'],['claude','Claude accounts only'],['codex','Codex accounts only']]) { %>
+          <% for (const [value,label] of [['direct','Existing CLI accounts (9Router off)'],['auto','Auto — Claude, then Codex'],['claude','Claude accounts only'],['codex','Codex accounts only'],['qwen','Runpod Qwen'],['glm','Runpod GLM']]) { %>
           <option value="<%= value %>" <%= config.mode === value ? 'selected' : '' %>><%= label %></option>
           <% } %>
         </select>
       </label>
-      <p class="text-sm text-gray-400">Changes apply to the next call. Calls already running finish with their original route. To use one specific account, enable it and disable the other accounts for that provider.</p>
+      <p class="text-sm text-gray-400">Changes apply to the next call. Calls already running finish with their original route. Runpod choices are available after endpoint verification; paused routes cannot be saved. To use one specific subscription account, enable it and disable the other accounts for that provider.</p>
       <div class="grid sm:grid-cols-2 gap-4">
         <% for (const provider of ['claude','codex']) { for (const tier of ['quality','fast']) { %>
         <label class="block text-sm"><%= provider === 'claude' ? 'Claude' : 'Codex' %> — <%= tier %>

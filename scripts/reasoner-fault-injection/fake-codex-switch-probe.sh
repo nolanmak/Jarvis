@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"
+count_file="$HOME/.fake-cli/codex.count"
+prior_count=$(cat "$count_file" 2>/dev/null || printf '0')
+prompt=$(cat)
+if (( prior_count == 1 )); then
+  # Hold the GLM turn inside the real query dispatch while Discord changes
+  # the channel selection. The later tool calls must keep GLM's snapshot.
+  touch "$HOME/.fake-cli/switch-entered"
+  for _ in {1..600}; do
+    [[ -e "$HOME/.fake-cli/switch-release" ]] && break
+    sleep 0.05
+  done
+  [[ -e "$HOME/.fake-cli/switch-release" ]] || { echo 'model switch was not released' >&2; exit 1; }
+fi
+if (( prior_count > 0 )); then
+  [[ "$prompt" == *'<conversation_history>'* ]] || { echo 'missing conversation history' >&2; exit 1; }
+  [[ "$prompt" == *'assistant: TOOL_PROBE_01234567-89ab-cdef-0123-456789abcdef'* ]] || {
+    echo 'missing prior model answer' >&2; exit 1;
+  }
+fi
+if (( prior_count == 0 )); then
+  export PROBE_CREATE_CONTENT='TOOL_PROBE_01234567-89ab-cdef-0123-456789abcdef'
+fi
+export PROBE_MEMORY=1
+export PROBE_SWITCH_TURN="$prior_count"
+error_log="$HOME/.fake-cli/switch-error.log"
+mkdir -p "$(dirname "$error_log")"
+if ! printf '%s' "$prompt" | "$(dirname "${BASH_SOURCE[0]}")/fake-codex-read-probe.sh" "$@" 2>"$error_log"; then
+  cat "$error_log" >&2
+  exit 1
+fi
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1200,"cached_input_tokens":800,"cache_write_input_tokens":0,"output_tokens":40,"reasoning_output_tokens":16}}'

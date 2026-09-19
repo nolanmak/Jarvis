@@ -7,6 +7,7 @@ The execution transport is wired separately from this policy core.
 """
 import os
 import json
+import hashlib
 import math
 import subprocess
 import fnmatch
@@ -472,7 +473,8 @@ def read_only_operation(name, arguments):
     # These are explicit query contracts in augmentagent-mcp-memory, not
     # arbitrary server annotations or a prefix-based read exemption.
     if name in ('mcp__memory__memory_search', 'mcp__memory__memory_recent',
-                'mcp__memory__search_conversation_history', 'mcp__memory__read_conversation_thread'):
+                'mcp__memory__search_conversation_history', 'mcp__memory__read_conversation_thread',
+                'mcp__memory__search_messages', 'mcp__memory__conversation_stats'):
         return True
     if name.startswith('mcp__socialapi__'):
         verb = re.split(r'[_-]', name[len('mcp__socialapi__'):].lower(), maxsplit=1)[0]
@@ -492,8 +494,14 @@ def read_only_operation(name, arguments):
     if len(argv) < 3:
         return False
     if program == 'augmentagent':
-        return (argv[1] == 'gmail' and argv[2] in {'search', 'accounts', 'list-attachments', 'get-attachment'}
-            or argv[1] == 'repo-docs' and argv[2] in {'sources', 'list', 'get'})
+        return ((argv[1], argv[2]) in {
+            ('gmail', 'search'), ('gmail', 'accounts'),
+            ('gmail', 'list-attachments'),
+            ('repo-docs', 'sources'), ('repo-docs', 'list'), ('repo-docs', 'get'),
+            ('finance', 'status'), ('finance', 'transactions'), ('finance', 'summary'),
+            ('calendar', 'list-events'), ('meetup', 'events'),
+            ('linkedin', 'recent-dms'),
+        })
     return program == 'aa-gh' and argv[1] in {'issue', 'pr'} and argv[2] in {'list', 'view', 'diff', 'checks'}
 
 
@@ -2125,6 +2133,9 @@ class Server:
         self.remotes = {}
         self.remote_tools = {}
         self.discovered = False
+        # One receipt per JSON-RPC tool call in this bridge process. The
+        # caller may resend a line after losing its reply; never rerun it.
+        self.call_receipts = {}
         # A Readiness found while starting; reported on every tool method.
         self.startup_failure = startup_failure
 
@@ -2347,6 +2358,34 @@ def safe_dispatch(server, line):
         identifier = candidate
         if request.get('jsonrpc') != '2.0' or not isinstance(request.get('method'), str):
             return json.dumps(rpc_error(identifier, -32600, 'Invalid Request'))
+        receipt_key = None
+        if request['method'] == 'tools/call':
+            if identifier is None:
+                return json.dumps(rpc_error(identifier, -32600, 'Tool call requires an ID'))
+            receipt_key = (type(identifier), identifier)
+            params = json.dumps(request.get('params'), sort_keys=True,
+                                separators=(',', ':'), ensure_ascii=False)
+            digest = hashlib.sha256(params.encode()).digest()
+            prior = server.call_receipts.get(receipt_key)
+            if prior is not None:
+                if prior[0] != digest:
+                    return json.dumps(rpc_error(identifier, -32600, 'Tool call ID was reused with different arguments'))
+                return prior[1] or json.dumps({'jsonrpc': '2.0', 'id': identifier,
+                    'result': {'isError': True, 'content': [{'type': 'text',
+                    'text': 'Earlier tool call outcome is uncertain; inspect current state before another change.'}]}})
+            if len(server.call_receipts) >= 1024:
+                params_obj = request.get('params')
+                name = params_obj.get('name') if isinstance(params_obj, dict) else None
+                arguments = params_obj.get('arguments') if isinstance(params_obj, dict) else None
+                if (not isinstance(name, str) or not isinstance(arguments, dict)
+                        or not read_only_operation(name, arguments)):
+                    return json.dumps(rpc_error(identifier, -32000, 'Tool call limit reached'))
+                # A fresh read is needed to reconcile an uncertain mutation.
+                # Keep all earlier receipts; this extra read cannot repeat a
+                # write and is deliberately not cached by call ID.
+                receipt_key = None
+            else:
+                server.call_receipts[receipt_key] = (digest, None)
         try:
             response = {'jsonrpc': '2.0', 'id': identifier, 'result': server.dispatch(request)}
         except Readiness as error:
@@ -2355,7 +2394,12 @@ def safe_dispatch(server, line):
             response = rpc_error(identifier, -32602, 'Invalid params')
         except Denied:
             response = rpc_error(identifier, -32601, 'Unsupported method')
-        return json.dumps(response)
+        serialized = json.dumps(response)
+        if receipt_key is not None:
+            # Read results can be large; keep memory bounded. A duplicate of
+            # an oversized result is refused without repeating its effects.
+            server.call_receipts[receipt_key] = (digest, serialized if len(serialized) <= 65536 else None)
+        return serialized
     except Exception:
         # Never echo internal details; the tool journal owns effect uncertainty.
         return json.dumps(rpc_error(identifier, -32603, 'Internal error'))

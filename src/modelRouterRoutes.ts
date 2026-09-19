@@ -70,7 +70,13 @@ export function createModelRouterRoutes(
             },
           },
         });
-        if (next.mode !== "direct") {
+        if (next.mode === "qwen" || next.mode === "glm") {
+          const flag = next.mode === "qwen"
+            ? "AUGMENTAGENT_MODEL_QWEN_ENABLED"
+            : "AUGMENTAGENT_MODEL_GLM_ENABLED";
+          if (process.env[flag] !== "1")
+            throw new Error(`${next.mode.toUpperCase()} is paused until Runpod verification`);
+        } else if (next.mode !== "direct") {
           const accounts = await clientFor(previous).accounts();
           const providers =
             next.mode === "auto" ? ["claude", "codex"] : [next.mode];

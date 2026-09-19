@@ -2,6 +2,7 @@
 JARVIS_TEST_MODEL_ROUTER_CONFIG=/path/model-router.json python3 -m unittest discover -s scripts/tests -p model_router_live_test.py -v
 """
 import http.server
+import importlib.util
 import json
 import os
 import threading
@@ -10,6 +11,7 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
+from unittest import mock
 
 
 @unittest.skipUnless(os.environ.get('JARVIS_TEST_MODEL_ROUTER_CONFIG'), 'requires explicitly selected local 9Router')
@@ -18,6 +20,7 @@ class RouterFailover(unittest.TestCase):
         config = json.loads(Path(os.environ['JARVIS_TEST_MODEL_ROUTER_CONFIG']).read_text())
         base = config['base_url'].removesuffix('/v1')
         self.assertTrue(base.startswith('http://127.0.0.1:'))
+        upstream_host = config.get('upstream_host', '127.0.0.1')
         seen = []
         class Upstream(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -32,7 +35,8 @@ class RouterFailover(unittest.TestCase):
                     status,body=200,{'id':'qa','object':'chat.completion','created':1,'model':'qa-model','choices':[{'index':0,'message':{'role':'assistant','content':'ACCOUNT_TWO_OK'},'finish_reason':'stop'}],'usage':{'prompt_tokens':1,'completion_tokens':1,'total_tokens':2}}
                 data=json.dumps(body).encode()
                 self.send_response(status);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
-        server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Upstream)
+        bind_host = '0.0.0.0' if upstream_host == 'host.docker.internal' else '127.0.0.1'
+        server=http.server.ThreadingHTTPServer((bind_host,0),Upstream)
         thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
         cookie=None
         def api(endpoint, body=None, method=None, inference=False):
@@ -46,7 +50,7 @@ class RouterFailover(unittest.TestCase):
         try:
             _,cookie=api('/api/auth/login',{'password':config['admin_password']})
             prefix='qa-'+uuid.uuid4().hex[:10]
-            node,_=api('/api/provider-nodes',{'name':'Synthetic account failover QA','prefix':prefix,'apiType':'chat','baseUrl':f'http://127.0.0.1:{server.server_port}/v1'})
+            node,_=api('/api/provider-nodes',{'name':'Synthetic account failover QA','prefix':prefix,'apiType':'chat','baseUrl':f'http://{upstream_host}:{server.server_port}/v1'})
             provider=node['node']['id']
             api('/api/providers',{'provider':provider,'name':'Synthetic exhausted account','apiKey':'exhausted-synthetic-account','priority':1})
             second,_=api('/api/providers',{'provider':provider,'name':'Synthetic healthy account','apiKey':'healthy-synthetic-account','priority':2})
@@ -57,13 +61,443 @@ class RouterFailover(unittest.TestCase):
             api('/api/providers/'+second['connection']['id'],{'isActive':False},method='PUT')
             with self.assertRaises(urllib.error.HTTPError) as error:
                 api('/v1/chat/completions',request,inference=True)
-            self.assertIn(error.exception.code,[429,503])
+            try:
+                self.assertIn(error.exception.code,[429,503])
+            finally:
+                error.exception.close()
             api('/api/providers/'+second['connection']['id'],{'isActive':True},method='PUT')
             response,_=api('/v1/chat/completions',request,inference=True)
             self.assertEqual(response['choices'][0]['message']['content'],'ACCOUNT_TWO_OK')
         finally:
             if node: api('/api/provider-nodes/'+node['node']['id'],method='DELETE')
             server.shutdown();server.server_close();thread.join()
+
+    def test_responses_namespace_tools_preserve_schema_and_return_identity(self):
+        config = json.loads(Path(os.environ['JARVIS_TEST_MODEL_ROUTER_CONFIG']).read_text())
+        base = config['base_url'].removesuffix('/v1')
+        seen = []
+        class Upstream(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args): pass
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))))
+                seen.append(body)
+                names = [t['function']['name'] for t in body.get('tools', [])]
+                calls = [{'id': 'call_namespace_' + str(i), 'type': 'function',
+                          'function': {'name': name, 'arguments': '{"file_path":"fixture.txt"}'}}
+                         for i, name in enumerate(names)]
+                reply = {'id': 'namespace-qa', 'object': 'chat.completion', 'created': 1,
+                         'model': 'qa-model', 'choices': [{'index': 0, 'message':
+                         {'role': 'assistant', 'content': None, 'tool_calls': calls},
+                         'finish_reason': 'tool_calls'}]}
+                if body.get('stream'):
+                    chunks = [{'id': 'namespace-qa', 'object': 'chat.completion.chunk', 'created': 1,
+                               'model': 'qa-model', 'choices': [{'index': 0, 'delta':
+                               {'tool_calls': [{**call, 'index': i}]}, 'finish_reason': None}]}
+                              for i, call in enumerate(calls)]
+                    chunks.append({'id': 'namespace-qa', 'object': 'chat.completion.chunk',
+                                   'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'tool_calls'}]})
+                    raw = ''.join('data: ' + json.dumps(c) + '\n\n' for c in chunks).encode() + b'data: [DONE]\n\n'
+                    mime = 'text/event-stream'
+                else:
+                    raw = json.dumps(reply).encode(); mime = 'application/json'
+                self.send_response(200); self.send_header('Content-Type', mime)
+                self.send_header('Content-Length', str(len(raw))); self.end_headers(); self.wfile.write(raw)
+        server = http.server.ThreadingHTTPServer(('0.0.0.0' if config.get('upstream_host') else '127.0.0.1', 0), Upstream)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        cookie = ''; node = None
+        def api(path, body=None, method=None):
+            req = urllib.request.Request(base + path, data=None if body is None else json.dumps(body).encode(),
+                  headers={'Content-Type': 'application/json', 'Cookie': cookie,
+                           'Authorization': 'Bearer ' + config['api_key']}, method=method)
+            with urllib.request.urlopen(req, timeout=30) as response:
+                return response.read(), response.headers.get('Set-Cookie', '').split(';')[0]
+        try:
+            _, cookie = api('/api/auth/login', {'password': config['admin_password']})
+            prefix = 'qa-' + uuid.uuid4().hex[:10]
+            raw, _ = api('/api/provider-nodes', {'name': 'Synthetic namespace QA', 'prefix': prefix,
+                      'apiType': 'chat', 'baseUrl': 'http://' + config.get('upstream_host', '127.0.0.1') + ':' + str(server.server_port) + '/v1'})
+            node = json.loads(raw)['node']
+            api('/api/providers', {'provider': node['id'], 'name': 'Synthetic namespace account', 'apiKey': 'synthetic-namespace-key'})
+            function = {'type': 'function', 'name': 'Read', 'parameters': {'type': 'object',
+                        'properties': {'file_path': {'type': 'string'}}, 'required': ['file_path']}}
+            tools = [{'type': 'namespace', 'name': name, 'tools': [function]} for name in ['mcp__jarvis', 'other']]
+            for stream in [False, True]:
+                raw, _ = api('/v1/responses', {'model': prefix + '/qa-model', 'stream': stream, 'tools': tools,
+                            'input': [{'role': 'user', 'content': 'Synthetic schema test'}]})
+                sent = seen[-1]['tools']
+                self.assertEqual(len(sent), 2)
+                for tool in sent:
+                    self.assertEqual(tool['function']['parameters'], function['parameters'])
+                self.assertNotEqual(sent[0]['function']['name'], sent[1]['function']['name'])
+                if stream:
+                    events = [json.loads(line[6:]) for line in raw.decode().splitlines() if line.startswith('data: {')]
+                    output = [e['item'] for e in events if e.get('type') == 'response.output_item.done']
+                else: output = json.loads(raw)['output']
+                calls = [item for item in output if item.get('type') == 'function_call']
+                self.assertEqual([(c.get('namespace'), c['name']) for c in calls], [('mcp__jarvis', 'Read'), ('other', 'Read')])
+                history = [{'role': 'user', 'content': 'Read'}, *calls,
+                           *[{'type': 'function_call_output', 'call_id': c['call_id'], 'output': 'done'} for c in calls]]
+                api('/v1/responses', {'model': prefix + '/qa-model', 'stream': stream, 'tools': tools, 'input': history})
+                prior = [c['function']['name'] for m in seen[-1]['messages'] for c in m.get('tool_calls', [])]
+                self.assertEqual(prior, [t['function']['name'] for t in sent])
+        finally:
+            if node: api('/api/provider-nodes/' + node['id'], method='DELETE')
+            server.shutdown(); server.server_close(); thread.join()
+
+    def test_chat_completion_forwards_idempotency_key(self):
+        config = json.loads(Path(os.environ['JARVIS_TEST_MODEL_ROUTER_CONFIG']).read_text())
+        base = config['base_url'].removesuffix('/v1')
+        self.assertTrue(base.startswith('http://127.0.0.1:'))
+        upstream_host = config.get('upstream_host', '127.0.0.1')
+        seen = []
+
+        class Upstream(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get('Content-Length', 0)))
+                seen.append((self.headers.get('Idempotency-Key'), sorted(self.headers.keys())))
+                body = ({'id': 'qa', 'object': 'chat.completion', 'created': 1,
+                         'model': 'qa-model', 'choices': [{'index': 0,
+                         'message': {'role': 'assistant', 'content': 'SYNTHETIC_OK'},
+                         'finish_reason': 'stop'}]} if len(seen) == 1 else
+                        {'error': {'message': 'synthetic reconciliation required',
+                                   'type': 'reconciliation_required'}})
+                data = json.dumps(body).encode()
+                self.send_response(200 if len(seen) == 1 else 409)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        bind_host = '0.0.0.0' if upstream_host == 'host.docker.internal' else '127.0.0.1'
+        server = http.server.ThreadingHTTPServer((bind_host, 0), Upstream)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        cookie = None
+
+        def api(endpoint, body=None, method=None, inference=False, idempotency_key=None):
+            headers = {'Content-Type': 'application/json'}
+            if cookie:
+                headers['Cookie'] = cookie
+            if inference:
+                headers['Authorization'] = 'Bearer ' + config['api_key']
+            if idempotency_key:
+                headers['Idempotency-Key'] = idempotency_key
+            request = urllib.request.Request(base + endpoint,
+                    data=None if body is None else json.dumps(body).encode(),
+                    headers=headers, method=method)
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.load(response), response.headers.get('Set-Cookie', '').split(';')[0]
+
+        node = None
+        try:
+            _, cookie = api('/api/auth/login', {'password': config['admin_password']})
+            prefix = 'qa-' + uuid.uuid4().hex[:10]
+            node, _ = api('/api/provider-nodes', {'name': 'Synthetic idempotency QA',
+                            'prefix': prefix, 'apiType': 'chat',
+                            'baseUrl': f'http://{upstream_host}:{server.server_port}/v1'})
+            provider = node['node']['id']
+            api('/api/providers', {'provider': provider, 'name': 'Synthetic idempotency account',
+                                   'apiKey': 'synthetic-idempotency-account'})
+            body = {'model': prefix + '/qa-model', 'messages': [{'role': 'user',
+                    'content': 'Synthetic idempotency test only'}], 'stream': False}
+            result, _ = api('/v1/chat/completions', body, inference=True,
+                            idempotency_key='synthetic-logical-turn-1')
+            self.assertEqual(result['choices'][0]['message']['content'], 'SYNTHETIC_OK')
+            body['messages'][0]['content'] = 'Synthetic 409 retry test only'
+            with self.assertRaises(urllib.error.HTTPError) as response:
+                api('/v1/chat/completions', body, inference=True)
+            try:
+                self.assertEqual(len(seen), 2, '9Router retried a reconciliation-required response')
+                self.assertEqual((seen[0][0], response.exception.code),
+                                 ('synthetic-logical-turn-1', 409),
+                                 '9Router must preserve the request key and reconciliation status')
+            finally:
+                response.exception.close()
+        finally:
+            if node:
+                api('/api/provider-nodes/' + node['node']['id'], method='DELETE')
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_chat_and_responses_preserve_parallel_tool_call_ids_and_results(self):
+        """The pinned gateway must not sever Qwen's prior tool/result links."""
+        config = json.loads(Path(os.environ['JARVIS_TEST_MODEL_ROUTER_CONFIG']).read_text())
+        base = config['base_url'].removesuffix('/v1')
+        self.assertTrue(base.startswith('http://127.0.0.1:'))
+        upstream_host = config.get('upstream_host', '127.0.0.1')
+        seen = []
+
+        class Upstream(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                payload = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))))
+                seen.append(payload)
+                if payload.get('stream'):
+                    pieces = [
+                        {'role': 'assistant'},
+                        {'tool_calls': [{'index': 0, 'id': 'call_stream_a',
+                          'type': 'function', 'function': {'name': 'Read',
+                          'arguments': '{"file_'}}]},
+                        {'tool_calls': [{'index': 0, 'function':
+                          {'arguments': 'path":"a.md"}'}}]},
+                        {'tool_calls': [{'index': 1, 'id': 'call_stream_b',
+                          'type': 'function', 'function': {'name': 'Read',
+                          'arguments': '{"file_'}}]},
+                        {'tool_calls': [{'index': 1, 'function':
+                          {'arguments': 'path":"b.md"}'}}]},
+                    ]
+                    chunks = [
+                        {'id': 'chatcmpl-synthetic-stream',
+                         'object': 'chat.completion.chunk', 'created': 1,
+                         'model': 'qa-model', 'choices': [{'index': 0,
+                         'delta': piece, 'finish_reason': None}]}
+                        for piece in pieces
+                    ]
+                    chunks.append({'id': 'chatcmpl-synthetic-stream',
+                                   'object': 'chat.completion.chunk', 'created': 1,
+                                   'model': 'qa-model', 'choices': [{'index': 0,
+                                   'delta': {}, 'finish_reason': 'tool_calls'}]})
+                    raw = (': synthetic heartbeat\n\n' + ''.join('data: ' + json.dumps(chunk)
+                        + '\n\n' for chunk in chunks) + 'data: [DONE]\n\n').encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.send_header('Content-Length', str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+                body = {'id': 'synthetic-tool-history', 'object': 'chat.completion',
+                        'created': 1, 'model': 'qa-model', 'choices': [{'index': 0,
+                        'message': {'role': 'assistant', 'content': 'TOOL_HISTORY_OK'},
+                        'finish_reason': 'stop'}]}
+                raw = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        bind_host = '0.0.0.0' if upstream_host == 'host.docker.internal' else '127.0.0.1'
+        server = http.server.ThreadingHTTPServer((bind_host, 0), Upstream)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        cookie = None
+
+        def api(endpoint, body=None, method=None, inference=False):
+            headers = {'Content-Type': 'application/json'}
+            if cookie:
+                headers['Cookie'] = cookie
+            if inference:
+                headers['Authorization'] = 'Bearer ' + config['api_key']
+            request = urllib.request.Request(base + endpoint,
+                    data=None if body is None else json.dumps(body).encode(),
+                    headers=headers, method=method)
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.load(response), response.headers.get('Set-Cookie', '').split(';')[0]
+
+        node = None
+        try:
+            _, cookie = api('/api/auth/login', {'password': config['admin_password']})
+            prefix = 'qa-' + uuid.uuid4().hex[:10]
+            node, _ = api('/api/provider-nodes', {'name': 'Synthetic tool history QA',
+                    'prefix': prefix, 'apiType': 'chat',
+                    'baseUrl': f'http://{upstream_host}:{server.server_port}/v1'})
+            api('/api/providers', {'provider': node['node']['id'],
+                'name': 'Synthetic tool history account', 'apiKey': 'synthetic-tool-history'})
+            messages = [
+                {'role': 'user', 'content': 'Read two files.'},
+                {'role': 'assistant', 'content': None, 'tool_calls': [
+                    {'id': 'call_a', 'type': 'function', 'function':
+                        {'name': 'Read', 'arguments': '{"file_path":"a.md"}'}},
+                    {'id': 'call_b', 'type': 'function', 'function':
+                        {'name': 'Read', 'arguments': '{"file_path":"b.md"}'}},
+                ]},
+                {'role': 'tool', 'tool_call_id': 'call_b', 'content': 'second result'},
+                {'role': 'tool', 'tool_call_id': 'call_a', 'content': 'first result'},
+                {'role': 'user', 'content': 'Use both results.'},
+            ]
+            response, _ = api('/v1/chat/completions', {'model': prefix + '/qa-model',
+                            'messages': messages, 'stream': False}, inference=True)
+            self.assertEqual(response['choices'][0]['message']['content'], 'TOOL_HISTORY_OK')
+            self.assertEqual(len(seen), 1)
+            forwarded = seen[0]['messages']
+            calls = next(item['tool_calls'] for item in forwarded if item['role'] == 'assistant')
+            results = [item for item in forwarded if item['role'] == 'tool']
+            self.assertEqual([call['id'] for call in calls], ['call_a', 'call_b'])
+            self.assertEqual([(item['tool_call_id'], item['content']) for item in results],
+                             [('call_b', 'second result'), ('call_a', 'first result')])
+
+            adapter_path = Path(__file__).resolve().parents[1] / 'runpod-adapter/server.py'
+            spec = importlib.util.spec_from_file_location('synthetic_runpod_adapter', adapter_path)
+            adapter = importlib.util.module_from_spec(spec)
+            with mock.patch.dict(os.environ, {'RUNPOD_API_KEY': 'synthetic-test-key',
+                                               'ADAPTER_API_KEY': 'synthetic-client-key'}):
+                spec.loader.exec_module(adapter)
+            normalized = adapter.normalize_messages(forwarded)
+            self.assertEqual([(item['tool_name'], item['content']) for item in normalized
+                              if item['role'] == 'tool'],
+                             [('Read', 'first result'), ('Read', 'second result')])
+
+            # Fragmented Chat SSE tool arguments must emerge as complete
+            # Responses function calls; the heartbeat and [DONE] are framing.
+            stream_request = urllib.request.Request(base + '/v1/responses',
+                data=json.dumps({'model': prefix + '/qa-model',
+                    'input': 'Call Read for a.md and b.md.', 'stream': True,
+                    'tools': [{'type': 'function', 'name': 'Read',
+                        'parameters': {'type': 'object', 'properties': {
+                            'file_path': {'type': 'string'}}}}]}).encode(),
+                headers={'Authorization': 'Bearer ' + config['api_key'],
+                         'Content-Type': 'application/json'})
+            with urllib.request.urlopen(stream_request, timeout=30) as stream_response:
+                events = [json.loads(line[6:]) for line in stream_response.read().decode().splitlines()
+                          if line.startswith('data: {')]
+            added = [event['item'] for event in events
+                     if event.get('type') == 'response.output_item.added'
+                     and event.get('item', {}).get('type') == 'function_call']
+            deltas = {}
+            for event in events:
+                if event.get('type') == 'response.function_call_arguments.delta':
+                    deltas[event['item_id']] = deltas.get(event['item_id'], '') + event['delta']
+            self.assertEqual([(item['call_id'], item['name']) for item in added],
+                             [('call_stream_a', 'Read'), ('call_stream_b', 'Read')])
+            self.assertEqual([json.loads(deltas[item['id']]) for item in added],
+                             [{'file_path': 'a.md'}, {'file_path': 'b.md'}])
+            self.assertTrue(any(event.get('type') == 'response.completed' for event in events))
+
+            # The Codex CLI uses Responses, which 9Router converts to Chat
+            # Completions before the adapter sees it. The same call IDs must
+            # survive that conversion, including out-of-order parallel results.
+            responses_input = [
+                {'role': 'user', 'content': 'Read two files.'},
+                {'type': 'function_call', 'call_id': 'call_a', 'name': 'Read',
+                 'arguments': '{"file_path":"a.md"}'},
+                {'type': 'function_call', 'call_id': 'call_b', 'name': 'Read',
+                 'arguments': '{"file_path":"b.md"}'},
+                {'type': 'function_call_output', 'call_id': 'call_b', 'output': 'second result'},
+                {'type': 'function_call_output', 'call_id': 'call_a', 'output': 'first result'},
+                {'role': 'user', 'content': 'Use both results.'},
+            ]
+            api('/v1/responses', {'model': prefix + '/qa-model',
+                'input': responses_input, 'stream': False,
+                'tools': [{'type': 'function', 'name': 'Read',
+                           'description': 'Read one synthetic file',
+                           'parameters': {'type': 'object', 'properties': {
+                               'file_path': {'type': 'string'}}, 'required': ['file_path']}}]},
+                inference=True)
+            self.assertEqual(len(seen), 3)
+            forwarded = seen[2]['messages']
+            calls = [call for item in forwarded if item['role'] == 'assistant'
+                     for call in item.get('tool_calls', [])]
+            results = [item for item in forwarded if item['role'] == 'tool']
+            self.assertEqual([call['id'] for call in calls], ['call_a', 'call_b'])
+            self.assertEqual([(item['tool_call_id'], item['content']) for item in results],
+                             [('call_b', 'second result'), ('call_a', 'first result')])
+            normalized = adapter.normalize_messages(forwarded)
+            self.assertEqual([(item['tool_name'], item['content']) for item in normalized
+                              if item['role'] == 'tool'],
+                             [('Read', 'first result'), ('Read', 'second result')])
+        finally:
+            if node:
+                api('/api/provider-nodes/' + node['node']['id'], method='DELETE')
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_unsupported_media_fails_before_reaching_upstream(self):
+        config = json.loads(Path(os.environ['JARVIS_TEST_MODEL_ROUTER_CONFIG']).read_text())
+        base = config['base_url'].removesuffix('/v1')
+        self.assertTrue(base.startswith('http://127.0.0.1:'))
+        upstream_host = config.get('upstream_host', '127.0.0.1')
+        seen = []
+
+        class Upstream(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                seen.append(self.rfile.read(int(self.headers.get('Content-Length', 0))))
+                body = b'{"choices":[{"message":{"role":"assistant","content":"SYNTHETIC_OK"}}]}'
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        bind_host = '0.0.0.0' if upstream_host == 'host.docker.internal' else '127.0.0.1'
+        server = http.server.ThreadingHTTPServer((bind_host, 0), Upstream)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        cookie = None
+
+        def api(endpoint, body=None, method=None, inference=False):
+            headers = {'Content-Type': 'application/json'}
+            if cookie:
+                headers['Cookie'] = cookie
+            if inference:
+                headers['Authorization'] = 'Bearer ' + config['api_key']
+            request = urllib.request.Request(base + endpoint,
+                    data=None if body is None else json.dumps(body).encode(),
+                    headers=headers, method=method)
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.load(response), response.headers.get('Set-Cookie', '').split(';')[0]
+
+        node = None
+        try:
+            _, cookie = api('/api/auth/login', {'password': config['admin_password']})
+            prefix = 'qa-' + uuid.uuid4().hex[:10]
+            node, _ = api('/api/provider-nodes', {'name': 'Synthetic no-silent-image QA',
+                            'prefix': prefix, 'apiType': 'chat',
+                            'baseUrl': f'http://{upstream_host}:{server.server_port}/v1'})
+            api('/api/providers', {'provider': node['node']['id'],
+                                   'name': 'Synthetic text-only account',
+                                   'apiKey': 'synthetic-text-only-account'})
+            prior_image = {'role': 'user',
+                           'content': [{'type': 'text', 'text': 'Describe this'},
+                                       {'type': 'image_url', 'image_url': {
+                                           'url': 'data:image/png;base64,iVBORw0KGgo='}}]}
+            document = {'role': 'user', 'content': [
+                {'type': 'file', 'file': {'filename': 'note.pdf',
+                 'file_data': 'data:application/pdf;base64,JVBERi0='}}]}
+            audio = {'role': 'user', 'content': [
+                {'type': 'audio_url', 'audio_url': {'url': 'data:audio/wav;base64,UklGRg=='}}]}
+            video = {'role': 'user', 'content': [
+                {'type': 'video_url', 'video_url': {'url': 'data:video/mp4;base64,AAAA'}}]}
+            for label, messages in [
+                ('current image', [prior_image]),
+                ('history image', [prior_image,
+                                   {'role': 'assistant', 'content': 'Earlier response'},
+                                   {'role': 'user', 'content': 'Recall the image'}]),
+                ('current document', [document]),
+                ('history document', [document,
+                                      {'role': 'assistant', 'content': 'Earlier response'},
+                                      {'role': 'user', 'content': 'Recall the document'}]),
+                ('current audio', [audio]),
+                ('current video', [video]),
+            ]:
+                with self.subTest(label=label):
+                    body = {'model': prefix + '/qa-model', 'messages': messages,
+                            'stream': False}
+                    with self.assertRaises(urllib.error.HTTPError) as error:
+                        api('/v1/chat/completions', body, inference=True)
+                    try:
+                        response_body = error.exception.read().decode('utf-8', errors='replace')
+                        self.assertEqual(error.exception.code, 422,
+                                         'unsupported media must fail instead of being silently omitted: '
+                                         + response_body[:500])
+                    finally:
+                        error.exception.close()
+            self.assertEqual(seen, [], 'unsupported media reached the text-only upstream')
+        finally:
+            if node:
+                api('/api/provider-nodes/' + node['node']['id'], method='DELETE')
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
 
 @unittest.skipUnless(os.environ.get('JARVIS_TEST_ROUTER_AGENT_BIN'), 'requires built agent and installed Claude/Codex CLIs')
