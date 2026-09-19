@@ -24,7 +24,7 @@ installer applies `sidecars/9router/runpod-reconciliation.patch` before building
 a supplied built source must already contain it. The service uses a distinct
 runtime directory for this patched version. For Docker, run
 `bash scripts/build-model-router-image.sh` to build
-`jarvis-9router:0.5.75-runpod-4` from the same source and dependency lock.
+`jarvis-9router:0.5.75-runpod-5` from the same source and dependency lock.
 
 After deploying this agent version, open **Settings → Models & accounts**:
 
@@ -139,3 +139,9 @@ account.
 
 - [9Router source at the pinned revision](https://github.com/decolua/9router/tree/17c4cc76877bd1755030a8414f8d0083f48dcccf)
 - [Codex custom model provider configuration](https://learn.chatgpt.com/docs/config-file/config-reference)
+
+The `runpod-5` patch also preserves Responses API namespace tools through Chat
+Completions backends. It forwards leaf schemas under stable aliases and restores
+namespace/name on returned calls, including streamed events and follow-up history.
+The installed gateway fixture tests two namespaces containing the same `Read`
+name, so schemas and identities cannot silently collapse into a group tool.

@@ -72,6 +72,78 @@ class RouterFailover(unittest.TestCase):
             if node: api('/api/provider-nodes/'+node['node']['id'],method='DELETE')
             server.shutdown();server.server_close();thread.join()
 
+    def test_responses_namespace_tools_preserve_schema_and_return_identity(self):
+        config = json.loads(Path(os.environ['JARVIS_TEST_MODEL_ROUTER_CONFIG']).read_text())
+        base = config['base_url'].removesuffix('/v1')
+        seen = []
+        class Upstream(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args): pass
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))))
+                seen.append(body)
+                names = [t['function']['name'] for t in body.get('tools', [])]
+                calls = [{'id': 'call_namespace_' + str(i), 'type': 'function',
+                          'function': {'name': name, 'arguments': '{"file_path":"fixture.txt"}'}}
+                         for i, name in enumerate(names)]
+                reply = {'id': 'namespace-qa', 'object': 'chat.completion', 'created': 1,
+                         'model': 'qa-model', 'choices': [{'index': 0, 'message':
+                         {'role': 'assistant', 'content': None, 'tool_calls': calls},
+                         'finish_reason': 'tool_calls'}]}
+                if body.get('stream'):
+                    chunks = [{'id': 'namespace-qa', 'object': 'chat.completion.chunk', 'created': 1,
+                               'model': 'qa-model', 'choices': [{'index': 0, 'delta':
+                               {'tool_calls': [{**call, 'index': i}]}, 'finish_reason': None}]}
+                              for i, call in enumerate(calls)]
+                    chunks.append({'id': 'namespace-qa', 'object': 'chat.completion.chunk',
+                                   'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'tool_calls'}]})
+                    raw = ''.join('data: ' + json.dumps(c) + '\n\n' for c in chunks).encode() + b'data: [DONE]\n\n'
+                    mime = 'text/event-stream'
+                else:
+                    raw = json.dumps(reply).encode(); mime = 'application/json'
+                self.send_response(200); self.send_header('Content-Type', mime)
+                self.send_header('Content-Length', str(len(raw))); self.end_headers(); self.wfile.write(raw)
+        server = http.server.ThreadingHTTPServer(('0.0.0.0' if config.get('upstream_host') else '127.0.0.1', 0), Upstream)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        cookie = ''; node = None
+        def api(path, body=None, method=None):
+            req = urllib.request.Request(base + path, data=None if body is None else json.dumps(body).encode(),
+                  headers={'Content-Type': 'application/json', 'Cookie': cookie,
+                           'Authorization': 'Bearer ' + config['api_key']}, method=method)
+            with urllib.request.urlopen(req, timeout=30) as response:
+                return response.read(), response.headers.get('Set-Cookie', '').split(';')[0]
+        try:
+            _, cookie = api('/api/auth/login', {'password': config['admin_password']})
+            prefix = 'qa-' + uuid.uuid4().hex[:10]
+            raw, _ = api('/api/provider-nodes', {'name': 'Synthetic namespace QA', 'prefix': prefix,
+                      'apiType': 'chat', 'baseUrl': 'http://' + config.get('upstream_host', '127.0.0.1') + ':' + str(server.server_port) + '/v1'})
+            node = json.loads(raw)['node']
+            api('/api/providers', {'provider': node['id'], 'name': 'Synthetic namespace account', 'apiKey': 'synthetic-namespace-key'})
+            function = {'type': 'function', 'name': 'Read', 'parameters': {'type': 'object',
+                        'properties': {'file_path': {'type': 'string'}}, 'required': ['file_path']}}
+            tools = [{'type': 'namespace', 'name': name, 'tools': [function]} for name in ['mcp__jarvis', 'other']]
+            for stream in [False, True]:
+                raw, _ = api('/v1/responses', {'model': prefix + '/qa-model', 'stream': stream, 'tools': tools,
+                            'input': [{'role': 'user', 'content': 'Synthetic schema test'}]})
+                sent = seen[-1]['tools']
+                self.assertEqual(len(sent), 2)
+                for tool in sent:
+                    self.assertEqual(tool['function']['parameters'], function['parameters'])
+                self.assertNotEqual(sent[0]['function']['name'], sent[1]['function']['name'])
+                if stream:
+                    events = [json.loads(line[6:]) for line in raw.decode().splitlines() if line.startswith('data: {')]
+                    output = [e['item'] for e in events if e.get('type') == 'response.output_item.done']
+                else: output = json.loads(raw)['output']
+                calls = [item for item in output if item.get('type') == 'function_call']
+                self.assertEqual([(c.get('namespace'), c['name']) for c in calls], [('mcp__jarvis', 'Read'), ('other', 'Read')])
+                history = [{'role': 'user', 'content': 'Read'}, *calls,
+                           *[{'type': 'function_call_output', 'call_id': c['call_id'], 'output': 'done'} for c in calls]]
+                api('/v1/responses', {'model': prefix + '/qa-model', 'stream': stream, 'tools': tools, 'input': history})
+                prior = [c['function']['name'] for m in seen[-1]['messages'] for c in m.get('tool_calls', [])]
+                self.assertEqual(prior, [t['function']['name'] for t in sent])
+        finally:
+            if node: api('/api/provider-nodes/' + node['id'], method='DELETE')
+            server.shutdown(); server.server_close(); thread.join()
+
     def test_chat_completion_forwards_idempotency_key(self):
         config = json.loads(Path(os.environ['JARVIS_TEST_MODEL_ROUTER_CONFIG']).read_text())
         base = config['base_url'].removesuffix('/v1')

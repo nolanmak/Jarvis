@@ -12,6 +12,9 @@ cp "$repo_root/sidecars/9router/package-lock.json" "$source_dir/package-lock.jso
 git -C "$source_dir" apply --check "$repo_root/sidecars/9router/runpod-reconciliation.patch"
 git -C "$source_dir" apply "$repo_root/sidecars/9router/runpod-reconciliation.patch"
 
+NAMESPACED_TOOLS_MODULE="$source_dir/open-sse/translator/concerns/namespacedTools.js" \
+  node --test "$repo_root/scripts/tests/model_router_namespace_test.mjs"
+
 # Upstream's Dockerfile uses an unlocked npm install. Build this pinned image
 # from the same committed dependency lock that the Linux service installer uses.
 python3 - "$source_dir/Dockerfile" <<'PY'
@@ -26,4 +29,4 @@ if dockerfile.count(old) != 1:
 path.write_text(dockerfile.replace(old, new))
 PY
 
-docker build --tag jarvis-9router:0.5.75-runpod-4 "$source_dir"
+docker build --tag jarvis-9router:0.5.75-runpod-5 "$source_dir"

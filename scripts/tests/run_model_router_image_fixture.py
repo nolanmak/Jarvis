@@ -18,7 +18,7 @@ import urllib.request
 import uuid
 
 
-IMAGE = "jarvis-9router:0.5.75-runpod-4"
+IMAGE = "jarvis-9router:0.5.75-runpod-5"
 
 
 def free_port():

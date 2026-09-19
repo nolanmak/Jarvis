@@ -250,8 +250,19 @@ text and audited Read calls for Claude and Codex through the connected 9Router
 account pools. The Read probe permits Markdown around the exact nonce while
 still requiring the matching provider/session/file audit receipt.
 
-The Runpod setup inventory supplies endpoint IDs but no live Runpod key.
-The host adapter and registered routes are prepared with both GPU routes
-paused. Paid Qwen/GLM inference, scale-down/recovery, and actual Discord gateway
-acceptance are still outstanding. These receipts do not mark the full PR ready
-for rollout.
+The Runpod setup inventory supplied endpoint IDs; a later private credential
+transfer enabled authenticated preflight and live host testing. Qwen returned
+`RUNPOD_OK` through the selected Jarvis CLI route (149,313 ms queue/startup and
+9,231 ms execution). GLM allocated no workers during its bounded probe and
+returned no model output; its load-balancer cancellation remains explicitly
+unsupported in the adapter journal. Both endpoints were restored to zero workers.
+
+The live Qwen Read probe exposed a missing Responses namespace translation:
+the gateway advertised `mcp__jarvis` as an empty function instead of exposing
+its Read leaf and parameters. Gateway revision `runpod-5` flattens namespace
+leaves to stable collision-checked aliases, retains prior-call identities, and
+restores the namespace/name pair in JSON and SSE responses. The regression was
+red against `runpod-4`; all five installed-router fixtures and three fragmented
+stream/schema unit tests pass with the fix. Claude/Codex live regression and
+Qwen's audited Read are checked again after installation. Full live parity and
+actual Discord gateway acceptance remain release gates.
