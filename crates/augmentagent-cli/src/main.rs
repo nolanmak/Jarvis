@@ -2,6 +2,7 @@
 
 #[cfg(test)]
 mod provider_migration_tests;
+mod model_tool;
 #[cfg(test)]
 mod provider_channel_tests;
 #[cfg(test)]
@@ -591,6 +592,14 @@ enum Cmd {
         /// check; per-channel validate summaries sourced from `status`).
         #[arg(long, default_value_t = false)]
         deep: bool,
+    },
+    /// Internal conversation-bound MCP server for owner model control.
+    #[command(hide = true)]
+    ModelTool {
+        #[arg(long)]
+        channel: u64,
+        #[arg(long)]
+        readiness: String,
     },
     /// #655/#667 — one live round-trip through the provider fallback chain.
     /// Builds the production reasoner (AUGMENTAGENT_REASONER_CHAIN +
@@ -2400,6 +2409,9 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if let Cmd::ModelTool { channel, ref readiness } = cli.cmd {
+        return model_tool::serve(channel, readiness);
+    }
     if let Cmd::RepoDocs { ref op } = cli.cmd {
         return repo_docs::run(op, cli.wiki_dir.as_deref()).await;
     }
@@ -4329,6 +4341,7 @@ async fn main() -> Result<()> {
             std::process::exit(code);
         }
         Cmd::Env { ref op, json } => env_cfg::run_env(op, json),
+        Cmd::ModelTool { channel, ref readiness } => model_tool::serve(channel, readiness),
         Cmd::ReasonerSelftest { ref prompt, ref profile, tool_probe } =>
             run_reasoner_selftest(prompt, profile.as_deref(), tool_probe).await,
         Cmd::Install { component } => installers::run_install(component).await,
@@ -9084,6 +9097,7 @@ impl QueryHandler for WikiQuerier {
     ) -> anyhow::Result<String> {
         let mut opts = ask_opts(self.wiki_root.clone(), self.repo_root.clone());
         enable_newsletter_tools(&mut opts, ctx);
+        model_tool::configure(&mut opts, ctx, &self.reasoner, &self.repo_root.join("target/release/augmentagent"));
         // #132 / #201 — Stamp this request's session id onto every audit
         // record produced by the spawn, and (if we have the bits from the
         // Discord side) plug in a per-request notifier so high-risk tool
@@ -9123,35 +9137,39 @@ impl QueryHandler for WikiQuerier {
 
     async fn model_command(&self, channel_id: u64, text: &str) -> Option<String> {
         use augmentagent_channel_core::model_selection::{config_path, run_command, SelectionStore};
-        use augmentagent_channel_core::providers::ProviderKind;
         let store = SelectionStore::new(config_path());
         run_command(&store, &channel_id.to_string(), text, |profile| {
-            if !self.reasoner.provider_names().contains(&profile.name()) {
-                return Err(format!("{} is not available in this Jarvis process; restart after configuring it", profile.name()));
-            }
-            let router = augmentagent_channel_core::model_router::load()
-                .map_err(|_| "9Router configuration is invalid".to_string())?;
-            match profile {
-                ProviderKind::Qwen => {
-                    if !augmentagent_channel_core::model_selection::runtime_profile_enabled(profile) {
-                        Err("Qwen is paused; enable it after Runpod scale-down and live tool verification".into())
-                    } else if router.is_none() { Err("Qwen requires a configured 9Router endpoint".into()) }
-                    else { Ok(()) }
-                }
-                ProviderKind::Glm => {
-                    if !augmentagent_channel_core::model_selection::runtime_profile_enabled(profile) {
-                        Err("GLM is paused; enable it after live deployment verification".into())
-                    } else if router.is_none() { Err("GLM requires a configured 9Router endpoint".into()) }
-                    else { Ok(()) }
-                }
-                ProviderKind::Claude => Ok(()),
-                ProviderKind::Codex => {
-                    if router.is_some() || augmentagent_channel_core::codex::codex_auth_available() { Ok(()) }
-                    else { Err("Codex account is not configured".into()) }
-                }
-                _ => Err("Unsupported model profile".into()),
-            }
+            model_profile_ready(&self.reasoner, profile)
         })
+    }
+}
+
+fn model_profile_ready(reasoner: &FallbackReasoner, profile: augmentagent_channel_core::providers::ProviderKind) -> Result<(), String> {
+    use augmentagent_channel_core::providers::ProviderKind;
+    if !reasoner.provider_names().contains(&profile.name()) {
+        return Err(format!("{} is not available in this Jarvis process; restart after configuring it", profile.name()));
+    }
+    let router = augmentagent_channel_core::model_router::load()
+        .map_err(|_| "9Router configuration is invalid".to_string())?;
+    match profile {
+        ProviderKind::Qwen => {
+            if !augmentagent_channel_core::model_selection::runtime_profile_enabled(profile) {
+                Err("Qwen is paused; enable it after Runpod scale-down and live tool verification".into())
+            } else if router.is_none() { Err("Qwen requires a configured 9Router endpoint".into()) }
+            else { Ok(()) }
+        }
+        ProviderKind::Glm => {
+            if !augmentagent_channel_core::model_selection::runtime_profile_enabled(profile) {
+                Err("GLM is paused; enable it after live deployment verification".into())
+            } else if router.is_none() { Err("GLM requires a configured 9Router endpoint".into()) }
+            else { Ok(()) }
+        }
+        ProviderKind::Claude => Ok(()),
+        ProviderKind::Codex => {
+            if router.is_some() || augmentagent_channel_core::codex::codex_auth_available() { Ok(()) }
+            else { Err("Codex account is not configured".into()) }
+        }
+        _ => Err("Unsupported model profile".into()),
     }
 }
 

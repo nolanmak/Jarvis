@@ -35,7 +35,7 @@ fn discord_model_switch_sequence_uses_one_audited_harness() {
         r#"#!/usr/bin/env python3
 import json, sys
 names = ('search_conversation_history', 'read_conversation_thread',
-         'search_messages', 'conversation_stats', 'memory_search', 'memory_recent')
+         'search_messages', 'conversation_stats', 'memory_search', 'memory_recent', 'switch_model')
 for line in sys.stdin:
     request = json.loads(line)
     method = request.get('method')
@@ -60,7 +60,7 @@ for line in sys.stdin:
     let finance = release.join("augmentagent");
     std::fs::write(
         &finance,
-        "#!/bin/sh\n[ \"$#\" -eq 2 ] && [ \"$1\" = finance ] && [ \"$2\" = status ] || exit 64\nprintf 'SHELL_FIXTURE_OK\\n'\n",
+        "#!/bin/sh\nif [ \"$1\" = model-tool ]; then exec \"$(dirname \"$0\")/augmentagent-mcp-memory\"; fi\n[ \"$#\" -eq 2 ] && [ \"$1\" = finance ] && [ \"$2\" = status ] || exit 64\nprintf 'SHELL_FIXTURE_OK\\n'\n",
     )
     .unwrap();
     std::fs::set_permissions(&finance, std::fs::Permissions::from_mode(0o700)).unwrap();
