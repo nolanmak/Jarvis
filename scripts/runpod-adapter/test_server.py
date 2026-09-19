@@ -137,6 +137,9 @@ class NormalizeMessagesTests(unittest.TestCase):
     def test_output_limit_caps_large_codex_metadata_request(self):
         self.assertEqual(module.predict_limit({'max_completion_tokens': 64000}, {'max_output_tokens': 2048}), 2048)
         self.assertEqual(module.predict_limit({'max_tokens': 512}, {'max_output_tokens': 2048}), 512)
+        self.assertEqual(module.predict_limit({}, {'max_output_tokens': 16384}), 16384)
+        self.assertEqual(module.predict_limit({'max_tokens': 64000}, {'max_output_tokens': 16384}), 16384)
+        self.assertEqual(module.predict_limit({}, {}), 2048)
         with self.assertRaises(ValueError):
             module.predict_limit({'max_tokens': -1}, {'max_output_tokens': 2048})
 
@@ -229,10 +232,12 @@ class JobLifecycleTests(unittest.TestCase):
             routes = pathlib.Path(tmp) / 'routes.json'
             routes.write_text(json.dumps({'qwen38-27b': {
                 'type': 'ollama-queue', 'base_url': 'https://api.runpod.ai/v2/endpoint',
-                'max_output_tokens': 128}}))
+                'max_output_tokens': 16384, 'context_window': 262144}}))
             journal_path = pathlib.Path(tmp) / 'jobs.sqlite3'
             def upstream(url, payload=None):
                 if url.endswith('/run'):
+                    self.assertEqual(payload['input']['options']['num_ctx'], 262144)
+                    self.assertEqual(payload['input']['options']['num_predict'], 16384)
                     return {'id': 'job-1'}
                 if url.endswith('/status/job-1'):
                     return {'id': 'job-1', 'status': 'COMPLETED',

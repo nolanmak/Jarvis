@@ -370,8 +370,8 @@ def stream_chunks(response):
     yield final
 
 def predict_limit(body, route):
-    requested = body.get('max_completion_tokens', body.get('max_tokens', 2048))
     maximum = route.get('max_output_tokens', 2048)
+    requested = body.get('max_completion_tokens', body.get('max_tokens', maximum))
     if type(requested) is not int or requested <= 0 or type(maximum) is not int or maximum <= 0:
         raise ValueError('invalid output token limit')
     return min(requested, maximum)
@@ -473,6 +473,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 options={k:body[k] for k in ['temperature','top_p','seed'] if k in body}
                 try:
                     options['num_predict']=predict_limit(body, route)
+                    if 'context_window' in route:
+                        context = route['context_window']
+                        if type(context) is not int or context <= 0:
+                            raise ValueError('invalid context window')
+                        options['num_ctx'] = context
                     messages=normalize_messages(body.get('messages',[]))
                 except ValueError as error:
                     raise InvalidRequestError(str(error)) from error

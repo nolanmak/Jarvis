@@ -285,7 +285,7 @@ impl CodexCliReasoner {
             for value in router.codex_overrides() { args.extend(["-c".into(), value]); }
         }
         if let Some((context, compact)) = match self.kind {
-            ProviderKind::Qwen => Some((16_384, 12_288)),
+            ProviderKind::Qwen => Some((262_144, 229_376)),
             ProviderKind::Glm => Some((32_768, 24_576)),
             _ => None,
         } {
@@ -1272,8 +1272,10 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
             let argv = std::fs::read_to_string(&record).unwrap();
             assert!(argv.contains(&format!("-m\n{expected}\n")), "wrong model: {argv}");
             assert!(argv.contains("model_providers.augmentagent_router.wire_api=\"responses\""));
-            let context = if kind == ProviderKind::Qwen { 16_384 } else { 32_768 };
+            let context = if kind == ProviderKind::Qwen { 262_144 } else { 32_768 };
             assert!(argv.contains(&format!("model_context_window={context}")));
+            let compact = if kind == ProviderKind::Qwen { 229_376 } else { 24_576 };
+            assert!(argv.contains(&format!("model_auto_compact_token_limit={compact}")));
             assert!(!argv.contains("router-secret"));
         }
     }
