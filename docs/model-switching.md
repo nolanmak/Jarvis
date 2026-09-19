@@ -306,7 +306,10 @@ auto-compaction at 229,376 tokens. Set the Runpod worker's
 `OLLAMA_CONTEXT_LENGTH=262144` to match. In the private adapter route for
 `qwen38-27b`, set `max_output_tokens` to 16384 and `context_window` to
 262144. The adapter sends `num_ctx` on each request so a reused worker
-also applies the configured context. The route ceiling is also
+also applies the configured context. Set `execution_timeout_ms` to 1200000
+and the Runpod endpoint execution timeout to match, allowing long input
+processing plus generation within a bounded 20-minute job. The adapter
+retains a 10-minute execution default for routes without this setting. The route ceiling is also
 the default when a request omits its output budget; explicit smaller
 requests remain smaller. Other routes retain their existing defaults.
 

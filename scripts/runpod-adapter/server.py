@@ -470,6 +470,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # honored and must fail before a paid Runpod submission.
                 if choice not in ('auto','none'):
                     raise InvalidRequestError('Qwen tool_choice supports only auto or none')
+                execution_timeout = route.get('execution_timeout_ms', 600000)
+                if type(execution_timeout) is not int or not 1 <= execution_timeout <= 1800000:
+                    raise InvalidRequestError('invalid execution timeout')
                 options={k:body[k] for k in ['temperature','top_p','seed'] if k in body}
                 try:
                     options['num_predict']=predict_limit(body, route)
@@ -521,7 +524,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             base=route['base_url']
             try:
-                submission=rpc(base+'/run',{'input':payload,'policy':{'executionTimeout':600000,'ttl':3600000}})
+                submission=rpc(base+'/run',{'input':payload,'policy':{'executionTimeout':execution_timeout,'ttl':3600000}})
                 job=submission['id']
             except urllib.error.HTTPError as error:
                 error.close()

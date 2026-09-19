@@ -232,10 +232,12 @@ class JobLifecycleTests(unittest.TestCase):
             routes = pathlib.Path(tmp) / 'routes.json'
             routes.write_text(json.dumps({'qwen38-27b': {
                 'type': 'ollama-queue', 'base_url': 'https://api.runpod.ai/v2/endpoint',
-                'max_output_tokens': 16384, 'context_window': 262144}}))
+                'max_output_tokens': 16384, 'context_window': 262144,
+                'execution_timeout_ms': 1200000}}))
             journal_path = pathlib.Path(tmp) / 'jobs.sqlite3'
             def upstream(url, payload=None):
                 if url.endswith('/run'):
+                    self.assertEqual(payload['policy']['executionTimeout'], 1200000)
                     self.assertEqual(payload['input']['options']['num_ctx'], 262144)
                     self.assertEqual(payload['input']['options']['num_predict'], 16384)
                     return {'id': 'job-1'}
