@@ -297,3 +297,26 @@ runpodctl serverless logs "$ENDPOINT_ID" --source system --tail 20
 The [RunPod CLI implementation notes](https://github.com/runpod/runpodctl/blob/main/AGENTS.md)
 document the distinction between cached ready workers and running containers.
 A passing inference probe and actual container shutdown are separate receipts.
+
+
+### Qwen context and output budget
+
+Qwen uses a 262,144-token context window in the Jarvis Codex bridge, with
+auto-compaction at 229,376 tokens. Set the Runpod worker's
+`OLLAMA_CONTEXT_LENGTH=262144` to match. In the private adapter route for
+`qwen38-27b`, set `max_output_tokens` to 16384 and `context_window` to
+262144. The adapter sends `num_ctx` on each request so a reused worker
+also applies the configured context. Set `execution_timeout_ms` to 1200000
+and the Runpod endpoint execution timeout to match, allowing long input
+processing plus generation within a bounded 20-minute job. The adapter
+retains a 10-minute execution default for routes without this setting. The route ceiling is also
+the default when a request omits its output budget; explicit smaller
+requests remain smaller. Other routes retain their existing defaults.
+
+Increasing these settings does not validate GPU memory capacity by itself.
+Verify a long-context request on the actual worker, a tool-call round trip,
+and scale-to-zero. Serverless cost projections must use measured prefill
+and generation rates and include startup/idle time. Claude/Codex cached
+input tokens cannot be assumed to retain their cache savings after moving
+to Runpod. Per-call usage records can aggregate several tool turns and are
+not measurements of the largest individual context window.
