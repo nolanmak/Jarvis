@@ -121,6 +121,7 @@ apply_update() {
       log "COMPUTER WORKER INSTALL FAILED — withholding build stamp"
       return 1
     fi
+    systemctl --user daemon-reload >> "$LOG" 2>&1 || return 1
     restart_unit augmentagent-computer-use.service || RESTART_FAILURES=$((RESTART_FAILURES + 1))
   fi
 

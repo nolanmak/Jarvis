@@ -38,3 +38,28 @@ test("cancellation kills a pending provider call promptly and removes its privat
   assert.ok(Date.now() - start < 5000);
   assert.deepEqual(await readdir(dir), ["fake-codex"]);
 });
+test("missing native provider is a typed unavailable result and leaves no private files", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "runner-unavailable-"));
+  const prior = process.env.CODEX_CLI;
+  process.env.CODEX_CLI = join(dir, "absent-codex");
+  t.after(async () => {
+    if (prior === undefined) delete process.env.CODEX_CLI;
+    else process.env.CODEX_CLI = prior;
+    await rm(dir, { recursive: true, force: true });
+  });
+  await assert.rejects(
+    runModel(
+      {
+        model: "gpt-6-astra",
+        goal: "fixture",
+        hosts: ["fixture.test"],
+        actions: 0,
+        evidence: [],
+      },
+      { stateDirectory: dir, socket: join(dir, "unused"), token: "synthetic" },
+      new AbortController().signal,
+    ),
+    /model_unavailable/,
+  );
+  assert.deepEqual(await readdir(dir), []);
+});

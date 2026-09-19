@@ -14,7 +14,8 @@ profile. No NewsletterBuddy research run is needed.
    worker (NewsletterBuddy PR #29). Both workers must use the same bridge
    directory and lock directory. Leave the bridge itself running to retain
    Chrome's consented upstream connection.
-3. Install `systemd/augmentagent-computer-use.service` as a user unit. Adjust
+3. Link `systemd/augmentagent-computer-use.service` as a user unit with
+   `systemctl --user link /absolute/repo/systemd/augmentagent-computer-use.service`. Adjust
    its absolute paths if this installation uses a different layout. Enable
    and start it. It creates an owner-only state directory, credential and Unix
    socket. Jarvis resolves its client path through the shared state-directory

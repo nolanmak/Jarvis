@@ -84,6 +84,8 @@ export async function checkUpgrade(directory) {
       if (
         !/187/.test(result.answer) ||
         !/2026-09-24|September 24/.test(result.answer) ||
+        !/2026-09-23|September 23/.test(result.answer) ||
+        !/2026-09-25|September 25/.test(result.answer) ||
         !/Founder|19:00|7[ :]*[pP]/.test(result.answer) ||
         result.unresolved?.length
       )

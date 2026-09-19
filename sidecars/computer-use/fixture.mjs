@@ -74,7 +74,7 @@ export async function runFixture(model) {
         actions: 0,
         evidence: [],
         hosts: ["fixture.test"],
-        goal: "Use https://fixture.test to search one-way SFO to PHL on September 24 2026, one adult economy. Report the observed fare and details. Then use https://fixture.test/events to find the technology event and its date/time. Do not buy anything. Include both findings.",
+        goal: "Use https://fixture.test to compare one-way SFO to PHL on September 23, September 24 and September 25 2026, one adult economy. Search each date separately and report each date in ISO YYYY-MM-DD format with its observed fare and details. Then use https://fixture.test/events to find the technology event and its date/time. Do not buy anything. Include both findings.",
       },
       { stateDirectory: dir, socket, token: "synthetic" },
       controller.signal,

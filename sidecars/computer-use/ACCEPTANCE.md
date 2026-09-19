@@ -75,6 +75,41 @@ unbounded automatic retry loop. A stale cleanup lock deliberately blocks
 subsequent tasks until the operator verifies cleanup. These limitations are
 also documented in README.md.
 
-GitHub-hosted checks could not start because repository Actions billing was
-blocked. Local test results are reported separately; hosted CI is not claimed
-to be green.
+NewsletterBuddy hosted checks could not start because that repository reported
+an Actions billing block; its local checks passed (88 passed, 10 optional
+skips; real Chrome bridge/worker integration 9 passed). Jarvis PR #1169 hosted
+checks run normally and must be checked separately before merge.
+
+## Recorded staging runs (2026-09-19 UTC)
+
+- Full Rust workspace: 2,960 passed, 0 failed, 46 ignored (125 result groups).
+  Final command exited 0. An intervening run during release compilation hit
+  `hung_primary_times_out_and_fallback_serves` process-cleanup timing; the
+  complete rerun after compilation passed. Release build also passed.
+- Python bridge: 154 discovered, 146 passed, 8 host-dependent skips.
+- Updater rebuild trigger/stamp/restart hygiene: 29 / 6 / 21 passed.
+- Dashboard regression: 40 passed and production build passed.
+- Existing-Chrome flight conversation, release binary, task started 17:42 UTC:
+  ordinary request for one-way SFO→PHL, September 24, 2026, one adult economy.
+  Parent delegated automatically, polled until completion, then returned
+  $233 Frontier F9 2930/F9 2970, SFO 23:58 PDT September 24 → PHL 14:21 EDT
+  September 25, DFW connection (4h11m), total 11h23m. Reported zero included
+  carry-on/checked bags and unknown fare brand/personal item allowance.
+  Comparison: Alaska $292, Southwest $342. Evidence observed around
+  17:44 UTC on [Google Flights](https://www.google.com/travel/flights/search?tfs=CBwQAhoeEgoyMDI2LTA5LTI0agcIARIDU0ZPcgcIARIDUEhMQAFIAXABggELCP___________wGYAQI&tfu=EgoIAhAAGAAgAigB).
+  Earlier live iterations caught replayed status reads, premature parent
+  answers, unsupported fare labels and missing read RPC rules; this final
+  staging result includes those fixes.
+- Non-flight owner conversation at 17:36:43 UTC: browser opened HN newest,
+  selected its first discussion with comments, followed the discussion, and
+  returned observed title, 1 point, 2 comments and
+  [discussion URL](https://news.ycombinator.com/item?id=49768461).
+- Live recovery: started with deliberately unavailable bridge; observed
+  `needs_action/chrome_debugging_required`; restored access by linking the
+  selected existing bridge, resumed the same task/model, then cancelled while
+  the native model was pending. Cancellation plus subsequent verification
+  took 531 ms; no profile lock remained and status stayed cancelled.
+
+Live fares are observations, not CI assertions or guaranteed availability.
+Raw transcripts remain private on the host under `/tmp/1168-parent-*.log`.
+Production-main verification is recorded in PR #1169 after deployment.

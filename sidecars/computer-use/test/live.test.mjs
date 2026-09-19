@@ -10,6 +10,8 @@ test(
     );
     assert.match(result.answer, /187/);
     assert.match(result.answer, /September 24|2026-09-24/);
+    assert.match(result.answer, /September 23|2026-09-23/);
+    assert.match(result.answer, /September 25|2026-09-25/);
     assert.match(result.answer, /Founder|19:00|7[ :]*[pP]/);
     assert.ok(result.evidenceIds.length);
   },
