@@ -61,6 +61,12 @@ pub fn pause_after_failures() -> i64 {
         .unwrap_or(i64::MAX)
 }
 
+/// #1135 — spacing between reminder nags within one open cycle. Fixed at once
+/// a day per the acceptance criterion; deliberately NOT operator-configurable,
+/// so no env misconfig can make a reminder re-fire more often than daily.
+/// Tests override the scheduler's snapshot of this value directly.
+const NAG_INTERVAL_SECS: i64 = 86_400;
+
 /// Runs a loop's stored prompt and returns the agent's text answer. The CLI
 /// implements this against the same `FallbackReasoner` + `ask_opts` used for
 /// wiki queries, so `/loop 1h what changed in my inbox` works exactly like
@@ -91,6 +97,21 @@ fn loop_request_id(id: &str, created_at_ms: i64, last_run_ms: Option<i64>) -> St
 #[async_trait]
 pub trait LoopPoster: Send + Sync {
     async fn post_to(&self, channel_ref: &str, body: &str) -> anyhow::Result<()>;
+
+    /// #1135 — post a reminder nag with Acknowledge / Dismiss controls. The
+    /// default delegates to `post_to` (no buttons) so surfaces that don't
+    /// implement interactive controls still deliver the text; the Discord CLI
+    /// impl overrides this to attach the `reminder_buttons` row keyed by
+    /// `loop_id` and `cycle_ms` (the open cycle the buttons resolve).
+    async fn post_reminder(
+        &self,
+        channel_ref: &str,
+        body: &str,
+        _loop_id: &str,
+        _cycle_ms: i64,
+    ) -> anyhow::Result<()> {
+        self.post_to(channel_ref, body).await
+    }
 }
 
 /// Parses free-form `/loop <…>` create-text into a [`ParsedLoop`]. The CLI's
@@ -166,6 +187,9 @@ pub struct ParsedLoop {
     /// #231 — IANA timezone anchor for `cron_expr`. Required iff
     /// `cron_expr` is `Some`.
     pub tz: Option<String>,
+    /// #1135 — opt into nag mode: re-fire once a day until Acknowledged /
+    /// Dismissed. Default `false`; only the explicit create paths set it.
+    pub nag_until_ack: bool,
 }
 
 /// Read `<N><unit>` (or `<N> <unit-word>`) at the start of `s`, returning the
@@ -268,6 +292,7 @@ pub fn parse_create_args(rest: &str) -> Result<ParsedLoop, String> {
             duration_secs: None,
             cron_expr: None,
             tz: None,
+            nag_until_ack: false,
         });
     }
 
@@ -330,6 +355,7 @@ pub fn parse_create_args(rest: &str) -> Result<ParsedLoop, String> {
             duration_secs,
             cron_expr: None,
             tz: None,
+            nag_until_ack: false,
         });
     }
 
@@ -496,6 +522,7 @@ pub async fn handle_loop_command_with_model(
                 parsed.cron_expr.as_deref(),
                 parsed.tz.as_deref(),
                 model_profile,
+                parsed.nag_until_ack,
             ) {
                 Ok(id) => match parsed.duration_secs {
                     Some(dur) => format!(
@@ -581,6 +608,9 @@ pub struct LoopScheduler {
     runner: Arc<dyn LoopRunner>,
     poster: Arc<dyn LoopPoster>,
     tick_interval: Duration,
+    /// #1135 — spacing between re-nags within one open cycle. Seeded from the
+    /// fixed daily `NAG_INTERVAL_SECS`; tests override this field directly.
+    nag_interval_secs: i64,
 }
 
 impl LoopScheduler {
@@ -594,6 +624,7 @@ impl LoopScheduler {
             runner,
             poster,
             tick_interval: Duration::from_secs(30),
+            nag_interval_secs: NAG_INTERVAL_SECS,
         }
     }
 
@@ -626,11 +657,21 @@ impl LoopScheduler {
         // iteration always runs.
         let loops = self.store.list_active_user_loops()?;
         for l in loops {
+            // #1135 — a reminder loop with an OPEN nag cycle re-fires on the
+            // nag cadence (once a day by default), anchored on its last fire,
+            // ignoring the base cron/interval schedule until the owner
+            // Acknowledges or Dismisses (which clears `nag_cycle_ms`).
+            // `last_run_ms` is always Some once a cycle has been opened.
+            let due_at = if l.nag_until_ack && l.nag_cycle_ms.is_some() {
+                l.last_run_ms
+                    .map(|t| t + self.nag_interval_secs * 1000)
+                    .unwrap_or(0)
+            }
             // #231 — cron-style loops (`cron_expr` + `tz`) compute next
             // firing via the cron crate anchored in the row's tz. Plain
             // interval loops keep the legacy arithmetic (back-compat for
             // every existing row, which has cron_expr = NULL).
-            let due_at = if let (Some(cron_expr), Some(tz)) =
+            else if let (Some(cron_expr), Some(tz)) =
                 (l.cron_expr.as_deref(), l.tz.as_deref())
             {
                 match next_cron_firing_ms(cron_expr, tz, l.last_run_ms, l.created_at_ms) {
@@ -653,7 +694,7 @@ impl LoopScheduler {
             if due_at > now {
                 continue;
             }
-            self.run_one(&l).await;
+            self.run_one(&l, due_at).await;
         }
         // Sweep any loops whose `for <duration>` deadline has passed. The
         // store stops them in one statement and returns the surface info so
@@ -674,8 +715,14 @@ impl LoopScheduler {
         Ok(())
     }
 
-    async fn run_one(&self, l: &UserLoop) {
+    /// `due_at` is the schedule time this fire satisfied — used to stamp a
+    /// freshly-opened nag cycle (#1135).
+    async fn run_one(&self, l: &UserLoop, due_at: i64) {
         info!(loop_id = %l.id, "running loop");
+        // #1135 — scheduled boundary this fire satisfied: the cycle marker, and
+        // the base-cadence anchor restored on Ack/Dismiss. A never-run interval
+        // loop has due_at == 0, so anchor on the fire time (not the epoch).
+        let cycle_ms = if due_at > 0 { due_at } else { now_millis() };
         let pause_after = pause_after_failures();
         let request_id = loop_request_id(&l.id, l.created_at_ms, l.last_run_ms);
         match self
@@ -686,7 +733,19 @@ impl LoopScheduler {
             Ok(answer) => {
                 let header = format!("🔁 loop `{}` · _{}_", l.id, truncate(&l.prompt, 80));
                 let body = loop_result_body(&header, &answer);
-                if let Err(e) = self.poster.post_to(&l.channel_ref, &body).await {
+                // #1135 — nag loops post with Acknowledge / Dismiss controls;
+                // everything else posts plain text. The buttons are keyed to
+                // the cycle they resolve: the already-open marker, or (on the
+                // first fire) the schedule time we're about to stamp below.
+                let posted = if l.nag_until_ack {
+                    let cycle_id = l.nag_cycle_ms.unwrap_or(cycle_ms);
+                    self.poster
+                        .post_reminder(&l.channel_ref, &body, &l.id, cycle_id)
+                        .await
+                } else {
+                    self.poster.post_to(&l.channel_ref, &body).await
+                };
+                if let Err(e) = posted {
                     warn!(loop_id = %l.id, "loop post failed: {e:#}");
                     let _ = self.store.record_user_loop_run(
                         &l.id,
@@ -699,6 +758,15 @@ impl LoopScheduler {
                 let _ = self
                     .store
                     .record_user_loop_run(&l.id, true, "ok", pause_after);
+                // #1135 — first fire of a scheduled cycle opens the nag so the
+                // scheduler keeps re-nagging daily until Ack/Dismiss. Guarded
+                // by `nag_cycle_ms IS NULL` in the store, so a re-nag within an
+                // already-open cycle is a no-op.
+                if l.nag_until_ack && l.nag_cycle_ms.is_none() {
+                    if let Err(e) = self.store.open_nag_cycle(&l.id, cycle_ms) {
+                        warn!(loop_id = %l.id, "open_nag_cycle failed: {e:#}");
+                    }
+                }
             }
             Err(e) => {
                 warn!(loop_id = %l.id, "loop prompt failed: {e:#}");
@@ -993,14 +1061,14 @@ mod tests {
         }
         let (store, file) = tmp_store();
         store.create_user_loop_with_model("synthetic-owner", "discord", "synthetic-channel", 60,
-            "synthetic task", None, None, None, Some("glm")).unwrap();
+            "synthetic task", None, None, None, Some("glm"), false).unwrap();
         let runner = Arc::new(Runner { ids: std::sync::Mutex::new(Vec::new()),
             models: std::sync::Mutex::new(Vec::new()),
             complete: std::sync::atomic::AtomicBool::new(false), started: tokio::sync::Notify::new() });
         {
             let row = store.list_active_user_loops().unwrap().remove(0);
             let scheduler = LoopScheduler::new(Arc::new(store), runner.clone(), Arc::new(Poster));
-            let running = scheduler.run_one(&row);
+            let running = scheduler.run_one(&row, 0);
             tokio::pin!(running);
             tokio::select! {
                 _ = &mut running => panic!("fixture must stop during execution"),
@@ -1013,10 +1081,10 @@ mod tests {
         assert!(row.last_run_ms.is_none());
         runner.complete.store(true, std::sync::atomic::Ordering::SeqCst);
         let scheduler = LoopScheduler::new(reopened.clone(), runner.clone(), Arc::new(Poster));
-        scheduler.run_one(&row).await;
+        scheduler.run_one(&row, 0).await;
         let next = reopened.list_active_user_loops().unwrap().remove(0);
         assert!(next.last_run_ms.is_some());
-        scheduler.run_one(&next).await;
+        scheduler.run_one(&next, 0).await;
         let ids = runner.ids.lock().unwrap();
         assert_eq!(ids.len(), 3);
         assert_eq!(ids[0], ids[1], "restarted occurrence must reuse its request identity");
@@ -1179,6 +1247,7 @@ mod tests {
             duration_secs: None,
             cron_expr: None,
             tz: None,
+            nag_until_ack: false,
         };
         let err = validate_parsed(&p, 0).unwrap_err();
         assert!(err.contains("positive"), "got: {err}");
@@ -1446,5 +1515,87 @@ mod tests {
         // Phase 2: now the expiry sweep runs and stops it.
         let expired = store.stop_expired_user_loops(now_millis()).unwrap();
         assert_eq!(expired.len(), 1, "expiry sweep stops the loop after due processing");
+    }
+
+    /// #1135 — a nag loop re-fires daily (via `post_reminder`, with buttons)
+    /// while its cycle is open, then goes silent once Acknowledged/Dismissed
+    /// until the next scheduled cadence.
+    #[tokio::test]
+    async fn nag_loop_refires_until_acknowledged_then_goes_silent() {
+        struct Runner;
+        #[async_trait]
+        impl LoopRunner for Runner {
+            async fn run_prompt(&self, _id: &str, _owner: &str, _prompt: &str, _model: Option<&str>) -> anyhow::Result<String> {
+                Ok("take your meds".into())
+            }
+        }
+        #[derive(Default)]
+        struct CountingPoster {
+            reminders: std::sync::atomic::AtomicUsize,
+            plain: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait]
+        impl LoopPoster for CountingPoster {
+            async fn post_to(&self, _c: &str, _b: &str) -> anyhow::Result<()> {
+                self.plain.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            async fn post_reminder(&self, _c: &str, _b: &str, _loop_id: &str, _cycle_ms: i64) -> anyhow::Result<()> {
+                self.reminders.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (store, _file) = tmp_store();
+        let store = Arc::new(store);
+        let id = store
+            .create_user_loop_with_model(
+                "user-1135", "discord", "chan", 3600, "take meds", None, None, None, None, true,
+            )
+            .unwrap();
+        let poster = Arc::new(CountingPoster::default());
+        let mut scheduler =
+            LoopScheduler::new(store.clone(), Arc::new(Runner), poster.clone());
+        // Short nag cadence so the test can drive re-fires by backdating.
+        scheduler.nag_interval_secs = 100;
+
+        // First tick: the never-run loop is due, fires as a reminder (buttons)
+        // and opens the nag cycle.
+        scheduler.tick().await.unwrap();
+        assert_eq!(poster.reminders.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(poster.plain.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(store.list_user_loops("user-1135").unwrap()[0].nag_cycle_ms.is_some());
+
+        // Immediate re-tick: the nag isn't due again yet — no extra post.
+        scheduler.tick().await.unwrap();
+        assert_eq!(poster.reminders.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Backdate last_run past the nag cadence → the nag re-fires.
+        let backdated = now_millis() - 200_000;
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE user_loops SET last_run_ms = ?2 WHERE id = ?1",
+                    (id.as_str(), backdated),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        scheduler.tick().await.unwrap();
+        assert_eq!(poster.reminders.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // Still one open cycle — the re-fire didn't reopen it.
+        assert!(store.list_user_loops("user-1135").unwrap()[0].nag_cycle_ms.is_some());
+
+        // Acknowledge closes the open cycle; the loop returns to its base
+        // cadence (last_run is recent, interval is 1h) so it goes silent.
+        let open_cycle = store.list_user_loops("user-1135").unwrap()[0].nag_cycle_ms.unwrap();
+        assert_eq!(store.acknowledge_nag_cycle(&id, open_cycle).unwrap(), 1);
+        assert!(store.list_user_loops("user-1135").unwrap()[0].nag_cycle_ms.is_none());
+        scheduler.tick().await.unwrap();
+        assert_eq!(
+            poster.reminders.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "acknowledged loop must not nag again until its next scheduled cycle",
+        );
     }
 }

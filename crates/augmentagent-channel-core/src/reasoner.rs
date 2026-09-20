@@ -2258,10 +2258,16 @@ Plus REQUIRED:
 - A prompt (what the loop should do each tick)
 Optionally:
 - A total duration (auto-stop time)
+- nag_until_ack (bool, #1135): true ONLY when the user asks to be reminded
+  repeatedly until they respond — "remind me… until I acknowledge", "nag me
+  until it's done", "keep reminding me until I mark it done/dismiss". A plain
+  recurring task is NOT a nag; omit the key or set false.
 
 Output a SINGLE JSON object on one line, no prose, no code fences:
   INTERVAL form: {"interval_secs": <int>, "prompt": <string>, "duration_secs": <int or null>}
   CRON form:     {"cron_expr": "<5-field cron>", "tz": "<IANA tz>", "prompt": <string>, "duration_secs": <int or null>}
+Add "nag_until_ack": true to either form when (and only when) the user asked to
+be reminded until they acknowledge or dismiss.
 
 Cron field order is `min hour day-of-month month day-of-week`. Day-of-week is
 Unix convention (0=Sun..6=Sat) but PREFER NAMES (MON, TUE, …) which are
@@ -2280,6 +2286,8 @@ Examples:
   "thirty seconds /digest" → {"interval_secs": 30, "prompt": "/digest", "duration_secs": null}
   "every Monday 9am Eastern, ping me" → {"cron_expr": "0 9 * * MON", "tz": "America/New_York", "prompt": "ping me", "duration_secs": null}
   "every weekday at noon UTC say morning" → {"cron_expr": "0 12 * * MON-FRI", "tz": "UTC", "prompt": "say morning", "duration_secs": null}
+  "remind me to take meds every day at 9am Eastern until I acknowledge" → {"cron_expr": "0 9 * * *", "tz": "America/New_York", "prompt": "take meds", "duration_secs": null, "nag_until_ack": true}
+  "nag me every 30m until I reply to the recruiter" → {"interval_secs": 1800, "prompt": "reply to the recruiter", "duration_secs": null, "nag_until_ack": true}
   "every monday say hi" → {"error": "what timezone for the Monday schedule? (e.g. America/New_York, UTC)"}
   "every weekday at 8am check inbox" → {"error": "what timezone for 8am? (e.g. America/New_York, UTC)"}
   "asdf" → {"error": "couldn't find a cadence — try `loop 5m do thing`, `loop do thing every 5m`, or `loop every Monday 9am EST do thing`"}

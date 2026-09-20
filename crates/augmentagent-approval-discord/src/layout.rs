@@ -597,6 +597,36 @@ pub fn recompose_button_row(action_id: &str) -> CreateActionRow {
     .style(ButtonStyle::Primary)])
 }
 
+/// #1135 — the Acknowledge / Dismiss button row appended to a `/loop` reminder
+/// nag; both verbs close the open cycle (see `Store::acknowledge_nag_cycle`).
+/// The `action_id` slot packs `loop_id@cycle_ms` so a button is cycle-specific:
+/// a stale button on an older re-fire carries the old marker and won't match.
+/// Loop ids are UUIDs (no `@`), so the separator is unambiguous.
+pub fn reminder_buttons(loop_id: &str, cycle_ms: i64) -> CreateActionRow {
+    let action_id = reminder_action_id(loop_id, cycle_ms);
+    CreateActionRow::Buttons(vec![
+        CreateButton::new(CustomId::new(&action_id, Verb::LoopAck).to_string())
+            .label("Acknowledge")
+            .style(ButtonStyle::Success),
+        CreateButton::new(CustomId::new(&action_id, Verb::LoopDismiss).to_string())
+            .label("Dismiss")
+            .style(ButtonStyle::Secondary),
+    ])
+}
+
+/// #1135 — pack a loop id and its open-cycle marker into a CustomId
+/// `action_id` slot. [`parse_reminder_action_id`] is the inverse.
+fn reminder_action_id(loop_id: &str, cycle_ms: i64) -> String {
+    format!("{loop_id}@{cycle_ms}")
+}
+
+/// #1135 — inverse of [`reminder_action_id`]. Returns `(loop_id, cycle_ms)`,
+/// or `None` if the slot isn't a loop-nag action id.
+pub fn parse_reminder_action_id(action_id: &str) -> Option<(&str, i64)> {
+    let (loop_id, cycle) = action_id.rsplit_once('@')?;
+    Some((loop_id, cycle.parse().ok()?))
+}
+
 /// Custom-time modal opened by the `custom` schedule token (#501). One short
 /// text input; the placeholder doubles as the format cheat-sheet. Known
 /// cosmetic artifact: dismissing the modal leaves the select displaying
@@ -846,6 +876,17 @@ pub fn extract_feedback(rows: &[serenity::all::ActionRow]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reminder_action_id_packs_and_unpacks_the_cycle_marker() {
+        // #1135 — the loop id + cycle marker survive packing so the click
+        // handler can resolve the exact cycle a button was minted for.
+        let loop_id = "550e8400-e29b-41d4-a716-446655440000";
+        let packed = reminder_action_id(loop_id, 12_345);
+        assert_eq!(parse_reminder_action_id(&packed), Some((loop_id, 12_345)));
+        // A raw action id with no cycle marker isn't a loop-nag id.
+        assert_eq!(parse_reminder_action_id(loop_id), None);
+    }
 
     #[test]
     fn truncate_respects_char_boundary() {

@@ -43,6 +43,7 @@ pub use layout::{append_needs_input_marker, approval_message, split_needs_input,
 pub use layout::{append_assumes_marker, split_assumes, strip_assumes_for_send};
 // #501 — scheduled-notice layout, for brokers/tests outside this crate.
 pub use layout::{scheduled_notice_message, schedule_modal, SCHEDULE_CUSTOM_VALUE};
+pub use layout::reminder_buttons;
 pub use loops::{
     handle_loop_command, match_loop_prefix, max_active_per_user, min_interval_secs,
     next_cron_firing_ms, normalize_and_validate_cron, parse_interval, pause_after_failures,

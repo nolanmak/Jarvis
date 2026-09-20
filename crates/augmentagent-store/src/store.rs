@@ -797,6 +797,23 @@ impl Store {
         if !column_exists(conn, "user_loops", "model_profile")? {
             conn.execute("ALTER TABLE user_loops ADD COLUMN model_profile TEXT", [])?;
         }
+        // #1135 — nag-until-ack. `nag_until_ack` is the per-loop opt-in (0 =
+        // off, the default). `nag_cycle_ms` is the open-cycle marker: non-NULL
+        // means a scheduled occurrence fired and awaits Acknowledge/Dismiss, so
+        // the scheduler re-fires daily instead of on the base cadence. Both
+        // nullable/defaulted so legacy rows migrate byte-for-byte.
+        if !column_exists(conn, "user_loops", "nag_until_ack")? {
+            conn.execute(
+                "ALTER TABLE user_loops ADD COLUMN nag_until_ack INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !column_exists(conn, "user_loops", "nag_cycle_ms")? {
+            conn.execute(
+                "ALTER TABLE user_loops ADD COLUMN nag_cycle_ms INTEGER",
+                [],
+            )?;
+        }
 
         // #47 — cross-surface state sync. `status_source` records which surface
         // resolved an action (discord / dashboard / telegram / cli / nudge) so
@@ -5311,12 +5328,17 @@ impl Store {
     ) -> StoreResult<String> {
         self.create_user_loop_with_model(
             owner, channel, channel_ref, interval_secs, prompt, expires_at_ms,
-            cron_expr, tz, None,
+            cron_expr, tz, None, false,
         )
     }
 
     /// Create a loop with an optional durable model pin. Legacy callers
     /// inherit the daemon default through `create_user_loop`.
+    ///
+    /// `nag_until_ack` opts the loop into #1135 nag mode (re-fire daily
+    /// until the owner Acknowledges/Dismisses each scheduled cycle). `false`
+    /// is the default and preserves normal-cadence behavior.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_user_loop_with_model(
         &self,
         owner: &str,
@@ -5328,6 +5350,7 @@ impl Store {
         cron_expr: Option<&str>,
         tz: Option<&str>,
         model_profile: Option<&str>,
+        nag_until_ack: bool,
     ) -> StoreResult<String> {
         if let Some(model) = model_profile {
             if !matches!(model, "claude" | "qwen" | "glm" | "codex") {
@@ -5341,8 +5364,8 @@ impl Store {
             "INSERT INTO user_loops \
                  (id, owner, channel, channel_ref, interval_secs, prompt, \
                   status, fail_count, created_at_ms, updated_at_ms, \
-                  expires_at_ms, cron_expr, tz, model_profile) \
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 0, ?7, ?7, ?8, ?9, ?10, ?11)",
+                  expires_at_ms, cron_expr, tz, model_profile, nag_until_ack) \
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 0, ?7, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 id,
                 owner,
@@ -5355,6 +5378,7 @@ impl Store {
                 cron_expr,
                 tz,
                 model_profile,
+                nag_until_ack,
             ],
         )?;
         Ok(id)
@@ -5367,7 +5391,7 @@ impl Store {
             "SELECT id, owner, channel, channel_ref, interval_secs, prompt, \
                     status, last_run_ms, last_status, fail_count, \
                     created_at_ms, updated_at_ms, expires_at_ms, \
-                    cron_expr, tz, model_profile \
+                    cron_expr, tz, model_profile, nag_until_ack, nag_cycle_ms \
                FROM user_loops \
               WHERE owner = ?1 AND status != 'stopped' \
               ORDER BY created_at_ms DESC",
@@ -5388,7 +5412,7 @@ impl Store {
             "SELECT id, owner, channel, channel_ref, interval_secs, prompt, \
                     status, last_run_ms, last_status, fail_count, \
                     created_at_ms, updated_at_ms, expires_at_ms, \
-                    cron_expr, tz, model_profile \
+                    cron_expr, tz, model_profile, nag_until_ack, nag_cycle_ms \
                FROM user_loops \
               WHERE status = 'active' \
               ORDER BY created_at_ms ASC",
@@ -5457,6 +5481,45 @@ impl Store {
             )?;
         }
         Ok(())
+    }
+
+    /// #1135 — open a nag cycle for a reminder loop. Stamps `nag_cycle_ms`
+    /// with the cycle's due time so the scheduler re-fires daily until the
+    /// user acknowledges or dismisses. Guarded by `nag_cycle_ms IS NULL` so a
+    /// re-fire within an already-open cycle is a no-op; returns true only when
+    /// this call actually opened the cycle.
+    pub fn open_nag_cycle(&self, id: &str, cycle_ms: i64) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE user_loops SET nag_cycle_ms = ?2, updated_at_ms = ?3 \
+              WHERE id = ?1 AND nag_cycle_ms IS NULL",
+            params![id, cycle_ms, now_millis()],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// #1135 — close an open nag cycle (Acknowledge / Dismiss). Clears
+    /// `nag_cycle_ms` so the loop goes silent until its next scheduled cron /
+    /// interval cycle. The update is conditional on BOTH the loop still being
+    /// `active` AND `nag_cycle_ms` matching the exact `cycle_ms` the tapped
+    /// button was minted for, so:
+    ///   * a button left on an older re-fire message no longer matches once a
+    ///     newer cycle is open (its `cycle_ms` differs) — it can't resolve the
+    ///     later cycle;
+    ///   * a stopped loop (which retains its stale `nag_cycle_ms`) is a no-op;
+    ///   * a second tap on the same message affects zero rows.
+    /// Also rewinds `last_run_ms` to `cycle_ms` so the base cron/interval
+    /// cadence resumes from the scheduled cycle, not the last daily re-fire
+    /// (which `record_user_loop_run` had advanced it to).
+    /// Returns the number of rows changed (1 on the resolve, 0 otherwise).
+    pub fn acknowledge_nag_cycle(&self, id: &str, cycle_ms: i64) -> StoreResult<usize> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE user_loops SET nag_cycle_ms = NULL, last_run_ms = ?2, updated_at_ms = ?3 \
+              WHERE id = ?1 AND status = 'active' AND nag_cycle_ms = ?2",
+            params![id, cycle_ms, now_millis()],
+        )?;
+        Ok(n)
     }
 
     /// Transition every active loop whose `expires_at_ms <= now` to
@@ -7287,6 +7350,9 @@ fn row_to_whatsapp_device(r: &rusqlite::Row) -> rusqlite::Result<WhatsappDevice>
     })
 }
 
+/// The single `UserLoop` constructor. Both getters (`list_user_loops`,
+/// `list_active_user_loops`) map through here, so their `SELECT`s must list all
+/// 18 columns in this order; no other query builds a `UserLoop`.
 fn row_to_user_loop(r: &rusqlite::Row) -> rusqlite::Result<UserLoop> {
     Ok(UserLoop {
         id: r.get(0)?,
@@ -7305,6 +7371,8 @@ fn row_to_user_loop(r: &rusqlite::Row) -> rusqlite::Result<UserLoop> {
         cron_expr: r.get(13)?,
         tz: r.get(14)?,
         model_profile: r.get(15)?,
+        nag_until_ack: r.get::<_, i64>(16)? != 0,
+        nag_cycle_ms: r.get(17)?,
     })
 }
 
@@ -8895,7 +8963,7 @@ mod tests {
             pinned_id = store
                 .create_user_loop_with_model(
                     "u1", "discord", "chan", 60, "pinned prompt", None, None, None,
-                    Some("qwen"),
+                    Some("qwen"), false,
                 )
                 .unwrap();
             store
@@ -8914,7 +8982,7 @@ mod tests {
             None
         );
         assert!(reopened.create_user_loop_with_model(
-            "u1", "discord", "chan", 60, "bad", None, None, None, Some("gemini")
+            "u1", "discord", "chan", 60, "bad", None, None, None, Some("gemini"), false
         ).is_err());
     }
 
@@ -8952,6 +9020,94 @@ mod tests {
         old_json.as_object_mut().unwrap().remove("model_profile");
         let decoded: UserLoop = serde_json::from_value(old_json).unwrap();
         assert!(decoded.model_profile.is_none());
+    }
+
+    #[test]
+    fn create_user_loop_with_nag_persists_flag() {
+        // #1135 — the opt-in flag round-trips; default create leaves it off.
+        let (s, _f) = fresh_store();
+        s.create_user_loop_with_model(
+            "u1", "discord", "c", 300, "take meds", None, None, None, None, true,
+        )
+        .unwrap();
+        s.create_user_loop("u1", "discord", "c", 300, "normal", None, None, None)
+            .unwrap();
+        let loops = s.list_user_loops("u1").unwrap();
+        let nagging = loops.iter().find(|l| l.prompt == "take meds").unwrap();
+        let plain = loops.iter().find(|l| l.prompt == "normal").unwrap();
+        assert!(nagging.nag_until_ack);
+        assert!(nagging.nag_cycle_ms.is_none());
+        assert!(!plain.nag_until_ack);
+    }
+
+    #[test]
+    fn nag_cycle_lifecycle_open_close_stale_and_stopped() {
+        // #1135 — open is idempotent within a cycle; close is conditional on
+        // the exact open cycle AND status='active', so a stale button (an
+        // older cycle marker) and a stopped loop are both no-ops (acceptance
+        // criterion 5).
+        let (s, _f) = fresh_store();
+        let id = s
+            .create_user_loop_with_model(
+                "u1", "discord", "c", 300, "take meds", None, None, None, None, true,
+            )
+            .unwrap();
+
+        // First fire opens the cycle at scheduled time 100; a re-fire is a no-op.
+        assert!(s.open_nag_cycle(&id, 100).unwrap());
+        assert!(!s.open_nag_cycle(&id, 999).unwrap());
+        assert_eq!(s.list_user_loops("u1").unwrap()[0].nag_cycle_ms, Some(100));
+
+        // A daily re-fire advances last_run_ms far past the cycle boundary.
+        s.record_user_loop_run(&id, true, "ok", i64::MAX).unwrap();
+        assert!(s.list_user_loops("u1").unwrap()[0].last_run_ms.unwrap() > 100);
+
+        // Acknowledge closes cycle 100; a second (stale/double) tap is a no-op.
+        // The resolve also rewinds last_run_ms to 100 so the base cadence
+        // resumes from the scheduled cycle, not the last nag (#1135 regression).
+        assert_eq!(s.acknowledge_nag_cycle(&id, 100).unwrap(), 1);
+        assert_eq!(s.acknowledge_nag_cycle(&id, 100).unwrap(), 0);
+        let after_ack = &s.list_user_loops("u1").unwrap()[0];
+        assert!(after_ack.nag_cycle_ms.is_none());
+        assert_eq!(after_ack.last_run_ms, Some(100), "ack must rewind last_run");
+
+        // A later cycle opens; a button minted for the OLD cycle can't close it.
+        assert!(s.open_nag_cycle(&id, 200).unwrap());
+        assert_eq!(s.acknowledge_nag_cycle(&id, 100).unwrap(), 0, "stale button");
+        assert_eq!(s.list_user_loops("u1").unwrap()[0].nag_cycle_ms, Some(200));
+        assert_eq!(s.acknowledge_nag_cycle(&id, 200).unwrap(), 1, "matching tap");
+
+        // Stopping leaves the stale marker; a tap afterwards must not mutate it.
+        assert!(s.open_nag_cycle(&id, 300).unwrap());
+        assert!(s.stop_user_loop("u1", &id).unwrap());
+        assert_eq!(s.acknowledge_nag_cycle(&id, 300).unwrap(), 0, "stopped loop");
+    }
+
+    #[test]
+    fn legacy_user_loops_schema_adds_nag_columns_with_defaults() {
+        // #1135 — a row written before the nag columns existed migrates in
+        // with nag_until_ack=false and nag_cycle_ms=NULL, untouched otherwise.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        {
+            let conn = rusqlite::Connection::open(file.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE user_loops (\
+                    id TEXT PRIMARY KEY, owner TEXT NOT NULL, channel TEXT NOT NULL, \
+                    channel_ref TEXT NOT NULL, interval_secs INTEGER NOT NULL, \
+                    prompt TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', \
+                    last_run_ms INTEGER, last_status TEXT, fail_count INTEGER NOT NULL DEFAULT 0, \
+                    created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL\
+                );\
+                INSERT INTO user_loops (id, owner, channel, channel_ref, interval_secs, prompt, \
+                    created_at_ms, updated_at_ms) \
+                VALUES ('legacy', 'owner', 'discord', 'channel', 60, 'old prompt', 1, 1);"
+            ).unwrap();
+        }
+        let store = Store::open(file.path()).unwrap();
+        let row = store.list_user_loops("owner").unwrap().remove(0);
+        assert_eq!(row.id, "legacy");
+        assert!(!row.nag_until_ack);
+        assert!(row.nag_cycle_ms.is_none());
     }
 
     #[test]
