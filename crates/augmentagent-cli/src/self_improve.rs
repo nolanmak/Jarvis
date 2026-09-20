@@ -3731,6 +3731,16 @@ struct BaselineCache {
     /// of a `main` that does not build (no test names to keep).
     #[serde(default)]
     gate_err: Option<String>,
+    /// #1171 — the durable "main has been red since" instant the health
+    /// watchdog reads instead of the cache file's mtime. The loop rewrites this
+    /// file (fresh mtime) on every new `main` commit and every full re-check,
+    /// so mtime restarts the watchdog's 6-hour clock on a `main` that is red
+    /// across a series of commits and `red-main-stuck` can never fire. This
+    /// stamp is set on the FIRST red verdict of an unbroken red streak,
+    /// preserved when a later `main` commit is also red, and cleared the moment
+    /// `main` goes green. RFC3339 UTC.
+    #[serde(default)]
+    red_since: Option<String>,
 }
 
 impl BaselineCache {
@@ -3795,12 +3805,31 @@ impl BaselineCache {
     }
 
     /// #932 — the full gate ran on `sha`: `failing` is now the whole story,
-    /// and `gate_err` is `Some` exactly when the gate was red.
-    fn record_full(&mut self, sha: &str, failing: &[String], gate_err: Option<String>) {
+    /// and `gate_err` is `Some` exactly when the gate was red. `now` stamps
+    /// [`red_since`](Self::red_since) (#1171) — the caller passes `Utc::now()`.
+    fn record_full(
+        &mut self,
+        sha: &str,
+        failing: &[String],
+        gate_err: Option<String>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        // The redness of THIS verdict, judged from the arguments — not from
+        // the accumulated state, which `record` only ever appends to.
+        let is_red = !failing.is_empty() || gate_err.is_some();
         self.reset_if_moved(sha);
         self.record(sha, failing, failing);
         self.full_checked = true;
         self.gate_err = gate_err;
+        // #1171 — keep the streak's start across still-red commits; a green
+        // verdict is the only thing that ends it.
+        if is_red {
+            if self.red_since.is_none() {
+                self.red_since = Some(now.to_rfc3339());
+            }
+        } else {
+            self.red_since = None;
+        }
     }
 
     fn reset_if_moved(&mut self, sha: &str) {
@@ -3810,6 +3839,10 @@ impl BaselineCache {
             self.failing.clear();
             self.full_checked = false;
             self.gate_err = None;
+            // #1171 — `red_since` is deliberately NOT cleared here: a red
+            // streak spans commits, so a new (still-red) `main` must keep the
+            // original start time. `record_full` clears it only on a green
+            // verdict.
         }
     }
 
@@ -3980,8 +4013,9 @@ async fn main_is_red(repo_root: &Path) -> Option<RedMain> {
             sha = short,
             "self-improve: full gate on origin/main (once per main commit)"
         );
+        let now = chrono::Utc::now();
         match full_gate_on_main(repo_root).await {
-            Ok(Ok(())) => cache.record_full(&sha, &[], None),
+            Ok(Ok(())) => cache.record_full(&sha, &[], None, now),
             Ok(Err(gate_err)) => {
                 let text = format!("{gate_err:#}");
                 let failing = failing_tests(&text);
@@ -3991,7 +4025,7 @@ async fn main_is_red(repo_root: &Path) -> Option<RedMain> {
                     "origin/main is RED: {}",
                     truncate(&text, 600)
                 );
-                cache.record_full(&sha, &failing, Some(truncate(&text, 4000)));
+                cache.record_full(&sha, &failing, Some(truncate(&text, 4000)), now);
             }
             Err(e) => {
                 warn!("could not run the full gate on origin/main; proceeding as before: {e:#}");
@@ -13311,7 +13345,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // A targeted (#931) check does NOT count as a full one.
         c.record("s1", &t(&["a"]), &[]);
         assert!(c.needs_full_check("s1"));
-        c.record_full("s1", &t(&["b"]), None);
+        c.record_full("s1", &t(&["b"]), None, chrono::Utc::now());
         assert!(!c.needs_full_check("s1"), "full gate ran once for s1");
         assert!(c.is_red("s1"));
         assert_eq!(c.failing_for("s1"), &t(&["b"])[..]);
@@ -13324,18 +13358,69 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // A new main SHA needs its own full gate.
         assert!(c2.needs_full_check("s2"));
         let mut c3 = c2;
-        c3.record_full("s2", &[], Some("cargo build failed:\nerror[E0308]".into()));
+        c3.record_full("s2", &[], Some("cargo build failed:\nerror[E0308]".into()), chrono::Utc::now());
         assert!(
             c3.is_red("s2"),
             "a main that does not build is red with no test names"
         );
         assert!(c3.failing_for("s2").is_empty());
         assert!(c3.gate_err_for("s2").is_some());
-        c3.record_full("s3", &[], None);
+        c3.record_full("s3", &[], None, chrono::Utc::now());
         assert!(
             !c3.is_red("s3") && !c3.needs_full_check("s3"),
             "green main is remembered too"
         );
+    }
+
+    /// #1171 — the durable "red since" the health watchdog reads instead of the
+    /// cache file's mtime. It is stamped when `main` first goes red, kept the
+    /// same when a NEW `main` commit is also red (a red streak spans commits,
+    /// so the 6-hour clock must not restart), and cleared the moment `main`
+    /// goes green.
+    #[test]
+    fn baseline_stamps_red_since_and_preserves_it_across_a_still_red_main() {
+        let t = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+
+        let mut c = BaselineCache::default();
+        assert!(c.red_since.is_none(), "a fresh cache has no streak");
+
+        // First red verdict stamps the start of the streak.
+        let t0 = at("2026-09-14T00:00:00Z");
+        c.record_full("s1", &t(&["a"]), Some("boom".into()), t0);
+        assert_eq!(c.red_since, Some(t0.to_rfc3339()), "first red stamps the streak");
+
+        // A NEW, still-red main commit keeps the ORIGINAL stamp: the streak did
+        // not end just because the commit changed. This is the incident fix.
+        let t1 = at("2026-09-14T09:00:00Z");
+        c.record_full("s2", &t(&["a"]), Some("still boom".into()), t1);
+        assert_eq!(c.sha, "s2", "the cache moved to the new commit");
+        assert_eq!(
+            c.red_since,
+            Some(t0.to_rfc3339()),
+            "the streak start is preserved across a still-red commit change"
+        );
+
+        // Main goes green ⇒ the streak clears.
+        let t2 = at("2026-09-14T10:00:00Z");
+        c.record_full("s3", &[], None, t2);
+        assert!(c.red_since.is_none(), "a green main ends the streak");
+
+        // Red again later starts a fresh streak from the new red time.
+        let t3 = at("2026-09-14T11:00:00Z");
+        c.record_full("s4", &t(&["b"]), None, t3);
+        assert_eq!(c.red_since, Some(t3.to_rfc3339()), "a later red starts a new streak");
+
+        // The stamp survives a round-trip through disk.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autopr-baseline.json");
+        c.save(&path);
+        let reloaded = BaselineCache::load(&path);
+        assert_eq!(reloaded.red_since, Some(t3.to_rfc3339()), "red_since persists");
     }
 
     // Structural: the scoper's "not agent-fixable" verdict never labels a

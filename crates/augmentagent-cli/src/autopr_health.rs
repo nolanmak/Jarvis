@@ -549,8 +549,19 @@ fn daemon_active() -> bool {
         .unwrap_or(false)
 }
 
-/// Is `main` currently recorded red, and since when (the cache file's mtime)?
-fn red_main_since(dir: &Path) -> Option<DateTime<Utc>> {
+/// The cache's current red-`main` record: the commit it judged, the durable
+/// "red since" stamp (#1171) when the loop wrote one, and the file mtime as the
+/// pre-#1171 fallback. `None` when the cache does not record `main` red.
+#[derive(Debug, Clone)]
+struct BaselineRed {
+    sha: String,
+    red_since: Option<DateTime<Utc>>,
+    mtime: DateTime<Utc>,
+}
+
+/// Read [`BaselineRed`] from `autopr-baseline.json`. A record counts as red
+/// when it has failing tests OR a gate error (`main` did not build).
+fn read_baseline_red(dir: &Path) -> Option<BaselineRed> {
     let p = dir.join("autopr-baseline.json");
     let raw = std::fs::read_to_string(&p).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
@@ -559,8 +570,53 @@ fn red_main_since(dir: &Path) -> Option<DateTime<Utc>> {
     if failing != Some(true) && build_err != Some(true) {
         return None;
     }
+    let sha = v
+        .get("sha")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let red_since = v
+        .get("red_since")
+        .and_then(|s| s.as_str())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc));
     let mtime = std::fs::metadata(&p).ok()?.modified().ok()?;
-    Some(DateTime::<Utc>::from(mtime))
+    Some(BaselineRed {
+        sha,
+        red_since,
+        mtime: DateTime::<Utc>::from(mtime),
+    })
+}
+
+/// When `main` went red, for the `red-main-stuck` rule — the durable stamp
+/// when present, else the file mtime (#1171). A verdict cached for a commit
+/// that is no longer `origin/main` is stale: `main`'s current state is unknown
+/// until the loop re-checks, so it is NOT reported as red — reporting it would
+/// alert on history, or on a commit that may since have gone green.
+fn resolve_red_since(red: Option<BaselineRed>, current_main: Option<&str>) -> Option<DateTime<Utc>> {
+    let red = red?;
+    match current_main {
+        // The verdict is about the main we have right now: trust it, and prefer
+        // the durable stamp over the mtime the loop resets on every rewrite.
+        Some(cur) if cur == red.sha => Some(red.red_since.unwrap_or(red.mtime)),
+        // A superseded commit: the verdict is history, not the present state.
+        Some(_) => None,
+        // Offline / unknowable main: best-effort rather than going blind.
+        None => Some(red.red_since.unwrap_or(red.mtime)),
+    }
+}
+
+/// `origin/main` as this checkout already knows it. No fetch — the watchdog
+/// reads state, it does not move refs. `None` when git cannot answer.
+fn current_origin_main(repo_root: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "origin/main"])
+        .current_dir(repo_root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
 }
 
 /// Every open PR number, or `None` when `gh` could not be asked — unknown
@@ -691,7 +747,10 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
             .exists()
             .then(|| free_gb(&gate_dir))
             .flatten(),
-        red_main_since: red_main_since(&dir),
+        red_main_since: resolve_red_since(
+            read_baseline_red(&dir),
+            current_origin_main(repo_root).as_deref(),
+        ),
         repeated_refusals: scan_repeated_refusals(&log, now - chrono::Duration::days(3)),
         open_prs: open_pr_numbers(),
         draft_ages_days: open_draft_ages(now),
@@ -1195,5 +1254,118 @@ mod tests {
         assert!(!analyze(&closed, &Thresholds::default()).iter().any(|x| x.code == "review-held"));
         // And with nothing held, nothing is said.
         assert!(analyze(&healthy(), &Thresholds::default()).is_empty());
+    }
+
+    /// #1171 — the incident. The loop rewrites `autopr-baseline.json` (fresh
+    /// mtime) on every new `origin/main` commit and every full re-check, so a
+    /// `main` red across a series of commits used to reset the 6-hour clock on
+    /// every rewrite and `red-main-stuck` could never fire. The fix keys on a
+    /// durable `red_since` written by the loop, so a fresh mtime no longer
+    /// hides a stale red main.
+    #[test]
+    fn red_since_prefers_the_durable_stamp_over_a_fresh_mtime() {
+        let red = BaselineRed {
+            sha: "abc".into(),
+            red_since: Some(t0() - Duration::hours(10)),
+            mtime: t0(), // just rewritten this tick
+        };
+        let since = resolve_red_since(Some(red), Some("abc")).expect("a red main is known");
+        assert_eq!(
+            since,
+            t0() - Duration::hours(10),
+            "the durable stamp must win over a just-reset mtime"
+        );
+        // Fed to the pure rule, the false green is gone: a main red for 10h fires.
+        let f = analyze(
+            &HealthInputs { red_main_since: Some(since), ..healthy() },
+            &Thresholds::default(),
+        );
+        assert_eq!(codes(&f), vec!["red-main-stuck"]);
+    }
+
+    /// #1171 — a verdict cached for a commit that is no longer `origin/main`
+    /// is stale: `main` may now be green, or a fresh red the loop has not yet
+    /// re-checked. Either way it is not evidence about `main` right now, so it
+    /// must not raise an alert (the loop re-checks on its next tick).
+    #[test]
+    fn a_superseded_red_verdict_is_not_reported_as_red_main() {
+        let red = BaselineRed {
+            sha: "old".into(),
+            red_since: Some(t0() - Duration::hours(10)),
+            mtime: t0(),
+        };
+        assert!(
+            resolve_red_since(Some(red), Some("new")).is_none(),
+            "a verdict about a superseded commit is unknown, not red"
+        );
+    }
+
+    /// #1171 — a cache written before `red_since` existed still works: mtime is
+    /// the best available "since", but only while the verdict is about the main
+    /// we have now. Offline (main unknown) stays best-effort rather than blind.
+    #[test]
+    fn red_since_falls_back_to_mtime_for_a_pre_upgrade_cache() {
+        let red = BaselineRed {
+            sha: "abc".into(),
+            red_since: None,
+            mtime: t0() - Duration::hours(8),
+        };
+        assert_eq!(
+            resolve_red_since(Some(red.clone()), Some("abc")),
+            Some(t0() - Duration::hours(8)),
+            "no durable stamp ⇒ mtime, when the sha matches current main"
+        );
+        assert_eq!(
+            resolve_red_since(Some(red), None),
+            Some(t0() - Duration::hours(8)),
+            "offline: keep the best-effort answer rather than going blind"
+        );
+        assert!(resolve_red_since(None, Some("abc")).is_none(), "no cache ⇒ nothing");
+    }
+
+    /// #1171 — reading the on-disk cache: a red record (by failing tests OR by
+    /// a build error) is returned with its durable stamp; a green cache is not
+    /// a red record; an unreadable/missing file is `None`.
+    #[test]
+    fn read_baseline_red_parses_red_since_and_ignores_a_green_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("autopr-baseline.json");
+
+        // Red with a durable stamp.
+        std::fs::write(
+            &p,
+            r#"{"sha":"abc","failing":["x"],"full_checked":true,"gate_err":null,"red_since":"2026-09-14T02:00:00Z"}"#,
+        )
+        .unwrap();
+        let r = read_baseline_red(dir.path()).expect("a red cache is read");
+        assert_eq!(r.sha, "abc");
+        assert_eq!(
+            r.red_since,
+            Some(
+                DateTime::parse_from_rfc3339("2026-09-14T02:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+
+        // Red by build error, no test names, no stamp (legacy): read, red_since None.
+        std::fs::write(
+            &p,
+            r#"{"sha":"abc","failing":[],"full_checked":true,"gate_err":"cargo build failed"}"#,
+        )
+        .unwrap();
+        let r = read_baseline_red(dir.path()).expect("a build-red cache is read");
+        assert!(r.red_since.is_none(), "legacy cache has no durable stamp");
+
+        // Green ⇒ not a red record.
+        std::fs::write(
+            &p,
+            r#"{"sha":"abc","failing":[],"full_checked":true,"gate_err":null}"#,
+        )
+        .unwrap();
+        assert!(read_baseline_red(dir.path()).is_none(), "green is not red");
+
+        // Missing file ⇒ None.
+        assert!(read_baseline_red(&dir.path().join("nope")).is_none());
     }
 }
