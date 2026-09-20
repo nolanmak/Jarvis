@@ -6,6 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Lets downstream test targets opt out of an operator's router file while
+# retaining explicit fixture paths through AUGMENTAGENT_MODEL_ROUTER_CONFIG.
+test-isolation = []
+
 [dependencies]
 augmentagent-store = { path = "../augmentagent-store" }
 augmentagent-wiki = { path = "../augmentagent-wiki" }

@@ -27,5 +27,6 @@ chrono = { workspace = true }
 # Dangercat git dep deferred: repo is private; see root Cargo.toml note.
 
 [dev-dependencies]
+augmentagent-channel-core = { path = "../augmentagent-channel-core", features = ["test-isolation"] }
 tempfile = "3"
 rusqlite = { workspace = true }
