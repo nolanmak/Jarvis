@@ -1281,10 +1281,14 @@ mod tests {
             r#"{"title":"Test Engineer","company":"Example Organization","phones":[],"confidence":{"title":0.9,"company":0.9}}"#,
         );
         let reasoner = stub.reasoner();
-        let fields = SignatureExtractor::new(&reasoner)
-            .extract("Fixture Author\nTest Engineer\nExample Organization")
-            .await
-            .unwrap();
+        // Stay hermetic against the operator's live router: pinning is read at
+        // spawn time, so disable routing around the extraction call (#1170).
+        let fields = augmentagent_channel_core::model_router::without_router(
+            SignatureExtractor::new(&reasoner)
+                .extract("Fixture Author\nTest Engineer\nExample Organization"),
+        )
+        .await
+        .unwrap();
         assert_eq!(fields.company.as_deref(), Some("Example Organization"));
 
         let calls = stub.calls();
