@@ -337,6 +337,13 @@ class ToolPolicyTests(unittest.TestCase):
             with self.subTest(command=command), self.assertRaises(bridge.Denied):
                 self.policy.command_argv(command)
 
+    def test_bridge_refuses_direct_git_push_even_when_profile_allows_git(self):
+        policy = bridge.Policy({'cwd': str(self.root), 'read_roots': [str(self.root)],
+                                'write_roots': [str(self.root)], 'allowed_tools': ['Bash(git *)']})
+        self.assertEqual(bridge.git_subcommand(['git', '-C', str(self.root), 'push', 'origin']), 'push')
+        with self.assertRaisesRegex(bridge.Denied, 'CCat public-push gate'):
+            policy.run_command('git push origin HEAD')
+
     @requires_sandbox
     def test_allowed_command_executes_and_does_not_evaluate_shell_text(self):
         outcome=self.policy.run_command("printf 'hello; world'")

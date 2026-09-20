@@ -6105,6 +6105,59 @@ async fn post_reply_approval_card(
 }
 
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExternalMessageCcatGate {
+    Clear,
+    Review,
+    Block,
+}
+
+fn external_message_ccat_gate(outcome: augmentagent_ccat::DecisionOutcome) -> ExternalMessageCcatGate {
+    match outcome {
+        augmentagent_ccat::DecisionOutcome::Allow => ExternalMessageCcatGate::Clear,
+        augmentagent_ccat::DecisionOutcome::Block => ExternalMessageCcatGate::Block,
+        augmentagent_ccat::DecisionOutcome::Review | augmentagent_ccat::DecisionOutcome::Unavailable => {
+            ExternalMessageCcatGate::Review
+        }
+    }
+}
+
+/// CCat is additive to the existing human approval boundary. A provider
+/// failure therefore raises the existing card with a review marker; it never
+/// turns an already approval-gated send into an automatic send.
+async fn ccat_external_message_gate(context_body: &str, draft_body: &str) -> ExternalMessageCcatGate {
+    use augmentagent_ccat::{evaluate, redact, DecisionProvider, SeaCatDecisionProvider, EXTERNAL_MESSAGE_SEND_POLICY};
+
+    if std::env::var("AUGMENTAGENT_CCAT_ENABLED").as_deref() != Ok("true") {
+        return ExternalMessageCcatGate::Clear;
+    }
+    let prepared = format!("Outbound-message context:\n{context_body}\n\nDraft:\n{draft_body}");
+    let payload = redact(&prepared);
+    let provider = match SeaCatDecisionProvider::from_environment() {
+        Ok(provider) => provider,
+        Err(_) => return ExternalMessageCcatGate::Review,
+    };
+    external_message_ccat_gate(evaluate(
+        &EXTERNAL_MESSAGE_SEND_POLICY,
+        payload.sha256,
+        provider.decide(&payload.text, &EXTERNAL_MESSAGE_SEND_POLICY).await,
+    ).outcome)
+}
+
+#[cfg(test)]
+mod external_message_ccat_tests {
+    use super::*;
+    use augmentagent_ccat::DecisionOutcome;
+
+    #[test]
+    fn ccat_never_upgrades_an_external_message_to_auto_send() {
+        assert_eq!(external_message_ccat_gate(DecisionOutcome::Allow), ExternalMessageCcatGate::Clear);
+        assert_eq!(external_message_ccat_gate(DecisionOutcome::Review), ExternalMessageCcatGate::Review);
+        assert_eq!(external_message_ccat_gate(DecisionOutcome::Unavailable), ExternalMessageCcatGate::Review);
+        assert_eq!(external_message_ccat_gate(DecisionOutcome::Block), ExternalMessageCcatGate::Block);
+    }
+}
+
 /// Raise a Discord approval card for an operator-initiated social draft
 /// (#571 / #572).
 ///
@@ -6153,6 +6206,18 @@ async fn post_social_approval_card(
         .context("DISCORD_CHANNEL_ID required for --post")?
         .parse()
         .context("DISCORD_CHANNEL_ID must be numeric")?;
+    let http = serenity::http::Http::new(&token);
+    let channel = serenity::all::ChannelId::new(cid);
+    let ccat_gate = ccat_external_message_gate(context_body, draft_body).await;
+    if ccat_gate == ExternalMessageCcatGate::Block {
+        let notice = serenity::builder::CreateMessage::new().content(
+            "CCat blocked this external-message draft (policy: external_message_send). No approval card or send was created.",
+        );
+        if let Err(error) = channel.send_message(&http, notice).await {
+            tracing::warn!("CCat block notice could not be posted: {error}");
+        }
+        anyhow::bail!("CCat blocked external-message draft");
+    }
 
     let inbound = StoreEmail {
         attachments: Vec::new(),
@@ -6184,9 +6249,12 @@ async fn post_social_approval_card(
         )
         .context("log action row")?;
 
-    let http = serenity::http::Http::new(&token);
-    let channel = serenity::all::ChannelId::new(cid);
-    let card = approval_message(&action_id, &inbound, draft_body, 0);
+    let card_body = if ccat_gate == ExternalMessageCcatGate::Review {
+        format!("{draft_body}\n\n[CCat: review required]")
+    } else {
+        draft_body.to_string()
+    };
+    let card = approval_message(&action_id, &inbound, &card_body, 0);
     if let Err(e) = channel.send_message(&http, card).await {
         // The rows are already written — `approval_message` needs the action
         // id, so the action has to exist before the card can be built. A

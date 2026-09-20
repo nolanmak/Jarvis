@@ -333,6 +333,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "augmentagent-ccat"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "augmentagent-auth",
+ "hex",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
 name = "augmentagent-channel-apple-notes"
 version = "0.1.0"
 dependencies = [
@@ -942,6 +960,7 @@ dependencies = [
  "augmentagent-approval-discord",
  "augmentagent-auth",
  "augmentagent-browser-client",
+ "augmentagent-ccat",
  "augmentagent-channel-apple-notes",
  "augmentagent-channel-calendar",
  "augmentagent-channel-contacts",

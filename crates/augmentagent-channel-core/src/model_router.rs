@@ -50,8 +50,10 @@ pub fn config_path() -> PathBuf {
 }
 
 pub fn load() -> anyhow::Result<Option<RouterConfig>> {
-    // Unit tests must never use the operator's live routing/accounts.
-    #[cfg(test)]
+    // Unit tests must never use the operator's live routing/accounts. Core is
+    // often a dependency of the test target, where `cfg(test)` is not set on
+    // this crate, so those targets opt in through `test-isolation`.
+    #[cfg(any(test, feature = "test-isolation"))]
     if std::env::var_os("AUGMENTAGENT_MODEL_ROUTER_CONFIG").is_none() {
         return Ok(None);
     }

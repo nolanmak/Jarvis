@@ -42,6 +42,7 @@ augmentagent-embeddings = { path = "../augmentagent-embeddings" }
 augmentagent-channel-apple-notes = { path = "../augmentagent-channel-apple-notes" }
 augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
 augmentagent-auth = { path = "../augmentagent-auth" }
+augmentagent-ccat = { path = "../augmentagent-ccat" }
 augmentagent-wiki = { path = "../augmentagent-wiki" }
 augmentagent-browser-client = { path = "../augmentagent-browser-client" }
 augmentagent-renderer-client = { path = "../augmentagent-renderer-client" }

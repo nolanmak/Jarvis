@@ -12,6 +12,8 @@ Run from a clean checkout with dependencies installed:
 ```sh
 bash scripts/check-no-personal-data.sh --tracked
 python3 scripts/tests/check-no-personal-data.test.py
+python3 scripts/tests/ccat-public-push-gate.test.py
+python3 scripts/tests/ccat-calibrate.test.py
 npm run build
 npm test
 cargo test --workspace

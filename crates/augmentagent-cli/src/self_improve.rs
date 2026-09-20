@@ -445,6 +445,11 @@ async fn run(cmd: &str, args: &[&str], cwd: &Path) -> Result<(bool, String, Stri
             }
         }
     }
+    if cmd == "git" && configured_ccat_public_push(args) {
+        if let Err(error) = require_ccat_pre_push_hook(cwd) {
+            return Ok((false, String::new(), error));
+        }
+    }
     let out = Command::new(cmd)
         .args(args)
         .current_dir(cwd)
@@ -457,6 +462,63 @@ async fn run(cmd: &str, args: &[&str], cwd: &Path) -> Result<(bool, String, Stri
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     ))
+}
+
+/// Autonomous publishing may only use the same installed pre-push gate as an
+/// operator. This is deliberately checked before spawning Git: a missing hook
+/// cannot be recovered after a remote ref exists.
+fn configured_ccat_public_push(args: &[&str]) -> bool {
+    let enabled = std::env::var("AUGMENTAGENT_CCAT_ENABLED").as_deref() == Ok("true");
+    let remotes = std::env::var("AUGMENTAGENT_CCAT_PUBLIC_REMOTES").unwrap_or_default();
+    configured_ccat_public_push_for(args, enabled, &remotes)
+}
+
+fn configured_ccat_public_push_for(args: &[&str], enabled: bool, remotes: &str) -> bool {
+    if !enabled { return false; }
+    let Some(push) = args.iter().position(|arg| *arg == "push") else {
+        return false;
+    };
+    let Some(remote) = args[push + 1..].iter().find(|arg| !arg.starts_with('-')) else {
+        return false;
+    };
+    remotes.split(',')
+        .map(str::trim)
+        .any(|name| !name.is_empty() && name == *remote)
+}
+
+fn require_ccat_pre_push_hook(cwd: &Path) -> std::result::Result<(), String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(cwd)
+        .output()
+        .map_err(|_| "CCat public push refused: Git metadata is unavailable".to_string())?;
+    if !output.status.success() {
+        return Err("CCat public push refused: Git metadata is unavailable".into());
+    }
+    let common = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let common = Path::new(&common);
+    let common = if common.is_absolute() { common.to_path_buf() } else { cwd.join(common) };
+    let hook = common.join("hooks/pre-push");
+    let body = std::fs::read_to_string(&hook)
+        .map_err(|_| "CCat public push refused: install the CCat pre-push hook first".to_string())?;
+    if !body.contains("ccat-public-push-gate.sh") {
+        return Err("CCat public push refused: installed pre-push hook is not the CCat gate".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod ccat_push_gate_tests {
+    use super::*;
+
+    #[test]
+    fn configured_public_push_is_exactly_remote_scoped() {
+        assert!(configured_ccat_public_push_for(&["push", "origin", "branch"], true, "origin, public"));
+        assert!(configured_ccat_public_push_for(&["push", "public", "branch"], true, "origin, public"));
+        assert!(!configured_ccat_public_push_for(&["push", "origin-backup", "branch"], true, "origin, public"));
+        assert!(!configured_ccat_public_push_for(&["status"], true, "origin, public"));
+        assert!(!configured_ccat_public_push_for(&["push", "origin", "branch"], false, "origin"));
+    }
 }
 
 /// #300 — Compute the sanitized env for the build/test verification gate.
