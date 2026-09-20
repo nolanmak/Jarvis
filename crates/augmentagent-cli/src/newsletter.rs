@@ -13,6 +13,9 @@ use sha2::{Digest, Sha256};
 
 const PLATFORM: &str = "newsletterbuddy";
 const ACCOUNT: &str = augmentagent_auth::DEFAULT_ACCOUNT;
+/// The audience-approval / release / delivery-status endpoints require a
+/// distinct editorial credential; the research token cannot reach them.
+const EDITORIAL_ACCOUNT: &str = "editorial";
 
 #[derive(Subcommand)]
 pub enum Command {
@@ -209,6 +212,31 @@ pub enum Command {
         #[arg(long)]
         revision: u32,
     },
+    /// Approve a draft revision for a channel, binding the audience snapshot and
+    /// creating held (unsent) delivery rows. Owner-operated; editorial credential.
+    Approve {
+        #[arg(long)]
+        newsletter_id: String,
+        #[arg(long)]
+        draft_revision: u32,
+        #[arg(long, value_parser = ["email", "sms"])]
+        channel: String,
+    },
+    /// Release an approval: move its held rows to the queue so the delivery
+    /// worker sends them for real. Owner-operated; editorial credential.
+    Release {
+        #[arg(long)]
+        newsletter_id: String,
+        #[arg(long)]
+        approval_id: String,
+    },
+    /// Read redacted per-recipient delivery statuses for an approval.
+    Deliveries {
+        #[arg(long)]
+        newsletter_id: String,
+        #[arg(long)]
+        approval_id: String,
+    },
 }
 
 fn request_key(event_id: &str, operation: &str) -> String {
@@ -388,29 +416,49 @@ struct Api {
     client: Client,
 }
 
+/// Load a NewsletterBuddy bearer token: an explicit private file
+/// (`token_file_env`), else `~/.config/augmentagent/<default_file>`, else the OS
+/// credential store under `keyring_account`.
+fn load_token(token_file_env: &str, default_file: &str, keyring_account: &str) -> Result<String> {
+    let configured = std::env::var_os(token_file_env);
+    let default = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|p| std::path::PathBuf::from(p).join(".config")))
+        .map(|p| p.join("augmentagent").join(default_file));
+    let selected = configured.map(std::path::PathBuf::from)
+        .or_else(|| default.filter(|p| std::fs::symlink_metadata(p).is_ok()));
+    let token = if let Some(path) = selected {
+        token_file(&path)?
+    } else {
+        String::from_utf8(augmentagent_auth::Auth::get(PLATFORM, keyring_account)
+            .context("NewsletterBuddy token missing; configure a private token file or the OS credential store")?)
+            .context("NewsletterBuddy token is not UTF-8")?
+    };
+    if token.is_empty() || token.bytes().any(|b| !b.is_ascii_graphic()) {
+        bail!("NewsletterBuddy token is invalid");
+    }
+    Ok(token)
+}
+
 impl Api {
     fn from_local_config() -> Result<Self> {
+        Self::build(load_token("NEWSLETTERBUDDY_TOKEN_FILE", "newsletterbuddy.token", ACCOUNT)?)
+    }
+
+    /// Editorial credential for audience approval, release and delivery status.
+    fn from_editorial_config() -> Result<Self> {
+        Self::build(load_token(
+            "NEWSLETTERBUDDY_EDITORIAL_TOKEN_FILE",
+            "newsletterbuddy-editorial.token",
+            EDITORIAL_ACCOUNT,
+        )?)
+    }
+
+    fn build(token: String) -> Result<Self> {
         let base = validated_url(
             &std::env::var("NEWSLETTERBUDDY_URL")
                 .context("NEWSLETTERBUDDY_URL is not configured")?,
         )?;
-        let configured = std::env::var_os("NEWSLETTERBUDDY_TOKEN_FILE");
-        let default = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .or_else(|| std::env::var_os("HOME").map(|p| std::path::PathBuf::from(p).join(".config")))
-            .map(|p| p.join("augmentagent/newsletterbuddy.token"));
-        let selected = configured.map(std::path::PathBuf::from)
-            .or_else(|| default.filter(|p| std::fs::symlink_metadata(p).is_ok()));
-        let token = if let Some(path) = selected {
-            token_file(&path)?
-        } else {
-            String::from_utf8(augmentagent_auth::Auth::get(PLATFORM, ACCOUNT)
-                .context("NewsletterBuddy token missing; configure a private token file or the OS credential store")?)
-                .context("NewsletterBuddy token is not UTF-8")?
-        };
-        if token.is_empty() || token.bytes().any(|b| !b.is_ascii_graphic()) {
-            bail!("NewsletterBuddy token is invalid");
-        }
         Ok(Self {
             base,
             token,
@@ -479,7 +527,16 @@ pub async fn run(command: &Command) -> Result<()> {
         println!("NewsletterBuddy token stored for this host");
         return Ok(());
     }
-    let api = Api::from_local_config()?;
+    // Approval, release and delivery status need the editorial credential; the
+    // research token cannot reach those endpoints.
+    let api = if matches!(
+        command,
+        Command::Approve { .. } | Command::Release { .. } | Command::Deliveries { .. }
+    ) {
+        Api::from_editorial_config()?
+    } else {
+        Api::from_local_config()?
+    };
     let result = match command {
         Command::Configure => unreachable!(),
         Command::Create { name } => {
@@ -804,6 +861,50 @@ pub async fn run(command: &Command) -> Result<()> {
             )
             .await?
         }
+        Command::Approve {
+            newsletter_id,
+            draft_revision,
+            channel,
+        } => {
+            let id = uuid(newsletter_id)?;
+            let key = event_request_key(&format!("approve:{id}:{draft_revision}:{channel}"))?;
+            api.call(
+                Method::POST,
+                &format!("v1/newsletters/{id}/approvals"),
+                Some(json!({"draftRevision": draft_revision, "channel": channel})),
+                Some(&key),
+            )
+            .await?
+        }
+        Command::Release {
+            newsletter_id,
+            approval_id,
+        } => {
+            let id = uuid(newsletter_id)?;
+            let approval = uuid(approval_id)?;
+            let key = event_request_key(&format!("release:{id}:{approval}"))?;
+            api.call(
+                Method::POST,
+                &format!("v1/newsletters/{id}/approvals/{approval}/release"),
+                Some(json!({})),
+                Some(&key),
+            )
+            .await?
+        }
+        Command::Deliveries {
+            newsletter_id,
+            approval_id,
+        } => {
+            let id = uuid(newsletter_id)?;
+            let approval = uuid(approval_id)?;
+            api.call(
+                Method::GET,
+                &format!("v1/newsletters/{id}/approvals/{approval}/deliveries"),
+                None,
+                None,
+            )
+            .await?
+        }
     };
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
@@ -856,6 +957,26 @@ mod tests {
         assert_ne!(
             request_key("123:456", &schedule_create_operation(id, 2, "research")),
             request_key("123:456", &schedule_create_operation(id, 2, "draft")),
+        );
+    }
+
+    #[test]
+    fn approval_and_release_request_keys_are_scoped_and_distinct() {
+        let id = "123e4567-e89b-12d3-a456-426614174000";
+        // Approving the same draft for email and sms are separate operations.
+        assert_ne!(
+            request_key("123:456", &format!("approve:{id}:2:email")),
+            request_key("123:456", &format!("approve:{id}:2:sms")),
+        );
+        // Releasing an approval is distinct from approving a draft revision.
+        assert_ne!(
+            request_key("123:456", &format!("approve:{id}:2:email")),
+            request_key("123:456", &format!("release:{id}:{id}")),
+        );
+        // A replay of the same trusted event yields a stable release key.
+        assert_eq!(
+            request_key("123:456", &format!("release:{id}:{id}")),
+            request_key("123:456", &format!("release:{id}:{id}")),
         );
     }
 
