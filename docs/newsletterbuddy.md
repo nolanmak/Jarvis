@@ -17,3 +17,13 @@ This is an implementation slice, not a staging sign-off. A Linux Jarvis ↔ News
 ## Draft with the Jarvis reasoner
 
 `draft-submit --newsletter-id ID --brief-revision N --proposal-json JSON` saves a proposal written by the current Jarvis reasoner, without a separate NewsletterBuddy model account. The JSON contains `subject`, `intro`, and `items`; each item has `headline`, `summary`, and `evidenceIds` taken from the evidence response. The service validates references, checks research readiness and stores an immutable cited revision. Replaying the same trusted event is idempotent; changed content under the same request is rejected. `generate` remains available when the service has its own draft model configured. Neither command approves or sends.
+
+## Approve and release a send (owner-operated)
+
+Sending an edition is a two-step, owner-only path that uses a **distinct editorial credential** (`from_editorial_config`): the research bearer token cannot reach these endpoints. Configure it as a private mode-0600 file at `~/.config/augmentagent/newsletterbuddy-editorial.token` (override with `NEWSLETTERBUDDY_EDITORIAL_TOKEN_FILE`) or in the OS credential store under the `editorial` account; NewsletterBuddy must have the matching `NEWSLETTER_EDITORIAL_TOKEN_SHA256` configured.
+
+- `approve --newsletter-id ID --draft-revision N --channel email|sms` binds the latest immutable draft hash, channel and audience snapshot and creates **held** (unsent) delivery rows. It returns the approval `id`.
+- `release --newsletter-id ID --approval-id AID` moves those held rows to the queue; the delivery worker then sends them for real. Returns `{ "queued": <count> }`.
+- `deliveries --newsletter-id ID --approval-id AID` reads redacted per-recipient statuses (no addresses).
+
+`approve` and `release` are **not** exposed to the Discord reasoner — they are run by the owner from a terminal, because an approval binds an audience and a release sends real email, and the reasoner processes untrusted research content. Only the read-only `deliveries` status query is available to the reasoner. Both mutating commands derive their `Idempotency-Key` from the trusted request ID plus operation and target, so a replay of the same event does not double-approve or double-release. Set `NEWSLETTERBUDDY_REQUEST_ID` (shaped `<digits>:<digits>`, e.g. `0:$(date +%s%N)`) when running them manually.
