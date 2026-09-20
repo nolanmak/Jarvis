@@ -2102,7 +2102,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        ch.poll_once().await.unwrap();
+        // Stay hermetic against the operator's live router: pinning is read at
+        // spawn time, so disable routing around the whole poll (#1170).
+        augmentagent_channel_core::model_router::without_router(ch.poll_once())
+            .await
+            .unwrap();
 
         let code_mode_prompt = code_mode_system(&manifest_v1());
         let quality = model_for(ProviderKind::Claude, ModelTier::Quality);

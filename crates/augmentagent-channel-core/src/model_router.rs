@@ -67,6 +67,18 @@ pub fn current() -> anyhow::Result<Option<RouterConfig>> {
     }
 }
 
+/// Run `fut` with model routing forced off: `current()` short-circuits on the
+/// `None` snapshot and never reaches `load()`, so the operator's live router
+/// config cannot leak into an argv-stub test. Test-only — production code must
+/// keep consulting the real router through `current()`/`load()`. Downstream test
+/// targets (e.g. augmentagent-channel-email) reach this by enabling the
+/// `test-isolation` feature on their dev-dependency, since `cfg(test)` is not set
+/// on this crate when it is compiled as a dependency.
+#[cfg(any(test, feature = "test-isolation"))]
+pub async fn without_router<F: std::future::Future>(fut: F) -> F::Output {
+    SNAPSHOT.scope(None, fut).await
+}
+
 /// A Discord/default profile applies only to this call's cloned router
 /// configuration. The persisted account settings and other calls are intact.
 pub fn select_profile(config: Option<RouterConfig>, selected: Option<ProviderKind>) -> anyhow::Result<Option<RouterConfig>> {
@@ -282,6 +294,37 @@ pub(crate) mod tests {
             })
             .await;
         assert!(current().unwrap().is_none());
+    }
+    /// #1170 reproduction. The daemon exports AUGMENTAGENT_MODEL_ROUTER_CONFIG
+    /// pointing at a live loopback router, so an argv-stub test that forgets to
+    /// isolate sees `current()` fall through to `load()` and return the
+    /// operator's routing. `without_router` must short-circuit on the `None`
+    /// snapshot and never reach `load()`. The env is set in a child process
+    /// (this module's convention) so the global mutation cannot leak into
+    /// parallel tests.
+    #[tokio::test]
+    async fn without_router_bypasses_a_live_router_config_from_the_environment() {
+        const NAME: &str =
+            "model_router::tests::without_router_bypasses_a_live_router_config_from_the_environment";
+        if std::env::var_os("JARVIS_ROUTER_CONFIG_CHILD").is_some() {
+            assert!(current().unwrap().is_some(), "precondition: load() sees the env router");
+            without_router(async {
+                assert!(current().unwrap().is_none(), "without_router must bypass load()");
+            })
+            .await;
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model-router.json");
+        std::fs::write(&path, fixture().to_string()).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env("JARVIS_ROUTER_CONFIG_CHILD", "1")
+            .env("AUGMENTAGENT_MODEL_ROUTER_CONFIG", &path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr));
     }
     #[test]
     fn rejects_external_endpoints_and_cross_provider_models() {
