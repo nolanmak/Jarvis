@@ -103,3 +103,49 @@ The Rust issue publisher, research issue filer and maintenance issue/PR writes
 also validate titles and bodies before spawning GitHub commands. Recognizable
 emails, phone numbers, token shapes and raw diagnostic identifiers cause a
 refusal with values withheld. Reserved example domains remain valid fixtures.
+
+## CCat public-push gate
+
+CCat is an optional, fail-closed semantic review gate for explicitly configured
+public remotes. It does not replace deterministic scanning: the pre-push gate
+runs `check-no-personal-data.sh` before sending a redacted diff representation
+to SeaCat. A local secret/PII finding means SeaCat is not called.
+
+Enable it only after setting `SEACAT_API_KEY`,
+`AUGMENTAGENT_CCAT_ENABLED=true`, and a comma-separated list of public remote
+names in `AUGMENTAGENT_CCAT_PUBLIC_REMOTES`, then run
+`scripts/install-git-hooks.sh`. CCat `allow` permits the push; `review` needs a
+single-use CCAP receipt bound to the exact ref and redacted payload hash;
+`block`, invalid provider data, timeout, and missing configuration stop it.
+Neither the raw diff nor SeaCat's raw response is stored in the receipt.
+
+CCAP receipts are HMAC-SHA256 signed with the separate owner-only
+`CCAT_APPROVAL_SIGNING_KEY`, expire after five minutes, and are atomically
+consumed when the gate uses them. After inspecting a `review` outcome, the
+operator creates one with `augmentagent-ccat receipt-create <payload-hash>
+<local-sha> <remote-ref> <new-private-receipt-path>`, then retries the push
+with `CCAT_APPROVAL_RECEIPT` pointing to that file. The hook verifies it using
+`receipt-verify`; unsigned, expired, mismatched, or reused files fail closed.
+
+Git hooks protect configured workstations and agent paths; `git push
+--no-verify` and an uncontrolled clone can bypass them. GitHub Actions cannot
+prevent a public ref from being received because they run after push. Keep
+default branches protected, restrict direct-push permissions, and enable
+GitHub secret-scanning push protection where available. CCat is not proof of
+factual correctness, legal compliance, or exhaustive PII detection.
+
+The Codex tool bridge refuses direct `git push`: its ordinary Git sandbox
+disables repository hooks, so allowing that operation would bypass the gate.
+
+Before changing a CCat public-push threshold, label a decision run and verify
+it locally with `scripts/ccat-calibrate.py --input <run.jsonl>`. A public-push
+threshold requires at least 100 labelled examples and zero false allows. The
+run file is private operational evidence: it must contain only case IDs and
+outcomes, never source text, diffs, identifiers, or provider prompts.
+`AUGMENTAGENT_CCAT_CALIBRATION_REPORT` must point to that verified private
+JSONL file before the public-push hook will make a provider request.
+
+Jarvis's autonomous self-improvement publisher performs the same check before
+any configured-public `git push`: it refuses if the installed common Git hook
+does not invoke `ccat-public-push-gate.sh`. This preserves the normal hook's
+deterministic scan, calibration check, CCat call, and receipt verification.

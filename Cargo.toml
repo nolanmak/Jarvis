@@ -39,6 +39,7 @@ members = [
     "crates/augmentagent-renderer-client",
     "crates/augmentagent-approval-discord",
     "crates/augmentagent-auth",
+    "crates/augmentagent-ccat",
     "crates/augmentagent-wiki",
     "crates/augmentagent-cli",
     "crates/augmentagent-loops",
@@ -80,6 +81,7 @@ dotenvy = "0.15"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+regex = "1"
 
 # HTTP
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

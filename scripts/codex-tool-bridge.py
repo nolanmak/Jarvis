@@ -1487,6 +1487,12 @@ class Policy:
             runtime_reads = [str(resolved_executable)]
             dependency_roots = []
             if Path(argv[0]).name == 'git':
+                if git_subcommand(argv) == 'push':
+                    # The bridge's Git environment disables hooks to keep an
+                    # untrusted repository from executing arbitrary hook code.
+                    # A push would consequently bypass CCat, so agent paths
+                    # must use Jarvis's dedicated public-push gate instead.
+                    raise Denied('direct git push is unavailable through the bridge; use the CCat public-push gate')
                 if any(arg.split('=', 1)[0] in ('--ext-diff', '--textconv') for arg in argv[1:]):
                     raise Denied('external Git diff helpers are not permitted')
                 git_env = {'PATH': self.environment.get('PATH', os.defpath),
@@ -1840,6 +1846,24 @@ class Policy:
             if argv == tokens or (prefix and argv[:len(tokens)] == tokens):
                 return argv
         raise Denied('command is not permitted by this profile')
+
+
+def git_subcommand(argv):
+    """Return Git's top-level command without treating option values as it."""
+    takes_value = {'-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env'}
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token == '--':
+            return argv[index + 1] if index + 1 < len(argv) else None
+        if token in takes_value:
+            index += 2
+            continue
+        if token.startswith('-'):
+            index += 1
+            continue
+        return token
+    return None
 
 
 def npm_subcommand(argv):
