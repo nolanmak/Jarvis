@@ -31,6 +31,8 @@ pub const DEFAULT_BUILD_TIMEOUT_SECS: u64 = 600;
 pub const MAX_BUILD_TIMEOUT_SECS: u64 = 900;
 /// Session directory prefix, shared with the bridge.
 pub const SESSION_PREFIX: &str = "jarvis-vm-session-";
+/// Build-cache image filename, shared with the bridge.
+pub const IMAGE_NAME: &str = "build-cache.img";
 /// A session without a readable owner record younger than this may still be
 /// starting; leave it for the next sweep.
 const OWNERLESS_GRACE: Duration = Duration::from_secs(10 * 60);
@@ -52,6 +54,115 @@ fn configured_timeout(value: Option<String>) -> u64 {
 /// The default build-command timeout from the daemon's own environment.
 pub fn build_timeout_secs() -> u64 {
     configured_timeout(std::env::var(TIMEOUT_ENV).ok())
+}
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// Daemon environment override (integer GiB) for the free-space headroom kept
+/// after admitting a session.
+pub const HEADROOM_ENV: &str = "AUGMENTAGENT_BUILD_SCRATCH_HEADROOM_GIB";
+/// Daemon environment override (integer GiB) for one session's build-cache
+/// image cap.
+pub const IMAGE_CAP_ENV: &str = "AUGMENTAGENT_BUILD_SCRATCH_IMAGE_CAP_GIB";
+/// Daemon environment override (integer GiB) for the total build-cache budget
+/// across all sessions.
+pub const BUDGET_ENV: &str = "AUGMENTAGENT_BUILD_SCRATCH_BUDGET_GIB";
+
+/// Free-space headroom kept after admitting a session (20 GiB default).
+pub const DEFAULT_HEADROOM_BYTES: u64 = 20 * GIB;
+/// One session's build-cache image cap (12 GiB default): one checkout's debug
+/// target for a couple of workspace crates (~9.4 GiB) plus ~0.8 GiB Cargo home.
+pub const DEFAULT_IMAGE_CAP_BYTES: u64 = 12 * GIB;
+/// Total build-cache budget across all sessions (24 GiB default).
+pub const DEFAULT_BUDGET_BYTES: u64 = 24 * GIB;
+
+/// A headroom below this cannot absorb the volume's ordinary churn.
+pub const MIN_HEADROOM_BYTES: u64 = 4 * GIB;
+/// An image cap below this cannot hold a workspace debug build (~9.4 GiB target
+/// plus ~0.8 GiB Cargo home).
+pub const MIN_IMAGE_CAP_BYTES: u64 = 10 * GIB;
+
+/// Build-VM scratch admission limits, resolved from the daemon's own
+/// environment and carried to the bridge in the private policy exactly like the
+/// scratch root and timeout — never from `opts.env` or the model. The bridge
+/// admits a new session only within these bounds, so operators can tune the one
+/// host's capacity (see `docs/BUILD-VM.md`). Field names match the JSON keys the
+/// bridge reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct BuildScratchLimits {
+    /// Free space kept in reserve after admitting a session.
+    pub headroom_bytes: u64,
+    /// Per-session build-cache image cap.
+    pub cache_bytes: u64,
+    /// Total build-cache budget across all sessions.
+    pub budget_bytes: u64,
+}
+
+impl BuildScratchLimits {
+    /// The limits from the daemon's own environment (integer GiB). A value that
+    /// is present but not a positive integer becomes 0 bytes so [`validate`]
+    /// rejects it — it is never silently replaced by the default and never
+    /// clamped.
+    ///
+    /// [`validate`]: BuildScratchLimits::validate
+    pub fn from_env() -> Self {
+        Self::from_values(
+            std::env::var(HEADROOM_ENV).ok(),
+            std::env::var(IMAGE_CAP_ENV).ok(),
+            std::env::var(BUDGET_ENV).ok(),
+        )
+    }
+
+    fn from_values(headroom: Option<String>, cache: Option<String>, budget: Option<String>) -> Self {
+        Self {
+            headroom_bytes: configured_gib(headroom, DEFAULT_HEADROOM_BYTES),
+            cache_bytes: configured_gib(cache, DEFAULT_IMAGE_CAP_BYTES),
+            budget_bytes: configured_gib(budget, DEFAULT_BUDGET_BYTES),
+        }
+    }
+
+    /// Reject out-of-range limits (fail closed, never clamp). These are the same
+    /// bounds the bridge re-checks before admitting a session.
+    pub fn validate(&self) -> Result<(), String> {
+        let gib = |bytes: u64| bytes / GIB;
+        if self.headroom_bytes < MIN_HEADROOM_BYTES {
+            return Err(format!(
+                "headroom {} GiB is below the {} GiB minimum",
+                gib(self.headroom_bytes),
+                gib(MIN_HEADROOM_BYTES)
+            ));
+        }
+        if self.cache_bytes < MIN_IMAGE_CAP_BYTES {
+            return Err(format!(
+                "image cap {} GiB is below the {} GiB minimum for a workspace debug build",
+                gib(self.cache_bytes),
+                gib(MIN_IMAGE_CAP_BYTES)
+            ));
+        }
+        if self.budget_bytes < self.cache_bytes {
+            return Err(format!(
+                "budget {} GiB is below the {} GiB image cap",
+                gib(self.budget_bytes),
+                gib(self.cache_bytes)
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// An integer-GiB environment value in bytes: unset or blank yields the default;
+/// present but not a positive integer yields 0, so it fails validation rather
+/// than being silently defaulted or clamped.
+fn configured_gib(value: Option<String>, default_bytes: u64) -> u64 {
+    match value {
+        Some(v) if !v.trim().is_empty() => v
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|gib| *gib > 0)
+            .map_or(0, |gib| gib.saturating_mul(GIB)),
+        _ => default_bytes,
+    }
 }
 
 /// Resolve an absolute path whose tail may not exist yet: canonicalize the
@@ -356,6 +467,39 @@ mod tests {
         assert_eq!(configured_timeout(Some("0".into())), 1);
         assert_eq!(configured_timeout(Some("300".into())), 300);
         assert_eq!(configured_timeout(Some("soon".into())), 600);
+    }
+
+    #[test]
+    fn scratch_limits_parse_from_env_without_clamping_and_validate_their_bounds() {
+        let gib = 1024u64 * 1024 * 1024;
+        let defaults = BuildScratchLimits {
+            headroom_bytes: 20 * gib,
+            cache_bytes: 12 * gib,
+            budget_bytes: 24 * gib,
+        };
+        // Unset or blank yields the documented defaults, which validate.
+        assert_eq!(BuildScratchLimits::from_values(None, None, None), defaults);
+        assert_eq!(
+            BuildScratchLimits::from_values(Some("".into()), Some("  ".into()), None),
+            defaults
+        );
+        assert!(defaults.validate().is_ok());
+        // Integer GiB is parsed to bytes, never clamped up or down.
+        assert_eq!(
+            BuildScratchLimits::from_values(Some("8".into()), Some("30".into()), Some("60".into())),
+            BuildScratchLimits { headroom_bytes: 8 * gib, cache_bytes: 30 * gib, budget_bytes: 60 * gib }
+        );
+        // Present but not a positive integer becomes 0 bytes and fails closed —
+        // never silently defaulted.
+        for bad in ["0", "-4", "abc", "9.5"] {
+            let limits = BuildScratchLimits::from_values(Some(bad.into()), None, None);
+            assert_eq!(limits.headroom_bytes, 0, "{bad}");
+            assert!(limits.validate().is_err(), "{bad} must fail closed, not default");
+        }
+        // Each bound is rejected on its own.
+        assert!(BuildScratchLimits { headroom_bytes: 3 * gib, ..defaults }.validate().is_err());
+        assert!(BuildScratchLimits { cache_bytes: 9 * gib, ..defaults }.validate().is_err());
+        assert!(BuildScratchLimits { budget_bytes: 11 * gib, ..defaults }.validate().is_err());
     }
 
     #[test]

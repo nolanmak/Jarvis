@@ -83,9 +83,28 @@ Disk safety: the scratch volume is shared with the daemon's own build caches.
 A new session is admitted only when both of these hold:
 
 - Free space covers the whole new image, the unallocated remainder of every
-  other session's image, and 20 GiB of headroom.
-- The allocated blocks of all images, plus the new image's cap, stay within a
-  24 GiB budget.
+  other session's image, and the free-space headroom.
+- The allocated blocks of all images, plus the new image's cap, stay within the
+  build-cache budget.
+
+The three admission limits are configurable from the **daemon environment only**
+(never a task/profile environment or the model), carried to the bridge in its
+policy exactly like the scratch root. All are integer GiB:
+
+| Daemon environment | Default | Lower bound | Meaning |
+| --- | --- | --- | --- |
+| `AUGMENTAGENT_BUILD_SCRATCH_HEADROOM_GIB` | 20 | 4 | free space kept after admitting a session |
+| `AUGMENTAGENT_BUILD_SCRATCH_IMAGE_CAP_GIB` | 12 | 10 | per-session build-cache image cap |
+| `AUGMENTAGENT_BUILD_SCRATCH_BUDGET_GIB` | 24 | ≥ image cap | total build-cache budget across sessions |
+
+The defaults admit at most one session on this host. A value that is out of
+range or unparseable fails closed with `JARVIS_READINESS:build_scratch_limits`
+before any file is created — it is never silently clamped. `augmentagent doctor`
+reports the `build_scratch` check as the scratch volume's free space, the three
+effective limits, and how many sessions can be admitted right now (an error when
+the limits are invalid). Because the scratch volume is shared with the auto-PR
+gate cache, raising `AUGMENTAGENT_GATE_CACHE_MAX_MB` leaves less free space for
+build sessions; lower it (or the headroom) if the two contend on this one host.
 
 Otherwise builds fail with `JARVIS_READINESS:build_scratch_space`, naming the
 path and the numbers, before any file is created. The image is attached with

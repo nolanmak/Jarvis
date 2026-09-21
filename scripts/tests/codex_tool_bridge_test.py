@@ -2582,6 +2582,55 @@ class BuildScratchTests(unittest.TestCase):
         self.assertEqual(bridge.BuildScratch.HEADROOM_BYTES, 20 * 1024**3)
         self.assertEqual(bridge.BuildScratch.BUDGET_BYTES, 24 * 1024**3)
 
+    def test_admission_uses_the_policy_limits(self):
+        # #1092: the daemon-supplied limits, not the class defaults, gate
+        # admission. A 5 GiB headroom (far below the 20 GiB default) admits a
+        # build the default would refuse.
+        gib = 1024**3
+        limits = {'headroom_bytes': 5 * gib, 'cache_bytes': 12 * gib, 'budget_bytes': 30 * gib}
+        policy = self.policy(build_scratch_limits=limits)
+        self.assertIsNone(policy._scratch.limits_error)
+        self.assertEqual(policy._scratch.headroom_bytes, 5 * gib)
+        self.assertEqual(policy._scratch.budget_bytes, 30 * gib)
+        cache = 64 * 1024**2  # the helper shrinks the actual image to this
+        policy._scratch.statvfs = self.fake_statvfs(free_bytes=5 * gib + cache - 4096)
+        with self.assertRaises(bridge.Readiness) as raised:
+            policy.run_command('cargo build')
+        self.assertIn('JARVIS_READINESS:build_scratch_space', str(raised.exception))
+        self.assertEqual(list(self.scratch.iterdir()), [])
+        self.assertEqual(self.calls, [])
+        policy._scratch.statvfs = self.fake_statvfs(free_bytes=5 * gib + cache + 4096)
+        policy.run_command('cargo build')
+        self.assertEqual(len(self.calls), 1)
+
+    def test_invalid_policy_limits_fail_builds_closed_with_a_named_readiness(self):
+        # #1092: an out-of-range limit fails closed under a named category and
+        # creates no session/image; it is never silently clamped.
+        gib = 1024**3
+        bad = {'headroom_bytes': 20 * gib, 'cache_bytes': 12 * gib, 'budget_bytes': 4 * gib}
+        policy = self.policy(build_scratch_limits=bad)
+        self.assertIsNotNone(policy._scratch.limits_error)
+        (self.root / 'note.md').write_text('synthetic')
+        self.assertEqual(policy.read('note.md'), 'synthetic', 'other tools stay available')
+        with self.assertRaises(bridge.Readiness) as raised:
+            policy.run_command('cargo build')
+        self.assertIn('JARVIS_READINESS:build_scratch_limits', str(raised.exception))
+        self.assertEqual(list(self.scratch.iterdir()), [], 'no session or image is created')
+        self.assertEqual(self.calls, [])
+
+    def test_profile_environment_cannot_set_the_limits(self):
+        # #1092: the GiB knobs are honoured only from the daemon environment,
+        # which the daemon folds into build_scratch_limits. The same names
+        # smuggled through a profile/preset environment are ignored.
+        policy = self.policy(environment={
+            'AUGMENTAGENT_BUILD_SCRATCH_HEADROOM_GIB': '1',
+            'AUGMENTAGENT_BUILD_SCRATCH_IMAGE_CAP_GIB': '1',
+            'AUGMENTAGENT_BUILD_SCRATCH_BUDGET_GIB': '1',
+        })
+        self.assertIsNone(policy._scratch.limits_error)
+        self.assertEqual(policy._scratch.headroom_bytes, bridge.BuildScratch.HEADROOM_BYTES)
+        self.assertEqual(policy._scratch.budget_bytes, bridge.BuildScratch.BUDGET_BYTES)
+
     def test_host_volume_full_after_a_build_is_a_named_readiness_error(self):
         policy = self.policy()
         def fills_the_volume(*args, **kwargs):
