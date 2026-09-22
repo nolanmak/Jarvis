@@ -315,6 +315,16 @@ sys.stdout.write(json.dumps({'matches': matches}))
 FILE_TOOLS = {'Read', 'Write', 'Edit', 'Glob', 'Grep', 'LS'}
 KNOWN_TOOLS = FILE_TOOLS | {'WebSearch', 'WebFetch', 'NotebookEdit'}
 CONTROL_PARTS = {'.git', '.codex', '.claude', '.ssh', '.gnupg', '.aws', '.azure'}
+# #1078 — instruction/config files Claude Code or Codex auto-load from a working
+# directory (and its ancestors). A model write to any of these under the wiki
+# would persist as instructions into every later wiki call and survive in the
+# private mirror. Denied on WRITE, case-insensitive, on any path component (the
+# `.claude` directory is already blocked for read and write by CONTROL_PARTS).
+# Stored lower-cased for the case-insensitive compare. This mirrors the
+# canonical PROTECTED_INJECTION_NAMES in codex_tools.rs; a Rust parity test
+# fails if the two drift.
+INJECTION_NAMES = frozenset({'claude.md', 'claude.local.md', '.claude',
+                             '.mcp.json', 'agents.md'})
 MAX_FILE_BYTES = 8 * 1024 * 1024
 # Tool paths: components below the scope root, and bytes of the absolute path
 # (Linux PATH_MAX). Enforced for every read, write and search entry (#1042).
@@ -1016,6 +1026,11 @@ class Policy:
             if any(p in CONTROL_PARTS or p == '.env' or p.startswith('.env.')
                    for p in parts):
                 raise Denied('credential and control paths are excluded')
+            # #1078 — a model write must not create an instruction/config file
+            # a later call auto-loads. Read stays allowed (the wiki guard only
+            # denies writes too); the write branch is the injection boundary.
+            if writing and any(p.lower() in INJECTION_NAMES for p in parts):
+                raise Denied('instruction and config paths are excluded on write')
             return root, parts
         raise Denied('path is outside the permitted workspace')
 

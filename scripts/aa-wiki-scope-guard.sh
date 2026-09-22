@@ -27,6 +27,13 @@ set -euo pipefail
 # Codex bridge enforces.
 export LC_ALL=C
 
+# #1078 — shared reserved-injection-name list + matcher, sourced so this guard
+# and aa-journal-guard.sh cannot drift from each other or from the canonical
+# PROTECTED_INJECTION_NAMES in codex_tools.rs.
+GUARD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=aa-wiki-protected-names.sh
+source "$GUARD_DIR/aa-wiki-protected-names.sh"
+
 if [[ -z "${WIKI_ROOT:-}" ]]; then
   echo "aa-wiki-scope-guard: WIKI_ROOT unset" >&2
   exit 2
@@ -58,6 +65,10 @@ TOOL=$(printf '%s' "$INPUT" | jq -r '.tool_name // empty')
 case "$TOOL" in
   Read|Write|Edit)
     CANDIDATE=$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // empty')
+    ;;
+  NotebookEdit)
+    # NotebookEdit names its target `notebook_path`, not `file_path` (#1078).
+    CANDIDATE=$(printf '%s' "$INPUT" | jq -r '.tool_input.notebook_path // empty')
     ;;
   Glob|Grep)
     CANDIDATE=$(printf '%s' "$INPUT" | jq -r '.tool_input.path // empty')
@@ -94,6 +105,25 @@ fi
 if RESOLVED=$(readlink -m -- "$ABS" 2>/dev/null); then
   ABS="$RESOLVED"
 fi
+
+# #1078 — deny model writes to instruction/config files Claude Code or Codex
+# auto-load from a working directory (CLAUDE.md, CLAUDE.local.md, .claude,
+# .mcp.json, AGENTS.md). One planted here would steer every later wiki call and
+# survive in the private mirror. Only writes are denied — reads of an ordinary
+# page are unaffected — and only inside the wiki, since anything outside is
+# already blocked below. The path is checked relative to the wiki root so the
+# root's own components cannot false-positive.
+case "$TOOL" in
+  Write|Edit|NotebookEdit)
+    if [[ "$ABS" == "$WIKI_ROOT_ABS"/* ]] \
+       && aa_path_has_protected_injection_name "${ABS#"$WIKI_ROOT_ABS"/}"; then
+      REASON="Refusing to write an instruction/config file Claude Code or Codex auto-loads (CLAUDE.md, CLAUDE.local.md, .claude, .mcp.json, AGENTS.md). A file planted here persists as instructions into every later wiki call and through the mirror (#1078). Tool=$TOOL path=$ABS"
+      jq -n --arg r "$REASON" \
+        '{decision:"block", reason:$r, hookSpecificOutput:{hookEventName:"PreToolUse", permissionDecision:"deny", permissionDecisionReason:$r}}'
+      exit 0
+    fi
+    ;;
+esac
 
 # Allow when ABS is inside WIKI_ROOT_ABS. We compare with a trailing slash
 # to avoid `/wiki-evil` matching when WIKI_ROOT is `/wiki`.

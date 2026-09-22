@@ -127,5 +127,37 @@ expect_block "A non-ASCII digit lookalike is blocked under a UTF-8 locale" \
 expect_block "A non-ASCII session file name is blocked under a UTF-8 locale" \
   Read file_path $'/tmp/aa-imsg/4242-17/n\xc3\xa9.jpeg' "$I_ENV" "LANG=en_US.UTF-8"
 
+# #1078 — instruction/config files Claude Code or Codex auto-load must not be
+# model-writable inside the wiki: a planted one would steer every later wiki
+# call and survive in the private mirror. Case-insensitive, any path component,
+# for Write/Edit/NotebookEdit only. Ordinary pages that merely look similar stay
+# writable, and reads are unaffected.
+expect_block "Write CLAUDE.md at the wiki root is blocked" \
+  Write file_path "$WIKI/CLAUDE.md"
+expect_block "Write people/CLAUDE.md is blocked" \
+  Write file_path "$WIKI/people/CLAUDE.md"
+expect_block "Write lowercase claude.md is blocked (case-insensitive)" \
+  Write file_path "$WIKI/claude.md"
+expect_block "Write CLAUDE.local.md is blocked" \
+  Write file_path "$WIKI/CLAUDE.local.md"
+expect_block "Write under a .claude/ component is blocked" \
+  Write file_path "$WIKI/.claude/settings.json"
+expect_block "Write .mcp.json is blocked" \
+  Write file_path "$WIKI/.mcp.json"
+expect_block "Write AGENTS.md is blocked" \
+  Write file_path "$WIKI/AGENTS.md"
+expect_block "Edit CLAUDE.md is blocked" \
+  Edit file_path "$WIKI/CLAUDE.md"
+expect_block "NotebookEdit of CLAUDE.md (notebook_path arg) is blocked" \
+  NotebookEdit notebook_path "$WIKI/CLAUDE.md"
+expect_allow "Write an ordinary people page is allowed (no false positive)" \
+  Write file_path "$WIKI/people/claude-shannon.md"
+expect_allow "Write claude-notes.md is allowed (not a reserved name)" \
+  Write file_path "$WIKI/claude-notes.md"
+expect_allow "Write mcp-notes.md is allowed (not a reserved name)" \
+  Write file_path "$WIKI/mcp-notes.md"
+expect_allow "Read of CLAUDE.md inside the wiki is allowed (injection rule is write-only)" \
+  Read file_path "$WIKI/CLAUDE.md"
+
 printf '\n%d ok, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

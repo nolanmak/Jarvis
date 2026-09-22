@@ -24,11 +24,11 @@ fn discord_model_switch_sequence_uses_one_audited_harness() {
         .join("../..")
         .canonicalize()
         .unwrap();
-    std::fs::copy(
-        source_repo.join("scripts/aa-wiki-scope-guard.sh"),
-        scripts.join("aa-wiki-scope-guard.sh"),
-    )
-    .unwrap();
+    // The scope guard sources aa-wiki-protected-names.sh from its own dir
+    // (#1078); copy both or the guard aborts under `set -euo pipefail`.
+    for script in ["aa-wiki-scope-guard.sh", "aa-wiki-protected-names.sh"] {
+        std::fs::copy(source_repo.join("scripts").join(script), scripts.join(script)).unwrap();
+    }
     let memory = release.join("augmentagent-mcp-memory");
     std::fs::write(
         &memory,

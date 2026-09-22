@@ -87,6 +87,24 @@ pub fn build_runner() -> BuildRunner {
 
 /// Hook script whose Read carve-outs these definitions describe.
 pub const SCOPE_GUARD_SCRIPT: &str = "aa-wiki-scope-guard.sh";
+
+/// Instruction/config files that Claude Code or Codex auto-load from a working
+/// directory — and its ancestors — on every call. A model write to any of these
+/// under the wiki would persist as instructions into every later wiki call
+/// (ask, ingest, resume, lint) and survive in the private mirror, turning a
+/// one-off prompt injection into a durable one (#1078). This is the one
+/// canonical definition: it is mirrored, case-insensitive on any path
+/// component, into both wiki guard scripts (`scripts/aa-wiki-protected-names.sh`,
+/// sourced by `aa-wiki-scope-guard.sh` and `aa-journal-guard.sh`) and the Codex
+/// bridge (`scripts/codex-tool-bridge.py`), and pinned to those copies by
+/// `protected_injection_names_are_mirrored_across_guard_and_bridge`.
+///
+/// This list is the injection boundary; the guard/bridge hooks enforce it on
+/// write. Proposal #2 (`--setting-sources`, to stop parent-directory memory
+/// loading) is a token-cost optimization (#448), not this boundary, and is
+/// deferred there — the write denial holds regardless of what a call loads.
+pub const PROTECTED_INJECTION_NAMES: &[&str] =
+    &["CLAUDE.md", "CLAUDE.local.md", ".claude", ".mcp.json", "AGENTS.md"];
 /// Discord attachments (augmentagent-approval-discord, #441/#939) are written
 /// to `/tmp/aa-{img,txt,doc}-<msg_id>-<idx>.<ext>`.
 pub const DISCORD_ATTACHMENT_DIR: &str = "/tmp";
@@ -584,6 +602,64 @@ mod tests {
             }
         }
         assert_eq!(found[&session_dir], found[&session_file], "session file regex must require a validated session dir");
+    }
+
+    /// #1078 — the reserved injection-name list has exactly one canonical
+    /// definition (`PROTECTED_INJECTION_NAMES`). This pins the two other copies
+    /// to it: the shared shell snippet both wiki guards source, and the Codex
+    /// bridge's write-deny set. If any copy drifts, a name could be denied on
+    /// one provider and writable on the other — this test fails first.
+    #[test]
+    fn protected_injection_names_are_mirrored_across_guard_and_bridge() {
+        use std::collections::BTreeSet;
+        let canonical: BTreeSet<String> =
+            PROTECTED_INJECTION_NAMES.iter().map(|s| s.to_string()).collect();
+        let canonical_lower: BTreeSet<String> =
+            PROTECTED_INJECTION_NAMES.iter().map(|s| s.to_lowercase()).collect();
+
+        // The shared shell snippet: AA_PROTECTED_INJECTION_NAMES=("A" "B" ...).
+        // Same casing as the canonical list (the shell compares case-insensitively
+        // at runtime via `${,,}`).
+        let snippet = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/aa-wiki-protected-names.sh"
+        ))
+        .unwrap();
+        // Quoted contents sit at the odd indices when splitting on the quote.
+        let shell_names = between(&snippet, "AA_PROTECTED_INJECTION_NAMES=(", ")")
+            .split('"')
+            .enumerate()
+            .filter_map(|(i, tok)| (i % 2 == 1).then(|| tok.to_string()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            shell_names, canonical,
+            "aa-wiki-protected-names.sh drifted from PROTECTED_INJECTION_NAMES"
+        );
+
+        // The Codex bridge: INJECTION_NAMES = frozenset({'a', 'b', ...}),
+        // lower-cased for its case-insensitive compare.
+        let bridge = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/codex-tool-bridge.py"
+        ))
+        .unwrap();
+        let bridge_names = between(&bridge, "INJECTION_NAMES = frozenset({", "}")
+            .split('\'')
+            .enumerate()
+            .filter_map(|(i, tok)| (i % 2 == 1).then(|| tok.to_string()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            bridge_names, canonical_lower,
+            "codex-tool-bridge.py INJECTION_NAMES drifted from PROTECTED_INJECTION_NAMES"
+        );
+    }
+
+    /// Slice between the first `open` and the next `close` after it.
+    fn between<'a>(haystack: &'a str, open: &str, close: &str) -> &'a str {
+        let start = haystack.find(open).expect("open marker present") + open.len();
+        let rest = &haystack[start..];
+        let end = rest.find(close).expect("close marker present");
+        &rest[..end]
     }
 
     /// The same names are admitted by the real guard (bash ERE, in the daemon's

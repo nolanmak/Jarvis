@@ -2061,8 +2061,11 @@ fn build_wiki_scope_settings(
             }
         },
         "hooks": {
+            // #1078 — NotebookEdit joins the write-capable tools so the guard's
+            // reserved-injection-name denial (CLAUDE.md, .claude, …) also covers
+            // a notebook write.
             "PreToolUse": [{
-                "matcher": "Read|Write|Edit|Glob|Grep",
+                "matcher": "Read|Write|Edit|NotebookEdit|Glob|Grep",
                 "hooks": [{
                     "type": "command",
                     "command": guard_path.to_string_lossy()
@@ -2285,8 +2288,10 @@ pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
         Some(guard) => Some(
             serde_json::json!({
                 "hooks": {
+                    // #1078 — NotebookEdit joins the matcher so the guard's
+                    // reserved-injection-name denial covers a notebook write too.
                     "PreToolUse": [{
-                        "matcher": "Write|Edit",
+                        "matcher": "Write|Edit|NotebookEdit",
                         "hooks": [{ "type": "command", "command": guard.to_string_lossy() }]
                     }]
                 }
@@ -2789,6 +2794,81 @@ mod tests {
         );
     }
 
+    /// #1078 — every write-capable wiki preset must attach a PreToolUse hook
+    /// covering Write|Edit|NotebookEdit and forward a canonical WIKI_ROOT so the
+    /// guard resolves. The prior attempt wired the reserved-name denial into
+    /// ask_opts + ingest_opts but left resume_opts (settings_json: None, no
+    /// WIKI_ROOT) unguarded, so `resume ingest` on Claude could still write
+    /// CLAUDE.md into the wiki. This enumerates the presets so a future
+    /// write-capable preset that forgets the hook is caught here.
+    #[test]
+    fn every_write_capable_wiki_preset_guards_injection_files() {
+        let repo = tempfile::tempdir().expect("repo tmpdir");
+        let wiki = tempfile::tempdir().expect("wiki tmpdir");
+        std::fs::write(repo.path().join("data.db"), b"").unwrap();
+        let _guard = EnvGuard::unset("AUGMENTAGENT_DB");
+
+        let presets: Vec<(&str, ReasonerOpts)> = vec![
+            (
+                "ask",
+                ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf()),
+            ),
+            ("ingest", ingest_opts("sys".into(), wiki.path().to_path_buf())),
+            ("resume", resume_opts(wiki.path().to_path_buf())),
+        ];
+        let canonical = std::fs::canonicalize(wiki.path()).unwrap();
+        for (name, opts) in presets {
+            assert!(
+                opts.allowed_tools.iter().any(|t| t == "Write" || t == "Edit"),
+                "{name}: expected a write-capable preset"
+            );
+            let settings = opts.settings_json.as_deref().unwrap_or_else(|| {
+                panic!("{name}: must ship settings_json with the injection guard hook")
+            });
+            let value: serde_json::Value = serde_json::from_str(settings).unwrap();
+            let groups = value
+                .pointer("/hooks/PreToolUse")
+                .and_then(|v| v.as_array())
+                .unwrap_or_else(|| panic!("{name}: no PreToolUse hook groups"));
+            // A group whose matcher regex covers each write tool AND runs a
+            // guard shell script (aa-wiki-scope-guard.sh or aa-journal-guard.sh).
+            for tool in ["Write", "Edit", "NotebookEdit"] {
+                let covered = groups.iter().any(|group| {
+                    let matcher = group
+                        .get("matcher")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(".*");
+                    let re = regex::Regex::new(&format!(r"\A(?:{matcher})\z")).unwrap();
+                    re.is_match(tool)
+                        && group
+                            .get("hooks")
+                            .and_then(|v| v.as_array())
+                            .into_iter()
+                            .flatten()
+                            .any(|hook| {
+                                hook.get("type").and_then(|v| v.as_str()) == Some("command")
+                                    && hook
+                                        .get("command")
+                                        .and_then(|v| v.as_str())
+                                        .is_some_and(|c| c.ends_with(".sh"))
+                            })
+                });
+                assert!(covered, "{name}: no guard hook covers {tool}");
+            }
+            let wiki_env = opts
+                .env
+                .iter()
+                .find(|(k, _)| k == "WIKI_ROOT")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("{name}: WIKI_ROOT not forwarded to the guard"));
+            assert_eq!(
+                wiki_env,
+                canonical.to_string_lossy(),
+                "{name}: WIKI_ROOT must be the canonical wiki path"
+            );
+        }
+    }
+
     #[test]
     fn ask_opts_ships_absolute_db_env() {
         let repo = tempfile::tempdir().expect("repo tmpdir");
@@ -3192,6 +3272,34 @@ mod tests {
         let script = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../scripts/tests/aa-wiki-scope-guard.test.sh"
+        );
+        if std::process::Command::new("jq")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let out = std::process::Command::new("bash")
+            .arg(script)
+            .output()
+            .expect("bash runs");
+        assert!(
+            out.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// #1094 + #1078 — the wiki-ingest guard's journal/ block, its reserved
+    /// injection-name denial, and its no-false-positive cases live in
+    /// `scripts/tests/aa-journal-guard.test.sh` (needs jq).
+    #[test]
+    fn wiki_journal_guard_shell_tests_pass() {
+        let script = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/tests/aa-journal-guard.test.sh"
         );
         if std::process::Command::new("jq")
             .arg("--version")
@@ -3627,6 +3735,43 @@ mod tests {
 /// Preset for the one-shot `resume ingest` CLI. Opus quality for a single-run
 /// seeding pass. Full wiki R/W/E with cwd pinned so writes cannot escape.
 pub fn resume_opts(wiki_root: PathBuf) -> ReasonerOpts {
+    // #337 lesson (shared with ingest_opts): the guard resolves WIKI_ROOT from
+    // the spawned CLI's cwd, so it must be absolute.
+    let wiki_root = std::fs::canonicalize(&wiki_root).unwrap_or_else(|_| {
+        std::env::current_dir()
+            .map(|d| d.join(&wiki_root))
+            .unwrap_or(wiki_root)
+    });
+    // #1078 — resume is a third write-capable wiki preset (Write+Edit,
+    // acceptEdits, cwd = wiki_root). It shipped no PreToolUse hook, so
+    // `augmentagent resume ingest <file>` on the default Claude provider could
+    // still write CLAUDE.md / AGENTS.md / .mcp.json / .claude into the wiki,
+    // where every later call would load it as instructions. Attach the same
+    // path-scope guard the query preset uses; its shared reserved-name block is
+    // the injection boundary. WIKI_ROOT is set unconditionally below so the
+    // guard resolves; a stripped deploy that lacks the script degrades to
+    // prompt-only (fail-open, matching ingest_opts) but keeps cwd scoping.
+    let settings_json = match locate_repo_script(crate::codex_tools::SCOPE_GUARD_SCRIPT) {
+        Some(guard) => Some(
+            serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "Write|Edit|NotebookEdit",
+                        "hooks": [{ "type": "command", "command": guard.to_string_lossy() }]
+                    }]
+                }
+            })
+            .to_string(),
+        ),
+        None => {
+            tracing::warn!(
+                "{} not found; resume ingest injection-file guard is prompt-only",
+                crate::codex_tools::SCOPE_GUARD_SCRIPT
+            );
+            None
+        }
+    };
+    let wiki_root_env = wiki_root.to_string_lossy().into_owned();
     ReasonerOpts {
         system_prompt: include_str!("../../../schema/resume-ingest.md").to_string(),
         model: Some(opus_model()), // Opus — seeding the wiki is high-leverage and one-shot
@@ -3640,8 +3785,8 @@ pub fn resume_opts(wiki_root: PathBuf) -> ReasonerOpts {
         add_dirs: vec![wiki_root.clone()],
         permission_mode: "acceptEdits".into(),
         cwd: Some(wiki_root),
-        env: Vec::new(),
-        settings_json: None,
+        env: vec![("WIKI_ROOT".into(), wiki_root_env)],
+        settings_json,
         restrict_env: false,
         audit_logger: None,
         audit_notifier: None,

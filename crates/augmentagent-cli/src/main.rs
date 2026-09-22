@@ -8261,6 +8261,7 @@ async fn git_commit_batch(
 const WIKI_SYNC_FORBIDDEN: &[&str] = &["data.db", "data.db-wal", "data.db-shm", ".env"];
 
 fn wiki_sync_check_forbidden(list: &str, what: &str) -> Result<()> {
+    use augmentagent_channel_core::codex_tools::PROTECTED_INJECTION_NAMES;
     for f in list.lines() {
         let f = f.trim();
         if f.is_empty() {
@@ -8273,8 +8274,69 @@ fn wiki_sync_check_forbidden(list: &str, what: &str) -> Result<()> {
                  Fix wiki/.gitignore before syncing — this must never reach the mirror."
             );
         }
+        // #1078 — an instruction/config file Claude Code or Codex auto-loads
+        // (CLAUDE.md, .claude/…, .mcp.json, AGENTS.md) must never persist
+        // through the mirror, or a planted injection survives there. Match any
+        // `/`-split component, case-insensitive, so `.claude/settings.json` is
+        // caught by its `.claude` component, not only a base-name hit.
+        if f.split('/').any(|c| {
+            PROTECTED_INJECTION_NAMES
+                .iter()
+                .any(|reserved| c.eq_ignore_ascii_case(reserved))
+        }) {
+            anyhow::bail!(
+                "wiki sync refused: instruction/config file `{f}` is {what} in the wiki repo. \
+                 These files are auto-loaded as agent instructions and must never reach the mirror (#1078)."
+            );
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod wiki_sync_forbidden_tests {
+    use super::wiki_sync_check_forbidden;
+
+    #[test]
+    fn refuses_sensitive_non_content_files() {
+        // Existing guard (KB sync #4): db + secrets + lock files.
+        for f in ["data.db", "wiki/data.db-wal", ".env", "people/dana.md.lock"] {
+            assert!(
+                wiki_sync_check_forbidden(f, "staged").is_err(),
+                "should refuse {f}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_injection_config_files_by_any_component() {
+        // #1078 — instruction/config files a later daemon call auto-loads must
+        // never reach the mirror, matched on any `/`-split component,
+        // case-insensitive. `.claude/settings.json` is caught by its `.claude`
+        // component, not a base-name hit.
+        for f in [
+            "CLAUDE.md",
+            "people/CLAUDE.md",
+            "claude.md",
+            "CLAUDE.local.md",
+            ".claude/settings.json",
+            ".mcp.json",
+            "AGENTS.md",
+            "agents.md",
+        ] {
+            assert!(
+                wiki_sync_check_forbidden(f, "staged").is_err(),
+                "should refuse {f}"
+            );
+        }
+    }
+
+    #[test]
+    fn allows_ordinary_pages() {
+        // No false positives, and a multi-line staged list is fine.
+        let staged = "people/claude-shannon.md\nclaude-notes.md\nmcp-notes.md\nabout/index.md\n";
+        assert!(wiki_sync_check_forbidden(staged, "staged").is_ok());
+    }
 }
 
 /// Run `git -C <dir> <args>`; return whether it exited 0.
@@ -9382,8 +9444,12 @@ mod query_delivery_contract_tests {
         std::fs::create_dir(&wiki).unwrap();
         std::fs::create_dir_all(repo.join("target/release")).unwrap();
         std::fs::create_dir(repo.join("scripts")).unwrap();
-        std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/aa-wiki-scope-guard.sh"),
-            repo.join("scripts/aa-wiki-scope-guard.sh")).unwrap();
+        // The scope guard sources aa-wiki-protected-names.sh from its own dir
+        // (#1078); copy both or the guard aborts under `set -euo pipefail`.
+        for script in ["aa-wiki-scope-guard.sh", "aa-wiki-protected-names.sh"] {
+            std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts").join(script),
+                repo.join("scripts").join(script)).unwrap();
+        }
         std::os::unix::fs::symlink(memory, repo.join("target/release/augmentagent-mcp-memory")).unwrap();
         std::fs::write(wiki.join("note.txt"), "SYNTHETIC_DELIVERY_62BD\n").unwrap();
         let original = b"%PDF-1.7\n\x00\xffSYNTHETIC_ORIGINAL";
