@@ -32,7 +32,9 @@ use augmentagent_channel_email::sigextract::{
     detect_signature_block, is_human_sender, signature_patch, strip_quoted_reply,
     SignatureExtractor,
 };
-use augmentagent_channel_email::{GmailChannel, GmailChannelConfig, OutboundObserver};
+use augmentagent_channel_email::{
+    parse_rfc2822_or_ms, GmailChannel, GmailChannelConfig, OutboundObserver,
+};
 use augmentagent_channel_linkedin::{
     build_normshares_body, default_auth_path, is_linkedin_email, ConnectionRequestEngagement,
     FriendFeedEngagement, InvitationsTrigger, LinkedInApi, LinkedInAuth,
@@ -7112,7 +7114,7 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
 
     let mut bulk_ids: Vec<String> = Vec::new();
     let mut empty_ids: Vec<String> = Vec::new();
-    let mut answered_threads: Vec<String> = Vec::new();
+    let mut answered_ids: Vec<String> = Vec::new();
 
     for row in &pending {
         // Rule 3 (#484) — the card has no draft to approve. This happens when a
@@ -7142,23 +7144,33 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
             bulk_ids.push(row.id.clone());
             continue;
         }
-        // Rule 1 — the user already replied on this thread. `i64::MIN` as the
-        // "after" bound asks the broad question ("any user reply on this thread
-        // at all?"), which is the right one for a card that is still sitting
-        // unanswered in the queue: if the user has spoken on this thread since
-        // we raised it, the draft we are holding is stale by definition.
+        // Rule 1 — the user already replied to THIS inbound. The bound is the
+        // card's own inbound arrival (`receivedAt`), so we only retire when a
+        // reply landed AFTER the message we drafted for — never on the strength
+        // of some earlier reply on the same thread. On a live back-and-forth
+        // thread an unbounded "any reply ever?" check (#1196) would let a single
+        // old reply supersede every future draft the daemon makes for newer
+        // inbounds on that thread, silently, before the owner can act — exactly
+        // the false "Already resolved (superseded)." the user reported. This
+        // mirrors the inbound triage gate (#218): parse `receivedAt`, and fall
+        // back to `i64::MAX` (retire on nothing) when the arrival is unknown or
+        // unparseable, so a bad date never over-retires.
         let Some(tid) = row.thread_id.as_deref() else {
             continue;
         };
-        match store.thread_has_user_reply_after(tid, i64::MIN) {
+        let after_ms = match row.received_at.as_deref().map(parse_rfc2822_or_ms) {
+            Some(ms) if ms > 0 => ms,
+            _ => i64::MAX,
+        };
+        match store.thread_has_user_reply_after(tid, after_ms) {
             Ok(true) => {
                 info!(
                     action_id = %row.id,
                     thread = %tid,
                     from = %row.from_email,
-                    "stale approval: retiring card, user already replied on thread"
+                    "stale approval: retiring card, user already replied to this inbound"
                 );
-                answered_threads.push(tid.to_string());
+                answered_ids.push(row.id.clone());
             }
             Ok(false) => {}
             Err(e) => warn!(
@@ -7170,17 +7182,14 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
     }
 
     // #500 — scheduled sends get Rule 1 ONLY (user replied on the thread),
-    // bounded to replies AFTER the schedule was ARMED, and retired through
-    // the per-row CAS — never through the thread-wide answered_threads flip
-    // below. Both properties are load-bearing: the pending pass's Rule 1 is
-    // deliberately UNbounded ("any reply ever"), so sharing its thread list
-    // would cancel armed schedules over replies that predate them; and Rule 2
-    // must never run on scheduled rows (`fromEmail` on a compose card is the
-    // sending account or the replied-to sender, #962 — the bulk-sender
-    // heuristic would cancel a scheduled reply to any newsletter-looking
-    // address). This durable pass is the backstop for the engine's
-    // fire-time guard: a transient failure there would otherwise let the
-    // send fire over the owner's manual reply.
+    // bounded to replies AFTER the schedule was ARMED (its own cutoff, distinct
+    // from the pending pass's per-inbound `receivedAt` bound), and retired
+    // through the per-row CAS below. Rule 2 must never run on scheduled rows
+    // (`fromEmail` on a compose card is the sending account or the replied-to
+    // sender, #962 — the bulk-sender heuristic would cancel a scheduled reply
+    // to any newsletter-looking address). This durable pass is the backstop for
+    // the engine's fire-time guard: a transient failure there would otherwise
+    // let the send fire over the owner's manual reply.
     let mut scheduled_retired = 0usize;
     for (action_id, tid, armed_at_ms) in &scheduled {
         match store.thread_has_user_reply_after(tid, *armed_at_ms) {
@@ -7220,15 +7229,15 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
         &empty_ids,
         "superseded: no draft to approve (empty draft body)",
     )?;
-    answered_threads.sort();
-    answered_threads.dedup();
-    for tid in &answered_threads {
-        let ids = store.mark_pending_drafts_superseded_by_thread(
-            tid,
-            "superseded: you already replied on this thread",
-        )?;
-        retired += ids.len();
-    }
+    // #1196 — flip the answered cards by their own ids, not by thread. Rule 1
+    // decided per-card (each against its inbound's `receivedAt`), so two cards
+    // on one thread that straddle a single reply are judged independently: the
+    // one drafted for an inbound that predates the reply retires, the one for a
+    // newer inbound stays pending.
+    retired += store.mark_pending_superseded_by_ids(
+        &answered_ids,
+        "superseded: you already replied on this thread",
+    )?;
     Ok(retired)
 }
 
@@ -18824,6 +18833,46 @@ mod stale_reconcile_tests {
             .unwrap()
     }
 
+    /// #1196 — seed a pending card whose inbound arrived at an explicit
+    /// `receivedAt` (the raw Date-header string), so a test can place the
+    /// card's inbound before or after a recorded reply and assert Rule 1's
+    /// per-card bound.
+    fn seed_pending_dated(
+        store: &Store,
+        msg: &str,
+        thread: Option<&str>,
+        from: &str,
+        received_at: &str,
+    ) -> String {
+        store
+            .upsert_email(&Email {
+                attachments: Vec::new(),
+                to: String::new(),
+                cc: String::new(),
+                message_id: msg.into(),
+                thread_id: thread.map(String::from),
+                from: from.into(),
+                subject: "subj".into(),
+                body: "body".into(),
+                date: received_at.into(),
+                account_entity_id: Some("acc".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            })
+            .unwrap();
+        store
+            .log_action(
+                msg,
+                thread,
+                from,
+                "subj",
+                Some("body"),
+                Some("a draft"),
+                ActionStatus::Pending,
+            )
+            .unwrap()
+    }
+
     fn status_of(store: &Store, id: &str) -> String {
         store
             .with_conn(|c| {
@@ -18836,18 +18885,27 @@ mod stale_reconcile_tests {
             .unwrap()
     }
 
-    /// Rule 1: the user answered the thread from Gmail web/mobile. The card we
-    /// are still holding is asking them to reply to mail they already replied
-    /// to — exactly the stale carousel the user reported.
+    /// Rule 1: the user answered THIS inbound from Gmail web/mobile — the reply
+    /// landed after the message the card is drafting for. The card we are still
+    /// holding is asking them to reply to mail they already replied to — exactly
+    /// the stale carousel the user reported. The seeded inbound arrives at
+    /// 2026-07-13T12:00:00Z (~1.784e12 ms), so the reply at 1.8e12 ms is
+    /// unambiguously after it and Rule 1 must fire (#1196).
     #[test]
     fn retires_cards_on_threads_the_user_already_answered() {
         let (store, _t) = fresh_store();
         let answered = seed_pending(&store, "m-1", Some("T-answered"), "dana@labs.example.com"); // pii-ok: synthetic
         let untouched = seed_pending(&store, "m-2", Some("T-open"), "sam@labs.example.com"); // pii-ok: synthetic
 
-        // The OutboundObserver saw the user reply on T-answered.
+        // The OutboundObserver saw the user reply on T-answered, AFTER the
+        // inbound arrived.
         store
-            .record_outbound_thread_event("acc", "user-reply-1", Some("T-answered"), 9_000_000)
+            .record_outbound_thread_event(
+                "acc",
+                "user-reply-1",
+                Some("T-answered"),
+                1_800_000_000_000,
+            )
             .unwrap();
 
         let n = reconcile_stale_approvals_tick(&store).unwrap();
@@ -18857,6 +18915,76 @@ mod stale_reconcile_tests {
             status_of(&store, &untouched),
             "pending",
             "a thread the user has NOT answered must stay in the queue"
+        );
+    }
+
+    /// #1196 regression — the reported bug. A reply that PREDATES this card's
+    /// inbound must NOT retire the card: on a live back-and-forth thread the
+    /// owner replied once earlier, then new mail arrived and the daemon drafted
+    /// a fresh reply. The old unbounded `i64::MIN` "any reply ever?" check
+    /// superseded that fresh card within one sweep, so Revise/Schedule returned
+    /// "Already resolved (superseded)." Bounded to the inbound's `receivedAt`,
+    /// the earlier reply is out of window and the card stays actionable.
+    #[test]
+    fn reconcile_keeps_a_fresh_card_when_the_only_reply_predates_its_inbound() {
+        let (store, _t) = fresh_store();
+        // Inbound arrives 2026-07-13T12:00:00Z (~1.784e12 ms).
+        let fresh = seed_pending(&store, "m-1", Some("T-live"), "dana@labs.example.com"); // pii-ok: synthetic
+
+        // The only recorded reply on the thread is from long BEFORE this
+        // inbound — an earlier turn in the same conversation.
+        store
+            .record_outbound_thread_event("acc", "old-reply", Some("T-live"), 9_000_000)
+            .unwrap();
+
+        let n = reconcile_stale_approvals_tick(&store).unwrap();
+        assert_eq!(n, 0, "an older reply must not retire a card for a newer inbound");
+        assert_eq!(
+            status_of(&store, &fresh),
+            "pending",
+            "the fresh draft must stay actionable so Revise/Schedule works"
+        );
+    }
+
+    /// #1196 — Rule 1 is decided per card, not per thread. Two cards share one
+    /// thread; a single reply sits BETWEEN their inbound arrivals. Only the card
+    /// whose inbound predates the reply is stale; the card for the newer inbound
+    /// (arriving after the reply) must survive.
+    #[test]
+    fn reconcile_rule1_is_bounded_per_card_on_a_shared_thread() {
+        let (store, _t) = fresh_store();
+        // Same human sender, same thread — Rules 2 and 3 don't apply.
+        let older = seed_pending_dated(
+            &store,
+            "m-old",
+            Some("T-shared"),
+            "Dana Rivera <dana@labs.example.com>", // pii-ok: synthetic
+            "2026-01-01T00:00:00Z", // ~1.767e12 ms
+        );
+        let newer = seed_pending_dated(
+            &store,
+            "m-new",
+            Some("T-shared"),
+            "Dana Rivera <dana@labs.example.com>", // pii-ok: synthetic
+            "2026-06-01T00:00:00Z", // ~1.780e12 ms
+        );
+
+        // One reply, timestamped between the two inbounds.
+        store
+            .record_outbound_thread_event("acc", "mid-reply", Some("T-shared"), 1_770_000_000_000)
+            .unwrap();
+
+        let n = reconcile_stale_approvals_tick(&store).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            status_of(&store, &older),
+            "superseded",
+            "the card for the inbound that predates the reply is stale"
+        );
+        assert_eq!(
+            status_of(&store, &newer),
+            "pending",
+            "the card for the inbound that arrived AFTER the reply must survive"
         );
     }
 

@@ -165,7 +165,13 @@ pub fn classify_outbound(
 /// "unknown" and uses wallclock-now as the cursor advance). Wrong-by-a-few-
 /// seconds is harmless: the cursor is `MAX(stored, new)` so a stale value
 /// just doesn't advance.
-pub(crate) fn parse_rfc2822_or_ms(s: &str) -> i64 {
+///
+/// `pub` because it is the single canonical Date-header parser reused by the
+/// inbound triage gate (#218) and the reconcile sweep's Rule 1 bound (#1196):
+/// both turn a stored `receivedAt` into the "only replies after this" cutoff,
+/// and both map a `0` (unknown) result to `i64::MAX` so an unparseable date
+/// never over-retires. Do not add a second date parser.
+pub fn parse_rfc2822_or_ms(s: &str) -> i64 {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return 0;

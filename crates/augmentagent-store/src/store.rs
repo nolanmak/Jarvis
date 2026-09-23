@@ -3295,7 +3295,8 @@ impl Store {
         let mut stmt = guard.prepare(
             "SELECT a.id, a.threadId, a.fromEmail, a.subject, \
                     COALESCE(a.originalBody, ''), \
-                    (a.draftBody IS NULL OR TRIM(a.draftBody, ' \t\r\n') = '') \
+                    (a.draftBody IS NULL OR TRIM(a.draftBody, ' \t\r\n') = ''), \
+                    e.receivedAt \
                FROM actions a \
                LEFT JOIN emails e ON a.messageId = e.messageId \
               WHERE a.status = 'pending' \
@@ -3310,6 +3311,7 @@ impl Store {
                 subject: r.get(3)?,
                 body: r.get(4)?,
                 draft_empty: r.get(5)?,
+                received_at: r.get(6)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -7330,6 +7332,12 @@ pub struct PendingActionRow {
     /// True when this card has no draft to approve (draftBody NULL/blank).
     /// A card with nothing to approve is stale on its face (#484).
     pub draft_empty: bool,
+    /// The inbound's arrival time (`emails.receivedAt`, the raw Date-header
+    /// string), or `None` when the join finds no matching email. #1196 — the
+    /// reconcile sweep's Rule 1 bounds "user already replied on this thread" to
+    /// replies AFTER this instant, so an earlier reply on a live back-and-forth
+    /// thread can't retire a card raised for a NEWER inbound.
+    pub received_at: Option<String>,
 }
 
 /// #48 — the three code-mode columns on `actions`, returned by
@@ -10359,6 +10367,51 @@ mod tests {
         s.record_outbound_thread_event("ent-1", "msg-noth", None, 20_000)
             .unwrap();
         assert!(!s.thread_has_user_reply_after("T-other", 0).unwrap());
+    }
+
+    /// #1196 — the reconcile sweep needs each pending card's inbound arrival to
+    /// bound Rule 1 per-card. `pending_actions_for_reconcile` must surface
+    /// `emails.receivedAt`, and leave it `None` when no email row joins.
+    #[test]
+    fn pending_actions_for_reconcile_exposes_received_at() {
+        let (s, _f) = fresh_store();
+        // A card whose inbound row exists: receivedAt round-trips.
+        let mut email = sample_email("m-has-email");
+        email.date = "2026-04-13T12:00:00Z".into();
+        s.upsert_email(&email).unwrap();
+        s.log_action(
+            "m-has-email",
+            Some("T1"),
+            "a@b.example.com",
+            "s",
+            None,
+            Some("d"),
+            ActionStatus::Pending,
+        )
+        .unwrap();
+        // A card with no matching email row: received_at is None (LEFT JOIN).
+        s.log_action(
+            "m-no-email",
+            Some("T2"),
+            "a@b.example.com",
+            "s",
+            None,
+            Some("d"),
+            ActionStatus::Pending,
+        )
+        .unwrap();
+
+        let rows = s.pending_actions_for_reconcile().unwrap();
+        let with_email = rows
+            .iter()
+            .find(|r| r.thread_id.as_deref() == Some("T1"))
+            .expect("card with email present");
+        assert_eq!(with_email.received_at.as_deref(), Some("2026-04-13T12:00:00Z"));
+        let no_email = rows
+            .iter()
+            .find(|r| r.thread_id.as_deref() == Some("T2"))
+            .expect("card without email present");
+        assert_eq!(no_email.received_at, None);
     }
 
     /// #525 — the dashboard's paste-your-key card writes here; the daemon has
