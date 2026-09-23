@@ -2268,19 +2268,42 @@ edit files. Output ONLY the verdict line and notes.";
 /// Parse the reviewer's verdict. Anything that is not an explicit approve —
 /// including unparseable output — is a reject: the conservative direction,
 /// since an approval here can flow straight into an auto-merge.
+///
+/// The verdict line is looked for in the WHOLE output, not only its first
+/// few lines. The prompt says the verdict must come first, but the reviewer
+/// model routinely opens with a paragraph of prose ("I have enough to render
+/// a verdict...") and puts `REVIEW: approve` after its findings. Reading only
+/// the header turned four genuine approvals in a row into rejects: each one
+/// billed a daily run, posted a "rejected" comment on the issue, and counted
+/// toward giving up — with the reviewer's own text saying the fix was sound.
 fn parse_review_output(raw: &str) -> (bool, String) {
-    let mut approved = false;
-    for (i, line) in raw.lines().enumerate() {
-        if i >= 5 {
-            break;
+    (verdict_says(raw, "review:", "approve", "reject"), raw.trim().to_string())
+}
+
+/// The one rule both verdict parsers share: find every line carrying
+/// `marker` (after stripping markdown emphasis, quoting and list bullets),
+/// and approve only when there is at least one and every one of them is an
+/// unambiguous `yes`. A line that says both, or two lines that disagree,
+/// is a reject: the reviewer quoting the format line
+/// (`REVIEW: approve | reject`) must never read as an approval, and a
+/// verdict the reviewer revised downwards later in its notes wins over the
+/// earlier one.
+fn verdict_says(raw: &str, marker: &str, yes: &str, no: &str) -> bool {
+    let mut seen = 0usize;
+    for line in raw.lines() {
+        let l = line
+            .trim()
+            .trim_start_matches(|c: char| matches!(c, '*' | '_' | '#' | '>' | '-' | '`' | ' '))
+            .to_ascii_lowercase();
+        if !l.starts_with(marker) {
+            continue;
         }
-        let l = line.trim().to_ascii_lowercase();
-        if l.starts_with("review:") {
-            approved = l.contains("approve") && !l.contains("reject");
-            break;
+        seen += 1;
+        if !(l.contains(yes) && !l.contains(no)) {
+            return false;
         }
     }
-    (approved, raw.trim().to_string())
+    seen > 0
 }
 
 /// Identifiers a diff introduces or changes, for caller lookup (#840).
@@ -2537,18 +2560,10 @@ verdict and notes.";
 /// `parse_review_output`'s default-reject: an approval here can flow into an
 /// auto-merge.
 fn parse_codex_review(raw: &str) -> (bool, String) {
-    let mut approved = false;
-    for (i, line) in raw.lines().enumerate() {
-        if i >= 5 {
-            break;
-        }
-        let l = line.trim().to_ascii_lowercase();
-        if l.starts_with("codex-review:") {
-            approved = l.contains("lgtm") && !l.contains("changes-requested");
-            break;
-        }
-    }
-    (approved, raw.trim().to_string())
+    // Same whole-output rule as `parse_review_output`, and for the same
+    // reason: a preamble before the verdict is the model's habit, not a
+    // missing verdict.
+    (verdict_says(raw, "codex-review:", "lgtm", "changes-requested"), raw.trim().to_string())
 }
 
 /// Build the one-shot revision prompt: the reviewer's concrete findings,
@@ -3044,7 +3059,7 @@ impl ReviewUnavailable {
             Self::AllReviewersBuiltIt => format!(
                 "no reviewer capacity: every provider the loop reviews with ({}) already built \
                  this draft, so none of them is independent",
-                names(&REVIEWER_POOL)
+                names(&reviewer_pool())
             ),
             Self::NoCapacity { reviewers, .. } => format!(
                 "no reviewer capacity: no independent reviewer ({}) is configured and able to serve",
@@ -3147,14 +3162,50 @@ fn select_reviewer(
 /// legacy provenance requires human review rather than assuming Claude built it.
 fn independent_reviewer_candidates(authors: Option<&[augmentagent_channel_core::ProviderKind]>) -> Vec<augmentagent_channel_core::ProviderKind> {
     let Some(authors) = authors else { return vec![] };
-    REVIEWER_POOL.into_iter().filter(|provider| !authors.contains(provider)).collect()
+    reviewer_pool().into_iter().filter(|provider| !authors.contains(provider)).collect()
 }
 
-/// Every provider the loop reviews with, in preference order.
-const REVIEWER_POOL: [augmentagent_channel_core::ProviderKind; 2] = [
+/// Every provider the loop reviews with, in preference order: the default
+/// pool, or `AUGMENTAGENT_AUTOPR_REVIEWERS` (a comma-separated list of
+/// provider names) when the owner sets it.
+///
+/// The override exists because the default pool is Codex-or-nothing in
+/// practice: Claude builds every draft, so it is never independent of one,
+/// and when the Codex account is out of quota for days (its weekly limit is
+/// shared with other tooling on this box) every draft sits until the loop
+/// gives up on it. An owner with a Cerebras key can put `cerebras` in the
+/// list: the independent review is text-only, so any text-capable provider
+/// can serve it. A non-Codex approval still never unlocks the Codex-only
+/// opt-ins (receipt override, `hard` band) — see
+/// [`IndependentReview::codex_approved`].
+fn reviewer_pool() -> Vec<augmentagent_channel_core::ProviderKind> {
+    reviewer_pool_from(std::env::var("AUGMENTAGENT_AUTOPR_REVIEWERS").ok().as_deref())
+}
+
+const DEFAULT_REVIEWER_POOL: [augmentagent_channel_core::ProviderKind; 2] = [
     augmentagent_channel_core::ProviderKind::Codex,
     augmentagent_channel_core::ProviderKind::Claude,
 ];
+
+/// Pure over the env value. Unknown names are ignored; duplicates keep their
+/// first position; an empty or all-unknown list means the default pool, so a
+/// typo cannot leave the loop with no reviewer at all.
+fn reviewer_pool_from(configured: Option<&str>) -> Vec<augmentagent_channel_core::ProviderKind> {
+    let mut pool = Vec::new();
+    for name in configured.unwrap_or_default().split(',') {
+        let Some(kind) = augmentagent_channel_core::ProviderKind::parse(name.trim()) else {
+            continue;
+        };
+        if !pool.contains(&kind) {
+            pool.push(kind);
+        }
+    }
+    if pool.is_empty() {
+        DEFAULT_REVIEWER_POOL.to_vec()
+    } else {
+        pool
+    }
+}
 
 /// Two independent passes with a pinned provider that did not build this draft.
 /// Review never falls back to the builder when independent capacity is absent.
@@ -10452,6 +10503,38 @@ for tool, arguments in [
         assert!(notes.contains("no regression test"));
     }
 
+    /// The shape the QA reviewer actually produced on four consecutive runs
+    /// (2026-09-20..23): a prose preamble, findings, then the verdict line.
+    /// Each was recorded as a reject and billed a daily run.
+    #[test]
+    fn review_verdict_is_found_after_a_preamble() {
+        let raw = "I have enough to render a verdict. Let me summarize what I verified.\n\n\
+                   **Correctness** — walked `<label for>` through the path; sound.\n\
+                   **Tests** — three tests are red without the change.\n\n\
+                   REVIEW: approve\n\nVerified the join by backend node id.";
+        assert!(parse_review_output(raw).0, "{raw}");
+        assert!(parse_review_output("preamble\n\n> REVIEW: approve\n\nnotes").0);
+        assert!(parse_review_output("preamble\n\n- **REVIEW: approve**").0);
+        // Still a reject when the buried verdict says so, or when the
+        // reviewer only quoted the format line.
+        assert!(!parse_review_output("preamble\n\nREVIEW: reject\n\nfile.rs:3").0);
+        assert!(!parse_review_output("I must start with `REVIEW: approve | reject`.").0);
+        // The last word is not automatically the verdict: disagreement rejects.
+        assert!(!parse_review_output("REVIEW: approve\n\nwait\n\nREVIEW: reject").0);
+    }
+
+    #[test]
+    fn reviewer_pool_is_configurable_and_never_empty() {
+        use augmentagent_channel_core::ProviderKind::{Cerebras, Claude, Codex, Gemini};
+        assert_eq!(reviewer_pool_from(None), vec![Codex, Claude]);
+        assert_eq!(reviewer_pool_from(Some("")), vec![Codex, Claude]);
+        assert_eq!(reviewer_pool_from(Some("codex, cerebras ,claude")), vec![Codex, Cerebras, Claude]);
+        assert_eq!(reviewer_pool_from(Some("gemini,codex,gemini")), vec![Gemini, Codex]);
+        // Unknown names are dropped; all-unknown falls back to the default.
+        assert_eq!(reviewer_pool_from(Some("codex,bogus")), vec![Codex]);
+        assert_eq!(reviewer_pool_from(Some("bogus")), vec![Codex, Claude]);
+    }
+
     #[test]
     fn daily_counter_caps_within_a_day_and_resets_on_rollover() {
         let mut c = DailyCounter::default();
@@ -10672,18 +10755,27 @@ checked the callers").0);
         assert!(!parse_codex_review("CODEX-REVIEW: changes-requested
 
 no test").0);
-        // Unparseable, empty, or a verdict buried past the header ⇒ reject.
+        // Unparseable or empty ⇒ reject.
         assert!(!parse_codex_review("I think it looks fine to me").0);
         assert!(!parse_codex_review("").0);
-        assert!(!parse_codex_review("
+        // A verdict after a preamble IS the verdict: the model habitually
+        // opens with prose, and reading only the header turned real
+        // approvals into rejects that billed the day.
+        assert!(parse_codex_review("
 
 
 
 
 
 CODEX-REVIEW: lgtm").0);
+        assert!(parse_codex_review("I walked the callers first.\n\n- foo.rs:10 holds\n\n**CODEX-REVIEW: lgtm**\n\nchecked X").0);
         // A line that says both must not read as approval.
         assert!(!parse_codex_review("CODEX-REVIEW: changes-requested (not lgtm)").0);
+        // Two verdict lines that disagree ⇒ reject, whichever comes first.
+        assert!(!parse_codex_review("CODEX-REVIEW: lgtm\n\nActually no.\n\nCODEX-REVIEW: changes-requested").0);
+        assert!(!parse_codex_review("CODEX-REVIEW: changes-requested\n\nOn reflection:\n\nCODEX-REVIEW: lgtm").0);
+        // Quoting the format line is not a verdict.
+        assert!(!parse_codex_review("The format is `CODEX-REVIEW: lgtm | changes-requested`. Looks fine.").0);
     }
 
     #[test]
