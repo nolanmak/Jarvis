@@ -5,6 +5,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { checkAction, checkUrl } from "./policy.mjs";
 import { forward } from "./network.mjs";
 
+// Per-response byte cap for captured off-the-wire evidence bodies. Exported so
+// tests can assert stored bodies against the literal value.
+export const RESPONSE_BODY_CAP = 64 * 1024;
+
 export class BrowserSession {
   constructor(options) {
     this.options = options;
@@ -13,6 +17,7 @@ export class BrowserSession {
     this.closed = false;
     this.refs = new Map();
     this.networkFailures = [];
+    this.networkResponses = [];
   }
   open(hosts) {
     this.opening = this.attach(hosts);
@@ -71,10 +76,13 @@ export class BrowserSession {
       });
       await this.page.routeWebSocket("**/*", (ws) => ws.close());
       await this.page.route("**/*", async (route) => {
+        let response;
         try {
-          await route.fulfill(
-            await (this.options.forward ?? forward)(route.request(), hosts),
+          response = await (this.options.forward ?? forward)(
+            route.request(),
+            hosts,
           );
+          await route.fulfill(response);
         } catch (e) {
           const u = new URL(route.request().url());
           this.networkFailures.push({
@@ -90,7 +98,12 @@ export class BrowserSession {
           });
           this.networkFailures = this.networkFailures.slice(-20);
           await route.abort().catch(() => {});
+          return;
         }
+        // Isolated so a malformed body never falls into the failure/abort path.
+        try {
+          this.captureResponse(route.request(), response);
+        } catch {}
       });
       await this.page.exposeBinding("__jarvisOwnerInput", () => {
         if (!this.operating) this.interfered = true;
@@ -258,6 +271,7 @@ export class BrowserSession {
       ...data,
       url,
       networkFailures: this.networkFailures,
+      networkResponses: this.networkResponses,
       observedAt: new Date().toISOString(),
       id: randomUUID(),
       screenshot: await this.page.screenshot({
@@ -266,6 +280,37 @@ export class BrowserSession {
         timeout: 4000,
       }),
     };
+  }
+  // Capture the off-the-wire body of a successful XHR/fetch response for an
+  // allowed host as first-class evidence. Headers/cookies are never stored and
+  // the query string is dropped (path is the pathname only), so no credential
+  // material survives; the body is bounded to RESPONSE_BODY_CAP bytes.
+  captureResponse(request, response) {
+    if (!["xhr", "fetch"].includes(request.resourceType())) return;
+    const u = new URL(request.url());
+    if (!this.hosts.includes(u.hostname)) return;
+    const buf = Buffer.isBuffer(response.body)
+      ? response.body
+      : Buffer.from(String(response.body ?? ""));
+    const contentType =
+      response.contentType ?? response.headers?.["content-type"];
+    const bodyExcerpt = buf.subarray(0, RESPONSE_BODY_CAP).toString("utf8");
+    const entry = {
+      host: u.hostname,
+      path: u.pathname,
+      status: response.status,
+      contentType,
+      observedAt: new Date().toISOString(),
+    };
+    if ((contentType ?? "").includes("json")) {
+      try {
+        entry.json = JSON.parse(bodyExcerpt);
+      } catch {
+        entry.bodyExcerpt = bodyExcerpt;
+      }
+    } else entry.bodyExcerpt = bodyExcerpt;
+    this.networkResponses.push(entry);
+    this.networkResponses = this.networkResponses.slice(-20);
   }
   close() {
     if (this.closing) return this.closing;
