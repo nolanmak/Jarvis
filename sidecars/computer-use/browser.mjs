@@ -2,12 +2,18 @@ import { chromium } from "playwright";
 import { readFile, realpath, open, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
 import { checkAction, checkUrl } from "./policy.mjs";
 import { forward } from "./network.mjs";
 
 // Per-response byte cap for captured off-the-wire evidence bodies. Exported so
 // tests can assert stored bodies against the literal value.
 export const RESPONSE_BODY_CAP = 64 * 1024;
+// Aggregate caps per snapshot: at most this many entries and this many bytes of
+// body text in total. Every observation is persisted and sent to the model, so
+// the evidence record must stay small; the most recent responses are kept.
+export const RESPONSE_ENTRY_CAP = 4;
+export const RESPONSE_TOTAL_CAP = 128 * 1024;
 
 export class BrowserSession {
   constructor(options) {
@@ -147,6 +153,9 @@ export class BrowserSession {
     if (this.interfered) throw Error("owner_interference");
     checkAction(action, task);
     this.operating = true;
+    // Captured responses are per-action evidence: only bodies observed while
+    // this action runs appear in its snapshot.
+    this.networkResponses = [];
     try {
       let locator;
       if (action.kind === "press" && action.key === "Enter") {
@@ -281,36 +290,56 @@ export class BrowserSession {
       }),
     };
   }
-  // Capture the off-the-wire body of a successful XHR/fetch response for an
-  // allowed host as first-class evidence. Headers/cookies are never stored and
-  // the query string is dropped (path is the pathname only), so no credential
-  // material survives; the body is bounded to RESPONSE_BODY_CAP bytes.
+  // Capture the off-the-wire body of a successful (2xx) text/JSON XHR/fetch
+  // response for an allowed host as first-class evidence. Headers/cookies are
+  // never stored and the query string is dropped (path is the pathname only),
+  // so no credential material survives; each body is bounded to
+  // RESPONSE_BODY_CAP bytes and the snapshot to RESPONSE_ENTRY_CAP entries /
+  // RESPONSE_TOTAL_CAP bytes, keeping the most recent responses.
   captureResponse(request, response) {
     if (!["xhr", "fetch"].includes(request.resourceType())) return;
     const u = new URL(request.url());
     if (!this.hosts.includes(u.hostname)) return;
+    const status = Number(response.status);
+    if (!(status >= 200 && status < 300)) return;
+    const contentType = String(
+      response.contentType ?? response.headers?.["content-type"] ?? "",
+    )
+      .trim()
+      .toLowerCase();
+    if (!contentType.startsWith("text/") && !contentType.includes("json"))
+      return;
     const buf = Buffer.isBuffer(response.body)
       ? response.body
       : Buffer.from(String(response.body ?? ""));
-    const contentType =
-      response.contentType ?? response.headers?.["content-type"];
-    const bodyExcerpt = buf.subarray(0, RESPONSE_BODY_CAP).toString("utf8");
+    // StringDecoder.write() withholds an incomplete trailing multi-byte
+    // sequence instead of emitting U+FFFD, so the excerpt never exceeds the cap.
+    const bodyExcerpt = new StringDecoder("utf8").write(
+      buf.subarray(0, RESPONSE_BODY_CAP),
+    );
     const entry = {
       host: u.hostname,
       path: u.pathname,
-      status: response.status,
+      status,
       contentType,
       observedAt: new Date().toISOString(),
     };
-    if ((contentType ?? "").includes("json")) {
+    if (contentType.includes("json")) {
       try {
         entry.json = JSON.parse(bodyExcerpt);
       } catch {
         entry.bodyExcerpt = bodyExcerpt;
       }
     } else entry.bodyExcerpt = bodyExcerpt;
-    this.networkResponses.push(entry);
-    this.networkResponses = this.networkResponses.slice(-20);
+    const list = [...this.networkResponses, entry].slice(-RESPONSE_ENTRY_CAP);
+    const bytes = (e) =>
+      Buffer.byteLength(e.bodyExcerpt ?? JSON.stringify(e.json) ?? "");
+    while (
+      list.length > 1 &&
+      list.reduce((n, e) => n + bytes(e), 0) > RESPONSE_TOTAL_CAP
+    )
+      list.shift();
+    this.networkResponses = list;
   }
   close() {
     if (this.closing) return this.closing;
