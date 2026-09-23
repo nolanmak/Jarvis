@@ -2314,9 +2314,16 @@ pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
             "Write".into(),
             "Edit".into(),
         ],
-        add_dirs: vec![wiki_root],
+        add_dirs: vec![wiki_root.clone()],
         permission_mode: "acceptEdits".into(),
-        cwd: None,
+        // #1078 — pin cwd to the wiki like ask_opts/resume_opts do. With
+        // `cwd: None` the ingest CLI inherited the daemon's cwd (the repo
+        // checkout, which holds the repo's own CLAUDE.md), and acceptEdits
+        // auto-approves writes there — so a content-steered ingest call could
+        // edit `<repo>/CLAUDE.md`, which every wiki call loads by walking up
+        // from cwd. aa-journal-guard.sh independently denies any write outside
+        // WIKI_ROOT.
+        cwd: Some(wiki_root),
         env: vec![("WIKI_ROOT".into(), wiki_root_env)],
         settings_json,
         restrict_env: false,

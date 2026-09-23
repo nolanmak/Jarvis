@@ -15,6 +15,11 @@ bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n     %s\n' "$1" "${2:-}"; }
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 WIKI="$TMP/wiki"; mkdir -p "$WIKI/people" "$WIKI/journal"
+# A stand-in for the daemon's repo checkout: the cwd the ingest CLI used to
+# inherit, holding its own CLAUDE.md (#1078).
+REPO="$TMP/repo"; mkdir -p "$REPO"; printf 'repo instructions\n' > "$REPO/CLAUDE.md"
+# cwd the guard runs in; relative paths resolve against it like the CLI's do.
+GUARD_CWD="$WIKI"
 
 event() {
   jq -cn --arg t "$1" --arg k "$2" --arg p "$3" \
@@ -22,7 +27,7 @@ event() {
 }
 run_guard() {
   local tool="$1" key="$2" path="$3"; shift 3
-  event "$tool" "$key" "$path" | env WIKI_ROOT="$WIKI" "$@" bash "$GUARD"
+  event "$tool" "$key" "$path" | (cd "$GUARD_CWD" && env WIKI_ROOT="$WIKI" "$@" bash "$GUARD")
 }
 is_block() {
   printf '%s' "$1" | jq -e 'try (.decision == "block") catch false' >/dev/null 2>&1
@@ -61,6 +66,26 @@ expect_block "NotebookEdit of CLAUDE.md (notebook_path arg) is blocked" \
   NotebookEdit notebook_path "$WIKI/CLAUDE.md"
 expect_allow "Write people/claude-shannon.md is allowed (no false positive)" \
   Write file_path "$WIKI/people/claude-shannon.md"
+
+# #1078 — writes must stay inside the wiki. The ingest CLI used to inherit the
+# daemon's repo cwd, where acceptEdits would let it edit the repo's own
+# CLAUDE.md; the guard now denies any write outside WIKI_ROOT, whatever cwd is.
+GUARD_CWD="$REPO"
+expect_block "Edit <repo>/CLAUDE.md (absolute) from a non-wiki cwd is blocked" \
+  Edit file_path "$REPO/CLAUDE.md"
+expect_block "Write CLAUDE.md (relative) from a non-wiki cwd is blocked" \
+  Write file_path "CLAUDE.md"
+expect_block "Write an ordinary file outside the wiki is blocked" \
+  Write file_path "$REPO/notes.md"
+expect_allow "Write an absolute wiki page from a non-wiki cwd is still allowed" \
+  Write file_path "$WIKI/people/dana.md"
+GUARD_CWD="$WIKI"
+expect_allow "Write a wiki-relative page from the wiki cwd is allowed (no false positive)" \
+  Write file_path "people/dana.md"
+expect_block "Write a wiki-relative CLAUDE.md from the wiki cwd is blocked" \
+  Write file_path "CLAUDE.md"
+expect_block "Write ../CLAUDE.md escaping the wiki is blocked" \
+  Write file_path "../CLAUDE.md"
 
 printf '\n%d ok, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -59,13 +59,26 @@ if RESOLVED=$(readlink -m -- "$ABS" 2>/dev/null); then
   ABS="$RESOLVED"
 fi
 
+# #1078 — every write must land inside the wiki. The ingest CLI used to
+# inherit the daemon's cwd (the repo checkout, which holds the repo's own
+# CLAUDE.md) and acceptEdits auto-approves writes there, so a content-steered
+# ingest call could edit `<repo>/CLAUDE.md` — a file every wiki call loads by
+# walking up from cwd. ingest_opts now pins cwd to the wiki root, and this
+# guard denies anything outside it regardless, so a stale preset cannot reopen
+# the hole. Compared with a trailing slash so `/wiki-evil` never matches `/wiki`.
+if [[ "$ABS" != "$WIKI_ROOT_ABS"/* ]]; then
+  REASON="Refusing to write outside the wiki root ($WIKI_ROOT_ABS). Ingest may only create or edit wiki pages; a write elsewhere (e.g. a CLAUDE.md the next call would load as instructions) is a persistent injection vector (#1078). Tool=$TOOL path=$ABS"
+  jq -n --arg r "$REASON" \
+    '{decision:"block", reason:$r, hookSpecificOutput:{hookEventName:"PreToolUse", permissionDecision:"deny", permissionDecisionReason:$r}}'
+  exit 0
+fi
+
 # #1078 — deny writes to instruction/config files Claude Code or Codex
 # auto-load (CLAUDE.md, CLAUDE.local.md, .claude, .mcp.json, AGENTS.md). One
 # planted here would steer every later wiki call and survive in the private
 # mirror. Checked relative to the wiki root so the root's own components cannot
 # false-positive; shares the reserved list with aa-wiki-scope-guard.sh.
-if [[ "$ABS" == "$WIKI_ROOT_ABS"/* ]] \
-   && aa_path_has_protected_injection_name "${ABS#"$WIKI_ROOT_ABS"/}"; then
+if aa_path_has_protected_injection_name "${ABS#"$WIKI_ROOT_ABS"/}"; then
   REASON="Refusing to write an instruction/config file Claude Code or Codex auto-loads (CLAUDE.md, CLAUDE.local.md, .claude, .mcp.json, AGENTS.md). A file planted here persists as instructions into every later wiki call and through the mirror (#1078). Tool=$TOOL path=$ABS"
   jq -n --arg r "$REASON" \
     '{decision:"block", reason:$r, hookSpecificOutput:{hookEventName:"PreToolUse", permissionDecision:"deny", permissionDecisionReason:$r}}'
