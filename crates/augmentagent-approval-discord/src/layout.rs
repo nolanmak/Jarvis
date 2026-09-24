@@ -7,7 +7,7 @@ use augmentagent_store::Email;
 use serenity::all::{
     ActionRowComponent, ButtonStyle, CreateActionRow, CreateButton, CreateEmbed, CreateEmbedFooter,
     CreateInputText, CreateModal, CreateMessage, CreateSelectMenu, CreateSelectMenuKind,
-    CreateSelectMenuOption, InputTextStyle,
+    CreateSelectMenuOption, EditMessage, InputTextStyle,
 };
 
 use crate::custom_id::{CustomId, Verb};
@@ -319,6 +319,37 @@ pub fn approval_message(
     draft: &str,
     redraft_count: i64,
 ) -> CreateMessage {
+    let (embed, rows) = approval_embed_and_rows(action_id, email, draft, redraft_count);
+    CreateMessage::new().embed(embed).components(rows)
+}
+
+/// #1188 — the in-place edit form of [`approval_message`]. When
+/// `gmail update-draft` repoints a pending card at a replacement draft, the
+/// visible Discord message is edited to this so "what the card shows equals
+/// what Approve will send". Built from the exact same `(embed, rows)` as
+/// [`approval_message`], so the redrawn card is byte-identical to a freshly
+/// posted one for the same inputs.
+pub fn approval_edit_message(
+    action_id: &str,
+    email: &Email,
+    draft: &str,
+    redraft_count: i64,
+) -> EditMessage {
+    let (embed, rows) = approval_embed_and_rows(action_id, email, draft, redraft_count);
+    EditMessage::new().embed(embed).components(rows)
+}
+
+/// Shared body of [`approval_message`] / [`approval_edit_message`]: everything
+/// that turns `(action_id, email, draft, redraft_count)` into the card's embed
+/// and its component rows, minus the final `CreateMessage`/`EditMessage`
+/// wrapper. Keeping the two entry points on this one builder is what
+/// guarantees a redrawn card and a freshly posted one render identically.
+fn approval_embed_and_rows(
+    action_id: &str,
+    email: &Email,
+    draft: &str,
+    redraft_count: i64,
+) -> (CreateEmbed, Vec<CreateActionRow>) {
     // Strip the needs-input marker BEFORE anything else so the human never
     // sees the raw `<!--aa:needs-input …-->` fence and the draft preview is
     // the real reply text. No marker ⇒ `human == draft`, byte-identical card.
@@ -365,7 +396,7 @@ pub fn approval_message(
                 .label("Skip")
                 .style(ButtonStyle::Secondary),
         ]);
-        return CreateMessage::new().embed(embed).components(vec![row]);
+        return (embed, vec![row]);
     }
 
     let button_row = CreateActionRow::Buttons(vec![
@@ -405,7 +436,7 @@ pub fn approval_message(
     if is_schedulable(email) {
         rows.push(schedule_row(action_id));
     }
-    CreateMessage::new().embed(embed).components(rows)
+    (embed, rows)
 }
 
 /// #501 — can this card's action ride the scheduled-send pipeline? Only the
@@ -1034,6 +1065,35 @@ mod tests {
         assert!(with.contains("aa:act-1:skip"));
         // The draft text is shown verbatim (no marker stripping artifacts).
         assert!(with.contains("Sounds good"));
+    }
+
+    #[test]
+    fn edit_message_matches_posted_card_embed_and_rows() {
+        // #1188 — a redrawn card (EditMessage, produced when `gmail
+        // update-draft` repoints a pending card at a replacement draft) must
+        // render the SAME embed and the SAME component rows as a freshly
+        // posted card (CreateMessage) for identical inputs. Otherwise the
+        // in-place redraw could drift the preview, the subject, or the button
+        // custom_ids away from what Approve actually sends.
+        let e = email();
+        let draft = "Hello,\n\nRevised body here.\n\nBest,\nN";
+        for (redraft_count, kind) in [(0i64, "dm"), (1, "dm"), (0, "identity_merge")] {
+            let mut e = e.clone();
+            e.kind = kind.into();
+            let post = serde_json::to_value(approval_message("act-9", &e, draft, redraft_count))
+                .expect("CreateMessage serializes");
+            let edit =
+                serde_json::to_value(approval_edit_message("act-9", &e, draft, redraft_count))
+                    .expect("EditMessage serializes");
+            assert_eq!(
+                post["embeds"], edit["embeds"],
+                "embed drifted between post and edit ({kind}, v{redraft_count})"
+            );
+            assert_eq!(
+                post["components"], edit["components"],
+                "component rows drifted between post and edit ({kind}, v{redraft_count})"
+            );
+        }
     }
 
     #[test]

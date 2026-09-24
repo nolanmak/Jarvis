@@ -6629,6 +6629,48 @@ async fn run_linkedin_recent_dms(
     Ok(())
 }
 
+/// #1188 (review) — hard wall-clock bound on one card's best-effort redraw.
+/// serenity's `Http` (like `#500`'s ComposioClient) sets no request timeout,
+/// so the history fetch + edit inside `edit_card_for_action` would otherwise
+/// await forever on a stalled Discord — turning a cosmetic, best-effort redraw
+/// into an indefinite block on a `gmail update-draft` that already succeeded.
+/// Generous enough for a busy channel's fetch-100 + edit under rate limits,
+/// finite so a hung dependency can't wedge the command.
+const REDRAW_CARD_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// #1188 — resolve the Discord `(Http, ChannelId)` for an in-place approval
+/// card redraw, or `None` when the bot isn't configured. Mirrors the env
+/// contract every other Discord CLI path uses (`DISCORD_BOT_TOKEN` +
+/// numeric `DISCORD_CHANNEL_ID`). `None` on any absent/malformed value; the
+/// caller then logs a best-effort warning (see `redraw_unconfigured_warning`)
+/// and still succeeds rather than turning a successful draft update into an
+/// error.
+fn redraw_discord_target() -> Option<(serenity::http::Http, serenity::all::ChannelId)> {
+    let token = std::env::var("DISCORD_BOT_TOKEN").ok().filter(|t| !t.is_empty())?;
+    let cid: u64 = std::env::var("DISCORD_CHANNEL_ID").ok()?.trim().parse().ok()?;
+    Some((
+        serenity::http::Http::new(&token),
+        serenity::all::ChannelId::new(cid),
+    ))
+}
+
+/// #1188 — the best-effort warning emitted when `update-draft` repointed
+/// pending approval cards but Discord isn't configured (`DISCORD_BOT_TOKEN` /
+/// `DISCORD_CHANNEL_ID` unset or invalid), so the posted card can't be redrawn.
+/// The command still SUCCEEDS — the draft is already repointed and Approve
+/// sends the new draft — but the acceptance criterion requires this case to log
+/// a warning rather than go silent, or the card keeps showing the stale draft
+/// with no trace of why. Kept pure so that "warn but succeed" contract is
+/// unit-tested.
+fn redraw_unconfigured_warning(repointed_ids: &[String]) -> String {
+    format!(
+        "warning: Discord not configured (DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID \
+         unset or invalid); approval card(s) {} not redrawn (Approve still sends \
+         the new draft)",
+        repointed_ids.join(", ")
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_gmail_update_draft(
     store: Arc<Store>,
@@ -6707,6 +6749,7 @@ async fn run_gmail_update_draft(
     // #419 card-sync — any pending approval card pointing at the replaced
     // draft would otherwise Approve a deleted id. Repoint it at the new
     // draft and refresh the stored body so Revise sees the current text.
+    let mut repointed_ids: Vec<String> = Vec::new();
     match store.find_pending_action_ids_by_draft_id(&draft_id) {
         Ok(ids) => {
             for action_id in ids {
@@ -6727,10 +6770,85 @@ async fn run_gmail_update_draft(
                 ) {
                     eprintln!("warning: card {action_id} envelope not refreshed: {e}");
                 }
+                // #1188 — the replacement draft may also change the subject;
+                // record it so the redrawn card (and the Revise carry-through)
+                // render `[subject: …]` matching what Approve will send.
+                if let Err(e) = store.set_action_subject(&action_id, Some(&subject)) {
+                    eprintln!("warning: card {action_id} subject not refreshed: {e}");
+                }
                 println!("approval card {action_id} now follows the new draft");
+                repointed_ids.push(action_id);
             }
         }
         Err(e) => eprintln!("warning: card-sync lookup failed: {e}"),
+    }
+    // #1188 — repointing the card server-side is invisible on Discord: the
+    // posted message still shows the OLD subject/body/attachment, so "what the
+    // card shows" no longer equals "what Approve sends". Redraw the visible
+    // card(s) in place. Best-effort and env-gated: no Discord config, or a
+    // redraw failure, only leaves a stale-looking card — the draft is already
+    // repointed, so we never propagate. Every non-redraw path still warns so a
+    // stale card is never left without a trace of why.
+    if !repointed_ids.is_empty() {
+        match redraw_discord_target() {
+            Some((http, channel_id)) => {
+                for action_id in &repointed_ids {
+                    // #1188 (review) — the row was just repointed above, but a
+                    // concurrent resolve/delete can drop it before we redraw.
+                    // Warn rather than skip silently: every non-redraw path must
+                    // leave a trace of why the card still looks stale.
+                    let Some(row) = store.get_action_with_email(action_id).ok().flatten() else {
+                        eprintln!(
+                            "warning: approval card {action_id} row not found; not redrawn \
+                             (Approve still sends the new draft)"
+                        );
+                        continue;
+                    };
+                    let redraft_count = store.redraft_count(action_id).unwrap_or(0);
+                    let redraw_body = augmentagent_approval_discord::append_envelope_markers(
+                        body_str.clone(),
+                        Some(store.as_ref()),
+                        action_id,
+                        &row.email.from,
+                        attachment.as_ref().map(|a| a.name.as_str()),
+                    );
+                    let edit = augmentagent_approval_discord::approval_edit_message(
+                        action_id,
+                        &row.email,
+                        &redraw_body,
+                        redraft_count,
+                    );
+                    // #1188 (review) — bound the redraw I/O: serenity's Http
+                    // has no request timeout, so a stalled Discord must not
+                    // hang the already-succeeded draft update. On elapse we
+                    // warn and move on, same as any other redraw miss.
+                    match tokio::time::timeout(
+                        REDRAW_CARD_TIMEOUT,
+                        augmentagent_approval_discord::edit_card_for_action(
+                            &http, channel_id, action_id, edit,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(true)) => {}
+                        Ok(Ok(false)) => eprintln!(
+                            "warning: approval card {action_id} not in the last 100 channel \
+                             messages; not redrawn (Approve still sends the new draft)"
+                        ),
+                        Ok(Err(e)) => {
+                            eprintln!("warning: approval card {action_id} redraw failed: {e}")
+                        }
+                        Err(_elapsed) => eprintln!(
+                            "warning: approval card {action_id} redraw timed out after {}s; \
+                             not redrawn (Approve still sends the new draft)",
+                            REDRAW_CARD_TIMEOUT.as_secs()
+                        ),
+                    }
+                }
+            }
+            // Discord unset/malformed: warn but succeed (acceptance criterion 2).
+            None => eprintln!("{}", redraw_unconfigured_warning(&repointed_ids)),
+        }
     }
     println!("draft updated: new id={new_id} (replaces {draft_id}) account={email}");
     if let Some(t) = thread_id {
@@ -9831,6 +9949,73 @@ mod approval_body_tests {
         }
     }
 
+    /// #1188 — a `gmail update-draft` that repoints a pending approval card
+    /// must ALSO redraw the visible Discord card in place, or the posted
+    /// message keeps showing the old subject/body/attachment and "what the
+    /// card shows" drifts from "what Approve sends". The redraw is delegated to
+    /// the approval crate's `edit_card_for_action` (built from
+    /// `approval_edit_message`); guard that the repoint path still wires it,
+    /// and still records the replacement subject the card renders.
+    #[test]
+    fn update_draft_redraws_the_repointed_approval_card() {
+        let src = include_str!("main.rs");
+        let start = src
+            .find("async fn run_gmail_update_draft(")
+            .expect("run_gmail_update_draft must exist");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("fn end")];
+        assert!(
+            body.contains("set_action_subject("),
+            "update-draft must record the replacement subject so the card shows it"
+        );
+        assert!(
+            body.contains("approval_edit_message("),
+            "update-draft must build the in-place card edit"
+        );
+        assert!(
+            body.contains("edit_card_for_action("),
+            "update-draft must redraw the visible approval card in place"
+        );
+        // #1188 (review) — the best-effort redraw is env-gated, but when Discord
+        // isn't configured the command must WARN, not silently skip. Guard that
+        // the repoint path still wires the warning into the unconfigured arm.
+        assert!(
+            body.contains("redraw_unconfigured_warning("),
+            "update-draft must warn (not silently skip) when Discord isn't configured"
+        );
+        // #1188 (review) — a repointed row can vanish (concurrent resolve/delete)
+        // before the redraw. That branch must WARN too, not `continue` silently,
+        // or the card is left stale with no trace of why.
+        assert!(
+            body.contains("row not found; not redrawn"),
+            "update-draft must warn when a repointed card's row is gone before redraw"
+        );
+        // #1188 (review) — serenity's Http has no request timeout, so the
+        // best-effort redraw I/O (history fetch + edit) must be wrapped in a
+        // bounded tokio timeout, or a stalled Discord blocks a draft update
+        // that already succeeded. Guard that the bound stays wired.
+        assert!(
+            body.contains("tokio::time::timeout(") && body.contains("REDRAW_CARD_TIMEOUT"),
+            "update-draft must bound the redraw I/O with a timeout so a stalled Discord \
+             can't hang the command"
+        );
+    }
+
+    /// #1188 (review) — best-effort redraw: an `update-draft` that repointed a
+    /// pending card must still SUCCEED when Discord isn't configured, but log a
+    /// warning rather than silently skip the redraw — otherwise the posted card
+    /// stays stale with no trace of why. Assert the warning names the affected
+    /// cards and still reassures that Approve sends the new draft.
+    #[test]
+    fn redraw_unconfigured_warning_names_cards_and_succeeds() {
+        let w = super::redraw_unconfigured_warning(&["act-1".to_string(), "act-2".to_string()]);
+        assert!(w.starts_with("warning:"), "must be a warning line: {w}");
+        assert!(w.contains("act-1") && w.contains("act-2"), "must name the cards: {w}");
+        assert!(
+            w.contains("Approve still sends the new draft"),
+            "must reassure the command still succeeds: {w}"
+        );
+    }
+
     /// One reader for all three, so they cannot drift apart again — which is
     /// exactly how two of them ended up passing `None`.
     #[test]
@@ -12928,6 +13113,7 @@ impl ReplyApprover {
                     Some(self.store.as_ref()),
                     action_id,
                     &action.email.from,
+                    None,
                 );
                 let count =
                     self.store.redraft_count(action_id).unwrap_or(0).max(0) as u32;
@@ -13022,6 +13208,7 @@ impl ReplyApprover {
                 Some(self.store.as_ref()),
                 action_id,
                 &action.email.from,
+                None,
             );
             let count = self.store.redraft_count(action_id).unwrap_or(0).max(0) as u32;
             match broker
