@@ -7133,6 +7133,17 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
             empty_ids.push(row.id.clone());
             continue;
         }
+        // #1203 — owner override. A recomposed row was explicitly restored by
+        // the owner from a superseded state; Rule 1 (already replied) and Rule
+        // 2 (bulk sender) are exactly the reasons it was superseded, so
+        // re-applying them here would silently re-retire the card the owner
+        // just chose to keep — the #1196/#1199 silent-vanish, reintroduced.
+        // Skip both for this row only (Rule 3 above still stands: a
+        // recomposed row should never be empty, but if it somehow is, an empty
+        // card is stale regardless of who armed it).
+        if row.recomposed {
+            continue;
+        }
         // Rule 2 — bulk/marketing sender. Cheap, purely local, so check first.
         if !is_human_sender(&row.from_email, &row.body) {
             info!(
@@ -11839,6 +11850,10 @@ impl ApprovalActionHandler for ReplyApprover {
         self.run_back_to_queue(action_id).await
     }
 
+    async fn recompose(&self, action_id: &str) -> ApprovalActionOutcome {
+        self.run_recompose(action_id).await
+    }
+
     async fn is_schedule_live(&self, action_id: &str) -> bool {
         match self.handle_load(action_id) {
             Some(a) => matches!(a.action.status.as_str(), "scheduled" | "sending"),
@@ -12839,6 +12854,95 @@ impl ReplyApprover {
             "schedule disarmed via approval handler; card reposted"
         );
         ApprovalActionOutcome::Unscheduled
+    }
+
+    /// #1203 — "Recompose": restore a superseded draft as a fresh pending card.
+    /// Repost-then-CAS mirror of [`Self::run_back_to_queue`]: post the card
+    /// while the row is still `superseded`, then flip `superseded → pending`
+    /// via the CAS-gated `recompose_action`. On CAS loss (double-click, or the
+    /// row moved on) the pre-posted card is taken back down and the standard
+    /// already-resolved ack is returned. The store flip stamps `recomposedAtMs`
+    /// so the reconcile sweep won't re-retire the row (that durability is the
+    /// whole point — see the store method / #1196 / #1199).
+    async fn run_recompose(&self, action_id: &str) -> ApprovalActionOutcome {
+        let Some(action) = self.handle_load(action_id) else {
+            return ApprovalActionOutcome::NotFound;
+        };
+        // Only a superseded row is recomposable. Anything else (already
+        // pending again, sent, scheduled, …) → the standard resolved ack.
+        if action.action.status != "superseded" {
+            return Self::resolved_outcome(&self.store, action_id);
+        }
+        // Defensive: the button is gated off for empty-draft supersedes
+        // (`offers_recompose`), but a `stale`-reasoned row could carry an empty
+        // draft. Never repost a blank card.
+        let draft_body = action.action.draft_body.clone().unwrap_or_default();
+        if draft_body.trim().is_empty() {
+            return ApprovalActionOutcome::Failed {
+                message: "nothing to recompose — the draft is empty".into(),
+            };
+        }
+
+        // Repost while still 'superseded' (same helper + redraft count the
+        // Revise / Back-to-queue reposts use, so envelope markers and the
+        // quick-refine row match the original card).
+        let mut reposted: Option<(u64, u64)> = None;
+        let mut repost_failed = false;
+        if let Some(broker) = self.broker_handle() {
+            let draft = augmentagent_approval_discord::append_envelope_markers(
+                draft_body,
+                Some(self.store.as_ref()),
+                action_id,
+                &action.email.from,
+            );
+            let count = self.store.redraft_count(action_id).unwrap_or(0).max(0) as u32;
+            match broker
+                .post_approval_card(action_id, &action.email, &draft, count)
+                .await
+            {
+                Ok(ids) => reposted = ids,
+                Err(e) => {
+                    repost_failed = true;
+                    tracing::warn!(
+                        action_id,
+                        "recompose: card repost failed (proceeding; re-nudge \
+                         below covers it): {e}"
+                    );
+                }
+            }
+        }
+
+        let cas = self.store.recompose_action(action_id, "discord");
+        if !matches!(cas, Ok(true)) {
+            // The row never became pending (a racing surface resolved it, or
+            // it was no longer superseded) — take the pre-posted card back
+            // down so it doesn't advertise an actionable card for a resolved
+            // row until the next startup sweep.
+            if let (Some((c, m)), Some(broker)) = (reposted, self.broker_handle()) {
+                if let Err(e) = broker.delete_message(c, m).await {
+                    tracing::warn!(
+                        action_id,
+                        "recompose: rollback of pre-posted card failed: {e}"
+                    );
+                }
+            }
+            return match cas {
+                Ok(_) => Self::resolved_outcome(&self.store, action_id),
+                Err(e) => ApprovalActionOutcome::Failed {
+                    message: format!("recompose: resolve failed: {e}"),
+                },
+            };
+        }
+        if repost_failed {
+            // The CAS seeded the row ACTIVE with a full re-nudge interval, but
+            // no card is actually visible. Pull the timer to now so the
+            // NudgeScheduler's next tick re-posts the card instead of leaving
+            // the owner cardless.
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let _ = self.store.record_nudge(action_id, now_ms);
+        }
+        tracing::info!(action_id, "superseded draft recomposed; card reposted");
+        ApprovalActionOutcome::Recomposed
     }
 }
 
@@ -18975,6 +19079,193 @@ mod stale_reconcile_tests {
             "pending",
             "the card for the inbound that arrived AFTER the reply must survive"
         );
+    }
+
+    // ---- #1203: recompose durability + per-row scoping ----
+
+    /// A superseded, then recomposed, row carries the persisted override.
+    /// Helper: seed a human-sender pending card, retire it via the given
+    /// supersede reason, then one-click-recompose it back to pending.
+    fn seed_recomposed(store: &Store, msg: &str, thread: Option<&str>, from: &str, reason: &str) -> String {
+        let id = seed_pending(store, msg, thread, from);
+        assert_eq!(
+            store.mark_pending_superseded_by_ids(&[id.clone()], reason).unwrap(),
+            1
+        );
+        assert!(store.recompose_action(&id, "test").unwrap(), "recompose must flip the superseded row");
+        assert_eq!(status_of(store, &id), "pending", "recompose returns the row to pending");
+        id
+    }
+
+    /// AC3 — the whole point of the durable override: the reconcile sweep must
+    /// NOT re-retire a card the owner recomposed, even though the exact Rule 1
+    /// condition that first superseded it (a reply after this inbound) still
+    /// holds. Its untouched twin on the SAME thread still retires — the
+    /// exemption is scoped per row, not per thread (#1196 regression guard).
+    #[tokio::test]
+    async fn reconcile_spares_a_recomposed_card_but_not_its_untouched_twin() {
+        let (store, _t) = fresh_store();
+        let kept = seed_recomposed(
+            &store,
+            "m-keep",
+            Some("T-answered"),
+            "Dana Rivera <dana@labs.example.com>", // pii-ok: synthetic
+            "superseded: you already replied on this thread",
+        );
+        let twin = seed_pending(&store, "m-twin", Some("T-answered"), "Sam Vale <sam@labs.example.com>"); // pii-ok: synthetic
+
+        // A user reply landed on the thread AFTER both inbounds — the exact
+        // Rule 1 trigger. Without the override, `kept` would be swept again.
+        store
+            .record_outbound_thread_event("acc", "user-reply", Some("T-answered"), 1_800_000_000_000)
+            .unwrap();
+
+        let n = reconcile_stale_approvals_tick(&store).unwrap();
+        assert_eq!(n, 1, "only the untouched twin is retired");
+        assert_eq!(
+            status_of(&store, &kept),
+            "pending",
+            "the recomposed card survives Rule 1 — no #1196/#1199 silent re-vanish"
+        );
+        assert_eq!(
+            status_of(&store, &twin),
+            "superseded",
+            "the twin on the same thread still retires — the exemption is per-row"
+        );
+
+        // Durable across ticks: a second sweep must not eventually catch it.
+        assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 0);
+        assert_eq!(status_of(&store, &kept), "pending");
+    }
+
+    /// AC3 — the override also exempts Rule 2 (bulk sender). A recomposed card
+    /// from an address the bulk heuristic would flag is a deliberate owner
+    /// override: they chose to keep this draft, so the sweep must leave it.
+    #[tokio::test]
+    async fn reconcile_spares_a_recomposed_bulk_sender_card() {
+        let (store, _t) = fresh_store();
+        let kept = seed_recomposed(
+            &store,
+            "m-blast",
+            Some("T-bulk"),
+            "Brand <marketing@engage.brand.example.com>", // pii-ok: synthetic
+            "superseded: bulk/automated sender, no reply needed",
+        );
+
+        // No reply on the thread — Rule 2 is the only thing that could retire
+        // it, and the override must veto it.
+        assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 0);
+        assert_eq!(
+            status_of(&store, &kept),
+            "pending",
+            "the recomposed bulk-sender card survives Rule 2"
+        );
+    }
+
+    /// A `ReplyApprover` with a store and no wired broker — enough to exercise
+    /// the recompose handler's decision logic without any network. With the
+    /// broker `OnceLock` empty, the happy path is a pure store CAS (no card
+    /// repost).
+    fn approver_with_store(store: Arc<Store>) -> ReplyApprover {
+        ReplyApprover {
+            store,
+            gmail: Arc::new(ComposioClient::new("test-key".into())),
+            calendar: Arc::new(augmentagent_channel_calendar::ComposioCalendarClient::new(
+                "test-key".into(),
+            )),
+            linkedin: None,
+            discord: None,
+            slack: Default::default(),
+            telegram: Default::default(),
+            github: None,
+            socialapi: None,
+            reasoner: Arc::new(FallbackReasoner::claude_only()),
+            draft_skill: String::new(),
+            wiki_root: None,
+            nudge: std::sync::OnceLock::new(),
+            broker: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// AC6 — the CLI recompose handler's four decision branches: unknown id,
+    /// a non-superseded row (returns the resolved ack, does NOT flip),
+    /// the empty-draft defense (Failed, stays superseded), and the happy path
+    /// (Recomposed, row is pending with the persisted override set).
+    #[tokio::test]
+    async fn run_recompose_handles_every_branch() {
+        let (store, _t) = fresh_store();
+        let store = Arc::new(store);
+        let approver = approver_with_store(Arc::clone(&store));
+
+        // (1) unknown id → NotFound.
+        assert!(matches!(
+            approver.run_recompose("does-not-exist").await,
+            ApprovalActionOutcome::NotFound
+        ));
+
+        // (2) a still-pending row is not recomposable → resolved ack, and the
+        // row must NOT be touched.
+        let pending = seed_pending(&store, "m-p", Some("T-p"), "Dana <dana@labs.example.com>"); // pii-ok: synthetic
+        match approver.run_recompose(&pending).await {
+            ApprovalActionOutcome::AlreadyResolved { status, .. } => {
+                assert_eq!(status, "pending");
+            }
+            other => panic!("expected AlreadyResolved(pending), got {other:?}"),
+        }
+        assert_eq!(status_of(&store, &pending), "pending");
+
+        // (3) empty-draft defense: a superseded row whose draft is blank must
+        // never be reposted as an empty card — Failed, stays superseded.
+        store
+            .upsert_email(&Email {
+                attachments: Vec::new(),
+                to: String::new(),
+                cc: String::new(),
+                message_id: "m-empty".into(),
+                thread_id: Some("T-empty".into()),
+                from: "Dana <dana@labs.example.com>".into(), // pii-ok: synthetic
+                subject: "subj".into(),
+                body: "body".into(),
+                date: "2026-07-13T12:00:00Z".into(),
+                account_entity_id: Some("acc".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            })
+            .unwrap();
+        let empty = store
+            .log_action("m-empty", Some("T-empty"), "Dana <dana@labs.example.com>", "subj", Some("body"), Some("   "), ActionStatus::Pending) // pii-ok: synthetic
+            .unwrap();
+        assert_eq!(
+            store.mark_pending_superseded_by_ids(&[empty.clone()], "superseded: stale").unwrap(),
+            1
+        );
+        match approver.run_recompose(&empty).await {
+            ApprovalActionOutcome::Failed { message } => {
+                assert!(message.contains("empty"), "got: {message}");
+            }
+            other => panic!("expected Failed(empty), got {other:?}"),
+        }
+        assert_eq!(status_of(&store, &empty), "superseded", "the blank row must stay retired");
+
+        // (4) happy path: a superseded row with a real draft → Recomposed, and
+        // the store row is pending with the durable override set.
+        let good = seed_pending(&store, "m-good", Some("T-good"), "Dana <dana@labs.example.com>"); // pii-ok: synthetic
+        assert_eq!(
+            store.mark_pending_superseded_by_ids(&[good.clone()], "superseded: you already replied on this thread").unwrap(),
+            1
+        );
+        assert!(matches!(
+            approver.run_recompose(&good).await,
+            ApprovalActionOutcome::Recomposed
+        ));
+        assert_eq!(status_of(&store, &good), "pending");
+        let row = store
+            .pending_actions_for_reconcile()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == good)
+            .expect("recomposed row is pending");
+        assert!(row.recomposed, "the persisted override must be set so the sweep skips it");
     }
 
     /// Rule 2: bulk senders. These are the ~100 cards that jammed the live
