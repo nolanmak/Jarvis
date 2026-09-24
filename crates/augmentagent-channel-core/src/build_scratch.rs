@@ -160,7 +160,13 @@ fn configured_gib(value: Option<String>, default_bytes: u64) -> u64 {
             .parse::<u64>()
             .ok()
             .filter(|gib| *gib > 0)
-            .map_or(0, |gib| gib.saturating_mul(GIB)),
+            // Overflowing GiB→bytes must fail closed, not saturate: a
+            // `saturating_mul` would silently pin an absurd value to u64::MAX,
+            // which then passes `validate()` and admits an effectively
+            // unbounded budget. `checked_mul` maps overflow to the 0 sentinel
+            // so validation rejects it — the same as any other invalid value.
+            .and_then(|gib| gib.checked_mul(GIB))
+            .unwrap_or(0),
         _ => default_bytes,
     }
 }
@@ -495,6 +501,15 @@ mod tests {
             let limits = BuildScratchLimits::from_values(Some(bad.into()), None, None);
             assert_eq!(limits.headroom_bytes, 0, "{bad}");
             assert!(limits.validate().is_err(), "{bad} must fail closed, not default");
+        }
+        // A GiB value that overflows u64 when scaled to bytes must fail closed
+        // too — not saturate to u64::MAX and slip past validate() as an
+        // effectively unbounded budget. `u64::MAX` GiB and any value above
+        // u64::MAX / GiB both overflow.
+        for overflow in [u64::MAX.to_string(), (u64::MAX / GIB + 1).to_string()] {
+            let limits = BuildScratchLimits::from_values(None, None, Some(overflow.clone()));
+            assert_eq!(limits.budget_bytes, 0, "{overflow} must not saturate");
+            assert!(limits.validate().is_err(), "{overflow} must fail closed");
         }
         // Each bound is rejected on its own.
         assert!(BuildScratchLimits { headroom_bytes: 3 * gib, ..defaults }.validate().is_err());
