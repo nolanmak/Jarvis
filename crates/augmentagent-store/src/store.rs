@@ -3173,9 +3173,22 @@ impl Store {
         // already in flight and flipping the row under it would let the
         // conditional finish_send report a phantom failure for a send that
         // landed.
+        // #1191 — a still-`pending` row carrying a `--send-at` proposal
+        // (`scheduledAtMs IS NOT NULL`) is excluded for the same reason. The
+        // proposal is a live card the owner has yet to Approve; it never
+        // auto-fires, so no time-bounded reply check can guard it the way
+        // `mark_scheduled_superseded` guards an armed `scheduled` row. Left in,
+        // these no-reply heuristics would flip the proposal to `superseded`
+        // with no successor card, and a later Approve would load
+        // `status != 'pending'` and return AlreadyResolved{"superseded"}. A
+        // proposal is retired only by a genuine replacement card
+        // (`mark_pending_superseded_by_ids`) or the 7-day
+        // `expire_pending_older_than` sweep. Back-to-queue NULLs `scheduledAtMs`
+        // (`unschedule_action`), so a reposted plain card is reconcilable again.
         let mut stmt = guard.prepare(
             "SELECT id FROM actions \
-             WHERE threadId = ?1 AND status IN ('pending', 'dry_run')",
+             WHERE threadId = ?1 AND status IN ('pending', 'dry_run') \
+               AND scheduledAtMs IS NULL",
         )?;
         let ids: Vec<String> = stmt
             .query_map(params![thread_id], |r| r.get::<_, String>(0))?
@@ -3189,7 +3202,8 @@ impl Store {
              SET status = 'superseded', \
                  errorMessage = COALESCE(NULLIF(?2, ''), 'superseded by manual reply'), \
                  updatedAt = ?3 \
-             WHERE threadId = ?1 AND status IN ('pending', 'dry_run')",
+             WHERE threadId = ?1 AND status IN ('pending', 'dry_run') \
+               AND scheduledAtMs IS NULL",
             params![thread_id, reason, now],
         )?;
         Ok(ids)
@@ -3302,6 +3316,13 @@ impl Store {
     /// #927 — `identity_merge` cards are excluded: every staleness rule reads an
     /// inbound *email*, and a merge card has no thread and a display name, not a
     /// mailbox, in `fromEmail` — which the bulk-sender rule retires on sight.
+    ///
+    /// #1191 — pending `--send-at` proposals (`scheduledAtMs IS NOT NULL`) are
+    /// excluded too. They are live cards awaiting the owner's Approve and must
+    /// not be fed into the empty-draft / bulk-sender / answered-thread rules,
+    /// which would supersede them with no successor card (mirrors the
+    /// `mark_pending_drafts_superseded_by_thread` guard). A proposal is retired
+    /// only by a genuine replacement or the 7-day expiry.
     pub fn pending_actions_for_reconcile(&self) -> StoreResult<Vec<PendingActionRow>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = guard.prepare(
@@ -3313,6 +3334,7 @@ impl Store {
                FROM actions a \
                LEFT JOIN emails e ON a.messageId = e.messageId \
               WHERE a.status = 'pending' \
+                AND a.scheduledAtMs IS NULL \
                 AND COALESCE(e.kind, '') <> 'identity_merge' \
               ORDER BY a.createdAt ASC",
         )?;
@@ -3356,6 +3378,48 @@ impl Store {
                  errorMessage = COALESCE(NULLIF(?1, ''), 'superseded: stale'), \
                  updatedAt = ?2 \
              WHERE status = 'pending' AND id IN ({placeholders})"
+        );
+        let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() + 2);
+        params_vec.push(&reason);
+        params_vec.push(&now);
+        for id in ids {
+            params_vec.push(id);
+        }
+        let n = guard.execute(&sql, params_vec.as_slice())?;
+        Ok(n)
+    }
+
+    /// #1191 — the reconcile sweep's per-card heuristics (bulk sender, empty
+    /// draft, thread already answered) must never supersede a `--send-at`
+    /// proposal. `pending_actions_for_reconcile` already excludes armed rows at
+    /// SELECT time, but a compose card is born pending with `scheduledAtMs`
+    /// still NULL and set a moment later; a sweep that snapshotted it in that
+    /// window would otherwise flip it here after it became scheduled, leaving
+    /// the owner's Approve to hit "Already resolved (superseded)". So the
+    /// heuristic UPDATE re-checks `scheduledAtMs IS NULL` under the connection
+    /// lock, closing the read-then-write race. The genuine replacement path
+    /// (`mark_pending_superseded_by_ids`, a follow-up compose deliberately
+    /// retiring the prior card) stays unfiltered.
+    pub fn mark_pending_heuristic_superseded_by_ids(
+        &self,
+        ids: &[String],
+        reason: &str,
+    ) -> StoreResult<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let placeholders: String = (0..ids.len())
+            .map(|i| format!("?{}", i + 3))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "UPDATE actions \
+             SET status = 'superseded', \
+                 errorMessage = COALESCE(NULLIF(?1, ''), 'superseded: stale'), \
+                 updatedAt = ?2 \
+             WHERE status = 'pending' AND scheduledAtMs IS NULL AND id IN ({placeholders})"
         );
         let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() + 2);
         params_vec.push(&reason);
@@ -9280,6 +9344,10 @@ mod tests {
         let plain = pending_action(&s, "m-th-0");
         let scheduled = pending_action(&s, "m-th-1");
         let sending = pending_action(&s, "m-th-2");
+        // #1191 — a still-pending `--send-at` proposal (scheduledAtMs set, not
+        // yet armed) shares the thread and must survive the flip too.
+        let proposal = pending_action(&s, "m-th-3");
+        s.set_action_scheduled_at(&proposal, Some(9_000)).unwrap();
         s.schedule_action(&scheduled, 1_000, "t").unwrap();
         s.schedule_action(&sending, 1_000, "t").unwrap();
         s.claim_action_for_send(&sending, ActionStatus::Scheduled, "t")
@@ -9297,9 +9365,23 @@ mod tests {
             !ids.contains(&sending),
             "a row mid-send must not be flipped under the Composio call"
         );
+        // #1191 — a live pending proposal is retired only by a real
+        // replacement or the 7-day expiry, never by this no-reply flip.
+        assert!(
+            !ids.contains(&proposal),
+            "a pending --send-at proposal must survive the thread-wide flip"
+        );
         let (status, at, _) = raw_action_row(&s, &scheduled);
         assert_eq!(status, "scheduled");
         assert_eq!(at, Some(1_000));
+        let (p_status, p_at, _) = raw_action_row(&s, &proposal);
+        assert_eq!(p_status, "pending", "proposal keeps status='pending'");
+        assert_eq!(p_at, Some(9_000), "proposal keeps its scheduledAtMs");
+        // And the owner's Approve can still arm it afterwards.
+        assert!(
+            s.schedule_action(&proposal, 9_000, "discord").unwrap(),
+            "Approve must still reach the arm path on a surviving proposal"
+        );
     }
 
     #[test]
@@ -10423,6 +10505,82 @@ mod tests {
             .mark_pending_drafts_superseded_by_thread("nope", "rsn")
             .unwrap();
         assert!(affected.is_empty());
+    }
+
+    /// #1191 — the reconcile pending pass must not see live `--send-at`
+    /// proposals. A plain pending draft is enumerated; a pending row with
+    /// `scheduledAtMs` set (an un-armed proposal) is filtered out, so the
+    /// empty-draft / bulk-sender / answered-thread rules never touch it.
+    #[test]
+    fn pending_actions_for_reconcile_excludes_send_at_proposals() {
+        let (s, _f) = fresh_store();
+        let plain = pending_action(&s, "m-rec-plain");
+        let proposal = pending_action(&s, "m-rec-proposal");
+        s.set_action_scheduled_at(&proposal, Some(9_000)).unwrap();
+
+        let ids: Vec<String> = s
+            .pending_actions_for_reconcile()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert!(ids.contains(&plain), "plain pending draft is reconcilable");
+        assert!(
+            !ids.contains(&proposal),
+            "a pending --send-at proposal must be excluded from reconcile"
+        );
+        // The proposal is untouched and its Approve still arms it.
+        let (status, at, _) = raw_action_row(&s, &proposal);
+        assert_eq!(status, "pending");
+        assert_eq!(at, Some(9_000));
+        assert!(s.schedule_action(&proposal, 9_000, "discord").unwrap());
+    }
+
+    /// #1191 — the guard protects proposals only from the *no-replacement*
+    /// paths. A genuine replacement card (follow-up compose) still supersedes
+    /// the prior proposal via the explicit-id path, so duplicates don't
+    /// accumulate in the queue.
+    #[test]
+    fn genuine_replacement_still_supersedes_pending_proposal() {
+        let (s, _f) = fresh_store();
+        let proposal = pending_action(&s, "m-repl-proposal");
+        s.set_action_scheduled_at(&proposal, Some(9_000)).unwrap();
+
+        let n = s
+            .mark_pending_superseded_by_ids(
+                std::slice::from_ref(&proposal),
+                "superseded by follow-up compose",
+            )
+            .unwrap();
+        assert_eq!(n, 1, "genuine replacement still retires the proposal");
+        let (status, ..) = raw_action_row(&s, &proposal);
+        assert_eq!(status, "superseded");
+    }
+
+    /// #1191 — the reconcile heuristics use the *filtered* id path, which
+    /// re-checks `scheduledAtMs IS NULL` under the lock. This closes the
+    /// creation-window race: a compose card is born pending with a NULL
+    /// schedule and armed a moment later, so a sweep that snapshotted it as
+    /// plain-pending must not flip it after `set_action_scheduled_at` ran.
+    #[test]
+    fn heuristic_supersede_skips_a_row_that_became_scheduled() {
+        let (s, _f) = fresh_store();
+        let plain = pending_action(&s, "m-heur-plain");
+        let armed = pending_action(&s, "m-heur-armed");
+        // Simulate the compose card that armed itself after the sweep's SELECT.
+        s.set_action_scheduled_at(&armed, Some(9_000)).unwrap();
+
+        let n = s
+            .mark_pending_heuristic_superseded_by_ids(
+                &[plain.clone(), armed.clone()],
+                "superseded: bulk/automated sender, no reply needed",
+            )
+            .unwrap();
+        assert_eq!(n, 1, "only the unscheduled row is heuristically retired");
+        assert_eq!(raw_action_row(&s, &plain).0, "superseded");
+        let (status, at, _) = raw_action_row(&s, &armed);
+        assert_eq!(status, "pending", "the armed proposal is left for Approve");
+        assert_eq!(at, Some(9_000));
     }
 
     /// Cursor starts unset and survives a monotonic upsert; an older write
