@@ -38,9 +38,13 @@ expect_allow() { # <desc> <tool> <key> <path>
   if [ "$rc" -eq 0 ] && ! is_block "$out"; then ok "$desc"; else bad "$desc" "rc=$rc out=$out"; fi
 }
 expect_block() { # <desc> <tool> <key> <path>
+  # A content-based block is the guard's designed path: it prints the deny JSON
+  # and exits 0. Requiring the JSON (not merely a nonzero exit) means a guard
+  # that crashes to exit 2 with no decision — a fail-open regression Claude Code
+  # would no longer surface a reason for — fails the test instead of passing it.
   local desc="$1"; shift
   local out; out=$(run_guard "$@"); local rc=$?
-  if [ "$rc" -ne 0 ] || is_block "$out"; then ok "$desc"; else bad "$desc" "guard allowed it: rc=$rc out=$out"; fi
+  if [ "$rc" -eq 0 ] && is_block "$out"; then ok "$desc"; else bad "$desc" "expected a deny decision (block JSON, rc=0): rc=$rc out=$out"; fi
 }
 
 # #1094 regression — journal/ is machine-managed.
@@ -66,6 +70,15 @@ expect_block "NotebookEdit of CLAUDE.md (notebook_path arg) is blocked" \
   NotebookEdit notebook_path "$WIKI/CLAUDE.md"
 expect_allow "Write people/claude-shannon.md is allowed (no false positive)" \
   Write file_path "$WIKI/people/claude-shannon.md"
+
+# #1078 hardening — a symlink whose REQUESTED name is a reserved injection file
+# but which resolves to a benign page must still be blocked. `readlink -m`
+# follows the link, so a resolved-path-only check would launder the name; the
+# guard also checks the pre-resolution requested path.
+mkdir -p "$WIKI/sub"
+ln -s ../people/dana.md "$WIKI/sub/CLAUDE.md"
+expect_block "Write a symlink named CLAUDE.md resolving to a benign page is blocked (requested path)" \
+  Write file_path "$WIKI/sub/CLAUDE.md"
 
 # #1078 — writes must stay inside the wiki. The ingest CLI used to inherit the
 # daemon's repo cwd, where acceptEdits would let it edit the repo's own

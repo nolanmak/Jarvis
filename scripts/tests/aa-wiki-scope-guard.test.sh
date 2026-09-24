@@ -58,14 +58,18 @@ expect_allow() { # <desc> <tool> <key> <path> [extra-env...]
 }
 
 expect_block() { # <desc> <tool> <key> <path> [extra-env...]
+  # A content/scope block is the guard's designed path: deny JSON on stdout,
+  # exit 0. Requiring the JSON (not merely a nonzero exit) means a guard that
+  # crashes to exit 2 with no decision — a fail-open regression Claude Code
+  # would no longer surface a reason for — fails the test instead of passing it.
   local desc="$1"; shift
   local out
   out=$(run_guard "$@")
   local rc=$?
-  if [ "$rc" -ne 0 ] || is_block "$out"; then
+  if [ "$rc" -eq 0 ] && is_block "$out"; then
     ok "$desc"
   else
-    bad "$desc" "guard allowed it: rc=$rc out=$out"
+    bad "$desc" "expected a deny decision (block JSON, rc=0): rc=$rc out=$out"
   fi
 }
 
@@ -158,6 +162,15 @@ expect_allow "Write mcp-notes.md is allowed (not a reserved name)" \
   Write file_path "$WIKI/mcp-notes.md"
 expect_allow "Read of CLAUDE.md inside the wiki is allowed (injection rule is write-only)" \
   Read file_path "$WIKI/CLAUDE.md"
+
+# #1078 hardening — a symlink whose REQUESTED name is a reserved injection file
+# but which resolves to a benign page must still be blocked. `readlink -m`
+# follows the link, so a resolved-path-only check would launder the name; the
+# guard also checks the pre-resolution requested path.
+mkdir -p "$WIKI/sub"
+ln -s ../people/dana.md "$WIKI/sub/CLAUDE.md"
+expect_block "Write a symlink named CLAUDE.md resolving to a benign page is blocked (requested path)" \
+  Write file_path "$WIKI/sub/CLAUDE.md"
 
 printf '\n%d ok, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

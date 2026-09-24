@@ -59,6 +59,22 @@ if RESOLVED=$(readlink -m -- "$ABS" 2>/dev/null); then
   ABS="$RESOLVED"
 fi
 
+# #1078 — the protected-name check below also runs against the REQUESTED path,
+# before `readlink -m` collapses it. `readlink -m` follows symlinks, so a link
+# whose own name is `CLAUDE.md` but which resolves to a benign page would slip
+# past a resolved-path-only check. Comparing the pre-resolution name too closes
+# that laundering: if the requested name OR the resolved name hits the reserved
+# list, the write is denied. Relative candidates are already wiki-relative;
+# absolute ones are made relative only when they land under the wiki root.
+REQUESTED_REL=""
+if [[ "$CANDIDATE" = /* ]]; then
+  if [[ "$CANDIDATE" == "$WIKI_ROOT_ABS"/* ]]; then
+    REQUESTED_REL="${CANDIDATE#"$WIKI_ROOT_ABS"/}"
+  fi
+else
+  REQUESTED_REL="$CANDIDATE"
+fi
+
 # #1078 — every write must land inside the wiki. The ingest CLI used to
 # inherit the daemon's cwd (the repo checkout, which holds the repo's own
 # CLAUDE.md) and acceptEdits auto-approves writes there, so a content-steered
@@ -78,7 +94,8 @@ fi
 # planted here would steer every later wiki call and survive in the private
 # mirror. Checked relative to the wiki root so the root's own components cannot
 # false-positive; shares the reserved list with aa-wiki-scope-guard.sh.
-if aa_path_has_protected_injection_name "${ABS#"$WIKI_ROOT_ABS"/}"; then
+if aa_path_has_protected_injection_name "$REQUESTED_REL" \
+   || aa_path_has_protected_injection_name "${ABS#"$WIKI_ROOT_ABS"/}"; then
   REASON="Refusing to write an instruction/config file Claude Code or Codex auto-loads (CLAUDE.md, CLAUDE.local.md, .claude, .mcp.json, AGENTS.md). A file planted here persists as instructions into every later wiki call and through the mirror (#1078). Tool=$TOOL path=$ABS"
   jq -n --arg r "$REASON" \
     '{decision:"block", reason:$r, hookSpecificOutput:{hookEventName:"PreToolUse", permissionDecision:"deny", permissionDecisionReason:$r}}'
