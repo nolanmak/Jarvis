@@ -3375,6 +3375,48 @@ impl Store {
         Ok(n)
     }
 
+    /// #1191 — the reconcile sweep's per-card heuristics (bulk sender, empty
+    /// draft, thread already answered) must never supersede a `--send-at`
+    /// proposal. `pending_actions_for_reconcile` already excludes armed rows at
+    /// SELECT time, but a compose card is born pending with `scheduledAtMs`
+    /// still NULL and set a moment later; a sweep that snapshotted it in that
+    /// window would otherwise flip it here after it became scheduled, leaving
+    /// the owner's Approve to hit "Already resolved (superseded)". So the
+    /// heuristic UPDATE re-checks `scheduledAtMs IS NULL` under the connection
+    /// lock, closing the read-then-write race. The genuine replacement path
+    /// (`mark_pending_superseded_by_ids`, a follow-up compose deliberately
+    /// retiring the prior card) stays unfiltered.
+    pub fn mark_pending_heuristic_superseded_by_ids(
+        &self,
+        ids: &[String],
+        reason: &str,
+    ) -> StoreResult<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let placeholders: String = (0..ids.len())
+            .map(|i| format!("?{}", i + 3))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "UPDATE actions \
+             SET status = 'superseded', \
+                 errorMessage = COALESCE(NULLIF(?1, ''), 'superseded: stale'), \
+                 updatedAt = ?2 \
+             WHERE status = 'pending' AND scheduledAtMs IS NULL AND id IN ({placeholders})"
+        );
+        let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() + 2);
+        params_vec.push(&reason);
+        params_vec.push(&now);
+        for id in ids {
+            params_vec.push(id);
+        }
+        let n = guard.execute(&sql, params_vec.as_slice())?;
+        Ok(n)
+    }
+
     /// #219 — read the high-water `sent` timestamp the outbound observer has
     /// already classified for `entity_id`. `None` (treated as 0 by the
     /// observer) before the first poll on that account, so the first tick
@@ -10386,6 +10428,32 @@ mod tests {
         assert_eq!(n, 1, "genuine replacement still retires the proposal");
         let (status, ..) = raw_action_row(&s, &proposal);
         assert_eq!(status, "superseded");
+    }
+
+    /// #1191 — the reconcile heuristics use the *filtered* id path, which
+    /// re-checks `scheduledAtMs IS NULL` under the lock. This closes the
+    /// creation-window race: a compose card is born pending with a NULL
+    /// schedule and armed a moment later, so a sweep that snapshotted it as
+    /// plain-pending must not flip it after `set_action_scheduled_at` ran.
+    #[test]
+    fn heuristic_supersede_skips_a_row_that_became_scheduled() {
+        let (s, _f) = fresh_store();
+        let plain = pending_action(&s, "m-heur-plain");
+        let armed = pending_action(&s, "m-heur-armed");
+        // Simulate the compose card that armed itself after the sweep's SELECT.
+        s.set_action_scheduled_at(&armed, Some(9_000)).unwrap();
+
+        let n = s
+            .mark_pending_heuristic_superseded_by_ids(
+                &[plain.clone(), armed.clone()],
+                "superseded: bulk/automated sender, no reply needed",
+            )
+            .unwrap();
+        assert_eq!(n, 1, "only the unscheduled row is heuristically retired");
+        assert_eq!(raw_action_row(&s, &plain).0, "superseded");
+        let (status, at, _) = raw_action_row(&s, &armed);
+        assert_eq!(status, "pending", "the armed proposal is left for Approve");
+        assert_eq!(at, Some(9_000));
     }
 
     /// Cursor starts unset and survives a monotonic upsert; an older write

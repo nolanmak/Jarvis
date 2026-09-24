@@ -7230,11 +7230,15 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
     }
 
     let mut retired = scheduled_retired;
-    retired += store.mark_pending_superseded_by_ids(
+    // #1191 — every heuristic supersede below re-checks `scheduledAtMs IS NULL`
+    // so a proposal that became scheduled between this tick's SELECT and here is
+    // left for its own scheduled pass / the owner's Approve, never flipped out
+    // from under them.
+    retired += store.mark_pending_heuristic_superseded_by_ids(
         &bulk_ids,
         "superseded: bulk/automated sender, no reply needed",
     )?;
-    retired += store.mark_pending_superseded_by_ids(
+    retired += store.mark_pending_heuristic_superseded_by_ids(
         &empty_ids,
         "superseded: no draft to approve (empty draft body)",
     )?;
@@ -7243,7 +7247,7 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
     // on one thread that straddle a single reply are judged independently: the
     // one drafted for an inbound that predates the reply retires, the one for a
     // newer inbound stays pending.
-    retired += store.mark_pending_superseded_by_ids(
+    retired += store.mark_pending_heuristic_superseded_by_ids(
         &answered_ids,
         "superseded: you already replied on this thread",
     )?;
@@ -19059,8 +19063,11 @@ mod stale_reconcile_tests {
     #[test]
     fn keeps_live_send_at_proposals_off_the_no_reply_supersede_paths() {
         let (store, _t) = fresh_store();
-        // Proposal + plain card share a thread the owner already replied to,
-        // so Rule 1 (answered-thread flip) would otherwise fire on both.
+        // Proposal + plain card share a thread the owner already replied to.
+        // Both inbounds arrive 2026-07-13T12:00:00Z (~1.784e12 ms); the reply
+        // below is AFTER them (1.8e12 ms), so #1196's per-inbound bound is
+        // satisfied and Rule 1 (answered-thread flip) would otherwise fire on
+        // both — only the schedule marker keeps the proposal off it.
         let proposal =
             seed_pending(&store, "m-prop", Some("T-prop"), "Dana Rivera <dana@labs.example.com>"); // pii-ok: synthetic
         store
@@ -19069,7 +19076,7 @@ mod stale_reconcile_tests {
         let plain =
             seed_pending(&store, "m-plain", Some("T-prop"), "Dana Rivera <dana@labs.example.com>"); // pii-ok: synthetic
         store
-            .record_outbound_thread_event("acc", "user-reply-p", Some("T-prop"), 8_000_000)
+            .record_outbound_thread_event("acc", "user-reply-p", Some("T-prop"), 1_800_000_000_000)
             .unwrap();
 
         reconcile_stale_approvals_tick(&store).unwrap();
