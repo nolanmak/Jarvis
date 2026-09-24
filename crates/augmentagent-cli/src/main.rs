@@ -11855,6 +11855,7 @@ impl ReplyApprover {
         if action.action.status != "pending" {
             return ApprovalActionOutcome::AlreadyResolved {
                 status: action.action.status,
+                detail: action.action.error_message,
             };
         }
         // #927 — kind first: a merge card carries platform "wiki" and no draft.
@@ -11926,11 +11927,7 @@ impl ReplyApprover {
         ) {
             Ok(true) => {}
             Ok(false) => {
-                let status = self
-                    .handle_load(action_id)
-                    .map(|a| a.action.status)
-                    .unwrap_or_else(|| "resolved".into());
-                return ApprovalActionOutcome::AlreadyResolved { status };
+                return Self::resolved_outcome(&self.store, action_id);
             }
             Err(e) => {
                 return ApprovalActionOutcome::Failed {
@@ -12122,8 +12119,7 @@ impl ReplyApprover {
         match store.claim_action_for_send(action_id, ActionStatus::Pending, "discord") {
             Ok(true) => {}
             Ok(false) => {
-                let status = Self::current_status(store, action_id);
-                return ApprovalActionOutcome::AlreadyResolved { status };
+                return Self::resolved_outcome(store, action_id);
             }
             Err(e) => {
                 let message = format!("identity merge: claim failed: {e}");
@@ -12169,9 +12165,7 @@ impl ReplyApprover {
         let reason = Some("merge declined by approver");
         match store.try_resolve_action(action_id, ActionStatus::Rejected, "discord", reason) {
             Ok(true) => ApprovalActionOutcome::Skipped,
-            Ok(false) => ApprovalActionOutcome::AlreadyResolved {
-                status: Self::current_status(store, action_id),
-            },
+            Ok(false) => Self::resolved_outcome(store, action_id),
             Err(e) => ApprovalActionOutcome::Failed {
                 message: format!("skip: resolve failed: {e}"),
             },
@@ -12182,6 +12176,25 @@ impl ReplyApprover {
     fn current_status(store: &Store, action_id: &str) -> String {
         let row = store.get_action_with_email(action_id).ok().flatten();
         row.map(|a| a.action.status).unwrap_or_else(|| "resolved".into())
+    }
+
+    /// #1199 — build an `AlreadyResolved` outcome that carries the row's
+    /// persisted `errorMessage` (the specific supersede reason) as `detail`, so
+    /// the Discord render layer (`resolved_message`) can tell the owner *why*
+    /// the card is gone and where the live draft is. One store read; falls back
+    /// to a bare `status: "resolved"` with no detail when the row can't be
+    /// loaded (row cleared out from under us).
+    fn resolved_outcome(store: &Store, action_id: &str) -> ApprovalActionOutcome {
+        match store.get_action_with_email(action_id).ok().flatten() {
+            Some(a) => ApprovalActionOutcome::AlreadyResolved {
+                status: a.action.status,
+                detail: a.action.error_message,
+            },
+            None => ApprovalActionOutcome::AlreadyResolved {
+                status: "resolved".into(),
+                detail: None,
+            },
+        }
     }
 
     /// #927 — what every verb but Approve and Skip owes a merge card. Revise
@@ -12202,6 +12215,7 @@ impl ReplyApprover {
         if action.action.status != "pending" {
             return ApprovalActionOutcome::AlreadyResolved {
                 status: action.action.status,
+                detail: action.action.error_message,
             };
         }
         // #927 — kind first, same as Approve: no arm below fits a merge card.
@@ -12241,11 +12255,7 @@ impl ReplyApprover {
         ) {
             Ok(true) => {}
             Ok(false) => {
-                let status = self
-                    .handle_load(action_id)
-                    .map(|a| a.action.status)
-                    .unwrap_or_else(|| "resolved".into());
-                return ApprovalActionOutcome::AlreadyResolved { status };
+                return Self::resolved_outcome(&self.store, action_id);
             }
             Err(e) => {
                 return ApprovalActionOutcome::Failed {
@@ -12276,6 +12286,7 @@ impl ReplyApprover {
         if action.action.status != "pending" {
             return ApprovalActionOutcome::AlreadyResolved {
                 status: action.action.status,
+                detail: action.action.error_message,
             };
         }
         if let Some(out) = Self::reject_identity_merge_verb(&action.email) {
@@ -12481,11 +12492,7 @@ impl ReplyApprover {
                         "revise: cleanup of orphan redraft failed: {e}"
                     );
                 }
-                let status = self
-                    .handle_load(action_id)
-                    .map(|a| a.action.status)
-                    .unwrap_or_else(|| "resolved".into());
-                return ApprovalActionOutcome::AlreadyResolved { status };
+                return Self::resolved_outcome(&self.store, action_id);
             }
         }
         // The subject override is only meaningful next to the draft id it
@@ -12576,11 +12583,7 @@ impl ReplyApprover {
         match self.store.schedule_action(action_id, at_ms, "discord") {
             Ok(true) => {}
             Ok(false) => {
-                let status = self
-                    .handle_load(action_id)
-                    .map(|a| a.action.status)
-                    .unwrap_or_else(|| "resolved".into());
-                return ApprovalActionOutcome::AlreadyResolved { status };
+                return Self::resolved_outcome(&self.store, action_id);
             }
             Err(e) => {
                 return ApprovalActionOutcome::Failed {
@@ -12650,11 +12653,7 @@ impl ReplyApprover {
         ) {
             Ok(true) => {}
             Ok(false) => {
-                let status = self
-                    .handle_load(action_id)
-                    .map(|a| a.action.status)
-                    .unwrap_or_else(|| "resolved".into());
-                return ApprovalActionOutcome::AlreadyResolved { status };
+                return Self::resolved_outcome(&self.store, action_id);
             }
             Err(e) => {
                 return ApprovalActionOutcome::Failed {
@@ -12727,11 +12726,7 @@ impl ReplyApprover {
         ) {
             Ok(true) => {}
             Ok(false) => {
-                let status = self
-                    .handle_load(action_id)
-                    .map(|a| a.action.status)
-                    .unwrap_or_else(|| "resolved".into());
-                return ApprovalActionOutcome::AlreadyResolved { status };
+                return Self::resolved_outcome(&self.store, action_id);
             }
             Err(e) => {
                 return ApprovalActionOutcome::Failed {
@@ -12824,13 +12819,7 @@ impl ReplyApprover {
                 }
             }
             return match cas {
-                Ok(_) => {
-                    let status = self
-                        .handle_load(action_id)
-                        .map(|a| a.action.status)
-                        .unwrap_or_else(|| "resolved".into());
-                    ApprovalActionOutcome::AlreadyResolved { status }
-                }
+                Ok(_) => Self::resolved_outcome(&self.store, action_id),
                 Err(e) => ApprovalActionOutcome::Failed {
                     message: format!("back to queue: resolve failed: {e}"),
                 },
@@ -19451,7 +19440,38 @@ mod identity_merge_tests {
         store.claim_action_for_send(&claimed, ActionStatus::Pending, "discord").unwrap();
         assert!(matches!(
             ReplyApprover::skip_identity_merge(&store, &claimed),
-            ApprovalActionOutcome::AlreadyResolved { status } if status == "sending"
+            ApprovalActionOutcome::AlreadyResolved { status, .. } if status == "sending"
         ));
+    }
+
+    /// AC5 (#1199) — the persisted supersede reason (`actions.errorMessage`) is
+    /// carried through the handler into `AlreadyResolved.detail`, not dropped.
+    /// Skip a row that a reconcile-style sweep has already flipped to
+    /// `superseded` with a reason, and assert the outcome echoes both the
+    /// status and the exact stored reason.
+    #[test]
+    fn already_resolved_carries_the_stored_supersede_reason() {
+        let (store, _t, wiki) = seeded_env();
+        let (email, payload, draft) = build_identity_merge_card(&dry_run(&store, &wiki));
+        let action_id = record_identity_merge_proposal(&store, &email, &payload, &draft).unwrap();
+
+        // Retire the row exactly as the pending reconcile sweep does (#1196).
+        const REASON: &str = "superseded: you already replied on this thread";
+        let n = store
+            .mark_pending_superseded_by_ids(&[action_id.clone()], REASON)
+            .unwrap();
+        assert_eq!(n, 1, "row should have flipped to superseded");
+
+        match ReplyApprover::skip_identity_merge(&store, &action_id) {
+            ApprovalActionOutcome::AlreadyResolved { status, detail } => {
+                assert_eq!(status, "superseded");
+                assert_eq!(
+                    detail.as_deref(),
+                    Some(REASON),
+                    "the stored errorMessage must reach the render layer"
+                );
+            }
+            other => panic!("expected AlreadyResolved, got {other:?}"),
+        }
     }
 }
