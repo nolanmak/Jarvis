@@ -40,6 +40,10 @@ class Readiness(Denied):
                                'free space on that volume or wait for other build sessions to finish.',
         'build_cache_full': 'VM build cache ran out of space at {path} ({detail}); the build did not complete. '
                             'Free space on that volume, or narrow the build, before retrying.',
+        'build_scratch_limits': 'VM build scratch admission limits are out of range or malformed ({detail}); set '
+                                'AUGMENTAGENT_BUILD_SCRATCH_HEADROOM_GIB, AUGMENTAGENT_BUILD_SCRATCH_IMAGE_CAP_GIB and '
+                                'AUGMENTAGENT_BUILD_SCRATCH_BUDGET_GIB in the daemon environment within the documented '
+                                'bounds (see docs/BUILD-VM.md).',
     }
 
     def __init__(self, category, path=None, detail=''):
@@ -91,17 +95,48 @@ class BuildScratch:
     CACHE_BYTES = 12 * 1024**3
     HEADROOM_BYTES = 20 * 1024**3
     BUDGET_BYTES = 24 * 1024**3
+    # Lower bounds the daemon-supplied limits must clear (#1092): below these a
+    # session either cannot hold a workspace debug build or cannot leave the
+    # shared volume room to churn.
+    MIN_HEADROOM_BYTES = 4 * 1024**3
+    MIN_CACHE_BYTES = 10 * 1024**3
     # Below this after a failed build, the volume (not the build) is the cause.
     FULL_BYTES = 1024**3
 
-    def __init__(self, root, refused=False):
+    def __init__(self, root, refused=False, limits=None):
         self.root = Path(root) if root else None
         self.refused = refused
         self.cache_bytes = self.CACHE_BYTES
         self.headroom_bytes = self.HEADROOM_BYTES
         self.budget_bytes = self.BUDGET_BYTES
+        # #1092: operator limits travel through the private policy, never the
+        # profile environment or the model. A bad value is deferred (like
+        # `refused`) and fails the build closed at admission; it is never clamped.
+        self.limits_error = self._seed_limits(limits) if limits is not None else None
         self.statvfs = os.statvfs
         self.session = None
+
+    def _seed_limits(self, limits):
+        """Seed the per-session limits from the daemon's policy. Return an error
+        string (deferred to admission) when a value is missing, non-integer or
+        out of range; never clamp."""
+        if not isinstance(limits, dict):
+            return 'admission limits must be an object'
+        try:
+            headroom = int(limits['headroom_bytes'])
+            cache = int(limits['cache_bytes'])
+            budget = int(limits['budget_bytes'])
+        except (KeyError, TypeError, ValueError):
+            return 'admission limits must name integer headroom_bytes, cache_bytes and budget_bytes'
+        self.headroom_bytes, self.cache_bytes, self.budget_bytes = headroom, cache, budget
+        gib = 1024**3
+        if headroom < self.MIN_HEADROOM_BYTES:
+            return f'headroom {headroom / gib:.0f} GiB is below the {self.MIN_HEADROOM_BYTES // gib} GiB minimum'
+        if cache < self.MIN_CACHE_BYTES:
+            return f'image cap {cache / gib:.0f} GiB is below the {self.MIN_CACHE_BYTES // gib} GiB minimum'
+        if budget < cache:
+            return f'budget {budget / gib:.0f} GiB is below the {cache / gib:.0f} GiB image cap'
+        return None
 
     def _open_root(self):
         """An O_NOFOLLOW directory fd for the root: owner-only (exactly 0700)."""
@@ -118,6 +153,10 @@ class BuildScratch:
         return descriptor
 
     def _require_space(self, root_fd):
+        # #1092: fail closed before touching the volume when the operator limits
+        # are out of range; no session or image is created.
+        if self.limits_error:
+            raise Readiness('build_scratch_limits', detail=self.limits_error)
         gib = 1024**3
         allocated = outstanding = 0
         for name in os.listdir(root_fd):
@@ -840,7 +879,9 @@ class Policy:
         scratch = config.get('build_scratch_dir')
         refused = scratch is not None and (not Path(scratch).is_absolute() or any(
             Path(scratch).resolve() == root or root in Path(scratch).resolve().parents for root in self.write_roots))
-        self._scratch = BuildScratch(scratch, refused=refused)
+        # #1092: admission limits come from the daemon's policy, never the
+        # profile environment (config['environment']) or the model.
+        self._scratch = BuildScratch(scratch, refused=refused, limits=config.get('build_scratch_limits'))
         configured_timeout = config.get('build_timeout_secs')
         self.build_timeout = min(max(int(configured_timeout), 1), COMMAND_TIMEOUT_MAX) \
             if configured_timeout is not None else BUILD_TIMEOUT_DEFAULT

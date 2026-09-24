@@ -65,7 +65,8 @@ install -d -m 700 /mnt/build/codex-vm
 Each bridge session creates `<root>/jarvis-vm-session-*` holding:
 
 - `owner.json`: the bridge pid and its kernel start time.
-- `build-cache.img`: a sparse 12 GiB ext4 image, mode 0600, attached to each
+- `build-cache.img`: a sparse ext4 image capped at `AUGMENTAGENT_BUILD_SCRATCH_IMAGE_CAP_GIB`
+  (12 GiB by default), mode 0600, attached to each
   `cargo` guest as a virtio disk at `/build-cache`. It holds the Cargo target
   directory and Cargo home for the whole session, so a second `cargo` command is
   incremental. Snapshots keep source mtimes. The host never mounts it. It is a disk
@@ -83,12 +84,40 @@ Disk safety: the scratch volume is shared with the daemon's own build caches.
 A new session is admitted only when both of these hold:
 
 - Free space covers the whole new image, the unallocated remainder of every
-  other session's image, and 20 GiB of headroom.
-- The allocated blocks of all images, plus the new image's cap, stay within a
-  24 GiB budget.
+  other session's image, and the free-space headroom.
+- The allocated blocks of all images, plus the new image's cap, stay within the
+  build-cache budget.
+
+The three admission limits are configurable from the **daemon environment only**
+(never a task/profile environment or the model), carried to the bridge in its
+policy exactly like the scratch root. All are integer GiB:
+
+| Daemon environment | Default | Lower bound | Meaning |
+| --- | --- | --- | --- |
+| `AUGMENTAGENT_BUILD_SCRATCH_HEADROOM_GIB` | 20 | 4 | free space kept after admitting a session |
+| `AUGMENTAGENT_BUILD_SCRATCH_IMAGE_CAP_GIB` | 12 | 10 | per-session build-cache image cap |
+| `AUGMENTAGENT_BUILD_SCRATCH_BUDGET_GIB` | 24 | ≥ image cap | total build-cache budget across sessions |
+
+On this host the defaults admit one session at a time: the 24 GiB budget would
+by itself fit two 12 GiB images, but the free-space rule is the binding
+constraint — the first session needs 32 GiB free (20 GiB headroom + a 12 GiB
+image) and a second concurrent session needs about 44 GiB, more than the
+volume's ~37 GiB free. Raise the budget and free more space to run two. A value
+that is out of range or unparseable fails closed with
+`JARVIS_READINESS:build_scratch_limits` before any build-scratch session or
+image file is created — it is never silently clamped. `augmentagent doctor`
+reports the `build_scratch` check as the scratch volume's free space, the three
+effective limits, and how many sessions can be admitted right now (an error when
+the limits are invalid). Doctor reads these from its own process environment, so
+run it with the same environment the daemon has (e.g. the same `.env`); limits
+set only via the service's `Environment=` will not show unless doctor is run
+with them too. Because the scratch volume is shared with the auto-PR
+gate cache, raising `AUGMENTAGENT_GATE_CACHE_MAX_MB` leaves less free space for
+build sessions; lower it (or the headroom) if the two contend on this one host.
 
 Otherwise builds fail with `JARVIS_READINESS:build_scratch_space`, naming the
-path and the numbers, before any file is created. The image is attached with
+path and the numbers, before any build-scratch session or image file is created.
+The image is attached with
 `werror=report,rerror=report`, so a host ENOSPC fails the guest's writes instead
 of pausing the VM until its deadline. When the image or the volume fills, the
 build reports `JARVIS_READINESS:build_cache_full` naming the image or the scratch

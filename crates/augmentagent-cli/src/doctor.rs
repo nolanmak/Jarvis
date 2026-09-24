@@ -189,6 +189,8 @@ pub async fn run(store: Arc<Store>, json: Option<bool>, deep: bool) -> Result<i3
     findings.push(check_handoff_journals());
     // 16. build VM — Codex cargo/npm/npx runner readiness (#1041)
     findings.push(check_build_vm());
+    // 17. build scratch — admission-limit validity and capacity (#1092)
+    findings.push(check_build_scratch());
 
     // --- Deep checks (off by default).
     if deep {
@@ -1355,6 +1357,130 @@ fn build_vm_finding(
     Finding::ok(NAME, "ok: VM runtime configured, qemu and kernel present, /dev/kvm read-write via group or owner")
 }
 
+/// What doctor observed about the build scratch volume (#1092).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScratchUsage {
+    /// Bytes available to this user on the scratch volume.
+    free_bytes: u64,
+    /// Allocated blocks of every existing session's build-cache image.
+    allocated: u64,
+    /// Those images' unallocated remainder (sparse growth still to come).
+    outstanding: u64,
+}
+
+const SCRATCH_NAME: &str = "build_scratch";
+const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
+
+/// The admission capacity finding: invalid limits fail closed under the named
+/// `build_scratch_limits` readiness category (mirroring the bridge); otherwise
+/// report free space, the effective limits, and how many sessions can be
+/// admitted right now. Pure over injected volume numbers so it is unit-testable.
+fn build_scratch_finding(
+    limits: &augmentagent_channel_core::build_scratch::BuildScratchLimits,
+    free_bytes: u64,
+    allocated: u64,
+    outstanding: u64,
+) -> Finding {
+    if let Err(why) = limits.validate() {
+        return Finding::error(
+            SCRATCH_NAME,
+            format!(
+                "admission limits invalid: {why}; every Codex build fails closed \
+                 (JARVIS_READINESS:build_scratch_limits)"
+            ),
+            Some("set AUGMENTAGENT_BUILD_SCRATCH_{HEADROOM,IMAGE_CAP,BUDGET}_GIB in range; see docs/BUILD-VM.md"),
+        );
+    }
+    let gib = |bytes: u64| bytes as f64 / BYTES_PER_GIB as f64;
+    // max(0, min(floor((budget-allocated)/cap), floor((free-headroom-outstanding)/cap))).
+    // saturating_sub keeps a full volume or over-budget state at zero admissible.
+    let by_budget = limits.budget_bytes.saturating_sub(allocated) / limits.cache_bytes;
+    let by_free =
+        free_bytes.saturating_sub(limits.headroom_bytes).saturating_sub(outstanding) / limits.cache_bytes;
+    let admissible = by_budget.min(by_free);
+    let message = format!(
+        "{:.1} GiB free; limits: {} GiB headroom, {} GiB image cap, {} GiB budget; \
+         {admissible} session(s) admissible now ({:.1} GiB allocated across images, \
+         {:.1} GiB reserved for their growth)",
+        gib(free_bytes),
+        limits.headroom_bytes / BYTES_PER_GIB,
+        limits.cache_bytes / BYTES_PER_GIB,
+        limits.budget_bytes / BYTES_PER_GIB,
+        gib(allocated),
+        gib(outstanding),
+    );
+    if admissible == 0 {
+        Finding::warn(
+            SCRATCH_NAME,
+            format!(
+                "{message} — no Codex build can be admitted until space frees up; the scratch volume is \
+                 shared with the auto-PR gate cache (AUGMENTAGENT_GATE_CACHE_MAX_MB)"
+            ),
+            Some("free space on the scratch volume, or lower AUGMENTAGENT_GATE_CACHE_MAX_MB"),
+        )
+    } else {
+        Finding::ok(SCRATCH_NAME, message)
+    }
+}
+
+fn check_build_scratch() -> Finding {
+    use augmentagent_channel_core::build_scratch;
+    let limits = build_scratch::BuildScratchLimits::from_env();
+    let usage = probe_scratch_usage(&build_scratch::scratch_dir());
+    build_scratch_finding(&limits, usage.free_bytes, usage.allocated, usage.outstanding)
+}
+
+/// Free space (from the nearest existing ancestor) and the allocated/unallocated
+/// bytes of every session's build-cache image under the scratch root.
+fn probe_scratch_usage(root: &std::path::Path) -> ScratchUsage {
+    use augmentagent_channel_core::build_scratch::{IMAGE_NAME, SESSION_PREFIX};
+    use std::os::unix::fs::MetadataExt;
+    let free_bytes = statvfs_available(root);
+    let (mut allocated, mut outstanding) = (0u64, 0u64);
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            if !entry.file_name().to_string_lossy().starts_with(SESSION_PREFIX) {
+                continue;
+            }
+            if let Ok(meta) = std::fs::symlink_metadata(entry.path().join(IMAGE_NAME)) {
+                if meta.file_type().is_file() {
+                    let used = meta.blocks() * 512;
+                    allocated += used;
+                    outstanding += meta.size().saturating_sub(used);
+                }
+            }
+        }
+    }
+    ScratchUsage { free_bytes, allocated, outstanding }
+}
+
+/// Available bytes on the volume holding `path`, resolved through its nearest
+/// existing ancestor (a not-yet-provisioned root sits on the same volume).
+fn statvfs_available(path: &std::path::Path) -> u64 {
+    let mut candidate = Some(path);
+    while let Some(dir) = candidate {
+        if dir.exists() {
+            if let Some(free) = statvfs_bavail(dir) {
+                return free;
+            }
+        }
+        candidate = dir.parent();
+    }
+    0
+}
+
+fn statvfs_bavail(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c_path` is a valid NUL-terminated string; `buf` is zeroed and
+    // fully written by a successful call.
+    let mut buf: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut buf) } != 0 {
+        return None;
+    }
+    Some((buf.f_bavail as u64).saturating_mul(buf.f_frsize as u64))
+}
+
 // ---------------------------------------------------------------------------
 // `--deep` checks.
 // ---------------------------------------------------------------------------
@@ -1981,6 +2107,44 @@ mod tests {
             .as_deref()
             .unwrap()
             .starts_with("sudo usermod -aG kvm synthetic-user"));
+    }
+
+    #[test]
+    fn build_scratch_finding_reports_capacity_and_fails_closed_on_invalid_limits() {
+        use augmentagent_channel_core::build_scratch::BuildScratchLimits;
+        let gib = 1024u64 * 1024 * 1024;
+        let limits = BuildScratchLimits {
+            headroom_bytes: 20 * gib,
+            cache_bytes: 12 * gib,
+            budget_bytes: 24 * gib,
+        };
+        // 37 GiB free, empty root: budget admits floor(24/12)=2, free admits
+        // floor((37-20)/12)=1 → min is 1.
+        let one = build_scratch_finding(&limits, 37 * gib, 0, 0);
+        assert_eq!(one.severity, Severity::Ok, "{}", one.message);
+        assert!(one.message.contains("37.0 GiB free"), "{}", one.message);
+        assert!(
+            one.message.contains("20 GiB headroom")
+                && one.message.contains("12 GiB image cap")
+                && one.message.contains("24 GiB budget"),
+            "{}",
+            one.message
+        );
+        assert!(one.message.contains("1 session(s) admissible"), "{}", one.message);
+
+        // Below the headroom → nothing admissible → a warning naming the
+        // shared gate-cache trade-off.
+        let none = build_scratch_finding(&limits, 15 * gib, 0, 0);
+        assert_eq!(none.severity, Severity::Warn, "{}", none.message);
+        assert!(none.message.contains("0 session(s) admissible"), "{}", none.message);
+        assert!(none.message.contains("AUGMENTAGENT_GATE_CACHE_MAX_MB"), "{}", none.message);
+
+        // An out-of-range limit (budget below the image cap) is an error that
+        // names the fail-closed readiness category.
+        let bad = BuildScratchLimits { budget_bytes: 4 * gib, ..limits };
+        let err = build_scratch_finding(&bad, 500 * gib, 0, 0);
+        assert_eq!(err.severity, Severity::Error, "{}", err.message);
+        assert!(err.message.contains("build_scratch_limits"), "{}", err.message);
     }
 
     #[test]

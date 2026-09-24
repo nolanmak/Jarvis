@@ -260,6 +260,8 @@ impl BridgeLaunch {
             // #1036: VM build scratch root and default build timeout.
             "build_scratch_dir": scratch,
             "build_timeout_secs": crate::build_scratch::build_timeout_secs(),
+            // #1092: session admission limits, from the daemon environment only.
+            "build_scratch_limits": crate::build_scratch::BuildScratchLimits::from_env(),
         });
         fn private_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
             let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
@@ -377,6 +379,7 @@ mod tests {
         opts.add_dirs.push(transcripts.clone());
         opts.env.push(("SYNTHETIC_TOKEN".into(), "secret-fixture-only".into()));
         opts.env.push(("AUGMENTAGENT_BUILD_VM_CONFIG".into(), "untrusted-profile-override".into()));
+        opts.env.push(("AUGMENTAGENT_BUILD_SCRATCH_HEADROOM_GIB".into(), "1".into()));
         opts.handoff_path = Some(temp.path().join("private-handoff.json"));
         let launch = BridgeLaunch::prepare(&opts, &launch_dir).unwrap();
         assert!(launch.native_cwd.starts_with(&launch_dir));
@@ -398,6 +401,14 @@ mod tests {
         // policy (codex runs with a cleared environment), never opts.env.
         assert_eq!(policy["build_scratch_dir"], serde_json::json!(crate::build_scratch::scratch_dir()));
         assert_eq!(policy["build_timeout_secs"], crate::build_scratch::build_timeout_secs());
+        // #1092: admission limits come from the daemon environment (from_env),
+        // never the profile's opts.env — the 1 GiB headroom pushed above is not
+        // honoured (it would also be below the fail-closed minimum).
+        assert_eq!(
+            policy["build_scratch_limits"],
+            serde_json::json!(crate::build_scratch::BuildScratchLimits::from_env())
+        );
+        assert_ne!(policy["build_scratch_limits"]["headroom_bytes"], serde_json::json!(1024u64 * 1024 * 1024));
         for helper in ["codex-build-vm.py", "build-dependency-proxy.py", "provider-supervisor.py"] {
             assert_eq!(std::fs::metadata(launch_dir.join(helper)).unwrap().permissions().mode() & 0o777, 0o600);
         }
