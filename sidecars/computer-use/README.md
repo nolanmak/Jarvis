@@ -55,7 +55,11 @@ Restarted tasks report `needs_action` instead of claiming success.
 Task text and metadata are private, with 24-hour retention for inactive tasks.
 Screenshots are sent to the configured model in memory; only their hashes are
 persisted. Evidence excludes HTTP headers/cookies, redacts email identifiers
-and strips credential query parameters. Current native Codex transport reports
+and strips credential query parameters. Successful (2xx) text/JSON XHR/fetch
+response bodies from assigned hosts are captured per action as bounded,
+sanitized `networkResponses` (path only, no headers or query string; 64 KiB
+per body, at most 4 entries / 128 KiB per snapshot, most recent kept) so fares
+are read off the wire rather than only from painted text. Current native Codex transport reports
 token usage when its turn finishes; action/time limits are enforced during
 execution, while token usage is accounting, not a hard monetary cap.
 
