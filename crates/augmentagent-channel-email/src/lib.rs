@@ -21,7 +21,8 @@ pub use channel::{
 };
 pub use inbound::{email_to_work_item, GmailInbound};
 pub use outbound::{
-    classify_outbound, Classification, OutboundEvent, OutboundObserver, ACTION_ID_HEADER,
+    classify_outbound, parse_rfc2822_or_ms, Classification, OutboundEvent, OutboundObserver,
+    ACTION_ID_HEADER,
 };
 pub use scheduled::{
     record_self_send, ScheduledSendEngine, TickSummary, RETRY_EXEMPT_RETRY_COUNT,
