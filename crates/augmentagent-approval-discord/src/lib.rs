@@ -69,8 +69,16 @@ use thiserror::Error;
 pub enum ApprovalActionOutcome {
     /// No such action in the db.
     NotFound,
-    /// Action already in a terminal state (sent / rejected / permanent_error).
-    AlreadyResolved { status: String },
+    /// Action already in a terminal state (sent / rejected / permanent_error /
+    /// superseded). `detail` carries the raw `actions.errorMessage` the store
+    /// persisted for this terminal row (e.g. the specific supersede reason), or
+    /// `None` when the row is gone or has no message. The render layer
+    /// (`event_handler::resolved_message`) turns `(status, detail)` into
+    /// owner-actionable copy with a recovery pointer (#1199).
+    AlreadyResolved {
+        status: String,
+        detail: Option<String>,
+    },
     /// Approve succeeded — email sent, action marked Sent.
     Approved,
     /// Skip succeeded — draft deleted, action marked Rejected.

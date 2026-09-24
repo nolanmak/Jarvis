@@ -263,7 +263,10 @@ impl WhatsappControlSurface {
                 // Re-post the refreshed card; pointer stays on action_id.
                 let _ = self.post_card(action_id, &email, &draft).await;
             }
-            ApprovalActionOutcome::AlreadyResolved { status } => {
+            ApprovalActionOutcome::AlreadyResolved { status, .. } => {
+                // #1199 note: the WhatsApp control surface keeps its terse
+                // rendering; only the Discord path surfaces `detail`. Enriching
+                // this is out of scope for #1199.
                 self.active_card.lock().await.remove(chat_jid);
                 self.send_to_control(&format!("Already {status} — nothing to do."))
                     .await

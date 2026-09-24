@@ -1109,8 +1109,8 @@ fn describe(outcome: &ApprovalActionOutcome) -> String {
         ApprovalActionOutcome::NotFound => {
             "No record of that approval — it may have been cleared.".into()
         }
-        ApprovalActionOutcome::AlreadyResolved { status } => {
-            format!("Already resolved ({status}).")
+        ApprovalActionOutcome::AlreadyResolved { status, detail } => {
+            resolved_message(status, detail.as_deref())
         }
         ApprovalActionOutcome::Approved => "Approved — sending.".into(),
         ApprovalActionOutcome::Skipped => "Skipped — draft discarded.".into(),
@@ -1125,6 +1125,54 @@ fn describe(outcome: &ApprovalActionOutcome) -> String {
             "Schedule cancelled — draft discarded.".into()
         }
         ApprovalActionOutcome::Failed { message } => format!("Failed: {message}"),
+    }
+}
+
+/// #1199 — render a terminal `AlreadyResolved { status, detail }` as
+/// owner-actionable copy. `detail` is the raw `actions.errorMessage` the store
+/// persisted (the specific supersede reason for a `superseded` row; unused for
+/// the other terminal statuses).
+///
+/// Before #1199 every terminal state collapsed to `Already resolved
+/// (superseded).`, which never said *why* the card was gone and offered no
+/// recovery path. Now the reason is surfaced and each class points at the
+/// owner's real next step:
+///   - already replied (reconcile Rule 1 / replied-after-scheduling) → the
+///     thread is handled, nothing to send;
+///   - bulk/automated sender (Rule 2) → no reply was needed;
+///   - empty draft body (Rule 3 / #484) → recompose;
+///   - newer manual reply / follow-up compose / `stale` / unknown reason →
+///     act on the newest card for this thread.
+///
+/// `detail == None` (row gone, or no stored message) falls through to the
+/// "newest card" pointer, which is the safe default for a `superseded` row and
+/// never panics.
+fn resolved_message(status: &str, detail: Option<&str>) -> String {
+    match status {
+        "superseded" => {
+            let reason = detail.unwrap_or_default();
+            if reason.contains("already replied")
+                || reason.contains("replied on this thread after scheduling")
+            {
+                "You already handled this thread, so the draft was retired — nothing left to send."
+                    .into()
+            } else if reason.contains("bulk/automated") {
+                "Retired — bulk/automated sender, no reply needed.".into()
+            } else if reason.contains("empty draft body") {
+                "The draft was empty, so it was cleared — recompose if you meant to reply.".into()
+            } else {
+                // "superseded by manual reply", "superseded by follow-up
+                // compose", "superseded: stale", or any unrecognized reason.
+                "A newer version replaced this draft. Act on the newest card for this thread."
+                    .into()
+            }
+        }
+        "sent" => "Already sent.".into(),
+        "scheduled" => "Already scheduled — see the scheduled notice.".into(),
+        "sending" => "Already sending — a send is in flight.".into(),
+        "skipped" | "rejected" => "Already skipped — draft discarded.".into(),
+        "cancelled" => "Schedule already cancelled.".into(),
+        other => format!("Already resolved ({other})."),
     }
 }
 
@@ -1175,7 +1223,7 @@ fn should_delete_notice(outcome: &ApprovalActionOutcome) -> bool {
         ApprovalActionOutcome::Approved
         | ApprovalActionOutcome::CancelledSchedule
         | ApprovalActionOutcome::Unscheduled => true,
-        ApprovalActionOutcome::AlreadyResolved { status } => {
+        ApprovalActionOutcome::AlreadyResolved { status, .. } => {
             status != "scheduled" && status != "sending"
         }
         _ => false,
@@ -2479,6 +2527,79 @@ mod tests {
         assert!(!sweep_should_delete(SweptKind::Notice, true, true));
     }
 
+    // ---- #1199: superseded/terminal outcome → owner-facing copy ----
+
+    /// AC3 — the seven distinct supersede reasons the store persists must no
+    /// longer collapse to the flat pre-#1199 message; each class must carry its
+    /// own recovery pointer.
+    #[test]
+    fn resolved_message_distinguishes_supersede_reasons() {
+        const OLD_FLAT: &str = "Already resolved (superseded).";
+
+        // "you already replied" (reconcile Rule 1) and its scheduled sibling:
+        // the thread is handled, so no "newest card" pointer.
+        for reason in [
+            "superseded: you already replied on this thread",
+            "superseded: you replied on this thread after scheduling",
+        ] {
+            let m = resolved_message("superseded", Some(reason));
+            assert_ne!(m, OLD_FLAT, "reason {reason:?} must not be the flat msg");
+            let lm = m.to_lowercase();
+            assert!(lm.contains("already handled"), "got: {m}");
+            assert!(!lm.contains("newest card"), "handled thread needs no pointer: {m}");
+        }
+
+        // Newer manual reply / follow-up compose / stale / unknown → point at
+        // the live card.
+        for reason in [
+            "superseded by manual reply",
+            "superseded by follow-up compose",
+            "superseded: stale",
+            "superseded: something we have never seen before",
+        ] {
+            let m = resolved_message("superseded", Some(reason));
+            assert_ne!(m, OLD_FLAT, "reason {reason:?} must not be the flat msg");
+            assert!(
+                m.to_lowercase().contains("newest card for this thread"),
+                "reason {reason:?} got: {m}"
+            );
+        }
+
+        // Bulk/automated sender (Rule 2) → no reply was needed.
+        let bulk = resolved_message("superseded", Some("superseded: bulk/automated sender, no reply needed"));
+        assert_ne!(bulk, OLD_FLAT);
+        assert!(bulk.to_lowercase().contains("no reply needed"), "got: {bulk}");
+
+        // Empty draft (Rule 3 / #484) → recompose.
+        let empty = resolved_message("superseded", Some("superseded: no draft to approve (empty draft body)"));
+        assert_ne!(empty, OLD_FLAT);
+        assert!(empty.to_lowercase().contains("recompose"), "got: {empty}");
+    }
+
+    /// AC4 — non-superseded terminal statuses render specific, non-flat copy;
+    /// an unknown status falls back to the generic form.
+    #[test]
+    fn resolved_message_covers_terminal_statuses() {
+        assert_eq!(resolved_message("sent", None), "Already sent.");
+        assert!(resolved_message("scheduled", None).to_lowercase().contains("scheduled"));
+        assert!(resolved_message("sending", None).to_lowercase().contains("sending"));
+        assert!(resolved_message("skipped", None).to_lowercase().contains("skipped"));
+        assert!(resolved_message("rejected", None).to_lowercase().contains("skipped"));
+        assert!(resolved_message("cancelled", None).to_lowercase().contains("cancelled"));
+        assert_eq!(
+            resolved_message("weird_new_status", None),
+            "Already resolved (weird_new_status)."
+        );
+    }
+
+    /// AC6 — a `None` detail (row gone / no stored message) is safe: non-empty,
+    /// no panic, for both a superseded row and the generic fallback.
+    #[test]
+    fn resolved_message_handles_missing_detail() {
+        assert!(!resolved_message("superseded", None).is_empty());
+        assert!(!resolved_message("resolved", None).is_empty());
+    }
+
     // ---- #501: outcome → message-cleanup decisions ----
 
     #[test]
@@ -2487,15 +2608,18 @@ mod tests {
         assert!(should_delete_notice(&ApprovalActionOutcome::CancelledSchedule));
         assert!(should_delete_notice(&ApprovalActionOutcome::Unscheduled));
         assert!(should_delete_notice(&ApprovalActionOutcome::AlreadyResolved {
-            status: "sent".into()
+            status: "sent".into(),
+            detail: None
         }));
         // A double-click loser while the schedule is still live (armed, or
         // the winner mid-send) must NOT take the notice down (#501 review).
         assert!(!should_delete_notice(&ApprovalActionOutcome::AlreadyResolved {
-            status: "sending".into()
+            status: "sending".into(),
+            detail: None
         }));
         assert!(!should_delete_notice(&ApprovalActionOutcome::AlreadyResolved {
-            status: "scheduled".into()
+            status: "scheduled".into(),
+            detail: None
         }));
         assert!(!should_delete_notice(&ApprovalActionOutcome::Failed {
             message: "x".into()
@@ -2513,7 +2637,8 @@ mod tests {
         ));
         assert!(should_delete_card_after_schedule(
             &ApprovalActionOutcome::AlreadyResolved {
-                status: "scheduled".into()
+                status: "scheduled".into(),
+                detail: None
             }
         ));
         // A guard rejection must leave the card so the owner picks again.
