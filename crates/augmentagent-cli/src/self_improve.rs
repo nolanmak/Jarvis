@@ -3125,6 +3125,7 @@ fn reviewer_status(kind: augmentagent_channel_core::ProviderKind) -> ReviewerSta
 /// resume lane calls it BEFORE spending anything and `independent_review`
 /// calls it to choose, so the two cannot disagree about a draft.
 fn select_reviewer(
+    pool: &[augmentagent_channel_core::ProviderKind],
     authors: std::result::Result<Option<Vec<augmentagent_channel_core::ProviderKind>>, String>,
     status: impl Fn(augmentagent_channel_core::ProviderKind) -> ReviewerStatus,
 ) -> std::result::Result<augmentagent_channel_core::ProviderKind, ReviewUnavailable> {
@@ -3133,7 +3134,7 @@ fn select_reviewer(
         Ok(None) => return Err(ReviewUnavailable::ProvenanceUnknown),
         Err(error) => return Err(ReviewUnavailable::ProvenanceUnverifiable { error }),
     };
-    let candidates = independent_reviewer_candidates(Some(&authors));
+    let candidates = independent_reviewer_candidates(pool, Some(&authors));
     if candidates.is_empty() {
         return Err(ReviewUnavailable::AllReviewersBuiltIt);
     }
@@ -3158,11 +3159,17 @@ fn select_reviewer(
     }
 }
 
-/// Select only providers outside every recorded builder attempt. Unknown
-/// legacy provenance requires human review rather than assuming Claude built it.
-fn independent_reviewer_candidates(authors: Option<&[augmentagent_channel_core::ProviderKind]>) -> Vec<augmentagent_channel_core::ProviderKind> {
+/// Select only providers of `pool` outside every recorded builder attempt.
+/// Unknown legacy provenance requires human review rather than assuming
+/// Claude built it. The pool is a parameter so tests pin it: reading the
+/// environment here made the tests depend on the operator's
+/// `AUGMENTAGENT_AUTOPR_REVIEWERS` (#1201).
+fn independent_reviewer_candidates(
+    pool: &[augmentagent_channel_core::ProviderKind],
+    authors: Option<&[augmentagent_channel_core::ProviderKind]>,
+) -> Vec<augmentagent_channel_core::ProviderKind> {
     let Some(authors) = authors else { return vec![] };
-    reviewer_pool().into_iter().filter(|provider| !authors.contains(provider)).collect()
+    pool.iter().copied().filter(|provider| !authors.contains(provider)).collect()
 }
 
 /// Every provider the loop reviews with, in preference order: the default
@@ -3221,6 +3228,7 @@ async fn independent_review(
     // #1037 — the same selection the resume lane's preflight makes, so the
     // two can never disagree about whether this draft is reviewable, or why.
     let provider = match select_reviewer(
+        &reviewer_pool(),
         builder.review_authors().map_err(|e| format!("{e:#}")),
         reviewer_status,
     ) {
@@ -5738,7 +5746,7 @@ async fn resume_draft_pr(
     // merged `main`, ran the full gate and only then discovered there was
     // nobody to review it — then billed the run and blamed "capacity" for
     // what was usually unknown provenance, every day, forever.
-    if let Err(why) = select_reviewer(authors, reviewer_status) {
+    if let Err(why) = select_reviewer(&reviewer_pool(), authors, reviewer_status) {
         return Ok(hold_unreviewable(
             repo_root,
             pr,
@@ -9854,7 +9862,7 @@ for tool, arguments in [
             && record["args"]["command"].as_str().is_some_and(|command| command.starts_with("git diff"))), "missing diff review: {summary}");
         assert_eq!(reasoner.usage(), vec![("codex", 1, 1)]);
         assert_eq!(reasoner.mutation_providers(), vec![ProviderKind::Codex]);
-        assert_eq!(independent_reviewer_candidates(Some(&reasoner.mutation_providers())), vec![ProviderKind::Claude]);
+        assert_eq!(independent_reviewer_candidates(&DEFAULT_REVIEWER_POOL, Some(&reasoner.mutation_providers())), vec![ProviderKind::Claude]);
         assert!(!repo.join("target").exists(), "build output escaped the disposable VM snapshot");
         assert_eq!(reasoner.review_authors().unwrap(), Some(vec![ProviderKind::Codex]));
         let resumed = build_reasoner();
@@ -9882,10 +9890,15 @@ for tool, arguments in [
     #[test]
     fn independent_reviewer_excludes_all_builders_and_unknown_history() {
         use augmentagent_channel_core::ProviderKind::{Claude, Codex};
-        assert_eq!(independent_reviewer_candidates(Some(&[Claude])), vec![Codex]);
-        assert_eq!(independent_reviewer_candidates(Some(&[Codex])), vec![Claude]);
-        assert!(independent_reviewer_candidates(Some(&[Claude, Codex])).is_empty());
-        assert!(independent_reviewer_candidates(None).is_empty());
+        let pool = &DEFAULT_REVIEWER_POOL;
+        assert_eq!(independent_reviewer_candidates(pool, Some(&[Claude])), vec![Codex]);
+        assert_eq!(independent_reviewer_candidates(pool, Some(&[Codex])), vec![Claude]);
+        assert!(independent_reviewer_candidates(pool, Some(&[Claude, Codex])).is_empty());
+        assert!(independent_reviewer_candidates(pool, None).is_empty());
+        // A configured pool: Cerebras is independent of a Claude-built draft.
+        use augmentagent_channel_core::ProviderKind::Cerebras;
+        let wide = reviewer_pool_from(Some("codex,cerebras,claude"));
+        assert_eq!(independent_reviewer_candidates(&wide, Some(&[Claude])), vec![Codex, Cerebras]);
     }
 
     #[test]
@@ -15619,28 +15632,28 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     fn review_gaps_are_told_apart_before_anything_is_spent() {
         use augmentagent_channel_core::ProviderKind::{Claude, Codex};
         let ready = |_| ReviewerStatus::Ready;
-        assert_eq!(select_reviewer(Ok(None), ready), Err(ReviewUnavailable::ProvenanceUnknown));
+        assert_eq!(select_reviewer(&DEFAULT_REVIEWER_POOL, Ok(None), ready), Err(ReviewUnavailable::ProvenanceUnknown));
         assert!(matches!(
-            select_reviewer(Err("lock busy".into()), ready),
+            select_reviewer(&DEFAULT_REVIEWER_POOL, Err("lock busy".into()), ready),
             Err(ReviewUnavailable::ProvenanceUnverifiable { .. })
         ));
         assert_eq!(
-            select_reviewer(Ok(Some(vec![Claude, Codex])), ready),
+            select_reviewer(&DEFAULT_REVIEWER_POOL, Ok(Some(vec![Claude, Codex])), ready),
             Err(ReviewUnavailable::AllReviewersBuiltIt)
         );
-        assert_eq!(select_reviewer(Ok(Some(vec![Claude])), ready), Ok(Codex));
-        assert_eq!(select_reviewer(Ok(Some(vec![Codex])), ready), Ok(Claude));
+        assert_eq!(select_reviewer(&DEFAULT_REVIEWER_POOL, Ok(Some(vec![Claude])), ready), Ok(Codex));
+        assert_eq!(select_reviewer(&DEFAULT_REVIEWER_POOL, Ok(Some(vec![Codex])), ready), Ok(Claude));
 
         let reset = synthetic_reset();
         let codex_latched = move |k| {
             if k == Codex { ReviewerStatus::Latched(Some(reset)) } else { ReviewerStatus::Ready }
         };
         assert_eq!(
-            select_reviewer(Ok(Some(vec![Claude])), codex_latched),
+            select_reviewer(&DEFAULT_REVIEWER_POOL, Ok(Some(vec![Claude])), codex_latched),
             Err(ReviewUnavailable::Latched { until: vec![("codex".into(), Some(reset))] })
         );
         assert_eq!(
-            select_reviewer(Ok(Some(vec![])), codex_latched),
+            select_reviewer(&DEFAULT_REVIEWER_POOL, Ok(Some(vec![])), codex_latched),
             Ok(Claude),
             "a latched reviewer gives way to another independent one that is ready"
         );
@@ -15648,7 +15661,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             if k == Codex { ReviewerStatus::NotConfigured("not installed".into()) } else { ReviewerStatus::Ready }
         };
         assert!(matches!(
-            select_reviewer(Ok(Some(vec![Claude])), codex_missing),
+            select_reviewer(&DEFAULT_REVIEWER_POOL, Ok(Some(vec![Claude])), codex_missing),
             Err(ReviewUnavailable::NoCapacity { .. })
         ));
         let missing_and_latched = move |k| {
@@ -15659,7 +15672,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             }
         };
         assert_eq!(
-            select_reviewer(Ok(Some(vec![])), missing_and_latched),
+            select_reviewer(&DEFAULT_REVIEWER_POOL, Ok(Some(vec![])), missing_and_latched),
             Err(ReviewUnavailable::Latched { until: vec![("claude".into(), Some(reset))] }),
             "a latch names when it comes back, so it outranks a missing reviewer"
         );
@@ -16068,7 +16081,7 @@ else:
         let until = chrono::Utc::now() + chrono::Duration::hours(2);
         augmentagent_channel_core::CooldownLatch::system().latch("claude", until, "synthetic quota");
         // Codex built it, so Claude is the only independent reviewer.
-        let why = select_reviewer(Ok(Some(vec![Codex])), reviewer_status).unwrap_err();
+        let why = select_reviewer(&DEFAULT_REVIEWER_POOL, Ok(Some(vec![Codex])), reviewer_status).unwrap_err();
         assert_eq!(why.code(), "reviewer-latched", "{why:?}");
         let when = until.format("%Y-%m-%d %H:%M UTC").to_string();
         assert!(why.headline().contains(&format!("reviewer latched until {when}")), "{}", why.headline());
