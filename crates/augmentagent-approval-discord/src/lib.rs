@@ -32,12 +32,15 @@ pub mod timeparse;
 pub use broker::{DiscordApprovalBroker, DiscordConfig};
 // #501 — `append_envelope_markers` is shared with the CLI's Back-to-queue
 // repost so it renders the same To/cc/bcc decoration as the Revise repost.
-pub use event_handler::{append_envelope_markers, chunk_for_discord};
+pub use event_handler::{append_envelope_markers, chunk_for_discord, edit_card_for_action};
 pub use journal_cmd::{parse_journal_command, JournalCmd, JOURNAL_NOT_CONFIGURED, JOURNAL_USAGE};
 // #35 Phase 5: the email channel appends the needs-input marker to the
 // persisted draft via this; the card decodes it on render. `NeedsInput` is
 // re-exported for the channel/test surface.
-pub use layout::{append_needs_input_marker, approval_message, split_needs_input, NeedsInput};
+pub use layout::{
+    append_needs_input_marker, approval_edit_message, approval_message, split_needs_input,
+    NeedsInput,
+};
 // #785: the drafter emits the assumed-facts marker; the channel splits it off
 // the Gmail body and the card renders it as the "⚠ Assumes" field.
 pub use layout::{append_assumes_marker, split_assumes, strip_assumes_for_send};

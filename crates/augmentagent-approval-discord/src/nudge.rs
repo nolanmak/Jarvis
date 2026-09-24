@@ -138,6 +138,7 @@ impl NudgeScheduler {
             Some(self.store.as_ref()),
             &action_id,
             &card.action.email.from,
+            None,
         );
 
         // Compute X/Y. Update session state for new promotions only — re-nudges

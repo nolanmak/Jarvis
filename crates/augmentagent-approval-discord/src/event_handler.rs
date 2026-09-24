@@ -1119,6 +1119,7 @@ impl EventHandler for Handler {
                             store_for_capture.as_deref(),
                             &action_id,
                             &email.from,
+                            None,
                         );
                         // #1190 — lead the reposted card with the 🔁 Revise-
                         // result header so it can never be read as a coincidental
@@ -1482,9 +1483,10 @@ async fn delete_notice_message(
 /// #473 — append the stored compose envelope to a reposted card body as the
 /// same display markers the original card carried (`[to: …]`/`[cc: …]`/
 /// `[bcc: …]`), plus `[subject: …]` when a Revise overrode the header
-/// (#652). `[to:]` is shown only when it differs from `card_from` (the
-/// card's From line), matching compose-time behavior. No store or no
-/// recorded envelope (auto-triage replies, non-gmail platforms) → the body
+/// (#652) and `[attachment: …]` when a file rides along (#1188). `[to:]` is
+/// shown only when it differs from `card_from` (the card's From line),
+/// matching compose-time behavior. No store or no recorded envelope
+/// (auto-triage replies, non-gmail platforms) and no `attachment` → the body
 /// passes through unchanged. Public since #501: the Back-to-queue repost in
 /// the CLI reuses it so the reposted card matches the Revise repost exactly.
 pub fn append_envelope_markers(
@@ -1492,26 +1494,33 @@ pub fn append_envelope_markers(
     store: Option<&augmentagent_store::Store>,
     action_id: &str,
     card_from: &str,
+    attachment: Option<&str>,
 ) -> String {
-    let Some(env) = store.and_then(|s| s.get_action_envelope(action_id).ok().flatten()) else {
-        return body;
-    };
+    let env = store.and_then(|s| s.get_action_envelope(action_id).ok().flatten());
     let mut markers = String::new();
-    if let Some(to) = env.to.as_deref() {
-        if !to.eq_ignore_ascii_case(card_from) {
-            markers.push_str(&format!("\n[to: {to}]"));
+    if let Some(env) = env.as_ref() {
+        if let Some(to) = env.to.as_deref() {
+            if !to.eq_ignore_ascii_case(card_from) {
+                markers.push_str(&format!("\n[to: {to}]"));
+            }
+        }
+        if let Some(cc) = env.cc.as_deref() {
+            markers.push_str(&format!("\n[cc: {cc}]"));
+        }
+        if let Some(bcc) = env.bcc.as_deref() {
+            markers.push_str(&format!("\n[bcc: {bcc}]"));
+        }
+        // #652 — a Revise that changed the subject is otherwise invisible: the
+        // card title still renders the inbound subject.
+        if let Some(subject) = env.subject.as_deref() {
+            markers.push_str(&format!("\n[subject: {subject}]"));
         }
     }
-    if let Some(cc) = env.cc.as_deref() {
-        markers.push_str(&format!("\n[cc: {cc}]"));
-    }
-    if let Some(bcc) = env.bcc.as_deref() {
-        markers.push_str(&format!("\n[bcc: {bcc}]"));
-    }
-    // #652 — a Revise that changed the subject is otherwise invisible: the
-    // card title still renders the inbound subject.
-    if let Some(subject) = env.subject.as_deref() {
-        markers.push_str(&format!("\n[subject: {subject}]"));
+    // #1188 — a file attached to the (replacement) draft is shown as its own
+    // display marker so the redrawn card names exactly what Approve will send.
+    // Rendered after the envelope markers, matching `ENVELOPE_MARKER_NAMES`.
+    if let Some(name) = attachment {
+        markers.push_str(&format!("\n[attachment: {name}]"));
     }
     if markers.is_empty() {
         return body;
@@ -1691,6 +1700,40 @@ fn classify_custom_id(raw: &str) -> Option<(String, SweptKind)> {
         | Verb::LoopDismiss => return None,
     };
     Some((parsed.action_id, kind))
+}
+
+/// #1188 — edit an existing approval card in place. When `gmail update-draft`
+/// repoints a pending card at a replacement draft, the visible message must be
+/// redrawn so its subject/body/`[attachment:]` preview matches what Approve
+/// will send — hence an in-place `EditMessage` rather than a delete-and-repost
+/// (which would lose the card's scroll position and mint a fresh message).
+///
+/// Scans the most recent ~100 messages in `channel_id` for the actionable card
+/// carrying `action_id` (matched by its button `custom_id`s, the same way the
+/// startup sweep locates cards) and applies `edit`. Returns `Ok(true)` when a
+/// card was found and edited, `Ok(false)` when none matched (already resolved,
+/// scrolled past the last 100, or never posted). Best-effort by convention at
+/// the call site: the draft is repointed server-side regardless of the redraw.
+pub async fn edit_card_for_action(
+    http: &Http,
+    channel_id: ChannelId,
+    action_id: &str,
+    edit: EditMessage,
+) -> anyhow::Result<bool> {
+    let messages = channel_id
+        .messages(http, GetMessages::new().limit(100))
+        .await?;
+    for msg in messages {
+        let Some((found, kind)) = action_id_from_message(&msg) else {
+            continue;
+        };
+        if kind != SweptKind::Card || found != action_id {
+            continue;
+        }
+        channel_id.edit_message(http, msg.id, edit).await?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Soft cap on how much of a text file we feed into the prompt. Files larger
@@ -2617,7 +2660,7 @@ mod tests {
     fn envelope_markers_show_overridden_to_and_bcc() {
         let (s, id, _f) =
             store_with_envelope(Some("omer@y.example.com"), None, Some("josh@x.example.com"));
-        let out = append_envelope_markers("body".into(), Some(&s), &id, "josh@x.example.com");
+        let out = append_envelope_markers("body".into(), Some(&s), &id, "josh@x.example.com", None);
         assert!(out.contains("[to: omer@y.example.com]"), "missing to marker: {out}");
         assert!(out.contains("[bcc: josh@x.example.com]"), "missing bcc marker: {out}");
         assert!(out.starts_with("body"), "body must lead: {out}");
@@ -2629,7 +2672,7 @@ mod tests {
         // that Revise actually applied the subject they asked for.
         let (s, id, _f) = store_with_envelope(None, None, None);
         s.set_action_subject(&id, Some("Invoice for July")).unwrap();
-        let out = append_envelope_markers("body".into(), Some(&s), &id, "alice@example.com");
+        let out = append_envelope_markers("body".into(), Some(&s), &id, "alice@example.com", None);
         assert!(
             out.contains("[subject: Invoice for July]"),
             "missing subject marker: {out}"
@@ -2637,7 +2680,7 @@ mod tests {
 
         // Untouched subject → no marker, even with an envelope recorded.
         let (s, id, _f) = store_with_envelope(None, Some("cc@example.com"), None);
-        let out = append_envelope_markers("body".into(), Some(&s), &id, "alice@example.com");
+        let out = append_envelope_markers("body".into(), Some(&s), &id, "alice@example.com", None);
         assert!(!out.contains("[subject:"), "spurious subject marker: {out}");
     }
 
@@ -2648,7 +2691,7 @@ mod tests {
         // redundant noise — From = To is already the truth.
         let (s, id, _f) =
             store_with_envelope(Some("a@b.example.com"), Some("cc@d.example.com"), None);
-        let out = append_envelope_markers("body".into(), Some(&s), &id, "a@b.example.com");
+        let out = append_envelope_markers("body".into(), Some(&s), &id, "a@b.example.com", None);
         assert!(!out.contains("[to:"), "redundant to marker: {out}");
         assert!(out.contains("[cc: cc@d.example.com]"), "missing cc marker: {out}");
     }
@@ -2664,7 +2707,7 @@ mod tests {
             "body",
             &[("scheduling".to_string(), "what time works?".to_string())],
         );
-        let out = append_envelope_markers(body, Some(&s), &id, "a@example.com");
+        let out = append_envelope_markers(body, Some(&s), &id, "a@example.com", None);
         let (human, asks) = crate::split_needs_input(&out);
         assert!(
             human.contains("[cc: cc@example.com]"),
@@ -2685,7 +2728,7 @@ mod tests {
             &crate::append_assumes_marker("body", &["you're free on the 14th".to_string()]),
             &[("scheduling".to_string(), "what time works?".to_string())],
         );
-        let out = append_envelope_markers(body, Some(&s), &id, "a@example.com");
+        let out = append_envelope_markers(body, Some(&s), &id, "a@example.com", None);
         let (human, asks) = crate::split_needs_input(&out);
         let (human, facts) = crate::split_assumes(&human);
         assert_eq!(asks.len(), 1, "needs-input ask lost: {out}");
@@ -2714,11 +2757,57 @@ mod tests {
             .unwrap();
         // Row exists but no envelope was ever recorded (auto-triage shape).
         assert_eq!(
-            append_envelope_markers("body".into(), Some(&s), &id, "a@b.example.com"),
+            append_envelope_markers("body".into(), Some(&s), &id, "a@b.example.com", None),
             "body"
         );
         // No store wired at all.
-        assert_eq!(append_envelope_markers("body".into(), None, &id, "a@b.example.com"), "body");
+        assert_eq!(
+            append_envelope_markers("body".into(), None, &id, "a@b.example.com", None),
+            "body"
+        );
+    }
+
+    #[test]
+    fn attachment_marker_renders_before_needs_input_and_none_is_unchanged() {
+        // #1188 — a file attached to the (replacement) draft is shown as its
+        // own `[attachment:]` marker so the redrawn card names exactly what
+        // Approve will send. It must land in the HUMAN part (before any #35
+        // needs-input marker), which every card render truncates after.
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let s = augmentagent_store::Store::open(f.path()).unwrap();
+        let id = s
+            .log_action(
+                "m-att",
+                None,
+                "a@b.example.com",
+                "s",
+                None,
+                Some("d"),
+                augmentagent_store::ActionStatus::Pending,
+            )
+            .unwrap();
+        let body = crate::append_needs_input_marker(
+            "body",
+            &[("scheduling".to_string(), "what time works?".to_string())],
+        );
+        let out = append_envelope_markers(
+            body.clone(),
+            Some(&s),
+            &id,
+            "a@b.example.com",
+            Some("invoice.pdf"),
+        );
+        let (human, asks) = crate::split_needs_input(&out);
+        assert!(
+            human.contains("[attachment: invoice.pdf]"),
+            "attachment marker lost from rendered card: {out}"
+        );
+        assert_eq!(asks.len(), 1, "needs-input ask lost: {out}");
+        // No attachment and no envelope ⇒ body passes through byte-for-byte.
+        assert_eq!(
+            append_envelope_markers(body.clone(), Some(&s), &id, "a@b.example.com", None),
+            body
+        );
     }
 
     // ---- #501: verb-aware startup sweep ----
