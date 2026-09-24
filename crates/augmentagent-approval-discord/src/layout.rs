@@ -272,6 +272,41 @@ pub fn flag_notice_message(email: &Email, reason: &str) -> CreateMessage {
     CreateMessage::new().content(content)
 }
 
+/// #1190 — durable in-channel notice posted when a Revise/QuickRefine redraft
+/// produced NO new card (LLM error/refusal, #962 re-address failure, missing
+/// entity, …). The redraft flow's only other failure signal is an *ephemeral*
+/// followup, which vanishes and is easily mistaken for a coincidental 🚩 triage
+/// flag that lands nearby. This is a persistent, content-only ⚠️ message — no
+/// buttons, no embed — so the owner always sees that Revise did nothing and the
+/// card above is unchanged. Deliberately distinct from [`flag_notice_message`]
+/// (🚩) so neither reads as the other.
+///
+/// `email` is `Option` because a `NotFound` outcome (the action row was
+/// resolved/removed before revise ran) has no pre-revise snapshot to name — yet
+/// the owner must still be told, so the notice degrades to a subject-less form
+/// rather than being suppressed.
+pub fn revise_failure_notice(email: Option<&Email>, reason: &str) -> CreateMessage {
+    let reason = truncate(reason, 500);
+    let subject_clause = match email {
+        Some(e) => format!(" for **{}**", truncate(&e.subject, 256)),
+        None => String::new(),
+    };
+    let content = format!(
+        "⚠️ **Revise produced no new draft** — the approval card above{subject_clause} \
+         is unchanged.\n_reason: {reason}_\nRetry **Revise** or **Skip** the draft."
+    );
+    CreateMessage::new().content(content)
+}
+
+/// #1190 — header prepended (via `.content(...)`) to the reposted approval card
+/// after a successful Revise, so the redrafted card is unmistakably the Revise
+/// *result* and can never be confused with a coincidental 🚩 triage notice.
+/// [`approval_message`] builds only `.embed().components()` and never sets
+/// `.content()`, so this prepends cleanly without clobbering the card.
+pub fn revise_result_prefix() -> &'static str {
+    "🔁 **Revised draft** — your requested changes are applied below."
+}
+
 /// Build an approval card. `redraft_count` is how many times this draft has
 /// already been refined (0 on first post). When the count is under
 /// [`MAX_REDRAFT_ITERATIONS`] a second action row — the "Quick refine…"
@@ -1575,6 +1610,74 @@ mod tests {
         let (prose, markers) = split_trailing_envelope_markers("body\n[note: hi]");
         assert_eq!(prose, "body\n[note: hi]");
         assert!(markers.is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // #1190: the Revise result must be unmistakable in both directions — a
+    // durable ⚠️ notice when no card is produced, a 🔁 header when one is.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn revise_failure_notice_is_a_distinct_warning_with_no_buttons() {
+        let e = email();
+        let v = json(&revise_failure_notice(
+            Some(&e),
+            "Failed: provider refused the redraft",
+        ));
+        // Content-only ⚠️ — carries the warning marker and names the draft.
+        assert!(v.contains("\u{26A0}"), "must carry the ⚠️ marker: {v}");
+        assert!(v.contains("Re: hi"), "must name the affected draft subject: {v}");
+        // No buttons and no action custom_id — it is a plain notice, not a card.
+        assert!(!v.contains("aa:"), "notice must carry no action custom_id: {v}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&v).expect("notice json parses");
+        assert!(
+            parsed["components"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(true),
+            "notice must have no component rows: {v}"
+        );
+        // Distinct from the 🚩 triage flag so a coincidental notice can never be
+        // read as this result and vice versa.
+        let flag = json(&flag_notice_message(&e, "important sender"));
+        assert!(flag.contains("\u{1F6A9}"), "flag notice keeps its 🚩");
+        assert!(
+            !v.contains("\u{1F6A9}"),
+            "revise notice must not use the 🚩 flag glyph: {v}"
+        );
+    }
+
+    #[test]
+    fn revise_failure_notice_still_warns_without_a_snapshot() {
+        // #1190 — a NotFound outcome has no pre-revise snapshot, so no subject
+        // is available; the notice must still carry the durable ⚠️ warning
+        // rather than degrade to nothing (the silent-failure the issue reports).
+        let v = json(&revise_failure_notice(None, "Draft/action not found"));
+        assert!(v.contains("\u{26A0}"), "subject-less notice keeps the ⚠️: {v}");
+        assert!(
+            v.contains("produced no new draft"),
+            "subject-less notice keeps its explanation: {v}"
+        );
+        assert!(
+            !v.contains("\u{1F6A9}"),
+            "revise notice must not use the 🚩 flag glyph: {v}"
+        );
+    }
+
+    #[test]
+    fn revise_result_prefix_is_a_header_that_never_clobbers_the_card() {
+        let prefix = revise_result_prefix();
+        assert!(!prefix.is_empty(), "the result header must be non-empty");
+        // The reposted card is `.embed().components()` only — it must NOT set
+        // `content`, or prepending the prefix via `.content()` would clobber it.
+        let card: serde_json::Value =
+            serde_json::from_str(&json(&approval_message("act-1190", &email(), "draft", 0)))
+                .expect("card json parses");
+        assert!(
+            card.get("content").map(|c| c.is_null()).unwrap_or(true),
+            "approval_message must not set content, else the prefix clobbers it: {card}"
+        );
     }
 
     #[test]
