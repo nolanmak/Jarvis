@@ -352,30 +352,58 @@ pub(crate) fn reasoner_timeout_for_class(
     }
 }
 
-/// Best-effort parse of the Claude CLI quota refusal's reset hint:
+/// Best-effort parse of a provider's quota refusal reset hint.
+///
+/// Two wordings are known:
 ///
 /// ```text
 /// You've hit your session limit · resets 9:30am (America/New_York)
+/// You've hit your usage limit. ... or try again at 3:00 PM.
+/// You've hit your usage limit. ... or try again at Sep 24th, 2026 4:18 AM.
 /// ```
 ///
-/// Returns the next UTC instant matching `<h>:<mm><am|pm>` in the named IANA
-/// timezone (today if still ahead, else tomorrow). Any parse failure returns
-/// `None` — the cooldown latch then falls back to a fixed interval, so a
-/// wording change can never break failover, only its precision.
+/// The first is the Claude CLI: a clock time in a named IANA zone (UTC when
+/// absent), meaning the next such instant. Its horizon is capped at 6 h:
+/// Claude windows are 5-hourly, and a missing zone can put the guess hours
+/// off, so anything further is treated as mis-parsed.
+///
+/// The others are the Codex CLI, which prints the reset in the machine's
+/// LOCAL time, with a date when the reset is not today (its weekly limit).
+/// That form is parsed in the local zone and allowed up to 8 days out: the
+/// date is explicit, so a zone mistake costs hours, not a week. Before this
+/// case existed, a week-long Codex wall was mis-read as `None` and latched
+/// for the 30-minute default, so every half hour the loop re-hit the wall
+/// and reported a reset time that had already passed.
+///
+/// Any parse failure returns `None` — the cooldown latch then falls back to
+/// a fixed interval, so a wording change can never break failover, only its
+/// precision.
 pub fn parse_reset_hint(message: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    use chrono::TimeZone;
     let lower = message.to_ascii_lowercase();
-    let idx = lower.find("resets ")?;
-    let rest = message[idx + "resets ".len()..].trim();
-    // Time token: "9:30am" or "10am".
-    let time_tok = rest.split_whitespace().next()?;
-    let time_lower = time_tok.to_ascii_lowercase();
-    let (num, is_pm) = if let Some(t) = time_lower.strip_suffix("pm") {
-        (t, true)
-    } else if let Some(t) = time_lower.strip_suffix("am") {
-        (t, false)
+    if let Some(idx) = lower.find("resets ") {
+        return parse_claude_reset(message[idx + "resets ".len()..].trim());
+    }
+    if let Some(idx) = lower.find("try again at ") {
+        return parse_codex_reset(message[idx + "try again at ".len()..].trim());
+    }
+    None
+}
+
+/// `9:30am`, `10am`, `4:18 AM` (one token, or time and meridiem split) →
+/// `(hour24, minute, tokens consumed)`.
+fn parse_clock(tokens: &[&str]) -> Option<(u32, u32, usize)> {
+    let first = tokens.first()?.trim_end_matches(['.', ',']).to_ascii_lowercase();
+    let (num, meridiem, used) = if let Some(t) = first.strip_suffix("pm") {
+        (t.to_string(), true, 1)
+    } else if let Some(t) = first.strip_suffix("am") {
+        (t.to_string(), false, 1)
     } else {
-        return None;
+        let second = tokens.get(1)?.trim_end_matches(['.', ',']).to_ascii_lowercase();
+        match second.as_str() {
+            "pm" => (first, true, 2),
+            "am" => (first, false, 2),
+            _ => return None,
+        }
     };
     let (h, m) = match num.split_once(':') {
         Some((h, m)) => (h.parse::<u32>().ok()?, m.parse::<u32>().ok()?),
@@ -384,12 +412,20 @@ pub fn parse_reset_hint(message: &str) -> Option<chrono::DateTime<chrono::Utc>> 
     if h == 0 || h > 12 || m > 59 {
         return None;
     }
-    let hour24 = match (h, is_pm) {
+    let hour24 = match (h, meridiem) {
         (12, false) => 0,
         (12, true) => 12,
         (h, true) => h + 12,
         (h, false) => h,
     };
+    Some((hour24, m, used))
+}
+
+/// The Claude wording: next `<clock>` in the named zone, capped at 6 h.
+fn parse_claude_reset(rest: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::TimeZone;
+    let tokens: Vec<&str> = rest.split_whitespace().collect();
+    let (hour24, m, _) = parse_clock(&tokens)?;
     // Timezone suffix: "(America/New_York)". Absent → UTC is assumed, which
     // can be hours wrong — tolerable ONLY because of the plausibility cap
     // below, which bounds any tz mistake at a short latch or a None.
@@ -420,6 +456,57 @@ pub fn parse_reset_hint(message: &str) -> Option<chrono::DateTime<chrono::Utc>> 
         return None;
     }
     Some(candidate_utc)
+}
+
+/// The Codex wording, in the machine's local zone: `3:00 PM` (next such
+/// instant, so within 24 h) or `Sep 24th, 2026 4:18 AM` (that instant, at
+/// most 8 days out).
+fn parse_codex_reset(rest: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::TimeZone;
+    let tokens: Vec<&str> = rest.split_whitespace().collect();
+    let now_local = chrono::Local::now();
+    let (date, clock_tokens) = match month_number(tokens.first()?) {
+        Some(month) => {
+            let day: u32 = tokens
+                .get(1)?
+                .trim_end_matches(',')
+                .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+                .parse()
+                .ok()?;
+            let year: i32 = tokens.get(2)?.trim_end_matches(',').parse().ok()?;
+            (chrono::NaiveDate::from_ymd_opt(year, month, day)?, &tokens[3..])
+        }
+        None => (now_local.date_naive(), &tokens[..]),
+    };
+    let (hour24, m, _) = parse_clock(clock_tokens)?;
+    let naive = date.and_hms_opt(hour24, m, 0)?;
+    let mut candidate = chrono::Local.from_local_datetime(&naive).earliest()?;
+    let dated = clock_tokens.len() != tokens.len();
+    if !dated && candidate <= now_local {
+        candidate = chrono::Local
+            .from_local_datetime(&(naive + chrono::Duration::days(1)))
+            .earliest()?;
+    }
+    let candidate_utc = candidate.with_timezone(&chrono::Utc);
+    let horizon = chrono::Utc::now() + chrono::Duration::days(8);
+    if candidate_utc <= chrono::Utc::now() || candidate_utc > horizon {
+        return None;
+    }
+    Some(candidate_utc)
+}
+
+fn month_number(token: &str) -> Option<u32> {
+    const MONTHS: [&str; 12] = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
+    let t = token.trim_end_matches(['.', ',']).to_ascii_lowercase();
+    if t.len() < 3 {
+        return None;
+    }
+    MONTHS
+        .iter()
+        .position(|m| t.starts_with(m))
+        .map(|i| i as u32 + 1)
 }
 
 /// Wrap an untyped `CallError::Other` in the matching [`ReasonerError`]
@@ -4126,6 +4213,72 @@ mod failover_error_tests {
         assert!(parse_reset_hint("no reset here").is_none());
         assert!(parse_reset_hint("resets whenever").is_none());
         assert!(parse_reset_hint("resets 13:00pm (Mars/Olympus)").is_none());
+    }
+
+    /// The Codex CLI's wall wording, in local time, with a date when the
+    /// reset is not today. Mis-reading it as `None` latched Codex for the
+    /// 30-minute default against a multi-day wall (2026-09-20..24).
+    #[test]
+    fn parse_reset_hint_reads_the_codex_wording_in_local_time() {
+        use chrono::{Datelike, Timelike};
+        let fmt = |at: chrono::DateTime<chrono::Local>| {
+            let (h12, ampm) = match at.hour() {
+                0 => (12, "AM"),
+                h @ 1..=11 => (h, "AM"),
+                12 => (12, "PM"),
+                h => (h - 12, "PM"),
+            };
+            (h12, at.minute(), ampm)
+        };
+
+        // Dated form, three days out: exact instant, well past the Claude cap.
+        let far = chrono::Local::now() + chrono::Duration::days(3);
+        let (h12, min, ampm) = fmt(far);
+        let month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+            [far.month0() as usize];
+        let suffix = match far.day() {
+            1 | 21 | 31 => "st",
+            2 | 22 => "nd",
+            3 | 23 => "rd",
+            _ => "th",
+        };
+        let msg = format!(
+            "You’ve hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to \
+             purchase more credits or try again at {month} {}{suffix}, {} {h12}:{min:02} {ampm}.",
+            far.day(),
+            far.year()
+        );
+        let at = parse_reset_hint(&msg).unwrap_or_else(|| panic!("dated codex reset must parse: {msg}"));
+        let expected = far.with_timezone(&chrono::Utc);
+        assert_eq!(
+            (at.year(), at.month(), at.day(), at.hour(), at.minute()),
+            (expected.year(), expected.month(), expected.day(), expected.hour(), expected.minute()),
+            "{msg}"
+        );
+
+        // Time-only form, two hours out: the next such local instant.
+        let near = chrono::Local::now() + chrono::Duration::hours(2);
+        let (h12, min, ampm) = fmt(near);
+        let msg = format!(
+            "You've hit your usage limit for gpt-5.5-codex. Switch to another model now, or try again at {h12}:{min:02} {ampm}."
+        );
+        let at = parse_reset_hint(&msg).unwrap_or_else(|| panic!("time-only codex reset must parse: {msg}"));
+        let expected = near.with_timezone(&chrono::Utc);
+        assert_eq!((at.hour(), at.minute()), (expected.hour(), expected.minute()), "{msg}");
+        assert!(at > chrono::Utc::now());
+
+        // Time-only, already past today: tomorrow, not None.
+        let past = chrono::Local::now() - chrono::Duration::hours(2);
+        let (h12, min, ampm) = fmt(past);
+        let at = parse_reset_hint(&format!("try again at {h12}:{min:02} {ampm}."))
+            .expect("a past clock time means tomorrow");
+        assert!(at > chrono::Utc::now() + chrono::Duration::hours(21));
+
+        // A dated reset in the past, or absurdly far out, is stale text.
+        assert!(parse_reset_hint("try again at Jan 1st, 2020 4:18 AM.").is_none());
+        assert!(parse_reset_hint("try again at Jan 1st, 2099 4:18 AM.").is_none());
+        assert!(parse_reset_hint("try again at whenever").is_none());
+        assert!(parse_reset_hint("try again at Sep 24th, 2026").is_none());
     }
 
     /// Write an executable stub script the reasoner spawns instead of the

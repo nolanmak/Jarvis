@@ -106,8 +106,17 @@ fn unrecognised_strike_window() -> chrono::Duration {
 /// Hard ceiling on any latch derived from a PARSED reset hint (#655 review).
 /// Claude session windows are 5-hourly; anything longer means the hint came
 /// from quoted/stale text and must not black the provider out for a day.
-fn max_ratelimit_latch() -> chrono::Duration {
-    chrono::Duration::hours(6)
+///
+/// Codex is different: its weekly limit names a reset days out, with an
+/// explicit date ([`crate::reasoner::parse_reset_hint`]), and clamping that
+/// to 6 h made the chain re-spawn codex into the same wall every cooldown
+/// while reporting a reset that had passed. Providers other than Claude get
+/// the parser's own 8-day horizon.
+fn max_ratelimit_latch(kind: ProviderKind) -> chrono::Duration {
+    match kind {
+        ProviderKind::Claude => chrono::Duration::hours(6),
+        _ => chrono::Duration::days(8),
+    }
 }
 
 struct Entry {
@@ -698,7 +707,7 @@ impl FallbackReasoner {
                                 } => {
                                     // Clamp even a parsed reset (#655 review
                                     // — belt to parse_reset_hint's suspenders).
-                                    (*at).min(Utc::now() + max_ratelimit_latch())
+                                    (*at).min(Utc::now() + max_ratelimit_latch(entry.kind))
                                 }
                                 ReasonerError::RateLimited { .. } => {
                                     Utc::now() + default_ratelimit_cooldown()
