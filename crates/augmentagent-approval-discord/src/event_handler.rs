@@ -26,7 +26,8 @@ use crate::broker::BrokerState;
 use crate::custom_id::{CustomId, Verb};
 use crate::layout::{
     approval_message, extract_feedback, extract_fill_values, fill_ask_modal, fill_feedback,
-    recompose_button_row, revise_modal, schedule_modal, split_needs_input, SCHEDULE_CUSTOM_VALUE,
+    recompose_button_row, revise_failure_notice, revise_modal, revise_result_prefix, schedule_modal,
+    split_needs_input, SCHEDULE_CUSTOM_VALUE,
 };
 use crate::ApprovalActionOutcome;
 
@@ -537,15 +538,20 @@ impl EventHandler for Handler {
                                 return;
                             }
 
-                            // Snapshot the pre-redraft draft BEFORE revising
+                            // Snapshot the pre-redraft action BEFORE revising
                             // (revise mutates draftBody in place) — needed for
                             // the (orig, feedback, revised) eval triple (#37).
-                            let original_draft = store_for_capture
+                            // The email is retained too so a redraft that
+                            // produces no card (#1190) can name the affected
+                            // draft in the durable notice.
+                            let snapshot = store_for_capture
                                 .as_ref()
                                 .and_then(|s| {
                                     s.get_action_with_email(&action_id).ok().flatten()
-                                })
-                                .map(|a| a.action.draft_body.unwrap_or_default());
+                                });
+                            let original_draft = snapshot
+                                .as_ref()
+                                .map(|a| a.action.draft_body.clone().unwrap_or_default());
 
                             let outcome = match handler {
                                 Some(h) => h.revise(&action_id, &feedback).await,
@@ -580,6 +586,29 @@ impl EventHandler for Handler {
                             followup_with_recovery(&ctx_clone, &comp_clone, &outcome, &action_id)
                                 .await;
 
+                            // #1190 — a redraft that produced no card leaves the
+                            // old card in place with only an ephemeral trace,
+                            // which a coincidental 🚩 triage flag can visually
+                            // displace. Post a durable ⚠️ notice so the owner
+                            // always knows the redraft did nothing — posted even
+                            // when there is no snapshot (e.g. NotFound), which is
+                            // the exact case that used to go silent. Best-effort:
+                            // the channel post IS the durable sink, so a send
+                            // failure (Discord outage) can only be logged; the
+                            // ephemeral followup above remains as a fallback.
+                            if let Some(notice) =
+                                redraft_no_card_notice(&outcome, snapshot.as_ref().map(|a| &a.email))
+                            {
+                                if let Err(e) =
+                                    approval_channel.send_message(&ctx_clone.http, notice).await
+                                {
+                                    warn!(
+                                        action_id = %action_id,
+                                        "quick_refine: failed to post no-card notice: {e}"
+                                    );
+                                }
+                            }
+
                             let mut new_card_posted = false;
                             if let Some((email, draft)) = repost {
                                 // Persist preset choice + bump the counter, then
@@ -604,8 +633,11 @@ impl EventHandler for Handler {
                                     redraft_count = count,
                                     "quick_refine applied"
                                 );
-                                let msg =
-                                    approval_message(&action_id, &email, &draft, count);
+                                // #1190 — lead the reposted card with the 🔁
+                                // Revise-result header so it can never be read
+                                // as a coincidental 🚩 triage notice.
+                                let msg = approval_message(&action_id, &email, &draft, count)
+                                    .content(revise_result_prefix());
                                 match approval_channel
                                     .send_message(&ctx_clone.http, msg)
                                     .await
@@ -971,13 +1003,17 @@ impl EventHandler for Handler {
                 let modal_clone = modal.clone();
 
                 tokio::spawn(async move {
-                    // Snapshot the pre-Revise draft BEFORE calling revise — the
+                    // Snapshot the pre-Revise action BEFORE calling revise — the
                     // revise call mutates `actions.draftBody` in-place, so a
-                    // post-call read would return the new draft. (#37)
-                    let original_draft = store_for_capture
+                    // post-call read would return the new draft. (#37) The email
+                    // is retained too so a redraft that produces no card (#1190)
+                    // can name the affected draft in the durable notice.
+                    let snapshot = store_for_capture
                         .as_ref()
-                        .and_then(|s| s.get_action_with_email(&action_id).ok().flatten())
-                        .map(|a| a.action.draft_body.unwrap_or_default());
+                        .and_then(|s| s.get_action_with_email(&action_id).ok().flatten());
+                    let original_draft = snapshot
+                        .as_ref()
+                        .map(|a| a.action.draft_body.clone().unwrap_or_default());
 
                     let outcome = match handler {
                         Some(h) => h.revise(&action_id, &feedback).await,
@@ -1032,6 +1068,30 @@ impl EventHandler for Handler {
                         warn!(action_id = %action_id, "revise: followup failed: {e}");
                     }
 
+                    // #1190 — when the redraft produced no card at all (LLM
+                    // error/refusal, #962 re-address failure, missing entity),
+                    // the old card is (correctly) left in place and the only
+                    // trace so far is the ephemeral followup above — which a
+                    // coincidental 🚩 triage notice can visually displace. Post
+                    // a durable, distinct ⚠️ channel notice so the owner always
+                    // knows Revise did nothing — posted even when there is no
+                    // snapshot (e.g. NotFound), the exact case that used to go
+                    // silent. Best-effort: the channel post IS the durable sink,
+                    // so a send failure (Discord outage) can only be logged; the
+                    // ephemeral followup above remains as a fallback.
+                    if let Some(notice) =
+                        redraft_no_card_notice(&outcome, snapshot.as_ref().map(|a| &a.email))
+                    {
+                        if let Err(e) =
+                            approval_channel.send_message(&ctx_clone.http, notice).await
+                        {
+                            warn!(
+                                action_id = %action_id,
+                                "revise: failed to post no-card notice: {e}"
+                            );
+                        }
+                    }
+
                     // Post the new card BEFORE deleting the old one. If the
                     // re-post fails the old card stays as a fallback so the
                     // user isn't left without a card to act on.
@@ -1060,7 +1120,11 @@ impl EventHandler for Handler {
                             &action_id,
                             &email.from,
                         );
-                        let msg = approval_message(&action_id, &email, &draft, count);
+                        // #1190 — lead the reposted card with the 🔁 Revise-
+                        // result header so it can never be read as a coincidental
+                        // 🚩 triage notice.
+                        let msg = approval_message(&action_id, &email, &draft, count)
+                            .content(revise_result_prefix());
                         match approval_channel.send_message(&ctx_clone.http, msg).await {
                             Ok(_) => new_card_posted = true,
                             Err(e) => warn!(
@@ -1209,6 +1273,41 @@ async fn ack_ephemeral(
     {
         warn!("failed to ack interaction: {e}");
     }
+}
+
+/// #1190 — did a redraft entry point (Revise/FillAsk modal submit, or the
+/// QuickRefine select) fail to repost a new approval card, leaving the owner
+/// with no durable signal? True for `Failed`/`NotFound`: `revise` returned no
+/// draft, `repost` is `None`, the old card stays, and the ONLY trace is an
+/// ephemeral followup a coincidental 🚩 triage notice can visually displace —
+/// so those two warrant a durable in-channel notice. False for `Revised` (a
+/// fresh card is reposted) and `AlreadyResolved` (the stale card is deleted and
+/// the ephemeral explains why), and false for every other outcome, none of
+/// which a redraft path can produce. Pure so the decision is exhaustively
+/// unit-testable — a new `ApprovalActionOutcome` variant forces a choice here.
+fn redraft_produced_no_card(outcome: &ApprovalActionOutcome) -> bool {
+    matches!(
+        outcome,
+        ApprovalActionOutcome::Failed { .. } | ApprovalActionOutcome::NotFound
+    )
+}
+
+/// #1190 — build the durable no-card notice for a redraft outcome, if one is
+/// warranted. Returns `Some` for exactly the outcomes [`redraft_produced_no_card`]
+/// flags (`Failed`/`NotFound`), and — critically — does so REGARDLESS of whether
+/// a pre-revise snapshot exists. `NotFound` (the action row was resolved/removed
+/// before revise ran) routinely has no snapshot, yet that is precisely the case
+/// the issue reports as silently producing nothing; gating the notice on the
+/// snapshot is what left the owner with no signal. The snapshot email, when
+/// present, only enriches the notice with the affected subject. `None` for every
+/// outcome that reposts a fresh card or deletes the stale one. Pure so both
+/// redraft callers share one decision that is exhaustively unit-testable.
+fn redraft_no_card_notice(
+    outcome: &ApprovalActionOutcome,
+    snapshot_email: Option<&augmentagent_store::Email>,
+) -> Option<CreateMessage> {
+    redraft_produced_no_card(outcome)
+        .then(|| revise_failure_notice(snapshot_email, &describe(outcome)))
 }
 
 fn describe(outcome: &ApprovalActionOutcome) -> String {
@@ -2814,6 +2913,126 @@ mod tests {
                 "status {status} off even with a superseded-shaped detail"
             );
         }
+    }
+
+    // ---- #1190: durable no-card notice on a failed redraft ----
+
+    fn sample_email() -> augmentagent_store::Email {
+        augmentagent_store::Email {
+            attachments: Vec::new(),
+            to: String::new(),
+            cc: String::new(),
+            message_id: "m-1190".into(),
+            thread_id: Some("t-1190".into()),
+            from: "peer@example.com".into(),
+            subject: "Re: proposal".into(),
+            body: "the inbound message".into(),
+            date: "2026-09-24T00:00:00Z".into(),
+            account_entity_id: Some("acc".into()),
+            platform: "gmail".into(),
+            kind: "dm".into(),
+        }
+    }
+
+    /// The enumeration seam for the durable notice: `Failed`/`NotFound` are the
+    /// only outcomes a redraft path can produce without reposting a card, so
+    /// only they warrant the ⚠️ notice. `Revised` reposts a card and
+    /// `AlreadyResolved` deletes the stale one + explains ephemerally, so
+    /// neither notifies; every other outcome is unreachable from a redraft path
+    /// and stays off. Exhaustive so a new variant forces a decision here.
+    #[test]
+    fn redraft_produced_no_card_covers_all_outcomes() {
+        // Notify: the redraft failed and no card was posted.
+        assert!(redraft_produced_no_card(&ApprovalActionOutcome::Failed {
+            message: "provider refused".into()
+        }));
+        assert!(redraft_produced_no_card(&ApprovalActionOutcome::NotFound));
+
+        // Do NOT notify: a fresh card was reposted / the stale card handled.
+        assert!(!redraft_produced_no_card(&ApprovalActionOutcome::Revised {
+            email: sample_email(),
+            draft: "new draft".into()
+        }));
+        assert!(
+            !redraft_produced_no_card(&ApprovalActionOutcome::AlreadyResolved {
+                status: "superseded".into(),
+                detail: None
+            })
+        );
+
+        // Every other outcome is unreachable from a redraft path — off.
+        assert!(!redraft_produced_no_card(&ApprovalActionOutcome::Approved));
+        assert!(!redraft_produced_no_card(&ApprovalActionOutcome::Skipped));
+        assert!(!redraft_produced_no_card(&ApprovalActionOutcome::Scheduled {
+            at_ms: 1,
+            local: "t".into()
+        }));
+        assert!(!redraft_produced_no_card(&ApprovalActionOutcome::Unscheduled));
+        assert!(!redraft_produced_no_card(
+            &ApprovalActionOutcome::CancelledSchedule
+        ));
+        assert!(!redraft_produced_no_card(&ApprovalActionOutcome::Recomposed));
+    }
+
+    /// #1190 exact repro: the user clicks Revise (or QuickRefine) and `revise`
+    /// returns no revised draft. The handler must always emit a durable notice —
+    /// including the missing-snapshot path (`NotFound`), which is what the prior
+    /// fix gated on a snapshot and therefore left silent. This tests the shared
+    /// decision the two handler sites call, so the send path can't regress to
+    /// "no snapshot ⇒ no message" without failing here.
+    #[test]
+    fn failed_redraft_always_yields_a_durable_notice() {
+        let content = |o: &ApprovalActionOutcome, e: Option<&augmentagent_store::Email>| {
+            redraft_no_card_notice(o, e).map(|m| {
+                serde_json::to_value(&m).expect("notice serializes")["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+        };
+
+        // NotFound with NO snapshot (the row was resolved/removed before revise
+        // ran) still produces a ⚠️ notice — the case that used to go silent.
+        let notfound = content(&ApprovalActionOutcome::NotFound, None)
+            .expect("NotFound must yield a notice even without a snapshot");
+        assert!(notfound.contains('\u{26A0}'), "notice carries ⚠️: {notfound}");
+
+        // Failed with no snapshot likewise notifies.
+        assert!(content(
+            &ApprovalActionOutcome::Failed {
+                message: "provider refused the redraft".into()
+            },
+            None,
+        )
+        .is_some());
+
+        // With a snapshot the notice names the affected draft subject.
+        let named = content(
+            &ApprovalActionOutcome::Failed {
+                message: "boom".into(),
+            },
+            Some(&sample_email()),
+        )
+        .expect("Failed yields a notice");
+        assert!(named.contains("Re: proposal"), "names the subject: {named}");
+
+        // Outcomes that repost a fresh card or delete the stale one: no notice.
+        assert!(content(
+            &ApprovalActionOutcome::Revised {
+                email: sample_email(),
+                draft: "new draft".into()
+            },
+            Some(&sample_email()),
+        )
+        .is_none());
+        assert!(content(
+            &ApprovalActionOutcome::AlreadyResolved {
+                status: "superseded".into(),
+                detail: None
+            },
+            None,
+        )
+        .is_none());
     }
 
     // ---- #501: outcome → message-cleanup decisions ----
