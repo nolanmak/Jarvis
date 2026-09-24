@@ -13,7 +13,7 @@ use std::sync::Arc;
 use serenity::all::{
     ActionRowComponent, Attachment, ButtonKind, ChannelId, Context, CreateAttachment,
     CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
-    CreateMessage, EventHandler, GetMessages, Http, Interaction, Message, MessageId,
+    CreateMessage, EditMessage, EventHandler, GetMessages, Http, Interaction, Message, MessageId,
     MessageReference, Ready, UserId,
 };
 use tracing::{debug, info, warn};
@@ -783,6 +783,55 @@ impl EventHandler for Handler {
                                 .await;
                         });
                     }
+                    Verb::LoopAck | Verb::LoopDismiss => {
+                        // #1135 — reminder nag controls. `action_id` packs
+                        // `loop_id@cycle_ms`; the store closes only that exact
+                        // cycle (stale button / stopped loop are no-ops).
+                        // Closing is a fast local write, so we ack inline.
+                        let Some((loop_id, cycle_ms)) =
+                            crate::layout::parse_reminder_action_id(&cid.action_id)
+                        else {
+                            ack_ephemeral(&ctx, &comp, "Already handled.").await;
+                            return;
+                        };
+                        let dismissed = matches!(cid.verb, Verb::LoopDismiss);
+                        let rows = match self.state.store.as_ref() {
+                            Some(store) => {
+                                store.acknowledge_nag_cycle(loop_id, cycle_ms).unwrap_or(0)
+                            }
+                            None => 0,
+                        };
+                        if rows == 0 {
+                            // Stale/double tap, resolved-elsewhere, or stopped
+                            // loop. Say so and leave the message untouched.
+                            ack_ephemeral(&ctx, &comp, "Already handled.").await;
+                            return;
+                        }
+                        let note = if dismissed {
+                            "💤 dismissed — I'll remind you next cycle."
+                        } else {
+                            "✅ acknowledged — done for now."
+                        };
+                        ack_ephemeral(&ctx, &comp, note).await;
+                        // Finalize the source message: drop the buttons and
+                        // stamp the outcome so it's clear the nag is resolved.
+                        let mut new_content = comp.message.content.clone();
+                        new_content.push_str("\n\n");
+                        new_content.push_str(note);
+                        if let Err(e) = comp
+                            .channel_id
+                            .edit_message(
+                                &ctx.http,
+                                comp.message.id,
+                                EditMessage::new()
+                                    .content(new_content)
+                                    .components(vec![]),
+                            )
+                            .await
+                        {
+                            warn!(loop_id = %loop_id, "failed to finalize reminder message: {e}");
+                        }
+                    }
                     Verb::ReviseModal | Verb::FillAskModal | Verb::ScheduleModal => {
                         debug!("unexpected modal verb on component interaction");
                     }
@@ -1535,7 +1584,12 @@ fn classify_custom_id(raw: &str) -> Option<(String, SweptKind)> {
         // #1203 — Recompose rides only on the transient recovery ephemeral,
         // never on a persisted card/notice, so the scrollback sweep must not
         // classify (and thus try to reconcile) a message on its behalf.
-        | Verb::Recompose => return None,
+        | Verb::Recompose
+        // #1135 — loop nag buttons target `user_loops`, not `actions`, and
+        // are resolved by their own component arm; never sweep them as a
+        // card/notice.
+        | Verb::LoopAck
+        | Verb::LoopDismiss => return None,
     };
     Some((parsed.action_id, kind))
 }
@@ -2584,13 +2638,16 @@ mod tests {
             assert_eq!(id, "a2");
             assert_eq!(kind, SweptKind::Notice, "{v} must classify as Notice");
         }
-        // Select/modal verbs never identify a message kind.
+        // Select/modal verbs and #1135 loop-nag verbs never identify a
+        // sweepable message kind.
         for v in [
             "quick_refine",
             "schedule_pick",
             "schedule_modal",
             "revise_modal",
             "fill_ask_modal",
+            "loop_ack",
+            "loop_dismiss",
         ] {
             assert!(classify_custom_id(&format!("aa:a3:{v}")).is_none());
         }

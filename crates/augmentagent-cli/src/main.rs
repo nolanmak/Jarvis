@@ -9675,12 +9675,19 @@ fn parse_loop_json(raw: &str) -> std::result::Result<augmentagent_approval_disco
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    // #1135 — opt into nag mode when the parser recognizes reminder phrasing
+    // ("remind me…", "nag me until I…"). Absent/false ⇒ normal cadence.
+    let nag_until_ack = parsed
+        .get("nag_until_ack")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     Ok(augmentagent_approval_discord::ParsedLoop {
         interval_secs: interval,
         prompt,
         duration_secs,
         cron_expr,
         tz,
+        nag_until_ack,
     })
 }
 
@@ -10655,6 +10662,16 @@ mod loop_parser_tests {
     }
 
     #[test]
+    fn nag_until_ack_defaults_off_and_parses_when_true() {
+        // #1135 — absent flag ⇒ normal cadence; explicit true opts in.
+        let plain = r#"{"interval_secs": 86400, "prompt": "take meds"}"#;
+        assert!(!parse_loop_json(plain).unwrap().nag_until_ack);
+        let nagging =
+            r#"{"interval_secs": 86400, "prompt": "take meds", "nag_until_ack": true}"#;
+        assert!(parse_loop_json(nagging).unwrap().nag_until_ack);
+    }
+
+    #[test]
     fn strips_code_fences() {
         let raw = "```json\n{\"interval_secs\": 30, \"prompt\": \"x\", \"duration_secs\": null}\n```";
         let p = parse_loop_json(raw).unwrap();
@@ -10709,6 +10726,38 @@ impl LoopPoster for DiscordLoopPoster {
                 .send_message(&*self.http, CreateMessage::new().content(chunk))
                 .await
                 .context("discord send_message (loop result)")?;
+        }
+        Ok(())
+    }
+
+    /// #1135 — reminder nags carry Acknowledge / Dismiss controls on the
+    /// final chunk (buttons must ride a real message; multi-chunk bodies keep
+    /// their leading chunks button-free).
+    async fn post_reminder(
+        &self,
+        channel_ref: &str,
+        body: &str,
+        loop_id: &str,
+        cycle_ms: i64,
+    ) -> anyhow::Result<()> {
+        use serenity::all::{ChannelId, CreateMessage};
+        let cid: u64 = channel_ref
+            .parse()
+            .with_context(|| format!("loop channel_ref not a u64: {channel_ref}"))?;
+        let channel = ChannelId::new(cid);
+        let chunks = augmentagent_approval_discord::chunk_for_discord(body);
+        let last = chunks.len().saturating_sub(1);
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let mut msg = CreateMessage::new().content(chunk);
+            if i == last {
+                msg = msg.components(vec![augmentagent_approval_discord::reminder_buttons(
+                    loop_id, cycle_ms,
+                )]);
+            }
+            channel
+                .send_message(&*self.http, msg)
+                .await
+                .context("discord send_message (loop reminder)")?;
         }
         Ok(())
     }

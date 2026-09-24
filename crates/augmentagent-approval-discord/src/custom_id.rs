@@ -51,6 +51,13 @@ pub enum Verb {
     /// stored draft reposted as a fresh card, and the row marked so the
     /// reconcile sweep won't re-retire it.
     Recompose,
+    /// "Acknowledge" on a `/loop` reminder nag (#1135): closes the open nag
+    /// cycle (done). The `action_id` slot carries the loop id, not an action
+    /// UUID — these verbs target `user_loops`, not `actions`.
+    LoopAck,
+    /// "Dismiss" on a `/loop` reminder nag (#1135): closes the open nag cycle
+    /// (skip this cycle). Same silence-until-next-cadence effect as LoopAck.
+    LoopDismiss,
 }
 
 impl Verb {
@@ -69,6 +76,8 @@ impl Verb {
             Self::CancelSchedule => "cancel_schedule",
             Self::BackToQueue => "back_to_queue",
             Self::Recompose => "recompose",
+            Self::LoopAck => "loop_ack",
+            Self::LoopDismiss => "loop_dismiss",
         }
     }
 
@@ -87,6 +96,8 @@ impl Verb {
             "cancel_schedule" => Self::CancelSchedule,
             "back_to_queue" => Self::BackToQueue,
             "recompose" => Self::Recompose,
+            "loop_ack" => Self::LoopAck,
+            "loop_dismiss" => Self::LoopDismiss,
             _ => return None,
         })
     }
@@ -144,6 +155,8 @@ mod tests {
             Verb::CancelSchedule,
             Verb::BackToQueue,
             Verb::Recompose,
+            Verb::LoopAck,
+            Verb::LoopDismiss,
         ] {
             let cid = CustomId::new("550e8400-e29b-41d4-a716-446655440000", v);
             let s = cid.to_string();

@@ -540,6 +540,17 @@ pub struct UserLoop {
     /// Explicit model for every occurrence. `None` inherits the daemon
     /// default, preserving behavior for rows created before this column.
     pub model_profile: Option<String>,
+    /// #1135 — opt-in nag mode. When true the scheduler re-fires the
+    /// reminder once a day at the same time until the owner Acknowledges or
+    /// Dismisses the open cycle. `#[serde(default)]` keeps rows serialized
+    /// before this column deserializing as `false`.
+    #[serde(default)]
+    pub nag_until_ack: bool,
+    /// #1135 — open-cycle marker. Non-NULL (the due time of the cycle that
+    /// opened the nag) means a nag is in flight; `None` means silent until
+    /// the next scheduled cron/interval cycle. Only meaningful when
+    /// `nag_until_ack` is true.
+    pub nag_cycle_ms: Option<i64>,
 }
 
 /// #117 — an allowlisted repo the multi-repo agent-coding loop is permitted

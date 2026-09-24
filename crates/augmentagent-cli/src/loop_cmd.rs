@@ -93,6 +93,10 @@ pub enum LoopOp {
         /// default at execution time.
         #[arg(long, value_parser = ["claude", "qwen", "glm", "codex"])]
         model: Option<String>,
+        /// #1135 — nag mode: re-fire this reminder once a day until the owner
+        /// taps Acknowledge/Dismiss on Discord. Default off (normal cadence).
+        #[arg(long, default_value_t = false)]
+        nag_until_ack: bool,
         /// Emit JSON `{"id":"<uuid>","interval_secs":N,...}` instead of
         /// plain `<uuid>` on stdout. Lets callers parse the loop id without
         /// regex.
@@ -182,6 +186,7 @@ pub fn run_with(store: &Store, op: LoopOp) -> Result<i32> {
             owner,
             expires_in,
             model,
+            nag_until_ack,
             json,
         } => {
             if let Some(model) = model.as_deref() {
@@ -197,6 +202,7 @@ pub fn run_with(store: &Store, op: LoopOp) -> Result<i32> {
                 channel_ref,
                 owner,
                 expires_in,
+                nag_until_ack,
             };
             let resolved = resolve_create_args(args, env_lookup)?;
             let id = store.create_user_loop_with_model(
@@ -209,6 +215,7 @@ pub fn run_with(store: &Store, op: LoopOp) -> Result<i32> {
                 resolved.cron_expr.as_deref(),
                 resolved.tz.as_deref(),
                 model.as_deref(),
+                resolved.nag_until_ack,
             )?;
             if json {
                 let payload = serde_json::json!({
@@ -220,6 +227,7 @@ pub fn run_with(store: &Store, op: LoopOp) -> Result<i32> {
                     "cron_expr": resolved.cron_expr,
                     "tz": resolved.tz,
                     "model_profile": model,
+                    "nag_until_ack": resolved.nag_until_ack,
                 });
                 println!("{}", serde_json::to_string(&payload)?);
             } else {
@@ -257,6 +265,8 @@ struct CreateArgs {
     channel_ref: Option<String>,
     owner: Option<String>,
     expires_in: Option<String>,
+    /// #1135 — opt into nag mode (re-fire daily until Ack/Dismiss).
+    nag_until_ack: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,6 +283,8 @@ struct ResolvedCreate {
     cron_expr: Option<String>,
     /// Canonical IANA tz, or `None` for interval-based loops.
     tz: Option<String>,
+    /// #1135 — persisted verbatim; gates nag mode in the store.
+    nag_until_ack: bool,
 }
 
 /// Live env lookup. Split out as a function pointer so tests can inject a
@@ -393,6 +405,7 @@ where
         expires_at_ms,
         cron_expr,
         tz: tz_canonical,
+        nag_until_ack: args.nag_until_ack,
     })
 }
 
@@ -711,6 +724,7 @@ mod tests {
             channel_ref: None,
             owner: None,
             expires_in: None,
+            nag_until_ack: false,
         };
         let env = fake_env(&[
             ("DISCORD_ALLOWED_USER_ID", "user-from-env"),
@@ -734,6 +748,7 @@ mod tests {
             channel_ref: Some("override-chan".into()),
             owner: Some("override-owner".into()),
             expires_in: None,
+            nag_until_ack: false,
         };
         // Env has different values; explicit flags should win.
         let env = fake_env(&[
@@ -756,6 +771,7 @@ mod tests {
             channel_ref: Some("c".into()),
             owner: Some("o".into()),
             expires_in: None,
+            nag_until_ack: false,
         };
         let err = resolve_create_args(args, |_| None).unwrap_err();
         assert!(err.to_string().contains("--interval"));
@@ -771,6 +787,7 @@ mod tests {
             channel_ref: Some("c".into()),
             owner: Some("o".into()),
             expires_in: None,
+            nag_until_ack: false,
         };
         let err = resolve_create_args(args, |_| None).unwrap_err();
         assert!(err.to_string().contains("--prompt"));
@@ -786,6 +803,7 @@ mod tests {
             channel_ref: Some("c".into()),
             owner: None,
             expires_in: None,
+            nag_until_ack: false,
         };
         let err = resolve_create_args(args, |_| None).unwrap_err();
         assert!(err.to_string().contains("--owner"));
@@ -801,6 +819,7 @@ mod tests {
             channel_ref: None,
             owner: Some("o".into()),
             expires_in: None,
+            nag_until_ack: false,
         };
         let err = resolve_create_args(args, |_| None).unwrap_err();
         assert!(err.to_string().contains("--channel-ref"));
@@ -816,6 +835,7 @@ mod tests {
             channel_ref: Some("c".into()),
             owner: Some("o".into()),
             expires_in: Some("5m".into()),
+            nag_until_ack: false,
         };
         let err = resolve_create_args(args, |_| None).unwrap_err();
         assert!(err.to_string().contains("shorter than"));
@@ -832,6 +852,7 @@ mod tests {
             channel_ref: Some("c".into()),
             owner: Some("o".into()),
             expires_in: None,
+            nag_until_ack: false,
         };
         let err = resolve_create_args_with(args, |_| None, 3600).unwrap_err();
         assert!(err.to_string().contains("floor"));
@@ -848,6 +869,7 @@ mod tests {
             channel_ref: Some("c".into()),
             owner: Some("o".into()),
             expires_in: None,
+            nag_until_ack: false,
         };
         let r = resolve_create_args_with(args, |_| None, 0).unwrap();
         assert_eq!(r.interval_secs, 45);
@@ -863,6 +885,7 @@ mod tests {
             channel_ref: Some("c".into()),
             owner: Some("o".into()),
             expires_in: Some("2h".into()),
+            nag_until_ack: false,
         };
         let before = now_millis();
         let r = resolve_create_args(args, |_| None).unwrap();
@@ -890,6 +913,7 @@ mod tests {
                 owner: Some("test-owner".into()),
                 expires_in: None,
                 model: None,
+                nag_until_ack: false,
                 json: false,
             },
         )
@@ -936,6 +960,7 @@ mod tests {
             owner: Some("test-owner".into()),
             expires_in: None,
             model: Some(model.into()),
+            nag_until_ack: false,
             json: false,
         };
         run_with(&store, create("glm")).unwrap();
@@ -943,6 +968,51 @@ mod tests {
         assert_eq!(row.model_profile.as_deref(), Some("glm"));
         assert!(run_with(&store, create("gemini")).is_err());
         assert_eq!(store.list_user_loops("test-owner").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn run_create_with_nag_persists_flag() {
+        // #1135 — `--nag-until-ack` round-trips to the stored row; default off.
+        let (_tmp, store) = seed_store();
+        let create = |nag: bool| LoopOp::Create {
+            interval: Some("1d".into()),
+            cron: None,
+            tz: None,
+            prompt: "take meds".into(),
+            channel_ref: Some("test-channel".into()),
+            owner: Some("nag-owner".into()),
+            expires_in: None,
+            model: None,
+            nag_until_ack: nag,
+            json: false,
+        };
+        run_with(&store, create(true)).unwrap();
+        run_with(&store, create(false)).unwrap();
+        let loops = store.list_user_loops("nag-owner").unwrap();
+        assert_eq!(loops.iter().filter(|l| l.nag_until_ack).count(), 1);
+        assert_eq!(loops.iter().filter(|l| !l.nag_until_ack).count(), 1);
+    }
+
+    #[test]
+    fn create_cli_parses_nag_until_ack_flag() {
+        let cli = crate::Cli::try_parse_from([
+            "augmentagent", "loop", "create", "--interval", "1d",
+            "--prompt", "take meds", "--nag-until-ack",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            crate::Cmd::Loop { op: LoopOp::Create { nag_until_ack: true, .. } }
+        ));
+        // Absent flag defaults to false.
+        let plain = crate::Cli::try_parse_from([
+            "augmentagent", "loop", "create", "--interval", "1d", "--prompt", "hi",
+        ])
+        .unwrap();
+        assert!(matches!(
+            plain.cmd,
+            crate::Cmd::Loop { op: LoopOp::Create { nag_until_ack: false, .. } }
+        ));
     }
 
     #[test]
@@ -972,6 +1042,7 @@ mod tests {
             channel_ref: Some("c".into()),
             owner: Some("o".into()),
             expires_in: None,
+            nag_until_ack: false,
         };
         let r = resolve_create_args(args, |_| None).unwrap();
         assert_eq!(r.interval_secs, 0, "cron loops persist 0 for interval_secs");
@@ -991,6 +1062,7 @@ mod tests {
             channel_ref: Some("c".into()),
             owner: Some("o".into()),
             expires_in: None,
+            nag_until_ack: false,
         };
         let err = resolve_create_args(args, |_| None).unwrap_err();
         assert!(err.to_string().contains("--cron and --tz"));
@@ -1006,6 +1078,7 @@ mod tests {
             channel_ref: Some("c".into()),
             owner: Some("o".into()),
             expires_in: None,
+            nag_until_ack: false,
         };
         let err = resolve_create_args(args, |_| None).unwrap_err();
         assert!(err.to_string().contains("either --interval or"));
@@ -1021,6 +1094,7 @@ mod tests {
             channel_ref: Some("c".into()),
             owner: Some("o".into()),
             expires_in: None,
+            nag_until_ack: false,
         };
         let err = resolve_create_args(args, |_| None).unwrap_err();
         assert!(err.to_string().contains("--cron"));
@@ -1036,6 +1110,7 @@ mod tests {
             channel_ref: Some("c".into()),
             owner: Some("o".into()),
             expires_in: None,
+            nag_until_ack: false,
         };
         let err = resolve_create_args(args, |_| None).unwrap_err();
         assert!(err.to_string().contains("--tz"));
