@@ -46,6 +46,11 @@ pub enum Verb {
     /// "Back to queue" on the scheduled notice (#501) — the non-destructive
     /// mis-click escape: `scheduled → pending`, card reposted.
     BackToQueue,
+    /// "Recompose" on the #1199 recovery ephemeral (#1203): the owner overrides
+    /// the auto-retirement of a superseded draft — `superseded → pending`, the
+    /// stored draft reposted as a fresh card, and the row marked so the
+    /// reconcile sweep won't re-retire it.
+    Recompose,
 }
 
 impl Verb {
@@ -63,6 +68,7 @@ impl Verb {
             Self::SendNow => "send_now",
             Self::CancelSchedule => "cancel_schedule",
             Self::BackToQueue => "back_to_queue",
+            Self::Recompose => "recompose",
         }
     }
 
@@ -80,6 +86,7 @@ impl Verb {
             "send_now" => Self::SendNow,
             "cancel_schedule" => Self::CancelSchedule,
             "back_to_queue" => Self::BackToQueue,
+            "recompose" => Self::Recompose,
             _ => return None,
         })
     }
@@ -136,6 +143,7 @@ mod tests {
             Verb::SendNow,
             Verb::CancelSchedule,
             Verb::BackToQueue,
+            Verb::Recompose,
         ] {
             let cid = CustomId::new("550e8400-e29b-41d4-a716-446655440000", v);
             let s = cid.to_string();

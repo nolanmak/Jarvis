@@ -585,6 +585,18 @@ pub fn scheduled_notice_message(
     CreateMessage::new().embed(embed).components(vec![buttons])
 }
 
+/// #1203 — the single-button action row the #1199 recovery ephemeral carries
+/// when a superseded draft is recomposable (`offers_recompose`). Clicking it
+/// fires `Verb::Recompose` against `action_id`. Kept here beside the other
+/// button builders; the event handler decides *when* to attach it.
+pub fn recompose_button_row(action_id: &str) -> CreateActionRow {
+    CreateActionRow::Buttons(vec![CreateButton::new(
+        CustomId::new(action_id, Verb::Recompose).to_string(),
+    )
+    .label("Recompose")
+    .style(ButtonStyle::Primary)])
+}
+
 /// Custom-time modal opened by the `custom` schedule token (#501). One short
 /// text input; the placeholder doubles as the format cheat-sheet. Known
 /// cosmetic artifact: dismissing the modal leaves the select displaying
@@ -1257,6 +1269,25 @@ mod tests {
         assert!(v.contains("aa:act-s5:schedule_modal"));
         assert!(v.contains("\"when\""));
         assert!(v.contains("tomorrow 9am"));
+    }
+
+    /// #1203 — the recovery button carries the round-trippable Recompose
+    /// custom_id keyed to the action, a single button, no other verbs.
+    #[test]
+    fn recompose_button_row_encodes_the_recompose_verb() {
+        let row = recompose_button_row("act-r9");
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&row).expect("row serializes"))
+                .expect("row json parses");
+        let buttons = v["components"].as_array().expect("buttons");
+        assert_eq!(buttons.len(), 1, "exactly one Recompose button");
+        let s = serde_json::to_string(&row).unwrap();
+        assert!(s.contains("aa:act-r9:recompose"), "got: {s}");
+        assert!(s.contains("Recompose"));
+        // Must NOT carry any other card/notice verb.
+        assert!(!s.contains(":approve"));
+        assert!(!s.contains(":skip"));
+        assert!(!s.contains(":back_to_queue"));
     }
 
     // ---------------------------------------------------------------------

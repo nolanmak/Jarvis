@@ -305,6 +305,16 @@ impl WhatsappControlSurface {
                     .await
                     .ok();
             }
+            // #1203 — Recompose is a Discord-only recovery affordance today;
+            // the WhatsApp control surface can't raise it (no recompose verb
+            // here), but the shared handler could return it, so ack with the
+            // same wording as the Discord surface. Parity note mirrors the
+            // #1199 out-of-scope decision above.
+            ApprovalActionOutcome::Recomposed => {
+                self.send_to_control("Recomposed — draft pending again.")
+                    .await
+                    .ok();
+            }
         }
     }
 

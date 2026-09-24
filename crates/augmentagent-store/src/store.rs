@@ -420,6 +420,18 @@ impl Store {
         if !column_exists(conn, "actions", "noticeMessageId")? {
             conn.execute("ALTER TABLE actions ADD COLUMN noticeMessageId TEXT", [])?;
         }
+        // #1203 — owner "Recompose" override. Set to `now` when the owner
+        // one-click-restores a superseded draft as a fresh pending card
+        // (`recompose_action`). Its only job is to exempt that row from the
+        // reconcile sweep's Rule 1 (owner already replied) and Rule 2
+        // (bulk/automated sender): those are exactly the reasons the draft was
+        // superseded, so without the override the next 30-min tick would
+        // silently re-retire the card the owner just chose to keep —
+        // reproducing the #1196/#1199 silent-vanish. NULL for every row that
+        // was never recomposed.
+        if !column_exists(conn, "actions", "recomposedAtMs")? {
+            conn.execute("ALTER TABLE actions ADD COLUMN recomposedAtMs INTEGER", [])?;
+        }
         // Mirrors idx_scheduled_posts_fire: the engine's due query is
         // `status = 'scheduled' AND scheduledAtMs <= now`.
         conn.execute(
@@ -3296,7 +3308,8 @@ impl Store {
             "SELECT a.id, a.threadId, a.fromEmail, a.subject, \
                     COALESCE(a.originalBody, ''), \
                     (a.draftBody IS NULL OR TRIM(a.draftBody, ' \t\r\n') = ''), \
-                    e.receivedAt \
+                    e.receivedAt, \
+                    (a.recomposedAtMs IS NOT NULL) \
                FROM actions a \
                LEFT JOIN emails e ON a.messageId = e.messageId \
               WHERE a.status = 'pending' \
@@ -3312,6 +3325,7 @@ impl Store {
                 body: r.get(4)?,
                 draft_empty: r.get(5)?,
                 received_at: r.get(6)?,
+                recomposed: r.get(7)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -5567,6 +5581,36 @@ impl Store {
         Ok(n == 1)
     }
 
+    /// #1203 — owner "Recompose": `superseded → pending`, restoring a retired
+    /// draft as a fresh actionable card. CAS-gated on `status = 'superseded'`
+    /// so a double-click, or a row that meanwhile moved on, can never resurrect
+    /// a terminal (sent / scheduled / …) action — the loser reads `false` and
+    /// the handler shows the standard already-resolved ack.
+    ///
+    /// Sets `recomposedAtMs = now`: this is the load-bearing part. Rule 1
+    /// (owner already replied) and Rule 2 (bulk sender) are exactly why the
+    /// draft was superseded, so the reconcile sweep would re-retire the row on
+    /// its next 30-min tick; `recomposedAtMs` is the per-row override that
+    /// exempts it (see `pending_actions_for_reconcile` / the tick). The old
+    /// supersede reason in `errorMessage` is cleared so the now-live pending
+    /// row carries no stale terminal message. The nudge pointer is re-armed
+    /// exactly like `unschedule_action` (`nudgeCount = 1`, full interval) so
+    /// the caller-reposted card is the active one and the NudgeScheduler cannot
+    /// post a second card in the window.
+    pub fn recompose_action(&self, action_id: &str, source: &str) -> StoreResult<bool> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE actions \
+                SET status = 'pending', recomposedAtMs = ?4, errorMessage = NULL, \
+                    nudgeCount = 1, nextNudgeAtMs = ?2, \
+                    status_source = ?3, status_updated_at = ?4, updatedAt = ?4 \
+              WHERE id = ?1 AND status = 'superseded'",
+            params![action_id, now + NUDGE_INTERVAL_MS, source, now],
+        )?;
+        Ok(n == 1)
+    }
+
     /// Engine-only claim: `scheduled → sending`, additionally gated on the
     /// fire time still being due. The tick works from a due-list snapshot
     /// that can be minutes old (earlier rows' sends are wall-clock bounded
@@ -7338,6 +7382,11 @@ pub struct PendingActionRow {
     /// replies AFTER this instant, so an earlier reply on a live back-and-forth
     /// thread can't retire a card raised for a NEWER inbound.
     pub received_at: Option<String>,
+    /// #1203 — true when the owner has one-click-recomposed this row
+    /// (`recomposedAtMs IS NOT NULL`). The reconcile sweep skips Rule 1 and
+    /// Rule 2 for it: the owner explicitly overrode the auto-retirement, so it
+    /// must survive the next tick. Per-row, never a global switch.
+    pub recomposed: bool,
 }
 
 /// #48 — the three code-mode columns on `actions`, returned by
@@ -9543,6 +9592,84 @@ mod tests {
         assert!(!s.mark_pending_approved(&id).unwrap());
         let a = s.get_action_with_email(&id).unwrap().unwrap();
         assert_eq!(a.action.status, "approved");
+    }
+
+    /// #1203 (AC2) — Recompose flips exactly a `superseded` row back to
+    /// `pending`, stamps the reconcile override (`recomposedAtMs`), clears the
+    /// stale supersede reason, and re-arms the nudge. CAS-gated: a pending row
+    /// can't be recomposed, and a second call after the flip is a no-op.
+    #[test]
+    fn recompose_action_flips_only_superseded_rows_and_sets_the_override() {
+        let (s, _f) = fresh_store();
+        let e = sample_email("rc");
+        s.upsert_email(&e).unwrap();
+        let id = s
+            .log_action("rc", Some("T1"), "a@b.example.com", "s", None, Some("draft body"), ActionStatus::Pending)
+            .unwrap();
+
+        // A still-pending row has nothing to recompose.
+        assert!(!s.recompose_action(&id, "discord").unwrap());
+        assert!(
+            !s.pending_actions_for_reconcile().unwrap().iter().find(|r| r.id == id).unwrap().recomposed,
+            "override not set on a row that was never recomposed"
+        );
+
+        // Retire it with a Rule-1 reason keyed to its own id.
+        assert_eq!(
+            s.mark_pending_superseded_by_ids(&[id.clone()], "superseded: you already replied on this thread")
+                .unwrap(),
+            1
+        );
+        {
+            let a = s.get_action_with_email(&id).unwrap().unwrap();
+            assert_eq!(a.action.status, "superseded");
+            assert_eq!(
+                a.action.error_message.as_deref(),
+                Some("superseded: you already replied on this thread")
+            );
+        }
+
+        // Recompose: superseded -> pending, override set, reason cleared.
+        assert!(s.recompose_action(&id, "discord").unwrap());
+        let a = s.get_action_with_email(&id).unwrap().unwrap();
+        assert_eq!(a.action.status, "pending");
+        assert_eq!(a.action.error_message, None, "stale supersede reason cleared on recompose");
+
+        let row = s
+            .pending_actions_for_reconcile()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id)
+            .expect("recomposed row is pending again");
+        assert!(row.recomposed, "recomposedAtMs surfaced as the per-row reconcile override");
+
+        // A fresh nudge cycle is seeded so the reposted card actually surfaces.
+        let nudge_count: i64 = s
+            .with_conn(|c| {
+                c.query_row("SELECT nudgeCount FROM actions WHERE id = ?1", params![id], |r| {
+                    r.get(0)
+                })
+            })
+            .unwrap();
+        assert_eq!(nudge_count, 1, "recompose seeds nudgeCount=1");
+
+        // Second recompose is a no-op — the row is pending, not superseded.
+        assert!(!s.recompose_action(&id, "discord").unwrap());
+    }
+
+    /// #1203 (AC2) — the CAS is scoped to `status = 'superseded'`, so a
+    /// terminal row (e.g. `sent`) is NEVER resurrected into the queue.
+    #[test]
+    fn recompose_action_never_resurrects_a_terminal_sent_row() {
+        let (s, _f) = fresh_store();
+        let e = sample_email("rc2");
+        s.upsert_email(&e).unwrap();
+        let id = s
+            .log_action("rc2", Some("T2"), "a@b.example.com", "s", None, Some("d"), ActionStatus::Pending)
+            .unwrap();
+        s.update_action_status(&id, ActionStatus::Sent, None, None).unwrap();
+        assert!(!s.recompose_action(&id, "discord").unwrap());
+        assert_eq!(s.get_action_with_email(&id).unwrap().unwrap().action.status, "sent");
     }
 
     // --- #117 multi-repo allowlist + gate -----------------------------

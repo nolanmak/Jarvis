@@ -26,7 +26,7 @@ use crate::broker::BrokerState;
 use crate::custom_id::{CustomId, Verb};
 use crate::layout::{
     approval_message, extract_feedback, extract_fill_values, fill_ask_modal, fill_feedback,
-    revise_modal, schedule_modal, split_needs_input, SCHEDULE_CUSTOM_VALUE,
+    recompose_button_row, revise_modal, schedule_modal, split_needs_input, SCHEDULE_CUSTOM_VALUE,
 };
 use crate::ApprovalActionOutcome;
 
@@ -404,7 +404,8 @@ impl EventHandler for Handler {
                                     message: "no action handler configured".into(),
                                 },
                             };
-                            followup(&ctx_clone, &comp_clone, &describe(&outcome)).await;
+                            followup_with_recovery(&ctx_clone, &comp_clone, &outcome, &action_id)
+                                .await;
                             if should_delete_source(&outcome) {
                                 delete_source_message(
                                     &ctx_clone,
@@ -432,7 +433,8 @@ impl EventHandler for Handler {
                                     message: "no action handler configured".into(),
                                 },
                             };
-                            followup(&ctx_clone, &comp_clone, &describe(&outcome)).await;
+                            followup_with_recovery(&ctx_clone, &comp_clone, &outcome, &action_id)
+                                .await;
                             if should_delete_source(&outcome) {
                                 delete_source_message(
                                     &ctx_clone,
@@ -575,7 +577,8 @@ impl EventHandler for Handler {
                                 None
                             };
 
-                            followup(&ctx_clone, &comp_clone, &describe(&outcome)).await;
+                            followup_with_recovery(&ctx_clone, &comp_clone, &outcome, &action_id)
+                                .await;
 
                             let mut new_card_posted = false;
                             if let Some((email, draft)) = repost {
@@ -692,7 +695,8 @@ impl EventHandler for Handler {
                                     message: "no action handler configured".into(),
                                 },
                             };
-                            followup(&ctx_clone, &comp_clone, &describe(&outcome)).await;
+                            followup_with_recovery(&ctx_clone, &comp_clone, &outcome, &action_id)
+                                .await;
                             // The handler posted the scheduled notice; the
                             // actionable card is now retired (Scheduled) or
                             // was already stale (AlreadyResolved). The
@@ -734,7 +738,8 @@ impl EventHandler for Handler {
                                     message: "no action handler configured".into(),
                                 },
                             };
-                            followup(&ctx_clone, &comp_clone, &describe(&outcome)).await;
+                            followup_with_recovery(&ctx_clone, &comp_clone, &outcome, &action_id)
+                                .await;
                             // The interaction's own message IS the notice
                             // for these verbs — remove it once the schedule
                             // left the scheduled state. Quiet best-effort:
@@ -749,6 +754,33 @@ impl EventHandler for Handler {
                                 )
                                 .await;
                             }
+                        });
+                    }
+                    Verb::Recompose => {
+                        // #1203 — one-click recovery button on the #1199
+                        // recovery ephemeral. Restore a superseded draft:
+                        // `superseded → pending`, a fresh card reposted, the
+                        // row exempted from the reconcile sweep. The button
+                        // lives on an EPHEMERAL followup, not the approval card,
+                        // so there is no source message to delete — the handler
+                        // posts the new card itself.
+                        if let Err(e) = defer_ephemeral(&ctx, &comp).await {
+                            warn!("failed to defer Recompose: {e}");
+                            return;
+                        }
+                        let handler = self.state.action_handler.clone();
+                        let action_id = cid.action_id.clone();
+                        let ctx_clone = ctx.clone();
+                        let comp_clone = comp.clone();
+                        tokio::spawn(async move {
+                            let outcome = match handler {
+                                Some(h) => h.recompose(&action_id).await,
+                                None => ApprovalActionOutcome::Failed {
+                                    message: "no action handler configured".into(),
+                                },
+                            };
+                            followup_with_recovery(&ctx_clone, &comp_clone, &outcome, &action_id)
+                                .await;
                         });
                     }
                     Verb::ReviseModal | Verb::FillAskModal | Verb::ScheduleModal => {
@@ -1082,6 +1114,32 @@ async fn followup(
     }
 }
 
+/// #1203 — the recovery-aware followup. Renders the outcome exactly as
+/// [`describe`] does, and when the outcome is a recomposable `superseded`
+/// terminal (`offers_recompose`), attaches the one-click Recompose button
+/// keyed to `action_id`. Every ephemeral ack for a button/schedule click goes
+/// through here so the button surfaces regardless of which stale button the
+/// owner happened to press. Non-recomposable outcomes render identically to a
+/// plain [`followup`] (no components).
+async fn followup_with_recovery(
+    ctx: &Context,
+    comp: &serenity::all::ComponentInteraction,
+    outcome: &ApprovalActionOutcome,
+    action_id: &str,
+) {
+    let mut fu = CreateInteractionResponseFollowup::new()
+        .content(describe(outcome))
+        .ephemeral(true);
+    if let ApprovalActionOutcome::AlreadyResolved { status, detail } = outcome {
+        if offers_recompose(status, detail.as_deref()) {
+            fu = fu.components(vec![recompose_button_row(action_id)]);
+        }
+    }
+    if let Err(e) = comp.create_followup(&ctx.http, fu).await {
+        warn!("failed to send followup: {e}");
+    }
+}
+
 /// Non-deferred immediate ephemeral ack — used only for the authorization
 /// rejection path, where we have no slow work to do.
 async fn ack_ephemeral(
@@ -1124,8 +1182,33 @@ fn describe(outcome: &ApprovalActionOutcome) -> String {
         ApprovalActionOutcome::CancelledSchedule => {
             "Schedule cancelled — draft discarded.".into()
         }
+        ApprovalActionOutcome::Recomposed => {
+            "Recomposed — a fresh approval card is posted below. It won't be \
+             auto-retired again."
+                .into()
+        }
         ApprovalActionOutcome::Failed { message } => format!("Failed: {message}"),
     }
+}
+
+/// #1203 — should the #1199 recovery ephemeral carry a one-click **Recompose**
+/// button for this terminal outcome? Pure so it is exhaustively testable; the
+/// serenity button construction stays a thin wrapper over it.
+///
+/// True only for a `superseded` row whose reason is NOT the empty-draft case
+/// (#484: there is literally nothing to recompose — the button would post an
+/// empty card). Every other supersede reason (already replied, bulk sender,
+/// newer version, `stale`, unknown) is a legitimate owner override: they may
+/// still want the drafted reply, so offer the button. The CLI handler defends
+/// the empty-draft edge again (a `stale`-reasoned row could in theory carry an
+/// empty draft), returning `Failed` rather than carding a blank.
+///
+/// False for every non-superseded terminal status and for a `None` detail
+/// (reason unknown → don't guess a draft exists; the owner can act on the
+/// newest card, per the #1199 pointer).
+fn offers_recompose(status: &str, detail: Option<&str>) -> bool {
+    status == "superseded"
+        && detail.is_some_and(|reason| !reason.contains("empty draft body"))
 }
 
 /// #1199 — render a terminal `AlreadyResolved { status, detail }` as
@@ -1448,7 +1531,11 @@ fn classify_custom_id(raw: &str) -> Option<(String, SweptKind)> {
         | Verb::FillAskModal
         | Verb::QuickRefine
         | Verb::SchedulePick
-        | Verb::ScheduleModal => return None,
+        | Verb::ScheduleModal
+        // #1203 — Recompose rides only on the transient recovery ephemeral,
+        // never on a persisted card/notice, so the scrollback sweep must not
+        // classify (and thus try to reconcile) a message on its behalf.
+        | Verb::Recompose => return None,
     };
     Some((parsed.action_id, kind))
 }
@@ -2598,6 +2685,78 @@ mod tests {
     fn resolved_message_handles_missing_detail() {
         assert!(!resolved_message("superseded", None).is_empty());
         assert!(!resolved_message("resolved", None).is_empty());
+    }
+
+    // ---- #1203: Recompose recovery button ----
+
+    /// AC4 — the `Recomposed` outcome renders success copy that promises the
+    /// fresh card AND the durability guarantee (won't be auto-retired again),
+    /// so the owner isn't left wondering whether the reconcile sweep will just
+    /// vanish it a second time.
+    #[test]
+    fn describe_recomposed_promises_fresh_card_and_durability() {
+        let m = describe(&ApprovalActionOutcome::Recomposed);
+        let lm = m.to_lowercase();
+        assert!(lm.contains("recompose"), "got: {m}");
+        assert!(lm.contains("posted below"), "must promise a fresh card: {m}");
+        assert!(
+            lm.contains("won't be") || lm.contains("auto-retired"),
+            "must promise durability: {m}"
+        );
+        // Distinct from the neighbouring outcome copy.
+        assert_ne!(m, describe(&ApprovalActionOutcome::Unscheduled));
+        assert_ne!(
+            m,
+            describe(&ApprovalActionOutcome::AlreadyResolved {
+                status: "superseded".into(),
+                detail: Some("superseded: you already replied on this thread".into()),
+            })
+        );
+    }
+
+    /// AC5 — the pure button gate. True ONLY for a `superseded` row whose reason
+    /// is a legitimate override (still has a draft worth reposting); false for
+    /// the empty-draft supersede (nothing to repost), every non-superseded
+    /// terminal status, and an unknown (`None`) reason.
+    #[test]
+    fn offers_recompose_only_for_recomposable_superseded_reasons() {
+        // Legitimate overrides — the owner may still want the drafted reply.
+        for reason in [
+            "superseded: you already replied on this thread",
+            "superseded: you replied on this thread after scheduling",
+            "superseded: bulk/automated sender, no reply needed",
+            "superseded by manual reply",
+            "superseded by follow-up compose",
+            "superseded: stale",
+            "superseded: something we have never seen before",
+        ] {
+            assert!(
+                offers_recompose("superseded", Some(reason)),
+                "reason {reason:?} should offer Recompose"
+            );
+        }
+
+        // Empty draft (Rule 3 / #484): nothing to repost — no button. Uses the
+        // exact reason string the CLI reconcile sweep persists.
+        assert!(
+            !offers_recompose(
+                "superseded",
+                Some("superseded: no draft to approve (empty draft body)")
+            ),
+            "empty-draft supersede must NOT offer Recompose"
+        );
+
+        // Unknown reason → don't guess a draft exists.
+        assert!(!offers_recompose("superseded", None));
+
+        // Every non-superseded terminal status is off, regardless of detail.
+        for status in ["sent", "sending", "scheduled", "skipped", "rejected", "cancelled"] {
+            assert!(!offers_recompose(status, None), "status {status} off");
+            assert!(
+                !offers_recompose(status, Some("superseded: you already replied on this thread")),
+                "status {status} off even with a superseded-shaped detail"
+            );
+        }
     }
 
     // ---- #501: outcome → message-cleanup decisions ----

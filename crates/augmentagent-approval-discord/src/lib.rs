@@ -97,6 +97,12 @@ pub enum ApprovalActionOutcome {
     /// Cancel succeeded (#501) — scheduled send cancelled
     /// (`scheduled → rejected`), Gmail draft deleted like Skip.
     CancelledSchedule,
+    /// Recompose succeeded (#1203) — the owner restored a superseded draft:
+    /// `superseded → pending`, a fresh approval card reposted, and the row
+    /// marked so the reconcile sweep won't re-retire it. Distinct from
+    /// `Unscheduled` (that path also deletes a scheduled notice; this one has
+    /// none).
+    Recomposed,
     /// The handler attempted the action but hit an error (transient or
     /// permanent). Show the message to the user; the action stays pending so
     /// they can retry.
@@ -316,6 +322,17 @@ pub trait ApprovalActionHandler: Send + Sync {
         let _ = action_id;
         ApprovalActionOutcome::Failed {
             message: "scheduling is not supported by this handler".into(),
+        }
+    }
+
+    /// #1203 — "Recompose" on the recovery ephemeral: restore a superseded
+    /// draft (`superseded → pending`, card reposted, row exempted from the
+    /// reconcile sweep). Default `Failed`: handlers without a store/broker
+    /// (tests, Noop) don't support recovery.
+    async fn recompose(&self, action_id: &str) -> ApprovalActionOutcome {
+        let _ = action_id;
+        ApprovalActionOutcome::Failed {
+            message: "recompose is not supported by this handler".into(),
         }
     }
 
