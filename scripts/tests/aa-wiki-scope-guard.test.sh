@@ -58,14 +58,18 @@ expect_allow() { # <desc> <tool> <key> <path> [extra-env...]
 }
 
 expect_block() { # <desc> <tool> <key> <path> [extra-env...]
+  # A content/scope block is the guard's designed path: deny JSON on stdout,
+  # exit 0. Requiring the JSON (not merely a nonzero exit) means a guard that
+  # crashes to exit 2 with no decision — a fail-open regression Claude Code
+  # would no longer surface a reason for — fails the test instead of passing it.
   local desc="$1"; shift
   local out
   out=$(run_guard "$@")
   local rc=$?
-  if [ "$rc" -ne 0 ] || is_block "$out"; then
+  if [ "$rc" -eq 0 ] && is_block "$out"; then
     ok "$desc"
   else
-    bad "$desc" "guard allowed it: rc=$rc out=$out"
+    bad "$desc" "expected a deny decision (block JSON, rc=0): rc=$rc out=$out"
   fi
 }
 
@@ -126,6 +130,47 @@ expect_block "A non-ASCII digit lookalike is blocked under a UTF-8 locale" \
   Read file_path $'/tmp/aa-txt-\xd9\xa1-0.md' "LANG=en_US.UTF-8"
 expect_block "A non-ASCII session file name is blocked under a UTF-8 locale" \
   Read file_path $'/tmp/aa-imsg/4242-17/n\xc3\xa9.jpeg' "$I_ENV" "LANG=en_US.UTF-8"
+
+# #1078 — instruction/config files Claude Code or Codex auto-load must not be
+# model-writable inside the wiki: a planted one would steer every later wiki
+# call and survive in the private mirror. Case-insensitive, any path component,
+# for Write/Edit/NotebookEdit only. Ordinary pages that merely look similar stay
+# writable, and reads are unaffected.
+expect_block "Write CLAUDE.md at the wiki root is blocked" \
+  Write file_path "$WIKI/CLAUDE.md"
+expect_block "Write people/CLAUDE.md is blocked" \
+  Write file_path "$WIKI/people/CLAUDE.md"
+expect_block "Write lowercase claude.md is blocked (case-insensitive)" \
+  Write file_path "$WIKI/claude.md"
+expect_block "Write CLAUDE.local.md is blocked" \
+  Write file_path "$WIKI/CLAUDE.local.md"
+expect_block "Write under a .claude/ component is blocked" \
+  Write file_path "$WIKI/.claude/settings.json"
+expect_block "Write .mcp.json is blocked" \
+  Write file_path "$WIKI/.mcp.json"
+expect_block "Write AGENTS.md is blocked" \
+  Write file_path "$WIKI/AGENTS.md"
+expect_block "Edit CLAUDE.md is blocked" \
+  Edit file_path "$WIKI/CLAUDE.md"
+expect_block "NotebookEdit of CLAUDE.md (notebook_path arg) is blocked" \
+  NotebookEdit notebook_path "$WIKI/CLAUDE.md"
+expect_allow "Write an ordinary people page is allowed (no false positive)" \
+  Write file_path "$WIKI/people/claude-shannon.md"
+expect_allow "Write claude-notes.md is allowed (not a reserved name)" \
+  Write file_path "$WIKI/claude-notes.md"
+expect_allow "Write mcp-notes.md is allowed (not a reserved name)" \
+  Write file_path "$WIKI/mcp-notes.md"
+expect_allow "Read of CLAUDE.md inside the wiki is allowed (injection rule is write-only)" \
+  Read file_path "$WIKI/CLAUDE.md"
+
+# #1078 hardening — a symlink whose REQUESTED name is a reserved injection file
+# but which resolves to a benign page must still be blocked. `readlink -m`
+# follows the link, so a resolved-path-only check would launder the name; the
+# guard also checks the pre-resolution requested path.
+mkdir -p "$WIKI/sub"
+ln -s ../people/dana.md "$WIKI/sub/CLAUDE.md"
+expect_block "Write a symlink named CLAUDE.md resolving to a benign page is blocked (requested path)" \
+  Write file_path "$WIKI/sub/CLAUDE.md"
 
 printf '\n%d ok, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

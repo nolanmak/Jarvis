@@ -325,6 +325,26 @@ class ToolPolicyTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(bridge.Denied):
                 self.policy.write(name, 'SYNTHETIC_SECRET')
 
+    def test_injection_config_files_are_not_model_writable(self):
+        # #1078 — instruction/config files a later Claude/Codex call auto-loads
+        # (CLAUDE.md, CLAUDE.local.md, .claude, .mcp.json, AGENTS.md) must never
+        # be created by a model write, case-insensitive on any path component;
+        # otherwise a one-off prompt injection persists across calls and through
+        # the private mirror. Parity with the Claude wiki guard.
+        for name in ['CLAUDE.md', 'people/CLAUDE.md', 'claude.md',
+                     'CLAUDE.local.md', 'Claude.local.md', '.claude/settings.json',
+                     '.mcp.json', 'AGENTS.md', 'agents.md']:
+            with self.subTest(name=name), self.assertRaises(bridge.Denied):
+                self.policy.write(name, 'SYNTHETIC_INJECTION')
+        # No false positives: ordinary pages that merely look similar stay writable.
+        for name in ['people/claude-shannon.md', 'claude-notes.md', 'mcp-notes.md']:
+            with self.subTest(name=name):
+                self.policy.write(name, 'synthetic ordinary page')
+                self.assertEqual(self.policy.read(name), 'synthetic ordinary page')
+        # The rule is write-only: reading an existing CLAUDE.md is unaffected.
+        (self.root / 'CLAUDE.md').write_text('planted before the guard')
+        self.assertEqual(self.policy.read('CLAUDE.md'), 'planted before the guard')
+
     def test_command_matches_tokens_and_never_shell_syntax(self):
         self.assertEqual(self.policy.command_argv('printf "hello world"'),
                          ['printf', 'hello world'])

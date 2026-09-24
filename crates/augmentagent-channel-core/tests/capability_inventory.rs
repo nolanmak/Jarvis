@@ -241,7 +241,12 @@ fn core_presets_match_permission_contracts() {
         // FullAgentic (Claude-only) — a fallback provider would silently
         // bypass the guard.
         ("ingest_opts", ingest_opts("Synthetic ingestion instructions".into(), wiki.clone()), FullAgentic, true),
-        ("resume_opts", resume_opts(wiki.clone()), WriteTools, true),
+        // #1078: resume now ships the same PreToolUse scope-guard hook as
+        // ingest, so it classifies FullAgentic for the same reason — a
+        // provider that ignores the hook must not silently serve it. Write
+        // scope is still wiki-only. WriteTools and FullAgentic map to the same
+        // provider set, so no fallback provider loses resume.
+        ("resume_opts", resume_opts(wiki.clone()), FullAgentic, true),
         ("ask_opts", ask_opts(wiki.clone(), fixture.path().into()), FullAgentic, true),
         ("tone_summarize_opts", tone_summarize_opts(), TextOnly, false),
         ("social_adapter_opts", social_adapter_opts("Synthetic adaptation instructions".into()), TextOnly, false),
