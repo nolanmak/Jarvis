@@ -7184,12 +7184,21 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
     // #500 — scheduled sends get Rule 1 ONLY (user replied on the thread),
     // bounded to replies AFTER the schedule was ARMED (its own cutoff, distinct
     // from the pending pass's per-inbound `receivedAt` bound), and retired
-    // through the per-row CAS below. Rule 2 must never run on scheduled rows
+    // through the per-row CAS below — never through the thread-wide
+    // answered_threads flip. Rule 2 must never run on scheduled rows
     // (`fromEmail` on a compose card is the sending account or the replied-to
     // sender, #962 — the bulk-sender heuristic would cancel a scheduled reply
     // to any newsletter-looking address). This durable pass is the backstop for
     // the engine's fire-time guard: a transient failure there would otherwise
     // let the send fire over the owner's manual reply.
+    //
+    // #1191 — the pending pass above never sees a still-`pending`
+    // `--send-at` proposal either: `pending_actions_for_reconcile` filters
+    // `scheduledAtMs IS NULL`, and the answered-thread flip below routes
+    // through `mark_pending_drafts_superseded_by_thread`, which carries the
+    // same guard. A proposal never auto-fires, so it needs no reconcile
+    // cancellation — only the owner's Approve (arm) or the 7-day expiry
+    // retires it. Both guards live in the store so every caller inherits them.
     let mut scheduled_retired = 0usize;
     for (action_id, tid, armed_at_ms) in &scheduled {
         match store.thread_has_user_reply_after(tid, *armed_at_ms) {
@@ -19039,6 +19048,40 @@ mod stale_reconcile_tests {
             status_of(&store, &good),
             "pending",
             "a card with a real draft for a real person must stay in the queue"
+        );
+    }
+
+    /// #1191 — a live `--send-at` proposal must survive the reconcile sweep
+    /// even when its thread already saw a user reply (Rule 1). It is retired
+    /// only by Approve (arm) or the 7-day expiry, never by the no-reply
+    /// heuristics that would leave it `superseded` with no successor card — the
+    /// reported symptom, where Approve then returns AlreadyResolved.
+    #[test]
+    fn keeps_live_send_at_proposals_off_the_no_reply_supersede_paths() {
+        let (store, _t) = fresh_store();
+        // Proposal + plain card share a thread the owner already replied to,
+        // so Rule 1 (answered-thread flip) would otherwise fire on both.
+        let proposal =
+            seed_pending(&store, "m-prop", Some("T-prop"), "Dana Rivera <dana@labs.example.com>"); // pii-ok: synthetic
+        store
+            .set_action_scheduled_at(&proposal, Some(9_000_000_000))
+            .unwrap();
+        let plain =
+            seed_pending(&store, "m-plain", Some("T-prop"), "Dana Rivera <dana@labs.example.com>"); // pii-ok: synthetic
+        store
+            .record_outbound_thread_event("acc", "user-reply-p", Some("T-prop"), 8_000_000)
+            .unwrap();
+
+        reconcile_stale_approvals_tick(&store).unwrap();
+        assert_eq!(
+            status_of(&store, &proposal),
+            "pending",
+            "a live --send-at proposal must survive the reconcile sweep"
+        );
+        assert_eq!(
+            status_of(&store, &plain),
+            "superseded",
+            "the plain card on the answered thread is still retired"
         );
     }
 }
