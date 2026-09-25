@@ -67,7 +67,19 @@ export async function runModel(task, options, signal) {
   let output = "",
     usage,
     lastError,
-    stderrTail = Buffer.alloc(0);
+    stderrTail = Buffer.alloc(0),
+    stderrTruncated = false;
+  // The tail is capped to the last CAP bytes for memory, so once it overflows it
+  // can begin partway through a token. redact() keys on a token's leading shape
+  // (Bearer/sk-/…), so a secret whose prefix was sliced off the front would slip
+  // through as an unrecognizable suffix. Drop that leading partial token before
+  // surfacing: every token that remains either started inside the window (prefix
+  // intact) or is truncated only at the end (prefix intact), so redact() — run
+  // downstream in classifyFailure — sees each remaining secret whole.
+  const stderrDiag = () => {
+    const s = stderrTail.toString("utf8");
+    return stderrTruncated ? s.replace(/^\S*\s*/, "") : s;
+  };
   try {
     return await new Promise((resolve, reject) => {
       const child = spawn(process.env.CODEX_CLI || "codex", args, {
@@ -120,26 +132,22 @@ export async function runModel(task, options, signal) {
       });
       child.stderr.on("data", (chunk) => {
         stderrTail = Buffer.concat([stderrTail, chunk]);
-        if (stderrTail.length > CAP)
+        if (stderrTail.length > CAP) {
           stderrTail = stderrTail.subarray(stderrTail.length - CAP);
+          stderrTruncated = true;
+        }
       });
       child.on("error", (err) => {
         signal.removeEventListener("abort", kill);
         if (signal.aborted) resolve({ usage, cancelled: true });
         else
-          reject(
-            classifyFailure(
-              null,
-              lastError,
-              stderrTail.toString("utf8") || err.message,
-            ),
-          );
+          reject(classifyFailure(null, lastError, stderrDiag() || err.message));
       });
       child.on("close", (code) => {
         signal.removeEventListener("abort", kill);
         if (signal.aborted) resolve({ usage, cancelled: true });
         else if (code !== 0)
-          reject(classifyFailure(code, lastError, stderrTail.toString("utf8")));
+          reject(classifyFailure(code, lastError, stderrDiag()));
         else resolve({ usage });
       });
       child.stdin.end(
@@ -215,10 +223,13 @@ function classifyFailure(code, lastError, stderrTail) {
     err.resetAt = resetText ? isoReset(resetText) : null;
     return err;
   }
-  if (
-    /model[^\n]*(?:not found|unknown|unavailable|does not exist)/i.test(message)
-  ) {
-    const err = Error(message);
+  // Unknown-model text can arrive as a JSON error event (message) or only on
+  // stderr (tail); classify from either so a stderr-only "model not found" is
+  // not misfiled as an opaque provider_error.
+  const unknownModel =
+    /model[^\n]*(?:not found|unknown|unavailable|does not exist)/i;
+  if (unknownModel.test(message) || unknownModel.test(tail)) {
+    const err = Error(message || tail);
     err.code = "model_unavailable";
     return err;
   }

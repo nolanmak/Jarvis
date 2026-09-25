@@ -145,6 +145,20 @@ test("a genuinely unknown model is typed as model_unavailable", async (t) => {
     return true;
   });
 });
+test("an unknown model reported only on stderr is typed as model_unavailable, not provider_error", async (t) => {
+  const dir = await setup(t, "runner-unknown-stderr-");
+  // No JSON error event: the diagnostic lives solely on stderr, as a native
+  // codex prints for a missing model. Classification must consult the tail too.
+  await fakeCodex(dir, {
+    stderr: ["codex: error: model 'gpt-6-astra' not found\n"],
+    code: 1,
+  });
+  await assert.rejects(invoke(dir), (err) => {
+    assert.equal(err.code, "model_unavailable");
+    assert.notEqual(err.code, "provider_error");
+    return true;
+  });
+});
 test("a non-zero exit with no recognizable event is provider_error carrying a bounded stderr tail", async (t) => {
   const dir = await setup(t, "runner-provider-");
   await fakeCodex(dir, {
@@ -164,16 +178,40 @@ test("a full-cap provider stderr tail keeps the prefixed message within CAP", as
   const dir = await setup(t, "runner-provider-cap-");
   // A stderr tail that saturates the byte budget: the "provider_error: "
   // prefix must count against CAP, not be added on top of an already full-cap
-  // detail. Regression for the prefix pushing err.message past CAP.
+  // detail. Regression for the prefix pushing err.message past CAP. Whitespace-
+  // separated words keep the surfaced tail near-full after the sliced leading
+  // fragment is dropped, so the prefix accounting is actually exercised.
   await fakeCodex(dir, {
     stdout: ["this line is not json\n"],
-    stderr: ["E".repeat(CAP * 2) + "\n"],
+    stderr: [("verbose failure detail ".repeat(4) + "\n").repeat(40)],
     code: 1,
   });
   await assert.rejects(invoke(dir), (err) => {
     assert.equal(err.code, "provider_error");
+    assert.ok(err.detail && err.detail.length > 0);
     assert.ok(Buffer.byteLength(err.message, "utf8") <= CAP);
     assert.ok(Buffer.byteLength(err.detail, "utf8") <= CAP);
+    return true;
+  });
+});
+test("a secret straddling the cap boundary is dropped, not surfaced as an unredacted suffix", async (t) => {
+  const dir = await setup(t, "runner-redact-boundary-");
+  // Place a Bearer token so the last-CAP-bytes window begins inside it: the
+  // "Bearer " prefix that redact() keys on falls off the front. Retaining the
+  // raw suffix would leak the token, so the sliced leading fragment must be
+  // discarded before the tail is surfaced. The token is 30 word chars — no
+  // Bearer prefix once sliced, and < 40 so it also escapes the base64 catch-all.
+  const marker = "LEAKMARKER0";
+  const token = "k".repeat(19) + marker;
+  const trailer = "t".repeat(CAP - 31);
+  await fakeCodex(dir, {
+    stderr: ["x".repeat(600) + " Bearer " + token + "\n" + trailer],
+    code: 1,
+  });
+  await assert.rejects(invoke(dir), (err) => {
+    assert.equal(err.code, "provider_error");
+    for (const field of [err.message, err.detail])
+      assert.ok(!String(field ?? "").includes(marker));
     return true;
   });
 });
