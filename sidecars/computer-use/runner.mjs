@@ -3,6 +3,8 @@ import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
+// Byte cap on any diagnostic tail we surface on a rejection.
+export const CAP = 2048;
 export async function runModel(task, options, signal) {
   const dir = await mkdtemp(join(options.stateDirectory, "model-"));
   const instructions = join(dir, "instructions.md");
@@ -63,7 +65,9 @@ export async function runModel(task, options, signal) {
     args.push("-c", `${key}=${toml(value)}`);
   args.push("-");
   let output = "",
-    usage;
+    usage,
+    lastError,
+    stderrTail = Buffer.alloc(0);
   try {
     return await new Promise((resolve, reject) => {
       const child = spawn(process.env.CODEX_CLI || "codex", args, {
@@ -94,16 +98,48 @@ export async function runModel(task, options, signal) {
           try {
             const v = JSON.parse(line);
             if (v.type === "turn.completed") usage = v.usage;
+            else if (
+              v.type === "error" &&
+              typeof v.message === "string" &&
+              v.message
+            )
+              lastError = v.message;
+            else if (v.type === "turn.failed" && !lastError) {
+              const e = v.error;
+              const m =
+                typeof e === "string"
+                  ? e
+                  : e && typeof e.message === "string"
+                    ? e.message
+                    : "";
+              if (m) lastError = m;
+            }
           } catch {}
         }
         if (output.length > 1000000) kill();
       });
-      child.stderr.resume();
-      child.on("error", () => reject(Error("model_unavailable")));
+      child.stderr.on("data", (chunk) => {
+        stderrTail = Buffer.concat([stderrTail, chunk]);
+        if (stderrTail.length > CAP)
+          stderrTail = stderrTail.subarray(stderrTail.length - CAP);
+      });
+      child.on("error", (err) => {
+        signal.removeEventListener("abort", kill);
+        if (signal.aborted) resolve({ usage, cancelled: true });
+        else
+          reject(
+            classifyFailure(
+              null,
+              lastError,
+              stderrTail.toString("utf8") || err.message,
+            ),
+          );
+      });
       child.on("close", (code) => {
         signal.removeEventListener("abort", kill);
         if (signal.aborted) resolve({ usage, cancelled: true });
-        else if (code !== 0) reject(Error("model_unavailable"));
+        else if (code !== 0)
+          reject(classifyFailure(code, lastError, stderrTail.toString("utf8")));
         else resolve({ usage });
       });
       child.stdin.end(
@@ -124,6 +160,77 @@ export async function runModel(task, options, signal) {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+}
+// Mirrors evidence.mjs's redaction posture (email, Bearer) and extends it to
+// the secret shapes a provider error might leak (API keys, long hex/base64).
+function redact(text) {
+  return String(text ?? "")
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[email redacted]")
+    .replace(/\b(Bearer\s+)[\w.-]+/gi, "$1[redacted]")
+    .replace(/\bsk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}/gi, "[secret redacted]")
+    .replace(/\b[0-9a-f]{32,}\b/gi, "[secret redacted]")
+    .replace(/\b[A-Za-z0-9+/]{40,}={0,2}/g, "[secret redacted]");
+}
+// Truncate to at most `cap` UTF-8 bytes without splitting a multi-byte
+// character. String.slice caps UTF-16 code units, which for non-ASCII text
+// (e.g. CJK) lets the surfaced tail run several times past the byte budget we
+// persist and log; a byte cap keeps every branch within CAP.
+function capBytes(text, cap) {
+  const buf = Buffer.from(String(text ?? ""), "utf8");
+  if (buf.length <= cap) return buf.toString("utf8");
+  // Back off cap onto a lead byte: UTF-8 continuation bytes are 0b10xxxxxx.
+  let end = cap;
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
+  return buf.subarray(0, end).toString("utf8");
+}
+// Best-effort ISO for a reset phrase; null unless it carries a timezone/offset.
+function isoReset(text) {
+  const zoned =
+    /[+-]\d{2}:?\d{2}\b/.test(text) ||
+    /\b(?:UTC|GMT|Z|[A-Z]{2,5}T)\b/.test(text);
+  if (!zoned) return null;
+  const ms = Date.parse(text);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+// Turn a non-zero codex exit into a typed Error whose stable `code` lets the
+// caller distinguish a quota wall (retryable at a time) from a missing model
+// or an opaque provider failure, instead of one shared literal.
+function classifyFailure(code, lastError, stderrTail) {
+  // Cap both diagnostic sources up front so every branch — not just
+  // provider_error — honors CAP, even when lastError is an arbitrarily large
+  // JSON error message that never passed through the stderr byte cap.
+  const message = capBytes(redact(lastError), CAP);
+  const tail = capBytes(redact(stderrTail), CAP);
+  const usageSource = /usage limit/i.test(message)
+    ? message
+    : /usage limit/i.test(tail)
+      ? tail
+      : null;
+  if (usageSource) {
+    const m = usageSource.match(/try again at ([^.]+)/i);
+    const resetText = m ? m[1].trim() : null;
+    const err = Error(message || tail || "usage_limit");
+    err.code = "usage_limit";
+    err.resetText = resetText;
+    err.resetAt = resetText ? isoReset(resetText) : null;
+    return err;
+  }
+  if (
+    /model[^\n]*(?:not found|unknown|unavailable|does not exist)/i.test(message)
+  ) {
+    const err = Error(message);
+    err.code = "model_unavailable";
+    return err;
+  }
+  const detail = message || tail;
+  // Re-cap after prefixing: `detail` is already <= CAP, but the
+  // "provider_error: " prefix would otherwise push err.message past CAP.
+  const err = Error(
+    detail ? capBytes(`provider_error: ${detail}`, CAP) : "provider_error",
+  );
+  err.code = "provider_error";
+  err.detail = detail;
+  return err;
 }
 function toml(value) {
   if (typeof value === "object" && !Array.isArray(value))
