@@ -49,6 +49,26 @@ test("restart fences running tasks and resumes once without resetting budget or 
   assert.equal(b.model, "gpt-6-astra");
   assert.equal(s.resume("owner", a.id, "resume1").generation, b.generation);
 });
+test("typed failure fields persist additively through update and survive get verbatim", (t) => {
+  const s = new Tasks(fixture(t));
+  const a = s.start("owner", "e", input);
+  const g = s.claim(a.id);
+  s.update(a.id, g, {
+    status: "needs_action",
+    reason: "provider_error: worker crashed",
+    code: "provider_error",
+    resetText: "Sep 24th, 2026 4:18 AM",
+    resetAt: null,
+  });
+  const got = s.get("owner", a.id);
+  assert.equal(got.status, "needs_action");
+  assert.equal(got.code, "provider_error");
+  assert.equal(got.resetText, "Sep 24th, 2026 4:18 AM");
+  assert.ok("resetAt" in got && got.resetAt === null);
+  // Additive: the merge drops no pre-existing row field.
+  assert.equal(got.model, "gpt-6-astra");
+  assert.equal(got.owner, "owner");
+});
 test("cancel fences pending model results and preserves evidence", (t) => {
   const s = new Tasks(fixture(t));
   const a = s.start("owner", "e", input);

@@ -3,7 +3,50 @@ import assert from "node:assert/strict";
 import { mkdtemp, writeFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runModel } from "../runner.mjs";
+import { runModel, CAP } from "../runner.mjs";
+function invoke(dir, signal = new AbortController().signal) {
+  return runModel(
+    {
+      model: "gpt-6-astra",
+      goal: "fixture",
+      hosts: ["fixture.test"],
+      actions: 0,
+      evidence: [],
+    },
+    { stateDirectory: dir, socket: join(dir, "unused"), token: "synthetic" },
+    signal,
+  );
+}
+// A fake `codex` that emits canned --json stdout / stderr then exits with the
+// chosen code, waiting for stdin to close so the parent's write never EPIPEs.
+async function fakeCodex(dir, { stdout = [], stderr = [], code = 0 }) {
+  const emit = (fd, items) =>
+    items.map((s) => `fs.writeSync(${fd}, ${JSON.stringify(s)});`).join("\n");
+  const lines = stdout.map((o) =>
+    typeof o === "string" ? o : JSON.stringify(o) + "\n",
+  );
+  const body =
+    'const fs = require("node:fs");\n' +
+    emit(1, lines) +
+    "\n" +
+    emit(2, stderr) +
+    "\n" +
+    'process.stdin.on("data", () => {});\n' +
+    `process.stdin.on("end", () => process.exit(${code}));\n`;
+  const bin = join(dir, "fake-codex");
+  await writeFile(bin, "#!/usr/bin/env node\n" + body, { mode: 0o700 });
+  process.env.CODEX_CLI = bin;
+}
+async function setup(t, prefix) {
+  const dir = await mkdtemp(join(tmpdir(), prefix));
+  const prior = process.env.CODEX_CLI;
+  t.after(async () => {
+    if (prior === undefined) delete process.env.CODEX_CLI;
+    else process.env.CODEX_CLI = prior;
+    await rm(dir, { recursive: true, force: true });
+  });
+  return dir;
+}
 test("cancellation kills a pending provider call promptly and removes its private files", async (t) => {
   const dir = await mkdtemp(join(tmpdir(), "runner-cancel-"));
   const bin = join(dir, "fake-codex");
@@ -38,7 +81,7 @@ test("cancellation kills a pending provider call promptly and removes its privat
   assert.ok(Date.now() - start < 5000);
   assert.deepEqual(await readdir(dir), ["fake-codex"]);
 });
-test("missing native provider is a typed unavailable result and leaves no private files", async (t) => {
+test("missing native provider surfaces provider_error, not a bare model_unavailable, and leaves no private files", async (t) => {
   const dir = await mkdtemp(join(tmpdir(), "runner-unavailable-"));
   const prior = process.env.CODEX_CLI;
   process.env.CODEX_CLI = join(dir, "absent-codex");
@@ -47,19 +90,188 @@ test("missing native provider is a typed unavailable result and leaves no privat
     else process.env.CODEX_CLI = prior;
     await rm(dir, { recursive: true, force: true });
   });
-  await assert.rejects(
-    runModel(
-      {
-        model: "gpt-6-astra",
-        goal: "fixture",
-        hosts: ["fixture.test"],
-        actions: 0,
-        evidence: [],
-      },
-      { stateDirectory: dir, socket: join(dir, "unused"), token: "synthetic" },
-      new AbortController().signal,
-    ),
-    /model_unavailable/,
-  );
+  await assert.rejects(invoke(dir), (err) => {
+    assert.equal(err.code, "provider_error");
+    return true;
+  });
   assert.deepEqual(await readdir(dir), []);
+});
+test("a usage-limit wall is typed as usage_limit with the reset phrase, never collapsed to model_unavailable", async (t) => {
+  const dir = await setup(t, "runner-usage-");
+  await fakeCodex(dir, {
+    stdout: [
+      {
+        type: "error",
+        message:
+          "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 24th, 2026 4:18 AM.",
+      },
+      { type: "turn.failed", error: { message: "turn failed" } },
+    ],
+    code: 1,
+  });
+  await assert.rejects(invoke(dir), (err) => {
+    assert.equal(err.code, "usage_limit");
+    assert.notEqual(err.code, "model_unavailable");
+    assert.equal(err.resetText, "Sep 24th, 2026 4:18 AM");
+    assert.equal(err.resetAt, null);
+    assert.match(err.message, /usage limit/);
+    return true;
+  });
+});
+test("an oversized non-ASCII terminal lastError is bounded to CAP by bytes, not code units", async (t) => {
+  const dir = await setup(t, "runner-cap-");
+  // A JSON error event never passes through the stderr byte cap, so its message
+  // is the unbounded source. CAP is a byte budget: a usage-limit wall trailed by
+  // 2,048 CJK characters (~6 KiB in UTF-8) must still surface no more than CAP
+  // BYTES — a code-unit slice would pass ~2,048 chars straight through.
+  await fakeCodex(dir, {
+    stdout: [{ type: "error", message: "usage limit " + "中".repeat(2048) }],
+    code: 1,
+  });
+  await assert.rejects(invoke(dir), (err) => {
+    assert.equal(err.code, "usage_limit");
+    assert.ok(Buffer.byteLength(err.message, "utf8") <= CAP);
+    return true;
+  });
+});
+test("a genuinely unknown model is typed as model_unavailable", async (t) => {
+  const dir = await setup(t, "runner-unknown-model-");
+  await fakeCodex(dir, {
+    stdout: [{ type: "error", message: "model 'gpt-6-astra' not found" }],
+    code: 1,
+  });
+  await assert.rejects(invoke(dir), (err) => {
+    assert.equal(err.code, "model_unavailable");
+    return true;
+  });
+});
+test("an unknown model reported only on stderr is typed as model_unavailable, not provider_error", async (t) => {
+  const dir = await setup(t, "runner-unknown-stderr-");
+  // No JSON error event: the diagnostic lives solely on stderr, as a native
+  // codex prints for a missing model. Classification must consult the tail too.
+  await fakeCodex(dir, {
+    stderr: ["codex: error: model 'gpt-6-astra' not found\n"],
+    code: 1,
+  });
+  await assert.rejects(invoke(dir), (err) => {
+    assert.equal(err.code, "model_unavailable");
+    assert.notEqual(err.code, "provider_error");
+    return true;
+  });
+});
+test("a temporary capacity failure ('model temporarily unavailable') is provider_error, not model_unavailable", async (t) => {
+  const dir = await setup(t, "runner-capacity-");
+  // An upstream capacity wall, not a missing model: "unavailable" alone must
+  // not force model_unavailable. It falls through to provider_error.
+  await fakeCodex(dir, {
+    stdout: [
+      { type: "error", message: "model temporarily unavailable, please retry" },
+    ],
+    code: 1,
+  });
+  await assert.rejects(invoke(dir), (err) => {
+    assert.equal(err.code, "provider_error");
+    assert.notEqual(err.code, "model_unavailable");
+    return true;
+  });
+});
+test("a non-zero exit with no recognizable event is provider_error carrying a bounded stderr tail", async (t) => {
+  const dir = await setup(t, "runner-provider-");
+  await fakeCodex(dir, {
+    stdout: ["this line is not json\n"],
+    stderr: ["codex: fatal: worker crashed unexpectedly\n"],
+    code: 1,
+  });
+  await assert.rejects(invoke(dir), (err) => {
+    assert.equal(err.code, "provider_error");
+    assert.ok(err.detail && err.detail.length > 0);
+    assert.ok(err.detail.length <= CAP);
+    assert.match(err.detail, /worker crashed/);
+    return true;
+  });
+});
+test("a full-cap provider stderr tail keeps the prefixed message within CAP", async (t) => {
+  const dir = await setup(t, "runner-provider-cap-");
+  // A stderr tail that saturates the byte budget: the "provider_error: "
+  // prefix must count against CAP, not be added on top of an already full-cap
+  // detail. Regression for the prefix pushing err.message past CAP. Whitespace-
+  // separated words keep the surfaced tail near-full after the sliced leading
+  // fragment is dropped, so the prefix accounting is actually exercised.
+  await fakeCodex(dir, {
+    stdout: ["this line is not json\n"],
+    stderr: [("verbose failure detail ".repeat(4) + "\n").repeat(40)],
+    code: 1,
+  });
+  await assert.rejects(invoke(dir), (err) => {
+    assert.equal(err.code, "provider_error");
+    assert.ok(err.detail && err.detail.length > 0);
+    assert.ok(Buffer.byteLength(err.message, "utf8") <= CAP);
+    assert.ok(Buffer.byteLength(err.detail, "utf8") <= CAP);
+    return true;
+  });
+});
+test("a secret straddling the cap boundary is dropped, not surfaced as an unredacted suffix", async (t) => {
+  const dir = await setup(t, "runner-redact-boundary-");
+  // Place a Bearer token so the last-CAP-bytes window begins inside it: the
+  // "Bearer " prefix that redact() keys on falls off the front. Retaining the
+  // raw suffix would leak the token, so the sliced leading fragment must be
+  // discarded before the tail is surfaced. The token is 30 word chars — no
+  // Bearer prefix once sliced, and < 40 so it also escapes the base64 catch-all.
+  const marker = "LEAKMARKER0";
+  const token = "k".repeat(19) + marker;
+  const trailer = "t".repeat(CAP - 31);
+  await fakeCodex(dir, {
+    stderr: ["x".repeat(600) + " Bearer " + token + "\n" + trailer],
+    code: 1,
+  });
+  await assert.rejects(invoke(dir), (err) => {
+    assert.equal(err.code, "provider_error");
+    for (const field of [err.message, err.detail])
+      assert.ok(!String(field ?? "").includes(marker));
+    return true;
+  });
+});
+test("secrets injected into stderr are redacted from every surfaced field", async (t) => {
+  const dir = await setup(t, "runner-redact-");
+  const SECRET = "TOPSECRETtoken1234567890abcdefABCDEF";
+  await fakeCodex(dir, {
+    stderr: [`auth failed Authorization: Bearer ${SECRET}\n`],
+    code: 1,
+  });
+  await assert.rejects(invoke(dir), (err) => {
+    assert.equal(err.code, "provider_error");
+    for (const field of [err.message, err.detail, err.resetText])
+      assert.ok(!String(field ?? "").includes(SECRET));
+    return true;
+  });
+});
+test("a prefixed provider token (github ghp_) is redacted from every surfaced field", async (t) => {
+  const dir = await setup(t, "runner-redact-ghp-");
+  // Regression: a `ghp_` credential escapes every entropy catch-all — the
+  // underscore breaks the base64 run and its 36-char mixed-case body is neither
+  // hex nor >= 40 base64 chars — so without an explicit prefix rule it persists
+  // in reason. Inject it into both diagnostic sources (stdout error + stderr).
+  const SECRET = "ghp_" + "A1b2C3d4E5f6".repeat(3);
+  await fakeCodex(dir, {
+    stdout: [
+      { type: "error", message: `provider auth rejected token ${SECRET}` },
+    ],
+    stderr: [`codex: error: bad credentials ${SECRET}\n`],
+    code: 1,
+  });
+  await assert.rejects(invoke(dir), (err) => {
+    assert.equal(err.code, "provider_error");
+    for (const field of [err.message, err.detail, err.resetText])
+      assert.ok(!String(field ?? "").includes(SECRET));
+    return true;
+  });
+});
+test("a clean exit reporting turn.completed still resolves with usage", async (t) => {
+  const dir = await setup(t, "runner-success-");
+  await fakeCodex(dir, {
+    stdout: [{ type: "turn.completed", usage: { total_tokens: 7 } }],
+    code: 0,
+  });
+  const result = await invoke(dir);
+  assert.deepEqual(result.usage, { total_tokens: 7 });
 });

@@ -121,7 +121,7 @@ async function execute(t) {
     },
     Math.max(1, 300000 - t.elapsedMs),
   );
-  let result, reason, usage;
+  let result, reason, usage, failure;
   try {
     await session.open(t.hosts);
     const r = await runModel(
@@ -134,6 +134,12 @@ async function execute(t) {
     if (!result) reason = current.reason ?? "model_finished_without_evidence";
   } catch (e) {
     reason = e.message;
+    if (e.code)
+      failure = {
+        code: e.code,
+        resetAt: e.resetAt ?? null,
+        resetText: e.resetText ?? null,
+      };
   } finally {
     clearTimeout(timeout);
     try {
@@ -148,10 +154,16 @@ async function execute(t) {
       });
       if (result && !reason) tasks.finish(t.id, generation, result);
       else
+        // tasks.update merges via Object.assign and get() returns the row
+        // verbatim, so these typed failure fields persist; report() spreads the
+        // row and mcp.mjs stringifies it as a plain-text tool result (no strict
+        // schema), so they reach Jarvis additively — old consumers ignore them,
+        // new ones can act on `code`/`resetAt`/`resetText`.
         tasks.update(t.id, generation, {
           status:
             reason === "time_budget_exhausted" ? "partial" : "needs_action",
           reason,
+          ...(failure ?? {}),
         });
     } catch {
       /* cancellation fenced the worker */
