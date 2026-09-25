@@ -15,6 +15,32 @@ export const RESPONSE_BODY_CAP = 64 * 1024;
 export const RESPONSE_ENTRY_CAP = 4;
 export const RESPONSE_TOTAL_CAP = 128 * 1024;
 
+// Interactive accessibility roles. Any AX node computing to one of these is
+// actionable and is surfaced from the accessibility tree even when the fixed
+// DOM selector scrape misses it (e.g. a <div role="link"> the selector list,
+// which only enumerates role="button"/combobox/option/tab/gridcell/checkbox,
+// never matches).
+const ACTIONABLE_ROLES = new Set([
+  "button",
+  "link",
+  "checkbox",
+  "radio",
+  "switch",
+  "tab",
+  "menuitem",
+  "menuitemcheckbox",
+  "menuitemradio",
+  "option",
+  "combobox",
+  "listbox",
+  "textbox",
+  "searchbox",
+  "slider",
+  "spinbutton",
+  "gridcell",
+  "treeitem",
+]);
+
 export class BrowserSession {
   constructor(options) {
     this.options = options;
@@ -275,6 +301,7 @@ export class BrowserSession {
             : null,
       };
     }, prefix);
+    await this.groundOnAxTree(data.elements, prefix);
     this.refs = new Map(data.elements.map((e) => [e.ref, e]));
     return {
       ...data,
@@ -289,6 +316,98 @@ export class BrowserSession {
         timeout: 4000,
       }),
     };
+  }
+  // Ground the emitted element set on Chromium's own computed accessibility
+  // tree. The literal DOM scrape above gives cheap, visibility-filtered refs
+  // for the elements a fixed selector list matches; this pass then
+  //   (a) overwrites each of their roles/labels with the AX-computed role and
+  //       name, so externally-labelled inputs (<label for>, aria-labelledby)
+  //       and implicit-role elements (<a href> -> "link") ground correctly, and
+  //   (b) appends the actionable AX nodes the selector list never matched
+  //       (e.g. <div role="link">), stamping each one a data-jarvis-ref so
+  //       act() resolves it exactly like a scraped ref.
+  // The 250 cap is honoured across both sets, and any CDP failure (including a
+  // failed session handshake, caught inside the try) falls back to the literal
+  // scrape. One getFullAXTree plus one DOM.getDocument walk key everything by
+  // the document-global backend id, so the join needs no per-node round-trips.
+  async groundOnAxTree(elements, prefix) {
+    let cdp;
+    try {
+      cdp = await this.context.newCDPSession(this.page);
+      const { nodes } = await cdp.send("Accessibility.getFullAXTree");
+      const computed = new Map();
+      for (const node of nodes) {
+        if (node.ignored || node.backendDOMNodeId == null) continue;
+        computed.set(node.backendDOMNodeId, {
+          role: node.role?.value,
+          name: node.name?.value,
+        });
+      }
+      const { root } = await cdp.send("DOM.getDocument", {
+        depth: -1,
+        pierce: false,
+      });
+      const refToBackend = new Map();
+      const byBackend = new Map();
+      const walk = (node) => {
+        byBackend.set(node.backendNodeId, node);
+        const attrs = node.attributes ?? [];
+        for (let i = 0; i < attrs.length; i += 2)
+          if (attrs[i] === "data-jarvis-ref")
+            refToBackend.set(attrs[i + 1], node.backendNodeId);
+        for (const child of node.children ?? []) walk(child);
+      };
+      walk(root);
+      // `covered` holds only the backend ids the CURRENT scrape emitted -- NOT
+      // every data-jarvis-ref in the live DOM. An AX-only node (e.g. a
+      // <div role="link"> the selector list never matches) keeps its stamped ref
+      // across snapshots because the scrape never re-stamps it, so seeding
+      // covered from refToBackend.values() would mark that node covered on every
+      // repeat snapshot -- discovery below would skip it and it would silently
+      // drop out of the grounded set. Seeding from the emitted refs instead lets
+      // discovery re-emit (and re-stamp) it each time.
+      const covered = new Set();
+      for (const el of elements) {
+        const backend = refToBackend.get(el.ref);
+        if (backend != null) covered.add(backend);
+        const c = computed.get(backend);
+        if (!c) continue;
+        if (c.role) el.role = c.role;
+        if (c.name) el.label = c.name.slice(0, 250);
+      }
+      // Discovery: actionable AX nodes the selector scrape never emitted. Each
+      // is stamped in the live DOM so its ref resolves through act(); the cap
+      // is shared with the scrape so the set stays <= 250.
+      for (const [backendId, c] of computed) {
+        if (elements.length >= 250) break;
+        if (covered.has(backendId) || !ACTIONABLE_ROLES.has(c.role)) continue;
+        const node = byBackend.get(backendId);
+        if (!node) continue;
+        covered.add(backendId);
+        const ref = prefix + "-" + elements.length;
+        await cdp.send("DOM.setAttributeValue", {
+          nodeId: node.nodeId,
+          name: "data-jarvis-ref",
+          value: ref,
+        });
+        const attrs = node.attributes ?? [];
+        let type;
+        for (let i = 0; i < attrs.length; i += 2)
+          if (attrs[i] === "type") type = attrs[i + 1];
+        elements.push({
+          ref,
+          tag: node.nodeName,
+          role: c.role,
+          label: (c.name ?? "").slice(0, 250),
+          value: undefined,
+          type,
+        });
+      }
+    } catch {
+      // Best-effort grounding: fall back to the literal-scrape values.
+    } finally {
+      if (cdp) await cdp.detach().catch(() => {});
+    }
   }
   // Capture the off-the-wire body of a successful (2xx) text/JSON XHR/fetch
   // response for an allowed host as first-class evidence. Headers/cookies are
