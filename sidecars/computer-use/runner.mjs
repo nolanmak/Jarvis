@@ -176,6 +176,14 @@ function redact(text) {
     .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[email redacted]")
     .replace(/\b(Bearer\s+)[\w.-]+/gi, "$1[redacted]")
     .replace(/\bsk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}/gi, "[secret redacted]")
+    // Prefixed provider tokens the entropy catch-alls miss: an internal
+    // underscore/dash breaks the base64 run and a mixed-case body defeats the
+    // hex rule, so e.g. a GitHub `ghp_`/`github_pat_` credential would survive.
+    // Match the well-known prefixes explicitly, as the sk- rule already does.
+    .replace(
+      /\b(?:gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AKIA|ASIA)[A-Za-z0-9_-]{16,}/g,
+      "[secret redacted]",
+    )
     .replace(/\b[0-9a-f]{32,}\b/gi, "[secret redacted]")
     .replace(/\b[A-Za-z0-9+/]{40,}={0,2}/g, "[secret redacted]");
 }

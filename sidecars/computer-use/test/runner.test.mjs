@@ -229,6 +229,27 @@ test("secrets injected into stderr are redacted from every surfaced field", asyn
     return true;
   });
 });
+test("a prefixed provider token (github ghp_) is redacted from every surfaced field", async (t) => {
+  const dir = await setup(t, "runner-redact-ghp-");
+  // Regression: a `ghp_` credential escapes every entropy catch-all — the
+  // underscore breaks the base64 run and its 36-char mixed-case body is neither
+  // hex nor >= 40 base64 chars — so without an explicit prefix rule it persists
+  // in reason. Inject it into both diagnostic sources (stdout error + stderr).
+  const SECRET = "ghp_" + "A1b2C3d4E5f6".repeat(3);
+  await fakeCodex(dir, {
+    stdout: [
+      { type: "error", message: `provider auth rejected token ${SECRET}` },
+    ],
+    stderr: [`codex: error: bad credentials ${SECRET}\n`],
+    code: 1,
+  });
+  await assert.rejects(invoke(dir), (err) => {
+    assert.equal(err.code, "provider_error");
+    for (const field of [err.message, err.detail, err.resetText])
+      assert.ok(!String(field ?? "").includes(SECRET));
+    return true;
+  });
+});
 test("a clean exit reporting turn.completed still resolves with usage", async (t) => {
   const dir = await setup(t, "runner-success-");
   await fakeCodex(dir, {
