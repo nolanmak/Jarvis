@@ -159,6 +159,22 @@ test("an unknown model reported only on stderr is typed as model_unavailable, no
     return true;
   });
 });
+test("a temporary capacity failure ('model temporarily unavailable') is provider_error, not model_unavailable", async (t) => {
+  const dir = await setup(t, "runner-capacity-");
+  // An upstream capacity wall, not a missing model: "unavailable" alone must
+  // not force model_unavailable. It falls through to provider_error.
+  await fakeCodex(dir, {
+    stdout: [
+      { type: "error", message: "model temporarily unavailable, please retry" },
+    ],
+    code: 1,
+  });
+  await assert.rejects(invoke(dir), (err) => {
+    assert.equal(err.code, "provider_error");
+    assert.notEqual(err.code, "model_unavailable");
+    return true;
+  });
+});
 test("a non-zero exit with no recognizable event is provider_error carrying a bounded stderr tail", async (t) => {
   const dir = await setup(t, "runner-provider-");
   await fakeCodex(dir, {

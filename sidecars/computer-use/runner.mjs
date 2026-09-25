@@ -233,9 +233,14 @@ function classifyFailure(code, lastError, stderrTail) {
   }
   // Unknown-model text can arrive as a JSON error event (message) or only on
   // stderr (tail); classify from either so a stderr-only "model not found" is
-  // not misfiled as an opaque provider_error.
-  const unknownModel =
-    /model[^\n]*(?:not found|unknown|unavailable|does not exist)/i;
+  // not misfiled as an opaque provider_error. `model_unavailable` is reserved
+  // for a genuinely missing/unknown model, so match only phrasings that mean
+  // that ("not found"/"unknown"/"does not exist"). A bare "unavailable" is
+  // deliberately excluded: codex prints "model temporarily unavailable" for an
+  // upstream capacity wall, and masks quota walls behind the literal
+  // "model_unavailable" token — neither is a missing model, so both fall
+  // through to provider_error (usage walls carrying "usage limit" type above).
+  const unknownModel = /model[^\n]*(?:not found|unknown|does not exist)/i;
   if (unknownModel.test(message) || unknownModel.test(tail)) {
     const err = Error(message || tail);
     err.code = "model_unavailable";
