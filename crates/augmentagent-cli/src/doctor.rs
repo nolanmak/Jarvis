@@ -1057,10 +1057,14 @@ fn check_handoff_journals() -> Finding {
         return Finding::ok("handoff_journals", "no HOME; journal root unknown");
     };
     let grace = handoff::retention_from_env();
-    handoff_journal_finding(handoff::sweep_finished(&root, grace, true), grace)
+    // #1071 — the same orphan pass the daemon runs at start, read-only, so doctor
+    // can say how many markers are clearable and how many predate the upgrade.
+    let orphans = handoff::clear_orphaned_markers(&root, &handoff::LivenessEnv::probe(), true);
+    handoff_journal_finding(handoff::sweep_finished(&root, grace, true), orphans.unwrap_or_default(), grace)
 }
 
-fn handoff_journal_finding(report: Result<handoff::SweepReport>, grace: Duration) -> Finding {
+fn handoff_journal_finding(report: Result<handoff::SweepReport>, orphans: handoff::OrphanReport,
+    grace: Duration) -> Finding {
     const NAME: &str = "handoff_journals";
     const HINT: &str = "augmentagent handoff-prune --dry-run";
     let report = match report {
@@ -1069,7 +1073,8 @@ fn handoff_journal_finding(report: Result<handoff::SweepReport>, grace: Duration
     };
     let msg = format!(
         "{} request dirs, {} MB; {} finished past the {}h grace ({} by over two sweep intervals); \
-         for information: {} unfinished (operator recovery), {} with lifecycle markers",
+         for information: {} unfinished (operator recovery), {} with lifecycle markers \
+         ({} orphaned, {} written before the marker upgrade)",
         report.requests,
         report.bytes / (1024 * 1024),
         report.removed,
@@ -1077,7 +1082,15 @@ fn handoff_journal_finding(report: Result<handoff::SweepReport>, grace: Duration
         report.finished_overdue,
         report.kept_unfinished,
         report.kept_active,
+        orphans.cleared,
+        orphans.kept_legacy,
     );
+    // The daemon clears every provable orphan at start, so one still here
+    // means that pass is not running (#1071).
+    if orphans.cleared > 0 {
+        let msg = format!("{msg} — orphaned markers are not being cleared at daemon start");
+        return Finding::warn(NAME, msg, Some(HINT));
+    }
     // A live sweep removes every finished journal within two intervals of its
     // expiry, so one still here means the sweep stopped (#1035 review).
     if report.finished_overdue > 0 {
@@ -1946,8 +1959,16 @@ mod tests {
             kept_unfinished: 2,
             ..Default::default()
         };
-        let ok = handoff_journal_finding(Ok(healthy), grace);
+        // #1071 — a legacy marker is information (only an operator can retire
+        // one); a *clearable* orphan is a warning, the start-up pass missed it.
+        let legacy = handoff::OrphanReport { kept_live: 1, kept_legacy: 2, ..Default::default() };
+        let ok = handoff_journal_finding(Ok(healthy), legacy, grace);
         assert_eq!(ok.severity, Severity::Ok, "{}", ok.message);
+        assert!(ok.message.contains("0 orphaned, 2 written before the marker upgrade"), "{}", ok.message);
+        let stuck = handoff::OrphanReport { cleared: 1, ..legacy };
+        let stuck_finding = handoff_journal_finding(Ok(healthy), stuck, grace);
+        assert!(stuck_finding.message.contains("not being cleared at daemon start"),
+            "{}", stuck_finding.message);
         // Counts only request dirs, and reports what needs an operator as information.
         assert!(
             ok.message.contains("420 request dirs") && !ok.message.contains("423"),
@@ -1973,7 +1994,7 @@ mod tests {
             finished_overdue: 1,
             ..healthy
         };
-        let stalled_finding = handoff_journal_finding(Ok(stalled), grace);
+        let stalled_finding = handoff_journal_finding(Ok(stalled), legacy, grace);
         assert!(
             stalled_finding
                 .message
@@ -1983,10 +2004,11 @@ mod tests {
         );
         let refused = Err(anyhow::anyhow!("handoff directory is not private"));
         for finding in [
-            handoff_journal_finding(Ok(many), grace),
-            handoff_journal_finding(Ok(large), grace),
+            handoff_journal_finding(Ok(many), legacy, grace),
+            handoff_journal_finding(Ok(large), legacy, grace),
             stalled_finding,
-            handoff_journal_finding(refused, grace),
+            stuck_finding,
+            handoff_journal_finding(refused, legacy, grace),
         ] {
             assert_eq!(finding.severity, Severity::Warn, "{}", finding.message);
             assert_eq!(

@@ -7,6 +7,9 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+/// The liveness probes [`clear_orphaned_markers`] reads (#1071).
+pub use crate::process_tree::LivenessEnv;
+
 pub(crate) fn system_root() -> Option<PathBuf> {
     crate::state_dir::state_dir().map(|dir| dir.join("reasoner-handoffs"))
 }
@@ -492,6 +495,60 @@ pub fn sweep_finished(root: &Path, grace: Duration, dry_run: bool) -> anyhow::Re
     sweep(root, grace, if dry_run { Pass::DryRun } else { Pass::Remove })
 }
 
+/// The request directory name `request_path` writes: a hex SHA-256 digest.
+fn is_request_name(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|name| name.len() == 64
+        && name.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
+}
+
+/// What one orphan pass saw (#1071). `kept_legacy` (pre-#1071, recording no
+/// writer to judge) is counted apart from `kept_unproven` so an operator can
+/// watch that backlog drain.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct OrphanReport {
+    pub cleared: u64,
+    pub kept_live: u64,
+    pub kept_legacy: u64,
+    pub kept_unproven: u64,
+}
+
+/// Clear lifecycle markers left by a call that cannot still be running (#1071).
+/// `dry_run` reads only: no locks are taken and nothing is created or removed.
+/// Only markers are cleared; a cleared request rejoins the normal sweep path,
+/// where an unsettled journal still keeps it until an operator decides.
+pub fn clear_orphaned_markers(root: &Path, env: &LivenessEnv, dry_run: bool) -> anyhow::Result<OrphanReport> {
+    use crate::process_tree::Liveness;
+    let mut report = OrphanReport::default();
+    let metadata = match std::fs::symlink_metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+        result => result?,
+    };
+    anyhow::ensure!(is_private_directory(&metadata) && metadata.uid() == euid(), "handoff directory is not private");
+    let root = std::path::absolute(root)?;
+    for entry in std::fs::read_dir(&root)? {
+        let name = entry?.file_name();
+        if !is_request_name(&name) { continue }
+        let directory = root.join(&name);
+        // The same validation the sweep applies: private, unlinked, expected entries.
+        if !matches!(Snapshot::read(&directory), Ok(Some(_))) { continue }
+        let journal = directory.join(JOURNAL);
+        // Nothing to clear, and no lock to take: leave the retention clock alone.
+        if crate::process_tree::request_idle(&journal).unwrap_or(false) { continue }
+        match crate::process_tree::clear_if_dead(&journal, env, dry_run) {
+            Ok(Liveness::Dead) => report.cleared += 1,
+            Ok(Liveness::Live) => report.kept_live += 1,
+            Ok(Liveness::Legacy) => report.kept_legacy += 1,
+            Ok(Liveness::Unproven) => report.kept_unproven += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(request = %name.to_string_lossy(), "orphaned marker pass left a request: {error}");
+                report.kept_unproven += 1;
+            }
+        }
+    }
+    Ok(report)
+}
+
 fn sweep(root: &Path, grace: Duration, mut pass: Pass) -> anyhow::Result<SweepReport> {
     let mut report = SweepReport::default();
     let metadata = match std::fs::symlink_metadata(root) {
@@ -505,8 +562,7 @@ fn sweep(root: &Path, grace: Duration, mut pass: Pass) -> anyhow::Result<SweepRe
     for entry in std::fs::read_dir(&root)? {
         let name = entry?.file_name();
         report.entries += 1;
-        let request = name.to_str().is_some_and(|name| name.len() == 64
-            && name.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')));
+        let request = is_request_name(&name);
         let directory = root.join(&name);
         if request && std::fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.file_type().is_dir()) {
             report.requests += 1;
@@ -639,11 +695,24 @@ pub type SweepHook = std::sync::Arc<dyn Fn() + Send + Sync>;
 /// blocking pool; `also` runs first on every tick, on the blocking pool too. A removal needs two consecutive passes to agree (see
 /// [`Pass::Confirm`]). Failures only log; shutdown stops the loop.
 pub async fn run_sweep_loop(root: Option<PathBuf>, grace: Duration, interval: Duration,
-    shutdown: tokio_util::sync::CancellationToken, also: Option<SweepHook>) -> anyhow::Result<()> {
+    shutdown: tokio_util::sync::CancellationToken, also: Option<SweepHook>,
+    liveness: LivenessEnv) -> anyhow::Result<()> {
     if root.is_none() {
         tracing::warn!("handoff journal sweep disabled: no HOME to locate the journal root");
         if also.is_none() {
             return Ok(());
+        }
+    }
+    // #1071 — once, before the first pass and before any channel can start a
+    // provider: clear markers left by a daemon that died mid-call. A cleared
+    // request then takes the normal idle → grace → confirm path.
+    if let Some(root) = root.clone() {
+        match tokio::task::spawn_blocking(move ||
+            clear_orphaned_markers(&root, &liveness, false)).await {
+            Ok(Ok(r)) => tracing::info!(cleared = r.cleared, kept_live = r.kept_live,
+                kept_legacy = r.kept_legacy, kept_unproven = r.kept_unproven, "handoff orphaned marker pass"),
+            Ok(Err(error)) => tracing::warn!("handoff orphaned marker pass failed: {error:#}"),
+            Err(error) => tracing::warn!("handoff orphaned marker task failed: {error}"),
         }
     }
     let mut ticker = tokio::time::interval(interval);
@@ -1283,6 +1352,50 @@ for line in sys.stdin:
         assert_eq!((report.entries, report.kept()), (12, 10));
     }
 
+    /// #1071 — an orphan left by a daemon that died mid-call is cleared and
+    /// rejoins the sweep; a live call's and a pre-#1071 marker are kept.
+    #[test]
+    fn the_orphan_pass_clears_only_provably_dead_markers_and_reports_the_rest() {
+        let (_temp, root) = private_root();
+        let marker = |journal: &Path, contents: Value|
+            write_private(&journal.with_extension("active"), &contents.to_string());
+        let identity = |boot: &str, pid: libc::pid_t| json!({"version": 2,
+            "receipt": "/nonexistent/synthetic-cleanup-complete", "boot_id": boot, "writer_pid": pid,
+            "writer_start": 4242, "writer_cgroup": "/synthetic.slice/augmentagent.service",
+            "writer_cgroup_inode": 424242});
+        let orphan = request(&root, "synthetic-orphan", Some(json!([completed_row()])));
+        let uncertain = request(&root, "synthetic-orphan-uncertain", Some(json!([completed_row(), started_row()])));
+        let live = request(&root, "synthetic-in-flight", Some(json!([completed_row()])));
+        let legacy = request(&root, "synthetic-legacy-marker", Some(json!([completed_row()])));
+        marker(&orphan, identity("a-previous-boot", 999));
+        marker(&uncertain, identity("a-previous-boot", 999));
+        marker(&live, identity("this-boot", 1234));
+        marker(&legacy, json!({"version": 1, "receipt": "/nonexistent/synthetic-cleanup-complete"}));
+        for journal in [&orphan, &uncertain, &live, &legacy] { age(journal, TWO_DAYS); }
+        let env = LivenessEnv::injected(Some("this-boot".into()),
+            Box::new(|pid| (pid == 1234).then_some(4242)), Box::new(|_, _| crate::process_tree::Cgroup::Gone));
+
+        // The pre-#1071 marker is counted apart from the other doubtful cases,
+        // which is what doctor reports as the pre-upgrade backlog.
+        let dry = clear_orphaned_markers(&root, &env, true).unwrap();
+        assert_eq!(dry, OrphanReport { cleared: 2, kept_live: 1, kept_legacy: 1, kept_unproven: 0 });
+        assert!(orphan.with_extension("active").exists(), "a dry run must change nothing");
+
+        assert_eq!(clear_orphaned_markers(&root, &env, false).unwrap(), dry);
+        assert!(!orphan.with_extension("active").exists() && !uncertain.with_extension("active").exists());
+        assert!(live.with_extension("active").exists() && legacy.with_extension("active").exists());
+
+        // The cleared requests rejoin the sweep from the start of a fresh grace
+        // period (removing the marker moved the directory's mtime): the settled
+        // one becomes removable, the one with a `started` row waits for recovery.
+        assert_eq!(sweep_finished(&root, GRACE, true).unwrap().kept_recent, 2);
+        for journal in [&orphan, &uncertain] { age(journal, TWO_DAYS); }
+        let swept = sweep_finished(&root, GRACE, false).unwrap();
+        assert!(gone(&orphan), "a cleared orphan must become eligible for the sweep");
+        assert!(uncertain.exists() && std::fs::read_to_string(&uncertain).unwrap().contains("\"started\""));
+        assert_eq!((swept.removed, swept.kept_active, swept.kept_unfinished), (1, 2, 1));
+    }
+
     #[test]
     fn sweep_never_follows_symlinks_and_refuses_non_private_state() {
         use std::os::unix::fs::{symlink, DirBuilderExt, PermissionsExt};
@@ -1656,7 +1769,8 @@ for line in sys.stdin:
             seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         });
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let task = tokio::spawn(run_sweep_loop(None, GRACE, Duration::from_millis(20), shutdown.clone(), Some(also)));
+        let task = tokio::spawn(run_sweep_loop(None, GRACE, Duration::from_millis(20), shutdown.clone(),
+            Some(also), LivenessEnv::probe()));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while calls.load(std::sync::atomic::Ordering::SeqCst) < 2 {
             assert!(std::time::Instant::now() < deadline, "the scratch sweep did not run on consecutive ticks");
@@ -1667,6 +1781,34 @@ for line in sys.stdin:
         tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
     }
 
+    /// #1071, the reported case through the path the daemon actually runs: the
+    /// previous instance was killed mid-call and left a marker; starting the
+    /// successor's sweep loop — nothing else — must retire it, before the first
+    /// sweep pass. The pass is not called directly, so wiring it out of
+    /// `run_sweep_loop` fails this test.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_retires_the_marker_the_previous_instance_orphaned() {
+        let (_temp, root) = private_root();
+        let journal = request(&root, "synthetic-orphaned-by-restart", Some(json!([started_row()])));
+        write_private(&journal.with_extension("active"), &json!({"version": 2,
+            "receipt": "/nonexistent/synthetic-cleanup-complete", "boot_id": "a-previous-boot",
+            "writer_pid": 999, "writer_start": 4242, "writer_cgroup": "/synthetic.slice/augmentagent.service",
+            "writer_cgroup_inode": 424242}).to_string());
+        let rows = std::fs::read_to_string(&journal).unwrap();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(run_sweep_loop(Some(root.clone()), GRACE, Duration::from_secs(3600),
+            shutdown.clone(), None, LivenessEnv::injected(Some("this-boot".into()),
+                Box::new(|_| None), Box::new(|_, _| crate::process_tree::Cgroup::Gone))));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while journal.with_extension("active").exists() {
+            assert!(std::time::Instant::now() < deadline, "the startup orphan pass did not run");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(&journal).unwrap(), rows, "the journal must be left for recovery");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn sweep_loop_runs_at_start_and_stops_on_shutdown() {
         assert!(SWEEP_INTERVAL <= Duration::from_secs(3600), "C2: at least hourly");
@@ -1674,7 +1816,8 @@ for line in sys.stdin:
         let journal = request(&root, "synthetic-startup-sweep", Some(json!([completed_row()])));
         age(&journal, TWO_DAYS);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let task = tokio::spawn(run_sweep_loop(Some(root.clone()), GRACE, Duration::from_millis(50), shutdown.clone(), None));
+        let task = tokio::spawn(run_sweep_loop(Some(root.clone()), GRACE, Duration::from_millis(50),
+            shutdown.clone(), None, LivenessEnv::probe()));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !gone(&journal) {
             assert!(std::time::Instant::now() < deadline, "startup sweep did not run");

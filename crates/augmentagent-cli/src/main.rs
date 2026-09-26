@@ -2855,6 +2855,21 @@ async fn main() -> Result<()> {
                     s2.cancel();
                 }
             });
+            // #1071 — a stop or restart sends SIGTERM. Without this the process
+            // dies at once and every in-flight call leaves a lifecycle marker;
+            // cancelling lets the channels drop their ProcessGroups, which
+            // retire their markers normally.
+            let s3 = shutdown.clone();
+            tokio::spawn(async move {
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(mut term) => {
+                        term.recv().await;
+                        info!("SIGTERM received");
+                        s3.cancel();
+                    }
+                    Err(e) => warn!("SIGTERM handler unavailable; a stop may orphan markers: {e:#}"),
+                }
+            });
             // Collect the enabled channels' runners + optional digest scheduler.
             let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
 
@@ -2869,6 +2884,9 @@ async fn main() -> Result<()> {
                 // #1036 — also reap Codex VM build sessions left by a killed
                 // bridge (and any VM still running for them), hourly.
                 Some(std::sync::Arc::new(augmentagent_channel_core::build_scratch::sweep_and_log)),
+                // #1071 — the loop's start also clears markers orphaned by a
+                // previous instance that died mid-call.
+                augmentagent_channel_core::handoff::LivenessEnv::probe(),
             )));
 
 
@@ -3360,10 +3378,31 @@ async fn main() -> Result<()> {
                     }
                 });
             }
-            for handle in tasks {
-                handle.await??;
+            // #1071 — cancelling is only half of a clean stop: the markers
+            // retire when the channels unwind and drop their ProcessGroups. So
+            // join every task, bounded so a wedged one cannot hold the stop open
+            // until systemd's SIGKILL. A failing task cancels the rest rather
+            // than returning at once, which would drop the process while other
+            // supervisors are still retiring — the orphans at issue.
+            const SHUTDOWN_DRAIN: Duration = Duration::from_secs(30);
+            let mut failure = None;
+            let drained = tokio::time::timeout(SHUTDOWN_DRAIN, async {
+                for handle in tasks {
+                    let outcome = match handle.await {
+                        Ok(Ok(())) => continue,
+                        Ok(Err(e)) => e,
+                        Err(e) => anyhow::Error::new(e),
+                    };
+                    warn!("daemon task failed: {outcome:#}");
+                    failure.get_or_insert(outcome);
+                    shutdown.cancel();
+                }
+            })
+            .await;
+            if drained.is_err() {
+                warn!("shutdown drain timed out; the next start's orphan pass will clear any marker left behind");
             }
-            Ok(())
+            failure.map_or(Ok(()), Err)
         }
         Cmd::Transcripts { ref op } => match op {
             TranscriptsOp::Sync {
