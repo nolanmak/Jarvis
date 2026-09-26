@@ -53,7 +53,18 @@ const ATTEMPT_MARKER: &str = "<!-- self-improve-attempt -->";
 /// Max changed lines we'll allow in a single self-improvement diff.
 const MAX_DIFF_LINES: usize = 600;
 /// Consecutive failed attempts before we comment + back off (label marker).
-const MAX_ATTEMPTS: u32 = 3;
+/// #1214 — 5, up from 3: an issue now gives up early only when it is stuck
+/// (two consecutive attempts with the same failure fingerprint); this is the
+/// ceiling for one that keeps failing in new ways.
+const MAX_ATTEMPTS: u32 = 5;
+
+/// #1214 — the durable reason comment `label_gave_up` posts before it labels.
+const GAVE_UP_REASON_MARKER_PREFIX: &str = "<!-- self-improve-gave-up reason=";
+/// #1214 — reason codes for the give-ups that are verdicts, not attempts.
+const GIVE_UP_SCOPER_NOT_FIXABLE: &str = "scoper:not-fixable";
+const GIVE_UP_SCOPER_PREDICTS_REFUSAL: &str = "scoper:predicts-refusal";
+const GIVE_UP_BLAST_RADIUS_NAMED: &str = "guard:blast-radius-named";
+const GIVE_UP_UNTRUSTED_AUTHOR: &str = "held:untrusted-author";
 /// What [`run_once`] returns when no labeled issue is waiting. The #630
 /// auto-PR loop matches on this to tell an idle tick (one cheap `gh issue
 /// list`, no reasoner spend) from an engaged run (counts against the daily
@@ -792,7 +803,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
             )
             .await
             .ok();
-            label_gave_up(repo_root, number).await.ok();
+            label_gave_up(repo_root, number, GIVE_UP_BLAST_RADIUS_NAMED).await.ok();
             continue;
         }
         if has_open_agent_pr(repo_root, number).await? {
@@ -5170,7 +5181,7 @@ async fn hold_unreviewable(
         // close WITHOUT the label invites the fresh lane to rebuild over the
         // branch, so a failed label leaves the draft open and unmarked; the
         // next pass (at most once a UTC day) tries again.
-        match label_gave_up(repo_root, issue).await {
+        match label_gave_up(repo_root, issue, &format!("held:{}", why.code())).await {
             Ok(()) => {
                 close_gave_up_pr(repo_root, pr, issue, body).await;
                 note_stood_down(&path, pr, issue, why);
@@ -5915,10 +5926,10 @@ async fn resume_draft_pr(
                     repo_root,
                 )
                 .await;
-                let attempts = record_attempt(repo_root, issue.number, Some(failure_record(reasoner, FailureKind::GuardRefusal, "resume:conflict", &why))).await.unwrap_or(1);
-                if attempts >= MAX_ATTEMPTS {
-                    label_gave_up(repo_root, issue.number).await.ok();
-                    close_gave_up_pr(repo_root, pr, issue.number, &gave_up_close_comment(pr, issue.number, attempts, &why)).await;
+                let attempts = record_attempt(repo_root, issue.number, Some(failure_record(reasoner, FailureKind::GuardRefusal, "resume:conflict", &why))).await.unwrap_or_else(|_| Tally::uncounted());
+                if attempts.exhausted() {
+                    label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                    close_gave_up_pr(repo_root, pr, issue.number, &gave_up_close_comment(pr, issue.number, attempts.n, &why)).await;
                 }
                 let message = format!(
                     "PR #{pr}: merge conflict with main not resolved ({why}); attempt {attempts}"
@@ -5983,9 +5994,9 @@ async fn resume_draft_pr(
                 )),
             )
             .await
-            .unwrap_or(1);
-            label_gave_up(repo_root, issue.number).await.ok();
-            close_gave_up_pr(repo_root, pr, issue.number, &gave_up_close_comment(pr, issue.number, attempts, &reason)).await;
+            .unwrap_or_else(|_| Tally::uncounted());
+            label_gave_up(repo_root, issue.number, "guard:blast-radius-diff").await.ok();
+            close_gave_up_pr(repo_root, pr, issue.number, &gave_up_close_comment(pr, issue.number, attempts.n, &reason)).await;
             return Ok(RunReport::triage(format!(
                 "PR #{pr}: resume refused — blast radius on `{pattern}`; stood down"
             )));
@@ -6138,10 +6149,10 @@ async fn resume_draft_pr(
                 repo_root,
             )
             .await;
-            let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); failure_record(reasoner, kind, "resume:gate", &detail) })).await.unwrap_or(1);
-            if attempts >= MAX_ATTEMPTS {
-                label_gave_up(repo_root, issue.number).await.ok();
-                close_gave_up_pr(repo_root, pr, issue.number, &gave_up_close_comment(pr, issue.number, attempts, &format!("{gate_err:#}"))).await;
+            let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); failure_record(reasoner, kind, "resume:gate", &detail) })).await.unwrap_or_else(|_| Tally::uncounted());
+            if attempts.exhausted() {
+                label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                close_gave_up_pr(repo_root, pr, issue.number, &gave_up_close_comment(pr, issue.number, attempts.n, &format!("{gate_err:#}"))).await;
             }
             return Ok(RunReport::built(format!(
                 "PR #{pr}: resume gate failed (attempt {attempts})"
@@ -6322,12 +6333,12 @@ async fn resume_draft_pr(
             )
             .await;
             cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
-            let attempts = record_attempt(repo_root, issue.number, Some(failure_record(reasoner, FailureKind::ReviewReject, "resume:review", &independent.notes))).await.unwrap_or(1);
-            if attempts >= MAX_ATTEMPTS {
+            let attempts = record_attempt(repo_root, issue.number, Some(failure_record(reasoner, FailureKind::ReviewReject, "resume:review", &independent.notes))).await.unwrap_or_else(|_| Tally::uncounted());
+            if attempts.exhausted() {
                 // Every future resume would replay the same disagreement;
                 // the label hands it to a human with the exchange attached.
-                label_gave_up(repo_root, issue.number).await.ok();
-                close_gave_up_pr(repo_root, pr, issue.number, &gave_up_close_comment(pr, issue.number, attempts, &independent.notes)).await;
+                label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                close_gave_up_pr(repo_root, pr, issue.number, &gave_up_close_comment(pr, issue.number, attempts.n, &independent.notes)).await;
             }
             notify_discord(&format!(
                 "📝 resumed draft still needs review after {rounds_done} rounds: {} — PR #{pr}",
@@ -6757,7 +6768,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // label it out of the selection pool immediately. Without this, the
         // unattended loop re-picks the same issue every tick: it head-of-line
         // blocks every other labeled issue and re-comments daily, forever.
-        label_gave_up(repo_root, issue.number).await.ok();
+        label_gave_up(repo_root, issue.number, GIVE_UP_UNTRUSTED_AUTHOR).await.ok();
         return Ok(RunReport::triage(format!(
             "issue #{}: refused — untrusted author '{}' (requires owner approval)",
             issue.number, issue.author
@@ -6900,7 +6911,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 )
                 .await
                 .ok();
-                label_gave_up(repo_root, issue.number).await.ok();
+                label_gave_up(repo_root, issue.number, GIVE_UP_SCOPER_NOT_FIXABLE).await.ok();
                 return Ok(RunReport::triage(format!(
                     "issue #{}: scoped as not agent-fixable — labeled out",
                     issue.number
@@ -6940,7 +6951,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             )
             .await
             .ok();
-            label_gave_up(repo_root, issue.number).await.ok();
+            label_gave_up(repo_root, issue.number, GIVE_UP_SCOPER_PREDICTS_REFUSAL).await.ok();
             return Ok(RunReport::triage(format!(
                 "issue #{}: refused pre-build ({reason}) — labeled out",
                 issue.number
@@ -7018,8 +7029,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             Some(rec(FailureKind::NoChanges, "build", &truncate(&summary, 800), "", 0)),
         )
         .await
-        .unwrap_or(1);
-        if attempts >= MAX_ATTEMPTS {
+        .unwrap_or_else(|_| Tally::uncounted());
+        if attempts.exhausted() {
             backoff_comment(
                 repo_root,
                 issue.number,
@@ -7031,7 +7042,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             )
             .await
             .ok();
-            label_gave_up(repo_root, issue.number).await.ok();
+            label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
         }
         return Ok(RunReport::built(format!(
             "issue #{}: reasoner made no changes; skipped (attempt {attempts})",
@@ -7059,7 +7070,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             )),
         )
         .await
-        .unwrap_or(1);
+        .unwrap_or_else(|_| Tally::uncounted());
         warn!(
             issue = issue.number,
             pattern, %line, "refused: diff hit the blast-radius guard"
@@ -7081,8 +7092,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         )
         .await
         .ok();
-        if attempts >= MAX_ATTEMPTS {
-            label_gave_up(repo_root, issue.number).await.ok();
+        if attempts.exhausted() {
+            label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
         }
         return Ok(RunReport::built(format!(
             "issue #{}: refused — diff hit blast-radius guard on `{pattern}` (attempt {attempts})",
@@ -7135,7 +7146,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             )),
         )
         .await
-        .unwrap_or(1);
+        .unwrap_or_else(|_| Tally::uncounted());
         backoff_comment(
             repo_root,
             issue.number,
@@ -7146,8 +7157,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         )
         .await
         .ok();
-        if attempts >= MAX_ATTEMPTS {
-            label_gave_up(repo_root, issue.number).await.ok();
+        if attempts.exhausted() {
+            label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
         }
         return Ok(RunReport::built(format!(
             "issue #{}: refused — diff too large ({lines} lines, attempt {attempts})",
@@ -7245,8 +7256,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "gate", &detail, &diff, lines) }),
         )
         .await
-        .unwrap_or(1);
-        if attempts >= MAX_ATTEMPTS {
+        .unwrap_or_else(|_| Tally::uncounted());
+        if attempts.exhausted() {
             backoff_comment(
                 repo_root,
                 issue.number,
@@ -7258,7 +7269,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             )
             .await
             .ok();
-            label_gave_up(repo_root, issue.number).await.ok();
+            label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
         }
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
         return Ok(RunReport::built(format!(
@@ -7302,7 +7313,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             Some(rec(FailureKind::ReviewReject, "qa-review", &review_notes, &diff, lines)),
         )
         .await
-        .unwrap_or(1);
+        .unwrap_or_else(|_| Tally::uncounted());
         backoff_comment(
             repo_root,
             issue.number,
@@ -7313,8 +7324,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         )
         .await
         .ok();
-        if attempts >= MAX_ATTEMPTS {
-            label_gave_up(repo_root, issue.number).await.ok();
+        if attempts.exhausted() {
+            label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
         }
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
         return Ok(RunReport::built(format!(
@@ -7390,7 +7401,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 let (_ok, diff2, _) = run("git", &["diff", "--cached"], &worktree).await?;
                 if let Some((pattern, line)) = blast_radius_hit_in_diff(&diff2) {
                     warn!(issue = issue.number, pattern, %line, "revision hit the blast-radius guard");
-                    let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "revise:blast-radius", &format!("matched `{pattern}` on: {line}"), &diff_touched_paths(&diff2), diff_line_count(&diff2)))).await.unwrap_or(1);
+                    let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "revise:blast-radius", &format!("matched `{pattern}` on: {line}"), &diff_touched_paths(&diff2), diff_line_count(&diff2)))).await.unwrap_or_else(|_| Tally::uncounted());
                     backoff_comment(
                         repo_root,
                         issue.number,
@@ -7401,8 +7412,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     )
                     .await
                     .ok();
-                    if attempts >= MAX_ATTEMPTS {
-                        label_gave_up(repo_root, issue.number).await.ok();
+                    if attempts.exhausted() {
+                        label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
                     }
                     cleanup(worktree, branch, repo_root.to_path_buf()).await;
                     return Ok(RunReport::built(format!(
@@ -7428,7 +7439,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         ));
                         continue;
                     }
-                    let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "revise:size", &format!("diff is {lines2} lines (cap {MAX_DIFF_LINES})"), &diff_touched_paths(&diff2), lines2))).await.unwrap_or(1);
+                    let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "revise:size", &format!("diff is {lines2} lines (cap {MAX_DIFF_LINES})"), &diff_touched_paths(&diff2), lines2))).await.unwrap_or_else(|_| Tally::uncounted());
                     backoff_comment(
                         repo_root,
                         issue.number,
@@ -7440,8 +7451,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     )
                     .await
                     .ok();
-                    if attempts >= MAX_ATTEMPTS {
-                        label_gave_up(repo_root, issue.number).await.ok();
+                    if attempts.exhausted() {
+                        label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
                     }
                     cleanup(worktree, branch, repo_root.to_path_buf()).await;
                     return Ok(RunReport::built(format!(
@@ -7465,8 +7476,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         ));
                         continue;
                     }
-                    let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "revise:gate", &detail, &diff_touched_paths(&diff2), lines2) })).await.unwrap_or(1);
-                    if attempts >= MAX_ATTEMPTS {
+                    let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "revise:gate", &detail, &diff_touched_paths(&diff2), lines2) })).await.unwrap_or_else(|_| Tally::uncounted());
+                    if attempts.exhausted() {
                         backoff_comment(
                             repo_root,
                             issue.number,
@@ -7478,7 +7489,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         )
                         .await
                         .ok();
-                        label_gave_up(repo_root, issue.number).await.ok();
+                        label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
                     }
                     cleanup(worktree, branch, repo_root.to_path_buf()).await;
                     return Ok(RunReport::built(format!(
@@ -7522,8 +7533,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         lines = diff_line_count(&full_after);
         if let Err(gate_err) = verification_gate(&worktree).await {
             warn!(issue = issue.number, "final full gate failed after revisions: {gate_err:#}");
-            let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "revise:final-gate", &detail, &diff_touched_paths(&full_after), lines) })).await.unwrap_or(1);
-            if attempts >= MAX_ATTEMPTS {
+            let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "revise:final-gate", &detail, &diff_touched_paths(&full_after), lines) })).await.unwrap_or_else(|_| Tally::uncounted());
+            if attempts.exhausted() {
                 backoff_comment(
                     repo_root,
                     issue.number,
@@ -7535,7 +7546,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 )
                 .await
                 .ok();
-                label_gave_up(repo_root, issue.number).await.ok();
+                label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
             }
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
             return Ok(RunReport::built(format!(
@@ -8024,9 +8035,9 @@ async fn record_hard_failure(
     err: &str,
     rec: AttemptRecord,
 ) -> String {
-    let attempts = record_attempt(repo_root, issue, Some(rec)).await.unwrap_or(1);
-    warn!(issue, attempts, "self-improve: {what}: {err}");
-    if attempts >= MAX_ATTEMPTS {
+    let attempts = record_attempt(repo_root, issue, Some(rec)).await.unwrap_or_else(|_| Tally::uncounted());
+    warn!(issue, attempts = attempts.n, "self-improve: {what}: {err}");
+    if attempts.exhausted() {
         backoff_comment(
             repo_root,
             issue,
@@ -8039,7 +8050,7 @@ async fn record_hard_failure(
         )
         .await
         .ok();
-        label_gave_up(repo_root, issue).await.ok();
+        label_gave_up(repo_root, issue, attempts.reason()).await.ok();
     }
     format!("issue #{issue}: {what} (attempt {attempts}); no PR opened")
 }
@@ -8049,7 +8060,7 @@ async fn record_hard_failure(
 /// `rec` (#803) is persisted to the local [`AttemptHistory`] so the next
 /// attempt's prompts can say what this one hit, and its kind/stage/first
 /// line go into the marker comment. `None` = a site that does not say.
-async fn record_attempt(repo_root: &Path, issue: u64, rec: Option<AttemptRecord>) -> Result<u32> {
+async fn record_attempt(repo_root: &Path, issue: u64, rec: Option<AttemptRecord>) -> Result<Tally> {
     let rec = rec.unwrap_or_else(AttemptRecord::unspecified);
     {
         let path = attempt_history_path();
@@ -8067,7 +8078,7 @@ async fn record_attempt(repo_root: &Path, issue: u64, rec: Option<AttemptRecord>
     // loop counts against `AUGMENTAGENT_AUTOPR_DAILY_CAP` like any run.
     if !rec.kind.counts_toward_max_attempts() {
         warn!(issue, kind = rec.kind.as_str(), stage = %rec.stage, "attempt not charged (harness failure)");
-        return Ok(0);
+        return Ok(Tally { n: 0, give_up: None });
     }
     let gh = gh_bin();
     let (_ok, stdout, _) = run(
@@ -8077,6 +8088,10 @@ async fn record_attempt(repo_root: &Path, issue: u64, rec: Option<AttemptRecord>
     )
     .await?;
     let prior = stdout.matches(ATTEMPT_MARKER).count() as u32;
+    // #1214 — the verdict reads the durable markers (not the local history,
+    // which rolls over), and an uncharged harness failure writes no marker,
+    // so it can never break a run of identical failures.
+    let give_up = give_up_verdict(&marker_fingerprints(&stdout), &fingerprint(&rec), rec.kind, prior + 1);
     // #851 — a model failure is remembered for the rest of the UTC day so
     // the picker moves on instead of handing this issue straight back next
     // tick (a deterministic refusal would only be re-bought). Harness
@@ -8096,8 +8111,211 @@ async fn record_attempt(repo_root: &Path, issue: u64, rec: Option<AttemptRecord>
         repo_root,
     )
     .await;
-    Ok(n)
+    Ok(Tally { n, give_up })
 }
+
+/// #1214 — one charged attempt's count and, when the loop should stop, why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Tally {
+    /// Charged attempts on the issue including this one; 0 = not charged.
+    n: u32,
+    /// The give-up reason code, when this attempt ends the issue's run.
+    give_up: Option<String>,
+}
+
+impl Tally {
+    /// What a caller assumes when the count itself could not be read: one
+    /// attempt, no give-up — a `gh` outage is not evidence of being stuck.
+    fn uncounted() -> Self {
+        Self { n: 1, give_up: None }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.give_up.is_some()
+    }
+
+    fn reason(&self) -> &str {
+        self.give_up.as_deref().unwrap_or("attempts")
+    }
+}
+
+impl std::fmt::Display for Tally {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.n)
+    }
+}
+
+/// #1214 — should the loop stop on this issue? Stuck when this failure's
+/// fingerprint matches the previous charged attempt's; otherwise only at the
+/// [`MAX_ATTEMPTS`] ceiling. Three attempts that fail three different ways
+/// are three lessons, not proof the issue cannot be fixed.
+fn give_up_verdict(prior: &[Option<String>], fp: &str, kind: FailureKind, n: u32) -> Option<String> {
+    if prior.last().and_then(|p| p.as_deref()) == Some(fp) {
+        return Some(format!("stuck:{}:{fp}", kind.as_str()));
+    }
+    (n >= MAX_ATTEMPTS).then(|| format!("attempts:{}", kind.as_str()))
+}
+
+/// #1214 — what a failure IS, stripped of what varies between two runs of
+/// the same failure: kind, the stage without its lane prefix (`revise:gate`
+/// and `gate` are the same wall), the sorted touched paths, and the failing
+/// test names, else the first compiler error code. Eight hex characters.
+fn fingerprint(rec: &AttemptRecord) -> String {
+    use sha2::{Digest, Sha256};
+    let stage = rec.stage.rsplit(':').next().unwrap_or(&rec.stage);
+    let key = format!(
+        "{}|{stage}|{}|{}",
+        rec.kind.as_str(),
+        touched_paths(&rec.diffstat).join(","),
+        failure_signal(&rec.detail)
+    );
+    Sha256::digest(key.as_bytes()).iter().take(4).map(|b| format!("{b:02x}")).collect()
+}
+
+/// Paths from a `git diff --stat` or from diff headers.
+fn touched_paths(diffstat: &str) -> Vec<String> {
+    let mut paths: Vec<String> = diffstat
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            if let Some(rest) = l.strip_prefix("diff --git a/") {
+                return rest.split(" b/").next().map(str::to_string);
+            }
+            if let Some(rest) = l.strip_prefix("+++ b/").or_else(|| l.strip_prefix("--- a/")) {
+                return Some(rest.to_string());
+            }
+            let (path, _) = l.split_once(" | ")?;
+            Some(path.trim().to_string())
+        })
+        .filter(|p| !p.is_empty())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Failing test names (`---- name stdout ----`, `test name ... FAILED`),
+/// else the first `error[E....]` code, else nothing.
+fn failure_signal(detail: &str) -> String {
+    let mut tests: Vec<&str> = detail
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            if let Some(rest) = l.strip_prefix("---- ") {
+                return rest.strip_suffix(" stdout ----");
+            }
+            l.strip_prefix("test ")?.strip_suffix(" ... FAILED")
+        })
+        .collect();
+    tests.sort_unstable();
+    tests.dedup();
+    if !tests.is_empty() {
+        return tests.join(",");
+    }
+    detail
+        .split_whitespace()
+        .find(|w| w.starts_with("error[E"))
+        .and_then(|w| w.split(']').next())
+        .map(|code| format!("{code}]"))
+        .unwrap_or_default()
+}
+
+/// #1214 — the fingerprint of every attempt marker, oldest first; `None`
+/// for markers written before fingerprints existed.
+fn marker_fingerprints(comments: &str) -> Vec<Option<String>> {
+    comments
+        .split(ATTEMPT_MARKER)
+        .skip(1)
+        .map(|tail| {
+            let head: String = tail.chars().take(160).collect();
+            let at = head.find("[fp:")?;
+            let fp: String = head[at + 4..].chars().take_while(char::is_ascii_hexdigit).collect();
+            (fp.len() == 8).then_some(fp)
+        })
+        .collect()
+}
+
+/// #1214 — why a labelled issue gave up. The newest comment that explains
+/// a give-up decides: the reason comment `label_gave_up` posts; for issues
+/// labelled before reason codes existed, the wording those refusals used;
+/// else the last charged attempt kind from the markers, then from the local
+/// history; else `unrecorded` (labelled by hand).
+fn gave_up_reason(comments: &[String], history: Option<&[AttemptRecord]>) -> String {
+    const LEGACY: [(&str, &str); 4] = [
+        (SCOPE_GAVE_UP_MARKER, GIVE_UP_SCOPER_NOT_FIXABLE),
+        ("refused before building", GIVE_UP_SCOPER_PREDICTS_REFUSAL),
+        ("names a deploy/auth/secret", GIVE_UP_BLAST_RADIUS_NAMED),
+        ("Held from the auto-PR pool", "held:owner-triage"),
+    ];
+    for body in comments.iter().rev() {
+        if let Some(at) = body.find(GAVE_UP_REASON_MARKER_PREFIX) {
+            let rest = &body[at + GAVE_UP_REASON_MARKER_PREFIX.len()..];
+            if let Some(code) = rest.split_whitespace().next() {
+                return code.to_string();
+            }
+        }
+        if let Some((_, code)) = LEGACY.iter().find(|(phrase, _)| body.contains(phrase)) {
+            return code.to_string();
+        }
+        if let Some(k) = marker_kinds(body).into_iter().rev().find(|k| k.counts_toward_max_attempts()) {
+            return format!("attempts:{}", k.as_str());
+        }
+    }
+    match history.and_then(|h| h.iter().rev().map(|r| r.kind).find(|k| k.counts_toward_max_attempts())) {
+        Some(k) => format!("attempts:{}", k.as_str()),
+        None => "unrecorded".to_string(),
+    }
+}
+
+/// #1214 — labelled issues grouped by reason (its first two segments, so
+/// per-fingerprint codes group by kind), largest group first.
+fn gave_up_breakdown(labelled: &[(u64, Vec<String>)], history: &AttemptHistory) -> Vec<(String, u32)> {
+    let mut counts: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    for (n, comments) in labelled {
+        let code = gave_up_reason(comments, history.issues.get(n).map(Vec::as_slice));
+        let key = code.split(':').take(2).collect::<Vec<_>>().join(":");
+        *counts.entry(key).or_default() += 1;
+    }
+    let mut out: Vec<(String, u32)> = counts.into_iter().collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+/// `gh issue list --json number,comments` → `(number, comment bodies)`.
+fn parse_labelled(json: &str) -> Vec<(u64, Vec<String>)> {
+    let Ok(serde_json::Value::Array(rows)) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter_map(|row| {
+            let n = row.get("number")?.as_u64()?;
+            let bodies = row
+                .get("comments")
+                .and_then(serde_json::Value::as_array)
+                .map(|c| c.iter().filter_map(|x| Some(x.get("body")?.as_str()?.to_string())).collect())
+                .unwrap_or_default();
+            Some((n, bodies))
+        })
+        .collect()
+}
+
+const LABELLED_LIST_ARGS: [&str; 10] = [
+    "issue", "list", "--state", "open", "--label", GAVE_UP_LABEL, "--limit", "500", "--json", "number,comments",
+];
+
+/// #1214 — the health watchdog's breakdown; `None` when `gh` cannot say.
+pub(crate) fn gave_up_breakdown_live(repo_root: &Path) -> Option<Vec<(String, u32)>> {
+    let out = std::process::Command::new(gh_bin())
+        .args(LABELLED_LIST_ARGS)
+        .current_dir(repo_root)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let labelled = parse_labelled(&String::from_utf8_lossy(&out.stdout));
+    Some(gave_up_breakdown(&labelled, &AttemptHistory::load(&attempt_history_path())))
+}
+
 
 async fn backoff_comment(repo_root: &Path, issue: u64, body: &str) -> Result<()> {
     let gh = gh_bin();
@@ -8113,8 +8331,15 @@ async fn backoff_comment(repo_root: &Path, issue: u64, body: &str) -> Result<()>
     Ok(())
 }
 
-async fn label_gave_up(repo_root: &Path, issue: u64) -> Result<()> {
+async fn label_gave_up(repo_root: &Path, issue: u64, reason: &str) -> Result<()> {
     let gh = gh_bin();
+    // #1214 — the reason first: a labelled issue always says why, and a
+    // reason comment on an issue whose label then failed is harmless.
+    let note = format!(
+        "{GAVE_UP_REASON_MARKER_PREFIX}{reason} -->\nAuto-PR gave up on this issue: `{reason}`. \
+         Remove the `{GAVE_UP_LABEL}` label to put it back in the pool."
+    );
+    let _ = run(&gh, &["issue", "comment", &issue.to_string(), "--body", &note], repo_root).await;
     // #1037 L1 — the exit status is the answer: a caller that closes a draft
     // only once the label is on has to know when it is not.
     let (ok, _out, err) = run(
@@ -9569,10 +9794,11 @@ fn record_reasoner_error(issue: u64, rec: AttemptRecord) {
 /// (the count is derived from it) and now says what happened.
 fn attempt_marker_body(n: u32, rec: &AttemptRecord) -> String {
     let head = format!(
-        "{ATTEMPT_MARKER} attempt {n} — {} at {} after {}s",
+        "{ATTEMPT_MARKER} attempt {n} — {} at {} after {}s [fp:{}]",
         rec.kind.as_str(),
         rec.stage,
-        rec.wall_secs
+        rec.wall_secs,
+        fingerprint(rec)
     );
     match rec.detail.lines().find(|l| !l.trim().is_empty()) {
         Some(first) => format!("{head}: {}", truncate(first, 300)),
@@ -15218,6 +15444,224 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         ])));
     }
 
+    // ---- #1214: give up only when provably stuck ----
+
+    fn synthetic_rec(kind: FailureKind, stage: &str, detail: &str, diffstat: &str) -> AttemptRecord {
+        AttemptRecord {
+            kind,
+            stage: stage.into(),
+            detail: detail.into(),
+            diffstat: diffstat.into(),
+            ..AttemptRecord::unspecified()
+        }
+    }
+
+    /// The fingerprint names the failure, not its incidental text: line
+    /// numbers, timings and path order do not change it; a different failing
+    /// test, file set or kind does.
+    #[test]
+    fn fingerprint_is_stable_across_incidental_detail() {
+        let a = synthetic_rec(FailureKind::GateRed, "gate",
+            "---- store::tests::nag_cycle stdout ----\nthread panicked at src/lib.rs:41:5\nfinished in 3.2s",
+            "crates/b/src/lib.rs | 4 ++\ncrates/a/src/lib.rs | 12 ++--");
+        let same = synthetic_rec(FailureKind::GateRed, "revise:gate",
+            "---- store::tests::nag_cycle stdout ----\nthread panicked at src/lib.rs:57:9\nfinished in 9.8s",
+            "diff --git a/crates/a/src/lib.rs b/crates/a/src/lib.rs\ndiff --git a/crates/b/src/lib.rs b/crates/b/src/lib.rs");
+        assert_eq!(fingerprint(&a), fingerprint(&same), "lane prefix, line numbers, timing and path order are incidental");
+        let other_test = synthetic_rec(FailureKind::GateRed, "gate",
+            "---- store::tests::nag_close stdout ----", "crates/a/src/lib.rs | 1 +\ncrates/b/src/lib.rs | 1 +");
+        assert_ne!(fingerprint(&a), fingerprint(&other_test));
+        let compile = synthetic_rec(FailureKind::GateRed, "gate", "error[E0425]: cannot find value `x`", "crates/a/src/lib.rs | 1 +");
+        let compile_elsewhere = synthetic_rec(FailureKind::GateRed, "gate", "error[E0425]: cannot find value `y`", "crates/c/src/lib.rs | 1 +");
+        assert_ne!(fingerprint(&compile), fingerprint(&compile_elsewhere), "same error code, different files");
+        let review = synthetic_rec(FailureKind::ReviewReject, "gate", "", "crates/a/src/lib.rs | 1 +");
+        assert_ne!(fingerprint(&review), fingerprint(&synthetic_rec(FailureKind::GateRed, "gate", "", "crates/a/src/lib.rs | 1 +")));
+        assert_eq!(fingerprint(&a).len(), 8);
+    }
+
+    /// C1–C3 as a pure rule over the durable markers.
+    #[test]
+    fn give_up_verdict_needs_a_repeat_or_the_attempt_ceiling() {
+        assert_eq!(MAX_ATTEMPTS, 5);
+        let fa = "aaaaaaaa".to_string();
+        assert_eq!(give_up_verdict(&[], "aaaaaaaa", FailureKind::GateRed, 1), None);
+        // Distinct fingerprints keep going.
+        assert_eq!(give_up_verdict(&[Some("bbbbbbbb".into()), Some("cccccccc".into())], "aaaaaaaa", FailureKind::GateRed, 3), None);
+        // Two consecutive identical: stuck.
+        assert_eq!(
+            give_up_verdict(&[Some("bbbbbbbb".into()), Some(fa.clone())], "aaaaaaaa", FailureKind::GateRed, 3),
+            Some("stuck:gate-red:aaaaaaaa".into())
+        );
+        // Identical but not consecutive: not stuck.
+        assert_eq!(give_up_verdict(&[Some(fa.clone()), Some("bbbbbbbb".into())], "aaaaaaaa", FailureKind::GateRed, 3), None);
+        // Legacy markers carry no fingerprint and never match.
+        assert_eq!(give_up_verdict(&[None], "aaaaaaaa", FailureKind::GateRed, 2), None);
+        // The ceiling still holds for a loop that never repeats itself.
+        assert_eq!(give_up_verdict(&[None, None, None, None], "aaaaaaaa", FailureKind::ReviewReject, 5), Some("attempts:review-reject".into()));
+    }
+
+    #[test]
+    fn marker_carries_and_returns_the_fingerprint() {
+        let rec = synthetic_rec(FailureKind::GateRed, "gate", "---- a::b stdout ----", "x.rs | 1 +");
+        let body = attempt_marker_body(2, &rec);
+        assert!(body.contains(&format!("[fp:{}]", fingerprint(&rec))), "{body}");
+        let comments = format!("{{\"comments\":[{{\"body\":\"{ATTEMPT_MARKER} attempt 1 — gate-red at gate after 3s: old\"}},{{\"body\":{}}}]}}",
+            serde_json::to_string(&body).unwrap());
+        assert_eq!(marker_fingerprints(&comments), vec![None, Some(fingerprint(&rec))]);
+        assert_eq!(marker_kinds(&comments), vec![FailureKind::GateRed, FailureKind::GateRed], "#955 still reads the kind");
+    }
+
+    /// C1–C3 end to end: `record_attempt` and `label_gave_up` against a
+    /// scripted `gh` that keeps the issue's comments, in a child process
+    /// with every piece of state under a tempdir.
+    #[test]
+    fn give_up_happens_only_when_stuck_against_scripted_gh() {
+        const CHILD: &str = "JARVIS_1214_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let gh = fake_gh_1214(root.path());
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "self_improve::tests::give_up_happens_only_when_stuck_against_scripted_gh", "--nocapture"])
+                .env(CHILD, "1")
+                .env("JARVIS_1214_ROOT", root.path())
+                .env("HOME", root.path().join("home"))
+                .env(augmentagent_channel_core::state_dir::STATE_HOME_ENV, root.path().join("state"))
+                .env("GH_BIN", gh)
+                .env_remove("AUGMENTAGENT_AUTOPR_HISTORY_FILE")
+                .env_remove("AUGMENTAGENT_AUTOPR_ATTEMPTED_FILE")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os("JARVIS_1214_ROOT").unwrap());
+        let repo = root.clone();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let calls = || std::fs::read_to_string(root.join("gh-calls.jsonl")).unwrap_or_default();
+            // C1 — three attempts, three different failures: no give-up, and
+            // the issue is only held for today.
+            let distinct = [
+                synthetic_rec(FailureKind::GateRed, "gate", "---- a::one stdout ----", "a.rs | 1 +"),
+                synthetic_rec(FailureKind::GateRed, "gate", "---- a::two stdout ----", "a.rs | 1 +"),
+                synthetic_rec(FailureKind::ReviewReject, "qa-review", "REVIEW: reject", "a.rs | 1 +"),
+            ];
+            for (i, rec) in distinct.into_iter().enumerate() {
+                let t = record_attempt(&repo, 71001, Some(rec)).await.unwrap();
+                assert_eq!(t.n, i as u32 + 1);
+                assert!(!t.exhausted(), "distinct failures are progress: {t:?}");
+            }
+            assert!(!calls().contains("--add-label"), "{}", calls());
+            let ledger = AttemptLedger::load(&attempt_ledger_path());
+            assert!(ledger.attempted_today(utc_day_now(), 71001));
+            assert!(!ledger.attempted_today(utc_day_now() + 1, 71001), "eligible again the next UTC day");
+
+            // C2 + C3 — the same failure twice, with an uncharged infra
+            // failure in between: stuck, labelled, and the reason says so.
+            let stuck = synthetic_rec(FailureKind::GateRed, "gate", "---- a::same stdout ----", "a.rs | 1 +");
+            let fp = fingerprint(&stuck);
+            assert!(!record_attempt(&repo, 71002, Some(stuck.clone())).await.unwrap().exhausted());
+            let infra = record_attempt(&repo, 71002, Some(synthetic_rec(FailureKind::Infra, "gate", "No space left on device", ""))).await.unwrap();
+            assert_eq!((infra.n, infra.exhausted()), (0, false), "infra is never charged");
+            let t = record_attempt(&repo, 71002, Some(stuck)).await.unwrap();
+            assert_eq!(t.n, 2, "the infra failure was not counted");
+            assert!(t.exhausted());
+            assert_eq!(t.reason(), format!("stuck:gate-red:{fp}"));
+            label_gave_up(&repo, 71002, t.reason()).await.unwrap();
+            let log = calls();
+            assert!(log.contains("--add-label"), "{log}");
+            let comments = std::fs::read_to_string(root.join("comments-71002.json")).unwrap();
+            assert!(comments.contains(&format!("reason=stuck:gate-red:{fp}")), "{comments}");
+        });
+    }
+
+    fn fake_gh_1214(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let gh = root.join("fake-gh.py");
+        std::fs::write(&gh, r#"#!/usr/bin/env python3
+import json, os, pathlib, sys
+root = pathlib.Path(os.environ['JARVIS_1214_ROOT'])
+args = sys.argv[1:]
+with (root/'gh-calls.jsonl').open('a') as log:
+    log.write(json.dumps(args)+'\n')
+def store(n):
+    return root/('comments-%s.json' % n)
+def load(n):
+    p = store(n)
+    return json.loads(p.read_text()) if p.exists() else []
+if args[:2]==['issue','view'] and '--json' in args:
+    print(json.dumps({'comments':[{'body':b} for b in load(args[2])]}))
+elif args[:2]==['issue','comment']:
+    n = args[2]; body = args[args.index('--body')+1]
+    store(n).write_text(json.dumps(load(n)+[body]))
+elif args[:2]==['issue','edit']:
+    print('ok')
+else:
+    sys.stderr.write('unsupported fake gh call: '+json.dumps(args)+'\n'); sys.exit(1)
+"#).unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        gh
+    }
+
+    /// C4 — a scoper verdict on a never-built issue still labels out at
+    /// once, and says so with a reason code.
+    #[test]
+    fn scoper_not_fixable_labels_on_first_occurrence_with_its_reason() {
+        assert!(may_label_out(&[]), "first-pass triage labels out immediately");
+        assert_eq!(GIVE_UP_SCOPER_NOT_FIXABLE, "scoper:not-fixable");
+        let src = include_str!("self_improve.rs");
+        let at = src.find("Auto-fix triage: {SCOPE_GAVE_UP_MARKER}").expect("the scoper refusal");
+        let label = at + src[at..].find("label_gave_up(").expect("labelled");
+        assert!(src[label..label + 120].contains("GIVE_UP_SCOPER_NOT_FIXABLE"), "{}", &src[label..label + 120]);
+    }
+
+    /// C6 input — reasons come from the durable comments first, then the
+    /// local history, and every labelled issue lands in exactly one bucket.
+    #[test]
+    fn gave_up_reasons_are_derived_and_bucketed() {
+        let marker = |code: &str| format!("{GAVE_UP_REASON_MARKER_PREFIX}{code} -->\nAuto-PR gave up.");
+        let labelled = vec![
+            (1u64, vec![marker("stuck:gate-red:aaaaaaaa")]),
+            (2, vec![marker("stuck:gate-red:bbbbbbbb")]),
+            (3, vec![marker("scoper:not-fixable")]),
+            (4, vec![format!("{ATTEMPT_MARKER} attempt 3 — review-reject at qa-review after 9s: x")]),
+            (5, vec!["Held from the auto-PR pool: **unbuildable as specified**".to_string()]),
+            (6, vec![]),
+        ];
+        let mut history = AttemptHistory::default();
+        history.push(6, synthetic_rec(FailureKind::GateRed, "gate", "", ""));
+        assert_eq!(gave_up_reason(&labelled[0].1, None), "stuck:gate-red:aaaaaaaa");
+        assert_eq!(gave_up_reason(&labelled[3].1, None), "attempts:review-reject");
+        assert_eq!(gave_up_reason(&labelled[4].1, None), "held:owner-triage");
+        let scoped = vec![format!("Auto-fix triage: {SCOPE_GAVE_UP_MARKER}, so the pipeline is leaving it.")];
+        assert_eq!(gave_up_reason(&scoped, None), GIVE_UP_SCOPER_NOT_FIXABLE, "legacy wording");
+        // The newest explanation wins: attempts first, then a scoper verdict.
+        let later = vec![labelled[3].1[0].clone(), scoped[0].clone()];
+        assert_eq!(gave_up_reason(&later, None), GIVE_UP_SCOPER_NOT_FIXABLE);
+        assert_eq!(gave_up_reason(&["just a human note".to_string()], None), "unrecorded");
+        assert_eq!(gave_up_reason(&labelled[5].1, history.issues.get(&6).map(Vec::as_slice)), "attempts:gate-red");
+        let buckets = gave_up_breakdown(&labelled, &history);
+        assert_eq!(buckets.iter().map(|(_, n)| n).sum::<u32>(), labelled.len() as u32);
+        assert!(buckets.contains(&("stuck:gate-red".to_string(), 2)), "{buckets:?}");
+    }
+
+    /// C7 — the label is added in exactly one place, and that place records
+    /// the reason before it labels.
+    #[test]
+    fn the_gave_up_label_is_never_applied_without_a_reason() {
+        let src = include_str!("self_improve.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]\n#[path = \"self_improve_lifecycle_tests.rs\"]").expect("tests")];
+        assert_eq!(prod.matches("\"--add-label\"").count(), 1, "one labelling site");
+        let start = prod.find("async fn label_gave_up(").expect("label_gave_up");
+        let body = &prod[start..start + prod[start..].find("\n}\n").unwrap()];
+        assert!(body.starts_with("async fn label_gave_up(repo_root: &Path, issue: u64, reason: &str)"), "{}", &body[..80]);
+        let noted = body.find("GAVE_UP_REASON_MARKER_PREFIX").expect("records the reason");
+        let labelled = body.find("\"--add-label\"").unwrap();
+        assert!(noted < labelled, "the reason is recorded before the label goes on");
+    }
+
     #[test]
     fn marker_kinds_reads_back_every_recorded_kind() {
         for kind in FailureKind::ALL {
@@ -15298,7 +15742,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             gate < marker,
             "the harness check must precede the marker comment"
         );
-        assert!(body[gate..marker].contains("return Ok(0)"));
+        assert!(body[gate..marker].contains("return Ok(Tally { n: 0, give_up: None })"));
     }
 
     #[test]
@@ -15372,7 +15816,10 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let check = body.find("if !rec.kind.counts_toward_max_attempts()").expect("harness check");
         let ledger = body.find("AttemptLedger::mark_persist(").expect("ledger mark");
         assert!(check < ledger, "ledger mark must follow the harness check");
-        assert!(body[check..ledger].contains("return Ok(0)"), "harness failures return before the mark");
+        assert!(
+            body[check..ledger].contains("return Ok(Tally { n: 0, give_up: None })"),
+            "harness failures return before the mark"
+        );
         assert_eq!(body.matches("AttemptLedger::mark_persist(").count(), 1);
     }
 
@@ -16196,8 +16643,9 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
 
         // A gave-up the review path did not cause keeps the attempts wording.
         let waiting = UnreviewableRecord { stood_down: false, ..latched };
-        assert!(swept_close_comment(71001, 70995, Some(&waiting)).contains("after 3 attempts"));
-        assert!(swept_close_comment(71002, 70996, None).contains("after 3 attempts"));
+        let wording = format!("after {MAX_ATTEMPTS} attempts");
+        assert!(swept_close_comment(71001, 70995, Some(&waiting)).contains(&wording));
+        assert!(swept_close_comment(71002, 70996, None).contains(&wording));
 
         let src = include_str!("self_improve.rs");
         let f = src.find("async fn find_resumable_draft(").expect("the finder");
