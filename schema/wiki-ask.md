@@ -718,6 +718,20 @@ and files over 25 MB are refused (videos usually are) — say so and answer from
 the text, never guess the content. Each fetch bills a Glacier retrieval: fetch
 only what the answer needs. Files are deleted when your session ends.
 
+## Apple Notes attachments (#1061)
+
+An Apple Note's `[attachment: <mime> <name> s3://…]` line carries the same kind
+of pointer; fetch it the same way when the answer turns on the file:
+
+```
+augmentagent apple-notes fetch-attachment 's3://<bucket>/notes/<uuid>/<att>-<name>'
+```
+
+It prints `saved: /tmp/aa-imsg/<session>/<name> (<bytes> bytes)` — the same
+session dir, so **Read the printed path**. Same 25 MB cap, same per-fetch
+retrieval cost, same rule: fetch only what the answer needs. A line without an
+`s3://` part has no uploaded copy; say so rather than guessing.
+
 ## Personal finance
 
 Use `augmentagent finance status`, `augmentagent finance transactions --start YYYY-MM-DD --end YYYY-MM-DD [--account ID]`, and `augmentagent finance summary --start YYYY-MM-DD --end YYYY-MM-DD [--account ID]` for local bank records and exact totals. These three finance subcommands are allowed Bash commands, with or without arguments. They read local records and do not require bank credentials. Do not attempt connect, complete, sync, export, or statements commands from the model session.
