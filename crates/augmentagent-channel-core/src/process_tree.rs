@@ -3,7 +3,7 @@ use tokio::process::{Child, Command};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 
@@ -221,8 +221,6 @@ fn retire_request(marker: &std::path::Path, receipt: &std::path::Path) -> std::i
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Liveness { Dead, Live, Legacy, Unproven }
 
-/// The unit whose `KillMode` licenses the same-boot proof.
-const DAEMON_UNIT: &str = "augmentagent.service";
 const MARKER_VERSION: u64 = 2;
 
 fn read_trimmed(path: &str) -> Option<String> {
@@ -237,51 +235,82 @@ fn process_start(pid: libc::pid_t) -> Option<u64> {
     stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()
 }
 
-fn unit_kill_mode() -> Option<String> {
-    let output = std::process::Command::new("systemctl")
-        .args(["--user", "show", "-p", "KillMode", "--value", DAEMON_UNIT])
-        .stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    (output.status.success() && !value.is_empty()).then_some(value)
+/// The cgroup a call ran in, as it stands now. `Gone` covers both a vanished
+/// directory and one the kernel has since re-created for another invocation
+/// (a different inode): either way the recorded cgroup was destroyed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Cgroup { Gone, Empty, Populated, Unknown }
+
+/// The cgroup v2 mount, where `/proc/self/cgroup`'s path is rooted.
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// This process's own cgroup v2 path and that directory's inode, which
+/// identifies this particular invocation's cgroup.
+fn own_cgroup() -> Option<(String, u64)> {
+    let line = read_trimmed("/proc/self/cgroup")?;
+    let path = line.rsplit_once("::")?.1.to_owned();
+    let inode = std::fs::metadata(format!("{CGROUP_ROOT}{path}")).ok()?.ino();
+    Some((path, inode))
+}
+
+/// Does the cgroup a call ran in still hold any process? A cgroup directory can
+/// only be removed once it is empty, and systemd creates a fresh one for each
+/// unit start, so a missing or re-created directory is the kernel's own record
+/// that every process of that call is gone — no assumption about what stopped
+/// the previous instance, or about a supervisor still sitting in it.
+fn cgroup_state(path: &str, inode: u64) -> Cgroup {
+    let directory = format!("{CGROUP_ROOT}{path}");
+    match std::fs::metadata(&directory).map(|found| found.ino() == inode) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Cgroup::Gone,
+        Err(_) => Cgroup::Unknown,
+        Ok(false) => Cgroup::Gone,
+        Ok(true) => match std::fs::read_to_string(format!("{directory}/cgroup.procs")) {
+            Ok(procs) if procs.trim().is_empty() => Cgroup::Empty,
+            Ok(_) => Cgroup::Populated,
+            Err(_) => Cgroup::Unknown,
+        },
+    }
 }
 
 /// The liveness probes [`call_provably_dead`] reads, injected so the predicate
-/// is unit-testable without a daemon, a boot or a systemd bus.
+/// is unit-testable without a daemon, a boot or a real cgroup hierarchy.
 pub struct LivenessEnv {
     boot_id: Option<String>,
-    cgroup: Option<String>,
-    kill_mode: Option<String>,
     start_of: Box<dyn Fn(libc::pid_t) -> Option<u64> + Send + Sync>,
+    cgroup_of: Box<dyn Fn(&str, u64) -> Cgroup + Send + Sync>,
 }
 
 impl LivenessEnv {
-    /// Production: `/proc` plus one read-only `systemctl show` query.
+    /// Production: `/proc` and the cgroup v2 hierarchy, read-only.
     pub fn probe() -> Self {
         LivenessEnv {
             boot_id: read_trimmed("/proc/sys/kernel/random/boot_id"),
-            cgroup: read_trimmed("/proc/self/cgroup"),
-            kill_mode: unit_kill_mode(),
             start_of: Box::new(process_start),
+            cgroup_of: Box::new(cgroup_state),
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn injected(boot_id: Option<String>, cgroup: Option<String>, kill_mode: Option<String>,
-        start_of: Box<dyn Fn(libc::pid_t) -> Option<u64> + Send + Sync>) -> Self {
-        LivenessEnv { boot_id, cgroup, kill_mode, start_of }
+    pub(crate) fn injected(boot_id: Option<String>,
+        start_of: Box<dyn Fn(libc::pid_t) -> Option<u64> + Send + Sync>,
+        cgroup_of: Box<dyn Fn(&str, u64) -> Cgroup + Send + Sync>) -> Self {
+        LivenessEnv { boot_id, start_of, cgroup_of }
     }
 }
 
 /// Can any descendant of the call that wrote `marker` still be running? Two
 /// independent proofs of "no", and nothing else clears a marker: a different
-/// `boot_id` (no process named by the marker survived the reboot, whatever
-/// killed the daemon), or the same boot with a writer that is gone whose cgroup
-/// is this process's own unit cgroup under a confirmed `KillMode=control-group`
-/// (systemd killed the whole previous cgroup before this instance started).
+/// `boot_id` (nothing the marker names survived the reboot), or, on the same
+/// boot, a writer that is gone whose cgroup the kernel says now holds no
+/// process at all. The cgroup, not `KillMode`, is the proof: `KillMode` says
+/// only what systemd *intends* on stop, not that it stopped the prior instance,
+/// and nothing about a supervisor still sitting in that cgroup.
 ///
 /// The writer is recorded rather than the supervisor: the marker must exist
 /// before `spawn` yields a pid, and a dead supervisor would not prove its
-/// detached grandchildren are gone (that is what the receipt is for).
+/// detached grandchildren are gone (that is what the receipt is for). The
+/// writer's cgroup does bound them: `spawn_supervised` never moves a child out
+/// of it, so every descendant of the call is a member.
 fn call_provably_dead(marker: &std::path::Path, env: &LivenessEnv) -> Liveness {
     let writer = match marker_identity(marker) {
         Identity::Writer(writer) => writer,
@@ -292,14 +321,17 @@ fn call_provably_dead(marker: &std::path::Path, env: &LivenessEnv) -> Liveness {
     if writer.boot_id != current_boot { return Liveness::Dead; }
     // Never pid alone: a reused pid is a different process.
     if (env.start_of)(writer.pid) == Some(writer.start) { return Liveness::Live; }
-    if env.cgroup.as_deref() == Some(writer.cgroup.as_str()) && env.kill_mode.as_deref() == Some("control-group") {
-        return Liveness::Dead;
+    match (env.cgroup_of)(&writer.cgroup, writer.cgroup_inode) {
+        Cgroup::Gone | Cgroup::Empty => Liveness::Dead,
+        // A populated cgroup may hold this very process (a restarted daemon
+        // reuses the unit's path, but not its inode) or a live descendant of
+        // the call. Neither is provably dead, so keep the marker.
+        Cgroup::Populated | Cgroup::Unknown => Liveness::Unproven,
     }
-    Liveness::Unproven
 }
 
 /// Who wrote a marker, as recorded by [`begin_request`].
-struct Writer { boot_id: String, pid: libc::pid_t, start: u64, cgroup: String }
+struct Writer { boot_id: String, pid: libc::pid_t, start: u64, cgroup: String, cgroup_inode: u64 }
 
 /// What a marker says about its writer. `Legacy` (a well-formed pre-#1071
 /// marker, recording no writer) is reported apart from `Unknown` (missing,
@@ -316,7 +348,8 @@ fn marker_identity(marker: &std::path::Path) -> Identity {
         boot_id: value["boot_id"].as_str().filter(|boot| !boot.is_empty())?.to_owned(),
         pid: value["writer_pid"].as_i64().and_then(|pid| libc::pid_t::try_from(pid).ok()).filter(|pid| *pid > 0)?,
         start: value["writer_start"].as_u64()?,
-        cgroup: value["writer_cgroup"].as_str().filter(|cgroup| !cgroup.is_empty())?.to_owned(),
+        cgroup: value["writer_cgroup"].as_str().filter(|cgroup| cgroup.starts_with('/'))?.to_owned(),
+        cgroup_inode: value["writer_cgroup_inode"].as_u64()?,
     });
     writer().map_or(Identity::Unknown, Identity::Writer)
 }
@@ -364,13 +397,15 @@ fn begin_request(journal: Option<&std::path::Path>, receipt: &std::path::Path) -
     // #1071 — who wrote this, and on which boot, so an orphan left by a
     // daemon that died mid-call can be proved dead later.
     let writer = unsafe { libc::getpid() };
+    let (cgroup, cgroup_inode) = own_cgroup().unzip();
     file.write_all(serde_json::json!({
         "version": MARKER_VERSION,
         "receipt": receipt,
         "boot_id": read_trimmed("/proc/sys/kernel/random/boot_id"),
         "writer_pid": writer,
         "writer_start": process_start(writer),
-        "writer_cgroup": read_trimmed("/proc/self/cgroup"),
+        "writer_cgroup": cgroup,
+        "writer_cgroup_inode": cgroup_inode,
     }).to_string().as_bytes())?;
     file.sync_all()?;
     std::fs::File::open(parent)?.sync_all()?;
@@ -518,32 +553,34 @@ mod tests {
     /// call can still be running. Every gap in either proof keeps it.
     #[test]
     fn a_marker_is_cleared_only_when_the_call_is_provably_dead() {
-        const SERVICE: &str = "0::/user.slice/user-1000.slice/app.slice/augmentagent.service";
-        let env = |boot: Option<&str>, cgroup: Option<&str>, kill: Option<&str>, live: bool| LivenessEnv {
+        const SERVICE: &str = "/user.slice/user-1000.slice/app.slice/augmentagent.service";
+        let env = |boot: Option<&str>, live: bool, cgroup: Cgroup| LivenessEnv {
             boot_id: boot.map(str::to_owned),
-            cgroup: cgroup.map(str::to_owned),
-            kill_mode: kill.map(str::to_owned),
             start_of: Box::new(move |_| live.then_some(4242)),
+            cgroup_of: Box::new(move |_, _| cgroup),
         };
         // The daemon's own reading, from which each case departs in one way.
-        let daemon = || env(Some("this-boot"), Some(SERVICE), Some("control-group"), false);
+        let daemon = || env(Some("this-boot"), false, Cgroup::Gone);
         let cases: Vec<(&str, serde_json::Value, LivenessEnv, Liveness)> = vec![
             ("a foreign boot proves a reboot killed everything", json!({"boot_id": "other-boot"}),
-                env(Some("this-boot"), None, None, true), Liveness::Dead),
+                env(Some("this-boot"), true, Cgroup::Populated), Liveness::Dead),
             ("the writer is still running", json!({}),
-                env(Some("this-boot"), Some(SERVICE), Some("control-group"), true), Liveness::Live),
-            ("writer gone, service cgroup killed as a control group", json!({}), daemon(), Liveness::Dead),
-            ("a foreground CLI's cgroup is not the unit's",
-                json!({"writer_cgroup": "0::/user.slice/session-3.scope"}), daemon(), Liveness::Unproven),
-            ("KillMode does not kill the whole cgroup", json!({}),
-                env(Some("this-boot"), Some(SERVICE), Some("process"), false), Liveness::Unproven),
-            ("KillMode could not be read", json!({}),
-                env(Some("this-boot"), Some(SERVICE), None, false), Liveness::Unproven),
+                env(Some("this-boot"), true, Cgroup::Gone), Liveness::Live),
+            ("writer gone, its cgroup destroyed so every member had exited", json!({}), daemon(),
+                Liveness::Dead),
+            ("writer gone, its cgroup still there and holding nobody", json!({}),
+                env(Some("this-boot"), false, Cgroup::Empty), Liveness::Dead),
+            ("the cgroup still holds a process, which may be a descendant", json!({}),
+                env(Some("this-boot"), false, Cgroup::Populated), Liveness::Unproven),
+            ("the cgroup could not be read at all", json!({}),
+                env(Some("this-boot"), false, Cgroup::Unknown), Liveness::Unproven),
             ("boot id could not be read", json!({"boot_id": "other-boot"}),
-                env(None, Some(SERVICE), Some("control-group"), false), Liveness::Unproven),
+                env(None, false, Cgroup::Gone), Liveness::Unproven),
             ("a pre-#1071 marker has no identity", json!({"version": 1}), daemon(), Liveness::Legacy),
             ("a v2 marker missing a field",
                 json!({"writer_start": serde_json::Value::Null}), daemon(), Liveness::Unproven),
+            ("a v2 marker whose writer ran outside any cgroup v2 hierarchy",
+                json!({"writer_cgroup": serde_json::Value::Null}), daemon(), Liveness::Unproven),
         ];
         let request = || {
             let directory = tempfile::tempdir().unwrap();
@@ -557,7 +594,8 @@ mod tests {
             let (directory, journal) = request();
             let marker = journal.with_extension("active");
             let mut value = json!({"version": MARKER_VERSION, "receipt": directory.path().join("cleanup-complete"),
-                "boot_id": "this-boot", "writer_pid": 999, "writer_start": 4242, "writer_cgroup": SERVICE});
+                "boot_id": "this-boot", "writer_pid": 999, "writer_start": 4242,
+                "writer_cgroup": SERVICE, "writer_cgroup_inode": 424242});
             for (key, replacement) in overrides.as_object().unwrap() {
                 value[key] = replacement.clone();
             }
@@ -567,33 +605,26 @@ mod tests {
             assert_eq!(clear_if_dead(&journal, &env, false).unwrap(), wanted, "{case}");
             assert_eq!(marker.exists(), wanted != Liveness::Dead, "{case}");
         }
-        // Unreadable markers are kept, never cleared.
-        for case in ["corrupt", "dangling-link"] {
+        // A marker that cannot be read as one is kept, never cleared.
+        for bytes in [Some(&b"not json"[..]), None] {
             let (directory, journal) = request();
             let marker = journal.with_extension("active");
-            if case == "corrupt" {
-                write(&marker, b"not json");
-            } else {
-                std::os::unix::fs::symlink(directory.path().join("missing"), &marker).unwrap();
+            match bytes {
+                Some(bytes) => write(&marker, bytes),
+                None => std::os::unix::fs::symlink(directory.path().join("missing"), &marker).unwrap(),
             }
-            assert_eq!(clear_if_dead(&journal, &daemon(), false).unwrap(), Liveness::Unproven, "{case}");
-            assert!(marker.symlink_metadata().is_ok(), "{case}");
+            assert_eq!(clear_if_dead(&journal, &daemon(), false).unwrap(), Liveness::Unproven);
+            assert!(marker.symlink_metadata().is_ok(), "{bytes:?}");
         }
-    }
 
-    /// #1071 — every unlink is judged by `clear_marker`, so the two proofs
-    /// stay independent: a verified receipt clears a marker whose writer is
-    /// still running, and a dead writer clears one with no receipt to read.
-    #[test]
-    fn both_proofs_are_judged_at_the_one_clearing_site() {
-        // Real probes: this test process wrote the marker, and is alive.
+        // Both proofs are judged at the one clearing site, and stay
+        // independent: a verified receipt clears a marker whose writer — this
+        // very test process, under the real probes — is still running.
         let live = LivenessEnv::injected(read_trimmed("/proc/sys/kernel/random/boot_id"),
-            None, None, Box::new(process_start));
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            Box::new(process_start), Box::new(cgroup_state));
+        let (directory, journal) = request();
         let receipt = directory.path().join("cleanup-complete");
-        let marker = begin_request(Some(&directory.path().join("operations.json")), &receipt)
-            .unwrap().unwrap();
+        let marker = begin_request(Some(&journal), &receipt).unwrap().unwrap();
         assert_eq!(clear_marker(&marker, Proof::WriterGone(&live)).unwrap(), Liveness::Live,
             "with no receipt, a running writer keeps its marker");
         assert_eq!(clear_marker(&marker, Proof::Reaped(&receipt)).unwrap(), Liveness::Dead,
@@ -601,13 +632,13 @@ mod tests {
         assert!(!marker.exists());
     }
 
-    /// #1071, the reported case verbatim: a deploy kills the daemon mid-call,
-    /// so the marker its `Drop` would have retired leaks. The successor start
-    /// must retire it and must leave the journal's `started` row for the
-    /// operator. Nothing about the writer is simulated: a real forked process
-    /// takes the marker and exits without unwinding, as systemd's SIGKILL leaves
-    /// a daemon, and the successor judges it with the real `/proc` probe. Only
-    /// `KillMode` is injected — that is the unit's configuration.
+    /// #1071, the reported case verbatim, with a real writer rather than a
+    /// hand-written marker: a deploy kills the daemon mid-call, so the marker
+    /// its `Drop` would have retired leaks. A real forked process takes the
+    /// marker through `begin_request` and `_exit`s without unwinding, as
+    /// systemd's SIGKILL leaves a daemon, and the real `/proc` probe judges it
+    /// gone. Only the cgroup reading is injected — this process cannot make
+    /// systemd destroy the previous start's cgroup; it has its own cases above.
     #[test]
     fn a_restart_during_a_call_retires_the_marker_it_orphaned() {
         let directory = tempfile::tempdir().unwrap();
@@ -635,9 +666,13 @@ mod tests {
         let Identity::Writer(recorded) = marker_identity(&marker) else { panic!("marker has no writer") };
         assert_eq!(recorded.pid, writer, "the marker names its real writer");
 
+        let recorded_cgroup = recorded.cgroup.clone();
         let env = LivenessEnv { boot_id: read_trimmed("/proc/sys/kernel/random/boot_id"),
-            cgroup: read_trimmed("/proc/self/cgroup"), kill_mode: Some("control-group".into()),
-            start_of: Box::new(process_start) };
+            start_of: Box::new(process_start),
+            cgroup_of: Box::new(move |path, _| {
+                assert_eq!(path, recorded_cgroup, "the writer's own cgroup must be the one probed");
+                Cgroup::Gone
+            }) };
         assert_eq!(clear_if_dead(&journal, &env, false).unwrap(), Liveness::Dead);
         assert!(!marker.exists(), "the marker must not survive the restart");
         assert_eq!(std::fs::read_to_string(&journal).unwrap(), rows, "clearing must not edit the journal");

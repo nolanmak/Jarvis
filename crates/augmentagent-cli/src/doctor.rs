@@ -1959,10 +1959,8 @@ mod tests {
             kept_unfinished: 2,
             ..Default::default()
         };
-        // #1071 — a legacy marker is information, not a warning: only an
-        // operator can retire one, and the count shows that backlog draining.
-        // A *clearable* orphan is a warning: the daemon's start-up pass should
-        // have cleared it already.
+        // #1071 — a legacy marker is information (only an operator can retire
+        // one); a *clearable* orphan is a warning, the start-up pass missed it.
         let legacy = handoff::OrphanReport { kept_live: 1, kept_legacy: 2, ..Default::default() };
         let ok = handoff_journal_finding(Ok(healthy), legacy, grace);
         assert_eq!(ok.severity, Severity::Ok, "{}", ok.message);

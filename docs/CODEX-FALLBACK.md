@@ -955,32 +955,36 @@ What it never touches, and for how long:
   - a supervisor's `all-descendants-reaped` receipt — offered by a
     `ProcessGroup` as it drops, and by the resume gate when the same turn is
     dispatched again and that receipt still verifies; and
-  - the orphan pass (#1071), which the daemon runs once at start — before any
-    channel can dispatch — and `handoff-prune` runs on every invocation. With
-    no receipt left to read, it proves instead that the writing process cannot
-    still be running: a `boot_id` differing from
-    `/proc/sys/kernel/random/boot_id` means no process named by the marker
+  - the orphan pass (#1071), run once as the daemon's sweep loop starts, before
+    any channel can dispatch. With no receipt left to read, it proves instead
+    that the writing process cannot still be running: a `boot_id` differing
+    from `/proc/sys/kernel/random/boot_id` means nothing the marker names
     survived the reboot; failing that, on the same boot, the recorded writer
     must be gone (pid **and** its `/proc` start time, so a reused pid never
-    counts), its recorded cgroup must equal this process's own, and
-    `systemctl --user show -p KillMode augmentagent.service` must read
-    `control-group` — systemd then killed the whole previous cgroup before this
-    instance started. A foreground CLI's marker carries a different cgroup, so
-    only a boot change clears it.
+    counts) **and** the cgroup v2 directory it ran in must now hold no process
+    at all — either destroyed (the kernel only removes an *empty* cgroup, and
+    each unit start gets a fresh one, so a missing directory or a different
+    inode at that path is the kernel's own record that every member exited) or
+    still present with an empty `cgroup.procs`. `spawn_supervised` never moves
+    a child out of the writer's cgroup, so that set bounds every descendant of
+    the call, supervisor included. The reading is deliberately *not*
+    `KillMode`: that says only what systemd intends on stop, not that it
+    stopped the prior instance, and nothing about a supervisor still in that
+    cgroup.
 
   Every other reading keeps the marker: an unreadable, linked, oversized or
-  truncated marker, an unreadable boot id, an unconfirmed `KillMode`, and every
-  pre-#1071 marker (no writer identity, so no proof can apply). `doctor` and
-  `handoff-prune` count pre-upgrade markers apart from the other doubtful ones
-  so that backlog is visible as it drains; a marker doctor finds *clearable* is
-  a warning instead, since the start-up pass should have taken it. Clearing
-  removes only the marker: the journal keeps its `started` row, so the request
-  becomes idle to the sweep but stays *unfinished* and still needs the recovery
-  command above. The daemon also handles SIGTERM, so `systemctl --user
-  stop/restart` cancels in-flight calls and then *waits* — up to 30s — for every
+  truncated marker, an unreadable boot id, a cgroup that still holds a process
+  or cannot be read, and every pre-#1071 marker (no writer identity, so no
+  proof can apply). `doctor` counts pre-upgrade markers apart from the other
+  doubtful ones so that backlog is visible as it drains; a marker it finds
+  *clearable* is a warning instead, since the start-up pass should have taken
+  it. Clearing removes only the marker: the journal keeps its `started` row, so
+  the request becomes idle to the sweep but stays *unfinished* and still needs
+  the recovery command above. The daemon also handles SIGTERM, so a stop or
+  restart cancels in-flight calls and then *waits* — up to 30s — for every
   channel task to unwind and drop its `ProcessGroup`, which is what retires the
-  markers; keep the unit's `TimeoutStopSec` above that drain. The orphan pass
-  covers what the drain cannot: SIGKILL, a timed-out drain, OOM, power loss.
+  markers; keep `TimeoutStopSec` above that drain. The orphan pass covers what
+  the drain cannot: SIGKILL, a timed-out drain, OOM, power loss.
 
 Do not delete handoff state by hand.
 
