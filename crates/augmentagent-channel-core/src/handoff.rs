@@ -508,8 +508,8 @@ pub struct OrphanReport {
     pub cleared: u64,
     /// The writing process is still running.
     pub kept_live: u64,
-    /// Written before #1071, so it records no writer to judge. Counted apart
-    /// from `kept_unproven` so an operator can watch that backlog drain.
+    /// Pre-#1071: records no writer to judge. Counted apart from
+    /// `kept_unproven` so an operator can watch that backlog drain.
     pub kept_legacy: u64,
     /// No proof either way.
     pub kept_unproven: u64,
@@ -519,8 +519,7 @@ pub struct OrphanReport {
 /// `dry_run` reads only: no locks are taken and nothing is created or removed.
 /// Only markers are cleared; a cleared request rejoins the normal sweep path,
 /// where an unsettled journal still keeps it until an operator decides.
-pub fn clear_orphaned_markers(root: &Path, env: &LivenessEnv, dry_run: bool)
-    -> anyhow::Result<OrphanReport> {
+pub fn clear_orphaned_markers(root: &Path, env: &LivenessEnv, dry_run: bool) -> anyhow::Result<OrphanReport> {
     use crate::process_tree::Liveness;
     let mut report = OrphanReport::default();
     let metadata = match std::fs::symlink_metadata(root) {

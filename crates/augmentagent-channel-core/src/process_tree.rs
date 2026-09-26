@@ -176,20 +176,19 @@ fn marker_receipt(marker: &std::path::Path) -> std::io::Result<PathBuf> {
 }
 
 /// What a caller offers as proof that no descendant of the call can still be
-/// running. Neither proof subsumes the other, so both exist, but both are
-/// judged in [`clear_marker`] rather than at the call site.
+/// running. Neither proof subsumes the other, so both exist.
 enum Proof<'a> {
-    /// The supervisor's `all-descendants-reaped` receipt, already read by the
-    /// caller, which observed the reaping directly.
+    /// The supervisor's `all-descendants-reaped` receipt, read by the caller,
+    /// which observed the reaping directly.
     Reaped(&'a std::path::Path),
     /// No receipt left: prove instead that the writer is gone (#1071).
     WriterGone(&'a LivenessEnv),
 }
 
-/// The single site that unlinks a lifecycle marker, and the single site that
-/// decides one may be unlinked. The caller must already hold the lifecycle
-/// lock; the proof is evaluated here against the marker as it is on disk, so
-/// no path removes a marker on its own authority.
+/// The one site that unlinks a lifecycle marker, and the one site that decides
+/// it may be unlinked. The caller must already hold the lifecycle lock; the
+/// proof is judged here against the marker on disk, so no path removes a
+/// marker on its own authority.
 fn clear_marker(marker: &std::path::Path, proof: Proof<'_>) -> std::io::Result<Liveness> {
     let verdict = match proof {
         // The marker must still name the verified receipt; if it names another,
@@ -217,8 +216,8 @@ fn retire_request(marker: &std::path::Path, receipt: &std::path::Path) -> std::i
 /// Whether a call's descendants can still be running (#1071). Only `Dead` (no
 /// process from that call can survive) clears the marker; `Live` means its
 /// writer is still running, `Legacy` a pre-#1071 marker with no identity to
-/// judge — counted apart for `doctor` to report — and `Unproven` an unreadable
-/// marker or an incomplete proof.
+/// judge (counted apart for `doctor`), `Unproven` an unreadable marker or an
+/// incomplete proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Liveness { Dead, Live, Legacy, Unproven }
 
@@ -276,10 +275,9 @@ impl LivenessEnv {
 /// Can any descendant of the call that wrote `marker` still be running? Two
 /// independent proofs of "no", and nothing else clears a marker: a different
 /// `boot_id` (no process named by the marker survived the reboot, whatever
-/// killed the daemon), or the same boot with a writer that is gone whose
-/// cgroup is this process's own unit cgroup under a confirmed
-/// `KillMode=control-group` (systemd killed the whole previous cgroup before
-/// this instance started).
+/// killed the daemon), or the same boot with a writer that is gone whose cgroup
+/// is this process's own unit cgroup under a confirmed `KillMode=control-group`
+/// (systemd killed the whole previous cgroup before this instance started).
 ///
 /// The writer is recorded rather than the supervisor: the marker must exist
 /// before `spawn` yields a pid, and a dead supervisor would not prove its
@@ -304,9 +302,9 @@ fn call_provably_dead(marker: &std::path::Path, env: &LivenessEnv) -> Liveness {
 struct Writer { boot_id: String, pid: libc::pid_t, start: u64, cgroup: String }
 
 /// What a marker says about its writer. `Legacy` (a well-formed pre-#1071
-/// marker, which records no writer) is reported apart from `Unknown` (missing,
-/// unreadable, or a v2 marker missing or malforming a field) so operators can
-/// see how many pre-upgrade markers are left; both keep the marker.
+/// marker, recording no writer) is reported apart from `Unknown` (missing,
+/// unreadable, or a v2 marker with a missing or malformed field) so operators
+/// can see the pre-upgrade backlog; both keep the marker.
 enum Identity { Writer(Writer), Legacy, Unknown }
 
 fn marker_identity(marker: &std::path::Path) -> Identity {
@@ -327,7 +325,7 @@ fn marker_identity(marker: &std::path::Path) -> Identity {
 /// it takes no lock and creates nothing. A clearing run re-reads the marker
 /// under the lifecycle lock, so a newer owner's marker is never removed. Only
 /// the marker is touched: the journal keeps its `started` rows, so the request
-/// stays uncertain and the recovery command can still act on it.
+/// stays uncertain and recovery can still act on it.
 pub(crate) fn clear_if_dead(journal: &std::path::Path, env: &LivenessEnv, dry_run: bool)
     -> std::io::Result<Liveness> {
     let marker = journal.with_extension("active");
@@ -543,10 +541,9 @@ mod tests {
                 env(Some("this-boot"), Some(SERVICE), None, false), Liveness::Unproven),
             ("boot id could not be read", json!({"boot_id": "other-boot"}),
                 env(None, Some(SERVICE), Some("control-group"), false), Liveness::Unproven),
-            ("a pre-#1071 marker has no identity, and is counted as such",
-                json!({"version": 1}), daemon(), Liveness::Legacy),
-            ("a v2 marker missing a field", json!({"writer_start": serde_json::Value::Null}),
-                daemon(), Liveness::Unproven),
+            ("a pre-#1071 marker has no identity", json!({"version": 1}), daemon(), Liveness::Legacy),
+            ("a v2 marker missing a field",
+                json!({"writer_start": serde_json::Value::Null}), daemon(), Liveness::Unproven),
         ];
         let request = || {
             let directory = tempfile::tempdir().unwrap();

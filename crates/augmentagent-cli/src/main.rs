@@ -3376,12 +3376,11 @@ async fn main() -> Result<()> {
                 });
             }
             // #1071 — cancelling is only half of a clean stop: the markers
-            // retire when the channels unwind and drop their ProcessGroups.
-            // So join every task, and bound the wait so a wedged one cannot
-            // hold the stop open until systemd's SIGKILL. A failing task
-            // cancels the rest instead of returning straight away, which
-            // would drop the process while other supervisors are still
-            // retiring — exactly the orphans this issue is about.
+            // retire when the channels unwind and drop their ProcessGroups. So
+            // join every task, bounding the wait so a wedged one cannot hold
+            // the stop open until systemd's SIGKILL. A failing task cancels the
+            // rest rather than returning at once, which would drop the process
+            // while other supervisors are still retiring — the orphans at issue.
             const SHUTDOWN_DRAIN: Duration = Duration::from_secs(30);
             let mut failure = None;
             let drained = tokio::time::timeout(SHUTDOWN_DRAIN, async {

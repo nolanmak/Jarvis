@@ -971,17 +971,16 @@ What it never touches, and for how long:
   Every other reading keeps the marker: an unreadable, linked, oversized or
   truncated marker, an unreadable boot id, an unconfirmed `KillMode`, and every
   pre-#1071 marker (no writer identity, so no proof can apply). `doctor` and
-  `handoff-prune` count those pre-upgrade markers apart from the other doubtful
-  ones, so the backlog is visible as it drains; a marker doctor finds
-  *clearable* is a warning instead, since the start-up pass should have taken it.
-  Clearing removes only the marker: the journal keeps its `started` row, so the
-  request becomes idle to the sweep but stays *unfinished* and still needs the
-  recovery command above before anything is removed. The daemon also handles
-  SIGTERM, so `systemctl --user stop/restart` cancels in-flight calls and then
-  *waits* — up to 30s — for every channel task to unwind and drop its
-  `ProcessGroup`, which is what retires the markers; keep the unit's
-  `TimeoutStopSec` above that drain. The orphan pass covers what the drain
-  cannot: SIGKILL, a timed-out drain, OOM, power loss.
+  `handoff-prune` count pre-upgrade markers apart from the other doubtful ones
+  so that backlog is visible as it drains; a marker doctor finds *clearable* is
+  a warning instead, since the start-up pass should have taken it. Clearing
+  removes only the marker: the journal keeps its `started` row, so the request
+  becomes idle to the sweep but stays *unfinished* and still needs the recovery
+  command above. The daemon also handles SIGTERM, so `systemctl --user
+  stop/restart` cancels in-flight calls and then *waits* — up to 30s — for every
+  channel task to unwind and drop its `ProcessGroup`, which is what retires the
+  markers; keep the unit's `TimeoutStopSec` above that drain. The orphan pass
+  covers what the drain cannot: SIGKILL, a timed-out drain, OOM, power loss.
 
 Do not delete handoff state by hand.
 

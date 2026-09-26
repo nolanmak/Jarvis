@@ -1057,9 +1057,8 @@ fn check_handoff_journals() -> Finding {
         return Finding::ok("handoff_journals", "no HOME; journal root unknown");
     };
     let grace = handoff::retention_from_env();
-    // #1071 — the same orphan pass the daemon runs at start, read-only, so
-    // doctor can say how many markers are clearable and how many predate the
-    // upgrade (those need an operator).
+    // #1071 — the same orphan pass the daemon runs at start, read-only, so doctor
+    // can say how many markers are clearable and how many predate the upgrade.
     let orphans = handoff::clear_orphaned_markers(&root, &handoff::LivenessEnv::probe(), true);
     handoff_journal_finding(handoff::sweep_finished(&root, grace, true), orphans.unwrap_or_default(), grace)
 }
