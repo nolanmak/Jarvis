@@ -586,6 +586,11 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Auto-PR loop maintenance (#1214).
+    Autopr {
+        #[command(subcommand)]
+        op: AutoprOp,
+    },
     Doctor {
         /// Force JSON (`--json`) or human table. Default: auto — JSON when
         /// stdout is piped, table on a tty.
@@ -750,6 +755,20 @@ enum Cmd {
         component: installers::UninstallComponent,
     },
     // === end setup+maintenance subcommands ===
+}
+
+#[derive(Subcommand)]
+enum AutoprOp {
+    /// Put `agent-gave-up` issues back in the pool by recorded reason code
+    /// (`stuck:gate-red:<fp>`, `attempts:review-reject`, `scoper:not-fixable`,
+    /// …). `--reason` matches the whole code or any whole `:` segment of it.
+    Readmit {
+        #[arg(long)]
+        reason: String,
+        /// List the matching issue numbers, one per line; change nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -4333,6 +4352,17 @@ async fn main() -> Result<()> {
             )
             .await?;
             std::process::exit(code);
+        }
+        Cmd::Autopr { op: AutoprOp::Readmit { reason, dry_run } } => {
+            let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            for n in self_improve::readmit(&root, &reason, dry_run).await? {
+                if dry_run {
+                    println!("{n}");
+                } else {
+                    println!("readmitted #{n}");
+                }
+            }
+            Ok(())
         }
         Cmd::AutoprHealth { notify, json } => {
             let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));

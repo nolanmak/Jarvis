@@ -8267,6 +8267,11 @@ fn gave_up_reason(comments: &[String], history: Option<&[AttemptRecord]>) -> Str
     }
 }
 
+/// #1214 — `wanted` names the whole code or one whole `:`-segment of it.
+fn reason_matches(code: &str, wanted: &str) -> bool {
+    code == wanted || code.split(':').any(|seg| seg == wanted)
+}
+
 /// #1214 — labelled issues grouped by reason (its first two segments, so
 /// per-fingerprint codes group by kind), largest group first.
 fn gave_up_breakdown(labelled: &[(u64, Vec<String>)], history: &AttemptHistory) -> Vec<(String, u32)> {
@@ -8303,6 +8308,35 @@ const LABELLED_LIST_ARGS: [&str; 10] = [
     "issue", "list", "--state", "open", "--label", GAVE_UP_LABEL, "--limit", "500", "--json", "number,comments",
 ];
 
+/// #1214 — `augmentagent autopr readmit`: the labelled issues whose reason
+/// matches `wanted`. With `dry_run` nothing on GitHub changes; otherwise the
+/// label comes off each, which puts it back in the pool.
+pub(crate) async fn readmit(repo_root: &Path, wanted: &str, dry_run: bool) -> Result<Vec<u64>> {
+    let gh = gh_bin();
+    let (ok, stdout, stderr) = run(&gh, &LABELLED_LIST_ARGS, repo_root).await?;
+    if !ok {
+        bail!("gh issue list failed: {}", truncate(&stderr, 300));
+    }
+    let history = AttemptHistory::load(&attempt_history_path());
+    let matched: Vec<u64> = parse_labelled(&stdout)
+        .into_iter()
+        .filter(|(n, comments)| {
+            reason_matches(&gave_up_reason(comments, history.issues.get(n).map(Vec::as_slice)), wanted)
+        })
+        .map(|(n, _)| n)
+        .collect();
+    if !dry_run {
+        for n in &matched {
+            let (ok, _o, e) =
+                run(&gh, &["issue", "edit", &n.to_string(), "--remove-label", GAVE_UP_LABEL], repo_root).await?;
+            if !ok {
+                bail!("removing `{GAVE_UP_LABEL}` from #{n} failed: {}", truncate(&e, 300));
+            }
+        }
+    }
+    Ok(matched)
+}
+
 /// #1214 — the health watchdog's breakdown; `None` when `gh` cannot say.
 pub(crate) fn gave_up_breakdown_live(repo_root: &Path) -> Option<Vec<(String, u32)>> {
     let out = std::process::Command::new(gh_bin())
@@ -8337,7 +8371,8 @@ async fn label_gave_up(repo_root: &Path, issue: u64, reason: &str) -> Result<()>
     // reason comment on an issue whose label then failed is harmless.
     let note = format!(
         "{GAVE_UP_REASON_MARKER_PREFIX}{reason} -->\nAuto-PR gave up on this issue: `{reason}`. \
-         Remove the `{GAVE_UP_LABEL}` label to put it back in the pool."
+         Remove the `{GAVE_UP_LABEL}` label, or run `augmentagent autopr readmit --reason <code>`, \
+         to put it back in the pool."
     );
     let _ = run(&gh, &["issue", "comment", &issue.to_string(), "--body", &note], repo_root).await;
     // #1037 L1 — the exit status is the answer: a caller that closes a draft
@@ -15645,6 +15680,16 @@ else:
         let buckets = gave_up_breakdown(&labelled, &history);
         assert_eq!(buckets.iter().map(|(_, n)| n).sum::<u32>(), labelled.len() as u32);
         assert!(buckets.contains(&("stuck:gate-red".to_string(), 2)), "{buckets:?}");
+    }
+
+    #[test]
+    fn readmit_matches_a_whole_reason_segment() {
+        assert!(reason_matches("stuck:gate-red:aaaaaaaa", "gate-red"));
+        assert!(reason_matches("attempts:gate-red", "gate-red"));
+        assert!(reason_matches("scoper:not-fixable", "scoper:not-fixable"));
+        assert!(reason_matches("scoper:not-fixable", "scoper"));
+        assert!(!reason_matches("stuck:gate-red:aaaaaaaa", "gate"), "segments, not substrings");
+        assert!(!reason_matches("unrecorded", "gate-red"));
     }
 
     /// C7 — the label is added in exactly one place, and that place records
