@@ -120,6 +120,13 @@ expect_block "Read escaping the session dir via .. is blocked" \
 expect_block "Write into the session dir is blocked" \
   Write file_path "/tmp/aa-imsg/4242-17/x" "$I_ENV"
 
+# #1061 — `apple-notes fetch-attachment` writes into that same session dir, so the
+# path it prints is admitted by the carve-out above with no second /tmp root.
+expect_allow "Read of this session's fetched Apple Notes attachment is allowed" \
+  Read file_path "/tmp/aa-imsg/4242-17/ATT-1-scan-3fa2b1c0.jpeg" "$I_ENV"
+expect_block "Read of a concurrent session's Apple Notes attachment is blocked" \
+  Read file_path "/tmp/aa-imsg/4242-18/ATT-1-scan-3fa2b1c0.jpeg" "$I_ENV"
+
 # #1045 — Discord attachment tempfiles: Read only, the exact ASCII name shape,
 # in any locale (bash bracket ranges are collation-dependent under UTF-8).
 expect_allow "Read of a Discord attachment tempfile is allowed" \

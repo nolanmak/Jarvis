@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from apple_notes_sync import (  # noqa: E402
     APPLE_EPOCH,
     apple_time_to_iso,
+    attachment_key,
     decode_note_body,
     slugify,
     sync,
@@ -29,6 +30,7 @@ from apple_notes_sync import (  # noqa: E402
 )
 
 ACCOUNT_PK = 2
+ACCOUNT_UUID = "4A43B10C-0000-0000-0000-000000000000"
 FOLDER_NOTES = 3
 FOLDER_WORK = 4
 FOLDER_TRASH = 1
@@ -90,7 +92,7 @@ def make_fixture_db(path):
     )
     con.execute(
         "INSERT INTO ZICCLOUDSYNCINGOBJECT (Z_PK, ZNAME, ZIDENTIFIER) VALUES (?, ?, ?)",
-        (ACCOUNT_PK, "iCloud", "4A43B10C-0000-0000-0000-000000000000"),
+        (ACCOUNT_PK, "iCloud", ACCOUNT_UUID),
     )
     for pk, title, ftype in ((FOLDER_TRASH, "Recently Deleted", 1), (FOLDER_NOTES, "Notes", 0), (FOLDER_WORK, "Work", 0)):
         con.execute(
@@ -153,6 +155,13 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(slugify("📫"), "untitled")
         self.assertEqual(slugify(""), "untitled")
         self.assertEqual(len(slugify("x" * 500)), 80)
+
+    def test_attachment_key_is_portable_and_keeps_the_extension(self):
+        # The extension survives: the ask agent renders a fetched image by it.
+        key = attachment_key("00000000-0000-0000-0000-000000000010", "ATT-1", "scan 1/é.jpeg")
+        self.assertEqual(key, "notes/00000000-0000-0000-0000-000000000010/ATT-1-scan-1-e.jpeg")
+        self.assertRegex(key.rsplit("/", 1)[1], r"^[A-Za-z0-9._-]+$")
+        self.assertEqual(attachment_key("U", "A", None), "notes/U/A-untitled")
 
     def test_uti_to_mime(self):
         self.assertEqual(uti_to_mime("public.jpeg"), "image/jpeg")
@@ -271,6 +280,113 @@ class SyncTests(unittest.TestCase):
         add_note(self.con, 10, "Pic", "￼", attachments=[("ATT-404", "public.jpeg")])
         self.run_sync()
         self.assertIn("[attachment: image/jpeg ATT-404]", self.read("notes/notes/pic.md"))
+
+    # -- attachment upload (#1061) --
+
+    def media_file(self, ident, filename, body=b"jpegbytes"):
+        """Plant the file Notes keeps for an attachment, under the media root
+        the exporter derives from --db."""
+        path = self.db.parent / "Accounts" / ACCOUNT_UUID / "Media" / f"MEDIA-{ident}" / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(body)
+        return path
+
+    def test_failed_upload_is_retried_once_on_the_next_run(self):
+        uuid = add_note(self.con, 10, "Pic", "￼", attachments=[("ATT-1", "public.jpeg")])
+        add_attachment(self.con, 10, "ATT-1", "public.jpeg", "IMG_0001.jpeg")
+        local = self.media_file("ATT-1", "IMG_0001.jpeg")
+        key = attachment_key(uuid, "ATT-1", "IMG_0001.jpeg")
+        calls = []
+
+        def upload(path, bucket, k):
+            calls.append((path, bucket, k))
+            return len(calls) > 1  # the first attempt fails
+
+        s3 = {"bucket": "notes-bucket", "uploader": upload}
+        sync(self.db, self.out, self.state, s3=s3)
+        # No pointer to an object that is not there; the item is queued once.
+        self.assertIn("[attachment: image/jpeg IMG_0001.jpeg]", self.read("notes/notes/pic.md"))
+        self.assertEqual(self.state_json()["pending_uploads"],
+                         [{"path": str(local), "key": key, "note": uuid}])
+
+        sync(self.db, self.out, self.state, s3=s3)
+        self.assertIn(f"[attachment: image/jpeg IMG_0001.jpeg s3://notes-bucket/{key}]",
+                      self.read("notes/notes/pic.md"))
+        self.assertEqual(self.state_json()["pending_uploads"], [])
+        self.assertEqual([c[2] for c in calls], [key, key])
+
+    def test_unchanged_note_does_not_re_upload(self):
+        add_note(self.con, 10, "Pic", "￼", attachments=[("ATT-1", "public.jpeg")])
+        add_attachment(self.con, 10, "ATT-1", "public.jpeg", "IMG_0001.jpeg")
+        self.media_file("ATT-1", "IMG_0001.jpeg")
+        calls = []
+        s3 = {"bucket": "notes-bucket", "uploader": lambda p, b, k: calls.append(k) or True}
+        sync(self.db, self.out, self.state, s3=s3)
+        sync(self.db, self.out, self.state, s3=s3)
+        self.assertEqual(len(calls), 1)
+
+    def test_missing_media_file_keeps_the_line_without_a_uri(self):
+        add_note(self.con, 10, "Pic", "￼", attachments=[("ATT-1", "public.jpeg")])
+        add_attachment(self.con, 10, "ATT-1", "public.jpeg", "IMG_0001.jpeg")
+        s3 = {"bucket": "notes-bucket", "uploader": lambda p, b, k: self.fail("no upload")}
+        sync(self.db, self.out, self.state, s3=s3)
+        self.assertIn("[attachment: image/jpeg IMG_0001.jpeg]", self.read("notes/notes/pic.md"))
+        self.assertEqual(self.state_json().get("pending_uploads", []), [])
+
+    def test_pending_upload_whose_file_vanished_is_dropped(self):
+        add_note(self.con, 10, "Pic", "￼", attachments=[("ATT-1", "public.jpeg")])
+        add_attachment(self.con, 10, "ATT-1", "public.jpeg", "IMG_0001.jpeg")
+        local = self.media_file("ATT-1", "IMG_0001.jpeg")
+        s3 = {"bucket": "notes-bucket", "uploader": lambda p, b, k: False}
+        sync(self.db, self.out, self.state, s3=s3)
+        self.assertEqual(len(self.state_json()["pending_uploads"]), 1)
+        local.unlink()
+        sync(self.db, self.out, self.state, s3=s3)
+        self.assertEqual(self.state_json()["pending_uploads"], [])
+
+    def test_secret_in_attachment_filename_quarantines_the_note(self):
+        uuid = add_note(self.con, 10, "Pic", "￼", attachments=[("ATT-1", "public.jpeg")])
+        add_attachment(self.con, 10, "ATT-1", "public.jpeg", "AKIAIOSFODNN7EXAMPLE.jpeg")
+        self.media_file("ATT-1", "AKIAIOSFODNN7EXAMPLE.jpeg")
+        s3 = {"bucket": "notes-bucket", "uploader": lambda p, b, k: self.fail("no upload")}
+        counts = sync(self.db, self.out, self.state, s3=s3)
+        self.assertEqual(counts["skipped"], 1)
+        self.assertEqual(list(self.out.glob("notes/*/*.md")), [])
+        self.assertNotIn(uuid, self.index())
+        self.assertEqual(self.state_json()["skipped"][uuid]["reason"], "attachment-secret")
+
+    def test_attachment_secret_removes_a_previously_written_note(self):
+        add_note(self.con, 10, "Pic", "￼", attachments=[("ATT-1", "public.jpeg")])
+        add_attachment(self.con, 10, "ATT-1", "public.jpeg", "clean.jpeg")
+        self.run_sync()
+        self.assertTrue((self.out / "notes/notes/pic.md").exists())
+        self.con.execute("UPDATE ZICCLOUDSYNCINGOBJECT SET ZFILENAME = ? WHERE ZIDENTIFIER = ?",
+                         ("AKIAIOSFODNN7EXAMPLE.jpeg", "MEDIA-ATT-1"))
+        set_body(self.con, 10, "￼", modified=1782475400, attachments=[("ATT-1", "public.jpeg")])
+        self.assertEqual(self.run_sync()["skipped"], 1)
+        self.assertFalse((self.out / "notes/notes/pic.md").exists())
+
+    def test_attachment_bytes_are_never_scrubbed(self):
+        add_note(self.con, 10, "Pic", "￼", attachments=[("ATT-1", "public.jpeg")])
+        add_attachment(self.con, 10, "ATT-1", "public.jpeg", "IMG_0001.jpeg")
+        secret_bytes = b"\x00binary AKIAIOSFODNN7EXAMPLE\xff"
+        local = self.media_file("ATT-1", "IMG_0001.jpeg", body=secret_bytes)
+        uploaded = []
+        s3 = {"bucket": "notes-bucket", "uploader": lambda p, b, k: uploaded.append(p) or True}
+        with unittest.mock.patch("apple_notes_sync.scrub", wraps=__import__("scrub").scrub) as spy:
+            sync(self.db, self.out, self.state, s3=s3)
+        self.assertEqual(uploaded, [str(local)])
+        self.assertEqual(local.read_bytes(), secret_bytes)
+        for call in spy.call_args_list:
+            self.assertIsInstance(call.args[0], str)
+
+    def test_no_s3_config_leaves_the_bundle_byte_identical(self):
+        add_note(self.con, 10, "Pic", "￼", attachments=[("ATT-1", "public.jpeg")])
+        add_attachment(self.con, 10, "ATT-1", "public.jpeg", "IMG_0001.jpeg")
+        self.media_file("ATT-1", "IMG_0001.jpeg")
+        self.run_sync()
+        self.assertIn("[attachment: image/jpeg IMG_0001.jpeg]", self.read("notes/notes/pic.md"))
+        self.assertNotIn("pending_uploads", self.state_json())
 
     # -- mutability --
 

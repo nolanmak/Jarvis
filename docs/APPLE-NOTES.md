@@ -93,6 +93,34 @@ read the database, grant access to the Python executable the scheduler prints.
    Commits are titled `Sync notes <date>: N new, N updated, N renamed, N deleted`
    and list the touched titles. Without a remote the commit is kept locally.
 
+## Attachments in S3 (optional, #1061)
+
+Note bodies carry only `[attachment: <mime> <filename>]` — the files themselves
+stay on the Mac. Pass `--s3-bucket` (and `--aws-profile`) to upload each one to
+a private bucket you own and append its `s3://` pointer to that line:
+
+```sh
+python3 scripts/apple-notes/sync.py --out ~/AppleNotesSync --s3-bucket <bucket> --aws-profile <profile>
+```
+
+Uploads go to `notes/<note-uuid>/<attachment-uuid>-<filename>` via the AWS CLI.
+A failed upload leaves the line without a pointer and is retried on the next run
+(`pending_uploads` in `.sync_state.json`); the attachment's bytes are never
+scrubbed, but a filename with a scrubber finding quarantines the whole note.
+
+On the agent side, set `AUGMENTAGENT_APPLE_NOTES_S3_BUCKET` (and `_PREFIX`, if
+you did not use the default `notes/`) so ask mode can pull one referenced file:
+
+```sh
+./target/release/augmentagent apple-notes fetch-attachment 's3://<bucket>/notes/<uuid>/<att>-<name>'
+```
+
+The download is capped at 25 MB, refused outside the configured bucket/prefix,
+and lands in the ask session's private `/tmp` dir, which is deleted when the
+session ends. Without the bucket the verb reports that attachments are not
+configured and makes no network call. Grant the credential read-only access to
+that one bucket; the Mac's upload profile needs write and nothing else.
+
 ## Schedule every 2 minutes
 
 ```sh

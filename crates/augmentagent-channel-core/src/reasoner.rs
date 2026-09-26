@@ -1809,6 +1809,9 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     // session's `/tmp/aa-imsg/<session>/` (allowlist + 25 MB cap in the CLI). Only this verb: `sync --apply` writes.
     let bash_imessage_fetch_abs = format!("Bash({} imessage fetch-attachment *)", bin.display());
     let bash_imessage_fetch_bare = "Bash(augmentagent imessage fetch-attachment *)".to_string();
+    // #1061 — the same for the Apple Notes bundle, into the same session dir.
+    let bash_notes_fetch_abs = format!("Bash({} apple-notes fetch-attachment *)", bin.display());
+    let bash_notes_fetch_bare = "Bash(augmentagent apple-notes fetch-attachment *)".to_string();
     // The sub-CLI inherits our cwd = wiki_root, so its default `data.db`
     // lookup would fail. Ship an absolute `AUGMENTAGENT_DB` so `main.rs`
     // resolves the db regardless of cwd.
@@ -1933,13 +1936,19 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             env.push(("DISCORD_CHANNEL_ID".into(), cid));
         }
     }
-    // #888 — `imessage fetch-attachment` reads `AUGMENTAGENT_IMESSAGE_S3_*` and signs via the
-    // default AWS credential chain, which any `AWS_*` var may steer: forward both prefixes whole,
-    // only with a bucket configured (no keys leak where the feature is off). The download dir is
-    // minted per session: the guard admits Reads only there; the call site deletes exactly it.
-    if std::env::var("AUGMENTAGENT_IMESSAGE_S3_BUCKET").is_ok_and(|b| !b.trim().is_empty()) {
+    // #888/#1061 — `imessage fetch-attachment` and `apple-notes fetch-attachment` read their
+    // `AUGMENTAGENT_*_S3_*` config and sign via the default AWS credential chain, which any
+    // `AWS_*` var may steer: forward all three prefixes whole, only with a bucket configured
+    // (no keys leak where the feature is off). Both verbs download into one session dir: the
+    // guard admits Reads only there; the call site deletes exactly it.
+    let bucket_set = |k: &str| std::env::var(k).is_ok_and(|b| !b.trim().is_empty());
+    if bucket_set("AUGMENTAGENT_IMESSAGE_S3_BUCKET")
+        || bucket_set("AUGMENTAGENT_APPLE_NOTES_S3_BUCKET")
+    {
         for (k, v) in std::env::vars() {
-            if (k.starts_with("AWS_") || k.starts_with("AUGMENTAGENT_IMESSAGE_S3_"))
+            if (k.starts_with("AWS_")
+                || k.starts_with("AUGMENTAGENT_IMESSAGE_S3_")
+                || k.starts_with("AUGMENTAGENT_APPLE_NOTES_S3_"))
                 && !v.trim().is_empty()
             {
                 env.push((k, v));
@@ -2019,6 +2028,8 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_linkedin_comment_bare,
             bash_imessage_fetch_abs,
             bash_imessage_fetch_bare,
+            bash_notes_fetch_abs,
+            bash_notes_fetch_bare,
             format!("Bash({} issue create *)", aa_gh.display()),
             format!("Bash({} issue list *)", aa_gh.display()),
             format!("Bash({} issue view *)", aa_gh.display()),
@@ -3366,6 +3377,48 @@ mod tests {
             env(&again, "AUGMENTAGENT_IMESSAGE_TMP_DIR"),
             "one dir per session"
         );
+    }
+
+    /// #1061 — `apple-notes fetch-attachment` is reachable in both Bash forms, and the notes
+    /// bucket alone mints the shared session dir (the iMessage one being unset). With neither
+    /// bucket set nothing is minted and no AWS config leaves the daemon.
+    #[test]
+    fn ask_opts_allows_apple_notes_fetch_attachment_on_the_notes_bucket_alone() {
+        let repo = tempfile::tempdir().expect("repo tmpdir");
+        let wiki = tempfile::tempdir().expect("wiki tmpdir");
+        std::fs::write(repo.path().join("data.db"), b"").unwrap();
+        let _notes = EnvGuard::set("AUGMENTAGENT_APPLE_NOTES_S3_BUCKET", "notes-bundle");
+        std::env::remove_var("AUGMENTAGENT_IMESSAGE_S3_BUCKET");
+
+        let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
+        let env = |o: &ReasonerOpts, k: &str| {
+            o.env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone())
+        };
+        let joined = opts.allowed_tools.join("\n");
+        for needle in [
+            "Bash(augmentagent apple-notes fetch-attachment *)".to_string(),
+            format!(
+                "Bash({} apple-notes fetch-attachment *)",
+                repo.path().join("target/release/augmentagent").display()
+            ),
+        ] {
+            assert!(opts.allowed_tools.contains(&needle), "missing {needle}; got:\n{joined}");
+        }
+        assert!(
+            !joined.contains("apple-notes *"),
+            "no apple-notes wildcard (poll-once writes history): {joined}"
+        );
+        assert_eq!(
+            env(&opts, "AUGMENTAGENT_APPLE_NOTES_S3_BUCKET").as_deref(),
+            Some("notes-bundle")
+        );
+        let dir = env(&opts, "AUGMENTAGENT_IMESSAGE_TMP_DIR").expect("shared session dir minted");
+        assert!(dir.starts_with("/tmp/aa-imsg/"), "{dir}");
+
+        std::env::remove_var("AUGMENTAGENT_APPLE_NOTES_S3_BUCKET");
+        let off = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
+        assert_eq!(env(&off, "AUGMENTAGENT_IMESSAGE_TMP_DIR"), None);
+        assert_eq!(env(&off, "AUGMENTAGENT_APPLE_NOTES_S3_BUCKET"), None);
     }
 
     /// #888 — the session-dir Read carve-out's cases live in `scripts/tests/aa-wiki-scope-guard.test.sh` (needs jq).

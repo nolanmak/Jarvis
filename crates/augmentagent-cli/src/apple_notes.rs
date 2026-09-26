@@ -18,6 +18,12 @@ pub enum Op {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Download one bundle attachment by its `s3://` pointer (#1061) into the
+    /// ask session's `/tmp/aa-imsg/<session>/` and print the path.
+    FetchAttachment {
+        /// The `s3://<bucket>/<key>` from an `[attachment: …]` line.
+        s3_uri: String,
+    },
 }
 
 async fn poll(config: &Config, store: Arc<Store>, dry_run: bool) -> Result<notes::Report> {
