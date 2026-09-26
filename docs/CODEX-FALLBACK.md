@@ -958,31 +958,30 @@ What it never touches, and for how long:
   - the orphan pass (#1071), which the daemon runs once at start — before any
     channel can dispatch — and `handoff-prune` runs on every invocation. With
     no receipt left to read, it proves instead that the writing process cannot
-    still be running. A `boot_id` differing from
+    still be running: a `boot_id` differing from
     `/proc/sys/kernel/random/boot_id` means no process named by the marker
-    survived the reboot. Failing that, on the same boot, the recorded writer
+    survived the reboot; failing that, on the same boot, the recorded writer
     must be gone (pid **and** its `/proc` start time, so a reused pid never
     counts), its recorded cgroup must equal this process's own, and
     `systemctl --user show -p KillMode augmentagent.service` must read
     `control-group` — systemd then killed the whole previous cgroup before this
-    instance started. A marker written by a foreground CLI carries a different
-    cgroup, so only a boot change clears it.
+    instance started. A foreground CLI's marker carries a different cgroup, so
+    only a boot change clears it.
 
   Every other reading keeps the marker: an unreadable, linked, oversized or
   truncated marker, an unreadable boot id, an unconfirmed `KillMode`, and every
-  pre-#1071 marker (no writer identity, so no proof can apply).
-
+  pre-#1071 marker (no writer identity, so no proof can apply). `doctor` and
+  `handoff-prune` count those pre-upgrade markers apart from the other doubtful
+  ones, so the backlog is visible as it drains; a marker doctor finds
+  *clearable* is a warning instead, since the start-up pass should have taken it.
   Clearing removes only the marker: the journal keeps its `started` row, so the
   request becomes idle to the sweep but stays *unfinished* and still needs the
-  recovery command above before anything is removed.
-
-  The daemon also handles SIGTERM, so `systemctl --user stop/restart` cancels
-  in-flight calls and then *waits* — up to 30s — for every channel task to
-  unwind and drop its `ProcessGroup`, which is what retires the markers.
-  Cancelling alone would not: the process would exit while supervisors were
-  still reaping. Keep the unit's `TimeoutStopSec` above that drain, or systemd
-  SIGKILLs mid-retire. The orphan pass covers what the drain cannot: SIGKILL,
-  a drain that times out, OOM, power loss.
+  recovery command above before anything is removed. The daemon also handles
+  SIGTERM, so `systemctl --user stop/restart` cancels in-flight calls and then
+  *waits* — up to 30s — for every channel task to unwind and drop its
+  `ProcessGroup`, which is what retires the markers; keep the unit's
+  `TimeoutStopSec` above that drain. The orphan pass covers what the drain
+  cannot: SIGKILL, a timed-out drain, OOM, power loss.
 
 Do not delete handoff state by hand.
 

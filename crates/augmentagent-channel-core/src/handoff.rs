@@ -508,14 +508,16 @@ pub struct OrphanReport {
     pub cleared: u64,
     /// The writing process is still running.
     pub kept_live: u64,
-    /// No proof either way, including every pre-#1071 marker.
+    /// Written before #1071, so it records no writer to judge. Counted apart
+    /// from `kept_unproven` so an operator can watch that backlog drain.
+    pub kept_legacy: u64,
+    /// No proof either way.
     pub kept_unproven: u64,
 }
 
 /// Clear lifecycle markers left by a call that cannot still be running (#1071).
 /// `dry_run` reads only: no locks are taken and nothing is created or removed.
-///
-/// Only markers are cleared. A cleared request rejoins the normal sweep path,
+/// Only markers are cleared; a cleared request rejoins the normal sweep path,
 /// where an unsettled journal still keeps it until an operator decides.
 pub fn clear_orphaned_markers(root: &Path, env: &LivenessEnv, dry_run: bool)
     -> anyhow::Result<OrphanReport> {
@@ -539,6 +541,7 @@ pub fn clear_orphaned_markers(root: &Path, env: &LivenessEnv, dry_run: bool)
         match crate::process_tree::clear_if_dead(&journal, env, dry_run) {
             Ok(Liveness::Dead) => report.cleared += 1,
             Ok(Liveness::Live) => report.kept_live += 1,
+            Ok(Liveness::Legacy) => report.kept_legacy += 1,
             Ok(Liveness::Unproven) => report.kept_unproven += 1,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
@@ -707,11 +710,11 @@ pub async fn run_sweep_loop(root: Option<PathBuf>, grace: Duration, interval: Du
     // provider: clear markers left by a daemon that died mid-call. A cleared
     // request then takes the normal idle → grace → confirm path.
     if let Some(root) = root.clone() {
-        let pass = tokio::task::spawn_blocking(move ||
-            clear_orphaned_markers(&root, &LivenessEnv::probe(), false)).await;
-        match pass {
+        match tokio::task::spawn_blocking(move ||
+            clear_orphaned_markers(&root, &LivenessEnv::probe(), false)).await {
             Ok(Ok(report)) => tracing::info!(cleared = report.cleared, kept_live = report.kept_live,
-                kept_unproven = report.kept_unproven, "handoff orphaned marker pass"),
+                kept_legacy = report.kept_legacy, kept_unproven = report.kept_unproven,
+                "handoff orphaned marker pass"),
             Ok(Err(error)) => tracing::warn!("handoff orphaned marker pass failed: {error:#}"),
             Err(error) => tracing::warn!("handoff orphaned marker task failed: {error}"),
         }
@@ -1358,42 +1361,37 @@ for line in sys.stdin:
     #[test]
     fn the_orphan_pass_clears_only_provably_dead_markers_and_reports_the_rest() {
         let (_temp, root) = private_root();
-        let marker = |journal: &Path, contents: Value| {
+        let marker = |journal: &Path, contents: Value|
             write_private(&journal.with_extension("active"), &contents.to_string());
-        };
         let identity = |boot: &str, pid: libc::pid_t| json!({"version": 2,
             "receipt": "/nonexistent/synthetic-cleanup-complete", "boot_id": boot, "writer_pid": pid,
             "writer_start": 4242, "writer_cgroup": "0::/synthetic.slice/augmentagent.service"});
         let orphan = request(&root, "synthetic-orphan", Some(json!([completed_row()])));
-        marker(&orphan, identity("a-previous-boot", 999));
         let uncertain = request(&root, "synthetic-orphan-uncertain", Some(json!([completed_row(), started_row()])));
-        marker(&uncertain, identity("a-previous-boot", 999));
         let live = request(&root, "synthetic-in-flight", Some(json!([completed_row()])));
-        marker(&live, identity("this-boot", 1234));
         let legacy = request(&root, "synthetic-legacy-marker", Some(json!([completed_row()])));
+        marker(&orphan, identity("a-previous-boot", 999));
+        marker(&uncertain, identity("a-previous-boot", 999));
+        marker(&live, identity("this-boot", 1234));
         marker(&legacy, json!({"version": 1, "receipt": "/nonexistent/synthetic-cleanup-complete"}));
-        for journal in [&orphan, &uncertain, &live, &legacy] {
-            age(journal, TWO_DAYS);
-        }
+        for journal in [&orphan, &uncertain, &live, &legacy] { age(journal, TWO_DAYS); }
         let env = LivenessEnv::injected(Some("this-boot".into()), None, None, Box::new(|pid| (pid == 1234).then_some(4242)));
 
+        // The pre-#1071 marker is counted apart from the other doubtful cases,
+        // which is what doctor reports as the pre-upgrade backlog.
         let dry = clear_orphaned_markers(&root, &env, true).unwrap();
-        assert_eq!(dry, OrphanReport { cleared: 2, kept_live: 1, kept_unproven: 1 });
+        assert_eq!(dry, OrphanReport { cleared: 2, kept_live: 1, kept_legacy: 1, kept_unproven: 0 });
         assert!(orphan.with_extension("active").exists(), "a dry run must change nothing");
 
-        let report = clear_orphaned_markers(&root, &env, false).unwrap();
-        assert_eq!(report, dry);
+        assert_eq!(clear_orphaned_markers(&root, &env, false).unwrap(), dry);
         assert!(!orphan.with_extension("active").exists() && !uncertain.with_extension("active").exists());
         assert!(live.with_extension("active").exists() && legacy.with_extension("active").exists());
 
-        // The cleared requests rejoin the sweep from the start of a fresh
-        // grace period (removing the marker moved the directory's mtime): the
-        // settled one is then removable, the one with a `started` row stays
-        // for the recovery command.
+        // The cleared requests rejoin the sweep from the start of a fresh grace
+        // period (removing the marker moved the directory's mtime): the settled
+        // one becomes removable, the one with a `started` row waits for recovery.
         assert_eq!(sweep_finished(&root, GRACE, true).unwrap().kept_recent, 2);
-        for journal in [&orphan, &uncertain] {
-            age(journal, TWO_DAYS);
-        }
+        for journal in [&orphan, &uncertain] { age(journal, TWO_DAYS); }
         let swept = sweep_finished(&root, GRACE, false).unwrap();
         assert!(gone(&orphan), "a cleared orphan must become eligible for the sweep");
         assert!(uncertain.exists() && std::fs::read_to_string(&uncertain).unwrap().contains("\"started\""));

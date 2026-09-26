@@ -182,8 +182,7 @@ enum Proof<'a> {
     /// The supervisor's `all-descendants-reaped` receipt, already read by the
     /// caller, which observed the reaping directly.
     Reaped(&'a std::path::Path),
-    /// No receipt left to read: prove instead that the writing process itself
-    /// cannot still be running (#1071).
+    /// No receipt left: prove instead that the writer is gone (#1071).
     WriterGone(&'a LivenessEnv),
 }
 
@@ -215,17 +214,13 @@ fn retire_request(marker: &std::path::Path, receipt: &std::path::Path) -> std::i
     }
 }
 
-/// Whether a call's descendants can still be running (#1071). Every reading
-/// that leaves any doubt is [`Liveness::Unproven`], which keeps the marker.
+/// Whether a call's descendants can still be running (#1071). Only `Dead` (no
+/// process from that call can survive) clears the marker; `Live` means its
+/// writer is still running, `Legacy` a pre-#1071 marker with no identity to
+/// judge — counted apart for `doctor` to report — and `Unproven` an unreadable
+/// marker or an incomplete proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Liveness {
-    /// No process from that call can survive. The marker may be cleared.
-    Dead,
-    /// The process that wrote the marker is still running.
-    Live,
-    /// Unreadable, pre-#1071, or the proof is incomplete. Keep the marker.
-    Unproven,
-}
+pub(crate) enum Liveness { Dead, Live, Legacy, Unproven }
 
 /// The unit whose `KillMode` licenses the same-boot proof.
 const DAEMON_UNIT: &str = "augmentagent.service";
@@ -247,9 +242,8 @@ fn unit_kill_mode() -> Option<String> {
     let output = std::process::Command::new("systemctl")
         .args(["--user", "show", "-p", "KillMode", "--value", DAEMON_UNIT])
         .stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
-    if !output.status.success() { return None; }
     let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    (!value.is_empty()).then_some(value)
+    (output.status.success() && !value.is_empty()).then_some(value)
 }
 
 /// The liveness probes [`call_provably_dead`] reads, injected so the predicate
@@ -279,21 +273,23 @@ impl LivenessEnv {
     }
 }
 
-/// Can any descendant of the call that wrote `marker` still be running?
-///
-/// Two independent proofs of "no", and nothing else clears a marker:
-///
-/// * a different `boot_id` — no process named by the marker survived the
-///   reboot, whatever killed the daemon;
-/// * the same boot, a writer that is gone, and a writer cgroup that is this
-///   process's own unit cgroup with a confirmed `KillMode=control-group` —
-///   systemd killed the whole previous cgroup before this instance started.
+/// Can any descendant of the call that wrote `marker` still be running? Two
+/// independent proofs of "no", and nothing else clears a marker: a different
+/// `boot_id` (no process named by the marker survived the reboot, whatever
+/// killed the daemon), or the same boot with a writer that is gone whose
+/// cgroup is this process's own unit cgroup under a confirmed
+/// `KillMode=control-group` (systemd killed the whole previous cgroup before
+/// this instance started).
 ///
 /// The writer is recorded rather than the supervisor: the marker must exist
 /// before `spawn` yields a pid, and a dead supervisor would not prove its
 /// detached grandchildren are gone (that is what the receipt is for).
 fn call_provably_dead(marker: &std::path::Path, env: &LivenessEnv) -> Liveness {
-    let Some(writer) = marker_identity(marker) else { return Liveness::Unproven };
+    let writer = match marker_identity(marker) {
+        Identity::Writer(writer) => writer,
+        Identity::Legacy => return Liveness::Legacy,
+        Identity::Unknown => return Liveness::Unproven,
+    };
     let Some(current_boot) = env.boot_id.as_deref() else { return Liveness::Unproven };
     if writer.boot_id != current_boot { return Liveness::Dead; }
     // Never pid alone: a reused pid is a different process.
@@ -304,32 +300,34 @@ fn call_provably_dead(marker: &std::path::Path, env: &LivenessEnv) -> Liveness {
     Liveness::Unproven
 }
 
-/// Who wrote a marker, as recorded by [`begin_request`]. `None` for a marker
-/// that is missing, unreadable, pre-#1071, or missing any identity field.
-struct Writer {
-    boot_id: String,
-    pid: libc::pid_t,
-    start: u64,
-    cgroup: String,
-}
+/// Who wrote a marker, as recorded by [`begin_request`].
+struct Writer { boot_id: String, pid: libc::pid_t, start: u64, cgroup: String }
 
-fn marker_identity(marker: &std::path::Path) -> Option<Writer> {
-    let value: serde_json::Value = serde_json::from_slice(&private_read(marker).ok()?).ok()?;
-    if value["version"] != MARKER_VERSION { return None; }
-    Some(Writer {
+/// What a marker says about its writer. `Legacy` (a well-formed pre-#1071
+/// marker, which records no writer) is reported apart from `Unknown` (missing,
+/// unreadable, or a v2 marker missing or malforming a field) so operators can
+/// see how many pre-upgrade markers are left; both keep the marker.
+enum Identity { Writer(Writer), Legacy, Unknown }
+
+fn marker_identity(marker: &std::path::Path) -> Identity {
+    let Ok(bytes) = private_read(marker) else { return Identity::Unknown };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return Identity::Unknown };
+    if value["version"] == 1 { return Identity::Legacy; }
+    if value["version"] != MARKER_VERSION { return Identity::Unknown; }
+    let writer = || Some(Writer {
         boot_id: value["boot_id"].as_str().filter(|boot| !boot.is_empty())?.to_owned(),
         pid: value["writer_pid"].as_i64().and_then(|pid| libc::pid_t::try_from(pid).ok()).filter(|pid| *pid > 0)?,
         start: value["writer_start"].as_u64()?,
         cgroup: value["writer_cgroup"].as_str().filter(|cgroup| !cgroup.is_empty())?.to_owned(),
-    })
+    });
+    writer().map_or(Identity::Unknown, Identity::Writer)
 }
 
 /// Clear one orphaned marker, or report why it was kept. `dry_run` reads only:
 /// it takes no lock and creates nothing. A clearing run re-reads the marker
-/// under the lifecycle lock, so a newer owner's marker is never removed.
-///
-/// Only the marker is touched. The journal keeps its `started` rows, so the
-/// request stays uncertain and the recovery command can still act on it.
+/// under the lifecycle lock, so a newer owner's marker is never removed. Only
+/// the marker is touched: the journal keeps its `started` rows, so the request
+/// stays uncertain and the recovery command can still act on it.
 pub(crate) fn clear_if_dead(journal: &std::path::Path, env: &LivenessEnv, dry_run: bool)
     -> std::io::Result<Liveness> {
     let marker = journal.with_extension("active");
@@ -529,40 +527,44 @@ mod tests {
             kill_mode: kill.map(str::to_owned),
             start_of: Box::new(move |_| live.then_some(4242)),
         };
+        // The daemon's own reading, from which each case departs in one way.
+        let daemon = || env(Some("this-boot"), Some(SERVICE), Some("control-group"), false);
         let cases: Vec<(&str, serde_json::Value, LivenessEnv, Liveness)> = vec![
-            ("foreign boot proves a reboot killed everything",
-                json!({"boot_id": "other-boot"}), env(Some("this-boot"), None, None, true), Liveness::Dead),
-            ("the writer is still running",
-                json!({}), env(Some("this-boot"), Some(SERVICE), Some("control-group"), true), Liveness::Live),
-            ("same boot, writer gone, service cgroup killed as a control group",
-                json!({}), env(Some("this-boot"), Some(SERVICE), Some("control-group"), false), Liveness::Dead),
+            ("a foreign boot proves a reboot killed everything", json!({"boot_id": "other-boot"}),
+                env(Some("this-boot"), None, None, true), Liveness::Dead),
+            ("the writer is still running", json!({}),
+                env(Some("this-boot"), Some(SERVICE), Some("control-group"), true), Liveness::Live),
+            ("writer gone, service cgroup killed as a control group", json!({}), daemon(), Liveness::Dead),
             ("a foreground CLI's cgroup is not the unit's",
-                json!({"writer_cgroup": "0::/user.slice/session-3.scope"}),
-                env(Some("this-boot"), Some(SERVICE), Some("control-group"), false), Liveness::Unproven),
-            ("KillMode does not kill the whole cgroup",
-                json!({}), env(Some("this-boot"), Some(SERVICE), Some("process"), false), Liveness::Unproven),
-            ("KillMode could not be read",
-                json!({}), env(Some("this-boot"), Some(SERVICE), None, false), Liveness::Unproven),
-            ("boot id could not be read",
-                json!({"boot_id": "other-boot"}), env(None, Some(SERVICE), Some("control-group"), false), Liveness::Unproven),
-            ("pre-#1071 marker carries no identity",
-                json!({"version": 1}), env(Some("this-boot"), Some(SERVICE), Some("control-group"), false), Liveness::Unproven),
-            ("a v2 marker missing a field",
-                json!({"writer_start": serde_json::Value::Null}),
-                env(Some("this-boot"), Some(SERVICE), Some("control-group"), false), Liveness::Unproven),
+                json!({"writer_cgroup": "0::/user.slice/session-3.scope"}), daemon(), Liveness::Unproven),
+            ("KillMode does not kill the whole cgroup", json!({}),
+                env(Some("this-boot"), Some(SERVICE), Some("process"), false), Liveness::Unproven),
+            ("KillMode could not be read", json!({}),
+                env(Some("this-boot"), Some(SERVICE), None, false), Liveness::Unproven),
+            ("boot id could not be read", json!({"boot_id": "other-boot"}),
+                env(None, Some(SERVICE), Some("control-group"), false), Liveness::Unproven),
+            ("a pre-#1071 marker has no identity, and is counted as such",
+                json!({"version": 1}), daemon(), Liveness::Legacy),
+            ("a v2 marker missing a field", json!({"writer_start": serde_json::Value::Null}),
+                daemon(), Liveness::Unproven),
         ];
-        for (case, overrides, env, wanted) in cases {
+        let request = || {
             let directory = tempfile::tempdir().unwrap();
             std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
             let journal = directory.path().join("operations.json");
+            (directory, journal)
+        };
+        let write = |marker: &std::path::Path, bytes: &[u8]| std::fs::OpenOptions::new()
+            .create_new(true).write(true).mode(0o600).open(marker).unwrap().write_all(bytes).unwrap();
+        for (case, overrides, env, wanted) in cases {
+            let (directory, journal) = request();
             let marker = journal.with_extension("active");
             let mut value = json!({"version": MARKER_VERSION, "receipt": directory.path().join("cleanup-complete"),
                 "boot_id": "this-boot", "writer_pid": 999, "writer_start": 4242, "writer_cgroup": SERVICE});
             for (key, replacement) in overrides.as_object().unwrap() {
                 value[key] = replacement.clone();
             }
-            let mut file = std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(&marker).unwrap();
-            file.write_all(value.to_string().as_bytes()).unwrap();
+            write(&marker, value.to_string().as_bytes());
             assert_eq!(clear_if_dead(&journal, &env, true).unwrap(), wanted, "{case} (dry run)");
             assert!(marker.exists(), "{case}: a dry run must change nothing");
             assert_eq!(clear_if_dead(&journal, &env, false).unwrap(), wanted, "{case}");
@@ -570,18 +572,14 @@ mod tests {
         }
         // Unreadable markers are kept, never cleared.
         for case in ["corrupt", "dangling-link"] {
-            let directory = tempfile::tempdir().unwrap();
-            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-            let journal = directory.path().join("operations.json");
+            let (directory, journal) = request();
             let marker = journal.with_extension("active");
             if case == "corrupt" {
-                let mut file = std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(&marker).unwrap();
-                file.write_all(b"not json").unwrap();
+                write(&marker, b"not json");
             } else {
                 std::os::unix::fs::symlink(directory.path().join("missing"), &marker).unwrap();
             }
-            let probes = env(Some("this-boot"), Some(SERVICE), Some("control-group"), false);
-            assert_eq!(clear_if_dead(&journal, &probes, false).unwrap(), Liveness::Unproven, "{case}");
+            assert_eq!(clear_if_dead(&journal, &daemon(), false).unwrap(), Liveness::Unproven, "{case}");
             assert!(marker.symlink_metadata().is_ok(), "{case}");
         }
     }
@@ -591,14 +589,14 @@ mod tests {
     /// still running, and a dead writer clears one with no receipt to read.
     #[test]
     fn both_proofs_are_judged_at_the_one_clearing_site() {
-        // Real probes: this test process wrote the markers, and is alive.
+        // Real probes: this test process wrote the marker, and is alive.
         let live = LivenessEnv::injected(read_trimmed("/proc/sys/kernel/random/boot_id"),
             None, None, Box::new(process_start));
         let directory = tempfile::tempdir().unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let journal = directory.path().join("operations.json");
         let receipt = directory.path().join("cleanup-complete");
-        let marker = begin_request(Some(&journal), &receipt).unwrap().unwrap();
+        let marker = begin_request(Some(&directory.path().join("operations.json")), &receipt)
+            .unwrap().unwrap();
         assert_eq!(clear_marker(&marker, Proof::WriterGone(&live)).unwrap(), Liveness::Live,
             "with no receipt, a running writer keeps its marker");
         assert_eq!(clear_marker(&marker, Proof::Reaped(&receipt)).unwrap(), Liveness::Dead,
@@ -610,9 +608,9 @@ mod tests {
     /// so the marker its `Drop` would have retired leaks. The successor start
     /// must retire it and must leave the journal's `started` row for the
     /// operator. Nothing about the writer is simulated: a real forked process
-    /// takes the marker and exits without unwinding, as systemd's SIGKILL
-    /// leaves a daemon, and the successor judges it with the real `/proc`
-    /// probe. Only `KillMode` is injected — that is the unit's configuration.
+    /// takes the marker and exits without unwinding, as systemd's SIGKILL leaves
+    /// a daemon, and the successor judges it with the real `/proc` probe. Only
+    /// `KillMode` is injected — that is the unit's configuration.
     #[test]
     fn a_restart_during_a_call_retires_the_marker_it_orphaned() {
         let directory = tempfile::tempdir().unwrap();
@@ -620,8 +618,8 @@ mod tests {
         let journal = directory.path().join("operations.json");
         let rows = json!({"version": 1, "operations": [{"tool": "mcp__fixture__create",
             "arguments": {}, "status": "started"}]}).to_string();
-        let mut file = std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(&journal).unwrap();
-        file.write_all(rows.as_bytes()).unwrap();
+        std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600)
+            .open(&journal).unwrap().write_all(rows.as_bytes()).unwrap();
 
         let receipt = directory.path().join("cleanup-complete");
         let writer = unsafe { libc::fork() };
@@ -637,7 +635,8 @@ mod tests {
         assert_eq!(status, 0, "the writer did not take the marker");
         let marker = journal.with_extension("active");
         assert!(marker.exists() && !request_idle(&journal).unwrap(), "the orphan blocks the request");
-        assert_eq!(marker_identity(&marker).unwrap().pid, writer, "the marker names its real writer");
+        let Identity::Writer(recorded) = marker_identity(&marker) else { panic!("marker has no writer") };
+        assert_eq!(recorded.pid, writer, "the marker names its real writer");
 
         let env = LivenessEnv { boot_id: read_trimmed("/proc/sys/kernel/random/boot_id"),
             cgroup: read_trimmed("/proc/self/cgroup"), kill_mode: Some("control-group".into()),

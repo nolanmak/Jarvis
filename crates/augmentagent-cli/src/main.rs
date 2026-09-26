@@ -2857,7 +2857,7 @@ async fn main() -> Result<()> {
             });
             // #1071 — `systemctl --user stop/restart` sends SIGTERM. Without
             // this the process dies at once and every in-flight call leaves a
-            // lifecycle marker behind. Cancelling lets the channels drop their
+            // lifecycle marker behind; cancelling lets the channels drop their
             // ProcessGroups, which retire their markers normally.
             let s3 = shutdown.clone();
             tokio::spawn(async move {
@@ -3386,31 +3386,21 @@ async fn main() -> Result<()> {
             let mut failure = None;
             let drained = tokio::time::timeout(SHUTDOWN_DRAIN, async {
                 for handle in tasks {
-                    match handle.await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            warn!("daemon task failed: {e:#}");
-                            failure.get_or_insert(e);
-                            shutdown.cancel();
-                        }
-                        Err(e) => {
-                            warn!("daemon task did not join: {e}");
-                            failure.get_or_insert_with(|| anyhow::Error::new(e));
-                            shutdown.cancel();
-                        }
-                    }
+                    let outcome = match handle.await {
+                        Ok(Ok(())) => continue,
+                        Ok(Err(e)) => e,
+                        Err(e) => anyhow::Error::new(e),
+                    };
+                    warn!("daemon task failed: {outcome:#}");
+                    failure.get_or_insert(outcome);
+                    shutdown.cancel();
                 }
             })
             .await;
             if drained.is_err() {
-                warn!(
-                    "shutdown drain timed out; the next start's orphan pass will clear any marker left behind"
-                );
+                warn!("shutdown drain timed out; the next start's orphan pass will clear any marker left behind");
             }
-            match failure {
-                Some(e) => Err(e),
-                None => Ok(()),
-            }
+            failure.map_or(Ok(()), Err)
         }
         Cmd::Transcripts { ref op } => match op {
             TranscriptsOp::Sync {
