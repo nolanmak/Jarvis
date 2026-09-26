@@ -91,6 +91,10 @@ pub fn run(
     }
     const DAEMON_NOTE: &str = "this process's environment (shell and .env); the daemon reads its own, which may differ";
     let grace_hours = setting.grace.as_secs() / 3600;
+    // #1071 — clear markers left by a call that cannot still be running, so
+    // this pass is no longer permanently stuck on an orphan. Same predicate
+    // the daemon uses at start; a dry run only reports what it would clear.
+    let orphans = handoff::clear_orphaned_markers(root, &handoff::LivenessEnv::probe(), opts.dry_run)?;
     let report = handoff::sweep_finished(root, setting.grace, opts.dry_run)?;
     if opts.json {
         let forced = forced_past.map(|state| format!("{state:?}").to_lowercase());
@@ -104,6 +108,7 @@ pub fn run(
                 "grace_note": DAEMON_NOTE,
                 "dry_run": opts.dry_run,
                 "forced_past_daemon_state": forced,
+                "orphaned_markers": orphans,
                 "report": report,
             }))?
         )?;
@@ -139,6 +144,14 @@ pub fn run(
         report.kept_unfinished,
         report.kept_busy,
         report.kept_untrusted,
+    )?;
+    writeln!(
+        out,
+        "orphaned lifecycle markers: {} {} ({} still running, {} with no proof either way)",
+        if opts.dry_run { "would clear" } else { "cleared" },
+        orphans.cleared,
+        orphans.kept_live,
+        orphans.kept_unproven,
     )?;
     if opts.dry_run {
         writeln!(out, "\n(dry run — nothing was locked, created or removed)")?;
@@ -249,6 +262,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #1071 — the operator path is no longer stuck on an orphan: a marker
+    /// from an earlier boot is cleared, and its journal is left in place.
+    #[test]
+    fn a_removing_pass_clears_a_marker_left_by_an_earlier_boot() {
+        let (_temp, root, request) = finished_root();
+        let journal = request.join("operations.json");
+        let mut file = std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600)
+            .open(journal.with_extension("active")).unwrap();
+        file.write_all(serde_json::json!({"version": 2, "receipt": "/nonexistent/synthetic-cleanup-complete",
+            "boot_id": "00000000-0000-4000-8000-000000000000", "writer_pid": 999, "writer_start": 4242,
+            "writer_cgroup": "0::/synthetic.slice/augmentagent.service"}).to_string().as_bytes()).unwrap();
+        let mut out = Vec::new();
+        let opts = Options { dry_run: true, ..Default::default() };
+        run(opts, &default_grace(), &root, &|| DaemonState::Unknown, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("would clear 1"), "{out}");
+        assert!(journal.with_extension("active").exists(), "a dry run must change nothing");
+
+        let mut out = Vec::new();
+        let opts = Options { yes: true, ..Default::default() };
+        run(opts, &default_grace(), &root, &|| DaemonState::Inactive, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("cleared 1"), "{out}");
+        assert!(!journal.with_extension("active").exists());
+        // Cleared inside this run, so the sweep still saw the marker; the
+        // journal survives for the next pass rather than being removed early.
+        assert!(journal.exists(), "{out}");
     }
 
     #[test]

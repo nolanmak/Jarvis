@@ -2855,6 +2855,21 @@ async fn main() -> Result<()> {
                     s2.cancel();
                 }
             });
+            // #1071 — `systemctl --user stop/restart` sends SIGTERM. Without
+            // this the process dies at once and every in-flight call leaves a
+            // lifecycle marker behind. Cancelling lets the channels drop their
+            // ProcessGroups, which retire their markers normally.
+            let s3 = shutdown.clone();
+            tokio::spawn(async move {
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(mut term) => {
+                        term.recv().await;
+                        info!("SIGTERM received");
+                        s3.cancel();
+                    }
+                    Err(e) => warn!("SIGTERM handler unavailable; a stop may orphan markers: {e:#}"),
+                }
+            });
             // Collect the enabled channels' runners + optional digest scheduler.
             let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
 
@@ -3360,10 +3375,42 @@ async fn main() -> Result<()> {
                     }
                 });
             }
-            for handle in tasks {
-                handle.await??;
+            // #1071 — cancelling is only half of a clean stop: the markers
+            // retire when the channels unwind and drop their ProcessGroups.
+            // So join every task, and bound the wait so a wedged one cannot
+            // hold the stop open until systemd's SIGKILL. A failing task
+            // cancels the rest instead of returning straight away, which
+            // would drop the process while other supervisors are still
+            // retiring — exactly the orphans this issue is about.
+            const SHUTDOWN_DRAIN: Duration = Duration::from_secs(30);
+            let mut failure = None;
+            let drained = tokio::time::timeout(SHUTDOWN_DRAIN, async {
+                for handle in tasks {
+                    match handle.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            warn!("daemon task failed: {e:#}");
+                            failure.get_or_insert(e);
+                            shutdown.cancel();
+                        }
+                        Err(e) => {
+                            warn!("daemon task did not join: {e}");
+                            failure.get_or_insert_with(|| anyhow::Error::new(e));
+                            shutdown.cancel();
+                        }
+                    }
+                }
+            })
+            .await;
+            if drained.is_err() {
+                warn!(
+                    "shutdown drain timed out; the next start's orphan pass will clear any marker left behind"
+                );
             }
-            Ok(())
+            match failure {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
         }
         Cmd::Transcripts { ref op } => match op {
             TranscriptsOp::Sync {
