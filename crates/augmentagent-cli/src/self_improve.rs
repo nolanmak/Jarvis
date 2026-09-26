@@ -8954,23 +8954,73 @@ pub struct AutoPrLoop {
     dry_run: bool,
     interval: std::time::Duration,
     daily_cap: u32,
+    /// Where the daily counter persists (#814); injectable so a loop test
+    /// never touches the owner's state.
+    counter_path: PathBuf,
+    /// The provider cooldown latch the quota brake reads (#1215).
+    latch: augmentagent_channel_core::CooldownLatch,
+    /// Wall clock, injectable so a whole UTC day can be scripted (#1215).
+    clock: LoopClock,
 }
+
+/// #1215 — the loop's notion of "now".
+pub(crate) type LoopClock = Arc<dyn Fn() -> chrono::DateTime<chrono::Utc> + Send + Sync>;
 
 /// Engaged-run counter with UTC-day rollover. Pure so it's testable;
 /// [`load`](Self::load) / [`save`](Self::save) add the durability.
+///
+/// #1215 — it also carries the day's quota-brake state and the spread gate,
+/// because the loop's success path restarts the daemon (every merged PR
+/// touching `crates/` triggers a rebuild): anything kept in memory would be
+/// forgotten after each win, exactly as the run count was before #814.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct DailyCounter {
     day: u64,
     runs: u32,
+    /// Distinct Claude quota latches seen today.
+    #[serde(default)]
+    claude_latches: u32,
+    /// Reset instant of the last latch counted, so one latch seen on many
+    /// ticks counts once.
+    #[serde(default)]
+    last_claude_latch: Option<i64>,
+    /// `runs` at the moment the brake engaged; the cap is frozen one past it.
+    #[serde(default)]
+    brake_runs: Option<u32>,
+    /// No new run starts before this instant (unix seconds): the spread gate.
+    #[serde(default)]
+    not_before: Option<i64>,
 }
 
 impl DailyCounter {
     fn runs_today(&mut self, day: u64) -> u32 {
         if day != self.day {
-            self.day = day;
-            self.runs = 0;
+            *self = Self { day, ..Self::default() };
         }
         self.runs
+    }
+
+    /// #1215 — feed the current Claude latch, if any: `(reset, reason)`.
+    fn observe_claude_latch(&mut self, day: u64, latch: Option<(i64, &str)>) {
+        let _ = self.runs_today(day);
+        let Some((reset, reason)) = latch else { return };
+        if !is_quota_latch(reason) || self.last_claude_latch == Some(reset) {
+            return;
+        }
+        self.last_claude_latch = Some(reset);
+        self.claude_latches += 1;
+        if self.claude_latches >= QUOTA_BRAKE_LATCHES && self.brake_runs.is_none() {
+            self.brake_runs = Some(self.runs);
+        }
+    }
+
+    /// #1215 — today's cap after the quota brake.
+    fn cap_today(&mut self, day: u64, cap: u32) -> u32 {
+        let _ = self.runs_today(day);
+        match self.brake_runs {
+            Some(at) => effective_cap(cap, at, self.claude_latches),
+            None => cap,
+        }
     }
 
     fn record(&mut self, day: u64) {
@@ -9572,6 +9622,60 @@ fn daily_counter_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("autopr-daily-runs.json"))
 }
 
+/// #1215 — Claude quota latches in one UTC day that engage the brake.
+const QUOTA_BRAKE_LATCHES: u32 = 2;
+
+/// #1215 — the quota brake. Two Claude session-limit latches in one UTC day
+/// mean the loop is competing with the owner for the same Max quota (#448):
+/// allow one more run past where the brake engaged, then stop for the day.
+fn effective_cap(cap: u32, runs_so_far: u32, claude_latches_today: u32) -> u32 {
+    if claude_latches_today >= QUOTA_BRAKE_LATCHES {
+        cap.min(runs_so_far + 1)
+    } else {
+        cap
+    }
+}
+
+/// #1215 — a latch written for a quota refusal (`ReasonerError::RateLimited`
+/// displays as "<provider> rate limit: ..."), not an outage or a timeout.
+fn is_quota_latch(reason: &str) -> bool {
+    reason.contains("rate limit")
+}
+
+/// #1215 — how long to wait after an engaged run before starting the next:
+/// the rest of the UTC day split so the remaining runs cover it, never less
+/// than the tick interval. Without this every run started back to back at
+/// 00:00 UTC and the loop idled for the other ~19 hours.
+fn next_tick_delay(
+    now: chrono::DateTime<chrono::Utc>,
+    cap: u32,
+    runs_so_far: u32,
+    interval: std::time::Duration,
+) -> std::time::Duration {
+    let left = cap.saturating_sub(runs_so_far);
+    if left == 0 {
+        return interval;
+    }
+    let secs_into_day = now.timestamp().rem_euclid(86_400) as u64;
+    let remaining = 86_400 - secs_into_day;
+    interval.max(std::time::Duration::from_secs(remaining / (u64::from(left) + 1)))
+}
+
+fn utc_day_of(now: chrono::DateTime<chrono::Utc>) -> u64 {
+    now.timestamp().div_euclid(86_400) as u64
+}
+
+/// #1215 — `(runs today, today's cap after the brake, brake engaged)`, for
+/// the health watchdog.
+pub(crate) fn runs_today_status() -> (u32, u32, bool) {
+    let mut counter = DailyCounter::load(&daily_counter_path());
+    let cap = AutoPrLoop::cap_from(std::env::var("AUGMENTAGENT_AUTOPR_DAILY_CAP").ok().as_deref());
+    let day = utc_day_now();
+    let runs = counter.runs_today(day);
+    let today = counter.cap_today(day, cap);
+    (runs, today, counter.brake_runs.is_some())
+}
+
 fn utc_day_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -9581,7 +9685,9 @@ fn utc_day_now() -> u64 {
 
 impl AutoPrLoop {
     const DEFAULT_INTERVAL_SECS: u64 = 1_800;
-    const DEFAULT_DAILY_CAP: u32 = 3;
+    /// #1215 — 5, up from 3: issues were filed faster than three serial
+    /// runs a day could ship them. Spend stays bounded by the quota brake.
+    const DEFAULT_DAILY_CAP: u32 = 5;
     /// How many consecutive triage-only refusals one tick may clear.
     const MAX_TRIAGE_PER_TICK: u32 = 5;
     /// #954 — no tick may outlive this. Generous (a builder legitimately
@@ -9612,7 +9718,7 @@ impl AutoPrLoop {
     /// Env-gated constructor: `None` unless `AUGMENTAGENT_AUTOPR=1|true`.
     /// `AUGMENTAGENT_AUTOPR_INTERVAL_SECS` (default 1800, floor 300 — the
     /// tick does a real `gh issue list`) and `AUGMENTAGENT_AUTOPR_DAILY_CAP`
-    /// (default 3) tune cadence and spend ceiling.
+    /// (default 5, #1215) tune cadence and spend ceiling.
     pub fn from_env(repo_root: PathBuf, dry_run: bool) -> Option<Self> {
         Self::from_values(
             repo_root,
@@ -9643,16 +9749,38 @@ impl AutoPrLoop {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(Self::DEFAULT_INTERVAL_SECS)
             .max(300);
-        let daily_cap = daily_cap
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(Self::DEFAULT_DAILY_CAP)
-            .max(1);
         Some(Self {
             repo_root,
             dry_run,
             interval: std::time::Duration::from_secs(interval),
-            daily_cap,
+            daily_cap: Self::cap_from(daily_cap),
+            counter_path: daily_counter_path(),
+            latch: augmentagent_channel_core::CooldownLatch::system(),
+            clock: Arc::new(chrono::Utc::now),
         })
+    }
+
+    /// The configured cap, or the default; never 0 (a cap of 0 would make the
+    /// loop a silent no-op the owner enabled on purpose).
+    fn cap_from(daily_cap: Option<&str>) -> u32 {
+        daily_cap
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(Self::DEFAULT_DAILY_CAP)
+            .max(1)
+    }
+
+    /// A loop whose counter and latch live under `state`, on the real clock.
+    #[cfg(test)]
+    fn for_tests(repo_root: PathBuf, daily_cap: u32, state: &Path) -> Self {
+        Self {
+            repo_root,
+            dry_run: true,
+            interval: std::time::Duration::from_secs(Self::DEFAULT_INTERVAL_SECS),
+            daily_cap,
+            counter_path: state.join("autopr-daily-runs.json"),
+            latch: augmentagent_channel_core::CooldownLatch::at(state.join("reasoner-cooldowns.json")),
+            clock: Arc::new(chrono::Utc::now),
+        }
     }
 
     pub async fn run(self, shutdown: tokio_util::sync::CancellationToken) -> Result<()> {
@@ -9681,7 +9809,7 @@ impl AutoPrLoop {
             dry_run = self.dry_run,
             "auto-PR loop started (#630/#653): polling open issues (self-triage, no label gate)"
         );
-        let counter_path = daily_counter_path();
+        let counter_path = self.counter_path.clone();
         let mut counter = DailyCounter::load(&counter_path);
         loop {
             tokio::select! {
@@ -9699,12 +9827,24 @@ impl AutoPrLoop {
                 info!(swept, "auto-PR: merged already-approved drafts (unbilled)");
             }
 
-            let today = utc_day_now();
-            if counter.runs_today(today) >= self.daily_cap {
+            let now = (self.clock)();
+            let today = utc_day_of(now);
+            // #1215 — the quota brake: count today's Claude quota latches.
+            let latch = self.latch.latched_entry("claude");
+            counter.observe_claude_latch(today, latch.as_ref().map(|(t, r)| (*t, r.as_str())));
+            counter.save(&counter_path);
+            let cap = counter.cap_today(today, self.daily_cap);
+            if counter.runs_today(today) >= cap {
                 info!(
-                    daily_cap = self.daily_cap,
+                    daily_cap = cap,
+                    braked = counter.brake_runs.is_some(),
                     "auto-PR: daily cap reached; idling until the next UTC day"
                 );
+                continue;
+            }
+            // #1215 — the spread gate: the last run set when the next may start.
+            if let Some(at) = counter.not_before.filter(|at| now.timestamp() < *at) {
+                info!(not_before = at, "auto-PR: spreading today's runs; next run later");
                 continue;
             }
             // Triage-only outcomes are cheap and permanently label the
@@ -9733,20 +9873,21 @@ impl AutoPrLoop {
                     Ok(r) if r.is_idle() => break,
                     Ok(r) if r.billed => {
                         counter.record(today);
+                        // #1215 — spread the rest of today's runs over the
+                        // rest of the day. This replaces #851's same-tick
+                        // continuation, which spent every run back to back
+                        // at 00:00 UTC; the attempt ledger still guarantees
+                        // the next pick is a different issue.
+                        let delay = next_tick_delay((self.clock)(), cap, counter.runs, self.interval);
+                        counter.not_before = Some((self.clock)().timestamp() + delay.as_secs() as i64);
                         counter.save(&counter_path);
                         info!(
                             runs_today = counter.runs_today(today),
-                            daily_cap = self.daily_cap,
+                            daily_cap = cap,
+                            next_in_secs = delay.as_secs(),
                             "auto-PR: {r}"
                         );
-                        // #851 — with budget left, keep going in the SAME
-                        // tick. The attempt ledger guarantees the next pick
-                        // is a different issue, so remaining slots go to the
-                        // rest of the pool instead of idling 30 minutes —
-                        // or, worse, re-buying the refusal just recorded.
-                        if counter.runs_today(today) >= self.daily_cap {
-                            break;
-                        }
+                        break;
                     }
                     Ok(r) => {
                         triaged += 1;
@@ -10214,6 +10355,137 @@ for tool, arguments in [
         AutoPrLoop::from_values(PathBuf::from("/tmp/repo"), true, enabled, interval, cap)
     }
 
+    // ---- #1215: throughput — cap 5, quota brake, spread runs ----
+
+    fn utc(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc)
+    }
+
+    /// C1 — an unset cap is 5.
+    #[test]
+    fn default_daily_cap_is_five() {
+        assert_eq!(loop_values(Some("1"), None, None).unwrap().daily_cap, 5);
+        assert_eq!(AutoPrLoop::DEFAULT_DAILY_CAP, 5);
+    }
+
+    /// C2 — the brake engages on the second Claude session-limit latch of the
+    /// day and freezes the cap one run past where it engaged.
+    #[test]
+    fn quota_brake_caps_the_day_after_two_claude_latches() {
+        assert_eq!(effective_cap(5, 2, 2), 3);
+        assert_eq!(effective_cap(5, 2, 1), 5);
+        assert_eq!(effective_cap(5, 0, 0), 5);
+        assert_eq!(effective_cap(2, 4, 3), 2, "never above the configured cap");
+    }
+
+    /// C2, stateful half: distinct latches are counted once each, only
+    /// quota latches count, the brake freezes at the runs seen when it
+    /// engaged, and a new UTC day starts clean.
+    #[test]
+    fn claude_latch_observation_counts_distinct_quota_latches_per_day() {
+        let mut c = DailyCounter::default();
+        let (day, cap) = (200, 5);
+        c.record(day);
+        c.record(day);
+        let reset_a = utc("2026-09-26T09:30:00Z").timestamp();
+        let reset_b = utc("2026-09-26T14:30:00Z").timestamp();
+        // An outage latch is not a quota wall.
+        c.observe_claude_latch(day, Some((reset_a, "claude unavailable: exit 1")));
+        assert_eq!(c.cap_today(day, cap), 5);
+        c.observe_claude_latch(day, Some((reset_a, "claude rate limit: You've hit your session limit")));
+        // The same latch seen on the next tick is still one latch.
+        c.observe_claude_latch(day, Some((reset_a, "claude rate limit: You've hit your session limit")));
+        assert_eq!(c.cap_today(day, cap), 5, "one latch is not a pattern");
+        c.observe_claude_latch(day, None);
+        c.observe_claude_latch(day, Some((reset_b, "claude rate limit: You've hit your session limit")));
+        assert_eq!(c.cap_today(day, cap), 3, "braked at runs(2) + 1");
+        c.record(day);
+        assert_eq!(c.cap_today(day, cap), 3, "the brake does not creep up with later runs");
+        assert_eq!(c.cap_today(day + 1, cap), 5, "a new UTC day starts clean");
+        assert_eq!(c.runs_today(day + 1), 0);
+    }
+
+    /// C3 — after a run, the next one waits so the remaining runs cover the
+    /// rest of the UTC day, never less than the tick interval.
+    #[test]
+    fn next_run_is_spread_across_the_rest_of_the_utc_day() {
+        let interval = std::time::Duration::from_secs(1800);
+        let at_midnight = next_tick_delay(utc("2026-09-26T00:00:00Z"), 5, 0, interval);
+        assert!(at_midnight >= std::time::Duration::from_secs(4 * 3600), "{at_midnight:?}");
+        assert_eq!(
+            next_tick_delay(utc("2026-09-26T22:00:00Z"), 5, 4, interval),
+            std::time::Duration::from_secs(3600)
+        );
+        assert_eq!(next_tick_delay(utc("2026-09-26T23:45:00Z"), 5, 4, interval), interval, "the floor");
+        assert_eq!(next_tick_delay(utc("2026-09-26T12:00:00Z"), 5, 5, interval), interval, "capped: no spread");
+    }
+
+    /// C4 — a scripted UTC day with every candidate green: exactly `cap`
+    /// engaged runs, spread over the day, and the next candidate is not
+    /// built. Paused tokio time drives a synthetic clock; nothing touches
+    /// the owner's state (counter and latch live in a tempdir, and the repo
+    /// root does not exist, so the sweep's `gh` fails synchronously).
+    #[tokio::test(start_paused = true)]
+    async fn a_scripted_green_day_ships_exactly_the_cap_spread_across_it() {
+        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+        let state = tempfile::tempdir().unwrap();
+        let start = tokio::time::Instant::now();
+        let base = utc("2026-09-26T00:00:00Z");
+        let clock: LoopClock = Arc::new(move || {
+            base + chrono::Duration::from_std(tokio::time::Instant::now() - start).unwrap()
+        });
+        let mut lp = AutoPrLoop::for_tests(PathBuf::from("/nonexistent"), 5, state.path());
+        lp.interval = std::time::Duration::from_secs(1800);
+        lp.clock = Arc::clone(&clock);
+        let built = Arc::new(std::sync::Mutex::new(Vec::<chrono::DateTime<chrono::Utc>>::new()));
+        let asked = Arc::new(AtomicU32::new(0));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (seen, stop, runs, now) = (Arc::clone(&built), shutdown.clone(), Arc::clone(&asked), Arc::clone(&clock));
+        let run = lp.run_with(shutdown, AutoPrLoop::MAX_TICK, move || {
+            let (seen, stop, runs, now) = (Arc::clone(&seen), stop.clone(), Arc::clone(&runs), Arc::clone(&now));
+            async move {
+                let at = now();
+                if at >= utc("2026-09-26T23:59:00Z") {
+                    stop.cancel();
+                    return Ok(RunReport::idle());
+                }
+                let nth = runs.fetch_add(1, SeqCst) + 1;
+                seen.lock().unwrap().push(at);
+                Ok(RunReport::built(format!("issue #{nth}: PR auto-merged")))
+            }
+        });
+        // Past the end of the synthetic day, the loop must have stopped.
+        tokio::time::timeout(std::time::Duration::from_secs(26 * 3600), run)
+            .await
+            .expect("the loop reaches the end of the day")
+            .unwrap();
+        let built = built.lock().unwrap().clone();
+        assert_eq!(built.len(), 5, "exactly the cap, the sixth candidate is not built: {built:?}");
+        // The loop stopped on the first tick of the NEXT UTC day, which
+        // rolled the persisted counter over to a fresh budget.
+        let counter = DailyCounter::load(&state.path().join("autopr-daily-runs.json"));
+        assert_eq!((counter.day, counter.runs), (utc_day_of(utc("2026-09-27T00:00:00Z")), 0));
+        let last = *built.last().unwrap();
+        assert!(last >= utc("2026-09-26T16:00:00Z"), "runs cover the day, not its first hours: {built:?}");
+        for pair in built.windows(2) {
+            assert!(pair[1] - pair[0] >= chrono::Duration::hours(2), "spread: {built:?}");
+        }
+    }
+
+    /// The brake reads the real latch file shape: a quota latch written by
+    /// the fallback chain is what `observe_claude_latch` is fed.
+    #[test]
+    fn loop_reads_the_claude_latch_with_its_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let latch = augmentagent_channel_core::CooldownLatch::at(dir.path().join("c.json"));
+        let until = chrono::Utc::now() + chrono::Duration::hours(2);
+        latch.latch("claude", until, "claude rate limit: You've hit your session limit");
+        let (ts, reason) = latch.latched_entry("claude").expect("latched");
+        assert_eq!(ts, until.timestamp());
+        assert!(is_quota_latch(&reason));
+        assert!(!is_quota_latch("claude unavailable: exit 1"));
+    }
+
     #[test]
     fn auto_pr_loop_requires_explicit_opt_in() {
         // Every engaged run spends the owner's subscription (#448) — absent,
@@ -10643,7 +10915,9 @@ for tool, arguments in [
         assert_eq!(AutoPrLoop::MAX_TICK, std::time::Duration::from_secs(3 * 60 * 60));
         // Cap `u32::MAX`: the tick that matters is the one AFTER the wedge.
         let (root, cap) = (PathBuf::from("/nonexistent"), u32::MAX);
-        let lp = AutoPrLoop { repo_root: root, dry_run: true, interval: ms(5), daily_cap: cap };
+        let state = tempfile::tempdir().unwrap();
+        let mut lp = AutoPrLoop::for_tests(root, cap, state.path());
+        lp.interval = ms(5);
         let calls = Arc::new(AtomicU32::new(0));
         let shutdown = tokio_util::sync::CancellationToken::new();
         let (seen, stop) = (Arc::clone(&calls), shutdown.clone());
@@ -15189,7 +15463,9 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(body.contains("record_hard_failure(repo_root, issue.number, \"git push failed\""));
         // The loop charges exactly the billed reports against the daily cap.
         let start = src.find("pub async fn run(self, shutdown:").expect("AutoPrLoop::run");
-        let body = &src[start..start + 4000];
+        // `run` and its tick loop `run_with`, up to the end of the impl.
+        let end = start + src[start..].find("\n#[cfg(test)]\n").expect("end of AutoPrLoop");
+        let body = &src[start..end];
         assert!(body.contains("Ok(r) if r.billed => {"), "billed reports are what the cap counts");
         assert!(body.contains("counter.record(today);"));
         // #954 — the production tick runs on MAX_TICK, the budget whose

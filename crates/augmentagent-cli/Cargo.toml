@@ -94,6 +94,8 @@ libc = "0.2"
 # sqlite db path so probe output is deterministic on a fresh box.
 [dev-dependencies]
 wiremock.workspace = true
+# #1215 — paused tokio time drives the scripted-day loop test.
+tokio = { workspace = true, features = ["test-util"] }
 insta = { version = "1", features = ["json", "redactions"] }
 # Used by the snapshot test to pre-seed the legacy schema tables (`actions`,
 # `emails`, `gmail_accounts`) that `Store::migrate` assumes already exist —
