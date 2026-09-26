@@ -2614,6 +2614,14 @@ fn build_revise_prompt(
     format!("{base}{}", prior_attempts_section(prior))
 }
 
+/// Does a red initial gate earn a repair round? Budget left, a code failure
+/// rather than an infra one (a full disk is not the builder's to fix), and
+/// at least one failure this diff introduced (#931: main's own red is not
+/// repaired on the issue's dime; #932: unless the issue IS the red-main one).
+fn gate_repair_wanted(used: u32, budget: u32, gate_text: &str, preexisting_only: bool) -> bool {
+    used < budget && infra_failure_reason(gate_text).is_none() && !preexisting_only
+}
+
 /// Synthetic "findings" for a gate-repair round (#873): the last change went
 /// RED — a compile error or failing test — and the next round's job is to
 /// make it green again. This is the red→fix half of TDD; treating a red gate
@@ -7147,8 +7155,69 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         )));
     }
 
-    // Verification gate.
-    if let Err(gate_err) = verification_gate(&worktree).await {
+    // Verification gate. #873 gave the resume lane and the post-revision
+    // gate repair rounds; the FIRST gate after a fresh build stayed
+    // terminal and threw the whole build away on its first red — the #875
+    // shape again. Red→fix is the other half of TDD: the builder sees the
+    // compiler/test output verbatim and repairs while budget remains. The
+    // rounds come out of the same revise budget the review loop draws on,
+    // so a run never spends more revision calls than it could before.
+    let mut gate_repairs = 0u32;
+    let mut gate_result = verification_gate(&worktree).await;
+    while let Err(gate_err) = &gate_result {
+        let gate_text = format!("{gate_err:#}");
+        let verdict = preexisting_on_main(repo_root, &gate_text).await;
+        let preexisting_only = verdict.as_ref().is_some_and(|v| v.introduced.is_empty())
+            && !is_red_main_issue(&issue.body);
+        if !gate_repair_wanted(gate_repairs, revise_rounds(), &gate_text, preexisting_only) {
+            break;
+        }
+        // Only the failures this diff introduced are its job.
+        let gate_text = match verdict.as_ref() {
+            Some(v) if !v.preexisting.is_empty() => format!(
+                "{gate_text}\n\nAlready failing on `main` before this change — NOT yours, \
+                 ignore: {}",
+                v.preexisting.join(", ")
+            ),
+            _ => gate_text,
+        };
+        gate_repairs += 1;
+        info!(
+            issue = issue.number,
+            round = gate_repairs,
+            max_rounds = revise_rounds(),
+            "initial gate red; repair round"
+        );
+        match reasoner
+            .call_revision(
+                &fix_opts(worktree.clone()),
+                &build_revise_prompt(&issue, &gate_findings(&gate_text), lines, prior_attempts.as_deref()),
+            )
+            .await
+        {
+            Err(e) => {
+                // Provider trouble, not a verdict — the red result stands.
+                warn!(issue = issue.number, "gate-repair round failed; keeping the red verdict: {e:#}");
+                break;
+            }
+            Ok(rs) => {
+                let _ = drop_root_scratch(&worktree).await;
+                let _ = run("git", &["add", "-A"], &worktree).await?;
+                let (_ok, d2, _) = run("git", &["diff", "--cached"], &worktree).await?;
+                // A repair may not smuggle in a guarded path or blow the cap:
+                // the red verdict stands and the run ends below as before.
+                if blast_radius_hit_in_diff(&d2).is_some() || diff_line_count(&d2) > MAX_DIFF_LINES {
+                    warn!(issue = issue.number, "gate repair tripped a guard; keeping the red verdict");
+                    break;
+                }
+                lines = diff_line_count(&d2);
+                diff = d2;
+                summary = format!("{summary}\n\nGate repair {gate_repairs}: {}", truncate(&rs, 200));
+                gate_result = verification_gate(&worktree).await;
+            }
+        }
+    }
+    if let Err(gate_err) = gate_result {
         warn!(
             issue = issue.number,
             "verification gate failed: {gate_err:#}"
@@ -7286,7 +7355,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // blast/size guards, the full verification gate, and BOTH codex passes —
     // a revised diff earns its verdict, it does not inherit one.
     let max_rounds = revise_rounds();
-    let mut round = 0u32;
+    // Gate repairs on the initial build already drew on this budget.
+    let mut round = gate_repairs;
     // Set when a round overgrew the size cap: the next round revises against
     // a shrink instruction instead of codex notes, and codex is not consulted
     // on a diff that cannot ship anyway.
@@ -11216,6 +11286,21 @@ CODEX-REVIEW: lgtm").0);
         assert!(!automerge_receipt_ok(gated, false, Some("1")));
     }
 
+    /// The first gate after a fresh build gets repair rounds like the resume
+    /// lane and the post-revision gate already do; the decision stays pure.
+    #[test]
+    fn initial_gate_repair_is_budgeted_and_skips_infra_and_main_failures() {
+        let red = "error[E0425]: cannot find value `x` in this scope";
+        assert!(gate_repair_wanted(0, 3, red, false));
+        assert!(gate_repair_wanted(2, 3, red, false));
+        assert!(!gate_repair_wanted(3, 3, red, false), "budget spent");
+        assert!(!gate_repair_wanted(0, 0, red, false), "revise kill switch");
+        assert!(!gate_repair_wanted(0, 3, red, true), "main's own failure is not repaired here");
+        let infra = "error: failed to write to disk: No space left on device (os error 28)";
+        assert!(infra_failure_reason(infra).is_some(), "fixture must classify as infra");
+        assert!(!gate_repair_wanted(0, 3, infra, false), "infra is not a code failure");
+    }
+
     #[test]
     fn revise_rounds_defaults_bounded_and_respects_the_kill_switch() {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -11977,8 +12062,17 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let start = src.find("pub async fn run_once(").expect("run_once");
         let end = start + src[start..].find("\n}\n").expect("end of run_once");
         let body = &src[start..end];
+        // The repair loop (#873, fresh path) checks the baseline BEFORE
+        // spending a repair round, exactly like the resume lane.
+        let repair_at = body
+            .find("while let Err(gate_err) = &gate_result {")
+            .expect("gate-repair loop");
+        let repair = &body[repair_at..];
+        let pre_repair = repair.find("preexisting_on_main(").expect("baseline check before repair");
+        let call = repair.find("call_revision(").expect("repair round");
+        assert!(pre_repair < call, "baseline check must precede the repair round");
         let gate_at = body
-            .find("if let Err(gate_err) = verification_gate(&worktree).await {")
+            .find("if let Err(gate_err) = gate_result {")
             .expect("gate-failure arm");
         let arm = &body[gate_at..];
         let pre = arm
