@@ -104,6 +104,8 @@ pub struct HealthInputs {
     pub unreviewable_drafts: Vec<(u64, String, String, u32)>,
     /// #1215 — today's engaged runs against today's cap.
     pub runs_today: Option<RunsToday>,
+    /// #1214 — open `agent-gave-up` issues grouped by reason code.
+    pub gave_up_by_reason: Option<Vec<(String, u32)>>,
 }
 
 /// #1215 — how much of today's run budget is spent.
@@ -404,6 +406,13 @@ pub fn render_text(findings: &[Finding], i: &HealthInputs) -> String {
     if let Some(r) = i.runs_today {
         let brake = if r.braked { " (brake: on)" } else { "" };
         out.push_str(&format!("\nruns today: {} of {}{brake}", r.runs, r.cap));
+    }
+    if let Some(groups) = &i.gave_up_by_reason {
+        let total: u32 = groups.iter().map(|(_, n)| n).sum();
+        out.push_str(&format!("\ngave-up by reason ({total}):"));
+        for (code, n) in groups {
+            out.push_str(&format!("\n  {n:>4}  {code}"));
+        }
     }
     out
 }
@@ -781,6 +790,7 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
             let (runs, cap, braked) = crate::self_improve::runs_today_status();
             Some(RunsToday { runs, cap, braked })
         },
+        gave_up_by_reason: crate::self_improve::gave_up_breakdown_live(repo_root),
     }
 }
 
@@ -857,6 +867,29 @@ mod tests {
         assert!(!render_text(&[], &i).contains("runs today"));
     }
 
+    /// #1214 C6 — the report groups labelled issues by reason, and the
+    /// block's counts sum to the number of labelled issues.
+    #[test]
+    fn text_output_groups_gave_up_issues_by_reason() {
+        let mut i = HealthInputs::default();
+        i.gave_up_by_reason = Some(vec![
+            ("scoper:not-fixable".into(), 52),
+            ("stuck:gate-red".into(), 2),
+            ("unrecorded".into(), 54),
+        ]);
+        let text = render_text(&[], &i);
+        assert!(text.contains("gave-up by reason (108)"), "{text}");
+        let block = &text[text.find("gave-up by reason").unwrap()..];
+        let total: u32 = block
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.split_whitespace().next()?.parse::<u32>().ok())
+            .sum();
+        assert_eq!(total, 108, "{block}");
+        i.gave_up_by_reason = None;
+        assert!(!render_text(&[], &i).contains("gave-up by reason"));
+    }
+
     #[test]
     fn df_avail_parses_gnu_and_bsd_posix_layouts() {
         // GNU `df -P -k`
@@ -896,6 +929,7 @@ mod tests {
             draft_ages_days: vec![(990, 0)],
             unreviewable_drafts: vec![],
             runs_today: None,
+            gave_up_by_reason: None,
         }
     }
 
