@@ -2,6 +2,8 @@
 
 Status: in progress. This record distinguishes observed evidence from required live gates.
 
+The current AC01–AC12 coverage and missing proof are tracked in [acceptance-map.md](acceptance-map.md).
+
 ## Baseline at start of issue
 
 - Base revision: `fb0bbdbb63a3fddc2065f3c95b08732dd0b49a62` (`github/main`).
