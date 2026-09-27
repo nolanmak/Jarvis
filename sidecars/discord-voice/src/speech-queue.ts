@@ -64,20 +64,24 @@ export class SpeechQueue {
     return job.done;
   }
 
-  interrupt(): void {
+  interrupt(): SpeechReceipt[] {
     this.generation++;
-    if (this.active) {
+    const interrupted: SpeechReceipt[] = [];
+    if (this.active?.receipt.status === 'playing') {
       this.active.receipt.status = 'interrupted';
       this.active.receipt.stoppedAtMs ??= Date.now();
       this.active.controller.abort();
       this.sink.interrupt();
+      interrupted.push({ ...this.active.receipt });
     }
     for (const job of this.pending.splice(0)) {
       job.receipt.status = 'interrupted';
       job.receipt.stoppedAtMs = Date.now();
       job.controller.abort();
       job.resolve(job.receipt);
+      interrupted.push({ ...job.receipt });
     }
+    return interrupted;
   }
 
   stop(): void {

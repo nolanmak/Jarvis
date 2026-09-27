@@ -178,7 +178,15 @@ export class VoiceAudio {
     return this.speech.status(utteranceId);
   }
 
-  interrupt(): void { this.speech.interrupt(); }
+  interrupt(): void {
+    for (const receipt of this.speech.interrupt()) {
+      this.emit({ version: 1, kind: 'speech_interrupted',
+        conversationId: this.binding.conversationId, generation: this.binding.generation,
+        guildId: this.binding.guildId, utteranceId: receipt.utteranceId,
+        stoppedAtMs: receipt.stoppedAtMs,
+        partialAudioPlayed: receipt.firstPlaybackAtMs !== undefined });
+    }
+  }
 
   stop(): void {
     if (this.closed) return;
@@ -186,6 +194,7 @@ export class VoiceAudio {
     this.retryAbort.abort();
     this.state = 'stopped';
     if (this.cap) clearTimeout(this.cap);
+    this.interrupt();
     this.speech.stop();
     this.sink.stop();
     this.receiver?.destroy();
@@ -233,7 +242,7 @@ export class VoiceAudio {
     this.speechActive = false;
     this.pcmCarry = undefined;
     if (this.cap) clearTimeout(this.cap);
-    this.speech.interrupt();
+    this.interrupt();
     this.recovery = this.recoverStt(message);
     void this.recovery.finally(() => { this.recovery = undefined; });
   }
@@ -265,7 +274,7 @@ export class VoiceAudio {
     if (this.closed || epoch !== this.sttEpoch) return;
     if (event.kind === 'speech_start' || (event.kind === 'partial' && !this.speechActive)) {
       this.speechActive = true;
-      this.speech.interrupt();
+      this.interrupt();
       this.cap = setTimeout(() => this.fail('Owner utterance exceeded 120 seconds'), 120_000);
     }
     if (event.kind !== 'final') return;

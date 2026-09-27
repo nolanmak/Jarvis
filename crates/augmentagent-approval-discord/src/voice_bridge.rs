@@ -523,6 +523,35 @@ impl VoiceBridge {
                     }
                 }
             }
+            Some("speech_interrupted") => {
+                let Some(binding) = self.binding_for_frame(&frame) else {
+                    return;
+                };
+                let Some(utterance_id) = frame.get("utteranceId").and_then(Value::as_str) else {
+                    return;
+                };
+                if utterance_id.is_empty() || utterance_id.len() > 128
+                    || !utterance_id.chars().all(|character| character.is_ascii_alphanumeric()
+                        || "-_:.".contains(character)) {
+                    return;
+                }
+                let Some(handler) = self.turn_handler.read().await.clone() else {
+                    return;
+                };
+                let Ok(channel_id) = binding.text_channel_id.parse::<u64>() else {
+                    return;
+                };
+                let playback = if frame.get("partialAudioPlayed").and_then(Value::as_bool) == Some(true) {
+                    "Partial agent audio was played before interruption"
+                } else {
+                    "Agent speech was interrupted before playback"
+                };
+                let notice = format!("🔊 **{playback}** (receipt `{utterance_id}`).");
+                tokio::spawn(async move {
+                    let _ = ChannelId::new(channel_id).send_message(&handler.http,
+                        CreateMessage::new().content(notice)).await;
+                });
+            }
             Some("transcript") => {
                 let Some(binding) = self.binding_for_frame(&frame) else {
                     return;
@@ -795,6 +824,40 @@ mod tests {
             "self_deaf":false,"self_mute":false}}),
             &binding()
         ));
+    }
+
+    #[tokio::test]
+    async fn interrupted_receipt_is_mirrored_to_its_bound_text_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voice.sock");
+        let _sidecar = tokio::net::UnixListener::bind(&path).unwrap();
+        let bridge = VoiceBridge::connect(&path).await.unwrap();
+        bridge.active.insert("1".into(), binding());
+        let local = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = local.local_addr().unwrap();
+        let http = Arc::new(serenity::http::HttpBuilder::new("test-token")
+            .proxy(format!("http://{proxy}"))
+            .ratelimiter_disabled(true)
+            .build());
+        bridge.set_turn_handler(Arc::new(ImmediateVoiceQuery(Arc::new(AtomicUsize::new(0)))), http).await;
+        bridge.handle_frame(json!({"version":1,"kind":"speech_interrupted",
+            "guildId":"1","conversationId":"1:2","generation":6,
+            "utteranceId":"turn-1:answer","stoppedAtMs":123,
+            "partialAudioPlayed":true})).await;
+        let (mut request, _) = tokio::time::timeout(Duration::from_secs(1), local.accept())
+            .await.unwrap().unwrap();
+        let mut body = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !String::from_utf8_lossy(&body).contains("Partial agent audio was played before interruption") {
+                let mut chunk = [0u8; 4096];
+                let count = request.read(&mut chunk).await.unwrap();
+                assert!(count > 0, "Discord mirror request closed before its body");
+                body.extend_from_slice(&chunk[..count]);
+            }
+        }).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("turn-1:answer"));
+        assert!(body.contains("channels/2/messages"));
     }
 
     #[tokio::test]

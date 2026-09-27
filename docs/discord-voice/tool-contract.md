@@ -13,6 +13,8 @@ The native Codex and Claude turns load the `voice` stdio MCP server only while t
 
 Sidecar receipts include `queuedAtMs` and, as stages occur, `ttsRequestedAtMs`, `ttsFirstByteAtMs`, `firstPlaybackAtMs`, and `stoppedAtMs` (Unix milliseconds). `firstPlaybackAtMs` records the Discord audio player's Playing transition; it is not proof that a remote listener heard a packet. `speech_status` is the way to retrieve later stages. The daemon logs the committed-transcript timestamp and native handler-dispatch timestamp under the turn ID without logging raw audio or transcript text. Actual provider/Discord latency gates still require live measurements.
 
+When speech is interrupted, the sidecar emits one `speech_interrupted` event per affected receipt. The daemon mirrors a notice to the bound text conversation; `partialAudioPlayed` says only whether the local player started before interruption, not whether Discord listeners heard audio.
+
 The model cannot provide a guild, text channel, voice channel, generation, native session, or capability token. The daemon issues a random per-turn grant to the stdio MCP process via its private configuration. The MCP facade forwards one JSON line to an owner-only Unix socket:
 
 ```json

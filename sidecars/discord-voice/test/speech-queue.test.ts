@@ -88,10 +88,11 @@ test('interrupt stops playback and drops every late synthesis chunk', async () =
   );
   queue.speak('utterance-2', 'hello');
   await first;
-  queue.interrupt();
+  const affected = queue.interrupt();
   releaseLate();
   await queue.whenDone('utterance-2');
   assert.equal(queue.status('utterance-2')?.status, 'interrupted');
+  assert.deepEqual(affected.map(receipt => receipt.utteranceId), ['utterance-2']);
   assert.deepEqual(played, [1]);
   assert.equal(stops, 1);
 });

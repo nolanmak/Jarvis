@@ -60,6 +60,8 @@ The queue's 20-case synthetic overlap test now checks local stop timing and late
 
 For latency readiness, speech receipts now expose queued, TTS request, TTS first byte, audio-player Playing, and stopped timestamps. `speech-queue.test.ts` holds the final chunk for five real seconds and confirms its first local playback occurs before that chunk. Two Rust tests first failed when a stalled Discord transcript mirror delayed native dispatch and speech; the bridge now starts transcript mirroring independently, starts the native handler immediately, and can queue speech before the mirror finishes while still posting the transcript before the text reply. These timestamps and tests are not the 30-turn live p50/p95 evidence; the player state is not a remote packet receipt.
 
+Interrupted speech now emits a receipt-scoped sidecar event once, including whether the local audio player had started. The Rust bridge validates the active binding before mirroring an interruption notice into its original text conversation. The notice distinguishes partial local playback from interruption before playback. This is synthetic receipt/mirror evidence; a real listener's partial-audio observation is still required for AC10.
+
 ## Required next gates
 
 1. Prove Discord DAVE join, owner audio receive/decode, and outbound playback in a test guild. Mocked adapter and native MCP tests cannot satisfy this gate.

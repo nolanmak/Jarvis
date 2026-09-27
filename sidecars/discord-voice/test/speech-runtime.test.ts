@@ -88,3 +88,31 @@ test('three failed STT reconnect attempts end with one visible failure and stopp
   assert.ok(frames.some(frame => frame.kind === 'audio_status' && frame.state === 'stopped'));
   assert.equal(frames.filter(frame => frame.kind === 'transcript').length, 0);
 });
+
+test('interrupt emits the affected receipt for the original text mirror', async () => {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await new Promise<void>(resolve => server.once('listening', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('expected TCP address');
+  const frames: Array<Record<string, unknown>> = [];
+  const audio = new VoiceAudio(fakeConnection(), binding, {
+    sttProvider: 'deepgram', ttsProvider: 'deepgram',
+    sttKey: 'synthetic-key', ttsKey: 'synthetic-key',
+    sttEndpoint: `ws://127.0.0.1:${address.port}`,
+  }, frame => { frames.push(frame as Record<string, unknown>); return true; });
+  try {
+    await audio.start();
+    audio.speak('turn-1:answer', 'synthetic spoken answer');
+    audio.interrupt();
+    assert.equal(audio.speechStatus('turn-1:answer')?.status, 'interrupted');
+    assert.deepEqual(frames.filter(frame => frame.kind === 'speech_interrupted')
+      .map(frame => frame.utteranceId), ['turn-1:answer']);
+    assert.equal(frames.find(frame => frame.kind === 'speech_interrupted')?.partialAudioPlayed, false);
+    audio.interrupt();
+    assert.equal(frames.filter(frame => frame.kind === 'speech_interrupted').length, 1);
+  } finally {
+    audio.stop();
+    for (const client of server.clients) client.terminate();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});

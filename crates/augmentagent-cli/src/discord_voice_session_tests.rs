@@ -108,6 +108,7 @@ async fn voice_flag_preserves_unbound_qwen_and_glm_text_routes() {
             .args(["--exact", "discord_voice_session_tests::voice_flag_preserves_unbound_qwen_and_glm_text_routes", "--nocapture"])
             .env("VOICE_LEGACY_PROFILES_TEST_ROOT", dir.path())
             .env("AUGMENTAGENT_MODEL_SELECTION_CONFIG", dir.path().join("selection.json"))
+            .env("AUGMENTAGENT_MODEL_ROUTER_CONFIG", dir.path().join("router.json"))
             .env("AUGMENTAGENT_MODEL_QWEN_ENABLED", "1")
             .env("AUGMENTAGENT_MODEL_GLM_ENABLED", "1")
             .output().unwrap();
@@ -116,6 +117,14 @@ async fn voice_flag_preserves_unbound_qwen_and_glm_text_routes() {
         return;
     };
     let root = PathBuf::from(root);
+    std::fs::write(root.join("router.json"), serde_json::json!({
+        "version": 1, "mode": "direct", "base_url": "http://127.0.0.1:1/v1",
+        "api_key": "synthetic-test-key",
+        "models": {
+            "claude": {"quality": "cc/synthetic", "fast": "cc/synthetic"},
+            "codex": {"quality": "cx/synthetic", "fast": "cx/synthetic"}
+        }
+    }).to_string()).unwrap();
     let wiki = root.join("wiki");
     std::fs::create_dir_all(&wiki).unwrap();
     let store = Arc::new(Store::open(root.join("data.db")).unwrap());
