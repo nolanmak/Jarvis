@@ -8,6 +8,8 @@ mod computer_tool;
 mod provider_channel_tests;
 #[cfg(test)]
 mod model_switch_sequence_tests;
+#[cfg(test)]
+mod discord_voice_session_tests;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -9258,6 +9260,9 @@ struct WikiQuerier {
     reasoner: Arc<FallbackReasoner>,
     wiki_root: PathBuf,
     repo_root: PathBuf,
+    conversation_store: Option<Arc<Store>>,
+    conversation_scheduler: Arc<augmentagent_approval_discord::conversation::ConversationScheduler>,
+    voice_enabled: bool,
 }
 
 /// #389 — Owner rules travel with EVERY query-mode prompt, injected at
@@ -9450,12 +9455,85 @@ impl QueryHandler for WikiQuerier {
         let answer = async {
             let store = augmentagent_channel_core::model_selection::SelectionStore::new(
                 augmentagent_channel_core::model_selection::config_path());
-            let selected = store.selected(ctx.channel_id.as_ref().map(|channel| channel.get().to_string()).as_deref())?;
+            let selected = match augmentagent_channel_core::native_session::CURRENT
+                .try_with(|session| session.provider()) {
+                Ok(provider) => Some(provider),
+                Err(_) => store.selected(ctx.channel_id.as_ref().map(|channel| channel.get().to_string()).as_deref())?,
+            };
             augmentagent_channel_core::model_selection::SELECTED_PROFILE
                 .scope(selected, self.reasoner.call_transcript(&opts, &prompt)).await
         }.await;
         sweep_imessage_attachments(&opts.env);
         answer
+    }
+
+    async fn answer_turn(
+        &self,
+        ctx: &augmentagent_approval_discord::AuditCtx,
+        history: &str,
+        current: &str,
+    ) -> anyhow::Result<String> {
+        let legacy_prompt = || {
+            if history.is_empty() { current.to_string() }
+            else { format!("{history}\n\nuser's current message:\n{current}") }
+        };
+        let (Some(guild_id), Some(channel_id), Some(store)) =
+            (ctx.guild_id, ctx.channel_id, self.conversation_store.as_ref())
+        else {
+            return self.answer(ctx, &legacy_prompt()).await;
+        };
+        if !self.voice_enabled || !ctx.owner_authorized {
+            return self.answer(ctx, &legacy_prompt()).await;
+        }
+        let guild = guild_id.to_string();
+        let channel = channel_id.get().to_string();
+        let conversation = format!("{guild}:{channel}");
+        self.conversation_scheduler.submit(&conversation, &ctx.session_id, || async {
+            use augmentagent_channel_core::{
+                native_session::{NativeSession, CURRENT},
+                providers::ProviderKind,
+            };
+            let binding = store.discord_conversation(&guild, &channel)?;
+            if binding.as_ref().is_some_and(|item| item.uncertain) {
+                anyhow::bail!("Native conversation has an uncertain turn; inspect it before continuing");
+            }
+            let selection = augmentagent_channel_core::model_selection::SelectionStore::new(
+                augmentagent_channel_core::model_selection::config_path()
+            ).selected(Some(&channel))?;
+            let provider = if let Some(item) = &binding {
+                let bound = match item.provider.as_str() {
+                    "claude" => ProviderKind::Claude,
+                    "codex" => ProviderKind::Codex,
+                    _ => anyhow::bail!("Unsupported bound native provider"),
+                };
+                if selection.is_some_and(|selected| selected != bound) {
+                    anyhow::bail!("Model selection conflicts with bound native session; explicitly end or migrate the conversation");
+                }
+                bound
+            } else {
+                let selected = selection.unwrap_or(ProviderKind::Claude);
+                anyhow::ensure!(matches!(selected, ProviderKind::Claude | ProviderKind::Codex),
+                    "Discord voice conversations currently require Claude or Codex");
+                selected
+            };
+            let session = NativeSession::from_id(provider,
+                binding.as_ref().map(|item| item.native_session_id.clone()))?;
+            let prompt = if binding.is_some() { current.to_string() } else { legacy_prompt() };
+            let answer = CURRENT.scope(Arc::clone(&session), self.answer(ctx, &prompt)).await;
+            if let Some(id) = session.id() {
+                if binding.is_none() {
+                    store.bind_discord_conversation(&augmentagent_store::DiscordConversation {
+                        guild_id: guild.clone(), channel_id: channel.clone(),
+                        provider: provider.name().to_string(), native_session_id: id,
+                        cwd: self.wiki_root.to_string_lossy().into_owned(),
+                        uncertain: answer.is_err() || session.is_uncertain(),
+                    })?;
+                } else if answer.is_err() || session.is_uncertain() {
+                    store.mark_discord_conversation_uncertain(&guild, &channel)?;
+                }
+            }
+            answer
+        }).await.map_err(anyhow::Error::msg)
     }
 
     async fn model_command(&self, channel_id: u64, text: &str) -> Option<String> {
@@ -9464,6 +9542,37 @@ impl QueryHandler for WikiQuerier {
         run_command(&store, &channel_id.to_string(), text, |profile| {
             model_profile_ready(&self.reasoner, profile)
         })
+    }
+
+    async fn model_command_in_guild(
+        &self,
+        guild_id: Option<u64>,
+        channel_id: u64,
+        text: &str,
+    ) -> Option<String> {
+        if self.voice_enabled {
+            if let (Some(guild), Some(store)) = (guild_id, self.conversation_store.as_ref()) {
+                match store.discord_conversation(&guild.to_string(), &channel_id.to_string()) {
+                    Ok(Some(binding)) => {
+                        let mut words = text.split_whitespace();
+                        if matches!(words.next(), Some("/model" | "model")) {
+                            let args: Vec<_> = words.collect();
+                            let same = matches!(args.as_slice(), ["set", name] | [name]
+                                if *name == binding.provider);
+                            if !same && !matches!(args.as_slice(), [] | ["help"] | ["list"] | ["status"]) {
+                                return Some(format!(
+                                    "This conversation is bound to native {} session {}. Switching models would start a different session; the current binding stays unchanged.",
+                                    binding.provider, binding.native_session_id
+                                ));
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => return Some(format!("Model selection unavailable: {error}")),
+                }
+            }
+        }
+        self.model_command(channel_id, text).await
     }
 }
 
@@ -9643,7 +9752,8 @@ mod query_delivery_contract_tests {
             (ProviderKind::Claude, primary.clone()),
             (ProviderKind::Codex, Arc::new(augmentagent_channel_core::codex::CodexCliReasoner::openai())),
         ], CooldownLatch::at(repo.join("cooldowns.json"))));
-        let handler = WikiQuerier { reasoner: reasoner.clone(), wiki_root: wiki.clone(), repo_root: repo.into() };
+        let handler = WikiQuerier { reasoner: reasoner.clone(), wiki_root: wiki.clone(), repo_root: repo.into(),
+            conversation_store: None, conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()), voice_enabled: false };
         for turn in 0..2 {
             let mut ctx = augmentagent_approval_discord::AuditCtx::empty();
             ctx.session_id = format!("synthetic-channel:synthetic-turn-{turn}");
@@ -9703,7 +9813,8 @@ mod query_delivery_contract_tests {
                 marker: format!("ATTACH: {}", document.display()),
             }))], CooldownLatch::at(fixture.path().join("cooldowns.json"))));
         let handler = WikiQuerier { reasoner: reasoner.clone(), wiki_root: wiki.clone(),
-            repo_root: fixture.path().to_path_buf() };
+            repo_root: fixture.path().to_path_buf(), conversation_store: None,
+            conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()), voice_enabled: false };
         let mut context = augmentagent_approval_discord::AuditCtx::empty();
         context.session_id = "synthetic-channel:synthetic-turn".into();
         let answer = handler.answer(&context, "Deliver the original synthetic document").await.unwrap();
@@ -13347,6 +13458,9 @@ async fn build_broker(
             reasoner: Arc::clone(&reasoner),
             wiki_root: root.clone(),
             repo_root: repo_root.clone(),
+            conversation_store: Some(Arc::clone(&store)),
+            conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()),
+            voice_enabled: std::env::var("AUGMENTAGENT_DISCORD_VOICE_ENABLED").as_deref() == Ok("1"),
         };
         Arc::new(q) as Arc<dyn QueryHandler>
     });

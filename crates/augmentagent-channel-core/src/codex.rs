@@ -202,6 +202,12 @@ impl CodexCliReasoner {
         clean: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> anyhow::Result<String> {
         let provider = self.provider_name();
+        let mut native_lease = crate::native_session::CURRENT
+            .try_with(|session| std::sync::Arc::clone(session))
+            .ok()
+            .map(|session| session.begin(self.kind))
+            .transpose()?;
+        let native_launch = native_lease.as_ref().map(|lease| lease.launch());
         let router = crate::model_router::current()?.filter(|r| r.enabled() || self.kind != ProviderKind::Codex);
         if matches!(self.kind, ProviderKind::Qwen | ProviderKind::Glm) && router.is_none() {
             return Err(ReasonerError::Local { message: "Runpod model requires a configured 9Router endpoint".into() }.into());
@@ -267,7 +273,6 @@ impl CodexCliReasoner {
             "--skip-git-repo-check".into(),
             "--ignore-user-config".into(),
             "--ignore-rules".into(),
-            "--ephemeral".into(),
             "--strict-config".into(),
             "-c".into(),
             "approval_policy=never".into(),
@@ -281,6 +286,12 @@ impl CodexCliReasoner {
             "-m".into(),
             model.clone(),
         ];
+        if native_launch.is_none() {
+            args.push("--ephemeral".into());
+        }
+        if matches!(native_launch.as_ref(), Some(crate::native_session::Launch::Resume { .. })) {
+            args.insert(1, "resume".into());
+        }
         if let Some(router) = &router {
             for value in router.codex_overrides() { args.extend(["-c".into(), value]); }
         }
@@ -300,8 +311,12 @@ impl CodexCliReasoner {
             args.push("-c".into());
             args.push(config.clone());
         }
-        args.push("-C".into());
-        args.push(bridge.native_cwd.to_string_lossy().into_owned());
+        if let Some(crate::native_session::Launch::Resume { id }) = &native_launch {
+            args.push(id.clone());
+        } else {
+            args.push("-C".into());
+            args.push(bridge.native_cwd.to_string_lossy().into_owned());
+        }
         // "-" = read the prompt from stdin, mirroring the claude spawn shape.
         args.push("-".into());
 
@@ -310,6 +325,9 @@ impl CodexCliReasoner {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if matches!(native_launch.as_ref(), Some(crate::native_session::Launch::Resume { .. })) {
+            cmd.current_dir(&bridge.native_cwd);
+        }
 
         // Always a clean env (the #128 posture): OS essentials + CODEX_HOME
         // + exactly the secrets this backend needs, JIT-loaded. The daemon's
@@ -393,6 +411,13 @@ impl CodexCliReasoner {
                 continue;
             };
             let kind = v.get("type").and_then(|t| t.as_str());
+            if kind == Some("thread.started") {
+                if let (Some(lease), Some(id)) =
+                    (native_lease.as_mut(), v.get("thread_id").and_then(|value| value.as_str()))
+                {
+                    lease.observe(id)?;
+                }
+            }
             if kind.is_some_and(|k| k.starts_with("turn.") || k.starts_with("item.")) {
                 turn_began = true;
             }
@@ -467,6 +492,9 @@ impl CodexCliReasoner {
             // ordinary text (the claude failure shape). Catch it here too.
             if crate::reasoner::is_rate_limited(&final_text) {
                 return Err(turn_error(provider, FailureClass::Quota, capability, final_text));
+            }
+            if let Some(lease) = native_lease {
+                lease.finish()?;
             }
             return Ok(final_text);
         }

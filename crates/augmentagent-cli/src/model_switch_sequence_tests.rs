@@ -215,6 +215,9 @@ async fn discord_model_switch_sequence_child() {
         reasoner: build_reasoner(),
         wiki_root: root.join("wiki"),
         repo_root: root.join("repo"),
+        conversation_store: None,
+        conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()),
+        voice_enabled: false,
     };
     let file = root.join("wiki/probe.txt");
     let mut history = String::new();
@@ -237,6 +240,7 @@ async fn discord_model_switch_sequence_child() {
         };
         let ctx = augmentagent_approval_discord::AuditCtx {
             session_id: format!("{CHANNEL}:{}", index + 1),
+            guild_id: None,
             http: None,
             channel_id: Some(serenity::model::id::ChannelId::new(CHANNEL)),
             owner_authorized: true,
@@ -274,6 +278,7 @@ async fn discord_model_switch_sequence_child() {
     assert!(reply.contains("set to claude"), "{reply}");
     assert_eq!(handler.selected_model(CHANNEL).await.unwrap().as_deref(), Some("claude"));
     let ctx = augmentagent_approval_discord::AuditCtx {
+        guild_id: None,
         session_id: format!("{CHANNEL}:4"),
         http: None,
         channel_id: Some(serenity::model::id::ChannelId::new(CHANNEL)),

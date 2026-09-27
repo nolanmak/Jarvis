@@ -87,3 +87,4 @@ pub use trigger::{
 
 pub mod model_router;
 pub mod model_selection;
+pub mod native_session;

@@ -38,6 +38,8 @@ pub struct DiscordConversation {
     pub provider: String,
     pub native_session_id: String,
     pub cwd: String,
+    /// The previous native turn may have run tools before its result was lost.
+    pub uncertain: bool,
 }
 
 /// #900 — an interrupted ShadowNote sync pass, persisted after every page so
@@ -83,8 +85,8 @@ impl Store {
         let guard = self.conn.lock().expect("store mutex poisoned");
         guard.execute(
             "INSERT INTO discord_conversations \
-             (guild_id, channel_id, provider, native_session_id, cwd, created_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             (guild_id, channel_id, provider, native_session_id, cwd, created_at_ms, uncertain) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
              ON CONFLICT(guild_id, channel_id) DO NOTHING",
             params![
                 binding.guild_id,
@@ -92,11 +94,12 @@ impl Store {
                 binding.provider,
                 binding.native_session_id,
                 binding.cwd,
-                now_millis()
+                now_millis(),
+                binding.uncertain as i64
             ],
         )?;
         let persisted = guard.query_row(
-            "SELECT guild_id, channel_id, provider, native_session_id, cwd \
+            "SELECT guild_id, channel_id, provider, native_session_id, cwd, uncertain \
              FROM discord_conversations WHERE guild_id = ?1 AND channel_id = ?2",
             params![binding.guild_id, binding.channel_id],
             |row| {
@@ -106,6 +109,7 @@ impl Store {
                     provider: row.get(2)?,
                     native_session_id: row.get(3)?,
                     cwd: row.get(4)?,
+                    uncertain: row.get::<_, i64>(5)? != 0,
                 })
             },
         )?;
@@ -124,7 +128,7 @@ impl Store {
     ) -> StoreResult<Option<DiscordConversation>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         Ok(guard.query_row(
-            "SELECT guild_id, channel_id, provider, native_session_id, cwd \
+            "SELECT guild_id, channel_id, provider, native_session_id, cwd, uncertain \
              FROM discord_conversations WHERE guild_id = ?1 AND channel_id = ?2",
             params![guild_id, channel_id],
             |row| {
@@ -134,10 +138,27 @@ impl Store {
                     provider: row.get(2)?,
                     native_session_id: row.get(3)?,
                     cwd: row.get(4)?,
+                    uncertain: row.get::<_, i64>(5)? != 0,
                 })
             },
         )
         .optional()?)
+    }
+
+    pub fn mark_discord_conversation_uncertain(
+        &self,
+        guild_id: &str,
+        channel_id: &str,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let changed = guard.execute(
+            "UPDATE discord_conversations SET uncertain = 1 WHERE guild_id = ?1 AND channel_id = ?2",
+            params![guild_id, channel_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::InvalidInput("Discord conversation is not bound".into()));
+        }
+        Ok(())
     }
 
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
@@ -337,6 +358,7 @@ impl Store {
                 native_session_id TEXT NOT NULL,\
                 cwd TEXT NOT NULL,\
                 created_at_ms INTEGER NOT NULL,\
+                uncertain INTEGER NOT NULL DEFAULT 0 CHECK(uncertain IN (0, 1)),\
                 PRIMARY KEY(guild_id, channel_id),\
                 UNIQUE(provider, native_session_id)\
             )",

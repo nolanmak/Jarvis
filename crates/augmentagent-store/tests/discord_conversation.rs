@@ -7,6 +7,7 @@ fn conversation(channel: &str, session: &str) -> DiscordConversation {
         provider: "claude".into(),
         native_session_id: session.into(),
         cwd: "/tmp/voice-fixture".into(),
+        uncertain: false,
     }
 }
 
@@ -42,4 +43,18 @@ fn invalid_bindings_never_persist() {
     invalid.native_session_id.clear();
     assert!(store.bind_discord_conversation(&invalid).is_err());
     assert_eq!(store.discord_conversation("guild-1", "thread-1").unwrap(), None);
+}
+
+#[test]
+fn uncertain_native_turn_survives_restart_and_cannot_be_rebound_as_active() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    let store = Store::open(&path).unwrap();
+    let binding = conversation("thread-1", "session-1");
+    store.bind_discord_conversation(&binding).unwrap();
+    store.mark_discord_conversation_uncertain("guild-1", "thread-1").unwrap();
+    drop(store);
+    let reopened = Store::open(&path).unwrap();
+    assert!(reopened.discord_conversation("guild-1", "thread-1").unwrap().unwrap().uncertain);
+    assert!(reopened.bind_discord_conversation(&binding).is_err());
 }

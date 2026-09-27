@@ -100,7 +100,9 @@ impl EventHandler for Handler {
         // Model selection is an owner control, never part of the model prompt.
         // This runs after the existing fail-closed allowlist and before any
         // attachment download or history collection.
-        if let Some(reply) = handler.model_command(msg.channel_id.get(), &user_text).await {
+        if let Some(reply) = handler.model_command_in_guild(
+            msg.guild_id.map(|guild| guild.get()), msg.channel_id.get(), &user_text
+        ).await {
             let builder = CreateMessage::new().content(reply)
                 .reference_message(MessageReference::from((msg.channel_id, msg.id)));
             if let Err(error) = msg.channel_id.send_message(&ctx.http, builder).await {
@@ -260,6 +262,7 @@ impl EventHandler for Handler {
         let http = ctx.http.clone();
         let channel_id = msg.channel_id;
         let msg_id = msg.id;
+        let guild_id = msg.guild_id.map(|guild| guild.get());
         let bot_user_id = self.state.bot_user_id.get().copied();
         let allowed_user_id = self.state.allowed_user_id;
         let wiki_root = self.state.wiki_root.clone();
@@ -287,12 +290,7 @@ impl EventHandler for Handler {
             let extracted_docs = extract_doc_attachments(&docs, msg_id.get()).await;
             downloaded_txts.extend(extracted_docs);
 
-            let prompt = build_prompt_with_context(
-                &history,
-                &user_text,
-                &downloaded_imgs,
-                &downloaded_txts,
-            );
+            let current = build_prompt(&user_text, &downloaded_imgs, &downloaded_txts);
 
             // #125: Liveness signal. Discord's typing indicator auto-expires
             // after ~10s, so we kick one off immediately and re-broadcast on a
@@ -306,12 +304,16 @@ impl EventHandler for Handler {
             // high-risk tool calls (Write/Edit/Bash/...).
             let audit_ctx = crate::AuditCtx {
                 session_id: format!("{}:{}", channel_id, msg_id),
+                guild_id,
                 http: Some(http.clone()),
                 channel_id: Some(channel_id),
                 owner_authorized: allowed_user_id.is_some(),
             };
-            let result =
-                run_with_typing(&http, channel_id, handler.answer(&audit_ctx, &prompt)).await;
+            let result = run_with_typing(
+                &http,
+                channel_id,
+                handler.answer_turn(&audit_ctx, &history, &current),
+            ).await;
             info!(%channel_id, %msg_id, success = result.is_ok(), "discord query completed");
 
             // Best-effort cleanup. Tempfiles aren't load-bearing for the reply
@@ -2253,6 +2255,7 @@ fn build_prompt(
 /// Layer a pre-formatted `<conversation_history>` block in front of the
 /// current-turn prompt. If `history` is empty, falls through to the bare
 /// `build_prompt` so first-turn messages match prior behavior exactly.
+#[cfg(test)]
 fn build_prompt_with_context(
     history: &str,
     user_text: &str,

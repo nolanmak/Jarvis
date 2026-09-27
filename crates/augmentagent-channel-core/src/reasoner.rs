@@ -1064,6 +1064,11 @@ impl ClaudeCliReasoner {
         capture: TextCapture,
         clean: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<String, CallError> {
+        let mut native_lease = crate::native_session::CURRENT
+            .try_with(|session| Arc::clone(session))
+            .ok()
+            .map(|session| session.begin(crate::providers::ProviderKind::Claude))
+            .transpose()?;
         let mut args: Vec<String> = vec![
             "-p".into(),
             "--output-format".into(),
@@ -1072,6 +1077,19 @@ impl ClaudeCliReasoner {
             "--permission-mode".into(),
             opts.permission_mode.clone(),
         ];
+        if let Some(lease) = &native_lease {
+            match lease.launch() {
+                crate::native_session::Launch::Create { requested_id: Some(id) } => {
+                    args.extend(["--session-id".into(), id]);
+                }
+                crate::native_session::Launch::Resume { id } => {
+                    args.extend(["--resume".into(), id]);
+                }
+                crate::native_session::Launch::Create { requested_id: None } => {
+                    return Err(CallError::Other(anyhow::anyhow!("Claude session ID was not assigned")));
+                }
+            }
+        }
 
         // `--allowedTools`: empty list = no tools. Space-separated names per claude CLI docs.
         args.push("--allowedTools".into());
@@ -1230,6 +1248,17 @@ impl ClaudeCliReasoner {
             if line.trim().is_empty() {
                 continue;
             }
+            if let Some(lease) = native_lease.as_mut() {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if (value["type"] == "system" && value["subtype"] == "init")
+                        || value["type"] == "result"
+                    {
+                        if let Some(id) = value["session_id"].as_str() {
+                            lease.observe(id)?;
+                        }
+                    }
+                }
+            }
             if let Some(u) = crate::token_usage::parse_usage(&line) {
                 observed_usage = Some(u);
             }
@@ -1312,6 +1341,9 @@ impl ClaudeCliReasoner {
             return Err(CallError::RateLimited {
                 message: final_text.trim().to_string(),
             });
+        }
+        if let Some(lease) = native_lease {
+            lease.finish()?;
         }
         Ok(final_text)
     }
