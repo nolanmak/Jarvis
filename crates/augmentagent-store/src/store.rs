@@ -29,6 +29,17 @@ pub enum StoreError {
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
+/// A Discord text conversation bound to one real native agent session.
+/// Audit request IDs are deliberately not stored here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscordConversation {
+    pub guild_id: String,
+    pub channel_id: String,
+    pub provider: String,
+    pub native_session_id: String,
+    pub cwd: String,
+}
+
 /// #900 — an interrupted ShadowNote sync pass, persisted after every page so
 /// a restart resumes pagination instead of replaying the whole batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +67,79 @@ pub struct Store {
 }
 
 impl Store {
+    /// First writer wins. A voice join may repeat the exact binding, but may
+    /// not silently fork a text conversation or bind one native session twice.
+    pub fn bind_discord_conversation(&self, binding: &DiscordConversation) -> StoreResult<()> {
+        if binding.guild_id.trim().is_empty()
+            || binding.channel_id.trim().is_empty()
+            || binding.native_session_id.trim().is_empty()
+            || binding.cwd.trim().is_empty()
+            || !matches!(binding.provider.as_str(), "codex" | "claude")
+        {
+            return Err(StoreError::InvalidInput(
+                "invalid Discord conversation binding".into(),
+            ));
+        }
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO discord_conversations \
+             (guild_id, channel_id, provider, native_session_id, cwd, created_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(guild_id, channel_id) DO NOTHING",
+            params![
+                binding.guild_id,
+                binding.channel_id,
+                binding.provider,
+                binding.native_session_id,
+                binding.cwd,
+                now_millis()
+            ],
+        )?;
+        let persisted = guard.query_row(
+            "SELECT guild_id, channel_id, provider, native_session_id, cwd \
+             FROM discord_conversations WHERE guild_id = ?1 AND channel_id = ?2",
+            params![binding.guild_id, binding.channel_id],
+            |row| {
+                Ok(DiscordConversation {
+                    guild_id: row.get(0)?,
+                    channel_id: row.get(1)?,
+                    provider: row.get(2)?,
+                    native_session_id: row.get(3)?,
+                    cwd: row.get(4)?,
+                })
+            },
+        )?;
+        if &persisted != binding {
+            return Err(StoreError::InvalidInput(
+                "Discord conversation is already bound to another native session".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn discord_conversation(
+        &self,
+        guild_id: &str,
+        channel_id: &str,
+    ) -> StoreResult<Option<DiscordConversation>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        Ok(guard.query_row(
+            "SELECT guild_id, channel_id, provider, native_session_id, cwd \
+             FROM discord_conversations WHERE guild_id = ?1 AND channel_id = ?2",
+            params![guild_id, channel_id],
+            |row| {
+                Ok(DiscordConversation {
+                    guild_id: row.get(0)?,
+                    channel_id: row.get(1)?,
+                    provider: row.get(2)?,
+                    native_session_id: row.get(3)?,
+                    cwd: row.get(4)?,
+                })
+            },
+        )
+        .optional()?)
+    }
+
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         let path_buf = path.as_ref().to_path_buf();
         let conn = Connection::open(path)?;
@@ -245,6 +329,18 @@ impl Store {
     /// its own CREATE TABLE IF NOT EXISTS in `initDb()` so the dashboard can
     /// boot even if the Rust daemon hasn't run yet (concurrent systemd start).
     fn migrate(conn: &Connection) -> StoreResult<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS discord_conversations (\
+                guild_id TEXT NOT NULL,\
+                channel_id TEXT NOT NULL,\
+                provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude')),\
+                native_session_id TEXT NOT NULL,\
+                cwd TEXT NOT NULL,\
+                created_at_ms INTEGER NOT NULL,\
+                PRIMARY KEY(guild_id, channel_id),\
+                UNIQUE(provider, native_session_id)\
+            )",
+        )?;
         // -------------------------------------------------------------------
         // #45 — Rust-owned schema. Mirrors `src/db.ts::initDb()` exactly
         // (column names, types, NOT NULL, DEFAULT, PRIMARY KEY). Do NOT
