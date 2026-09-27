@@ -65,3 +65,39 @@ test('interrupt stops playback and drops every late synthesis chunk', async () =
   assert.deepEqual(played, [1]);
   assert.equal(stops, 1);
 });
+
+test('twenty overlap cases stop local playback promptly and fence late chunks', async () => {
+  for (let overlap = 0; overlap < 20; overlap++) {
+    let releaseLate!: () => void;
+    const late = new Promise<void>(resolve => { releaseLate = resolve; });
+    let firstAudio!: () => void;
+    const first = new Promise<void>(resolve => { firstAudio = resolve; });
+    const played: number[] = [];
+    let stoppedAt = 0;
+    const queue = new SpeechQueue(async function* (text) {
+      if (text === 'pending') throw new Error('pending synthesis must never start');
+      yield Buffer.from([overlap, 0]);
+      await late;
+      yield Buffer.from([100 + overlap, 0]);
+    }, { async play(audio) {
+      for await (const chunk of audio) {
+        played.push(chunk.readInt16LE(0));
+        if (played.length === 1) firstAudio();
+      }
+    }, interrupt() { stoppedAt = performance.now(); } });
+    const activeId = `active-${overlap}`;
+    queue.speak(activeId, 'active');
+    await first;
+    const pendingId = `pending-${overlap}`;
+    if (overlap % 2 === 1) queue.speak(pendingId, 'pending');
+    const eventAt = performance.now();
+    queue.interrupt(); // owner speech-start and /voice interrupt use this boundary
+    assert.ok(stoppedAt - eventAt < 250, `overlap ${overlap} did not stop within 250 ms`);
+    releaseLate();
+    assert.equal((await queue.whenDone(activeId)).status, 'interrupted');
+    if (overlap % 2 === 1) {
+      assert.equal((await queue.whenDone(pendingId)).status, 'interrupted');
+    }
+    assert.deepEqual(played, [overlap], `overlap ${overlap} played a stale chunk`);
+  }
+});

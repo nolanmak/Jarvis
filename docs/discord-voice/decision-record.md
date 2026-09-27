@@ -56,6 +56,8 @@ Local provider refusal fixtures now cover HTTP 401, 429, and 500 for each Deepgr
 
 Review hardening: `conversation_scheduler.rs` first failed because a queue-full turn ID stayed permanently rejected and old full answers stayed cached. It now admits a later retry after the queue drains, keeps at most 128 completed results per conversation, and evicts idle conversation queues beyond 1,024. Durable store turn IDs still reject a submitted turn after memory-cache eviction. `voice_flag_preserves_unbound_qwen_and_glm_text_routes` first failed with “Discord voice conversations currently require Claude or Codex”; unbound Qwen/GLM text now retains the existing route when the voice flag is on. `failed_turn_without_native_id_is_not_replayed_after_restart` first failed when its new, distinct turn was also blocked: a refusal before a native lease now consumes only the original turn ID, while a dropped native lease still marks the conversation uncertain. SQLite test fixtures use temporary directories so WAL sidecars are removed, and the sidecar stops dispatching a batched frame if its client socket has been destroyed.
 
+The queue's 20-case synthetic overlap test now checks local stop timing and late-chunk fencing for active output, including cases with pending output. This is below the real speech-event and Discord audio-player boundary, so live p95 and full ingress integration remain open.
+
 ## Required next gates
 
 1. Prove Discord DAVE join, owner audio receive/decode, and outbound playback in a test guild. Mocked adapter and native MCP tests cannot satisfy this gate.
