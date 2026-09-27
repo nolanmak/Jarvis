@@ -134,6 +134,14 @@ impl CooldownLatch {
         }
     }
 
+    /// Like [`latched_until`](Self::latched_until), plus the recorded reason:
+    /// `(reset as unix seconds, reason)`. The auto-PR quota brake (#1215)
+    /// counts only quota latches, and only the reason tells them apart.
+    pub fn latched_entry(&self, provider: &str) -> Option<(i64, String)> {
+        let entry = self.read_all().remove(provider)?;
+        (entry.until > Utc::now()).then(|| (entry.until.timestamp(), entry.reason))
+    }
+
     /// Latch `provider` until `until`. Later of (existing, new) wins so a
     /// racing shorter latch can't shrink a parsed reset time.
     pub fn latch(&self, provider: &str, until: DateTime<Utc>, reason: &str) {

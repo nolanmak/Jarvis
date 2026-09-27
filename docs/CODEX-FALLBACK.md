@@ -47,7 +47,7 @@ it is the address the service CLIs use to reach the Secret Service keyring.
 | --- | --- | --- |
 | `COMPOSIO_API_KEY` | `ask_opts` (keyring, just in time) | `augmentagent gmail` subcommands |
 | `DISCORD_BOT_TOKEN` (and `DISCORD_CHANNEL_ID`) | `ask_opts`, from the daemon environment | `augmentagent gmail compose --post` approval card |
-| Every `AWS_*` variable (and `AUGMENTAGENT_IMESSAGE_S3_*`) | `ask_opts`, only when an iMessage S3 bucket is configured | `imessage fetch-attachment` |
+| Every `AWS_*` variable (and `AUGMENTAGENT_IMESSAGE_S3_*`, `AUGMENTAGENT_APPLE_NOTES_S3_*`) | `ask_opts`, only when an iMessage or Apple Notes S3 bucket is configured | `imessage fetch-attachment`, `apple-notes fetch-attachment` |
 | `SOCIALAPI_API_KEY` | SocialAPI MCP presets (keyring, just in time) | SocialAPI MCP server |
 
 The policy also carries non-secret but private paths: `settings` (hooks and

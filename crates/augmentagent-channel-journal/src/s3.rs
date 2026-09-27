@@ -3,6 +3,12 @@
 //! `[attachment: …]` line) by `augmentagent imessage fetch-attachment` into the ask
 //! session's own dir under [`ATTACHMENT_TMP_ROOT`]. Enforced here: the pre-network bucket/prefix
 //! allowlist, the streamed [`MAX_ATTACHMENT_BYTES`] cap, private (verified) temp dirs, the cleanup.
+//!
+//! #1061 — Apple Notes attachments (`s3://<bucket>/notes/<uuid>/<att>-<name>`) ride the same
+//! machinery via [`AttachmentSource::from_notes_env`]: only the env prefix and the default key
+//! prefix differ. [`ATTACHMENT_TMP_ROOT`] is the shared per-ask-session scratch dir for both
+//! channels on purpose — it is the one `/tmp` root the scope guard admits for `Read`, so a second
+//! root would need a second carve-out in the guard and in the Codex bridge for no benefit.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -27,11 +33,15 @@ pub const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 pub const GC_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Key prefix the exporter writes under (`scripts/imessage/imessage_sync.py`).
 pub const DEFAULT_PREFIX: &str = "conversations/";
+/// Env prefix + key prefix of the Apple Notes exporter (`scripts/apple-notes/apple_notes_sync.py`).
+pub const NOTES_ENV_PREFIX: &str = "AUGMENTAGENT_APPLE_NOTES_S3";
+pub const NOTES_DEFAULT_PREFIX: &str = "notes/";
+const IMESSAGE_ENV_PREFIX: &str = "AUGMENTAGENT_IMESSAGE_S3";
 
 #[derive(Debug, Error)]
 pub enum S3FetchError {
-    #[error("iMessage attachment fetch is not configured: set AUGMENTAGENT_IMESSAGE_S3_BUCKET")]
-    NotConfigured,
+    #[error("attachment fetch is not configured: set {0}_BUCKET")]
+    NotConfigured(String),
     #[error("refused: {0}")]
     Refused(String),
     #[error("signing: {0}")]
@@ -148,18 +158,30 @@ impl AttachmentSource {
         }
     }
 
-    /// `AUGMENTAGENT_IMESSAGE_S3_BUCKET` / `_PREFIX` / `_ENDPOINT` (path-style
-    /// base URL for S3-compatible or mock servers) and `AWS_REGION` (or
-    /// `AWS_DEFAULT_REGION`, else `us-east-1` — S3 rejects a wrong one loudly).
-    pub fn from_env() -> Result<Self, S3FetchError> {
+    /// `<var_prefix>_BUCKET` / `_PREFIX` / `_ENDPOINT` (path-style base URL for
+    /// S3-compatible or mock servers) and `AWS_REGION` (or `AWS_DEFAULT_REGION`,
+    /// else `us-east-1` — S3 rejects a wrong one loudly).
+    fn from_env_prefixed(var_prefix: &str, default_key_prefix: &str) -> Result<Self, S3FetchError> {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-        let bucket = var("AUGMENTAGENT_IMESSAGE_S3_BUCKET").ok_or(S3FetchError::NotConfigured)?;
+        let bucket = var(&format!("{var_prefix}_BUCKET"))
+            .ok_or_else(|| S3FetchError::NotConfigured(var_prefix.into()))?;
         let region = var("AWS_REGION")
             .or_else(|| var("AWS_DEFAULT_REGION"))
             .unwrap_or_else(|| "us-east-1".into());
-        let mut src = Self::new(bucket.trim(), var("AUGMENTAGENT_IMESSAGE_S3_PREFIX").as_deref(), &region);
-        src.endpoint = var("AUGMENTAGENT_IMESSAGE_S3_ENDPOINT").map(|u| u.trim_end_matches('/').into());
+        let key_prefix = var(&format!("{var_prefix}_PREFIX")).unwrap_or_else(|| default_key_prefix.into());
+        let mut src = Self::new(bucket.trim(), Some(&key_prefix), &region);
+        src.endpoint = var(&format!("{var_prefix}_ENDPOINT")).map(|u| u.trim_end_matches('/').into());
         Ok(src)
+    }
+
+    /// The iMessage bundle's attachments (#888).
+    pub fn from_env() -> Result<Self, S3FetchError> {
+        Self::from_env_prefixed(IMESSAGE_ENV_PREFIX, DEFAULT_PREFIX)
+    }
+
+    /// The Apple Notes bundle's attachments (#1061) — same machinery, own bucket.
+    pub fn from_notes_env() -> Result<Self, S3FetchError> {
+        Self::from_env_prefixed(NOTES_ENV_PREFIX, NOTES_DEFAULT_PREFIX)
     }
 
     /// The allowlist, pre-network: configured bucket + prefix, no `..` segment, non-empty basename.
@@ -286,6 +308,12 @@ mod tests {
 
     const URI: &str = "s3://imsg-bundle/conversations/Alice B/attachments/9-IMG_001.jpeg";
 
+    /// `from_*_env` reads process-wide state; serialize the tests that set it.
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(Default::default)
+    }
+
     fn creds() -> SharedCredentialsProvider {
         SharedCredentialsProvider::new(Credentials::new("AKIDTEST", "SECRETTEST", None, None, "t"))
     }
@@ -338,6 +366,61 @@ mod tests {
         mock.assert_async().await;
         assert_eq!(n, 9);
         assert_eq!(std::fs::read(&dest).unwrap(), b"jpegbytes");
+    }
+
+    /// #1061 — the Apple Notes channel reads its own env prefix and defaults to `notes/`;
+    /// the iMessage prefix is outside its allowlist, and no bucket means no network at all.
+    #[tokio::test]
+    async fn notes_source_defaults_to_the_notes_prefix_and_refuses_anything_else() {
+        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("AUGMENTAGENT_APPLE_NOTES_S3_BUCKET");
+        let err = AttachmentSource::from_notes_env().unwrap_err();
+        assert!(
+            matches!(&err, S3FetchError::NotConfigured(p) if p == NOTES_ENV_PREFIX),
+            "{err}"
+        );
+        assert!(err.to_string().contains("AUGMENTAGENT_APPLE_NOTES_S3_BUCKET"), "{err}");
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server.mock("GET", mockito::Matcher::Any).expect(0).create_async().await;
+        std::env::set_var("AUGMENTAGENT_APPLE_NOTES_S3_BUCKET", "notes-bundle");
+        std::env::set_var("AUGMENTAGENT_APPLE_NOTES_S3_ENDPOINT", server.url());
+        let source = AttachmentSource::from_notes_env().expect("configured");
+        std::env::remove_var("AUGMENTAGENT_APPLE_NOTES_S3_BUCKET");
+        std::env::remove_var("AUGMENTAGENT_APPLE_NOTES_S3_ENDPOINT");
+        assert_eq!(source.prefix, NOTES_DEFAULT_PREFIX);
+        let good = "s3://notes-bundle/notes/00000000-0000-0000-0000-000000000010/ATT-1-scan.jpeg";
+        assert_eq!(source.resolve_key(good).unwrap(), good.trim_start_matches("s3://notes-bundle/"));
+        let dir = tempfile::tempdir().unwrap();
+        for uri in [
+            "s3://notes-bundle/conversations/Alice B/attachments/9-IMG_001.jpeg",
+            "s3://other-bucket/notes/x/ATT-1-scan.jpeg",
+            "s3://notes-bundle/notes/../conversations/x",
+        ] {
+            let err = source.fetch_with(&creds(), uri, &dir.path().join("out")).await.unwrap_err();
+            assert!(matches!(err, S3FetchError::Refused(_)), "{uri}: {err}");
+        }
+        mock.assert_async().await;
+    }
+
+    /// #1061 — the cap holds for notes keys too, and the partial file goes with it.
+    #[tokio::test]
+    async fn oversized_notes_object_is_aborted_and_partial_file_removed() {
+        let mut server = mockito::Server::new_async().await;
+        let body = vec![b'x'; MAX_ATTACHMENT_BYTES as usize + 1];
+        server
+            .mock("GET", mockito::Matcher::Any)
+            .with_chunked_body(move |w| w.write_all(&body))
+            .create_async()
+            .await;
+        let mut source = AttachmentSource::new("notes-bundle", Some(NOTES_DEFAULT_PREFIX), "us-east-1");
+        source.endpoint = Some(server.url());
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("scan.pdf");
+        let uri = "s3://notes-bundle/notes/00000000-0000-0000-0000-000000000010/ATT-1-scan.pdf";
+        let err = source.fetch_with(&creds(), uri, &dest).await.unwrap_err();
+        assert!(matches!(err, S3FetchError::TooLarge), "{err}");
+        assert!(!dest.exists(), "partial file must be deleted");
     }
 
     /// Codex review — a dotted bucket must not be virtual-hosted (TLS would fail).

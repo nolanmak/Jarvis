@@ -13,6 +13,7 @@ import argparse
 import fcntl
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -39,6 +40,10 @@ def parser():
     ap.add_argument("--db", type=lambda p: Path(p).expanduser().resolve(), default=DEFAULT_DB)
     ap.add_argument("--out", type=output_path, default=str(DEFAULT_OUT))
     ap.add_argument("--commit", action="store_true", help="git add/commit/push the bundle after syncing")
+    ap.add_argument("--s3-bucket", help="opt in to uploading attachments to your private S3 bucket")
+    ap.add_argument("--aws-profile")
+    ap.add_argument("--media-root", type=lambda p: Path(p).expanduser().resolve(),
+                    help="Group Container holding Accounts/<account>/Media (default: the --db directory)")
     return ap
 
 
@@ -80,8 +85,23 @@ def commit(out, counts, titles):
     print(f"committed and pushed: {subject}")
 
 
+def uploader(bucket, profile):
+    """`aws s3 cp` closure matching apple_notes_sync's `s3['uploader']` contract (#1061)."""
+    def upload(path, bucket_name, key):
+        cmd = ["aws", "s3", "cp", path, f"s3://{bucket_name}/{key}", "--only-show-errors"]
+        if profile:
+            cmd += ["--profile", profile]
+        try:
+            return subprocess.run(cmd, capture_output=True, timeout=300).returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+    return {"bucket": bucket, "uploader": upload}
+
+
 def run(args):
     os.umask(0o077)
+    if args.s3_bucket and not shutil.which("aws"):
+        raise RuntimeError("AWS CLI is required for --s3-bucket")
     args.out.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (args.out / ".sync.lock").open("a") as lock:
         try:
@@ -91,7 +111,9 @@ def run(args):
             return
         config = load_config(args.out)
         touched = []
-        counts = sync(args.db, args.out, args.out / ".sync_state.json", config=config, touched=touched)
+        counts = sync(args.db, args.out, args.out / ".sync_state.json", config=config, touched=touched,
+                      s3=uploader(args.s3_bucket, args.aws_profile) if args.s3_bucket else None,
+                      media_root=args.media_root)
         print("synced: " + ", ".join(f"{counts[k]} {k}" for k in ("new", "updated", "renamed", "deleted", "unchanged", "skipped")))
         if args.commit:
             commit(args.out, counts, touched)

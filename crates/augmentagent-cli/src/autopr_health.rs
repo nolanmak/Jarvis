@@ -102,6 +102,19 @@ pub struct HealthInputs {
     /// #1037 — drafts the resume lane is holding because no independent
     /// review is possible: `(pr, reason code, reason, days without a review)`.
     pub unreviewable_drafts: Vec<(u64, String, String, u32)>,
+    /// #1215 — today's engaged runs against today's cap.
+    pub runs_today: Option<RunsToday>,
+    /// #1214 — open `agent-gave-up` issues grouped by reason code.
+    pub gave_up_by_reason: Option<Vec<(String, u32)>>,
+}
+
+/// #1215 — how much of today's run budget is spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunsToday {
+    pub runs: u32,
+    /// Today's cap, after the quota brake.
+    pub cap: u32,
+    pub braked: bool,
 }
 
 /// Thresholds, so a noisy box can be tuned without a rebuild.
@@ -386,6 +399,24 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
 
 /// One Discord/stdout message for a set of findings. `None` when healthy —
 /// a watchdog that pings on every clean run trains you to ignore it.
+/// #1215 — the text output: the report (or the healthy line), then today's
+/// budget, which is the first thing a reader asks when nothing shipped.
+pub fn render_text(findings: &[Finding], i: &HealthInputs) -> String {
+    let mut out = report(findings).unwrap_or_else(|| "✓ auto-PR loop healthy".to_string());
+    if let Some(r) = i.runs_today {
+        let brake = if r.braked { " (brake: on)" } else { "" };
+        out.push_str(&format!("\nruns today: {} of {}{brake}", r.runs, r.cap));
+    }
+    if let Some(groups) = &i.gave_up_by_reason {
+        let total: u32 = groups.iter().map(|(_, n)| n).sum();
+        out.push_str(&format!("\ngave-up by reason ({total}):"));
+        for (code, n) in groups {
+            out.push_str(&format!("\n  {n:>4}  {code}"));
+        }
+    }
+    out
+}
+
 pub fn report(findings: &[Finding]) -> Option<String> {
     if findings.is_empty() {
         return None;
@@ -755,6 +786,11 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
         open_prs: open_pr_numbers(),
         draft_ages_days: open_draft_ages(now),
         unreviewable_drafts: crate::self_improve::unreviewable_drafts(),
+        runs_today: {
+            let (runs, cap, braked) = crate::self_improve::runs_today_status();
+            Some(RunsToday { runs, cap, braked })
+        },
+        gave_up_by_reason: crate::self_improve::gave_up_breakdown_live(repo_root),
     }
 }
 
@@ -778,10 +814,7 @@ pub async fn run(repo_root: &Path, notify: bool, json: bool) -> anyhow::Result<i
             .collect();
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
-        match report(&findings) {
-            Some(text) => println!("{text}"),
-            None => println!("✓ auto-PR loop healthy"),
-        }
+        println!("{}", render_text(&findings, &inputs));
     }
 
     if notify {
@@ -819,6 +852,43 @@ async fn notify_discord(text: &str) {
 mod tests {
     // (tests continue below; the #1030 case is appended at the end)
     use super::*;
+
+    /// #1215 C5 — the text report always says how much of today's budget
+    /// is spent, healthy or not.
+    #[test]
+    fn text_output_reports_runs_against_the_cap() {
+        let mut i = HealthInputs::default();
+        i.runs_today = Some(RunsToday { runs: 2, cap: 5, braked: false });
+        assert!(render_text(&[], &i).contains("runs today: 2 of 5"), "{}", render_text(&[], &i));
+        assert!(render_text(&[], &i).contains("✓ auto-PR loop healthy"));
+        i.runs_today = Some(RunsToday { runs: 3, cap: 3, braked: true });
+        assert!(render_text(&[], &i).contains("runs today: 3 of 3 (brake: on)"));
+        i.runs_today = None;
+        assert!(!render_text(&[], &i).contains("runs today"));
+    }
+
+    /// #1214 C6 — the report groups labelled issues by reason, and the
+    /// block's counts sum to the number of labelled issues.
+    #[test]
+    fn text_output_groups_gave_up_issues_by_reason() {
+        let mut i = HealthInputs::default();
+        i.gave_up_by_reason = Some(vec![
+            ("scoper:not-fixable".into(), 52),
+            ("stuck:gate-red".into(), 2),
+            ("unrecorded".into(), 54),
+        ]);
+        let text = render_text(&[], &i);
+        assert!(text.contains("gave-up by reason (108)"), "{text}");
+        let block = &text[text.find("gave-up by reason").unwrap()..];
+        let total: u32 = block
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.split_whitespace().next()?.parse::<u32>().ok())
+            .sum();
+        assert_eq!(total, 108, "{block}");
+        i.gave_up_by_reason = None;
+        assert!(!render_text(&[], &i).contains("gave-up by reason"));
+    }
 
     #[test]
     fn df_avail_parses_gnu_and_bsd_posix_layouts() {
@@ -858,6 +928,8 @@ mod tests {
             open_prs: None,
             draft_ages_days: vec![(990, 0)],
             unreviewable_drafts: vec![],
+            runs_today: None,
+            gave_up_by_reason: None,
         }
     }
 

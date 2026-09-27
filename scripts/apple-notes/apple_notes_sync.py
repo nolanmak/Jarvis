@@ -68,6 +68,15 @@ def slugify(title, limit=80):
     return text[:limit].rstrip("-") or "untitled"
 
 
+def attachment_key(note_uuid, attachment_uuid, filename):
+    """S3 key mirroring the bundle layout (#1061): notes/<note>/<attachment>-<file>.
+    The name is slugified so the fetch side's local name stays portable, but keeps
+    its extension — that is how a fetched image is recognized."""
+    stem, dot, ext = (filename or "").rpartition(".")
+    name = slugify(stem) + f".{ext.lower()}" if dot and ext.isalnum() else slugify(filename)
+    return f"notes/{note_uuid}/{attachment_uuid}-{name}"
+
+
 # --- protobuf ----------------------------------------------------------------
 
 def _varint(buf, i):
@@ -227,19 +236,27 @@ def _rows(con):
     ).fetchall()
 
 
-def _attachment_names(con, note_pk):
-    """{attachment_identifier: filename} for a note's attachment objects."""
+def _attachment_names(con, note_pk, media_root=None):
+    """{attachment_identifier: (filename, local_path_or_None)} for a note's
+    attachment objects. Notes keeps the file itself under
+    `<media_root>/Accounts/<account>/Media/<media-uuid>/<filename>` (#1061)."""
     out = {}
-    for ident, filename in con.execute(
+    for ident, filename, media_uuid, account in con.execute(
         """
-        SELECT att.ZIDENTIFIER, COALESCE(media.ZFILENAME, att.ZFILENAME)
+        SELECT att.ZIDENTIFIER, COALESCE(media.ZFILENAME, att.ZFILENAME),
+               media.ZIDENTIFIER, acct.ZIDENTIFIER
         FROM ZICCLOUDSYNCINGOBJECT att
         LEFT JOIN ZICCLOUDSYNCINGOBJECT media ON media.Z_PK = att.ZMEDIA
+        LEFT JOIN ZICCLOUDSYNCINGOBJECT note ON note.Z_PK = att.ZNOTE
+        LEFT JOIN ZICCLOUDSYNCINGOBJECT acct ON acct.Z_PK = note.ZACCOUNT7
         WHERE att.ZNOTE = ? AND att.ZTYPEUTI IS NOT NULL
         """,
         (note_pk,),
     ):
-        out[ident] = filename
+        local = None
+        if media_root and filename and media_uuid and account:
+            local = Path(media_root) / "Accounts" / account / "Media" / media_uuid / filename
+        out[ident] = (filename, local)
     return out
 
 
@@ -254,7 +271,7 @@ def _first_line(con, note_pk):
     return text.split("\n", 1)[0]
 
 
-def _render_body(text, attachments, names):
+def _render_body(text, attachments, names, uris=None):
     """Replace U+FFFC placeholders with attachment lines. Returns (text, labels)."""
     labels = []
     parts = text.split(PLACEHOLDER)
@@ -262,12 +279,51 @@ def _render_body(text, attachments, names):
     for i, part in enumerate(parts[1:]):
         if i < len(attachments):
             ident, uti = attachments[i]
-            label = f"{uti_to_mime(uti)} {names.get(ident) or ident}"
+            filename = names.get(ident, (None, None))[0]
+            label = f"{uti_to_mime(uti)} {filename or ident}"
+            uri = (uris or {}).get(ident)
+            if uri:
+                label += f" {uri}"
         else:
             label = "unknown"
         labels.append(label)
         rendered += f"[attachment: {label}]" + part
     return rendered, labels
+
+
+def _upload_attachments(uuid, attachments, names, s3, pending, done):
+    """Put each attachment's bytes in the bucket; return {identifier: s3 URI}
+    for the ones that landed there (#1061). A failed upload adds no URI and is
+    queued once, by key, for the next run. Bytes are never scrubbed."""
+    uris = {}
+    for ident, _ in attachments:
+        filename, local = names.get(ident, (None, None))
+        if not local or not local.exists():
+            continue
+        key = attachment_key(uuid, ident, filename)
+        if key in done or s3["uploader"](str(local), s3["bucket"], key):
+            done.add(key)
+            uris[ident] = f"s3://{s3['bucket']}/{key}"
+        elif not any(item["key"] == key for item in pending):
+            pending.append({"path": str(local), "key": key, "note": uuid})
+    return uris
+
+
+def _retry_uploads(s3, pending, notes):
+    """Re-attempt the uploads that failed on an earlier run. Returns
+    (still_pending, uploaded_keys); a note whose line was written without its
+    URI loses its `modified` stamp so this run re-renders it with the URI, and
+    an attachment that has since vanished locally is dropped, not retried forever."""
+    still, done = [], set()
+    for item in pending:
+        if not Path(item["path"]).exists():
+            continue
+        if not s3["uploader"](item["path"], s3["bucket"], item["key"]):
+            still.append(item)
+            continue
+        done.add(item["key"])
+        notes.get(item["note"], {}).pop("modified", None)
+    return still, done
 
 
 def _note_path(folder, title, uuid, taken):
@@ -278,15 +334,22 @@ def _note_path(folder, title, uuid, taken):
     return path
 
 
-def sync(db_path, out_dir, state_path, config=None, touched=None):
+def sync(db_path, out_dir, state_path, config=None, touched=None, s3=None, media_root=None):
     """Bring `out_dir` in line with the Notes database. Returns counts:
     {'new', 'updated', 'renamed', 'deleted', 'unchanged', 'skipped'}.
     If `touched` is a list, the (scrubbed) titles of written or removed
-    notes are appended to it, for commit messages."""
+    notes are appended to it, for commit messages.
+
+    s3 = {'bucket': str, 'uploader': callable(path, bucket, key) -> bool}
+    uploads each note's attachment files (read from `media_root`, the Group
+    Container that holds the database) and appends the `s3://` pointer to its
+    `[attachment: …]` line (#1061). Failed uploads carry no pointer and are
+    retried on later runs via state['pending_uploads']."""
     config = config or {}
     touched = touched if touched is not None else []
     skip_folders = set(config.get("skip_folders") or [])
     skip_notes = set(config.get("skip_notes") or [])
+    media_root = Path(media_root) if media_root else (Path(db_path).resolve().parent if s3 else None)
     out_dir = Path(out_dir)
     _mkdir_private(out_dir)
     state = _load_json(state_path, {"notes": {}, "skipped": {}})
@@ -294,6 +357,11 @@ def sync(db_path, out_dir, state_path, config=None, touched=None):
     state.setdefault("skipped", {})
     index = _load_json(out_dir / "notes" / "index.json", {})
     loaded = json.dumps(state, sort_keys=True), json.dumps(index, sort_keys=True)
+    uploaded = set()
+    if s3:
+        state["pending_uploads"], uploaded = _retry_uploads(
+            s3, state.get("pending_uploads", []), state["notes"]
+        )
     counts = {k: 0 for k in ("new", "updated", "renamed", "deleted", "unchanged", "skipped")}
     now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
@@ -331,6 +399,7 @@ def sync(db_path, out_dir, state_path, config=None, touched=None):
 
         taken = set()
         for uuid, (pk, title, created, modified, folder, account) in live.items():
+            names = _attachment_names(con, pk, media_root)
             reason = None
             if folder in skip_folders:
                 reason = "skip-folder"
@@ -338,6 +407,10 @@ def sync(db_path, out_dir, state_path, config=None, touched=None):
                 reason = "skip-note"
             elif scrub(title)[1]:
                 reason = "title-secret"
+            # Filenames reach both the bundle line and the S3 key, so they are
+            # scrubbed like a title (#1061); the bytes never are.
+            elif any(scrub(filename)[1] for filename, _ in names.values() if filename):
+                reason = "attachment-secret"
             if reason is None:
                 prior_skip = state["skipped"].get(uuid)
                 if prior_skip and prior_skip.get("modified") == modified and prior_skip.get("rules") == SCRUB_RULES:
@@ -375,7 +448,8 @@ def sync(db_path, out_dir, state_path, config=None, touched=None):
                 text, attachments = decode_note_body(row[0]) if row and row[0] else ("", [])
             except ValueError:
                 text, attachments = "", []
-            text, labels = _render_body(text, attachments, _attachment_names(con, pk))
+            uris = _upload_attachments(uuid, attachments, names, s3, state["pending_uploads"], uploaded) if s3 else {}
+            text, labels = _render_body(text, attachments, names, uris)
             text, findings = scrub(text)
             redactions = sorted({f.kind for f in findings})
             digest = hashlib.sha256(f"{title}\n{text}".encode("utf-8")).hexdigest()

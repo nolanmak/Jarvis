@@ -586,6 +586,11 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Auto-PR loop maintenance (#1214).
+    Autopr {
+        #[command(subcommand)]
+        op: AutoprOp,
+    },
     Doctor {
         /// Force JSON (`--json`) or human table. Default: auto — JSON when
         /// stdout is piped, table on a tty.
@@ -750,6 +755,20 @@ enum Cmd {
         component: installers::UninstallComponent,
     },
     // === end setup+maintenance subcommands ===
+}
+
+#[derive(Subcommand)]
+enum AutoprOp {
+    /// Put `agent-gave-up` issues back in the pool by recorded reason code
+    /// (`stuck:gate-red:<fp>`, `attempts:review-reject`, `scoper:not-fixable`,
+    /// …). `--reason` matches the whole code or any whole `:` segment of it.
+    Readmit {
+        #[arg(long)]
+        reason: String,
+        /// List the matching issue numbers, one per line; change nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3870,6 +3889,9 @@ async fn main() -> Result<()> {
         Cmd::TriagePrefilter { op } => triage_prefilter_cmd::run(store, op).await,
         Cmd::AppleNotes { op } => match op {
             apple_notes::Op::PollOnce { dry_run } => apple_notes::poll_command(store, dry_run).await,
+            apple_notes::Op::FetchAttachment { s3_uri } => {
+                run_apple_notes_fetch_attachment(&s3_uri).await
+            }
         },
         Cmd::Imessage { ref op } => match op {
             ImessageOp::Sync { apply } => {
@@ -4372,6 +4394,17 @@ async fn main() -> Result<()> {
             )
             .await?;
             std::process::exit(code);
+        }
+        Cmd::Autopr { op: AutoprOp::Readmit { reason, dry_run } } => {
+            let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            for n in self_improve::readmit(&root, &reason, dry_run).await? {
+                if dry_run {
+                    println!("{n}");
+                } else {
+                    println!("readmitted #{n}");
+                }
+            }
+            Ok(())
         }
         Cmd::AutoprHealth { notify, json } => {
             let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -14553,7 +14586,20 @@ fn run_imessage_poll_once(store: Arc<Store>) -> Result<()> {
 /// #888 — one attachment for the ask agent, into this session's (verified) dir.
 async fn run_imessage_fetch_attachment(s3_uri: &str) -> Result<()> {
     use augmentagent_channel_journal::s3;
-    let source = s3::AttachmentSource::from_env()?;
+    run_fetch_attachment(s3::AttachmentSource::from_env()?, s3_uri).await
+}
+
+/// #1061 — the Apple Notes bundle's own bucket, same session dir and caps.
+async fn run_apple_notes_fetch_attachment(s3_uri: &str) -> Result<()> {
+    use augmentagent_channel_journal::s3;
+    run_fetch_attachment(s3::AttachmentSource::from_notes_env()?, s3_uri).await
+}
+
+async fn run_fetch_attachment(
+    source: augmentagent_channel_journal::s3::AttachmentSource,
+    s3_uri: &str,
+) -> Result<()> {
+    use augmentagent_channel_journal::s3;
     let dir = s3::session_dir();
     s3::prepare_tmp_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
     let dest = dir.join(s3::local_name(&source.resolve_key(s3_uri)?));
@@ -14615,6 +14661,34 @@ mod imessage_fetch_attachment_tests {
         sweep_imessage_attachments(&[(s3::SESSION_DIR_ENV.into(), session.clone())]);
         assert!(!Path::new(&session).exists(), "call site removes the session dir");
         assert!(!stale.exists(), "the same sweep reclaims the day-old crashed session");
+
+        // #1061 — the Apple Notes verb parses and lands in the same session dir...
+        std::env::set_var("AUGMENTAGENT_APPLE_NOTES_S3_BUCKET", "notes-bundle");
+        std::env::set_var("AUGMENTAGENT_APPLE_NOTES_S3_ENDPOINT", server.url());
+        std::env::set_var(s3::SESSION_DIR_ENV, &session);
+        let notes_object = "notes/00000000-0000-0000-0000-000000000010/ATT-1-scan.jpeg";
+        let notes_uri = format!("s3://notes-bundle/{notes_object}");
+        let notes_mock = server
+            .mock("GET", "/notes-bundle/notes/00000000-0000-0000-0000-000000000010/ATT-1-scan.jpeg")
+            .with_body(b"scanbytes")
+            .create_async()
+            .await;
+        let cli = Cli::try_parse_from(["augmentagent", "apple-notes", "fetch-attachment", &notes_uri])
+            .expect("verb parses");
+        assert!(matches!(cli.cmd,
+            Cmd::AppleNotes { op: apple_notes::Op::FetchAttachment { ref s3_uri } } if *s3_uri == notes_uri));
+        run_apple_notes_fetch_attachment(&notes_uri).await.expect("fetch");
+        notes_mock.assert_async().await;
+        assert_eq!(
+            std::fs::read(Path::new(&session).join(s3::local_name(notes_object))).expect("saved"),
+            b"scanbytes"
+        );
+
+        // ...and without a bucket it refuses before any request.
+        std::env::remove_var("AUGMENTAGENT_APPLE_NOTES_S3_BUCKET");
+        let err = run_apple_notes_fetch_attachment(&notes_uri).await.unwrap_err();
+        assert!(err.to_string().contains("AUGMENTAGENT_APPLE_NOTES_S3_BUCKET"), "{err}");
+        sweep_imessage_attachments(&[(s3::SESSION_DIR_ENV.into(), session)]);
     }
 }
 
