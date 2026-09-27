@@ -43,3 +43,26 @@ test('ignores stale stop and gateway events after rejoin', () => {
   assert.equal(destroyed, 2);
   assert.throws(() => service.start(start('text-1', 2)));
 });
+
+test('fifty attach and detach cycles release every voice connection', () => {
+  let joined = 0;
+  let destroyed = 0;
+  const service = new VoiceCoordinator(() => {
+    joined++;
+    let closed = false;
+    return { destroy() {
+      assert.equal(closed, false, 'voice connection was destroyed twice');
+      closed = true;
+      destroyed++;
+    } };
+  }, () => true);
+  for (let generation = 1; generation <= 50; generation++) {
+    service.start(start('text-1', generation));
+    assert.equal(service.status('text-1')?.generation, generation);
+    assert.equal(service.stop('text-1', generation), true);
+    assert.equal(service.status('text-1'), undefined);
+    assert.equal(service.stop('text-1', generation), false);
+  }
+  assert.equal(joined, 50);
+  assert.equal(destroyed, 50);
+});

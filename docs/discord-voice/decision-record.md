@@ -46,6 +46,8 @@ Disposable, ephemeral native CLI calls used a synthetic local Unix-socket endpoi
 
 The selected tool calls and results are checked in as [native-mcp-probe-2026-09-27.json](native-mcp-probe-2026-09-27.json). The raw temporary CLI logs and synthetic fixture socket were removed after extraction.
 
+The sidecar also passes a 50-cycle fake-connection attach/detach test with exactly 50 destroys and no retained binding after each stop. This covers the coordinator handle boundary only. It does not yet prove that 50 real Discord receivers, provider sockets, and playback jobs are released.
+
 ## Required next gates
 
 1. Prove Discord DAVE join, owner audio receive/decode, and outbound playback in a test guild. Mocked adapter and native MCP tests cannot satisfy this gate.
