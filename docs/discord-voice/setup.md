@@ -31,6 +31,14 @@ systemctl --user status augmentagent-discord-voice.service
 
 The checked-in unit assumes this repository lives at `~/AugmentAgent`; adjust `WorkingDirectory` and `ExecStart` in a user override if it does not. `ExecStartPre` creates `%t/augmentagent` as a private directory, and the sidecar creates a mode-0600 socket at `%t/augmentagent/discord-voice.sock`.
 
+After the voice unit is running, run its read-only doctor with the same provider environment. It checks the pinned Node runtime, selected provider keys without printing them, socket ownership/mode, and an active local listener. A pass means the service is ready for a **live test**, not that Discord audio or a provider has been verified.
+
+```sh
+cd ~/AugmentAgent/sidecars/discord-voice
+npm run build
+./node_modules/node/bin/node --env-file="$HOME/.config/augmentagent/discord-voice.env" dist/scripts/doctor.js
+```
+
 For the daemon, set `AUGMENTAGENT_DISCORD_VOICE_ENABLED=1` in its private `.env`, keep the existing owner allowlist, and restart `augmentagent.service` after the sidecar is listening. By default the daemon uses `$XDG_RUNTIME_DIR/augmentagent/discord-voice.sock`. If it runs outside a user systemd session, set `AUGMENTAGENT_DISCORD_VOICE_SOCKET` to the same **absolute** path as the sidecar. There is no root-owned `/run/augmentagent` fallback. To order startup without making text depend on audio, a user drop-in for `augmentagent.service` may add `After=augmentagent-discord-voice.service` and `Wants=augmentagent-discord-voice.service`.
 
 ## Test-guild UX
