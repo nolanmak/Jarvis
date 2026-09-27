@@ -2875,17 +2875,11 @@ async fn main() -> Result<()> {
                 }
             });
             // #1071 — a stop or restart sends SIGTERM. Without this the process
-            // dies at once and every in-flight call leaves a lifecycle marker;
-            // cancelling lets the channels drop their ProcessGroups, which
-            // retire their markers normally.
+            // dies at once and every in-flight call leaves a lifecycle marker.
             let s3 = shutdown.clone();
             tokio::spawn(async move {
                 match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                    Ok(mut term) => {
-                        term.recv().await;
-                        info!("SIGTERM received");
-                        s3.cancel();
-                    }
+                    Ok(mut term) => { term.recv().await; info!("SIGTERM received"); s3.cancel(); }
                     Err(e) => warn!("SIGTERM handler unavailable; a stop may orphan markers: {e:#}"),
                 }
             });
@@ -3397,12 +3391,14 @@ async fn main() -> Result<()> {
                     }
                 });
             }
-            // #1071 — cancelling is only half of a clean stop: the markers
-            // retire when the channels unwind and drop their ProcessGroups. So
-            // join every task, bounded so a wedged one cannot hold the stop open
-            // until systemd's SIGKILL. A failing task cancels the rest rather
+            // #1071 — cancelling is only half of a clean stop: a ProcessGroup
+            // retires its marker from Drop, and a runner's group is a local of the
+            // in-flight call, so it drops when that future is dropped or returns.
+            // So join every task, bounded so a wedged one cannot hold the stop
+            // open until systemd's SIGKILL. A failing task cancels the rest rather
             // than returning at once, which would drop the process while other
-            // supervisors are still retiring — the orphans at issue.
+            // supervisors are still retiring. Nothing depends on a runner reacting
+            // promptly: what the drain misses, the next start's orphan pass clears.
             const SHUTDOWN_DRAIN: Duration = Duration::from_secs(30);
             let mut failure = None;
             let drained = tokio::time::timeout(SHUTDOWN_DRAIN, async {

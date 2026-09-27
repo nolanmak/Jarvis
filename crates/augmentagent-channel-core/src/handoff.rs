@@ -502,8 +502,8 @@ fn is_request_name(name: &OsStr) -> bool {
 }
 
 /// What one orphan pass saw (#1071). `kept_legacy` (pre-#1071, recording no
-/// writer to judge) is counted apart from `kept_unproven` so the logged
-/// pre-upgrade backlog is visible as it drains.
+/// writer to judge) is counted apart from `kept_unproven` because no pass can
+/// ever clear one: `doctor` reports that backlog, which never drains itself.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct OrphanReport {
     pub cleared: u64,
@@ -512,10 +512,10 @@ pub struct OrphanReport {
     pub kept_unproven: u64,
 }
 
+
 /// Clear lifecycle markers left by a call that cannot still be running (#1071).
-/// `dry_run` reads only: no locks are taken and nothing is created or removed.
-/// Only markers are cleared; a cleared request rejoins the normal sweep path,
-/// where an unsettled journal still keeps it until an operator decides.
+/// `dry_run` reads only. Only markers are cleared; a cleared request rejoins the
+/// normal sweep path, where an unsettled journal still waits on an operator.
 pub fn clear_orphaned_markers(root: &Path, env: &LivenessEnv, dry_run: bool) -> anyhow::Result<OrphanReport> {
     use crate::process_tree::Liveness;
     let mut report = OrphanReport::default();
@@ -541,7 +541,7 @@ pub fn clear_orphaned_markers(root: &Path, env: &LivenessEnv, dry_run: bool) -> 
             Ok(Liveness::Unproven) => report.kept_unproven += 1,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                tracing::warn!(request = %name.to_string_lossy(), "orphaned marker pass left a request: {error}");
+                tracing::warn!(request = %name.to_string_lossy(), "orphan pass left a request: {error}");
                 report.kept_unproven += 1;
             }
         }
@@ -707,8 +707,7 @@ pub async fn run_sweep_loop(root: Option<PathBuf>, grace: Duration, interval: Du
     // provider: clear markers left by a daemon that died mid-call. A cleared
     // request then takes the normal idle → grace → confirm path.
     if let Some(root) = root.clone() {
-        match tokio::task::spawn_blocking(move ||
-            clear_orphaned_markers(&root, &liveness, false)).await {
+        match tokio::task::spawn_blocking(move || clear_orphaned_markers(&root, &liveness, false)).await {
             Ok(Ok(r)) => tracing::info!(cleared = r.cleared, kept_live = r.kept_live,
                 kept_legacy = r.kept_legacy, kept_unproven = r.kept_unproven, "handoff orphaned marker pass"),
             Ok(Err(error)) => tracing::warn!("handoff orphaned marker pass failed: {error:#}"),
@@ -1367,27 +1366,24 @@ for line in sys.stdin:
         let uncertain = request(&root, "synthetic-orphan-uncertain", Some(json!([completed_row(), started_row()])));
         let live = request(&root, "synthetic-in-flight", Some(json!([completed_row()])));
         let legacy = request(&root, "synthetic-legacy-marker", Some(json!([completed_row()])));
-        marker(&orphan, identity("a-previous-boot", 999));
-        marker(&uncertain, identity("a-previous-boot", 999));
+        for journal in [&orphan, &uncertain] { marker(journal, identity("a-previous-boot", 999)); }
         marker(&live, identity("this-boot", 1234));
         marker(&legacy, json!({"version": 1, "receipt": "/nonexistent/synthetic-cleanup-complete"}));
         for journal in [&orphan, &uncertain, &live, &legacy] { age(journal, TWO_DAYS); }
         let env = LivenessEnv::injected(Some("this-boot".into()),
             Box::new(|pid| (pid == 1234).then_some(4242)), Box::new(|_, _| crate::process_tree::Cgroup::Gone));
 
-        // The pre-#1071 marker is counted apart from the other doubtful cases,
-        // which is what doctor reports as the pre-upgrade backlog.
+        // The pre-#1071 marker is counted apart from the other doubtful cases.
         let dry = clear_orphaned_markers(&root, &env, true).unwrap();
         assert_eq!(dry, OrphanReport { cleared: 2, kept_live: 1, kept_legacy: 1, kept_unproven: 0 });
         assert!(orphan.with_extension("active").exists(), "a dry run must change nothing");
-
         assert_eq!(clear_orphaned_markers(&root, &env, false).unwrap(), dry);
         assert!(!orphan.with_extension("active").exists() && !uncertain.with_extension("active").exists());
         assert!(live.with_extension("active").exists() && legacy.with_extension("active").exists());
 
-        // The cleared requests rejoin the sweep from the start of a fresh grace
-        // period (removing the marker moved the directory's mtime): the settled
-        // one becomes removable, the one with a `started` row waits for recovery.
+        // The cleared requests rejoin the sweep from a fresh grace period
+        // (removing the marker moved the directory's mtime): the settled one
+        // becomes removable, the `started` one still waits for recovery.
         assert_eq!(sweep_finished(&root, GRACE, true).unwrap().kept_recent, 2);
         for journal in [&orphan, &uncertain] { age(journal, TWO_DAYS); }
         let swept = sweep_finished(&root, GRACE, false).unwrap();
@@ -1781,11 +1777,10 @@ for line in sys.stdin:
         tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
     }
 
-    /// #1071, the reported case through the path the daemon actually runs: the
-    /// previous instance was killed mid-call and left a marker; starting the
-    /// successor's sweep loop — nothing else — must retire it, before the first
-    /// sweep pass. The pass is not called directly, so wiring it out of
-    /// `run_sweep_loop` fails this test.
+    /// #1071, the reported case through the path the daemon runs: the previous
+    /// instance was killed mid-call and left a marker; starting the successor's
+    /// sweep loop — nothing else — must retire it. The pass is not called
+    /// directly, so wiring it out of `run_sweep_loop` fails this test.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_restart_retires_the_marker_the_previous_instance_orphaned() {
         let (_temp, root) = private_root();

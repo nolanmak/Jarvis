@@ -1057,10 +1057,14 @@ fn check_handoff_journals() -> Finding {
         return Finding::ok("handoff_journals", "no HOME; journal root unknown");
     };
     let grace = handoff::retention_from_env();
-    handoff_journal_finding(handoff::sweep_finished(&root, grace, true), grace)
+    // #1071 — a dry run, so this only counts what the daemon's pass would do.
+    let orphans = handoff::clear_orphaned_markers(&root, &handoff::LivenessEnv::probe(), true)
+        .unwrap_or_default();
+    handoff_journal_finding(handoff::sweep_finished(&root, grace, true), grace, orphans)
 }
 
-fn handoff_journal_finding(report: Result<handoff::SweepReport>, grace: Duration) -> Finding {
+fn handoff_journal_finding(report: Result<handoff::SweepReport>, grace: Duration,
+    orphans: handoff::OrphanReport) -> Finding {
     const NAME: &str = "handoff_journals";
     const HINT: &str = "augmentagent handoff-prune --dry-run";
     let report = match report {
@@ -1078,6 +1082,9 @@ fn handoff_journal_finding(report: Result<handoff::SweepReport>, grace: Duration
         report.kept_unfinished,
         report.kept_active,
     );
+    // #1071 — of those markers, what the next orphan pass would make of each.
+    let msg = format!("{msg} ({} clearable as orphans, {} pre-#1071, {} live, {} doubtful)",
+        orphans.cleared, orphans.kept_legacy, orphans.kept_live, orphans.kept_unproven);
     // A live sweep removes every finished journal within two intervals of its
     // expiry, so one still here means the sweep stopped (#1035 review).
     if report.finished_overdue > 0 {
@@ -1096,6 +1103,13 @@ fn handoff_journal_finding(report: Result<handoff::SweepReport>, grace: Duration
             ),
             Some(HINT),
         );
+    }
+    // A pre-#1071 marker records no writer, so no orphan pass can ever prove it
+    // dead; unlike the other kept counts this backlog does not drain by itself.
+    if orphans.kept_legacy > 0 {
+        return Finding::warn(NAME,
+            format!("{msg} — {} marker(s) predate #1071; no pass can prove them dead", orphans.kept_legacy),
+            Some("python3 scripts/codex-tool-bridge.py --handoff-status <journal>"));
     }
     Finding::ok(NAME, msg)
 }
@@ -1946,8 +1960,19 @@ mod tests {
             kept_unfinished: 2,
             ..Default::default()
         };
-        let ok = handoff_journal_finding(Ok(healthy), grace);
+        // #1071 — of the 3 markers, one is clearable, one live, one doubtful.
+        let seen = handoff::OrphanReport { cleared: 1, kept_live: 1, kept_unproven: 1, kept_legacy: 0 };
+        let ok = handoff_journal_finding(Ok(healthy), grace, seen);
         assert_eq!(ok.severity, Severity::Ok, "{}", ok.message);
+        assert!(ok.message.contains("1 clearable as orphans") && ok.message.contains("0 pre-#1071"),
+            "{}", ok.message);
+        // A pre-#1071 marker cannot be proved dead by any pass, so doctor warns.
+        let legacy = handoff_journal_finding(Ok(healthy), grace,
+            handoff::OrphanReport { kept_legacy: 2, ..seen });
+        assert_eq!(legacy.severity, Severity::Warn, "{}", legacy.message);
+        assert!(legacy.message.contains("2 marker(s) predate #1071")
+            && legacy.suggested_cmd.as_deref().is_some_and(|h| h.contains("--handoff-status")),
+            "{}", legacy.message);
         // Counts only request dirs, and reports what needs an operator as information.
         assert!(
             ok.message.contains("420 request dirs") && !ok.message.contains("423"),
@@ -1973,7 +1998,7 @@ mod tests {
             finished_overdue: 1,
             ..healthy
         };
-        let stalled_finding = handoff_journal_finding(Ok(stalled), grace);
+        let stalled_finding = handoff_journal_finding(Ok(stalled), grace, seen);
         assert!(
             stalled_finding
                 .message
@@ -1983,10 +2008,10 @@ mod tests {
         );
         let refused = Err(anyhow::anyhow!("handoff directory is not private"));
         for finding in [
-            handoff_journal_finding(Ok(many), grace),
-            handoff_journal_finding(Ok(large), grace),
+            handoff_journal_finding(Ok(many), grace, seen),
+            handoff_journal_finding(Ok(large), grace, seen),
             stalled_finding,
-            handoff_journal_finding(refused, grace),
+            handoff_journal_finding(refused, grace, seen),
         ] {
             assert_eq!(finding.severity, Severity::Warn, "{}", finding.message);
             assert_eq!(
