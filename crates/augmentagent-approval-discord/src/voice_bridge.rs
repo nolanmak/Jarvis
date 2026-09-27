@@ -82,6 +82,26 @@ impl VoiceBridge {
         *self.turn_handler.write().await = Some(TurnHandler { query, http });
     }
 
+    pub(crate) async fn mirror_tool_speech(
+        &self,
+        binding: &VoiceBinding,
+        turn_id: &str,
+        utterance_id: &str,
+        text: &str,
+    ) -> Result<()> {
+        let Some(handler) = self.turn_handler.read().await.clone() else {
+            bail!("Voice text mirror is unavailable");
+        };
+        let channel = ChannelId::new(binding.text_channel_id.parse()?);
+        let mirror = format!("🔊 **Agent** (`{turn_id}/{utterance_id}`): {text}");
+        for chunk in crate::event_handler::chunk_for_discord(&mirror) {
+            channel
+                .send_message(&handler.http, CreateMessage::new().content(chunk))
+                .await?;
+        }
+        Ok(())
+    }
+
     pub fn binding(&self, guild_id: &str) -> Option<VoiceBinding> {
         self.active.get(guild_id).map(|item| item.clone())
     }
@@ -518,7 +538,9 @@ impl VoiceBridge {
                         break;
                     }
                 }
-                if !answer.trim().is_empty()
+                let final_spoken = handler.query.take_final_spoken(&turn_id);
+                if !final_spoken
+                    && !answer.trim().is_empty()
                     && answer.len() <= 12_000
                     && self.binding(&binding.guild_id).as_ref() == Some(&binding)
                 {
@@ -615,6 +637,20 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     struct FakeVoiceQuery(Arc<AtomicUsize>);
+
+    struct FinalSpokenVoiceQuery(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl QueryHandler for FinalSpokenVoiceQuery {
+        async fn answer(&self, _ctx: &AuditCtx, _question: &str) -> anyhow::Result<String> {
+            Ok("already spoken through the bound tool".into())
+        }
+
+        fn take_final_spoken(&self, _turn_id: &str) -> bool {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+    }
 
     #[async_trait::async_trait]
     impl QueryHandler for FakeVoiceQuery {
@@ -812,5 +848,49 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn final_output_delivered_by_tool_is_not_played_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voice.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let bridge = VoiceBridge::connect(&path).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        bridge.active.insert("1".into(), binding());
+        let checked = Arc::new(AtomicUsize::new(0));
+        let local = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = local.local_addr().unwrap();
+        drop(local);
+        let http = Arc::new(
+            serenity::http::HttpBuilder::new("test-token")
+                .proxy(format!("http://{proxy}"))
+                .ratelimiter_disabled(true)
+                .build(),
+        );
+        bridge
+            .set_turn_handler(Arc::new(FinalSpokenVoiceQuery(Arc::clone(&checked))), http)
+            .await;
+        bridge
+            .handle_frame(
+                json!({"version":1,"kind":"transcript","conversationId":"1:2",
+            "generation":6,"guildId":"1","ownerId":"4","turnId":"voice:6:final-test",
+            "text":"synthetic request"}),
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while checked.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut lines = BufReader::new(stream).lines();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), lines.next_line())
+                .await
+                .is_err(),
+            "final answer was sent to speech twice"
+        );
     }
 }

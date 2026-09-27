@@ -1133,11 +1133,25 @@ impl ClaudeCliReasoner {
             .as_ref()
             .map(|launch| &launch.settings_json)
             .or(opts.settings_json.as_ref());
+        // The voice grant is a per-turn capability. Keep its MCP config in a
+        // private temp file rather than in Claude's process argv, which other
+        // same-host processes can inspect via /proc.
+        let mut _voice_mcp_file: Option<tempfile::NamedTempFile> = None;
         if let Some(settings) = effective_settings {
             let (settings_only, mcp_config) = split_mcp_from_settings(settings);
             if let Some(mcp_json) = mcp_config {
                 args.push("--mcp-config".into());
-                args.push(mcp_json);
+                let has_voice = serde_json::from_str::<serde_json::Value>(&mcp_json)
+                    .map_err(anyhow::Error::from)?
+                    .pointer("/mcpServers/voice").is_some();
+                if has_voice {
+                    let file = tempfile::NamedTempFile::new()?;
+                    std::fs::write(file.path(), mcp_json)?;
+                    args.push(file.path().to_string_lossy().into_owned());
+                    _voice_mcp_file = Some(file);
+                } else {
+                    args.push(mcp_json);
+                }
                 args.push("--strict-mcp-config".into());
             }
             if let Some(s) = settings_only {
@@ -4543,6 +4557,31 @@ mod failover_error_tests {
     // ---- #898: process-global cap on concurrent CLI subprocesses ----
 
     const RESULT_OK: &str = r#"echo '{"type":"result","result":"ok"}'"#;
+
+    #[tokio::test]
+    async fn claude_voice_mcp_grant_is_in_private_config_file_not_process_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let args_path = dir.path().join("argv.txt");
+        let config_path = dir.path().join("captured-mcp.json");
+        let bin = stub_cli(&dir, "fake-claude-voice-config", &format!(
+            "printf '%s\\n' \"$@\" > {}\nprevious=''\nfor argument in \"$@\"; do\n  if [ \"$previous\" = '--mcp-config' ]; then cp \"$argument\" {}; fi\n  previous=\"$argument\"\ndone\ncat >/dev/null\n{RESULT_OK}\n",
+            args_path.display(), config_path.display()));
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        let mut opts = dummy_opts();
+        opts.allowed_tools.push("mcp__voice__voice_status".into());
+        opts.settings_json = Some(serde_json::json!({"mcpServers":{"voice":{
+            "command":"/fixture/augmentagent","args":["voice-tool"],
+            "env":{"AUGMENTAGENT_VOICE_TOOL_SOCKET":"/fixture/voice.sock",
+                "AUGMENTAGENT_VOICE_TOOL_GRANT":"SYNTHETIC_PRIVATE_GRANT"}
+        }}}).to_string());
+        assert_eq!(reasoner.call(&opts, "synthetic voice request").await.unwrap(), "ok");
+        let args = std::fs::read_to_string(args_path).unwrap();
+        assert!(args.contains("--mcp-config"));
+        assert!(!args.contains("SYNTHETIC_PRIVATE_GRANT"));
+        let config: serde_json::Value = serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+        assert_eq!(config["mcpServers"]["voice"]["env"]["AUGMENTAGENT_VOICE_TOOL_GRANT"],
+            "SYNTHETIC_PRIVATE_GRANT");
+    }
 
     /// 40 concurrent calls through a stub that sleeps must never have more
     /// than the gate's capacity of children alive at once — and must all

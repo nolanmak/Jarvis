@@ -11,6 +11,7 @@
 pub mod attachments;
 pub mod conversation;
 pub mod voice_bridge;
+pub mod voice_tool;
 mod broker;
 mod custom_id;
 mod event_handler;
@@ -369,6 +370,14 @@ pub trait ApprovalActionHandler: Send + Sync {
 #[async_trait]
 pub trait QueryHandler: Send + Sync {
     async fn answer(&self, ctx: &AuditCtx, question: &str) -> anyhow::Result<String>;
+
+    /// Attach the private voice-tool endpoint after the Discord gateway has
+    /// connected. Non-voice query handlers keep the default no-op behavior.
+    fn attach_voice_tools(&self, _service: std::sync::Arc<voice_tool::VoiceToolService>) {}
+
+    /// Consume an explicit final-output marker from the agent's speech tool.
+    /// Only the native query handler that issued the grant can return true.
+    fn take_final_spoken(&self, _turn_id: &str) -> bool { false }
 
     /// The current turn and optional migration history are separate so a
     /// native session can include history only when it is first created.

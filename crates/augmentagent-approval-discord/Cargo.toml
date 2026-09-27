@@ -32,6 +32,7 @@ serde_json = { workspace = true }
 reqwest = { workspace = true }
 tokio-tungstenite = "0.21"
 libc = "0.2"
+uuid = { workspace = true }
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"

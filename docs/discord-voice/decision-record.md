@@ -2,7 +2,7 @@
 
 Status: in progress. This record distinguishes observed evidence from required live gates.
 
-## Production baseline
+## Baseline at start of issue
 
 - Base revision: `fb0bbdbb63a3fddc2065f3c95b08732dd0b49a62` (`github/main`).
 - Rust `augmentagent-approval-discord` owns the production Discord gateway. Its `GatewayIntents` currently omit `GUILD_VOICE_STATES`; the handler processes text and interaction events.
@@ -26,21 +26,31 @@ Executed on this Linux host in fresh `/tmp` directories, with synthetic prompts 
 
 Codex's first resume attempt without `--skip-git-repo-check` exited one because the disposable directory was not a trusted Git repository. The retry with that flag passed. The temporary probe logs are local, untracked artifacts.
 
-## First implementation slice
+## Current implementation
 
-A durable `discord_conversations` table stores the actual native session identity separately from audit IDs. Its primary key is `(guild_id, channel_id)`, and `(provider, native_session_id)` is unique. Identical rebinds are idempotent. A different session for the same conversation is rejected. This is storage only; the existing text query path does not yet use it.
+A durable `discord_conversations` table stores the actual native session identity separately from audit IDs. Its primary key is `(guild_id, channel_id)`, and `(provider, native_session_id)` is unique. Identical rebinds are idempotent. A different session for the same conversation is rejected. The production text query path uses this binding when `AUGMENTAGENT_DISCORD_VOICE_ENABLED=1`. A durable turn-claim ledger marks uncertain turns before CLI execution so a daemon restart cannot silently replay a tool call. Text and finalized speech share a per-conversation queue and native session lease.
 
-The sidecar now has a strict version-1 Unix-socket frame parser, mode-0600 IPC listener, generation-scoped gateway adapter, and one-binding-per-guild voice connection coordinator. Its `start` call can ask the Rust-owned gateway to join a voice channel, and `stop`/owner departure destroys the local connection. Rust forwarding, provider streams, playback, and commands are not yet wired; these tests use fake gateway/connection objects.
+The Rust gateway forwards binding-scoped voice state/server events to a private Node 24 sidecar. `/voice start`, `status`, `stop`, and `interrupt` are wired from the existing text conversation. The sidecar has a strict version-1 Unix-socket frame parser, a generation-scoped gateway adapter, one binding per guild, owner-only receive, Deepgram/ElevenLabs STT and TTS adapters, an interruptible playback queue, and speech receipts. The Rust bridge mirrors committed transcripts to the originating text channel, submits them to the same native session scheduler, mirrors replies, and queues unspoken final replies. These paths have deterministic fake-transport tests. They have **not** passed a live Discord DAVE/audio/provider test yet.
+
+An ephemeral second Unix socket exposes `speak({text, utterance_id})`, `speech_status`, `voice_status`, and `voice_interrupt` to the native CLIs. The server issues a random grant only for an owner-authorized active binding, checks its guild/conversation/generation on every call, and revokes it after the turn. The model does not supply a Discord target. The server prefixes utterance IDs with the grant and refuses a changed text for a reused ID; the sidecar also deduplicates playback. The literal utterance ID `final` marks that turn's final output, so its normal final answer is not played twice. Codex receives the grant through its stdio MCP environment; Claude receives it in a private temporary MCP config file, not in process arguments. Tool speech is mirrored to the originating text channel, and a mirror failure is visible as `mirrored:false` in the receipt response.
 
 TDD evidence: `cargo test -p augmentagent-store --test discord_conversation` failed first with unresolved `DiscordConversation` and missing `Store` methods. After the schema and API were added, all three tests passed.
 
+For the speech-tool boundary, `cargo test -p augmentagent-approval-discord --test voice_tool_contract` initially failed because the `voice_tool` module did not exist. The passing contract now covers a wrong conversation, invalid/expired grant, target spoofing, duplicate utterance ID without a second sidecar `speak`, changed text for a reused ID, stop invalidation, receipt, and status. `voice_bridge::tests::final_output_delivered_by_tool_is_not_played_again` exercises the final-output marker. `discord_voice_session_tests::active_voice_binding_injects_tool_only_into_its_owner_conversation_turn` proves the CLI query handler injects tools only for the active owner conversation.
+
+### Native speech-tool compatibility probe (2026-09-27)
+
+Disposable, ephemeral native CLI calls used a synthetic local Unix-socket endpoint that returned `state=probe-listening` or a queued receipt. They did **not** contact Discord, Deepgram, or ElevenLabs. The endpoint saw one `voice_status` and one `speak({text:"SYNTHETIC_VOICE_1220",utterance_id:"final"})` from each CLI. Codex `0.156.1` reported completed `mcp_tool_call` events for `voice_status` and `speak`, then returned `STATUS=probe-listening` and `RECEIPT=queued`. Claude `2.1.281` initialized with the `voice` MCP server connected, used `ToolSearch` to discover each tool, called both, then returned the same status and receipt markers. The fake endpoint was stopped after the probes. This verifies native discovery/call transport for both installed CLIs, not audible output or actual provider compatibility.
+
+The selected tool calls and results are checked in as [native-mcp-probe-2026-09-27.json](native-mcp-probe-2026-09-27.json). The raw temporary CLI logs and synthetic fixture socket were removed after extraction.
+
 ## Required next gates
 
-1. Prove native create/submit/resume for Codex and Claude in disposable sessions, including actual session IDs and one writer. Do not use the current audit ID as proof.
-2. Implement the shared scheduler and route production text through it without weakening model selection, tool scope, or approvals.
-3. Prove Discord DAVE join, owner audio receive/decode, and outbound playback in a test guild before relying on the proposed gateway adapter. Confirm Node 24 runtime and Opus/FFmpeg support on the target host.
-4. Complete both streaming provider pairs, command UX, MCP speech tools, interruption, recovery, and the issue's AC01–AC12 evidence. Do not merge or close the issue until those gates pass.
+1. Prove Discord DAVE join, owner audio receive/decode, and outbound playback in a test guild. Mocked adapter and native MCP tests cannot satisfy this gate.
+2. Prove Deepgram and ElevenLabs STT/TTS live, including a mixed pair. Provider keys are absent from the checked daemon `.env`; do not count contract tests as live compatibility.
+3. Complete the audio fixtures, measured interruption/latency gates, bounded reconnection and restart handling, 50-cycle cleanup, and full acceptance-ID evidence. Confirm typed/voice approval and attachment parity in the live path.
+4. Finish Linux service/setup, doctor, config examples, opt-in live script, CI integration, and CLI QA. Keep the PR draft until AC01–AC12 and CI are green.
 
 ## Rollback
 
-The new table is additive and not yet used by production traffic. To roll back this slice, deploy the previous binary. The table can remain inert. If removing data is required after exporting any bindings, stop the daemon and run `DROP TABLE discord_conversations` against a backup/copy first; never do that as part of an automatic downgrade.
+The schema is additive and used only when `AUGMENTAGENT_DISCORD_VOICE_ENABLED=1`. To roll back, disable that flag, stop the sidecar, and deploy the previous binary. The native binding and turn-ledger tables may remain inert. If removing data is required after exporting bindings, stop the daemon and use the documented database backup/rollback procedure; never automatically drop a table that may hold a live native session identity.

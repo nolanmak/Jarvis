@@ -186,6 +186,9 @@ pub fn read_allowances(opts: &ReasonerOpts) -> Vec<ReadAllowance> {
 pub struct BridgeLaunch {
     pub native_cwd: PathBuf,
     pub config_overrides: Vec<String>,
+    /// Per-turn voice capability, forwarded to Codex and then only to its
+    /// configured stdio MCP child. Values never appear in CLI argv.
+    pub voice_env: Vec<(String, String)>,
     /// The bridge policy, which carries integration secrets (#1044). It lives
     /// in its own randomly named 0700 directory, never in the launch directory
     /// that contains `native_cwd`, so no path walked up from Codex's cwd names it.
@@ -221,6 +224,27 @@ impl BridgeLaunch {
         let object = settings.as_object().ok_or_else(|| anyhow::anyhow!("unsupported settings shape"))?;
         if object.keys().any(|k| !matches!(k.as_str(), "hooks" | "mcpServers")) {
             anyhow::bail!("unsupported settings: refusing to drop provider policy");
+        }
+        let mut voice_launch: Option<(String, Vec<(String, String)>)> = None;
+        if let Some(server) = settings.pointer("/mcpServers/voice") {
+            anyhow::ensure!(opts.allowed_tools.iter().any(|tool| tool == "mcp__voice__speak"),
+                "voice MCP server requires an explicit speech tool allowance");
+            let command = server.get("command").and_then(|value| value.as_str())
+                .ok_or_else(|| anyhow::anyhow!("voice MCP command is missing"))?;
+            anyhow::ensure!(Path::new(command).is_absolute() &&
+                server.get("args") == Some(&json!(["voice-tool"])),
+                "voice MCP launch is invalid");
+            let env = server.get("env").and_then(|value| value.as_object())
+                .ok_or_else(|| anyhow::anyhow!("voice MCP environment is missing"))?;
+            anyhow::ensure!(env.len() == 2, "voice MCP environment has unexpected keys");
+            let mut entries = Vec::new();
+            for key in ["AUGMENTAGENT_VOICE_TOOL_SOCKET", "AUGMENTAGENT_VOICE_TOOL_GRANT"] {
+                let value = env.get(key).and_then(|value| value.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("voice MCP environment is incomplete"))?;
+                anyhow::ensure!(!value.is_empty(), "voice MCP environment is empty");
+                entries.push((key.to_string(), value.to_string()));
+            }
+            voice_launch = Some((command.to_string(), entries));
         }
         let web_search = opts.allowed_tools.iter().any(|tool| tool == "WebSearch");
         let web_fetch = opts.allowed_tools.iter().any(|tool| tool == "WebFetch");
@@ -326,7 +350,14 @@ impl BridgeLaunch {
             "mcp_servers.jarvis={{command=\"python3\",args=[\"-I\",{},{}],required=true,startup_timeout_sec=120,tool_timeout_sec=900,default_tools_approval_mode=\"approve\"}}",
             serde_json::to_string(&server_path)?, serde_json::to_string(&policy_path)?
         ));
-        Ok(Self { native_cwd, config_overrides, policy_path, _policy_dir: policy_dir })
+        let voice_env = if let Some((command, env)) = voice_launch {
+            config_overrides.push(format!(
+                "mcp_servers.voice={{command={},args=[\"voice-tool\"],required=true,env_vars=[\"AUGMENTAGENT_VOICE_TOOL_SOCKET\",\"AUGMENTAGENT_VOICE_TOOL_GRANT\"],default_tools_approval_mode=\"approve\"}}",
+                serde_json::to_string(&command)?
+            ));
+            env
+        } else { Vec::new() };
+        Ok(Self { native_cwd, config_overrides, voice_env, policy_path, _policy_dir: policy_dir })
     }
 }
 
@@ -433,6 +464,34 @@ mod tests {
         assert_eq!(policy["write_roots"], serde_json::json!([wiki]));
         assert!(policy["read_roots"].as_array().unwrap().contains(&serde_json::json!(transcripts)));
         assert_eq!(std::fs::metadata(launch.policy_path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn voice_mcp_capability_is_forwarded_only_to_the_bound_stdio_server() {
+        let fixture = tempfile::tempdir().unwrap();
+        let wiki = fixture.path().join("wiki");
+        let launch_dir = fixture.path().join("launch");
+        std::fs::create_dir(&wiki).unwrap();
+        std::fs::create_dir(&launch_dir).unwrap();
+        let mut opts = crate::reasoner::ask_opts(wiki, fixture.path().into());
+        let mut settings: serde_json::Value =
+            serde_json::from_str(opts.settings_json.as_ref().unwrap()).unwrap();
+        settings["mcpServers"]["voice"] = serde_json::json!({
+            "command":"/fixture/augmentagent", "args":["voice-tool"],
+            "env":{"AUGMENTAGENT_VOICE_TOOL_SOCKET":"/private/voice.sock",
+                "AUGMENTAGENT_VOICE_TOOL_GRANT":"fake-grant-42"}
+        });
+        opts.settings_json = Some(settings.to_string());
+        assert!(BridgeLaunch::prepare(&opts, &launch_dir).is_err(),
+            "a voice server without an allowed tool must fail closed");
+        opts.allowed_tools.push("mcp__voice__speak".into());
+        let launch = BridgeLaunch::prepare(&opts, &launch_dir).unwrap();
+        let args = launch.config_overrides.join("\n");
+        assert!(args.contains("mcp_servers.voice="));
+        assert!(args.contains("env_vars=[\"AUGMENTAGENT_VOICE_TOOL_SOCKET\",\"AUGMENTAGENT_VOICE_TOOL_GRANT\"]"));
+        assert!(!args.contains("fake-grant-42"), "grant must not be in argv");
+        assert_eq!(launch.voice_env.iter().find(|(key, _)| key == "AUGMENTAGENT_VOICE_TOOL_GRANT")
+            .map(|(_, value)| value.as_str()), Some("fake-grant-42"));
     }
 
     /// Integration secrets used by hooks, service CLIs and MCP children,

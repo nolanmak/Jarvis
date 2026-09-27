@@ -184,6 +184,9 @@ impl DiscordApprovalBroker {
         let http = Arc::clone(&client.http);
         if let (Some(bridge), Some(query)) = (&state.voice_bridge, &config.query_handler) {
             bridge.set_turn_handler(Arc::clone(query), Arc::clone(&http)).await;
+            let tools = crate::voice_tool::VoiceToolService::start(bridge).await
+                .map_err(|error| ApprovalError::Discord(format!("voice tool socket: {error}")))?;
+            query.attach_voice_tools(tools);
         }
 
         tokio::spawn(async move {

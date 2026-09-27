@@ -511,6 +511,7 @@ impl EventHandler for Handler {
         let bot_user_id = self.state.bot_user_id.get().copied();
         let allowed_user_id = self.state.allowed_user_id;
         let wiki_root = self.state.wiki_root.clone();
+        let voice_bridge = self.state.voice_bridge.clone();
 
         info!(%channel_id, %msg_id, "discord query received");
         tokio::spawn(async move {
@@ -596,6 +597,20 @@ impl EventHandler for Handler {
                         "wiki answer chunk",
                     )
                     .await;
+                    let final_spoken = handler.take_final_spoken(&audit_ctx.session_id);
+                    if !final_spoken && !answer.trim().is_empty() && answer.len() <= 12_000 {
+                        if let (Some(bridge), Some(guild)) = (&voice_bridge, guild_id) {
+                            let guild = guild.to_string();
+                            let conversation = format!("{guild}:{}", channel_id.get());
+                            if bridge.binding(&guild).as_ref().is_some_and(|binding|
+                                binding.conversation_id == conversation) {
+                                if let Err(error) = bridge.speak(&guild, &conversation,
+                                    &format!("{}:final", audit_ctx.session_id), &answer).await {
+                                    warn!("could not speak Discord text reply: {error}");
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     let mut err_msg = format!("wiki query failed: {e}");

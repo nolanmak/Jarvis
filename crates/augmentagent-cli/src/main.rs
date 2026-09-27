@@ -3,6 +3,7 @@
 #[cfg(test)]
 mod provider_migration_tests;
 mod model_tool;
+mod voice_tool;
 mod computer_tool;
 #[cfg(test)]
 mod provider_channel_tests;
@@ -611,6 +612,9 @@ enum Cmd {
         #[arg(long)]
         readiness: String,
     },
+    /// Internal conversation-bound MCP server for Discord speech.
+    #[command(hide = true)]
+    VoiceTool,
     /// #655/#667 — one live round-trip through the provider fallback chain.
     /// Builds the production reasoner (AUGMENTAGENT_REASONER_CHAIN +
     /// eligibility checks), sends a trivial text-only prompt, and prints the
@@ -2435,6 +2439,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     if let Cmd::ModelTool { channel, ref readiness } = cli.cmd {
         return model_tool::serve(channel, readiness);
+    }
+    if let Cmd::VoiceTool = cli.cmd {
+        return voice_tool::serve();
     }
     if let Cmd::RepoDocs { ref op } = cli.cmd {
         return repo_docs::run(op, cli.wiki_dir.as_deref()).await;
@@ -4380,6 +4387,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Env { ref op, json } => env_cfg::run_env(op, json),
         Cmd::ModelTool { channel, ref readiness } => model_tool::serve(channel, readiness),
+        Cmd::VoiceTool => voice_tool::serve(),
         Cmd::ReasonerSelftest { ref prompt, ref profile, tool_probe } =>
             run_reasoner_selftest(prompt, profile.as_deref(), tool_probe).await,
         Cmd::Install { component } => installers::run_install(component).await,
@@ -9263,6 +9271,8 @@ struct WikiQuerier {
     conversation_store: Option<Arc<Store>>,
     conversation_scheduler: Arc<augmentagent_approval_discord::conversation::ConversationScheduler>,
     voice_enabled: bool,
+    voice_tools: std::sync::OnceLock<Arc<augmentagent_approval_discord::voice_tool::VoiceToolService>>,
+    final_spoken_turns: dashmap::DashMap<String, ()>,
 }
 
 /// #389 — Owner rules travel with EVERY query-mode prompt, injected at
@@ -9403,6 +9413,14 @@ fn extract_md_section<'a>(md: &'a str, heading: &str) -> Option<&'a str> {
 
 #[async_trait]
 impl QueryHandler for WikiQuerier {
+    fn attach_voice_tools(&self, service: Arc<augmentagent_approval_discord::voice_tool::VoiceToolService>) {
+        let _ = self.voice_tools.set(service);
+    }
+
+    fn take_final_spoken(&self, turn_id: &str) -> bool {
+        self.final_spoken_turns.remove(turn_id).is_some()
+    }
+
     async fn selected_model(&self, channel_id: u64) -> Result<Option<String>, String> {
         let store = augmentagent_channel_core::model_selection::SelectionStore::new(
             augmentagent_channel_core::model_selection::config_path());
@@ -9426,6 +9444,16 @@ impl QueryHandler for WikiQuerier {
         enable_newsletter_tools(&mut opts, ctx);
         computer_tool::configure(&mut opts, ctx, &self.repo_root);
         model_tool::configure(&mut opts, ctx, &self.reasoner, &self.repo_root.join("target/release/augmentagent"));
+        let voice_grant = self.voice_tools.get().and_then(|service| {
+            let guild = ctx.guild_id?;
+            let channel = ctx.channel_id?;
+            if !ctx.owner_authorized { return None; }
+            service.grant(&guild.to_string(), &format!("{guild}:{}", channel.get()), &ctx.session_id)
+                .map(|grant| (service, grant))
+        });
+        if let Some((service, grant)) = &voice_grant {
+            voice_tool::configure(&mut opts, grant, service, &std::env::current_exe()?)?;
+        }
         // #132 / #201 — Stamp this request's session id onto every audit
         // record produced by the spawn, and (if we have the bits from the
         // Discord side) plug in a per-request notifier so high-risk tool
@@ -9463,6 +9491,10 @@ impl QueryHandler for WikiQuerier {
             augmentagent_channel_core::model_selection::SELECTED_PROFILE
                 .scope(selected, self.reasoner.call_transcript(&opts, &prompt)).await
         }.await;
+        if answer.is_ok() &&
+            voice_grant.as_ref().is_some_and(|(_, grant)| grant.final_spoken()) {
+            self.final_spoken_turns.insert(ctx.session_id.clone(), ());
+        }
         sweep_imessage_attachments(&opts.env);
         answer
     }
@@ -9761,7 +9793,8 @@ mod query_delivery_contract_tests {
             (ProviderKind::Codex, Arc::new(augmentagent_channel_core::codex::CodexCliReasoner::openai())),
         ], CooldownLatch::at(repo.join("cooldowns.json"))));
         let handler = WikiQuerier { reasoner: reasoner.clone(), wiki_root: wiki.clone(), repo_root: repo.into(),
-            conversation_store: None, conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()), voice_enabled: false };
+            conversation_store: None, conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()), voice_enabled: false,
+            voice_tools: std::sync::OnceLock::new(), final_spoken_turns: dashmap::DashMap::new() };
         for turn in 0..2 {
             let mut ctx = augmentagent_approval_discord::AuditCtx::empty();
             ctx.session_id = format!("synthetic-channel:synthetic-turn-{turn}");
@@ -9822,7 +9855,8 @@ mod query_delivery_contract_tests {
             }))], CooldownLatch::at(fixture.path().join("cooldowns.json"))));
         let handler = WikiQuerier { reasoner: reasoner.clone(), wiki_root: wiki.clone(),
             repo_root: fixture.path().to_path_buf(), conversation_store: None,
-            conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()), voice_enabled: false };
+            conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()), voice_enabled: false,
+            voice_tools: std::sync::OnceLock::new(), final_spoken_turns: dashmap::DashMap::new() };
         let mut context = augmentagent_approval_discord::AuditCtx::empty();
         context.session_id = "synthetic-channel:synthetic-turn".into();
         let answer = handler.answer(&context, "Deliver the original synthetic document").await.unwrap();
@@ -13469,6 +13503,8 @@ async fn build_broker(
             conversation_store: Some(Arc::clone(&store)),
             conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()),
             voice_enabled: std::env::var("AUGMENTAGENT_DISCORD_VOICE_ENABLED").as_deref() == Ok("1"),
+            voice_tools: std::sync::OnceLock::new(),
+            final_spoken_turns: dashmap::DashMap::new(),
         };
         Arc::new(q) as Arc<dyn QueryHandler>
     });

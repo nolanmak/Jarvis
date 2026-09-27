@@ -6,6 +6,76 @@ use augmentagent_channel_core::{
 };
 use std::sync::Mutex;
 
+struct McpCaptureFixture(Arc<Mutex<Vec<(Option<serde_json::Value>, Vec<String>)>>>);
+
+#[async_trait]
+impl Reasoner for McpCaptureFixture {
+    async fn call(&self, opts: &ReasonerOpts, _prompt: &str) -> anyhow::Result<String> {
+        self.0.lock().unwrap().push((opts.settings_json.as_deref()
+            .map(serde_json::from_str).transpose()?, opts.allowed_tools.clone()));
+        Ok("synthetic reply".into())
+    }
+}
+
+#[tokio::test]
+async fn active_voice_binding_injects_tool_only_into_its_owner_conversation_turn() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("sidecar.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let sidecar = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+        let request: serde_json::Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(request["kind"], "start");
+        let reply = serde_json::json!({"version":1,"kind":"reply","requestId":request["requestId"],"ok":true});
+        write.write_all(format!("{reply}\n").as_bytes()).await.unwrap();
+        let _ = lines.next_line().await;
+    });
+    let bridge = augmentagent_approval_discord::voice_bridge::VoiceBridge::connect(&socket).await.unwrap();
+    bridge.start(augmentagent_approval_discord::voice_bridge::VoiceBinding {
+        guild_id:"1".into(), conversation_id:"1:2".into(), text_channel_id:"2".into(),
+        voice_channel_id:"3".into(), owner_id:"4".into(), bot_user_id:"5".into(), generation:6,
+    }).await.unwrap();
+    let service = augmentagent_approval_discord::voice_tool::VoiceToolService::start(&bridge).await.unwrap();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let reasoner = Arc::new(FallbackReasoner::for_tests(
+        vec![(ProviderKind::Claude, Arc::new(McpCaptureFixture(Arc::clone(&captured))))],
+        augmentagent_channel_core::cooldown::CooldownLatch::at(root.path().join("cooldowns.json")),
+    ));
+    let wiki = root.path().join("wiki");
+    std::fs::create_dir(&wiki).unwrap();
+    let handler = WikiQuerier {
+        reasoner, wiki_root: wiki, repo_root: root.path().to_path_buf(),
+        conversation_store: None,
+        conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()),
+        voice_enabled: true,
+        voice_tools: std::sync::OnceLock::new(), final_spoken_turns: dashmap::DashMap::new(),
+    };
+    handler.attach_voice_tools(Arc::clone(&service));
+    let mut ctx = augmentagent_approval_discord::AuditCtx {
+        session_id:"2:10".into(), guild_id:Some(1), http:None,
+        channel_id:Some(serenity::model::id::ChannelId::new(2)), owner_authorized:true,
+    };
+    handler.answer(&ctx, "hello").await.unwrap();
+    ctx.channel_id = Some(serenity::model::id::ChannelId::new(9));
+    handler.answer(&ctx, "other conversation").await.unwrap();
+    ctx.channel_id = Some(serenity::model::id::ChannelId::new(2));
+    ctx.owner_authorized = false;
+    handler.answer(&ctx, "not owner").await.unwrap();
+    let calls = captured.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0].0.as_ref().unwrap()["mcpServers"]["voice"]["args"],
+        serde_json::json!(["voice-tool"]));
+    assert!(calls[0].1.contains(&"mcp__voice__speak".to_string()));
+    for (settings, tools) in &calls[1..] {
+        assert!(settings.as_ref().unwrap()["mcpServers"].get("voice").is_none());
+        assert!(!tools.iter().any(|tool| tool.starts_with("mcp__voice__")));
+    }
+    sidecar.abort();
+}
+
 struct SessionFixture {
     calls: Arc<Mutex<Vec<(String, String)>>>,
 }
@@ -56,6 +126,8 @@ async fn guild_text_uses_one_native_session_and_bootstraps_history_only_once() {
         conversation_store: Some(Arc::clone(&store)),
         conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()),
         voice_enabled: true,
+        voice_tools: std::sync::OnceLock::new(),
+        final_spoken_turns: dashmap::DashMap::new(),
     };
     let mut ctx = augmentagent_approval_discord::AuditCtx {
         session_id: "2:1".into(), guild_id: Some(1), http: None,
@@ -125,6 +197,8 @@ async fn uncertain_native_turn_is_persisted_and_blocks_replay() {
         conversation_store: Some(Arc::clone(&store)),
         conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()),
         voice_enabled: true,
+        voice_tools: std::sync::OnceLock::new(),
+        final_spoken_turns: dashmap::DashMap::new(),
     };
     let mut ctx = augmentagent_approval_discord::AuditCtx {
         session_id: "2:1".into(), guild_id: Some(1), http: None,
@@ -181,6 +255,8 @@ async fn failed_turn_without_native_id_is_not_replayed_after_restart() {
             conversation_store: Some(Arc::new(Store::open(root.join("data.db")).unwrap())),
             conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()),
             voice_enabled: true,
+            voice_tools: std::sync::OnceLock::new(),
+            final_spoken_turns: dashmap::DashMap::new(),
         };
         assert!(handler.answer_turn(&ctx, "", "must not replay").await.is_err());
     }
