@@ -35,6 +35,18 @@ test('doctor checks a private live socket and selected providers without returni
     assert.equal(exitCode, 0);
     assert.match(Buffer.concat(output).toString(), /ready-for-live-test/);
     assert.doesNotMatch(Buffer.concat(output).toString(), /fake-|secret/);
+    const liveOutput: Buffer[] = [];
+    const live = spawn(process.execPath,
+      [new URL('../scripts/live-voice.js', import.meta.url).pathname,
+        '--guild-id', '123456789012345678', '--text-channel-id', '223456789012345678',
+        '--voice-channel-id', '323456789012345678', '--agent', 'codex',
+        '--run-id', 'disposable-01', '--preflight-only'],
+      { env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
+    live.stdout.on('data', (chunk: Buffer) => liveOutput.push(chunk));
+    live.stderr.on('data', (chunk: Buffer) => liveOutput.push(chunk));
+    assert.equal(await new Promise<number | null>(resolve => live.on('exit', resolve)), 0);
+    assert.match(Buffer.concat(liveOutput).toString(), /awaiting-live-evidence/);
+    assert.doesNotMatch(Buffer.concat(liveOutput).toString(), /fake-|secret/);
     await chmod(socket, 0o666);
     await assert.rejects(checkVoicePreflight(env), /mode 0600/);
     await assert.rejects(checkVoicePreflight({ ...env, ELEVENLABS_API_KEY: '' }), /TTS key is missing/);

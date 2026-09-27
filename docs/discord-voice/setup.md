@@ -47,6 +47,22 @@ Use the configured owner account and an existing guild text channel/thread. Join
 
 Keep the first test session disposable. Do not use a personal long-lived native agent session as a destructive fixture. The bot must have Discord voice connect/speak permissions in the test guild. Use the issue's acceptance checklist to record actual audio, transcript, and session-ID evidence separately from mocked tests.
 
+The opt-in live recorder requires a test guild ID, the existing text channel/thread ID, the existing voice channel ID, an agent, and a disposable run ID. First run it with `--preflight-only` to verify arguments and local service readiness; it does not contact Discord or providers. For an interactive run, add `--output` pointing to a **new** local JSON file and omit `--preflight-only`. It prompts for what you actually observed in Discord, stores the report with mode `0600`, and marks it `operator-recorded-unverified`. Compare it with bot logs, native session traces, and measured audio before checking any acceptance criterion. Run separately for each agent and provider pairing; this script does not manufacture an audible pass.
+
+```sh
+cd ~/AugmentAgent/sidecars/discord-voice
+npm run build
+set -a
+. "$HOME/.config/augmentagent/discord-voice.env"
+set +a
+npm run test:live -- \
+  --guild-id TEST_GUILD_ID --text-channel-id TEST_TEXT_CHANNEL_ID \
+  --voice-channel-id TEST_VOICE_CHANNEL_ID --agent codex --run-id disposable-codex-01 \
+  --preflight-only
+# For a real operator-recorded run, omit --preflight-only and add:
+# --output "$HOME/voice-test-codex-01.json"
+```
+
 ## Troubleshooting and rollback
 
 ```sh

@@ -53,7 +53,7 @@ The sidecar also passes a 50-cycle fake-connection attach/detach test with exact
 1. Prove Discord DAVE join, owner audio receive/decode, and outbound playback in a test guild. Mocked adapter and native MCP tests cannot satisfy this gate.
 2. Prove Deepgram and ElevenLabs STT/TTS live, including a mixed pair. Provider keys are absent from the checked daemon `.env`; do not count contract tests as live compatibility.
 3. Complete the audio fixtures, measured interruption/latency gates, provider-stream recovery and real process-crash/restart proof, 50-cycle cleanup, and full acceptance-ID evidence. Confirm typed/voice approval and attachment parity in the live path.
-4. Finish the opt-in live script, CI integration, and full CLI QA. The Linux service, config example, setup guide, and read-only doctor are checked in. The doctor checks local readiness only; it is not live audio evidence. Keep the PR draft until AC01–AC12 and CI are green.
+4. Finish CI integration and full CLI QA. The Linux service, config example, setup guide, read-only doctor, and opt-in operator live recorder are checked in. The doctor checks local readiness; the recorder marks observations unverified. Neither is live audio evidence until run in a test guild and corroborated with logs and session traces. Keep the PR draft until AC01–AC12 and CI are green.
 
 ## Rollback
 
