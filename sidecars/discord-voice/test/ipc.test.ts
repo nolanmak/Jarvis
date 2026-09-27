@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, stat, rm } from 'node:fs/promises';
+import { mkdtemp, stat, rm, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createConnection, type Socket } from 'node:net';
+import { spawn } from 'node:child_process';
 import test from 'node:test';
 import { VoiceIpcServer } from '../src/ipc.js';
 import { VoiceCoordinator } from '../src/voice-coordinator.js';
@@ -66,6 +67,44 @@ test('oversized IPC input is closed without killing the sidecar', async () => {
   } finally {
     oversized.destroy();
     await service.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('restart recovers a stale socket but never replaces a live listener or a regular file', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'jarvis-voice-restart-'));
+  const path = join(directory, 'voice.sock');
+  const child = spawn(process.execPath, ['-e',
+    'const s=require("node:net").createServer();s.listen(process.argv[1],()=>process.stdout.write("READY\\n"))', path],
+    { stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      child.stdout!.once('data', chunk => chunk.toString().includes('READY') ? resolve() : reject(new Error('child not ready')));
+      child.once('error', reject);
+    });
+    child.kill('SIGKILL');
+    await new Promise<void>(resolve => child.once('close', () => resolve()));
+    assert.equal((await stat(path)).isSocket(), true);
+    const recovered = new VoiceIpcServer(path, new VoiceCoordinator(() => ({ destroy() {} }), () => true));
+    await recovered.listen();
+    const socket = createConnection(path);
+    try {
+      await new Promise<void>(resolve => socket.once('connect', resolve));
+      const rival = new VoiceIpcServer(path, new VoiceCoordinator(() => ({ destroy() {} }), () => true));
+      await assert.rejects(rival.listen(), /already|active|in use/i);
+      socket.write(JSON.stringify({ version: 1, kind: 'status', requestId: 'still-live',
+        conversationId: 'text-1', generation: 1 }) + '\n');
+      assert.equal((await readLine(socket) as { requestId: string }).requestId, 'still-live');
+    } finally {
+      socket.destroy();
+      await recovered.close();
+    }
+    await writeFile(path, 'do not replace');
+    const regular = new VoiceIpcServer(path, new VoiceCoordinator(() => ({ destroy() {} }), () => true));
+    await assert.rejects(regular.listen(), /socket|regular|exists/i);
+    assert.equal(await readFile(path, 'utf8'), 'do not replace');
+  } finally {
+    if (child.exitCode === null) child.kill('SIGKILL');
     await rm(directory, { recursive: true, force: true });
   }
 });

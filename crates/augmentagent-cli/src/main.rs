@@ -13462,6 +13462,21 @@ fn format_local_send_time(at_ms: i64) -> String {
     }
 }
 
+fn resolve_discord_voice_socket(
+    enabled: bool,
+    explicit: Option<std::ffi::OsString>,
+    runtime: Option<std::ffi::OsString>,
+) -> Result<Option<PathBuf>> {
+    if !enabled { return Ok(None); }
+    let path = explicit.filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| runtime.filter(|value| !value.is_empty())
+            .map(|value| PathBuf::from(value).join("augmentagent/discord-voice.sock")))
+        .context("Discord voice needs AUGMENTAGENT_DISCORD_VOICE_SOCKET or XDG_RUNTIME_DIR")?;
+    anyhow::ensure!(path.is_absolute(), "Discord voice socket path must be absolute");
+    Ok(Some(path))
+}
+
 async fn build_broker(
     cli: &Cli,
     store: Arc<Store>,
@@ -13493,6 +13508,9 @@ async fn build_broker(
         .and_then(|s| s.parse().ok());
 
     let reasoner = build_reasoner();
+    let voice_enabled = std::env::var("AUGMENTAGENT_DISCORD_VOICE_ENABLED").as_deref() == Ok("1");
+    let voice_socket_path = resolve_discord_voice_socket(voice_enabled,
+        std::env::var_os("AUGMENTAGENT_DISCORD_VOICE_SOCKET"), std::env::var_os("XDG_RUNTIME_DIR"))?;
 
     let repo_root = std::env::current_dir().context("current_dir")?;
     let query_handler: Option<Arc<dyn QueryHandler>> = cli.wiki_dir.as_ref().map(|root| {
@@ -13502,7 +13520,7 @@ async fn build_broker(
             repo_root: repo_root.clone(),
             conversation_store: Some(Arc::clone(&store)),
             conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()),
-            voice_enabled: std::env::var("AUGMENTAGENT_DISCORD_VOICE_ENABLED").as_deref() == Ok("1"),
+            voice_enabled,
             voice_tools: std::sync::OnceLock::new(),
             final_spoken_turns: dashmap::DashMap::new(),
         };
@@ -13592,10 +13610,7 @@ async fn build_broker(
         loop_parser,
         wiki_root: cli.wiki_dir.clone(),
         journal_ops,
-        voice_socket_path: (std::env::var("AUGMENTAGENT_DISCORD_VOICE_ENABLED").as_deref() == Ok("1"))
-            .then(|| std::env::var_os("AUGMENTAGENT_DISCORD_VOICE_SOCKET")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/run/augmentagent/discord-voice.sock"))),
+        voice_socket_path,
     })
     .await
     .context("start discord broker")?;

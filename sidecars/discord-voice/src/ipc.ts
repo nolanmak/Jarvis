@@ -1,11 +1,51 @@
-import { chmod, unlink } from 'node:fs/promises';
-import { createServer, type Server, type Socket } from 'node:net';
+import { chmod, lstat, unlink } from 'node:fs/promises';
+import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { parseFrame, type Frame } from './protocol.js';
 import { VoiceCoordinator } from './voice-coordinator.js';
 import { loadSpeechConfig } from './speech-runtime.js';
 
 const MAX_FRAME_BYTES = 32_768;
 const MAX_QUEUED_BYTES = 1_048_576;
+
+/** Reclaim only a dead Unix socket from a crashed previous sidecar. */
+async function prepareSocketPath(path: string): Promise<void> {
+  const previous = await lstat(path).catch(error => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  });
+  if (!previous) return;
+  if (!previous.isSocket()) throw new Error('Voice IPC path exists and is not a socket');
+  if (process.getuid && previous.uid !== process.getuid()) {
+    throw new Error('Voice IPC socket belongs to another user');
+  }
+  const state = await new Promise<'live' | 'stale' | 'gone'>((resolve, reject) => {
+    const probe = createConnection(path);
+    const timer = setTimeout(() => { probe.destroy(); reject(new Error('Voice IPC socket probe timed out')); }, 500);
+    probe.once('connect', () => {
+      clearTimeout(timer);
+      probe.destroy();
+      resolve('live');
+    });
+    probe.once('error', (error: NodeJS.ErrnoException) => {
+      clearTimeout(timer);
+      probe.destroy();
+      if (error.code === 'ECONNREFUSED') resolve('stale');
+      else if (error.code === 'ENOENT') resolve('gone');
+      else reject(error);
+    });
+  });
+  if (state === 'live') throw new Error('Voice IPC socket is already active');
+  if (state === 'gone') return;
+  const current = await lstat(path).catch(error => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  });
+  if (!current) return;
+  if (!current.isSocket() || current.dev !== previous.dev || current.ino !== previous.ino) {
+    throw new Error('Voice IPC socket changed during recovery');
+  }
+  await unlink(path);
+}
 
 /** One Rust daemon connection over a mode-0600 Unix socket. */
 export class VoiceIpcServer {
@@ -26,6 +66,7 @@ export class VoiceIpcServer {
   async listen(): Promise<void> {
     const previous = process.umask(0o177);
     try {
+      await prepareSocketPath(this.path);
       await new Promise<void>((resolve, reject) => {
         this.server.once('error', reject);
         this.server.listen(this.path, () => {
