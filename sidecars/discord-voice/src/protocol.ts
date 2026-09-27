@@ -82,6 +82,13 @@ function generation(value: unknown): number {
   return value as number;
 }
 
+function voiceToken(value: unknown): string {
+  if (typeof value !== 'string' || !value || value.length > 4096 || value.trim() !== value) {
+    throw new Error('Invalid token');
+  }
+  return value;
+}
+
 export function parseFrame(raw: string): Frame {
   if (Buffer.byteLength(raw) > 32_768) throw new Error('IPC frame too large');
   const value = record(JSON.parse(raw) as unknown);
@@ -116,7 +123,7 @@ export function parseFrame(raw: string): Frame {
     case 'voice_server':
       exact(value, ['version', 'kind', 'conversationId', 'generation', 'guildId', 'endpoint', 'token']);
       return { ...common, kind: 'voice_server', guildId: id(value.guildId, 'guildId'),
-        endpoint: id(value.endpoint, 'endpoint'), token: id(value.token, 'token') };
+        endpoint: id(value.endpoint, 'endpoint'), token: voiceToken(value.token) };
     default:
       throw new Error('Unknown IPC frame kind');
   }

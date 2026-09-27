@@ -8,6 +8,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "start": "./node_modules/node/bin/node dist/src/main.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && ./node_modules/node/bin/node --test dist/test/*.test.js",
     "test:live": "./node_modules/node/bin/node dist/scripts/live-voice.js"

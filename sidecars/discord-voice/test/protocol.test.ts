@@ -30,3 +30,12 @@ test('rejects arbitrary speak targets and oversized text', () => {
   assert.throws(() => parseFrame(JSON.stringify({ ...speak, channelId: 'other-channel' })));
   assert.throws(() => parseFrame(JSON.stringify({ ...speak, text: 'a'.repeat(12001) })));
 });
+
+test('accepts a long Discord voice token without relaxing identifier bounds', () => {
+  const token = 'v'.repeat(1024);
+  const frame = { version: 1, kind: 'voice_server', conversationId: 'text-1',
+    generation: 1, guildId: 'guild-1', endpoint: 'voice.example.test', token };
+  assert.deepEqual(parseFrame(JSON.stringify(frame)), frame);
+  assert.throws(() => parseFrame(JSON.stringify({ ...frame, guildId: 'g'.repeat(129) })));
+  assert.throws(() => parseFrame(JSON.stringify({ ...frame, token: 'v'.repeat(4097) })));
+});
