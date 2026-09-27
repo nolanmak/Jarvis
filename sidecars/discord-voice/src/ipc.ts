@@ -2,6 +2,7 @@ import { chmod, unlink } from 'node:fs/promises';
 import { createServer, type Server, type Socket } from 'node:net';
 import { parseFrame, type Frame } from './protocol.js';
 import { VoiceCoordinator } from './voice-coordinator.js';
+import { loadSpeechConfig } from './speech-runtime.js';
 
 const MAX_FRAME_BYTES = 32_768;
 const MAX_QUEUED_BYTES = 1_048_576;
@@ -10,13 +11,15 @@ const MAX_QUEUED_BYTES = 1_048_576;
 export class VoiceIpcServer {
   private readonly server: Server;
   private readonly coordinator: VoiceCoordinator;
+  private readonly managedCoordinator: boolean;
   private client?: Socket;
 
   constructor(private readonly path: string, coordinator?: VoiceCoordinator) {
+    this.managedCoordinator = coordinator === undefined;
     this.coordinator = coordinator ?? new VoiceCoordinator(undefined, (binding, payload) => {
       return this.send({ version: 1, kind: 'gateway_send', conversationId: binding.conversationId,
         generation: binding.generation, guildId: binding.guildId, payload });
-    });
+    }, frame => this.send(frame));
     this.server = createServer(socket => this.accept(socket));
   }
 
@@ -84,7 +87,7 @@ export class VoiceIpcServer {
       frame = parseFrame(raw);
       switch (frame.kind) {
         case 'start':
-          this.coordinator.start(frame);
+          this.coordinator.start(frame, this.managedCoordinator ? loadSpeechConfig(process.env) : undefined);
           break;
         case 'stop':
           if (!this.coordinator.stop(frame.conversationId, frame.generation)) {
@@ -92,17 +95,24 @@ export class VoiceIpcServer {
           }
           break;
         case 'interrupt':
-          throw new Error('Interrupt is not available until playback is configured');
+          if (!this.coordinator.interrupt(frame.conversationId, frame.generation)) {
+            throw new Error('Voice binding is not listening');
+          }
+          break;
         case 'status':
           this.send({ version: 1, kind: 'reply', requestId: frame.requestId, ok: true,
-            binding: this.coordinator.status(frame.conversationId) ?? null });
+            binding: this.coordinator.status(frame.conversationId) ?? null,
+            state: this.coordinator.audioStatus(frame.conversationId) ?? null });
           return;
         case 'voice_state':
         case 'voice_server':
           this.coordinator.onFrame(frame);
           return;
         case 'speak':
-          throw new Error('Speech provider is not configured');
+          this.send({ version: 1, kind: 'reply', requestId: frame.requestId, ok: true,
+            receipt: this.coordinator.speak(frame.conversationId, frame.generation,
+              frame.utteranceId, frame.text) });
+          return;
       }
       this.send({ version: 1, kind: 'reply', requestId: frame.requestId, ok: true });
     } catch (error) {

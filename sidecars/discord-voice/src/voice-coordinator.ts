@@ -2,14 +2,17 @@ import {
   joinVoiceChannel,
   type CreateVoiceConnectionOptions,
   type JoinVoiceChannelOptions,
+  type VoiceConnection,
 } from '@discordjs/voice';
 import { GatewayBridge } from './gateway-bridge.js';
 import type { Frame, StartFrame } from './protocol.js';
+import { VoiceAudio, type SpeechConfig } from './speech-runtime.js';
+import type { SpeechReceipt } from './speech-queue.js';
 
 type VoiceHandle = { destroy(): void };
 type Join = (options: CreateVoiceConnectionOptions & JoinVoiceChannelOptions) => VoiceHandle;
 type GatewaySend = (binding: StartFrame, payload: unknown) => boolean;
-type Active = { binding: StartFrame; bridge: GatewayBridge; connection: VoiceHandle };
+type Active = { binding: StartFrame; bridge: GatewayBridge; connection: VoiceHandle; audio?: VoiceAudio };
 
 /** The process owns only audio connections. Rust owns the bot gateway and authorization. */
 export class VoiceCoordinator {
@@ -19,9 +22,10 @@ export class VoiceCoordinator {
   constructor(
     private readonly join: Join = joinVoiceChannel,
     private readonly sendGateway: GatewaySend = () => false,
+    private readonly emitAudio: (frame: unknown) => boolean = () => false,
   ) {}
 
-  start(binding: StartFrame): void {
+  start(binding: StartFrame, speech?: SpeechConfig): void {
     const current = this.activeByGuild.get(binding.guildId);
     if (current) {
       if (current.binding.conversationId === binding.conversationId &&
@@ -43,8 +47,17 @@ export class VoiceCoordinator {
       selfMute: false,
       adapterCreator: methods => bridge.create(methods),
     });
-    this.activeByGuild.set(binding.guildId, { binding, bridge, connection });
+    let audio: VoiceAudio | undefined;
+    try {
+      if (speech) audio = new VoiceAudio(connection as VoiceConnection, binding, speech, this.emitAudio);
+    } catch (error) {
+      connection.destroy();
+      bridge.destroy();
+      throw error;
+    }
+    this.activeByGuild.set(binding.guildId, { binding, bridge, connection, audio });
     this.lastGeneration.set(binding.guildId, binding.generation);
+    if (audio) void audio.start();
   }
 
   stop(conversationId: string, generation: number): boolean {
@@ -54,6 +67,7 @@ export class VoiceCoordinator {
     );
     if (!active) return false;
     this.activeByGuild.delete(active.binding.guildId);
+    active.audio?.stop();
     active.connection.destroy();
     active.bridge.destroy();
     return true;
@@ -75,6 +89,26 @@ export class VoiceCoordinator {
   status(conversationId: string): StartFrame | undefined {
     return [...this.activeByGuild.values()]
       .find(item => item.binding.conversationId === conversationId)?.binding;
+  }
+
+  audioStatus(conversationId: string): string | undefined {
+    return [...this.activeByGuild.values()]
+      .find(item => item.binding.conversationId === conversationId)?.audio?.status;
+  }
+
+  speak(conversationId: string, generation: number, utteranceId: string, text: string): SpeechReceipt {
+    const active = [...this.activeByGuild.values()].find(item =>
+      item.binding.conversationId === conversationId && item.binding.generation === generation);
+    if (!active?.audio) throw new Error('Voice binding is not listening');
+    return active.audio.speak(utteranceId, text);
+  }
+
+  interrupt(conversationId: string, generation: number): boolean {
+    const active = [...this.activeByGuild.values()].find(item =>
+      item.binding.conversationId === conversationId && item.binding.generation === generation);
+    if (!active?.audio) return false;
+    active.audio.interrupt();
+    return true;
   }
 
   shutdown(): void {

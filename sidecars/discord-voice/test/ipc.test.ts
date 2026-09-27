@@ -61,7 +61,7 @@ test('oversized IPC input is closed without killing the sidecar', async () => {
     healthy.write(JSON.stringify({ version: 1, kind: 'status', requestId: 'req-after-error',
       conversationId: 'text-1', generation: 1 }) + '\n');
     assert.deepEqual(await readLine(healthy), { version: 1, kind: 'reply',
-      requestId: 'req-after-error', ok: true, binding: null });
+      requestId: 'req-after-error', ok: true, binding: null, state: null });
     healthy.destroy();
   } finally {
     oversized.destroy();
