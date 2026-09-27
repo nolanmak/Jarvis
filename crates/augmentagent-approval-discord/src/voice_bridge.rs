@@ -181,6 +181,79 @@ impl VoiceBridge {
             .to_string())
     }
 
+    pub async fn speak(
+        &self,
+        guild_id: &str,
+        conversation_id: &str,
+        utterance_id: &str,
+        text: &str,
+    ) -> Result<Value> {
+        let binding = self
+            .binding(guild_id)
+            .context("No active voice binding in this guild")?;
+        anyhow::ensure!(
+            binding.conversation_id == conversation_id,
+            "Voice is bound to another conversation"
+        );
+        anyhow::ensure!(
+            !utterance_id.is_empty() && utterance_id.len() <= 128,
+            "Invalid speech utterance ID"
+        );
+        anyhow::ensure!(
+            !text.trim().is_empty() && text.len() <= 12_000,
+            "Invalid speech text"
+        );
+        let reply = self
+            .request(json!({
+                "version": 1, "kind": "speak", "conversationId": conversation_id,
+                "generation": binding.generation, "utteranceId": utterance_id,
+                "text": text,
+            }))
+            .await?;
+        let receipt = reply
+            .get("receipt")
+            .context("Voice sidecar omitted speech receipt")?;
+        anyhow::ensure!(
+            receipt.get("utteranceId").and_then(Value::as_str) == Some(utterance_id),
+            "Voice sidecar returned another utterance receipt"
+        );
+        Ok(receipt.clone())
+    }
+
+    pub async fn speech_status(
+        &self,
+        guild_id: &str,
+        conversation_id: &str,
+        utterance_id: &str,
+    ) -> Result<Option<Value>> {
+        let binding = self
+            .binding(guild_id)
+            .context("No active voice binding in this guild")?;
+        anyhow::ensure!(
+            binding.conversation_id == conversation_id,
+            "Voice is bound to another conversation"
+        );
+        anyhow::ensure!(
+            !utterance_id.is_empty() && utterance_id.len() <= 128,
+            "Invalid speech utterance ID"
+        );
+        let reply = self
+            .request(json!({
+                "version": 1, "kind": "speech_status", "conversationId": conversation_id,
+                "generation": binding.generation, "utteranceId": utterance_id,
+            }))
+            .await?;
+        match reply.get("receipt") {
+            Some(Value::Null) => Ok(None),
+            Some(receipt)
+                if receipt.get("utteranceId").and_then(Value::as_str) == Some(utterance_id) =>
+            {
+                Ok(Some(receipt.clone()))
+            }
+            _ => bail!("Voice sidecar returned an invalid speech receipt"),
+        }
+    }
+
     pub async fn forward_voice_state(
         &self,
         guild_id: &str,
@@ -449,11 +522,14 @@ impl VoiceBridge {
                     && answer.len() <= 12_000
                     && self.binding(&binding.guild_id).as_ref() == Some(&binding)
                 {
-                    let result = self.request(json!({
-                        "version": 1, "kind": "speak", "conversationId": binding.conversation_id,
-                        "generation": binding.generation, "utteranceId": format!("{turn_id}:final"),
-                        "text": answer,
-                    })).await;
+                    let result = self
+                        .speak(
+                            &binding.guild_id,
+                            &binding.conversation_id,
+                            &format!("{turn_id}:final"),
+                            &answer,
+                        )
+                        .await;
                     if let Err(error) = result {
                         warn!("could not speak Discord voice reply: {error}");
                     }
@@ -640,6 +716,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn speech_receipts_are_scoped_to_the_active_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voice.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            for expected in ["start", "speak", "speech_status"] {
+                let frame: Value =
+                    serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+                assert_eq!(frame["kind"], expected);
+                assert_eq!(frame["conversationId"], "1:2");
+                assert_eq!(frame["generation"], 6);
+                if expected != "start" {
+                    assert_eq!(frame["utteranceId"], "turn-1:answer");
+                }
+                let receipt = json!({"utteranceId":"turn-1:answer","status":"queued"});
+                let reply = json!({"version":1,"kind":"reply","requestId":frame["requestId"],
+                    "ok":true,"receipt":receipt});
+                write
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let bridge = VoiceBridge::connect(&path).await.unwrap();
+        bridge.start(binding()).await.unwrap();
+        assert!(bridge
+            .speak("1", "1:9", "turn-1:answer", "hello")
+            .await
+            .is_err());
+        let receipt = bridge
+            .speak("1", "1:2", "turn-1:answer", "hello")
+            .await
+            .unwrap();
+        assert_eq!(receipt["status"], "queued");
+        assert!(bridge
+            .speech_status("1", "1:9", "turn-1:answer")
+            .await
+            .is_err());
+        let status = bridge
+            .speech_status("1", "1:2", "turn-1:answer")
+            .await
+            .unwrap();
+        assert_eq!(status.unwrap()["utteranceId"], "turn-1:answer");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn committed_transcript_routes_once_to_the_bound_text_session_and_speaks_reply() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("voice.sock");
@@ -654,14 +780,10 @@ mod tests {
             assert_eq!(speak["conversationId"], "1:2");
             assert_eq!(speak["utteranceId"], "voice:6:0:final");
             assert_eq!(speak["text"], "synthetic spoken answer");
+            let reply = json!({"version":1,"kind":"reply","requestId":speak["requestId"],
+                "ok":true,"receipt":{"utteranceId":"voice:6:0:final","status":"queued"}});
             write
-                .write_all(
-                    format!(
-                        "{{\"version\":1,\"kind\":\"reply\",\"requestId\":\"{}\",\"ok\":true}}\n",
-                        speak["requestId"].as_str().unwrap()
-                    )
-                    .as_bytes(),
-                )
+                .write_all(format!("{reply}\n").as_bytes())
                 .await
                 .unwrap();
         });
