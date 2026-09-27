@@ -58,6 +58,8 @@ Review hardening: `conversation_scheduler.rs` first failed because a queue-full 
 
 The queue's 20-case synthetic overlap test now checks local stop timing and late-chunk fencing for active output, including cases with pending output. This is below the real speech-event and Discord audio-player boundary, so live p95 and full ingress integration remain open.
 
+For latency readiness, speech receipts now expose queued, TTS request, TTS first byte, audio-player Playing, and stopped timestamps. `speech-queue.test.ts` holds the final chunk for five real seconds and confirms its first local playback occurs before that chunk. Two Rust tests first failed when a stalled Discord transcript mirror delayed native dispatch and speech; the bridge now starts transcript mirroring independently, starts the native handler immediately, and can queue speech before the mirror finishes while still posting the transcript before the text reply. These timestamps and tests are not the 30-turn live p50/p95 evidence; the player state is not a remote packet receipt.
+
 ## Required next gates
 
 1. Prove Discord DAVE join, owner audio receive/decode, and outbound playback in a test guild. Mocked adapter and native MCP tests cannot satisfy this gate.

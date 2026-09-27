@@ -59,6 +59,8 @@ test('STT disconnect reconnects without replaying or suppressing a later turn', 
       ['first phrase', 'second phrase']);
     const turnIds = frames.filter(frame => frame.kind === 'transcript').map(frame => frame.turnId);
     assert.equal(new Set(turnIds).size, 2);
+    assert.ok(frames.filter(frame => frame.kind === 'transcript')
+      .every(frame => typeof frame.committedAtMs === 'number'));
     assert.equal(audio.status, 'listening');
   } finally {
     audio.stop();

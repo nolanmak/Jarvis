@@ -9559,6 +9559,10 @@ impl QueryHandler for WikiQuerier {
             // dies before recording a result or native ID, restart must not
             // silently submit this Discord turn a second time.
             store.claim_discord_turn(&guild, &channel, &ctx.session_id)?;
+            let handler_dispatched_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+            tracing::info!(turn_id = %ctx.session_id, %guild, %channel,
+                handler_dispatched_at_ms, "Discord native turn handler dispatched");
             let answer = CURRENT.scope(Arc::clone(&session), self.answer(ctx, &prompt)).await;
             if let Some(id) = session.id() {
                 if binding.is_none() {

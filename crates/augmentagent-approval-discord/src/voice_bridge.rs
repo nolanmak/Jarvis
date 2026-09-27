@@ -553,6 +553,10 @@ impl VoiceBridge {
                 let bridge = Arc::clone(self);
                 let turn_id = turn_id.to_string();
                 let transcript = transcript.trim().to_string();
+                let committed_at_ms = frame.get("committedAtMs").and_then(Value::as_u64);
+                tracing::info!(conversation_id = %binding.conversation_id,
+                    turn_id = %turn_id, ?committed_at_ms,
+                    "Discord voice utterance committed");
                 tokio::spawn(async move {
                     bridge
                         .process_transcript(binding, handler, turn_id, transcript)
@@ -586,15 +590,18 @@ impl VoiceBridge {
         };
         let channel = ChannelId::new(channel_id);
         let mirror = format!("🎙️ **You:** {transcript}");
-        for chunk in crate::event_handler::chunk_for_discord(&mirror) {
-            if let Err(error) = channel
-                .send_message(&handler.http, CreateMessage::new().content(chunk))
-                .await
-            {
-                warn!("could not mirror Discord voice transcript: {error}");
-                break;
+        let mirror_http = Arc::clone(&handler.http);
+        let mirror_task = tokio::spawn(async move {
+            for chunk in crate::event_handler::chunk_for_discord(&mirror) {
+                if let Err(error) = channel
+                    .send_message(&mirror_http, CreateMessage::new().content(chunk))
+                    .await
+                {
+                    warn!("could not mirror Discord voice transcript: {error}");
+                    break;
+                }
             }
-        }
+        });
         let audit = AuditCtx {
             session_id: turn_id.clone(),
             guild_id: Some(guild_id),
@@ -602,17 +609,9 @@ impl VoiceBridge {
             channel_id: Some(channel),
             owner_authorized: true,
         };
-        match handler.query.answer_turn(&audit, "", &transcript).await {
+        let answer = handler.query.answer_turn(&audit, "", &transcript).await;
+        match answer {
             Ok(answer) => {
-                for chunk in crate::event_handler::chunk_for_discord(&answer) {
-                    if let Err(error) = channel
-                        .send_message(&handler.http, CreateMessage::new().content(chunk))
-                        .await
-                    {
-                        warn!("could not mirror Discord voice reply: {error}");
-                        break;
-                    }
-                }
                 let final_spoken = handler.query.take_final_spoken(&turn_id);
                 if !final_spoken
                     && !answer.trim().is_empty()
@@ -631,8 +630,21 @@ impl VoiceBridge {
                         warn!("could not speak Discord voice reply: {error}");
                     }
                 }
+                // Preserve visible transcript-before-reply order without
+                // making Discord REST latency delay native work or audio.
+                let _ = mirror_task.await;
+                for chunk in crate::event_handler::chunk_for_discord(&answer) {
+                    if let Err(error) = channel
+                        .send_message(&handler.http, CreateMessage::new().content(chunk))
+                        .await
+                    {
+                        warn!("could not mirror Discord voice reply: {error}");
+                        break;
+                    }
+                }
             }
             Err(error) => {
+                let _ = mirror_task.await;
                 let _ = channel
                     .send_message(
                         &handler.http,
@@ -717,6 +729,16 @@ mod tests {
 
     struct FinalSpokenVoiceQuery(Arc<AtomicUsize>);
 
+    struct ImmediateVoiceQuery(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl QueryHandler for ImmediateVoiceQuery {
+        async fn answer(&self, _ctx: &AuditCtx, _question: &str) -> anyhow::Result<String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok("synthetic reply".into())
+        }
+    }
+
     #[async_trait::async_trait]
     impl QueryHandler for FinalSpokenVoiceQuery {
         async fn answer(&self, _ctx: &AuditCtx, _question: &str) -> anyhow::Result<String> {
@@ -773,6 +795,60 @@ mod tests {
             "self_deaf":false,"self_mute":false}}),
             &binding()
         ));
+    }
+
+    #[tokio::test]
+    async fn native_submission_does_not_wait_for_a_slow_discord_transcript_mirror() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voice.sock");
+        let _listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let bridge = VoiceBridge::connect(&path).await.unwrap();
+        let local = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = local.local_addr().unwrap();
+        let http = Arc::new(serenity::http::HttpBuilder::new("test-token")
+            .proxy(format!("http://{proxy}"))
+            .ratelimiter_disabled(true)
+            .build());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn(Arc::clone(&bridge).process_transcript(binding(),
+            TurnHandler { query: Arc::new(ImmediateVoiceQuery(Arc::clone(&calls))), http },
+            "voice:6:slow-mirror".into(), "hello".into()));
+        let (_request, _) = tokio::time::timeout(Duration::from_secs(1), local.accept())
+            .await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_millis(200), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn spoken_reply_does_not_wait_for_a_slow_discord_transcript_mirror() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voice.sock");
+        let sidecar = tokio::net::UnixListener::bind(&path).unwrap();
+        let bridge = VoiceBridge::connect(&path).await.unwrap();
+        let (sidecar_stream, _) = sidecar.accept().await.unwrap();
+        bridge.active.insert("1".into(), binding());
+        let local = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = local.local_addr().unwrap();
+        let http = Arc::new(serenity::http::HttpBuilder::new("test-token")
+            .proxy(format!("http://{proxy}"))
+            .ratelimiter_disabled(true)
+            .build());
+        let task = tokio::spawn(Arc::clone(&bridge).process_transcript(binding(),
+            TurnHandler { query: Arc::new(ImmediateVoiceQuery(Arc::new(AtomicUsize::new(0)))), http },
+            "voice:6:slow-audio".into(), "hello".into()));
+        let (_request, _) = tokio::time::timeout(Duration::from_secs(1), local.accept())
+            .await.unwrap().unwrap();
+        let mut lines = BufReader::new(sidecar_stream).lines();
+        let speak = tokio::time::timeout(Duration::from_millis(200), lines.next_line())
+            .await.unwrap().unwrap().unwrap();
+        let frame: Value = serde_json::from_str(&speak).unwrap();
+        assert_eq!(frame["kind"], "speak");
+        assert_eq!(frame["text"], "synthetic reply");
+        task.abort();
     }
 
     #[tokio::test]

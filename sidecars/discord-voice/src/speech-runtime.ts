@@ -60,13 +60,15 @@ class DiscordPlaybackSink implements PlaybackSink {
     this.subscription = subscription;
   }
 
-  async play(audio: AsyncIterable<Buffer>): Promise<void> {
+  async play(audio: AsyncIterable<Buffer>, onPlaybackStart?: () => void): Promise<void> {
     const source = new PassThrough({ highWaterMark: 65_536 });
     const converter = mono24ToStereo48();
     source.on('error', () => {});
     converter.on('error', () => {});
     converter.pipe(source);
     this.current = { source, converter };
+    const started = (): void => { onPlaybackStart?.(); };
+    this.player.once(AudioPlayerStatus.Playing, started);
     this.player.play(createAudioResource(source, { inputType: StreamType.Raw }));
     let received = false;
     try {
@@ -82,6 +84,7 @@ class DiscordPlaybackSink implements PlaybackSink {
       converter.end();
       await entersState(this.player, AudioPlayerStatus.Idle, 120_000);
     } finally {
+      this.player.off(AudioPlayerStatus.Playing, started);
       if (this.current?.converter === converter) this.current = undefined;
       converter.destroy();
       source.destroy();
@@ -276,7 +279,8 @@ export class VoiceAudio {
     this.committed.add(turnId);
     this.emit({ version: 1, kind: 'transcript', conversationId: this.binding.conversationId,
       generation: this.binding.generation, guildId: this.binding.guildId,
-      ownerId: this.binding.ownerId, turnId, text: event.text });
+      ownerId: this.binding.ownerId, turnId, text: event.text,
+      committedAtMs: Date.now() });
   }
 
   private fail(message: string): void {

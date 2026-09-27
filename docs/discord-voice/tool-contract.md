@@ -11,6 +11,8 @@ The native Codex and Claude turns load the `voice` stdio MCP server only while t
 
 `text` is nonempty and at most 12,000 UTF-8 bytes. `utterance_id` is 1–64 ASCII letters, digits, `.`, `_`, or `-`. Reusing an ID with identical text returns the existing receipt and never sends a second `speak` frame to the sidecar. Reusing it with different text fails. The literal ID `final` means the tool delivered the final answer for this turn; the normal final answer is then mirrored as text but not automatically played a second time. A different ID may be used for speech while the agent is still working. A receipt is asynchronous: `queued` does not prove audible playback; `speech_status` can report `queued`, `playing`, `completed`, `interrupted`, or `failed`. `mirrored:false` means the text mirror could not be posted; retry the same ID and text to retry the mirror without replaying audio.
 
+Sidecar receipts include `queuedAtMs` and, as stages occur, `ttsRequestedAtMs`, `ttsFirstByteAtMs`, `firstPlaybackAtMs`, and `stoppedAtMs` (Unix milliseconds). `firstPlaybackAtMs` records the Discord audio player's Playing transition; it is not proof that a remote listener heard a packet. `speech_status` is the way to retrieve later stages. The daemon logs the committed-transcript timestamp and native handler-dispatch timestamp under the turn ID without logging raw audio or transcript text. Actual provider/Discord latency gates still require live measurements.
+
 The model cannot provide a guild, text channel, voice channel, generation, native session, or capability token. The daemon issues a random per-turn grant to the stdio MCP process via its private configuration. The MCP facade forwards one JSON line to an owner-only Unix socket:
 
 ```json

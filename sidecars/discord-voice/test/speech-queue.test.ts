@@ -36,6 +36,36 @@ test('speech starts before synthesis completes and duplicate receipt never repla
   assert.equal(synthesisCalls, 1);
 });
 
+test('a five-second chunked stream records first playback before its last chunk', async () => {
+  let firstAudio!: () => void;
+  const first = new Promise<void>(resolve => { firstAudio = resolve; });
+  const chunks: number[] = [];
+  const queue = new SpeechQueue(async function* () {
+    yield Buffer.from([1, 0]);
+    await new Promise(resolve => setTimeout(resolve, 5_000));
+    yield Buffer.from([2, 0]);
+  }, { async play(audio, onPlaybackStart) {
+    for await (const chunk of audio) {
+      chunks.push(chunk.readInt16LE(0));
+      if (chunks.length === 1) {
+        onPlaybackStart?.();
+        firstAudio();
+      }
+    }
+  }, interrupt() {} });
+  const receipt = queue.speak('slow-stream', 'hello');
+  await first;
+  assert.deepEqual(chunks, [1]);
+  assert.equal(queue.status('slow-stream')?.status, 'playing');
+  assert.ok(receipt.ttsFirstByteAtMs !== undefined);
+  assert.ok(receipt.firstPlaybackAtMs !== undefined);
+  assert.ok(receipt.firstPlaybackAtMs! >= receipt.queuedAtMs);
+  await queue.whenDone('slow-stream');
+  assert.deepEqual(chunks, [1, 2]);
+  assert.equal(receipt.status, 'completed');
+  assert.ok(receipt.stoppedAtMs! - receipt.queuedAtMs >= 4_900);
+});
+
 test('interrupt stops playback and drops every late synthesis chunk', async () => {
   let releaseLate!: () => void;
   const late = new Promise<void>(resolve => { releaseLate = resolve; });
