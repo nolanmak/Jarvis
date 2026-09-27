@@ -75,3 +75,41 @@ test('ElevenLabs TTS yields PCM before the HTTP stream finishes', async () => {
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });
+
+for (const status of [401, 429, 500]) {
+  test(`Deepgram TTS surfaces HTTP ${status} handshake refusal`, async () => {
+    const server = new WebSocketServer({ host: '127.0.0.1', port: 0,
+      verifyClient: (_info, callback) => callback(false, status) });
+    await new Promise<void>(resolve => server.once('listening', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('expected TCP address');
+    try {
+      await assert.rejects(async () => {
+        for await (const _ of streamTts({ provider: 'deepgram', apiKey: 'synthetic-test-key',
+          text: 'hello', endpoint: `ws://127.0.0.1:${address.port}` })) { /* no audio expected */ }
+      }, new RegExp(`HTTP ${status}`));
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
+  test(`ElevenLabs TTS surfaces HTTP ${status} response failure`, async () => {
+    const server = createServer((_request, response) => {
+      response.writeHead(status);
+      response.end();
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('expected TCP address');
+    try {
+      await assert.rejects(async () => {
+        for await (const _ of streamTts({ provider: 'elevenlabs', apiKey: 'synthetic-test-key',
+          voiceId: 'voice-test', text: 'hello', endpoint: `http://127.0.0.1:${address.port}` })) {
+          /* no audio expected */
+        }
+      }, new RegExp(`HTTP ${status}`));
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+}

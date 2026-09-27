@@ -60,6 +60,23 @@ for (const provider of ['deepgram', 'elevenlabs'] as const) {
       await new Promise<void>(resolve => server.close(() => resolve()));
     }
   });
+
+  for (const status of [401, 429, 500]) {
+    test(`${provider} STT surfaces HTTP ${status} handshake refusal`, async () => {
+      const server = new WebSocketServer({ host: '127.0.0.1', port: 0,
+        verifyClient: (_info, callback) => callback(false, status) });
+      await new Promise<void>(resolve => server.once('listening', resolve));
+      const address = server.address();
+      if (!address || typeof address === 'string') throw new Error('expected TCP address');
+      try {
+        await assert.rejects(openSttSession({ provider, apiKey: 'synthetic-test-key',
+          endpoint: `ws://127.0.0.1:${address.port}`,
+          onEvent: () => {}, onError: () => {} }), new RegExp(`HTTP ${status}`));
+      } finally {
+        await new Promise<void>(resolve => server.close(() => resolve()));
+      }
+    });
+  }
 }
 
 test('cancelling STT closes its provider socket without waiting for a server event', async () => {

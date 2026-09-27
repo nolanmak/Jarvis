@@ -52,6 +52,8 @@ The sidecar also passes a 50-cycle fake-connection attach/detach test with exact
 
 For STT recovery, `speech-runtime.test.ts` initially failed with `STT reconnect timed out` after the first provider WebSocket closed. The passing test now observes two separately identified committed turns across a local provider disconnect/reconnect. A second test confirms that three failed retries end with one visible `audio_failure` and stopped state. Retries use 1/2/4 seconds in production, drop PCM while the provider is unavailable, and do not replay partial audio. The fake test uses shorter delays. A separate `stt.test.ts` test initially failed with `STT socket survived cancellation`; the passing version closes the provider socket promptly when voice stops. The reconnect test also exposed an FFmpeg child that could remain open after stop; resampler abort now closes its pipes, sends SIGTERM, and uses a 200 ms SIGKILL fallback. This remains synthetic local-provider evidence, not live Deepgram/ElevenLabs recovery.
 
+Local provider refusal fixtures now cover HTTP 401, 429, and 500 for each Deepgram/ElevenLabs STT and TTS adapter. Every adapter surfaces the status instead of producing a transcript or audio. These fixtures do not prove the vendors' live behavior or quota state.
+
 ## Required next gates
 
 1. Prove Discord DAVE join, owner audio receive/decode, and outbound playback in a test guild. Mocked adapter and native MCP tests cannot satisfy this gate.
