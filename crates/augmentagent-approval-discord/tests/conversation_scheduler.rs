@@ -76,4 +76,32 @@ async fn eleventh_pending_turn_is_rejected_without_silent_loss() {
     release.notify_one();
     assert!(first.await.unwrap().is_ok());
     for item in pending { assert!(item.await.unwrap().is_ok()); }
+    let retried = scheduler.submit("guild-1:text-1", "overflow", || async {
+        Ok("admitted after drain".into())
+    }).await.unwrap();
+    assert_eq!(retried, "admitted after drain");
+}
+
+#[tokio::test]
+async fn completed_answers_and_idle_conversations_have_bounded_memory_cache() {
+    let scheduler = ConversationScheduler::new();
+    for number in 0..200 {
+        scheduler.submit("guild-1:text-1", &format!("turn-{number}"), || async {
+            Ok("answer".repeat(100))
+        }).await.unwrap();
+    }
+    let old = scheduler.submit("guild-1:text-1", "turn-0", || async {
+        Ok("evicted answer".into())
+    }).await.unwrap();
+    assert_eq!(old, "evicted answer");
+
+    for number in 0..1100 {
+        scheduler.submit(&format!("guild-1:thread-{number}"), "turn", || async {
+            Ok("answer".into())
+        }).await.unwrap();
+    }
+    let old_thread = scheduler.submit("guild-1:thread-0", "turn", || async {
+        Ok("evicted thread".into())
+    }).await.unwrap();
+    assert_eq!(old_thread, "evicted thread");
 }

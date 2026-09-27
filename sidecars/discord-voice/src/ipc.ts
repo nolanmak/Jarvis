@@ -105,6 +105,7 @@ export class VoiceIpcServer {
       }
       let newline: number;
       while ((newline = pending.indexOf(10)) >= 0) {
+        if (socket.destroyed || this.client !== socket) return;
         const line = pending.subarray(0, newline);
         pending = pending.subarray(newline + 1);
         if (line.length > MAX_FRAME_BYTES) {

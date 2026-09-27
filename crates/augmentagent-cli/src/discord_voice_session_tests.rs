@@ -91,6 +91,60 @@ struct SessionFixture {
     calls: Arc<Mutex<Vec<(String, String)>>>,
 }
 
+struct LegacyProfileFixture;
+
+#[async_trait]
+impl Reasoner for LegacyProfileFixture {
+    async fn call(&self, _opts: &ReasonerOpts, _prompt: &str) -> anyhow::Result<String> {
+        Ok("legacy profile reply".into())
+    }
+}
+
+#[tokio::test]
+async fn voice_flag_preserves_unbound_qwen_and_glm_text_routes() {
+    let Ok(root) = std::env::var("VOICE_LEGACY_PROFILES_TEST_ROOT") else {
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "discord_voice_session_tests::voice_flag_preserves_unbound_qwen_and_glm_text_routes", "--nocapture"])
+            .env("VOICE_LEGACY_PROFILES_TEST_ROOT", dir.path())
+            .env("AUGMENTAGENT_MODEL_SELECTION_CONFIG", dir.path().join("selection.json"))
+            .env("AUGMENTAGENT_MODEL_QWEN_ENABLED", "1")
+            .env("AUGMENTAGENT_MODEL_GLM_ENABLED", "1")
+            .output().unwrap();
+        assert!(output.status.success(), "{}\n{}",
+            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        return;
+    };
+    let root = PathBuf::from(root);
+    let wiki = root.join("wiki");
+    std::fs::create_dir_all(&wiki).unwrap();
+    let store = Arc::new(Store::open(root.join("data.db")).unwrap());
+    let selection = augmentagent_channel_core::model_selection::SelectionStore::new(
+        root.join("selection.json"));
+    selection.set(Some("2"), Some(ProviderKind::Qwen)).unwrap();
+    selection.set(Some("3"), Some(ProviderKind::Glm)).unwrap();
+    let fixture = Arc::new(LegacyProfileFixture);
+    let reasoner = Arc::new(FallbackReasoner::for_tests(vec![
+        (ProviderKind::Qwen, fixture.clone() as Arc<dyn Reasoner>),
+        (ProviderKind::Glm, fixture as Arc<dyn Reasoner>),
+    ], augmentagent_channel_core::cooldown::CooldownLatch::at(root.join("cooldowns.json"))));
+    let handler = WikiQuerier {
+        reasoner, wiki_root: wiki, repo_root: root,
+        conversation_store: Some(Arc::clone(&store)),
+        conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()),
+        voice_enabled: true, voice_tools: std::sync::OnceLock::new(),
+        final_spoken_turns: dashmap::DashMap::new(),
+    };
+    for channel in [2, 3] {
+        let ctx = augmentagent_approval_discord::AuditCtx {
+            session_id: format!("{channel}:1"), guild_id: Some(1), http: None,
+            channel_id: Some(serenity::model::id::ChannelId::new(channel)), owner_authorized: true,
+        };
+        assert_eq!(handler.answer_turn(&ctx, "older text", "new text").await.unwrap(), "legacy profile reply");
+        assert!(store.discord_conversation("1", &channel.to_string()).unwrap().is_none());
+    }
+}
+
 #[async_trait]
 impl Reasoner for SessionFixture {
     async fn call(&self, _opts: &ReasonerOpts, prompt: &str) -> anyhow::Result<String> {
@@ -272,4 +326,14 @@ async fn failed_turn_without_native_id_is_not_replayed_after_restart() {
         assert!(handler.answer_turn(&ctx, "", "must not replay").await.is_err());
     }
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let handler = WikiQuerier {
+        reasoner, wiki_root: wiki, repo_root: root.clone(),
+        conversation_store: Some(Arc::new(Store::open(root.join("data.db")).unwrap())),
+        conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()),
+        voice_enabled: true, voice_tools: std::sync::OnceLock::new(),
+        final_spoken_turns: dashmap::DashMap::new(),
+    };
+    let next = augmentagent_approval_discord::AuditCtx { session_id: "2:2".into(), ..ctx };
+    assert!(handler.answer_turn(&next, "", "new turn after pre-launch failure").await.is_err());
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 }

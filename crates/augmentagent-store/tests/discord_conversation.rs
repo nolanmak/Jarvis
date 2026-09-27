@@ -29,16 +29,16 @@ fn binding_survives_restart_and_rejects_a_second_native_session() {
 
 #[test]
 fn same_native_session_cannot_be_bound_to_two_conversations() {
-    let file = tempfile::NamedTempFile::new().unwrap();
-    let store = Store::open(file.path()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("test.db")).unwrap();
     store.bind_discord_conversation(&conversation("thread-1", "session-1")).unwrap();
     assert!(store.bind_discord_conversation(&conversation("thread-2", "session-1")).is_err());
 }
 
 #[test]
 fn invalid_bindings_never_persist() {
-    let file = tempfile::NamedTempFile::new().unwrap();
-    let store = Store::open(file.path()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("test.db")).unwrap();
     let mut invalid = conversation("thread-1", "session-1");
     invalid.native_session_id.clear();
     assert!(store.bind_discord_conversation(&invalid).is_err());

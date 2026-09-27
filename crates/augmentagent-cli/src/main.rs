@@ -9544,8 +9544,12 @@ impl QueryHandler for WikiQuerier {
                 bound
             } else {
                 let selected = selection.unwrap_or(ProviderKind::Claude);
-                anyhow::ensure!(matches!(selected, ProviderKind::Claude | ProviderKind::Codex),
-                    "Discord voice conversations currently require Claude or Codex");
+                if !matches!(selected, ProviderKind::Claude | ProviderKind::Codex) {
+                    // The voice flag does not migrate unrelated model profiles.
+                    // Keep their existing text route until the owner explicitly
+                    // selects a native Claude/Codex conversation.
+                    return self.answer(ctx, &legacy_prompt()).await;
+                }
                 selected
             };
             let session = NativeSession::from_id(provider,
@@ -9562,15 +9566,18 @@ impl QueryHandler for WikiQuerier {
                         guild_id: guild.clone(), channel_id: channel.clone(),
                         provider: provider.name().to_string(), native_session_id: id,
                         cwd: self.wiki_root.to_string_lossy().into_owned(),
-                        uncertain: answer.is_err() || session.is_uncertain(),
+                        uncertain: session.is_uncertain(),
                     })?;
-                } else if answer.is_err() || session.is_uncertain() {
+                } else if session.is_uncertain() {
                     store.mark_discord_conversation_uncertain(&guild, &channel)?;
                 }
             }
+            // A refusal before NativeSession::begin has no native side effects.
+            // Preserve this turn ID as consumed, but let a later turn proceed.
+            // A dropped lease marks the session uncertain and blocks replay.
             store.finish_discord_turn(
                 &guild, &channel, &ctx.session_id,
-                answer.is_ok() && !session.is_uncertain(),
+                !session.is_uncertain(),
             )?;
             answer
         }).await.map_err(anyhow::Error::msg)
