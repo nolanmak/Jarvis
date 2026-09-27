@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -69,6 +69,65 @@ pub struct Store {
 }
 
 impl Store {
+    /// Claim a Discord text or finalized speech turn before invoking a native
+    /// agent. A pending/uncertain row after restart blocks automatic replay.
+    pub fn claim_discord_turn(
+        &self,
+        guild_id: &str,
+        channel_id: &str,
+        turn_id: &str,
+    ) -> StoreResult<()> {
+        if [guild_id, channel_id, turn_id].iter().any(|value| value.trim().is_empty()) {
+            return Err(StoreError::InvalidInput("Discord turn identity is required".into()));
+        }
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let unfinished: Option<String> = tx.query_row(
+            "SELECT turn_id FROM discord_native_turns \
+             WHERE guild_id = ?1 AND channel_id = ?2 AND status != 'complete' LIMIT 1",
+            params![guild_id, channel_id],
+            |row| row.get(0),
+        ).optional()?;
+        if let Some(prior) = unfinished {
+            return Err(StoreError::InvalidInput(format!(
+                "Discord native turn {prior} is uncertain; inspect it before continuing"
+            )));
+        }
+        let inserted = tx.execute(
+            "INSERT INTO discord_native_turns \
+             (guild_id, channel_id, turn_id, status, created_at_ms) \
+             VALUES (?1, ?2, ?3, 'pending', ?4) \
+             ON CONFLICT(guild_id, channel_id, turn_id) DO NOTHING",
+            params![guild_id, channel_id, turn_id, now_millis()],
+        )?;
+        if inserted == 0 {
+            return Err(StoreError::InvalidInput("Discord native turn was already submitted".into()));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Only the native runner that claimed a pending turn can resolve it.
+    pub fn finish_discord_turn(
+        &self,
+        guild_id: &str,
+        channel_id: &str,
+        turn_id: &str,
+        success: bool,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let status = if success { "complete" } else { "uncertain" };
+        let changed = guard.execute(
+            "UPDATE discord_native_turns SET status = ?4, finished_at_ms = ?5 \
+             WHERE guild_id = ?1 AND channel_id = ?2 AND turn_id = ?3 AND status = 'pending'",
+            params![guild_id, channel_id, turn_id, status, now_millis()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidInput("Discord native turn is not pending".into()));
+        }
+        Ok(())
+    }
+
     /// First writer wins. A voice join may repeat the exact binding, but may
     /// not silently fork a text conversation or bind one native session twice.
     pub fn bind_discord_conversation(&self, binding: &DiscordConversation) -> StoreResult<()> {
@@ -362,6 +421,19 @@ impl Store {
                 PRIMARY KEY(guild_id, channel_id),\
                 UNIQUE(provider, native_session_id)\
             )",
+        )?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS discord_native_turns (\
+                guild_id TEXT NOT NULL,\
+                channel_id TEXT NOT NULL,\
+                turn_id TEXT NOT NULL,\
+                status TEXT NOT NULL CHECK(status IN ('pending', 'complete', 'uncertain')),\
+                created_at_ms INTEGER NOT NULL,\
+                finished_at_ms INTEGER,\
+                PRIMARY KEY(guild_id, channel_id, turn_id)\
+            );\
+            CREATE INDEX IF NOT EXISTS idx_discord_native_turns_unfinished \
+            ON discord_native_turns(guild_id, channel_id, status)",
         )?;
         // -------------------------------------------------------------------
         // #45 — Rust-owned schema. Mirrors `src/db.ts::initDb()` exactly

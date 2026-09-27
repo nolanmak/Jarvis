@@ -9519,6 +9519,10 @@ impl QueryHandler for WikiQuerier {
             let session = NativeSession::from_id(provider,
                 binding.as_ref().map(|item| item.native_session_id.clone()))?;
             let prompt = if binding.is_some() { current.to_string() } else { legacy_prompt() };
+            // Persist the claim before the CLI can run tools. If the daemon
+            // dies before recording a result or native ID, restart must not
+            // silently submit this Discord turn a second time.
+            store.claim_discord_turn(&guild, &channel, &ctx.session_id)?;
             let answer = CURRENT.scope(Arc::clone(&session), self.answer(ctx, &prompt)).await;
             if let Some(id) = session.id() {
                 if binding.is_none() {
@@ -9532,6 +9536,10 @@ impl QueryHandler for WikiQuerier {
                     store.mark_discord_conversation_uncertain(&guild, &channel)?;
                 }
             }
+            store.finish_discord_turn(
+                &guild, &channel, &ctx.session_id,
+                answer.is_ok() && !session.is_uncertain(),
+            )?;
             answer
         }).await.map_err(anyhow::Error::msg)
     }

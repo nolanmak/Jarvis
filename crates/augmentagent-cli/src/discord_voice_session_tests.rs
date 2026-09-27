@@ -139,3 +139,50 @@ async fn uncertain_native_turn_is_persisted_and_blocks_replay() {
     let second = handler.answer_turn(&ctx, "", "do not replay").await.unwrap_err();
     assert!(second.to_string().contains("uncertain turn"));
 }
+
+struct NoIdFixture(Arc<std::sync::atomic::AtomicUsize>);
+
+#[async_trait]
+impl Reasoner for NoIdFixture {
+    async fn call(&self, _opts: &ReasonerOpts, _prompt: &str) -> anyhow::Result<String> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        anyhow::bail!("synthetic transport failure before session identity was observed")
+    }
+}
+
+#[tokio::test]
+async fn failed_turn_without_native_id_is_not_replayed_after_restart() {
+    let Ok(root) = std::env::var("VOICE_NO_ID_TEST_ROOT") else {
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "discord_voice_session_tests::failed_turn_without_native_id_is_not_replayed_after_restart", "--nocapture"])
+            .env("VOICE_NO_ID_TEST_ROOT", dir.path())
+            .env("AUGMENTAGENT_MODEL_SELECTION_CONFIG", dir.path().join("selection.json"))
+            .output().unwrap();
+        assert!(output.status.success(), "{}\n{}",
+            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        return;
+    };
+    let root = PathBuf::from(root);
+    let wiki = root.join("wiki");
+    std::fs::create_dir_all(&wiki).unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reasoner = Arc::new(FallbackReasoner::for_tests(
+        vec![(ProviderKind::Claude, Arc::new(NoIdFixture(Arc::clone(&calls))))],
+        augmentagent_channel_core::cooldown::CooldownLatch::at(root.join("cooldowns.json")),
+    ));
+    let ctx = augmentagent_approval_discord::AuditCtx {
+        session_id: "2:1".into(), guild_id: Some(1), http: None,
+        channel_id: Some(serenity::model::id::ChannelId::new(2)), owner_authorized: true,
+    };
+    for _ in 0..2 {
+        let handler = WikiQuerier {
+            reasoner: Arc::clone(&reasoner), wiki_root: wiki.clone(), repo_root: root.clone(),
+            conversation_store: Some(Arc::new(Store::open(root.join("data.db")).unwrap())),
+            conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()),
+            voice_enabled: true,
+        };
+        assert!(handler.answer_turn(&ctx, "", "must not replay").await.is_err());
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}

@@ -58,3 +58,33 @@ fn uncertain_native_turn_survives_restart_and_cannot_be_rebound_as_active() {
     assert!(reopened.discord_conversation("guild-1", "thread-1").unwrap().unwrap().uncertain);
     assert!(reopened.bind_discord_conversation(&binding).is_err());
 }
+
+#[test]
+fn pending_turn_survives_restart_and_prevents_replay_without_a_native_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    let store = Store::open(&path).unwrap();
+    store.claim_discord_turn("guild-1", "thread-1", "message-1").unwrap();
+    drop(store);
+
+    let reopened = Store::open(&path).unwrap();
+    assert!(reopened.claim_discord_turn("guild-1", "thread-1", "message-1").is_err());
+    assert!(reopened.claim_discord_turn("guild-1", "thread-1", "message-2").is_err());
+    reopened.claim_discord_turn("guild-1", "thread-2", "message-3").unwrap();
+}
+
+#[test]
+fn completed_turn_allows_next_turn_but_rejects_duplicate_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    let store = Store::open(&path).unwrap();
+    store.claim_discord_turn("guild-1", "thread-1", "message-1").unwrap();
+    store.finish_discord_turn("guild-1", "thread-1", "message-1", true).unwrap();
+    drop(store);
+
+    let reopened = Store::open(&path).unwrap();
+    assert!(reopened.claim_discord_turn("guild-1", "thread-1", "message-1").is_err());
+    reopened.claim_discord_turn("guild-1", "thread-1", "message-2").unwrap();
+    reopened.finish_discord_turn("guild-1", "thread-1", "message-2", false).unwrap();
+    assert!(reopened.claim_discord_turn("guild-1", "thread-1", "message-3").is_err());
+}
