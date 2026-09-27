@@ -1,0 +1,62 @@
+name: Discord voice
+
+on:
+  pull_request:
+    paths:
+      - 'sidecars/discord-voice/**'
+      - 'crates/augmentagent-approval-discord/**'
+      - 'crates/augmentagent-channel-core/**'
+      - 'crates/augmentagent-cli/**'
+      - 'crates/augmentagent-store/**'
+      - 'docs/discord-voice/**'
+      - 'systemd/augmentagent-discord-voice.service'
+      - '.github/workflows/discord-voice.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'sidecars/discord-voice/**'
+      - 'crates/augmentagent-approval-discord/**'
+      - 'crates/augmentagent-channel-core/**'
+      - 'crates/augmentagent-cli/**'
+      - 'crates/augmentagent-store/**'
+      - 'docs/discord-voice/**'
+      - 'systemd/augmentagent-discord-voice.service'
+      - '.github/workflows/discord-voice.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  sidecar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: sidecars/discord-voice
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.17.0'
+          cache: npm
+          cache-dependency-path: sidecars/discord-voice/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm audit --omit=optional --audit-level=high
+      # Live calls require a disposable guild and provider credentials. They
+      # remain explicit opt-in verification, never synthetic CI success.
+
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: discord-voice
+      - run: cargo test -p augmentagent-approval-discord -p augmentagent-channel-core -p augmentagent-store --locked
+      - run: cargo test -p augmentagent-cli --bin augmentagent --locked -- --test-threads=1
