@@ -1,5 +1,6 @@
 import { once } from 'node:events';
 import { PassThrough } from 'node:stream';
+import { setTimeout as wait } from 'node:timers/promises';
 import {
   AudioPlayerStatus, EndBehaviorType, NoSubscriberBehavior, StreamType,
   VoiceConnectionStatus, createAudioPlayer, createAudioResource, entersState,
@@ -19,6 +20,10 @@ export type SpeechConfig = {
   sttKey: string;
   ttsKey: string;
   elevenLabsVoiceId?: string;
+  /** Test transport only; production leaves this unset. */
+  sttEndpoint?: string;
+  /** Test clock only; production uses 1/2/4 seconds. */
+  sttRetryDelays?: readonly number[];
 };
 
 function provider(value: string | undefined): SttProvider {
@@ -109,8 +114,11 @@ export class VoiceAudio {
   private finalCounter = 0;
   private readonly committed = new Set<string>();
   private pcmCarry?: number;
+  private sttEpoch = 0;
+  private readonly retryAbort = new AbortController();
+  private recovery?: Promise<void>;
   private closed = false;
-  private state: 'connecting' | 'listening' | 'failed' | 'stopped' = 'connecting';
+  private state: 'connecting' | 'listening' | 'reconnecting' | 'failed' | 'stopped' = 'connecting';
 
   constructor(
     private readonly connection: VoiceConnection,
@@ -131,11 +139,12 @@ export class VoiceAudio {
     try {
       await entersState(this.connection, VoiceConnectionStatus.Ready, 20_000);
       if (this.closed) return;
-      this.stt = await openSttSession({
-        provider: this.config.sttProvider, apiKey: this.config.sttKey,
-        onEvent: event => this.onSttEvent(event),
-        onError: error => this.fail(error.message),
-      });
+      try {
+        this.stt = await this.openStt(0);
+      } catch (error) {
+        await this.recoverStt(error instanceof Error ? error.message : 'STT connection failed');
+      }
+      if (!this.stt) return;
       if (this.closed) { this.stt.close(); return; }
       const receiver = this.connection.receiver.subscribe(this.binding.ownerId, {
         end: { behavior: EndBehaviorType.Manual },
@@ -171,6 +180,7 @@ export class VoiceAudio {
   stop(): void {
     if (this.closed) return;
     this.closed = true;
+    this.retryAbort.abort();
     this.state = 'stopped';
     if (this.cap) clearTimeout(this.cap);
     this.speech.stop();
@@ -179,6 +189,7 @@ export class VoiceAudio {
     this.decoder?.destroy();
     this.resampler?.abort();
     this.stt?.close();
+    this.stt = undefined;
     this.emitStatus();
   }
 
@@ -192,12 +203,63 @@ export class VoiceAudio {
         this.stt.writePcm(pcm.subarray(offset, Math.min(offset + 2560, even)));
       }
     } catch (error) {
-      this.fail(error instanceof Error ? error.message : 'STT audio forwarding failed');
+      if (error instanceof Error && error.message === 'STT stream is closed') {
+        this.onSttFailure(error.message, this.sttEpoch);
+      } else {
+        this.fail(error instanceof Error ? error.message : 'STT audio forwarding failed');
+      }
     }
   }
 
-  private onSttEvent(event: SttEvent): void {
-    if (this.closed) return;
+  private async openStt(epoch: number): Promise<SttSession> {
+    this.sttEpoch = epoch;
+    const session = await openSttSession({
+      provider: this.config.sttProvider, apiKey: this.config.sttKey,
+      endpoint: this.config.sttEndpoint,
+      signal: this.retryAbort.signal,
+      onEvent: event => this.onSttEvent(event, epoch),
+      onError: error => this.onSttFailure(error.message, epoch),
+    });
+    return session;
+  }
+
+  private onSttFailure(message: string, epoch: number): void {
+    if (this.closed || epoch !== this.sttEpoch || this.recovery) return;
+    this.stt?.close();
+    this.stt = undefined;
+    this.speechActive = false;
+    this.pcmCarry = undefined;
+    if (this.cap) clearTimeout(this.cap);
+    this.speech.interrupt();
+    this.recovery = this.recoverStt(message);
+    void this.recovery.finally(() => { this.recovery = undefined; });
+  }
+
+  private async recoverStt(initialError: string): Promise<void> {
+    this.state = 'reconnecting';
+    this.emitStatus();
+    let lastError = initialError;
+    for (const milliseconds of this.config.sttRetryDelays ?? [1000, 2000, 4000]) {
+      try {
+        await wait(milliseconds, undefined, { signal: this.retryAbort.signal });
+      } catch { return; }
+      if (this.closed) return;
+      try {
+        const session = await this.openStt(this.sttEpoch + 1);
+        if (this.closed) { session.close(); return; }
+        this.stt = session;
+        this.state = 'listening';
+        this.emitStatus();
+        return;
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : 'STT reconnect failed';
+      }
+    }
+    this.fail(`STT stopped after three reconnect attempts: ${lastError}`);
+  }
+
+  private onSttEvent(event: SttEvent, epoch: number): void {
+    if (this.closed || epoch !== this.sttEpoch) return;
     if (event.kind === 'speech_start' || (event.kind === 'partial' && !this.speechActive)) {
       this.speechActive = true;
       this.speech.interrupt();
@@ -207,7 +269,9 @@ export class VoiceAudio {
     this.speechActive = false;
     if (this.cap) clearTimeout(this.cap);
     const index = event.turnIndex ?? this.finalCounter++;
-    const turnId = `voice:${this.binding.generation}:${index}`;
+    const turnId = epoch === 0
+      ? `voice:${this.binding.generation}:${index}`
+      : `voice:${this.binding.generation}:r${epoch}:${index}`;
     if (this.committed.has(turnId)) return;
     this.committed.add(turnId);
     this.emit({ version: 1, kind: 'transcript', conversationId: this.binding.conversationId,

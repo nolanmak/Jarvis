@@ -58,11 +58,14 @@ export function resampleDiscordPcmForStt(): SttResampler {
     '-f', 's16le', '-ar', '16000', '-ac', '1', 'pipe:1',
   ], { stdio: ['pipe', 'pipe', 'pipe'] });
   let stderr = '';
+  let aborted = false;
+  let forceKill: ReturnType<typeof setTimeout> | undefined;
   child.stderr.on('data', (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-4096); });
   const exit = new Promise<void>((resolve, reject) => {
     child.once('error', reject);
     child.once('exit', (code, signal) => {
-      if (code === 0 || signal === 'SIGTERM') resolve();
+      if (forceKill) clearTimeout(forceKill);
+      if (aborted || code === 0 || signal === 'SIGTERM') resolve();
       else reject(new Error(`FFmpeg resampling failed (${code ?? signal}): ${stderr}`));
     });
   });
@@ -73,6 +76,15 @@ export function resampleDiscordPcmForStt(): SttResampler {
       if (!child.stdin.writableEnded) child.stdin.end();
       await exit;
     },
-    abort(): void { child.kill('SIGTERM'); },
+    abort(): void {
+      if (aborted) return;
+      aborted = true;
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      child.kill('SIGTERM');
+      forceKill = setTimeout(() => child.kill('SIGKILL'), 200);
+      forceKill.unref();
+    },
   };
 }

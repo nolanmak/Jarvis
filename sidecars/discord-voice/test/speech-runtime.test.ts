@@ -1,0 +1,88 @@
+import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import test from 'node:test';
+import { VoiceConnectionStatus, type VoiceConnection } from '@discordjs/voice';
+import { WebSocketServer } from 'ws';
+import { VoiceAudio, type SpeechConfig } from '../src/speech-runtime.js';
+import type { StartFrame } from '../src/protocol.js';
+
+const binding: StartFrame = { version: 1, kind: 'start', requestId: 'request-1',
+  guildId: 'guild-1', channelId: 'voice-1', conversationId: 'text-1',
+  ownerId: 'owner-1', botUserId: 'bot-1', generation: 7 };
+
+function fakeConnection(): VoiceConnection {
+  return Object.assign(new EventEmitter(), {
+    state: { status: VoiceConnectionStatus.Ready },
+    subscribe: () => ({ unsubscribe() {} }),
+    receiver: { subscribe: () => new PassThrough() },
+  }) as unknown as VoiceConnection;
+}
+
+test('STT disconnect reconnects without replaying or suppressing a later turn', async () => {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await new Promise<void>(resolve => server.once('listening', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('expected TCP address');
+  let connections = 0;
+  server.on('connection', socket => {
+    connections++;
+    socket.send(JSON.stringify({ type: 'TurnInfo', event: 'EndOfTurn', turn_index: 0,
+      transcript: connections === 1 ? 'first phrase' : 'second phrase' }));
+    if (connections === 1) setTimeout(() => socket.close(), 10);
+  });
+  const config: SpeechConfig = { sttProvider: 'deepgram', ttsProvider: 'deepgram',
+    sttKey: 'synthetic-key', ttsKey: 'synthetic-key',
+    sttEndpoint: `ws://127.0.0.1:${address.port}`, sttRetryDelays: [10, 20, 40] };
+  const frames: Array<Record<string, unknown>> = [];
+  const audio = new VoiceAudio(fakeConnection(), binding, config, frame => {
+    frames.push(frame as Record<string, unknown>);
+    return true;
+  });
+  try {
+    await audio.start();
+    await new Promise<void>((resolve, reject) => {
+      const interval = setInterval(() => {
+        if (frames.filter(frame => frame.kind === 'transcript').length === 2) {
+          clearInterval(interval);
+          clearTimeout(deadline);
+          resolve();
+        }
+      }, 5);
+      const deadline = setTimeout(() => {
+        clearInterval(interval);
+        reject(new Error(`STT reconnect timed out: connections=${connections} frames=${JSON.stringify(frames)}`));
+      }, 500);
+    });
+    assert.equal(connections, 2);
+    assert.deepEqual(frames.filter(frame => frame.kind === 'transcript').map(frame => frame.text),
+      ['first phrase', 'second phrase']);
+    const turnIds = frames.filter(frame => frame.kind === 'transcript').map(frame => frame.turnId);
+    assert.equal(new Set(turnIds).size, 2);
+    assert.equal(audio.status, 'listening');
+  } finally {
+    audio.stop();
+    for (const client of server.clients) client.terminate();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('three failed STT reconnect attempts end with one visible failure and stopped audio', async () => {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await new Promise<void>(resolve => server.once('listening', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('expected TCP address');
+  await new Promise<void>(resolve => server.close(() => resolve()));
+  const frames: Array<Record<string, unknown>> = [];
+  const audio = new VoiceAudio(fakeConnection(), binding, {
+    sttProvider: 'deepgram', ttsProvider: 'deepgram',
+    sttKey: 'synthetic-key', ttsKey: 'synthetic-key',
+    sttEndpoint: `ws://127.0.0.1:${address.port}`, sttRetryDelays: [10, 20, 40],
+  }, frame => { frames.push(frame as Record<string, unknown>); return true; });
+  await audio.start();
+  assert.equal(audio.status, 'stopped');
+  assert.equal(frames.filter(frame => frame.kind === 'audio_failure').length, 1);
+  assert.ok(frames.some(frame => frame.kind === 'audio_status' && frame.state === 'reconnecting'));
+  assert.ok(frames.some(frame => frame.kind === 'audio_status' && frame.state === 'stopped'));
+  assert.equal(frames.filter(frame => frame.kind === 'transcript').length, 0);
+});

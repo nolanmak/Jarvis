@@ -50,11 +50,13 @@ The selected tool calls and results are checked in as [native-mcp-probe-2026-09-
 
 The sidecar also passes a 50-cycle fake-connection attach/detach test with exactly 50 destroys and no retained binding after each stop. This covers the coordinator handle boundary only. It does not yet prove that 50 real Discord receivers, provider sockets, and playback jobs are released.
 
+For STT recovery, `speech-runtime.test.ts` initially failed with `STT reconnect timed out` after the first provider WebSocket closed. The passing test now observes two separately identified committed turns across a local provider disconnect/reconnect. A second test confirms that three failed retries end with one visible `audio_failure` and stopped state. Retries use 1/2/4 seconds in production, drop PCM while the provider is unavailable, and do not replay partial audio. The fake test uses shorter delays. A separate `stt.test.ts` test initially failed with `STT socket survived cancellation`; the passing version closes the provider socket promptly when voice stops. The reconnect test also exposed an FFmpeg child that could remain open after stop; resampler abort now closes its pipes, sends SIGTERM, and uses a 200 ms SIGKILL fallback. This remains synthetic local-provider evidence, not live Deepgram/ElevenLabs recovery.
+
 ## Required next gates
 
 1. Prove Discord DAVE join, owner audio receive/decode, and outbound playback in a test guild. Mocked adapter and native MCP tests cannot satisfy this gate.
 2. Prove Deepgram and ElevenLabs STT/TTS live, including a mixed pair. Provider keys are absent from the checked daemon `.env`; do not count contract tests as live compatibility.
-3. Complete the audio fixtures, measured interruption/latency gates, provider-stream recovery and real process-crash/restart proof, 50-cycle cleanup, and full acceptance-ID evidence. Confirm typed/voice approval and attachment parity in the live path.
+3. Complete the audio fixtures, measured interruption/latency gates, live provider-stream recovery and real process-crash/restart proof, 50-cycle cleanup, and full acceptance-ID evidence. Confirm typed/voice approval and attachment parity in the live path.
 4. Confirm the new sidecar/Rust CI workflow is green and complete full CLI QA. The Linux service, config example, setup guide, read-only doctor, and opt-in operator live recorder are checked in. The doctor checks local readiness; the recorder marks observations unverified. Neither is live audio evidence until run in a test guild and corroborated with logs and session traces. Keep the PR draft until AC01–AC12 and CI are green.
 
 ## Rollback

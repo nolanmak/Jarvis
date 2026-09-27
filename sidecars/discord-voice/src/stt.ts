@@ -10,6 +10,7 @@ export type SttOptions = {
   apiKey: string;
   onEvent(event: SttEvent): void;
   onError(error: Error): void;
+  signal?: AbortSignal;
   /** Local contract servers supply an endpoint; production uses vendor URLs. */
   endpoint?: string;
 };
@@ -38,36 +39,58 @@ export async function openSttSession(options: SttOptions): Promise<SttSession> {
     headers, handshakeTimeout: 5_000, maxPayload: 131_072, perMessageDeflate: false,
   });
   let closed = false;
-  await new Promise<void>((resolve, reject) => {
-    const onOpen = (): void => {
-      socket.off('error', onHandshakeError);
-      socket.off('unexpected-response', onUnexpectedResponse);
-      resolve();
-    };
-    const onUnexpectedResponse = (_request: unknown, response: { statusCode?: number }): void => {
-      closed = true;
-      socket.terminate();
-      reject(new Error(`${options.provider} STT handshake failed (HTTP ${response.statusCode})`));
-    };
-    const onHandshakeError = (): void => {
-      closed = true;
-      reject(new Error(`${options.provider} STT connection failed`));
-    };
-    socket.once('open', onOpen);
-    socket.once('unexpected-response', onUnexpectedResponse);
-    socket.once('error', onHandshakeError);
-  });
+  let rejectHandshake: ((error: Error) => void) | undefined;
+  const abort = (): void => {
+    if (closed) return;
+    closed = true;
+    socket.terminate();
+    rejectHandshake?.(new Error('STT connection cancelled'));
+  };
+  // A provider may emit its first turn frame in the same event-loop tick as
+  // the handshake. Register before awaiting open so that frame is not lost.
   socket.on('message', (data: RawData, binary: boolean) => {
     if (closed || binary) return;
     const event = parseSttEvent(options.provider, data.toString());
     if (event) options.onEvent(event);
   });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      rejectHandshake = reject;
+      const onOpen = (): void => {
+        socket.off('error', onHandshakeError);
+        socket.off('unexpected-response', onUnexpectedResponse);
+        resolve();
+      };
+      const onUnexpectedResponse = (_request: unknown, response: { statusCode?: number }): void => {
+        closed = true;
+        socket.terminate();
+        reject(new Error(`${options.provider} STT handshake failed (HTTP ${response.statusCode})`));
+      };
+      const onHandshakeError = (): void => {
+        closed = true;
+        reject(new Error(`${options.provider} STT connection failed`));
+      };
+      socket.once('open', onOpen);
+      socket.once('unexpected-response', onUnexpectedResponse);
+      socket.once('error', onHandshakeError);
+      options.signal?.addEventListener('abort', abort, { once: true });
+      if (options.signal?.aborted) abort();
+    });
+  } catch (error) {
+    options.signal?.removeEventListener('abort', abort);
+    socket.terminate();
+    throw error;
+  } finally {
+    rejectHandshake = undefined;
+  }
+  if (closed) throw new Error('STT connection cancelled');
   socket.on('error', () => {
     if (!closed) options.onError(new Error(`${options.provider} STT stream failed`));
   });
   socket.on('close', () => {
     if (!closed) options.onError(new Error(`${options.provider} STT stream disconnected`));
     closed = true;
+    options.signal?.removeEventListener('abort', abort);
   });
   return {
     writePcm(chunk: Buffer): void {
@@ -85,6 +108,7 @@ export async function openSttSession(options: SttOptions): Promise<SttSession> {
     close(): void {
       if (closed) return;
       closed = true;
+      options.signal?.removeEventListener('abort', abort);
       if (socket.readyState === WebSocket.OPEN) socket.close(1000);
       else socket.terminate();
     },

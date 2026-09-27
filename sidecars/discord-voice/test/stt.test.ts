@@ -61,3 +61,26 @@ for (const provider of ['deepgram', 'elevenlabs'] as const) {
     }
   });
 }
+
+test('cancelling STT closes its provider socket without waiting for a server event', async () => {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await new Promise<void>(resolve => server.once('listening', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('expected TCP address');
+  const closed = new Promise<void>(resolve => {
+    server.once('connection', socket => socket.once('close', resolve));
+  });
+  const controller = new AbortController();
+  const session = await openSttSession({ provider: 'deepgram', apiKey: 'synthetic-test-key',
+    endpoint: `ws://127.0.0.1:${address.port}`, signal: controller.signal,
+    onEvent: () => {}, onError: () => {} });
+  try {
+    controller.abort();
+    await Promise.race([closed,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('STT socket survived cancellation')), 200))]);
+  } finally {
+    session.close();
+    for (const client of server.clients) client.terminate();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});

@@ -517,7 +517,7 @@ impl VoiceBridge {
                         });
                     }
                 } else if let Some(state) = frame.get("state").and_then(Value::as_str) {
-                    if matches!(state, "connecting" | "listening" | "stopped" | "failed") {
+                    if matches!(state, "connecting" | "listening" | "reconnecting" | "stopped" | "failed") {
                         self.audio_states
                             .insert(binding.guild_id, state.to_string());
                     }
