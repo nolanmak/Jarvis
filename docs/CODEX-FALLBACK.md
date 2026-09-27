@@ -975,16 +975,14 @@ What it never touches, and for how long:
   Every other reading keeps the marker: an unreadable, linked, oversized or
   truncated marker, an unreadable boot id, a cgroup that still holds a process
   or cannot be read, and every pre-#1071 marker (no writer identity, so no
-  proof can apply). `doctor` counts pre-upgrade markers apart from the other
-  doubtful ones so that backlog is visible as it drains; a marker it finds
-  *clearable* is a warning instead, since the start-up pass should have taken
-  it. Clearing removes only the marker: the journal keeps its `started` row, so
-  the request becomes idle to the sweep but stays *unfinished* and still needs
-  the recovery command above. The daemon also handles SIGTERM, so a stop or
-  restart cancels in-flight calls and then *waits* — up to 30s — for every
-  channel task to unwind and drop its `ProcessGroup`, which is what retires the
-  markers; keep `TimeoutStopSec` above that drain. The orphan pass covers what
-  the drain cannot: SIGKILL, a timed-out drain, OOM, power loss.
+  proof can apply). Clearing removes only the marker: the journal keeps its
+  `started` row, so the request becomes idle to the sweep but stays
+  *unfinished* and still needs the recovery command above. The daemon also
+  handles SIGTERM, so a stop or restart cancels in-flight calls and then
+  *waits* — up to 30s — for every channel task to unwind and drop its
+  `ProcessGroup`, which is what retires the markers; keep `TimeoutStopSec`
+  above that drain. The orphan pass covers what the drain cannot: SIGKILL, a
+  timed-out drain, OOM, power loss.
 
 Do not delete handoff state by hand.
 

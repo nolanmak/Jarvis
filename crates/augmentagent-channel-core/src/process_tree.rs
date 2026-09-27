@@ -176,12 +176,11 @@ fn marker_receipt(marker: &std::path::Path) -> std::io::Result<PathBuf> {
 }
 
 /// What a caller offers as proof that no descendant of the call can still be
-/// running. Neither proof subsumes the other, so both exist.
+/// running: the supervisor's `all-descendants-reaped` receipt, read by the
+/// caller that observed the reaping, or — with no receipt left — that the
+/// writer itself is gone (#1071). Neither subsumes the other.
 enum Proof<'a> {
-    /// The supervisor's `all-descendants-reaped` receipt, read by the caller,
-    /// which observed the reaping directly.
     Reaped(&'a std::path::Path),
-    /// No receipt left: prove instead that the writer is gone (#1071).
     WriterGone(&'a LivenessEnv),
 }
 
@@ -216,8 +215,7 @@ fn retire_request(marker: &std::path::Path, receipt: &std::path::Path) -> std::i
 /// Whether a call's descendants can still be running (#1071). Only `Dead` (no
 /// process from that call can survive) clears the marker; `Live` means its
 /// writer is still running, `Legacy` a pre-#1071 marker with no identity to
-/// judge (counted apart for `doctor`), `Unproven` an unreadable marker or an
-/// incomplete proof.
+/// judge, `Unproven` an unreadable marker or an incomplete proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Liveness { Dead, Live, Legacy, Unproven }
 
@@ -333,10 +331,9 @@ fn call_provably_dead(marker: &std::path::Path, env: &LivenessEnv) -> Liveness {
 /// Who wrote a marker, as recorded by [`begin_request`].
 struct Writer { boot_id: String, pid: libc::pid_t, start: u64, cgroup: String, cgroup_inode: u64 }
 
-/// What a marker says about its writer. `Legacy` (a well-formed pre-#1071
-/// marker, recording no writer) is reported apart from `Unknown` (missing,
-/// unreadable, or a v2 marker with a missing or malformed field) so operators
-/// can see the pre-upgrade backlog; both keep the marker.
+/// What a marker says about its writer. `Legacy` is a well-formed pre-#1071
+/// marker recording no writer; `Unknown` is missing, unreadable, or a v2
+/// marker with a malformed field. Both keep the marker.
 enum Identity { Writer(Writer), Legacy, Unknown }
 
 fn marker_identity(marker: &std::path::Path) -> Identity {

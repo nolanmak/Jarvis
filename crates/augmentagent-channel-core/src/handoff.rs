@@ -502,8 +502,8 @@ fn is_request_name(name: &OsStr) -> bool {
 }
 
 /// What one orphan pass saw (#1071). `kept_legacy` (pre-#1071, recording no
-/// writer to judge) is counted apart from `kept_unproven` so an operator can
-/// watch that backlog drain.
+/// writer to judge) is counted apart from `kept_unproven` so the logged
+/// pre-upgrade backlog is visible as it drains.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct OrphanReport {
     pub cleared: u64,
