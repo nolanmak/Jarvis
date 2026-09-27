@@ -10,6 +10,7 @@
 
 pub mod attachments;
 pub mod conversation;
+pub mod voice_bridge;
 mod broker;
 mod custom_id;
 mod event_handler;

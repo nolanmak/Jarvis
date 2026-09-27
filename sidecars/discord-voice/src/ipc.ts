@@ -4,6 +4,7 @@ import { parseFrame, type Frame } from './protocol.js';
 import { VoiceCoordinator } from './voice-coordinator.js';
 
 const MAX_FRAME_BYTES = 32_768;
+const MAX_QUEUED_BYTES = 1_048_576;
 
 /** One Rust daemon connection over a mode-0600 Unix socket. */
 export class VoiceIpcServer {
@@ -50,6 +51,7 @@ export class VoiceIpcServer {
       return;
     }
     this.client = socket;
+    socket.on('error', () => { /* close handler tears down the binding */ });
     let pending = Buffer.alloc(0);
     socket.on('data', (chunk: Buffer) => {
       pending = Buffer.concat([pending, chunk]);
@@ -113,6 +115,15 @@ export class VoiceIpcServer {
 
   private send(value: unknown): boolean {
     if (!this.client || this.client.destroyed) return false;
-    return this.client.write(`${JSON.stringify(value)}\n`);
+    const frame = `${JSON.stringify(value)}\n`;
+    if (this.client.writableLength + Buffer.byteLength(frame) > MAX_QUEUED_BYTES) return false;
+    try {
+      // `write()` returning false means the frame was accepted into Node's
+      // buffer. The gateway adapter must not treat that as a failed send.
+      this.client.write(frame);
+      return true;
+    } catch {
+      return false;
+    }
   }
 }

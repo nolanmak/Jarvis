@@ -13556,6 +13556,10 @@ async fn build_broker(
         loop_parser,
         wiki_root: cli.wiki_dir.clone(),
         journal_ops,
+        voice_socket_path: (std::env::var("AUGMENTAGENT_DISCORD_VOICE_ENABLED").as_deref() == Ok("1"))
+            .then(|| std::env::var_os("AUGMENTAGENT_DISCORD_VOICE_SOCKET")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/run/augmentagent/discord-voice.sock"))),
     })
     .await
     .context("start discord broker")?;

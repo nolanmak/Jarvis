@@ -45,3 +45,27 @@ test('Unix socket is private and dispatches start/stop with versioned replies', 
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test('oversized IPC input is closed without killing the sidecar', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'jarvis-voice-ipc-'));
+  const path = join(directory, 'voice.sock');
+  const service = new VoiceIpcServer(path, new VoiceCoordinator(() => ({ destroy() {} }), () => true));
+  await service.listen();
+  const oversized = createConnection(path);
+  try {
+    await new Promise<void>(resolve => oversized.once('connect', resolve));
+    oversized.write('x'.repeat(33_000));
+    await new Promise<void>(resolve => oversized.once('close', resolve));
+    const healthy = createConnection(path);
+    await new Promise<void>(resolve => healthy.once('connect', resolve));
+    healthy.write(JSON.stringify({ version: 1, kind: 'status', requestId: 'req-after-error',
+      conversationId: 'text-1', generation: 1 }) + '\n');
+    assert.deepEqual(await readLine(healthy), { version: 1, kind: 'reply',
+      requestId: 'req-after-error', ok: true, binding: null });
+    healthy.destroy();
+  } finally {
+    oversized.destroy();
+    await service.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
