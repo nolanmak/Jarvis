@@ -182,6 +182,9 @@ impl DiscordApprovalBroker {
             .await?;
 
         let http = Arc::clone(&client.http);
+        if let (Some(bridge), Some(query)) = (&state.voice_bridge, &config.query_handler) {
+            bridge.set_turn_handler(Arc::clone(query), Arc::clone(&http)).await;
+        }
 
         tokio::spawn(async move {
             if let Err(e) = client.start().await {

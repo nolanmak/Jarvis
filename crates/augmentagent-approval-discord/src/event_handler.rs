@@ -198,6 +198,7 @@ impl Handler {
                 };
                 let binding = VoiceBinding {
                     guild_id: guild.clone(), conversation_id: conversation.clone(),
+                    text_channel_id: channel.clone(),
                     voice_channel_id: voice_channel.get().to_string(),
                     owner_id: command.user.id.get().to_string(),
                     bot_user_id: bot_id.get().to_string(),
@@ -218,9 +219,11 @@ impl Handler {
                 }
                 let session = self.state.store.as_ref()
                     .and_then(|store| store.discord_conversation(&guild, &command.channel_id.get().to_string()).ok().flatten());
+                let audio_state = bridge.status(&guild, &conversation).await
+                    .unwrap_or_else(|_| "disconnected".into());
                 match session {
-                    Some(session) => format!("Voice binding: <#{}> ↔ <#{}>. Native {} session {}. Audio connection requested.",
-                        command.channel_id.get(), binding.voice_channel_id, session.provider, session.native_session_id),
+                    Some(session) => format!("Voice binding: <#{}> ↔ <#{}>. Native {} session {}. Audio state: {}.",
+                        command.channel_id.get(), binding.voice_channel_id, session.provider, session.native_session_id, audio_state),
                     None => "Voice binding is active, but its native session could not be read.".into(),
                 }
             }

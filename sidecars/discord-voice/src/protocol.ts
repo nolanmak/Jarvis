@@ -29,6 +29,15 @@ export type ControlFrame = {
   generation: number;
 };
 
+export type SpeechStatusFrame = {
+  version: 1;
+  kind: 'speech_status';
+  requestId: string;
+  conversationId: string;
+  generation: number;
+  utteranceId: string;
+};
+
 export type GatewayStateFrame = {
   version: 1;
   kind: 'voice_state';
@@ -50,7 +59,7 @@ export type GatewayServerFrame = {
   token: string;
 };
 
-export type Frame = StartFrame | SpeakFrame | ControlFrame | GatewayStateFrame | GatewayServerFrame;
+export type Frame = StartFrame | SpeakFrame | ControlFrame | SpeechStatusFrame | GatewayStateFrame | GatewayServerFrame;
 
 function record(value: unknown): Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -114,6 +123,10 @@ export function parseFrame(raw: string): Frame {
     case 'status':
       exact(value, ['version', 'kind', 'requestId', 'conversationId', 'generation']);
       return { ...common, kind: value.kind, requestId: id(value.requestId, 'requestId') };
+    case 'speech_status':
+      exact(value, ['version', 'kind', 'requestId', 'conversationId', 'generation', 'utteranceId']);
+      return { ...common, kind: 'speech_status', requestId: id(value.requestId, 'requestId'),
+        utteranceId: id(value.utteranceId, 'utteranceId') };
     case 'voice_state':
       exact(value, ['version', 'kind', 'conversationId', 'generation', 'guildId', 'userId', 'channelId', 'sessionId']);
       if (value.channelId !== null) id(value.channelId, 'channelId');

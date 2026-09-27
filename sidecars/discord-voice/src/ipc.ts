@@ -113,6 +113,11 @@ export class VoiceIpcServer {
             receipt: this.coordinator.speak(frame.conversationId, frame.generation,
               frame.utteranceId, frame.text) });
           return;
+        case 'speech_status':
+          this.send({ version: 1, kind: 'reply', requestId: frame.requestId, ok: true,
+            receipt: this.coordinator.speechStatus(frame.conversationId, frame.generation,
+              frame.utteranceId) ?? null });
+          return;
       }
       this.send({ version: 1, kind: 'reply', requestId: frame.requestId, ok: true });
     } catch (error) {

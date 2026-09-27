@@ -10,6 +10,7 @@ use anyhow::{bail, Context as _, Result};
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use serde_json::{json, Value};
+use serenity::all::{ChannelId, CreateMessage, Http};
 use serenity::gateway::ShardMessenger;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -18,6 +19,8 @@ use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 use tracing::warn;
 
+use crate::{AuditCtx, QueryHandler};
+
 const MAX_FRAME_BYTES: usize = 32_768;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -25,17 +28,27 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct VoiceBinding {
     pub guild_id: String,
     pub conversation_id: String,
+    pub text_channel_id: String,
     pub voice_channel_id: String,
     pub owner_id: String,
     pub bot_user_id: String,
     pub generation: u64,
 }
 
+#[derive(Clone)]
+struct TurnHandler {
+    query: Arc<dyn QueryHandler>,
+    http: Arc<Http>,
+}
+
 pub struct VoiceBridge {
     writer: Mutex<OwnedWriteHalf>,
     pending: DashMap<String, oneshot::Sender<Result<Value, String>>>,
     active: DashMap<String, VoiceBinding>,
+    seen_transcripts: DashMap<String, ()>,
+    audio_states: DashMap<String, String>,
     shard: RwLock<Option<ShardMessenger>>,
+    turn_handler: RwLock<Option<TurnHandler>>,
     next_id: AtomicU64,
     closed: AtomicBool,
 }
@@ -50,7 +63,10 @@ impl VoiceBridge {
             writer: Mutex::new(writer),
             pending: DashMap::new(),
             active: DashMap::new(),
+            seen_transcripts: DashMap::new(),
+            audio_states: DashMap::new(),
             shard: RwLock::new(None),
+            turn_handler: RwLock::new(None),
             next_id: AtomicU64::new(1),
             closed: AtomicBool::new(false),
         });
@@ -60,6 +76,10 @@ impl VoiceBridge {
 
     pub async fn set_shard(&self, shard: ShardMessenger) {
         *self.shard.write().await = Some(shard);
+    }
+
+    pub async fn set_turn_handler(&self, query: Arc<dyn QueryHandler>, http: Arc<Http>) {
+        *self.turn_handler.write().await = Some(TurnHandler { query, http });
     }
 
     pub fn binding(&self, guild_id: &str) -> Option<VoiceBinding> {
@@ -95,6 +115,10 @@ impl VoiceBridge {
         if result.is_err() {
             self.active.remove(&binding.guild_id);
         }
+        if result.is_ok() {
+            self.audio_states
+                .insert(binding.guild_id.clone(), "connecting".into());
+        }
         result.map(|_| ())
     }
 
@@ -112,6 +136,10 @@ impl VoiceBridge {
             }))
             .await;
         self.active.remove(guild_id);
+        self.audio_states.remove(guild_id);
+        let prefix = format!("{}:{}:", binding.guild_id, binding.generation);
+        self.seen_transcripts
+            .retain(|key, _| !key.starts_with(&prefix));
         if result.is_err() {
             self.send_leave(guild_id).await;
         }
@@ -131,6 +159,26 @@ impl VoiceBridge {
         }))
         .await
         .map(|_| ())
+    }
+
+    pub async fn status(&self, guild_id: &str, conversation_id: &str) -> Result<String> {
+        let binding = self
+            .binding(guild_id)
+            .context("No active voice binding in this guild")?;
+        if binding.conversation_id != conversation_id {
+            bail!("Voice is bound to another conversation");
+        }
+        let reply = self
+            .request(json!({
+                "version": 1, "kind": "status", "conversationId": conversation_id,
+                "generation": binding.generation,
+            }))
+            .await?;
+        Ok(reply
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("connecting")
+            .to_string())
     }
 
     pub async fn forward_voice_state(
@@ -235,7 +283,7 @@ impl VoiceBridge {
         self.close().await;
     }
 
-    async fn handle_frame(&self, frame: Value) {
+    async fn handle_frame(self: &Arc<Self>, frame: Value) {
         if frame.get("version") != Some(&json!(1)) {
             return;
         }
@@ -280,7 +328,146 @@ impl VoiceBridge {
                     shard.websocket_message(WebSocketMessage::Text(payload.to_string()));
                 }
             }
+            Some("audio_status") | Some("audio_failure") => {
+                let Some(binding) = self.binding_for_frame(&frame) else {
+                    return;
+                };
+                if frame["kind"] == "audio_failure" {
+                    self.active.remove(&binding.guild_id);
+                    self.audio_states
+                        .insert(binding.guild_id.clone(), "failed".into());
+                    let prefix = format!("{}:{}:", binding.guild_id, binding.generation);
+                    self.seen_transcripts
+                        .retain(|key, _| !key.starts_with(&prefix));
+                    self.send_leave(&binding.guild_id).await;
+                    if let Some(handler) = self.turn_handler.read().await.clone() {
+                        tokio::spawn(async move {
+                            if let Ok(channel) = binding.text_channel_id.parse::<u64>() {
+                                let _ = ChannelId::new(channel).send_message(&handler.http,
+                                    CreateMessage::new().content("Voice audio stopped after a connection or provider failure. Text remains available; check the voice service before restarting.")).await;
+                            }
+                        });
+                    }
+                } else if let Some(state) = frame.get("state").and_then(Value::as_str) {
+                    if matches!(state, "connecting" | "listening" | "stopped" | "failed") {
+                        self.audio_states
+                            .insert(binding.guild_id, state.to_string());
+                    }
+                }
+            }
+            Some("transcript") => {
+                let Some(binding) = self.binding_for_frame(&frame) else {
+                    return;
+                };
+                if frame.get("ownerId").and_then(Value::as_str) != Some(binding.owner_id.as_str()) {
+                    return;
+                }
+                let Some(turn_id) = frame.get("turnId").and_then(Value::as_str) else {
+                    return;
+                };
+                let Some(transcript) = frame.get("text").and_then(Value::as_str) else {
+                    return;
+                };
+                if turn_id.is_empty()
+                    || turn_id.len() > 128
+                    || transcript.trim().is_empty()
+                    || transcript.len() > 12_000
+                {
+                    return;
+                }
+                let seen_key = format!("{}:{}:{turn_id}", binding.guild_id, binding.generation);
+                if self.seen_transcripts.insert(seen_key, ()).is_some() {
+                    return;
+                }
+                let Some(handler) = self.turn_handler.read().await.clone() else {
+                    return;
+                };
+                let bridge = Arc::clone(self);
+                let turn_id = turn_id.to_string();
+                let transcript = transcript.trim().to_string();
+                tokio::spawn(async move {
+                    bridge
+                        .process_transcript(binding, handler, turn_id, transcript)
+                        .await;
+                });
+            }
             _ => {}
+        }
+    }
+
+    fn binding_for_frame(&self, frame: &Value) -> Option<VoiceBinding> {
+        let guild_id = frame.get("guildId")?.as_str()?;
+        let binding = self.binding(guild_id)?;
+        (frame.get("conversationId")?.as_str()? == binding.conversation_id
+            && frame.get("generation")?.as_u64()? == binding.generation)
+            .then_some(binding)
+    }
+
+    async fn process_transcript(
+        self: Arc<Self>,
+        binding: VoiceBinding,
+        handler: TurnHandler,
+        turn_id: String,
+        transcript: String,
+    ) {
+        let (Ok(guild_id), Ok(channel_id)) = (
+            binding.guild_id.parse::<u64>(),
+            binding.text_channel_id.parse::<u64>(),
+        ) else {
+            return;
+        };
+        let channel = ChannelId::new(channel_id);
+        let mirror = format!("🎙️ **You:** {transcript}");
+        for chunk in crate::event_handler::chunk_for_discord(&mirror) {
+            if let Err(error) = channel
+                .send_message(&handler.http, CreateMessage::new().content(chunk))
+                .await
+            {
+                warn!("could not mirror Discord voice transcript: {error}");
+                break;
+            }
+        }
+        let audit = AuditCtx {
+            session_id: turn_id.clone(),
+            guild_id: Some(guild_id),
+            http: Some(Arc::clone(&handler.http)),
+            channel_id: Some(channel),
+            owner_authorized: true,
+        };
+        match handler.query.answer_turn(&audit, "", &transcript).await {
+            Ok(answer) => {
+                for chunk in crate::event_handler::chunk_for_discord(&answer) {
+                    if let Err(error) = channel
+                        .send_message(&handler.http, CreateMessage::new().content(chunk))
+                        .await
+                    {
+                        warn!("could not mirror Discord voice reply: {error}");
+                        break;
+                    }
+                }
+                if !answer.trim().is_empty()
+                    && answer.len() <= 12_000
+                    && self.binding(&binding.guild_id).as_ref() == Some(&binding)
+                {
+                    let result = self.request(json!({
+                        "version": 1, "kind": "speak", "conversationId": binding.conversation_id,
+                        "generation": binding.generation, "utteranceId": format!("{turn_id}:final"),
+                        "text": answer,
+                    })).await;
+                    if let Err(error) = result {
+                        warn!("could not speak Discord voice reply: {error}");
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = channel
+                    .send_message(
+                        &handler.http,
+                        CreateMessage::new()
+                            .content(format!("Voice turn could not complete: {error}")),
+                    )
+                    .await;
+            }
         }
     }
 
@@ -307,6 +494,8 @@ impl VoiceBridge {
             self.send_leave(&guild).await;
         }
         self.active.clear();
+        self.audio_states.clear();
+        self.seen_transcripts.clear();
         let ids: Vec<_> = self
             .pending
             .iter()
@@ -346,12 +535,28 @@ fn valid_gateway_send(payload: &Value, binding: &VoiceBinding) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncBufReadExt, BufReader};
+
+    struct FakeVoiceQuery(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl QueryHandler for FakeVoiceQuery {
+        async fn answer(&self, ctx: &AuditCtx, question: &str) -> anyhow::Result<String> {
+            assert_eq!(ctx.session_id, "voice:6:0");
+            assert_eq!(ctx.guild_id, Some(1));
+            assert_eq!(ctx.channel_id, Some(ChannelId::new(2)));
+            assert_eq!(question, "synthetic spoken request");
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok("synthetic spoken answer".into())
+        }
+    }
 
     fn binding() -> VoiceBinding {
         VoiceBinding {
             guild_id: "1".into(),
             conversation_id: "1:2".into(),
+            text_channel_id: "2".into(),
             voice_channel_id: "3".into(),
             owner_id: "4".into(),
             bot_user_id: "5".into(),
@@ -432,5 +637,58 @@ mod tests {
         bridge.stop("1", "1:2").await.unwrap();
         assert!(bridge.binding("1").is_none());
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn committed_transcript_routes_once_to_the_bound_text_session_and_speaks_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voice.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let speak: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(speak["kind"], "speak");
+            assert_eq!(speak["conversationId"], "1:2");
+            assert_eq!(speak["utteranceId"], "voice:6:0:final");
+            assert_eq!(speak["text"], "synthetic spoken answer");
+            write
+                .write_all(
+                    format!(
+                        "{{\"version\":1,\"kind\":\"reply\",\"requestId\":\"{}\",\"ok\":true}}\n",
+                        speak["requestId"].as_str().unwrap()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let bridge = VoiceBridge::connect(&path).await.unwrap();
+        bridge.active.insert("1".into(), binding());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let local = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = local.local_addr().unwrap();
+        drop(local);
+        let http = Arc::new(
+            serenity::http::HttpBuilder::new("test-token")
+                .proxy(format!("http://{proxy}"))
+                .ratelimiter_disabled(true)
+                .build(),
+        );
+        bridge
+            .set_turn_handler(Arc::new(FakeVoiceQuery(Arc::clone(&calls))), http)
+            .await;
+        let transcript = json!({ "version": 1, "kind": "transcript", "conversationId": "1:2",
+            "generation": 6, "guildId": "1", "ownerId": "4", "turnId": "voice:6:0",
+            "text": "synthetic spoken request" });
+        bridge.handle_frame(transcript.clone()).await;
+        bridge.handle_frame(transcript).await;
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

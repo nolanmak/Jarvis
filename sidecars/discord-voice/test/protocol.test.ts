@@ -39,3 +39,10 @@ test('accepts a long Discord voice token without relaxing identifier bounds', ()
   assert.throws(() => parseFrame(JSON.stringify({ ...frame, guildId: 'g'.repeat(129) })));
   assert.throws(() => parseFrame(JSON.stringify({ ...frame, token: 'v'.repeat(4097) })));
 });
+
+test('speech receipt lookup is bound to a conversation generation', () => {
+  const lookup = { version: 1, kind: 'speech_status', requestId: 'req-3',
+    conversationId: 'text-1', generation: 2, utteranceId: 'utt-1' };
+  assert.deepEqual(parseFrame(JSON.stringify(lookup)), lookup);
+  assert.throws(() => parseFrame(JSON.stringify({ ...lookup, channelId: 'other' })));
+});

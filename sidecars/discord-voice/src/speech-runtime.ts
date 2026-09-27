@@ -108,6 +108,7 @@ export class VoiceAudio {
   private speechActive = false;
   private finalCounter = 0;
   private readonly committed = new Set<string>();
+  private pcmCarry?: number;
   private closed = false;
   private state: 'connecting' | 'listening' | 'failed' | 'stopped' = 'connecting';
 
@@ -184,9 +185,11 @@ export class VoiceAudio {
   private forwardPcm(chunk: Buffer): void {
     if (this.closed || !this.stt) return;
     try {
-      const even = chunk.length - chunk.length % 2;
+      const pcm = this.pcmCarry === undefined ? chunk : Buffer.concat([Buffer.from([this.pcmCarry]), chunk]);
+      const even = pcm.length - pcm.length % 2;
+      this.pcmCarry = pcm.length % 2 ? pcm[pcm.length - 1] : undefined;
       for (let offset = 0; offset < even; offset += 2560) {
-        this.stt.writePcm(chunk.subarray(offset, Math.min(offset + 2560, even)));
+        this.stt.writePcm(pcm.subarray(offset, Math.min(offset + 2560, even)));
       }
     } catch (error) {
       this.fail(error instanceof Error ? error.message : 'STT audio forwarding failed');

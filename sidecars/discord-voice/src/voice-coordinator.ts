@@ -49,7 +49,13 @@ export class VoiceCoordinator {
     });
     let audio: VoiceAudio | undefined;
     try {
-      if (speech) audio = new VoiceAudio(connection as VoiceConnection, binding, speech, this.emitAudio);
+      if (speech) audio = new VoiceAudio(connection as VoiceConnection, binding, speech, frame => {
+        const sent = this.emitAudio(frame);
+        if (frame && typeof frame === 'object' && (frame as { kind?: string }).kind === 'audio_failure') {
+          queueMicrotask(() => { this.stop(binding.conversationId, binding.generation); });
+        }
+        return sent;
+      });
     } catch (error) {
       connection.destroy();
       bridge.destroy();
@@ -109,6 +115,12 @@ export class VoiceCoordinator {
     if (!active?.audio) return false;
     active.audio.interrupt();
     return true;
+  }
+
+  speechStatus(conversationId: string, generation: number, utteranceId: string): SpeechReceipt | undefined {
+    const active = [...this.activeByGuild.values()].find(item =>
+      item.binding.conversationId === conversationId && item.binding.generation === generation);
+    return active?.audio?.speechStatus(utteranceId);
   }
 
   shutdown(): void {
