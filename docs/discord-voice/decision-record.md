@@ -34,7 +34,7 @@ The Rust gateway forwards binding-scoped voice state/server events to a private 
 
 An ephemeral second Unix socket exposes `speak({text, utterance_id})`, `speech_status`, `voice_status`, and `voice_interrupt` to the native CLIs. The server issues a random grant only for an owner-authorized active binding, checks its guild/conversation/generation on every call, and revokes it after the turn. The model does not supply a Discord target. The server prefixes utterance IDs with the grant and refuses a changed text for a reused ID; the sidecar also deduplicates playback. The literal utterance ID `final` marks that turn's final output, so its normal final answer is not played twice. Codex receives the grant through its stdio MCP environment; Claude receives it in a private temporary MCP config file, not in process arguments. Tool speech is mirrored to the originating text channel, and a mirror failure is visible as `mirrored:false` in the receipt response.
 
-The sidecar now checks an existing socket before startup: it reclaims a same-user stale Unix socket, but refuses a live listener or a regular file. A checked-in Linux user unit runs the pinned Node 24 runtime with a provider-only environment file, and the daemon defaults to `$XDG_RUNTIME_DIR/augmentagent/discord-voice.sock` when the feature is on. These address cold-start and stale-file setup; reconnect after a running sidecar crashes remains a release gate.
+The sidecar now checks an existing socket before startup: it reclaims a same-user stale Unix socket, but refuses a live listener or a regular file. A checked-in Linux user unit runs the pinned Node 24 runtime with a provider-only environment file, and the daemon defaults to `$XDG_RUNTIME_DIR/augmentagent/discord-voice.sock` when the feature is on. The Rust bridge retries a missing startup socket or a dropped live socket three times with 1/2/4-second delays. A dropped connection clears the old binding and pending IPC requests before retrying; reconnect never automatically rejoins voice or replays a turn. Focused tests cover delayed sidecar startup, recovery with an explicit new start, and exhausted retries. A real process-crash/restart and provider-stream recovery remain live gates.
 
 TDD evidence: `cargo test -p augmentagent-store --test discord_conversation` failed first with unresolved `DiscordConversation` and missing `Store` methods. After the schema and API were added, all three tests passed.
 
@@ -50,8 +50,8 @@ The selected tool calls and results are checked in as [native-mcp-probe-2026-09-
 
 1. Prove Discord DAVE join, owner audio receive/decode, and outbound playback in a test guild. Mocked adapter and native MCP tests cannot satisfy this gate.
 2. Prove Deepgram and ElevenLabs STT/TTS live, including a mixed pair. Provider keys are absent from the checked daemon `.env`; do not count contract tests as live compatibility.
-3. Complete the audio fixtures, measured interruption/latency gates, bounded reconnection and restart handling, 50-cycle cleanup, and full acceptance-ID evidence. Confirm typed/voice approval and attachment parity in the live path.
-4. Finish Linux service/setup, doctor, config examples, opt-in live script, CI integration, and CLI QA. Keep the PR draft until AC01–AC12 and CI are green.
+3. Complete the audio fixtures, measured interruption/latency gates, provider-stream recovery and real process-crash/restart proof, 50-cycle cleanup, and full acceptance-ID evidence. Confirm typed/voice approval and attachment parity in the live path.
+4. Finish doctor, opt-in live script, CI integration, and CLI QA. The Linux service, config example, and initial setup guide are checked in. Keep the PR draft until AC01–AC12 and CI are green.
 
 ## Rollback
 

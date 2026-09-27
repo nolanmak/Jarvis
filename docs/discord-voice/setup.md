@@ -48,7 +48,7 @@ ls -l "$XDG_RUNTIME_DIR/augmentagent/discord-voice.sock"
 ```
 
 - “Join an existing server voice channel” means the owner was not in a regular guild voice channel when `/voice start` ran.
-- “Voice sidecar is unavailable” means the daemon could not connect to the socket at startup. Check the unit, its provider-only environment file, the socket path, and service ordering, then restart the daemon. The sidecar safely reclaims a stale socket left by a crashed previous process, but refuses to replace a live listener or a regular file.
+- “Voice sidecar is disconnected” means it was absent at startup or dropped during a call. The daemon tries the socket three times at 1/2/4-second intervals; check the unit, its provider-only environment file, and the socket path. After a successful reconnect, run `/voice start` again from the same text conversation. If all retries fail, restart the daemon after fixing the sidecar. The sidecar safely reclaims a stale socket left by a crashed previous process, but refuses to replace a live listener or a regular file.
 - A provider-key error at start means the independently selected STT or TTS provider lacks a key (or ElevenLabs TTS lacks a voice ID). A provider 401/403/429/5xx must be treated as a failed live gate, not a mocked success.
 - An “uncertain turn” means the native CLI may have run tools before a failure. Inspect the durable turn ledger and native session before any manual recovery; do not resubmit the same turn automatically.
 

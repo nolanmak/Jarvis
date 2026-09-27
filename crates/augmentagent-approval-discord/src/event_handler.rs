@@ -124,6 +124,9 @@ impl Handler {
         let conversation = format!("{}:{}", guild_id.get(), command.channel_id.get());
         match option.name.as_str() {
             "start" => {
+                if !bridge.is_connected() {
+                    return format!("Voice sidecar is {}. Check its service and retry after it reconnects.", bridge.transport_status());
+                }
                 let requested_agent = match &option.value {
                     CommandDataOptionValue::SubCommand(options) => options.iter().find_map(|item| {
                         if item.name == "agent" {
@@ -212,7 +215,8 @@ impl Handler {
             }
             "status" => {
                 let Some(binding) = bridge.binding(&guild) else {
-                    return "Voice is stopped; the text conversation remains available.".into();
+                    return format!("Voice is {}; the text conversation remains available.",
+                        if bridge.transport_status() == "reconnecting" { "reconnecting" } else { "stopped" });
                 };
                 if binding.conversation_id != conversation {
                     return format!("Voice is bound to {} in this server.", binding.conversation_id);

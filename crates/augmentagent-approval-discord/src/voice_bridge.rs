@@ -1,7 +1,7 @@
 //! Private, versioned IPC between the Rust-owned Discord gateway and the
 //! Linux voice sidecar. The sidecar never receives the bot token.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +23,18 @@ use crate::{AuditCtx, QueryHandler};
 
 const MAX_FRAME_BYTES: usize = 32_768;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const RECONNECT_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
+#[cfg(test)]
+const RECONNECT_DELAYS: [Duration; 3] = [
+    Duration::from_millis(10),
+    Duration::from_millis(20),
+    Duration::from_millis(40),
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VoiceBinding {
@@ -42,7 +54,8 @@ struct TurnHandler {
 }
 
 pub struct VoiceBridge {
-    writer: Mutex<OwnedWriteHalf>,
+    socket_path: PathBuf,
+    writer: Mutex<Option<OwnedWriteHalf>>,
     pending: DashMap<String, oneshot::Sender<Result<Value, String>>>,
     active: DashMap<String, VoiceBinding>,
     seen_transcripts: DashMap<String, ()>,
@@ -51,15 +64,25 @@ pub struct VoiceBridge {
     turn_handler: RwLock<Option<TurnHandler>>,
     next_id: AtomicU64,
     closed: AtomicBool,
+    reconnecting: AtomicBool,
 }
 
 impl VoiceBridge {
     pub async fn connect(path: &Path) -> Result<Arc<Self>> {
-        let stream = UnixStream::connect(path)
-            .await
-            .with_context(|| format!("connect Discord voice sidecar at {}", path.display()))?;
-        let (reader, writer) = stream.into_split();
+        let stream = UnixStream::connect(path).await;
+        let connected = stream.is_ok();
+        let (reader, writer) = match stream {
+            Ok(stream) => {
+                let (reader, writer) = stream.into_split();
+                (Some(reader), Some(writer))
+            }
+            Err(error) => {
+                warn!("Discord voice sidecar unavailable at {}: {error}; retrying", path.display());
+                (None, None)
+            }
+        };
         let bridge = Arc::new(Self {
+            socket_path: path.to_path_buf(),
             writer: Mutex::new(writer),
             pending: DashMap::new(),
             active: DashMap::new(),
@@ -68,10 +91,53 @@ impl VoiceBridge {
             shard: RwLock::new(None),
             turn_handler: RwLock::new(None),
             next_id: AtomicU64::new(1),
-            closed: AtomicBool::new(false),
+            closed: AtomicBool::new(!connected),
+            reconnecting: AtomicBool::new(!connected),
         });
-        tokio::spawn(Arc::clone(&bridge).read_loop(reader));
+        if let Some(reader) = reader {
+            tokio::spawn(Arc::clone(&bridge).read_loop(reader));
+        } else {
+            tokio::spawn(Arc::clone(&bridge).recover_initial_connection());
+        }
         Ok(bridge)
+    }
+
+    pub fn is_connected(&self) -> bool {
+        !self.closed.load(Ordering::SeqCst)
+    }
+
+    pub fn transport_status(&self) -> &'static str {
+        if self.is_connected() {
+            "connected"
+        } else if self.reconnecting.load(Ordering::SeqCst) {
+            "reconnecting"
+        } else {
+            "stopped"
+        }
+    }
+
+    async fn recover_initial_connection(self: Arc<Self>) {
+        if let Some(stream) = self.retry_connect().await {
+            let (reader, writer) = stream.into_split();
+            *self.writer.lock().await = Some(writer);
+            self.closed.store(false, Ordering::SeqCst);
+            self.reconnecting.store(false, Ordering::SeqCst);
+            tokio::spawn(self.read_loop(reader));
+            warn!("Discord voice sidecar connected after startup retry");
+        }
+    }
+
+    async fn retry_connect(&self) -> Option<UnixStream> {
+        for delay in RECONNECT_DELAYS {
+            tokio::time::sleep(delay).await;
+            match UnixStream::connect(&self.socket_path).await {
+                Ok(stream) => return Some(stream),
+                Err(error) => warn!("Discord voice sidecar reconnect failed: {error}"),
+            }
+        }
+        warn!("Discord voice sidecar stopped after three reconnect attempts");
+        self.reconnecting.store(false, Ordering::SeqCst);
+        None
     }
 
     pub async fn set_shard(&self, shard: ShardMessenger) {
@@ -340,40 +406,49 @@ impl VoiceBridge {
             bail!("Voice IPC frame exceeds size limit");
         }
         data.push(b'\n');
-        self.writer
-            .lock()
-            .await
-            .write_all(&data)
-            .await
-            .context("write voice IPC frame")
+        let mut writer = self.writer.lock().await;
+        let writer = writer.as_mut().context("Voice sidecar is disconnected")?;
+        writer.write_all(&data).await.context("write voice IPC frame")
     }
 
     async fn read_loop(self: Arc<Self>, mut reader: OwnedReadHalf) {
-        let mut pending = Vec::new();
         let mut chunk = [0u8; 4096];
         loop {
-            let read = match reader.read(&mut chunk).await {
-                Ok(0) => break,
-                Ok(read) => read,
-                Err(_) => break,
-            };
-            for byte in &chunk[..read] {
-                if *byte == b'\n' {
-                    if let Ok(frame) = serde_json::from_slice::<Value>(&pending) {
-                        self.handle_frame(frame).await;
-                    }
-                    pending.clear();
-                } else {
-                    pending.push(*byte);
-                    if pending.len() > MAX_FRAME_BYTES {
-                        warn!("voice IPC frame exceeded size limit");
-                        self.close().await;
-                        return;
+            let mut pending = Vec::new();
+            loop {
+                let read = match reader.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(read) => read,
+                    Err(_) => break,
+                };
+                for byte in &chunk[..read] {
+                    if *byte == b'\n' {
+                        if let Ok(frame) = serde_json::from_slice::<Value>(&pending) {
+                            self.handle_frame(frame).await;
+                        }
+                        pending.clear();
+                    } else {
+                        pending.push(*byte);
+                        if pending.len() > MAX_FRAME_BYTES {
+                            warn!("voice IPC frame exceeded size limit");
+                            self.close().await;
+                            return;
+                        }
                     }
                 }
             }
+            self.close().await;
+            self.reconnecting.store(true, Ordering::SeqCst);
+            let Some(stream) = self.retry_connect().await else {
+                return;
+            };
+            let (next_reader, next_writer) = stream.into_split();
+            *self.writer.lock().await = Some(next_writer);
+            self.closed.store(false, Ordering::SeqCst);
+            self.reconnecting.store(false, Ordering::SeqCst);
+            reader = next_reader;
+            warn!("Discord voice sidecar reconnected; start a new voice binding to resume");
         }
-        self.close().await;
     }
 
     async fn handle_frame(self: &Arc<Self>, frame: Value) {
@@ -604,7 +679,9 @@ impl VoiceBridge {
                 let _ = tx.send(Err("Voice sidecar disconnected".into()));
             }
         }
-        let _ = self.writer.lock().await.shutdown().await;
+        if let Some(mut writer) = self.writer.lock().await.take() {
+            let _ = writer.shutdown().await;
+        }
     }
 }
 
@@ -696,6 +773,94 @@ mod tests {
             "self_deaf":false,"self_mute":false}}),
             &binding()
         ));
+    }
+
+    #[tokio::test]
+    async fn sidecar_can_start_after_gateway_without_restarting_the_gateway() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voice.sock");
+        let bridge = VoiceBridge::connect(&path).await.unwrap();
+        assert!(!bridge.is_connected());
+        assert_eq!(bridge.transport_status(), "reconnecting");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !bridge.is_connected() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(bridge.is_connected());
+        assert_eq!(bridge.transport_status(), "connected");
+        drop(stream);
+    }
+
+    #[tokio::test]
+    async fn sidecar_restart_clears_old_binding_then_accepts_explicit_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voice.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let bridge = VoiceBridge::connect(&path).await.unwrap();
+        let (first, _) = listener.accept().await.unwrap();
+        bridge.active.insert("1".into(), binding());
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while bridge.binding("1").is_some() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (second, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let (read, mut write) = second.into_split();
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(read).lines();
+            let start: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(start["kind"], "start");
+            assert_eq!(start["generation"], 6);
+            let reply = json!({"version":1,"kind":"reply","requestId":start["requestId"],"ok":true});
+            write.write_all(format!("{reply}\n").as_bytes()).await.unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while bridge.closed.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        bridge.start(binding()).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sidecar_reconnect_stops_after_three_failed_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voice.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let bridge = VoiceBridge::connect(&path).await.unwrap();
+        let (first, _) = listener.accept().await.unwrap();
+        bridge.active.insert("1".into(), binding());
+        drop(first);
+        drop(listener);
+        std::fs::remove_file(&path).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while bridge.binding("1").is_some() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(bridge.closed.load(Ordering::SeqCst));
+        assert_eq!(bridge.transport_status(), "stopped");
+        assert!(bridge.start(binding()).await.unwrap_err().to_string().contains("disconnected"));
     }
 
     #[tokio::test]
