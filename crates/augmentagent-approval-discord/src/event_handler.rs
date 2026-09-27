@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serenity::all::{
-    ActionRowComponent, Attachment, ButtonKind, ChannelId, Context, CreateAttachment,
+    ActionRowComponent, Attachment, ButtonKind, Channel, ChannelId, ChannelType, Context, CreateAttachment,
     CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
     CreateMessage, EditMessage, EventHandler, GetMessages, Http, Interaction, Message, MessageId,
     MessageReference, Ready, UserId,
@@ -41,6 +41,26 @@ const DISCORD_MSG_LIMIT: usize = 1900;
 /// the check entirely (fail-open) when no allowlist was configured.
 fn is_authorized(allowed_user_id: Option<UserId>, actor: UserId) -> bool {
     matches!(allowed_user_id, Some(allowed) if allowed == actor)
+}
+
+fn is_query_thread(kind: ChannelType, parent: Option<ChannelId>, query: ChannelId) -> bool {
+    matches!(kind, ChannelType::NewsThread | ChannelType::PublicThread | ChannelType::PrivateThread)
+        && parent == Some(query)
+}
+
+async fn is_query_conversation(ctx: &Context, msg: &Message, query: Option<ChannelId>) -> bool {
+    let Some(query) = query else { return false; };
+    if msg.channel_id == query { return true; }
+    let Some(guild_id) = msg.guild_id else { return false; };
+    if let Some(guild) = ctx.cache.guild(guild_id) {
+        if let Some(thread) = guild.threads.iter().find(|thread| thread.id == msg.channel_id) {
+            return is_query_thread(thread.kind, thread.parent_id, query);
+        }
+    }
+    match msg.channel_id.to_channel(&ctx.http).await {
+        Ok(Channel::Guild(channel)) => is_query_thread(channel.kind, channel.parent_id, query),
+        _ => false,
+    }
 }
 
 pub struct Handler {
@@ -78,21 +98,18 @@ impl EventHandler for Handler {
             return;
         };
 
-        let is_dm = msg.guild_id.is_none();
-        let in_query_channel = self
-            .state
-            .query_channel_id
-            .is_some_and(|cid| cid == msg.channel_id);
-        if !is_dm && !in_query_channel {
-            return;
-        }
-
         if !is_authorized(self.state.allowed_user_id, msg.author.id) {
             debug!(
                 "ignoring message from unauthorized user {} (allowlist configured: {})",
                 msg.author.id.get(),
                 self.state.allowed_user_id.is_some()
             );
+            return;
+        }
+
+        let is_dm = msg.guild_id.is_none();
+        let in_query_channel = is_query_conversation(&ctx, &msg, self.state.query_channel_id).await;
+        if !is_dm && !in_query_channel {
             return;
         }
 
@@ -2562,6 +2579,17 @@ fn hard_split(s: &str, max: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use augmentagent_docs::doc_command_for;
+
+    #[test]
+    fn query_threads_are_separate_conversations_under_the_configured_channel() {
+        let query = ChannelId::new(10);
+        for kind in [ChannelType::PublicThread, ChannelType::PrivateThread, ChannelType::NewsThread] {
+            assert!(is_query_thread(kind, Some(query), query));
+            assert!(!is_query_thread(kind, Some(ChannelId::new(11)), query));
+        }
+        assert!(!is_query_thread(ChannelType::Text, Some(query), query));
+        assert!(!is_query_thread(ChannelType::Voice, Some(query), query));
+    }
 
     #[tokio::test]
     async fn stalled_typing_request_does_not_block_answer() {
