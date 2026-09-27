@@ -946,39 +946,39 @@ What it never touches, and for how long:
   stay until the recovery command above records a decision. The next passes
   then treat them like any other finished journal.
 - **Journals with an `operations.active` marker are retained while the marker
-  exists.** A marker means a provider is running or its descendants' cleanup
-  has not been verified. The recovery command refuses while a marker exists,
-  and the sweep never clears one. One function unlinks a marker, judging the
-  proof against the marker on disk, so no caller removes one on its own
-  authority. It accepts two proofs, neither subsuming the other:
-
-  - a supervisor's `all-descendants-reaped` receipt — offered by a
-    `ProcessGroup` as it drops, and by the resume gate when the same turn is
-    dispatched again and that receipt still verifies; and
-  - the orphan pass (#1071), run once as the daemon's sweep loop starts, before
-    any channel can dispatch. With no receipt left to read, it proves instead
-    that the writing process cannot still be running: a `boot_id` differing from
-    `/proc/sys/kernel/random/boot_id` means nothing the marker names survived the
-    reboot; failing that, on the same boot, the recorded writer must be gone (pid
-    **and** its `/proc` start time, so a reused pid never counts) **and** the
-    cgroup v2 directory it ran in must now hold no process — destroyed, re-created
-    at a new inode (the kernel removes only an *empty* cgroup and each unit start
-    gets a fresh one), or present with an empty `cgroup.procs`. `spawn_supervised`
-    never moves a child out of the writer's cgroup, so that set bounds every
-    descendant, supervisor included. The reading is deliberately *not* `KillMode`,
-    which says only what systemd intends on stop.
-
-  Every other reading keeps the marker: an unreadable, linked, oversized or
-  truncated marker, an unreadable boot id, a cgroup that still holds a process or
-  cannot be read, and every pre-#1071 marker (no writer identity, so no proof can
-  apply — `doctor` counts those separately, since unlike the other kept markers
-  that backlog never drains on its own). Clearing removes only the marker: the
-  journal keeps its `started` row, so the request becomes idle to the sweep but
-  stays *unfinished* and still needs the recovery command above. The daemon also
-  handles SIGTERM, so a stop cancels in-flight calls and then *waits* — up to 30s
-  — for every channel task to unwind and drop its `ProcessGroup`, which retires
-  the markers; keep `TimeoutStopSec` above that drain. The orphan pass covers
-  what the drain cannot: SIGKILL, a timed-out drain, OOM, power loss.
+  exists.** A marker means a provider is running or its descendants' cleanup has
+  not been verified. The recovery command refuses while a marker exists, and the
+  sweep never clears one. A single function unlinks a marker, judging the proof
+  against the marker on disk, so no caller removes one on its own authority. It
+  accepts two proofs, neither subsuming the other: a supervisor's
+  `all-descendants-reaped` receipt — offered by a `ProcessGroup` as it drops, and
+  by the resume gate when the same turn is dispatched again and that receipt still
+  verifies — or, with no receipt left to read, that the writing process cannot
+  still be running. The latter is the orphan pass (#1071), run once as the sweep
+  loop starts, before any channel can dispatch: a `boot_id` differing from
+  `/proc/sys/kernel/random/boot_id` means nothing the marker names survived the
+  reboot; failing that, on the same boot, the recorded writer must be gone (pid
+  **and** its `/proc` start time, so a reused pid never counts) **and** its cgroup
+  v2 directory must hold no process that could have outlived the call — gone,
+  re-created at a new inode (the kernel removes only an *empty* cgroup), or empty.
+  A plain `systemctl restart`, though, puts the successor into the *same* unit
+  cgroup at the same inode, so a surviving populated directory usually just holds
+  the new daemon; its members are therefore compared against our own start time,
+  since anything the predecessor leaked must predate us. One older member, or no
+  readable start time for ourselves, keeps the marker. `spawn_supervised` never
+  moves a child out of the writer's cgroup, so that set bounds every descendant.
+  The reading is deliberately *not* `KillMode`, which says only what systemd
+  intends on stop. Every other reading keeps the marker: an unreadable, linked,
+  oversized or truncated marker, an unreadable boot id, a cgroup that cannot be
+  read, and every pre-#1071 marker (no writer identity, so no proof can apply —
+  `doctor` counts those separately, since unlike the rest that backlog never
+  drains on its own). Clearing removes only the marker: the journal keeps its
+  `started` row, so the request becomes idle to the sweep but stays *unfinished*
+  and still needs the recovery command above. The daemon also handles SIGTERM, so
+  a stop cancels the runners and joins them, letting each in-flight call return
+  and drop its `ProcessGroup` — best-effort only, since cancellation is observed
+  *between* work items and a SIGKILL can cut a call short regardless. Correctness
+  rests on the orphan pass, which needs no runner cooperation.
 
 Do not delete handoff state by hand.
 

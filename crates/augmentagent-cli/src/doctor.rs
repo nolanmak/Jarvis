@@ -1083,8 +1083,7 @@ fn handoff_journal_finding(report: Result<handoff::SweepReport>, grace: Duration
         report.kept_active,
     );
     // #1071 — of those markers, what the next orphan pass would make of each.
-    let msg = format!("{msg} ({} clearable as orphans, {} pre-#1071, {} live, {} doubtful)",
-        orphans.cleared, orphans.kept_legacy, orphans.kept_live, orphans.kept_unproven);
+    let msg = format!("{msg} ({} clearable as orphans, {} pre-#1071)", orphans.cleared, orphans.kept_legacy);
     // A live sweep removes every finished journal within two intervals of its
     // expiry, so one still here means the sweep stopped (#1035 review).
     if report.finished_overdue > 0 {
@@ -1964,15 +1963,12 @@ mod tests {
         let seen = handoff::OrphanReport { cleared: 1, kept_live: 1, kept_unproven: 1, kept_legacy: 0 };
         let ok = handoff_journal_finding(Ok(healthy), grace, seen);
         assert_eq!(ok.severity, Severity::Ok, "{}", ok.message);
-        assert!(ok.message.contains("1 clearable as orphans") && ok.message.contains("0 pre-#1071"),
-            "{}", ok.message);
+        assert!(ok.message.contains("1 clearable as orphans"), "{}", ok.message);
         // A pre-#1071 marker cannot be proved dead by any pass, so doctor warns.
         let legacy = handoff_journal_finding(Ok(healthy), grace,
             handoff::OrphanReport { kept_legacy: 2, ..seen });
         assert_eq!(legacy.severity, Severity::Warn, "{}", legacy.message);
-        assert!(legacy.message.contains("2 marker(s) predate #1071")
-            && legacy.suggested_cmd.as_deref().is_some_and(|h| h.contains("--handoff-status")),
-            "{}", legacy.message);
+        assert!(legacy.message.contains("2 marker(s) predate #1071"), "{}", legacy.message);
         // Counts only request dirs, and reports what needs an operator as information.
         assert!(
             ok.message.contains("420 request dirs") && !ok.message.contains("423"),

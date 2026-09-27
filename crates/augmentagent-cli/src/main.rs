@@ -3391,33 +3391,15 @@ async fn main() -> Result<()> {
                     }
                 });
             }
-            // #1071 — cancelling is only half of a clean stop: a ProcessGroup
-            // retires its marker from Drop, and a runner's group is a local of the
-            // in-flight call, so it drops when that future is dropped or returns.
-            // So join every task, bounded so a wedged one cannot hold the stop
-            // open until systemd's SIGKILL. A failing task cancels the rest rather
-            // than returning at once, which would drop the process while other
-            // supervisors are still retiring. Nothing depends on a runner reacting
-            // promptly: what the drain misses, the next start's orphan pass clears.
-            const SHUTDOWN_DRAIN: Duration = Duration::from_secs(30);
-            let mut failure = None;
-            let drained = tokio::time::timeout(SHUTDOWN_DRAIN, async {
-                for handle in tasks {
-                    let outcome = match handle.await {
-                        Ok(Ok(())) => continue,
-                        Ok(Err(e)) => e,
-                        Err(e) => anyhow::Error::new(e),
-                    };
-                    warn!("daemon task failed: {outcome:#}");
-                    failure.get_or_insert(outcome);
-                    shutdown.cancel();
-                }
-            })
-            .await;
-            if drained.is_err() {
-                warn!("shutdown drain timed out; the next start's orphan pass will clear any marker left behind");
+            // Joining lets a cancelled runner return and drop its ProcessGroup,
+            // retiring that call's marker (#1071) — best-effort, not the fix:
+            // cancellation is seen between work items (`tick_once` awaits each
+            // `handle`), and SIGKILL can cut a call short anyway. Correctness rests
+            // on the next start's orphan pass, which needs no runner cooperation.
+            for handle in tasks {
+                handle.await??;
             }
-            failure.map_or(Ok(()), Err)
+            Ok(())
         }
         Cmd::Transcripts { ref op } => match op {
             TranscriptsOp::Sync {

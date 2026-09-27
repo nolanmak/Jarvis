@@ -501,17 +501,11 @@ fn is_request_name(name: &OsStr) -> bool {
         && name.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
 }
 
-/// What one orphan pass saw (#1071). `kept_legacy` (pre-#1071, recording no
-/// writer to judge) is counted apart from `kept_unproven` because no pass can
-/// ever clear one: `doctor` reports that backlog, which never drains itself.
+/// What one orphan pass saw (#1071). `kept_legacy` (pre-#1071, recording no writer
+/// to judge) is counted apart because no pass can ever clear one: `doctor` reports
+/// that backlog, which unlike the others never drains itself.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub struct OrphanReport {
-    pub cleared: u64,
-    pub kept_live: u64,
-    pub kept_legacy: u64,
-    pub kept_unproven: u64,
-}
-
+pub struct OrphanReport { pub cleared: u64, pub kept_live: u64, pub kept_legacy: u64, pub kept_unproven: u64 }
 
 /// Clear lifecycle markers left by a call that cannot still be running (#1071).
 /// `dry_run` reads only. Only markers are cleared; a cleared request rejoins the
@@ -695,8 +689,7 @@ pub type SweepHook = std::sync::Arc<dyn Fn() + Send + Sync>;
 /// blocking pool; `also` runs first on every tick, on the blocking pool too. A removal needs two consecutive passes to agree (see
 /// [`Pass::Confirm`]). Failures only log; shutdown stops the loop.
 pub async fn run_sweep_loop(root: Option<PathBuf>, grace: Duration, interval: Duration,
-    shutdown: tokio_util::sync::CancellationToken, also: Option<SweepHook>,
-    liveness: LivenessEnv) -> anyhow::Result<()> {
+    shutdown: tokio_util::sync::CancellationToken, also: Option<SweepHook>, liveness: LivenessEnv) -> anyhow::Result<()> {
     if root.is_none() {
         tracing::warn!("handoff journal sweep disabled: no HOME to locate the journal root");
         if also.is_none() {
@@ -1366,12 +1359,14 @@ for line in sys.stdin:
         let uncertain = request(&root, "synthetic-orphan-uncertain", Some(json!([completed_row(), started_row()])));
         let live = request(&root, "synthetic-in-flight", Some(json!([completed_row()])));
         let legacy = request(&root, "synthetic-legacy-marker", Some(json!([completed_row()])));
-        for journal in [&orphan, &uncertain] { marker(journal, identity("a-previous-boot", 999)); }
+        // Same boot as the pass: a restart, not a reboot, so each orphan has to be
+        // proved dead by its writer being gone and its cgroup holding only us.
+        for journal in [&orphan, &uncertain] { marker(journal, identity("this-boot", 999)); }
         marker(&live, identity("this-boot", 1234));
         marker(&legacy, json!({"version": 1, "receipt": "/nonexistent/synthetic-cleanup-complete"}));
         for journal in [&orphan, &uncertain, &live, &legacy] { age(journal, TWO_DAYS); }
-        let env = LivenessEnv::injected(Some("this-boot".into()),
-            Box::new(|pid| (pid == 1234).then_some(4242)), Box::new(|_, _| crate::process_tree::Cgroup::Gone));
+        let env = LivenessEnv::injected(Some("this-boot".into()), Box::new(|pid| (pid == 1234).then_some(4242)),
+            Box::new(|_, _| crate::process_tree::Cgroup::Successor));
 
         // The pre-#1071 marker is counted apart from the other doubtful cases.
         let dry = clear_orphaned_markers(&root, &env, true).unwrap();
@@ -1777,23 +1772,27 @@ for line in sys.stdin:
         tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
     }
 
-    /// #1071, the reported case through the path the daemon runs: the previous
-    /// instance was killed mid-call and left a marker; starting the successor's
-    /// sweep loop — nothing else — must retire it. The pass is not called
-    /// directly, so wiring it out of `run_sweep_loop` fails this test.
+    /// #1071, the reported case through the path the daemon runs: a `systemctl
+    /// restart` killed the previous instance mid-call and left a marker; starting
+    /// the successor's sweep loop — nothing else — must retire it. The pass is not
+    /// called directly, so wiring it out of `run_sweep_loop` fails this test.
+    ///
+    /// Deliberately *not* a reboot: the marker names this same boot, so the reboot
+    /// proof cannot apply, and the cgroup reading is the realistic restart one —
+    /// the unit cgroup survived at its inode holding only the new daemon.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_restart_retires_the_marker_the_previous_instance_orphaned() {
         let (_temp, root) = private_root();
         let journal = request(&root, "synthetic-orphaned-by-restart", Some(json!([started_row()])));
         write_private(&journal.with_extension("active"), &json!({"version": 2,
-            "receipt": "/nonexistent/synthetic-cleanup-complete", "boot_id": "a-previous-boot",
+            "receipt": "/nonexistent/synthetic-cleanup-complete", "boot_id": "this-boot",
             "writer_pid": 999, "writer_start": 4242, "writer_cgroup": "/synthetic.slice/augmentagent.service",
             "writer_cgroup_inode": 424242}).to_string());
         let rows = std::fs::read_to_string(&journal).unwrap();
         let shutdown = tokio_util::sync::CancellationToken::new();
         let task = tokio::spawn(run_sweep_loop(Some(root.clone()), GRACE, Duration::from_secs(3600),
             shutdown.clone(), None, LivenessEnv::injected(Some("this-boot".into()),
-                Box::new(|_| None), Box::new(|_, _| crate::process_tree::Cgroup::Gone))));
+                Box::new(|_| None), Box::new(|_, _| crate::process_tree::Cgroup::Successor))));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while journal.with_extension("active").exists() {
             assert!(std::time::Instant::now() < deadline, "the startup orphan pass did not run");
