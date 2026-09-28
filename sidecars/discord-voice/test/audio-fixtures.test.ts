@@ -174,3 +174,54 @@ test('intentional silence produces no committed turn and only the owner stream i
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });
+
+test('non-owner and bot Opus packets send zero PCM to STT while owner packets do', async () => {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await new Promise<void>(resolve => server.once('listening', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('expected TCP address');
+  let bytes = 0;
+  server.on('connection', socket => socket.on('message', (data, binary) => {
+    bytes += binary ? Buffer.from(data as Buffer).length
+      : Buffer.from((JSON.parse(data.toString()) as { audio_base_64: string }).audio_base_64, 'base64').length;
+  }));
+  const streams = new Map(['owner-1', 'other-1', 'bot-1'].map(id => [id, new PassThrough()]));
+  const subscriptions: string[] = [];
+  const voice = Object.assign(new EventEmitter(), {
+    state: { status: VoiceConnectionStatus.Ready },
+    subscribe: () => ({ unsubscribe() {} }),
+    receiver: { subscribe: (userId: string) => {
+      subscriptions.push(userId);
+      const stream = streams.get(userId);
+      if (!stream) throw new Error(`Unexpected subscription: ${userId}`);
+      return stream;
+    } },
+  }) as unknown as VoiceConnection;
+  const binding: StartFrame = { version: 1, kind: 'start', requestId: 'owner-boundary',
+    guildId: 'guild-1', channelId: 'voice-1', conversationId: 'text-1',
+    ownerId: 'owner-1', botUserId: 'bot-1', generation: 101 };
+  const audio = new VoiceAudio(voice, binding, {
+    sttProvider: 'deepgram', ttsProvider: 'deepgram',
+    sttKey: 'synthetic-test-key', ttsKey: 'synthetic-test-key',
+    sttEndpoint: `ws://127.0.0.1:${address.port}`,
+  }, () => true);
+  try {
+    await audio.start();
+    const clip = discordPcm(readFileSync(fixtures[0]!.path));
+    assert.ok(await feedOpus(streams.get('other-1')!, clip) > 0);
+    assert.ok(await feedOpus(streams.get('bot-1')!, clip) > 0);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(bytes, 0, 'neither unbound speaker may reach the STT socket');
+    assert.deepEqual(subscriptions, ['owner-1']);
+    assert.ok(await feedOpus(streams.get('owner-1')!, clip) > 0);
+    for (let attempt = 0; bytes < 8_000 && attempt < 100; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.ok(bytes >= 8_000, 'owner PCM must reach the same STT socket');
+  } finally {
+    audio.stop();
+    for (const stream of streams.values()) stream.destroy();
+    for (const client of server.clients) client.terminate();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
