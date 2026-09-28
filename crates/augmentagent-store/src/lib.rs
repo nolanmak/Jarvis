@@ -5,6 +5,7 @@
 //! concurrently.
 
 pub mod models;
+pub mod notes;
 pub mod redact;
 mod store;
 

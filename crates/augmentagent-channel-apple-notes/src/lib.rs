@@ -178,7 +178,7 @@ pub fn note_email(doc: &NoteDoc) -> Email {
         to: String::new(),
         cc: String::new(),
         attachments: doc.attachments.clone(),
-        subject: format!("Apple Note: {} [{}]", doc.title, doc.folder),
+        subject: augmentagent_store::notes::note_subject(&doc.title, &doc.folder),
         body: doc.text.clone(),
         date: doc.modified.clone(),
         account_entity_id: Some("apple-notes".into()),
@@ -385,6 +385,23 @@ mod tests {
     fn parse_note_rejects_missing_frontmatter() {
         assert!(parse_note("just text").is_err());
         assert!(parse_note("---\ntitle: x\n").is_err());
+    }
+
+    /// #1060 — `search_notes` hands its `message_id` to
+    /// `read_conversation_thread`, which looks rows up by `threadId`. That
+    /// reaches the note only because this writer sets both to one value.
+    #[test]
+    fn note_email_threads_the_note_under_its_own_message_id() {
+        let email = note_email(&NoteDoc {
+            identifier: "x-1".into(),
+            title: "Cabin plan".into(),
+            folder: "Trips".into(),
+            ..Default::default()
+        });
+        assert_eq!(email.message_id, "apple-notes:x-1");
+        assert_eq!(email.thread_id.as_deref(), Some(email.message_id.as_str()));
+        let parsed = augmentagent_store::notes::note_title_folder(&email.subject);
+        assert_eq!(parsed, Some(("Cabin plan", "Trips")));
     }
 
     #[test]
