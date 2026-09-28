@@ -9,6 +9,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import time
 import sys
 
 from imessage_sync import load_contacts, sync
@@ -79,14 +80,29 @@ def run(args):
             ), recursive=True))
         s3 = None
         if args.s3_bucket:
-            def upload(path, bucket, key):
+            def upload(path, bucket, key, deadline=None):
                 cmd = ["aws", "s3", "cp", path, f"s3://{bucket}/{key}", "--only-show-errors"]
                 if args.aws_profile:
                     cmd += ["--profile", args.aws_profile]
+                # Cap each file by whatever is left of the run's budget, so one
+                # slow transfer cannot overrun the schedule on its own.
+                limit = 300.0
+                if deadline is not None:
+                    limit = min(limit, deadline - time.monotonic())
+                    if limit <= 0:
+                        return False
                 try:
-                    return subprocess.run(cmd, capture_output=True, timeout=300).returncode == 0
+                    done = subprocess.run(cmd, capture_output=True, timeout=limit)
                 except subprocess.TimeoutExpired:
+                    print(f"upload timed out, will retry: {key}", file=sys.stderr)
                     return False
+                if done.returncode != 0:
+                    # Without this the failure is invisible: --only-show-errors
+                    # writes to stderr and the queue silently re-grows each run.
+                    print(f"upload failed ({done.returncode}): {key}: "
+                          f"{done.stderr.decode(errors='replace').strip()[:200]}",
+                          file=sys.stderr)
+                return done.returncode == 0
             s3 = {"bucket": args.s3_bucket, "uploader": upload}
         result = sync(args.db, args.out, args.out / ".sync_state.json", contacts=contacts, s3=s3)
         print(f"synced {result['messages']} messages across {result['conversations']} conversations")
