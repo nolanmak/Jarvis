@@ -70,6 +70,8 @@ For AC07 integration, `speech-runtime.test.ts` now starts an actual local fake D
 
 A separate virtual-clock regression first failed when duplicate `StartOfTurn` events left an older 120-second timer armed after a committed transcript; the stale timer later stopped a healthy call. Speech-start now arms the cap only on the transition into an active utterance. The passing test commits the turn, advances past both possible cap deadlines, and observes no failure.
 
+For AC10, a 50-cycle fake audio-runtime test now opens both local STT and TTS WebSockets on every start, queues one speech job, then stops. After each cycle it observes a destroyed receiver, interrupted receipt, unsubscribed playback sink, and zero open provider clients. This supplements the existing 50-cycle coordinator handle test; it does not prove cleanup of real Discord receivers or native scheduler leases during a live call.
+
 ## Required next gates
 
 1. Prove Discord DAVE join, owner audio receive/decode, and outbound playback in a test guild. Mocked adapter and native MCP tests cannot satisfy this gate.

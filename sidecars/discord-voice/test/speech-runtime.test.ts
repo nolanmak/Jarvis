@@ -189,6 +189,66 @@ test('duplicate speech-start events cannot leave a stale 120-second cap after co
   }
 });
 
+test('fifty audio start and stop cycles close provider sockets, receivers, and playback subscriptions', async () => {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await new Promise<void>(resolve => server.once('listening', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('expected TCP address');
+  let sttOpened = 0;
+  let ttsOpened = 0;
+  server.on('connection', (socket, request) => {
+    if (request.url?.startsWith('/v2/listen')) { sttOpened++; return; }
+    if (!request.url?.startsWith('/v1/speak')) throw new Error('Unexpected provider path');
+    ttsOpened++;
+    socket.on('message', data => {
+      if ((JSON.parse(data.toString()) as { type: string }).type === 'Flush') {
+        socket.send(Buffer.alloc(48_000));
+      }
+    });
+  });
+  let unsubscribed = 0;
+  try {
+    for (let generation = 1; generation <= 50; generation++) {
+      const receiver = new PassThrough();
+      const connection = Object.assign(new EventEmitter(), {
+        state: { status: VoiceConnectionStatus.Ready },
+        subscribe: () => ({ unsubscribe() { unsubscribed++; } }),
+        receiver: { subscribe: () => receiver },
+      }) as unknown as VoiceConnection;
+      const audio: VoiceAudio = new VoiceAudio(connection, { ...binding, generation }, {
+        sttProvider: 'deepgram', ttsProvider: 'deepgram',
+        sttKey: 'synthetic-key', ttsKey: 'synthetic-key',
+        sttEndpoint: `ws://127.0.0.1:${address.port}`,
+        ttsEndpoint: `ws://127.0.0.1:${address.port}`,
+      }, () => true);
+      try {
+        await audio.start();
+        assert.equal(audio.status, 'listening');
+        audio.speak(`cycle-${generation}`, 'a response to interrupt');
+        for (let attempt = 0; ttsOpened < generation && attempt < 100; attempt++) {
+          await new Promise(resolve => setTimeout(resolve, 2));
+        }
+        assert.equal(ttsOpened, generation, `TTS did not open in cycle ${generation}`);
+      } finally {
+        audio.stop();
+      }
+      assert.equal(audio.status, 'stopped');
+      assert.equal(receiver.destroyed, true);
+      assert.equal(audio.speechStatus(`cycle-${generation}`)?.status, 'interrupted');
+      for (let attempt = 0; server.clients.size > 0 && attempt < 100; attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 2));
+      }
+      assert.equal(server.clients.size, 0, `provider socket leaked in cycle ${generation}`);
+      assert.equal(unsubscribed, generation, `playback subscription leaked in cycle ${generation}`);
+    }
+    assert.equal(sttOpened, 50);
+    assert.equal(ttsOpened, 50);
+  } finally {
+    for (const client of server.clients) client.terminate();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
 for (const trigger of ['owner speech-start', 'voice interrupt command'] as const) {
   test(`${trigger} cancels active TTS and marks its receipt within 250 ms`, async () => {
     const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
