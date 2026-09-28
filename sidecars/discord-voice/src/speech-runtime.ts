@@ -22,6 +22,8 @@ export type SpeechConfig = {
   elevenLabsVoiceId?: string;
   /** Test transport only; production leaves this unset. */
   sttEndpoint?: string;
+  /** Test transport only; production leaves this unset. */
+  ttsEndpoint?: string;
   /** Test clock only; production uses 1/2/4 seconds. */
   sttRetryDelays?: readonly number[];
 };
@@ -133,6 +135,7 @@ export class VoiceAudio {
     this.speech = new SpeechQueue((text, signal) => streamTts({
       provider: config.ttsProvider, apiKey: config.ttsKey,
       voiceId: config.elevenLabsVoiceId, text, signal,
+      endpoint: config.ttsEndpoint,
     }), this.sink);
   }
 

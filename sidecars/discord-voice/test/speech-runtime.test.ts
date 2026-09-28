@@ -150,3 +150,65 @@ test('a 120-second owner utterance stops at the configured cap without submittin
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });
+
+for (const trigger of ['owner speech-start', 'voice interrupt command'] as const) {
+  test(`${trigger} cancels active TTS and marks its receipt within 250 ms`, async () => {
+    const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+    await new Promise<void>(resolve => server.once('listening', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('expected TCP address');
+    let sttPeer: import('ws').WebSocket | undefined;
+    let ttsPeer: import('ws').WebSocket | undefined;
+    let finishFirst!: () => void;
+    const firstAudio = new Promise<void>(resolve => { finishFirst = resolve; });
+    let finishClosed!: () => void;
+    const ttsClosed = new Promise<void>(resolve => { finishClosed = resolve; });
+    server.on('connection', (socket, request) => {
+      if (request.url?.startsWith('/v2/listen')) { sttPeer = socket; return; }
+      if (!request.url?.startsWith('/v1/speak')) throw new Error('Unexpected provider path');
+      ttsPeer = socket;
+      socket.once('close', finishClosed);
+      socket.on('message', data => {
+        if ((JSON.parse(data.toString()) as { type: string }).type !== 'Flush') return;
+        socket.send(Buffer.alloc(48_000));
+        finishFirst();
+      });
+    });
+    const frames: Array<Record<string, unknown>> = [];
+    const audio = new VoiceAudio(fakeConnection(), binding, {
+      sttProvider: 'deepgram', ttsProvider: 'deepgram',
+      sttKey: 'synthetic-key', ttsKey: 'synthetic-key',
+      sttEndpoint: `ws://127.0.0.1:${address.port}`,
+      ttsEndpoint: `ws://127.0.0.1:${address.port}`,
+    }, frame => { frames.push(frame as Record<string, unknown>); return true; });
+    try {
+      await audio.start();
+      audio.speak('active-answer', 'first chunk then interruption');
+      await Promise.race([firstAudio, new Promise<never>((_, reject) => setTimeout(
+        () => reject(new Error('TTS did not start')), 1_000))]);
+      assert.equal(audio.speechStatus('active-answer')?.status, 'playing');
+      const began = performance.now();
+      if (trigger === 'owner speech-start') {
+        assert.ok(sttPeer);
+        sttPeer.send(JSON.stringify({ type: 'TurnInfo', event: 'StartOfTurn', turn_index: 0 }));
+      } else {
+        audio.interrupt();
+      }
+      for (let attempt = 0; !frames.some(frame => frame.kind === 'speech_interrupted') && attempt < 100; attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 2));
+      }
+      const elapsed = performance.now() - began;
+      assert.ok(elapsed < 250, `local interrupt took ${elapsed} ms`);
+      assert.equal(audio.speechStatus('active-answer')?.status, 'interrupted');
+      assert.equal(frames.filter(frame => frame.kind === 'speech_interrupted').length, 1);
+      await Promise.race([ttsClosed, new Promise<never>((_, reject) => setTimeout(
+        () => reject(new Error('TTS socket survived interruption')), 250))]);
+      assert.ok(ttsPeer);
+      assert.equal(frames.filter(frame => frame.kind === 'transcript').length, 0);
+    } finally {
+      audio.stop();
+      for (const client of server.clients) client.terminate();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+}

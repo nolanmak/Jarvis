@@ -66,6 +66,8 @@ AC06 fixture hardening: 20 fixed, attributed WAV clips from the TensorFlow Speec
 
 The first fixture run failed because no PCM reached the fake STT server until the FFmpeg input closed. A standalone one-second open-input probe reproduced zero output, while closing yielded 32,000 bytes. Adding `-probesize 32 -analyzeduration 0` before the raw PCM input caused PCM to arrive while the input remained open; the prerecorded suite and a direct one-second regression test now pass. This removes a measured local buffering defect but does not establish live endpointing or latency percentiles.
 
+For AC07 integration, `speech-runtime.test.ts` now starts an actual local fake Deepgram TTS stream, then sends either a fake Deepgram `StartOfTurn` or the direct voice interrupt command. Both paths mark the active receipt interrupted in under 250 ms and close the TTS WebSocket. The first red run failed typecheck because the runtime did not expose a test-only TTS endpoint; the runtime now passes that endpoint through to the existing TTS adapter. The fake connection does not establish the Discord audio player's stop time or remote audibility.
+
 ## Required next gates
 
 1. Prove Discord DAVE join, owner audio receive/decode, and outbound playback in a test guild. Mocked adapter and native MCP tests cannot satisfy this gate.
