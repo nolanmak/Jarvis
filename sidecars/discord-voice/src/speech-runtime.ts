@@ -275,7 +275,7 @@ export class VoiceAudio {
 
   private onSttEvent(event: SttEvent, epoch: number): void {
     if (this.closed || epoch !== this.sttEpoch) return;
-    if (event.kind === 'speech_start' || (event.kind === 'partial' && !this.speechActive)) {
+    if (!this.speechActive && (event.kind === 'speech_start' || event.kind === 'partial')) {
       this.speechActive = true;
       this.interrupt();
       this.cap = setTimeout(() => this.fail('Owner utterance exceeded 120 seconds'), 120_000);

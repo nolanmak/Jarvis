@@ -68,6 +68,8 @@ The first fixture run failed because no PCM reached the fake STT server until th
 
 For AC07 integration, `speech-runtime.test.ts` now starts an actual local fake Deepgram TTS stream, then sends either a fake Deepgram `StartOfTurn` or the direct voice interrupt command. Both paths mark the active receipt interrupted in under 250 ms and close the TTS WebSocket. The first red run failed typecheck because the runtime did not expose a test-only TTS endpoint; the runtime now passes that endpoint through to the existing TTS adapter. The fake connection does not establish the Discord audio player's stop time or remote audibility.
 
+A separate virtual-clock regression first failed when duplicate `StartOfTurn` events left an older 120-second timer armed after a committed transcript; the stale timer later stopped a healthy call. Speech-start now arms the cap only on the transition into an active utterance. The passing test commits the turn, advances past both possible cap deadlines, and observes no failure.
+
 ## Required next gates
 
 1. Prove Discord DAVE join, owner audio receive/decode, and outbound playback in a test guild. Mocked adapter and native MCP tests cannot satisfy this gate.

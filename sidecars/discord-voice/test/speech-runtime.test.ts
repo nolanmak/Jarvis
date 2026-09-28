@@ -151,6 +151,44 @@ test('a 120-second owner utterance stops at the configured cap without submittin
   }
 });
 
+test('duplicate speech-start events cannot leave a stale 120-second cap after commit', async t => {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await new Promise<void>(resolve => server.once('listening', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('expected TCP address');
+  let peer: import('ws').WebSocket | undefined;
+  server.on('connection', socket => { peer = socket; });
+  const frames: Array<Record<string, unknown>> = [];
+  const audio = new VoiceAudio(fakeConnection(), binding, {
+    sttProvider: 'deepgram', ttsProvider: 'deepgram',
+    sttKey: 'synthetic-key', ttsKey: 'synthetic-key',
+    sttEndpoint: `ws://127.0.0.1:${address.port}`,
+  }, frame => { frames.push(frame as Record<string, unknown>); return true; });
+  const realSetTimeout = globalThis.setTimeout;
+  try {
+    await audio.start();
+    assert.ok(peer);
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    peer.send(JSON.stringify({ type: 'TurnInfo', event: 'StartOfTurn', turn_index: 0 }));
+    await new Promise<void>(resolve => realSetTimeout(resolve, 20));
+    t.mock.timers.tick(60_000);
+    peer.send(JSON.stringify({ type: 'TurnInfo', event: 'StartOfTurn', turn_index: 0 }));
+    await new Promise<void>(resolve => realSetTimeout(resolve, 20));
+    peer.send(JSON.stringify({ type: 'TurnInfo', event: 'EndOfTurn', turn_index: 0,
+      transcript: 'finished before cap' }));
+    await new Promise<void>(resolve => realSetTimeout(resolve, 20));
+    assert.equal(frames.filter(frame => frame.kind === 'transcript').length, 1);
+    t.mock.timers.tick(120_000);
+    assert.equal(audio.status, 'listening');
+    assert.equal(frames.filter(frame => frame.kind === 'audio_failure').length, 0);
+  } finally {
+    t.mock.timers.reset();
+    audio.stop();
+    for (const client of server.clients) client.terminate();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
 for (const trigger of ['owner speech-start', 'voice interrupt command'] as const) {
   test(`${trigger} cancels active TTS and marks its receipt within 250 ms`, async () => {
     const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
