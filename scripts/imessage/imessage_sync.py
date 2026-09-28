@@ -5,11 +5,13 @@ append-only `messages.md` with YAML frontmatter.
 Reads chat.db strictly read-only. Incremental state (last synced message
 ROWID) lives in `.sync_state.json` at the bundle root.
 """
+import inspect
 import json
 import hashlib
 import os
 import re
 import sqlite3
+import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -37,6 +39,15 @@ def is_uploadable(path):
     return not str(path).lower().endswith(SKIP_ATTACHMENT_SUFFIXES)
 
 
+def _takes_deadline(uploader):
+    """True when the uploader accepts a `deadline` keyword, so a slow file can
+    be cut off by the run's budget rather than its own per-file timeout."""
+    try:
+        return "deadline" in inspect.signature(uploader).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def drain_uploads(items, bucket, uploader, exists=None, workers=UPLOAD_WORKERS,
                   deadline=None):
     """Upload `items` ({'path','key'}) in parallel; return those still pending,
@@ -54,7 +65,17 @@ def drain_uploads(items, bucket, uploader, exists=None, workers=UPLOAD_WORKERS,
     def attempt(item):
         if deadline is not None and time.monotonic() >= deadline:
             return False
-        return uploader(item["path"], bucket, item["key"])
+        try:
+            if _takes_deadline(uploader):
+                return bool(uploader(item["path"], bucket, item["key"],
+                                     deadline=deadline))
+            return bool(uploader(item["path"], bucket, item["key"]))
+        except Exception as error:
+            # Never propagate: the caller saves the ROWID cursor after this
+            # returns, and losing it would re-append messages already written.
+            print(f"upload error, will retry: {item['key']}: {error}",
+                  file=sys.stderr)
+            return False
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         done = list(pool.map(attempt, live))

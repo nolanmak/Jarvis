@@ -4,6 +4,7 @@ Fixture chat.db is built in-memory with the subset of Apple's schema the
 sync reads, so tests run without Full Disk Access or real message data.
 """
 import json
+import time
 import sqlite3
 import unittest
 import tempfile
@@ -499,6 +500,48 @@ class TestDrainUploads(unittest.TestCase):
             exists=lambda p: True, workers=2, deadline=0.0)
         self.assertEqual(calls, [])
         self.assertEqual(len(still), 5)
+
+    def test_raising_uploader_keeps_the_item_queued(self):
+        # A raising uploader must not propagate: drain_uploads runs before the
+        # caller saves last_rowid, so an escaping exception would lose the cursor
+        # and the next run would append duplicate messages.
+        items = [{"path": "/tmp/f0", "key": "k0"}, {"path": "/tmp/f1", "key": "k1"}]
+
+        def boom(path, bucket, key):
+            if key == "k0":
+                raise OSError("connection reset")
+            return True
+
+        still = drain_uploads(items, "b", boom, exists=lambda p: True, workers=2)
+        self.assertEqual([i["key"] for i in still], ["k0"])
+
+    def test_non_bool_uploader_result_is_coerced(self):
+        still = drain_uploads([{"path": "/tmp/f0", "key": "k0"}], "b",
+                              lambda p, b, k: None,
+                              exists=lambda p: True, workers=1)
+        self.assertEqual([i["key"] for i in still], ["k0"])
+
+    def test_deadline_is_passed_to_the_uploader_when_it_accepts_one(self):
+        # A per-file timeout longer than the whole budget would let one slow
+        # file overrun the run, so the drain offers its deadline to uploaders
+        # that can use it.
+        seen = {}
+
+        def upload(path, bucket, key, deadline=None):
+            seen["deadline"] = deadline
+            return True
+
+        future = time.monotonic() + 60
+        drain_uploads([{"path": "/tmp/f0", "key": "k0"}], "b", upload,
+                      exists=lambda p: True, workers=1, deadline=future)
+        self.assertEqual(seen["deadline"], future)
+
+    def test_uploader_without_deadline_parameter_still_works(self):
+        calls = []
+        still = drain_uploads([{"path": "/tmp/f0", "key": "k0"}], "b",
+                              lambda p, b, k: calls.append(k) or True,
+                              exists=lambda p: True, workers=1, deadline=None)
+        self.assertEqual((calls, still), (["k0"], []))
 
     def test_order_is_preserved_for_requeued_items(self):
         items = [{"path": f"/tmp/f{i}", "key": f"k{i}"} for i in range(6)]
