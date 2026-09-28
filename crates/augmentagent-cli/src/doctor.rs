@@ -1103,12 +1103,11 @@ fn handoff_journal_finding(report: Result<handoff::SweepReport>, grace: Duration
             Some(HINT),
         );
     }
-    // A pre-#1071 marker records no writer, so no orphan pass can ever prove it
-    // dead; unlike the other kept counts this backlog does not drain by itself.
+    // A pre-#1071 marker records no writer, so no orphan pass can ever prove it dead;
+    // unlike the other kept counts this backlog does not drain by itself.
     if orphans.kept_legacy > 0 {
-        return Finding::warn(NAME,
-            format!("{msg} — {} marker(s) predate #1071; no pass can prove them dead", orphans.kept_legacy),
-            Some("python3 scripts/codex-tool-bridge.py --handoff-status <journal>"));
+        return Finding::warn(NAME, format!("{msg} — {} marker(s) predate #1071; no pass can prove them dead",
+            orphans.kept_legacy), Some("python3 scripts/codex-tool-bridge.py --handoff-status <journal>"));
     }
     Finding::ok(NAME, msg)
 }
@@ -1959,14 +1958,13 @@ mod tests {
             kept_unfinished: 2,
             ..Default::default()
         };
-        // #1071 — of the 3 markers, one is clearable, one live, one doubtful.
+        // #1071 — of the 3 markers, one is clearable, one live, one doubtful. A
+        // pre-#1071 marker no pass can prove dead is the one that warrants a warning.
         let seen = handoff::OrphanReport { cleared: 1, kept_live: 1, kept_unproven: 1, kept_legacy: 0 };
         let ok = handoff_journal_finding(Ok(healthy), grace, seen);
         assert_eq!(ok.severity, Severity::Ok, "{}", ok.message);
         assert!(ok.message.contains("1 clearable as orphans"), "{}", ok.message);
-        // A pre-#1071 marker cannot be proved dead by any pass, so doctor warns.
-        let legacy = handoff_journal_finding(Ok(healthy), grace,
-            handoff::OrphanReport { kept_legacy: 2, ..seen });
+        let legacy = handoff_journal_finding(Ok(healthy), grace, handoff::OrphanReport { kept_legacy: 2, ..seen });
         assert_eq!(legacy.severity, Severity::Warn, "{}", legacy.message);
         assert!(legacy.message.contains("2 marker(s) predate #1071"), "{}", legacy.message);
         // Counts only request dirs, and reports what needs an operator as information.

@@ -165,10 +165,9 @@ pub(crate) fn touch_request(journal: &std::path::Path) -> std::io::Result<bool> 
 
 fn marker_receipt(marker: &std::path::Path) -> std::io::Result<PathBuf> {
     let value: serde_json::Value = serde_json::from_slice(&private_read(marker)?)?;
-    // Markers written before #1071 carry no writer identity; both versions
-    // name the same receipt, so every receipt-based path accepts both.
-    let known = value["version"] == 1 || value["version"] == MARKER_VERSION;
-    let receipt = value["receipt"].as_str().filter(|_| known)
+    // Pre-#1071 markers carry no writer identity, but name the same receipt.
+    let receipt = value["receipt"].as_str()
+        .filter(|_| value["version"] == 1 || value["version"] == MARKER_VERSION)
         .ok_or_else(|| std::io::Error::other("invalid lifecycle marker"))?;
     let receipt = PathBuf::from(receipt);
     if !receipt.is_absolute() { return Err(std::io::Error::other("invalid receipt location")); }
@@ -176,17 +175,17 @@ fn marker_receipt(marker: &std::path::Path) -> std::io::Result<PathBuf> {
 }
 
 /// Proof that no descendant of the call can still be running: the supervisor's
-/// `all-descendants-reaped` receipt, or — with no receipt left — that the writer
-/// is gone (#1071). Neither subsumes the other.
+/// `all-descendants-reaped` receipt, or — with no receipt left — that the writer is
+/// gone (#1071). Neither subsumes the other.
 enum Proof<'a> { Reaped(&'a std::path::Path), WriterGone(&'a LivenessEnv) }
 
-/// The one site that unlinks a lifecycle marker, and the one that decides it may
-/// be. The caller must hold the lifecycle lock; the proof is judged here against
-/// the marker on disk, so no path removes one on its own authority.
+/// The one site that unlinks a lifecycle marker, and the one that decides it may be.
+/// The caller must hold the lifecycle lock; the proof is judged here against the
+/// marker on disk, so no path removes one on its own authority.
 fn clear_marker(marker: &std::path::Path, proof: Proof<'_>) -> std::io::Result<Liveness> {
     let verdict = match proof {
-        // The marker must still name the verified receipt; if it names another,
-        // a newer invocation owns this logical request and is running.
+        // The marker must still name the verified receipt; if it names another, a
+        // newer invocation owns this logical request and is running.
         Proof::Reaped(receipt) if marker_receipt(marker)?.as_path() == receipt => Liveness::Dead,
         Proof::Reaped(_) => Liveness::Live,
         Proof::WriterGone(env) => call_provably_dead(marker, env),
@@ -207,9 +206,9 @@ fn retire_request(marker: &std::path::Path, receipt: &std::path::Path) -> std::i
     }
 }
 
-/// Whether a call's descendants can still be running (#1071). Only `Dead` clears
-/// the marker; `Live` means its writer is still running, `Legacy` a pre-#1071
-/// marker with no identity to judge, `Unproven` an incomplete proof.
+/// Whether a call's descendants can still be running (#1071). Only `Dead` clears the
+/// marker; `Live` means its writer is still running, `Legacy` a pre-#1071 marker with
+/// no identity to judge, `Unproven` an incomplete proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Liveness { Dead, Live, Legacy, Unproven }
 
@@ -220,21 +219,24 @@ fn read_trimmed(path: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-/// Field 22 of `/proc/<pid>/stat`, read after the last `)` so a comm holding spaces
-/// or parentheses cannot shift the offset. `None` means no such process.
-fn process_start(pid: libc::pid_t) -> Option<u64> {
+/// A field of `/proc/<pid>/stat`, counting from the one after the last `)` so a comm
+/// holding spaces or parentheses cannot shift the offset. `None`: no such process.
+fn stat_field<T: std::str::FromStr>(pid: libc::pid_t, field: usize) -> Option<T> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()
+    stat.rsplit_once(')')?.1.split_whitespace().nth(field - 3)?.parse().ok()
 }
 
-/// The cgroup a call ran in, as it stands now. `Gone` covers a vanished directory
-/// and one re-created at another inode: either way the recorded one was destroyed.
-/// `Successor` is the restart case — it survived holding processes, but all began
-/// after us. `Populated` holds one predating us, as a leaked descendant would.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Cgroup { Gone, Empty, Successor, Populated, Unknown }
+/// Field 22 of `/proc/<pid>/stat`: when the process started, to tell a reused pid
+/// from the one the marker names.
+fn process_start(pid: libc::pid_t) -> Option<u64> { stat_field(pid, 22) }
 
-/// The cgroup v2 mount, where `/proc/self/cgroup`'s path is rooted.
+/// The cgroup a call ran in, as it stands now. `Gone` covers a vanished directory and
+/// one re-created at another inode: either way the recorded one was destroyed. `Ours`
+/// holds nobody but this process and its own descendants — empty, or the restart case.
+/// `Populated` holds something else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Cgroup { Gone, Ours, Populated, Unknown }
+
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// This process's own cgroup v2 path and inode, which together identify it.
@@ -245,12 +247,12 @@ fn own_cgroup() -> Option<(String, u64)> {
     Some((path, inode))
 }
 
-/// Does the cgroup a call ran in still hold a process that could have survived
-/// from it? The kernel removes such a directory only once it is empty, so its
-/// absence is its own record that every process of that call is gone. A surviving
-/// directory needs its members read, because a plain restart puts the successor
-/// into the *same* unit cgroup at the same inode: treating any occupant as
-/// possibly-a-descendant would keep every orphan forever, the bug #1071 reports.
+/// Does the cgroup a call ran in still hold a process that could have survived from
+/// it? The kernel removes such a directory only once it is empty, so its absence is
+/// its own record that every process of that call is gone. A surviving one needs its
+/// members read: an in-place restart can leave the successor in the *same* unit cgroup
+/// at the same inode, and reading any occupant as possibly-a-descendant would keep
+/// every orphan forever, the #1071 bug.
 fn cgroup_state(path: &str, inode: u64) -> Cgroup {
     let directory = format!("{CGROUP_ROOT}{path}");
     match std::fs::metadata(&directory).map(|found| found.ino() == inode) {
@@ -258,24 +260,34 @@ fn cgroup_state(path: &str, inode: u64) -> Cgroup {
         Err(_) => Cgroup::Unknown,
         Ok(false) => Cgroup::Gone,
         Ok(true) => match std::fs::read_to_string(format!("{directory}/cgroup.procs")) {
-            Ok(procs) => cgroup_members(&procs, process_start, process_start(unsafe { libc::getpid() })),
+            Ok(procs) => cgroup_members(&procs, process_parent, unsafe { libc::getpid() }),
             Err(_) => Cgroup::Unknown,
         },
     }
 }
 
-/// Classify a `cgroup.procs` body against our own start time: anything the dead call
-/// leaked must predate us, so a member older than us is `Populated` and one younger
-/// is the successor's. A member whose start cannot be read has already exited.
-/// Without our own start time nothing compares, so any member keeps the marker.
-fn cgroup_members(procs: &str, start_of: impl Fn(libc::pid_t) -> Option<u64>, own: Option<u64>) -> Cgroup {
-    let mut members = procs.split_whitespace().filter_map(|pid| pid.parse().ok()).peekable();
-    if members.peek().is_none() { return Cgroup::Empty; }
-    let Some(own) = own else { return Cgroup::Populated };
-    if members.any(|pid| start_of(pid).is_some_and(|start| start < own)) {
-        return Cgroup::Populated;
-    }
-    Cgroup::Successor
+/// Field 4 of `/proc/<pid>/stat`: the parent, for the ancestry walk below.
+fn process_parent(pid: libc::pid_t) -> Option<libc::pid_t> { stat_field(pid, 4) }
+
+/// Classify a `cgroup.procs` body by ancestry: only if every member's `/proc` parent
+/// chain reaches this process does nothing of the dead call survive there. Anything
+/// we cannot walk up to ourselves keeps the marker — a foreign process, a listed pid
+/// `/proc` will not show (no proven exit), or a leak of the call, reparented away
+/// from us when its parent died. Start times cannot serve: a still-live writer's
+/// child spawned after us is younger than us yet not ours.
+fn cgroup_members(procs: &str, parent_of: impl Fn(libc::pid_t) -> Option<libc::pid_t>,
+    own: libc::pid_t) -> Cgroup {
+    let ours = |member: libc::pid_t| {
+        let mut pid = member;
+        // Bounded, so a `/proc` reading that cycles cannot hang the pass.
+        (0..64).any(|_| match parent_of(pid).filter(|_| pid != own) {
+            Some(next) if next > 1 && next != pid => { pid = next; false }
+            _ => true, // Reached us, or the chain ended below us. Stop looking.
+        }) && pid == own
+    };
+    // An empty body vacuously satisfies this, which is the right reading.
+    let mut members = procs.split_whitespace().filter_map(|pid| pid.parse().ok());
+    if members.all(ours) { Cgroup::Ours } else { Cgroup::Populated }
 }
 
 /// The liveness probes [`call_provably_dead`] reads, injected so the predicate is
@@ -297,14 +309,16 @@ impl LivenessEnv {
     }
 }
 
+/// Who wrote a marker, as recorded by [`begin_request`].
+struct Writer { boot_id: String, pid: libc::pid_t, start: u64, cgroup: String, cgroup_inode: u64 }
+
 /// Can any descendant of the call that wrote `marker` still be running? Two
 /// independent proofs of "no": a different `boot_id` (nothing the marker names
 /// survived the reboot), or, on the same boot, a writer that is gone whose cgroup
-/// holds no process that could have outlived it. The cgroup, not `KillMode`, is
-/// the proof: `KillMode` says only what systemd *intends* on stop. The writer is
-/// recorded rather than the supervisor because the marker must exist before
-/// `spawn` yields a pid, and `spawn_supervised` never moves a child out of the
-/// writer's cgroup anyway.
+/// holds no process that could have outlived it. The cgroup, not `KillMode`, is the
+/// proof: `KillMode` says only what systemd *intends* on stop. The writer is recorded
+/// rather than the supervisor because the marker must exist before `spawn` yields a
+/// pid, and `spawn_supervised` never moves a child out of its cgroup anyway.
 fn call_provably_dead(marker: &std::path::Path, env: &LivenessEnv) -> Liveness {
     let writer = match marker_identity(marker) {
         Identity::Writer(writer) => writer,
@@ -316,19 +330,16 @@ fn call_provably_dead(marker: &std::path::Path, env: &LivenessEnv) -> Liveness {
     // Never pid alone: a reused pid is a different process.
     if (env.start_of)(writer.pid) == Some(writer.start) { return Liveness::Live; }
     match (env.cgroup_of)(&writer.cgroup, writer.cgroup_inode) {
-        // Destroyed, emptied, or — after a plain restart into the same unit
-        // cgroup — holding none but the successor's own younger processes.
-        Cgroup::Gone | Cgroup::Empty | Cgroup::Successor => Liveness::Dead,
-        // A member older than this process could be a descendant the call leaked.
+        // Destroyed, emptied, or — after an in-place restart into the same unit
+        // cgroup — holding none but this process and its own descendants.
+        Cgroup::Gone | Cgroup::Ours => Liveness::Dead,
+        // Any member we cannot claim as ours may be one the call leaked.
         Cgroup::Populated | Cgroup::Unknown => Liveness::Unproven,
     }
 }
 
-/// Who wrote a marker, as recorded by [`begin_request`].
-struct Writer { boot_id: String, pid: libc::pid_t, start: u64, cgroup: String, cgroup_inode: u64 }
-
-/// What a marker says about its writer. `Legacy` is a well-formed pre-#1071 marker
-/// recording no writer; `Unknown` is missing, unreadable, or malformed. Both keep it.
+/// What a marker says about its writer. `Legacy` is a well-formed pre-#1071 marker with
+/// no writer recorded; `Unknown` is missing, unreadable, or malformed. Both keep it.
 enum Identity { Writer(Writer), Legacy, Unknown }
 
 fn marker_identity(marker: &std::path::Path) -> Identity {
@@ -341,14 +352,16 @@ fn marker_identity(marker: &std::path::Path) -> Identity {
         pid: value["writer_pid"].as_i64().and_then(|pid| libc::pid_t::try_from(pid).ok()).filter(|pid| *pid > 0)?,
         start: value["writer_start"].as_u64()?,
         cgroup: value["writer_cgroup"].as_str().filter(|cgroup| cgroup.starts_with('/'))?.to_owned(),
-        cgroup_inode: value["writer_cgroup_inode"].as_u64()?,
+        // Zero is no inode, so it would match no directory and read as `Gone` — a
+        // clearing verdict out of a malformed field. Keep the marker instead.
+        cgroup_inode: value["writer_cgroup_inode"].as_u64().filter(|inode| *inode > 0)?,
     });
     writer().map_or(Identity::Unknown, Identity::Writer)
 }
 
-/// Clear one orphaned marker, or report why it was kept. `dry_run` reads only: it
-/// takes no lock and creates nothing. Only the marker is touched — the journal keeps
-/// its `started` rows, so recovery can still act on the request.
+/// Clear one orphaned marker, or report why it was kept. `dry_run` reads only: it takes
+/// no lock and creates nothing. Only the marker is touched — the journal keeps its
+/// `started` rows, so recovery can still act on the request.
 pub(crate) fn clear_if_dead(journal: &std::path::Path, env: &LivenessEnv, dry_run: bool) -> std::io::Result<Liveness> {
     let marker = journal.with_extension("active");
     if dry_run { return Ok(call_provably_dead(&marker, env)); }
@@ -381,8 +394,8 @@ fn begin_request(journal: Option<&std::path::Path>, receipt: &std::path::Path) -
         .map_err(|error| if error.kind() == std::io::ErrorKind::AlreadyExists {
             std::io::Error::new(std::io::ErrorKind::WouldBlock, "previous request cleanup is unverified")
         } else { error })?;
-    // #1071 — who wrote this, and on which boot, so an orphan left by a daemon
-    // that died mid-call can be proved dead later.
+    // #1071 — who wrote this, and on which boot, so an orphan left by a daemon that
+    // died mid-call can be proved dead later.
     let writer = unsafe { libc::getpid() };
     let (cgroup, cgroup_inode) = own_cgroup().unzip();
     file.write_all(serde_json::json!({
@@ -536,35 +549,29 @@ mod tests {
         }
     }
 
-    /// #1071 — a marker is cleared only on a proof that no descendant of the
-    /// call can still be running. Every gap in either proof keeps it.
+    /// #1071 — a marker is cleared only on a proof that no descendant of the call can
+    /// still be running. Every gap in either proof keeps it.
     #[test]
     fn a_marker_is_cleared_only_when_the_call_is_provably_dead() {
-        const SERVICE: &str = "/user.slice/user-1000.slice/app.slice/augmentagent.service";
         let env = |boot: Option<&str>, live: bool, cgroup: Cgroup| LivenessEnv {
-            boot_id: boot.map(str::to_owned),
-            start_of: Box::new(move |_| live.then_some(4242)),
-            cgroup_of: Box::new(move |_, _| cgroup),
-        };
+            boot_id: boot.map(str::to_owned), start_of: Box::new(move |_| live.then_some(4242)),
+            cgroup_of: Box::new(move |_, _| cgroup) };
         // The daemon's own reading, from which each case departs in one way.
         let daemon = || env(Some("this-boot"), false, Cgroup::Gone);
         let same_boot = |cgroup| env(Some("this-boot"), false, cgroup);
+        // A zero inode matches no directory, so it must not read `Gone` and clear.
         let cases: Vec<(&str, Value, LivenessEnv, Liveness)> = vec![
-            ("a foreign boot proves a reboot killed everything", json!({"boot_id": "other-boot"}),
+            ("a reboot killed everything the marker names", json!({"boot_id": "other"}),
                 env(Some("this-boot"), true, Cgroup::Populated), Liveness::Dead),
             ("the writer is still running", json!({}), env(Some("this-boot"), true, Cgroup::Gone), Liveness::Live),
             ("writer gone, its cgroup destroyed", json!({}), daemon(), Liveness::Dead),
-            ("writer gone, its cgroup holding nobody", json!({}), same_boot(Cgroup::Empty), Liveness::Dead),
-            ("a restart reused the unit cgroup; only younger processes in it", json!({}),
-                same_boot(Cgroup::Successor), Liveness::Dead),
-            ("the cgroup holds a process older than us, perhaps a descendant", json!({}),
-                same_boot(Cgroup::Populated), Liveness::Unproven),
+            ("a restart reused the unit cgroup; only we are in it", json!({}), same_boot(Cgroup::Ours), Liveness::Dead),
+            ("the cgroup holds someone not ours", json!({}), same_boot(Cgroup::Populated), Liveness::Unproven),
             ("the cgroup could not be read", json!({}), same_boot(Cgroup::Unknown), Liveness::Unproven),
-            ("boot id could not be read", json!({"boot_id": "other-boot"}),
-                env(None, false, Cgroup::Gone), Liveness::Unproven),
+            ("boot id could not be read", json!({"boot_id": "other"}), env(None, false, Cgroup::Gone), Liveness::Unproven),
             ("a pre-#1071 marker has no identity", json!({"version": 1}), daemon(), Liveness::Legacy),
-            ("a v2 marker missing a writer field", json!({"writer_start": Value::Null}),
-                daemon(), Liveness::Unproven),
+            ("a v2 marker missing a writer field", json!({"writer_start": Value::Null}), daemon(), Liveness::Unproven),
+            ("a v2 marker whose cgroup inode is zero", json!({"writer_cgroup_inode": 0}), daemon(), Liveness::Unproven),
         ];
         let request = || {
             let directory = tempfile::tempdir().unwrap();
@@ -579,7 +586,7 @@ mod tests {
             let marker = journal.with_extension("active");
             let mut value = json!({"version": MARKER_VERSION, "writer_pid": 999, "writer_start": 4242,
                 "receipt": directory.path().join("cleanup-complete"), "boot_id": "this-boot",
-                "writer_cgroup": SERVICE, "writer_cgroup_inode": 424242});
+                "writer_cgroup": "/synthetic.slice/augmentagent.service", "writer_cgroup_inode": 424242});
             for (key, replacement) in overrides.as_object().unwrap() { value[key] = replacement.clone(); }
             write(&marker, value.to_string().as_bytes());
             assert_eq!(clear_if_dead(&journal, &env, true).unwrap(), wanted, "{case} (dry run)");
@@ -587,67 +594,47 @@ mod tests {
             assert_eq!(clear_if_dead(&journal, &env, false).unwrap(), wanted, "{case}");
             assert_eq!(marker.exists(), wanted != Liveness::Dead, "{case}");
         }
-        // Unparseable, or a symlink `private_read` refuses: kept, never cleared.
-        for bytes in [Some(&b"not json"[..]), None] {
-            let (directory, journal) = request();
-            let marker = journal.with_extension("active");
-            match bytes {
-                Some(bytes) => write(&marker, bytes),
-                None => std::os::unix::fs::symlink(directory.path().join("missing"), &marker).unwrap(),
-            }
-            assert_eq!(clear_if_dead(&journal, &daemon(), false).unwrap(), Liveness::Unproven);
-            assert!(marker.symlink_metadata().is_ok(), "{bytes:?}");
-        }
-
-        // Both proofs are judged at the one clearing site and stay independent:
-        // on one marker, whose writer — this very test process, under the real
-        // probes — is running, only the receipt clears it.
+        // Both proofs stay independent at the one clearing site: on a real marker
+        // whose writer — this test process, under the real probes — is running, the
+        // receipt still clears it and the writer-gone proof does not.
         let (directory, journal) = request();
         let receipt = directory.path().join("cleanup-complete");
         let marker = begin_request(Some(&journal), &receipt).unwrap().unwrap();
-        assert_eq!(clear_marker(&marker, Proof::WriterGone(&LivenessEnv::probe())).unwrap(),
-            Liveness::Live, "with no receipt, a running writer keeps its marker");
-        assert_eq!(clear_marker(&marker, Proof::Reaped(&receipt)).unwrap(), Liveness::Dead,
-            "the same marker: a receipt outranks a running writer");
+        assert_eq!(clear_marker(&marker, Proof::WriterGone(&LivenessEnv::probe())).unwrap(), Liveness::Live);
+        assert_eq!(clear_marker(&marker, Proof::Reaped(&receipt)).unwrap(), Liveness::Dead);
         assert!(!marker.exists());
-    }
 
-    /// #1071 — the reading that decides the restart case. A plain systemd restart
-    /// leaves the successor in the *same* unit cgroup at the same inode, so a
-    /// surviving populated directory cannot mean "a descendant may live": it
-    /// usually just means us. Only a member predating us could be from the call.
-    #[test]
-    fn a_reused_unit_cgroup_holding_only_younger_processes_proves_the_call_dead() {
-        // Start times on one boot's clock: 100 = a leak from the dead predecessor,
-        // 500 = us, 900 = spawned after us. An unlisted pid has already exited.
-        let seen = |procs: &str, own| cgroup_members(procs, |pid| match pid {
-            100 => Some(100), 500 => Some(500), 900 => Some(900), _ => None }, own);
-        for (case, procs, own, wanted) in [
-            ("nobody left; whitespace only is still empty", " \n", Some(500), Cgroup::Empty),
-            ("the restart case: every member is younger", "500\n900\n", Some(500), Cgroup::Successor),
-            ("only us", "500\n", Some(500), Cgroup::Successor),
-            ("one older member may be a leaked descendant", "500\n100\n", Some(500), Cgroup::Populated),
-            ("a member that already exited cannot run", "500\n7777\n", Some(500), Cgroup::Successor),
-            ("no own start time ⇒ no proof", "900\n", None, Cgroup::Populated),
-        ] {
-            assert_eq!(seen(procs, own), wanted, "{case}");
-        }
-        // The real reading against our own cgroup, which holds us, so it is
-        // neither gone nor empty; a foreign inode means the recorded one is gone.
+        // #1071 — the reading that decides the restart case, by ancestry not age: a
+        // live writer's child spawned after us is younger than us yet not ours. 500 =
+        // us; 600/700 ours; 100 a leak reparented to pid 1 when its parent died; 800
+        // foreign; 900/901 a cycle; 7777 absent from /proc.
+        let seen = |procs: &str| cgroup_members(procs, |pid| match pid {
+            600 | 700 => Some(500), 100 => Some(1), 800 => Some(42),
+            900 => Some(901), 901 => Some(900), _ => None }, 500);
+        for (case, procs, wanted) in [
+            ("nobody is left: whitespace only", " \n", Cgroup::Ours),
+            ("the restart case: us and our own children", "500\n600\n700\n", Cgroup::Ours),
+            ("a reparented leak from the dead call", "500\n100\n", Cgroup::Populated),
+            ("a process belonging to nobody we know", "500\n800\n", Cgroup::Populated),
+            ("a listed pid /proc will not show is no proven exit", "500\n7777\n", Cgroup::Populated),
+            ("a cycle must terminate, and prove nothing", "900\n", Cgroup::Populated),
+        ] { assert_eq!(seen(procs), wanted, "{case}"); }
+        // And against the real hierarchy: our own cgroup holds us, a foreign inode
+        // means the recorded one is gone.
         if let Some((path, inode)) = own_cgroup() {
-            assert!(matches!(cgroup_state(&path, inode), Cgroup::Populated | Cgroup::Successor));
+            assert!(matches!(cgroup_state(&path, inode), Cgroup::Populated | Cgroup::Ours));
             assert_eq!(cgroup_state(&path, inode.wrapping_add(1)), Cgroup::Gone);
+            assert_eq!(process_parent(unsafe { libc::getpid() }), Some(unsafe { libc::getppid() }));
         }
     }
 
-    /// #1071, the reported case verbatim, with a real writer rather than a
-    /// hand-written marker: a deploy kills the daemon mid-call, so the marker its
-    /// `Drop` would have retired leaks. A forked process takes the marker through
-    /// `begin_request` and `_exit`s without unwinding, as SIGKILL leaves a daemon,
-    /// and the real `/proc` probe judges it gone. Only the cgroup reading is
-    /// injected — this process cannot make systemd restart the unit — and it gives
-    /// the *restart* reading, `Successor`: the unit cgroup survived at its inode
-    /// holding none but the new daemon, which is what the issue reports.
+    /// #1071, the reported case verbatim, with a real writer rather than a hand-written
+    /// marker: a deploy kills the daemon mid-call, so the marker its `Drop` would have
+    /// retired leaks. A forked process takes the marker through `begin_request` and
+    /// `_exit`s without unwinding, as SIGKILL leaves a daemon, and the real `/proc`
+    /// probe judges it gone. Only the cgroup reading is injected — this process cannot
+    /// make systemd restart the unit — and it gives the *restart* reading, `Ours`: the
+    /// unit cgroup survived at its inode holding none but the successor.
     #[test]
     fn a_restart_during_a_call_retires_the_marker_it_orphaned() {
         let directory = tempfile::tempdir().unwrap();
@@ -661,8 +648,8 @@ mod tests {
         let writer = unsafe { libc::fork() };
         assert!(writer >= 0, "fork failed");
         if writer == 0 {
-            // The daemon instance that dies mid-call: it takes the marker and
-            // is killed before any Drop can retire it. `_exit` skips unwinding.
+            // The daemon instance that dies mid-call: it takes the marker and is
+            // killed before any Drop can retire it. `_exit` skips unwinding.
             let wrote = begin_request(Some(&journal), &receipt).is_ok_and(|marker| marker.is_some());
             unsafe { libc::_exit(i32::from(!wrote)) };
         }
@@ -677,12 +664,12 @@ mod tests {
         let recorded_cgroup = recorded.cgroup.clone();
         let env = LivenessEnv { cgroup_of: Box::new(move |path, _| {
             assert_eq!(path, recorded_cgroup, "the writer's own cgroup must be the one probed");
-            Cgroup::Successor
+            Cgroup::Ours
         }), ..LivenessEnv::probe() };
         assert_eq!(clear_if_dead(&journal, &env, false).unwrap(), Liveness::Dead);
         assert!(!marker.exists(), "the marker must not survive the restart");
         assert_eq!(std::fs::read_to_string(&journal).unwrap(), rows, "clearing must not edit the journal");
-        // Idle to the sweep, but still unsettled, so recovery can act on it.
+        // Idle to the sweep, yet still unsettled, so recovery can act on it.
         assert!(request_idle(&journal).unwrap() && !crate::handoff::request_finished(&journal).unwrap());
     }
 

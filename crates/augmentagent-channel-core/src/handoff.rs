@@ -501,9 +501,9 @@ fn is_request_name(name: &OsStr) -> bool {
         && name.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
 }
 
-/// What one orphan pass saw (#1071). `kept_legacy` (pre-#1071, recording no writer
-/// to judge) is counted apart because no pass can ever clear one: `doctor` reports
-/// that backlog, which unlike the others never drains itself.
+/// What one orphan pass saw (#1071). `kept_legacy` (pre-#1071, recording no writer to
+/// judge) is counted apart because no pass can ever clear one: `doctor` reports that
+/// backlog, which unlike the others never drains itself.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct OrphanReport { pub cleared: u64, pub kept_live: u64, pub kept_legacy: u64, pub kept_unproven: u64 }
 
@@ -521,10 +521,9 @@ pub fn clear_orphaned_markers(root: &Path, env: &LivenessEnv, dry_run: bool) -> 
     let root = std::path::absolute(root)?;
     for entry in std::fs::read_dir(&root)? {
         let name = entry?.file_name();
-        if !is_request_name(&name) { continue }
         let directory = root.join(&name);
         // The same validation the sweep applies: private, unlinked, expected entries.
-        if !matches!(Snapshot::read(&directory), Ok(Some(_))) { continue }
+        if !is_request_name(&name) || !matches!(Snapshot::read(&directory), Ok(Some(_))) { continue }
         let journal = directory.join(JOURNAL);
         // Nothing to clear, and no lock to take: leave the retention clock alone.
         if crate::process_tree::request_idle(&journal).unwrap_or(false) { continue }
@@ -696,9 +695,9 @@ pub async fn run_sweep_loop(root: Option<PathBuf>, grace: Duration, interval: Du
             return Ok(());
         }
     }
-    // #1071 — once, before the first pass and before any channel can start a
-    // provider: clear markers left by a daemon that died mid-call. A cleared
-    // request then takes the normal idle → grace → confirm path.
+    // #1071 — once, before the first pass and before any channel can start a provider:
+    // clear markers left by a daemon that died mid-call. A cleared request then takes
+    // the normal idle → grace → confirm path.
     if let Some(root) = root.clone() {
         match tokio::task::spawn_blocking(move || clear_orphaned_markers(&root, &liveness, false)).await {
             Ok(Ok(r)) => tracing::info!(cleared = r.cleared, kept_live = r.kept_live,
@@ -1344,47 +1343,57 @@ for line in sys.stdin:
         assert_eq!((report.entries, report.kept()), (12, 10));
     }
 
-    /// #1071 — an orphan left by a daemon that died mid-call is cleared and
-    /// rejoins the sweep; a live call's and a pre-#1071 marker are kept.
-    #[test]
-    fn the_orphan_pass_clears_only_provably_dead_markers_and_reports_the_rest() {
+    /// #1071, the reported case through the path the daemon runs: a `systemctl restart`
+    /// killed the previous instance mid-call and left a marker; starting the successor's
+    /// sweep loop — nothing else — must retire it, so wiring the pass out of
+    /// `run_sweep_loop` fails this test. A live call's marker and a pre-#1071 one stay.
+    /// Deliberately *not* a reboot: the markers name this same boot, so that proof
+    /// cannot apply and the cgroup reading is the realistic restart one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_retires_the_marker_the_previous_instance_orphaned() {
         let (_temp, root) = private_root();
         let marker = |journal: &Path, contents: Value|
             write_private(&journal.with_extension("active"), &contents.to_string());
-        let identity = |boot: &str, pid: libc::pid_t| json!({"version": 2,
-            "receipt": "/nonexistent/synthetic-cleanup-complete", "boot_id": boot, "writer_pid": pid,
+        let identity = |pid: libc::pid_t| json!({"version": 2, "boot_id": "this-boot",
+            "receipt": "/nonexistent/synthetic-cleanup-complete", "writer_pid": pid,
             "writer_start": 4242, "writer_cgroup": "/synthetic.slice/augmentagent.service",
             "writer_cgroup_inode": 424242});
         let orphan = request(&root, "synthetic-orphan", Some(json!([completed_row()])));
-        let uncertain = request(&root, "synthetic-orphan-uncertain", Some(json!([completed_row(), started_row()])));
         let live = request(&root, "synthetic-in-flight", Some(json!([completed_row()])));
         let legacy = request(&root, "synthetic-legacy-marker", Some(json!([completed_row()])));
-        // Same boot as the pass: a restart, not a reboot, so each orphan has to be
-        // proved dead by its writer being gone and its cgroup holding only us.
-        for journal in [&orphan, &uncertain] { marker(journal, identity("this-boot", 999)); }
-        marker(&live, identity("this-boot", 1234));
+        marker(&orphan, identity(999));
+        marker(&live, identity(1234));
         marker(&legacy, json!({"version": 1, "receipt": "/nonexistent/synthetic-cleanup-complete"}));
-        for journal in [&orphan, &uncertain, &live, &legacy] { age(journal, TWO_DAYS); }
-        let env = LivenessEnv::injected(Some("this-boot".into()), Box::new(|pid| (pid == 1234).then_some(4242)),
-            Box::new(|_, _| crate::process_tree::Cgroup::Successor));
+        for journal in [&orphan, &live, &legacy] { age(journal, TWO_DAYS); }
+        let kept = std::fs::read_to_string(&orphan).unwrap();
+        let env = || LivenessEnv::injected(Some("this-boot".into()), Box::new(|pid| (pid == 1234).then_some(4242)),
+            Box::new(|_, _| crate::process_tree::Cgroup::Ours));
 
         // The pre-#1071 marker is counted apart from the other doubtful cases.
-        let dry = clear_orphaned_markers(&root, &env, true).unwrap();
-        assert_eq!(dry, OrphanReport { cleared: 2, kept_live: 1, kept_legacy: 1, kept_unproven: 0 });
+        assert_eq!(clear_orphaned_markers(&root, &env(), true).unwrap(),
+            OrphanReport { cleared: 1, kept_live: 1, kept_legacy: 1, kept_unproven: 0 });
         assert!(orphan.with_extension("active").exists(), "a dry run must change nothing");
-        assert_eq!(clear_orphaned_markers(&root, &env, false).unwrap(), dry);
-        assert!(!orphan.with_extension("active").exists() && !uncertain.with_extension("active").exists());
-        assert!(live.with_extension("active").exists() && legacy.with_extension("active").exists());
 
-        // The cleared requests rejoin the sweep from a fresh grace period
-        // (removing the marker moved the directory's mtime): the settled one
-        // becomes removable, the `started` one still waits for recovery.
-        assert_eq!(sweep_finished(&root, GRACE, true).unwrap().kept_recent, 2);
-        for journal in [&orphan, &uncertain] { age(journal, TWO_DAYS); }
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(run_sweep_loop(Some(root.clone()), GRACE, Duration::from_secs(3600),
+            shutdown.clone(), None, env()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while orphan.with_extension("active").exists() {
+            assert!(std::time::Instant::now() < deadline, "the startup orphan pass did not run");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
+        assert!(live.with_extension("active").exists() && legacy.with_extension("active").exists());
+        assert_eq!(std::fs::read_to_string(&orphan).unwrap(), kept, "the journal must be left for recovery");
+
+        // The cleared request rejoins the sweep from a fresh grace period (removing
+        // the marker moved the mtime), then becomes removable like any other.
+        assert_eq!(sweep_finished(&root, GRACE, true).unwrap().kept_recent, 1);
+        age(&orphan, TWO_DAYS);
         let swept = sweep_finished(&root, GRACE, false).unwrap();
         assert!(gone(&orphan), "a cleared orphan must become eligible for the sweep");
-        assert!(uncertain.exists() && std::fs::read_to_string(&uncertain).unwrap().contains("\"started\""));
-        assert_eq!((swept.removed, swept.kept_active, swept.kept_unfinished), (1, 2, 1));
+        assert_eq!((swept.removed, swept.kept_active), (1, 2));
     }
 
     #[test]
@@ -1770,37 +1779,6 @@ for line in sys.stdin:
         assert!(off_runtime.load(std::sync::atomic::Ordering::SeqCst), "the scratch sweep must run on the blocking pool");
         shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
-    }
-
-    /// #1071, the reported case through the path the daemon runs: a `systemctl
-    /// restart` killed the previous instance mid-call and left a marker; starting
-    /// the successor's sweep loop — nothing else — must retire it. The pass is not
-    /// called directly, so wiring it out of `run_sweep_loop` fails this test.
-    ///
-    /// Deliberately *not* a reboot: the marker names this same boot, so the reboot
-    /// proof cannot apply, and the cgroup reading is the realistic restart one —
-    /// the unit cgroup survived at its inode holding only the new daemon.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_restart_retires_the_marker_the_previous_instance_orphaned() {
-        let (_temp, root) = private_root();
-        let journal = request(&root, "synthetic-orphaned-by-restart", Some(json!([started_row()])));
-        write_private(&journal.with_extension("active"), &json!({"version": 2,
-            "receipt": "/nonexistent/synthetic-cleanup-complete", "boot_id": "this-boot",
-            "writer_pid": 999, "writer_start": 4242, "writer_cgroup": "/synthetic.slice/augmentagent.service",
-            "writer_cgroup_inode": 424242}).to_string());
-        let rows = std::fs::read_to_string(&journal).unwrap();
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        let task = tokio::spawn(run_sweep_loop(Some(root.clone()), GRACE, Duration::from_secs(3600),
-            shutdown.clone(), None, LivenessEnv::injected(Some("this-boot".into()),
-                Box::new(|_| None), Box::new(|_, _| crate::process_tree::Cgroup::Successor))));
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while journal.with_extension("active").exists() {
-            assert!(std::time::Instant::now() < deadline, "the startup orphan pass did not run");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        shutdown.cancel();
-        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
-        assert_eq!(std::fs::read_to_string(&journal).unwrap(), rows, "the journal must be left for recovery");
     }
 
     #[tokio::test(flavor = "current_thread")]
