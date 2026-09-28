@@ -178,7 +178,7 @@ pub fn note_email(doc: &NoteDoc) -> Email {
         to: String::new(),
         cc: String::new(),
         attachments: doc.attachments.clone(),
-        subject: format!("Apple Note: {} [{}]", doc.title, doc.folder),
+        subject: augmentagent_store::notes::note_subject(&doc.title, &doc.folder),
         body: doc.text.clone(),
         date: doc.modified.clone(),
         account_entity_id: Some("apple-notes".into()),

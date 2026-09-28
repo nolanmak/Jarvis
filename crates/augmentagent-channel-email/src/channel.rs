@@ -30,7 +30,9 @@ use augmentagent_channel_core::prompt::{
 };
 use augmentagent_channel_core::trigger::{WorkItem, WorkItemHandler};
 use augmentagent_channel_core::Reasoner;
-use augmentagent_store::{ActionStatus, RetryableReply, Store, TriageResult, NUDGE_INTERVAL_MS};
+use augmentagent_store::{
+    ActionStatus, Email, RetryableReply, Store, TriageResult, NUDGE_INTERVAL_MS,
+};
 
 use crate::gmail::{extract_bare_email, split_recipients, GmailApi};
 use crate::outbound::parse_rfc2822_or_ms;
@@ -463,6 +465,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 augmentagent_wiki::WikiReader::new(&layout).triage_hint(&email)
             })
             .unwrap_or_default();
+        let wiki_hint = with_notes_hint(&self.store, &email, &wiki_hint);
         let triage_prompt = triage_user_message(&email, learned, &wiki_hint);
         let raw = self.reasoner.call(&triage_opts, &triage_prompt).await?;
         let decision = match parse_decision(&raw) {
@@ -854,6 +857,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                         augmentagent_wiki::WikiReader::new(&layout).draft_hint(&email)
                     })
                     .unwrap_or_default();
+                let wiki_hint = with_notes_hint(&self.store, &email, &wiki_hint);
                 let tone_block = pick_tone_block(&self.store, entity_id, &email.from);
                 let thread_block = self.fetch_thread_block(entity_id, &email).await;
                 // #36: fast Haiku archetype pick → composed fragment, gated by
@@ -1825,6 +1829,29 @@ pub(crate) fn pick_tone_block(store: &Store, account: &str, to_addr: &str) -> St
 /// promote a degraded descriptor into a draft prompt.
 fn is_insufficient_sample(summary: &str) -> bool {
     summary.contains("\"insufficient_sample\"")
+}
+
+/// Append the #1060 Apple Notes hint to `wiki_hint` when the inbound message
+/// looks related to a note the owner wrote. No match adds nothing at all — an
+/// empty "related notes" section would read as "the owner has no notes".
+fn with_notes_hint(store: &Store, email: &Email, wiki_hint: &str) -> String {
+    let titles = match store.matching_note_titles(
+        &email.subject,
+        &email.from,
+        augmentagent_channel_core::prompt::NOTES_HINT_MAX,
+    ) {
+        Ok(titles) => titles,
+        Err(e) => {
+            warn!(message_id = %email.message_id, "note hint lookup failed: {e}");
+            return wiki_hint.to_string();
+        }
+    };
+    let hint = augmentagent_channel_core::prompt::notes_hint(&titles);
+    match (wiki_hint.trim().is_empty(), hint.is_empty()) {
+        (_, true) => wiki_hint.to_string(),
+        (true, false) => hint,
+        _ => format!("{wiki_hint}\n{hint}"),
+    }
 }
 
 fn now_millis() -> i64 {
@@ -4675,6 +4702,71 @@ Where: Microsoft Teams
                 assert_eq!(reasoner.0.load(Ordering::SeqCst), 1);
                 assert!(pf.recorded.lock().unwrap().is_empty());
             }
+        }
+    }
+
+    /// #1060 — the triage/draft hint naming the owner's own notes.
+    mod notes_hint {
+        use super::*;
+
+        fn note(store: &Store, id: &str, title: &str, body: &str) {
+            store
+                .upsert_email_backfill(
+                    &Email {
+                        attachments: vec![],
+                        to: String::new(),
+                        cc: String::new(),
+                        message_id: id.into(),
+                        thread_id: Some(id.into()),
+                        from: "me".into(),
+                        subject: augmentagent_store::notes::note_subject(title, "Notes"),
+                        body: body.into(),
+                        date: "2026-09-02T10:00:00Z".into(),
+                        account_entity_id: Some("apple-notes".into()),
+                        platform: "apple_notes".into(),
+                        kind: "note".into(),
+                    },
+                    1_600_000_000_000,
+                )
+                .unwrap();
+        }
+
+        fn inbound(subject: &str) -> Email {
+            Email {
+                attachments: vec![],
+                to: String::new(),
+                cc: String::new(),
+                message_id: "m1".into(),
+                thread_id: None,
+                from: "Dana Reyes <dana@example.org>".into(),
+                subject: subject.into(),
+                body: "b".into(),
+                date: "2026-09-10T10:00:00Z".into(),
+                account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            }
+        }
+
+        #[test]
+        fn a_matching_note_is_named_and_appended_after_any_wiki_hint() {
+            let (store, _f) = tmp_store();
+            note(&store, "n1", "Cabin plan", "book the cabin");
+            let hint = with_notes_hint(&store, &inbound("Re: cabin plan for October"), "");
+            assert!(hint.contains("\"Cabin plan\""), "hint: {hint}");
+            assert!(hint.contains("notes of their own"), "hint: {hint}");
+            let joined = with_notes_hint(&store, &inbound("cabin plan"), "- people/dana.md");
+            assert!(joined.starts_with("- people/dana.md\n"), "hint: {joined}");
+            assert!(joined.contains("\"Cabin plan\""), "hint: {joined}");
+        }
+
+        #[test]
+        fn no_match_adds_no_section_at_all() {
+            let (store, _f) = tmp_store();
+            note(&store, "n1", "Cabin plan", "book the cabin");
+            assert_eq!(with_notes_hint(&store, &inbound("lunch?"), ""), "");
+            let kept = with_notes_hint(&store, &inbound("lunch?"), "- people/dana.md");
+            assert_eq!(kept, "- people/dana.md");
         }
     }
 }
