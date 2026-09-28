@@ -1,8 +1,6 @@
-//! Subject encoding for Apple Notes rows (#1060).
-//!
-//! The notes channel stores one `emails` row per note with the title and
-//! folder packed into `subject`. Retrieval has to take them back out, so
-//! writer and readers share these helpers rather than each re-deriving it.
+//! Subject encoding for Apple Notes rows (#1060). The notes channel packs
+//! each note's title and folder into `subject`; retrieval has to take them
+//! back out, so writer and readers share these helpers.
 
 const PREFIX: &str = "Apple Note: ";
 
@@ -56,12 +54,10 @@ pub fn token_matches(needle: &str, haystack: &str) -> bool {
 /// edit. `None` when it doesn't parse, so callers can fall back rather than
 /// invent a date.
 pub fn note_modified_ms(received_at: &str) -> Option<i64> {
-    time::OffsetDateTime::parse(
-        received_at.trim(),
-        &time::format_description::well_known::Rfc3339,
-    )
-    .ok()
-    .map(|t| t.unix_timestamp_nanos() as i64 / 1_000_000)
+    let fmt = &time::format_description::well_known::Rfc3339;
+    time::OffsetDateTime::parse(received_at.trim(), fmt)
+        .ok()
+        .map(|t| t.unix_timestamp_nanos() as i64 / 1_000_000)
 }
 
 #[cfg(test)]
@@ -69,18 +65,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn modified_ms_reads_the_offset() {
-        let utc = note_modified_ms("2026-09-02T14:00:00Z").unwrap();
-        assert_eq!(note_modified_ms("2026-09-02T10:00:00-04:00"), Some(utc));
-        assert_eq!(note_modified_ms("not a date"), None);
-    }
-
-    #[test]
-    fn title_folder_splits_on_the_last_bracket_group() {
+    fn subject_round_trips_and_timestamps_read_the_offset() {
         let subject = note_subject("Cabin plan [draft]", "Notes");
         assert_eq!(note_title_folder(&subject), Some(("Cabin plan [draft]", "Notes")));
         // Older rows predate the folder suffix; non-note subjects are skipped.
         assert_eq!(note_title_folder("Apple Note: Groceries"), Some(("Groceries", "")));
         assert_eq!(note_title_folder("Re: cabin plan"), None);
+        let utc = note_modified_ms("2026-09-02T14:00:00Z").unwrap();
+        assert_eq!(note_modified_ms("2026-09-02T10:00:00-04:00"), Some(utc));
+        assert_eq!(note_modified_ms("not a date"), None);
     }
 }

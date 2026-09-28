@@ -7969,6 +7969,9 @@ mod tests {
         note_row(&s, "n2", "Receipts", "Work", "ping a_b@example.com", "2026-09-05T10:00:00Z");
         note_row(&s, "n3", "Groceries", "Work", "eggs\nmilk", "2026-09-06T10:00:00Z");
         note_row(&s, "n4", "Dana Reyes intro", "Work", "agenda", "2026-09-07T10:00:00Z");
+        note_row(&s, "n5", "Q3 targets", "Work", "revenue", "2026-09-08T10:00:00Z");
+        note_row(&s, "n6", "Amy onboarding", "Work", "buddy list", "2026-09-09T10:00:00Z");
+        note_row(&s, "n7", "Q30 sensor specs", "Work", "datasheet", "2026-09-10T10:00:00Z");
         let hits = |subject, from| s.matching_note_titles(subject, from, 3).unwrap();
 
         assert_eq!(hits("Re: cabin plan for October", "sam@example.net"), vec!["Cabin plan"]);
@@ -7987,19 +7990,9 @@ mod tests {
         assert!(hits("Work update", "dana@example.org").is_empty());
         assert!(hits("lunch?", "dana@example.org").is_empty());
         assert!(hits("lunch?", "me").is_empty());
-    }
-
-    #[test]
-    fn matching_note_titles_matches_short_subject_and_sender_tokens() {
-        let (s, _d) = fresh_store();
-        note_row(&s, "n1", "Q3 planning", "Work", "targets", "2026-09-02T10:00:00Z");
-        note_row(&s, "n2", "Amy onboarding", "Work", "buddy list", "2026-09-03T10:00:00Z");
-        note_row(&s, "n3", "Q30 sensor specs", "Work", "datasheet", "2026-09-04T10:00:00Z");
-        let hits = |subject, from| s.matching_note_titles(subject, from, 3).unwrap();
-
         // Short tokens are real names and quarters, not noise — but they must
         // match whole words, so "Q3" leaves the unrelated "Q30" note alone.
-        assert_eq!(hits("Q3 numbers", "sam@example.net"), vec!["Q3 planning"]);
+        assert_eq!(hits("Q3 numbers", "sam@example.net"), vec!["Q3 targets"]);
         assert_eq!(hits("unrelated", "Amy <amy@example.net>"), vec!["Amy onboarding"]);
         // Stopwords stay dropped, short or not.
         assert!(hits("is it ok to see you", "sam@example.net").is_empty());
