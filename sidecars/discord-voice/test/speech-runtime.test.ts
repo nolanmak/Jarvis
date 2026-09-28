@@ -89,6 +89,45 @@ test('three failed STT reconnect attempts end with one visible failure and stopp
   assert.equal(frames.filter(frame => frame.kind === 'transcript').length, 0);
 });
 
+test('malformed owner Opus fails visibly and closes its STT stream', async () => {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await new Promise<void>(resolve => server.once('listening', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('expected TCP address');
+  const receiver = new PassThrough();
+  const connection = Object.assign(new EventEmitter(), {
+    state: { status: VoiceConnectionStatus.Ready },
+    subscribe: () => ({ unsubscribe() {} }),
+    receiver: { subscribe: () => receiver },
+  }) as unknown as VoiceConnection;
+  const frames: Array<Record<string, unknown>> = [];
+  const audio = new VoiceAudio(connection, binding, {
+    sttProvider: 'deepgram', ttsProvider: 'deepgram',
+    sttKey: 'synthetic-key', ttsKey: 'synthetic-key',
+    sttEndpoint: `ws://127.0.0.1:${address.port}`,
+  }, frame => { frames.push(frame as Record<string, unknown>); return true; });
+  try {
+    await audio.start();
+    receiver.write(Buffer.from([255]));
+    for (let attempt = 0; audio.status !== 'stopped' && attempt < 100; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 2));
+    }
+    assert.equal(audio.status, 'stopped');
+    assert.equal(frames.filter(frame => frame.kind === 'audio_failure').length, 1);
+    assert.equal(frames.filter(frame => frame.kind === 'transcript').length, 0);
+    assert.equal(receiver.destroyed, true);
+    for (let attempt = 0; server.clients.size > 0 && attempt < 100; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 2));
+    }
+    assert.equal(server.clients.size, 0);
+  } finally {
+    audio.stop();
+    receiver.destroy();
+    for (const client of server.clients) client.terminate();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
 test('interrupt emits the affected receipt for the original text mirror', async () => {
   const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
   await new Promise<void>(resolve => server.once('listening', resolve));

@@ -76,7 +76,7 @@ test('ElevenLabs TTS yields PCM before the HTTP stream finishes', async () => {
   }
 });
 
-for (const status of [401, 429, 500]) {
+for (const status of [401, 403, 429, 500]) {
   test(`Deepgram TTS surfaces HTTP ${status} handshake refusal`, async () => {
     const server = new WebSocketServer({ host: '127.0.0.1', port: 0,
       verifyClient: (_info, callback) => callback(false, status) });

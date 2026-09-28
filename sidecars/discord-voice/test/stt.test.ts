@@ -61,7 +61,7 @@ for (const provider of ['deepgram', 'elevenlabs'] as const) {
     }
   });
 
-  for (const status of [401, 429, 500]) {
+  for (const status of [401, 403, 429, 500]) {
     test(`${provider} STT surfaces HTTP ${status} handshake refusal`, async () => {
       const server = new WebSocketServer({ host: '127.0.0.1', port: 0,
         verifyClient: (_info, callback) => callback(false, status) });
