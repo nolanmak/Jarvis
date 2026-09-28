@@ -2111,6 +2111,94 @@ impl Store {
         Ok(rows)
     }
 
+    /// Titles of Apple Notes an inbound message plausibly refers to (#1060):
+    /// a note whose title *or body* carries a content word from `subject`,
+    /// from the sender's display name, or the sender's bare address.
+    /// Newest-edited first, capped at `limit`. Empty when nothing matches —
+    /// the caller then emits no hint at all. Ordering comes from `receivedAt`
+    /// (the note's own `modified`, rewritten on every edit), never
+    /// `firstSeenAt`, which [`Store::upsert_email_backfill`] freezes.
+    ///
+    /// # Errors
+    ///
+    /// Whatever sqlite failed with.
+    pub fn matching_note_titles(
+        &self,
+        subject: &str,
+        from: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<String>> {
+        let mut needles = crate::notes::title_match_tokens(subject);
+        // Real inbound mail arrives as `Dana Reyes <dana@example.org>` and
+        // both halves name the sender to a note: the display name is how a
+        // note names a person, the address is what a body pastes. A bare
+        // address has no name half — tokenizing it yields junk like "example".
+        if let Some((name, _)) = from.split_once('<') {
+            for token in crate::notes::title_match_tokens(name) {
+                if !needles.contains(&token) {
+                    needles.push(token);
+                }
+            }
+        }
+        let address = bare_lower(from);
+        if address.contains('@') {
+            needles.push(address);
+        }
+        if needles.is_empty() {
+            return Ok(Vec::new());
+        }
+        // A coarse substring prefilter: `subject` is `Apple Note: <title>
+        // [<folder>]`, so a token equal to a folder name ("Work") matches
+        // every note filed there, and a short token matches inside longer
+        // words. The `token_matches` re-check below decides.
+        let mut clauses: Vec<String> = Vec::new();
+        let mut binds: Vec<String> = Vec::new();
+        for needle in &needles {
+            binds.push(format!("%{}%", like_escape(needle)));
+            let n = binds.len();
+            clauses.push(format!(
+                "(LOWER(subject) LIKE ?{n} ESCAPE '\\' \
+                 OR LOWER(COALESCE(body, '')) LIKE ?{n} ESCAPE '\\')"
+            ));
+        }
+        let sql = format!(
+            "SELECT subject, COALESCE(body, ''), COALESCE(receivedAt, '') FROM emails \
+             WHERE platform = 'apple_notes' AND ({})",
+            clauses.join(" OR "),
+        );
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(&sql)?;
+        let params = rusqlite::params_from_iter(binds.iter());
+        let rows = stmt
+            .query_map(params, |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut hits: Vec<(i64, String)> = rows
+            .into_iter()
+            .filter_map(|(subject, body, received_at)| {
+                let (title, _) = crate::notes::note_title_folder(&subject)?;
+                let haystack = format!("{}\n{}", title.to_lowercase(), body.to_lowercase());
+                let matched = needles
+                    .iter()
+                    .any(|n| crate::notes::token_matches(n, &haystack));
+                matched.then(|| {
+                    (
+                        crate::notes::note_modified_ms(&received_at).unwrap_or(i64::MIN),
+                        title.to_string(),
+                    )
+                })
+            })
+            .collect();
+        hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        hits.truncate(limit);
+        Ok(hits.into_iter().map(|(_, title)| title).collect())
+    }
+
     pub fn is_email_complete(&self, message_id: &str) -> StoreResult<bool> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let row: Option<Option<i64>> = guard
@@ -7488,6 +7576,19 @@ fn row_to_tone_example(r: &rusqlite::Row) -> rusqlite::Result<ToneExample> {
     })
 }
 
+/// Escape LIKE metacharacters for use with `ESCAPE '\'`. Addresses
+/// legitimately contain `_`, which would otherwise match any character.
+fn like_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn bare_lower(raw: &str) -> String {
     let s = if let (Some(open), Some(close)) = (raw.find('<'), raw.rfind('>')) {
         if open < close {
@@ -8030,6 +8131,79 @@ mod tests {
         assert_eq!(
             store.email_first_seen_at("imessage:+14155550123:0").unwrap(),
             Some(1_600_000_000_000)
+        );
+    }
+
+    fn note_row(store: &Store, id: &str, title: &str, folder: &str, body: &str, modified: &str) {
+        let email = Email {
+            message_id: id.into(),
+            thread_id: Some(id.into()),
+            from: "me".into(),
+            subject: crate::notes::note_subject(title, folder),
+            body: body.into(),
+            date: modified.into(),
+            account_entity_id: Some("apple-notes".into()),
+            platform: "apple_notes".into(),
+            kind: "note".into(),
+            ..sample_email(id)
+        };
+        // Notes ingest through the backfill path, whose UPDATE branch freezes
+        // firstSeenAt — the reason this query must read `receivedAt`.
+        store.upsert_email_backfill(&email, 1_600_000_000_000).unwrap();
+    }
+
+    #[test]
+    fn matching_note_titles_matches_subject_words_and_sender_mentions() {
+        let (s, _d) = fresh_store();
+        note_row(&s, "n1", "Cabin plan", "Trips", "book the cabin", "2026-09-02T10:00:00Z");
+        note_row(&s, "n2", "Receipts", "Work", "ping a_b@example.com", "2026-09-05T10:00:00Z");
+        note_row(&s, "n3", "Groceries", "Work", "eggs\nmilk", "2026-09-06T10:00:00Z");
+        note_row(&s, "n4", "Dana Reyes intro", "Work", "agenda", "2026-09-07T10:00:00Z");
+        note_row(&s, "n5", "Q3 targets", "Work", "revenue", "2026-09-08T10:00:00Z");
+        note_row(&s, "n6", "Amy onboarding", "Work", "buddy list", "2026-09-09T10:00:00Z");
+        note_row(&s, "n7", "Q30 sensor specs", "Work", "datasheet", "2026-09-10T10:00:00Z");
+        let hits = |subject, from| s.matching_note_titles(subject, from, 3).unwrap();
+
+        assert_eq!(hits("Re: cabin plan for October", "sam@example.net"), vec!["Cabin plan"]);
+        // The `From` display name identifies the sender to a note just as the
+        // address does: an unrelated subject must still surface Dana's note.
+        assert_eq!(hits("unrelated", "Dana Reyes <dana@example.org>"), vec!["Dana Reyes intro"]);
+        // A subject word may land in the body, under an unrelated title.
+        assert_eq!(hits("book the boat", "dana@example.org"), vec!["Cabin plan"]);
+        // Display-name headers are what actually arrive; the address inside
+        // is what a note body would mention. `_` is a LIKE wildcard, so the
+        // near-miss "axb@" must not match the stored "a_b@".
+        assert_eq!(hits("unrelated", "Pat Doe <A_B@Example.com>"), vec!["Receipts"]);
+        assert!(hits("unrelated", "axb@example.com").is_empty());
+        // "Work" is a folder, not a title: it must not drag in every note
+        // filed under it. A non-address sender searches no bodies at all.
+        assert!(hits("Work update", "dana@example.org").is_empty());
+        assert!(hits("lunch?", "dana@example.org").is_empty());
+        assert!(hits("lunch?", "me").is_empty());
+        // Short tokens are real names and quarters, not noise — but they must
+        // match whole words, so "Q3" leaves the unrelated "Q30" note alone.
+        assert_eq!(hits("Q3 numbers", "sam@example.net"), vec!["Q3 targets"]);
+        assert_eq!(hits("unrelated", "Amy <amy@example.net>"), vec!["Amy onboarding"]);
+        // Stopwords stay dropped, short or not.
+        assert!(hits("is it ok to see you", "sam@example.net").is_empty());
+    }
+
+    #[test]
+    fn matching_note_titles_orders_by_last_edit_and_respects_limit() {
+        let (s, _d) = fresh_store();
+        note_row(&s, "n1", "Cabin plan", "Trips", "x", "2026-09-02T10:00:00Z");
+        note_row(&s, "n2", "Cabin gear", "Trips", "x", "2026-09-04T10:00:00Z");
+        note_row(&s, "n3", "Cabin budget", "Trips", "x", "2026-09-03T10:00:00Z");
+        // An edit rewrites `receivedAt` only; firstSeenAt stays at ingest.
+        note_row(&s, "n1", "Cabin plan", "Trips", "x", "2026-09-09T10:00:00Z");
+
+        assert_eq!(
+            s.matching_note_titles("cabin", "dana@example.org", 3).unwrap(),
+            vec!["Cabin plan", "Cabin gear", "Cabin budget"],
+        );
+        assert_eq!(
+            s.matching_note_titles("cabin", "dana@example.org", 2).unwrap(),
+            vec!["Cabin plan", "Cabin gear"],
         );
     }
 

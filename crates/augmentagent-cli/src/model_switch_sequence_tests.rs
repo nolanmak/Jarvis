@@ -35,7 +35,8 @@ fn discord_model_switch_sequence_uses_one_audited_harness() {
         r#"#!/usr/bin/env python3
 import json, sys
 names = ('search_conversation_history', 'read_conversation_thread',
-         'search_messages', 'conversation_stats', 'memory_search', 'memory_recent', 'switch_model')
+         'search_messages', 'conversation_stats', 'search_notes',
+         'memory_search', 'memory_recent', 'switch_model')
 for line in sys.stdin:
     request = json.loads(line)
     method = request.get('method')

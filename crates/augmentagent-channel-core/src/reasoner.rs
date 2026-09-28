@@ -2034,6 +2034,8 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             // Both are read-only surfaces over the same db.
             "mcp__memory__search_messages".into(),
             "mcp__memory__conversation_stats".into(),
+            // #1060 — the owner's Apple Notes, searchable by title/body.
+            "mcp__memory__search_notes".into(),
             "mcp__memory__memory_search".into(),
             "mcp__memory__memory_recent".into(),
             "Bash(augmentagent finance status)".into(),
@@ -3178,6 +3180,7 @@ mod tests {
             "mcp__memory__read_conversation_thread",
             "mcp__memory__search_messages",
             "mcp__memory__conversation_stats",
+            "mcp__memory__search_notes",
             "mcp__memory__memory_search",
             "mcp__memory__memory_recent",
         ] {
@@ -5000,6 +5003,7 @@ mod message_tool_wiring {
         for doc_only in [
             "conversation_stats",
             "search_messages",
+            "search_notes",
             "is:latest",
             "ambiguous",
         ] {
