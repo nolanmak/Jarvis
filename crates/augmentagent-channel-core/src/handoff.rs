@@ -1357,9 +1357,9 @@ for line in sys.stdin:
             "receipt": "/nonexistent/synthetic-cleanup-complete", "writer_pid": pid,
             "writer_start": 4242, "writer_cgroup": "/synthetic.slice/augmentagent.service",
             "writer_cgroup_inode": 424242});
-        let orphan = request(&root, "synthetic-orphan", Some(json!([completed_row()])));
-        let live = request(&root, "synthetic-in-flight", Some(json!([completed_row()])));
-        let legacy = request(&root, "synthetic-legacy-marker", Some(json!([completed_row()])));
+        let journal = |name| request(&root, name, Some(json!([completed_row()])));
+        let (orphan, live, legacy) = (journal("synthetic-orphan"), journal("synthetic-in-flight"),
+            journal("synthetic-legacy-marker"));
         marker(&orphan, identity(999));
         marker(&live, identity(1234));
         marker(&legacy, json!({"version": 1, "receipt": "/nonexistent/synthetic-cleanup-complete"}));
@@ -1367,12 +1367,10 @@ for line in sys.stdin:
         let kept = std::fs::read_to_string(&orphan).unwrap();
         let env = || LivenessEnv::injected(Some("this-boot".into()), Box::new(|pid| (pid == 1234).then_some(4242)),
             Box::new(|_, _| crate::process_tree::Cgroup::Ours));
-
         // The pre-#1071 marker is counted apart from the other doubtful cases.
         assert_eq!(clear_orphaned_markers(&root, &env(), true).unwrap(),
             OrphanReport { cleared: 1, kept_live: 1, kept_legacy: 1, kept_unproven: 0 });
         assert!(orphan.with_extension("active").exists(), "a dry run must change nothing");
-
         let shutdown = tokio_util::sync::CancellationToken::new();
         let task = tokio::spawn(run_sweep_loop(Some(root.clone()), GRACE, Duration::from_secs(3600),
             shutdown.clone(), None, env()));
@@ -1385,7 +1383,6 @@ for line in sys.stdin:
         tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
         assert!(live.with_extension("active").exists() && legacy.with_extension("active").exists());
         assert_eq!(std::fs::read_to_string(&orphan).unwrap(), kept, "the journal must be left for recovery");
-
         // The cleared request rejoins the sweep from a fresh grace period (removing
         // the marker moved the mtime), then becomes removable like any other.
         assert_eq!(sweep_finished(&root, GRACE, true).unwrap().kept_recent, 1);

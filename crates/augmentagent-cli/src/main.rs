@@ -2422,14 +2422,16 @@ const DRAIN_BUDGET: Duration = Duration::from_secs(20);
 /// Join the daemon's tasks after cancellation, bounded (#1071). Letting a cancelled
 /// runner return drops its `ProcessGroup`, which retires that call's marker; a runner
 /// wedged in a call that never returns must not hold the stop open, so the budget
-/// expires and the next start's orphan pass clears what was left.
+/// expires and the next start's orphan pass clears what was left. One budget covers
+/// the whole join deliberately: it bounds the stop, which is what `TimeoutStopSec`
+/// measures — per-task budgets would multiply into a wait systemd would SIGKILL.
 async fn drain_daemon_tasks(tasks: Vec<tokio::task::JoinHandle<Result<()>>>, budget: Duration) -> Result<()> {
     let drained = tokio::time::timeout(budget, async {
         for handle in tasks { handle.await??; }
         Ok(())
     }).await;
     drained.unwrap_or_else(|_| {
-        warn!("shutdown drain timed out; the next start's orphan pass will clear any marker left behind");
+        warn!("shutdown drain timed out; the next start's orphan pass will clear any marker left");
         Ok(())
     })
 }
@@ -20221,10 +20223,10 @@ mod identity_merge_tests {
     }
 }
 
-/// #1071, the reported shape: one runner returns once cancelled (its `ProcessGroup`
-/// drops, retiring that marker), one is wedged in a provider call that never returns.
-/// An unbounded join waits on the wedged one forever, so the budget must expire and
-/// leave the rest to the next start's orphan pass.
+/// #1071, the reported shape: one runner returns once cancelled (its `ProcessGroup` drops,
+/// retiring that marker), one is wedged in a provider call that never returns. An unbounded
+/// join waits on the wedged one forever, so the budget must expire and leave the rest to
+/// the next start's orphan pass.
 #[cfg(test)]
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_wedged_runner_cannot_hold_the_stop_open_past_the_budget() {
@@ -20236,8 +20238,7 @@ async fn a_wedged_runner_cannot_hold_the_stop_open_past_the_budget() {
     let started = tokio::time::Instant::now();
     drain_daemon_tasks(vec![
         tokio::spawn(async move { sd.cancelled().await; flag.store(true, Ordering::SeqCst); Ok(()) }),
-        tokio::spawn(async { std::future::pending().await }),
-    ], DRAIN_BUDGET).await.unwrap();
+        tokio::spawn(async { std::future::pending().await })], DRAIN_BUDGET).await.unwrap();
     assert!(retired.load(Ordering::SeqCst), "the drain must let a cancelled runner unwind");
     assert!(started.elapsed() >= DRAIN_BUDGET && DRAIN_BUDGET <= Duration::from_secs(30),
         "the drain must end within a budget systemd's TimeoutStopSec outlives");

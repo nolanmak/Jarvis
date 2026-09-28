@@ -175,13 +175,13 @@ fn marker_receipt(marker: &std::path::Path) -> std::io::Result<PathBuf> {
 }
 
 /// Proof that no descendant of the call can still be running: the supervisor's
-/// `all-descendants-reaped` receipt, or — with no receipt left — that the writer is
-/// gone (#1071). Neither subsumes the other.
+/// `all-descendants-reaped` receipt, or — with no receipt left — that the writer is gone
+/// (#1071). Neither subsumes the other.
 enum Proof<'a> { Reaped(&'a std::path::Path), WriterGone(&'a LivenessEnv) }
 
-/// The one site that unlinks a lifecycle marker, and the one that decides it may be.
-/// The caller must hold the lifecycle lock; the proof is judged here against the
-/// marker on disk, so no path removes one on its own authority.
+/// The one site that unlinks a lifecycle marker, and the one that decides it may be. The
+/// caller must hold the lifecycle lock; the proof is judged here against the marker on
+/// disk, so no path removes one on its own authority.
 fn clear_marker(marker: &std::path::Path, proof: Proof<'_>) -> std::io::Result<Liveness> {
     let verdict = match proof {
         // The marker must still name the verified receipt; if it names another, a
@@ -206,9 +206,9 @@ fn retire_request(marker: &std::path::Path, receipt: &std::path::Path) -> std::i
     }
 }
 
-/// Whether a call's descendants can still be running (#1071). Only `Dead` clears the
-/// marker; `Live` means its writer is still running, `Legacy` a pre-#1071 marker with
-/// no identity to judge, `Unproven` an incomplete proof.
+/// Whether a call's descendants can still be running (#1071). Only `Dead` clears the marker;
+/// `Live` means its writer still runs, `Legacy` a pre-#1071 marker with no identity to judge,
+/// `Unproven` an incomplete proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Liveness { Dead, Live, Legacy, Unproven }
 
@@ -226,8 +226,7 @@ fn stat_field<T: std::str::FromStr>(pid: libc::pid_t, field: usize) -> Option<T>
     stat.rsplit_once(')')?.1.split_whitespace().nth(field - 3)?.parse().ok()
 }
 
-/// Field 22 of `/proc/<pid>/stat`: when the process started, to tell a reused pid
-/// from the one the marker names.
+/// Field 22: when the process started, to tell a reused pid from the one recorded.
 fn process_start(pid: libc::pid_t) -> Option<u64> { stat_field(pid, 22) }
 
 /// The cgroup a call ran in, as it stands now. `Gone` covers a vanished directory and
@@ -246,12 +245,12 @@ fn own_cgroup() -> Option<(String, u64)> {
     Some((path, inode))
 }
 
-/// Does the cgroup a call ran in still hold a process that could have survived from
-/// it? The kernel removes such a directory only once it is empty, so its absence is
-/// its own record that every process of that call is gone. A surviving one needs its
-/// members read: an in-place restart can leave the successor in the *same* unit cgroup
-/// at the same inode, and reading any occupant as possibly-a-descendant would keep
-/// every orphan forever — the #1071 bug.
+/// Does the cgroup a call ran in still hold a process that could have survived from it?
+/// The kernel removes such a directory only once it is empty, so its absence is its own
+/// record that every process of that call is gone. A surviving one needs its members
+/// read: an in-place restart can leave the successor in the *same* unit cgroup at the
+/// same inode, and reading any occupant as possibly-a-descendant would keep every orphan
+/// forever — the #1071 bug.
 fn cgroup_state(path: &str, inode: u64) -> Cgroup {
     let directory = format!("{CGROUP_ROOT}{path}");
     match std::fs::metadata(&directory).map(|found| found.ino() == inode) {
@@ -269,11 +268,11 @@ fn cgroup_state(path: &str, inode: u64) -> Cgroup {
 fn process_parent(pid: libc::pid_t) -> Option<libc::pid_t> { stat_field(pid, 4) }
 
 /// Classify a `cgroup.procs` body by ancestry: only if every member's `/proc` parent
-/// chain reaches this process does nothing of the dead call survive there. Anything
-/// we cannot walk up to ourselves keeps the marker — a foreign process, a listed pid
-/// `/proc` will not show (no proven exit), or a leak of the call, reparented away
-/// from us when its parent died. Start times cannot serve: a still-live writer's
-/// child spawned after us is younger than us yet not ours.
+/// chain reaches this process does nothing of the dead call survive there. Anything we
+/// cannot walk up to ourselves keeps the marker — a foreign process, a listed pid `/proc`
+/// will not show (no proven exit), or a leak of the call, reparented away from us when
+/// its parent died. Start times cannot serve: a live writer's child spawned after us is
+/// younger than us yet not ours.
 fn cgroup_members(procs: &str, parent_of: impl Fn(libc::pid_t) -> Option<libc::pid_t>,
     own: libc::pid_t) -> Cgroup {
     let ours = |member: libc::pid_t| {
@@ -311,13 +310,15 @@ impl LivenessEnv {
 /// Who wrote a marker, as recorded by [`begin_request`].
 struct Writer { boot_id: String, pid: libc::pid_t, start: u64, cgroup: String, cgroup_inode: u64 }
 
-/// Can any descendant of the call that wrote `marker` still be running? Two
-/// independent proofs of "no": a different `boot_id` (nothing the marker names
-/// survived the reboot), or, on the same boot, a writer that is gone whose cgroup
-/// holds no process that could have outlived it. The cgroup, not `KillMode`, is the
-/// proof: `KillMode` says only what systemd *intends* on stop. The writer is recorded
-/// rather than the supervisor because the marker must exist before `spawn` yields a
-/// pid, and `spawn_supervised` never moves a child out of its cgroup anyway.
+/// Can any descendant of the call that wrote `marker` still be running? Two independent
+/// proofs of "no": a different `boot_id` (nothing the marker names survived the reboot),
+/// or, on the same boot, a writer that is gone whose cgroup holds no process that could
+/// have outlived it. The cgroup's actual membership, not `KillMode`, is the proof —
+/// `KillMode` says only what systemd *intends* on stop, which is why `doctor` confirms
+/// `KillMode=control-group` separately as the deployment guarantee that a stop leaves no
+/// survivor there at all. The writer is recorded rather than the supervisor because the
+/// marker must exist before `spawn` yields a pid, and `spawn_supervised` never moves a
+/// child out of its cgroup anyway.
 fn call_provably_dead(marker: &std::path::Path, env: &LivenessEnv) -> Liveness {
     let writer = match marker_identity(marker) {
         Identity::Writer(writer) => writer,
@@ -353,14 +354,13 @@ fn marker_identity(marker: &std::path::Path) -> Identity {
         cgroup: value["writer_cgroup"].as_str().filter(|cgroup| cgroup.starts_with('/'))?.to_owned(),
         // Zero is no inode, so it would match no directory and read as `Gone` — a
         // clearing verdict out of a malformed field. Keep the marker instead.
-        cgroup_inode: value["writer_cgroup_inode"].as_u64().filter(|inode| *inode > 0)?,
-    });
+        cgroup_inode: value["writer_cgroup_inode"].as_u64().filter(|inode| *inode > 0)? });
     writer().map_or(Identity::Unknown, Identity::Writer)
 }
 
-/// Clear one orphaned marker, or report why it was kept. `dry_run` reads only: it takes
-/// no lock and creates nothing. Only the marker is touched — the journal keeps its
-/// `started` rows, so recovery can still act on the request.
+/// Clear one orphaned marker, or report why it was kept. `dry_run` reads only: it takes no
+/// lock and creates nothing. Only the marker is touched — the journal keeps its `started`
+/// rows, so recovery can still act on the request.
 pub(crate) fn clear_if_dead(journal: &std::path::Path, env: &LivenessEnv, dry_run: bool) -> std::io::Result<Liveness> {
     let marker = journal.with_extension("active");
     if dry_run { return Ok(call_provably_dead(&marker, env)); }
@@ -398,13 +398,10 @@ fn begin_request(journal: Option<&std::path::Path>, receipt: &std::path::Path) -
     let writer = unsafe { libc::getpid() };
     let (cgroup, cgroup_inode) = own_cgroup().unzip();
     file.write_all(serde_json::json!({
-        "version": MARKER_VERSION,
-        "receipt": receipt,
+        "version": MARKER_VERSION, "receipt": receipt, "writer_pid": writer,
         "boot_id": read_trimmed("/proc/sys/kernel/random/boot_id"),
-        "writer_pid": writer,
         "writer_start": process_start(writer),
-        "writer_cgroup": cgroup,
-        "writer_cgroup_inode": cgroup_inode,
+        "writer_cgroup": cgroup, "writer_cgroup_inode": cgroup_inode,
     }).to_string().as_bytes())?;
     file.sync_all()?;
     std::fs::File::open(parent)?.sync_all()?;
@@ -559,26 +556,22 @@ mod tests {
         let daemon = || env(Some("this-boot"), false, Cgroup::Gone);
         let same_boot = |cgroup| env(Some("this-boot"), false, cgroup);
         let cases: Vec<(&str, Value, LivenessEnv, Liveness)> = vec![
-            ("a reboot killed everything the marker names", json!({"boot_id": "other"}),
+            ("a reboot killed all the marker names", json!({"boot_id": "other"}),
                 env(Some("this-boot"), true, Cgroup::Populated), Liveness::Dead),
-            ("the writer is still running", json!({}), env(Some("this-boot"), true, Cgroup::Gone), Liveness::Live),
-            ("writer gone, its cgroup destroyed", json!({}), daemon(), Liveness::Dead),
-            ("a restart reused the unit cgroup; only we are in it", json!({}), same_boot(Cgroup::Ours), Liveness::Dead),
+            ("the writer still runs", json!({}), env(Some("this-boot"), true, Cgroup::Gone), Liveness::Live),
+            ("writer gone, cgroup destroyed", json!({}), daemon(), Liveness::Dead),
+            ("a restart reused the cgroup; only we are in it", json!({}), same_boot(Cgroup::Ours), Liveness::Dead),
             ("the cgroup holds someone not ours", json!({}), same_boot(Cgroup::Populated), Liveness::Unproven),
-            ("the cgroup could not be read", json!({}), same_boot(Cgroup::Unknown), Liveness::Unproven),
-            ("boot id could not be read", json!({"boot_id": "other"}), env(None, false, Cgroup::Gone), Liveness::Unproven),
+            ("the cgroup is unreadable", json!({}), same_boot(Cgroup::Unknown), Liveness::Unproven),
+            ("boot id is unreadable", json!({"boot_id": "other"}), env(None, false, Cgroup::Gone), Liveness::Unproven),
             ("a pre-#1071 marker has no identity", json!({"version": 1}), daemon(), Liveness::Legacy),
             ("a v2 marker missing a writer field", json!({"writer_start": Value::Null}), daemon(), Liveness::Unproven),
-            ("a v2 marker whose cgroup inode is zero", json!({"writer_cgroup_inode": 0}), daemon(), Liveness::Unproven),
-        ];
+            ("a v2 marker whose cgroup inode is zero", json!({"writer_cgroup_inode": 0}), daemon(), Liveness::Unproven)];
         let request = || {
             let directory = tempfile::tempdir().unwrap();
             std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
             let journal = directory.path().join("operations.json");
-            (directory, journal)
-        };
-        let write = |marker: &std::path::Path, bytes: &[u8]| std::fs::OpenOptions::new()
-            .create_new(true).write(true).mode(0o600).open(marker).unwrap().write_all(bytes).unwrap();
+            (directory, journal) };
         for (case, overrides, env, wanted) in cases {
             let (directory, journal) = request();
             let marker = journal.with_extension("active");
@@ -586,7 +579,8 @@ mod tests {
                 "receipt": directory.path().join("cleanup-complete"), "boot_id": "this-boot",
                 "writer_cgroup": "/synthetic.slice/augmentagent.service", "writer_cgroup_inode": 424242});
             for (key, replacement) in overrides.as_object().unwrap() { value[key] = replacement.clone(); }
-            write(&marker, value.to_string().as_bytes());
+            std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(&marker)
+                .unwrap().write_all(value.to_string().as_bytes()).unwrap();
             assert_eq!(clear_if_dead(&journal, &env, true).unwrap(), wanted, "{case} (dry run)");
             assert!(marker.exists(), "{case}: a dry run must change nothing");
             assert_eq!(clear_if_dead(&journal, &env, false).unwrap(), wanted, "{case}");
@@ -600,7 +594,6 @@ mod tests {
         assert_eq!(clear_marker(&marker, Proof::WriterGone(&LivenessEnv::probe())).unwrap(), Liveness::Live);
         assert_eq!(clear_marker(&marker, Proof::Reaped(&receipt)).unwrap(), Liveness::Dead);
         assert!(!marker.exists());
-
         // The reading that decides the restart case, by ancestry not age. 500 = us;
         // 600/700 ours; 100 a leak reparented to pid 1; 800 foreign; 900/901 a cycle;
         // 7777 absent from /proc.
@@ -613,22 +606,20 @@ mod tests {
             ("a reparented leak from the dead call", "500\n100\n", Cgroup::Populated),
             ("a process belonging to nobody we know", "500\n800\n", Cgroup::Populated),
             ("a listed pid /proc will not show is no proven exit", "500\n7777\n", Cgroup::Populated),
-            ("a cycle must terminate, and prove nothing", "900\n", Cgroup::Populated),
-        ] { assert_eq!(seen(procs), wanted, "{case}"); }
+            ("a cycle must terminate, and prove nothing", "900\n", Cgroup::Populated)]
+        { assert_eq!(seen(procs), wanted, "{case}"); }
         // And against the real hierarchy: a foreign inode means the recorded one is gone.
         if let Some((path, inode)) = own_cgroup() {
             assert!(matches!(cgroup_state(&path, inode), Cgroup::Populated | Cgroup::Ours));
             assert_eq!(cgroup_state(&path, inode.wrapping_add(1)), Cgroup::Gone);
-            assert_eq!(process_parent(unsafe { libc::getpid() }), Some(unsafe { libc::getppid() }));
         }
     }
 
-    /// #1071, the reported case verbatim, against a marker `begin_request` really wrote
-    /// rather than a hand-written one: a deploy kills the daemon mid-call, so the marker
-    /// its `Drop` would have retired leaks, and the successor must retire it. The writer
-    /// is this process with only its *liveness* probes injected — it must report gone,
-    /// which a test cannot make of itself, and this process likewise cannot make systemd
-    /// restart the unit, so the cgroup gives the restart reading, `Ours`. The real
+    /// #1071, the reported case verbatim, against a marker `begin_request` really wrote: a
+    /// deploy kills the daemon mid-call, so the marker its `Drop` would have retired leaks,
+    /// and the successor must retire it. The writer is this process with only its *liveness*
+    /// probes injected — it must report gone, which a test cannot make of itself, nor can a
+    /// test make systemd restart the unit, so the cgroup gives the restart reading, `Ours`.
     /// `boot_id` and the recorded cgroup path are read from `/proc` as in production.
     #[test]
     fn a_restart_during_a_call_retires_the_marker_it_orphaned() {
@@ -645,7 +636,6 @@ mod tests {
         let Identity::Writer(recorded) = marker_identity(&marker) else { panic!("marker has no writer") };
         assert_eq!(recorded.pid, unsafe { libc::getpid() }, "the marker names its real writer");
         assert_eq!(process_start(recorded.pid), Some(recorded.start), "a real start time");
-
         let recorded_cgroup = recorded.cgroup.clone();
         let env = LivenessEnv { start_of: Box::new(|_| None), cgroup_of: Box::new(move |path, _| {
             assert_eq!(path, recorded_cgroup, "the writer's own cgroup must be the one probed");

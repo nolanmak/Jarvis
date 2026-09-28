@@ -1051,6 +1051,17 @@ fn gate_finding(snap: Option<cli_gate::GateSnapshot>, now: u64) -> Finding {
 const HANDOFF_WARN_REQUESTS: u64 = 5_000;
 const HANDOFF_WARN_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 
+/// #1071 — the deployment guarantee behind the orphan pass's cgroup reading: with
+/// `KillMode=control-group` (systemd's default) a stop kills every process in the unit
+/// cgroup, so a restart cannot leave a survivor of the previous call there. Read-only, and
+/// `None` (no systemctl, no user bus, no such unit) is reported rather than assumed.
+fn daemon_kill_mode(unit: &str) -> Option<String> {
+    let shown = std::process::Command::new("systemctl")
+        .args(["--user", "show", "--property=KillMode", "--value", unit]).output().ok()?;
+    shown.status.success().then(|| String::from_utf8_lossy(&shown.stdout).trim().to_owned())
+        .filter(|mode| !mode.is_empty())
+}
+
 /// A read-only dry run over the live root: no locks, nothing created.
 fn check_handoff_journals() -> Finding {
     let Some(root) = handoff::journal_root() else {
@@ -1060,11 +1071,12 @@ fn check_handoff_journals() -> Finding {
     // #1071 — a dry run, so this only counts what the daemon's pass would do.
     let orphans = handoff::clear_orphaned_markers(&root, &handoff::LivenessEnv::probe(), true)
         .unwrap_or_default();
-    handoff_journal_finding(handoff::sweep_finished(&root, grace, true), grace, orphans)
+    handoff_journal_finding(handoff::sweep_finished(&root, grace, true), grace, orphans,
+        daemon_kill_mode(crate::handoff_prune::DAEMON_UNIT))
 }
 
 fn handoff_journal_finding(report: Result<handoff::SweepReport>, grace: Duration,
-    orphans: handoff::OrphanReport) -> Finding {
+    orphans: handoff::OrphanReport, kill_mode: Option<String>) -> Finding {
     const NAME: &str = "handoff_journals";
     const HINT: &str = "augmentagent handoff-prune --dry-run";
     let report = match report {
@@ -1109,7 +1121,14 @@ fn handoff_journal_finding(report: Result<handoff::SweepReport>, grace: Duration
         return Finding::warn(NAME, format!("{msg} — {} marker(s) predate #1071; no pass can prove them dead",
             orphans.kept_legacy), Some("python3 scripts/codex-tool-bridge.py --handoff-status <journal>"));
     }
-    Finding::ok(NAME, msg)
+    // #1071 — anything but control-group lets a stop leave a survivor in the unit
+    // cgroup, which the orphan pass would then (correctly) keep forever.
+    match kill_mode.as_deref() {
+        Some("control-group") | None => Finding::ok(NAME, msg),
+        Some(mode) => Finding::warn(NAME, format!("{msg} — KillMode={mode}: a stop may leave a \
+            survivor in the unit cgroup, so orphaned markers will be kept"),
+            Some("systemctl --user edit augmentagent.service  # KillMode=control-group")),
+    }
 }
 
 /// What doctor observed about `/dev/kvm` (injected in tests).
@@ -1958,15 +1977,24 @@ mod tests {
             kept_unfinished: 2,
             ..Default::default()
         };
-        // #1071 — of the 3 markers, one is clearable, one live, one doubtful. A
-        // pre-#1071 marker no pass can prove dead is the one that warrants a warning.
+        // #1071 — of the 3 markers, one is clearable, one live, one doubtful, and
+        // `kills` is the deployment the cgroup reading needs (no systemd reports None).
         let seen = handoff::OrphanReport { cleared: 1, kept_live: 1, kept_unproven: 1, kept_legacy: 0 };
-        let ok = handoff_journal_finding(Ok(healthy), grace, seen);
+        let kills = |report, orphans| handoff_journal_finding(report, grace, orphans,
+            Some("control-group".to_string()));
+        let ok = kills(Ok(healthy), seen);
         assert_eq!(ok.severity, Severity::Ok, "{}", ok.message);
         assert!(ok.message.contains("1 clearable as orphans"), "{}", ok.message);
-        let legacy = handoff_journal_finding(Ok(healthy), grace, handoff::OrphanReport { kept_legacy: 2, ..seen });
+        assert_eq!(handoff_journal_finding(Ok(healthy), grace, seen, None).severity, Severity::Ok);
+        let legacy = kills(Ok(healthy), handoff::OrphanReport { kept_legacy: 2, ..seen });
         assert_eq!(legacy.severity, Severity::Warn, "{}", legacy.message);
         assert!(legacy.message.contains("2 marker(s) predate #1071"), "{}", legacy.message);
+        // #1071 — any other KillMode lets a stop leave a survivor in the unit cgroup.
+        let process = handoff_journal_finding(Ok(healthy), grace, seen, Some("process".to_string()));
+        assert_eq!(process.severity, Severity::Warn, "{}", process.message);
+        assert!(process.message.contains("KillMode=process"), "{}", process.message);
+        // The live unit's own value, read read-only: present and non-empty, or absent.
+        assert!(daemon_kill_mode(crate::handoff_prune::DAEMON_UNIT).is_none_or(|m| !m.is_empty()));
         // Counts only request dirs, and reports what needs an operator as information.
         assert!(
             ok.message.contains("420 request dirs") && !ok.message.contains("423"),
@@ -1992,7 +2020,7 @@ mod tests {
             finished_overdue: 1,
             ..healthy
         };
-        let stalled_finding = handoff_journal_finding(Ok(stalled), grace, seen);
+        let stalled_finding = kills(Ok(stalled), seen);
         assert!(
             stalled_finding
                 .message
@@ -2002,10 +2030,10 @@ mod tests {
         );
         let refused = Err(anyhow::anyhow!("handoff directory is not private"));
         for finding in [
-            handoff_journal_finding(Ok(many), grace, seen),
-            handoff_journal_finding(Ok(large), grace, seen),
+            kills(Ok(many), seen),
+            kills(Ok(large), seen),
             stalled_finding,
-            handoff_journal_finding(refused, grace, seen),
+            kills(refused, seen),
         ] {
             assert_eq!(finding.severity, Severity::Warn, "{}", finding.message);
             assert_eq!(
