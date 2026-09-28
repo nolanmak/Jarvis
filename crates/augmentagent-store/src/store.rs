@@ -1922,9 +1922,10 @@ impl Store {
     }
 
     /// Titles of Apple Notes an inbound message plausibly refers to (#1060):
-    /// a note whose title *or body* carries a content word from `subject` or
-    /// the sender's address. Newest-edited first, capped at `limit`. Empty
-    /// when nothing matches — the caller emits no hint at all.
+    /// a note whose title *or body* carries a content word from `subject`,
+    /// from the sender's display name, or the sender's bare address.
+    /// Newest-edited first, capped at `limit`. Empty when nothing matches —
+    /// the caller emits no hint at all.
     ///
     /// Ordering and recency come from `receivedAt` (the note's own `modified`,
     /// rewritten on every edit), never `firstSeenAt`, which
@@ -1939,14 +1940,22 @@ impl Store {
         from: &str,
         limit: usize,
     ) -> StoreResult<Vec<String>> {
-        let tokens = crate::notes::title_match_tokens(subject);
-        // Only an address is specific enough to look for in a note body; a
-        // bare handle like "me" would substring-match every note there is.
-        let sender = bare_lower(from);
-        let sender = if sender.contains('@') { sender } else { String::new() };
-        let mut needles = tokens;
-        if !sender.is_empty() {
-            needles.push(sender);
+        let mut needles = crate::notes::title_match_tokens(subject);
+        // Real inbound mail arrives as `Dana Reyes <dana@example.org>`. Both
+        // halves identify the sender to a note: the display name is how a
+        // note titles or mentions a person, the address is what a note body
+        // pastes. A bare address has no name half — splitting one on
+        // punctuation would yield junk needles like "example".
+        if let Some((name, _)) = from.split_once('<') {
+            for token in crate::notes::title_match_tokens(name) {
+                if !needles.contains(&token) {
+                    needles.push(token);
+                }
+            }
+        }
+        let address = bare_lower(from);
+        if address.contains('@') {
+            needles.push(address);
         }
         if needles.is_empty() {
             return Ok(Vec::new());
@@ -7961,9 +7970,13 @@ mod tests {
         note_row(&s, "n1", "Cabin plan", "Trips", "book the cabin", "2026-09-02T10:00:00Z");
         note_row(&s, "n2", "Receipts", "Work", "ping a_b@example.com", "2026-09-05T10:00:00Z");
         note_row(&s, "n3", "Groceries", "Work", "eggs\nmilk", "2026-09-06T10:00:00Z");
+        note_row(&s, "n4", "Dana Reyes intro", "Work", "agenda", "2026-09-07T10:00:00Z");
         let hits = |subject, from| s.matching_note_titles(subject, from, 3).unwrap();
 
-        assert_eq!(hits("Re: cabin plan for October", "dana@example.org"), vec!["Cabin plan"]);
+        assert_eq!(hits("Re: cabin plan for October", "sam@example.net"), vec!["Cabin plan"]);
+        // The `From` display name identifies the sender to a note just as the
+        // address does: an unrelated subject must still surface Dana's note.
+        assert_eq!(hits("unrelated", "Dana Reyes <dana@example.org>"), vec!["Dana Reyes intro"]);
         // A subject word may land in the body, under an unrelated title.
         assert_eq!(hits("book the boat", "dana@example.org"), vec!["Cabin plan"]);
         // Display-name headers are what actually arrive; the address inside

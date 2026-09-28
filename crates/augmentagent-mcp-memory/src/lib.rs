@@ -1615,13 +1615,13 @@ mod note_tests {
             .execute(
                 "INSERT INTO emails (messageId, threadId, fromEmail, subject, body, receivedAt, accountEntityId, firstSeenAt, platform, kind) \
                  VALUES (?1, ?1, 'me', ?2, ?3, ?4, 'apple-notes', ?5, 'apple_notes', 'note')",
+                // Every note shares one firstSeenAt: ordering must come from
+                // `receivedAt`, which is what an edit rewrites.
                 rusqlite::params![
                     id,
                     augmentagent_store::notes::note_subject(title, folder),
                     body,
                     modified,
-                    // Every note shares one firstSeenAt: ordering must come
-                    // from `receivedAt`, which is what an edit rewrites.
                     1_600_000_000_000i64,
                 ],
             )
@@ -1661,17 +1661,27 @@ mod note_tests {
         assert!(format!("{err}").contains("query"), "got: {err}");
     }
 
+    /// `search_notes` tells the agent to read the full note with
+    /// `read_conversation_thread(message_id)` (schema/wiki-ask.md). That only
+    /// holds because the notes ingester sets `threadId = messageId`
+    /// (`augmentagent-channel-apple-notes::note_email`), which this pins.
+    #[test]
+    fn a_note_message_id_reads_back_as_a_thread_with_the_whole_body() {
+        let s = new_server();
+        fixtures(&s);
+        let hit = &s.search_notes("cabin", None, None).expect("search")[0];
+        let page = s.read_conversation_thread(&hit.message_id, 0, 0, 20).expect("read");
+        let messages = page["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 1, "{page}");
+        assert_eq!(messages[0]["body"], "book the cabin\nbring firewood");
+        assert_eq!(messages[0]["truncated"], false);
+    }
+
     #[test]
     fn dispatch_search_notes_keeps_redaction_markers_intact() {
         let s = new_server();
-        insert_note(
-            &s,
-            "n4",
-            "Wifi setup",
-            "Home",
-            "router password: [REDACTED:password-assignment]",
-            "2026-09-09T10:00:00Z",
-        );
+        let body = "router password: [REDACTED:password-assignment]";
+        insert_note(&s, "n4", "Wifi setup", "Home", body, "2026-09-09T10:00:00Z");
         let req = McpRequest {
             jsonrpc: "2.0".into(),
             id: json!(7),
