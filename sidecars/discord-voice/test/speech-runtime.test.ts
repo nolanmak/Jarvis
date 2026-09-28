@@ -116,3 +116,37 @@ test('interrupt emits the affected receipt for the original text mirror', async 
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });
+
+test('a 120-second owner utterance stops at the configured cap without submitting a turn', async t => {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await new Promise<void>(resolve => server.once('listening', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('expected TCP address');
+  let peer: import('ws').WebSocket | undefined;
+  server.on('connection', socket => { peer = socket; });
+  const frames: Array<Record<string, unknown>> = [];
+  const audio = new VoiceAudio(fakeConnection(), binding, {
+    sttProvider: 'deepgram', ttsProvider: 'deepgram',
+    sttKey: 'synthetic-key', ttsKey: 'synthetic-key',
+    sttEndpoint: `ws://127.0.0.1:${address.port}`,
+  }, frame => { frames.push(frame as Record<string, unknown>); return true; });
+  try {
+    await audio.start();
+    assert.ok(peer);
+    const realSetTimeout = globalThis.setTimeout;
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    peer.send(JSON.stringify({ type: 'TurnInfo', event: 'StartOfTurn', turn_index: 0 }));
+    await new Promise<void>(resolve => realSetTimeout(resolve, 20));
+    t.mock.timers.tick(119_999);
+    assert.equal(audio.status, 'listening');
+    t.mock.timers.tick(1);
+    assert.equal(audio.status, 'stopped');
+    assert.equal(frames.filter(frame => frame.kind === 'audio_failure').length, 1);
+    assert.equal(frames.filter(frame => frame.kind === 'transcript').length, 0);
+  } finally {
+    t.mock.timers.reset();
+    audio.stop();
+    for (const client of server.clients) client.terminate();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});

@@ -37,3 +37,18 @@ test('Discord 48 kHz stereo PCM is resampled to 16 kHz mono PCM', async () => {
   assert.equal(Buffer.concat(output).length, 1600 * 2);
   await resampler.close();
 });
+
+test('one second of Discord PCM reaches STT before the owner stream closes', async () => {
+  const resampler = resampleDiscordPcmForStt();
+  try {
+    const first = new Promise<Buffer>(resolve => resampler.output.once('data', resolve));
+    resampler.input.write(Buffer.alloc(48_000 * 4));
+    const chunk = await Promise.race([first,
+      new Promise<never>((_, reject) => setTimeout(() => reject(
+        new Error('STT resampler buffered the whole open utterance')), 500))]);
+    assert.ok(chunk.length > 0);
+    assert.equal(resampler.input.writableEnded, false);
+  } finally {
+    resampler.abort();
+  }
+});

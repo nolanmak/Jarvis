@@ -62,6 +62,10 @@ For latency readiness, speech receipts now expose queued, TTS request, TTS first
 
 Interrupted speech now emits a receipt-scoped sidecar event once, including whether the local audio player had started. The Rust bridge validates the active binding before mirroring an interruption notice into its original text conversation. The notice distinguishes partial local playback from interruption before playback. This is synthetic receipt/mirror evidence; a real listener's partial-audio observation is still required for AC10.
 
+AC06 fixture hardening: 20 fixed, attributed WAV clips from the TensorFlow Speech Commands mini dataset plus generated silence are checked in under `sidecars/discord-voice/test/fixtures/commands/`. Each clip is encoded to Discord-format Opus, decoded by the production receiver path, resampled, sent through one of the two provider protocol adapters to a local deterministic WebSocket server, and expected to yield exactly one normalized committed reference word. The local server returns the known fixture label; this tests transport and commit handling, not actual speech recognition. A virtual-clock provider speech-start fixture reaches the real 120-second cap and stops without a native turn. Only the configured owner ID is subscribed in the fake receiver; actual non-owner/bot zero-byte evidence still needs a live receiver test.
+
+The first fixture run failed because no PCM reached the fake STT server until the FFmpeg input closed. A standalone one-second open-input probe reproduced zero output, while closing yielded 32,000 bytes. Adding `-probesize 32 -analyzeduration 0` before the raw PCM input caused PCM to arrive while the input remained open; the prerecorded suite and a direct one-second regression test now pass. This removes a measured local buffering defect but does not establish live endpointing or latency percentiles.
+
 ## Required next gates
 
 1. Prove Discord DAVE join, owner audio receive/decode, and outbound playback in a test guild. Mocked adapter and native MCP tests cannot satisfy this gate.

@@ -54,6 +54,7 @@ export function resampleDiscordPcmForStt(): SttResampler {
   if (!ffmpegPath) throw new Error('Pinned FFmpeg binary is unavailable');
   const child = spawn(ffmpegPath, [
     '-hide_banner', '-loglevel', 'error',
+    '-probesize', '32', '-analyzeduration', '0',
     '-f', 's16le', '-ar', '48000', '-ac', '2', '-i', 'pipe:0',
     '-f', 's16le', '-ar', '16000', '-ac', '1', 'pipe:1',
   ], { stdio: ['pipe', 'pipe', 'pipe'] });
