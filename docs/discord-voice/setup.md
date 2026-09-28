@@ -63,6 +63,48 @@ npm run test:live -- \
 # --output "$HOME/voice-test-codex-01.json"
 ```
 
+## Latency report
+
+For AC09, capture at least 30 **live, no-tool** voice turns for each native agent on the same deployment and network. Keep the source logs, receipt JSON, and a recording or independent endpointing trace with the private test record. Export one JSON object using this shape (Unix epoch milliseconds throughout):
+
+```json
+{
+  "schemaVersion": 1,
+  "deployment": "test-guild-run-01",
+  "network": "owner client and server locations / connection",
+  "sttProvider": "deepgram",
+  "ttsProvider": "elevenlabs",
+  "turns": [
+    {
+      "agent": "codex",
+      "turnId": "unique-turn-id",
+      "noTool": true,
+      "idleAtCommit": true,
+      "speakTextChars": 42,
+      "speechEndedAtMs": 0,
+      "committedAtMs": 0,
+      "handlerDispatchedAtMs": 0,
+      "nativeSubmittedAtMs": 0,
+      "firstTextOutputAtMs": 0,
+      "answerCompletedAtMs": 0,
+      "queuedAtMs": 0,
+      "ttsRequestedAtMs": 0,
+      "ttsFirstByteAtMs": 0,
+      "firstPlaybackAtMs": 0
+    }
+  ]
+}
+```
+
+Replace the zero placeholders with actual increasing timestamps. `speechEndedAtMs` comes from the independent owner audio/endpointing trace; the bot cannot infer physical speech end from the provider's committed transcript. `committedAtMs` is in the transcript event and daemon log. `handlerDispatchedAtMs`, `nativeSubmittedAtMs`, `firstTextOutputAtMs`, and `answerCompletedAtMs` are in the daemon's turn-ID logs. Native submission is recorded after the CLI prompt has been fully written. The remaining fields and `speakTextChars` come from the sidecar speech receipt and spoken text. Match turn IDs across these sources; use a consistent clock or record clock offsets when the owner capture runs on another machine. Include only turns where the scheduler was idle at transcript commit (`idleAtCommit: true`) and where the agent made no tool calls (`noTool: true`); verify both from traces. Keep raw evidence for every sample, including slow outliers.
+
+```sh
+cd ~/AugmentAgent/sidecars/discord-voice
+npm run report:latency -- "$HOME/voice-timings.json" --output "$HOME/voice-latency-report.json"
+```
+
+The command rejects incomplete/nonchronological samples, requires 30 turns per agent, calculates nearest-rank p50/p95 for each stage, and exits nonzero if either required p95 gate fails. The report file is created mode `0600` and labeled `operator-supplied-timings-unverified`; review its source traces before treating a gate as passed. `firstPlaybackAtMs` is the local Discord player transition and does not prove remote audibility. Check the receiver's actual audio separately.
+
 ## Troubleshooting and rollback
 
 ```sh

@@ -7,13 +7,13 @@ if (!socketPath || !isAbsolute(socketPath)) {
 }
 
 const service = new VoiceIpcServer(socketPath);
-await service.listen();
+const listening = service.listen();
 
 let stopping = false;
 function stop(): void {
   if (stopping) return;
   stopping = true;
-  void service.close().catch(error => {
+  void listening.then(() => service.close()).catch(error => {
     process.exitCode = 1;
     console.error(error instanceof Error ? error.message : 'Voice sidecar shutdown failed');
   });
@@ -21,3 +21,4 @@ function stop(): void {
 
 process.on('SIGTERM', stop);
 process.on('SIGINT', stop);
+await listening;

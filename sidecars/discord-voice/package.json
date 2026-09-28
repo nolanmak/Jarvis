@@ -12,7 +12,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && ./node_modules/node/bin/node --test dist/test/*.test.js",
     "doctor": "./node_modules/node/bin/node dist/scripts/doctor.js",
-    "test:live": "./node_modules/node/bin/node dist/scripts/live-voice.js"
+    "test:live": "./node_modules/node/bin/node dist/scripts/live-voice.js",
+    "report:latency": "./node_modules/node/bin/node dist/scripts/latency-report.js"
   },
   "dependencies": {
     "@discordjs/voice": "0.19.2",

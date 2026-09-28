@@ -16,6 +16,8 @@ struct State {
     id: Option<String>,
     active: bool,
     uncertain: bool,
+    native_submitted_at_ms: Option<u64>,
+    first_text_output_at_ms: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -45,7 +47,8 @@ impl NativeSession {
             "native session ID is empty");
         Ok(Arc::new(Self {
             provider,
-            state: Mutex::new(State { id, active: false, uncertain: false }),
+            state: Mutex::new(State { id, active: false, uncertain: false,
+                native_submitted_at_ms: None, first_text_output_at_ms: None }),
         }))
     }
 
@@ -62,6 +65,8 @@ impl NativeSession {
             None => Launch::Create { requested_id: None },
         };
         state.active = true;
+        state.native_submitted_at_ms = None;
+        state.first_text_output_at_ms = None;
         Ok(Lease { session: Arc::clone(self), launch, observed_id: None, finished: false })
     }
 
@@ -76,11 +81,39 @@ impl NativeSession {
     pub fn provider(&self) -> ProviderKind {
         self.provider
     }
+
+    pub fn first_text_output_at_ms(&self) -> Option<u64> {
+        self.state.lock().expect("native session mutex poisoned").first_text_output_at_ms
+    }
+
+    pub fn native_submitted_at_ms(&self) -> Option<u64> {
+        self.state.lock().expect("native session mutex poisoned").native_submitted_at_ms
+    }
 }
 
 impl Lease {
     pub fn launch(&self) -> Launch {
         self.launch.clone()
+    }
+
+    /// Record when the prompt was fully written to the native CLI.
+    pub fn observe_native_submission(&self) {
+        let mut state = self.session.state.lock().expect("native session mutex poisoned");
+        if state.active && state.native_submitted_at_ms.is_none() {
+            state.native_submitted_at_ms = Some(std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default()
+                .as_millis().try_into().unwrap_or(u64::MAX));
+        }
+    }
+
+    /// Record the first nonempty assistant text observed in this native turn.
+    pub fn observe_first_text_output(&self) {
+        let mut state = self.session.state.lock().expect("native session mutex poisoned");
+        if state.active && state.first_text_output_at_ms.is_none() {
+            state.first_text_output_at_ms = Some(std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default()
+                .as_millis().try_into().unwrap_or(u64::MAX));
+        }
     }
 
     /// Verify the native CLI's own reported identity, not a derived audit ID.

@@ -49,3 +49,30 @@ fn observed_id_is_available_for_uncertain_turn_persistence() {
     assert_eq!(session.id().as_deref(), Some("observed-thread"));
     assert!(session.is_uncertain());
 }
+
+#[test]
+fn first_text_output_timestamp_is_set_once_and_reset_for_the_next_turn() {
+    let session = NativeSession::new(ProviderKind::Codex).unwrap();
+    let mut lease = session.begin(ProviderKind::Codex).unwrap();
+    assert_eq!(session.first_text_output_at_ms(), None);
+    assert_eq!(session.native_submitted_at_ms(), None);
+    lease.observe_native_submission();
+    let submitted = session.native_submitted_at_ms().unwrap();
+    lease.observe_native_submission();
+    assert_eq!(session.native_submitted_at_ms(), Some(submitted));
+    lease.observe_first_text_output();
+    let first = session.first_text_output_at_ms().unwrap();
+    assert!(first >= submitted);
+    lease.observe_first_text_output();
+    assert_eq!(session.first_text_output_at_ms(), Some(first));
+    lease.observe("thread-1").unwrap();
+    lease.finish().unwrap();
+    let mut next = session.begin(ProviderKind::Codex).unwrap();
+    assert_eq!(session.first_text_output_at_ms(), None);
+    assert_eq!(session.native_submitted_at_ms(), None);
+    next.observe_native_submission();
+    next.observe_first_text_output();
+    assert!(session.first_text_output_at_ms().unwrap() >= first);
+    next.observe("thread-1").unwrap();
+    next.finish().unwrap();
+}

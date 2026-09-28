@@ -9564,6 +9564,13 @@ impl QueryHandler for WikiQuerier {
             tracing::info!(turn_id = %ctx.session_id, %guild, %channel,
                 handler_dispatched_at_ms, "Discord native turn handler dispatched");
             let answer = CURRENT.scope(Arc::clone(&session), self.answer(ctx, &prompt)).await;
+            let answer_completed_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+            tracing::info!(turn_id = %ctx.session_id, %guild, %channel,
+                ?handler_dispatched_at_ms, ?answer_completed_at_ms,
+                native_submitted_at_ms = ?session.native_submitted_at_ms(),
+                first_text_output_at_ms = ?session.first_text_output_at_ms(),
+                "Discord native turn timing");
             if let Some(id) = session.id() {
                 if binding.is_none() {
                     store.bind_discord_conversation(&augmentagent_store::DiscordConversation {

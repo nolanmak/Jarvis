@@ -368,6 +368,7 @@ impl CodexCliReasoner {
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(user_message.as_bytes()).await?;
             stdin.shutdown().await?;
+            if let Some(lease) = native_lease.as_ref() { lease.observe_native_submission(); }
         }
 
         // Drain stderr CONCURRENTLY (#655 review): a child writing >64KB of
@@ -440,6 +441,9 @@ impl CodexCliReasoner {
                             item.and_then(|i| i.get("text")).and_then(|t| t.as_str())
                         {
                             if !text.trim().is_empty() {
+                                if let Some(lease) = native_lease.as_ref() {
+                                    lease.observe_first_text_output();
+                                }
                                 messages.push(text.to_string());
                             }
                         }
@@ -687,6 +691,24 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
         assert_eq!(got, "{\"decision\":\"reply\"}", "LastBlock keeps the final message");
         let all = r.call_transcript(&opts(), "classify this").await.unwrap();
         assert!(all.contains("scratch note") && all.contains("decision"));
+    }
+
+    #[tokio::test]
+    async fn native_codex_records_first_nonempty_assistant_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(&dir, "fake-codex-first-text", r#"
+cat >/dev/null
+echo '{"type":"thread.started","thread_id":"synthetic-thread"}'
+echo '{"type":"item.completed","item":{"type":"reasoning","text":"private"}}'
+echo '{"type":"item.completed","item":{"type":"agent_message","text":"visible answer"}}'
+"#);
+        let session = crate::native_session::NativeSession::new(ProviderKind::Codex).unwrap();
+        let answer = crate::native_session::CURRENT.scope(std::sync::Arc::clone(&session),
+            CodexCliReasoner::with_bin(bin).call(&opts(), "synthetic input")).await.unwrap();
+        assert_eq!(answer, "visible answer");
+        assert!(session.first_text_output_at_ms().unwrap() >=
+            session.native_submitted_at_ms().unwrap());
+        assert_eq!(session.id().as_deref(), Some("synthetic-thread"));
     }
 
     /// #1047 — a codex call writes exactly one usage row: provider `codex`,

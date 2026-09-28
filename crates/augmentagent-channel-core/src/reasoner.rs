@@ -1225,6 +1225,7 @@ impl ClaudeCliReasoner {
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(user_message.as_bytes()).await?;
             stdin.shutdown().await?;
+            if let Some(lease) = native_lease.as_ref() { lease.observe_native_submission(); }
         }
 
         let stdout = child
@@ -1291,6 +1292,9 @@ impl ClaudeCliReasoner {
                     for block in message.content {
                         if let ContentBlock::Text { text } = block {
                             if !text.trim().is_empty() {
+                                if let Some(lease) = native_lease.as_ref() {
+                                    lease.observe_first_text_output();
+                                }
                                 text_blocks.push(text);
                             }
                         }
@@ -4581,6 +4585,32 @@ mod failover_error_tests {
         let config: serde_json::Value = serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
         assert_eq!(config["mcpServers"]["voice"]["env"]["AUGMENTAGENT_VOICE_TOOL_GRANT"],
             "SYNTHETIC_PRIVATE_GRANT");
+    }
+
+    #[tokio::test]
+    async fn native_claude_records_first_nonempty_assistant_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_cli(&dir, "fake-claude-first-text", r#"
+session=''
+previous=''
+for argument in "$@"; do
+  if [ "$previous" = '--session-id' ]; then session="$argument"; fi
+  previous="$argument"
+done
+cat >/dev/null
+echo "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$session\"}"
+echo '{"type":"assistant","message":{"content":[{"type":"text","text":"visible answer"}]}}'
+echo "{\"type\":\"result\",\"session_id\":\"$session\",\"result\":\"visible answer\"}"
+"#);
+        let session = crate::native_session::NativeSession::new(
+            crate::providers::ProviderKind::Claude).unwrap();
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        let answer = crate::native_session::CURRENT.scope(Arc::clone(&session),
+            reasoner.call(&dummy_opts(), "synthetic input")).await.unwrap();
+        assert_eq!(answer, "visible answer");
+        assert!(session.first_text_output_at_ms().unwrap() >=
+            session.native_submitted_at_ms().unwrap());
+        assert!(session.id().is_some());
     }
 
     /// 40 concurrent calls through a stub that sleeps must never have more
