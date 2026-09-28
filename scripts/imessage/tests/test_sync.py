@@ -14,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from imessage_sync import (
     apple_time_to_iso,
+    drain_uploads,
+    is_uploadable,
     build_backfill_plan,
     build_link_tree,
     decode_attributed_body,
@@ -453,6 +455,67 @@ class TestSync(unittest.TestCase):
         self.assertIn("Ski Trip", conv)
         self.assertIn("chat0001/messages.md", conv)
 
+
+class TestDrainUploads(unittest.TestCase):
+    """drain_uploads is the shared queue drainer: parallel, bounded, and it
+    never loses an item it did not confirm."""
+
+    def test_uploads_run_concurrently(self):
+        # A serial drainer cannot finish 8 blocking uploads inside one barrier
+        # wait; a parallel one releases the barrier and returns.
+        import threading
+        barrier = threading.Barrier(8, timeout=10)
+        items = [{"path": f"/tmp/f{i}", "key": f"k{i}"} for i in range(8)]
+
+        def upload(path, bucket, key):
+            barrier.wait()
+            return True
+
+        self.assertEqual(
+            drain_uploads(items, "b", upload, exists=lambda p: True, workers=8), [])
+
+    def test_failures_are_kept_and_successes_dropped(self):
+        items = [{"path": f"/tmp/f{i}", "key": f"k{i}"} for i in range(4)]
+        still = drain_uploads(
+            items, "b", lambda p, b, k: k in ("k1", "k3"),
+            exists=lambda p: True, workers=4)
+        self.assertEqual([i["key"] for i in still], ["k0", "k2"])
+
+    def test_vanished_files_are_dropped_without_uploading(self):
+        items = [{"path": "/tmp/gone", "key": "k0"}]
+        calls = []
+        still = drain_uploads(
+            items, "b", lambda p, b, k: calls.append(k) or True,
+            exists=lambda p: False, workers=2)
+        self.assertEqual((calls, still), ([], []))
+
+    def test_deadline_stops_early_and_requeues_the_rest(self):
+        # Past deadline: nothing is attempted and the whole queue survives, so a
+        # cron run that is out of time cannot drop work.
+        items = [{"path": f"/tmp/f{i}", "key": f"k{i}"} for i in range(5)]
+        calls = []
+        still = drain_uploads(
+            items, "b", lambda p, b, k: calls.append(k) or True,
+            exists=lambda p: True, workers=2, deadline=0.0)
+        self.assertEqual(calls, [])
+        self.assertEqual(len(still), 5)
+
+    def test_order_is_preserved_for_requeued_items(self):
+        items = [{"path": f"/tmp/f{i}", "key": f"k{i}"} for i in range(6)]
+        still = drain_uploads(items, "b", lambda p, b, k: False,
+                              exists=lambda p: True, workers=4)
+        self.assertEqual([i["key"] for i in still], [f"k{i}" for i in range(6)])
+
+class TestUploadableFilter(unittest.TestCase):
+    """Link-preview payloads are metadata, not media worth storing."""
+
+    def test_plugin_payloads_are_not_uploadable(self):
+        self.assertFalse(is_uploadable("/x/Y.pluginPayloadAttachment"))
+        self.assertFalse(is_uploadable("/x/Y.PLUGINPAYLOADATTACHMENT"))
+
+    def test_real_media_is_uploadable(self):
+        for name in ("a.jpeg", "b.HEIC", "c.mov", "d.pdf", "e.png"):
+            self.assertTrue(is_uploadable("/x/" + name), name)
 
 if __name__ == "__main__":
     unittest.main()

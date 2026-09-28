@@ -84,9 +84,17 @@ def run(args):
                 if args.aws_profile:
                     cmd += ["--profile", args.aws_profile]
                 try:
-                    return subprocess.run(cmd, capture_output=True, timeout=300).returncode == 0
+                    done = subprocess.run(cmd, capture_output=True, timeout=300)
                 except subprocess.TimeoutExpired:
+                    print(f"upload timed out, will retry: {key}", file=sys.stderr)
                     return False
+                if done.returncode != 0:
+                    # Without this the failure is invisible: --only-show-errors
+                    # writes to stderr and the queue silently re-grows each run.
+                    print(f"upload failed ({done.returncode}): {key}: "
+                          f"{done.stderr.decode(errors='replace').strip()[:200]}",
+                          file=sys.stderr)
+                return done.returncode == 0
             s3 = {"bucket": args.s3_bucket, "uploader": upload}
         result = sync(args.db, args.out, args.out / ".sync_state.json", contacts=contacts, s3=s3)
         print(f"synced {result['messages']} messages across {result['conversations']} conversations")

@@ -11,6 +11,8 @@ import os
 import re
 import sqlite3
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,6 +23,42 @@ APPLE_EPOCH = 978307200  # 2001-01-01 00:00:00 UTC in unix seconds
 _NORMAL_ASSOC_TYPES = (0, None)
 
 HEADER_PREFIX = "### ["
+
+# Link previews (rich URL cards) arrive as attachments but hold no media worth
+# storing: uploading them cost more than half of every queue drain.
+SKIP_ATTACHMENT_SUFFIXES = (".pluginpayloadattachment",)
+
+UPLOAD_WORKERS = 8      # one `aws s3 cp` per file; the cold start dominates
+UPLOAD_BUDGET_S = 90.0  # leave the queue for the next run rather than overrun it
+
+
+def is_uploadable(path):
+    """False for attachments that are metadata rather than media."""
+    return not str(path).lower().endswith(SKIP_ATTACHMENT_SUFFIXES)
+
+
+def drain_uploads(items, bucket, uploader, exists=None, workers=UPLOAD_WORKERS,
+                  deadline=None):
+    """Upload `items` ({'path','key'}) in parallel; return those still pending,
+    in their original order.
+
+    An item is dropped only when it uploaded or its file is gone. Anything not
+    attempted — because the deadline passed — stays queued, so a run that is out
+    of time costs progress, never data.
+    """
+    exists = exists or (lambda path: Path(path).exists())
+    live = [item for item in items if exists(item["path"])]
+    if not live:
+        return []
+
+    def attempt(item):
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
+        return uploader(item["path"], bucket, item["key"])
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        done = list(pool.map(attempt, live))
+    return [item for item, ok in zip(live, done) if not ok]
 
 
 def apple_time_to_iso(raw):
@@ -358,15 +396,8 @@ def sync(db_path, out_dir, state_path, contacts=None, s3=None):
     state = _load_json(state_path, {"last_rowid": 0})
     index = _load_json(out_dir / "conversations" / "index.json", {})
 
-    pending = state.get("pending_uploads", [])
-    if s3 and pending:
-        still = []
-        for item in pending:
-            if not Path(item["path"]).exists():
-                continue  # attachment deleted locally; give up
-            if not s3["uploader"](item["path"], s3["bucket"], item["key"]):
-                still.append(item)
-        pending = still
+    pending = [item for item in state.get("pending_uploads", [])
+               if is_uploadable(item["path"])]
 
     for ident, entry in index.items():
         entry.setdefault("dir", ident)
@@ -440,11 +471,13 @@ def sync(db_path, out_dir, state_path, contacts=None, s3=None):
         for att_id, mime, name, filename in attachments:
             line = f"[attachment: {mime or 'unknown'} {name or 'unnamed'}"
             local = Path(filename).expanduser() if filename else None
-            if s3 and local and local.exists():
+            if s3 and local and local.exists() and is_uploadable(local):
                 key = attachment_key(index[ident]["dir"], att_id, name)
                 line += f" s3://{s3['bucket']}/{key}"
-                if not s3["uploader"](str(local), s3["bucket"], key):
-                    pending.append({"path": str(local), "key": key})
+                # Queued, not uploaded inline: the drain at the end of this
+                # function is parallel and bounded, so one slow file cannot
+                # stall the whole export.
+                pending.append({"path": str(local), "key": key})
             attach_lines.append(line + "]")
 
         sender = "me" if is_from_me else (handle or "unknown")
@@ -465,6 +498,13 @@ def sync(db_path, out_dir, state_path, contacts=None, s3=None):
         _write_indexes(out_dir, index)
 
     state["last_rowid"] = last_rowid
+    # One bounded, parallel drain per run, after this run's attachments joined
+    # the queue: retries and new files share the same budget.
+    if s3 and pending:
+        pending = drain_uploads(
+            pending, s3["bucket"], s3["uploader"],
+            deadline=time.monotonic() + UPLOAD_BUDGET_S)
+
     state["pending_uploads"] = pending
     state["synced_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
     Path(state_path).parent.mkdir(parents=True, exist_ok=True)

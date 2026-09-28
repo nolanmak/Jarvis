@@ -109,8 +109,70 @@ Uninstall with `python3 scripts/imessage/schedule.py --uninstall`; data is retai
 Attachment metadata is exported by default. Uploading attachment files requires
 the AWS CLI and explicit `--s3-bucket YOUR_PRIVATE_BUCKET`, optionally with
 `--aws-profile YOUR_PROFILE`. Use your own private bucket and credentials outside
-the repo. Failed uploads remain queued for later runs. Attachments already
-exported without S3 are not retroactively uploaded by this command.
+the repo. Attachments already exported without S3 are not retroactively uploaded
+by this command; `backfill.py` covers earlier history.
+
+### Setting up the bucket
+
+Attachment upload is opt-in and needs a private bucket plus credentials that can
+write to it. Nothing about this is read from the repo.
+
+1. Create a bucket in your own AWS account. Keep it private — block all public
+   access, and prefer default encryption. The exporter never changes bucket
+   settings and never makes an object public.
+2. Create an IAM user or role whose policy allows `s3:PutObject` on
+   `arn:aws:s3:::YOUR_BUCKET/*`. Nothing more is required to export; add
+   `s3:ListBucket` on `arn:aws:s3:::YOUR_BUCKET` only if you want to audit what
+   landed there.
+3. Store its credentials in a named AWS profile outside this checkout:
+
+   ```sh
+   aws configure --profile YOUR_PROFILE
+   ```
+
+4. Verify the credentials resolve before scheduling anything:
+
+   ```sh
+   aws sts get-caller-identity --profile YOUR_PROFILE
+   ```
+
+5. Export with upload enabled:
+
+   ```sh
+   python3 scripts/imessage/sync.py --s3-bucket YOUR_BUCKET --aws-profile YOUR_PROFILE
+   ```
+
+Pass the same two options after `--` when installing the schedule, or attachments
+export as metadata only. A scheduled job runs without your shell profile, so the
+credentials must live in the AWS profile itself and not in environment variables
+set by your shell.
+
+### How the upload queue behaves
+
+Every attachment is queued in `.sync_state.json` under `pending_uploads` and
+uploaded by a bounded parallel drain — `UPLOAD_WORKERS` files at a time, for at
+most `UPLOAD_BUDGET_S` seconds per run. The reference in `messages.md` is written
+either way, because the S3 key is deterministic and does not depend on the upload
+succeeding.
+
+An item leaves the queue only when it uploaded or its local file is gone.
+Anything the run did not attempt stays queued for the next one, so a run that
+runs out of time costs progress, never data. Upload failures print the key and
+the AWS error to stderr, which the scheduled job writes to its log — check there
+first if the queue stops shrinking.
+
+Link previews (`.pluginPayloadAttachment`) are skipped: they are rich-URL card
+payloads, not media. They are listed in `SKIP_ATTACHMENT_SUFFIXES`.
+
+Size the interval so a run can finish. A serial upload of a large backlog cannot
+complete inside a short interval — each `aws s3 cp` pays a process start, so
+hundreds of queued files take far longer than a two-minute tick. If you are
+importing years of history, run the first export by hand to completion before
+scheduling it, and check the queue afterwards:
+
+```sh
+python3 -c "import json;print(len(json.load(open('.sync_state.json'))['pending_uploads']))"
+```
 
 The exporter was ported from the existing bundle job and retains its incremental
 ROWID cursor and conversation format. It skips tapbacks; attributed-body decoding
