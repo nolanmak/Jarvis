@@ -1345,10 +1345,9 @@ for line in sys.stdin:
 
     /// #1071, the reported case through the path the daemon runs: a `systemctl restart`
     /// killed the previous instance mid-call and left a marker; starting the successor's
-    /// sweep loop — nothing else — must retire it, so wiring the pass out of
-    /// `run_sweep_loop` fails this test. A live call's marker and a pre-#1071 one stay.
-    /// Deliberately *not* a reboot: the markers name this same boot, so that proof
-    /// cannot apply and the cgroup reading is the realistic restart one.
+    /// sweep loop — nothing else — must retire it. A live call's marker and a pre-#1071
+    /// one stay. Deliberately *not* a reboot: the markers name this same boot, so only
+    /// the realistic restart cgroup reading can decide them.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_restart_retires_the_marker_the_previous_instance_orphaned() {
         let (_temp, root) = private_root();

@@ -2421,9 +2421,8 @@ const DRAIN_BUDGET: Duration = Duration::from_secs(20);
 
 /// Join the daemon's tasks after cancellation, bounded (#1071). Letting a cancelled
 /// runner return drops its `ProcessGroup`, which retires that call's marker; a runner
-/// wedged in a provider call that never returns must not hold the stop open, so the
-/// budget expires and the next start's orphan pass — needing no runner cooperation —
-/// clears what was left.
+/// wedged in a call that never returns must not hold the stop open, so the budget
+/// expires and the next start's orphan pass clears what was left.
 async fn drain_daemon_tasks(tasks: Vec<tokio::task::JoinHandle<Result<()>>>, budget: Duration) -> Result<()> {
     let drained = tokio::time::timeout(budget, async {
         for handle in tasks { handle.await??; }

@@ -965,21 +965,18 @@ What it never touches, and for how long:
   chain (walked bounded, so a cycle cannot hang the pass) must reach this process. Start
   times cannot serve — a live writer's child spawned after us is younger than us yet not
   ours. Anything we cannot claim keeps the marker: a foreign process, a listed pid `/proc`
-  will not show (no proven exit), or a leak of the call, reparented away from us when its
-  parent died. `spawn_supervised` never moves a child out of the writer's cgroup, so that
-  set bounds every descendant. The reading is deliberately *not* `KillMode`, which says
-  only what systemd intends on stop. Every other reading keeps the marker too: an
-  unreadable, linked, oversized or truncated marker, an unreadable boot id, a structurally
-  invalid writer field (a zero cgroup inode, which would match no directory and so read as
-  *gone*), a cgroup that cannot be read, and every pre-#1071 marker (no writer identity, so
-  no proof can apply — `doctor` counts those separately, since unlike the rest that backlog
-  never drains on its own). Clearing removes only the marker: the journal keeps its
-  `started` row, so the request becomes idle to the sweep but stays *unfinished* and still
-  needs the recovery command above. The daemon also handles SIGTERM, so a stop cancels the
-  runners and joins them for at most 20s, letting each in-flight call return and drop its
-  `ProcessGroup`; keep `TimeoutStopSec` above that. A runner wedged in a provider call that
-  never returns must not hold the stop open until SIGKILL — the orphan pass covers what it
-  leaves.
+  will not show (no proven exit), or a leak of the call reparented away from us. The
+  reading is deliberately *not* `KillMode`, which says only what systemd intends on stop.
+  Every other doubtful reading keeps the marker too — an unreadable or malformed marker,
+  an unreadable boot id, a zero cgroup inode, an unreadable cgroup, and every pre-#1071
+  marker (no writer identity, so no proof can apply; `doctor` counts those separately,
+  since unlike the rest that backlog never drains on its own). Clearing removes only the
+  marker: the journal keeps its `started` row, so the request becomes idle to the sweep
+  but stays *unfinished* and still needs the recovery command above. The daemon also
+  handles SIGTERM, so a stop cancels the runners and joins them for at most 20s, letting
+  each in-flight call drop its `ProcessGroup`; keep `TimeoutStopSec` above that. A runner
+  wedged in a call that never returns must not hold the stop open until SIGKILL — the
+  orphan pass covers what it leaves.
 
 Do not delete handoff state by hand.
 
