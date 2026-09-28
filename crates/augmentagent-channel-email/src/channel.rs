@@ -1835,18 +1835,15 @@ fn is_insufficient_sample(summary: &str) -> bool {
 /// looks related to a note the owner wrote. No match adds nothing at all — an
 /// empty "related notes" section would read as "the owner has no notes".
 fn with_notes_hint(store: &Store, email: &Email, wiki_hint: &str) -> String {
-    let titles = match store.matching_note_titles(
-        &email.subject,
-        &email.from,
-        augmentagent_channel_core::prompt::NOTES_HINT_MAX,
-    ) {
+    use augmentagent_channel_core::prompt::{notes_hint, NOTES_HINT_MAX};
+    let titles = match store.matching_note_titles(&email.subject, &email.from, NOTES_HINT_MAX) {
         Ok(titles) => titles,
         Err(e) => {
             warn!(message_id = %email.message_id, "note hint lookup failed: {e}");
             return wiki_hint.to_string();
         }
     };
-    let hint = augmentagent_channel_core::prompt::notes_hint(&titles);
+    let hint = notes_hint(&titles);
     match (wiki_hint.trim().is_empty(), hint.is_empty()) {
         (_, true) => wiki_hint.to_string(),
         (true, false) => hint,
@@ -4709,49 +4706,34 @@ Where: Microsoft Teams
     mod notes_hint {
         use super::*;
 
-        fn note(store: &Store, id: &str, title: &str, body: &str) {
-            store
-                .upsert_email_backfill(
-                    &Email {
-                        attachments: vec![],
-                        to: String::new(),
-                        cc: String::new(),
-                        message_id: id.into(),
-                        thread_id: Some(id.into()),
-                        from: "me".into(),
-                        subject: augmentagent_store::notes::note_subject(title, "Notes"),
-                        body: body.into(),
-                        date: "2026-09-02T10:00:00Z".into(),
-                        account_entity_id: Some("apple-notes".into()),
-                        platform: "apple_notes".into(),
-                        kind: "note".into(),
-                    },
-                    1_600_000_000_000,
-                )
-                .unwrap();
+        fn seeded() -> (Arc<Store>, tempfile::NamedTempFile) {
+            let (store, f) = tmp_store();
+            let note = Email {
+                message_id: "n1".into(),
+                thread_id: Some("n1".into()),
+                from: "me".into(),
+                subject: augmentagent_store::notes::note_subject("Cabin plan", "Notes"),
+                body: "book the cabin".into(),
+                date: "2026-09-02T10:00:00Z".into(),
+                account_entity_id: Some("apple-notes".into()),
+                platform: "apple_notes".into(),
+                kind: "note".into(),
+                ..threaded_inbound()
+            };
+            store.upsert_email_backfill(&note, 1_600_000_000_000).unwrap();
+            (store, f)
         }
 
         fn inbound(subject: &str) -> Email {
             Email {
-                attachments: vec![],
-                to: String::new(),
-                cc: String::new(),
-                message_id: "m1".into(),
-                thread_id: None,
-                from: "Dana Reyes <dana@example.org>".into(),
                 subject: subject.into(),
-                body: "b".into(),
-                date: "2026-09-10T10:00:00Z".into(),
-                account_entity_id: Some("acc1".into()),
-                platform: "gmail".into(),
-                kind: "dm".into(),
+                ..threaded_inbound()
             }
         }
 
         #[test]
         fn a_matching_note_is_named_and_appended_after_any_wiki_hint() {
-            let (store, _f) = tmp_store();
-            note(&store, "n1", "Cabin plan", "book the cabin");
+            let (store, _f) = seeded();
             let hint = with_notes_hint(&store, &inbound("Re: cabin plan for October"), "");
             assert!(hint.contains("\"Cabin plan\""), "hint: {hint}");
             assert!(hint.contains("notes of their own"), "hint: {hint}");
@@ -4762,8 +4744,7 @@ Where: Microsoft Teams
 
         #[test]
         fn no_match_adds_no_section_at_all() {
-            let (store, _f) = tmp_store();
-            note(&store, "n1", "Cabin plan", "book the cabin");
+            let (store, _f) = seeded();
             assert_eq!(with_notes_hint(&store, &inbound("lunch?"), ""), "");
             let kept = with_notes_hint(&store, &inbound("lunch?"), "- people/dana.md");
             assert_eq!(kept, "- people/dana.md");

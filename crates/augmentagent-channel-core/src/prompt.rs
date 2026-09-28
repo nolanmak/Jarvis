@@ -229,13 +229,16 @@ impl SkillPrompt {
     }
 }
 
-/// Max note titles named in a triage/draft hint (#1060). Titles only: the
-/// model calls `search_notes` when it wants the text.
+/// Max note titles named in a triage/draft hint (#1060).
 pub const NOTES_HINT_MAX: usize = 3;
 
-/// Hint lines naming the owner's own notes that look related to an inbound
+/// A hint line naming the owner's own notes that look related to an inbound
 /// message. Empty string when nothing matched — callers append this to the
 /// wiki hint, and an empty section is worse than none.
+///
+/// Titles only: the triage/draft reasoners have no note-reading tool, and a
+/// note body is the owner's private material. Naming it says "this is a
+/// topic the owner tracks", which is all the hint is for.
 pub fn notes_hint(titles: &[String]) -> String {
     if titles.is_empty() {
         return String::new();
@@ -246,9 +249,6 @@ pub fn notes_hint(titles: &[String]) -> String {
         .map(|t| format!("\"{}\"", sanitize_untrusted(t)))
         .collect::<Vec<_>>()
         .join(", ");
-    // Titles only. The triage/draft reasoners have no note-reading tool, and
-    // a note body is the owner's private material — naming it is enough to
-    // say "this topic is one the owner tracks", which is all the hint is for.
     format!("- The owner keeps notes of their own on this topic: {listed}. Treat it as a topic they are actively tracking.")
 }
 

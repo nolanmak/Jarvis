@@ -1925,11 +1925,9 @@ impl Store {
     /// a note whose title *or body* carries a content word from `subject`,
     /// from the sender's display name, or the sender's bare address.
     /// Newest-edited first, capped at `limit`. Empty when nothing matches —
-    /// the caller emits no hint at all.
-    ///
-    /// Ordering and recency come from `receivedAt` (the note's own `modified`,
-    /// rewritten on every edit), never `firstSeenAt`, which
-    /// [`Store::upsert_email_backfill`] deliberately freezes at first ingest.
+    /// the caller then emits no hint at all. Ordering comes from `receivedAt`
+    /// (the note's own `modified`, rewritten on every edit), never
+    /// `firstSeenAt`, which [`Store::upsert_email_backfill`] freezes.
     ///
     /// # Errors
     ///
@@ -1941,11 +1939,10 @@ impl Store {
         limit: usize,
     ) -> StoreResult<Vec<String>> {
         let mut needles = crate::notes::title_match_tokens(subject);
-        // Real inbound mail arrives as `Dana Reyes <dana@example.org>`. Both
-        // halves identify the sender to a note: the display name is how a
-        // note titles or mentions a person, the address is what a note body
-        // pastes. A bare address has no name half — splitting one on
-        // punctuation would yield junk needles like "example".
+        // Real inbound mail arrives as `Dana Reyes <dana@example.org>` and
+        // both halves name the sender to a note: the display name is how a
+        // note names a person, the address is what a body pastes. A bare
+        // address has no name half — tokenizing it yields junk like "example".
         if let Some((name, _)) = from.split_once('<') {
             for token in crate::notes::title_match_tokens(name) {
                 if !needles.contains(&token) {
@@ -1960,11 +1957,10 @@ impl Store {
         if needles.is_empty() {
             return Ok(Vec::new());
         }
-        // Either needle may land in either half of a note, so the coarse
-        // filter ORs subject and body for each. It stays coarse: `subject` is
-        // `Apple Note: <title> [<folder>]`, so a token equal to a folder name
-        // ("Work") matches every note filed there. The Rust re-check below
-        // runs over the *parsed* title plus body and is what decides.
+        // A coarse substring prefilter: `subject` is `Apple Note: <title>
+        // [<folder>]`, so a token equal to a folder name ("Work") matches
+        // every note filed there, and a short token matches inside longer
+        // words. The `token_matches` re-check below decides.
         let mut clauses: Vec<String> = Vec::new();
         let mut binds: Vec<String> = Vec::new();
         for needle in &needles {
@@ -1997,7 +1993,9 @@ impl Store {
             .filter_map(|(subject, body, received_at)| {
                 let (title, _) = crate::notes::note_title_folder(&subject)?;
                 let haystack = format!("{}\n{}", title.to_lowercase(), body.to_lowercase());
-                let matched = needles.iter().any(|n| haystack.contains(n.as_str()));
+                let matched = needles
+                    .iter()
+                    .any(|n| crate::notes::token_matches(n, &haystack));
                 matched.then(|| {
                     (
                         crate::notes::note_modified_ms(&received_at).unwrap_or(i64::MIN),
@@ -7989,6 +7987,22 @@ mod tests {
         assert!(hits("Work update", "dana@example.org").is_empty());
         assert!(hits("lunch?", "dana@example.org").is_empty());
         assert!(hits("lunch?", "me").is_empty());
+    }
+
+    #[test]
+    fn matching_note_titles_matches_short_subject_and_sender_tokens() {
+        let (s, _d) = fresh_store();
+        note_row(&s, "n1", "Q3 planning", "Work", "targets", "2026-09-02T10:00:00Z");
+        note_row(&s, "n2", "Amy onboarding", "Work", "buddy list", "2026-09-03T10:00:00Z");
+        note_row(&s, "n3", "Q30 sensor specs", "Work", "datasheet", "2026-09-04T10:00:00Z");
+        let hits = |subject, from| s.matching_note_titles(subject, from, 3).unwrap();
+
+        // Short tokens are real names and quarters, not noise — but they must
+        // match whole words, so "Q3" leaves the unrelated "Q30" note alone.
+        assert_eq!(hits("Q3 numbers", "sam@example.net"), vec!["Q3 planning"]);
+        assert_eq!(hits("unrelated", "Amy <amy@example.net>"), vec!["Amy onboarding"]);
+        // Stopwords stay dropped, short or not.
+        assert!(hits("is it ok to see you", "sam@example.net").is_empty());
     }
 
     #[test]

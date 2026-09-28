@@ -90,8 +90,8 @@ pub struct NoteHit {
     /// the stored timestamp doesn't parse — never guessed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_ms: Option<i64>,
-    /// First [`SNIPPET_MAX_CHARS`] chars of the note body, verbatim —
-    /// including any `[REDACTED:…]` markers the exporter wrote.
+    /// First [`SNIPPET_MAX_CHARS`] chars of the body, verbatim — including
+    /// any `[REDACTED:…]` markers the exporter wrote.
     pub snippet: String,
 }
 
@@ -362,13 +362,11 @@ impl Server {
         Ok(rows)
     }
 
-    /// #1060 — full-text search over stored Apple Notes. `query` is matched
-    /// case-insensitively against the note title and body; `folder` narrows
-    /// to one folder. Newest-edited first.
-    ///
-    /// Recency is `emails.receivedAt` (the note's own `modified`, rewritten
-    /// on every edit) rather than `firstSeenAt`, which the notes ingester's
-    /// backfill upsert freezes at first import.
+    /// #1060 — search over stored Apple Notes. `query` is matched
+    /// case-insensitively against title and body; `folder` narrows to one
+    /// folder. Newest-edited first, by `emails.receivedAt` (the note's own
+    /// `modified`, rewritten on every edit) rather than `firstSeenAt`, which
+    /// the ingester's backfill upsert freezes at first import.
     pub fn search_notes(
         &self,
         query: &str,
@@ -414,9 +412,7 @@ impl Server {
                 if folder.is_some_and(|f| !note_folder.eq_ignore_ascii_case(f)) {
                     return None;
                 }
-                if !title.to_lowercase().contains(&needle)
-                    && !body.to_lowercase().contains(&needle)
-                {
+                if !title.to_lowercase().contains(&needle) && !body.to_lowercase().contains(&needle) {
                     return None;
                 }
                 Some(NoteHit {
@@ -428,11 +424,7 @@ impl Server {
                 })
             })
             .collect();
-        hits.sort_by(|a, b| {
-            b.modified_ms
-                .cmp(&a.modified_ms)
-                .then_with(|| a.title.cmp(&b.title))
-        });
+        hits.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms).then_with(|| a.title.cmp(&b.title)));
         hits.truncate(limit);
         Ok(hits)
     }
@@ -709,10 +701,7 @@ impl Server {
             return tool_error(id, "query is required".into());
         };
         let folder = args.get("folder").and_then(Value::as_str);
-        let limit = args
-            .get("limit")
-            .and_then(Value::as_u64)
-            .map(|n| n as usize);
+        let limit = args.get("limit").and_then(Value::as_u64).map(|n| n as usize);
         match self.search_notes(query, folder, limit) {
             Ok(hits) => tool_json_result(id, &json!({ "hits": hits })),
             Err(e) => tool_error(id, format!("{e}")),
@@ -1610,20 +1599,14 @@ mod note_tests {
     use super::tests::*;
     use super::*;
 
+    /// Every note shares one `firstSeenAt`: ordering must come from
+    /// `receivedAt`, which is what an edit rewrites.
     fn insert_note(s: &Server, id: &str, title: &str, folder: &str, body: &str, modified: &str) {
         s.conn
             .execute(
                 "INSERT INTO emails (messageId, threadId, fromEmail, subject, body, receivedAt, accountEntityId, firstSeenAt, platform, kind) \
-                 VALUES (?1, ?1, 'me', ?2, ?3, ?4, 'apple-notes', ?5, 'apple_notes', 'note')",
-                // Every note shares one firstSeenAt: ordering must come from
-                // `receivedAt`, which is what an edit rewrites.
-                rusqlite::params![
-                    id,
-                    augmentagent_store::notes::note_subject(title, folder),
-                    body,
-                    modified,
-                    1_600_000_000_000i64,
-                ],
+                 VALUES (?1, ?1, 'me', ?2, ?3, ?4, 'apple-notes', 1600000000000, 'apple_notes', 'note')",
+                rusqlite::params![id, augmentagent_store::notes::note_subject(title, folder), body, modified],
             )
             .expect("seed note");
     }
@@ -1662,9 +1645,10 @@ mod note_tests {
     }
 
     /// `search_notes` tells the agent to read the full note with
-    /// `read_conversation_thread(message_id)` (schema/wiki-ask.md). That only
-    /// holds because the notes ingester sets `threadId = messageId`
-    /// (`augmentagent-channel-apple-notes::note_email`), which this pins.
+    /// `read_conversation_thread(message_id)` (schema/wiki-ask.md). That holds
+    /// only because the ingester writes `threadId = messageId`, pinned by
+    /// `note_email_threads_the_note_under_its_own_message_id` in
+    /// augmentagent-channel-apple-notes; this covers the read half.
     #[test]
     fn a_note_message_id_reads_back_as_a_thread_with_the_whole_body() {
         let s = new_server();
@@ -1682,7 +1666,7 @@ mod note_tests {
         let s = new_server();
         let body = "router password: [REDACTED:password-assignment]";
         insert_note(&s, "n4", "Wifi setup", "Home", body, "2026-09-09T10:00:00Z");
-        let req = McpRequest {
+        let resp = s.dispatch(&McpRequest {
             jsonrpc: "2.0".into(),
             id: json!(7),
             method: "tools/call".into(),
@@ -1690,8 +1674,7 @@ mod note_tests {
                 "name": "search_notes",
                 "arguments": { "query": "router", "folder": "Home" }
             })),
-        };
-        let resp = s.dispatch(&req);
+        });
         let text = resp["result"]["content"][0]["text"].as_str().expect("text");
         let parsed: Value = serde_json::from_str(text).expect("json");
         assert_eq!(parsed["hits"].as_array().expect("hits").len(), 1);

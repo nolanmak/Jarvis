@@ -1,9 +1,8 @@
 //! Subject encoding for Apple Notes rows (#1060).
 //!
 //! The notes channel stores one `emails` row per note with the title and
-//! folder packed into `subject`. Retrieval has to take them back out, so the
-//! writer and the readers share these two functions rather than each
-//! re-deriving the format.
+//! folder packed into `subject`. Retrieval has to take them back out, so
+//! writer and readers share these helpers rather than each re-deriving it.
 
 const PREFIX: &str = "Apple Note: ";
 
@@ -22,22 +21,34 @@ pub fn note_title_folder(subject: &str) -> Option<(&str, &str)> {
     }
 }
 
-/// Words from an inbound subject worth matching against note titles.
-/// Short and common words are dropped: a note channel's folders and titles
-/// are ordinary English, so a two- or three-letter token matches everything.
+/// Words from an inbound subject or sender name worth matching against
+/// notes. Common words are dropped, but short ones survive: "Amy" and "Q3"
+/// are exactly what a note gets titled after. [`token_matches`] is what
+/// keeps them from over-matching.
 pub fn title_match_tokens(subject: &str) -> Vec<String> {
-    const SKIP: &[&str] = &[
-        "about", "from", "have", "into", "just", "more", "need", "over", "please", "some", "that",
-        "the", "them", "then", "this", "with", "your",
-    ];
+    const SKIP: &str = " about all am an and any are as at be but by can did do for from fw fwd \
+        get had has have he her hi him his how if in into is it its just let me more my need new \
+        no not of ok on one or our out over please re see she so some thanks that the them then \
+        they this to up us was we were what when who why will with you your ";
     let mut tokens: Vec<String> = Vec::new();
     for word in subject.split(|c: char| !c.is_alphanumeric()) {
         let w = word.to_lowercase();
-        if w.chars().count() >= 4 && !SKIP.contains(&w.as_str()) && !tokens.contains(&w) {
+        if w.chars().count() >= 2 && !SKIP.split(' ').any(|s| s == w) && !tokens.contains(&w) {
             tokens.push(w);
         }
     }
     tokens
+}
+
+/// Whether `needle` occurs in the already-lowercased `haystack`. Four
+/// characters or more match as substrings, so "cabin" finds "cabins" and an
+/// address finds itself mid-sentence. Shorter needles must be whole words,
+/// or "q3" would hit "q30" and "amy" anything spelling it in passing.
+pub fn token_matches(needle: &str, haystack: &str) -> bool {
+    if needle.chars().count() >= 4 {
+        return haystack.contains(needle);
+    }
+    haystack.split(|c: char| !c.is_alphanumeric()).any(|w| w == needle)
 }
 
 /// Epoch ms of a note row's `receivedAt`, which carries the note's own
