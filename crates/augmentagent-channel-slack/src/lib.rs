@@ -9,9 +9,10 @@
 //! `augmentagent/slack/default` Keychain slot; multi-workspace is a follow-up.
 //!
 //! The real-time path (#1283) lives in [`transport`]: a first-party Slack app
-//! over Socket Mode plus a typed Web API client. It is not wired into `serve`
-//! yet; see `docs/SLACK-TRANSPORT.md`. The app's manifest and credential
-//! lifecycle (#1284) live in [`app`]; see `docs/SLACK-APP.md`.
+//! over Socket Mode plus a typed Web API client; see `docs/SLACK-TRANSPORT.md`.
+//! [`interactive`] (#1287) is the surface `serve` runs on top of it. The
+//! app's manifest and credential lifecycle (#1284) live in [`app`]; see
+//! `docs/SLACK-APP.md`.
 
 pub mod api;
 pub mod app;
@@ -20,6 +21,7 @@ pub mod channel;
 pub mod delivery;
 pub mod digest;
 pub mod inbound;
+pub mod interactive;
 pub mod owner;
 pub mod owner_setup;
 pub mod surface;

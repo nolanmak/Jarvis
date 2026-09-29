@@ -161,6 +161,20 @@ expression: json
     }
   },
   "host": "linux",
+  "interactive": {
+    "slack": {
+      "detail": "no Slack owner is bound",
+      "dry_run": false,
+      "healthy": false,
+      "heartbeat_unix": null,
+      "last_event_unix": null,
+      "last_send_unix": null,
+      "recovery": "Install the Slack app (`augmentagent slack app install --stdin`, see docs/SLACK-APP.md), bind yourself with `augmentagent slack app owner bind --user <member_id>`, then start the daemon.",
+      "state": "not_configured",
+      "state_since_unix": null,
+      "workspaces": []
+    }
+  },
   "queue": {
     "pending": 0
   },

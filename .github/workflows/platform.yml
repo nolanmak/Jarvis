@@ -88,6 +88,17 @@ jobs:
           cargo test -p augmentagent-channel-slack --test transport_download --test inbound_files
           cargo test -p augmentagent-approval-discord --lib -- event_handler:: attachments::
           cargo test -p augmentagent-cli --test slack_files_cli
+      # #1287 — the interactive Slack surface on its real dispatch path
+      # (Socket Mode over an in-memory WebSocket, durable inbox/outbox, owner
+      # gate, restart/shutdown/dry-run), the listener-health store, the serve
+      # wiring, and the built `serve` running Slack only against a local fake
+      # Slack, including Discord/WhatsApp failing beside it. No network.
+      - name: Slack interactive surface in serve
+        run: |
+          cargo test -p augmentagent-store --test surface_listener_health
+          cargo test -p augmentagent-channel-slack --test interactive_surface
+          cargo test -p augmentagent-cli --test slack_serve_cli
+          cargo test -p augmentagent-cli --bin augmentagent -- slack_serve::
       # #1284 — Slack app install/verify/rotate/remove: manifest contract,
       # credential lifecycle (in-memory store) and the real CLI against a
       # mock Slack with the file credential store. No Keychain, no network.
