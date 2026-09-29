@@ -37,6 +37,10 @@ pub struct Conversation {
     pub participants: Vec<String>,
     #[serde(default)]
     pub service: String,
+    /// `chat.guid` from `chat.db`, when the exporter wrote it. The only
+    /// way to address a group chat.
+    #[serde(default)]
+    pub chat_guid: Option<String>,
 }
 
 impl Conversation {
@@ -252,6 +256,7 @@ mod tests {
             title: "Ski Trip".into(),
             participants: vec!["+1".into(), "+2".into()],
             service: "iMessage".into(),
+            chat_guid: None,
         };
         assert!(group.is_group());
     }
@@ -264,6 +269,7 @@ mod tests {
             title: "John Smith".into(),
             participants: vec!["+14155550123".into()],
             service: "iMessage".into(),
+            chat_guid: None,
         };
         let entries = parse_entries(SAMPLE_MD);
         let email = synthetic_imessage_email(&conv, 1, &entries[1]);

@@ -51,6 +51,14 @@ pub fn history_wiki_capture_enabled() -> bool {
     parse_flag(std::env::var(ENV_HISTORY_WIKI_CAPTURE).ok().as_deref())
 }
 
+/// Global kill-switch for iMessage sends (#1301). Off unless set; approve
+/// refuses and the outbox hands nothing to the sender while it is off.
+pub const ENV_SEND_ENABLED: &str = "AUGMENTAGENT_IMESSAGE_SEND_ENABLED";
+
+pub fn send_enabled() -> bool {
+    parse_flag(std::env::var(ENV_SEND_ENABLED).ok().as_deref())
+}
+
 fn parse_flag(raw: Option<&str>) -> bool {
     matches!(
         raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
@@ -71,4 +79,31 @@ mod tests {
         assert!(parse_flag(Some("1")));
         assert!(parse_flag(Some(" TRUE ")));
     }
+
+    #[test]
+    fn send_kill_switch_is_off_unless_explicitly_enabled() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let cases: [(Option<&str>, bool); 10] = [
+            (None, false),
+            (Some(""), false),
+            (Some("0"), false),
+            (Some("false"), false),
+            (Some("no"), false),
+            (Some("1"), true),
+            (Some("true"), true),
+            (Some(" Yes "), true),
+            (Some("ON"), true),
+            (Some("enabled"), false),
+        ];
+        for (raw, want) in cases {
+            match raw {
+                Some(v) => std::env::set_var(ENV_SEND_ENABLED, v),
+                None => std::env::remove_var(ENV_SEND_ENABLED),
+            }
+            assert_eq!(send_enabled(), want, "{raw:?}");
+        }
+        std::env::remove_var(ENV_SEND_ENABLED);
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

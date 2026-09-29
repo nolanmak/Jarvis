@@ -5,12 +5,17 @@
 //! concurrently.
 
 pub mod delivery;
+pub mod imessage;
 pub mod models;
 pub mod notes;
 pub mod redact;
 mod store;
 pub mod surface;
 
+pub use imessage::{
+    ImessageOutboxItem, ImessageOutboxStatus, ImessageSendOutcome, ImessageTargetKind,
+    NewImessageOutboxItem,
+};
 pub use surface::{
     SurfaceAccountRef, SurfaceCapabilities, SurfaceCapability, SurfaceConversationRef,
     SurfaceMessageRef, SurfaceOwnerRef, SurfacePlatform, SurfaceRefError, SurfaceReplyTarget,

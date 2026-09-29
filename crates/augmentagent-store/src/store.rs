@@ -2212,6 +2212,8 @@ impl Store {
              );",
         )?;
 
+        crate::imessage::migrate(conn)?;
+
         Ok(())
     }
 
@@ -8224,7 +8226,7 @@ fn ms_to_rfc3339(ms: i64) -> String {
         .unwrap_or_default()
 }
 
-fn now_millis() -> i64 {
+pub(crate) fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
