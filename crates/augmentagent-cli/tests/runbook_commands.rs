@@ -11,7 +11,15 @@
 
 use std::process::Command;
 
-const RUNBOOK: &str = include_str!("../../../docs/SLACK-RUNBOOK.md");
+/// Read at test time, not `include_str!`: the updater rebuilds the daemon
+/// whenever a compile-embedded file changes, and a runbook edit must not.
+fn runbook() -> String {
+    std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/SLACK-RUNBOOK.md"
+    ))
+    .expect("docs/SLACK-RUNBOOK.md")
+}
 
 /// Replace every `<…>` placeholder with one dummy word.
 fn fill_placeholders(s: &str) -> String {
@@ -140,7 +148,7 @@ fn parses(args: &[String]) -> Result<(), String> {
 
 #[test]
 fn every_runbook_command_exists_in_the_cli() {
-    let cmds = commands(RUNBOOK);
+    let cmds = commands(&runbook());
     assert!(cmds.len() >= 30, "found only {} commands", cmds.len());
     let failures: Vec<String> = cmds.iter().filter_map(|c| parses(c).err()).collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -148,7 +156,7 @@ fn every_runbook_command_exists_in_the_cli() {
 
 #[test]
 fn the_runbook_covers_every_lifecycle_step() {
-    let cmds: Vec<String> = commands(RUNBOOK).iter().map(|c| c.join(" ")).collect();
+    let cmds: Vec<String> = commands(&runbook()).iter().map(|c| c.join(" ")).collect();
     for needed in [
         "install autostart",
         "slack app manifest",
