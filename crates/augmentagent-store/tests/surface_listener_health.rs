@@ -74,3 +74,30 @@ fn empty_state_is_refused() {
     bad.state = String::new();
     assert!(store.put_surface_listener_health(&bad).is_err());
 }
+
+/// #1287 — `status` opening the database while the daemon starts must not
+/// fail either process with `database is locked`: every open waits for the
+/// other's schema work instead of erroring at once.
+#[test]
+fn concurrent_opens_of_a_fresh_database_all_succeed() {
+    for round in 0..10 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.db");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(6));
+        let handles: Vec<_> = (0..6)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Store::open(&path).map(|_| ()).map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        for h in handles {
+            if let Err(e) = h.join().unwrap() {
+                panic!("round {round}: concurrent open failed: {e}");
+            }
+        }
+    }
+}

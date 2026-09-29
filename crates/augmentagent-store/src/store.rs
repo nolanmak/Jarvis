@@ -74,6 +74,23 @@ pub struct JournalSyncCursor {
 /// selected by the drain and would strand at `processed = 0` forever.
 pub const SOCIALAPI_WEBHOOK_KINDS: [&str; 2] = ["dm", "comment"];
 
+/// A migration step that failed only because another process was
+/// migrating the same file at the same time.
+fn lost_migration_race(e: &StoreError) -> bool {
+    let StoreError::Sqlite(rusqlite::Error::SqliteFailure(code, message)) = e else {
+        return false;
+    };
+    if matches!(
+        code.code,
+        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+    ) {
+        return true;
+    }
+    message
+        .as_deref()
+        .is_some_and(|m| m.contains("duplicate column name") || m.contains("already exists"))
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
     path: std::path::PathBuf,
@@ -356,16 +373,35 @@ impl Store {
         Ok(())
     }
 
+    /// Open (creating if needed) and migrate. Another process may be
+    /// migrating the same file at the same moment (`status` while the
+    /// daemon starts, #1287); `migrate` is idempotent but not serialised
+    /// across processes, so losing that race (a lock, or a column/table the
+    /// other process just added) is retried briefly instead of failing.
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
-        let path_buf = path.as_ref().to_path_buf();
+        let path = path.as_ref();
+        let mut attempt = 0u64;
+        loop {
+            match Self::open_once(path) {
+                Err(e) if attempt < 20 && lost_migration_race(&e) => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis((25 * attempt).min(250)));
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn open_once(path: &Path) -> StoreResult<Self> {
         let conn = Connection::open(path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Busy timeout first: switching to WAL and migrating take locks.
         conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Self::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
-            path: path_buf,
+            path: path.to_path_buf(),
         })
     }
 
