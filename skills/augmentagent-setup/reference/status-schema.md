@@ -57,6 +57,11 @@ they must agree.
     "whatsapp":  { "configured": false, "armed": false, "accounts": 0, "last_poll_unix": null, "needs": ["login"] }
   },
   "queue": { "pending": 0 },
+  "delivery": {
+    "discord":  { "inbound_backlog": 0, "inbound_dead_letter": 0, "outbound_backlog": 0, "outbound_retrying": 0, "outbound_reconcile": 0, "outbound_dead_letter": 0 },
+    "slack":    { "inbound_backlog": 1, "inbound_dead_letter": 0, "outbound_backlog": 3, "outbound_retrying": 1, "outbound_reconcile": 1, "outbound_dead_letter": 0 },
+    "whatsapp": { "inbound_backlog": 0, "inbound_dead_letter": 0, "outbound_backlog": 0, "outbound_retrying": 0, "outbound_reconcile": 0, "outbound_dead_letter": 1 }
+  },
   "summary": "ok"
 }
 ```
@@ -172,6 +177,26 @@ Each value is an object:
 
 - `pending` (integer): number of rows in `actions` with status
   `pending`. Comes from `Store::pending_reply_count()`.
+
+### delivery
+
+Added in #1285 (additive; still schema `"1"`). Durable delivery state per
+chat surface from `Store::surface_delivery_counts()`. `discord`, `slack`
+and `whatsapp` are always present (zeros when idle); any other platform
+with rows in the durable log is added. All values are integers.
+
+- `inbound_backlog`: accepted inbound events not yet handled.
+- `inbound_dead_letter`: inbound events that exhausted their attempts.
+- `outbound_backlog`: sends not yet settled (queued, sending, retrying or
+  awaiting reconcile).
+- `outbound_retrying`: part of the backlog waiting for a retry.
+- `outbound_reconcile`: part of the backlog that was in flight when the
+  daemon stopped; it is never resent until the provider is checked.
+- `outbound_dead_letter`: sends that exhausted their retries or failed
+  permanently.
+
+`augmentagent doctor` reports a `surface_delivery` warning when any surface
+has dead letters or sends awaiting reconcile.
 
 ## Stability promise
 
