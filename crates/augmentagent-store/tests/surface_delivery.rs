@@ -1378,3 +1378,35 @@ fn outbox_created_before_the_lookup_columns_is_migrated_in_place() {
     // Reopening is a no-op.
     Store::open(&path).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// #1287 — one surface's dispatcher never takes another surface's events
+// ---------------------------------------------------------------------------
+
+#[test]
+fn platform_scoped_inbound_claims_leave_other_surfaces_events_alone() {
+    let (_dir, _path, store) = temp_store();
+    let slack_chat = slack("D00000001");
+    let wa_chat = conv("whatsapp", "device:1", "chat:1", None);
+    // WhatsApp's event is older, so an unscoped claim would take it first.
+    store
+        .record_inbound_event(&event(&wa_chat, "wa-1", T0), T0)
+        .unwrap();
+    store
+        .record_inbound_event(&event(&slack_chat, "D00000001:1700000000.000100", T0 + 1), T0)
+        .unwrap();
+    let slack_platform = SurfacePlatform::new("slack").unwrap();
+
+    let claimed = store
+        .claim_next_inbound_event_for(&slack_platform, T0, 5)
+        .unwrap()
+        .expect("the slack event");
+    assert_eq!(claimed.event_id, "D00000001:1700000000.000100");
+    assert!(store
+        .claim_next_inbound_event_for(&slack_platform, T0, 5)
+        .unwrap()
+        .is_none());
+    // WhatsApp's row is still there for its own dispatcher.
+    let wa = store.claim_next_inbound_event(T0, 5).unwrap().unwrap();
+    assert_eq!(wa.event_id, "wa-1");
+}

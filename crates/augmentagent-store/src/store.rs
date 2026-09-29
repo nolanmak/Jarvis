@@ -639,6 +639,8 @@ impl Store {
         crate::delivery::migrate(conn)?;
         // #1286 / #1230 — owner binding, control conversations, rejection audit.
         crate::owner::migrate(conn)?;
+        // #1287 — live listener health reported by interactive surfaces.
+        crate::surface_health::migrate(conn)?;
         // -------------------------------------------------------------------
         // #45 — Rust-owned schema. Mirrors `src/db.ts::initDb()` exactly
         // (column names, types, NOT NULL, DEFAULT, PRIMARY KEY). Do NOT

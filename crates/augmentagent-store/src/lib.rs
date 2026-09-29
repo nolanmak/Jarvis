@@ -12,6 +12,7 @@ pub mod owner;
 pub mod redact;
 mod store;
 pub mod surface;
+pub mod surface_health;
 
 pub use imessage::{
     ImessageOutboxItem, ImessageOutboxStatus, ImessageSendOutcome, ImessageTargetKind,

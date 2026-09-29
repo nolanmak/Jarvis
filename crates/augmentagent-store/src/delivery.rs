@@ -370,6 +370,27 @@ impl Store {
         now_ms: i64,
         max_attempts: u32,
     ) -> StoreResult<Option<ClaimedInbound>> {
+        self.claim_inbound(None, now_ms, max_attempts)
+    }
+
+    /// [`claim_next_inbound_event`](Self::claim_next_inbound_event) limited
+    /// to one surface platform, so each surface's dispatcher only ever takes
+    /// its own events when several surfaces run in one daemon (#1287).
+    pub fn claim_next_inbound_event_for(
+        &self,
+        platform: &SurfacePlatform,
+        now_ms: i64,
+        max_attempts: u32,
+    ) -> StoreResult<Option<ClaimedInbound>> {
+        self.claim_inbound(Some(platform.as_str()), now_ms, max_attempts)
+    }
+
+    fn claim_inbound(
+        &self,
+        platform: Option<&str>,
+        now_ms: i64,
+        max_attempts: u32,
+    ) -> StoreResult<Option<ClaimedInbound>> {
         write_tx(self, |tx| loop {
             let candidate = tx
                 .query_row(
@@ -377,6 +398,7 @@ impl Store {
                             e.event_id, e.kind, e.occurred_at_ms, e.payload, e.attempts
                      FROM surface_inbound_events e
                      WHERE e.status = 'received'
+                       AND (?1 IS NULL OR e.platform = ?1)
                        AND NOT EXISTS (
                          SELECT 1 FROM surface_inbound_events p
                          WHERE p.platform = e.platform AND p.account_id = e.account_id
@@ -388,7 +410,7 @@ impl Store {
                                          OR (p.occurred_at_ms = e.occurred_at_ms AND p.seq < e.seq)))))
                      ORDER BY e.occurred_at_ms, e.seq
                      LIMIT 1",
-                    [],
+                    params![platform],
                     |r| {
                         Ok((
                             r.get::<_, i64>(0)?,
