@@ -41,6 +41,9 @@ into the service definition, and do not need to.
 | `AUGMENTAGENT_SLACK_INTERACTIVE` unset or `auto` | Run when an app is installed and an owner is bound |
 | `AUGMENTAGENT_SLACK_INTERACTIVE=1` | Run; missing setup is an error in `status`/`doctor` |
 | `AUGMENTAGENT_SLACK_INTERACTIVE=0` | Do not run (`disabled`); credentials are not read |
+| `AUGMENTAGENT_APPROVAL_SURFACES` unset or `auto` | Approval cards go to every configured surface (Discord and/or Slack) |
+| `AUGMENTAGENT_APPROVAL_SURFACES=slack` (or `discord`, `discord,slack`) | Approval cards go only to the named surfaces; with `slack` alone the Discord broker is not started and a Discord token without `DISCORD_CHANNEL_ID` is not an issue |
+| `AUGMENTAGENT_SLACK_APPROVAL_CHANNEL` unset or `dm`, or `control` | Where Slack approval cards are posted: the owner DM (default) or the control channel (section 4) |
 
 Never set `AUGMENTAGENT_INSECURE_CREDENTIAL_DIR` or
 `AUGMENTAGENT_SLACK_API_BASE` outside tests: the first stores every

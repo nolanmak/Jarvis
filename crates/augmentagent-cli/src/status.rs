@@ -497,10 +497,20 @@ pub fn static_config_issues(
     credentials: &augmentagent_auth::BackendDescription,
 ) -> Vec<ConfigIssue> {
     let mut out = Vec::new();
+    // #1289 — approvals routed away from Discord never start its broker. An
+    // unreadable routing word routes everywhere, as serve does.
+    let discord_routed = !matches!(
+        crate::approval_routing::Routing::parse(
+            env(crate::approval_routing::SURFACES_ENV).as_deref()
+        ),
+        Ok(r) if !r.discord
+    );
     if let Some(why) = discord_broker_issue(
         env("DISCORD_BOT_TOKEN").as_deref(),
         env("DISCORD_CHANNEL_ID").as_deref(),
-    ) {
+    )
+    .filter(|_| discord_routed)
+    {
         out.push(ConfigIssue {
             id: DISCORD_BROKER_ISSUE.into(),
             source: "cli",
@@ -2134,6 +2144,22 @@ mod tests {
         ] {
             assert!(static_config_issues(&fine, &keychain()).is_empty());
         }
+    }
+
+    #[test]
+    fn approvals_routed_away_from_discord_need_no_discord_channel_id() {
+        // #1289: AUGMENTAGENT_APPROVAL_SURFACES=slack never starts the
+        // Discord broker, so a leftover token is not a problem.
+        let env = env_of(&[
+            ("DISCORD_BOT_TOKEN", "synthetic-not-a-token"),
+            ("AUGMENTAGENT_APPROVAL_SURFACES", "slack"),
+        ]);
+        assert!(static_config_issues(&env, &keychain()).is_empty());
+        let env = env_of(&[
+            ("DISCORD_BOT_TOKEN", "synthetic-not-a-token"),
+            ("AUGMENTAGENT_APPROVAL_SURFACES", "discord,slack"),
+        ]);
+        assert_eq!(static_config_issues(&env, &keychain()).len(), 1);
     }
 
     #[test]

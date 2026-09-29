@@ -328,8 +328,9 @@ Added in #1299 (additive). Configuration problems, each with a fix. An
 array (possibly empty) of objects:
 
 - `id` (string): `discord.approval_broker` (a `DISCORD_BOT_TOKEN` without a
-  numeric `DISCORD_CHANNEL_ID`: serve runs without the Discord approval
-  broker), `credentials.insecure_file_store` (this process uses the
+  numeric `DISCORD_CHANNEL_ID` while approvals are routed to Discord, i.e.
+  `AUGMENTAGENT_APPROVAL_SURFACES` unset, `auto` or naming `discord`: serve
+  runs without the Discord approval broker), `credentials.insecure_file_store` (this process uses the
   plaintext store), `daemon.insecure_file_store` (the running daemon does),
   `credentials.unreadable` (warn: this process could not read one or more
   credential slots; `detail` lists each `augmentagent/<platform>/<account>`

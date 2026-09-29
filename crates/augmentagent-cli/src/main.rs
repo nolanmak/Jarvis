@@ -2819,6 +2819,9 @@ async fn main() -> Result<()> {
                 }
             };
             // #1299 — make this start visible to `status`/`doctor`.
+            if broker_error.is_none() {
+                broker_error = DISCORD_BROKER_ERROR.get().cloned();
+            }
             status::record_daemon_start(&store, dry_run, broker_error.as_deref());
             // Default (no_email=false) keeps the exact prod path: build + `?`
             // propagate + unconditional spawn. `--no-email true` makes a
@@ -14100,10 +14103,14 @@ async fn build_approval_surfaces(
             }
             // #1287 / #1289 — a Discord failure must not take the Slack
             // approvals down with it.
-            Err(e) if slack.is_some() => tracing::error!(
-                "discord approval broker disabled: {e:#}. Approvals continue on Slack; fix the \
-                 Discord settings and restart the daemon."
-            ),
+            Err(e) if slack.is_some() => {
+                tracing::error!(
+                    "discord approval broker disabled: {e:#}. Approvals continue on Slack; fix \
+                     the Discord settings and restart the daemon."
+                );
+                // #1299 — serve records it for `status`/`doctor`.
+                let _ = DISCORD_BROKER_ERROR.set(format!("{e:#}"));
+            }
             Err(e) => return Err(e),
         }
     }
@@ -14126,6 +14133,11 @@ async fn build_approval_surfaces(
     approver.broker.set(Arc::downgrade(&broker)).ok();
     Ok((broker, Some(approver)))
 }
+
+/// #1299 — why the Discord approval broker did not start while Slack
+/// approvals carried on (that error is logged, not returned), so serve can
+/// record it in the daemon start report.
+static DISCORD_BROKER_ERROR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Start the Discord bot with `handler` resolving its card clicks.
 async fn start_discord_broker(
