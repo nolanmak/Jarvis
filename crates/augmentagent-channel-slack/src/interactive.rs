@@ -39,6 +39,7 @@
 //! handler and the plain-text reply in #1288 and #1294.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -56,16 +57,20 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::delivery::ProgressMessage;
 use crate::delivery::{
-    enqueue_answer, Answer, DispatchOutcome, PlanOptions, SlackOutboxDispatcher,
+    enqueue_answer, Answer, AnswerFile, DispatchOutcome, PlanOptions, ProgressConfig,
+    SlackOutboxDispatcher,
 };
+use crate::harness::CANCELLED_REPLY;
+use crate::inbound::{default_inbound_root, prepare_inbound, InboundError, InboundOptions};
 use crate::owner::{
     admit, AdmitOutcome, OwnerInput, OwnerInputSink, OwnerInputSource, SlackBotIdentity,
     SlackOwnerAuthorizer,
 };
 use crate::surface::{SlackWorkspace, SLACK_SURFACE_PLATFORM};
 use crate::transport::event::{
-    parse_envelope_value, Envelope, EnvelopeKind, EventEnvelope, MessageEvent, SlackEvent,
+    parse_envelope_value, Envelope, EnvelopeKind, EventEnvelope, FileRef, MessageEvent, SlackEvent,
 };
 use crate::transport::socket::{
     Ack, ConnectionState, HandoffError, SlackDelivery, SlackEventSink, SocketConnector,
@@ -79,6 +84,9 @@ pub const STALE_AFTER: Duration = Duration::from_secs(60);
 /// Shown when a turn fails. The error itself goes to the daemon log only.
 pub const TURN_FAILED_REPLY: &str =
     "Sorry, something went wrong while answering that. The details are in the daemon log.";
+
+/// #1288 — the reply to `cancel`/`stop` when nothing is running there.
+pub const NOTHING_TO_CANCEL_REPLY: &str = "Nothing is running here to cancel. To stop a request, reply `cancel` in its thread (or in this DM for a DM request).";
 
 fn platform() -> SurfacePlatform {
     SurfacePlatform::new(SLACK_SURFACE_PLATFORM).expect("static platform")
@@ -109,11 +117,36 @@ pub struct SlackTurn {
     /// interactions.
     pub text: String,
     pub envelope: EventEnvelope,
+    /// #1288 — the persistent conversation this turn belongs to, and the
+    /// native session key: the DM, a thread in the DM, or a thread in a
+    /// channel (a top-level control-channel message starts its own thread).
+    /// `None` for input with nowhere to answer (a modal submission).
+    pub session: Option<SurfaceConversationRef>,
+    /// `slack:<team>:<event_id>`: globally unique, stable across restarts;
+    /// the turn claim, audit and handoff identity.
+    pub turn_id: String,
+    /// What the agent gets: the text plus the owner's files in the shared
+    /// (Discord) attachment format.
+    pub prompt: String,
+    /// The private per-message directory holding this turn's files, if any.
+    pub inbound_dir: Option<PathBuf>,
+    /// Fires when the owner cancels this turn.
+    pub cancel: CancellationToken,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SlackTurnReply {
     pub text: String,
+    /// #1294 — generated files, shared after the text.
+    pub files: Vec<AnswerFile>,
+}
+
+/// `slack:<team>:<event_id>`: the global turn ID for an event in `account`.
+pub fn slack_turn_id(account: &SurfaceAccountRef, event_id: &str) -> String {
+    let team = SlackWorkspace::from_account(account)
+        .map(|w| w.team_id().to_string())
+        .unwrap_or_else(|_| account.account_id().to_string());
+    format!("slack:{team}:{event_id}")
 }
 
 /// What runs an owner turn. `serve` plugs in an adapter over the shared
@@ -155,6 +188,12 @@ pub struct SlackSurfaceConfig {
     /// How often the health row is rewritten while nothing changes.
     pub heartbeat: Duration,
     pub socket: SocketModeConfig,
+    /// #1293/#1288 — where owner files are stored for a turn. `None` uses
+    /// `<state dir>/slack-inbound`.
+    pub inbound: Option<InboundOptions>,
+    /// #1294/#1288 — the throttled status line during a turn. `None` posts
+    /// none. Never posted in dry-run.
+    pub progress: Option<ProgressConfig>,
 }
 
 impl Default for SlackSurfaceConfig {
@@ -171,6 +210,8 @@ impl Default for SlackSurfaceConfig {
             idle_poll: Duration::from_secs(5),
             heartbeat: Duration::from_secs(15),
             socket: SocketModeConfig::default(),
+            inbound: None,
+            progress: None,
         }
     }
 }
@@ -518,10 +559,20 @@ fn thread_of(m: &MessageEvent) -> Option<&str> {
 /// (modal submissions, App Home).
 const NO_CONVERSATION: &str = "_none";
 
+/// The inbound lane an event is recorded under. The store runs one event
+/// per lane at a time, so a lane is exactly one conversation (#1288): the DM,
+/// a thread, or, for a top-level channel message, the thread that message
+/// starts (its answer and follow-ups go there). A `cancel` gets a lane of its
+/// own so it is handled at once instead of waiting behind the turn it stops.
 fn envelope_conversation(e: &EventEnvelope) -> (String, Option<String>) {
     let (channel, thread): (Option<&str>, Option<&str>) = match &e.event {
         SlackEvent::Message(m) | SlackEvent::ThreadReply(m) | SlackEvent::AppMention(m) => {
-            (Some(m.channel.as_str()), thread_of(m))
+            let thread = match thread_of(m) {
+                Some(t) => Some(t),
+                None if is_dm(&m.channel, m.channel_type.as_deref()) || m.ts.is_empty() => None,
+                None => Some(m.ts.as_str()),
+            };
+            (Some(m.channel.as_str()), thread)
         }
         SlackEvent::MessageEdited(x) => (
             Some(x.channel.as_str()),
@@ -585,8 +636,41 @@ fn envelope_time_ms(e: &EventEnvelope, now_ms: i64) -> i64 {
         .unwrap_or(now_ms)
 }
 
+/// `cancel`, `stop` (optionally `!`- or `/`-prefixed), alone in a message:
+/// the owner command that stops the running turn in that conversation.
+pub fn is_cancel_command(text: &str) -> bool {
+    let word = text
+        .trim()
+        .trim_start_matches(['!', '/'])
+        .to_ascii_lowercase();
+    matches!(word.as_str(), "cancel" | "stop")
+}
+
+fn message_files(event: &SlackEvent) -> &[FileRef] {
+    match event {
+        SlackEvent::Message(m) | SlackEvent::ThreadReply(m) | SlackEvent::AppMention(m) => &m.files,
+        _ => &[],
+    }
+}
+
+/// A private lane for a cancel command (see [`envelope_conversation`]).
+fn cancel_lane(e: &EventEnvelope) -> Option<String> {
+    match &e.event {
+        SlackEvent::Message(m) | SlackEvent::ThreadReply(m)
+            if m.files.is_empty() && is_cancel_command(&m.text) && !m.ts.is_empty() =>
+        {
+            Some(format!("cancel:{}", m.ts))
+        }
+        SlackEvent::SlashCommand(c) if is_cancel_command(&c.text) => {
+            Some(format!("cancel:{}", e.stable_id()))
+        }
+        _ => None,
+    }
+}
+
 fn inbound_record(e: &EventEnvelope, now_ms: i64) -> anyhow::Result<NewInboundEvent> {
     let (channel, thread) = envelope_conversation(e);
+    let thread = cancel_lane(e).or(thread);
     let conversation = SurfaceConversationRef::new(envelope_account(e), channel, thread)
         .context("inbound conversation")?;
     Ok(NewInboundEvent {
@@ -710,6 +794,11 @@ struct Ctx {
     clock: Clock,
     dispatch_wake: Notify,
     send_wake: Notify,
+    /// Where owner files go (`None`: no state directory on this host).
+    inbound: Option<InboundOptions>,
+    /// #1288 — the running turn of each conversation, by storage key, so a
+    /// `cancel` there can stop it.
+    running: Mutex<HashMap<String, CancellationToken>>,
 }
 
 impl Ctx {
@@ -811,6 +900,11 @@ impl SlackInteractiveSurface {
             self.config.dry_run,
             Arc::clone(&self.clock),
         );
+        let inbound = self
+            .config
+            .inbound
+            .clone()
+            .or_else(|| default_inbound_root().map(InboundOptions::new));
         let ctx = Arc::new(Ctx {
             store: Arc::clone(&self.store),
             platform: platform(),
@@ -825,6 +919,8 @@ impl SlackInteractiveSurface {
             clock: self.clock,
             dispatch_wake: Notify::new(),
             send_wake: Notify::new(),
+            inbound,
+            running: Mutex::new(HashMap::new()),
         });
 
         // This process owns the database: claims and in-flight sends left
@@ -973,13 +1069,23 @@ fn enqueue(
     turn_id: &str,
     markdown: &str,
 ) -> anyhow::Result<()> {
+    enqueue_with_files(ctx, conversation, turn_id, markdown, &[])
+}
+
+fn enqueue_with_files(
+    ctx: &Ctx,
+    conversation: &SurfaceConversationRef,
+    turn_id: &str,
+    markdown: &str,
+    files: &[AnswerFile],
+) -> anyhow::Result<()> {
     enqueue_answer(
         &ctx.store,
         conversation,
         &Answer {
             turn_id,
             markdown,
-            files: &[],
+            files,
         },
         &PlanOptions {
             max_attempts: ctx.config.max_send_attempts,
@@ -1113,17 +1219,203 @@ async fn run_turn(
     envelope: EventEnvelope,
     shutdown: &CancellationToken,
 ) {
+    let text = turn_text(&envelope.event);
+    let session = answer_conversation(&account, &input, &envelope);
+    let files = message_files(&envelope.event).to_vec();
+    if input.source != OwnerInputSource::Interaction && files.is_empty() && is_cancel_command(&text)
+    {
+        cancel_running(ctx, &claimed, session.as_ref());
+        return;
+    }
+    // Register first, so a `cancel` that arrives while files download or
+    // the agent runs finds this turn.
+    let cancel = CancellationToken::new();
+    let key = session.as_ref().map(SurfaceConversationRef::storage_key);
+    if let Some(key) = &key {
+        ctx.running
+            .lock()
+            .unwrap()
+            .insert(key.clone(), cancel.clone());
+    }
+    run_registered_turn(
+        ctx, claimed, account, input, envelope, session, text, files, cancel, shutdown,
+    )
+    .await;
+    if let Some(key) = key {
+        ctx.running.lock().unwrap().remove(&key);
+    }
+}
+
+/// `cancel` / `stop`: stop the running turn in this conversation. The
+/// stopped turn reports itself; with nothing running, say so.
+fn cancel_running(ctx: &Ctx, claimed: &ClaimedInbound, session: Option<&SurfaceConversationRef>) {
     let seq = claimed.seq;
+    let running = session.and_then(|s| ctx.running.lock().unwrap().get(&s.storage_key()).cloned());
+    match (running, session) {
+        (Some(token), _) => {
+            info!(seq, "slack interactive: cancelling the running turn");
+            token.cancel();
+        }
+        (None, Some(conversation)) => {
+            info!(seq, "slack interactive: cancel with nothing running");
+            let turn = answer_turn_id(&claimed.event_id);
+            if let Err(e) = enqueue(ctx, conversation, &turn, NOTHING_TO_CANCEL_REPLY) {
+                release(ctx, seq, &format!("enqueue cancel reply: {e}"));
+                return;
+            }
+        }
+        (None, None) => {}
+    }
+    settle(ctx, seq);
+}
+
+fn workspace_web(ctx: &Ctx, account: &SurfaceAccountRef) -> Option<Arc<dyn SlackWebApi>> {
+    let team = SlackWorkspace::from_account(account).ok()?;
+    ctx.workspaces
+        .get(team.team_id())
+        .map(|runtime| Arc::clone(&runtime.web))
+}
+
+/// The status line text, telling the owner how to stop the turn.
+fn progress_text(session: &SurfaceConversationRef) -> String {
+    if session.thread_id().is_some() {
+        "Working on it… reply `cancel` in this thread to stop.".into()
+    } else {
+        "Working on it… reply `cancel` to stop.".into()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_registered_turn(
+    ctx: &Ctx,
+    claimed: ClaimedInbound,
+    account: SurfaceAccountRef,
+    input: OwnerInput,
+    envelope: EventEnvelope,
+    session: Option<SurfaceConversationRef>,
+    text: String,
+    files: Vec<FileRef>,
+    cancel: CancellationToken,
+    shutdown: &CancellationToken,
+) {
+    let seq = claimed.seq;
+    let web = workspace_web(ctx, &account);
+
+    // Owner files → the shared attachment prompt (#1293).
+    let mut footer: Option<String> = None;
+    let mut inbound = None;
+    let mut prompt = text.trim().to_string();
+    if !files.is_empty() {
+        match (&ctx.inbound, &web) {
+            (Some(opts), Some(web)) => {
+                // Canonical paths in the prompt: the Codex bridge opens every
+                // component without following symlinks, and the scope guard
+                // compares canonically.
+                let mut opts = opts.clone();
+                if std::fs::create_dir_all(&opts.root).is_ok() {
+                    if let Ok(root) = opts.root.canonicalize() {
+                        opts.root = root;
+                    }
+                }
+                let prepared = tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {
+                        release(ctx, seq, "cancelled by shutdown");
+                        return;
+                    }
+                    r = prepare_inbound(web.as_ref(), &text, &files, &opts, &cancel) => r,
+                };
+                match prepared {
+                    Ok(message) => {
+                        footer = message.rejection_notice();
+                        prompt = message.prompt.clone();
+                        inbound = Some(message);
+                    }
+                    Err(InboundError::Cancelled) => {
+                        if let Some(conversation) = &session {
+                            let turn = answer_turn_id(&claimed.event_id);
+                            if let Err(e) = enqueue(ctx, conversation, &turn, CANCELLED_REPLY) {
+                                release(ctx, seq, &format!("enqueue answer: {e}"));
+                                return;
+                            }
+                        }
+                        settle(ctx, seq);
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(seq, error = %e, "slack interactive: owner files could not be stored");
+                        footer = Some(format!(
+                            "skipped {} file(s): they could not be stored on this host",
+                            files.len()
+                        ));
+                    }
+                }
+            }
+            _ => {
+                footer = Some(format!(
+                    "skipped {} file(s): no private file storage on this host",
+                    files.len()
+                ))
+            }
+        }
+    }
+    let starts_turn = inbound
+        .as_ref()
+        .map_or(!prompt.is_empty(), |m| m.starts_turn());
+    if !starts_turn {
+        // Only refused files: tell the owner, do not wake the agent.
+        if let (Some(notice), Some(conversation)) = (&footer, &session) {
+            let turn = answer_turn_id(&claimed.event_id);
+            if let Err(e) = enqueue(ctx, conversation, &turn, notice) {
+                release(ctx, seq, &format!("enqueue notice: {e}"));
+                return;
+            }
+        }
+        settle(ctx, seq);
+        return;
+    }
+
     let turn = SlackTurn {
         event_id: claimed.event_id.clone(),
         attempt: claimed.attempt,
         owner: input.owner.clone(),
         conversation: input.conversation.clone(),
         source: input.source,
-        text: turn_text(&envelope.event),
+        text,
         envelope: envelope.clone(),
+        session: session.clone(),
+        turn_id: slack_turn_id(&account, &claimed.event_id),
+        prompt,
+        inbound_dir: inbound
+            .as_ref()
+            .and_then(|m| m.dir().map(std::path::Path::to_path_buf)),
+        cancel: cancel.clone(),
     };
     info!(seq, attempt = turn.attempt, source = ?turn.source, "slack interactive: owner turn");
+
+    // The status line (live only; dry-run never posts).
+    let progress = match (&ctx.config.progress, &session, &web) {
+        (Some(config), Some(conversation), Some(web)) if !ctx.config.dry_run => {
+            match ProgressMessage::post(
+                Arc::clone(web),
+                conversation.conversation_id(),
+                conversation.thread_id(),
+                &progress_text(conversation),
+                config.clone(),
+                shutdown.child_token(),
+            )
+            .await
+            {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    warn!(seq, error = %e, "slack interactive: could not post the status line");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
     let result = tokio::select! {
         biased;
         _ = shutdown.cancelled() => {
@@ -1133,21 +1425,45 @@ async fn run_turn(
         }
         r = ctx.handler.handle_turn(&turn) => r,
     };
-    let text = match result {
-        Ok(Some(reply)) if !reply.text.trim().is_empty() => reply.text,
-        Ok(_) => {
+    // The files were only for this turn (Discord removes its temp files the
+    // same way); the directory goes whatever the outcome.
+    if let Some(message) = inbound {
+        if let Err(e) = message.cleanup() {
+            warn!(seq, error = %e, "slack interactive: could not remove the turn's files");
+        }
+    }
+    let status = match &result {
+        _ if cancel.is_cancelled() => "Stopped.",
+        Ok(_) => "Done.",
+        Err(_) => "Failed.",
+    };
+    if let Some(progress) = progress {
+        progress.finish(Some(status.to_string())).await;
+    }
+    let (mut text, files) = match result {
+        Ok(Some(reply)) if !reply.text.trim().is_empty() || !reply.files.is_empty() => {
+            (reply.text, reply.files)
+        }
+        Ok(_) if footer.is_none() => {
             settle(ctx, seq);
             return;
         }
+        Ok(_) => (String::new(), Vec::new()),
         Err(e) => {
             warn!(seq, error = %format!("{e:#}"), "slack interactive: turn failed");
-            TURN_FAILED_REPLY.to_string()
+            (TURN_FAILED_REPLY.to_string(), Vec::new())
         }
     };
-    match answer_conversation(&account, &input, &envelope) {
+    if let Some(footer) = footer {
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str(&footer);
+    }
+    match session {
         Some(conversation) => {
             let turn = answer_turn_id(&claimed.event_id);
-            if let Err(e) = enqueue(ctx, &conversation, &turn, &text) {
+            if let Err(e) = enqueue_with_files(ctx, &conversation, &turn, &text, &files) {
                 warn!(seq, error = %e, "slack interactive: could not queue the answer");
                 release(ctx, seq, &format!("enqueue answer: {e}"));
                 return;

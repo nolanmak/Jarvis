@@ -88,3 +88,8 @@ pub use trigger::{
 pub mod model_router;
 pub mod model_selection;
 pub mod native_session;
+// #1288 — the transport-neutral conversation turn (native sessions, turn
+// claims, cancellation) shared by Discord and Slack, and its conformance
+// fixtures.
+pub mod surface_conformance;
+pub mod surface_turn;

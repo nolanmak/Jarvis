@@ -524,3 +524,11 @@ fn adding_slack_leaves_existing_discord_and_whatsapp_rows_unchanged() {
         .claim_surface_turn(&SurfaceTurnRef::new(whatsapp, "message-2").unwrap())
         .is_err());
 }
+
+// #1288 — threads are persistent conversations on the interactive surface.
+#[test]
+fn threads_are_supported_now_that_each_thread_is_a_persistent_conversation() {
+    assert_eq!(SlackInteraction::Threads.status(), SupportStatus::Supported);
+    assert!(SlackInteraction::Threads.require().is_ok());
+    assert!(!parity_blockers().iter().any(|b| b.name == "threads"));
+}

@@ -139,12 +139,20 @@ What it does:
   an owner message starts a turn immediately; no poll or triage timer is
   involved. A redelivered message is acknowledged and never a second turn.
 - Owner messages in the DM with the app or the control channel, and
-  `/jarvis` commands, are answered through the same query path as Discord's
-  query channel (the wiki-backed query handler and the shared reasoner),
-  which needs `serve --wiki-dir`; without it the owner is told how to turn
-  queries on. Answers go through the durable outbox and the #1294 delivery
-  path (mrkdwn, splitting, reconcile). A DM is answered in the DM; a
-  control-channel message is answered in a thread under it.
+  `/jarvis` commands, run through the same agent as Discord (wiki, memory,
+  tools, skills, audit, provider fallback), which needs `serve --wiki-dir`;
+  without it the owner is told how to turn queries on. Answers go through
+  the durable outbox and the #1294 delivery path (mrkdwn, splitting,
+  reconcile). A DM is answered in the DM; a control-channel message is
+  answered in a thread under it.
+- Conversations (#1288): the DM, each DM thread and each control-channel
+  thread keep their own agent session, so a follow-up continues where the
+  last answer left off and separate threads never mix. A message sent while
+  that conversation is still working waits its turn. Reply `cancel` (or
+  `stop`) in the same thread, or in the DM, to stop the running request;
+  the status line shown while it works says so. After a restart, a request
+  that was cut off is reported and not re-run. Files you attach (images,
+  text, PDF/DOCX) are handed to the agent read-only for that one request.
 - Anyone else gets the fixed rejection: back in their DM with the app, or
   as an ephemeral message in a channel. It never reaches the reasoner.
   Buttons and modals get no answer yet (#1289).
@@ -174,9 +182,15 @@ which needs the user's login session; whether a launchd-run daemon can read
 an item written from a terminal is still unverified (#1246), so check
 `status` after the first start on a Mac.
 
-For tests and local QA only, a **debug build** answers every owner turn with
-`<value> <question>` instead of calling the reasoner when
-`AUGMENTAGENT_TEST_SLACK_TURN_REPLY` is set (release builds ignore it).
+For tests and local QA only, a **debug build** runs owner turns through the
+real harness with a fake agent instead of the reasoner when
+`AUGMENTAGENT_TEST_SLACK_TURN_REPLY` is set (release builds ignore it). The
+fake joins the conversation's native session and answers
+`<value> <first line> (session <id>, turn <n>)`, plus
+`read <file> (<bytes> bytes)` per attachment it could open; a message
+containing `slow` takes 15 s, so queueing, `cancel` and restart can be
+seen. `AUGMENTAGENT_SLACK_TEST_FILE_HOSTS` (loopback `host:port` only) lets
+it download attachments from a local fake.
 `crates/augmentagent-cli/tests/slack_serve_cli.rs` runs `serve` that way
 against a local fake Slack.
 

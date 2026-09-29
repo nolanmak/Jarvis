@@ -11,6 +11,8 @@ mod provider_channel_tests;
 mod model_switch_sequence_tests;
 #[cfg(test)]
 mod discord_voice_session_tests;
+#[cfg(test)]
+mod surface_conformance_tests;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -3208,16 +3210,20 @@ async fn main() -> Result<()> {
                     Arc::clone(&store),
                     move || -> Arc<dyn augmentagent_channel_slack::interactive::SlackTurnHandler> {
                         match wiki_root {
-                            Some(root) => Arc::new(slack_serve::QueryTurnHandler {
-                                query: Arc::new(wiki_querier(
+                            // #1288 — the shared conversation harness over
+                            // the same WikiQuerier Discord answers with.
+                            Some(root) => slack_serve::conversation_handler(
+                                Arc::clone(&store_q),
+                                Arc::new(wiki_querier(
                                     build_reasoner(),
-                                    root,
+                                    root.clone(),
                                     std::env::current_dir()
                                         .unwrap_or_else(|_| PathBuf::from(".")),
                                     store_q,
                                     false,
                                 )),
-                            }),
+                                root,
+                            ),
                             None => Arc::new(slack_serve::NoQueryHandler),
                         }
                     },
@@ -9623,8 +9629,8 @@ struct WikiQuerier {
 }
 
 /// The query handler Discord's query channel answers with. Also what the
-/// interactive Slack surface (#1287) answers owner messages with, through
-/// `slack_serve::QueryTurnHandler`, so both surfaces share one query path.
+/// interactive Slack surface answers owner turns with, through the shared
+/// conversation harness (#1288), so both surfaces share one agent path.
 fn wiki_querier(
     reasoner: Arc<FallbackReasoner>,
     wiki_root: PathBuf,
@@ -9812,6 +9818,11 @@ impl QueryHandler for WikiQuerier {
         question: &str,
     ) -> anyhow::Result<String> {
         let mut opts = ask_opts(self.wiki_root.clone(), self.repo_root.clone());
+        // #1288 — per-turn environment from the surface running this turn
+        // (Slack's inbound file directory, which the scope guard and the
+        // Codex bridge grant read-only). Empty for Discord turns.
+        opts.env
+            .extend(augmentagent_channel_core::surface_turn::turn_env());
         enable_newsletter_tools(&mut opts, ctx);
         computer_tool::configure(&mut opts, ctx, &self.repo_root);
         model_tool::configure(&mut opts, ctx, &self.reasoner, &self.repo_root.join("target/release/augmentagent"));
@@ -9891,78 +9902,50 @@ impl QueryHandler for WikiQuerier {
         let guild = guild_id.to_string();
         let channel = channel_id.get().to_string();
         let conversation = format!("{guild}:{channel}");
-        self.conversation_scheduler.submit(&conversation, &ctx.session_id, || async {
-            use augmentagent_channel_core::{
-                native_session::{NativeSession, CURRENT},
-                providers::ProviderKind,
-            };
-            let binding = store.discord_conversation(&guild, &channel)?;
-            if binding.as_ref().is_some_and(|item| item.uncertain) {
-                anyhow::bail!("Native conversation has an uncertain turn; inspect it before continuing");
-            }
-            let selection = augmentagent_channel_core::model_selection::SelectionStore::new(
-                augmentagent_channel_core::model_selection::config_path()
-            ).selected(Some(&channel))?;
-            let provider = if let Some(item) = &binding {
-                let bound = match item.provider.as_str() {
-                    "claude" => ProviderKind::Claude,
-                    "codex" => ProviderKind::Codex,
-                    _ => anyhow::bail!("Unsupported bound native provider"),
+        self.conversation_scheduler
+            .submit(&conversation, &ctx.session_id, || async {
+                use augmentagent_channel_core::surface_turn::{
+                    run_surface_turn, SurfaceTurnOutcome, SurfaceTurnRequest,
                 };
-                if selection.is_some_and(|selected| selected != bound) {
-                    anyhow::bail!("Model selection conflicts with bound native session; explicitly end or migrate the conversation");
+                // #1288 — the same transport-neutral turn Slack runs. A Discord
+                // text channel maps onto the original Discord tables (account =
+                // guild, conversation = channel, no thread), so bindings, claims
+                // and uncertain-turn handling are unchanged.
+                let chat = augmentagent_store::SurfaceConversationRef::new(
+                    augmentagent_store::SurfaceAccountRef::new(
+                        augmentagent_store::SurfacePlatform::new("discord")?,
+                        guild.clone(),
+                    )?,
+                    channel.clone(),
+                    None,
+                )?;
+                let turn = augmentagent_store::SurfaceTurnRef::new(chat, ctx.session_id.clone())?;
+                let cwd = self.wiki_root.to_string_lossy().into_owned();
+                let outcome = run_surface_turn(
+                    store,
+                    SurfaceTurnRequest {
+                        turn: &turn,
+                        history,
+                        current,
+                        cwd: &cwd,
+                    },
+                    || {
+                        augmentagent_channel_core::model_selection::SelectionStore::new(
+                            augmentagent_channel_core::model_selection::config_path(),
+                        )
+                        .selected(Some(&channel))
+                    },
+                    None,
+                    |prompt| async move { self.answer(ctx, &prompt).await },
+                )
+                .await?;
+                match outcome {
+                    SurfaceTurnOutcome::Answered(answer) => Ok(answer),
+                    SurfaceTurnOutcome::Cancelled => anyhow::bail!("Discord turn was cancelled"),
                 }
-                bound
-            } else {
-                let selected = selection.unwrap_or(ProviderKind::Claude);
-                if !matches!(selected, ProviderKind::Claude | ProviderKind::Codex) {
-                    // The voice flag does not migrate unrelated model profiles.
-                    // Keep their existing text route until the owner explicitly
-                    // selects a native Claude/Codex conversation.
-                    return self.answer(ctx, &legacy_prompt()).await;
-                }
-                selected
-            };
-            let session = NativeSession::from_id(provider,
-                binding.as_ref().map(|item| item.native_session_id.clone()))?;
-            let prompt = if binding.is_some() { current.to_string() } else { legacy_prompt() };
-            // Persist the claim before the CLI can run tools. If the daemon
-            // dies before recording a result or native ID, restart must not
-            // silently submit this Discord turn a second time.
-            store.claim_discord_turn(&guild, &channel, &ctx.session_id)?;
-            let handler_dispatched_at_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-            tracing::info!(turn_id = %ctx.session_id, %guild, %channel,
-                handler_dispatched_at_ms, "Discord native turn handler dispatched");
-            let answer = CURRENT.scope(Arc::clone(&session), self.answer(ctx, &prompt)).await;
-            let answer_completed_at_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-            tracing::info!(turn_id = %ctx.session_id, %guild, %channel,
-                ?handler_dispatched_at_ms, ?answer_completed_at_ms,
-                native_submitted_at_ms = ?session.native_submitted_at_ms(),
-                first_text_output_at_ms = ?session.first_text_output_at_ms(),
-                "Discord native turn timing");
-            if let Some(id) = session.id() {
-                if binding.is_none() {
-                    store.bind_discord_conversation(&augmentagent_store::DiscordConversation {
-                        guild_id: guild.clone(), channel_id: channel.clone(),
-                        provider: provider.name().to_string(), native_session_id: id,
-                        cwd: self.wiki_root.to_string_lossy().into_owned(),
-                        uncertain: session.is_uncertain(),
-                    })?;
-                } else if session.is_uncertain() {
-                    store.mark_discord_conversation_uncertain(&guild, &channel)?;
-                }
-            }
-            // A refusal before NativeSession::begin has no native side effects.
-            // Preserve this turn ID as consumed, but let a later turn proceed.
-            // A dropped lease marks the session uncertain and blocks replay.
-            store.finish_discord_turn(
-                &guild, &channel, &ctx.session_id,
-                !session.is_uncertain(),
-            )?;
-            answer
-        }).await.map_err(anyhow::Error::msg)
+            })
+            .await
+            .map_err(anyhow::Error::msg)
     }
 
     async fn model_command(&self, channel_id: u64, text: &str) -> Option<String> {

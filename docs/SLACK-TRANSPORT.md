@@ -420,16 +420,18 @@ line) and `starts_turn()`.
   an install hint; a converter is killed after 120 s (`kill_on_drop`, also
   on cancellation).
 
-### Remaining work for serve (#1287/#1288)
+### In serve (#1288)
 
-- Call `prepare_inbound` for owner `message`/`file_share` events after the
-  owner check (#1286), post `rejection_notice()` in the thread, and skip the
-  reasoner when `!starts_turn()`.
-- The wiki-ask scope guard (`scripts/aa-wiki-scope-guard.sh` and its Codex
-  mirror in `codex_tools.rs`) allows the reasoner's `Read` only on Discord's
-  `/tmp/aa-{img,txt,doc}-*` names; a read-only carve-out for
-  `<state dir>/slack-inbound/msg-*/NN-*` is needed when the dispatcher runs
-  a Claude turn on these files.
+- The dispatcher calls `prepare_inbound` for owner `message`/`file_share`
+  events after the owner check (#1286), appends `rejection_notice()` to the
+  answer (or posts it alone and skips the agent when `!starts_turn()`), and
+  removes the message directory when the turn ends.
+- The turn names its directory in `AUGMENTAGENT_SLACK_INBOUND_DIR`. The
+  wiki-ask scope guard (`scripts/aa-wiki-scope-guard.sh`) and its Codex
+  mirror (`SLACK_INBOUND_DIR_PATTERN` / `SLACK_INBOUND_FILE_NAME` in
+  `codex_tools.rs`) allow `Read`, and only `Read`, of `NN-<name>` files
+  directly inside that one canonical `…/slack-inbound/msg-*` directory:
+  siblings, `..`, a symlinked directory and other state files stay denied.
 
 ## Voice clips and spoken replies (#1297)
 
@@ -717,19 +719,76 @@ Code: `crates/augmentagent-channel-slack/src/interactive.rs`, wired by
   `surface_listener_health` on every change and every 15 s. `status` treats
   a live state older than 60 s as `disconnected`.
 - **Turn handler seam.** `SlackTurnHandler::handle_turn(&SlackTurn) ->
-  Option<SlackTurnReply>` is text in, Markdown out. `serve` plugs in
-  `QueryTurnHandler`, an adapter over the Discord crate's `QueryHandler`
-  (`WikiQuerier::answer`, one shared-reasoner call) with an `AuditCtx`
-  carrying a `slack:<account>:<event>` session ID, no Discord http, channel
-  or guild, and `owner_authorized: false` (the WhatsApp precedent: that flag
-  grants Discord-owner tools). #1288 replaces the adapter with the full
-  harness (sessions, history, tools and permissions, follow-ups, progress).
+  Option<SlackTurnReply>`: the turn carries its conversation (`session`),
+  global turn ID, prompt (text plus files), inbound directory and cancel
+  token; the reply is Markdown plus generated files. `serve` plugs in the
+  shared harness (#1288, below).
 
 Tests: `tests/interactive_surface.rs` (the real client, sink, dispatcher and
 outbox over an in-memory WebSocket with `RecordingSlackWebApi`, a fake turn
 handler and an hour-long fallback poll) and
 `augmentagent-cli/tests/slack_serve_cli.rs` (the built binary, Slack only,
 against a mock Web API and a local WebSocket).
+
+## Conversations, sessions and turn lifecycle (#1288)
+
+Code: `crates/augmentagent-channel-slack/src/harness.rs` (the handler
+`serve` runs), `interactive.rs` (lanes, cancel, files, progress) and
+`crates/augmentagent-channel-core/src/surface_turn.rs` (the native-session
+turn Discord's conversation path runs too).
+
+- **Conversations.** The DM with the app is one conversation; a thread in
+  the DM is another; a top-level control-channel message starts a thread
+  under itself and that thread is its conversation; a reply in any thread
+  continues that thread's conversation. The key is the transport-neutral
+  `SurfaceConversationRef` (account, channel, `thread_ts`), stable across
+  restarts. Each conversation is bound (`surface_conversations`) to one
+  native Claude or Codex session, created on its first turn and resumed on
+  every follow-up; two threads never share one.
+- **Same agent as Discord.** The harness calls the `QueryHandler` Discord
+  answers with (`WikiQuerier`: wiki-ask prompt and owner rules, tool
+  allowlist and scope guards, wiki and memory MCP, skills, tool audit keyed
+  by the turn ID, provider fallback) inside `run_surface_turn`. The turn ID
+  is `slack:<team>:<channel>:<ts>`. Owner authority: a turn reaches the
+  harness only after `owner::admit` returned `Owner` for the bound
+  `(workspace, user)`, the Slack counterpart of Discord's explicit owner
+  allowlist, so it runs with `owner_authorized: true`. Tools that need a
+  Discord channel (model switch, computer use, voice) are not offered on
+  Slack yet (#1292, #1297).
+- **Claim before execution.** `run_surface_turn` persists the turn claim
+  (`surface_native_turns`) before the agent runs. A redelivered event or a
+  replay after restart finds the claim and never submits the turn again.
+- **Queueing.** Inbound events are recorded under their conversation's
+  lane, and the store hands out one event per lane at a time: a message
+  sent while its conversation has a turn running waits, then continues the
+  same session; other conversations run concurrently (up to four turns).
+- **Cancel.** `cancel` or `stop` (optionally `!`/`/`-prefixed), alone in a
+  message, stops the running turn in that conversation: it is recorded in a
+  lane of its own so it never waits behind the turn it stops. The agent
+  future is dropped (the provider supervisor reaps the process tree), the
+  claim is resolved as cancelled, the owner gets "Stopped. …", and the next
+  message resumes the same session. With nothing running, the owner is
+  told how cancel works. The status line during a turn says
+  "reply `cancel` … to stop".
+- **Restart.** A turn interrupted by a restart or crash is replayed once:
+  its claim is still pending, so it is resolved as interrupted and not
+  re-run (its tools may already have acted), and the owner is told; the
+  next message resumes the same session. A provider that failed mid-turn
+  leaves the session uncertain (#1220 semantics): that conversation is not
+  continued automatically and the owner is told to start a new thread.
+- **Clarification and handoffs.** A clarifying question is an ordinary
+  answer in the thread; the owner's reply resumes the same native session.
+  Durable handoff journals are keyed by the turn ID exactly as on Discord.
+- **Progress and answers.** A throttled status line per turn (live only),
+  finished as Done / Stopped / Failed; the answer and any `ATTACH:` files
+  (validated against the wiki root with Discord's rules) go through
+  `enqueue_answer`. Dry run: the turn runs, nothing is posted.
+
+Tests: `tests/conversation_harness.rs` (the real dispatch path with the
+recording native provider), `augmentagent-channel-core/tests/surface_turn.rs`,
+the shared scenario in `surface_conformance.rs` run against Discord and
+Slack (`augmentagent-cli` `surface_conformance_tests`), and the built
+`serve` in `augmentagent-cli/tests/slack_serve_cli.rs`.
 
 ## Remaining live verification (owner, test workspace)
 

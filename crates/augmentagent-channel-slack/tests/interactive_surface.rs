@@ -158,6 +158,7 @@ impl SlackTurnHandler for FakeHandler {
         }
         Ok(Some(SlackTurnReply {
             text: format!("answer: {}", turn.text),
+            files: Vec::new(),
         }))
     }
 }

@@ -20,6 +20,8 @@ pub mod auth;
 pub mod channel;
 pub mod delivery;
 pub mod digest;
+// #1288 — owner turns through the shared agent harness.
+pub mod harness;
 pub mod inbound;
 pub mod interactive;
 pub mod owner;

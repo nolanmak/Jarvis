@@ -113,6 +113,14 @@ pub const DISCORD_ATTACHMENT_NAME: &str = r"aa-(txt|img|doc)-[0-9]+-[0-9]+\.[a-z
 /// directory, minted by `ask_opts` under this root and named by this variable.
 pub const IMESSAGE_SESSION_DIR_ENV: &str = "AUGMENTAGENT_IMESSAGE_TMP_DIR";
 pub const IMESSAGE_ATTACHMENT_ROOT: &str = "/tmp/aa-imsg";
+/// #1288 — the Slack surface names one owner message's private file directory
+/// (`<state dir>/slack-inbound/msg-*`) for the turn that reads it.
+pub const SLACK_INBOUND_DIR_ENV: &str = "AUGMENTAGENT_SLACK_INBOUND_DIR";
+/// The canonical form that directory must have (checked after resolving
+/// symlinks and `..`, so a link elsewhere grants nothing).
+pub const SLACK_INBOUND_DIR_PATTERN: &str = r"/.*/slack-inbound/msg-[A-Za-z0-9]+";
+/// Files in it: `NN-<sanitized name>` (`augmentagent_docs::inbound::sanitize_filename`).
+pub const SLACK_INBOUND_FILE_NAME: &str = r"[0-9]+-[A-Za-z0-9._-]+";
 /// One path segment: the session directory name and the CLI-sanitized file name.
 pub const PORTABLE_NAME: &str = r"[A-Za-z0-9._-]+";
 
@@ -145,6 +153,18 @@ pub fn imessage_session_dir(value: &str) -> Option<PathBuf> {
     (full_match(PORTABLE_NAME, name) && name != "." && name != "..").then(|| PathBuf::from(value))
 }
 
+/// #1288 — the Slack turn directory the guard accepts: an existing directory
+/// whose canonical path is `…/slack-inbound/msg-<alnum>`. Returned canonical,
+/// because the bridge opens every component without following symlinks.
+pub fn slack_inbound_dir(value: &str) -> Option<PathBuf> {
+    if !value.starts_with('/') {
+        return None;
+    }
+    let canonical = std::fs::canonicalize(value).ok()?;
+    let text = canonical.to_str()?;
+    (canonical.is_dir() && full_match(SLACK_INBOUND_DIR_PATTERN, text)).then_some(canonical)
+}
+
 /// Whether `opts` runs the scope guard on Read: Claude grants the carve-outs
 /// exactly there, and the bridge runs the same hook before every Read.
 fn runs_scope_guard_on_read(opts: &ReasonerOpts) -> bool {
@@ -165,7 +185,8 @@ fn runs_scope_guard_on_read(opts: &ReasonerOpts) -> bool {
 
 /// The Read exceptions `opts` is entitled to: none unless it allows Read under
 /// the scope guard; then Discord attachments, plus this session's iMessage
-/// attachment directory when one was minted (last assignment wins, as in the
+/// attachment directory when one was minted, plus the Slack turn's inbound
+/// file directory when the turn named one (last assignment wins, as in the
 /// spawned environment).
 pub fn read_allowances(opts: &ReasonerOpts) -> Vec<ReadAllowance> {
     if !opts.allowed_tools.iter().any(|tool| tool == "Read") || !runs_scope_guard_on_read(opts) {
@@ -179,6 +200,18 @@ pub fn read_allowances(opts: &ReasonerOpts) -> Vec<ReadAllowance> {
         .and_then(|(_, value)| imessage_session_dir(value));
     if let Some(directory) = session {
         allowances.push(ReadAllowance { directory, name_pattern: PORTABLE_NAME });
+    }
+    let slack = opts
+        .env
+        .iter()
+        .rev()
+        .find(|(key, _)| key == SLACK_INBOUND_DIR_ENV)
+        .and_then(|(_, value)| slack_inbound_dir(value));
+    if let Some(directory) = slack {
+        allowances.push(ReadAllowance {
+            directory,
+            name_pattern: SLACK_INBOUND_FILE_NAME,
+        });
     }
     allowances
 }
@@ -659,12 +692,32 @@ mod tests {
         let discord = format!("^{DISCORD_ATTACHMENT_DIR}/{DISCORD_ATTACHMENT_NAME}$");
         let session_dir = format!("^{IMESSAGE_ATTACHMENT_ROOT}/{PORTABLE_NAME}$");
         let session_file = format!("^\"${IMESSAGE_SESSION_DIR_ENV}\"/{PORTABLE_NAME}$");
+        let slack_dir = format!("^{SLACK_INBOUND_DIR_PATTERN}$");
+        let slack_file = format!("^{SLACK_INBOUND_FILE_NAME}$");
         // The transcript clone's tool gate is the guard's only other regex.
         let transcript_tools = "^(Read|Glob|Grep)$".to_string();
-        assert_eq!(found.keys().cloned().collect::<BTreeSet<_>>(),
-            BTreeSet::from([discord.clone(), session_dir.clone(), session_file.clone(), transcript_tools]),
-            "scope guard regexes drifted from the read allowance definition");
-        for carve_out in [&discord, &session_dir, &session_file] {
+        assert_eq!(
+            found.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                discord.clone(),
+                session_dir.clone(),
+                session_file.clone(),
+                slack_dir.clone(),
+                slack_file.clone(),
+                transcript_tools
+            ]),
+            "scope guard regexes drifted from the read allowance definition"
+        );
+        assert_eq!(
+            found[&slack_dir], found[&slack_file],
+            "a Slack file name counts only inside the validated turn dir"
+        );
+        assert!(
+            found[&slack_dir].contains(&format!("${SLACK_INBOUND_DIR_ENV}")),
+            "{}",
+            found[&slack_dir]
+        );
+        for carve_out in [&discord, &session_dir, &session_file, &slack_dir] {
             let statement = &found[carve_out];
             assert!(statement.contains(r#""$TOOL" == "Read""#), "not Read-gated: {statement}");
             for tool in ["Glob", "Grep", "Write", "Edit"] {
@@ -772,12 +825,184 @@ mod tests {
         }
     }
 
+    /// #1288 — the Slack carve-out: the real guard and the definition agree
+    /// on names inside a real turn directory (spaces and non-ASCII in the
+    /// state dir), and the guard admits nothing outside it.
+    #[test]
+    fn scope_guard_and_definition_agree_on_slack_inbound_files() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        if Command::new("jq").arg("--version").output().is_err() {
+            return;
+        }
+        let guard = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/aa-wiki-scope-guard.sh"
+        );
+        let wiki = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let root = state
+            .path()
+            .join("state dir \u{fc}")
+            .join("augmentagent")
+            .join("slack-inbound");
+        let turn = root.join("msg-Ab12Cd");
+        std::fs::create_dir_all(&turn).unwrap();
+        std::fs::create_dir_all(root.join("msg-Other1")).unwrap();
+        let guard_allows = |path: &Path, env_dir: Option<&Path>| -> bool {
+            let mut command = Command::new("bash");
+            command.arg(guard).env_clear().env("WIKI_ROOT", wiki.path());
+            if let Some(dir) = env_dir {
+                command.env(SLACK_INBOUND_DIR_ENV, dir);
+            }
+            command
+                .env("PATH", std::env::var_os("PATH").unwrap())
+                .env("LANG", "en_US.UTF-8");
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(
+                    serde_json::json!({"tool_name": "Read",
+                "tool_input": {"file_path": path}})
+                    .to_string()
+                    .as_bytes(),
+                )
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            output.status.success()
+                && !String::from_utf8_lossy(&output.stdout).contains("\"block\"")
+        };
+        for name in [
+            "00-notes.txt",
+            "01-report.pdf.txt",
+            "12-a_b-c.md",
+            "00-..",
+            "notes.txt",
+            "00-",
+            "0-",
+            "-0-a",
+            "00-a b",
+            "00-\u{e9}.txt",
+            "\u{661}\u{661}-a.txt",
+            "00-a\nb",
+            "x00-a",
+        ] {
+            let expected = full_match(SLACK_INBOUND_FILE_NAME, name);
+            assert_eq!(
+                guard_allows(&turn.join(name), Some(&turn)),
+                expected,
+                "{name:?}"
+            );
+        }
+        let file = turn.join("00-notes.txt");
+        assert!(!guard_allows(&file, None), "no env, no allowance");
+        assert!(
+            !guard_allows(&root.join("msg-Other1").join("00-notes.txt"), Some(&turn)),
+            "sibling turn"
+        );
+        assert!(
+            !guard_allows(
+                &turn.join("..").join("msg-Other1").join("00-notes.txt"),
+                Some(&turn)
+            ),
+            "traversal"
+        );
+        assert!(
+            !guard_allows(&root.join("00-notes.txt"), Some(&root)),
+            "the root itself is not a turn dir"
+        );
+        assert!(
+            !guard_allows(&state.path().join("00-notes.txt"), Some(state.path())),
+            "not a Slack dir"
+        );
+    }
+
+    #[test]
+    fn slack_inbound_dir_must_be_a_real_turn_directory() {
+        let state = tempfile::tempdir().unwrap();
+        let root = state.path().join("state dir \u{fc}").join("slack-inbound");
+        let turn = root.join("msg-Ab12Cd");
+        std::fs::create_dir_all(&turn).unwrap();
+        let canonical = turn.canonicalize().unwrap();
+        assert_eq!(
+            slack_inbound_dir(turn.to_str().unwrap()),
+            Some(canonical.clone())
+        );
+        let dotted = root.join("msg-Ab12Cd").join("..").join("msg-Ab12Cd");
+        assert_eq!(slack_inbound_dir(dotted.to_str().unwrap()), Some(canonical));
+        std::fs::create_dir_all(state.path().join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(state.path().join("elsewhere"), root.join("msg-Link01"))
+            .unwrap();
+        for value in [
+            String::new(),
+            "slack-inbound/msg-Ab12Cd".into(),
+            root.to_string_lossy().into_owned(),
+            root.join("msg-Missing1").to_string_lossy().into_owned(),
+            root.join("msg-Link01").to_string_lossy().into_owned(),
+            state
+                .path()
+                .join("elsewhere")
+                .to_string_lossy()
+                .into_owned(),
+        ] {
+            assert_eq!(slack_inbound_dir(&value), None, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn read_allowances_include_the_slack_turn_dir_only_when_named() {
+        let temp = tempfile::tempdir().unwrap();
+        let turn = temp.path().join("slack-inbound").join("msg-Ab12Cd");
+        std::fs::create_dir_all(&turn).unwrap();
+        let mut opts = crate::reasoner::ask_opts(temp.path().into(), temp.path().into());
+        opts.env.retain(|(key, _)| key != IMESSAGE_SESSION_DIR_ENV);
+        let discord = ReadAllowance {
+            directory: PathBuf::from("/tmp"),
+            name_pattern: DISCORD_ATTACHMENT_NAME,
+        };
+        assert_eq!(read_allowances(&opts), vec![discord.clone()]);
+        opts.env.push((
+            SLACK_INBOUND_DIR_ENV.into(),
+            turn.to_string_lossy().into_owned(),
+        ));
+        assert_eq!(
+            read_allowances(&opts),
+            vec![
+                discord.clone(),
+                ReadAllowance {
+                    directory: turn.canonicalize().unwrap(),
+                    name_pattern: SLACK_INBOUND_FILE_NAME
+                }
+            ]
+        );
+        opts.env.push((
+            SLACK_INBOUND_DIR_ENV.into(),
+            temp.path().to_string_lossy().into_owned(),
+        ));
+        assert_eq!(
+            read_allowances(&opts),
+            vec![discord],
+            "an invalid last value grants no Slack dir"
+        );
+    }
+
     #[test]
     fn read_allowance_patterns_are_portable_single_segment_names() {
         // Literals, bracket ranges, groups, alternation, `+` and `\.`: the same in
         // POSIX ERE (the guard), Rust regex and Python `re` (the bridge).
-        let portable = regex::Regex::new(r"\A(?:[A-Za-z0-9_-]|\\\.|\[[A-Za-z0-9._-]+\]|[()|+])+\z").unwrap();
-        for pattern in [DISCORD_ATTACHMENT_NAME, PORTABLE_NAME] {
+        let portable =
+            regex::Regex::new(r"\A(?:[A-Za-z0-9_-]|\\\.|\[[A-Za-z0-9._-]+\]|[()|+])+\z").unwrap();
+        for pattern in [
+            DISCORD_ATTACHMENT_NAME,
+            PORTABLE_NAME,
+            SLACK_INBOUND_FILE_NAME,
+        ] {
             assert!(portable.is_match(pattern), "{pattern}");
             for name in ["", "/", "a/b", "aa-txt-1-0.md/", "/aa-txt-1-0.md", "a\nb", "a\0b"] {
                 assert!(!full_match(pattern, name), "{pattern} admits {name:?}");

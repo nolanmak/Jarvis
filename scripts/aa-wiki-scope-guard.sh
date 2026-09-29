@@ -188,6 +188,22 @@ if [[ "$TOOL" == "Read" && "${AUGMENTAGENT_IMESSAGE_TMP_DIR:-}" =~ ^/tmp/aa-imsg
   exit 0
 fi
 
+# #1288 — files the owner sent on Slack are saved as
+# <state dir>/slack-inbound/msg-<random>/NN-<sanitized name>; the turn that
+# reads them names its own directory in $AUGMENTAGENT_SLACK_INBOUND_DIR. Read
+# only, directly inside that one directory, only the sanitized name shape.
+# Both sides are compared canonically (readlink -f: macOS and Linux), so
+# `..`, a sibling message's directory, a symlinked directory or any other
+# state file is refused. Mirrors SLACK_INBOUND_DIR_PATTERN /
+# SLACK_INBOUND_FILE_NAME in codex_tools.rs.
+if [[ "$TOOL" == "Read" && "${AUGMENTAGENT_SLACK_INBOUND_DIR:-}" == /* ]] \
+    && SLACK_TURN_DIR=$(readlink -f -- "$AUGMENTAGENT_SLACK_INBOUND_DIR" 2>/dev/null) \
+    && [[ "$SLACK_TURN_DIR" =~ ^/.*/slack-inbound/msg-[A-Za-z0-9]+$ ]] \
+    && SLACK_READ_DIR=$(readlink -f -- "$(dirname -- "$ABS")" 2>/dev/null) \
+    && [[ "$SLACK_READ_DIR" == "$SLACK_TURN_DIR" && "$(basename -- "$ABS")" =~ ^[0-9]+-[A-Za-z0-9._-]+$ ]]; then
+  exit 0
+fi
+
 # Block with a clear, structured JSON reason. Claude relays this to the
 # model so it can adjust and try again inside the sandbox.
 REASON="Path is outside the wiki root sandbox. Tool=$TOOL path=$ABS wiki_root=$WIKI_ROOT_ABS. The wiki-query agent may only read/write inside the wiki."
