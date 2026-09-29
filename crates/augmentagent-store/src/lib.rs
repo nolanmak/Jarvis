@@ -17,6 +17,8 @@ pub mod redact;
 pub mod slack_contact;
 mod store;
 pub mod surface;
+// #1292 — reset, cancel-all and loop pause/resume behind owner commands.
+pub mod surface_commands;
 pub mod surface_health;
 
 pub use imessage::{

@@ -19,6 +19,8 @@ mod journal_cmd;
 mod layout;
 mod loops;
 mod nudge;
+// #1292 — the shared owner-command registry (Discord triggers, Slack mapping).
+pub mod owner_commands;
 mod process_loops;
 // #994 — register (casing) audit for outbound drafts. Public: the delivery
 // layer checks receipts here and `gmail compose` gates its body on them.
@@ -58,6 +60,8 @@ pub use loops::{
     next_cron_firing_ms, normalize_and_validate_cron, parse_interval, pause_after_failures,
     validate_tz, LoopCommandParser, LoopPoster, LoopRunner, LoopScheduler, ParsedLoop,
 };
+// #1292 — Slack's loop command reuses the deterministic grammar and checks.
+pub use loops::{parse_create_args, validate_parsed};
 pub use nudge::NudgeScheduler;
 pub use status_bus::{StatusBus, StatusChanged};
 pub use surface::{ApprovalSurface, ComposedSurface};

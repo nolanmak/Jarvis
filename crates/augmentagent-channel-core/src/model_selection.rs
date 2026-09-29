@@ -70,6 +70,21 @@ pub fn runtime_profile_enabled(kind: ProviderKind) -> bool {
     std::env::var(flag).ok().as_deref() == Some("1")
 }
 
+/// A Discord channel ID (digits), or (#1292) a transport-neutral
+/// conversation storage key (`v1|<len>:<platform>|…`, as
+/// `SurfaceConversationRef::storage_key` writes it): printable ASCII from a
+/// narrow set, bounded, never a path or free text.
+fn valid_conversation_key(id: &str) -> bool {
+    let discord = !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_digit());
+    let surface = id.starts_with("v1|")
+        && id.len() <= 256
+        && id.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'|' | b':' | b'.' | b'/' | b'_' | b'-')
+        })
+        && !id.contains("..");
+    discord || surface
+}
+
 struct Lock(std::fs::File);
 impl Drop for Lock {
     fn drop(&mut self) {
@@ -84,6 +99,20 @@ pub struct SelectionStore {
 }
 
 tokio::task_local! { pub static SELECTED_PROFILE: Option<ProviderKind>; }
+
+tokio::task_local! {
+    /// #1292 — the model selection a surface turn resolved for its own
+    /// conversation (Slack keys it by the transport-neutral conversation,
+    /// not a Discord channel). The query handler uses it on the legacy
+    /// (non-native) route in place of a Discord channel lookup.
+    pub static CONVERSATION_SELECTION: Option<ProviderKind>;
+}
+
+/// `Some(selection)` inside a surface turn that resolved one (the inner
+/// `None` meaning "no selection: use the route"), `None` outside.
+pub fn conversation_selection() -> Option<Option<ProviderKind>> {
+    CONVERSATION_SELECTION.try_with(|selected| *selected).ok()
+}
 
 pub fn current() -> anyhow::Result<Option<ProviderKind>> {
     match SELECTED_PROFILE.try_with(|profile| *profile) {
@@ -168,10 +197,7 @@ impl SelectionStore {
             })
             .transpose()?;
         if let Some(id) = conversation {
-            anyhow::ensure!(
-                !id.is_empty() && id.len() <= 128 && id.chars().all(|c| c.is_ascii_digit()),
-                "invalid conversation id"
-            );
+            anyhow::ensure!(valid_conversation_key(id), "invalid conversation id");
         }
         let _lock = self.lock()?;
         let mut state = State::read(&self.path)?;
@@ -313,6 +339,64 @@ mod tests {
             store.selected(Some("1001")).unwrap(),
             Some(ProviderKind::Codex)
         );
+    }
+
+    /// #1292 — a Slack conversation is keyed by its transport-neutral storage
+    /// key, never a Discord snowflake; both live in the same file.
+    #[test]
+    fn surface_conversation_keys_persist_beside_discord_channel_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("selection.json");
+        let store = SelectionStore::new(&path);
+        let slack = "v1|5:slack|14:team:T00000001|9:D00000001|N";
+        let thread =
+            "v1|5:slack|31:enterprise:E00000001/team:T00000001|9:C00000001|S17:1700000100.000100";
+        store.set(Some(slack), Some(ProviderKind::Codex)).unwrap();
+        store.set(Some(thread), Some(ProviderKind::Qwen)).unwrap();
+        store.set(Some("123"), Some(ProviderKind::Claude)).unwrap();
+        let restarted = SelectionStore::new(&path);
+        assert_eq!(
+            restarted.selected(Some(slack)).unwrap(),
+            Some(ProviderKind::Codex)
+        );
+        assert_eq!(
+            restarted.selected(Some(thread)).unwrap(),
+            Some(ProviderKind::Qwen)
+        );
+        assert_eq!(
+            restarted.selected(Some("123")).unwrap(),
+            Some(ProviderKind::Claude)
+        );
+        assert_eq!(restarted.describe(slack).unwrap().1, "conversation");
+        for bad in [
+            "",
+            "not a key",
+            "slack|D1",
+            "v1|../../x y",
+            &format!("v1|{}", "9".repeat(300)),
+        ] {
+            assert!(
+                store.set(Some(bad), Some(ProviderKind::Codex)).is_err(),
+                "{bad:?}"
+            );
+        }
+        store.set(Some(slack), None).unwrap();
+        assert_eq!(store.selected(Some(slack)).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_surface_turn_carries_its_conversation_selection_to_the_legacy_route() {
+        assert_eq!(conversation_selection(), None);
+        CONVERSATION_SELECTION
+            .scope(Some(ProviderKind::Qwen), async {
+                assert_eq!(conversation_selection(), Some(Some(ProviderKind::Qwen)));
+            })
+            .await;
+        CONVERSATION_SELECTION
+            .scope(None, async {
+                assert_eq!(conversation_selection(), Some(None));
+            })
+            .await;
     }
 
     #[test]

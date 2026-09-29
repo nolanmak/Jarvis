@@ -38,8 +38,19 @@
 //! * **Generated files.** `ATTACH:` markers in the answer are validated
 //!   against the wiki root with Discord's rules and sent as Slack uploads.
 //!
-//! Not here: interactions and approval cards (#1289), owner commands such as
-//! model selection (#1292), notifications (#1295).
+//! **Model.** The provider for a conversation without a session comes from
+//! [`ProviderSelection`] (in `serve`, `commands::slack_selection`: the
+//! conversation's own `model` choice, its channel's, then the daemon
+//! default). A conversation already bound to a native session keeps that
+//! session's provider: a `model` choice that conflicts is refused by the
+//! command until `reset`, and an inherited one (channel or default) never
+//! breaks a bound conversation. The resolved choice is also handed to the
+//! agent as `model_selection::CONVERSATION_SELECTION`, which the query
+//! handler uses on the legacy (non-native) route instead of a Discord
+//! channel lookup.
+//!
+//! Not here: interactions and approval cards (#1289), owner commands
+//! (#1292, `commands`), notifications (#1295).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,6 +58,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use augmentagent_approval_discord::attachments::extract_attach_markers;
 use augmentagent_approval_discord::{AuditCtx, QueryHandler};
+use augmentagent_channel_core::model_selection::CONVERSATION_SELECTION;
 use augmentagent_channel_core::providers::ProviderKind;
 use augmentagent_channel_core::surface_turn::{
     run_surface_turn, SurfaceTurnOutcome, SurfaceTurnRequest, TURN_ENV,
@@ -79,8 +91,9 @@ pub const FINISHED_BEFORE_RESTART_REPLY: &str = "This request finished just befo
 /// The conversation's native session was left mid-turn by a provider
 /// failure (#1220 semantics): it is not continued automatically.
 pub const SESSION_UNCERTAIN_REPLY: &str = "An earlier request here stopped part-way inside the \
-     agent, so I won't continue this conversation automatically. Start a new thread (or a new \
-     top-level message in the control channel) to go on.";
+     agent, so I won't continue this conversation automatically. Send `reset` to start a new \
+     session here, or start a new thread (or a new top-level message in the control channel) to \
+     go on.";
 
 /// Picks the provider for a conversation without a bound session: the
 /// owner's model selection. `None` means the default (Claude).
@@ -206,24 +219,31 @@ impl SlackTurnHandler for SlackConversationHarness {
             .map(|dir| (SLACK_INBOUND_DIR_ENV.to_string(), dir.to_string()))
             .collect();
         let cwd = self.wiki_root.to_string_lossy().into_owned();
-        let selection = Arc::clone(&self.selection);
+        // A bound conversation continues its own session's provider.
+        let selected = match self.store.surface_conversation(session)? {
+            Some(_) => None,
+            None => (self.selection)(session)?,
+        };
         let outcome = TURN_ENV
             .scope(
                 env,
-                run_surface_turn(
-                    &self.store,
-                    SurfaceTurnRequest {
-                        turn: &claim,
-                        history: "",
-                        current: turn.prompt.trim(),
-                        cwd: &cwd,
-                    },
-                    || selection(session),
-                    Some(&turn.cancel),
-                    |prompt| {
-                        let ctx = &ctx;
-                        async move { self.agent.answer(ctx, &prompt).await }
-                    },
+                CONVERSATION_SELECTION.scope(
+                    selected,
+                    run_surface_turn(
+                        &self.store,
+                        SurfaceTurnRequest {
+                            turn: &claim,
+                            history: "",
+                            current: turn.prompt.trim(),
+                            cwd: &cwd,
+                        },
+                        || Ok(selected),
+                        Some(&turn.cancel),
+                        |prompt| {
+                            let ctx = &ctx;
+                            async move { self.agent.answer(ctx, &prompt).await }
+                        },
+                    ),
                 ),
             )
             .await;

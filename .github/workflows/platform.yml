@@ -185,6 +185,19 @@ jobs:
           cargo test -p augmentagent-store --test daemon_runtime_report
           cargo test -p augmentagent-channel-slack --test upgrade_state
           cargo test -p augmentagent-cli --test slack_ops_cli --test runbook_commands --test status_schema
+      # #1292 — Discord's owner commands on Slack: the shared registry
+      # against Discord's dispatcher (every command mapped or a named
+      # blocker), parse/authorize/execute/persist/reply per command, the
+      # private command lane, reset (new native session), cancel all,
+      # per-conversation model selection across restart, loop delivery to a
+      # Slack destination on a paused clock, and the process walker.
+      - name: Slack owner commands
+        run: |
+          cargo test -p augmentagent-store --test surface_commands
+          cargo test -p augmentagent-channel-core --lib -- model_selection::
+          cargo test -p augmentagent-approval-discord --test owner_command_registry
+          cargo test -p augmentagent-channel-slack --test owner_commands --test owner_commands_surface --test surface_contract
+          cargo test -p augmentagent-cli --bin augmentagent -- slack_serve::
       - name: Host-dependent CLI surface
         run: >-
           cargo test -p augmentagent-cli --bin augmentagent --

@@ -3289,6 +3289,17 @@ async fn main() -> Result<()> {
             // app and a bound owner (`augmentagent slack app …`), and it is
             // supervised so a Slack failure never ends `serve`. Status reads
             // its live health; AUGMENTAGENT_SLACK_INTERACTIVE=0 turns it off.
+            // #1292 — Slack owner commands and Slack loop delivery need a
+            // ready Slack plan (an installed app and a bound owner).
+            let slack_ready = matches!(slack_plan, Some(slack_serve::Plan::Ready { .. }));
+            let slack_commands = if slack_ready {
+                Some(slack_serve::slack_commands(
+                    Arc::clone(&store),
+                    slack_command_deps(&cli).await,
+                ))
+            } else {
+                None
+            };
             {
                 let store_q = Arc::clone(&store);
                 let wiki_root = cli.wiki_dir.clone();
@@ -3317,6 +3328,7 @@ async fn main() -> Result<()> {
                         }
                     },
                     slack_approvals,
+                    slack_commands,
                     dry_run,
                     shutdown.clone(),
                 ));
@@ -3492,21 +3504,48 @@ async fn main() -> Result<()> {
                 // a bot token (for the post-back HTTP client) and a wiki dir
                 // (the reasoner toolbelt is scoped to it); skips with a log
                 // otherwise. Gated on !dry_run alongside the other schedulers.
+                // #1292 — also for Slack loops (a ready Slack plan): output
+                // is routed by each loop's destination, and a loop whose
+                // surface this daemon does not serve is not run at all.
                 match (
                     std::env::var("DISCORD_BOT_TOKEN").ok(),
                     cli.wiki_dir.clone(),
                 ) {
-                    (Some(token), Some(wiki_root)) => {
+                    (token, Some(wiki_root)) if token.is_some() || slack_ready => {
+                        use augmentagent_channel_slack::commands::{
+                            SlackLoopPoster, SurfaceGatedRunner, SurfaceLoopPoster,
+                        };
                         let repo_root = std::env::current_dir()
                             .unwrap_or_else(|_| PathBuf::from("."));
-                        let runner = Arc::new(LoopReasonerRunner {
-                            reasoner: build_reasoner(),
-                            wiki_root,
-                            repo_root,
-                            allowed_owner_id: std::env::var("DISCORD_ALLOWED_USER_ID").ok(),
+                        let inner: Arc<dyn LoopRunner> = match slack_serve::test_loop_runner(
+                            std::env::var(slack_serve::TEST_REPLY_ENV).ok().as_deref(),
+                        ) {
+                            Some(stub) => {
+                                warn!("{} is set: loop prompts are answered by a stand-in, not the reasoner (debug build, local QA only)", slack_serve::TEST_REPLY_ENV);
+                                stub
+                            }
+                            None => Arc::new(LoopReasonerRunner {
+                                reasoner: build_reasoner(),
+                                wiki_root,
+                                repo_root,
+                                allowed_owner_id: std::env::var("DISCORD_ALLOWED_USER_ID").ok(),
+                            }),
+                        };
+                        let runner = Arc::new(SurfaceGatedRunner {
+                            inner,
+                            slack: slack_ready,
+                            discord: token.is_some(),
                         });
-                        let poster = Arc::new(DiscordLoopPoster {
-                            http: Arc::new(serenity::http::Http::new(&token)),
+                        let poster = Arc::new(SurfaceLoopPoster {
+                            slack: slack_ready.then(|| {
+                                Arc::new(SlackLoopPoster::new(Arc::clone(&store)))
+                                    as Arc<dyn LoopPoster>
+                            }),
+                            other: token.map(|token| {
+                                Arc::new(DiscordLoopPoster {
+                                    http: Arc::new(serenity::http::Http::new(&token)),
+                                }) as Arc<dyn LoopPoster>
+                            }),
                         });
                         let loops = Arc::new(LoopScheduler::new(
                             Arc::clone(&store),
@@ -3518,7 +3557,7 @@ async fn main() -> Result<()> {
                     }
                     _ => {
                         info!(
-                            "/loop scheduler disabled (needs DISCORD_BOT_TOKEN                              + --wiki-dir)"
+                            "/loop scheduler disabled (needs --wiki-dir and DISCORD_BOT_TOKEN or a ready Slack app)"
                         );
                     }
                 }
@@ -9983,7 +10022,19 @@ impl QueryHandler for WikiQuerier {
             let selected = match augmentagent_channel_core::native_session::CURRENT
                 .try_with(|session| session.provider()) {
                 Ok(provider) => Some(provider),
-                Err(_) => store.selected(ctx.channel_id.as_ref().map(|channel| channel.get().to_string()).as_deref())?,
+                // #1292 — a surface turn (Slack) resolved its own
+                // conversation's selection; Discord keeps the channel lookup.
+                Err(_) => {
+                    match augmentagent_channel_core::model_selection::conversation_selection() {
+                        Some(selected) => selected,
+                        None => store.selected(
+                            ctx.channel_id
+                                .as_ref()
+                                .map(|channel| channel.get().to_string())
+                                .as_deref(),
+                        )?,
+                    }
+                }
             };
             augmentagent_channel_core::model_selection::SELECTED_PROFILE
                 .scope(selected, self.reasoner.call_transcript(&opts, &prompt)).await
@@ -14350,29 +14401,7 @@ async fn start_discord_broker(
     // #428 — `!journal` write-back bridge. Present iff SHADOWNOTE_* config
     // exists (keyring/env); without it the command replies with the
     // not-configured notice and the daemon is otherwise unaffected.
-    let journal_ops: Option<Arc<dyn augmentagent_approval_discord::JournalOps>> =
-        match augmentagent_channel_journal::JournalRuntime::from_env().await {
-            Ok(Some(runtime)) => {
-                let wiki_schema = cli
-                    .wiki_dir
-                    .as_ref()
-                    .and_then(|_| std::fs::read_to_string("schema/wiki-skill.md").ok());
-                Some(Arc::new(CliJournalOps {
-                    runtime,
-                    reasoner: Arc::clone(reasoner),
-                    wiki_root: cli.wiki_dir.clone(),
-                    wiki_schema,
-                }))
-            }
-            Ok(None) => {
-                info!("!journal write-back disabled: SHADOWNOTE_* config not present");
-                None
-            }
-            Err(e) => {
-                warn!("!journal write-back disabled: {e:#}");
-                None
-            }
-        };
+    let journal_ops = journal_ops_from_env(cli, reasoner).await;
     let loop_parser: Option<Arc<dyn augmentagent_approval_discord::LoopCommandParser>> = Some(
         Arc::new(LoopReasonerParser {
             reasoner: Arc::clone(reasoner),
@@ -14393,6 +14422,53 @@ async fn start_discord_broker(
     })
     .await
     .context("start discord broker")
+}
+
+/// #428 — the `!journal` write-back bridge, present iff SHADOWNOTE_* config
+/// exists (keyring/env). Shared by Discord and (#1292) Slack's `journal`.
+async fn journal_ops_from_env(
+    cli: &Cli,
+    reasoner: &Arc<FallbackReasoner>,
+) -> Option<Arc<dyn augmentagent_approval_discord::JournalOps>> {
+    match augmentagent_channel_journal::JournalRuntime::from_env().await {
+        Ok(Some(runtime)) => {
+            let wiki_schema = cli
+                .wiki_dir
+                .as_ref()
+                .and_then(|_| std::fs::read_to_string("schema/wiki-skill.md").ok());
+            Some(Arc::new(CliJournalOps {
+                runtime,
+                reasoner: Arc::clone(reasoner),
+                wiki_root: cli.wiki_dir.clone(),
+                wiki_schema,
+            }))
+        }
+        Ok(None) => {
+            info!("!journal write-back disabled: SHADOWNOTE_* config not present");
+            None
+        }
+        Err(e) => {
+            warn!("!journal write-back disabled: {e:#}");
+            None
+        }
+    }
+}
+
+/// #1292 — what Slack's owner commands need from the daemon: the model
+/// selection file and the same readiness check `/model` uses, the
+/// model-backed loop parser, the journal bridge and the real process walker.
+async fn slack_command_deps(cli: &Cli) -> augmentagent_channel_slack::commands::SlackCommandDeps {
+    let reasoner = build_reasoner();
+    let mut deps = augmentagent_channel_slack::commands::SlackCommandDeps::new(
+        augmentagent_channel_core::model_selection::config_path(),
+    );
+    let ready = Arc::clone(&reasoner);
+    deps.model_ready = Arc::new(move |profile| model_profile_ready(&ready, profile));
+    deps.loop_parser = Some(Arc::new(LoopReasonerParser {
+        reasoner: Arc::clone(&reasoner),
+    }));
+    deps.journal = journal_ops_from_env(cli, &reasoner).await;
+    deps
 }
 
 fn build_channel(

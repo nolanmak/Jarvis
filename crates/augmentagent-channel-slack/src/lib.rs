@@ -20,6 +20,8 @@ pub mod app;
 pub mod approvals;
 pub mod auth;
 pub mod channel;
+// #1292 — Discord's owner commands on Slack (`/jarvis <command>`).
+pub mod commands;
 // #1290 — approved replies and new messages to Slack contacts.
 pub mod contact;
 pub mod delivery;
