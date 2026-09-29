@@ -93,6 +93,7 @@ mod setup;
 mod slack_app;
 mod slack_deliver;
 mod slack_files;
+mod slack_serve;
 mod status;
 
 #[derive(Parser)]
@@ -2734,7 +2735,20 @@ async fn main() -> Result<()> {
             dry_run,
             no_email,
         } => {
-            let (broker, approver) = build_broker(&cli, Arc::clone(&store), dry_run).await?;
+            // #1287 — a Discord configuration error must not stop the
+            // surfaces that are configured (Slack alone, for one): report it
+            // and run without the Discord approval broker, as an unset
+            // DISCORD_BOT_TOKEN already does.
+            let (broker, approver) = match build_broker(&cli, Arc::clone(&store), dry_run).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::error!(
+                        "discord approval broker disabled: {e:#}. Other surfaces keep running; \
+                         fix the Discord settings and restart the daemon."
+                    );
+                    (Arc::new(NoopBroker) as Arc<dyn ApprovalBroker>, None)
+                }
+            };
             // Default (no_email=false) keeps the exact prod path: build + `?`
             // propagate + unconditional spawn. `--no-email true` makes a
             // tenant agent that runs Discord/GitHub/Meetup/Drive only.
@@ -3171,6 +3185,37 @@ async fn main() -> Result<()> {
                 );
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { slack_digest.run(sd).await }));
+            }
+            // #1287 — interactive Slack surface: Socket Mode listener, owner
+            // gate and immediate turns. Independent of the Composio poll
+            // channel and digest above (their cadence and budgets are
+            // untouched) and of Discord/WhatsApp: it needs only an installed
+            // app and a bound owner (`augmentagent slack app …`), and it is
+            // supervised so a Slack failure never ends `serve`. Status reads
+            // its live health; AUGMENTAGENT_SLACK_INTERACTIVE=0 turns it off.
+            {
+                let store_q = Arc::clone(&store);
+                let wiki_root = cli.wiki_dir.clone();
+                tasks.push(slack_serve::spawn(
+                    Arc::clone(&store),
+                    move || -> Arc<dyn augmentagent_channel_slack::interactive::SlackTurnHandler> {
+                        match wiki_root {
+                            Some(root) => Arc::new(slack_serve::QueryTurnHandler {
+                                query: Arc::new(wiki_querier(
+                                    build_reasoner(),
+                                    root,
+                                    std::env::current_dir()
+                                        .unwrap_or_else(|_| PathBuf::from(".")),
+                                    store_q,
+                                    false,
+                                )),
+                            }),
+                            None => Arc::new(slack_serve::NoQueryHandler),
+                        }
+                    },
+                    dry_run,
+                    shutdown.clone(),
+                ));
             }
             if let Some(gh) = github_ch {
                 let sd = shutdown.clone();
@@ -9568,6 +9613,30 @@ struct WikiQuerier {
     final_spoken_turns: dashmap::DashMap<String, ()>,
 }
 
+/// The query handler Discord's query channel answers with. Also what the
+/// interactive Slack surface (#1287) answers owner messages with, through
+/// `slack_serve::QueryTurnHandler`, so both surfaces share one query path.
+fn wiki_querier(
+    reasoner: Arc<FallbackReasoner>,
+    wiki_root: PathBuf,
+    repo_root: PathBuf,
+    store: Arc<Store>,
+    voice_enabled: bool,
+) -> WikiQuerier {
+    WikiQuerier {
+        reasoner,
+        wiki_root,
+        repo_root,
+        conversation_store: Some(store),
+        conversation_scheduler: Arc::new(
+            augmentagent_approval_discord::conversation::ConversationScheduler::new(),
+        ),
+        voice_enabled,
+        voice_tools: std::sync::OnceLock::new(),
+        final_spoken_turns: dashmap::DashMap::new(),
+    }
+}
+
 /// #389 — Owner rules travel with EVERY query-mode prompt, injected at
 /// request time rather than left for the model to (maybe) read.
 ///
@@ -13840,17 +13909,13 @@ async fn build_broker(
 
     let repo_root = std::env::current_dir().context("current_dir")?;
     let query_handler: Option<Arc<dyn QueryHandler>> = cli.wiki_dir.as_ref().map(|root| {
-        let q = WikiQuerier {
-            reasoner: Arc::clone(&reasoner),
-            wiki_root: root.clone(),
-            repo_root: repo_root.clone(),
-            conversation_store: Some(Arc::clone(&store)),
-            conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()),
+        Arc::new(wiki_querier(
+            Arc::clone(&reasoner),
+            root.clone(),
+            repo_root.clone(),
+            Arc::clone(&store),
             voice_enabled,
-            voice_tools: std::sync::OnceLock::new(),
-            final_spoken_turns: dashmap::DashMap::new(),
-        };
-        Arc::new(q) as Arc<dyn QueryHandler>
+        )) as Arc<dyn QueryHandler>
     });
 
     // Approval action handler: needs Composio for send/delete/create_draft,
