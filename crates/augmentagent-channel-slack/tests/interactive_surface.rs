@@ -466,6 +466,12 @@ async fn owner_dm_begins_handling_within_one_second_and_the_answer_is_posted() {
     assert_eq!(post.channel, DM);
     assert_eq!(post.text, "answer: what is on today?");
     assert_eq!(post.thread_ts, None, "a top-level DM is answered top-level");
+    // Delivered by the shared outbox dispatcher (#1294), which tags every
+    // post with its idempotency key so an uncertain send can be reconciled.
+    assert_eq!(
+        post.metadata.as_ref().unwrap()["event_payload"]["idempotency_key"],
+        json!(format!("turn:{DM}:1700000000.000100:text:0"))
+    );
     eventually("event handled", || {
         h.inbound_status(&format!("{DM}:1700000000.000100")) == "handled"
     })
@@ -725,8 +731,9 @@ async fn restart_after_the_answer_was_queued_sends_it_without_a_second_turn() {
              VALUES ('slack', 'team:T00000001', ?1, '', ?2, 'post', ?3, 5, 0, 0, 0)",
             rusqlite::params![
                 DM,
-                format!("turn:{event_id}"),
-                json!({"channel": DM, "text": "answer: queued before the crash"}).to_string()
+                // The shared outbox dispatcher's key and payload (#1294).
+                format!("turn:{event_id}:text:0"),
+                json!({"text": "answer: queued before the crash", "part": 1, "parts": 1}).to_string()
             ],
         )
         .unwrap();

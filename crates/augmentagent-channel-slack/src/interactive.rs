@@ -45,15 +45,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Context as _;
 use async_trait::async_trait;
 use augmentagent_store::delivery::{
-    ClaimedInbound, InboundRecordOutcome, NewInboundEvent, NewOutboundSend, OutboundOperation,
-    OutboundSend, RetryPolicy,
+    ClaimedInbound, InboundRecordOutcome, NewInboundEvent, RetryPolicy,
 };
 use augmentagent_store::surface_health::SurfaceListenerHealth;
 use augmentagent_store::{
     Store, StoreResult, SurfaceAccountRef, SurfaceConversationRef, SurfaceOwnerRef,
     SurfacePlatform,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -71,7 +69,8 @@ use crate::transport::socket::{
     Ack, ConnectionState, HandoffError, SlackDelivery, SlackEventSink, SocketConnector,
     SocketModeClient, SocketModeConfig,
 };
-use crate::transport::web::{PostEphemeral, PostMessage, SlackWebApi, WebApiError};
+use crate::delivery::{enqueue_answer, Answer, DispatchOutcome, PlanOptions, SlackOutboxDispatcher};
+use crate::transport::web::{PostEphemeral, SlackWebApi};
 
 /// A report older than this means the daemon that wrote it stopped.
 pub const STALE_AFTER: Duration = Duration::from_secs(60);
@@ -590,33 +589,21 @@ fn inbound_record(e: &EventEnvelope, now_ms: i64) -> anyhow::Result<NewInboundEv
 }
 
 // ---------------------------------------------------------------------------
-// Outbound payload
+// Where replies go
 // ---------------------------------------------------------------------------
-
-/// What the sender needs to make one Slack call. Stored in the outbox.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OutboundText {
-    pub channel: String,
-    pub text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thread_ts: Option<String>,
-    /// Set for an ephemeral message only this user sees.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ephemeral_user: Option<String>,
-}
 
 fn is_dm(channel: &str, channel_type: Option<&str>) -> bool {
     channel_type == Some("im") || channel.starts_with('D')
 }
 
 /// Where an owner turn's answer goes: the same DM (in its thread, if the
-/// message was in one), or a thread under the message in a channel.
-fn answer_target(
+/// message was in one), or a thread under the message in a channel. The
+/// shared outbox dispatcher posts to the conversation's channel and thread.
+fn answer_conversation(
     account: &SurfaceAccountRef,
     input: &OwnerInput,
     envelope: &EventEnvelope,
-    text: String,
-) -> Option<(SurfaceConversationRef, OutboundText)> {
+) -> Option<SurfaceConversationRef> {
     let (channel, thread) = match &envelope.event {
         SlackEvent::Message(m) | SlackEvent::ThreadReply(m) | SlackEvent::AppMention(m) => {
             let thread = match thread_of(m) {
@@ -636,21 +623,23 @@ fn answer_target(
         ),
         _ => return None,
     };
-    let conversation =
-        SurfaceConversationRef::new(account.clone(), channel.clone(), thread.clone()).ok()?;
-    Some((
-        conversation,
-        OutboundText {
-            channel,
-            text,
-            thread_ts: thread,
-            ephemeral_user: None,
-        },
-    ))
+    SurfaceConversationRef::new(account.clone(), channel, thread).ok()
 }
 
-/// Where a rejection goes: back into a DM, or ephemeral to the sender.
-fn rejection_target(envelope: &EventEnvelope, text: &str) -> Option<OutboundText> {
+/// How a rejection reaches the person who was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RejectionReply {
+    /// A normal post in their DM with the app, through the outbox.
+    InDm,
+    /// Visible only to them, in the channel (and thread) they wrote in.
+    Ephemeral {
+        channel: String,
+        user: String,
+        thread_ts: Option<String>,
+    },
+}
+
+fn rejection_reply(envelope: &EventEnvelope) -> Option<RejectionReply> {
     let (channel, user, channel_type, thread) = match &envelope.event {
         SlackEvent::Message(m) | SlackEvent::ThreadReply(m) | SlackEvent::AppMention(m) => (
             m.channel.clone(),
@@ -665,12 +654,14 @@ fn rejection_target(envelope: &EventEnvelope, text: &str) -> Option<OutboundText
     if channel.is_empty() || user.is_empty() {
         return None;
     }
-    let dm = is_dm(&channel, channel_type.as_deref());
-    Some(OutboundText {
-        channel,
-        text: text.to_string(),
-        thread_ts: thread,
-        ephemeral_user: (!dm).then_some(user),
+    Some(if is_dm(&channel, channel_type.as_deref()) {
+        RejectionReply::InDm
+    } else {
+        RejectionReply::Ephemeral {
+            channel,
+            user,
+            thread_ts: thread,
+        }
     })
 }
 
@@ -684,11 +675,14 @@ fn turn_text(event: &SlackEvent) -> String {
     }
 }
 
-fn turn_key(event_id: &str) -> String {
-    format!("turn:{event_id}")
+/// Turn ID of an owner turn's answer on the outbox: the event identity, so
+/// a replay re-plans the same keys (`turn:<event_id>:text:<n>`).
+fn answer_turn_id(event_id: &str) -> String {
+    event_id.to_string()
 }
 
-fn reject_key(event_id: &str) -> String {
+/// Turn ID of a rejection posted in a DM.
+fn rejection_turn_id(event_id: &str) -> String {
     format!("reject:{event_id}")
 }
 
@@ -939,22 +933,26 @@ fn release(ctx: &Ctx, seq: i64, why: &str) {
     }
 }
 
+/// Queue `markdown` as one answer on the shared outbox (#1294): converted
+/// to mrkdwn, split, keyed by `turn_id`, delivered by
+/// [`SlackOutboxDispatcher`] (or recorded, in dry-run).
 fn enqueue(
     ctx: &Ctx,
-    conversation: SurfaceConversationRef,
-    key: String,
-    body: &OutboundText,
+    conversation: &SurfaceConversationRef,
+    turn_id: &str,
+    markdown: &str,
 ) -> anyhow::Result<()> {
-    let payload = serde_json::to_string(body)?;
-    ctx.store.enqueue_outbound_send(
-        &NewOutboundSend {
-            conversation,
-            idempotency_key: key,
-            operation: OutboundOperation::Post,
-            target_message_id: None,
-            payload,
+    enqueue_answer(
+        &ctx.store,
+        conversation,
+        &Answer {
+            turn_id,
+            markdown,
+            files: &[],
+        },
+        &PlanOptions {
             max_attempts: ctx.config.max_send_attempts,
-            interaction_expires_at_ms: None,
+            ..PlanOptions::default()
         },
         ctx.now(),
     )?;
@@ -998,17 +996,18 @@ async fn process(ctx: &Ctx, claimed: ClaimedInbound, shutdown: &CancellationToke
     // A replay whose answer was already queued: let the sender deliver it
     // and do not run the turn a second time.
     if claimed.attempt > 1 {
+        let prefix = format!("turn:{}:", answer_turn_id(&claimed.event_id));
         match ctx
             .store
-            .outbound_send_by_key(&account, &turn_key(&claimed.event_id))
+            .outbound_sends_with_key_prefix(&account, &prefix, &[])
         {
-            Ok(Some(_)) => {
+            Ok(parts) if !parts.is_empty() => {
                 info!(seq, "slack interactive: replayed event already answered");
                 settle(ctx, seq);
                 ctx.send_wake.notify_one();
                 return;
             }
-            Ok(None) => {}
+            Ok(_) => {}
             Err(e) => {
                 release(ctx, seq, &format!("store: {e}"));
                 return;
@@ -1039,16 +1038,26 @@ async fn process(ctx: &Ctx, claimed: ClaimedInbound, shutdown: &CancellationToke
         }
         AdmitOutcome::Rejected { reason, reply, .. } => {
             info!(seq, reason = reason.as_str(), "slack interactive: rejected");
-            if let Some(body) = reply.and_then(|text| rejection_target(&envelope, text)) {
-                if let Err(e) = enqueue(
-                    ctx,
-                    claimed.conversation.clone(),
-                    reject_key(&claimed.event_id),
-                    &body,
-                ) {
-                    release(ctx, seq, &format!("enqueue rejection: {e}"));
-                    return;
+            let target = reply.and_then(|text| rejection_reply(&envelope).map(|r| (text, r)));
+            match target {
+                Some((text, RejectionReply::InDm)) => {
+                    let turn = rejection_turn_id(&claimed.event_id);
+                    if let Err(e) = enqueue(ctx, &claimed.conversation, &turn, text) {
+                        release(ctx, seq, &format!("enqueue rejection: {e}"));
+                        return;
+                    }
                 }
+                // Ephemeral messages never appear in history, so the outbox
+                // could not reconcile one; they go straight to the Web API.
+                Some((
+                    text,
+                    RejectionReply::Ephemeral {
+                        channel,
+                        user,
+                        thread_ts,
+                    },
+                )) => post_ephemeral(ctx, &account, channel, user, thread_ts, text).await,
+                None => {}
             }
             settle(ctx, seq);
         }
@@ -1101,9 +1110,10 @@ async fn run_turn(
             TURN_FAILED_REPLY.to_string()
         }
     };
-    match answer_target(&account, &input, &envelope, text) {
-        Some((conversation, body)) => {
-            if let Err(e) = enqueue(ctx, conversation, turn_key(&claimed.event_id), &body) {
+    match answer_conversation(&account, &input, &envelope) {
+        Some(conversation) => {
+            let turn = answer_turn_id(&claimed.event_id);
+            if let Err(e) = enqueue(ctx, &conversation, &turn, &text) {
                 warn!(seq, error = %e, "slack interactive: could not queue the answer");
                 release(ctx, seq, &format!("enqueue answer: {e}"));
                 return;
@@ -1120,22 +1130,15 @@ async fn run_turn(
 
 async fn send_loop(ctx: Arc<Ctx>, shutdown: CancellationToken) {
     loop {
-        loop {
+        for runtime in ctx.workspaces.values() {
             if shutdown.is_cancelled() {
                 return;
             }
-            let send = match ctx
-                .store
-                .claim_next_outbound_send_for(&ctx.platform, ctx.now())
-            {
-                Ok(Some(s)) => s,
-                Ok(None) => break,
-                Err(e) => {
-                    warn!(error = %e, "slack interactive: outbox claim failed");
-                    break;
-                }
-            };
-            deliver(&ctx, send).await;
+            if ctx.config.dry_run {
+                record_dry_run(&ctx, runtime);
+            } else {
+                drain(&ctx, runtime).await;
+            }
         }
         tokio::select! {
             _ = shutdown.cancelled() => return,
@@ -1145,49 +1148,43 @@ async fn send_loop(ctx: Arc<Ctx>, shutdown: CancellationToken) {
     }
 }
 
-fn retryable(e: &WebApiError) -> bool {
-    match e {
-        WebApiError::Timeout
-        | WebApiError::Cancelled
-        | WebApiError::RateLimited { .. }
-        | WebApiError::Transport(_) => true,
-        WebApiError::Http { status, .. } => *status >= 500 || *status == 429,
-        WebApiError::Slack { error, .. } => matches!(
-            error.as_str(),
-            "ratelimited" | "service_unavailable" | "internal_error" | "fatal_error"
-                | "request_timeout"
-        ),
-        WebApiError::Json(_) | WebApiError::Unsupported(_) => false,
+/// Deliver this workspace's due sends with the shared dispatcher, which
+/// also reconciles uncertain sends and settles broken turns.
+async fn drain(ctx: &Ctx, runtime: &SlackWorkspaceRuntime) {
+    let dispatcher = SlackOutboxDispatcher::new(&ctx.store, runtime.web.as_ref(), &runtime.workspace)
+        .with_retry_policy(ctx.config.retry);
+    match dispatcher.drain(ctx.now()).await {
+        Ok(done) => {
+            for d in done {
+                match d.outcome {
+                    DispatchOutcome::Sent { .. } | DispatchOutcome::Reconciled { .. } => {
+                        ctx.health.sent(ctx.now())
+                    }
+                    ref other => debug!(key = %d.idempotency_key, outcome = ?other, "slack interactive: send not delivered yet"),
+                }
+            }
+        }
+        Err(e) => warn!(error = %e, "slack interactive: outbox drain failed"),
     }
 }
 
-async fn deliver(ctx: &Ctx, send: OutboundSend) {
-    let fail = |error: &str, retry: bool| {
-        if let Err(e) = ctx.store.mark_outbound_failed(
-            send.id,
-            error,
-            retry,
-            &ctx.config.retry,
-            ctx.now(),
-        ) {
-            warn!(id = send.id, error = %e, "slack interactive: could not record send failure");
-        }
-    };
-    let body: OutboundText = match serde_json::from_str(&send.payload) {
-        Ok(b) => b,
-        Err(e) => return fail(&format!("unreadable payload: {e}"), false),
-    };
-    let team = SlackWorkspace::from_account(send.conversation.account())
-        .map(|w| w.team_id().to_string())
-        .unwrap_or_default();
-    let Some(runtime) = ctx.workspaces.get(&team) else {
-        return fail("no installed Slack workspace for this send", false);
-    };
-    if ctx.config.dry_run {
+/// Dry run: settle this workspace's due sends as `sent` with a `dry-run:`
+/// provider ID and call nothing.
+fn record_dry_run(ctx: &Ctx, runtime: &SlackWorkspaceRuntime) {
+    let account = runtime.workspace.account();
+    loop {
+        let send = match ctx.store.claim_next_outbound_send_for(&account, ctx.now()) {
+            Ok(Some(s)) => s,
+            Ok(None) => return,
+            Err(e) => {
+                warn!(error = %e, "slack interactive: outbox claim failed");
+                return;
+            }
+        };
         info!(
             id = send.id,
-            channel = %body.channel,
-            ephemeral = body.ephemeral_user.is_some(),
+            key = %send.idempotency_key,
+            channel = send.conversation.conversation_id(),
             "slack interactive: dry-run, not sending"
         );
         match ctx
@@ -1195,42 +1192,47 @@ async fn deliver(ctx: &Ctx, send: OutboundSend) {
             .mark_outbound_sent(send.id, &format!("dry-run:{}", send.id), ctx.now())
         {
             Ok(()) => ctx.health.sent(ctx.now()),
-            Err(e) => warn!(id = send.id, error = %e, "slack interactive: could not record dry-run send"),
+            Err(e) => {
+                warn!(id = send.id, error = %e, "slack interactive: could not record dry-run send");
+                return;
+            }
         }
+    }
+}
+
+/// An ephemeral rejection, straight through the Web API (never in dry-run).
+async fn post_ephemeral(
+    ctx: &Ctx,
+    account: &SurfaceAccountRef,
+    channel: String,
+    user: String,
+    thread_ts: Option<String>,
+    text: &str,
+) {
+    if ctx.config.dry_run {
+        info!(%channel, "slack interactive: dry-run, not posting an ephemeral rejection");
         return;
     }
-    let result = match &body.ephemeral_user {
-        Some(user) => runtime
-            .web
-            .post_ephemeral(PostEphemeral {
-                channel: body.channel.clone(),
-                user: user.clone(),
-                text: body.text.clone(),
-                blocks: None,
-                thread_ts: body.thread_ts.clone(),
-            })
-            .await
-            .map(|ts| format!("ephemeral:{}:{ts}", body.channel)),
-        None => runtime
-            .web
-            .post_message(PostMessage {
-                channel: body.channel.clone(),
-                text: body.text.clone(),
-                thread_ts: body.thread_ts.clone(),
-                ..PostMessage::default()
-            })
-            .await
-            .map(|posted| format!("{}:{}", posted.channel, posted.ts)),
+    let team = SlackWorkspace::from_account(account)
+        .map(|w| w.team_id().to_string())
+        .unwrap_or_default();
+    let Some(runtime) = ctx.workspaces.get(&team) else {
+        warn!(team = %team, "slack interactive: rejection for a workspace that is not installed");
+        return;
     };
-    match result {
-        Ok(provider_id) => match ctx.store.mark_outbound_sent(send.id, &provider_id, ctx.now()) {
-            Ok(()) => ctx.health.sent(ctx.now()),
-            Err(e) => warn!(id = send.id, error = %e, "slack interactive: could not record send"),
-        },
-        Err(e) => {
-            warn!(id = send.id, error = %e, "slack interactive: send failed");
-            fail(&e.to_string(), retryable(&e));
-        }
+    match runtime
+        .web
+        .post_ephemeral(PostEphemeral {
+            channel,
+            user,
+            text: text.to_string(),
+            blocks: None,
+            thread_ts,
+        })
+        .await
+    {
+        Ok(_) => ctx.health.sent(ctx.now()),
+        Err(e) => warn!(error = %e, "slack interactive: ephemeral rejection failed"),
     }
 }
 

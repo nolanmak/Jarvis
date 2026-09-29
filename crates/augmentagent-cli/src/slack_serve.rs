@@ -82,9 +82,17 @@ pub enum Plan {
     },
     /// Start one surface for these installs (each has a bound owner).
     Ready {
-        installs: Vec<SlackAppCredentials>,
+        installs: Vec<ReadyInstall>,
         api_base: String,
     },
+}
+
+/// An installed workspace with a bound owner.
+pub struct ReadyInstall {
+    pub creds: SlackAppCredentials,
+    /// From the owner binding, so an Enterprise Grid workspace keeps its
+    /// enterprise ID: the account events are recorded and answered under.
+    pub workspace: SlackWorkspace,
 }
 
 fn inactive(
@@ -168,16 +176,24 @@ pub fn plan(
     let mut installs = Vec::new();
     let mut unbound = Vec::new();
     for team in &teams {
-        match find_binding(store, team) {
-            Ok(Some(_)) => {}
+        let workspace = match find_binding(store, team) {
+            Ok(Some(binding)) => match SlackWorkspace::from_account(binding.owner.account()) {
+                Ok(w) => w,
+                Err(e) => {
+                    return app_error(
+                        &SlackAppError::Store(format!("stored Slack owner binding: {e}")),
+                        teams.clone(),
+                    )
+                }
+            },
             Ok(None) => {
                 unbound.push(team.clone());
                 continue;
             }
             Err(e) => return app_error(&e, teams.clone()),
-        }
+        };
         match apps.load(team) {
-            Ok(Some(c)) => installs.push(c),
+            Ok(Some(creds)) => installs.push(ReadyInstall { creds, workspace }),
             Ok(None) => warn!(team = %team, "slack interactive: install index lists a team with no credentials"),
             Err(e) => return app_error(&e, teams.clone()),
         }
@@ -210,7 +226,7 @@ pub fn plan(
 /// one Socket Mode listener per distinct app.
 pub fn build_surface(
     store: Arc<Store>,
-    installs: &[SlackAppCredentials],
+    installs: &[ReadyInstall],
     api_base: &str,
     handler: Arc<dyn SlackTurnHandler>,
     dry_run: bool,
@@ -221,7 +237,7 @@ pub fn build_surface(
     let mut workspaces = Vec::new();
     let mut connectors: Vec<Arc<dyn SocketConnector>> = Vec::new();
     let mut apps_seen: Vec<String> = Vec::new();
-    for c in installs {
+    for ReadyInstall { creds: c, workspace } in installs {
         let web = HttpSlackWebApi::new(
             c.bot_token.clone(),
             WebApiConfig {
@@ -230,7 +246,7 @@ pub fn build_surface(
             },
         )?;
         workspaces.push(SlackWorkspaceRuntime {
-            workspace: SlackWorkspace::new(&c.team_id, None)?,
+            workspace: workspace.clone(),
             web: Arc::new(web) as Arc<dyn SlackWebApi>,
             bot: bot_identity(c),
         });
@@ -321,7 +337,7 @@ pub fn spawn(
             }
             Plan::Ready { installs, api_base } => (installs, api_base),
         };
-        let teams: Vec<String> = installs.iter().map(|c| c.team_id.clone()).collect();
+        let teams: Vec<String> = installs.iter().map(|i| i.creds.team_id.clone()).collect();
         info!(teams = %teams.join(", "), dry_run, "slack interactive surface starting");
         let handler = match test_turn_handler(std::env::var(TEST_REPLY_ENV).ok().as_deref()) {
             Some(stub) => {
@@ -631,13 +647,35 @@ mod tests {
         match plan(Ok(Switch::Auto), &apps, &store, Some("http://127.0.0.1:9")) {
             Plan::Ready { installs, api_base } => {
                 assert_eq!(
-                    installs.iter().map(|c| c.team_id.as_str()).collect::<Vec<_>>(),
+                    installs
+                        .iter()
+                        .map(|i| i.creds.team_id.as_str())
+                        .collect::<Vec<_>>(),
                     [TEAM]
                 );
+                assert_eq!(installs[0].workspace.account().account_id(), "team:T00000001");
                 assert_eq!(api_base, "http://127.0.0.1:9");
             }
             Plan::Inactive { detail, .. } => panic!("not ready: {detail}"),
         }
+    }
+
+    #[test]
+    fn an_enterprise_grid_binding_keeps_its_enterprise_account() {
+        let (_d, store) = temp_store();
+        let apps = SlackAppStore::new(Arc::new(MemoryCredentialStore::default()));
+        apps.save(&creds(TEAM)).unwrap();
+        let ws = SlackWorkspace::new(TEAM, Some("E00000001")).unwrap();
+        store.bind_surface_owner(&ws.owner("U00000001").unwrap(), T0).unwrap();
+        let Plan::Ready { installs, .. } =
+            plan(Ok(Switch::Auto), &apps, &store, Some("http://127.0.0.1:9"))
+        else {
+            panic!("not ready");
+        };
+        assert_eq!(
+            installs[0].workspace.account().account_id(),
+            "enterprise:E00000001/team:T00000001"
+        );
     }
 
     // --- adapter ---------------------------------------------------------
