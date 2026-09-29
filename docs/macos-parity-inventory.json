@@ -1414,6 +1414,22 @@
     "evidence": null
   },
   {
+    "id": "installer:install-computer-use.sh",
+    "source": "scripts/install-computer-use.sh",
+    "linux_baseline": "Linux installs the optional computer-use worker as a systemd user unit.",
+    "macos_target": "Mac installs the same worker as a private per-user LaunchAgent with configurable absolute paths.",
+    "prerequisites": [
+      "Node.js 22 or later",
+      "Python 3",
+      "signed-in launchd user session",
+      "shared Chrome bridge for research"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1249",
+    "test_plan": "Run computer-use-launchd.test.sh with a disposable home on both CI platforms, then verify install, restart, status and bridge readiness on a real Mac.",
+    "status": "in_progress",
+    "evidence": null
+  },
+  {
     "id": "installer:install-dashboard.sh",
     "source": "scripts/install-dashboard.sh",
     "linux_baseline": "Linux install-dashboard.sh installs or removes its matching component.",
@@ -1569,6 +1585,20 @@
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1245",
     "test_plan": "Run uninstall-calendar.sh against stubbed systemd and launchd in a disposable home; check file, state and rollback.",
     "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "installer:uninstall-computer-use.sh",
+    "source": "scripts/uninstall-computer-use.sh",
+    "linux_baseline": "Linux disables and unlinks the optional computer-use systemd unit.",
+    "macos_target": "Mac stops and removes only the computer-use LaunchAgent, keeping user task state.",
+    "prerequisites": [
+      "signed-in launchd user session",
+      "private test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1249",
+    "test_plan": "Run computer-use-launchd.test.sh for install, reinstall and uninstall in a disposable home, then check live launchctl state on a real Mac.",
+    "status": "in_progress",
     "evidence": null
   },
   {

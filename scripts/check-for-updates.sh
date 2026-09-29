@@ -116,13 +116,21 @@ apply_update() {
   # The browser worker is a separate long-running process with npm dependencies.
   # Deploy it only on hosts where the optional unit is installed.
   if [ "${NEEDS_COMPUTER_REBUILD:-1}" -eq 1 ] && [ -d "$REPO_ROOT/sidecars/computer-use" ] &&
-      [ "$(uname -s)" = Linux ] && systemctl --user cat augmentagent-computer-use.service >/dev/null 2>&1; then
+      { { [ "$(uname -s)" = Linux ] && systemctl --user cat augmentagent-computer-use.service >/dev/null 2>&1; } ||
+        { [ "$(uname -s)" = Darwin ] && [ -f "$HOME/Library/LaunchAgents/com.nolanmak.augmentagent.computer-use.plist" ]; }; }; then
     if ! (cd "$REPO_ROOT/sidecars/computer-use" && npm ci >> "$LOG" 2>&1); then
       log "COMPUTER WORKER INSTALL FAILED — withholding build stamp"
       return 1
     fi
-    systemctl --user daemon-reload >> "$LOG" 2>&1 || return 1
-    restart_unit augmentagent-computer-use.service || RESTART_FAILURES=$((RESTART_FAILURES + 1))
+    if [ "$(uname -s)" = Linux ]; then
+      systemctl --user daemon-reload >> "$LOG" 2>&1 || return 1
+      restart_unit augmentagent-computer-use.service || RESTART_FAILURES=$((RESTART_FAILURES + 1))
+    elif launchctl print "gui/$(id -u)/com.nolanmak.augmentagent.computer-use" >/dev/null 2>&1; then
+      restart_agent com.nolanmak.augmentagent.computer-use || RESTART_FAILURES=$((RESTART_FAILURES + 1))
+    else
+      log "computer-use launchd plist is installed but not loaded; dependencies updated, restart required after loading"
+      RESTART_FAILURES=$((RESTART_FAILURES + 1))
+    fi
   fi
 
   # Restart services so the new binary / config takes effect.
