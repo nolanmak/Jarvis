@@ -793,11 +793,33 @@ impl Store {
     /// Claim the next due send whose conversation has nothing earlier still
     /// open. Expired interaction responses are rewritten to a normal post.
     pub fn claim_next_outbound_send(&self, now_ms: i64) -> StoreResult<Option<OutboundSend>> {
+        self.claim_outbound(None, now_ms)
+    }
+
+    /// [`claim_next_outbound_send`](Self::claim_next_outbound_send) limited
+    /// to one platform account, so a transport never claims a send that
+    /// belongs to another surface or workspace.
+    pub fn claim_next_outbound_send_for(
+        &self,
+        account: &SurfaceAccountRef,
+        now_ms: i64,
+    ) -> StoreResult<Option<OutboundSend>> {
+        self.claim_outbound(Some(account), now_ms)
+    }
+
+    fn claim_outbound(
+        &self,
+        account: Option<&SurfaceAccountRef>,
+        now_ms: i64,
+    ) -> StoreResult<Option<OutboundSend>> {
+        let platform = account.map(|a| a.platform().as_str());
+        let account_id = account.map(|a| a.account_id());
         write_tx(self, |tx| {
             let id: Option<i64> = tx
                 .query_row(
                     "SELECT o.id FROM surface_outbox o
                      WHERE o.status IN ('queued', 'failed') AND o.next_attempt_at_ms <= ?1
+                       AND (?2 IS NULL OR (o.platform = ?2 AND o.account_id = ?3))
                        AND NOT EXISTS (
                          SELECT 1 FROM surface_outbox p
                          WHERE p.platform = o.platform AND p.account_id = o.account_id
@@ -805,7 +827,7 @@ impl Store {
                            AND p.id < o.id
                            AND p.status IN ('queued', 'sending', 'failed', 'reconcile'))
                      ORDER BY o.id LIMIT 1",
-                    params![now_ms],
+                    params![now_ms, platform, account_id],
                     |r| r.get(0),
                 )
                 .optional()?;
@@ -879,6 +901,22 @@ impl Store {
                 params![id, status.as_str(), error, next, now_ms],
             )?;
             Ok(status)
+        })
+    }
+
+    /// The attempt may or may not have reached the provider (a timeout or a
+    /// dropped connection after the request left). Park the send in
+    /// `reconcile` so it is never resent blindly; it keeps holding later
+    /// sends in its conversation until [`reconcile_outbound_sends`] or the
+    /// owner resolves it.
+    pub fn mark_outbound_uncertain(&self, id: i64, error: &str, now_ms: i64) -> StoreResult<()> {
+        write_tx(self, |tx| {
+            let changed = tx.execute(
+                "UPDATE surface_outbox SET status = 'reconcile', last_error = ?2, updated_at_ms = ?3
+                 WHERE id = ?1 AND status = 'sending'",
+                params![id, error, now_ms],
+            )?;
+            changed_one(changed, "outbound send is not in flight")
         })
     }
 

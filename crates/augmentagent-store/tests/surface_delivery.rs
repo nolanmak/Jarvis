@@ -1115,3 +1115,64 @@ fn delivery_drivers_are_send_for_send_hooks() {
     assert_send(reconcile_outbound_sends(&store, &Reconciler, T0));
     assert_send(catch_up_conversation(&store, &chat, &History, &policy, T0));
 }
+
+// ---------------------------------------------------------------------------
+// #1294 — a transport drains only its own account, and a send whose outcome
+// was lost mid-flight is parked for reconcile instead of being retried.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn account_scoped_claim_never_takes_another_surfaces_send() {
+    let (_dir, _path, store) = temp_store();
+    let wa = conv("whatsapp", "device:0001", "chat-1", None);
+    let other_team = conv("slack", "team:T00000002", "C00000001", None);
+    let mine = slack("C00000001");
+    store.enqueue_outbound_send(&send(&wa, "wa-1"), T0).unwrap();
+    store
+        .enqueue_outbound_send(&send(&other_team, "t2-1"), T0)
+        .unwrap();
+    store
+        .enqueue_outbound_send(&send(&mine, "t1-1"), T0)
+        .unwrap();
+
+    let claimed = store
+        .claim_next_outbound_send_for(mine.account(), T0)
+        .unwrap()
+        .expect("own send is due");
+    assert_eq!(claimed.idempotency_key, "t1-1");
+    assert!(store
+        .claim_next_outbound_send_for(mine.account(), T0)
+        .unwrap()
+        .is_none());
+    // The other surfaces' sends are untouched and still queued.
+    let next = store.claim_next_outbound_send(T0).unwrap().unwrap();
+    assert_eq!(next.idempotency_key, "wa-1");
+    assert_eq!(next.attempts, 1);
+}
+
+#[test]
+fn uncertain_send_goes_to_reconcile_and_holds_its_conversation() {
+    let (_dir, _path, store) = temp_store();
+    let chat = slack("C00000001");
+    store.enqueue_outbound_send(&send(&chat, "p1"), T0).unwrap();
+    store.enqueue_outbound_send(&send(&chat, "p2"), T0).unwrap();
+    let first = store.claim_next_outbound_send(T0).unwrap().unwrap();
+    store
+        .mark_outbound_uncertain(first.id, "timed out after the request left", T0 + 1)
+        .unwrap();
+    let parked = store.outbound_send(first.id).unwrap().unwrap();
+    assert_eq!(parked.status, SendStatus::Reconcile);
+    assert_eq!(
+        parked.last_error.as_deref(),
+        Some("timed out after the request left")
+    );
+    // Never resent blindly, and the later part waits behind it.
+    assert!(store
+        .claim_next_outbound_send(T0 + HOUR_MS)
+        .unwrap()
+        .is_none());
+    // Only an in-flight send can be parked.
+    assert!(store
+        .mark_outbound_uncertain(first.id, "again", T0 + 2)
+        .is_err());
+}
