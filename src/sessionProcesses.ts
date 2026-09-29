@@ -131,11 +131,11 @@ export function createSessionManager(backend: SessionBackend = process.platform 
       try { row = backend.inspect(pid); }
       catch { row = null; }
       if (!row) return { status: 404, body: { error: "process exited or is inaccessible" } };
+      if (row.pid !== pid || row.started !== started) {
+        return { status: 409, body: { error: "process identity changed; refresh sessions" } };
+      }
       if (row.uid !== backend.currentUid() || !isClaude(row)) {
         return { status: 403, body: { error: "pid is not an owned claude process" } };
-      }
-      if (row.started !== started) {
-        return { status: 409, body: { error: "process identity changed; refresh sessions" } };
       }
       const signal: NodeJS.Signals = force ? "SIGKILL" : "SIGTERM";
       try {

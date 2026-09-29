@@ -41,6 +41,8 @@ test("stop checks owner, executable and birth time immediately before signaling"
   assert.equal(manager.stop(221, current.started, false).status, 403);
   current = row({ executable: "/usr/bin/node", cmd: "node claude" });
   assert.equal(manager.stop(221, current.started, false).status, 403);
+  current = row({ pid: 222 });
+  assert.equal(manager.stop(221, current.started, false).status, 409);
   current = null;
   assert.equal(manager.stop(221, row().started, false).status, 404);
   assert.deepEqual(signals, []);
@@ -50,6 +52,13 @@ test("stop checks owner, executable and birth time immediately before signaling"
   assert.deepEqual(manager.stop(221, current.started, true),
                    { status: 200, body: { ok: true, pid: 221, signal: "SIGKILL" } });
   assert.deepEqual(signals, [[221, "SIGTERM"], [221, "SIGKILL"]]);
+  for (const [code, status] of [["ESRCH", 404], ["EPERM", 403]]) {
+    const failure = createSessionManager({
+      list: () => [current], inspect: () => current, currentUid: () => 501,
+      signal: () => { throw Object.assign(new Error(code), { code }); },
+    });
+    assert.equal(failure.stop(221, current.started, false).status, status);
+  }
 });
 
 test("macOS ps timeout is distinct from an empty process list", () => {
