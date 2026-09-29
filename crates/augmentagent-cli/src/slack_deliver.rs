@@ -19,8 +19,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 use augmentagent_channel_slack::app::{api_base_from, SlackAppStore, SLACK_API_BASE_ENV};
 use augmentagent_channel_slack::delivery::{
-    enqueue_answer, Answer, AnswerFile, DispatchOutcome, PlanOptions, SlackOutboxDispatcher,
-    DEFAULT_PART_CHARS,
+    enqueue_answer, notice_idempotency_key, Answer, AnswerFile, DispatchOutcome, PlanOptions,
+    ReconcilePolicy, SlackOutboxDispatcher, DEFAULT_PART_CHARS,
 };
 use augmentagent_channel_slack::surface::SlackWorkspace;
 use augmentagent_channel_slack::transport::{HttpSlackWebApi, WebApiConfig};
@@ -60,6 +60,13 @@ pub struct DeliverArgs {
     /// Characters per message part.
     #[arg(long, default_value_t = DEFAULT_PART_CHARS)]
     pub part_chars: usize,
+    /// Debug: per-request timeout for Slack Web API calls (ms).
+    #[arg(long, hide = true)]
+    pub request_timeout_ms: Option<u64>,
+    /// Debug: how long after a lost send a missing message proves it was
+    /// not delivered (ms).
+    #[arg(long, hide = true)]
+    pub reconcile_settle_ms: Option<i64>,
     #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value_t = false, action = clap::ArgAction::Set)]
     pub json: bool,
 }
@@ -149,12 +156,14 @@ fn status_hint(status: SendStatus) -> &'static str {
         SendStatus::Queued | SendStatus::Sending => "not sent yet; run the same command again",
         SendStatus::Failed => "retrying after a temporary failure; run the same command again later",
         SendStatus::Reconcile => {
-            "outcome unknown (the request may have reached Slack); check the conversation before sending again with a new --turn-id"
+            "outcome unknown: it is looked up in Slack history automatically; run the same command again later (it is resent only if it proves missing)"
         }
         SendStatus::DeadLetter => {
             "failed permanently; fix the cause shown and send again with a new --turn-id"
         }
-        SendStatus::Abandoned => "abandoned",
+        SendStatus::Abandoned => {
+            "not sent: another part of this answer failed, and a notice was posted instead"
+        }
     }
 }
 
@@ -245,11 +254,20 @@ async fn run_inner(args: &DeliverArgs, store: &Store) -> Result<bool, Failure> {
         installed.bot_token.clone(),
         WebApiConfig {
             base_url,
+            request_timeout: args
+                .request_timeout_ms
+                .map(std::time::Duration::from_millis)
+                .unwrap_or(WebApiConfig::default().request_timeout),
             ..WebApiConfig::default()
         },
     )
     .map_err(|e| Failure::new("slack_api", e.to_string(), "check network access to Slack"))?;
+    let mut reconcile = ReconcilePolicy::default();
+    if let Some(ms) = args.reconcile_settle_ms {
+        reconcile.settle_ms = ms.max(0);
+    }
     let dispatched = SlackOutboxDispatcher::new(store, &api, &workspace)
+        .with_reconcile_policy(reconcile)
         .drain(now_ms)
         .await
         .map_err(|e| Failure::new("store", e.to_string(), "check AUGMENTAGENT_DB is writable"))?;
@@ -278,6 +296,52 @@ async fn run_inner(args: &DeliverArgs, store: &Store) -> Result<bool, Failure> {
         }));
     }
     let sent_now = rows.iter().filter(|r| r["sent_now"] == json!(true)).count();
+    let notice_key = notice_idempotency_key(&turn_id);
+    let notice = store
+        .outbound_sends_with_key_prefix(&workspace.account(), &notice_key, &[])
+        .map_err(|e| Failure::new("store", e.to_string(), "check AUGMENTAGENT_DB"))?
+        .into_iter()
+        .find(|s| s.idempotency_key == notice_key)
+        .map(|s| {
+            json!({
+                "idempotency_key": s.idempotency_key,
+                "status": s.status.as_str(),
+                "provider_message_id": s.provider_message_id,
+                "last_error": s.last_error,
+            })
+        });
+    let events: Vec<Value> = dispatched
+        .iter()
+        .map(|d| {
+            let (outcome, detail) = match &d.outcome {
+                DispatchOutcome::Sent {
+                    provider_message_id,
+                } => ("sent", Some(provider_message_id.clone())),
+                DispatchOutcome::Retrying {
+                    error,
+                    next_attempt_at_ms,
+                } => (
+                    "retrying",
+                    Some(format!("{error} (next attempt at {next_attempt_at_ms})")),
+                ),
+                DispatchOutcome::DeadLettered { error } => ("dead_letter", Some(error.clone())),
+                DispatchOutcome::Uncertain { error } => ("uncertain", Some(error.clone())),
+                DispatchOutcome::Reconciled {
+                    provider_message_id,
+                } => ("reconciled", Some(provider_message_id.clone())),
+                DispatchOutcome::Requeued => ("requeued", None),
+                DispatchOutcome::LookupDeferred {
+                    error,
+                    next_lookup_at_ms,
+                } => (
+                    "lookup_deferred",
+                    Some(format!("{error} (next lookup at {next_lookup_at_ms})")),
+                ),
+                DispatchOutcome::Abandoned { reason } => ("abandoned", Some(reason.clone())),
+            };
+            json!({"idempotency_key": d.idempotency_key, "outcome": outcome, "detail": detail})
+        })
+        .collect();
     if args.json {
         println!(
             "{}",
@@ -292,6 +356,8 @@ async fn run_inner(args: &DeliverArgs, store: &Store) -> Result<bool, Failure> {
                 "already_enqueued": enqueued.duplicates,
                 "sent_now": sent_now,
                 "sends": Value::Array(rows),
+                "notice": notice,
+                "events": events,
             })
         );
     } else {
@@ -303,6 +369,19 @@ async fn run_inner(args: &DeliverArgs, store: &Store) -> Result<bool, Failure> {
             "Slack delivery to {place} in {team}: {} part(s), turn {turn_id}",
             rows.len()
         );
+        for e in &events {
+            if e["outcome"] != json!("sent") {
+                println!(
+                    "  event: {} {}{}",
+                    e["idempotency_key"].as_str().unwrap_or(""),
+                    e["outcome"].as_str().unwrap_or(""),
+                    e["detail"]
+                        .as_str()
+                        .map(|d| format!(": {d}"))
+                        .unwrap_or_default()
+                );
+            }
+        }
         if enqueued.duplicates > 0 {
             println!(
                 "  {} part(s) were already in the outbox (same turn); they are not sent twice",
@@ -328,6 +407,16 @@ async fn run_inner(args: &DeliverArgs, store: &Store) -> Result<bool, Failure> {
                     println!("      last error: {e}");
                 }
             }
+        }
+        if let Some(n) = &notice {
+            println!(
+                "  {:<42} {:<7} {:<11} {}",
+                n["idempotency_key"].as_str().unwrap_or(""),
+                "notice",
+                n["status"].as_str().unwrap_or(""),
+                n["provider_message_id"].as_str().unwrap_or("-"),
+            );
+            println!("      the answer could not be delivered in full; this notice says so in the conversation");
         }
         println!(
             "  sent now: {sent_now}; delivered in total: {}",

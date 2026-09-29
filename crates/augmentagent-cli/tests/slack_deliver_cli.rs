@@ -387,4 +387,18 @@ fn failures_exit_nonzero_with_recovery() {
         .as_str()
         .unwrap()
         .contains("--turn-id"));
+    // The answer is incomplete, so one notice says so in the conversation.
+    assert_eq!(v["notice"]["status"], json!("sent"), "{v}");
+    let texts = env.post_texts();
+    let notice = texts.last().unwrap();
+    assert!(
+        notice.contains("could not be delivered in full"),
+        "{notice}"
+    );
+    assert!(notice.contains("1 of 2"), "{notice}");
+    assert!(v["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["outcome"] == json!("dead_letter")));
 }
