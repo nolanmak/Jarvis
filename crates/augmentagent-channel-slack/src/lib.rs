@@ -10,9 +10,11 @@
 //!
 //! The real-time path (#1283) lives in [`transport`]: a first-party Slack app
 //! over Socket Mode plus a typed Web API client. It is not wired into `serve`
-//! yet; see `docs/SLACK-TRANSPORT.md`.
+//! yet; see `docs/SLACK-TRANSPORT.md`. The app's manifest and credential
+//! lifecycle (#1284) live in [`app`]; see `docs/SLACK-APP.md`.
 
 pub mod api;
+pub mod app;
 pub mod auth;
 pub mod channel;
 pub mod digest;
