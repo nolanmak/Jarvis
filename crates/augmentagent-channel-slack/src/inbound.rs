@@ -399,6 +399,13 @@ pub async fn prepare_inbound_with_voice(
                     continue;
                 }
             };
+            if let Err(why) = voice.stt.readiness() {
+                let why = format!(
+                    "voice clips can't be transcribed on this host: {why}; type the message instead"
+                );
+                reject(&mut msg, &name, RejectReason::Unavailable(why));
+                continue;
+            }
             let limits = &voice.limits;
             clips_seen += 1;
             if clips_seen > limits.max_clips {

@@ -14,7 +14,7 @@
 //! | `loop`      | `loop …`, buttons  | create/list/pause/resume/stop, `ack`/`dismiss`     |
 //! | `journal`   | `!journal …`       | `journal <text>`; `done` needs history (#1296)     |
 //! | `processes` | `!loops …`         | the cross-platform process walker                  |
-//! | `voice`     | `/voice …`         | blocker: live voice (#1298)                         |
+//! | `voice`     | `/voice …`         | spoken replies on/off per conversation (#1297); live voice is the #1298 blocker |
 //! | `reset`     | —                  | new native session for this conversation            |
 //! | `cancel all`| —                  | stop the running turn and drop the queue            |
 //! | `status`    | —                  | model, session, running/queued, loops               |
@@ -28,6 +28,7 @@
 mod loops;
 mod models;
 mod processes;
+mod voice;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -92,12 +93,14 @@ pub struct SlackCommandDeps {
     /// connection) for name resolution; `None` or `None` returned: IDs and
     /// subscribed names only.
     pub subscription_directory: Option<SubscriptionDirectory>,
+    /// #1297 — the daemon's speech providers for `voice status` (and the
+    /// warning `voice on` gives without text-to-speech). `None`: not set up.
+    pub voice: Option<crate::voice::VoiceReadiness>,
 }
 
 /// #1296 — the conversation list for a workspace (team ID).
-pub type SubscriptionDirectory = Arc<
-    dyn Fn(&str) -> Option<Arc<dyn crate::subscriptions::ConversationDirectory>> + Send + Sync,
->;
+pub type SubscriptionDirectory =
+    Arc<dyn Fn(&str) -> Option<Arc<dyn crate::subscriptions::ConversationDirectory>> + Send + Sync>;
 
 /// The Composio connection of `team`, when one is stored.
 pub fn composio_directory() -> SubscriptionDirectory {
@@ -126,6 +129,7 @@ impl SlackCommandDeps {
             processes: ProcessControl::default(),
             wiki_root: None,
             subscription_directory: Some(composio_directory()),
+            voice: None,
         }
     }
 }
@@ -187,6 +191,14 @@ pub fn recognize(text: &str, via_slash: bool) -> Option<Recognized> {
         None => (body, ""),
     };
     let lower = word.to_ascii_lowercase();
+    // #1297 — `voice on|off|status` typed plainly (a sentence that starts
+    // with "voice" still goes to the agent).
+    if lower == "voice" && sigil.is_none() && !via_slash {
+        return voice::is_subcommand(args).then(|| Recognized::Command {
+            name: "voice",
+            args: args.to_string(),
+        });
+    }
     if lower == "cancel" {
         return args
             .eq_ignore_ascii_case("all")
@@ -247,8 +259,8 @@ pub fn help_text() -> String {
     }
     out.push_str(
         "*Typing instead of `/jarvis`*: `help`, `status`, `reset` (or `new`) and `cancel all` on \
-         their own; `model …` and `loop …` as on Discord; `!journal …` and `!processes …` \
-         (Discord's `!loops`) with `!`. `cancel` (or `stop`) alone stops the running request. \
+         their own; `model …` and `loop …` as on Discord; `voice on|off|status`; `!journal …` \
+         and `!processes …` (Discord's `!loops`) with `!`. `cancel` (or `stop`) alone stops the running request. \
          `help <command>` shows one command.",
     );
     out
@@ -306,6 +318,7 @@ impl SlackCommands {
             "loop" => loops::command(&self.store, &self.deps, cx, args).await,
             "journal" => self.journal(args).await,
             "processes" => processes::command(&self.deps.processes, args).await,
+            "voice" => voice::command(&self.store, &self.deps, cx, args),
             "reset" => self.reset(cx),
             "cancel" => self.cancel_all(cx, args),
             "subscriptions" => self.subscriptions(cx, args).await,

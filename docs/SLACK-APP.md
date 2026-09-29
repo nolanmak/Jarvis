@@ -200,6 +200,19 @@ it download attachments from a local fake.
 `crates/augmentagent-cli/tests/slack_serve_cli.rs` runs `serve` that way
 against a local fake Slack.
 
+### Voice clips and spoken replies (#1297)
+
+Voice clips you send (Slack's record button or an uploaded audio file) are
+transcribed with whisper.cpp; the transcript is posted first and then
+answered like a typed message in the same conversation. `voice on` in a
+conversation makes each answer an audio file plus the full text; `voice
+off` goes back to text; `voice status` shows the mode and the providers.
+Per-host setup (whisper.cpp, `ffmpeg`, `DEEPGRAM_API_KEY` /
+`ELEVENLABS_API_KEY` + `ELEVENLABS_VOICE_ID`) is in
+[`SLACK-RUNBOOK.md`](SLACK-RUNBOOK.md) and
+[`SLACK-TRANSPORT.md`](SLACK-TRANSPORT.md#in-serve-1297). Live voice in huddles
+is not possible (#1298).
+
 ## 6. Approvals on Slack (#1289)
 
 With the app installed and an owner bound, `serve` posts approval cards to

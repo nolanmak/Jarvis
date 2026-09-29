@@ -949,6 +949,84 @@ async fn voice_names_the_live_voice_blocker() {
     assert!(reply.contains("#1298"), "{reply}");
 }
 
+// #1297 — `voice on|off|status`: spoken replies per conversation.
+#[test]
+fn voice_on_off_status_are_commands_in_plain_text_too() {
+    assert_eq!(command("voice on", false), Some(("voice", "on".into())));
+    assert_eq!(command("Voice OFF", false), Some(("voice", "OFF".into())));
+    assert_eq!(
+        command("voice status", false),
+        Some(("voice", "status".into()))
+    );
+    assert_eq!(command("!voice on", false), Some(("voice", "on".into())));
+    assert_eq!(command("voice on", true), Some(("voice", "on".into())));
+    // A sentence about voice still goes to the agent.
+    assert_eq!(command("voice notes are great", false), None);
+    assert_eq!(command("voice on the phone was bad", false), None);
+    assert_eq!(command("voice", false), None);
+}
+
+#[tokio::test]
+async fn voice_sets_the_reply_mode_per_conversation_and_a_thread_inherits_its_channel() {
+    use augmentagent_channel_slack::voice::reply::{reply_mode_for, ReplyMode};
+    use augmentagent_channel_slack::voice::VoiceReadiness;
+    let f = Fixture::new();
+    let mut deps = f.deps(FakeProcs {
+        procs: vec![],
+        self_pid: 1,
+        parents: HashMap::new(),
+        fail: false,
+    });
+    deps.voice = Some(VoiceReadiness {
+        stt: Ok("whisper-cpp".into()),
+        tts: Err("DEEPGRAM_API_KEY is not set".into()),
+    });
+    let c = SlackCommands::new(Arc::clone(&f.store), deps);
+    let idle = FakeControl::default();
+
+    assert_eq!(
+        reply_mode_for(&f.store, &channel()).unwrap(),
+        ReplyMode::Text
+    );
+    let on = run(&c, &channel(), &idle, "voice on").await;
+    assert!(on.contains("Spoken replies are on"), "{on}");
+    // No provider: said at once, and answers stay text with a note.
+    assert!(on.contains("DEEPGRAM_API_KEY is not set"), "{on}");
+    assert_eq!(
+        reply_mode_for(&f.store, &channel()).unwrap(),
+        ReplyMode::Spoken
+    );
+    // A thread of that channel inherits it until it chooses for itself.
+    assert_eq!(
+        reply_mode_for(&f.store, &thread()).unwrap(),
+        ReplyMode::Spoken
+    );
+    let off = run(&c, &thread(), &idle, "voice off").await;
+    assert!(off.contains("off"), "{off}");
+    assert_eq!(
+        reply_mode_for(&f.store, &thread()).unwrap(),
+        ReplyMode::Text
+    );
+    assert_eq!(
+        reply_mode_for(&f.store, &channel()).unwrap(),
+        ReplyMode::Spoken
+    );
+    // Each conversation is its own: the DM is untouched.
+    assert_eq!(reply_mode_for(&f.store, &dm()).unwrap(), ReplyMode::Text);
+
+    let status = run(&c, &channel(), &idle, "voice status").await;
+    assert!(status.contains("Spoken replies: on"), "{status}");
+    assert!(status.contains("whisper-cpp"), "{status}");
+    assert!(status.contains("DEEPGRAM_API_KEY is not set"), "{status}");
+    assert!(status.contains("#1298"), "{status}");
+    let status = run(&c, &thread(), &idle, "voice").await;
+    assert!(status.contains("Spoken replies: off"), "{status}");
+
+    let bad = run(&c, &dm(), &idle, "voice loud").await;
+    assert!(bad.contains("Usage: `voice"), "{bad}");
+    assert_eq!(reply_mode_for(&f.store, &dm()).unwrap(), ReplyMode::Text);
+}
+
 #[test]
 fn slack_loop_refs_round_trip_and_never_look_like_discord_ids() {
     for conversation in [dm(), thread(), channel()] {

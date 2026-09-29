@@ -12,12 +12,16 @@
 //!   the outbox (`voice::reply::enqueue_spoken_answer`). Re-running the same
 //!   command synthesises and sends nothing new.
 //!
-//! Speech providers: speech-to-text is the existing whisper.cpp transcriber
-//! (`vendor/whisper`, as for Telegram voice memos). No text-to-speech
-//! provider has a Rust file adapter yet (Deepgram/ElevenLabs TTS runs only
-//! inside the Discord voice sidecar), so `speak` fails clearly in release
-//! builds. For local QA, a debug build honours [`TEST_SPEECH_ENV`], which
-//! swaps in the offline scripted fakes; release builds ignore it.
+//! Speech providers: the daemon's own selection ([`daemon_speech`], also what
+//! `serve` uses): speech-to-text is the existing whisper.cpp transcriber
+//! (`vendor/whisper`, as for Telegram voice memos, or
+//! [`WHISPER_BIN_ENV`]/[`WHISPER_MODEL_ENV`]); text-to-speech is the Rust
+//! Deepgram/ElevenLabs adapter configured from the Discord voice sidecar's
+//! names (`DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`,
+//! `AUGMENTAGENT_SLACK_TTS_PROVIDER` / `AUGMENTAGENT_DISCORD_TTS_PROVIDER`).
+//! For local QA, a debug build honours [`TEST_SPEECH_ENV`] (offline scripted
+//! fakes) and [`TEST_TTS_ENDPOINT_ENV`] (the real TTS adapter against a
+//! loopback mock); release builds ignore both.
 //!
 //! Tokens are never printed or logged.
 
@@ -59,6 +63,165 @@ use tokio_util::sync::CancellationToken;
 /// (deepgram) and succeeds on the alternate (elevenlabs); `exhausted-all`
 /// exhausts both. Ignored in release builds.
 pub const TEST_SPEECH_ENV: &str = "AUGMENTAGENT_TEST_SLACK_SPEECH";
+
+/// #1297 — the daemon's speech-to-text for Slack clips: `whisper-cpp`
+/// (default) or `off`.
+pub const SLACK_STT_PROVIDER_ENV: &str = "AUGMENTAGENT_SLACK_STT_PROVIDER";
+/// whisper.cpp binary; default `<working dir>/vendor/whisper/main`.
+pub const WHISPER_BIN_ENV: &str = "AUGMENTAGENT_WHISPER_BIN";
+/// whisper.cpp model; default `<working dir>/vendor/whisper/models/ggml-medium.en.bin`.
+pub const WHISPER_MODEL_ENV: &str = "AUGMENTAGENT_WHISPER_MODEL";
+/// Debug builds only: point the real TTS adapter at a loopback `http://`
+/// mock (local QA). Ignored in release builds and for any other URL.
+pub const TEST_TTS_ENDPOINT_ENV: &str = "AUGMENTAGENT_TEST_SLACK_TTS_ENDPOINT";
+
+/// The daemon's speech setup for Slack (`serve`, `slack voice`).
+pub struct DaemonSpeech {
+    pub stt: SttStack,
+    pub tts: Option<TtsStack>,
+    /// What `voice status` shows, with the configuration's own reasons.
+    pub readiness: augmentagent_channel_slack::voice::VoiceReadiness,
+    /// The debug-only fakes are in use.
+    pub fake: bool,
+}
+
+/// [`TEST_TTS_ENDPOINT_ENV`] when it may be used: a debug build and a
+/// loopback `http://` URL.
+pub fn test_tts_endpoint(lookup: &impl Fn(&str) -> Option<String>, debug: bool) -> Option<String> {
+    if !debug {
+        return None;
+    }
+    let url = lookup(TEST_TTS_ENDPOINT_ENV)?.trim().to_string();
+    let rest = url.strip_prefix("http://")?;
+    let host = rest.split(['/', ':']).next().unwrap_or_default();
+    (matches!(host, "127.0.0.1" | "localhost") || rest.starts_with("[::1]"))
+        .then(|| url.trim_end_matches('/').to_string())
+}
+
+fn whisper_stt(
+    lookup: &impl Fn(&str) -> Option<String>,
+    repo_root: &std::path::Path,
+) -> Result<SttStack, String> {
+    let get = |k: &str| {
+        lookup(k)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    match get(SLACK_STT_PROVIDER_ENV)
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "whisper-cpp" | "whisper" => {}
+        "off" | "none" | "0" => {
+            return Err(format!(
+                "speech-to-text is turned off on this daemon ({SLACK_STT_PROVIDER_ENV})"
+            ))
+        }
+        other => {
+            return Err(format!(
+                "speech-to-text provider `{other}` is not supported ({SLACK_STT_PROVIDER_ENV}: use whisper-cpp)"
+            ))
+        }
+    }
+    let default = augmentagent_channel_voice::WhisperCppTranscriber::from_repo_root(repo_root);
+    let mut whisper = default;
+    if let Some(bin) = get(WHISPER_BIN_ENV) {
+        whisper.bin = PathBuf::from(bin);
+    }
+    if let Some(model) = get(WHISPER_MODEL_ENV) {
+        whisper.model = PathBuf::from(model);
+    }
+    if !whisper.bin.is_file() || !whisper.model.is_file() {
+        tracing::warn!(
+            bin = %whisper.bin.display(),
+            model = %whisper.model.display(),
+            "slack voice clips: whisper.cpp binary or model not found; run scripts/build-whisper.sh or set {WHISPER_BIN_ENV}/{WHISPER_MODEL_ENV}"
+        );
+        return Err("whisper.cpp is not installed on this host".into());
+    }
+    Ok(SttStack::new(Arc::new(TranscriberStt::new(
+        "whisper-cpp",
+        whisper,
+    ))))
+}
+
+/// The daemon's speech providers from `lookup` (the environment):
+/// speech-to-text per [`SLACK_STT_PROVIDER_ENV`] (whisper.cpp under
+/// `repo_root` unless overridden), text-to-speech from the Discord voice
+/// sidecar's names (`voice::providers::tts_from_env`). In a `debug` build,
+/// [`TEST_SPEECH_ENV`] swaps in the offline fakes, and
+/// [`TEST_TTS_ENDPOINT_ENV`] keeps the real TTS adapter but points it at a
+/// local mock.
+pub fn daemon_speech_from(
+    lookup: impl Fn(&str) -> Option<String>,
+    repo_root: &std::path::Path,
+    debug: bool,
+) -> DaemonSpeech {
+    use augmentagent_channel_slack::voice::providers::tts_from_env;
+    use augmentagent_channel_slack::voice::speech::UnconfiguredStt;
+    use augmentagent_channel_slack::voice::VoiceReadiness;
+    let endpoint = test_tts_endpoint(&lookup, debug);
+    if debug {
+        if let Some(Ok(p)) = test_providers(lookup(TEST_SPEECH_ENV).as_deref()) {
+            let tts = match &endpoint {
+                Some(url) => tts_from_env(&lookup, Some(url)),
+                None => p.tts.ok_or_else(|| "no fake".to_string()),
+            };
+            return DaemonSpeech {
+                readiness: VoiceReadiness {
+                    stt: Ok(p.stt.primary_provider().to_string()),
+                    tts: tts
+                        .as_ref()
+                        .map(|t| t.primary_provider().to_string())
+                        .map_err(Clone::clone),
+                },
+                stt: p.stt,
+                tts: tts.ok(),
+                fake: true,
+            };
+        }
+    }
+    let (stt, stt_ready) = match whisper_stt(&lookup, repo_root) {
+        Ok(s) => {
+            let name = s.primary_provider().to_string();
+            (s, Ok(name))
+        }
+        Err(why) => (
+            SttStack::new(Arc::new(UnconfiguredStt::new("whisper-cpp", why.clone()))),
+            Err(why),
+        ),
+    };
+    let tts = tts_from_env(&lookup, endpoint.as_deref());
+    let tts_ready = tts.as_ref().map(|t| match t.alternate_provider() {
+        Some(alt) => format!(
+            "{} (then {alt} if it runs out of credit)",
+            t.primary_provider()
+        ),
+        None => t.primary_provider().to_string(),
+    });
+    let tts_ready = tts_ready.map_err(|e| e.clone());
+    DaemonSpeech {
+        stt,
+        tts: tts.ok(),
+        readiness: VoiceReadiness {
+            stt: stt_ready,
+            tts: tts_ready,
+        },
+        fake: false,
+    }
+}
+
+/// [`daemon_speech_from`] over this process's environment and working
+/// directory.
+pub fn daemon_speech() -> DaemonSpeech {
+    let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    daemon_speech_from(
+        |k| std::env::var(k).ok(),
+        &repo_root,
+        cfg!(debug_assertions),
+    )
+}
 
 /// Largest answer read from a file or stdin.
 const MAX_TEXT_BYTES: u64 = 1024 * 1024;
@@ -153,6 +316,8 @@ fn fail(json_out: bool, f: &Failure) -> ! {
 struct Providers {
     stt: SttStack,
     tts: Option<TtsStack>,
+    /// Why there is no text-to-speech, when there is none.
+    tts_unavailable: Option<String>,
     /// `true` when the debug-only fakes are in use.
     fake: bool,
 }
@@ -230,27 +395,33 @@ fn test_providers(value: Option<&str>) -> Option<Result<Providers, String>> {
     Some(Ok(Providers {
         stt,
         tts: Some(tts),
+        tts_unavailable: None,
         fake: true,
     }))
 }
 
 fn providers() -> Result<Providers, Failure> {
     let raw = std::env::var(TEST_SPEECH_ENV).ok();
-    if let Some(p) = test_providers(raw.as_deref()) {
+    if let Some(Err(m)) = test_providers(raw.as_deref()) {
+        return Err(Failure::new(
+            "invalid_test_speech",
+            m,
+            format!("unset {TEST_SPEECH_ENV}"),
+        ));
+    }
+    // The daemon's own selection (#1297): whisper.cpp for clips, the
+    // sidecar's TTS names for spoken replies.
+    let speech = daemon_speech();
+    if speech.fake {
         tracing::warn!(
             "{TEST_SPEECH_ENV} replaces the speech providers with offline fakes (debug build)"
         );
-        return p.map_err(|m| {
-            Failure::new("invalid_test_speech", m, format!("unset {TEST_SPEECH_ENV}"))
-        });
     }
-    // The existing Rust speech-to-text path (Telegram voice memos).
-    let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let whisper = augmentagent_channel_voice::WhisperCppTranscriber::from_repo_root(&repo_root);
     Ok(Providers {
-        stt: SttStack::new(Arc::new(TranscriberStt::new("whisper-cpp", whisper))),
-        tts: None,
-        fake: false,
+        stt: speech.stt,
+        tts: speech.tts,
+        tts_unavailable: speech.readiness.tts.err(),
+        fake: speech.fake,
     })
 }
 
@@ -563,8 +734,11 @@ async fn speak(args: &SpeakArgs, store: &Store) -> Result<Value, Failure> {
     let Some(tts) = providers.tts.as_ref() else {
         return Err(Failure::new(
             "tts_unavailable",
-            "no text-to-speech provider has a file adapter yet: Deepgram/ElevenLabs TTS runs only inside the Discord voice sidecar",
-            "deliver the answer as text with `augmentagent slack deliver`; spoken replies need the TTS adapter tracked in #1297",
+            format!(
+                "no text-to-speech provider is configured: {}",
+                providers.tts_unavailable.as_deref().unwrap_or("unknown reason")
+            ),
+            "set DEEPGRAM_API_KEY (or ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID with AUGMENTAGENT_SLACK_TTS_PROVIDER=elevenlabs), or deliver the answer as text with `augmentagent slack deliver`",
         ));
     };
     let cancel = CancellationToken::new();
@@ -759,6 +933,102 @@ mod tests {
         } else {
             assert!(test_providers(Some("ok:hello")).is_none());
         }
+    }
+
+    fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k: &str| map.get(k).cloned()
+    }
+
+    #[test]
+    fn daemon_speech_without_whisper_or_keys_says_why_for_each_half() {
+        let repo = tempfile::tempdir().unwrap();
+        let d = daemon_speech_from(lookup(&[]), repo.path(), false);
+        let stt = d.readiness.stt.clone().unwrap_err();
+        assert!(stt.contains("whisper.cpp is not installed"), "{stt}");
+        assert_eq!(d.stt.readiness(), Err(stt));
+        assert!(d.tts.is_none());
+        let tts = d.readiness.tts.unwrap_err();
+        assert!(tts.contains("DEEPGRAM_API_KEY"), "{tts}");
+        assert!(!d.fake);
+    }
+
+    #[test]
+    fn daemon_speech_uses_whisper_from_the_repo_or_the_env_and_the_sidecar_tts_names() {
+        let repo = tempfile::tempdir().unwrap();
+        let vendor = repo.path().join("vendor/whisper/models");
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(repo.path().join("vendor/whisper/main"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(vendor.join("ggml-medium.en.bin"), b"model").unwrap();
+        let d = daemon_speech_from(
+            lookup(&[("DEEPGRAM_API_KEY", "dg-test-key")]),
+            repo.path(),
+            false,
+        );
+        assert_eq!(d.readiness.stt, Ok("whisper-cpp".to_string()));
+        assert_eq!(d.readiness.tts, Ok("deepgram".to_string()));
+        assert_eq!(
+            d.tts.as_ref().map(|t| t.primary_provider()),
+            Some("deepgram")
+        );
+
+        // Explicit paths win; a missing one is named for the operator.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let bin = elsewhere.path().join("whisper-cli");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        let bin_s = bin.to_string_lossy().into_owned();
+        let d = daemon_speech_from(
+            lookup(&[
+                (WHISPER_BIN_ENV, bin_s.as_str()),
+                (WHISPER_MODEL_ENV, "/nonexistent/m.bin"),
+            ]),
+            repo.path(),
+            false,
+        );
+        assert!(d.readiness.stt.is_err());
+
+        let d = daemon_speech_from(
+            lookup(&[(SLACK_STT_PROVIDER_ENV, "off")]),
+            repo.path(),
+            false,
+        );
+        assert!(d.readiness.stt.unwrap_err().contains("turned off"));
+        let d = daemon_speech_from(
+            lookup(&[(SLACK_STT_PROVIDER_ENV, "siri")]),
+            repo.path(),
+            false,
+        );
+        assert!(d.readiness.stt.unwrap_err().contains("whisper-cpp"));
+    }
+
+    #[test]
+    fn test_speech_overrides_are_debug_only_and_the_tts_endpoint_is_loopback_only() {
+        let repo = tempfile::tempdir().unwrap();
+        let fake = [(TEST_SPEECH_ENV, "ok:hello")];
+        let d = daemon_speech_from(lookup(&fake), repo.path(), true);
+        assert!(d.fake);
+        assert_eq!(d.readiness.stt, Ok("deepgram".to_string()));
+        let d = daemon_speech_from(lookup(&fake), repo.path(), false);
+        assert!(!d.fake, "release builds ignore the fakes");
+
+        // The real HTTP adapter against a local mock, debug builds only.
+        let mock = [
+            (TEST_SPEECH_ENV, "ok:hello"),
+            (TEST_TTS_ENDPOINT_ENV, "http://127.0.0.1:9"),
+            ("DEEPGRAM_API_KEY", "dg-test-key"),
+        ];
+        let d = daemon_speech_from(lookup(&mock), repo.path(), true);
+        assert_eq!(
+            test_tts_endpoint(&lookup(&mock), true),
+            Some("http://127.0.0.1:9".into())
+        );
+        assert_eq!(d.readiness.tts, Ok("deepgram".to_string()));
+        assert_eq!(test_tts_endpoint(&lookup(&mock), false), None);
+        let remote = [(TEST_TTS_ENDPOINT_ENV, "https://api.deepgram.com")];
+        assert_eq!(test_tts_endpoint(&lookup(&remote), true), None);
     }
 
     #[test]

@@ -105,9 +105,14 @@ jobs:
       # a provider through admit, spoken replies as audio + text mirror
       # delivered once, and `slack voice transcribe|speak` end to end against
       # a mock Slack. Synthetic audio, no network, no paid provider.
+      # In serve: owner clips as turns with the transcript shown, `voice
+      # on|off|status` persisted per conversation, spoken answers on the real
+      # dispatch path, and the Rust TTS adapter against a local HTTP mock.
       - name: Slack voice clips and spoken replies
         run: |
           cargo test -p augmentagent-channel-slack --test voice_clips --test voice_replies
+          cargo test -p augmentagent-channel-slack --test voice_surface --test voice_tts_http
+          cargo test -p augmentagent-store --test surface_reply_modes
           cargo test -p augmentagent-cli --test slack_voice_cli
           cargo test -p augmentagent-cli --bin augmentagent -- slack_voice::
       # #1288 — Slack owner turns through the shared harness: native session

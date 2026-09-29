@@ -14544,6 +14544,8 @@ async fn slack_command_deps(cli: &Cli) -> augmentagent_channel_slack::commands::
     deps.journal = journal_ops_from_env(cli, &reasoner).await;
     // #1296 — `subscribe <person>` resolves people through the wiki.
     deps.wiki_root = cli.wiki_dir.clone();
+    // #1297 — `voice status` / `voice on` report the daemon's providers.
+    deps.voice = Some(crate::slack_voice::daemon_speech().readiness);
     deps
 }
 

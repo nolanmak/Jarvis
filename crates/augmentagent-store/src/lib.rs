@@ -22,6 +22,8 @@ pub mod surface;
 // #1292 — reset, cancel-all and loop pause/resume behind owner commands.
 pub mod surface_commands;
 pub mod surface_health;
+// #1297 — per-conversation reply mode (text or spoken) behind `voice on|off`.
+pub mod surface_reply_modes;
 
 pub use imessage::{
     ImessageOutboxItem, ImessageOutboxStatus, ImessageSendOutcome, ImessageTargetKind,

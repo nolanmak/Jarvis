@@ -30,6 +30,10 @@
 //! readiness, loop parser and journal bridge, handed to [`spawn`]. The
 //! harness reads the same selection file per conversation
 //! ([`conversation_handler`]).
+//!
+//! #1297 — [`build_surface`] gives the surface the daemon's speech providers
+//! (`slack_voice::daemon_speech`): owner voice clips are transcribed into
+//! turns, and `voice on` conversations get spoken answers.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,9 +44,9 @@ use augmentagent_approval_discord::{AuditCtx, QueryHandler};
 use augmentagent_channel_slack::app::{
     api_base_from, SlackAppCredentials, SlackAppError, SlackAppStore, SLACK_API_BASE_ENV,
 };
+use augmentagent_channel_slack::catch_up::SubscribedCatchUp;
 use augmentagent_channel_slack::commands::{slack_selection, SlackCommandDeps, SlackCommands};
 use augmentagent_channel_slack::delivery::ProgressConfig;
-use augmentagent_channel_slack::catch_up::SubscribedCatchUp;
 use augmentagent_channel_slack::harness::SlackConversationHarness;
 use augmentagent_channel_slack::history::{SlackConversationHistory, TurnHistory};
 use augmentagent_channel_slack::ingest::SubscribedEventSink;
@@ -58,6 +62,10 @@ use augmentagent_channel_slack::transport::web::{
     test_file_hosts_from, DownloadLimits, HttpSlackWebApi, SlackWebApi, WebApiConfig,
     SLACK_TEST_FILE_HOSTS_ENV,
 };
+use augmentagent_channel_slack::voice::reply::{
+    default_spoken_reply_root, SLACK_VOICE_REPLIES_DIR,
+};
+use augmentagent_channel_slack::voice::SlackVoice;
 use augmentagent_store::Store;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -254,7 +262,10 @@ pub fn plan(
 
 /// #1296 — one bot-token Web API client per ready install, for the
 /// subscribed-conversation catch-up and the harness history.
-pub fn web_runtimes(installs: &[ReadyInstall], api_base: &str) -> Result<Vec<SlackWorkspaceRuntime>> {
+pub fn web_runtimes(
+    installs: &[ReadyInstall],
+    api_base: &str,
+) -> Result<Vec<SlackWorkspaceRuntime>> {
     installs
         .iter()
         .map(|i| {
@@ -331,6 +342,18 @@ pub fn build_surface(
             .allow_insecure_ws(loopback_test_server);
         connectors.push(Arc::new(connector));
     }
+    // #1297 — owner voice clips and `voice on` spoken replies, with the
+    // daemon's speech providers (whisper.cpp, the sidecar's TTS names).
+    let speech = crate::slack_voice::daemon_speech();
+    info!(
+        stt = %describe_ready(&speech.readiness.stt),
+        tts = %describe_ready(&speech.readiness.tts),
+        fake = speech.fake,
+        "slack voice: speech providers"
+    );
+    let replies_root = default_spoken_reply_root().unwrap_or_else(|| {
+        augmentagent_channel_core::state_dir::state_dir_or(".").join(SLACK_VOICE_REPLIES_DIR)
+    });
     Ok(SlackInteractiveSurface::new(
         store,
         workspaces,
@@ -341,9 +364,17 @@ pub fn build_surface(
             // #1288 — a status line per turn that says how to cancel it
             // (never posted in dry-run).
             progress: Some(ProgressConfig::default()),
+            voice: Some(SlackVoice::new(speech.stt, speech.tts, replies_root)),
             ..SlackSurfaceConfig::default()
         },
     ))
+}
+
+fn describe_ready(r: &Result<String, String>) -> String {
+    match r {
+        Ok(p) => p.clone(),
+        Err(why) => format!("unavailable: {why}"),
+    }
 }
 
 fn now_ms() -> i64 {
@@ -574,11 +605,9 @@ pub fn spawn(
                 warn!("{TEST_REPLY_ENV} is set: Slack turns run the real harness with a fake agent, not the reasoner (debug build, tests and local QA only)");
                 stub
             }
-            None => make_handler(
-                (!runtimes.is_empty()).then(|| {
-                    Arc::new(SlackConversationHistory::new(&runtimes)) as Arc<dyn TurnHistory>
-                }),
-            ),
+            None => make_handler((!runtimes.is_empty()).then(|| {
+                Arc::new(SlackConversationHistory::new(&runtimes)) as Arc<dyn TurnHistory>
+            })),
         };
         let surface = match build_surface(
             Arc::clone(&store),

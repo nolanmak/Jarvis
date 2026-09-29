@@ -94,6 +94,17 @@ Tools the Slack features call, resolved on the service `PATH`:
 
 The launchd installer puts both Homebrew prefixes on the service `PATH`.
 Voice transcription also needs whisper.cpp (`scripts/build-whisper.sh`).
+Its binary and model are found under the daemon's working directory
+(`vendor/whisper/`) or at `AUGMENTAGENT_WHISPER_BIN` / `AUGMENTAGENT_WHISPER_MODEL`;
+without them a clip gets "can't be transcribed on this host" and no turn.
+Spoken replies (`voice on`) need a text-to-speech key in the daemon's
+environment (its `.env`): `DEEPGRAM_API_KEY` (default vendor), or
+`ELEVENLABS_API_KEY` plus `ELEVENLABS_VOICE_ID` with
+`AUGMENTAGENT_SLACK_TTS_PROVIDER=elevenlabs` — the same names as the Discord
+voice sidecar. Both keys make the other vendor the credit fallback. Without
+a key, answers stay text with a one-line note. Same on macOS and Linux (no
+extra system package: the adapter is plain HTTPS). See
+[`SLACK-TRANSPORT.md`](SLACK-TRANSPORT.md#in-serve-1297).
 
 ## 2. Create the Slack app from the manifest
 
@@ -410,7 +421,8 @@ never host evidence.
     ask for a generated file. Expect the summary and an uploaded file.
 13. **Notifications** (#1295). Trigger a reminder. Expect it in Slack.
 14. **Voice clip** (#1297). Send a voice clip. Expect a transcript and an
-    answer. **Live voice** (#1298): record the result or the blocker in
+    answer. Send `voice on`, ask something: expect the text and a
+    `spoken-reply.wav` that plays; `voice off` goes back to text. **Live voice** (#1298): record the result or the blocker in
     `SLACK-LIVE-VOICE.md`.
 15. **Restart mid-turn.** Ask a long question and run
     `augmentagent service --unit daemon restart` before the answer. Expect
