@@ -123,10 +123,15 @@ fn stale_claim_becomes_unknown_never_queued_and_late_report_is_accepted() {
     store.enqueue_imessage_outbox(&item("a1")).unwrap();
     let claimed = store.claim_imessage_outbox().unwrap().unwrap();
     // A fresh claim is not stale.
-    assert_eq!(store.expire_imessage_outbox_claims(60_000).unwrap(), 0);
+    assert!(store
+        .expire_imessage_outbox_claims(60_000)
+        .unwrap()
+        .is_empty());
     // A zero timeout makes every claim stale.
     std::thread::sleep(std::time::Duration::from_millis(5));
-    assert_eq!(store.expire_imessage_outbox_claims(0).unwrap(), 1);
+    let expired = store.expire_imessage_outbox_claims(0).unwrap();
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].status, ImessageOutboxStatus::Unknown);
     let row = store.get_imessage_outbox(claimed.id).unwrap().unwrap();
     assert_eq!(row.status, ImessageOutboxStatus::Unknown);
     assert!(
@@ -203,4 +208,100 @@ fn empty_or_multiline_identifiers_are_rejected() {
         ..item("a1")
     };
     assert!(store.enqueue_imessage_outbox(&bad).is_err());
+}
+
+fn pending_action(store: &Store, msg: &str) -> String {
+    store
+        .log_action(
+            msg,
+            Some("imessage:+15555550100"), // pii-ok synthetic
+            HANDLE,
+            "s",
+            Some("b"),
+            Some("d"),
+            augmentagent_store::ActionStatus::Pending,
+        )
+        .unwrap()
+}
+
+fn backdate_action(store: &Store, id: &str, ms: i64) {
+    store
+        .with_conn(|c| {
+            c.execute(
+                "UPDATE actions SET updatedAt = updatedAt - ?2 WHERE id = ?1",
+                augmentagent_store::rusqlite::params![id, ms],
+            )
+        })
+        .unwrap();
+}
+
+#[test]
+fn stuck_sending_reconcile_skips_actions_owned_by_the_outbox() {
+    let (store, _dir) = fresh();
+    let owned = pending_action(&store, "m1");
+    let other = pending_action(&store, "m2");
+    for id in [&owned, &other] {
+        store
+            .claim_action_for_send(id, augmentagent_store::ActionStatus::Pending, "t")
+            .unwrap();
+        backdate_action(&store, id, 3_600_000);
+    }
+    store.enqueue_imessage_outbox(&item(&owned)).unwrap();
+    let now = i64::MAX / 2;
+    assert_eq!(
+        store.stuck_sending_actions(now, 600_000).unwrap(),
+        vec![other]
+    );
+}
+
+#[test]
+fn queued_rows_older_than_max_age_fail_as_expired() {
+    let (store, _dir) = fresh();
+    store.enqueue_imessage_outbox(&item("a1")).unwrap();
+    assert!(store
+        .expire_imessage_outbox_queued(60_000)
+        .unwrap()
+        .is_empty());
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let expired = store.expire_imessage_outbox_queued(0).unwrap();
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].status, ImessageOutboxStatus::Failed);
+    assert!(expired[0]
+        .error_detail
+        .as_deref()
+        .unwrap()
+        .contains("expired"));
+    assert!(store.claim_imessage_outbox().unwrap().is_none());
+}
+
+#[test]
+fn failures_are_reported_for_notice_exactly_once() {
+    let (store, _dir) = fresh();
+    for a in ["a1", "a2", "a3"] {
+        store.enqueue_imessage_outbox(&item(a)).unwrap();
+    }
+    let c1 = store.claim_imessage_outbox().unwrap().unwrap();
+    let c2 = store.claim_imessage_outbox().unwrap().unwrap();
+    store
+        .complete_imessage_outbox(
+            c1.id,
+            &ImessageSendOutcome::Failed {
+                error_code: Some(22),
+                reason: "x".into(),
+            },
+        )
+        .unwrap();
+    store
+        .complete_imessage_outbox(c2.id, &ImessageSendOutcome::Sent { message_guid: None })
+        .unwrap();
+    let pending = store.unnotified_imessage_outbox_failures().unwrap();
+    assert_eq!(
+        pending.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![c1.id]
+    );
+    assert!(store.mark_imessage_outbox_notified(c1.id).unwrap());
+    assert!(store
+        .unnotified_imessage_outbox_failures()
+        .unwrap()
+        .is_empty());
 }

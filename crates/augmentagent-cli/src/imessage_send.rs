@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use augmentagent_approval_discord::ApprovalActionOutcome;
 use augmentagent_store::{
-    ActionStatus, ActionWithEmail, NewImessageOutboxItem, Store, TriageResult,
+    ActionStatus, ActionWithEmail, ImessageOutboxItem, ImessageOutboxStatus, ImessageSendOutcome,
+    NewImessageOutboxItem, Store, TriageResult,
 };
 
 use crate::ReplyApprover;
@@ -66,7 +67,10 @@ impl ReplyApprover {
             Ok(t) => t,
             Err(e) => return failed(format!("cannot send: {e}")),
         };
-        match self.store.is_imessage_outbound_allowed(&target.conversation) {
+        match self
+            .store
+            .is_imessage_outbound_allowed(&target.conversation)
+        {
             Ok(true) => {}
             Ok(false) => {
                 return failed(format!(
@@ -102,9 +106,9 @@ impl ReplyApprover {
         };
         if let Err(e) = self.store.enqueue_imessage_outbox(&item) {
             let msg = format!("queueing the iMessage send failed: {e}");
-            let _ = self
-                .store
-                .update_action_status(action_id, ActionStatus::Error, None, Some(&msg));
+            let _ =
+                self.store
+                    .update_action_status(action_id, ActionStatus::Error, None, Some(&msg));
             return failed(msg);
         }
         // Keep the text that will actually go out on the row.
@@ -142,6 +146,230 @@ impl ReplyApprover {
             .mark_email_processed(&action.email.message_id, TriageResult::Reply);
         ApprovalActionOutcome::Skipped
     }
+}
+
+/// How long a claimed row may go unreported before its outcome is unknown.
+/// Must exceed the sender's worst case: the first Apple event after
+/// Messages starts took 60.6 s in #1280, plus up to 30 s of verification.
+pub(crate) const ENV_CLAIM_TIMEOUT_SECS: &str = "AUGMENTAGENT_IMESSAGE_CLAIM_TIMEOUT_SECS";
+const DEFAULT_CLAIM_TIMEOUT_SECS: i64 = 600;
+/// How long an approved reply may wait for the Mac before it is dropped.
+pub(crate) const ENV_OUTBOX_MAX_AGE_SECS: &str = "AUGMENTAGENT_IMESSAGE_OUTBOX_MAX_AGE_SECS";
+const DEFAULT_OUTBOX_MAX_AGE_SECS: i64 = 3600;
+
+pub(crate) const UNKNOWN_OUTCOME: &str = "iMessage send outcome unknown: the Mac sender claimed \
+     it but never reported back, so it may or may not have been sent. Check Messages before \
+     resending.";
+pub(crate) const EXPIRED: &str = "iMessage send expired before the Mac sender picked it up. \
+     Is the Mac awake and the sender installed?";
+
+fn env_secs(name: &str, default: i64) -> i64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+#[derive(clap::Subcommand, Debug, Clone)]
+pub(crate) enum OutboxOp {
+    /// Hand the oldest queued reply to the calling sender. Prints one JSON
+    /// line: `{"version":1,"item":null}` or the item to send.
+    Claim {
+        /// Accepted for clarity; output is always JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Report what the sender observed in chat.db for a claimed item.
+    Complete {
+        id: i64,
+        #[arg(long, value_parser = ["sent", "failed"])]
+        status: String,
+        /// `message.error` from chat.db.
+        #[arg(long)]
+        error_code: Option<i64>,
+        #[arg(long)]
+        reason: Option<String>,
+        /// `message.guid` of the sent row.
+        #[arg(long)]
+        message_guid: Option<String>,
+    },
+    /// Recent outbox rows: id, status, age and action. Never bodies or targets.
+    List {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+}
+
+/// Fail expired queued rows and stale claims, and flip their actions to
+/// `error`. Returns the rows that changed so the daemon can notify.
+pub(crate) fn reconcile_outbox(store: &Store) -> anyhow::Result<Vec<ImessageOutboxItem>> {
+    let claim_timeout_ms = env_secs(ENV_CLAIM_TIMEOUT_SECS, DEFAULT_CLAIM_TIMEOUT_SECS) * 1000;
+    let max_age_ms = env_secs(ENV_OUTBOX_MAX_AGE_SECS, DEFAULT_OUTBOX_MAX_AGE_SECS) * 1000;
+    let mut changed = store.expire_imessage_outbox_claims(claim_timeout_ms)?;
+    for row in &changed {
+        store.finish_send_error(&row.action_id, UNKNOWN_OUTCOME, None, "imessage")?;
+    }
+    let expired = store.expire_imessage_outbox_queued(max_age_ms)?;
+    for row in &expired {
+        store.finish_send_error(&row.action_id, EXPIRED, None, "imessage")?;
+    }
+    changed.extend(expired);
+    Ok(changed)
+}
+
+fn claim_json(item: Option<&ImessageOutboxItem>) -> String {
+    let item = item.map(|i| {
+        serde_json::json!({
+            "id": i.id,
+            "target": i.target,
+            "target_kind": i.target_kind.as_str(),
+            "service": i.service,
+            "body": i.body,
+        })
+    });
+    // Fixed key order: the contract is one exact line (#1304 AC-1).
+    format!(
+        "{{\"version\":1,\"item\":{}}}",
+        item.unwrap_or(serde_json::Value::Null)
+    )
+}
+
+/// Apply a sender report to the outbox row and its action.
+pub(crate) fn complete(
+    store: &Store,
+    id: i64,
+    outcome: &ImessageSendOutcome,
+) -> anyhow::Result<ImessageOutboxItem> {
+    let Some(before) = store.get_imessage_outbox(id)? else {
+        anyhow::bail!("no outbox item {id}");
+    };
+    if !store.complete_imessage_outbox(id, outcome)? {
+        anyhow::bail!(
+            "outbox item {id} is {}, not claimed; nothing changed",
+            before.status.as_str()
+        );
+    }
+    let action = store.get_action_with_email(&before.action_id)?;
+    match outcome {
+        ImessageSendOutcome::Sent { message_guid } => {
+            // A late report for a claim that had already been marked unknown
+            // moves the action from that error to sent: it did go out.
+            if !store.finish_send_sent(&before.action_id, "imessage")?
+                && before.status == ImessageOutboxStatus::Unknown
+            {
+                store.update_action_status(&before.action_id, ActionStatus::Sent, None, None)?;
+            }
+            if let Some(a) = &action {
+                let _ = store.mark_email_processed(&a.email.message_id, TriageResult::Reply);
+                let sent_id = message_guid
+                    .clone()
+                    .unwrap_or_else(|| format!("imessage-outbox:{id}"));
+                crate::record_self_send(
+                    store,
+                    Some(&sent_id),
+                    a.email.thread_id.as_deref(),
+                    a.email.account_entity_id.as_deref(),
+                    Some(&before.action_id),
+                );
+            }
+        }
+        ImessageSendOutcome::Failed { error_code, reason } => {
+            let msg = match error_code {
+                Some(code) => format!("imessage error {code}"),
+                None => format!("imessage send failed: {reason}"),
+            };
+            store.finish_send_error(&before.action_id, &msg, None, "imessage")?;
+        }
+    }
+    Ok(store.get_imessage_outbox(id)?.expect("row exists"))
+}
+
+pub(crate) fn run_outbox(store: &Store, op: &OutboxOp) -> anyhow::Result<()> {
+    match op {
+        OutboxOp::Claim { .. } => {
+            reconcile_outbox(store)?;
+            let item = if augmentagent_channel_imessage::send_enabled() {
+                store.claim_imessage_outbox()?
+            } else {
+                None
+            };
+            println!("{}", claim_json(item.as_ref()));
+            Ok(())
+        }
+        OutboxOp::Complete {
+            id,
+            status,
+            error_code,
+            reason,
+            message_guid,
+        } => {
+            let outcome = if status == "sent" {
+                ImessageSendOutcome::Sent {
+                    message_guid: message_guid.clone(),
+                }
+            } else {
+                ImessageSendOutcome::Failed {
+                    error_code: *error_code,
+                    reason: reason.clone().unwrap_or_else(|| "no reason given".into()),
+                }
+            };
+            let row = complete(store, *id, &outcome)?;
+            println!(
+                "{}",
+                serde_json::json!({"version": 1, "id": row.id, "status": row.status.as_str()})
+            );
+            Ok(())
+        }
+        OutboxOp::List { limit } => {
+            let now = chrono::Utc::now().timestamp_millis();
+            println!("id\tstatus\tage_s\taction_id");
+            for r in store.list_imessage_outbox(*limit)? {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    r.id,
+                    r.status.as_str(),
+                    (now - r.created_at_ms) / 1000,
+                    r.action_id
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+pub(crate) fn set_allowlist(
+    store: &Store,
+    outbound: bool,
+    allow: bool,
+    identifier: &str,
+) -> anyhow::Result<()> {
+    let changed = match (outbound, allow) {
+        (true, true) => store.allow_imessage_outbound(identifier)?,
+        (true, false) => store.deny_imessage_outbound(identifier)?,
+        (false, true) => store.allow_imessage_inbound(identifier)?,
+        (false, false) => store.deny_imessage_inbound(identifier)?,
+    };
+    let list = if outbound { "outbound" } else { "inbound" };
+    let verb = if allow { "added to" } else { "removed from" };
+    if changed {
+        println!("{verb} the {list} allowlist");
+    } else {
+        println!(
+            "no change: already {}",
+            if allow { "listed" } else { "absent" }
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn print_allowlists(store: &Store) -> anyhow::Result<()> {
+    for (label, outbound) in [("outbound", true), ("inbound", false)] {
+        for id in store.list_imessage_allowlist(outbound)? {
+            println!("{label}\t{id}");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -242,7 +470,12 @@ mod tests {
     }
 
     fn status(store: &Store, id: &str) -> String {
-        store.get_action_with_email(id).unwrap().unwrap().action.status
+        store
+            .get_action_with_email(id)
+            .unwrap()
+            .unwrap()
+            .action
+            .status
     }
 
     fn outbox_len(store: &Store) -> usize {

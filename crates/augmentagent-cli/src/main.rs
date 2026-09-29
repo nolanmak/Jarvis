@@ -1250,6 +1250,22 @@ enum ImessageOp {
         /// The `s3://<bucket>/<key>` from an `[attachment: …]` line.
         s3_uri: String,
     },
+    /// Send outbox used by the Mac-side sender (#1304).
+    Outbox {
+        #[command(subcommand)]
+        op: imessage_send::OutboxOp,
+    },
+    /// Allow approved replies to be sent to a conversation (its
+    /// `chat_identifier`, e.g. a phone number).
+    AllowOutbound { identifier: String },
+    /// Stop sends to a conversation.
+    DenyOutbound { identifier: String },
+    /// Draft reply cards for new messages in a conversation (#1306).
+    AllowInbound { identifier: String },
+    /// Stop drafting reply cards for a conversation.
+    DenyInbound { identifier: String },
+    /// Print both allowlists.
+    Allowlist,
 }
 
 #[derive(Subcommand)]
@@ -3905,6 +3921,20 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             ImessageOp::FetchAttachment { s3_uri } => run_imessage_fetch_attachment(s3_uri).await,
+            ImessageOp::Outbox { op } => imessage_send::run_outbox(&store, op),
+            ImessageOp::AllowOutbound { identifier } => {
+                imessage_send::set_allowlist(&store, true, true, identifier)
+            }
+            ImessageOp::DenyOutbound { identifier } => {
+                imessage_send::set_allowlist(&store, true, false, identifier)
+            }
+            ImessageOp::AllowInbound { identifier } => {
+                imessage_send::set_allowlist(&store, false, true, identifier)
+            }
+            ImessageOp::DenyInbound { identifier } => {
+                imessage_send::set_allowlist(&store, false, false, identifier)
+            }
+            ImessageOp::Allowlist => imessage_send::print_allowlists(&store),
         },
         Cmd::Calendar { op } => match op {
             CalendarOp::Backfill { .. } => {

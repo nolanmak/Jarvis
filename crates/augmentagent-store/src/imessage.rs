@@ -129,7 +129,8 @@ pub(crate) fn migrate(conn: &Connection) -> StoreResult<()> {
              completed_at_ms INTEGER,\
              error_code      INTEGER,\
              error_detail    TEXT,\
-             message_guid    TEXT\
+             message_guid    TEXT,\
+             notified_at_ms  INTEGER\
          );\
          CREATE INDEX IF NOT EXISTS idx_imessage_outbox_status \
              ON imessage_outbox(status, id);\
@@ -261,16 +262,69 @@ impl Store {
         Ok(n == 1)
     }
 
-    /// Move claims older than `timeout_ms` to `unknown`. Returns how many.
-    pub fn expire_imessage_outbox_claims(&self, timeout_ms: i64) -> StoreResult<usize> {
+    /// Move claims older than `timeout_ms` to `unknown` and return them.
+    pub fn expire_imessage_outbox_claims(
+        &self,
+        timeout_ms: i64,
+    ) -> StoreResult<Vec<ImessageOutboxItem>> {
+        let sql = format!(
+            "UPDATE imessage_outbox SET status = 'unknown' \
+              WHERE status = 'claimed' AND claimed_at_ms < ?1 \
+             RETURNING {COLUMNS}"
+        );
         let cutoff = now_millis() - timeout_ms;
         self.with_conn(|c| {
-            c.execute(
-                "UPDATE imessage_outbox SET status = 'unknown' \
-                  WHERE status = 'claimed' AND claimed_at_ms < ?1",
-                params![cutoff],
-            )
+            let mut stmt = c.prepare(&sql)?;
+            let rows = stmt.query_map(params![cutoff], row_to_item)?;
+            rows.collect()
         })
+    }
+
+    /// Fail queued rows older than `max_age_ms` and return them. A reply
+    /// that waited that long for the Mac is stale; sending it late is worse
+    /// than telling the operator it did not go.
+    pub fn expire_imessage_outbox_queued(
+        &self,
+        max_age_ms: i64,
+    ) -> StoreResult<Vec<ImessageOutboxItem>> {
+        let sql = format!(
+            "UPDATE imessage_outbox \
+                SET status = 'failed', completed_at_ms = ?2, \
+                    error_detail = 'expired before the Mac sender picked it up' \
+              WHERE status = 'queued' AND created_at_ms < ?1 \
+             RETURNING {COLUMNS}"
+        );
+        let now = now_millis();
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(&sql)?;
+            let rows = stmt.query_map(params![now - max_age_ms, now], row_to_item)?;
+            rows.collect()
+        })
+    }
+
+    /// Failed or unknown rows the operator has not been told about yet.
+    pub fn unnotified_imessage_outbox_failures(&self) -> StoreResult<Vec<ImessageOutboxItem>> {
+        let sql = format!(
+            "SELECT {COLUMNS} FROM imessage_outbox \
+              WHERE status IN ('failed', 'unknown') AND notified_at_ms IS NULL \
+              ORDER BY id"
+        );
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(&sql)?;
+            let rows = stmt.query_map([], row_to_item)?;
+            rows.collect()
+        })
+    }
+
+    pub fn mark_imessage_outbox_notified(&self, id: i64) -> StoreResult<bool> {
+        let n = self.with_conn(|c| {
+            c.execute(
+                "UPDATE imessage_outbox SET notified_at_ms = ?2 \
+                  WHERE id = ?1 AND notified_at_ms IS NULL",
+                params![id, now_millis()],
+            )
+        })?;
+        Ok(n == 1)
     }
 
     pub fn get_imessage_outbox(&self, id: i64) -> StoreResult<Option<ImessageOutboxItem>> {
