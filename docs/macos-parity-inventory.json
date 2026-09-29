@@ -2842,6 +2842,20 @@
     "evidence": null
   },
   {
+    "id": "sidecar:discord-voice",
+    "source": "sidecars/discord-voice/package.json",
+    "linux_baseline": "Linux can provision and operate the discord-voice sidecar.",
+    "macos_target": "Mac can provision, operate and recover the discord-voice sidecar with the same contract.",
+    "prerequisites": [
+      "sidecar-specific runtime",
+      "private socket/state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1255",
+    "test_plan": "Run discord-voice synthetic contract and managed-service lifecycle on native Mac and Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
     "id": "sidecar:fetch",
     "source": "sidecars/fetch/README.md",
     "linux_baseline": "Linux can provision and operate the fetch sidecar.",

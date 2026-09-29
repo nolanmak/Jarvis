@@ -7,9 +7,9 @@ and [epic #1259](https://github.com/nolanmak/Jarvis/issues/1259). Run
 source tree. The guard is also in the Linux/macOS platform workflow. A new
 discovered surface without an explicit row fails the test.
 
-The initial ledger contains 230 source-discovered entries: 71 top-level CLI
+The initial ledger contains 231 source-discovered entries: 71 top-level CLI
 commands, 27 channel crates, 86 literal dashboard/API routes, 20 systemd
-jobs, 15 shell installers, seven sidecars and four guarded tool helpers.
+jobs, 15 shell installers, eight sidecars and four guarded tool helpers.
 Every row is **unverified**. Source presence proves only that a capability
 needs parity work; it does not prove it works on Linux or macOS. The Linux
 baseline descriptions are hypotheses to check against current behavior. The

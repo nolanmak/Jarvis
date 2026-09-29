@@ -38,8 +38,14 @@ def discover(root=ROOT):
             if path.suffix in (".service", ".timer"):
                 add("unit", path.name, path)
 
-    for path in sorted((root / "sidecars").glob("*/README.md")):
-        add("sidecar", path.parent.name, path)
+    for directory in sorted((root / "sidecars").iterdir()):
+        if not directory.is_dir():
+            continue
+        for filename in ("README.md", "package.json", "pyproject.toml", "go.mod"):
+            path = directory / filename
+            if path.is_file():
+                add("sidecar", directory.name, path)
+                break
 
     for prefix in ("install", "uninstall"):
         for path in sorted((root / "scripts").glob(f"{prefix}-*.sh")):

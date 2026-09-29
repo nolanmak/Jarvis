@@ -18,6 +18,9 @@ class ParityInventoryTests(unittest.TestCase):
         found = {**discover(), "channel:synthetic-new-channel": "crates/new/Cargo.toml"}
         self.assertIn("untracked capability: channel:synthetic-new-channel", validate(rows, found))
 
+    def test_sidecar_without_readme_is_discovered(self):
+        self.assertIn("sidecar:discord-voice", discover())
+
     def test_verified_requires_evidence(self):
         rows = json.loads(MANIFEST.read_text())
         rows[0] = {**rows[0], "status": "verified", "evidence": None}
