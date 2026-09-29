@@ -13,11 +13,16 @@
 //! methods take URL-encoded arguments (documentation read 2026-09-29, not yet
 //! verified live — see `docs/SLACK-TRANSPORT.md`).
 //!
-//! File upload/download are declared on the trait and return
-//! [`WebApiError::Unsupported`] here; #1293 and #1294 own them.
+//! [`SlackWebApi::upload_file`] (#1294) uses Slack's external upload flow:
+//! `files.getUploadURLExternal`, a raw POST of the bytes (streamed from disk
+//! for [`UploadSource::Path`]) to the returned pre-signed URL, then
+//! `files.completeUploadExternal` to share it into the channel/thread. The
+//! bot token is never sent to the upload URL, and the URL itself is treated
+//! as a secret. `download_file` is still [`WebApiError::Unsupported`] (#1293).
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -79,6 +84,31 @@ pub enum WebApiError {
     Json(String),
     #[error("{0} is not implemented by this client")]
     Unsupported(&'static str),
+    /// Refused before any request: larger than [`UploadLimits::max_bytes`].
+    #[error("file is {size} bytes; the upload limit is {limit} bytes")]
+    FileTooLarge { size: u64, limit: u64 },
+    /// Refused locally: missing/unreadable/empty file, blank name, or an
+    /// upload URL that is not https (the URL is never echoed).
+    #[error("invalid upload: {0}")]
+    InvalidUpload(String),
+    /// The upload failed before `files.completeUploadExternal` was called,
+    /// so nothing was shared (Slack discards uncompleted uploads) and the
+    /// whole flow can be retried without a duplicate.
+    #[error("upload not completed ({step}): {source}")]
+    UploadIncomplete {
+        step: &'static str,
+        source: Box<WebApiError>,
+    },
+}
+
+impl WebApiError {
+    /// The innermost error, looking through [`WebApiError::UploadIncomplete`].
+    pub fn root(&self) -> &WebApiError {
+        match self {
+            Self::UploadIncomplete { source, .. } => source.root(),
+            other => other,
+        }
+    }
 }
 
 impl WebApiError {
@@ -127,6 +157,14 @@ pub struct PostMessage {
     pub unfurl_links: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mrkdwn: Option<bool>,
+    /// `false` so plain `@name` text is never turned into a mention (#1294).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_names: Option<bool>,
+    /// Slack message metadata (`{"event_type", "event_payload"}`); the
+    /// delivery planner stores the outbox idempotency key here so a lost
+    /// send can be found again (#1285). Sent as a JSON object (unverified).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -207,21 +245,55 @@ pub struct AuthTest {
     pub scopes: Option<Vec<String>>,
 }
 
-/// Declared for #1293/#1294; not implemented in this crate yet.
-#[derive(Debug, Clone, PartialEq)]
+/// Where the bytes of an upload come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadSource {
+    Bytes(Vec<u8>),
+    /// Streamed from disk; the path may contain spaces and any Unicode.
+    Path(PathBuf),
+}
+
+/// A file to share into a conversation (#1294).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadFile {
+    /// Channel/DM to share into; `None` leaves the file private to the bot.
     pub channel: Option<String>,
+    /// Name shown in Slack; Slack derives the file type from it.
     pub filename: String,
-    pub content: Vec<u8>,
+    pub source: UploadSource,
     pub title: Option<String>,
+    /// Share as a reply in this thread (needs `channel`).
     pub thread_ts: Option<String>,
     pub initial_comment: Option<String>,
+    /// Image description (`alt_txt`, max 1,000 characters per Slack docs).
+    pub alt_text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadedFile {
     pub id: String,
     pub permalink: Option<String>,
+}
+
+/// Bounds for [`SlackWebApi::upload_file`] on the HTTP client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadLimits {
+    /// Refuse larger files before any request. Default 1 GiB: Slack's
+    /// per-file limit as commonly documented in its help centre; the API
+    /// method pages read on 2026-09-29 do not state it (**unverified**).
+    pub max_bytes: u64,
+    /// Upper bound for the byte transfer to the upload URL (the Web API
+    /// calls keep [`WebApiConfig::request_timeout`]).
+    pub transfer_timeout: Duration,
+}
+
+impl Default for UploadLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: 1024 * 1024 * 1024,
+            transfer_timeout: Duration::from_secs(300),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -252,12 +324,12 @@ pub trait SlackWebApi: Send + Sync {
     /// user (#1286). Needs the `im:write` bot scope.
     async fn open_direct_conversation(&self, user_id: &str) -> Result<String, WebApiError>;
 
-    /// Deferred to #1293/#1294. Default: [`WebApiError::Unsupported`].
+    /// Upload and share a file. Default: [`WebApiError::Unsupported`].
     async fn upload_file(&self, _req: UploadFile) -> Result<UploadedFile, WebApiError> {
         Err(WebApiError::Unsupported("upload_file"))
     }
 
-    /// Deferred to #1293/#1294. Default: [`WebApiError::Unsupported`].
+    /// Deferred to #1293. Default: [`WebApiError::Unsupported`].
     async fn download_file(&self, _url_private: &str) -> Result<Vec<u8>, WebApiError> {
         Err(WebApiError::Unsupported("download_file"))
     }
@@ -279,6 +351,7 @@ struct Inner {
     token: BotToken,
     http: reqwest::Client,
     config: WebApiConfig,
+    upload: UploadLimits,
     sleeper: Arc<dyn Sleeper>,
 }
 
@@ -308,6 +381,7 @@ impl HttpSlackWebApi {
                 token,
                 http,
                 config,
+                upload: UploadLimits::default(),
                 sleeper: Arc::new(TokioSleeper),
             }),
             cancel: CancellationToken::new(),
@@ -318,6 +392,13 @@ impl HttpSlackWebApi {
     pub fn with_sleeper(mut self, sleeper: Arc<dyn Sleeper>) -> Self {
         let inner = Arc::get_mut(&mut self.inner).expect("with_sleeper before any clone");
         inner.sleeper = sleeper;
+        self
+    }
+
+    /// Replace the upload bounds (size limit, transfer timeout).
+    pub fn with_upload_limits(mut self, limits: UploadLimits) -> Self {
+        let inner = Arc::get_mut(&mut self.inner).expect("with_upload_limits before any clone");
+        inner.upload = limits;
         self
     }
 
@@ -451,6 +532,122 @@ impl HttpSlackWebApi {
                 .map(str::to_string);
             return Err(WebApiError::Slack { error, warning });
         }
+    }
+}
+
+/// Size of the upload, refusing empty, missing and oversized files before
+/// any request leaves the process.
+async fn upload_length(source: &UploadSource, limit: u64) -> Result<u64, WebApiError> {
+    let size = match source {
+        UploadSource::Bytes(b) => b.len() as u64,
+        UploadSource::Path(p) => {
+            let meta = tokio::fs::metadata(p)
+                .await
+                .map_err(|e| WebApiError::InvalidUpload(format!("{}: {e}", p.display())))?;
+            if !meta.is_file() {
+                return Err(WebApiError::InvalidUpload(format!(
+                    "{} is not a regular file",
+                    p.display()
+                )));
+            }
+            meta.len()
+        }
+    };
+    if size == 0 {
+        return Err(WebApiError::InvalidUpload("file is empty".into()));
+    }
+    if size > limit {
+        return Err(WebApiError::FileTooLarge { size, limit });
+    }
+    Ok(size)
+}
+
+/// The pre-signed upload URL must be https (plain http only on loopback,
+/// for tests) and carry no credentials. Never echoed in errors.
+fn checked_upload_url(raw: &str) -> Result<reqwest::Url, WebApiError> {
+    let bad = |why: &str| WebApiError::InvalidUpload(format!("upload URL rejected: {why}"));
+    let url = reqwest::Url::parse(raw).map_err(|_| bad("not a URL"))?;
+    let loopback = match url.host_str() {
+        Some("localhost") => true,
+        Some(h) => h
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback()),
+        None => false,
+    };
+    match url.scheme() {
+        "https" => {}
+        "http" if loopback => {}
+        _ => return Err(bad("not https")),
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(bad("carries credentials"));
+    }
+    Ok(url)
+}
+
+impl HttpSlackWebApi {
+    async fn send_upload_bytes(
+        &self,
+        url: reqwest::Url,
+        source: UploadSource,
+        length: u64,
+    ) -> Result<(), WebApiError> {
+        if self.cancel.is_cancelled() {
+            return Err(WebApiError::Cancelled);
+        }
+        let body = match source {
+            UploadSource::Bytes(bytes) => reqwest::Body::from(bytes),
+            UploadSource::Path(path) => {
+                let file = tokio::fs::File::open(&path)
+                    .await
+                    .map_err(|e| WebApiError::InvalidUpload(format!("{}: {e}", path.display())))?;
+                reqwest::Body::from(file)
+            }
+        };
+        let timeout = self.inner.upload.transfer_timeout;
+        let send = self
+            .inner
+            .http
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .header(reqwest::header::CONTENT_LENGTH, length)
+            .timeout(timeout)
+            .body(body)
+            .send();
+        debug!(bytes = length, "slack upload: sending bytes");
+        let response = tokio::select! {
+            _ = self.cancel.cancelled() => return Err(WebApiError::Cancelled),
+            r = tokio::time::timeout(timeout, send) => match r {
+                Err(_elapsed) => return Err(WebApiError::Timeout),
+                Ok(Err(e)) => return Err(WebApiError::transport(e)),
+                Ok(Ok(resp)) => resp,
+            },
+        };
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let retry_after =
+                parse_retry_after(response.headers()).unwrap_or(Duration::from_secs(1));
+            return Err(WebApiError::RateLimited { retry_after });
+        }
+        let text = tokio::select! {
+            _ = self.cancel.cancelled() => return Err(WebApiError::Cancelled),
+            t = tokio::time::timeout(self.inner.config.request_timeout, response.text()) => {
+                t.ok().and_then(Result::ok).unwrap_or_default()
+            }
+        };
+        let mut excerpt: String = redact(&text).chars().take(200).collect();
+        if excerpt.is_empty() {
+            excerpt.push_str("<empty>");
+        }
+        Err(WebApiError::Http {
+            status: status.as_u16(),
+            body: excerpt,
+        })
     }
 }
 
@@ -600,6 +797,87 @@ impl SlackWebApi for HttpSlackWebApi {
             .ok_or_else(|| WebApiError::Json("conversations.open: missing channel id".into()))
     }
 
+    async fn upload_file(&self, req: UploadFile) -> Result<UploadedFile, WebApiError> {
+        if req.filename.trim().is_empty() {
+            return Err(WebApiError::InvalidUpload("file name is blank".into()));
+        }
+        if req.thread_ts.is_some() && req.channel.is_none() {
+            return Err(WebApiError::InvalidUpload(
+                "a thread reply needs a channel".into(),
+            ));
+        }
+        let length = upload_length(&req.source, self.inner.upload.max_bytes).await?;
+
+        // Step 1: reserve the upload.
+        let length_arg = length.to_string();
+        let mut form: Vec<(&str, &str)> = vec![
+            ("filename", req.filename.as_str()),
+            ("length", length_arg.as_str()),
+        ];
+        if let Some(alt) = &req.alt_text {
+            form.push(("alt_txt", alt.as_str()));
+        }
+        let incomplete = |step: &'static str| {
+            move |e: WebApiError| WebApiError::UploadIncomplete {
+                step,
+                source: Box::new(e),
+            }
+        };
+        const STEP1: &str = "files.getUploadURLExternal";
+        let v = self
+            .call(STEP1, Body::Form(&form))
+            .await
+            .map_err(incomplete(STEP1))?;
+        let file_id = str_field(&v, "file_id")
+            .ok_or_else(|| WebApiError::Json(format!("{STEP1}: missing file_id")))
+            .map_err(incomplete(STEP1))?;
+        let upload_url = str_field(&v, "upload_url")
+            .ok_or_else(|| WebApiError::Json(format!("{STEP1}: missing upload_url")))
+            .map_err(incomplete(STEP1))
+            .and_then(|raw| checked_upload_url(&raw))?;
+
+        // Step 2: the bytes. Not retried here: a failed transfer is simply
+        // never completed, and Slack discards an upload that is not
+        // completed, so the caller can restart the whole flow.
+        self.send_upload_bytes(upload_url, req.source, length)
+            .await
+            .map_err(incomplete("upload"))?;
+
+        // Step 3: complete and share.
+        let mut file = json!({ "id": file_id });
+        if let Some(title) = &req.title {
+            file["title"] = json!(title);
+        }
+        let mut body = json!({ "files": [file] });
+        if let Some(channel) = &req.channel {
+            body["channel_id"] = json!(channel);
+        }
+        if let Some(ts) = &req.thread_ts {
+            body["thread_ts"] = json!(ts);
+        }
+        if let Some(comment) = &req.initial_comment {
+            body["initial_comment"] = json!(comment);
+        }
+        let v = self
+            .call("files.completeUploadExternal", Body::Json(body))
+            .await?;
+        let done = v
+            .get("files")
+            .and_then(Value::as_array)
+            .and_then(|files| {
+                files
+                    .iter()
+                    .find(|f| str_field(f, "id").as_deref() == Some(&file_id))
+            })
+            .ok_or_else(|| {
+                WebApiError::Json("files.completeUploadExternal: file missing from response".into())
+            })?;
+        Ok(UploadedFile {
+            id: file_id,
+            permalink: str_field(done, "permalink"),
+        })
+    }
+
     async fn auth_test(&self) -> Result<AuthTest, WebApiError> {
         let (v, headers) = self.call_with_headers("auth.test", Body::Form(&[])).await?;
         let scopes = headers
@@ -668,6 +946,7 @@ pub enum RecordedCall {
     UploadFile {
         filename: String,
         channel: Option<String>,
+        thread_ts: Option<String>,
         bytes: usize,
     },
     DownloadFile {
@@ -927,10 +1206,15 @@ impl SlackWebApi for RecordingSlackWebApi {
     }
 
     async fn upload_file(&self, req: UploadFile) -> Result<UploadedFile, WebApiError> {
+        let bytes = match &req.source {
+            UploadSource::Bytes(b) => b.len(),
+            UploadSource::Path(p) => std::fs::metadata(p).map(|m| m.len() as usize).unwrap_or(0),
+        };
         self.record(RecordedCall::UploadFile {
             filename: req.filename,
             channel: req.channel,
-            bytes: req.content.len(),
+            thread_ts: req.thread_ts,
+            bytes,
         })?;
         let n = self.ts_counter.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(UploadedFile {
