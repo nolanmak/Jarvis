@@ -18,6 +18,7 @@ pub mod app;
 pub mod auth;
 pub mod channel;
 pub mod digest;
+pub mod owner;
 pub mod surface;
 pub mod transport;
 pub mod types;

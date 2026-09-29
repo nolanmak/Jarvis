@@ -220,6 +220,40 @@ Source: https://docs.slack.dev/apis/events-api/using-socket-mode (checked
   mock + WebSocket handshake), secrets never in errors, plus the ignored live
   probe.
 
+## Owner authority (#1286)
+
+`augmentagent_channel_slack::owner` decides, per parsed envelope, whether
+input is the bound owner's (`Owner`), never a turn (`Ignore`) or refused
+(`Reject`). The binding is the shared store's `surface_owner_bindings` row for
+the workspace account (`team:T…` or `enterprise:E…/team:T…`) plus
+`surface_control_conversations` (the owner's DM with the app and, optionally,
+one private control channel). Rejections go to `surface_auth_rejections`
+with identifiers and a reason code only, never message text.
+
+- Authority is the exact `(workspace, user ID)` pair. Display names,
+  usernames, profile fields and emails are never read.
+- The envelope's team must be bound and its enterprise must match exactly;
+  a message or click whose acting user's team (`user_team`, `source_team`,
+  `team`, `user.team_id`) is another team is rejected, so Slack Connect users
+  and the owner's ID from another workspace carry no authority.
+- The app's own posts, other bots, workflows and integrations, edits and
+  unfurls (`message_changed`), deletions, hidden and system subtypes are
+  ignored before any identity check, so the agent never answers itself.
+- Messages start a turn only in a control conversation; chatter elsewhere is
+  ignored. Non-owners in a control conversation or DM with the app are
+  rejected. An externally shared control channel is rejected even for the
+  owner.
+- Interactions and slash commands are authorized by the acting user, not the
+  channel.
+- Every rejected user sees the same short text; no reply is offered for an
+  unbound workspace, an enterprise mismatch or a payload without an actor.
+
+`admit()` is the gate `serve` (#1287) puts in front of the harness: owner
+input goes to an `OwnerInputSink`, rejections are audited before it returns.
+Field names used for team and sharing checks come from the Events API,
+interactivity and slash-command reference pages; like the rest of this file
+they are unconfirmed against a live workspace (item 11 below).
+
 ## Remaining live verification (owner, test workspace)
 
 1. App-level token scope (`connections:write`) and `apps.connections.open`
@@ -240,3 +274,8 @@ Source: https://docs.slack.dev/apis/events-api/using-socket-mode (checked
    accepted as-is by Slack's "From a manifest" flow (#1284).
 10. A launchd-run daemon reading the `slack-app` Keychain item written from
     a terminal (#1246).
+11. Owner authority inputs (#1286): `enterprise_id` / `enterprise.id`,
+    `user_team` / `source_team` on Slack Connect messages, `user.team_id` on
+    interactions, `is_ext_shared_channel` on Events API callbacks, and whether
+    the app receives both `message` and `app_mention` for one post in a
+    control channel.
