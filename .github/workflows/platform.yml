@@ -195,6 +195,18 @@ jobs:
           cargo test -p augmentagent-auth
           cargo test -p augmentagent-channel-slack --test app_manifest --test app_install --test owner_setup
           cargo test -p augmentagent-cli --test slack_app_cli
+      # #1325 — credentials persist on Linux. The owner-only file store
+      # (0700/0600, atomic writes, corrupt slots, redaction, one-way
+      # read-through from the legacy keyring, a second process reading what
+      # the first wrote) on both hosts; on Linux, the same through the
+      # default store for the auth crate alone and for the real binary with
+      # the workspace's keyring features (`slack app install` in one
+      # process, `slack app status`/`status`/`doctor` in the next). No D-Bus
+      # session, no keyring, no network; the macOS CLI test is ignored there.
+      - name: Credential persistence (#1325)
+        run: |
+          cargo test -p augmentagent-auth --test private_file_store --test linux_default_store --test backend_description --test credential_store
+          cargo test -p augmentagent-cli --test linux_credential_persistence
       # #1299 — Slack operations: status/doctor setup steps, credential
       # backend and plaintext-store flags, the daemon's start report
       # (Discord broker off), reconnect count, a log scan for synthetic

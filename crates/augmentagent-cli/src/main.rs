@@ -17262,7 +17262,7 @@ async fn run_slack_persist_auth(
         .with_context(|| {
             format!(
                 "Keychain round-trip failed for team {} — save reported ok but read returned err. \
-                 On Linux this usually means Secret Service (gnome-keyring/kwallet) isn't running for this user session.",
+                 On Linux check that HOME is set and the `credentials` directory in the state directory belongs to this user (#1325).",
                 auth.team_id
             )
         })?;

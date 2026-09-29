@@ -19,6 +19,19 @@
 //! local QA against a mock Slack; never for real secrets). The static
 //! [`Auth`] helpers go through [`default_store`], so every channel honours
 //! the same override.
+//!
+//! #1325 — on Linux the default is [`PrivateFileCredentialStore`], an
+//! owner-only (`0700` directory, `0600` files) store under the private state
+//! directory, not the `keyring` crate. keyring 3 picks its Linux backend by
+//! Cargo feature, so the same code got its in-memory mock (nothing survives
+//! the process) or, once the workspace unified `sync-secret-service` in, the
+//! D-Bus Secret Service, which needs a session bus and an unlocked
+//! collection that a headless systemd daemon usually lacks; the kernel
+//! keyutils backend is lost on reboot. One file store read by the CLI and
+//! the daemon alike is the only option that persists and works headless.
+//! Credentials the released binary kept in the Secret Service are read
+//! through and copied into the file store on first use (see
+//! [`PrivateFileCredentialStore::with_legacy`]).
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -161,7 +174,8 @@ pub trait CredentialStore: Send + Sync {
 }
 
 /// The store the process should use: [`FileCredentialStore`] when
-/// [`INSECURE_FILE_STORE_ENV`] is set, otherwise the platform keyring.
+/// [`INSECURE_FILE_STORE_ENV`] is set, otherwise the platform store (the
+/// Keychain on macOS, [`PrivateFileCredentialStore`] on Linux).
 pub fn default_store() -> Arc<dyn CredentialStore> {
     store_for_override(std::env::var_os(INSECURE_FILE_STORE_ENV).as_deref())
 }
@@ -180,15 +194,76 @@ pub fn store_for_override(dir: Option<&OsStr>) -> Arc<dyn CredentialStore> {
             });
             Arc::new(FileCredentialStore::new(Path::new(dir)))
         }
-        None => Arc::new(KeychainCredentialStore),
+        None => platform_store(),
     }
 }
+
+/// The store used without the plaintext override: the Keychain on macOS
+/// (and the `keyring` default elsewhere), the owner-only file store on Linux
+/// (#1325).
+#[cfg(not(target_os = "linux"))]
+fn platform_store() -> Arc<dyn CredentialStore> {
+    Arc::new(KeychainCredentialStore)
+}
+
+#[cfg(target_os = "linux")]
+fn platform_store() -> Arc<dyn CredentialStore> {
+    match linux_credential_dir() {
+        // Credentials the shipped binary kept in the Secret Service before
+        // #1325 are read through and copied on first use.
+        Some(dir) => {
+            // One switch per process: `default_store` builds a store per
+            // call, and a keyring that timed out once stays off (#1325).
+            static LEGACY_OFF: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>> =
+                std::sync::OnceLock::new();
+            Arc::new(
+                PrivateFileCredentialStore::new(dir)
+                    .with_legacy(Arc::new(KeychainCredentialStore))
+                    .with_legacy_switch(Arc::clone(LEGACY_OFF.get_or_init(Default::default))),
+            )
+        }
+        None => Arc::new(UnavailableCredentialStore),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_credential_dir() -> Option<PathBuf> {
+    private_credential_dir(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+}
+
+/// #1325 — where [`PrivateFileCredentialStore`] keeps credentials by default:
+/// `credentials` under the daemon's state directory, resolved by the same
+/// rule as `augmentagent_channel_core::state_dir` (which this crate cannot
+/// link: channel-core depends on it). An absolute `XDG_STATE_HOME` wins;
+/// an empty or relative one is ignored; `None` without either.
+pub fn private_credential_dir(
+    state_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(dir) = state_home.map(PathBuf::from).filter(|d| d.is_absolute()) {
+        return Some(dir.join("augmentagent").join(CREDENTIALS_DIR));
+    }
+    home.map(|h| {
+        PathBuf::from(h)
+            .join(".local/state/augmentagent")
+            .join(CREDENTIALS_DIR)
+    })
+}
+
+const CREDENTIALS_DIR: &str = "credentials";
+
+/// Operator guidance when Linux has nowhere to keep credentials.
+#[cfg(target_os = "linux")]
+const NO_HOME_NOTE: &str = "neither HOME nor an absolute XDG_STATE_HOME is set, so there is \
+     nowhere to keep credentials (#1325); run the CLI and the daemon with HOME set (systemd \
+     user units set it) and re-run `augmentagent slack app install`";
 
 /// #1299 / #1325 — which credential backend a process uses, for `doctor` and
 /// `status`. Never contains a secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendDescription {
-    /// `macos-keychain`, `secret-service`, `keyutils`, `keyring-mock`,
+    /// `macos-keychain`, `private-file` (Linux, #1325), `unavailable` (Linux
+    /// without HOME), `platform-keyring`, `keyutils`, `keyring-mock`,
     /// `insecure-file`, …
     pub backend: &'static str,
     /// Credentials outlive the process that stored them.
@@ -218,6 +293,20 @@ pub fn describe_store_for_override(dir: Option<&OsStr>) -> BackendDescription {
             )),
         };
     }
+    #[cfg(target_os = "linux")]
+    {
+        describe_linux_store()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        describe_keyring_store()
+    }
+}
+
+/// The `keyring` crate's default backend, which [`KeychainCredentialStore`]
+/// uses: the login Keychain on macOS.
+#[cfg(not(target_os = "linux"))]
+fn describe_keyring_store() -> BackendDescription {
     use keyring::credential::CredentialPersistence;
     let persistence = keyring::default::default_credential_builder().persistence();
     let persistent = matches!(persistence, CredentialPersistence::UntilDelete);
@@ -242,6 +331,28 @@ pub fn describe_store_for_override(dir: Option<&OsStr>) -> BackendDescription {
         note,
     }
 }
+
+#[cfg(target_os = "linux")]
+fn describe_linux_store() -> BackendDescription {
+    match linux_credential_dir() {
+        Some(_) => BackendDescription {
+            backend: PRIVATE_FILE_BACKEND,
+            persistent: true,
+            insecure: false,
+            note: None,
+        },
+        None => BackendDescription {
+            backend: UNAVAILABLE_BACKEND,
+            persistent: false,
+            insecure: false,
+            note: Some(NO_HOME_NOTE.to_string()),
+        },
+    }
+}
+
+const PRIVATE_FILE_BACKEND: &str = "private-file";
+#[cfg(target_os = "linux")]
+const UNAVAILABLE_BACKEND: &str = "unavailable";
 
 /// macOS Keychain / platform keyring via the `keyring` crate.
 #[derive(Debug, Default, Clone, Copy)]
@@ -419,26 +530,7 @@ impl CredentialStore for FileCredentialStore {
         std::fs::create_dir_all(parent).map_err(io_err)?;
         set_mode(&self.dir, 0o700).map_err(io_err)?;
         set_mode(parent, 0o700).map_err(io_err)?;
-        let tmp = parent.join(format!(
-            ".{}.tmp-{}",
-            path.file_name().unwrap().to_string_lossy(),
-            std::process::id()
-        ));
-        {
-            use std::io::Write;
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            let mut f = opts.open(&tmp).map_err(io_err)?;
-            f.write_all(payload).map_err(io_err)?;
-            f.sync_all().map_err(io_err)?;
-        }
-        set_mode(&tmp, 0o600).map_err(io_err)?;
-        std::fs::rename(&tmp, &path).map_err(io_err)?;
+        write_atomic(&path, payload)?;
         debug!(platform, account, bytes = payload.len(), "auth put (file)");
         Ok(())
     }
@@ -478,6 +570,421 @@ impl CredentialStore for FileCredentialStore {
                 Presence::Unreadable(bounded(&format!("credential file store: {}", e.kind())))
             }
         }
+    }
+}
+
+/// Write `bytes` to `path` atomically: a `0600` temp file in the same
+/// directory, fsynced, then renamed over the slot. A reader sees the old
+/// file or the new one, never a torn write. The temp name is unique per
+/// process and call, so concurrent writers never share one.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), AuthError> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().expect("path has a platform directory");
+    let tmp = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        path.file_name().unwrap().to_string_lossy(),
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        set_mode(&tmp, 0o600)?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map_err(io_err)
+}
+
+/// Owner-only credential files at `<dir>/<platform>/<account>`
+/// (percent-encoded), the default store on Linux (#1325). The directory and
+/// each platform directory are `0700`, every file `0600`; a slot found
+/// group- or world-accessible is tightened before it is read. Each file is a
+/// small envelope (magic, length, FNV-1a checksum, payload) so a truncated or
+/// damaged slot is reported as corrupt instead of being handed out as a
+/// secret. Writes are atomic.
+///
+/// Not encrypted: any key the daemon could read unattended would sit beside
+/// the files with the same owner, so encryption would add no protection
+/// against the one reader `0600` admits (this user, or root). The protection
+/// is the same as `~/.ssh` keys.
+///
+/// With [`with_legacy`](Self::with_legacy), a slot missing here is looked up
+/// in the store that held credentials before (#1325: the `keyring` default,
+/// which the shipped Linux binary resolved to the D-Bus Secret Service) and
+/// copied here when found. Nothing is written to the legacy store; `delete`
+/// clears it too, so a deleted credential cannot come back. A legacy store
+/// that fails (no session bus) counts as missing.
+///
+/// Each legacy call runs on a helper thread and is abandoned after
+/// [`LEGACY_TIMEOUT`]: a locked Secret Service collection can start an
+/// unlock prompt and wait for a user who is not there. The first timeout or
+/// failure turns the legacy store off for this store and its clones (for
+/// the default store, the whole process), so later slots never wait again.
+#[derive(Clone)]
+pub struct PrivateFileCredentialStore {
+    dir: PathBuf,
+    legacy: Option<Arc<dyn CredentialStore>>,
+    legacy_timeout: std::time::Duration,
+    /// Set once the legacy store timed out or failed.
+    legacy_off: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// How long one legacy (Secret Service) lookup may take before it is
+/// treated as unavailable.
+pub const LEGACY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+const LEGACY_RECOVERY: &str = "unlock the login keyring (a desktop login, or \
+     `gnome-keyring-daemon --unlock`) and re-run the command, or enter the credential again \
+     (for Slack: `augmentagent slack app install`)";
+
+impl std::fmt::Debug for PrivateFileCredentialStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrivateFileCredentialStore")
+            .field("dir", &self.dir)
+            .field("legacy", &self.legacy.as_ref().map(|l| l.backend()))
+            .finish()
+    }
+}
+
+const ENVELOPE_MAGIC: &str = "augmentagent-credential 1";
+
+impl PrivateFileCredentialStore {
+    pub fn new(dir: impl AsRef<Path>) -> Self {
+        Self {
+            dir: dir.as_ref().to_path_buf(),
+            legacy: None,
+            legacy_timeout: LEGACY_TIMEOUT,
+            legacy_off: Default::default(),
+        }
+    }
+
+    /// Read through to `legacy` for slots not yet in this store, and copy
+    /// what it returns here (one-way migration, see the type docs).
+    pub fn with_legacy(mut self, legacy: Arc<dyn CredentialStore>) -> Self {
+        self.legacy = Some(legacy);
+        self
+    }
+
+    /// Test hook: bound each legacy call by `timeout` instead of
+    /// [`LEGACY_TIMEOUT`].
+    #[doc(hidden)]
+    pub fn with_legacy_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.legacy_timeout = timeout;
+        self
+    }
+
+    /// Share the "legacy store is off" switch (the default store uses one
+    /// per process, since `default_store` builds a store per call).
+    #[cfg(target_os = "linux")]
+    fn with_legacy_switch(mut self, off: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.legacy_off = off;
+        self
+    }
+
+    /// Run `call` against the legacy store on a helper thread, bounded by
+    /// the timeout. `None` when there is no legacy store, it is off, it
+    /// timed out or it failed (the last two turn it off). A timed-out
+    /// thread is left to finish on its own; it holds no lock of ours.
+    fn legacy_call<T: Send + 'static>(
+        &self,
+        platform: &str,
+        account: &str,
+        call: impl FnOnce(&dyn CredentialStore) -> Result<T, AuthError> + Send + 'static,
+    ) -> Option<Result<T, AuthError>> {
+        use std::sync::atomic::Ordering;
+        let legacy = Arc::clone(self.legacy.as_ref()?);
+        if self.legacy_off.load(Ordering::SeqCst) {
+            return None;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("legacy-credential-store".into())
+            .spawn(move || {
+                let _ = tx.send(call(legacy.as_ref()));
+            });
+        if let Err(e) = spawned {
+            debug!(error = %e, "legacy credential lookup not started");
+            self.legacy_off.store(true, Ordering::SeqCst);
+            return None;
+        }
+        match rx.recv_timeout(self.legacy_timeout) {
+            Ok(Err(AuthError::NotFound { .. })) => Some(Err(not_found(platform, account))),
+            Ok(Err(e)) => {
+                if !self.legacy_off.swap(true, Ordering::SeqCst) {
+                    debug!(platform, account, error = %e, "legacy credential store unavailable; not consulted again");
+                }
+                None
+            }
+            Ok(ok) => Some(ok),
+            Err(_) => {
+                if !self.legacy_off.swap(true, Ordering::SeqCst) {
+                    tracing::warn!(
+                        platform,
+                        account,
+                        timeout_ms = self.legacy_timeout.as_millis() as u64,
+                        "the legacy keyring (Secret Service) did not answer, so credentials \
+                         still stored only there are treated as missing for the rest of this \
+                         process (#1325); {LEGACY_RECOVERY}"
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// A slot from the legacy store, copied into this one. `None` when there
+    /// is no legacy store, it lacks the slot, or it cannot be read.
+    fn migrate(&self, platform: &str, account: &str) -> Option<Vec<u8>> {
+        let (p, a) = (platform.to_string(), account.to_string());
+        let from = self.legacy.as_ref()?.backend();
+        match self.legacy_call(platform, account, move |l| l.get(&p, &a))? {
+            Ok(bytes) => {
+                match self.put(platform, account, &bytes) {
+                    Ok(()) => tracing::info!(
+                        platform,
+                        account,
+                        from,
+                        "credential copied into the private file store (#1325)"
+                    ),
+                    Err(e) => tracing::warn!(
+                        platform,
+                        account,
+                        error = %e,
+                        "credential read from the legacy store but not copied"
+                    ),
+                }
+                Some(bytes)
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// The directory holding the credential files.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    fn path_for(&self, platform: &str, account: &str) -> Result<PathBuf, AuthError> {
+        Ok(self
+            .dir
+            .join(encode_component("platform", platform)?)
+            .join(encode_component("account", account)?))
+    }
+
+    /// Read and validate one slot. `Ok(None)` when it does not exist.
+    fn read_slot(&self, platform: &str, account: &str) -> Result<Option<Vec<u8>>, AuthError> {
+        let path = self.path_for(platform, account)?;
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io_err(e)),
+        };
+        if !meta.is_file() {
+            return Ok(None);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o077 != 0 {
+                tracing::warn!(
+                    platform,
+                    account,
+                    "credential file was readable by other users; restricting it to 0600"
+                );
+                set_mode(&path, 0o600).map_err(io_err)?;
+            }
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io_err(e)),
+        };
+        open_envelope(&bytes)
+            .map(Some)
+            .map_err(|why| corrupt(platform, account, why))
+    }
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn seal_envelope(payload: &[u8]) -> Vec<u8> {
+    let header = format!(
+        "{ENVELOPE_MAGIC}\nlen {} fnv1a64 {:016x}\n",
+        payload.len(),
+        fnv1a64(payload)
+    );
+    let mut out = header.into_bytes();
+    out.extend_from_slice(payload);
+    out
+}
+
+/// The payload of a sealed slot, or why it is not one. The reason never
+/// quotes the file's bytes.
+fn open_envelope(bytes: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let rest = bytes
+        .strip_prefix(ENVELOPE_MAGIC.as_bytes())
+        .and_then(|r| r.strip_prefix(b"\n"))
+        .ok_or("unrecognised header")?;
+    let nl = rest
+        .iter()
+        .position(|b| *b == b'\n')
+        .ok_or("truncated header")?;
+    let meta = std::str::from_utf8(&rest[..nl]).map_err(|_| "unreadable header")?;
+    let payload = &rest[nl + 1..];
+    let mut parts = meta.split(' ');
+    let (Some("len"), Some(len), Some("fnv1a64"), Some(sum), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return Err("unreadable header");
+    };
+    let len: usize = len.parse().map_err(|_| "unreadable length")?;
+    let sum = u64::from_str_radix(sum, 16).map_err(|_| "unreadable checksum")?;
+    if payload.len() != len {
+        return Err("length mismatch (truncated or extended)");
+    }
+    if fnv1a64(payload) != sum {
+        return Err("checksum mismatch");
+    }
+    Ok(payload.to_vec())
+}
+
+fn corrupt(platform: &str, account: &str, why: &str) -> AuthError {
+    AuthError::Keyring(keyring::Error::PlatformFailure(Box::new(
+        std::io::Error::other(format!(
+            "credential file for {SERVICE_PREFIX}{platform}/{account} is corrupt ({why}); \
+             re-run the command that stored it (for Slack: `augmentagent slack app install`)"
+        )),
+    )))
+}
+
+impl CredentialStore for PrivateFileCredentialStore {
+    fn backend(&self) -> &'static str {
+        PRIVATE_FILE_BACKEND
+    }
+
+    fn put(&self, platform: &str, account: &str, payload: &[u8]) -> Result<(), AuthError> {
+        let path = self.path_for(platform, account)?;
+        let parent = path.parent().expect("path has a platform directory");
+        std::fs::create_dir_all(parent).map_err(io_err)?;
+        set_mode(&self.dir, 0o700).map_err(io_err)?;
+        set_mode(parent, 0o700).map_err(io_err)?;
+        write_atomic(&path, &seal_envelope(payload))?;
+        debug!(
+            platform,
+            account,
+            bytes = payload.len(),
+            "auth put (private file)"
+        );
+        Ok(())
+    }
+
+    fn get(&self, platform: &str, account: &str) -> Result<Vec<u8>, AuthError> {
+        match self.read_slot(platform, account)? {
+            Some(bytes) => {
+                debug!(
+                    platform,
+                    account,
+                    bytes = bytes.len(),
+                    "auth get (private file)"
+                );
+                Ok(bytes)
+            }
+            None => self
+                .migrate(platform, account)
+                .ok_or_else(|| not_found(platform, account)),
+        }
+    }
+
+    fn delete(&self, platform: &str, account: &str) -> Result<(), AuthError> {
+        let path = self.path_for(platform, account)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err(e)),
+        }
+        let (p, a) = (platform.to_string(), account.to_string());
+        if let Some(Err(e)) = self.legacy_call(platform, account, move |l| l.delete(&p, &a)) {
+            debug!(platform, account, error = %e, "legacy credential store not cleared");
+        }
+        Ok(())
+    }
+
+    fn exists(&self, platform: &str, account: &str) -> bool {
+        self.presence(platform, account) == Presence::Present
+    }
+
+    /// Reads and validates the slot: a corrupt one is `Unreadable`. A slot
+    /// only in the legacy store is migrated and `Present`.
+    fn presence(&self, platform: &str, account: &str) -> Presence {
+        match self.read_slot(platform, account) {
+            Ok(Some(_)) => Presence::Present,
+            Ok(None) if self.migrate(platform, account).is_some() => Presence::Present,
+            Ok(None) => Presence::Missing,
+            Err(AuthError::Keyring(e)) => presence_from_keyring(Err(e)),
+            Err(e) => Presence::Unreadable(bounded(&e.to_string())),
+        }
+    }
+}
+
+/// Linux without HOME or an absolute XDG_STATE_HOME: every operation fails
+/// with the recovery instead of silently keeping credentials in memory.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+struct UnavailableCredentialStore;
+
+#[cfg(target_os = "linux")]
+impl UnavailableCredentialStore {
+    fn err() -> AuthError {
+        AuthError::Keyring(keyring::Error::NoStorageAccess(Box::new(
+            std::io::Error::other(NO_HOME_NOTE),
+        )))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl CredentialStore for UnavailableCredentialStore {
+    fn backend(&self) -> &'static str {
+        UNAVAILABLE_BACKEND
+    }
+    fn put(&self, _: &str, _: &str, _: &[u8]) -> Result<(), AuthError> {
+        Err(Self::err())
+    }
+    fn get(&self, _: &str, _: &str) -> Result<Vec<u8>, AuthError> {
+        Err(Self::err())
+    }
+    fn delete(&self, _: &str, _: &str) -> Result<(), AuthError> {
+        Err(Self::err())
+    }
+    fn exists(&self, _: &str, _: &str) -> bool {
+        false
+    }
+    fn presence(&self, _: &str, _: &str) -> Presence {
+        Presence::Unreadable(bounded(NO_HOME_NOTE))
     }
 }
 
@@ -528,7 +1035,9 @@ mod tests {
     #[test]
     fn get_missing_returns_not_found() {
         install_mock();
-        let err = Auth::get("testplat", "missing-user").unwrap_err();
+        let err = KeychainCredentialStore
+            .get("testplat", "missing-user")
+            .unwrap_err();
         let AuthError::NotFound { platform, account } = err else {
             panic!("expected NotFound, got {err:?}");
         };
@@ -540,7 +1049,9 @@ mod tests {
     fn delete_is_idempotent_when_missing() {
         install_mock();
         // Never written — must not error.
-        Auth::delete("testplat", "never-existed").unwrap();
+        KeychainCredentialStore
+            .delete("testplat", "never-existed")
+            .unwrap();
     }
 
     #[test]

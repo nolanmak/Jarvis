@@ -88,8 +88,15 @@ fn override_selects_the_file_backend_only_when_set() {
     let tmp = tempfile::tempdir().unwrap();
     let file: Arc<dyn CredentialStore> = store_for_override(Some(tmp.path().as_os_str()));
     assert_eq!(file.backend(), "insecure-file");
+    // #1325 — the platform store: the Keychain on macOS, the owner-only file
+    // store on Linux (never keyring's in-memory mock).
+    let platform = if cfg!(target_os = "linux") {
+        "private-file"
+    } else {
+        "keychain"
+    };
     let empty: Arc<dyn CredentialStore> = store_for_override(Some(std::ffi::OsStr::new("")));
-    assert_eq!(empty.backend(), "keychain");
+    assert_eq!(empty.backend(), platform);
     let default: Arc<dyn CredentialStore> = store_for_override(None);
-    assert_eq!(default.backend(), "keychain");
+    assert_eq!(default.backend(), platform);
 }

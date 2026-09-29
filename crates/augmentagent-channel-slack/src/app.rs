@@ -333,7 +333,7 @@ impl SlackAppError {
             Self::AmbiguousTeam { .. } => "Rerun with --team <team_id>; `augmentagent slack app status` lists installed workspaces.".into(),
             Self::NothingToRotate => "Pass --stdin, --app-token-file/--bot-token-file, or set AUGMENTAGENT_SLACK_APP_TOKEN / AUGMENTAGENT_SLACK_BOT_TOKEN.".into(),
             Self::SlackApi(_) => "Check the network and https://slack-status.com, then retry. Nothing was changed.".into(),
-            Self::CredentialStore(_) => "The Keychain/keyring could not be read or written. On macOS unlock the login keychain and run `augmentagent doctor --keychain-probe`; on Linux make sure the Secret Service (gnome-keyring or KWallet) is running for this user. Nothing was changed.".into(),
+            Self::CredentialStore(_) => "The Keychain/keyring could not be read or written. On macOS unlock the login keychain and run `augmentagent doctor --keychain-probe`; on Linux make sure HOME is set and the `credentials` directory in the state directory belongs to this user (#1325). Nothing was changed.".into(),
             Self::Corrupt { team_id, .. } => format!(
                 "Run `augmentagent slack app remove --team {team_id}` and install again."
             ),
