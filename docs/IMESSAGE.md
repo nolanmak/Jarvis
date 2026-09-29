@@ -1,10 +1,11 @@
-# iMessage history sync
+# iMessage history sync and replies
 
-The exporter and scheduler ship in `scripts/imessage/`. You need one source
-repository; message data lives in a private directory outside it. A Mac with
-Messages synced to your account exports history. The agent can read that directory
-locally or receive it over SSH on Linux. This integration imports history; it
-does not send iMessages.
+The exporter, sender and scheduler ship in `scripts/imessage/`. You need one
+source repository; message data lives in a private directory outside it. A Mac
+with Messages synced to your account exports history. The agent can read that
+directory locally or receive it over SSH on Linux. With sending enabled, the
+agent drafts replies as approval cards and a sender on the Mac delivers the
+ones you approve; see [Sending replies](#sending-replies).
 
 ## On the Mac
 
@@ -197,11 +198,122 @@ contacts, state, logs, bucket settings and SSH/AWS credentials are private runti
 data. The new exporter never stages, commits or pushes Git files. Ingested history
 may be sent to the agent's configured model provider for knowledge capture.
 
+## Sending replies
+
+Replies work like other channels: a new message in an opted-in conversation
+becomes an approval card with a draft, and nothing is sent until you approve
+it. Approve does not touch Messages. It queues the reply in the agent's
+outbox; a sender job on the Mac claims it, sends it with AppleScript and reads
+`chat.db` to confirm what happened, then reports back. The action turns
+`sent`, or `error` with the reason, and failures are posted as flag notices.
+
+```
+agent (macOS or Linux)                    Mac signed in to Messages
+new message -> draft -> card
+approve -> outbox row
+                            <- claim ---  send.py (launchd)
+                                          osascript, then verify in chat.db
+                            <- complete -
+action sent / error
+```
+
+The Mac always calls the agent: directly when both run on the same Mac, or
+over SSH to a Linux agent. The agent host holds no credentials for the Mac.
+
+### Enable it on the agent
+
+```dotenv
+AUGMENTAGENT_IMESSAGE_REPO_DIR=/absolute/path/to/private/imessage-bundle
+AUGMENTAGENT_IMESSAGE_SEND_ENABLED=1
+# Optional: poll the bundle more often than every 30 minutes.
+AUGMENTAGENT_IMESSAGE_POLL_SECS=120
+```
+
+`AUGMENTAGENT_IMESSAGE_SEND_ENABLED` is the kill-switch. While it is unset or
+`0`, Approve refuses and the outbox hands nothing to the Mac. Restart the
+daemon after changing it.
+
+Conversations are opt-in in both directions. Use the conversation identifier
+from the bundle index: a phone number or Apple ID email for a 1:1 chat.
+
+```sh
+augmentagent imessage allow-inbound  +15555550100  # draft cards for new messages
+augmentagent imessage allow-outbound +15555550100  # allow approved replies to send
+augmentagent imessage allowlist                    # show both lists
+augmentagent imessage deny-outbound  +15555550100
+```
+
+Cards are approved from Discord as usual. From a terminal on the agent host:
+`augmentagent imessage approve <action_id>` or `augmentagent imessage skip
+<action_id>`, with the same checks. `augmentagent imessage outbox list` shows
+queued and finished sends without bodies or recipients.
+
+### Install the sender on the Mac
+
+The sender needs Full Disk Access to read `chat.db` (the same Python grant as
+the exporter) and Automation permission to control Messages. macOS asks for
+Automation the first time it sends; run the first send by hand so you can
+accept the prompt.
+
+For an agent on the same Mac:
+
+```sh
+python3 scripts/imessage/send.py --agent-dir /absolute/path/to/agent/checkout
+python3 scripts/imessage/schedule.py --job send -- --agent-dir /absolute/path/to/agent/checkout
+```
+
+For a Linux agent, use the same SSH setup as the exporter (key-based, batch
+mode, host key already accepted) and pass the agent's checkout path on that
+host:
+
+```sh
+python3 scripts/imessage/send.py --remote agent@agent-host --agent-dir /home/agent/Jarvis
+python3 scripts/imessage/schedule.py --job send -- --remote agent@agent-host --agent-dir /home/agent/Jarvis
+```
+
+The send job runs every 15 seconds (`--every-seconds` changes it) and reuses
+one SSH connection for two minutes. Logs go to
+`~/Library/Logs/augmentagent/imessage-send.log`. Uninstall with
+`python3 scripts/imessage/schedule.py --job send --uninstall`.
+
+End-to-end latency is the exporter interval plus the agent poll interval for
+the card, then the send interval once you approve.
+
+### Delivery guarantees
+
+- `osascript` exits 0 even when delivery fails, so the sender only trusts
+  `chat.db`: a sent reply has an outgoing row in the target chat with
+  `is_sent = 1` and `error = 0`. Undeliverable sends show `error = 22`.
+- At most once. The sender journals each item before sending. If it dies
+  mid-send, the next run decides the outcome from `chat.db` and never sends
+  that item again. A claim nobody reports within 10 minutes
+  (`AUGMENTAGENT_IMESSAGE_CLAIM_TIMEOUT_SECS`) is marked unknown, and you
+  are told to check Messages before resending.
+- A reply the Mac has not picked up within an hour
+  (`AUGMENTAGENT_IMESSAGE_OUTBOX_MAX_AGE_SECS`) expires instead of going
+  out late.
+- The agent's own sends come back through the exporter and are recognised,
+  so they do not create cards. A reply you type yourself retires the
+  pending card for that conversation.
+
+### Limits
+
+- 1:1 iMessage conversations, text only. SMS and RCS conversations are
+  refused. Group chats need a `chat_guid` in the bundle index (written by
+  this exporter, not by older jobs) and their own `allow-outbound` entry;
+  cards are never drafted for groups.
+- The Mac must be logged in and awake, with Messages signed in.
+- No attachments, tapbacks, edits or unsend. BlueBubbles and Messages'
+  private API are not used; System Integrity Protection stays enabled.
+
 ## Tests
 
 ```sh
 python3 -m unittest discover -s scripts/imessage/tests -v
 cargo test -p augmentagent-channel-imessage
+cargo test -p augmentagent-store --test imessage_outbox
+cargo test -p augmentagent-cli --test imessage_outbox_cli
+cargo test -p augmentagent-cli --bin augmentagent imessage_send
 ```
 
 Python tests use synthetic SQLite databases and require neither a Mac nor access

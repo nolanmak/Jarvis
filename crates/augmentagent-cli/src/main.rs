@@ -1266,6 +1266,11 @@ enum ImessageOp {
     DenyInbound { identifier: String },
     /// Print both allowlists.
     Allowlist,
+    /// Approve one pending iMessage card from the terminal: the same checks
+    /// and outbox queueing as the card's Approve button.
+    Approve { action_id: String },
+    /// Skip one pending iMessage card from the terminal.
+    Skip { action_id: String },
 }
 
 #[derive(Subcommand)]
@@ -3935,6 +3940,12 @@ async fn main() -> Result<()> {
                 imessage_send::set_allowlist(&store, false, false, identifier)
             }
             ImessageOp::Allowlist => imessage_send::print_allowlists(&store),
+            ImessageOp::Approve { action_id } => {
+                imessage_send::run_cli_resolve(Arc::clone(&store), action_id, true).await
+            }
+            ImessageOp::Skip { action_id } => {
+                imessage_send::run_cli_resolve(Arc::clone(&store), action_id, false).await
+            }
         },
         Cmd::Calendar { op } => match op {
             CalendarOp::Backfill { .. } => {

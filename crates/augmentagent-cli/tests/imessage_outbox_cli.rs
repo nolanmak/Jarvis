@@ -294,3 +294,107 @@ fn claim_fails_queued_rows_past_max_age() {
     assert_eq!(status, "error");
     assert!(err.unwrap().contains("expired"));
 }
+
+/// A pending, not yet approved iMessage action plus a bundle that knows it.
+fn seed_pending(dir: &Path) -> (Store, String) {
+    let bundle = dir.join("bundle");
+    std::fs::create_dir_all(bundle.join("conversations")).unwrap();
+    std::fs::write(
+        bundle.join("conversations/index.json"),
+        serde_json::json!({PHONE: {"identifier": PHONE, "dir": "a", "title": "A",
+                                   "participants": [PHONE], "service": "iMessage"}})
+            .to_string(),
+    )
+    .unwrap();
+    let store = Store::open(&dir.join("agent.db")).unwrap();
+    let msg = format!("imessage:{PHONE}:1");
+    store
+        .upsert_email(&Email {
+            attachments: Vec::new(),
+            to: String::new(),
+            cc: String::new(),
+            message_id: msg.clone(),
+            thread_id: Some(format!("imessage:{PHONE}")),
+            from: PHONE.into(),
+            subject: "[iMessage] A".into(),
+            body: "free?".into(),
+            date: "2026-09-29T12:00:00Z".into(),
+            account_entity_id: Some("imessage".into()),
+            platform: "imessage".into(),
+            kind: "dm".into(),
+        })
+        .unwrap();
+    let id = store
+        .log_action(&msg, Some(&format!("imessage:{PHONE}")), PHONE, "[iMessage] A",
+                    Some("free?"), Some("yes"), ActionStatus::Pending)
+        .unwrap();
+    (store, id)
+}
+
+fn run_with_bundle(dir: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_augmentagent"))
+        .current_dir(dir)
+        .env("AUGMENTAGENT_DB", dir.join("agent.db"))
+        .env("AUGMENTAGENT_IMESSAGE_SEND_ENABLED", "1")
+        .env("AUGMENTAGENT_IMESSAGE_REPO_DIR", dir.join("bundle"))
+        .arg("imessage")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn cli_approve_queues_through_the_same_approver() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, id) = seed_pending(dir.path());
+    let refused = run_with_bundle(dir.path(), &["approve", &id]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("allow-outbound"));
+    assert_eq!(action_status(&store, &id).0, "pending");
+    store.allow_imessage_outbound(PHONE).unwrap();
+    stdout(&run_with_bundle(dir.path(), &["approve", &id]));
+    assert_eq!(action_status(&store, &id).0, "sending");
+    assert_eq!(store.list_imessage_outbox(5).unwrap().len(), 1);
+    let again = run_with_bundle(dir.path(), &["approve", &id]);
+    assert!(!again.status.success());
+    assert_eq!(store.list_imessage_outbox(5).unwrap().len(), 1);
+}
+
+#[test]
+fn cli_skip_rejects_the_card() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, id) = seed_pending(dir.path());
+    stdout(&run_with_bundle(dir.path(), &["skip", &id]));
+    assert_eq!(action_status(&store, &id).0, "rejected");
+    assert!(store.list_imessage_outbox(5).unwrap().is_empty());
+}
+
+#[test]
+fn cli_approve_refuses_non_imessage_actions() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("agent.db")).unwrap();
+    store
+        .upsert_email(&Email {
+            attachments: Vec::new(),
+            to: String::new(),
+            cc: String::new(),
+            message_id: "g1".into(),
+            thread_id: Some("t1".into()),
+            from: "a@example.com".into(),
+            subject: "s".into(),
+            body: "b".into(),
+            date: "2026-09-29T12:00:00Z".into(),
+            account_entity_id: Some("acc".into()),
+            platform: "gmail".into(),
+            kind: "dm".into(),
+        })
+        .unwrap();
+    let id = store
+        .log_action("g1", Some("t1"), "a@example.com", "s", Some("b"), Some("d"),
+                    ActionStatus::Pending)
+        .unwrap();
+    let out = run_with_bundle(dir.path(), &["approve", &id]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not an iMessage"));
+    assert_eq!(action_status(&store, &id).0, "pending");
+}

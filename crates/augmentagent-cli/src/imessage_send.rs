@@ -371,6 +371,64 @@ pub(crate) fn print_allowlists(store: &Store) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `imessage approve|skip <id>` — resolve one iMessage card through the
+/// approver without a Discord session. The approver is built with only what
+/// iMessage needs; any other platform is refused before it is touched.
+pub(crate) async fn run_cli_resolve(
+    store: std::sync::Arc<Store>,
+    action_id: &str,
+    approve: bool,
+) -> anyhow::Result<()> {
+    let Some(action) = store.get_action_with_email(action_id)? else {
+        anyhow::bail!("no action {action_id}");
+    };
+    if action.email.platform != PLATFORM {
+        anyhow::bail!(
+            "action {action_id} is not an iMessage card (platform {}); resolve it from its own surface",
+            action.email.platform
+        );
+    }
+    let approver = crate::ReplyApprover {
+        store: std::sync::Arc::clone(&store),
+        gmail: std::sync::Arc::new(crate::ComposioClient::new(String::new())),
+        calendar: std::sync::Arc::new(
+            augmentagent_channel_calendar::ComposioCalendarClient::new(String::new()),
+        ),
+        linkedin: None,
+        discord: None,
+        slack: Default::default(),
+        telegram: Default::default(),
+        github: None,
+        socialapi: None,
+        reasoner: std::sync::Arc::new(augmentagent_channel_core::fallback::FallbackReasoner::claude_only()),
+        draft_skill: String::new(),
+        wiki_root: None,
+        nudge: std::sync::OnceLock::new(),
+        broker: std::sync::OnceLock::new(),
+        imessage: ImessageSendConfig::from_env(),
+    };
+    let outcome = if approve {
+        approver.run_approve(action_id).await
+    } else {
+        approver.run_skip(action_id).await
+    };
+    match outcome {
+        ApprovalActionOutcome::Approved => {
+            println!("approved: queued for the Mac sender");
+            Ok(())
+        }
+        ApprovalActionOutcome::Skipped => {
+            println!("skipped");
+            Ok(())
+        }
+        ApprovalActionOutcome::Failed { message } => anyhow::bail!(message),
+        ApprovalActionOutcome::AlreadyResolved { status, .. } => {
+            anyhow::bail!("already resolved ({status})")
+        }
+        other => anyhow::bail!("unexpected outcome: {other:?}"),
+    }
+}
+
 /// Tell the operator about every failed or unknown send once, through the
 /// same flag-notice surface as other channels. Returns how many were posted.
 pub(crate) async fn notify_outbox_failures(
