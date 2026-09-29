@@ -4,6 +4,9 @@ Issue [#1284](https://github.com/nolanmak/Jarvis/issues/1284), part of the
 Slack parity epic [#1281](https://github.com/nolanmak/Jarvis/issues/1281).
 Transport decisions (Socket Mode, scopes, tokens) are in
 [`SLACK-TRANSPORT.md`](SLACK-TRANSPORT.md).
+The owner runbook (setup, verification, failures, rotation, upgrade,
+rollback, removal and the acceptance script, for macOS and Linux) is
+[`SLACK-RUNBOOK.md`](SLACK-RUNBOOK.md).
 
 Jarvis talks to Slack in real time through a first-party **Slack app over
 Socket Mode**. The app needs no public URL. This page covers creating the

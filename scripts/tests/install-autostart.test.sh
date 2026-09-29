@@ -142,6 +142,34 @@ else
 fi
 rm -rf "$TMP"
 
+# --- Slack surface settings (#1299) ------------------------------------------
+# The Slack surface runs inside serve: no extra unit or job. Its settings
+# (AUGMENTAGENT_SLACK_INTERACTIVE, …) come from the checkout's .env, which
+# serve loads from its working directory, so the service definition must
+# point its working directory at the checkout and carry no Slack setting or
+# token of its own.
+echo "install-autostart.sh Slack settings come from the checkout .env (#1299):"
+make_case
+run_installer install-autostart.sh
+has_line "$UNIT" "WorkingDirectory=$TMP/repo" \
+  && ok "unit runs serve from the checkout (reads its .env)" \
+  || bad "unit runs serve from the checkout (reads its .env)" "$(grep WorkingDirectory "$UNIT")"
+grep -qi slack "$UNIT" && bad "unit carries no Slack setting or token" "$(grep -i slack "$UNIT")" \
+  || ok "unit carries no Slack setting or token"
+rm -rf "$TMP"
+make_case
+printf '#!/usr/bin/env bash\necho Darwin\n' > "$TMP/bin/uname"
+printf '#!/usr/bin/env bash\n[ "$1" = print ] && exit 113\nexit 0\n' > "$TMP/bin/launchctl"
+chmod +x "$TMP/bin/uname" "$TMP/bin/launchctl"
+PLIST="$TMP/home/Library/LaunchAgents/com.nolanmak.augmentagent.plist"
+run_installer install-autostart.sh
+awk '/<key>WorkingDirectory<\/key>/{getline; print; exit}' "$PLIST" | grep -qF "<string>$TMP/repo</string>" \
+  && ok "plist runs serve from the checkout (reads its .env)" \
+  || bad "plist runs serve from the checkout (reads its .env)" "$(grep -A1 WorkingDirectory "$PLIST")"
+grep -qi slack "$PLIST" && bad "plist carries no Slack setting or token" "$(grep -i slack "$PLIST")" \
+  || ok "plist carries no Slack setting or token"
+rm -rf "$TMP"
+
 # --- tenant unit ------------------------------------------------------------
 echo "install-tenant.sh unit resource limits (#902):"
 make_case

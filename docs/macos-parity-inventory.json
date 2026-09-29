@@ -646,7 +646,7 @@
       "selected feature credentials or synthetic fixtures"
     ],
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
-    "test_plan": "Run augmentagent doctor --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "test_plan": "Run augmentagent doctor --help on both hosts, then add a synthetic behavior/guard test for this command. Slack diagnostics (#1299: credential_backend, interactive.slack.credentials, config.<id>, --deep slack_app.scopes): cargo test -p augmentagent-cli --test slack_ops_cli --test runbook_commands and --bin augmentagent -- doctor:: on both hosts; real Keychain-from-launchd proof stays with #1246/#1300.",
     "status": "unverified",
     "evidence": null
   },
@@ -1227,7 +1227,7 @@
       "selected feature credentials or synthetic fixtures"
     ],
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
-    "test_plan": "Run augmentagent status --help on both hosts, then add a synthetic behavior/guard test for this command. `interactive.slack` live listener health (#1287): cargo test -p augmentagent-cli --test slack_serve_cli --test status_schema and --bin augmentagent -- status:: doctor:: on both hosts.",
+    "test_plan": "Run augmentagent status --help on both hosts, then add a synthetic behavior/guard test for this command. `interactive.slack` live listener health (#1287): cargo test -p augmentagent-cli --test slack_serve_cli --test status_schema and --bin augmentagent -- status:: doctor:: on both hosts. #1299 fields (interactive.slack app_installed/owner_bound/credentials/reconnects, credentials, daemon_report, config_issues): cargo test -p augmentagent-cli --test slack_ops_cli on both hosts.",
     "status": "unverified",
     "evidence": null
   },

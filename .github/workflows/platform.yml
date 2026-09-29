@@ -149,6 +149,17 @@ jobs:
           cargo test -p augmentagent-auth
           cargo test -p augmentagent-channel-slack --test app_manifest --test app_install --test owner_setup
           cargo test -p augmentagent-cli --test slack_app_cli
+      # #1299 — Slack operations: status/doctor setup steps, credential
+      # backend and plaintext-store flags, the daemon's start report
+      # (Discord broker off), reconnect count, a log scan for synthetic
+      # tokens and message bodies, upgrade/rollback of a pre-#1299 state,
+      # and every runbook command parsed by the real CLI. No network, no
+      # Keychain (the auth crate's backend test runs in the step above).
+      - name: Slack operations, upgrade and runbook
+        run: |
+          cargo test -p augmentagent-store --test daemon_runtime_report
+          cargo test -p augmentagent-channel-slack --test upgrade_state
+          cargo test -p augmentagent-cli --test slack_ops_cli --test runbook_commands --test status_schema
       - name: Host-dependent CLI surface
         run: >-
           cargo test -p augmentagent-cli --bin augmentagent --
