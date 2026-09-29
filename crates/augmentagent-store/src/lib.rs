@@ -7,6 +7,7 @@
 pub mod delivery;
 pub mod models;
 pub mod notes;
+pub mod owner;
 pub mod redact;
 mod store;
 pub mod surface;
