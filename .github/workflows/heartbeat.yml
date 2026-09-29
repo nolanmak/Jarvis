@@ -1,0 +1,44 @@
+name: Heartbeat
+on:
+  pull_request:
+    paths:
+      - 'crates/augmentagent-heartbeat/**'
+      - 'crates/augmentagent-cli/src/heartbeat_cmd.rs'
+      - 'crates/augmentagent-cli/src/main.rs'
+      - 'crates/augmentagent-cli/tests/heartbeat_cli.rs'
+      - 'crates/augmentagent-store/**'
+      - 'crates/augmentagent-channel-core/src/reasoner.rs'
+      - 'docs/reasoner-capabilities.json'
+      - '.github/workflows/heartbeat.yml'
+      - 'Cargo.*'
+permissions:
+  contents: read
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format heartbeat crate
+        run: cargo fmt -p augmentagent-heartbeat -- --check
+      - name: Heartbeat lint
+        run: cargo clippy -p augmentagent-heartbeat --all-targets --no-deps -- -D warnings
+      - name: Heartbeat behavior
+        run: cargo test -p augmentagent-heartbeat
+      - name: Store schema and capability manifest
+        run: |
+          cargo test -p augmentagent-store --test heartbeat_schema
+          cargo test -p augmentagent-channel-core --test capability_inventory -- inventory_accounts every_production
+      - name: CLI unit and process tests
+        run: |
+          cargo test -p augmentagent-cli --bin augmentagent heartbeat_cmd::tests
+          cargo test -p augmentagent-cli --test heartbeat_cli
