@@ -68,6 +68,8 @@ jobs:
             "$bin" service --unit daemon status
             "$bin" service --unit daemon --json status
           fi
+      - name: macOS parity inventory guard
+        run: python3 -m unittest scripts.tests.macos_parity_inventory_test -v
       - name: Updater + installer shell suites
         shell: bash
         run: |
