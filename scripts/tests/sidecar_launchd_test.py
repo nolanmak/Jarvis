@@ -27,7 +27,9 @@ class SidecarLaunchdTests(unittest.TestCase):
         output = Path(self.scratch.name) / f"{name}.plist"
         proc = subprocess.run(
             ["python3", str(INSTALLER), name, "--render-only", str(output)],
-            env={**os.environ, "HOME": str(self.home)},
+            env={**os.environ, "HOME": str(self.home),
+                 "XDG_CONFIG_HOME": str(self.home / '.config'),
+                 "XDG_STATE_HOME": str(self.home / '.local/state')},
             text=True, capture_output=True,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -110,6 +112,8 @@ class SidecarLaunchdTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         env = {**os.environ, 'HOME': str(self.home),
+               'XDG_CONFIG_HOME': str(self.home / '.config'),
+               'XDG_STATE_HOME': str(self.home / '.local/state'),
                'PATH': f'{fake_bin}:/usr/bin:/bin', 'LAUNCHCTL_LOG': str(calls)}
         runtime = Path(self.scratch.name) / 'runtime'
         with mock.patch.object(module, 'ROOT', repo), \
