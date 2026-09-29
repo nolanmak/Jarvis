@@ -202,7 +202,10 @@ Each value is an object:
 - `last_poll_unix` (integer or null): unix-seconds timestamp of the most
   recent successful poll. Always `null` today; reserved for #7.
 - `needs` (array of strings): what's missing. `["login"]` when
-  `configured=false`, `[]` otherwise. The schema reserves room for
+  `configured=false`, `[]` otherwise. #1299: `["credentials_unreadable"]`
+  instead of `["login"]` when a keyring slot the channel depends on could
+  not be read by this process; such a channel is never reported as
+  `configured` or `armed` (a failed read used to count as present). The schema reserves room for
   richer entries (`"refresh_token"`, `"webhook_url"`, etc.) that future
   PRs may add — the skill must treat unknown strings as opaque and
   surface them verbatim.
@@ -263,14 +266,21 @@ otherwise, with `recovery` as the suggested action.
 
 Added in #1299 (additive; still schema `"1"`):
 
-- `app_installed` (boolean): the Slack app's install index exists in this
-  process's credential store (checked without reading a secret, so no
-  Keychain prompt).
+- `app_installed` (boolean or null): the Slack app's install index exists
+  (`true`) or does not (`false`) in this process's credential store; `null`
+  when this process cannot read the store (for example a macOS session with
+  no access to the login Keychain: SSH, or a launchd job before login), so
+  it is unknown. Never `true` from a failed read. On macOS the probe reads
+  the item, which can show a Keychain prompt for a binary the item does not
+  trust.
 - `owner_bound` (boolean): an owner binding exists in the database.
 - `credentials` (string): `missing` (no install visible to this process),
-  `present` (stored, not yet proven readable by the running daemon) or
-  `usable` (the daemon's fresh `connected` report proves it read the tokens
-  and Slack accepted them). Never `usable` without that proof.
+  `present` (stored, not yet proven readable by the running daemon),
+  `unreadable` (this process cannot read the credential store; `detail`
+  carries the store's reason and `recovery` points at
+  `augmentagent doctor --keychain-probe` and the login-session requirement)
+  or `usable` (the daemon's fresh `connected` report proves it read the
+  tokens and Slack accepted them). Never `usable` without that proof.
 - `reconnects` (integer or null): times the daemon that wrote the report
   entered `reconnecting`; resets when a new daemon process reports; `null`
   without a report.
@@ -320,7 +330,10 @@ array (possibly empty) of objects:
 - `id` (string): `discord.approval_broker` (a `DISCORD_BOT_TOKEN` without a
   numeric `DISCORD_CHANNEL_ID`: serve runs without the Discord approval
   broker), `credentials.insecure_file_store` (this process uses the
-  plaintext store), `daemon.insecure_file_store` (the running daemon does).
+  plaintext store), `daemon.insecure_file_store` (the running daemon does),
+  `credentials.unreadable` (warn: this process could not read one or more
+  credential slots; `detail` lists each `augmentagent/<platform>/<account>`
+  with the store's reason).
   Treat unknown ids as opaque.
 - `source` (string): `cli` (found from this process's environment, which
   includes `.env` in the working directory, like the daemon's) or `daemon`

@@ -11,7 +11,7 @@
 //!                   `src/dashboard.ts:78`)
 //!  * **channels**  — per-channel `configured`/`armed` derived from the
 //!                   SAME gates `Cmd::Serve` evaluates (#374): keyring
-//!                   slots via `augmentagent_auth::Auth::exists`, legacy
+//!                   slots via `augmentagent_auth::Auth::presence`, legacy
 //!                   credential files via each channel's
 //!                   `default_auth_path`, and store tables (workspaces,
 //!                   bots, subscriptions, accounts). `configured` = the
@@ -186,14 +186,16 @@ pub struct InteractiveStatus {
     pub last_send_unix: Option<i64>,
     pub state_since_unix: Option<i64>,
     pub heartbeat_unix: Option<i64>,
-    /// #1299 — an install record exists in this process's credential store
-    /// (checked without reading the secret).
-    pub app_installed: bool,
+    /// #1299 — the install index exists in this process's credential store
+    /// (`Some(true)`), does not (`Some(false)`), or the store could not be
+    /// read (`None`: unknown, never reported as installed).
+    pub app_installed: Option<bool>,
     /// #1299 — an owner binding exists in the database.
     pub owner_bound: bool,
     /// #1299 — `missing` (no install record visible here), `present`
-    /// (stored, not yet proven usable by the running daemon) or `usable`
-    /// (the daemon's fresh `connected` report proves it read them and Slack
+    /// (stored, not yet proven usable by the running daemon), `unreadable`
+    /// (this process cannot read the credential store) or `usable` (the
+    /// daemon's fresh `connected` report proves it read them and Slack
     /// accepted the app-level token). Never `usable` without that proof.
     pub credentials: String,
     /// #1299 — entries into `reconnecting` by the daemon that wrote the
@@ -203,9 +205,10 @@ pub struct InteractiveStatus {
 
 /// #1299 — what `status` knows about the Slack setup besides the daemon's
 /// report.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlackSetup {
-    pub app_installed: bool,
+    /// The install index slot, as this process's credential store sees it.
+    pub app: augmentagent_auth::Presence,
     pub owner_bound: bool,
     pub reconnects: Option<i64>,
     /// Whether the process that wrote the report is still alive; `None`
@@ -218,6 +221,12 @@ pub struct SlackSetup {
 const INTERACTIVE_SURFACES: &[&str] = &["slack"];
 
 const RESTART_DAEMON: &str = "augmentagent service --unit daemon restart";
+
+/// #1299 — what to do when this process cannot read the credential store.
+pub const UNREADABLE_RECOVERY: &str = "Run `augmentagent doctor --keychain-probe` from your \
+     logged-in session. On macOS the login Keychain is readable only from a login session (not \
+     over SSH or from a launchd job before you log in) and only while it is unlocked; unlock it \
+     in Keychain Access, then rerun `augmentagent status`. On Linux see #1325.";
 
 const INSTALL_RECOVERY: &str =
     "Install the Slack app (`augmentagent slack app install --stdin`, see \
@@ -233,13 +242,14 @@ pub fn interactive_status(
 ) -> InteractiveStatus {
     use augmentagent_channel_slack::interactive::{SurfaceState, STALE_AFTER};
     let secs = |ms: i64| ms / 1000;
-    let unproven = if setup.app_installed {
-        "present"
-    } else {
-        "missing"
+    use augmentagent_auth::Presence;
+    let (unproven, app_installed) = match &setup.app {
+        Presence::Present => ("present", Some(true)),
+        Presence::Missing => ("missing", Some(false)),
+        Presence::Unreadable(_) => ("unreadable", None),
     };
     let base = InteractiveStatus {
-        app_installed: setup.app_installed,
+        app_installed,
         owner_bound: setup.owner_bound,
         credentials: unproven.into(),
         ..Default::default()
@@ -251,7 +261,24 @@ pub fn interactive_status(
             recovery: Some(recovery),
             ..base.clone()
         };
-        return match (setup.app_installed, setup.owner_bound) {
+        if let Presence::Unreadable(reason) = &setup.app {
+            return InteractiveStatus {
+                state: if setup.owner_bound {
+                    SurfaceState::Disconnected
+                } else {
+                    SurfaceState::NotConfigured
+                }
+                .as_str()
+                .into(),
+                detail: Some(format!(
+                    "this process cannot read the credential store ({reason}), so whether the \
+                     Slack app is installed is unknown; the daemon has not reported this surface"
+                )),
+                recovery: Some(UNREADABLE_RECOVERY.into()),
+                ..base
+            };
+        }
+        return match (app_installed == Some(true), setup.owner_bound) {
             (true, true) => InteractiveStatus {
                 state: SurfaceState::Disconnected.as_str().into(),
                 detail: Some(
@@ -579,7 +606,11 @@ fn interactive_needs_attention(s: &InteractiveStatus) -> bool {
     !s.healthy && !matches!(s.state.as_str(), "not_configured" | "disabled")
 }
 
-fn collect_interactive(store: &Store, now_ms: i64) -> Result<BTreeMap<String, InteractiveStatus>> {
+fn collect_interactive(
+    store: &Store,
+    now_ms: i64,
+    app: &augmentagent_auth::Presence,
+) -> Result<BTreeMap<String, InteractiveStatus>> {
     let mut out = BTreeMap::new();
     for &name in INTERACTIVE_SURFACES {
         let platform = augmentagent_store::SurfacePlatform::new(name).expect("static platform");
@@ -591,12 +622,7 @@ fn collect_interactive(store: &Store, now_ms: i64) -> Result<BTreeMap<String, In
             .context("surface owner bindings")?
             .is_empty();
         let setup = SlackSetup {
-            // The install index slot, checked without reading any secret (no
-            // Keychain prompt). Same store the daemon's `slack app` code uses.
-            app_installed: augmentagent_auth::Auth::exists(
-                augmentagent_channel_slack::app::APP_CREDENTIAL_PLATFORM,
-                augmentagent_channel_slack::app::APP_INDEX_ACCOUNT,
-            ),
+            app: app.clone(),
             owner_bound,
             reconnects: store
                 .surface_listener_reconnects(&platform)
@@ -809,7 +835,7 @@ pub async fn collect(store: &Store) -> Result<StatusDoc> {
 
     let cfg = read_config_table(store)?;
     let core_keys = collect_core_keys(&cfg);
-    let channels = collect_channels(store, &cfg)?;
+    let (channels, mut unreadable_slots) = collect_channels(store, &cfg)?;
     let queue = QueueStatus {
         pending: store.pending_reply_count().context("queue depth")?,
     };
@@ -823,7 +849,19 @@ pub async fn collect(store: &Store) -> Result<StatusDoc> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let interactive = collect_interactive(store, now_ms)?;
+    // The Slack app's install index, as this process's store sees it (#1299).
+    let app_slot = (
+        augmentagent_channel_slack::app::APP_CREDENTIAL_PLATFORM,
+        augmentagent_channel_slack::app::APP_INDEX_ACCOUNT,
+    );
+    let app = augmentagent_auth::Auth::presence(app_slot.0, app_slot.1);
+    if let augmentagent_auth::Presence::Unreadable(reason) = &app {
+        unreadable_slots.push((
+            format!("augmentagent/{}/{}", app_slot.0, app_slot.1),
+            reason.clone(),
+        ));
+    }
+    let interactive = collect_interactive(store, now_ms, &app)?;
 
     let backend = augmentagent_auth::describe_default_store();
     let env = |k: &str| std::env::var(k).ok();
@@ -835,6 +873,7 @@ pub async fn collect(store: &Store) -> Result<StatusDoc> {
         .as_ref()
         .is_some_and(|r| crate::platform::pid_alive(r.pid));
     config_issues.extend(daemon_issues(report.as_ref(), running));
+    config_issues.extend(unreadable_credentials_issue(&unreadable_slots));
     let daemon_report = report
         .as_ref()
         .map(|r| DaemonReportStatus::from_report(r, running));
@@ -1091,7 +1130,7 @@ fn collect_core_keys(cfg: &BTreeMap<String, String>) -> CoreKeys {
 /// (#374). Per channel:
 ///
 ///   * `configured` — the credential / prerequisite serve checks is
-///     present: keyring slot (read-only `Auth::exists`, no migration side
+///     present: keyring slot (`Auth::presence`, no migration side
 ///     effects), legacy credential file (each channel's `default_auth_path`,
 ///     honouring its env override), or store rows.
 ///   * `armed` — serve would run a poller/listener for this channel right
@@ -1100,16 +1139,35 @@ fn collect_core_keys(cfg: &BTreeMap<String, String>) -> CoreKeys {
 ///     when their credential is present — posting/CLI surfaces still work,
 ///     but nothing polls.
 ///
-/// Caveat shared with the daemon: `Auth::exists` treats a keyring platform
-/// failure as "present" (it can't distinguish unreachable from missing
-/// without reading the secret); `doctor`'s `keyring_reachable` check covers
-/// that failure mode.
+/// #1299: keyring slots are probed with `Auth::presence`. A slot this
+/// process cannot read (a locked Keychain, a session without access to it)
+/// is neither present nor missing: a channel that depends on it is not
+/// configured and `needs` says `credentials_unreadable`, and the slot is
+/// returned so `status` can raise a `credentials.unreadable` issue.
+/// `(augmentagent/<platform>/<account>, reason)` for each slot that could not
+/// be read.
+type UnreadableSlots = Vec<(String, String)>;
+
 fn collect_channels(
     store: &Store,
     cfg: &BTreeMap<String, String>,
-) -> Result<BTreeMap<String, ChannelStatus>> {
-    use augmentagent_auth::{Auth, DEFAULT_ACCOUNT};
+) -> Result<(BTreeMap<String, ChannelStatus>, UnreadableSlots)> {
+    collect_channels_with(store, cfg, &|p: &str, a: &str| {
+        augmentagent_auth::Auth::presence(p, a)
+    })
+}
 
+/// [`collect_channels`] with the credential probe injected. Returns the
+/// channels and every unreadable slot as `(augmentagent/<platform>/<account>,
+/// reason)`.
+fn collect_channels_with(
+    store: &Store,
+    cfg: &BTreeMap<String, String>,
+    probe: &dyn Fn(&str, &str) -> augmentagent_auth::Presence,
+) -> Result<(BTreeMap<String, ChannelStatus>, UnreadableSlots)> {
+    use augmentagent_auth::{Presence, DEFAULT_ACCOUNT};
+
+    let mut unreadable_slots: Vec<(String, String)> = Vec::new();
     let mut out = BTreeMap::new();
     let repo_root = std::env::current_dir().unwrap_or_default();
     let composio = cfg_or_env(cfg, "composio_api_key", "COMPOSIO_API_KEY");
@@ -1123,6 +1181,17 @@ fn collect_channels(
         .unwrap_or(0);
 
     for &name in KNOWN_CHANNELS {
+        let unreadable = std::cell::RefCell::new(Vec::<(String, String)>::new());
+        let has = |platform: &str, account: &str| match probe(platform, account) {
+            Presence::Present => true,
+            Presence::Missing => false,
+            Presence::Unreadable(reason) => {
+                unreadable
+                    .borrow_mut()
+                    .push((format!("augmentagent/{platform}/{account}"), reason));
+                false
+            }
+        };
         let (configured, armed, accounts) = match name {
             // Serve spawns the gmail channel whenever the Composio key is
             // present (`build_channel`); accounts are enumerated per poll.
@@ -1134,13 +1203,13 @@ fn collect_channels(
                     .list_active_slack_workspaces()
                     .map(|v| v.len() as u32)
                     .unwrap_or(0);
-                let c = workspaces > 0 || Auth::exists("slack", DEFAULT_ACCOUNT);
+                let c = workspaces > 0 || has("slack", DEFAULT_ACCOUNT);
                 (c, c, workspaces)
             }
             // Discord-DM channel: keyring, else the creds file at
             // `default_creds_path` (AUGMENTAGENT_DISCORD_CREDS override).
             "discord" => {
-                let c = Auth::exists("discord", DEFAULT_ACCOUNT)
+                let c = has("discord", DEFAULT_ACCOUNT)
                     || augmentagent_channel_discord_dm::auth::default_creds_path(&repo_root)
                         .exists();
                 (c, c, 0)
@@ -1148,7 +1217,7 @@ fn collect_channels(
             // Session present ⇒ posting + publisher arm work, but serve
             // runs no twitter poller — inbound is CLI `poll-once` only.
             "twitter" => {
-                let c = Auth::exists("twitter", DEFAULT_ACCOUNT)
+                let c = has("twitter", DEFAULT_ACCOUNT)
                     || augmentagent_channel_twitter::auth::default_auth_path(&repo_root)
                         .exists();
                 (c, false, 0)
@@ -1156,7 +1225,7 @@ fn collect_channels(
             // One auth gate arms every LinkedIn serve task (DM poll, feed +
             // own-post + friend-feed engagement, invite triage).
             "linkedin" => {
-                let c = Auth::exists("linkedin", DEFAULT_ACCOUNT)
+                let c = has("linkedin", DEFAULT_ACCOUNT)
                     || augmentagent_channel_linkedin::auth::default_auth_path(&repo_root)
                         .exists();
                 (c, c, 0)
@@ -1174,7 +1243,8 @@ fn collect_channels(
                 (path.exists(), false, 0)
             }
             "reddit" => {
-                let c = augmentagent_channel_reddit::RedditAuth::exists();
+                let (platform, account) = augmentagent_channel_reddit::RedditAuth::SLOT;
+                let c = has(platform, account);
                 (c, c, 0)
             }
             // Serve loads whichever PAT slot `AUGMENTAGENT_GITHUB_LOGIN`
@@ -1182,7 +1252,7 @@ fn collect_channels(
             "github" => {
                 let login = std::env::var("AUGMENTAGENT_GITHUB_LOGIN")
                     .unwrap_or_else(|_| DEFAULT_ACCOUNT.to_string());
-                let c = Auth::exists("github", &login);
+                let c = has("github", &login);
                 (c, c, 0)
             }
             // No credential — serve arms meetup iff ≥1 active subscription.
@@ -1204,7 +1274,7 @@ fn collect_channels(
             }
             // Crate compiles but `Cmd::Whatsapp` is unimplemented and serve
             // has no wiring — credential presence is all we can report.
-            "whatsapp" => (Auth::exists("whatsapp", DEFAULT_ACCOUNT), false, 0),
+            "whatsapp" => (has("whatsapp", DEFAULT_ACCOUNT), false, 0),
             // Driven by the external `augmentagent-calendar.timer`, not
             // serve; `doctor`'s `calendar_scheduled` check covers the timer.
             "calendar" => (composio && gmail_accounts > 0, false, 0),
@@ -1236,17 +1306,25 @@ fn collect_channels(
             // accounts/posts are registered.
             "socialapi" => {
                 let key = cfg_or_env(cfg, "socialapi_api_key", "SOCIALAPI_API_KEY")
-                    || Auth::exists("socialapi", DEFAULT_ACCOUNT);
+                    || has("socialapi", DEFAULT_ACCOUNT);
                 (key, key, socialapi_accounts)
             }
             _ => (false, false, 0),
         };
 
+        let unreadable = unreadable.into_inner();
         let needs = if configured {
             Vec::new()
+        } else if !unreadable.is_empty() {
+            vec!["credentials_unreadable".to_string()]
         } else {
             vec!["login".to_string()]
         };
+        for slot in unreadable {
+            if !unreadable_slots.iter().any(|(s, _)| *s == slot.0) {
+                unreadable_slots.push(slot);
+            }
+        }
         out.insert(
             name.to_string(),
             ChannelStatus {
@@ -1258,7 +1336,33 @@ fn collect_channels(
             },
         );
     }
-    Ok(out)
+    Ok((out, unreadable_slots))
+}
+
+pub const UNREADABLE_CREDENTIALS_ISSUE: &str = "credentials.unreadable";
+
+/// #1299 — one issue naming every credential slot this process could not
+/// read, or `None` when every probe answered.
+pub fn unreadable_credentials_issue(slots: &[(String, String)]) -> Option<ConfigIssue> {
+    if slots.is_empty() {
+        return None;
+    }
+    let list = slots
+        .iter()
+        .map(|(slot, reason)| format!("{slot}: {reason}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(ConfigIssue {
+        id: UNREADABLE_CREDENTIALS_ISSUE.into(),
+        source: "cli",
+        severity: "warn".into(),
+        detail: format!(
+            "this process could not read {} credential slot(s), so what depends on them is \
+             reported as not configured rather than guessed: {list}",
+            slots.len()
+        ),
+        recovery: Some(UNREADABLE_RECOVERY.into()),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1396,7 +1500,7 @@ fn print_interactive(doc: &StatusDoc) {
         println!(
             "  {:<10} app installed {} | owner bound {} | credentials {} | reconnects {}",
             "",
-            yn(i.app_installed),
+            i.app_installed.map_or("unknown", yn),
             yn(i.owner_bound),
             i.credentials,
             i.reconnects
@@ -1693,10 +1797,15 @@ mod tests {
     use augmentagent_store::surface_health::SurfaceListenerHealth;
 
     const NOW_MS: i64 = 1_700_000_100_000;
+    use augmentagent_auth::Presence;
 
     fn setup(app_installed: bool, owner_bound: bool) -> SlackSetup {
         SlackSetup {
-            app_installed,
+            app: if app_installed {
+                Presence::Present
+            } else {
+                Presence::Missing
+            },
             owner_bound,
             reconnects: None,
             reporter_running: None,
@@ -1881,7 +1990,7 @@ mod tests {
             Some("no interactive Slack app is installed")
         );
         assert!(s.recovery.unwrap().contains("slack app install --stdin"));
-        assert!(!s.app_installed && !s.owner_bound);
+        assert!(s.app_installed == Some(false) && !s.owner_bound);
         assert_eq!(s.credentials, "missing");
     }
 
@@ -1899,7 +2008,7 @@ mod tests {
             "{recovery}"
         );
         assert!(!recovery.contains("slack app install"), "{recovery}");
-        assert!(s.app_installed && !s.owner_bound);
+        assert!(s.app_installed == Some(true) && !s.owner_bound);
         assert_eq!(s.credentials, "present");
     }
 
@@ -2126,6 +2235,112 @@ mod tests {
         for key in ["backend", "persistent", "insecure_file_store", "note"] {
             assert!(c.get(key).is_some(), "missing {key}");
         }
+    }
+
+    // --- #1299 unreadable credential store ------------------------------
+
+    fn unreadable(owner_bound: bool) -> SlackSetup {
+        SlackSetup {
+            app: Presence::Unreadable(
+                "no access to the credential store: User interaction is not allowed.".into(),
+            ),
+            owner_bound,
+            reconnects: None,
+            reporter_running: None,
+        }
+    }
+
+    #[test]
+    fn an_unreadable_store_never_claims_the_app_is_installed() {
+        for owner in [false, true] {
+            let s = interactive_status(None, unreadable(owner), NOW_MS);
+            assert_eq!(s.app_installed, None, "unknown, not installed");
+            assert_eq!(s.credentials, "unreadable");
+            assert!(!s.healthy);
+            let detail = s.detail.clone().unwrap();
+            assert!(
+                detail.contains("cannot read the credential store"),
+                "{detail}"
+            );
+            assert!(
+                detail.contains("User interaction is not allowed"),
+                "{detail}"
+            );
+            assert!(!detail.contains("installed but"), "{detail}");
+            let recovery = s.recovery.clone().unwrap();
+            assert!(
+                recovery.contains("augmentagent doctor --keychain-probe"),
+                "{recovery}"
+            );
+            assert!(recovery.contains("login session"), "{recovery}");
+            assert_eq!(s.to_json()["app_installed"], Value::Null);
+            assert_eq!(
+                s.state,
+                if owner {
+                    "disconnected"
+                } else {
+                    "not_configured"
+                },
+                "owner bound: {owner}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_an_unreadable_store_only_the_daemons_proof_makes_credentials_usable() {
+        let s = interactive_status(Some(report("connected", 1_000)), unreadable(true), NOW_MS);
+        assert_eq!(s.credentials, "usable");
+        assert_eq!(s.app_installed, None);
+        let s = interactive_status(
+            Some(report("reconnecting", 1_000)),
+            unreadable(true),
+            NOW_MS,
+        );
+        assert_eq!(s.credentials, "unreadable");
+    }
+
+    #[test]
+    fn an_unreadable_credential_store_does_not_arm_channels_and_is_an_issue() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("data.db")).unwrap();
+        let probe = |_: &str, _: &str| Presence::Unreadable("keychain locked".into());
+        let (channels, slots) = collect_channels_with(&store, &BTreeMap::new(), &probe).unwrap();
+        for name in [
+            "slack",
+            "linkedin",
+            "github",
+            "whatsapp",
+            "reddit",
+            "socialapi",
+        ] {
+            let c = &channels[name];
+            assert!(!c.configured && !c.armed, "{name} must not be armed");
+            assert_eq!(
+                c.needs,
+                vec!["credentials_unreadable".to_string()],
+                "{name}"
+            );
+        }
+        assert!(slots
+            .iter()
+            .any(|(slot, _)| slot == "augmentagent/slack/default"));
+        let issue = unreadable_credentials_issue(&slots).expect("issue");
+        assert_eq!(issue.id, "credentials.unreadable");
+        assert_eq!(issue.severity, "warn");
+        assert!(issue.detail.contains("augmentagent/slack/default"));
+        assert!(issue.detail.contains("keychain locked"));
+        assert!(issue
+            .recovery
+            .as_deref()
+            .unwrap()
+            .contains("augmentagent doctor --keychain-probe"));
+        assert!(unreadable_credentials_issue(&[]).is_none());
+
+        // A readable store that says "missing" keeps the old `login` need.
+        let missing = |_: &str, _: &str| Presence::Missing;
+        let (channels, slots) = collect_channels_with(&store, &BTreeMap::new(), &missing).unwrap();
+        assert!(slots.is_empty());
+        assert_eq!(channels["linkedin"].needs, vec!["login".to_string()]);
     }
 
     #[test]

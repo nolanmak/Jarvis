@@ -574,3 +574,61 @@ fn assert_clean(transcript: &str) {
         );
     }
 }
+
+/// #1299 — a credential store this process cannot read (the macOS case is a
+/// session without access to the login Keychain) is reported as unknown,
+/// never as an installed app. Reproduced here without the Keychain by making
+/// the plaintext test store's slot directory unreadable.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_credential_store_is_unknown_not_installed() {
+    use std::os::unix::fs::PermissionsExt;
+    let socket = fake_socket().await;
+    let mut server = mockito::Server::new_async().await;
+    mock_slack(&mut server, socket.port).await;
+    let env = Env::new(server.url());
+    env.ok(
+        &["slack", "app", "install", "--stdin"],
+        &format!("{APP}\n{BOT}\n"),
+    );
+    let slot_dir = env.root.join("creds").join("slack-app");
+    std::fs::set_permissions(&slot_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(&slot_dir).is_ok() {
+        // Running as root: permissions are not enforced, nothing to check.
+        std::fs::set_permissions(&slot_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        return;
+    }
+    let s = env.status();
+    let d = env.doctor(&[], &[]);
+    std::fs::set_permissions(&slot_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let slack = &s["interactive"]["slack"];
+    assert_eq!(slack["app_installed"], Value::Null, "{slack}");
+    assert_eq!(slack["credentials"], json!("unreadable"));
+    assert!(slack["detail"]
+        .as_str()
+        .unwrap()
+        .contains("cannot read the credential store"));
+    assert!(slack["recovery"]
+        .as_str()
+        .unwrap()
+        .contains("augmentagent doctor --keychain-probe"));
+    let unreadable = issue(&s, "credentials.unreadable", "cli").expect("unreadable issue");
+    assert!(unreadable["detail"]
+        .as_str()
+        .unwrap()
+        .contains("augmentagent/slack-app/_installs"));
+    assert_eq!(
+        finding(&d, "interactive.slack.credentials")["severity"],
+        json!("warn")
+    );
+    assert_eq!(
+        finding(&d, "config.credentials.unreadable")["severity"],
+        json!("warn")
+    );
+
+    // Readable again: installed, as before.
+    let slack = env.status()["interactive"]["slack"].clone();
+    assert_eq!(slack["app_installed"], json!(true));
+    assert_clean(&env.transcript.lock().unwrap());
+}

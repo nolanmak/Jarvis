@@ -156,7 +156,7 @@ matter:
 | --- | --- | --- |
 | `state` / `healthy` | `connected` / `true` | Only a connected listener whose daemon is still running and reported in the last 60 s is healthy. |
 | `app_installed`, `owner_bound` | `true`, `true` | The two setup steps; `detail` and `recovery` name the first one missing. |
-| `credentials` | `usable` | `missing` (none stored), `present` (stored, not yet proven readable by the daemon), `usable` (the daemon connected with them). Never `usable` without that proof. |
+| `credentials` | `usable` | `missing` (none stored), `present` (stored, not yet proven readable by the daemon), `unreadable` (this shell cannot read the credential store; `app_installed` is then `null`), `usable` (the daemon connected with them). Never `usable` without that proof. |
 | `last_event_unix`, `last_send_unix` | recent | Last inbound event and last accepted send. |
 | `reconnects` | small | Times the running daemon lost and re-opened the link. |
 | `delivery.slack` | zeros except in-flight work | Backlog, retries, sends awaiting reconcile, dead letters. |
@@ -180,6 +180,7 @@ stored install).
 | `state: disconnected`, "no heartbeat" | Daemon stopped or stuck | Restart; then read the logs (section 6) |
 | `state: disconnected`, token rejected | App-level token revoked | Section 7, then restart |
 | `state: reconnecting` for minutes | Network, or Slack is down | Check the network and slack-status.com; the daemon retries on its own |
+| `credentials: unreadable`, `app_installed: null`, `config.credentials.unreadable` | This shell cannot read the credential store: on macOS an SSH or remote session, a locked login Keychain, or no login session | Run `augmentagent doctor --keychain-probe` from your logged-in session, unlock the login Keychain, rerun `augmentagent status` |
 | `credentials: present` long after a restart (macOS) | The daemon cannot read the Keychain item | `augmentagent doctor --keychain-probe`, unlock the login Keychain, restart |
 | `config.discord.approval_broker` | `DISCORD_BOT_TOKEN` set without a numeric `DISCORD_CHANNEL_ID`; serve runs without Discord approvals | Set `DISCORD_CHANNEL_ID` in `.env` (or remove the token), restart |
 | `config.credentials.insecure_file_store` or `config.daemon.insecure_file_store` | `AUGMENTAGENT_INSECURE_CREDENTIAL_DIR` is set | Remove it from `.env` and the shell, reinstall the tokens, restart |

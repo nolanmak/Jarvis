@@ -237,7 +237,7 @@ pub async fn run(
         if status_doc
             .as_ref()
             .and_then(|d| d.interactive.get("slack"))
-            .is_some_and(|s| s.app_installed)
+            .is_some_and(|s| s.app_installed == Some(true))
         {
             findings.extend(slack_scope_findings(load_slack_install_summaries()));
         }
@@ -1965,6 +1965,13 @@ fn check_slack_credentials(i: &status::InteractiveStatus, macos: bool) -> Findin
                 Some(fix),
             )
         }
+        "unreadable" => Finding::warn(
+            NAME,
+            "this process cannot read the credential store, so whether the Slack app is \
+             installed is unknown"
+                .to_string(),
+            Some(status::UNREADABLE_RECOVERY),
+        ),
         _ if i.owner_bound => Finding::warn(
             NAME,
             "an owner is bound but no Slack app credentials are visible to this process"
@@ -3074,7 +3081,7 @@ mod tests {
             }
             .into(),
             healthy: credentials == "usable",
-            app_installed: app,
+            app_installed: Some(app),
             owner_bound: owner,
             credentials: credentials.into(),
             ..Default::default()
@@ -3121,6 +3128,20 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("slack app install --stdin"));
+    }
+
+    #[test]
+    fn an_unreadable_credential_store_is_never_reported_as_nothing_installed() {
+        let mut s = slack_status("unreadable", false, false);
+        s.app_installed = None;
+        let f = check_slack_credentials(&s, true);
+        assert_eq!(f.severity, Severity::Warn);
+        assert!(f.message.contains("cannot read"), "{}", f.message);
+        assert!(f
+            .suggested_cmd
+            .as_deref()
+            .unwrap()
+            .contains("augmentagent doctor --keychain-probe"));
     }
 
     fn summary(scopes: Option<Vec<&str>>) -> augmentagent_channel_slack::app::SlackAppSummary {
