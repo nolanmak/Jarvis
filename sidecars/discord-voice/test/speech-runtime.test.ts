@@ -69,6 +69,78 @@ test('STT disconnect reconnects without replaying or suppressing a later turn', 
   }
 });
 
+test('credit exhaustion switches STT to the configured alternate and commits only its final turn', async () => {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0,
+    verifyClient: (info, callback) => callback(!info.req.url?.startsWith('/v2/listen'), 402) });
+  await new Promise<void>(resolve => server.once('listening', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('expected TCP address');
+  let alternateConnections = 0;
+  server.on('connection', socket => {
+    alternateConnections++;
+    socket.send(JSON.stringify({ message_type: 'partial_transcript', text: 'unfinished' }));
+    socket.send(JSON.stringify({ message_type: 'committed_transcript', text: 'one final turn' }));
+  });
+  const frames: Array<Record<string, unknown>> = [];
+  const audio = new VoiceAudio(fakeConnection(), binding, {
+    sttProvider: 'deepgram', ttsProvider: 'deepgram', sttKey: 'dg-test', ttsKey: 'dg-test',
+    elevenLabsKey: 'el-test', sttEndpoint: `ws://127.0.0.1:${address.port}`,
+    sttRetryDelays: [1, 2, 4],
+  }, frame => { frames.push(frame as Record<string, unknown>); return true; });
+  try {
+    await audio.start();
+    for (let attempt = 0; !frames.some(frame => frame.kind === 'transcript') && attempt < 100; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 2));
+    }
+    assert.equal(audio.status, 'listening');
+    assert.equal(alternateConnections, 1);
+    assert.deepEqual(frames.filter(frame => frame.kind === 'provider_changed')
+      .map(frame => [frame.operation, frame.provider]), [['STT', 'elevenlabs']]);
+    assert.deepEqual(frames.filter(frame => frame.kind === 'transcript').map(frame => frame.text),
+      ['one final turn']);
+  } finally {
+    audio.stop();
+    for (const client of server.clients) client.terminate();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('ElevenLabs quota event switches STT after an established stream without replaying partial text', async () => {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await new Promise<void>(resolve => server.once('listening', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('expected TCP address');
+  let initial: import('ws').WebSocket | undefined;
+  server.on('connection', (socket, request) => {
+    if (request.url?.startsWith('/v1/speech-to-text/realtime')) initial = socket;
+    else socket.send(JSON.stringify({ type: 'TurnInfo', event: 'EndOfTurn', turn_index: 0,
+      transcript: 'new provider final' }));
+  });
+  const frames: Array<Record<string, unknown>> = [];
+  const audio = new VoiceAudio(fakeConnection(), binding, {
+    sttProvider: 'elevenlabs', ttsProvider: 'deepgram', sttKey: 'el-test', ttsKey: 'dg-test',
+    deepgramKey: 'dg-test', sttEndpoint: `ws://127.0.0.1:${address.port}`,
+    sttRetryDelays: [1, 2, 4],
+  }, frame => { frames.push(frame as Record<string, unknown>); return true; });
+  try {
+    await audio.start();
+    assert.ok(initial);
+    initial.send(JSON.stringify({ message_type: 'partial_transcript', text: 'unfinished' }));
+    initial.send(JSON.stringify({ message_type: 'quota_exceeded' }));
+    for (let attempt = 0; !frames.some(frame => frame.kind === 'transcript') && attempt < 100; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 2));
+    }
+    assert.deepEqual(frames.filter(frame => frame.kind === 'transcript').map(frame => frame.text),
+      ['new provider final']);
+    assert.deepEqual(frames.filter(frame => frame.kind === 'provider_changed')
+      .map(frame => [frame.operation, frame.provider]), [['STT', 'deepgram']]);
+  } finally {
+    audio.stop();
+    for (const client of server.clients) client.terminate();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
 test('three failed STT reconnect attempts end with one visible failure and stopped audio', async () => {
   const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
   await new Promise<void>(resolve => server.once('listening', resolve));

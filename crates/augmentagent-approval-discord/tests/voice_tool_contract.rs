@@ -43,6 +43,8 @@ async fn tool_grant_binds_speech_to_one_active_conversation_and_rejects_spoofing
             owner_id: "4".into(),
             bot_user_id: "5".into(),
             generation: 6,
+            stt_provider: None,
+            tts_provider: None,
         })
         .await
         .unwrap();

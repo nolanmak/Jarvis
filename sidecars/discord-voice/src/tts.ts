@@ -1,5 +1,6 @@
 import WebSocket, { type RawData } from 'ws';
 import type { SttProvider } from './stt-wire.js';
+import { ProviderError } from './provider-error.js';
 
 const PROVIDER_DEADLINE_MS = 30_000;
 const MAX_QUEUED_AUDIO_BYTES = 1_048_576;
@@ -84,7 +85,8 @@ async function* deepgramTts(options: TtsOptions, signal: AbortSignal): AsyncGene
       const onError = (): void => reject(new Error('Deepgram TTS connection failed'));
       const onUnexpected = (_request: unknown, response: { statusCode?: number }): void => {
         socket.terminate();
-        reject(new Error(`Deepgram TTS handshake failed (HTTP ${response.statusCode})`));
+        reject(new ProviderError('deepgram', 'TTS', String(response.statusCode),
+          `Deepgram TTS handshake failed (HTTP ${response.statusCode})`));
       };
       socket.once('open', onOpen);
       socket.once('error', onError);
@@ -100,7 +102,11 @@ async function* deepgramTts(options: TtsOptions, signal: AbortSignal): AsyncGene
       if (!frame || typeof frame !== 'object') return;
       const message = frame as Record<string, unknown>;
       if (message.type === 'Flushed') queue.finish();
-      else if (message.type === 'Error') queue.fail(new Error('Deepgram TTS provider error'));
+      else if (message.type === 'Error') {
+        const code = typeof message.code === 'string' || typeof message.code === 'number'
+          ? String(message.code) : 'provider_error';
+        queue.fail(new ProviderError('deepgram', 'TTS', code, `Deepgram TTS provider error (${code})`));
+      }
     });
     socket.on('error', () => queue.fail(new Error('Deepgram TTS stream failed')));
     socket.on('close', () => queue.fail(new Error('Deepgram TTS stream closed before flush')));
@@ -131,7 +137,8 @@ async function* elevenLabsTts(options: TtsOptions, signal: AbortSignal): AsyncGe
     body: JSON.stringify({ text: options.text, model_id: 'eleven_flash_v2_5' }),
     signal,
   });
-  if (!response.ok) throw new Error(`ElevenLabs TTS request failed (HTTP ${response.status})`);
+  if (!response.ok) throw new ProviderError('elevenlabs', 'TTS', String(response.status),
+    `ElevenLabs TTS request failed (HTTP ${response.status})`);
   if (!response.body) throw new Error('ElevenLabs TTS returned no audio stream');
   const reader = response.body.getReader();
   try {
@@ -154,4 +161,23 @@ export async function* streamTts(options: TtsOptions): AsyncGenerator<Buffer> {
     : AbortSignal.timeout(PROVIDER_DEADLINE_MS);
   if (options.provider === 'deepgram') yield* deepgramTts(options, signal);
   else yield* elevenLabsTts(options, signal);
+}
+
+/** Retry the same utterance only when no provider audio has escaped to playback. */
+export async function* streamTtsWithFallback(
+  primary: TtsOptions, alternate: TtsOptions | undefined, onSwitch: () => void,
+): AsyncGenerator<Buffer> {
+  let emitted = false;
+  try {
+    for await (const chunk of streamTts(primary)) {
+      emitted = true;
+      yield chunk;
+    }
+    return;
+  } catch (error) {
+    if (emitted || primary.signal?.aborted || !(error instanceof ProviderError) ||
+        !error.exhausted || !alternate) throw error;
+    onSwitch();
+    yield* streamTts(alternate);
+  }
 }

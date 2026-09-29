@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import test from 'node:test';
 import { WebSocketServer } from 'ws';
-import { streamTts } from '../src/tts.js';
+import { streamTts, streamTtsWithFallback } from '../src/tts.js';
 
 test('Deepgram TTS yields audio before the final websocket chunk', async () => {
   const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
@@ -113,3 +113,74 @@ for (const status of [401, 403, 429, 500]) {
     }
   });
 }
+
+test('TTS credit exhaustion switches vendors before the first audio chunk', async () => {
+  const server = createServer((_request, response) => { response.writeHead(402); response.end(); });
+  const websocket = new WebSocketServer({ server });
+  websocket.on('connection', socket => {
+    socket.on('message', data => {
+      if ((JSON.parse(data.toString()) as { type: string }).type === 'Flush') {
+        socket.send(Buffer.from([1, 0, 2, 0]));
+        socket.send(JSON.stringify({ type: 'Flushed' }));
+      }
+    });
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('expected TCP address');
+  const endpoint = `http://127.0.0.1:${address.port}`;
+  let switches = 0;
+  try {
+    const chunks: Buffer[] = [];
+    for await (const chunk of streamTtsWithFallback(
+      { provider: 'elevenlabs', apiKey: 'el-test', voiceId: 'voice-test', text: 'hello', endpoint },
+      { provider: 'deepgram', apiKey: 'dg-test', text: 'hello', endpoint },
+      () => { switches++; },
+    )) chunks.push(chunk);
+    assert.deepEqual(Buffer.concat(chunks), Buffer.from([1, 0, 2, 0]));
+    assert.equal(switches, 1);
+  } finally {
+    for (const client of websocket.clients) client.terminate();
+    await new Promise<void>(resolve => websocket.close(() => resolve()));
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('TTS never retries another vendor after partial audio escaped', async () => {
+  let alternateRequests = 0;
+  const server = createServer((_request, response) => {
+    alternateRequests++;
+    response.writeHead(200); response.end(Buffer.from([9, 0]));
+  });
+  const websocket = new WebSocketServer({ server });
+  websocket.on('connection', socket => {
+    socket.on('message', data => {
+      if ((JSON.parse(data.toString()) as { type: string }).type === 'Flush') {
+        socket.send(Buffer.from([1, 0]));
+        setTimeout(() => socket.send(JSON.stringify({ type: 'Error', code: 'quota_exceeded' })), 20);
+      }
+    });
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('expected TCP address');
+  const endpoint = `http://127.0.0.1:${address.port}`;
+  let switches = 0;
+  const chunks: Buffer[] = [];
+  try {
+    await assert.rejects(async () => {
+      for await (const chunk of streamTtsWithFallback(
+        { provider: 'deepgram', apiKey: 'dg-test', text: 'hello', endpoint },
+        { provider: 'elevenlabs', apiKey: 'el-test', voiceId: 'voice-test', text: 'hello', endpoint },
+        () => { switches++; },
+      )) chunks.push(chunk);
+    }, /provider error/);
+    assert.deepEqual(chunks, [Buffer.from([1, 0])]);
+    assert.equal(switches, 0);
+    assert.equal(alternateRequests, 0);
+  } finally {
+    for (const client of websocket.clients) client.terminate();
+    await new Promise<void>(resolve => websocket.close(() => resolve()));
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});

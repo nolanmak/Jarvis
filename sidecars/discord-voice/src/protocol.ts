@@ -9,6 +9,8 @@ export type StartFrame = {
   ownerId: string;
   botUserId: string;
   generation: number;
+  sttProvider?: 'deepgram' | 'elevenlabs';
+  ttsProvider?: 'deepgram' | 'elevenlabs';
 };
 
 export type SpeakFrame = {
@@ -98,6 +100,12 @@ function voiceToken(value: unknown): string {
   return value;
 }
 
+function speechProvider(value: unknown): 'deepgram' | 'elevenlabs' | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (value === 'deepgram' || value === 'elevenlabs') return value;
+  throw new Error('Invalid speech provider');
+}
+
 export function parseFrame(raw: string): Frame {
   if (Buffer.byteLength(raw) > 32_768) throw new Error('IPC frame too large');
   const value = record(JSON.parse(raw) as unknown);
@@ -105,10 +113,14 @@ export function parseFrame(raw: string): Frame {
   const common = { version: 1 as const, conversationId: id(value.conversationId, 'conversationId'), generation: generation(value.generation) };
   switch (value.kind) {
     case 'start':
-      exact(value, ['version', 'kind', 'requestId', 'guildId', 'channelId', 'conversationId', 'ownerId', 'botUserId', 'generation']);
+      if (Object.keys(value).some(key => !['version', 'kind', 'requestId', 'guildId', 'channelId', 'conversationId', 'ownerId', 'botUserId', 'generation', 'sttProvider', 'ttsProvider'].includes(key))) {
+        throw new Error('IPC frame contains an unexpected field');
+      }
       return { ...common, kind: 'start', requestId: id(value.requestId, 'requestId'),
         guildId: id(value.guildId, 'guildId'), channelId: id(value.channelId, 'channelId'),
-        ownerId: id(value.ownerId, 'ownerId'), botUserId: id(value.botUserId, 'botUserId') };
+        ownerId: id(value.ownerId, 'ownerId'), botUserId: id(value.botUserId, 'botUserId'),
+        ...(speechProvider(value.sttProvider) ? { sttProvider: speechProvider(value.sttProvider) } : {}),
+        ...(speechProvider(value.ttsProvider) ? { ttsProvider: speechProvider(value.ttsProvider) } : {}) };
     case 'speak': {
       exact(value, ['version', 'kind', 'requestId', 'conversationId', 'generation', 'utteranceId', 'text']);
       const speech = value.text;

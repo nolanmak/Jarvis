@@ -12,13 +12,16 @@ import type { StartFrame } from './protocol.js';
 import { SpeechQueue, type PlaybackSink, type SpeechReceipt } from './speech-queue.js';
 import { openSttSession, type SttSession } from './stt.js';
 import type { SttEvent, SttProvider } from './stt-wire.js';
-import { streamTts } from './tts.js';
+import { streamTtsWithFallback } from './tts.js';
+import { ProviderError } from './provider-error.js';
 
 export type SpeechConfig = {
   sttProvider: SttProvider;
   ttsProvider: SttProvider;
   sttKey: string;
   ttsKey: string;
+  deepgramKey?: string;
+  elevenLabsKey?: string;
   elevenLabsVoiceId?: string;
   /** Test transport only; production leaves this unset. */
   sttEndpoint?: string;
@@ -35,9 +38,9 @@ function provider(value: string | undefined): SttProvider {
 }
 
 /** Validate both independently selected providers before a voice join. */
-export function loadSpeechConfig(env: NodeJS.ProcessEnv): SpeechConfig {
-  const sttProvider = provider(env.AUGMENTAGENT_DISCORD_STT_PROVIDER);
-  const ttsProvider = provider(env.AUGMENTAGENT_DISCORD_TTS_PROVIDER);
+export function loadSpeechConfig(env: NodeJS.ProcessEnv, selection?: { sttProvider?: SttProvider; ttsProvider?: SttProvider }): SpeechConfig {
+  const sttProvider = provider(selection?.sttProvider ?? env.AUGMENTAGENT_DISCORD_STT_PROVIDER);
+  const ttsProvider = provider(selection?.ttsProvider ?? env.AUGMENTAGENT_DISCORD_TTS_PROVIDER);
   const selectedKey = (kind: SttProvider): string | undefined =>
     kind === 'deepgram' ? env.DEEPGRAM_API_KEY : env.ELEVENLABS_API_KEY;
   const sttKey = selectedKey(sttProvider);
@@ -48,6 +51,7 @@ export function loadSpeechConfig(env: NodeJS.ProcessEnv): SpeechConfig {
     throw new Error('ElevenLabs TTS voice ID is missing');
   }
   return { sttProvider, ttsProvider, sttKey, ttsKey,
+    deepgramKey: env.DEEPGRAM_API_KEY, elevenLabsKey: env.ELEVENLABS_API_KEY,
     elevenLabsVoiceId: env.ELEVENLABS_VOICE_ID };
 }
 
@@ -124,6 +128,8 @@ export class VoiceAudio {
   private recovery?: Promise<void>;
   private closed = false;
   private state: 'connecting' | 'listening' | 'reconnecting' | 'failed' | 'stopped' = 'connecting';
+  private activeSttProvider: SttProvider;
+  private activeTtsProvider: SttProvider;
 
   constructor(
     private readonly connection: VoiceConnection,
@@ -131,12 +137,10 @@ export class VoiceAudio {
     private readonly config: SpeechConfig,
     private readonly emit: (frame: unknown) => boolean,
   ) {
+    this.activeSttProvider = config.sttProvider;
+    this.activeTtsProvider = config.ttsProvider;
     this.sink = new DiscordPlaybackSink(connection);
-    this.speech = new SpeechQueue((text, signal) => streamTts({
-      provider: config.ttsProvider, apiKey: config.ttsKey,
-      voiceId: config.elevenLabsVoiceId, text, signal,
-      endpoint: config.ttsEndpoint,
-    }), this.sink);
+    this.speech = new SpeechQueue((text, signal) => this.synthesize(text, signal), this.sink);
   }
 
   get status(): string { return this.state; }
@@ -147,8 +151,14 @@ export class VoiceAudio {
       if (this.closed) return;
       try {
         this.stt = await this.openStt(0);
+        if (this.recovery) {
+          this.stt.close();
+          this.stt = undefined;
+          await this.recovery;
+        }
       } catch (error) {
-        await this.recoverStt(error instanceof Error ? error.message : 'STT connection failed');
+        this.recovery = this.recoverStt(error instanceof Error ? error : new Error('STT connection failed'));
+        try { await this.recovery; } finally { this.recovery = undefined; }
       }
       if (!this.stt) return;
       if (this.closed) { this.stt.close(); return; }
@@ -219,7 +229,7 @@ export class VoiceAudio {
       }
     } catch (error) {
       if (error instanceof Error && error.message === 'STT stream is closed') {
-        this.onSttFailure(error.message, this.sttEpoch);
+        this.onSttFailure(error, this.sttEpoch);
       } else {
         this.fail(error instanceof Error ? error.message : 'STT audio forwarding failed');
       }
@@ -229,32 +239,47 @@ export class VoiceAudio {
   private async openStt(epoch: number): Promise<SttSession> {
     this.sttEpoch = epoch;
     const session = await openSttSession({
-      provider: this.config.sttProvider, apiKey: this.config.sttKey,
+      provider: this.activeSttProvider, apiKey: this.keyFor(this.activeSttProvider, 'STT'),
       endpoint: this.config.sttEndpoint,
       signal: this.retryAbort.signal,
       onEvent: event => this.onSttEvent(event, epoch),
-      onError: error => this.onSttFailure(error.message, epoch),
+      onError: error => this.onSttFailure(error, epoch),
     });
     return session;
   }
 
-  private onSttFailure(message: string, epoch: number): void {
-    if (this.closed || epoch !== this.sttEpoch || this.recovery) return;
+  private onSttFailure(error: Error, epoch: number): void {
+    if (this.closed || epoch !== this.sttEpoch) return;
+    if (this.recovery) {
+      void this.recovery.finally(() => this.onSttFailure(error, epoch));
+      return;
+    }
     this.stt?.close();
     this.stt = undefined;
     this.speechActive = false;
     this.pcmCarry = undefined;
     if (this.cap) clearTimeout(this.cap);
     this.interrupt();
-    this.recovery = this.recoverStt(message);
+    this.recovery = this.recoverStt(error);
     void this.recovery.finally(() => { this.recovery = undefined; });
   }
 
-  private async recoverStt(initialError: string): Promise<void> {
+  private async recoverStt(initialError: Error): Promise<void> {
     this.state = 'reconnecting';
     this.emitStatus();
-    let lastError = initialError;
-    for (const milliseconds of this.config.sttRetryDelays ?? [1000, 2000, 4000]) {
+    let lastError = initialError.message;
+    const fallback = this.alternate(this.activeSttProvider, 'STT');
+    const switchNow = initialError instanceof ProviderError && initialError.exhausted && fallback;
+    if (initialError instanceof ProviderError && initialError.exhausted && !fallback) {
+      this.fail(`STT credits exhausted and no alternate provider is configured: ${initialError.message}`);
+      return;
+    }
+    if (switchNow) {
+      this.activeSttProvider = fallback;
+      this.emitProviderChange('STT', fallback);
+    }
+    for (const milliseconds of switchNow ? [0, ...(this.config.sttRetryDelays ?? [1000, 2000, 4000])]
+      : (this.config.sttRetryDelays ?? [1000, 2000, 4000])) {
       try {
         await wait(milliseconds, undefined, { signal: this.retryAbort.signal });
       } catch { return; }
@@ -268,9 +293,52 @@ export class VoiceAudio {
         return;
       } catch (error) {
         lastError = error instanceof Error ? error.message : 'STT reconnect failed';
+        if (error instanceof ProviderError && error.exhausted) {
+          if (this.activeSttProvider === this.config.sttProvider) {
+            const next = this.alternate(this.activeSttProvider, 'STT');
+            if (next) {
+              this.activeSttProvider = next;
+              this.emitProviderChange('STT', next);
+              continue;
+            }
+          }
+          break;
+        }
       }
     }
     this.fail(`STT stopped after three reconnect attempts: ${lastError}`);
+  }
+
+  private keyFor(provider: SttProvider, operation: 'STT' | 'TTS'): string {
+    if (provider === this.config[operation === 'STT' ? 'sttProvider' : 'ttsProvider']) {
+      return this.config[operation === 'STT' ? 'sttKey' : 'ttsKey'];
+    }
+    return (provider === 'deepgram' ? this.config.deepgramKey : this.config.elevenLabsKey) ?? '';
+  }
+
+  private alternate(provider: SttProvider, operation: 'STT' | 'TTS'): SttProvider | undefined {
+    const other = provider === 'deepgram' ? 'elevenlabs' : 'deepgram';
+    if (!this.keyFor(other, operation).trim()) return undefined;
+    if (operation === 'TTS' && other === 'elevenlabs' && !this.config.elevenLabsVoiceId) return undefined;
+    return other;
+  }
+
+  private emitProviderChange(operation: 'STT' | 'TTS', provider: SttProvider): void {
+    this.emit({ version: 1, kind: 'provider_changed', conversationId: this.binding.conversationId,
+      generation: this.binding.generation, guildId: this.binding.guildId, operation, provider });
+  }
+
+  private async *synthesize(text: string, signal: AbortSignal): AsyncGenerator<Buffer> {
+    const selected = this.activeTtsProvider;
+    const fallback = this.alternate(selected, 'TTS');
+    const options = (provider: SttProvider) => ({ provider, apiKey: this.keyFor(provider, 'TTS'),
+      voiceId: this.config.elevenLabsVoiceId, text, signal, endpoint: this.config.ttsEndpoint });
+    yield* streamTtsWithFallback(options(selected), fallback ? options(fallback) : undefined, () => {
+      if (fallback) {
+        this.activeTtsProvider = fallback;
+        this.emitProviderChange('TTS', fallback);
+      }
+    });
   }
 
   private onSttEvent(event: SttEvent, epoch: number): void {

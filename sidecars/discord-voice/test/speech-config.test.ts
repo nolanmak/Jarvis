@@ -25,3 +25,12 @@ test('missing selected credentials fail before joining voice', () => {
   assert.throws(() => loadSpeechConfig({ DEEPGRAM_API_KEY: 'synthetic-deepgram-key',
     AUGMENTAGENT_DISCORD_TTS_PROVIDER: 'elevenlabs' }), /ElevenLabs TTS key/);
 });
+
+test('Discord selection overrides defaults without exposing vendor keys in IPC', () => {
+  const config = loadSpeechConfig({ DEEPGRAM_API_KEY: 'dg-test', ELEVENLABS_API_KEY: 'el-test',
+    ELEVENLABS_VOICE_ID: 'voice-test' }, { sttProvider: 'elevenlabs', ttsProvider: 'deepgram' });
+  assert.equal(config.sttProvider, 'elevenlabs');
+  assert.equal(config.ttsProvider, 'deepgram');
+  assert.equal(config.sttKey, 'el-test');
+  assert.equal(config.ttsKey, 'dg-test');
+});

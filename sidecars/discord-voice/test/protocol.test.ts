@@ -14,6 +14,14 @@ test('accepts a versioned owner-bound start request', () => {
   });
 });
 
+test('accepts independent speech vendors and rejects invalid selections', () => {
+  const start = { version: 1, kind: 'start', requestId: 'req-1', guildId: 'guild-1',
+    channelId: 'voice-1', conversationId: 'text-1', ownerId: 'owner-1', botUserId: 'bot-1',
+    generation: 1, sttProvider: 'elevenlabs', ttsProvider: 'deepgram' };
+  assert.deepEqual(parseFrame(JSON.stringify(start)), start);
+  assert.throws(() => parseFrame(JSON.stringify({ ...start, sttProvider: 'unknown' })));
+});
+
 test('rejects unsupported versions and missing binding identity', () => {
   const good = { version: 1, kind: 'start', requestId: 'req-1', guildId: 'guild-1',
     channelId: 'voice-1', conversationId: 'text-1', ownerId: 'owner-1', botUserId: 'bot-1', generation: 1 };

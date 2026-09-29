@@ -48,6 +48,7 @@ async fn active_voice_binding_injects_tool_only_into_its_owner_conversation_turn
     bridge.start(augmentagent_approval_discord::voice_bridge::VoiceBinding {
         guild_id:"1".into(), conversation_id:"1:2".into(), text_channel_id:"2".into(),
         voice_channel_id:"3".into(), owner_id:"4".into(), bot_user_id:"5".into(), generation:6,
+        stt_provider: None, tts_provider: None,
     }).await.unwrap();
     let service = augmentagent_approval_discord::voice_tool::VoiceToolService::start(&bridge).await.unwrap();
     let captured = Arc::new(Mutex::new(Vec::new()));

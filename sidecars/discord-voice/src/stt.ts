@@ -1,5 +1,6 @@
 import WebSocket, { type RawData } from 'ws';
 import { parseSttEvent, type SttEvent, type SttProvider } from './stt-wire.js';
+import { ProviderError } from './provider-error.js';
 
 const MAX_PCM_CHUNK_BYTES = 65_536;
 const MAX_BUFFERED_BYTES = 1_048_576;
@@ -50,6 +51,21 @@ export async function openSttSession(options: SttOptions): Promise<SttSession> {
   // the handshake. Register before awaiting open so that frame is not lost.
   socket.on('message', (data: RawData, binary: boolean) => {
     if (closed || binary) return;
+    if (options.provider === 'elevenlabs') {
+      try {
+        const frame = JSON.parse(data.toString()) as Record<string, unknown>;
+        if (typeof frame.message_type === 'string' &&
+            ['auth_error', 'quota_exceeded', 'transcriber_error', 'input_error', 'invalid_request',
+              'error', 'rate_limited', 'queue_overflow', 'resource_exhausted',
+              'session_time_limit_exceeded'].includes(frame.message_type)) {
+          const code = typeof frame.error_code === 'string' ? frame.error_code
+            : typeof frame.code === 'string' ? frame.code : frame.message_type;
+          options.onError(new ProviderError(options.provider, 'STT', code,
+            `ElevenLabs STT provider error (${code})`));
+          return;
+        }
+      } catch { /* malformed frames cannot become transcripts */ }
+    }
     const event = parseSttEvent(options.provider, data.toString());
     if (event) options.onEvent(event);
   });
@@ -64,7 +80,8 @@ export async function openSttSession(options: SttOptions): Promise<SttSession> {
       const onUnexpectedResponse = (_request: unknown, response: { statusCode?: number }): void => {
         closed = true;
         socket.terminate();
-        reject(new Error(`${options.provider} STT handshake failed (HTTP ${response.statusCode})`));
+        reject(new ProviderError(options.provider, 'STT', String(response.statusCode),
+          `${options.provider} STT handshake failed (HTTP ${response.statusCode})`));
       };
       const onHandshakeError = (): void => {
         closed = true;

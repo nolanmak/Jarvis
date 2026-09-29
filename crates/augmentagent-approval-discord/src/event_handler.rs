@@ -51,7 +51,16 @@ fn voice_command() -> CreateCommand {
         .add_option(CreateCommandOption::new(CommandOptionType::SubCommand, "start", "Join your voice channel")
             .add_sub_option(CreateCommandOption::new(CommandOptionType::String, "agent", "Claude or Codex")
                 .add_string_choice("Claude", "claude")
-                .add_string_choice("Codex", "codex")))
+                .add_string_choice("Codex", "codex"))
+            .add_sub_option(CreateCommandOption::new(CommandOptionType::String, "stt", "Speech recognition provider")
+                .add_string_choice("Deepgram", "deepgram").add_string_choice("ElevenLabs", "elevenlabs"))
+            .add_sub_option(CreateCommandOption::new(CommandOptionType::String, "tts", "Spoken reply provider")
+                .add_string_choice("Deepgram", "deepgram").add_string_choice("ElevenLabs", "elevenlabs")))
+        .add_option(CreateCommandOption::new(CommandOptionType::SubCommand, "provider", "Switch speech vendors in this conversation")
+            .add_sub_option(CreateCommandOption::new(CommandOptionType::String, "stt", "Speech recognition provider")
+                .add_string_choice("Deepgram", "deepgram").add_string_choice("ElevenLabs", "elevenlabs"))
+            .add_sub_option(CreateCommandOption::new(CommandOptionType::String, "tts", "Spoken reply provider")
+                .add_string_choice("Deepgram", "deepgram").add_string_choice("ElevenLabs", "elevenlabs")))
         .add_option(CreateCommandOption::new(CommandOptionType::SubCommand, "status", "Show voice binding and native session"))
         .add_option(CreateCommandOption::new(CommandOptionType::SubCommand, "stop", "Leave voice and keep text context"))
         .add_option(CreateCommandOption::new(CommandOptionType::SubCommand, "interrupt", "Stop the current spoken reply"))
@@ -118,10 +127,20 @@ impl Handler {
             return "Voice sidecar is unavailable. Check its service and Unix socket, then retry.".into();
         };
         let Some(option) = command.data.options.first() else {
-            return "Use `/voice start`, `status`, `stop`, or `interrupt`.".into();
+            return "Use `/voice start`, `provider`, `status`, `stop`, or `interrupt`.".into();
         };
         let guild = guild_id.get().to_string();
         let conversation = format!("{}:{}", guild_id.get(), command.channel_id.get());
+        let speech_option = |name: &str| -> Option<String> {
+            let CommandDataOptionValue::SubCommand(options) = &option.value else { return None; };
+            options.iter().find_map(|item| {
+                if item.name != name { return None; }
+                match &item.value {
+                    CommandDataOptionValue::String(value) if matches!(value.as_str(), "deepgram" | "elevenlabs") => Some(value.clone()),
+                    _ => None,
+                }
+            })
+        };
         match option.name.as_str() {
             "start" => {
                 if !bridge.is_connected() {
@@ -206,11 +225,38 @@ impl Handler {
                     owner_id: command.user.id.get().to_string(),
                     bot_user_id: bot_id.get().to_string(),
                     generation: next_voice_generation(),
+                    stt_provider: speech_option("stt"),
+                    tts_provider: speech_option("tts"),
                 };
                 match bridge.start(binding).await {
                     Ok(()) => format!("Joining <#{}> for this conversation. Native {} session {} is bound; listening will begin when the voice connection is ready.",
                         voice_channel.get(), bound.provider, bound.native_session_id),
                     Err(error) => format!("Could not start Discord voice: {error}"),
+                }
+            }
+            "provider" => {
+                let Some(mut binding) = bridge.binding(&guild) else {
+                    return "Start voice in this conversation before switching providers.".into();
+                };
+                if binding.conversation_id != conversation {
+                    return format!("Voice is bound to {} in this server.", binding.conversation_id);
+                }
+                let stt = speech_option("stt");
+                let tts = speech_option("tts");
+                if stt.is_none() && tts.is_none() {
+                    return "Choose STT, TTS, or both providers to switch.".into();
+                }
+                if let Some(stt) = stt { binding.stt_provider = Some(stt); }
+                if let Some(tts) = tts { binding.tts_provider = Some(tts); }
+                if let Err(error) = bridge.stop(&guild, &conversation).await {
+                    return format!("Could not stop voice before switching providers: {error}");
+                }
+                binding.generation = next_voice_generation();
+                match bridge.start(binding.clone()).await {
+                    Ok(()) => format!("Switching speech providers in the same conversation: STT {}, TTS {}. Rejoining <#{}>.",
+                        binding.stt_provider.as_deref().unwrap_or("default"),
+                        binding.tts_provider.as_deref().unwrap_or("default"), binding.voice_channel_id),
+                    Err(error) => format!("Voice stopped, but the new providers could not start: {error}. The text session remains available."),
                 }
             }
             "status" => {
@@ -226,8 +272,10 @@ impl Handler {
                 let audio_state = bridge.status(&guild, &conversation).await
                     .unwrap_or_else(|_| "disconnected".into());
                 match session {
-                    Some(session) => format!("Voice binding: <#{}> ↔ <#{}>. Native {} session {}. Audio state: {}.",
-                        command.channel_id.get(), binding.voice_channel_id, session.provider, session.native_session_id, audio_state),
+                    Some(session) => format!("Voice binding: <#{}> ↔ <#{}>. Native {} session {}. Audio state: {}. Speech: STT {}, TTS {}.",
+                        command.channel_id.get(), binding.voice_channel_id, session.provider, session.native_session_id, audio_state,
+                        binding.stt_provider.as_deref().unwrap_or("default"),
+                        binding.tts_provider.as_deref().unwrap_or("default")),
                     None => "Voice binding is active, but its native session could not be read.".into(),
                 }
             }
@@ -239,7 +287,7 @@ impl Handler {
                 Ok(()) => "Current spoken reply interrupted.".into(),
                 Err(error) => format!("Could not interrupt Discord voice: {error}"),
             },
-            _ => "Use `/voice start`, `status`, `stop`, or `interrupt`.".into(),
+            _ => "Use `/voice start`, `provider`, `status`, `stop`, or `interrupt`.".into(),
         }
     }
 }

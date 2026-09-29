@@ -129,7 +129,7 @@ export class VoiceIpcServer {
       frame = parseFrame(raw);
       switch (frame.kind) {
         case 'start':
-          this.coordinator.start(frame, this.managedCoordinator ? loadSpeechConfig(process.env) : undefined);
+          this.coordinator.start(frame, this.managedCoordinator ? loadSpeechConfig(process.env, frame) : undefined);
           break;
         case 'stop':
           if (!this.coordinator.stop(frame.conversationId, frame.generation)) {

@@ -45,6 +45,8 @@ pub struct VoiceBinding {
     pub owner_id: String,
     pub bot_user_id: String,
     pub generation: u64,
+    pub stt_provider: Option<String>,
+    pub tts_provider: Option<String>,
 }
 
 #[derive(Clone)]
@@ -196,6 +198,7 @@ impl VoiceBridge {
                 "channelId": binding.voice_channel_id, "conversationId": binding.conversation_id,
                 "ownerId": binding.owner_id, "botUserId": binding.bot_user_id,
                 "generation": binding.generation,
+                "sttProvider": binding.stt_provider, "ttsProvider": binding.tts_provider,
             }))
             .await;
         if result.is_err() {
@@ -494,6 +497,30 @@ impl VoiceBridge {
                 }
                 if let Some(shard) = self.shard.read().await.as_ref() {
                     shard.websocket_message(WebSocketMessage::Text(payload.to_string()));
+                }
+            }
+            Some("provider_changed") => {
+                let Some(binding) = self.binding_for_frame(&frame) else { return; };
+                let Some(operation) = frame.get("operation").and_then(Value::as_str) else { return; };
+                let Some(provider) = frame.get("provider").and_then(Value::as_str) else { return; };
+                if !matches!(provider, "deepgram" | "elevenlabs") { return; }
+                if let Some(mut active) = self.active.get_mut(&binding.guild_id) {
+                    if active.generation != binding.generation { return; }
+                    match operation {
+                        "STT" => active.stt_provider = Some(provider.to_string()),
+                        "TTS" => active.tts_provider = Some(provider.to_string()),
+                        _ => return,
+                    }
+                }
+                if let Some(handler) = self.turn_handler.read().await.clone() {
+                    let operation = operation.to_string();
+                    let provider = provider.to_string();
+                    tokio::spawn(async move {
+                        if let Ok(channel) = binding.text_channel_id.parse::<u64>() {
+                            let _ = ChannelId::new(channel).send_message(&handler.http,
+                                CreateMessage::new().content(format!("Voice {operation} switched to {provider} after provider credits were exhausted."))).await;
+                        }
+                    });
                 }
             }
             Some("audio_status") | Some("audio_failure") => {
@@ -801,7 +828,26 @@ mod tests {
             owner_id: "4".into(),
             bot_user_id: "5".into(),
             generation: 6,
+            stt_provider: None,
+            tts_provider: None,
         }
+    }
+
+    #[tokio::test]
+    async fn provider_change_updates_only_the_active_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let bridge = VoiceBridge::connect(&directory.path().join("missing.sock"))
+            .await.unwrap();
+        bridge.active.insert("1".into(), binding());
+        bridge.handle_frame(json!({"version":1,"kind":"provider_changed",
+            "guildId":"1","conversationId":"1:2","generation":5,
+            "operation":"STT","provider":"elevenlabs"})).await;
+        assert_eq!(bridge.binding("1").unwrap().stt_provider, None);
+        bridge.handle_frame(json!({"version":1,"kind":"provider_changed",
+            "guildId":"1","conversationId":"1:2","generation":6,
+            "operation":"STT","provider":"elevenlabs"})).await;
+        assert_eq!(bridge.binding("1").unwrap().stt_provider.as_deref(), Some("elevenlabs"));
+        assert_eq!(bridge.binding("1").unwrap().tts_provider, None);
     }
 
     #[test]
