@@ -67,6 +67,7 @@ mod messages_cmd;
 mod embeddings_cmd;
 mod triage_prefilter_cmd;
 mod apple_notes;
+mod imessage_send;
 mod autopr_eval;
 mod autopr_health;
 mod channel_router;
@@ -11606,6 +11607,8 @@ struct ReplyApprover {
     /// a strong back-reference would cycle). Empty in dry-run / one-shot
     /// commands — every use is best-effort.
     broker: std::sync::OnceLock<std::sync::Weak<dyn ApprovalBroker>>,
+    /// #1303 — bundle location and kill-switch for iMessage replies.
+    imessage: imessage_send::ImessageSendConfig,
 }
 
 impl ReplyApprover {
@@ -12216,14 +12219,14 @@ impl ReplyApprover {
         }
     }
 
-    async fn revise_telegram(
+    /// Telegram and iMessage keep no server-side draft: regenerate locally
+    /// and put the row back to Pending so the card re-renders.
+    async fn revise_without_server_draft(
         &self,
         action_id: &str,
         feedback: &str,
         action: augmentagent_store::ActionWithEmail,
     ) -> ApprovalActionOutcome {
-        // Telegram has no server-side draft — just regenerate locally and
-        // bounce the action row back to Pending so the broker re-renders.
         let previous_draft = action.action.draft_body.clone().unwrap_or_default();
         let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
         let prompt = augmentagent_channel_core::prompt::redraft_message(
@@ -12245,7 +12248,7 @@ impl ReplyApprover {
             Some(&redraft),
             None,
         );
-        tracing::info!(action_id, "telegram revise: new draft persisted");
+        tracing::info!(action_id, platform = %action.email.platform, "revise: new draft persisted");
         ApprovalActionOutcome::Revised {
             email: action.email,
             draft: redraft,
@@ -12641,6 +12644,9 @@ impl ReplyApprover {
         if action.email.platform == "gcal" {
             return self.approve_gcal(action_id, action).await;
         }
+        if action.email.platform == imessage_send::PLATFORM {
+            return self.approve_imessage(action_id, action).await;
+        }
         if is_linkedin_email(&action.email) {
             return self.approve_linkedin(action_id, action).await;
         }
@@ -12997,6 +13003,9 @@ impl ReplyApprover {
         if action.email.platform == augmentagent_channel_socialapi::PLATFORM {
             return self.skip_socialapi(action_id, action);
         }
+        if action.email.platform == imessage_send::PLATFORM {
+            return self.skip_imessage(action_id, action);
+        }
         if is_linkedin_email(&action.email) {
             return self.skip_linkedin(action_id, action);
         }
@@ -13069,13 +13078,20 @@ impl ReplyApprover {
             return self.revise_slack(action_id, feedback, action).await;
         }
         if action.email.platform == "telegram" {
-            return self.revise_telegram(action_id, feedback, action).await;
+            return self
+                .revise_without_server_draft(action_id, feedback, action)
+                .await;
         }
         if action.email.platform == "github" {
             return self.revise_github(action_id, feedback, action).await;
         }
         if action.email.platform == augmentagent_channel_socialapi::PLATFORM {
             return self.revise_socialapi(action_id, feedback, action).await;
+        }
+        if action.email.platform == imessage_send::PLATFORM {
+            return self
+                .revise_without_server_draft(action_id, feedback, action)
+                .await;
         }
         if is_linkedin_email(&action.email) {
             return self.revise_linkedin(action_id, feedback, action).await;
@@ -13837,6 +13853,7 @@ async fn build_broker(
         wiki_root: cli.wiki_dir.clone(),
         nudge: std::sync::OnceLock::new(),
         broker: std::sync::OnceLock::new(),
+        imessage: imessage_send::ImessageSendConfig::from_env(),
     });
 
     let approver_for_broker = Arc::clone(&approver);
@@ -19979,24 +19996,7 @@ mod stale_reconcile_tests {
     /// broker `OnceLock` empty, the happy path is a pure store CAS (no card
     /// repost).
     fn approver_with_store(store: Arc<Store>) -> ReplyApprover {
-        ReplyApprover {
-            store,
-            gmail: Arc::new(ComposioClient::new("test-key".into())),
-            calendar: Arc::new(augmentagent_channel_calendar::ComposioCalendarClient::new(
-                "test-key".into(),
-            )),
-            linkedin: None,
-            discord: None,
-            slack: Default::default(),
-            telegram: Default::default(),
-            github: None,
-            socialapi: None,
-            reasoner: Arc::new(FallbackReasoner::claude_only()),
-            draft_skill: String::new(),
-            wiki_root: None,
-            nudge: std::sync::OnceLock::new(),
-            broker: std::sync::OnceLock::new(),
-        }
+        crate::test_support::approver_with_store(store)
     }
 
     /// AC6 — the CLI recompose handler's four decision branches: unknown id,
@@ -20612,6 +20612,34 @@ mod identity_merge_tests {
                 );
             }
             other => panic!("expected AlreadyResolved, got {other:?}"),
+        }
+    }
+}
+
+/// Test builders shared by sibling modules (`imessage_send`).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn approver_with_store(store: Arc<Store>) -> ReplyApprover {
+        ReplyApprover {
+            store,
+            gmail: Arc::new(ComposioClient::new("test-key".into())),
+            calendar: Arc::new(augmentagent_channel_calendar::ComposioCalendarClient::new(
+                "test-key".into(),
+            )),
+            linkedin: None,
+            discord: None,
+            slack: Default::default(),
+            telegram: Default::default(),
+            github: None,
+            socialapi: None,
+            reasoner: Arc::new(FallbackReasoner::claude_only()),
+            draft_skill: String::new(),
+            wiki_root: None,
+            nudge: std::sync::OnceLock::new(),
+            broker: std::sync::OnceLock::new(),
+            imessage: Default::default(),
         }
     }
 }

@@ -1,0 +1,389 @@
+//! iMessage replies through the approval card (#1303).
+//!
+//! Approve never touches Messages. It claims the action (`pending →
+//! sending`) and queues one outbox row; the Mac-side sender claims that row,
+//! sends it, verifies the result in `chat.db` and reports back through
+//! `augmentagent imessage outbox complete`, which is what finally flips the
+//! action to `sent` or `error` (#1304).
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use augmentagent_approval_discord::ApprovalActionOutcome;
+use augmentagent_store::{
+    ActionStatus, ActionWithEmail, NewImessageOutboxItem, Store, TriageResult,
+};
+
+use crate::ReplyApprover;
+
+pub(crate) const PLATFORM: &str = "imessage";
+
+/// Where approve reads conversations from and whether sends are armed.
+/// Built from the environment in the daemon; tests set it directly.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ImessageSendConfig {
+    pub bundle_dir: Option<PathBuf>,
+    pub send_enabled: bool,
+}
+
+impl ImessageSendConfig {
+    pub(crate) fn from_env() -> Self {
+        Self {
+            bundle_dir: augmentagent_channel_imessage::ImessageConfig::load().map(|c| c.repo_dir),
+            send_enabled: augmentagent_channel_imessage::send_enabled(),
+        }
+    }
+}
+
+impl ReplyApprover {
+    /// Every refusal happens before the claim, so a refused card stays
+    /// `pending` and can be approved again once the cause is fixed.
+    pub(crate) async fn approve_imessage(
+        &self,
+        action_id: &str,
+        action: ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        let failed = |message: String| ApprovalActionOutcome::Failed { message };
+        if !self.imessage.send_enabled {
+            return failed(format!(
+                "iMessage sending is off; set {}=1 on the agent to enable it",
+                augmentagent_channel_imessage::ENV_SEND_ENABLED
+            ));
+        }
+        let Some(bundle_dir) = self.imessage.bundle_dir.as_deref() else {
+            return failed(
+                "no iMessage bundle configured; set AUGMENTAGENT_IMESSAGE_REPO_DIR".into(),
+            );
+        };
+        let conversations =
+            match augmentagent_channel_imessage::Bundle::open(bundle_dir).conversations() {
+                Ok(c) => c,
+                Err(e) => return failed(format!("reading the iMessage bundle: {e:#}")),
+            };
+        let thread_id = action.email.thread_id.as_deref().unwrap_or_default();
+        let target = match augmentagent_channel_imessage::resolve_target(thread_id, &conversations)
+        {
+            Ok(t) => t,
+            Err(e) => return failed(format!("cannot send: {e}")),
+        };
+        match self.store.is_imessage_outbound_allowed(&target.conversation) {
+            Ok(true) => {}
+            Ok(false) => {
+                return failed(format!(
+                    "this conversation is not allowed to receive sends; run \
+                     `augmentagent imessage allow-outbound {}` to allow it",
+                    target.conversation
+                ))
+            }
+            Err(e) => return failed(format!("checking the outbound allowlist: {e}")),
+        }
+        let Some(draft) = action.action.draft_body.as_deref() else {
+            return failed("no draft body on action; cannot send".into());
+        };
+        let body = augmentagent_approval_discord::strip_assumes_for_send(draft);
+        if body.trim().is_empty() {
+            return failed("draft is empty after removing card markers; cannot send".into());
+        }
+
+        match self
+            .store
+            .claim_action_for_send(action_id, ActionStatus::Pending, "discord")
+        {
+            Ok(true) => {}
+            Ok(false) => return Self::resolved_outcome(&self.store, action_id),
+            Err(e) => return failed(format!("claim for send failed: {e}")),
+        }
+        let item = NewImessageOutboxItem {
+            action_id,
+            target: &target.target,
+            target_kind: target.kind,
+            service: &target.service,
+            body: &body,
+        };
+        if let Err(e) = self.store.enqueue_imessage_outbox(&item) {
+            let msg = format!("queueing the iMessage send failed: {e}");
+            let _ = self
+                .store
+                .update_action_status(action_id, ActionStatus::Error, None, Some(&msg));
+            return failed(msg);
+        }
+        // Keep the text that will actually go out on the row.
+        let _ = self.store.with_conn(|c| {
+            c.execute(
+                "UPDATE actions SET draftBody = ?2 WHERE id = ?1",
+                augmentagent_store::rusqlite::params![action_id, body],
+            )
+        });
+        tracing::info!(action_id, "imessage reply queued for the Mac sender");
+        ApprovalActionOutcome::Approved
+    }
+
+    pub(crate) fn skip_imessage(
+        &self,
+        action_id: &str,
+        action: ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        match self.store.try_resolve_action(
+            action_id,
+            ActionStatus::Rejected,
+            "discord",
+            Some("skipped by approver"),
+        ) {
+            Ok(true) => {}
+            Ok(false) => return Self::resolved_outcome(&self.store, action_id),
+            Err(e) => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("skip: resolve failed: {e}"),
+                }
+            }
+        }
+        let _ = self
+            .store
+            .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+        ApprovalActionOutcome::Skipped
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use augmentagent_channel_core::cooldown::CooldownLatch;
+    use augmentagent_channel_core::fallback::FallbackReasoner;
+    use augmentagent_channel_core::reasoner::{Reasoner, ReasonerOpts};
+    use augmentagent_store::{Email, ImessageOutboxStatus, ImessageTargetKind};
+    use tempfile::TempDir;
+
+    const PHONE: &str = "+15555550100"; // pii-ok synthetic
+    const SMS_PHONE: &str = "+15555550111"; // pii-ok synthetic
+
+    struct Redraft;
+
+    #[async_trait::async_trait]
+    impl Reasoner for Redraft {
+        async fn call(&self, _o: &ReasonerOpts, _m: &str) -> anyhow::Result<String> {
+            Ok("a better reply".into())
+        }
+    }
+
+    struct Fixture {
+        store: Arc<Store>,
+        approver: ReplyApprover,
+        _dir: TempDir,
+    }
+
+    fn fixture(send_enabled: bool) -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        std::fs::create_dir_all(bundle.join("conversations")).unwrap();
+        let index = serde_json::json!({
+            PHONE: {"identifier": PHONE, "dir": "a", "title": "A",
+                    "participants": [PHONE], "service": "iMessage"},
+            SMS_PHONE: {"identifier": SMS_PHONE, "dir": "b", "title": "B",
+                        "participants": [SMS_PHONE], "service": "SMS"},
+            "chat900": {"identifier": "chat900", "dir": "c", "title": "G",
+                        "participants": [PHONE, SMS_PHONE], "service": "iMessage"},
+        });
+        std::fs::write(
+            bundle.join("conversations/index.json"),
+            serde_json::to_string(&index).unwrap(),
+        )
+        .unwrap();
+        let store = Arc::new(Store::open(&dir.path().join("data.db")).unwrap());
+        let latch = CooldownLatch::at(dir.path().join("latch.json"));
+        let reasoner = FallbackReasoner::for_tests(
+            vec![(
+                augmentagent_channel_core::ProviderKind::Claude,
+                Arc::new(Redraft) as Arc<dyn Reasoner>,
+            )],
+            latch,
+        );
+        let mut approver = crate::test_support::approver_with_store(Arc::clone(&store));
+        approver.reasoner = Arc::new(reasoner);
+        approver.imessage = ImessageSendConfig {
+            bundle_dir: Some(bundle),
+            send_enabled,
+        };
+        Fixture {
+            store,
+            approver,
+            _dir: dir,
+        }
+    }
+
+    fn seed(store: &Store, identifier: &str, draft: &str) -> String {
+        let msg = format!("imessage:{identifier}:7");
+        store
+            .upsert_email(&Email {
+                attachments: Vec::new(),
+                to: String::new(),
+                cc: String::new(),
+                message_id: msg.clone(),
+                thread_id: Some(format!("imessage:{identifier}")),
+                from: identifier.into(),
+                subject: "[iMessage] A".into(),
+                body: "are you free tonight?".into(),
+                date: "2026-09-29T12:00:00Z".into(),
+                account_entity_id: Some(PLATFORM.into()),
+                platform: PLATFORM.into(),
+                kind: "dm".into(),
+            })
+            .unwrap();
+        store
+            .log_action(
+                &msg,
+                Some(&format!("imessage:{identifier}")),
+                identifier,
+                "[iMessage] A",
+                Some("are you free tonight?"),
+                Some(draft),
+                ActionStatus::Pending,
+            )
+            .unwrap()
+    }
+
+    fn status(store: &Store, id: &str) -> String {
+        store.get_action_with_email(id).unwrap().unwrap().action.status
+    }
+
+    fn outbox_len(store: &Store) -> usize {
+        store.list_imessage_outbox(100).unwrap().len()
+    }
+
+    fn failed_message(o: ApprovalActionOutcome) -> String {
+        match o {
+            ApprovalActionOutcome::Failed { message } => message,
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn approve_imessage_enqueues_once_and_never_reaches_gmail() {
+        let f = fixture(true);
+        f.store.allow_imessage_outbound(PHONE).unwrap();
+        let id = seed(&f.store, PHONE, "yes! 8pm? [assumes: owner is free]");
+        let out = f.approver.run_approve(&id).await;
+        assert!(matches!(out, ApprovalActionOutcome::Approved), "{out:?}");
+        let rows = f.store.list_imessage_outbox(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.status, ImessageOutboxStatus::Queued);
+        assert_eq!(row.action_id, id);
+        assert_eq!(row.target, PHONE);
+        assert_eq!(row.target_kind, ImessageTargetKind::Handle);
+        assert_eq!(row.service, "iMessage");
+        assert_eq!(
+            row.body,
+            augmentagent_approval_discord::strip_assumes_for_send(
+                "yes! 8pm? [assumes: owner is free]"
+            )
+        );
+        assert_eq!(status(&f.store, &id), "sending");
+    }
+
+    #[tokio::test]
+    async fn approve_refuses_when_kill_switch_is_off() {
+        let f = fixture(false);
+        f.store.allow_imessage_outbound(PHONE).unwrap();
+        let id = seed(&f.store, PHONE, "hi");
+        let msg = failed_message(f.approver.run_approve(&id).await);
+        assert!(msg.contains("AUGMENTAGENT_IMESSAGE_SEND_ENABLED"), "{msg}");
+        assert!(!msg.contains("draftId"));
+        assert_eq!(outbox_len(&f.store), 0);
+        assert_eq!(status(&f.store, &id), "pending");
+    }
+
+    #[tokio::test]
+    async fn approve_refuses_conversation_not_on_outbound_allowlist() {
+        let f = fixture(true);
+        let id = seed(&f.store, PHONE, "hi");
+        let msg = failed_message(f.approver.run_approve(&id).await);
+        assert!(msg.contains("allow-outbound"), "{msg}");
+        assert!(!msg.contains("draftId"));
+        assert_eq!(outbox_len(&f.store), 0);
+        assert_eq!(status(&f.store, &id), "pending");
+    }
+
+    #[tokio::test]
+    async fn approve_names_the_target_refusal() {
+        let f = fixture(true);
+        for (ident, want) in [
+            ("chat900", "group chat"),
+            (SMS_PHONE, "SMS conversations are not supported"),
+            ("+15555550122", "not found in the iMessage bundle"), // pii-ok synthetic
+        ] {
+            f.store.allow_imessage_outbound(ident).unwrap();
+            let id = seed(&f.store, ident, "hi");
+            let msg = failed_message(f.approver.run_approve(&id).await);
+            assert!(msg.contains(want), "{ident}: {msg}");
+            assert!(!msg.contains("draftId"));
+            assert_eq!(status(&f.store, &id), "pending");
+        }
+        assert_eq!(outbox_len(&f.store), 0);
+    }
+
+    #[tokio::test]
+    async fn approve_without_bundle_config_fails_cleanly() {
+        let mut f = fixture(true);
+        f.approver.imessage.bundle_dir = None;
+        f.store.allow_imessage_outbound(PHONE).unwrap();
+        let id = seed(&f.store, PHONE, "hi");
+        let msg = failed_message(f.approver.run_approve(&id).await);
+        assert!(msg.contains("AUGMENTAGENT_IMESSAGE_REPO_DIR"), "{msg}");
+        assert_eq!(outbox_len(&f.store), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_approves_queue_exactly_one_send() {
+        let f = fixture(true);
+        f.store.allow_imessage_outbound(PHONE).unwrap();
+        let id = seed(&f.store, PHONE, "hi");
+        let (a, b) = tokio::join!(f.approver.run_approve(&id), f.approver.run_approve(&id));
+        let approved = [&a, &b]
+            .iter()
+            .filter(|o| matches!(o, ApprovalActionOutcome::Approved))
+            .count();
+        let resolved = [&a, &b]
+            .iter()
+            .filter(|o| matches!(o, ApprovalActionOutcome::AlreadyResolved { .. }))
+            .count();
+        assert_eq!((approved, resolved), (1, 1), "{a:?} {b:?}");
+        assert_eq!(outbox_len(&f.store), 1);
+    }
+
+    #[tokio::test]
+    async fn skip_rejects_without_queueing() {
+        let f = fixture(true);
+        f.store.allow_imessage_outbound(PHONE).unwrap();
+        let id = seed(&f.store, PHONE, "hi");
+        assert!(matches!(
+            f.approver.run_skip(&id).await,
+            ApprovalActionOutcome::Skipped
+        ));
+        assert_eq!(status(&f.store, &id), "rejected");
+        assert_eq!(outbox_len(&f.store), 0);
+        // A later approve on the skipped card does nothing.
+        assert!(matches!(
+            f.approver.run_approve(&id).await,
+            ApprovalActionOutcome::AlreadyResolved { .. }
+        ));
+        assert_eq!(outbox_len(&f.store), 0);
+    }
+
+    #[tokio::test]
+    async fn revise_stores_new_draft_without_queueing() {
+        let f = fixture(true);
+        f.store.allow_imessage_outbound(PHONE).unwrap();
+        let id = seed(&f.store, PHONE, "hi");
+        match f.approver.run_revise(&id, "warmer").await {
+            ApprovalActionOutcome::Revised { draft, email } => {
+                assert_eq!(draft, "a better reply");
+                assert_eq!(email.platform, PLATFORM);
+            }
+            other => panic!("expected Revised, got {other:?}"),
+        }
+        let a = f.store.get_action_with_email(&id).unwrap().unwrap();
+        assert_eq!(a.action.status, "pending");
+        assert_eq!(a.action.draft_body.as_deref(), Some("a better reply"));
+        assert_eq!(outbox_len(&f.store), 0);
+    }
+}
