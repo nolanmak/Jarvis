@@ -7,12 +7,17 @@
 //! Each Slack workspace is a separate Composio connection under its own
 //! `entity_id`. v1 supports a single workspace at a time via the
 //! `augmentagent/slack/default` Keychain slot; multi-workspace is a follow-up.
+//!
+//! The real-time path (#1283) lives in [`transport`]: a first-party Slack app
+//! over Socket Mode plus a typed Web API client. It is not wired into `serve`
+//! yet; see `docs/SLACK-TRANSPORT.md`.
 
 pub mod api;
 pub mod auth;
 pub mod channel;
 pub mod digest;
 pub mod surface;
+pub mod transport;
 pub mod types;
 
 pub use api::{SlackClient, SlackError};
