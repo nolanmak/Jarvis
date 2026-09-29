@@ -20,11 +20,27 @@
 //! | timeout / connection lost / unreadable reply on a post or completion | `reconcile`: may have landed; resolved by a `SendReconciler`, never resent blindly |
 //! | same on `chat.update` | retried (an edit is idempotent) |
 //! | any other Slack error, HTTP 4xx, bad file, bad payload | `dead_letter` |
+//!
+//! [`SlackOutboxDispatcher::drain`] first settles broken turns, then before
+//! every claim resolves due `reconcile` sends with
+//! [`super::SlackSendReconciler`]: found → sent; absent after the settle
+//! window → requeued for one resend; failed lookups → backoff, then
+//! `dead_letter`.
+//!
+//! **A turn with a hole is closed, not continued.** When any text or file
+//! part of a turn is dead-lettered or abandoned, every part of that turn not
+//! yet sent is abandoned and one notice (`turn:<id>:notice`, sent once) tells
+//! the owner the answer could not be delivered in full and how many parts
+//! arrived. The check runs right after a part dead-letters and again at the
+//! start of every drain, so a restart in between changes nothing. The
+//! start-of-drain scan reads this workspace's dead-lettered and abandoned
+//! turn parts; those are rare, and the scan is a no-op for a settled turn.
 
 use std::path::PathBuf;
 
 use augmentagent_store::delivery::{
-    EnqueueOutcome, NewOutboundSend, OutboundOperation, OutboundSend, RetryPolicy, SendStatus,
+    EnqueueOutcome, NewOutboundSend, OutboundOperation, OutboundSend, ReconcileOutcome,
+    RetryPolicy, SendStatus,
 };
 use augmentagent_store::{
     Store, StoreError, StoreResult, SurfaceAccountRef, SurfaceConversationRef,
@@ -34,6 +50,7 @@ use serde_json::json;
 use thiserror::Error;
 use tracing::{debug, warn};
 
+use super::reconcile::{LookupResult, ReconcilePolicy, SlackSendReconciler};
 use super::{markdown_to_mrkdwn, split_message, DEFAULT_PART_CHARS};
 use crate::surface::{SlackMessageId, SlackWorkspace};
 use crate::transport::web::{
@@ -66,6 +83,22 @@ pub fn part_idempotency_key(turn_id: &str, kind: PartKind, index: usize) -> Stri
         PartKind::File => "file",
     };
     format!("turn:{turn_id}:{kind}:{index}")
+}
+
+/// `turn:<turn_id>:notice`: the one "not delivered in full" notice.
+pub fn notice_idempotency_key(turn_id: &str) -> String {
+    format!("turn:{turn_id}:notice")
+}
+
+/// The turn a text/file part key belongs to (`None` for notices and keys
+/// this module did not make). Parsed from the right, so turn IDs may
+/// contain `:`.
+fn part_turn(key: &str) -> Option<&str> {
+    let rest = key.strip_prefix("turn:")?;
+    let (head, index) = rest.rsplit_once(':')?;
+    let (turn, kind) = head.rsplit_once(':')?;
+    let numeric = !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit());
+    (numeric && matches!(kind, "text" | "file") && !turn.is_empty()).then_some(turn)
 }
 
 /// A generated file to share after the text.
@@ -278,6 +311,21 @@ pub enum DispatchOutcome {
     Uncertain {
         error: String,
     },
+    /// A `reconcile` send was found in Slack history and marked sent.
+    Reconciled {
+        provider_message_id: String,
+    },
+    /// A `reconcile` send proved absent; back in the queue for one resend.
+    Requeued,
+    /// A `reconcile` lookup could not settle it yet.
+    LookupDeferred {
+        error: String,
+        next_lookup_at_ms: i64,
+    },
+    /// Not sent because another part of the same turn failed.
+    Abandoned {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,6 +371,7 @@ fn classify(op: OutboundOperation, err: &WebApiError) -> Class {
         },
         WebApiError::FileTooLarge { .. }
         | WebApiError::InvalidUpload(_)
+        | WebApiError::InvalidRequest(_)
         | WebApiError::Unsupported(_) => Class::Permanent,
     }
 }
@@ -333,7 +382,10 @@ pub struct SlackOutboxDispatcher<'a> {
     api: &'a dyn SlackWebApi,
     account: SurfaceAccountRef,
     retry: RetryPolicy,
+    reconcile: ReconcilePolicy,
 }
+
+const ABANDON_REASON: &str = "an earlier part of this answer could not be delivered";
 
 impl<'a> SlackOutboxDispatcher<'a> {
     pub fn new(store: &'a Store, api: &'a dyn SlackWebApi, workspace: &SlackWorkspace) -> Self {
@@ -345,6 +397,7 @@ impl<'a> SlackOutboxDispatcher<'a> {
                 base_delay_ms: 2_000,
                 max_delay_ms: 5 * 60_000,
             },
+            reconcile: ReconcilePolicy::default(),
         }
     }
 
@@ -353,13 +406,221 @@ impl<'a> SlackOutboxDispatcher<'a> {
         self
     }
 
-    /// Claim and perform the next due send of this workspace, if any.
+    pub fn with_reconcile_policy(mut self, policy: ReconcilePolicy) -> Self {
+        self.reconcile = policy;
+        self
+    }
+
+    /// Claim and perform the next due send of this workspace, if any. A
+    /// part that dead-letters settles its turn at once (not reported here;
+    /// [`drain`](Self::drain) reports everything).
     pub async fn dispatch_next(&self, now_ms: i64) -> StoreResult<Option<Dispatched>> {
+        let mut out = Vec::new();
+        self.dispatch_one(now_ms, &mut out).await?;
+        Ok(out.into_iter().next())
+    }
+
+    /// Settle broken turns, then until nothing of this workspace is due at
+    /// `now_ms`: resolve due `reconcile` sends, then claim and send the next.
+    /// Stops by construction: failed sends and deferred lookups are due
+    /// later.
+    pub async fn drain(&self, now_ms: i64) -> StoreResult<Vec<Dispatched>> {
+        let mut out = Vec::new();
+        self.settle_broken_turns(now_ms, &mut out)?;
+        loop {
+            self.reconcile_due(now_ms, &mut out).await?;
+            if !self.dispatch_one(now_ms, &mut out).await? {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Resolve this workspace's `reconcile` sends whose lookup is due.
+    pub async fn reconcile_due(&self, now_ms: i64, out: &mut Vec<Dispatched>) -> StoreResult<()> {
+        let reconciler = SlackSendReconciler::new(self.api, self.reconcile.clone());
+        for send in self
+            .store
+            .outbound_sends_awaiting_reconcile_for(&self.account, now_ms)?
+        {
+            let outcome = match reconciler.lookup_at(&send, now_ms).await {
+                LookupResult::Found {
+                    provider_message_id,
+                } => {
+                    self.store.resolve_outbound_reconcile(
+                        send.id,
+                        &ReconcileOutcome::Delivered {
+                            provider_message_id: provider_message_id.clone(),
+                        },
+                        now_ms,
+                    )?;
+                    DispatchOutcome::Reconciled {
+                        provider_message_id,
+                    }
+                }
+                LookupResult::NotFound => match self.store.resolve_outbound_reconcile(
+                    send.id,
+                    &ReconcileOutcome::NotDelivered,
+                    now_ms,
+                )? {
+                    SendStatus::DeadLetter => DispatchOutcome::DeadLettered {
+                        error: "not delivered and no attempts left".into(),
+                    },
+                    _ => DispatchOutcome::Requeued,
+                },
+                LookupResult::TooEarly { recheck_at_ms } => {
+                    let error = "outcome unknown; not in Slack history yet".to_string();
+                    self.store.defer_outbound_reconcile(
+                        send.id,
+                        &error,
+                        recheck_at_ms,
+                        false,
+                        self.reconcile.max_lookups,
+                        now_ms,
+                    )?;
+                    DispatchOutcome::LookupDeferred {
+                        error,
+                        next_lookup_at_ms: recheck_at_ms,
+                    }
+                }
+                LookupResult::Failed(reason) => {
+                    let error = format!("reconcile lookup failed: {reason}");
+                    let next =
+                        now_ms + self.reconcile.retry.delay_after(send.reconcile_lookups + 1);
+                    match self.store.defer_outbound_reconcile(
+                        send.id,
+                        &error,
+                        next,
+                        true,
+                        self.reconcile.max_lookups,
+                        now_ms,
+                    )? {
+                        SendStatus::DeadLetter => DispatchOutcome::DeadLettered { error },
+                        _ => DispatchOutcome::LookupDeferred {
+                            error,
+                            next_lookup_at_ms: next,
+                        },
+                    }
+                }
+            };
+            self.push_and_settle(&send, outcome, now_ms, out)?;
+        }
+        Ok(())
+    }
+
+    fn push_and_settle(
+        &self,
+        send: &OutboundSend,
+        outcome: DispatchOutcome,
+        now_ms: i64,
+        out: &mut Vec<Dispatched>,
+    ) -> StoreResult<()> {
+        let dead = matches!(outcome, DispatchOutcome::DeadLettered { .. });
+        out.push(Dispatched {
+            id: send.id,
+            idempotency_key: send.idempotency_key.clone(),
+            operation: send.operation,
+            outcome,
+        });
+        match part_turn(&send.idempotency_key) {
+            Some(turn) if dead => self.settle_turn(turn, now_ms, out),
+            _ => Ok(()),
+        }
+    }
+
+    /// Every turn of this workspace with a dead-lettered or abandoned part.
+    fn settle_broken_turns(&self, now_ms: i64, out: &mut Vec<Dispatched>) -> StoreResult<()> {
+        let broken = self.store.outbound_sends_with_key_prefix(
+            &self.account,
+            "turn:",
+            &[SendStatus::DeadLetter, SendStatus::Abandoned],
+        )?;
+        let mut turns: Vec<&str> = broken
+            .iter()
+            .filter_map(|s| part_turn(&s.idempotency_key))
+            .collect();
+        turns.sort_unstable();
+        turns.dedup();
+        for turn in turns {
+            self.settle_turn(turn, now_ms, out)?;
+        }
+        Ok(())
+    }
+
+    /// Abandon the unsent parts of a broken turn and queue its one notice.
+    fn settle_turn(&self, turn: &str, now_ms: i64, out: &mut Vec<Dispatched>) -> StoreResult<()> {
+        let parts: Vec<OutboundSend> = self
+            .store
+            .outbound_sends_with_key_prefix(&self.account, &format!("turn:{turn}:"), &[])?
+            .into_iter()
+            .filter(|s| part_turn(&s.idempotency_key) == Some(turn))
+            .collect();
+        let broken = parts
+            .iter()
+            .any(|s| matches!(s.status, SendStatus::DeadLetter | SendStatus::Abandoned));
+        let Some(first) = parts.first() else {
+            return Ok(());
+        };
+        if !broken {
+            return Ok(());
+        }
+        for part in &parts {
+            if matches!(
+                part.status,
+                SendStatus::Queued | SendStatus::Failed | SendStatus::Reconcile
+            ) {
+                self.store
+                    .abandon_outbound_send(part.id, ABANDON_REASON, now_ms)?;
+                out.push(Dispatched {
+                    id: part.id,
+                    idempotency_key: part.idempotency_key.clone(),
+                    operation: part.operation,
+                    outcome: DispatchOutcome::Abandoned {
+                        reason: ABANDON_REASON.into(),
+                    },
+                });
+            }
+        }
+        let arrived = parts
+            .iter()
+            .filter(|s| s.status == SendStatus::Sent)
+            .count();
+        let payload = TextPayload {
+            text: format!(
+                ":warning: *This answer could not be delivered in full.* {arrived} of {} parts arrived; the rest was not sent.",
+                parts.len()
+            ),
+            part: 1,
+            parts: 1,
+        };
+        let notice = NewOutboundSend {
+            conversation: first.conversation.clone(),
+            idempotency_key: notice_idempotency_key(turn),
+            operation: OutboundOperation::Post,
+            target_message_id: None,
+            payload: serde_json::to_string(&payload)
+                .map_err(|e| StoreError::InvalidInput(e.to_string()))?,
+            max_attempts: first.max_attempts,
+            interaction_expires_at_ms: None,
+        };
+        if let EnqueueOutcome::Queued { .. } = self.store.enqueue_outbound_send(&notice, now_ms)? {
+            warn!(
+                turn,
+                arrived,
+                total = parts.len(),
+                "slack outbox: answer not delivered in full; notice queued"
+            );
+        }
+        Ok(())
+    }
+
+    /// Claim and perform one send; `false` when nothing was due.
+    async fn dispatch_one(&self, now_ms: i64, out: &mut Vec<Dispatched>) -> StoreResult<bool> {
         let Some(send) = self
             .store
             .claim_next_outbound_send_for(&self.account, now_ms)?
         else {
-            return Ok(None);
+            return Ok(false);
         };
         debug!(
             id = send.id,
@@ -378,23 +639,8 @@ impl<'a> SlackOutboxDispatcher<'a> {
             }
             Err((class, error)) => self.record_failure(&send, class, error, now_ms)?,
         };
-        Ok(Some(Dispatched {
-            id: send.id,
-            idempotency_key: send.idempotency_key,
-            operation: send.operation,
-            outcome,
-        }))
-    }
-
-    /// Dispatch until nothing of this workspace is due at `now_ms`. Stops by
-    /// construction: failed sends are due later and uncertain ones are
-    /// parked.
-    pub async fn drain(&self, now_ms: i64) -> StoreResult<Vec<Dispatched>> {
-        let mut out = Vec::new();
-        while let Some(done) = self.dispatch_next(now_ms).await? {
-            out.push(done);
-        }
-        Ok(out)
+        self.push_and_settle(&send, outcome, now_ms, out)?;
+        Ok(true)
     }
 
     fn record_failure(

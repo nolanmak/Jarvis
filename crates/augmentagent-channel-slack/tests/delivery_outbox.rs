@@ -7,20 +7,19 @@
 //! a temporary file-backed store and the recording Slack fake. The assertion
 //! every time: the delivered content equals the full answer exactly once.
 
-use std::future::Future;
 use std::time::Duration;
 
 use augmentagent_channel_slack::delivery::{
-    enqueue_answer, markdown_to_mrkdwn, part_idempotency_key, plan_answer, split_message, Answer,
-    AnswerFile, DispatchOutcome, PartKind, PlanError, PlanOptions, SlackOutboxDispatcher,
+    enqueue_answer, markdown_to_mrkdwn, notice_idempotency_key, part_idempotency_key, plan_answer,
+    split_message, Answer, AnswerFile, DispatchOutcome, PartKind, PlanError, PlanOptions,
+    ReconcilePolicy, SlackOutboxDispatcher, SlackSendReconciler,
 };
 use augmentagent_channel_slack::surface::SlackWorkspace;
 use augmentagent_channel_slack::transport::web::{
     PostMessage, RecordedCall, RecordingSlackWebApi, SlackWebApi, WebApiError,
 };
 use augmentagent_store::delivery::{
-    reconcile_outbound_sends, OutboundOperation, OutboundSend, ReconcileOutcome, SendReconciler,
-    SendStatus,
+    reconcile_outbound_sends, OutboundOperation, RetryPolicy, SendStatus,
 };
 use augmentagent_store::{Store, SurfaceConversationRef};
 
@@ -104,8 +103,13 @@ fn expected_parts(markdown: &str) -> Vec<String> {
         .collect()
 }
 
+/// Texts Slack accepted (refused attempts excluded), in order.
+fn delivered(api: &RecordingSlackWebApi) -> Vec<String> {
+    api.messages().into_iter().map(|m| m.text).collect()
+}
+
 fn assert_delivered_exactly_once(api: &RecordingSlackWebApi, markdown: &str) {
-    let texts: Vec<String> = posts(api).into_iter().map(|m| m.text).collect();
+    let texts = delivered(api);
     assert_eq!(
         texts,
         expected_parts(markdown),
@@ -299,25 +303,6 @@ async fn restart_between_parts_resumes_without_duplicates() {
     assert_delivered_exactly_once(&api, &md);
 }
 
-/// Stands in for a Slack history lookup matched on message metadata.
-struct MetadataReconciler<'a>(&'a RecordingSlackWebApi);
-
-impl SendReconciler for MetadataReconciler<'_> {
-    fn lookup(&self, send: &OutboundSend) -> impl Future<Output = ReconcileOutcome> + Send {
-        let hit = posts(self.0).iter().enumerate().find_map(|(n, m)| {
-            let key = &m.metadata.as_ref()?["event_payload"]["idempotency_key"];
-            (key == send.idempotency_key.as_str())
-                .then(|| format!("{CHANNEL}:1700000000.{:06}", n + 1))
-        });
-        std::future::ready(match hit {
-            Some(provider_message_id) => ReconcileOutcome::Delivered {
-                provider_message_id,
-            },
-            None => ReconcileOutcome::NotDelivered,
-        })
-    }
-}
-
 #[tokio::test]
 async fn crash_mid_send_is_reconciled_never_resent_blindly() {
     for reached_slack in [true, false] {
@@ -361,16 +346,71 @@ async fn crash_mid_send_is_reconciled_never_resent_blindly() {
         let store = Store::open(&db).unwrap();
         let recovery = store.recover_surface_delivery(T0 + 1_000).unwrap();
         assert_eq!(recovery.sends_to_reconcile, 1);
-        // Nothing is sent while part 2's fate is unknown.
-        assert!(drain(&store, &api, T0 + 1_000).await.is_empty());
-        let report = reconcile_outbound_sends(&store, &MetadataReconciler(&api), T0 + 2_000)
-            .await
-            .unwrap();
-        assert_eq!(report.delivered, usize::from(reached_slack));
-        assert_eq!(report.requeued, usize::from(!reached_slack));
-        drain(&store, &api, T0 + 2_000).await;
+        let outcomes = drain(&store, &api, T0 + 1_000).await;
+        if reached_slack {
+            // Found in the thread by its metadata: marked sent, never resent.
+            assert!(
+                matches!(outcomes[0], DispatchOutcome::Reconciled { .. }),
+                "{outcomes:?}"
+            );
+        } else {
+            // Not visible yet, but too early to call it lost: nothing is sent.
+            assert!(
+                matches!(
+                    outcomes.as_slice(),
+                    [DispatchOutcome::LookupDeferred { .. }]
+                ),
+                "{outcomes:?}"
+            );
+            let outcomes = drain(&store, &api, T0 + 30_000).await;
+            assert!(
+                matches!(outcomes[0], DispatchOutcome::Requeued),
+                "{outcomes:?}"
+            );
+        }
         assert_delivered_exactly_once(&api, &md);
+        assert!(api.calls().iter().any(|c| matches!(
+            c,
+            RecordedCall::ConversationsReplies { thread_ts, oldest: Some(oldest), .. }
+                if thread_ts == THREAD && oldest == "1699999940.000000"
+        )));
     }
+}
+
+#[tokio::test]
+async fn the_reconciler_also_works_with_the_generic_outbox_driver() {
+    let (_dir, db) = temp_db();
+    let store = Store::open(&db).unwrap();
+    let api = RecordingSlackWebApi::default();
+    let answer = Answer {
+        turn_id: TURN,
+        markdown: "one part",
+        files: &[],
+    };
+    enqueue_answer(&store, &thread(), &answer, &opts(), T0).unwrap();
+    api.push_lost_response(WebApiError::Timeout);
+    store.claim_next_outbound_send(T0).unwrap().unwrap();
+    // Deliver it the way the dispatcher would, then lose the reply.
+    let send = store
+        .outbound_sends_with_key_prefix(thread().account(), "turn:", &[])
+        .unwrap();
+    api.post_message(PostMessage {
+        channel: CHANNEL.into(),
+        text: "one part".into(),
+        thread_ts: Some(THREAD.into()),
+        metadata: Some(serde_json::json!({"event_type": "augmentagent_delivery",
+            "event_payload": {"idempotency_key": send[0].idempotency_key}})),
+        ..PostMessage::default()
+    })
+    .await
+    .unwrap_err();
+    store.recover_surface_delivery(T0 + 1).unwrap();
+    let reconciler = SlackSendReconciler::new(&api, ReconcilePolicy::default()).at(T0 + 1);
+    let report = reconcile_outbound_sends(&store, &reconciler, T0 + 1)
+        .await
+        .unwrap();
+    assert_eq!(report.delivered, 1);
+    assert_eq!(delivered(&api), ["one part"]);
 }
 
 #[tokio::test]
@@ -446,7 +486,60 @@ async fn upload_failing_midway_is_retried_and_lands_once() {
 }
 
 #[tokio::test]
-async fn ambiguous_failure_parks_the_part_and_holds_the_rest() {
+async fn uncertain_post_that_landed_is_found_by_metadata_and_not_resent() {
+    for in_thread in [true, false] {
+        let (_dir, db) = temp_db();
+        let store = Store::open(&db).unwrap();
+        let api = RecordingSlackWebApi::default();
+        let md = long_answer();
+        let conversation = if in_thread {
+            thread()
+        } else {
+            workspace().conversation(CHANNEL, None).unwrap()
+        };
+        let answer = Answer {
+            turn_id: TURN,
+            markdown: &md,
+            files: &[],
+        };
+        enqueue_answer(&store, &conversation, &answer, &opts(), T0).unwrap();
+        let dispatcher = SlackOutboxDispatcher::new(&store, &api, &workspace());
+        dispatcher.dispatch_next(T0).await.unwrap();
+        // Part 2 reaches Slack but the reply is lost.
+        api.push_lost_response(WebApiError::Timeout);
+        let outcomes: Vec<DispatchOutcome> = dispatcher
+            .drain(T0)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|d| d.outcome)
+            .collect();
+        assert!(
+            matches!(outcomes[0], DispatchOutcome::Uncertain { .. }),
+            "{outcomes:?}"
+        );
+        let DispatchOutcome::Reconciled {
+            provider_message_id,
+        } = &outcomes[1]
+        else {
+            panic!("expected reconcile, got {outcomes:?}");
+        };
+        assert_eq!(provider_message_id, "C00000001:1700000000.000002");
+        assert_delivered_exactly_once(&api, &md);
+        let used_replies = api
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::ConversationsReplies { .. }));
+        let used_history = api
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::ConversationsHistory { .. }));
+        assert_eq!((used_replies, used_history), (in_thread, !in_thread));
+    }
+}
+
+#[tokio::test]
+async fn uncertain_post_that_never_landed_is_resent_once_after_the_window() {
     let (_dir, db) = temp_db();
     let store = Store::open(&db).unwrap();
     let api = RecordingSlackWebApi::default();
@@ -460,15 +553,337 @@ async fn ambiguous_failure_parks_the_part_and_holds_the_rest() {
     let dispatcher = SlackOutboxDispatcher::new(&store, &api, &workspace());
     dispatcher.dispatch_next(T0).await.unwrap();
     api.push_error(WebApiError::Timeout);
-    let outcomes = dispatcher.drain(T0).await.unwrap();
-    assert!(matches!(
-        outcomes.as_slice(),
-        [d] if matches!(d.outcome, DispatchOutcome::Uncertain { .. })
-    ));
+    let outcomes: Vec<DispatchOutcome> = dispatcher
+        .drain(T0)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.outcome)
+        .collect();
+    let [DispatchOutcome::Uncertain { .. }, DispatchOutcome::LookupDeferred {
+        next_lookup_at_ms, ..
+    }] = outcomes.as_slice()
+    else {
+        panic!("expected uncertain then a deferred lookup: {outcomes:?}");
+    };
+    assert_eq!(
+        *next_lookup_at_ms,
+        T0 + 30_000,
+        "waits out the settle window"
+    );
     let row = store.outbound_send(queued.sends[1].id).unwrap().unwrap();
     assert_eq!(row.status, SendStatus::Reconcile);
+    assert_eq!(row.reconcile_lookups, 0, "too early is not a failed lookup");
+    assert!(dispatcher.drain(T0 + 29_999).await.unwrap().is_empty());
+    assert_eq!(delivered(&api).len(), 1, "later parts are held meanwhile");
+
+    let outcomes = dispatcher.drain(T0 + 30_000).await.unwrap();
+    assert!(matches!(outcomes[0].outcome, DispatchOutcome::Requeued));
+    assert_delivered_exactly_once(&api, &md);
     assert!(dispatcher.drain(T0 + 3_600_000).await.unwrap().is_empty());
-    assert_eq!(posts(&api).len(), 2);
+}
+
+#[tokio::test]
+async fn failing_lookups_back_off_then_dead_letter_and_unblock_the_turn() {
+    let (_dir, db) = temp_db();
+    let store = Store::open(&db).unwrap();
+    let api = RecordingSlackWebApi::default();
+    let md = long_answer();
+    let answer = Answer {
+        turn_id: TURN,
+        markdown: &md,
+        files: &[],
+    };
+    let parts = expected_parts(&md).len();
+    let queued = enqueue_answer(&store, &thread(), &answer, &opts(), T0).unwrap();
+    let dispatcher = SlackOutboxDispatcher::new(&store, &api, &workspace()).with_reconcile_policy(
+        ReconcilePolicy {
+            max_lookups: 3,
+            retry: RetryPolicy {
+                base_delay_ms: 5_000,
+                max_delay_ms: 60_000,
+            },
+            ..ReconcilePolicy::default()
+        },
+    );
+    dispatcher.dispatch_next(T0).await.unwrap();
+    // The post times out, then every history lookup fails.
+    api.push_error(WebApiError::Timeout);
+    let lookup_error = || WebApiError::Slack {
+        error: "internal_error".into(),
+        warning: None,
+    };
+    let mut next_lookups = Vec::new();
+    let mut now = T0;
+    for _ in 0..2 {
+        api.push_error(lookup_error());
+        let outcomes = dispatcher.drain(now).await.unwrap();
+        let last = outcomes.last().unwrap().outcome.clone();
+        let DispatchOutcome::LookupDeferred {
+            next_lookup_at_ms,
+            error,
+        } = last
+        else {
+            panic!("expected a deferred lookup: {outcomes:?}");
+        };
+        assert!(error.contains("internal_error"), "{error}");
+        next_lookups.push(next_lookup_at_ms - now);
+        now = next_lookup_at_ms;
+    }
+    assert_eq!(next_lookups, [5_000, 10_000], "lookups back off");
+    assert_eq!(delivered(&api).len(), 1, "nothing else goes out meanwhile");
+
+    // Third failure spends the budget: dead letter, the rest is abandoned
+    // and one notice explains it.
+    api.push_error(lookup_error());
+    let outcomes: Vec<DispatchOutcome> = dispatcher
+        .drain(now)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.outcome)
+        .collect();
+    assert!(
+        matches!(outcomes[0], DispatchOutcome::DeadLettered { .. }),
+        "{outcomes:?}"
+    );
+    let abandoned = outcomes
+        .iter()
+        .filter(|o| matches!(o, DispatchOutcome::Abandoned { .. }))
+        .count();
+    assert_eq!(abandoned, parts - 2);
+    let texts = delivered(&api);
+    assert_eq!(texts.len(), 2);
+    assert!(texts[1].contains("1 of"), "{}", texts[1]);
+    let part2 = store.outbound_send(queued.sends[1].id).unwrap().unwrap();
+    assert_eq!(part2.status, SendStatus::DeadLetter);
+    assert!(dispatcher.drain(now + 3_600_000).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn history_page_budget_exhausted_is_a_failed_lookup() {
+    let (_dir, db) = temp_db();
+    let store = Store::open(&db).unwrap();
+    let api = RecordingSlackWebApi::default();
+    // Unrelated chatter in the thread, more than the page budget covers.
+    for i in 0..5 {
+        api.post_message(PostMessage {
+            channel: CHANNEL.into(),
+            text: format!("chatter {i}"),
+            thread_ts: Some(THREAD.into()),
+            ..PostMessage::default()
+        })
+        .await
+        .unwrap();
+    }
+    let answer = Answer {
+        turn_id: TURN,
+        markdown: "one part",
+        files: &[],
+    };
+    enqueue_answer(&store, &thread(), &answer, &opts(), T0).unwrap();
+    api.push_error(WebApiError::Timeout);
+    let dispatcher = SlackOutboxDispatcher::new(&store, &api, &workspace()).with_reconcile_policy(
+        ReconcilePolicy {
+            page_limit: 2,
+            max_pages: 2,
+            ..ReconcilePolicy::default()
+        },
+    );
+    let outcomes = dispatcher.drain(T0 + 60_000).await.unwrap();
+    let DispatchOutcome::LookupDeferred { error, .. } = &outcomes[1].outcome else {
+        panic!("{outcomes:?}");
+    };
+    assert!(error.contains("page budget"), "{error}");
+    let row = store.outbound_send(outcomes[0].id).unwrap().unwrap();
+    assert_eq!(row.reconcile_lookups, 1);
+}
+
+#[tokio::test]
+async fn uncertain_upload_is_resent_after_the_window() {
+    let (dir, db) = temp_db();
+    let store = Store::open(&db).unwrap();
+    let api = RecordingSlackWebApi::default();
+    let files = vec![report_file(&dir)];
+    let answer = Answer {
+        turn_id: TURN,
+        markdown: "",
+        files: &files,
+    };
+    enqueue_answer(&store, &thread(), &answer, &opts(), T0).unwrap();
+    // The completion's reply is lost: its outcome is not recorded anywhere.
+    api.push_error(WebApiError::Timeout);
+    let dispatcher = SlackOutboxDispatcher::new(&store, &api, &workspace());
+    let outcomes = dispatcher.drain(T0).await.unwrap();
+    assert!(
+        matches!(outcomes[1].outcome, DispatchOutcome::LookupDeferred { .. }),
+        "{outcomes:?}"
+    );
+    let outcomes = dispatcher.drain(T0 + 30_000).await.unwrap();
+    assert!(matches!(outcomes[0].outcome, DispatchOutcome::Requeued));
+    assert!(matches!(outcomes[1].outcome, DispatchOutcome::Sent { .. }));
+    assert_eq!(uploads(&api), 2);
+}
+
+/// Four parts of roughly 100 characters.
+fn four_part_answer() -> (String, PlanOptions) {
+    let md: String = (0..4)
+        .map(|i| format!("Part {i}: {}", "word ".repeat(19)))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let opts = PlanOptions {
+        part_chars: 120,
+        ..PlanOptions::default()
+    };
+    (md, opts)
+}
+
+fn notice_texts(api: &RecordingSlackWebApi) -> Vec<String> {
+    api.messages()
+        .into_iter()
+        .filter(|m| {
+            m.metadata.as_ref().is_some_and(|v| {
+                v["event_payload"]["idempotency_key"] == notice_idempotency_key(TURN).as_str()
+            })
+        })
+        .map(|m| m.text)
+        .collect()
+}
+
+#[tokio::test]
+async fn dead_lettered_part_abandons_the_rest_and_sends_one_notice() {
+    let (_dir, db) = temp_db();
+    let store = Store::open(&db).unwrap();
+    let api = RecordingSlackWebApi::default();
+    let (md, opts) = four_part_answer();
+    let answer = Answer {
+        turn_id: TURN,
+        markdown: &md,
+        files: &[],
+    };
+    let queued = enqueue_answer(&store, &thread(), &answer, &opts, T0).unwrap();
+    assert_eq!(queued.sends.len(), 4);
+    let dispatcher = SlackOutboxDispatcher::new(&store, &api, &workspace());
+    dispatcher.dispatch_next(T0).await.unwrap();
+    api.push_error(WebApiError::Slack {
+        error: "msg_too_long".into(),
+        warning: None,
+    });
+    let outcomes: Vec<(String, DispatchOutcome)> = dispatcher
+        .drain(T0)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| (d.idempotency_key, d.outcome))
+        .collect();
+    assert!(
+        matches!(outcomes[0].1, DispatchOutcome::DeadLettered { .. }),
+        "{outcomes:?}"
+    );
+    assert_eq!(outcomes[1].0, format!("turn:{TURN}:text:2"));
+    assert!(matches!(outcomes[1].1, DispatchOutcome::Abandoned { .. }));
+    assert_eq!(outcomes[2].0, format!("turn:{TURN}:text:3"));
+    assert!(matches!(outcomes[2].1, DispatchOutcome::Abandoned { .. }));
+    assert_eq!(outcomes[3].0, notice_idempotency_key(TURN));
+    assert!(matches!(outcomes[3].1, DispatchOutcome::Sent { .. }));
+    assert_eq!(outcomes.len(), 4);
+
+    for (i, want) in [
+        SendStatus::Sent,
+        SendStatus::DeadLetter,
+        SendStatus::Abandoned,
+        SendStatus::Abandoned,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let row = store.outbound_send(queued.sends[i].id).unwrap().unwrap();
+        assert_eq!(row.status, want, "part {i}");
+    }
+    let notices = notice_texts(&api);
+    assert_eq!(notices.len(), 1);
+    assert!(
+        notices[0].contains("could not be delivered in full"),
+        "{}",
+        notices[0]
+    );
+    assert!(notices[0].contains("1 of 4"), "{}", notices[0]);
+    let notice_msg = api.messages().into_iter().last().unwrap();
+    assert_eq!(notice_msg.thread_ts.as_deref(), Some(THREAD));
+
+    // Nothing more, even when the turn is replayed.
+    assert!(dispatcher.drain(T0 + 3_600_000).await.unwrap().is_empty());
+    enqueue_answer(&store, &thread(), &answer, &opts, T0 + 3_600_000).unwrap();
+    assert!(dispatcher.drain(T0 + 3_600_000).await.unwrap().is_empty());
+    assert_eq!(delivered(&api).len(), 2, "part 1 and the notice");
+}
+
+#[tokio::test]
+async fn restart_after_a_dead_letter_still_settles_the_turn_exactly_once() {
+    let (_dir, db) = temp_db();
+    let api = RecordingSlackWebApi::default();
+    let (md, opts) = four_part_answer();
+    let answer = Answer {
+        turn_id: TURN,
+        markdown: &md,
+        files: &[],
+    };
+    {
+        let store = Store::open(&db).unwrap();
+        enqueue_answer(&store, &thread(), &answer, &opts, T0).unwrap();
+        SlackOutboxDispatcher::new(&store, &api, &workspace())
+            .dispatch_next(T0)
+            .await
+            .unwrap();
+        // Part 2 dead-letters and the process dies before settling the turn.
+        let part2 = store.claim_next_outbound_send(T0).unwrap().unwrap();
+        store
+            .mark_outbound_failed(
+                part2.id,
+                "slack error: msg_too_long",
+                false,
+                &RetryPolicy {
+                    base_delay_ms: 1,
+                    max_delay_ms: 1,
+                },
+                T0,
+            )
+            .unwrap();
+    }
+    for restart in 0..3 {
+        let store = Store::open(&db).unwrap();
+        store.recover_surface_delivery(T0 + restart).unwrap();
+        enqueue_answer(&store, &thread(), &answer, &opts, T0 + restart).unwrap();
+        drain(&store, &api, T0 + restart).await;
+    }
+    assert_eq!(notice_texts(&api).len(), 1);
+    assert_eq!(delivered(&api).len(), 2, "part 1 and one notice");
+}
+
+#[tokio::test]
+async fn an_abandoned_part_settles_the_turn_too() {
+    let (_dir, db) = temp_db();
+    let store = Store::open(&db).unwrap();
+    let api = RecordingSlackWebApi::default();
+    let (md, opts) = four_part_answer();
+    let answer = Answer {
+        turn_id: TURN,
+        markdown: &md,
+        files: &[],
+    };
+    let queued = enqueue_answer(&store, &thread(), &answer, &opts, T0).unwrap();
+    SlackOutboxDispatcher::new(&store, &api, &workspace())
+        .dispatch_next(T0)
+        .await
+        .unwrap();
+    store
+        .abandon_outbound_send(queued.sends[1].id, "owner cancelled", T0)
+        .unwrap();
+    drain(&store, &api, T0).await;
+    let notices = notice_texts(&api);
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].contains("1 of 4"), "{}", notices[0]);
+    assert_eq!(delivered(&api).len(), 2);
 }
 
 #[tokio::test]
@@ -487,10 +902,15 @@ async fn permanent_error_dead_letters_without_retry() {
         warning: None,
     });
     let outcomes = drain(&store, &api, T0).await;
-    assert!(matches!(
-        outcomes.as_slice(),
-        [DispatchOutcome::DeadLettered { error }] if error.contains("channel_not_found")
-    ));
+    assert!(
+        matches!(
+            outcomes.as_slice(),
+            [DispatchOutcome::DeadLettered { error }, DispatchOutcome::Sent { .. }]
+                if error.contains("channel_not_found")
+        ),
+        "{outcomes:?}"
+    );
+    assert!(notice_texts(&api)[0].contains("0 of 1"));
     assert!(drain(&store, &api, T0 + 3_600_000).await.is_empty());
 }
 

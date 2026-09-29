@@ -732,3 +732,208 @@ async fn recording_fake_scripts_direct_conversations_and_user_errors() {
         user_id: "U00000001".into()
     }));
 }
+
+// ---------------------------------------------------------------------------
+// #1294 — history lookups used to reconcile a send whose outcome was lost.
+// ---------------------------------------------------------------------------
+
+use augmentagent_channel_slack::transport::web::HistoryQuery;
+
+#[tokio::test]
+async fn conversations_history_is_bounded_paged_and_returns_metadata() {
+    let mut server = mockito::Server::new_async().await;
+    let mock = server
+        .mock("POST", "/conversations.history")
+        .match_header("authorization", format!("Bearer {BOT}").as_str())
+        .match_header(
+            "content-type",
+            Matcher::Regex("application/x-www-form-urlencoded".into()),
+        )
+        .match_body(Matcher::AllOf(vec![
+            Matcher::UrlEncoded("channel".into(), "C00000001".into()),
+            Matcher::UrlEncoded("oldest".into(), "1699999940.000000".into()),
+            Matcher::UrlEncoded("limit".into(), "200".into()),
+            Matcher::UrlEncoded("include_all_metadata".into(), "true".into()),
+            Matcher::UrlEncoded("cursor".into(), "bmV4dA==".into()),
+        ]))
+        .with_body(
+            json!({"ok": true, "has_more": true,
+            "response_metadata": {"next_cursor": "bW9yZQ=="},
+            "messages": [
+                {"type": "message", "ts": "1700000000.000200", "text": "part",
+                 "bot_id": "B00000001",
+                 "metadata": {"event_type": "augmentagent_delivery",
+                              "event_payload": {"idempotency_key": "turn:t:text:1"}}},
+                {"type": "message", "ts": "1700000000.000100", "text": "hi", "user": "U00000002"}
+            ]})
+            .to_string(),
+        )
+        .create_async()
+        .await;
+    let api = client(&server, Arc::new(RecordingSleeper::default()));
+    let page = api
+        .conversations_history(HistoryQuery {
+            channel: "C00000001".into(),
+            thread_ts: None,
+            oldest: Some("1699999940.000000".into()),
+            limit: 200,
+            cursor: Some("bmV4dA==".into()),
+            include_all_metadata: true,
+        })
+        .await
+        .expect("history");
+    assert!(page.has_more);
+    assert_eq!(page.next_cursor.as_deref(), Some("bW9yZQ=="));
+    assert_eq!(page.messages.len(), 2);
+    assert_eq!(page.messages[0].ts, "1700000000.000200");
+    assert_eq!(
+        page.messages[0].metadata.as_ref().unwrap()["event_payload"]["idempotency_key"],
+        json!("turn:t:text:1")
+    );
+    assert_eq!(page.messages[1].user.as_deref(), Some("U00000002"));
+    assert!(page.messages[1].metadata.is_none());
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn conversations_replies_targets_the_thread_and_reports_errors() {
+    let mut server = mockito::Server::new_async().await;
+    let ok = server
+        .mock("POST", "/conversations.replies")
+        .match_body(Matcher::AllOf(vec![
+            Matcher::UrlEncoded("channel".into(), "C00000001".into()),
+            Matcher::UrlEncoded("ts".into(), "1700000000.000100".into()),
+            Matcher::UrlEncoded("include_all_metadata".into(), "true".into()),
+        ]))
+        .with_body(
+            json!({"ok": true, "has_more": false, "messages": [
+                {"ts": "1700000000.000100", "text": "parent"},
+                {"ts": "1700000000.000300", "thread_ts": "1700000000.000100", "text": "reply"}
+            ]})
+            .to_string(),
+        )
+        .expect(1)
+        .create_async()
+        .await;
+    let api = client(&server, Arc::new(RecordingSleeper::default()));
+    let query = HistoryQuery {
+        channel: "C00000001".into(),
+        thread_ts: Some("1700000000.000100".into()),
+        oldest: None,
+        limit: 100,
+        cursor: None,
+        include_all_metadata: true,
+    };
+    let page = api
+        .conversations_replies(query.clone())
+        .await
+        .expect("replies");
+    assert!(!page.has_more);
+    assert_eq!(page.next_cursor, None);
+    assert_eq!(
+        page.messages[1].thread_ts.as_deref(),
+        Some("1700000000.000100")
+    );
+    ok.assert_async().await;
+
+    server.reset();
+    server
+        .mock("POST", "/conversations.replies")
+        .with_body(json!({"ok": false, "error": "thread_not_found"}).to_string())
+        .create_async()
+        .await;
+    let err = api.conversations_replies(query.clone()).await.unwrap_err();
+    assert!(
+        matches!(&err, WebApiError::Slack { error, .. } if error == "thread_not_found"),
+        "{err:?}"
+    );
+    // A replies lookup needs the thread.
+    let err = api
+        .conversations_replies(HistoryQuery {
+            thread_ts: None,
+            ..query
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WebApiError::InvalidRequest(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn recording_fake_serves_delivered_posts_as_history() {
+    let fake = RecordingSlackWebApi::default();
+    let meta = json!({"event_type": "augmentagent_delivery",
+                      "event_payload": {"idempotency_key": "k1"}});
+    // Delivered normally.
+    fake.post_message(PostMessage {
+        channel: "C00000001".into(),
+        text: "top".into(),
+        metadata: Some(meta.clone()),
+        ..PostMessage::default()
+    })
+    .await
+    .unwrap();
+    // Refused: recorded as a call, never delivered.
+    fake.push_error(WebApiError::Timeout);
+    fake.post_message(PostMessage {
+        channel: "C00000001".into(),
+        text: "refused".into(),
+        thread_ts: Some("1700000000.000100".into()),
+        ..PostMessage::default()
+    })
+    .await
+    .unwrap_err();
+    // Delivered, but the reply was lost.
+    fake.push_lost_response(WebApiError::Timeout);
+    fake.post_message(PostMessage {
+        channel: "C00000001".into(),
+        text: "landed".into(),
+        thread_ts: Some("1700000000.000100".into()),
+        metadata: Some(meta.clone()),
+        ..PostMessage::default()
+    })
+    .await
+    .unwrap_err();
+
+    let delivered: Vec<String> = fake.messages().into_iter().map(|m| m.text).collect();
+    assert_eq!(delivered, ["top", "landed"]);
+
+    let q = HistoryQuery {
+        channel: "C00000001".into(),
+        thread_ts: None,
+        oldest: None,
+        limit: 100,
+        cursor: None,
+        include_all_metadata: true,
+    };
+    let top = fake.conversations_history(q.clone()).await.unwrap();
+    assert_eq!(top.messages.len(), 1);
+    assert_eq!(top.messages[0].metadata.as_ref(), Some(&meta));
+    let without = fake
+        .conversations_history(HistoryQuery {
+            include_all_metadata: false,
+            ..q.clone()
+        })
+        .await
+        .unwrap();
+    assert!(without.messages[0].metadata.is_none());
+    let thread = fake
+        .conversations_replies(HistoryQuery {
+            thread_ts: Some("1700000000.000100".into()),
+            limit: 1,
+            ..q.clone()
+        })
+        .await
+        .unwrap();
+    assert_eq!(thread.messages.len(), 1);
+    assert_eq!(thread.messages[0].text.as_deref(), Some("landed"));
+    assert!(!thread.has_more);
+    fake.push_error(WebApiError::Slack {
+        error: "ratelimited".into(),
+        warning: None,
+    });
+    assert!(fake.conversations_history(q).await.is_err());
+    assert!(fake
+        .calls()
+        .iter()
+        .any(|c| matches!(c, RecordedCall::ConversationsReplies { thread_ts, .. } if thread_ts == "1700000000.000100")));
+}

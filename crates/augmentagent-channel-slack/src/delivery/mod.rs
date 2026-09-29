@@ -11,13 +11,15 @@
 pub mod mrkdwn;
 pub mod plan;
 pub mod progress;
+pub mod reconcile;
 pub mod split;
 
 pub use mrkdwn::markdown_to_mrkdwn;
 pub use plan::{
-    enqueue_answer, part_idempotency_key, plan_answer, Answer, AnswerEnqueued, AnswerFile,
-    DispatchOutcome, Dispatched, PartKind, PlanError, PlanOptions, PlannedSend,
-    SlackOutboxDispatcher, METADATA_EVENT_TYPE,
+    enqueue_answer, notice_idempotency_key, part_idempotency_key, plan_answer, Answer,
+    AnswerEnqueued, AnswerFile, DispatchOutcome, Dispatched, PartKind, PlanError, PlanOptions,
+    PlannedSend, SlackOutboxDispatcher, METADATA_EVENT_TYPE,
 };
 pub use progress::{ProgressConfig, ProgressMessage, ProgressReport};
+pub use reconcile::{slack_ts_from_ms, LookupResult, ReconcilePolicy, SlackSendReconciler};
 pub use split::{split_message, MessagePart, DEFAULT_PART_CHARS, MIN_PART_CHARS, SLACK_TEXT_LIMIT};

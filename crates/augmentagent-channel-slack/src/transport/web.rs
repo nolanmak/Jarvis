@@ -91,6 +91,9 @@ pub enum WebApiError {
     /// upload URL that is not https (the URL is never echoed).
     #[error("invalid upload: {0}")]
     InvalidUpload(String),
+    /// The request is malformed before anything is sent (a caller bug).
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
     /// The upload failed before `files.completeUploadExternal` was called,
     /// so nothing was shared (Slack discards uncompleted uploads) and the
     /// whole flow can be retried without a duplicate.
@@ -245,6 +248,44 @@ pub struct AuthTest {
     pub scopes: Option<Vec<String>>,
 }
 
+/// A bounded `conversations.history` / `conversations.replies` query
+/// (#1294: finding a send whose outcome was lost).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryQuery {
+    pub channel: String,
+    /// Required for `conversations.replies` (the thread's parent `ts`);
+    /// ignored by `conversations.history`.
+    pub thread_ts: Option<String>,
+    /// Only messages after this `ts` (exclusive).
+    pub oldest: Option<String>,
+    pub limit: u32,
+    pub cursor: Option<String>,
+    /// Ask Slack to include message metadata (`include_all_metadata`).
+    pub include_all_metadata: bool,
+}
+
+/// One message from a history or replies page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlackHistoryMessage {
+    pub ts: String,
+    pub thread_ts: Option<String>,
+    pub text: Option<String>,
+    pub user: Option<String>,
+    pub bot_id: Option<String>,
+    /// `{"event_type", "event_payload"}` when requested and present.
+    pub metadata: Option<Value>,
+    pub raw: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlackHistoryPage {
+    /// In Slack's order: newest first for history, parent then oldest
+    /// first for replies.
+    pub messages: Vec<SlackHistoryMessage>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+}
+
 /// Where the bytes of an upload come from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UploadSource {
@@ -327,6 +368,24 @@ pub trait SlackWebApi: Send + Sync {
     /// Upload and share a file. Default: [`WebApiError::Unsupported`].
     async fn upload_file(&self, _req: UploadFile) -> Result<UploadedFile, WebApiError> {
         Err(WebApiError::Unsupported("upload_file"))
+    }
+
+    /// `conversations.history` (top-level messages of a conversation).
+    /// Default: [`WebApiError::Unsupported`].
+    async fn conversations_history(
+        &self,
+        _query: HistoryQuery,
+    ) -> Result<SlackHistoryPage, WebApiError> {
+        Err(WebApiError::Unsupported("conversations_history"))
+    }
+
+    /// `conversations.replies` (a thread, parent first); `thread_ts` is
+    /// required. Default: [`WebApiError::Unsupported`].
+    async fn conversations_replies(
+        &self,
+        _query: HistoryQuery,
+    ) -> Result<SlackHistoryPage, WebApiError> {
+        Err(WebApiError::Unsupported("conversations_replies"))
     }
 
     /// Deferred to #1293. Default: [`WebApiError::Unsupported`].
@@ -651,6 +710,64 @@ impl HttpSlackWebApi {
     }
 }
 
+fn history_page(v: &Value) -> SlackHistoryPage {
+    let messages = v
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|m| {
+                    Some(SlackHistoryMessage {
+                        ts: str_field(m, "ts")?,
+                        thread_ts: str_field(m, "thread_ts"),
+                        text: str_field(m, "text"),
+                        user: str_field(m, "user"),
+                        bot_id: str_field(m, "bot_id"),
+                        metadata: m.get("metadata").filter(|x| x.is_object()).cloned(),
+                        raw: m.clone(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    SlackHistoryPage {
+        messages,
+        has_more: v.get("has_more").and_then(Value::as_bool).unwrap_or(false),
+        next_cursor: v
+            .pointer("/response_metadata/next_cursor")
+            .and_then(Value::as_str)
+            .filter(|c| !c.is_empty())
+            .map(str::to_string),
+    }
+}
+
+impl HttpSlackWebApi {
+    async fn history_call(
+        &self,
+        method: &str,
+        query: &HistoryQuery,
+        thread_ts: Option<&str>,
+    ) -> Result<SlackHistoryPage, WebApiError> {
+        let limit = query.limit.max(1).to_string();
+        let mut form: Vec<(&str, &str)> = vec![("channel", query.channel.as_str())];
+        if let Some(ts) = thread_ts {
+            form.push(("ts", ts));
+        }
+        if let Some(oldest) = &query.oldest {
+            form.push(("oldest", oldest.as_str()));
+        }
+        form.push(("limit", limit.as_str()));
+        if let Some(cursor) = &query.cursor {
+            form.push(("cursor", cursor.as_str()));
+        }
+        if query.include_all_metadata {
+            form.push(("include_all_metadata", "true"));
+        }
+        let v = self.call(method, Body::Form(&form)).await?;
+        Ok(history_page(&v))
+    }
+}
+
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     headers
         .get(reqwest::header::RETRY_AFTER)
@@ -878,6 +995,27 @@ impl SlackWebApi for HttpSlackWebApi {
         })
     }
 
+    async fn conversations_history(
+        &self,
+        query: HistoryQuery,
+    ) -> Result<SlackHistoryPage, WebApiError> {
+        self.history_call("conversations.history", &query, None)
+            .await
+    }
+
+    async fn conversations_replies(
+        &self,
+        query: HistoryQuery,
+    ) -> Result<SlackHistoryPage, WebApiError> {
+        let Some(ts) = query.thread_ts.clone() else {
+            return Err(WebApiError::InvalidRequest(
+                "conversations.replies needs thread_ts".into(),
+            ));
+        };
+        self.history_call("conversations.replies", &query, Some(&ts))
+            .await
+    }
+
     async fn auth_test(&self) -> Result<AuthTest, WebApiError> {
         let (v, headers) = self.call_with_headers("auth.test", Body::Form(&[])).await?;
         let scopes = headers
@@ -952,6 +1090,25 @@ pub enum RecordedCall {
     DownloadFile {
         url_private: String,
     },
+    ConversationsHistory {
+        channel: String,
+        oldest: Option<String>,
+    },
+    ConversationsReplies {
+        channel: String,
+        thread_ts: String,
+        oldest: Option<String>,
+    },
+}
+
+/// A message the recording fake accepted, served back by its history.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FakeMessage {
+    pub channel: String,
+    pub thread_ts: Option<String>,
+    pub ts: String,
+    pub text: String,
+    pub metadata: Option<Value>,
 }
 
 /// In-memory [`SlackWebApi`] that records every call and returns synthetic
@@ -968,6 +1125,9 @@ pub struct RecordingSlackWebApi {
     direct_conversations: Mutex<Vec<(String, Result<String, String>)>>,
     /// Per-user `users.info` Slack errors (e.g. `user_not_found`).
     user_errors: Mutex<Vec<(String, String)>>,
+    /// Posts that land but whose reply is replaced by this error.
+    lost_responses: Mutex<VecDeque<WebApiError>>,
+    messages: Mutex<Vec<FakeMessage>>,
     ts_counter: AtomicU64,
 }
 
@@ -1024,6 +1184,65 @@ impl RecordingSlackWebApi {
             .push((user_id.into(), error.into()));
     }
 
+    /// The next post is delivered (visible in history) but the caller gets
+    /// `err`, as when a reply is lost after Slack accepted the message.
+    pub fn push_lost_response(&self, err: WebApiError) {
+        self.lost_responses.lock().unwrap().push_back(err);
+    }
+
+    /// Messages that were delivered, in order.
+    pub fn messages(&self) -> Vec<FakeMessage> {
+        self.messages.lock().unwrap().clone()
+    }
+
+    fn history(&self, query: &HistoryQuery, thread: Option<&str>) -> SlackHistoryPage {
+        // `oldest` is not applied: fake timestamps are a counter, not a clock.
+        let mut matching: Vec<FakeMessage> = self
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.channel == query.channel)
+            .filter(|m| match thread {
+                Some(t) => m.thread_ts.as_deref() == Some(t) || m.ts == t,
+                None => m.thread_ts.is_none(),
+            })
+            .cloned()
+            .collect();
+        if thread.is_none() {
+            matching.reverse(); // newest first, like Slack
+        }
+        let start: usize = query
+            .cursor
+            .as_deref()
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let limit = query.limit.max(1) as usize;
+        let end = (start + limit).min(matching.len());
+        let messages = matching[start.min(end)..end]
+            .iter()
+            .map(|m| SlackHistoryMessage {
+                ts: m.ts.clone(),
+                thread_ts: m.thread_ts.clone(),
+                text: Some(m.text.clone()),
+                user: None,
+                bot_id: Some("B00000001".into()),
+                metadata: if query.include_all_metadata {
+                    m.metadata.clone()
+                } else {
+                    None
+                },
+                raw: Value::Null,
+            })
+            .collect();
+        let has_more = end < matching.len();
+        SlackHistoryPage {
+            messages,
+            has_more,
+            next_cursor: has_more.then(|| end.to_string()),
+        }
+    }
+
     fn record(&self, call: RecordedCall) -> Result<(), WebApiError> {
         self.calls.lock().unwrap().push(call);
         match self.errors.lock().unwrap().pop_front() {
@@ -1041,12 +1260,62 @@ impl RecordingSlackWebApi {
 #[async_trait]
 impl SlackWebApi for RecordingSlackWebApi {
     async fn post_message(&self, req: PostMessage) -> Result<PostedMessage, WebApiError> {
+        let lost = self.lost_responses.lock().unwrap().pop_front();
+        let message = FakeMessage {
+            channel: req.channel.clone(),
+            thread_ts: req.thread_ts.clone(),
+            ts: String::new(),
+            text: req.text.clone(),
+            metadata: req.metadata.clone(),
+        };
         let channel = req.channel.clone();
+        if let Some(err) = lost {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(RecordedCall::PostMessage(req));
+            let ts = self.next_ts();
+            self.messages
+                .lock()
+                .unwrap()
+                .push(FakeMessage { ts, ..message });
+            return Err(err);
+        }
         self.record(RecordedCall::PostMessage(req))?;
-        Ok(PostedMessage {
-            channel,
-            ts: self.next_ts(),
-        })
+        let ts = self.next_ts();
+        self.messages.lock().unwrap().push(FakeMessage {
+            ts: ts.clone(),
+            ..message
+        });
+        Ok(PostedMessage { channel, ts })
+    }
+
+    async fn conversations_history(
+        &self,
+        query: HistoryQuery,
+    ) -> Result<SlackHistoryPage, WebApiError> {
+        self.record(RecordedCall::ConversationsHistory {
+            channel: query.channel.clone(),
+            oldest: query.oldest.clone(),
+        })?;
+        Ok(self.history(&query, None))
+    }
+
+    async fn conversations_replies(
+        &self,
+        query: HistoryQuery,
+    ) -> Result<SlackHistoryPage, WebApiError> {
+        let Some(thread) = query.thread_ts.clone() else {
+            return Err(WebApiError::InvalidRequest(
+                "conversations.replies needs thread_ts".into(),
+            ));
+        };
+        self.record(RecordedCall::ConversationsReplies {
+            channel: query.channel.clone(),
+            thread_ts: thread.clone(),
+            oldest: query.oldest.clone(),
+        })?;
+        Ok(self.history(&query, Some(&thread)))
     }
 
     async fn update_message(&self, req: UpdateMessage) -> Result<PostedMessage, WebApiError> {
