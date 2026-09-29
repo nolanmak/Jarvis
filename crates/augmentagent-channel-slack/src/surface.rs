@@ -313,6 +313,11 @@ impl SlackInteraction {
     }
 }
 
+/// The dated live-voice feasibility record (#1298), relative to the repo
+/// root. Both voice rows cite it; `surface_contract` checks that the record's
+/// `Recorded status:` line matches the `LiveVoice` row.
+pub const LIVE_VOICE_FEASIBILITY_RECORD: &str = "docs/SLACK-LIVE-VOICE.md";
+
 const NOT_WIRED: &str = "no Slack interactive surface exists; the crate only polls subscribed \
      conversations through Composio and posts plain text (channel.rs, api.rs)";
 
@@ -347,7 +352,8 @@ pub const SLACK_SHARED_CAPABILITIES: [CapabilityRow<SurfaceCapability>; 11] = [
         SurfaceCapability::Voice,
         SupportStatus::Unproven,
         1298,
-        "live two-way audio through a Slack app is unverified; voice clips (#1297) do not satisfy it",
+        "no documented Slack API lets an app join a huddle or carry call audio (checked \
+         2026-09-29, docs/SLACK-LIVE-VOICE.md); voice clips (#1297) do not satisfy it",
     ),
 ];
 
@@ -405,7 +411,10 @@ pub const SLACK_INTERACTIONS: [CapabilityRow<SlackInteraction>; 9] = [
         SlackInteraction::LiveVoice,
         SupportStatus::Unproven,
         1298,
-        "whether a Slack app can exchange live audio with the owner is unverified",
+        "no documented Slack API lets an app join a huddle or carry call audio; the Calls API \
+         only registers a third-party call, so any route puts the audio outside Slack and \
+         needs an owner decision (checked 2026-09-29, docs/SLACK-LIVE-VOICE.md); voice \
+         clips (#1297) do not satisfy it",
     ),
 ];
 
