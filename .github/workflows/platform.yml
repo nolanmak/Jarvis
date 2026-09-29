@@ -49,6 +49,12 @@ jobs:
         run: cargo build --workspace --locked
       - name: Process walker + sidecar clients
         run: cargo test -p augmentagent-loops -p augmentagent-browser-client -p augmentagent-renderer-client
+      # #1226 / #1282 — the transport-neutral surface contracts and the Slack
+      # identity/capability mapping must hold on both hosts.
+      - name: Surface contracts (shared + Slack)
+        run: |
+          cargo test -p augmentagent-store --test surface_refs --test surface_sessions
+          cargo test -p augmentagent-channel-slack --test surface_contract
       - name: Host-dependent CLI surface
         run: >-
           cargo test -p augmentagent-cli --bin augmentagent --
