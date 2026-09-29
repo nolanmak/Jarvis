@@ -184,16 +184,12 @@ fn a_helper_function_or_an_ignored_test_is_not_a_passing_test() {
 #[test]
 fn a_supported_row_over_a_capability_the_table_does_not_support_fails() {
     let mut m = matrix();
-    let row = row_mut(&mut m, "voice-clips");
+    let row = row_mut(&mut m, "live-voice");
     row.status = RowStatus::Supported;
     row.blocker = None;
     let found = kinds(&m);
     assert!(
-        has(
-            &found,
-            ViolationKind::StatusAheadOfCapability,
-            "voice-clips"
-        ),
+        has(&found, ViolationKind::StatusAheadOfCapability, "live-voice"),
         "{found:#?}"
     );
 }
@@ -219,8 +215,8 @@ fn flipping_the_capability_table_without_the_matrix_fails_both_ways() {
     let m = matrix();
     let root = repo_root();
     let flipped = |name: &str| match name {
-        "voice_clip" => Some(SupportStatus::Supported),
-        "approve" => Some(SupportStatus::Unsupported),
+        "voice" | "live_voice" => Some(SupportStatus::Supported),
+        "voice_clip" => Some(SupportStatus::Unsupported),
         other => augmentagent_channel_slack::parity::capability_status(other),
     };
     let mut ctx = CheckContext::slack(&root);
@@ -230,11 +226,15 @@ fn flipping_the_capability_table_without_the_matrix_fails_both_ways() {
         .map(|v| (v.kind, format!("{} {}", v.subject, v.detail)))
         .collect();
     assert!(
-        has(&found, ViolationKind::StatusBehindCapability, "voice-clips"),
+        has(&found, ViolationKind::StatusBehindCapability, "live-voice"),
         "{found:#?}"
     );
     assert!(
-        has(&found, ViolationKind::StatusAheadOfCapability, "approvals"),
+        has(
+            &found,
+            ViolationKind::StatusAheadOfCapability,
+            "voice-clips"
+        ),
         "{found:#?}"
     );
 }
@@ -430,7 +430,7 @@ fn the_report_lists_every_row_and_every_open_blocker() {
     }
     for needle in [
         "supported        notifications",
-        "blocked          voice-clips",
+        "supported        voice-clips",
         "blocked          live-voice",
         "unverified-live  acceptance",
         "#1295",
@@ -462,7 +462,7 @@ fn the_json_report_carries_statuses_blockers_and_the_check_result() {
         + summary["blocked"].as_u64().unwrap()
         + summary["unverified_live"].as_u64().unwrap();
     assert_eq!(total, 20);
-    assert_eq!(summary["blocked"], 2);
+    assert_eq!(summary["blocked"], 1);
     let live = value["rows"]
         .as_array()
         .unwrap()
@@ -535,4 +535,27 @@ fn every_named_test_is_run_by_exactly_one_generated_cargo_command() {
             running[0]
         );
     }
+}
+
+// #1297 — the voice-clips row is supported by the serve-path tests.
+#[test]
+fn the_voice_clips_row_is_supported_by_the_serve_path_tests() {
+    let m = matrix();
+    let row = m.rows.iter().find(|r| r.id == "voice-clips").unwrap();
+    assert_eq!(row.status, RowStatus::Supported);
+    assert!(row.blocker.is_none());
+    for name in [
+        "an_owner_clip_is_a_turn_in_the_same_conversation_with_the_transcript_shown",
+        "voice_on_answers_with_audio_plus_the_text_once_and_voice_off_stops_it",
+        "credit_exhaustion_402_switches_to_the_other_vendor",
+        "clip_is_transcribed_into_turn_text_with_a_transcript_line",
+        "spoken_reply_is_an_audio_upload_plus_the_text_mirror_delivered_once",
+    ] {
+        assert!(
+            row.tests.iter().any(|t| t.name == name),
+            "{name} missing from voice-clips"
+        );
+    }
+    let live = m.rows.iter().find(|r| r.id == "live-voice").unwrap();
+    assert_eq!(live.status, RowStatus::Blocked);
 }

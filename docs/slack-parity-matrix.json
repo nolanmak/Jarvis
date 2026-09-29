@@ -365,12 +365,11 @@
       "capabilities": [
         "voice_clip"
       ],
-      "status": "blocked",
-      "blocker": {
-        "issue": 1297,
-        "reason": "The voice-clip pipeline runs only through `augmentagent slack voice`: serve's turn path does not transcribe clips yet, and release builds have no text-to-speech provider for spoken replies."
-      },
+      "status": "supported",
       "tests": [
+        {"package": "augmentagent-channel-slack", "target": "test:voice_surface", "name": "an_owner_clip_is_a_turn_in_the_same_conversation_with_the_transcript_shown"},
+        {"package": "augmentagent-channel-slack", "target": "test:voice_surface", "name": "voice_on_answers_with_audio_plus_the_text_once_and_voice_off_stops_it"},
+        {"package": "augmentagent-channel-slack", "target": "test:voice_tts_http", "name": "credit_exhaustion_402_switches_to_the_other_vendor"},
         {"package": "augmentagent-channel-slack", "target": "test:voice_clips", "name": "clip_is_transcribed_into_turn_text_with_a_transcript_line"},
         {"package": "augmentagent-channel-slack", "target": "test:voice_clips", "name": "non_owner_audio_never_reaches_the_speech_provider"},
         {"package": "augmentagent-channel-slack", "target": "test:voice_replies", "name": "spoken_reply_is_an_audio_upload_plus_the_text_mirror_delivered_once"},
