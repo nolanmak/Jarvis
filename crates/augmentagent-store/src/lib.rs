@@ -8,6 +8,13 @@ pub mod models;
 pub mod notes;
 pub mod redact;
 mod store;
+pub mod surface;
+
+pub use surface::{
+    SurfaceAccountRef, SurfaceCapabilities, SurfaceCapability, SurfaceConversationRef,
+    SurfaceMessageRef, SurfaceOwnerRef, SurfacePlatform, SurfaceRefError, SurfaceReplyTarget,
+    SurfaceTurnRef,
+};
 
 pub use models::{
     Account, ActionRecord, ActionStatus, AgentPrRun, AgentRepo, ChannelSubscription,
@@ -18,7 +25,7 @@ pub use models::{
     ToneProfile, TriageResult, UserLoop, WhatsappDevice,
 };
 pub use store::{
-    DiscordConversation, JournalSyncCursor,
+    DiscordConversation, JournalSyncCursor, NativeConversation,
     ActionCodeModeFields, ActionWithEmail, PendingActionRow, PendingNudge, RetryableReply,
     RevisionRecord, Store,
     StoreError, StoreResult, NUDGE_INTERVAL_MS,

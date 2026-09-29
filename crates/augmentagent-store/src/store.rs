@@ -7,6 +7,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::redact;
+use crate::surface::{SurfaceConversationRef, SurfaceTurnRef};
 
 use crate::models::{
     Account, ActionRecord, ActionStatus, AgentPrRun, AgentRepo, ChannelSubscription,
@@ -42,6 +43,16 @@ pub struct DiscordConversation {
     pub uncertain: bool,
 }
 
+/// A transport-owned conversation bound to one native agent session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeConversation {
+    pub conversation: SurfaceConversationRef,
+    pub provider: String,
+    pub native_session_id: String,
+    pub cwd: String,
+    pub uncertain: bool,
+}
+
 /// #900 — an interrupted ShadowNote sync pass, persisted after every page so
 /// a restart resumes pagination instead of replaying the whole batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +79,132 @@ pub struct Store {
     path: std::path::PathBuf,
 }
 
+fn surface_conversation_row(
+    conn: &Connection,
+    chat: &SurfaceConversationRef,
+) -> StoreResult<Option<NativeConversation>> {
+    Ok(conn.query_row(
+        "SELECT provider, native_session_id, cwd, uncertain FROM surface_conversations
+         WHERE platform = ?1 AND account_id = ?2 AND conversation_id = ?3 AND thread_id = ?4",
+        params![chat.account().platform().as_str(), chat.account().account_id(), chat.conversation_id(), chat.thread_id().unwrap_or("")],
+        |row| Ok(NativeConversation {
+            conversation: chat.clone(),
+            provider: row.get(0)?,
+            native_session_id: row.get(1)?,
+            cwd: row.get(2)?,
+            uncertain: row.get::<_, i64>(3)? != 0,
+        }),
+    ).optional()?)
+}
+
 impl Store {
+    pub fn bind_surface_conversation(&self, binding: &NativeConversation) -> StoreResult<()> {
+        let chat = &binding.conversation;
+        if chat.account().platform().as_str() == "discord" && chat.thread_id().is_none() {
+            return self.bind_discord_conversation(&DiscordConversation {
+                guild_id: chat.account().account_id().into(),
+                channel_id: chat.conversation_id().into(),
+                provider: binding.provider.clone(),
+                native_session_id: binding.native_session_id.clone(),
+                cwd: binding.cwd.clone(),
+                uncertain: binding.uncertain,
+            });
+        }
+        if binding.native_session_id.trim().is_empty()
+            || binding.cwd.trim().is_empty()
+            || !matches!(binding.provider.as_str(), "codex" | "claude")
+        {
+            return Err(StoreError::InvalidInput("invalid surface conversation binding".into()));
+        }
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO surface_conversations
+             (platform, account_id, conversation_id, thread_id, provider, native_session_id, cwd, created_at_ms, uncertain)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(platform, account_id, conversation_id, thread_id) DO NOTHING",
+            params![chat.account().platform().as_str(), chat.account().account_id(), chat.conversation_id(),
+                chat.thread_id().unwrap_or(""), binding.provider, binding.native_session_id,
+                binding.cwd, now_millis(), binding.uncertain as i64],
+        )?;
+        let persisted = surface_conversation_row(&guard, chat)?;
+        if persisted.as_ref() != Some(binding) {
+            return Err(StoreError::InvalidInput("surface conversation is already bound to another native session".into()));
+        }
+        Ok(())
+    }
+
+    pub fn surface_conversation(&self, chat: &SurfaceConversationRef) -> StoreResult<Option<NativeConversation>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        surface_conversation_row(&guard, chat)
+    }
+
+    pub fn mark_surface_conversation_uncertain(&self, chat: &SurfaceConversationRef) -> StoreResult<()> {
+        if chat.account().platform().as_str() == "discord" && chat.thread_id().is_none() {
+            return self.mark_discord_conversation_uncertain(chat.account().account_id(), chat.conversation_id());
+        }
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let changed = guard.execute(
+            "UPDATE surface_conversations SET uncertain = 1
+             WHERE platform = ?1 AND account_id = ?2 AND conversation_id = ?3 AND thread_id = ?4",
+            params![chat.account().platform().as_str(), chat.account().account_id(), chat.conversation_id(), chat.thread_id().unwrap_or("")],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::InvalidInput("surface conversation is not bound".into()));
+        }
+        Ok(())
+    }
+
+    pub fn claim_surface_turn(&self, turn: &SurfaceTurnRef) -> StoreResult<()> {
+        let chat = turn.conversation();
+        if chat.account().platform().as_str() == "discord" && chat.thread_id().is_none() {
+            return self.claim_discord_turn(chat.account().account_id(), chat.conversation_id(), turn.turn_id());
+        }
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let unfinished: Option<String> = tx.query_row(
+            "SELECT turn_id FROM surface_native_turns WHERE platform = ?1 AND account_id = ?2
+             AND conversation_id = ?3 AND thread_id = ?4 AND status != 'complete' LIMIT 1",
+            params![chat.account().platform().as_str(), chat.account().account_id(), chat.conversation_id(), chat.thread_id().unwrap_or("")],
+            |row| row.get(0),
+        ).optional()?;
+        if let Some(prior) = unfinished {
+            return Err(StoreError::InvalidInput(format!("surface native turn {prior} is uncertain; inspect it before continuing")));
+        }
+        let inserted = tx.execute(
+            "INSERT INTO surface_native_turns
+             (platform, account_id, conversation_id, thread_id, turn_id, status, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)
+             ON CONFLICT(platform, account_id, conversation_id, thread_id, turn_id) DO NOTHING",
+            params![chat.account().platform().as_str(), chat.account().account_id(), chat.conversation_id(),
+                chat.thread_id().unwrap_or(""), turn.turn_id(), now_millis()],
+        )?;
+        if inserted == 0 {
+            return Err(StoreError::InvalidInput("surface native turn was already submitted".into()));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn finish_surface_turn(&self, turn: &SurfaceTurnRef, success: bool) -> StoreResult<()> {
+        let chat = turn.conversation();
+        if chat.account().platform().as_str() == "discord" && chat.thread_id().is_none() {
+            return self.finish_discord_turn(chat.account().account_id(), chat.conversation_id(), turn.turn_id(), success);
+        }
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let status = if success { "complete" } else { "uncertain" };
+        let changed = guard.execute(
+            "UPDATE surface_native_turns SET status = ?6, finished_at_ms = ?7
+             WHERE platform = ?1 AND account_id = ?2 AND conversation_id = ?3 AND thread_id = ?4
+             AND turn_id = ?5 AND status = 'pending'",
+            params![chat.account().platform().as_str(), chat.account().account_id(), chat.conversation_id(),
+                chat.thread_id().unwrap_or(""), turn.turn_id(), status, now_millis()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidInput("surface native turn is not pending".into()));
+        }
+        Ok(())
+    }
+
     /// Claim a Discord text or finalized speech turn before invoking a native
     /// agent. A pending/uncertain row after restart blocks automatic replay.
     pub fn claim_discord_turn(
@@ -434,6 +570,70 @@ impl Store {
             );\
             CREATE INDEX IF NOT EXISTS idx_discord_native_turns_unfinished \
             ON discord_native_turns(guild_id, channel_id, status)",
+        )?;
+        // The old Discord tables remain the compatibility API. Triggers keep
+        // their writes visible to all surfaces, including after migration.
+        conn.execute_batch(
+            r#"CREATE TABLE IF NOT EXISTS surface_conversations (
+                platform TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL DEFAULT '',
+                provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude')),
+                native_session_id TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                uncertain INTEGER NOT NULL DEFAULT 0 CHECK(uncertain IN (0, 1)),
+                PRIMARY KEY(platform, account_id, conversation_id, thread_id),
+                UNIQUE(provider, native_session_id)
+            );
+            CREATE TABLE IF NOT EXISTS surface_native_turns (
+                platform TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL DEFAULT '',
+                turn_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('pending', 'complete', 'uncertain')),
+                created_at_ms INTEGER NOT NULL,
+                finished_at_ms INTEGER,
+                PRIMARY KEY(platform, account_id, conversation_id, thread_id, turn_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_surface_native_turns_unfinished
+            ON surface_native_turns(platform, account_id, conversation_id, thread_id, status);
+            INSERT INTO surface_conversations
+                (platform, account_id, conversation_id, thread_id, provider, native_session_id, cwd, created_at_ms, uncertain)
+            SELECT 'discord', guild_id, channel_id, '', provider, native_session_id, cwd, created_at_ms, uncertain
+            FROM discord_conversations WHERE true
+            ON CONFLICT(platform, account_id, conversation_id, thread_id) DO NOTHING;
+            INSERT INTO surface_native_turns
+                (platform, account_id, conversation_id, thread_id, turn_id, status, created_at_ms, finished_at_ms)
+            SELECT 'discord', guild_id, channel_id, '', turn_id, status, created_at_ms, finished_at_ms
+            FROM discord_native_turns WHERE true
+            ON CONFLICT(platform, account_id, conversation_id, thread_id, turn_id) DO NOTHING;
+            CREATE TRIGGER IF NOT EXISTS discord_conversation_surface_insert
+            AFTER INSERT ON discord_conversations BEGIN
+                INSERT INTO surface_conversations
+                    (platform, account_id, conversation_id, thread_id, provider, native_session_id, cwd, created_at_ms, uncertain)
+                VALUES ('discord', NEW.guild_id, NEW.channel_id, '', NEW.provider, NEW.native_session_id, NEW.cwd, NEW.created_at_ms, NEW.uncertain);
+            END;
+            CREATE TRIGGER IF NOT EXISTS discord_conversation_surface_uncertain
+            AFTER UPDATE OF uncertain ON discord_conversations BEGIN
+                UPDATE surface_conversations SET uncertain = NEW.uncertain
+                WHERE platform = 'discord' AND account_id = NEW.guild_id
+                    AND conversation_id = NEW.channel_id AND thread_id = '';
+            END;
+            CREATE TRIGGER IF NOT EXISTS discord_turn_surface_insert
+            AFTER INSERT ON discord_native_turns BEGIN
+                INSERT INTO surface_native_turns
+                    (platform, account_id, conversation_id, thread_id, turn_id, status, created_at_ms, finished_at_ms)
+                VALUES ('discord', NEW.guild_id, NEW.channel_id, '', NEW.turn_id, NEW.status, NEW.created_at_ms, NEW.finished_at_ms);
+            END;
+            CREATE TRIGGER IF NOT EXISTS discord_turn_surface_finish
+            AFTER UPDATE OF status ON discord_native_turns BEGIN
+                UPDATE surface_native_turns SET status = NEW.status, finished_at_ms = NEW.finished_at_ms
+                WHERE platform = 'discord' AND account_id = NEW.guild_id
+                    AND conversation_id = NEW.channel_id AND thread_id = '' AND turn_id = NEW.turn_id;
+            END;"#,
         )?;
         // -------------------------------------------------------------------
         // #45 — Rust-owned schema. Mirrors `src/db.ts::initDb()` exactly
