@@ -27,17 +27,15 @@ fn the_platform_store_reports_its_persistence() {
     assert!(!d.insecure);
     assert_ne!(d.backend, "insecure-file");
 
-    // Which backend the `keyring` crate resolves to depends on how it was
-    // compiled — feature unification across the workspace flips Linux between
-    // its in-memory mock, keyutils and a persistent platform keyring. What must
-    // hold for every one of them is the label -> persistence -> note mapping,
-    // so that `doctor` never claims a volatile store outlives the process.
+    // What must hold for every backend is the label -> persistence -> note
+    // mapping, so that `doctor` never claims a volatile store outlives the
+    // process.
     match d.backend {
-        "macos-keychain" | "platform-keyring" => {
+        "macos-keychain" | "platform-keyring" | "private-file" => {
             assert!(d.persistent, "{} keeps credentials after exit", d.backend);
             assert!(d.note.is_none(), "a persistent backend needs no caveat");
         }
-        "keyutils" | "keyring-mock" => {
+        "keyutils" | "keyring-mock" | "unavailable" => {
             assert!(!d.persistent, "{} is volatile", d.backend);
             assert!(
                 d.note.as_deref().unwrap_or("").contains("#1325"),
@@ -54,4 +52,18 @@ fn the_platform_store_reports_its_persistence() {
     if cfg!(target_os = "macos") {
         assert_eq!(d.backend, "macos-keychain");
     }
+}
+
+/// #1325 — Linux no longer depends on which keyring features Cargo unifies
+/// (in-memory mock for this crate alone, the D-Bus Secret Service in a
+/// workspace build): the default is the owner-only file store, which
+/// persists and needs no session bus. The runner always has HOME.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_uses_the_persistent_private_file_store() {
+    let d = describe_store_for_override(None);
+    assert_eq!(d.backend, "private-file");
+    assert!(d.persistent);
+    assert!(!d.insecure);
+    assert_eq!(d.note, None);
 }

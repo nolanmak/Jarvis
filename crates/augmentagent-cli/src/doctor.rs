@@ -1882,8 +1882,9 @@ fn check_interactive_surfaces(
 }
 
 /// #1299 / #1325 — which credential backend this process uses. Plaintext
-/// files are an error outside tests; a backend that forgets credentials when
-/// the process exits (keyring v3 without a Linux backend) is a warning.
+/// files are an error outside tests, and so is a backend that forgets
+/// credentials when the process exits (keyring's mock on an OS without a
+/// supported store, or Linux without HOME for the owner-only file store).
 fn check_credential_backend(d: &augmentagent_auth::BackendDescription) -> Finding {
     const NAME: &str = "credential_backend";
     if d.insecure {
@@ -1898,7 +1899,7 @@ fn check_credential_backend(d: &augmentagent_auth::BackendDescription) -> Findin
         );
     }
     if !d.persistent {
-        return Finding::warn(
+        return Finding::error(
             NAME,
             format!(
                 "{}: {}",
@@ -1908,9 +1909,11 @@ fn check_credential_backend(d: &augmentagent_auth::BackendDescription) -> Findin
                     .unwrap_or("credentials do not persist (#1325)")
             ),
             Some(
-                "credentials stored on this host (including `augmentagent slack app install`) do \
-                 not survive the command that stored them until #1325 enables a persistent \
-                 backend; run the Slack surface on macOS meanwhile",
+                "credentials stored here (including `augmentagent slack app install`) do not \
+                 survive the command that stored them. On Linux run the CLI and the daemon with \
+                 HOME set (or an absolute XDG_STATE_HOME) so the owner-only file store under the \
+                 state directory is used, then re-run `augmentagent slack app install`; on other \
+                 systems use macOS or Linux (#1325)",
             ),
         );
     }
@@ -3057,11 +3060,23 @@ mod tests {
             .unwrap()
             .contains("unset AUGMENTAGENT_INSECURE_CREDENTIAL_DIR"));
 
-        let volatile = check_credential_backend(&backend("keyring-mock", false, false));
-        assert_eq!(volatile.severity, Severity::Warn);
-        assert!(volatile.message.contains("keyring-mock"));
-        assert!(volatile.message.contains("#1325"));
-        assert!(volatile.suggested_cmd.is_some());
+        // #1325 — Linux's owner-only file store is persistent and fine.
+        let linux = check_credential_backend(&backend("private-file", true, false));
+        assert_eq!(linux.severity, Severity::Ok);
+        assert!(linux.message.contains("private-file"));
+
+        // A store that forgets credentials when the process exits (keyring's
+        // mock on an unsupported OS, or Linux without HOME) is an error with
+        // a recovery, never a silent success.
+        for volatile in ["keyring-mock", "unavailable"] {
+            let f = check_credential_backend(&backend(volatile, false, false));
+            assert_eq!(f.severity, Severity::Error, "{volatile}");
+            assert!(f.message.contains(volatile));
+            assert!(f.message.contains("#1325"));
+            let fix = f.suggested_cmd.as_deref().unwrap();
+            assert!(fix.contains("HOME"), "{fix}");
+            assert!(fix.contains("slack app install"), "{fix}");
+        }
     }
 
     #[test]

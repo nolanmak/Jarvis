@@ -226,7 +226,9 @@ const RESTART_DAEMON: &str = "augmentagent service --unit daemon restart";
 pub const UNREADABLE_RECOVERY: &str = "Run `augmentagent doctor --keychain-probe` from your \
      logged-in session. On macOS the login Keychain is readable only from a login session (not \
      over SSH or from a launchd job before you log in) and only while it is unlocked; unlock it \
-     in Keychain Access, then rerun `augmentagent status`. On Linux see #1325.";
+     in Keychain Access, then rerun `augmentagent status`. On Linux credentials are owner-only \
+     files under `credentials` in the state directory (#1325): run the CLI and the daemon as the \
+     same user with the same HOME, and check that directory is readable by that user.";
 
 const INSTALL_RECOVERY: &str =
     "Install the Slack app (`augmentagent slack app install --stdin`, see \

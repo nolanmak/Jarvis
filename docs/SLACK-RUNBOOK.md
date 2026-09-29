@@ -20,7 +20,7 @@ them from the checkout, where the daemon also runs and reads `.env`.
 | --- | --- |
 | macOS, Apple Silicon | Pending real-host acceptance (#1300). CI runs every Slack test on `macos-latest`. |
 | macOS, Intel | Pending, qualified separately from Apple Silicon (#1300). Not supported until recorded. |
-| Linux (systemd) | **Blocked for persistent credentials** by [#1325](https://github.com/nolanmak/Jarvis/issues/1325): the credential store has no Linux backend, so tokens stored by `slack app install` are gone when that command exits. `doctor` reports this as `credential_backend: keyring-mock`. Everything else in this runbook applies once #1325 lands. |
+| Linux (systemd) | Pending real-host acceptance (#1300). Credentials persist since [#1325](https://github.com/nolanmak/Jarvis/issues/1325) in an owner-only file store (`credential_backend: private-file`); CI proves a second process reads what the first stored. After upgrading from an earlier build, re-run `slack app install` (see Linux specifics). |
 
 A CI or mocked pass never qualifies a host. The acceptance script in
 section 11 is how a host gets qualified.
@@ -126,8 +126,8 @@ Install checks both tokens live and stores nothing unless every check
 passes, including the required bot scopes. `status` is local (no network);
 `verify` is a live check that refreshes the stored scopes.
 
-On macOS the tokens go to the login Keychain. On Linux they go to the
-platform keyring, which does not persist yet (#1325).
+On macOS the tokens go to the login Keychain. On Linux they go to
+owner-only files under `credentials` in the state directory (#1325).
 
 ## 4. Bind the owner and choose the DM or a control channel
 
@@ -203,7 +203,8 @@ stored install).
 | `credentials: present` long after a restart (macOS) | The daemon cannot read the Keychain item | `augmentagent doctor --keychain-probe`, unlock the login Keychain, restart |
 | `config.discord.approval_broker` | `DISCORD_BOT_TOKEN` set without a numeric `DISCORD_CHANNEL_ID`; serve runs without Discord approvals | Set `DISCORD_CHANNEL_ID` in `.env` (or remove the token), restart |
 | `config.credentials.insecure_file_store` or `config.daemon.insecure_file_store` | `AUGMENTAGENT_INSECURE_CREDENTIAL_DIR` is set | Remove it from `.env` and the shell, reinstall the tokens, restart |
-| `credential_backend: keyring-mock` (Linux) | #1325 | None yet; run Slack on macOS until #1325 lands |
+| `credential_backend: unavailable` (Linux) | Neither `HOME` nor an absolute `XDG_STATE_HOME` is set, so there is nowhere to keep credentials | Run the CLI and the daemon with `HOME` set (systemd user units set it), re-run `augmentagent slack app install`, restart |
+| `credential_backend: keyring-mock` | A build older than #1325 on Linux, or an OS with no supported store | Upgrade, then re-run `augmentagent slack app install` |
 | `slack_app.scopes` error | The app lacks a required scope | Add it in the app settings, reinstall the app, `augmentagent slack app rotate --stdin`, restart |
 | `surface_delivery` warning | Dead letters or sends awaiting reconcile | `augmentagent status --json` shows which surface; the daemon reconciles on its own |
 
@@ -342,12 +343,28 @@ affected. To keep the install but stop the surface, set
 - `augmentagent service --unit daemon restart` wraps `systemctl --user`.
   The daemon's own output is in `~/.local/state/augmentagent/*.log`, not the
   journal (section 6).
-- **Credential backend caveat (#1325).** The keyring library is built with
-  no Linux backend, so it falls back to an in-memory store: `slack app
-  install` succeeds and the tokens are gone when it exits, and the daemon
-  sees no install (`interactive.slack.detail: no interactive Slack app is
-  installed`). `augmentagent doctor` names the backend (`credential_backend:
-  keyring-mock`). Do not work around it with
+- **Credential store (#1325).** Credentials are owner-only files under
+  `credentials` in the state directory (`$XDG_STATE_HOME/augmentagent`, by
+  default under `~/.local/state`): the directory is `0700`, each file `0600`,
+  writes are atomic and a damaged file is reported, never used. It needs no
+  D-Bus session or unlocked keyring, so the headless `systemd --user` daemon
+  reads what the CLI stored, provided both run as the same user with the
+  same `HOME`. The files are not encrypted; they are protected like
+  `~/.ssh` keys, by ownership and mode. `augmentagent doctor` reports
+  `credential_backend: private-file (persistent)`.
+- **Upgrading from a build before #1325.** Earlier Linux builds kept
+  credentials in the keyring library: the released binary used the D-Bus
+  Secret Service (gnome-keyring or KWallet), which works only where a
+  session bus and an unlocked keyring exist, and a build of the auth crate
+  alone used an in-memory store that lost them when the command exited.
+  A credential still in the Secret Service is copied into the file store the
+  first time a command or the daemon reads it from a session where the
+  keyring is reachable and unlocked; it stays in the keyring, so rolling
+  back still finds it. Where the keyring was never reachable (a headless
+  host, or a store that never persisted), there is nothing to migrate:
+  after upgrading, re-run `augmentagent slack app install` and any other
+  channel login, then restart the daemon.
+- Do not work around a credential problem with
   `AUGMENTAGENT_INSECURE_CREDENTIAL_DIR`; `doctor` treats that as an error.
 
 ## 11. Owner acceptance script (#1300)
@@ -373,7 +390,8 @@ never host evidence.
 
 1. **Baseline.** Run `git rev-parse HEAD`, `uname -m`, then
    `augmentagent doctor --json`. Expect `credential_backend` ok and
-   persistent (Linux: pending #1325), and no `config.*` errors.
+   persistent (`macos-keychain` or, on Linux, `private-file`), and no
+   `config.*` errors.
 2. **Nothing installed.** `augmentagent status --json`. Expect
    `interactive.slack.state: not_configured`, `detail: no interactive Slack
    app is installed`, `credentials: missing`.

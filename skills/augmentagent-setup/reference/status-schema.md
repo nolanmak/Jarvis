@@ -300,16 +300,19 @@ scopes from the stored install record).
 Added in #1299 (additive). The credential backend of the process that ran
 `status` (`augmentagent_auth::describe_default_store`).
 
-- `backend` (string): `macos-keychain`, `platform-keyring`, `keyutils`,
-  `keyring-mock` (keyring built without a persistent backend for this OS,
-  today's Linux build, #1325) or `insecure-file`
-  (`AUGMENTAGENT_INSECURE_CREDENTIAL_DIR`).
+- `backend` (string): `macos-keychain`, `private-file` (Linux since
+  #1325: owner-only files under `credentials` in the state directory,
+  persistent), `unavailable` (Linux with neither `HOME` nor an absolute
+  `XDG_STATE_HOME`; not persistent, `note` says how to fix it),
+  `platform-keyring`, `keyutils`, `keyring-mock` (keyring built without a
+  persistent backend for this OS; Linux builds before #1325) or
+  `insecure-file` (`AUGMENTAGENT_INSECURE_CREDENTIAL_DIR`).
 - `persistent` (boolean): credentials outlive the process that stored them.
 - `insecure_file_store` (boolean): plaintext test store in use.
 - `note` (string or null): caveat for the operator.
 
 `doctor` reports the same as `credential_backend`: error for the plaintext
-store, warn when not persistent.
+store, and (since #1325) error with a recovery when not persistent.
 
 ### daemon_report
 
