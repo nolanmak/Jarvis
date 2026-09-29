@@ -196,7 +196,14 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
                         Err(e) => error!("slack poll failed: {e:#}"),
                     }
                     let jitter = jitter_secs();
-                    tokio::time::sleep(Duration::from_secs(jitter)).await;
+                    // #1287: the jitter can be an hour; shutdown must not wait.
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {
+                            info!("slack channel: shutdown signal received");
+                            return Ok(());
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(jitter)) => {}
+                    }
                 }
             }
         }
@@ -1158,6 +1165,31 @@ mod tests {
             },
             None,
         )
+    }
+
+    /// #1287 — serve's graceful shutdown waited out this loop's post-poll
+    /// jitter (up to an hour) because the sleep ignored the shutdown token.
+    #[tokio::test]
+    async fn shutdown_interrupts_the_post_poll_jitter() {
+        let (store, _f) = tmp_store();
+        let r = Arc::new(ScriptedReasoner::new(Vec::<&str>::new()));
+        let b: Arc<dyn ApprovalBroker> = Arc::new(CountingBroker::default());
+        let ch = Arc::new(build_channel(store, r, b));
+        let shutdown = CancellationToken::new();
+        let task = {
+            let ch = Arc::clone(&ch);
+            let sd = shutdown.clone();
+            tokio::spawn(async move { ch.run(sd).await })
+        };
+        // The first tick polls at once (no subscriptions), then the loop
+        // sleeps its jitter.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("run returns promptly on shutdown")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
