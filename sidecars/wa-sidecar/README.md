@@ -16,6 +16,11 @@ without connecting to a WhatsApp account. Live pairing and daemon wiring are
 tracked in [Jarvis #1228](https://github.com/nolanmak/Jarvis/issues/1228)
 and [#1231](https://github.com/nolanmak/Jarvis/issues/1231).
 
+On macOS, run `./sidecars/wa-sidecar/setup.sh` and then
+`python3 scripts/install-sidecar.py wa-sidecar` from the repo root. The
+LaunchAgent keeps the linked-device store across restarts and removal. See
+[`docs/MACOS-SIDECARS.md`](../../docs/MACOS-SIDECARS.md) for status and logs.
+
 ## Layout
 
 ```

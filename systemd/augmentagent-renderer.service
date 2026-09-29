@@ -1,6 +1,8 @@
 [Unit]
 Description=AugmentAgent Node renderer sidecar (Remotion)
 After=default.target
+StartLimitBurst=5
+StartLimitIntervalSec=60
 
 [Service]
 Type=simple
@@ -8,11 +10,10 @@ WorkingDirectory=%h/AugmentAgent/sidecars/renderer
 Environment=NODE_ENV=production
 Environment=AUGMENTAGENT_RENDERER_SOCK=%t/augmentagent/renderer.sock
 ExecStartPre=/usr/bin/mkdir -p %t/augmentagent
-ExecStart=/usr/bin/node %h/AugmentAgent/sidecars/renderer/server.mjs
+ExecStartPre=/usr/bin/chmod 700 %t/augmentagent
+ExecStart=/usr/bin/python3 %h/AugmentAgent/scripts/start-sidecar.py renderer %t/augmentagent/renderer.sock /usr/bin/node %h/AugmentAgent/sidecars/renderer/server.mjs
 Restart=on-failure
 RestartSec=5
-StartLimitBurst=5
-StartLimitIntervalSec=60
 StandardOutput=append:%S/augmentagent/renderer.stdout.log
 StandardError=append:%S/augmentagent/renderer.stderr.log
 

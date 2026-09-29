@@ -234,8 +234,26 @@ func TestTwoClientsGetTheirOwnResponsesAndLifecycleEvents(t *testing.T) {
 	}
 }
 
+func shortSocketPath(t *testing.T) string {
+	t.Helper()
+	root, err := os.MkdirTemp("/tmp", "wa-sock-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(root); err != nil {
+			t.Error(err)
+		}
+	})
+	path := filepath.Join(root, "wa.sock")
+	if len(path) >= 100 {
+		t.Fatalf("socket fixture path is too long: %s", path)
+	}
+	return path
+}
+
 func TestSecondSidecarCannotReplaceActiveSocket(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "wa.sock")
+	sock := shortSocketPath(t)
 	owner, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatal(err)
@@ -253,7 +271,7 @@ func TestSecondSidecarCannotReplaceActiveSocket(t *testing.T) {
 }
 
 func TestSidecarCanReplaceStaleSocket(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "wa.sock")
+	sock := shortSocketPath(t)
 	stale, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatal(err)

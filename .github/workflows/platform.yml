@@ -95,6 +95,8 @@ jobs:
           fi
       - name: macOS parity inventory guard
         run: python3 -m unittest scripts.tests.macos_parity_inventory_test -v
+      - name: Sidecar installer and socket ownership contracts
+        run: python3 -m unittest scripts.tests.sidecar_launchd_test scripts.tests.sidecar_socket_owner_test -v
       - name: Updater + installer shell suites
         shell: bash
         run: |
@@ -104,5 +106,21 @@ jobs:
             bash "scripts/tests/$t.test.sh"
             echo "::endgroup::"
           done
+          bash scripts/tests/updater-rebuild-trigger.test.sh
       - name: Launchd installer contract tests
         run: python3 -m unittest scripts.tests.launchd_installers_test scripts.tests.scheduled_sync_installers_test -v
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Fetch sidecar protocol and synthetic page
+        working-directory: sidecars/fetch
+        run: |
+          npm ci
+          npm test
+      - name: Renderer synthetic media artifact
+        working-directory: sidecars/renderer
+        run: |
+          npm ci
+          node --input-type=module -e "import('@remotion/renderer').then(m => m.ensureBrowser())"
+          cd ../..
+          python3 -m unittest sidecars.renderer.test_smoke -v

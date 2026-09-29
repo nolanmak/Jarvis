@@ -46,13 +46,15 @@ STUB
 d="$STUB_DIR"
 for a in "$@"; do
   case "$a" in
-    list-unit-files) mode=list ;; show) mode=show ;;
+    list-unit-files) mode=list ;; cat) mode=cat ;; show) mode=show ;;
     restart) mode=restart ;; is-active) mode=active ;;
   esac
 done
 pidfile="$d/mainpid"
 [ -s "$pidfile" ] || echo 100 > "$pidfile"
 case "${mode:-}" in
+  # This fixture has no optional sidecar units installed.
+  cat)     exit 1 ;;
   # Answer per pattern: the tenant glob must NOT list the prod unit, or the
   # updater's tenant loop would "restart" augmentagent.service as a tenant.
   list)    case "$*" in *augmentagent-tenant-*) ;; *) echo "augmentagent.service enabled enabled" ;; esac; exit 0 ;;

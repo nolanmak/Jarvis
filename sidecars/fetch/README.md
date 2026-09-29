@@ -68,8 +68,13 @@ Response frame:
 
 ## Install + run
 
+For managed macOS operation, run `sidecars/fetch/setup.sh` and then
+`python3 scripts/install-sidecar.py fetch` from the repo root. Optional paid
+provider credentials belong in a private `~/.config/augmentagent/fetch.env`,
+not in a launchd plist. See [`docs/MACOS-SIDECARS.md`](../../docs/MACOS-SIDECARS.md).
+
 ```sh
-npm run fetch:install     # installs deps + Chromium
+npm run fetch:install     # npm ci, build + Chromium
 npm run fetch:build
 npm run fetch:sidecar     # starts the socket server
 npm run fetch:smoke https://example.com   # standalone in-process smoke test

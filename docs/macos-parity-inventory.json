@@ -1561,6 +1561,21 @@
     "evidence": null
   },
   {
+    "id": "installer:install-sidecar.py",
+    "source": "scripts/install-sidecar.py",
+    "linux_baseline": "Linux runs renderer and optional sidecars under user services.",
+    "macos_target": "Mac installs renderer, fetch and WhatsApp as private, restartable LaunchAgents.",
+    "prerequisites": [
+      "sidecar-specific pinned build",
+      "signed-in launchd user session",
+      "private socket and state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1256",
+    "test_plan": "Run sidecar_launchd_test on Mac and Linux, then verify real service health and restart on Mac.",
+    "status": "in_progress",
+    "evidence": null
+  },
+  {
     "id": "installer:install-tenant.sh",
     "source": "scripts/install-tenant.sh",
     "linux_baseline": "Linux install-tenant.sh installs or removes its matching component.",
@@ -1729,6 +1744,20 @@
     ],
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1257",
     "test_plan": "Run runpod-adapter-uninstall.test.sh in a disposable home, then verify real launchctl state and journal retention.",
+    "status": "in_progress",
+    "evidence": null
+  },
+  {
+    "id": "installer:uninstall-sidecar.sh",
+    "source": "scripts/uninstall-sidecar.sh",
+    "linux_baseline": "Linux removes optional user sidecar jobs without deleting sessions.",
+    "macos_target": "Mac removes only the selected LaunchAgent and retains private sessions and state.",
+    "prerequisites": [
+      "signed-in launchd user session",
+      "private test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1256",
+    "test_plan": "Run sidecar_launchd_test in a disposable home on Mac and Linux, then verify real launchctl state.",
     "status": "in_progress",
     "evidence": null
   },
@@ -3215,6 +3244,20 @@
     "evidence": null
   },
   {
+    "id": "unit:augmentagent-fetch.service",
+    "source": "systemd/augmentagent-fetch.service",
+    "linux_baseline": "Linux runs the layered fetch worker as a private user service.",
+    "macos_target": "Mac runs the same fetch protocol as a private, restartable LaunchAgent.",
+    "prerequisites": [
+      "Node 22 and pinned fetch build",
+      "private socket and optional credentials"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1256",
+    "test_plan": "Run sidecar launchd, updater and fetch socket contracts on native Mac and Linux; check real launchd health.",
+    "status": "in_progress",
+    "evidence": null
+  },
+  {
     "id": "unit:augmentagent-finance-sync.service",
     "source": "scripts/systemd/augmentagent-finance-sync.service",
     "linux_baseline": "Linux has the augmentagent-finance-sync.service systemd job with its current start/schedule and recovery behavior.",
@@ -3366,6 +3409,20 @@
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1250",
     "test_plan": "Install the equivalent of augmentagent-wiki-sync.timer in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
     "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-wa-sidecar.service",
+    "source": "systemd/augmentagent-wa-sidecar.service",
+    "linux_baseline": "Linux runs the WhatsApp linked-device worker as a private user service.",
+    "macos_target": "Mac runs the same worker as a private, restartable LaunchAgent without deleting sessions.",
+    "prerequisites": [
+      "pinned Go sidecar build",
+      "private socket and session store"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1256",
+    "test_plan": "Run Go wire and launcher contracts on native Mac and Linux; verify controlled test-account pairing separately.",
+    "status": "in_progress",
     "evidence": null
   },
   {

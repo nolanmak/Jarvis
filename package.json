@@ -13,7 +13,7 @@
     "pm2:stop": "pm2 stop augmentagent",
     "pm2:restart": "pm2 restart augmentagent",
     "pm2:logs": "pm2 logs augmentagent",
-    "fetch:install": "cd sidecars/fetch && npm install && npx playwright install chromium",
+    "fetch:install": "bash sidecars/fetch/setup.sh",
     "fetch:build": "cd sidecars/fetch && npm run build",
     "fetch:sidecar": "cd sidecars/fetch && npm start",
     "fetch:smoke": "cd sidecars/fetch && npm run smoke --"
