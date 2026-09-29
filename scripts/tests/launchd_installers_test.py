@@ -112,6 +112,14 @@ class LaunchdInstallerTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), before)
         self.assertNotIn("bootout", (self.root / "launchctl.log").read_text())
 
+    def test_selected_chain_from_dotenv_requires_only_selected_cli(self):
+        self.env.pop("AUGMENTAGENT_REASONER_CHAIN")
+        (self.repo / ".env").write_text("AUGMENTAGENT_REASONER_CHAIN='codex,cerebras'\n")
+        (self.bin / "claude").unlink()
+        data = self.install("autostart")
+        self.assertEqual(data["ProgramArguments"][-1], "true")
+        self.assertIn(str(self.bin), data["EnvironmentVariables"]["PATH"])
+
     def test_failed_bootstrap_restores_previous_plist(self):
         self.install("autostart")
         path = self.home / "Library/LaunchAgents" / f"{LABELS['autostart']}.plist"
