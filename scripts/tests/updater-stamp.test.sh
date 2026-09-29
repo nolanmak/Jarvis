@@ -45,13 +45,16 @@ STUB
 d="$SYSTEMCTL_STUB_DIR"
 for a in "$@"; do
   case "$a" in
-    list-unit-files) mode=list ;; show) mode=show ;;
+    list-unit-files) mode=list ;; cat) mode=cat ;; show) mode=show ;;
     restart) mode=restart ;; is-active) mode=active ;;
   esac
 done
 pidfile="$d/mainpid"
 [ -s "$pidfile" ] || echo 100 > "$pidfile"
 case "${mode:-}" in
+  # Optional sidecars are not installed in this fixture. The updater checks
+  # `systemctl --user cat` before rebuilding one.
+  cat)     exit 1 ;;
   list)    echo "augmentagent.service enabled enabled"; exit 0 ;;
   show)    cat "$pidfile"; exit 0 ;;
   # BOUNCES=1 models a real restart (new MainPID); BOUNCES=0 models the
@@ -92,11 +95,12 @@ grep -q "NOT writing the build stamp" "$TMP/state/augmentagent/update.log" \
 
 # The retry path: with the stamp absent, the next tick must try again rather
 # than reporting `up to date`. This is the property the old code destroyed.
-run_updater 1 >/dev/null 2>&1
+run_updater 1 >/dev/null 2>&1; retry_rc=$?
 if [ -s "$STAMP_FILE" ]; then
   ok "a later tick recovers and writes the stamp once the restart works"
 else
-  bad "a later tick recovers and writes the stamp once the restart works" "stamp still absent"
+  bad "a later tick recovers and writes the stamp once the restart works" \
+    "stamp still absent; retry exit $retry_rc; $(tail -n 8 "$TMP/state/augmentagent/update.log")"
 fi
 rm -rf "$TMP"
 
