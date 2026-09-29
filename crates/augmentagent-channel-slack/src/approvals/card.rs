@@ -222,7 +222,13 @@ pub fn card(input: &CardInput<'_>) -> (String, Value) {
             quote(&truncate(email.body.trim(), 1200))
         )));
     }
-    let draft_title = if merge { "*Proposal*" } else { "*Draft reply*" };
+    let draft_title = if merge {
+        "*Proposal*"
+    } else if compose {
+        "*Message*"
+    } else {
+        "*Draft reply*"
+    };
     let draft_text = if human.trim().is_empty() {
         "_(empty)_".to_string()
     } else {

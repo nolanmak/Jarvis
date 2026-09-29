@@ -1083,7 +1083,8 @@ impl SlackApprovals {
                 if let Err(e) = self.post_card(&action_id, &email, &body, None).await {
                     warn!(action_id, "slack compose: card not posted: {e}");
                     return format!(
-                        "The message to **{}** is waiting for approval, but its card could not                          be posted ({e}). Reply `approvals` to see it. Nothing was sent.",
+                        "The message to **{}** is waiting for approval, but its card could not \
+                         be posted ({e}). Reply `approvals` to see it. Nothing was sent.",
                         recipient.label()
                     );
                 }
@@ -1094,7 +1095,8 @@ impl SlackApprovals {
                     warn!(action_id, "slack compose: record_nudge failed: {e}");
                 }
                 format!(
-                    "Card posted for a new Slack message to **{}**. Check where it goes and who                      sends it; nothing is sent until you approve it (`approve {r}`).",
+                    "Card posted for a new Slack message to **{}**. Check where it goes and who \
+                     sends it; nothing is sent until you approve it (`approve {r}`).",
                     recipient.label()
                 )
             }
@@ -1107,7 +1109,8 @@ impl SlackApprovals {
             ComposeOutcome::Ambiguous { query, candidates } => {
                 let list: Vec<String> = candidates.iter().map(|c| format!("• {c}")).collect();
                 format!(
-                    "Which one? “{query}” matches:\n{}\nSay the full name or the page, e.g.                      `compose <page>: …`. Nothing was sent.",
+                    "Which one? “{query}” matches:\n{}\nSay the full name or the page, e.g. \
+                     `compose <page>: …`. Nothing was sent.",
                     list.join("\n")
                 )
             }

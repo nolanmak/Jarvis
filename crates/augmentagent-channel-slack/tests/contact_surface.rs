@@ -256,6 +256,8 @@ async fn a_compose_command_posts_a_card_showing_the_destination_and_sender_and_s
         .expect("a compose command is an approval command");
     assert!(reply.contains("Alice Example"), "{reply}");
     assert!(reply.contains("approve"), "{reply}");
+    // CLI QA found a line continuation that left a run of spaces.
+    assert!(!reply.contains("  "), "{reply:?}");
     let cards = h.cards();
     assert_eq!(cards.len(), 1);
     let card = &cards[0];
@@ -265,6 +267,8 @@ async fn a_compose_command_posts_a_card_showing_the_destination_and_sender_and_s
     assert!(card.contains(OWNER), "{card}");
     assert!(card.contains("never the app bot"), "{card}");
     assert!(card.contains("Can we move lunch to Thursday?"), "{card}");
+    assert!(card.contains("*Message*"), "a new message is not a reply: {card}");
+    assert!(!card.contains("Draft reply"), "{card}");
     assert!(h.contact_posts().is_empty(), "composing never sends");
     assert_eq!(h.pending().len(), 1);
 }
@@ -322,6 +326,7 @@ async fn an_ambiguous_name_prompts_and_an_unknown_name_fails_closed() {
         "{ask}"
     );
     assert!(ask.contains("Which"), "{ask}");
+    assert!(!ask.contains("  "), "{ask:?}");
     let no = h
         .approvals
         .handle_command("compose Zed Nobody: hi")
