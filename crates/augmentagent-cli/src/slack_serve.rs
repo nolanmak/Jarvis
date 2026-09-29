@@ -18,6 +18,12 @@
 //! conversation (DM, DM thread, channel thread) that follow-ups resume.
 //! [`build_surface`] turns on the throttled status line (with its `cancel`
 //! hint) and the owner-file pipeline under `<state dir>/slack-inbound`.
+//!
+//! #1289 — [`build_approvals`] turns the same plan into the Slack approval
+//! surface: cards go to the owner's DM (or the bound control channel, see
+//! `approval_routing`), and the surface routes card clicks, modals and
+//! approval text commands to it. `serve` plans once ([`plan_from_env`]) so
+//! the credential store is read once for both.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -315,31 +321,105 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Read the switch, the installed apps and the owner bindings (off the
+/// runtime: the credential store may block on the Keychain).
+pub async fn plan_from_env(store: Arc<Store>) -> Result<Plan> {
+    Ok(tokio::task::spawn_blocking(move || {
+        let api_base = std::env::var(SLACK_API_BASE_ENV).ok();
+        plan(
+            Switch::from_env(),
+            &SlackAppStore::default_store(),
+            &store,
+            api_base.as_deref(),
+        )
+    })
+    .await?)
+}
+
+/// #1289 — the Slack approval surface for a ready plan: the first bound
+/// install (sorted by team), posting to the owner's DM or the bound control
+/// channel. `Ok(None)` when the plan is not ready. A DM that was never
+/// recorded is opened with `conversations.open` (and recorded by the owner
+/// binding the next time the owner writes).
+pub async fn build_approvals(
+    store: Arc<Store>,
+    plan: &Plan,
+    channel: crate::approval_routing::SlackChannel,
+    surfaces: augmentagent_approval_discord::CardSurfaces,
+) -> Result<Option<Arc<augmentagent_channel_slack::approvals::SlackApprovals>>> {
+    use augmentagent_channel_slack::approvals::{SlackApprovalConfig, SlackApprovals};
+    let Plan::Ready { installs, api_base } = plan else {
+        return Ok(None);
+    };
+    let Some(install) = installs
+        .iter()
+        .min_by(|a, b| a.creds.team_id.cmp(&b.creds.team_id))
+    else {
+        return Ok(None);
+    };
+    let web: Arc<dyn SlackWebApi> = Arc::new(HttpSlackWebApi::new(
+        install.creds.bot_token.clone(),
+        WebApiConfig {
+            base_url: api_base.clone(),
+            ..WebApiConfig::default()
+        },
+    )?);
+    let binding = find_binding(&store, &install.creds.team_id)?
+        .ok_or_else(|| anyhow::anyhow!("no owner is bound for {}", install.creds.team_id))?;
+    let destination = match channel {
+        crate::approval_routing::SlackChannel::Control => binding
+            .control_channel()
+            .map(|c| c.conversation_id().to_string())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} is `control` but no control channel is bound; run `augmentagent slack \
+                     app owner control set --channel <id>` or use `dm`",
+                    crate::approval_routing::SLACK_CHANNEL_ENV
+                )
+            })?,
+        crate::approval_routing::SlackChannel::Dm => match binding.direct_conversation() {
+            Some(dm) => dm.conversation_id().to_string(),
+            None => web
+                .open_direct_conversation(binding.owner.sender_id())
+                .await
+                .map_err(|e| anyhow::anyhow!("could not open the owner's DM for approvals: {e}"))?,
+        },
+    };
+    info!(team = %install.creds.team_id, channel = %destination, "slack approvals: cards go here");
+    Ok(Some(Arc::new(SlackApprovals::new(
+        store,
+        web,
+        SlackApprovalConfig {
+            workspace: install.workspace.clone(),
+            channel: destination,
+        },
+        surfaces,
+    ))))
+}
+
 /// Plan, build and run the interactive surface as one supervised `serve`
 /// task. Whatever happens, the task ends `Ok` (see [`supervise`]); an
 /// inactive or failed surface is reported through `status`.
 ///
 /// `make_handler` runs only when the surface will start, so an unconfigured
 /// box never builds a reasoner for it.
+///
+/// `planned` is the plan `serve` already made (to build the approval
+/// surface); `None` plans here. `approvals`, when set, receives card
+/// clicks, modal submissions and approval text commands.
 pub fn spawn(
     store: Arc<Store>,
+    planned: Option<Plan>,
     make_handler: impl FnOnce() -> Arc<dyn SlackTurnHandler> + Send + 'static,
+    approvals: Option<Arc<augmentagent_channel_slack::approvals::SlackApprovals>>,
     dry_run: bool,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<Result<()>> {
     supervise("slack interactive surface", async move {
-        let plan_store = Arc::clone(&store);
-        // The credential store may block (Keychain), so plan off the runtime.
-        let decided = tokio::task::spawn_blocking(move || {
-            let api_base = std::env::var(SLACK_API_BASE_ENV).ok();
-            plan(
-                Switch::from_env(),
-                &SlackAppStore::default_store(),
-                &plan_store,
-                api_base.as_deref(),
-            )
-        })
-        .await?;
+        let decided = match planned {
+            Some(p) => p,
+            None => plan_from_env(Arc::clone(&store)).await?,
+        };
         let (installs, api_base) = match decided {
             Plan::Inactive {
                 state,
@@ -403,6 +483,10 @@ pub fn spawn(
                 )?;
                 anyhow::bail!(detail);
             }
+        };
+        let surface = match approvals {
+            Some(a) => surface.with_approvals(a),
+            None => surface,
         };
         surface.run(shutdown).await
     })

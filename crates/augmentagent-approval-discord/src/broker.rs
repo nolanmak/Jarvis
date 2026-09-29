@@ -5,14 +5,16 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serenity::all::{ChannelId, GatewayIntents, MessageId, UserId};
+use serenity::all::{ChannelId, EditMessage, GatewayIntents, MessageId, UserId};
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
 use augmentagent_store::{Email, Store};
 
 use crate::event_handler::Handler;
-use crate::layout::{approval_message, flag_notice_message, scheduled_notice_message};
+use crate::layout::{
+    approval_edit_message, approval_message, flag_notice_message, scheduled_notice_message,
+};
 use crate::loops::LoopCommandParser;
 use crate::voice_bridge::VoiceBridge;
 use crate::{ApprovalActionHandler, ApprovalBroker, ApprovalError, JournalOps, QueryHandler};
@@ -125,6 +127,9 @@ impl BrokerState {
 pub struct DiscordApprovalBroker {
     http: Arc<serenity::http::Http>,
     channel_id: ChannelId,
+    /// #1289 — read when another surface decided an action, to redraw the
+    /// Discord card from the action's current state. `None`: no redraw.
+    store: Option<Arc<Store>>,
 }
 
 impl DiscordApprovalBroker {
@@ -209,6 +214,7 @@ impl DiscordApprovalBroker {
         Ok(Self {
             http,
             channel_id: approval_channel,
+            store: config.store.clone(),
         })
     }
 }
@@ -299,5 +305,56 @@ impl ApprovalBroker for DiscordApprovalBroker {
             .delete_message(&*self.http, MessageId::new(message_id))
             .await
             .map_err(|e| ApprovalError::Discord(e.to_string()))
+    }
+}
+
+/// #1289 — a decision taken on another surface (Slack) redraws the Discord
+/// card in place: a still-pending action (a revise elsewhere) gets the
+/// current draft; a decided one loses its buttons and says what happened,
+/// with the #1199 recovery pointer for a superseded draft. The card is found
+/// the same way the startup sweep finds it (its button IDs in the last 100
+/// channel messages), so no Discord message ID has to be stored. A card
+/// Discord itself resolved is already gone and is simply not found.
+#[async_trait]
+impl crate::sync::ApprovalCardSurface for DiscordApprovalBroker {
+    fn surface_name(&self) -> &'static str {
+        "discord"
+    }
+
+    async fn redraw_cards(&self, action_id: &str, origin: &str) {
+        let Some(store) = self.store.as_deref() else {
+            return;
+        };
+        let row = match store.get_action_with_email(action_id) {
+            Ok(Some(row)) => row,
+            Ok(None) => return,
+            Err(e) => {
+                warn!(action_id, "discord redraw: could not load the action: {e}");
+                return;
+            }
+        };
+        let status = row.action.status.as_str();
+        let edit =
+            match crate::outcome::card_status_line(status, row.action.error_message.as_deref()) {
+                None => {
+                    let count = store.redraft_count(action_id).unwrap_or(0);
+                    let draft = crate::append_envelope_markers(
+                        row.action.draft_body.clone().unwrap_or_default(),
+                        Some(store),
+                        action_id,
+                        &row.email.from,
+                        None,
+                    );
+                    approval_edit_message(action_id, &row.email, &draft, count)
+                }
+                Some(line) => EditMessage::new()
+                    .content(format!("{line} _(decided on {origin})_"))
+                    .components(vec![]),
+            };
+        match crate::edit_card_for_action(&self.http, self.channel_id, action_id, edit).await {
+            Ok(true) => info!(action_id, origin, "discord card redrawn"),
+            Ok(false) => {}
+            Err(e) => warn!(action_id, "discord redraw failed: {e:#}"),
+        }
     }
 }

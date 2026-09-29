@@ -16,6 +16,8 @@
 
 pub mod api;
 pub mod app;
+// #1289 — the approval workflow on Slack (cards, clicks, modals, commands).
+pub mod approvals;
 pub mod auth;
 pub mod channel;
 pub mod delivery;

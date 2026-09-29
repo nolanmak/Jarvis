@@ -866,6 +866,8 @@ impl Store {
         crate::owner::migrate(conn)?;
         // #1287 — live listener health reported by interactive surfaces.
         crate::surface_health::migrate(conn)?;
+        // #1289 — approval-card pointers per surface.
+        crate::approval_cards::migrate(conn)?;
         // -------------------------------------------------------------------
         // #45 — Rust-owned schema. Mirrors `src/db.ts::initDb()` exactly
         // (column names, types, NOT NULL, DEFAULT, PRIMARY KEY). Do NOT
@@ -4088,7 +4090,8 @@ impl Store {
                     COALESCE(a.originalBody, ''), \
                     (a.draftBody IS NULL OR TRIM(a.draftBody, ' \t\r\n') = ''), \
                     e.receivedAt, \
-                    (a.recomposedAtMs IS NOT NULL) \
+                    (a.recomposedAtMs IS NOT NULL), \
+                    COALESCE(e.platform, '') \
                FROM actions a \
                LEFT JOIN emails e ON a.messageId = e.messageId \
               WHERE a.status = 'pending' \
@@ -4106,6 +4109,7 @@ impl Store {
                 draft_empty: r.get(5)?,
                 received_at: r.get(6)?,
                 recomposed: r.get(7)?,
+                platform: r.get(8)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -8276,6 +8280,10 @@ pub struct PendingActionRow {
     /// Rule 2 for it: the owner explicitly overrode the auto-retirement, so it
     /// must survive the next tick. Per-row, never a global switch.
     pub recomposed: bool,
+    /// #1289 — the inbound's platform (`emails.platform`; empty when the
+    /// join finds no email). The bulk-sender rule reads an email address,
+    /// which a Slack contact's `from` never is.
+    pub platform: String,
 }
 
 /// #48 — the three code-mode columns on `actions`, returned by
