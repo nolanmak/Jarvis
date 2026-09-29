@@ -1185,7 +1185,7 @@
       "selected feature credentials or synthetic fixtures"
     ],
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
-    "test_plan": "Run augmentagent slack --help on both hosts, then add a synthetic behavior/guard test for this command. Nested `slack app manifest|install|verify|status|rotate|remove` (#1284): cargo test -p augmentagent-cli --test slack_app_cli (mock Slack, file credential store) on both hosts; Keychain access from a launchd daemon still needs a real-Mac check (#1246).",
+    "test_plan": "Run augmentagent slack --help on both hosts, then add a synthetic behavior/guard test for this command. Nested `slack app manifest|install|verify|status|rotate|remove` (#1284): cargo test -p augmentagent-cli --test slack_app_cli (mock Slack, file credential store) on both hosts; Keychain access from a launchd daemon still needs a real-Mac check (#1246). Nested `slack app owner bind|show|unbind` and `slack app owner control set|remove` (#1286): same test file plus cargo test -p augmentagent-channel-slack --test owner_setup --test owner_auth on both hosts; owner binding lives in the shared database, so no host-specific path or credential.",
     "status": "unverified",
     "evidence": null
   },

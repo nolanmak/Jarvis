@@ -59,6 +59,8 @@ Source: https://docs.slack.dev/apis/events-api/using-socket-mode (checked
   `chat:write` (`chat.postMessage`, `chat.update`, `chat.delete`,
   `chat.postEphemeral`), `reactions:write`, `users:read` (`users.info`),
   `channels:read`/`groups:read`/`im:read`/`mpim:read` (`conversations.info`),
+  `im:write` (`conversations.open` for the owner's DM, #1286; from the
+  method's reference page, not yet exercised live),
   `files:write`/`files:read` (#1293/#1294). `views.open` and `views.update`
   are listed with "No scopes required". Event subscriptions need the matching
   `*:history` scopes (`channels:history`, `groups:history`, `im:history`,
