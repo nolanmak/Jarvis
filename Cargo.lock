@@ -310,6 +310,7 @@ name = "augmentagent-auth"
 version = "0.1.0"
 dependencies = [
  "keyring",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
 ]

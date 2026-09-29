@@ -9,8 +9,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use augmentagent_channel_slack::transport::token::BotToken;
 use augmentagent_channel_slack::transport::web::{
-    HttpSlackWebApi, PostEphemeral, PostMessage, RecordedCall, RecordingSlackWebApi, SlackWebApi,
-    Sleeper, UpdateMessage, WebApiConfig, WebApiError,
+    AuthTest, HttpSlackWebApi, PostEphemeral, PostMessage, RecordedCall, RecordingSlackWebApi,
+    SlackWebApi, Sleeper, UpdateMessage, WebApiConfig, WebApiError,
 };
 use mockito::Matcher;
 use serde_json::json;
@@ -534,4 +534,129 @@ async fn recording_fake_records_calls_and_replays_scripted_results() {
     assert!(matches!(&calls[0], RecordedCall::PostMessage(m) if m.channel == "C404"));
     assert!(matches!(&calls[1], RecordedCall::PostMessage(m) if m.text == "hi"));
     assert!(matches!(&calls[2], RecordedCall::AddReaction { name, .. } if name == "eyes"));
+}
+
+// ---------------------------------------------------------------------------
+// #1284 — auth.test: identity + granted scopes for install/verify.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn auth_test_reports_identity_and_granted_scopes_from_the_header() {
+    let mut server = mockito::Server::new_async().await;
+    let mock = server
+        .mock("POST", "/auth.test")
+        .match_header("authorization", format!("Bearer {BOT}").as_str())
+        .with_status(200)
+        .with_header("x-oauth-scopes", "chat:write, users:read,app_mentions:read")
+        .with_body(
+            json!({
+                "ok": true,
+                "url": "https://example-test.slack.com/",
+                "team": "Example Test",
+                "user": "jarvis",
+                "team_id": "T00000001",
+                "user_id": "U00000001",
+                "bot_id": "B00000001",
+                "is_enterprise_install": false
+            })
+            .to_string(),
+        )
+        .create_async()
+        .await;
+
+    let api = client(&server, Arc::new(RecordingSleeper::default()));
+    let who = api.auth_test().await.expect("auth.test");
+    assert_eq!(
+        who,
+        AuthTest {
+            team_id: "T00000001".into(),
+            team: Some("Example Test".into()),
+            url: Some("https://example-test.slack.com/".into()),
+            user_id: "U00000001".into(),
+            user: Some("jarvis".into()),
+            bot_id: Some("B00000001".into()),
+            app_id: None,
+            enterprise_id: None,
+            scopes: Some(vec![
+                "chat:write".into(),
+                "users:read".into(),
+                "app_mentions:read".into()
+            ]),
+        }
+    );
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn auth_test_without_scope_header_reports_scopes_unknown() {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("POST", "/auth.test")
+        .with_body(json!({"ok": true, "team_id": "T00000001", "user_id": "U00000001"}).to_string())
+        .create_async()
+        .await;
+    let api = client(&server, Arc::new(RecordingSleeper::default()));
+    let who = api.auth_test().await.expect("auth.test");
+    assert_eq!(who.scopes, None);
+    assert_eq!(who.bot_id, None);
+}
+
+#[tokio::test]
+async fn auth_test_revoked_token_is_a_typed_slack_error_without_the_token() {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("POST", "/auth.test")
+        .with_body(json!({"ok": false, "error": "invalid_auth"}).to_string())
+        .expect(1)
+        .create_async()
+        .await;
+    let api = client(&server, Arc::new(RecordingSleeper::default()));
+    let err = api.auth_test().await.unwrap_err();
+    assert!(
+        matches!(&err, WebApiError::Slack { error, .. } if error == "invalid_auth"),
+        "{err:?}"
+    );
+    assert!(!format!("{err} {err:?}").contains(BOT));
+}
+
+#[tokio::test]
+async fn auth_test_missing_team_or_user_is_rejected() {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("POST", "/auth.test")
+        .with_body(json!({"ok": true}).to_string())
+        .create_async()
+        .await;
+    let api = client(&server, Arc::new(RecordingSleeper::default()));
+    assert!(matches!(
+        api.auth_test().await.unwrap_err(),
+        WebApiError::Json(_)
+    ));
+}
+
+#[tokio::test]
+async fn recording_fake_auth_test_is_scriptable_and_recorded() {
+    let fake = RecordingSlackWebApi::default();
+    let default = fake.auth_test().await.unwrap();
+    assert_eq!(default.team_id, "T00000001");
+    assert_eq!(default.user_id, "U00000001");
+    let scripted = AuthTest {
+        team_id: "T00000002".into(),
+        scopes: Some(vec!["chat:write".into()]),
+        ..default.clone()
+    };
+    fake.set_auth_test(scripted.clone());
+    assert_eq!(fake.auth_test().await.unwrap(), scripted);
+    fake.push_error(WebApiError::Slack {
+        error: "token_revoked".into(),
+        warning: None,
+    });
+    assert!(fake.auth_test().await.is_err());
+    assert_eq!(
+        fake.calls()
+            .iter()
+            .filter(|c| matches!(c, RecordedCall::AuthTest))
+            .count(),
+        3
+    );
 }
