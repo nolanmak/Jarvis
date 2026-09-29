@@ -96,6 +96,42 @@ pub struct WaMessage {
     /// device). These are filtered before triage.
     #[serde(default)]
     pub from_me: bool,
+    #[serde(flatten)]
+    pub metadata: WaMessageMetadata,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct WaMessageMetadata {
+    /// Message being quoted, or the target of a revoke event.
+    #[serde(default)]
+    pub quoted_message_id: String,
+    #[serde(default)]
+    pub mentioned_jids: Vec<String>,
+    #[serde(default)]
+    pub media: Option<WaMediaDescriptor>,
+    #[serde(default)]
+    pub is_edit: bool,
+    #[serde(default)]
+    pub is_revoke: bool,
+    #[serde(default)]
+    pub is_view_once: bool,
+    #[serde(default)]
+    pub is_ephemeral: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WaMediaDescriptor {
+    pub kind: String,
+    #[serde(default)]
+    pub mime_type: String,
+    #[serde(default)]
+    pub file_name: String,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub duration_secs: u32,
+    #[serde(default)]
+    pub voice_note: bool,
 }
 
 impl WaMessage {
@@ -156,7 +192,9 @@ pub struct WaContact {
 #[serde(tag = "event", rename_all = "kebab-case")]
 pub enum WaEvent {
     /// QR code string to render during pairing (`whatsapp login`).
-    Qr { code: String },
+    Qr {
+        code: String,
+    },
     /// Device paired successfully; carries the linked device + user JIDs.
     PairSuccess {
         device_jid: String,
@@ -164,12 +202,22 @@ pub enum WaEvent {
     },
     /// Socket connected / authenticated.
     Connected,
+    Disconnected,
     /// Server logged the device out — creds are dead, re-pair required.
-    LoggedOut { reason: String },
+    LoggedOut {
+        reason: String,
+    },
     /// A new inbound (or our own outbound) message.
     ReceivedMessage {
         #[serde(flatten)]
         message: WaMessage,
+    },
+    Receipt {
+        chat: Jid,
+        sender: Jid,
+        message_ids: Vec<String>,
+        receipt_type: String,
+        timestamp: i64,
     },
 }
 
@@ -216,9 +264,14 @@ mod tests {
     #[test]
     fn message_identity_survives_redelivery_but_separates_turns() {
         let mut message = WaMessage {
-            id: "synthetic-turn-one".into(), chat: Jid::new("fixture:1@example.invalid"),
-            sender: Jid::new("fixture@example.invalid"), push_name: String::new(),
-            text: "same request".into(), timestamp: 1, from_me: false,
+            id: "synthetic-turn-one".into(),
+            chat: Jid::new("fixture:1@example.invalid"),
+            sender: Jid::new("fixture@example.invalid"),
+            push_name: String::new(),
+            text: "same request".into(),
+            timestamp: 1,
+            from_me: false,
+            metadata: WaMessageMetadata::default(),
         };
         let first = message.stable_id();
         message.chat = Jid::new("fixture:2@example.invalid");
@@ -260,6 +313,7 @@ mod tests {
             text: "hey, free thursday?".into(),
             timestamp: 1776630000,
             from_me: false,
+            metadata: WaMessageMetadata::default(),
         };
         let email = m.into_email("15559998888");
         assert_eq!(email.message_id, "wa:15551234567@s.whatsapp.net:3EB0ABCDEF");
@@ -288,6 +342,7 @@ mod tests {
             text: "hi".into(),
             timestamp: 0,
             from_me: false,
+            metadata: WaMessageMetadata::default(),
         };
         let email = m.into_email("15559998888");
         assert!(email.from.starts_with("15551234567 <whatsapp:"));
@@ -336,6 +391,7 @@ mod tests {
             text: "sent by me".into(),
             timestamp: 0,
             from_me: true,
+            metadata: WaMessageMetadata::default(),
         };
         assert!(m.is_outbound());
     }

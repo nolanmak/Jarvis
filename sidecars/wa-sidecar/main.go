@@ -7,32 +7,32 @@
 //
 // Wire protocol — see crates/augmentagent-channel-whatsapp/src/api.rs:
 //
-//	Request  : {"request_id":"<uuid>","op":"<name>","params":{...}}
-//	Success  : {"request_id":"...","ok":true,"result":{...}}
-//	Failure  : {"request_id":"...","ok":false,
+//	Request  : {"version":1,"request_id":"<uuid>","op":"<name>","params":{...}}
+//	Success  : {"version":1,"request_id":"...","ok":true,"result":{...}}
+//	Failure  : {"version":1,"request_id":"...","ok":false,
 //	            "error":{"kind":"NotPaired"|"NotConnected"|"SendFailed"
-//	                           |"BadRequest"|"Internal","message":"..."}}
+//	                           |"BadRequest"|"Unavailable"|"Internal","message":"..."}}
 //
 //	Events (sidecar-initiated, no request_id):
-//	  {"event":"qr","code":"2@..."}
-//	  {"event":"pair-success","device_jid":"...","user_jid":"..."}
-//	  {"event":"connected"}
-//	  {"event":"logged-out","reason":"..."}
-//	  {"event":"received-message","id":"...","chat":"...","sender":"...",
+//	  {"version":1,"event":"qr","code":"2@..."}
+//	  {"version":1,"event":"pair-success","device_jid":"...","user_jid":"..."}
+//	  {"version":1,"event":"connected"}
+//	  {"version":1,"event":"disconnected"}
+//	  {"version":1,"event":"logged-out","reason":"..."}
+//	  {"version":1,"event":"received-message","id":"...","chat":"...","sender":"...",
 //	   "push_name":"...","text":"...","timestamp":1700000000,"from_me":false}
+//	  {"version":1,"event":"receipt","chat":"...","message_ids":["..."],...}
 //
 // Ops: status, list_chats, fetch_history, send_text.
 //
 // Lifecycle: on first run with no stored session the sidecar emits `qr`
-// events (the CLI renders them); after the phone scans, whatsmeow persists
-// the session to its SQLite store and emits `pair-success`. Subsequent runs
-// reconnect silently. A server-side logout emits `logged-out` and the Rust
-// side flips the whatsapp_devices row to logged_out.
+// events and retains the latest one for the pairing CLI (#1228). It never
+// logs a QR. On pairing, whatsmeow persists the session and emits
+// `pair-success`; subsequent starts reconnect. Server logout emits `logged-out`.
 //
-// Concurrency: one accepted connection at a time (the daemon is the only
-// client). Each request line is dispatched on its own goroutine so a slow
-// fetch_history doesn't head-of-line block a send_text; the write side is
-// serialized by a mutex.
+// Concurrency: one accepted connection at a time. Each request line is
+// dispatched on its own goroutine; writes are serialized by a mutex.
+// Daemon/CLI multiplexing and durable replay are tracked in #1229.
 package main
 
 import (
@@ -44,13 +44,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -69,11 +68,30 @@ func socketPath() string {
 	runtime := os.Getenv("XDG_RUNTIME_DIR")
 	if runtime == "" {
 		runtime = fmt.Sprintf("/run/user/%d", os.Getuid())
-		if _, err := os.Stat(runtime); err != nil {
-			runtime = "/tmp"
+		if info, err := os.Stat(runtime); err != nil || !info.IsDir() {
+			return filepath.Join(fmt.Sprintf("/tmp/augmentagent-%d", os.Getuid()), "wa.sock")
 		}
 	}
 	return filepath.Join(runtime, "augmentagent", "wa.sock")
+}
+
+// The WhatsApp session and socket must be inaccessible to other local users.
+// Reject a symlink at the leaf rather than chmoding its target.
+func privateDirectory(path string) error {
+	if err := os.MkdirAll(path, 0700); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is not a private directory", path)
+	}
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Uid != uint32(os.Getuid()) {
+		return fmt.Errorf("%s is owned by another user", path)
+	}
+	return os.Chmod(path, 0700)
 }
 
 // Session store path. whatsmeow persists the Noise device keys here; this is
@@ -96,6 +114,7 @@ func storePath() string {
 // ---------------------------------------------------------------------------
 
 type rpcRequest struct {
+	Version   int             `json:"version"`
 	RequestID string          `json:"request_id"`
 	Op        string          `json:"op"`
 	Params    json.RawMessage `json:"params"`
@@ -107,6 +126,7 @@ type rpcError struct {
 }
 
 type rpcResponse struct {
+	Version   int         `json:"version"`
 	RequestID string      `json:"request_id"`
 	OK        bool        `json:"ok"`
 	Result    interface{} `json:"result,omitempty"`
@@ -122,6 +142,7 @@ type sidecar struct {
 	// writeMu serializes all frames written to the active connection.
 	writeMu sync.Mutex
 	conn    net.Conn
+	lastQR  string
 	logger  waLog.Logger
 }
 
@@ -133,25 +154,44 @@ func (s *sidecar) writeFrame(v interface{}) {
 	}
 	b, err := json.Marshal(v)
 	if err != nil {
-		s.logger.Errorf("marshal frame: %v", err)
+		if s.logger != nil {
+			s.logger.Errorf("marshal frame: %v", err)
+		}
 		return
 	}
 	b = append(b, '\n')
+	_ = s.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if _, err := s.conn.Write(b); err != nil {
-		s.logger.Warnf("write frame: %v", err)
+		if s.logger != nil {
+			s.logger.Warnf("write frame: %v", err)
+		}
 	}
 }
 
 func (s *sidecar) emitEvent(ev map[string]interface{}) {
+	ev["version"] = 1
+	if ev["event"] == "qr" {
+		if code, ok := ev["code"].(string); ok {
+			s.writeMu.Lock()
+			s.lastQR = code
+			s.writeMu.Unlock()
+		}
+	}
+	if ev["event"] == "pair-success" || ev["event"] == "logged-out" {
+		s.writeMu.Lock()
+		s.lastQR = ""
+		s.writeMu.Unlock()
+	}
 	s.writeFrame(ev)
 }
 
 func (s *sidecar) ok(reqID string, result interface{}) {
-	s.writeFrame(rpcResponse{RequestID: reqID, OK: true, Result: result})
+	s.writeFrame(rpcResponse{Version: 1, RequestID: reqID, OK: true, Result: result})
 }
 
 func (s *sidecar) fail(reqID, kind, msg string) {
 	s.writeFrame(rpcResponse{
+		Version:   1,
 		RequestID: reqID,
 		OK:        false,
 		Error:     &rpcError{Kind: kind, Message: msg},
@@ -167,18 +207,55 @@ func (s *sidecar) handleWAEvent(rawEvt interface{}) {
 	switch evt := rawEvt.(type) {
 	case *events.Message:
 		text := extractText(evt)
+		contextInfo := messageContext(evt.Message)
+		var quotedID string
+		var mentions []string
+		if contextInfo != nil {
+			quotedID = contextInfo.GetStanzaID()
+			mentions = contextInfo.GetMentionedJID()
+		}
+		if mentions == nil {
+			mentions = []string{}
+		}
+		protocol := evt.Message.GetProtocolMessage()
+		isRevoke := protocol != nil && protocol.GetType() == waE2E.ProtocolMessage_REVOKE
+		if isRevoke {
+			quotedID = protocol.GetKey().GetID()
+		}
 		s.emitEvent(map[string]interface{}{
-			"event":     "received-message",
-			"id":        evt.Info.ID,
-			"chat":      evt.Info.Chat.String(),
-			"sender":    evt.Info.Sender.String(),
-			"push_name": evt.Info.PushName,
-			"text":      text,
-			"timestamp": evt.Info.Timestamp.Unix(),
-			"from_me":   evt.Info.IsFromMe,
+			"event":             "received-message",
+			"id":                evt.Info.ID,
+			"chat":              evt.Info.Chat.String(),
+			"sender":            evt.Info.Sender.String(),
+			"push_name":         evt.Info.PushName,
+			"text":              text,
+			"timestamp":         evt.Info.Timestamp.Unix(),
+			"from_me":           evt.Info.IsFromMe,
+			"quoted_message_id": quotedID,
+			"mentioned_jids":    mentions,
+			"media":             mediaDescriptor(evt.Message),
+			"is_edit":           evt.IsEdit,
+			"is_revoke":         isRevoke,
+			"is_view_once":      evt.IsViewOnce || evt.IsViewOnceV2 || evt.IsViewOnceV2Extension,
+			"is_ephemeral":      evt.IsEphemeral,
+		})
+	case *events.Receipt:
+		ids := make([]string, len(evt.MessageIDs))
+		for i, id := range evt.MessageIDs {
+			ids[i] = string(id)
+		}
+		s.emitEvent(map[string]interface{}{
+			"event":        "receipt",
+			"chat":         evt.Chat.String(),
+			"sender":       evt.Sender.String(),
+			"message_ids":  ids,
+			"receipt_type": receiptTypeName(evt.Type),
+			"timestamp":    evt.Timestamp.Unix(),
 		})
 	case *events.Connected:
 		s.emitEvent(map[string]interface{}{"event": "connected"})
+	case *events.Disconnected:
+		s.emitEvent(map[string]interface{}{"event": "disconnected"})
 	case *events.PairSuccess:
 		s.emitEvent(map[string]interface{}{
 			"event":      "pair-success",
@@ -193,8 +270,27 @@ func (s *sidecar) handleWAEvent(rawEvt interface{}) {
 	}
 }
 
-// extractText pulls the plain body out of the message protobuf. We only care
-// about conversation + extendedTextMessage (v1 scope: text DMs only).
+func receiptTypeName(kind types.ReceiptType) string {
+	switch kind {
+	case types.ReceiptTypeDelivered:
+		return "delivered"
+	case types.ReceiptTypeRead:
+		return "read"
+	case types.ReceiptTypeReadSelf:
+		return "read-self"
+	case types.ReceiptTypePlayed:
+		return "played"
+	case types.ReceiptTypeRetry:
+		return "retry"
+	case types.ReceiptTypeSender:
+		return "sender"
+	default:
+		return string(kind)
+	}
+}
+
+// extractText preserves captions so a media-only message still has the text
+// its sender wrote. The media descriptor travels separately.
 func extractText(evt *events.Message) string {
 	m := evt.Message
 	if m == nil {
@@ -206,7 +302,63 @@ func extractText(evt *events.Message) string {
 	if e := m.GetExtendedTextMessage(); e != nil {
 		return e.GetText()
 	}
+	if image := m.GetImageMessage(); image != nil {
+		return image.GetCaption()
+	}
+	if document := m.GetDocumentMessage(); document != nil {
+		return document.GetCaption()
+	}
+	if video := m.GetVideoMessage(); video != nil {
+		return video.GetCaption()
+	}
 	return ""
+}
+
+func messageContext(m *waE2E.Message) *waE2E.ContextInfo {
+	if m == nil {
+		return nil
+	}
+	if v := m.GetExtendedTextMessage(); v != nil {
+		return v.GetContextInfo()
+	}
+	if v := m.GetImageMessage(); v != nil {
+		return v.GetContextInfo()
+	}
+	if v := m.GetDocumentMessage(); v != nil {
+		return v.GetContextInfo()
+	}
+	if v := m.GetVideoMessage(); v != nil {
+		return v.GetContextInfo()
+	}
+	if v := m.GetAudioMessage(); v != nil {
+		return v.GetContextInfo()
+	}
+	if v := m.GetStickerMessage(); v != nil {
+		return v.GetContextInfo()
+	}
+	return nil
+}
+
+func mediaDescriptor(m *waE2E.Message) interface{} {
+	if m == nil {
+		return nil
+	}
+	if v := m.GetImageMessage(); v != nil {
+		return map[string]interface{}{"kind": "image", "mime_type": v.GetMimetype(), "size": v.GetFileLength()}
+	}
+	if v := m.GetDocumentMessage(); v != nil {
+		return map[string]interface{}{"kind": "document", "mime_type": v.GetMimetype(), "file_name": v.GetFileName(), "size": v.GetFileLength()}
+	}
+	if v := m.GetVideoMessage(); v != nil {
+		return map[string]interface{}{"kind": "video", "mime_type": v.GetMimetype(), "size": v.GetFileLength(), "duration_secs": v.GetSeconds()}
+	}
+	if v := m.GetAudioMessage(); v != nil {
+		return map[string]interface{}{"kind": "audio", "mime_type": v.GetMimetype(), "size": v.GetFileLength(), "duration_secs": v.GetSeconds(), "voice_note": v.GetPTT()}
+	}
+	if v := m.GetStickerMessage(); v != nil {
+		return map[string]interface{}{"kind": "sticker", "mime_type": v.GetMimetype(), "size": v.GetFileLength()}
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +366,10 @@ func extractText(evt *events.Message) string {
 // ---------------------------------------------------------------------------
 
 func (s *sidecar) dispatch(req rpcRequest) {
+	if req.Version != 1 {
+		s.fail(req.RequestID, "BadRequest", "unsupported protocol version")
+		return
+	}
 	switch req.Op {
 	case "status":
 		s.opStatus(req)
@@ -229,6 +385,12 @@ func (s *sidecar) dispatch(req rpcRequest) {
 }
 
 func (s *sidecar) opStatus(req rpcRequest) {
+	if s.client == nil {
+		s.ok(req.RequestID, map[string]interface{}{
+			"paired": false, "connected": false, "device_jid": "",
+		})
+		return
+	}
 	paired := s.client.Store.ID != nil
 	connected := s.client.IsConnected()
 	var deviceJID string
@@ -250,14 +412,16 @@ func (s *sidecar) opListChats(req rpcRequest) {
 	if p.Limit <= 0 {
 		p.Limit = 50
 	}
-	if s.client.Store.ID == nil {
+	if s.client == nil || s.client.Store.ID == nil {
 		s.fail(req.RequestID, "NotPaired", "no linked device")
 		return
 	}
 	// whatsmeow doesn't expose a server-side chat list; the closest source
 	// is the contact store. We surface known contacts as chat candidates;
 	// the Rust side dedups against the emails table for "active" chats.
-	contacts, err := s.client.Store.Contacts.GetAllContacts(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	contacts, err := s.client.Store.Contacts.GetAllContacts(ctx)
 	if err != nil {
 		s.fail(req.RequestID, "Internal", "GetAllContacts: "+err.Error())
 		return
@@ -292,11 +456,9 @@ func (s *sidecar) opFetchHistory(req rpcRequest) {
 		s.fail(req.RequestID, "BadRequest", "chat_jid required")
 		return
 	}
-	// whatsmeow's on-demand history sync is best-effort and not all
-	// servers honor it for linked devices. We return an empty slice rather
-	// than block; the control surface only uses history as optional
-	// context, and inbound events are the primary source of truth.
-	s.ok(req.RequestID, map[string]interface{}{"messages": []interface{}{}})
+	// This process has no durable history store yet. A successful empty result
+	// would tell the caller that a chat has no messages, which is false.
+	s.fail(req.RequestID, "Unavailable", "chat history is not stored by this sidecar")
 }
 
 func (s *sidecar) opSendText(req rpcRequest) {
@@ -308,7 +470,7 @@ func (s *sidecar) opSendText(req rpcRequest) {
 		s.fail(req.RequestID, "BadRequest", "chat_jid and text required")
 		return
 	}
-	if s.client.Store.ID == nil {
+	if s.client == nil || s.client.Store.ID == nil {
 		s.fail(req.RequestID, "NotPaired", "no linked device")
 		return
 	}
@@ -321,8 +483,10 @@ func (s *sidecar) opSendText(req rpcRequest) {
 		s.fail(req.RequestID, "BadRequest", "bad jid: "+err.Error())
 		return
 	}
-	msg := &waProtoMessage{Conversation: &p.Text}
-	resp, err := s.client.SendMessage(context.Background(), jid, msg.toProto())
+	msg := &waE2E.Message{Conversation: &p.Text}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := s.client.SendMessage(ctx, jid, msg)
 	if err != nil {
 		s.fail(req.RequestID, "SendFailed", err.Error())
 		return
@@ -337,7 +501,11 @@ func (s *sidecar) opSendText(req rpcRequest) {
 func (s *sidecar) serveConn(conn net.Conn) {
 	s.writeMu.Lock()
 	s.conn = conn
+	lastQR := s.lastQR
 	s.writeMu.Unlock()
+	if lastQR != "" {
+		s.writeFrame(map[string]interface{}{"version": 1, "event": "qr", "code": lastQR})
+	}
 	defer func() {
 		s.writeMu.Lock()
 		s.conn = nil
@@ -359,12 +527,21 @@ func (s *sidecar) serveConn(conn net.Conn) {
 		}
 		go s.dispatch(req)
 	}
+	if err := scanner.Err(); err != nil {
+		s.fail("", "BadRequest", "invalid or oversized request frame")
+	}
 }
 
 func main() {
 	logger := waLog.Stdout("wa-sidecar", "INFO", true)
+	// The contract harness runs the actual process/socket without contacting
+	// WhatsApp or loading a linked-device session.
+	if len(os.Args) == 2 && os.Args[1] == "--offline-test" {
+		serve(&sidecar{logger: logger})
+		return
+	}
 
-	if err := os.MkdirAll(filepath.Dir(storePath()), 0o700); err != nil {
+	if err := privateDirectory(filepath.Dir(storePath())); err != nil {
 		logger.Errorf("mkdir store dir: %v", err)
 		os.Exit(1)
 	}
@@ -386,7 +563,11 @@ func main() {
 
 	// Pairing vs. reconnect.
 	if client.Store.ID == nil {
-		qrChan, _ := client.GetQRChannel(context.Background())
+		qrChan, err := client.GetQRChannel(context.Background())
+		if err != nil {
+			logger.Errorf("start QR pairing: %v", err)
+			os.Exit(1)
+		}
 		if err := client.Connect(); err != nil {
 			logger.Errorf("connect (pairing): %v", err)
 			os.Exit(1)
@@ -394,13 +575,12 @@ func main() {
 		go func() {
 			for evt := range qrChan {
 				if evt.Event == "code" {
-					// Emit the raw code to the Rust side AND render it on
-					// stderr so `whatsapp login` is usable headless.
+					// Keep the latest code for a CLI that connects after pairing began.
+					// Never print QR/session material into service logs.
 					s.emitEvent(map[string]interface{}{
 						"event": "qr",
 						"code":  evt.Code,
 					})
-					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stderr)
 				} else {
 					logger.Infof("pair flow: %s", evt.Event)
 				}
@@ -413,13 +593,30 @@ func main() {
 		}
 	}
 
+	serve(s)
+}
+
+func serve(s *sidecar) {
+	logger := s.logger
 	// UDS listener.
 	sock := socketPath()
-	if err := os.MkdirAll(filepath.Dir(sock), 0o700); err != nil {
+	if err := privateDirectory(filepath.Dir(sock)); err != nil {
 		logger.Errorf("mkdir sock dir: %v", err)
 		os.Exit(1)
 	}
-	_ = os.Remove(sock)
+	if info, err := os.Lstat(sock); err == nil {
+		if info.Mode()&os.ModeSocket == 0 {
+			logger.Errorf("refusing to replace non-socket path %s", sock)
+			os.Exit(1)
+		}
+		if err := os.Remove(sock); err != nil {
+			logger.Errorf("remove stale socket: %v", err)
+			os.Exit(1)
+		}
+	} else if !os.IsNotExist(err) {
+		logger.Errorf("inspect socket path: %v", err)
+		os.Exit(1)
+	}
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
 		logger.Errorf("listen %s: %v", sock, err)
@@ -437,7 +634,9 @@ func main() {
 		<-sigCh
 		logger.Infof("shutdown signal received")
 		_ = ln.Close()
-		client.Disconnect()
+		if s.client != nil {
+			s.client.Disconnect()
+		}
 		_ = os.Remove(sock)
 		os.Exit(0)
 	}()
@@ -454,32 +653,3 @@ func main() {
 		s.serveConn(conn)
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Minimal protobuf shim
-// ---------------------------------------------------------------------------
-//
-// whatsmeow's SendMessage takes a *waE2E.Message. We only ever send a plain
-// `conversation` body in v1, so this shim keeps main.go readable without the
-// generated-proto import sprawl. `toProto()` is implemented against the
-// real type once `go mod tidy` resolves the whatsmeow proto package; until
-// then it documents the single field we populate.
-
-type waProtoMessage struct {
-	Conversation *string
-}
-
-// toProto is intentionally a thin adapter. Replace the body with:
-//
-//	return &waE2E.Message{Conversation: m.Conversation}
-//
-// once whatsmeow is resolved (the import path is
-// `go.mau.fi/whatsmeow/proto/waE2E`). Declared here so the call site in
-// opSendText reads naturally and the proto coupling is one-line localized.
-func (m *waProtoMessage) toProto() interface{} {
-	return struct {
-		Conversation *string
-	}{Conversation: m.Conversation}
-}
-
-var _ = strconv.Itoa // reserved for future numeric params; keeps import set stable

@@ -10,19 +10,20 @@ channel) and [#102](https://github.com/nolanmak/AugmentAgent/issues/102)
 (agent control/approval surface). Rust foundation crate:
 `crates/augmentagent-channel-whatsapp`.
 
-> **Build status:** the Rust side, the JSON-RPC contract, and mock-socket
-> tests are complete and green (`cargo test -p augmentagent-channel-whatsapp`
-> — 36 tests). The Go sidecar source is committed but **uncompiled**: this
-> host has no Go toolchain. `go mod tidy && go build` once Go is installed
-> (see #74 — "Go sidecar build pending").
+The sidecar builds with the pinned Go toolchain and committed `go.sum`. The
+Rust contract suite launches the compiled Go process in `--offline-test` mode
+without connecting to a WhatsApp account. Live pairing and daemon wiring are
+tracked in [Jarvis #1228](https://github.com/nolanmak/Jarvis/issues/1228)
+and [#1231](https://github.com/nolanmak/Jarvis/issues/1231).
 
 ## Layout
 
 ```
 sidecars/wa-sidecar/
-  go.mod      # whatsmeow + sqlite + qr deps (go mod tidy fills go.sum)
+  go.mod      # pinned whatsmeow + sqlite dependencies
+  go.sum      # committed dependency checksums
   main.go     # UDS NDJSON server, 4 ops, lifecycle events, QR pairing
-  setup.sh    # one-shot: go mod tidy + go build -> ./wa-sidecar
+  setup.sh    # one-shot: verified go build -> ./wa-sidecar
   README.md   # this file
 ```
 
@@ -35,29 +36,32 @@ NDJSON over a Unix stream socket. See the `main.go` package doc and
 `send_text`.
 
 **Events (sidecar-initiated):** `qr`, `pair-success`, `connected`,
-`logged-out`, `received-message`.
+`logged-out`, `received-message`, `receipt`. Message events include optional
+quote, mentions, media description and edit/revoke flags. Media download and
+durable receipt handling are tracked in the parity epic.
 
-Typed error kinds: `NotPaired`, `NotConnected`, `SendFailed`, `BadRequest`,
-`Internal`.
+Every request, response and event carries `"version":1`. Unknown versions
+return `BadRequest`; malformed frames are rejected. `fetch_history` currently
+returns `Unavailable` because the sidecar has no durable history store. It
+never reports a false empty history. Typed errors also include `NotPaired`,
+`NotConnected`, `SendFailed` and `Internal`.
 
-## Setup (one-time, once Go is on the box)
+## Build and offline contract test
 
 ```bash
-./sidecars/wa-sidecar/setup.sh        # go mod tidy + build
+./sidecars/wa-sidecar/setup.sh        # verified build from pinned modules
+cd sidecars/wa-sidecar && go test ./... && go test -race ./... && go vet ./...
+AUGMENTAGENT_WA_SIDECAR_TEST_BIN="$PWD/wa-sidecar" \
+  cargo test -p augmentagent-channel-whatsapp --test sidecar_contract
 ```
 
-Then pair a device:
-
-```bash
-augmentagent whatsapp login --phone 15551234567
-# scan the QR printed on the terminal with the phone's
-# WhatsApp -> Linked Devices -> Link a Device
-```
+The pairing CLI is not yet implemented. The sidecar buffers its latest QR for
+a connecting client and never prints the pairing secret to service logs.
 
 The whatsmeow session persists to
 `~/.local/state/augmentagent/whatsmeow.db`; subsequent sidecar starts
-reconnect silently. A server-side logout emits `logged-out` and the daemon
-flips the `whatsapp_devices` row to `logged_out` — re-run `whatsapp login`.
+reconnect silently. A server-side logout emits `logged-out`; #1228 wires the
+CLI and device-state reconciliation.
 
 ## Ban-risk gate (#40 / #74 / #102)
 
@@ -74,9 +78,8 @@ WhatsApp bans bot-like accounts aggressively. The channel is conservative:
 
 ## Operational notes
 
-- Single client (the daemon). A new connection replaces the old write
-  target; events buffer in the daemon's `mpsc` and drain on each poll.
+- The sidecar currently serves one socket client at a time. Multiplexing the
+  daemon and CLI and replaying disconnected events are tracked in #1229.
 - The sidecar reconnects whatsmeow internally; if the websocket drops,
   `send_text` returns `NotConnected` and the next inbound event re-arms it.
-- Run under systemd as `augmentagent-wa-sidecar.service` (Restart=always),
-  mirroring `augmentagent-browser-sidecar.service`.
+- Supervised installation and health checks are tracked in #1243.
