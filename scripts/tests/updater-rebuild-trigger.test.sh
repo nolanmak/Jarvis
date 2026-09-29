@@ -177,8 +177,12 @@ STUB
   rm -rf "$TMP"
 done
 make_case sidecars/discord-voice/src/main.ts
-printf '#!/usr/bin/env bash\necho Darwin\n' > "$TMP/bin/uname"
+printf '#!/usr/bin/env bash\nif [ "${1:-}" = -m ]; then echo arm64; else echo Darwin; fi\n' > "$TMP/bin/uname"
 chmod +x "$TMP/bin/uname"
+cp "$REPO_ROOT/sidecars/discord-voice/setup.sh" "$TMP/work/sidecars/discord-voice/setup.sh"
+mkdir -p "$TMP/work/sidecars/discord-voice/node_modules/node/bin"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/work/sidecars/discord-voice/node_modules/node/bin/node"
+chmod +x "$TMP/work/sidecars/discord-voice/node_modules/node/bin/node"
 mkdir -p "$TMP/Library/LaunchAgents"
 touch "$TMP/Library/LaunchAgents/com.nolanmak.augmentagent.discord-voice.plist"
 cat > "$TMP/bin/launchctl" <<'STUB'
@@ -198,11 +202,12 @@ STUB
 chmod +x "$TMP/bin/launchctl"
 updater_rebuilt || true
 if grep -q 'sidecars/discord-voice ci' "$TMP/npm-calls" 2>/dev/null &&
+    grep -q 'sidecars/discord-voice install --no-save --no-package-lock --omit=optional --ignore-scripts @snazzah/davey-darwin-arm64@0.1.12' "$TMP/npm-calls" 2>/dev/null &&
     grep -q 'sidecars/discord-voice run build' "$TMP/npm-calls" 2>/dev/null &&
     grep -q 'kickstart -k gui/.*/com.nolanmak.augmentagent.discord-voice' "$TMP/voice-launchctl-calls" 2>/dev/null; then
   ok "rebuilds and restarts installed macOS Discord voice after source update"
 else
-  bad "rebuilds and restarts installed macOS Discord voice after source update" "missing npm ci/build or launchctl restart"
+  bad "rebuilds and restarts installed macOS Discord voice after source update" "missing pinned codec setup or launchctl restart"
 fi
 rm -rf "$TMP"
 make_case crates/augmentagent-channel-voice/src/lib.rs

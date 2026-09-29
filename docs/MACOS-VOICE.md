@@ -14,8 +14,7 @@ checkout:
 
 ```bash
 cd sidecars/discord-voice
-npm ci
-npm run build
+bash setup.sh
 cd ../..
 install -d -m 0700 "$HOME/.config/augmentagent"
 install -m 0600 sidecars/discord-voice/voice.env.example \

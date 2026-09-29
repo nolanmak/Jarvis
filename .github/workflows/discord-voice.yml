@@ -70,7 +70,9 @@ jobs:
           node-version: '24.17.0'
           cache: npm
           cache-dependency-path: sidecars/discord-voice/package-lock.json
-      - run: npm ci
+      - run: bash setup.sh
+      - name: Check native codec binding
+        run: ./node_modules/node/bin/node -e "require('@snazzah/davey')"
       - run: npm run typecheck
       - run: npm test
       - run: npm audit --omit=optional --audit-level=high
@@ -93,8 +95,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: discord-voice
-      - run: cargo test -p augmentagent-approval-discord -p augmentagent-channel-core -p augmentagent-channel-voice -p augmentagent-store --locked
-      - run: cargo test -p augmentagent-cli --bin augmentagent --locked -- --test-threads=1
+      - name: Linux voice and channel regression suites
+        if: runner.os == 'Linux'
+        run: cargo test -p augmentagent-approval-discord -p augmentagent-channel-core -p augmentagent-channel-voice -p augmentagent-store --locked
+      - name: macOS voice and persistence regression suites
+        if: runner.os == 'macOS'
+        run: |
+          cargo test -p augmentagent-approval-discord -p augmentagent-channel-voice -p augmentagent-store --locked
+          cargo test -p augmentagent-channel-core --lib voice_bridge::tests --locked
+          cargo test -p augmentagent-channel-core --test conversation_scheduler --locked
+          cargo test -p augmentagent-channel-core --test voice_tool_contract --locked
+      - name: Linux CLI regression suite
+        if: runner.os == 'Linux'
+        run: cargo test -p augmentagent-cli --bin augmentagent --locked -- --test-threads=1
+      - name: macOS voice CLI regression suite
+        if: runner.os == 'macOS'
+        run: |
+          cargo test -p augmentagent-cli --bin augmentagent discord_voice_session_tests --locked -- --test-threads=1
+          cargo test -p augmentagent-cli --bin augmentagent resolve_discord_voice_socket --locked -- --test-threads=1
 
   whisper-native:
     name: whisper-native (${{ matrix.os }})

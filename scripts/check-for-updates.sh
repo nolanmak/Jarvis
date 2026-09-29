@@ -162,7 +162,7 @@ apply_update() {
     [ "$installed" = true ] || continue
     log "rebuilding installed $sidecar sidecar"
     if [ "$sidecar" = discord-voice ]; then
-      (cd "$REPO_ROOT/sidecars/discord-voice" && npm ci >> "$LOG" 2>&1 && npm run build >> "$LOG" 2>&1) || {
+      (cd "$REPO_ROOT/sidecars/discord-voice" && bash setup.sh >> "$LOG" 2>&1) || {
         log "discord-voice setup failed; withholding build stamp"
         return 1
       }

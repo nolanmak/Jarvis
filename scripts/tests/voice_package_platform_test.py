@@ -10,6 +10,17 @@ VOICE = ROOT / 'sidecars/discord-voice'
 
 
 class VoicePackagePlatformTests(unittest.TestCase):
+    def test_locked_install_includes_native_codec_bindings(self):
+        self.assertIn('omit=optional', (VOICE / '.npmrc').read_text().splitlines())
+        setup = (VOICE / 'setup.sh').read_text()
+        self.assertIn('@snazzah/davey-', setup)
+        self.assertIn('--no-save', setup)
+        self.assertIn('--no-package-lock', setup)
+        lock = json.loads((VOICE / 'package-lock.json').read_text())
+        for target in ('linux-x64-gnu', 'darwin-arm64', 'darwin-x64'):
+            package = lock['packages'][f'node_modules/@snazzah/davey-{target}']
+            self.assertEqual(package['version'], '0.1.12')
+
     def test_required_dependencies_support_linux_and_mac_targets(self):
         manifest = json.loads((VOICE / 'package.json').read_text())
         lock = json.loads((VOICE / 'package-lock.json').read_text())
