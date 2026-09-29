@@ -400,7 +400,7 @@ async fn status_and_doctor_name_each_missing_setup_step_with_its_recovery() {
     );
     let with_channel = [
         ("DISCORD_BOT_TOKEN", DISCORD_TOKEN),
-        ("DISCORD_CHANNEL_ID", "123456789012345678"),
+        ("DISCORD_CHANNEL_ID", "4242"),
     ];
     let s = env.json(&["status", "--json", "true"], &with_channel);
     assert!(issue(&s, "discord.approval_broker", "cli").is_none());
