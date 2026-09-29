@@ -15,6 +15,18 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 )
 
+func shortTestSocket(t *testing.T) string {
+	t.Helper()
+	// Go's t.TempDir includes the test name; on macOS that can exceed the
+	// smaller Unix-socket path limit before the listener is even created.
+	dir, err := os.MkdirTemp("/tmp", "wa-sock-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, "wa.sock")
+}
+
 // These exercise the actual NDJSON dispatcher while the WhatsApp network is
 // absent. A connected Rust client must get explicit failures, not a made-up
 // empty history or a successful reply in a protocol it cannot understand.
@@ -250,7 +262,7 @@ func TestTwoClientsGetTheirOwnResponsesAndLifecycleEvents(t *testing.T) {
 }
 
 func TestSecondSidecarCannotReplaceActiveSocket(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "wa.sock")
+	sock := shortTestSocket(t)
 	owner, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatal(err)
@@ -268,7 +280,7 @@ func TestSecondSidecarCannotReplaceActiveSocket(t *testing.T) {
 }
 
 func TestSidecarCanReplaceStaleSocket(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "wa.sock")
+	sock := shortTestSocket(t)
 	stale, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatal(err)

@@ -76,7 +76,10 @@ async fn compiled_go_process_matches_rust_wire_contract() {
         );
         return;
     };
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("wa-contract-")
+        .tempdir_in("/tmp")
+        .unwrap();
     let socket = temp.path().join("wa.sock");
     let _child = Sidecar(
         Command::new(binary)
