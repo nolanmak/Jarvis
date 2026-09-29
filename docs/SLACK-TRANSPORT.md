@@ -162,10 +162,122 @@ Source: https://docs.slack.dev/apis/events-api/using-socket-mode (checked
   `PostedMessage { channel, ts }` is the message reference used everywhere.
 - Every call is bounded by `request_timeout` (15 s) and by the
   `CancellationToken` bound with `HttpSlackWebApi::scoped`.
-- `upload_file` / `download_file` are declared on `SlackWebApi` and return
-  `WebApiError::Unsupported` in `HttpSlackWebApi`; #1293 and #1294 implement
-  them (Slack's `files.getUploadURLExternal` /
-  `files.completeUploadExternal` flow, **unverified**).
+- `upload_file` is implemented (#1294, see "Outbound delivery" below).
+  `download_file` still returns `WebApiError::Unsupported`; #1293 owns it.
+
+## Outbound delivery (#1294)
+
+Code: `crates/augmentagent-channel-slack/src/delivery/` (`mrkdwn.rs`,
+`split.rs`, `plan.rs`, `progress.rs`) and `HttpSlackWebApi::upload_file` in
+`transport/web.rs`. Not wired into `serve` yet (#1287/#1288); the operator
+path is `augmentagent slack deliver`.
+
+### Formatting and mentions
+
+Source: https://docs.slack.dev/messaging/formatting-message-text (read
+2026-09-29).
+
+- **[docs]** `&`, `<`, `>` must be sent as `&amp;`, `&lt;`, `&gt;`. The
+  converter escapes them everywhere, code included, so model text can never
+  form a `<…>` control sequence: `<!channel>`, `<!here>`, `<!everyone>`,
+  `<@U…>`, `<#C…>` and `<!subteam^…>` render as text.
+- **[docs]** "Plain text `@channel` does not trigger notifications; the
+  special syntax `<!channel>` is required." Defence in depth anyway: a word
+  joiner (U+2060) is inserted after the `@` of `@channel`/`@here`/`@everyone`,
+  and every post sends `link_names: false`. The `chat.postMessage` page
+  describes `link_names` as "Find and link user groups"; its default is
+  **unverified**, hence the explicit `false`.
+- **[docs]** mrkdwn has `*bold*`, `_italic_`, `~strike~`, `` `code` ``,
+  ```` ``` ```` blocks, `<url|text>` links, `>` quotes and no headings. The
+  converter maps Markdown onto these (table in `mrkdwn.rs`); headings become a
+  bold line and pipe tables a code block. Links are only built for
+  `http(s)`/`mailto` URLs without `<`, `>`, `|` or whitespace.
+- Code is verbatim apart from the entity escaping (which Slack renders back).
+  Known limitation: a literal ```` ``` ```` inside a `~~~`-fenced block ends
+  Slack's code block early.
+
+### Message size and splitting
+
+- **[docs]** `chat.postMessage`: keep `text` to 4,000 characters; Slack
+  truncates above 40,000. `chat.update`: `text` "cannot exceed 4,000
+  characters". Sources: https://docs.slack.dev/reference/methods/chat.postMessage,
+  https://docs.slack.dev/reference/methods/chat.update (2026-09-29).
+- Whether "characters" means Unicode scalars, UTF-16 units or bytes is
+  **unverified**. Parts default to 3,500 scalars (`DEFAULT_PART_CHARS`), so
+  even a part of only 4-byte characters (14,000 bytes) stays far below the
+  40,000 truncation point.
+- Splits prefer blank lines, then lines, then spaces, never inside an
+  entity, a `<…>` link or an inline code span. A cut inside a code block
+  closes the fence and reopens it in the next part. The parts' ranges tile
+  the input exactly (property test over 400 generated inputs).
+- Blocks are not used for answers (text only), so the 50-block limit does
+  not apply.
+
+### Multi-part delivery on the outbox
+
+- One outbox entry per part, keyed `turn:<turn_id>:text:<n>` /
+  `turn:<turn_id>:file:<n>`, all in the turn's conversation (thread
+  included). Re-planning the same turn enqueues nothing new; the outbox's
+  per-conversation ordering sends what is left, in order.
+- Every post carries message metadata `{"event_type":
+  "augmentagent_delivery", "event_payload": {"idempotency_key": …}}` so a
+  send whose outcome was lost can be found in history. **[docs]** the
+  `metadata` argument is "JSON object with event_type and event_payload
+  fields"; sending it as a JSON object in a JSON body is **unverified**. The
+  Slack `SendReconciler` that looks it up (`conversations.history` /
+  `conversations.replies`) is not implemented yet; until it is, a part in
+  `reconcile` holds the rest of its conversation and is visible in status.
+- Failure classes (dispatcher in `plan.rs`): rate limit / transient Slack
+  error / HTTP 5xx → retried after `max(backoff, Retry-After)`; upload failed
+  before completion → retried whole; timeout or lost connection on a post or
+  completion → `reconcile` (never resent blindly); other Slack errors, HTTP
+  4xx, bad file → `dead_letter`.
+- **[docs]** `chat.postMessage` allows "1 message per second to a specific
+  channel" with bursts; the dispatcher does not pace itself and relies on
+  429/`Retry-After`. Effective behaviour for a 10-part answer is
+  **unverified** live.
+
+### File upload
+
+Sources: https://docs.slack.dev/reference/methods/files.getUploadURLExternal,
+https://docs.slack.dev/reference/methods/files.completeUploadExternal,
+https://docs.slack.dev/messaging/working-with-files (all read 2026-09-29).
+
+1. `files.getUploadURLExternal` **[docs]**: `filename` and `length` (bytes)
+   required, `alt_txt` (max 1,000 characters) and `snippet_type` optional;
+   form-encoded or JSON; returns `upload_url` and `file_id`; scope
+   `files:write`; Tier 4 ("100+ per minute"). Sent form-encoded.
+2. POST the bytes to `upload_url` **[docs]**: "Files can be sent as raw
+   bytes or can be multipart form encoded"; the example sends
+   `Content-Type: application/octet-stream`. Sent raw, streamed from disk,
+   with `Content-Length`, **without** the bot token (the docs do not say the
+   URL needs one; **unverified**). The URL must be https (plain http only on
+   loopback, for tests) and is never logged or echoed in errors. Any 2xx is
+   success; the example body is `OK - <bytes>`.
+3. `files.completeUploadExternal` **[docs]**: `files` = `[{id, title}]`
+   required; `channel_id`, `thread_ts`, `initial_comment` optional; JSON
+   accepted; Tier 4. "If not called, the uploaded file and associated
+   metadata will be discarded", and it "may only be invoked once per
+   upload". A failure in steps 1–2 is therefore reported as
+   `WebApiError::UploadIncomplete` and retried from step 1 without risk of a
+   duplicate.
+
+- Size limit: the fetched method pages state none. `UploadLimits::max_bytes`
+  defaults to 1 GiB (Slack's commonly cited per-file limit, **unverified**);
+  larger files are refused before any request. Transfer timeout 300 s
+  (`UploadLimits::transfer_timeout`), cancellable with the client's token.
+- Slack derives the file type from `filename`; no content type is sent
+  beyond `application/octet-stream` (**unverified** for every type).
+- How long `upload_url` stays valid is not documented (**unverified**).
+
+### Progress
+
+`ProgressMessage` posts (or adopts) a status message and edits it with
+`chat.update` at most once per `min_interval` (default 3 s) per message,
+newest text wins, identical text is not re-sent, a rate-limited edit waits
+`max(interval, Retry-After)`. **[docs]** `chat.update` is Tier 3 ("50+ per
+minute"), per method per workspace. Progress edits are best effort and not
+written to the outbox.
 
 ## Install-time checks (#1284)
 
@@ -213,6 +325,16 @@ Source: https://docs.slack.dev/apis/events-api/using-socket-mode (checked
   `ok:false` errors, 429/`Retry-After` retry and caps, timeout, cancellation
   (including during a rate-limit wait), token never in Debug/errors,
   deferred file transfer, recording fake.
+- `tests/transport_upload.rs` (#1294): each upload step against a mock
+  Slack; step 1 fails, transfer cut off midway, upload host 5xx, completion
+  fails, size/empty/missing file, stalled transfer timeout and cancel, rate
+  limits, insecure upload URL, no token on the upload host.
+- `tests/delivery_format.rs`, `tests/delivery_outbox.rs`,
+  `tests/delivery_progress.rs` (#1294): conversion table and mention
+  neutralisation, splitting invariants, restart between parts, crash
+  mid-send reconciled, rate limit mid-answer, upload failing midway,
+  paused-clock progress throttling. `augmentagent-cli/tests/slack_deliver_cli.rs`
+  runs `slack deliver` end to end.
 - `tests/transport_socket.rs`: ack only after hand-off, rejected and slow
   hand-offs not acked, redelivery with stable id, unknown/malformed frames
   keep the link, response payloads, refresh drain then reconnect, forced
@@ -281,3 +403,9 @@ they are unconfirmed against a live workspace (item 11 below).
     interactions, `is_ext_shared_channel` on Events API callbacks, and whether
     the app receives both `message` and `app_mention` for one post in a
     control channel.
+12. #1294: the unit of the 4,000-character text limit; `link_names` default;
+    `metadata` accepted as a JSON object; the upload URL working without
+    an `Authorization` header; the per-file size limit; a real 10-part
+    answer and a PDF/PNG upload landing in a thread in order; a launchd-run
+    daemon reading generated files from the shared state/temp location
+    (#1256).
