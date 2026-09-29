@@ -431,6 +431,131 @@ line) and `starts_turn()`.
   `<state dir>/slack-inbound/msg-*/NN-*` is needed when the dispatcher runs
   a Claude turn on these files.
 
+## Voice clips and spoken replies (#1297)
+
+Asynchronous voice only: a recorded clip in, an uploaded audio reply out,
+in the same conversation and thread as typed turns. This is **not** live
+voice; that stays an open blocker ([`SLACK-LIVE-VOICE.md`](SLACK-LIVE-VOICE.md),
+#1298). Code: `crates/augmentagent-channel-slack/src/voice/`. Not wired into
+`serve` yet (#1288).
+
+### What Slack sends (file object, read 2026-09-29)
+
+- Clips recorded in Slack carry `subtype: slack_audio` / `slack_video`,
+  `media_display_type` and `duration_ms` **[docs]**; they arrive as
+  `files[]` on a `file_share` message like any upload. The documented audio
+  filetypes are `m4a`, `mp3`, `mp4`, `wav`, `ogg`, `webm` **[docs]**. Which
+  MIME each client uses for a clip (`audio/webm` on desktop, `audio/mp4` on
+  mobile are the expectation) is **unverified** against a live workspace;
+  detection therefore uses the MIME type, then the clip subtype, then the
+  Slack `filetype`/extension.
+- Slack's own `transcription` field is not used: it depends on the
+  workspace's plan and region and is not the shared speech stack.
+
+### Inbound
+
+`inbound::prepare_inbound_with_voice(api, text, files, opts, Some(&VoiceInbound), cancel)`:
+
+- decodes `audio/webm|ogg|opus|mp4|m4a|x-m4a|aac|mpeg|mp3|wav|x-wav|wave|flac`
+  and `video/mp4|webm|quicktime`; any other `audio/*`/`video/*` is skipped
+  before download with "unsupported audio format (…); send m4a, mp3, wav,
+  ogg, webm, flac or mp4";
+- limits: 25 MiB (declared and enforced while streaming), 10 minutes
+  (declared `duration_ms`, then the decoded length), 3 clips per message,
+  `ffmpeg` 60 s, transcription 120 s; each limit is an owner-facing reason;
+- downloads into the same private per-message directory as #1293, decodes
+  to 16 kHz mono 16-bit WAV (the format the Discord sidecar streams to both
+  vendors) and deletes the clip and the WAV as soon as the transcript is in;
+- the transcript joins the typed text in `turn_text()` (and the prompt), and
+  `transcript_notice()` is the line shown back to the owner
+  ("🎙️ Transcript of clip.webm (0:04): …"). An empty transcript, a decode
+  failure or a provider failure is a "skipped" reason telling the owner to
+  resend or type; the turn starts only if something else is left.
+- `prepare_inbound` (no speech stack) keeps #1293's behaviour: clips are
+  "unsupported". Owner-only: call it only for input `owner::admit`
+  dispatched (`tests/voice_clips.rs::non_owner_audio_never_reaches_the_speech_provider`).
+
+### Speech providers: the seam, not a second stack
+
+The Deepgram/ElevenLabs clients, provider selection
+(`AUGMENTAGENT_DISCORD_STT_PROVIDER` / `_TTS_PROVIDER`, `DEEPGRAM_API_KEY`,
+`ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`) and the credit fallback live
+only in the TypeScript sidecar (`sidecars/discord-voice`), bound to a live
+Discord voice session over private IPC; nothing in Rust calls them and they
+have no request/response mode for a recorded file. The Rust seam is
+`voice::speech`:
+
+- `SpeechToText` / `TextToSpeech` traits over a finished file or text;
+- `SttStack` / `TtsStack` with the sidecar's rule: switch to the alternate
+  vendor only on confirmed credit exhaustion (`402` or `quota_exceeded`,
+  `ProviderError.exhausted`); any other failure is reported as is;
+- `TranscriberStt` plugs in the existing Rust transcriber
+  (`augmentagent_channel_voice::Transcriber`, whisper.cpp under
+  `vendor/whisper`, used for Telegram voice memos). This is what `slack voice
+  transcribe` uses in a release build.
+- No TTS provider has a Rust file adapter yet, so spoken replies need one
+  before they work outside tests: either a request/response `synthesize`
+  op on the sidecar's IPC or a Rust port of its two TTS calls, reusing its
+  env names and fallback. Tracked as remaining work on #1297.
+
+`voice::fake::{ScriptedStt, ScriptedTts}` are offline fakes for tests; the
+CLI selects them only in a debug build through
+`AUGMENTAGENT_TEST_SLACK_SPEECH` (`ok:TEXT`, `fail:CODE`, `exhausted:TEXT`,
+`exhausted-all`); release builds ignore it.
+
+### Spoken replies
+
+`voice::reply::enqueue_spoken_answer(store, conversation, &SpokenAnswer { turn_id, markdown, files, mode }, Some(&tts), &opts, now_ms)`:
+
+- `ReplyMode` is per turn and defaults to `Text` (`"spoken"`/`"voice"`
+  parse to `Spoken`); the harness sets it when the owner asks for a spoken
+  answer;
+- the text mirror is always the full answer (`turn:<id>:text:<n>`); the
+  audio is the turn's first file (`turn:<id>:file:0`, WAV named
+  `spoken-reply.wav`, raw PCM from a provider gets a WAV header), then any
+  generated files;
+- the speech text drops Markdown markers, code blocks and URLs and is cut
+  at 12 000 characters (the sidecar's limit) with "The rest is in the text
+  reply.";
+- a restart of the same turn finds `turn:<id>:file:0` in the outbox and
+  neither synthesises nor sends again;
+- a TTS failure, timeout (30 s) or missing provider still delivers the text,
+  with "_Spoken reply unavailable: <provider> failed (…)._";
+- the audio is stored under `<state dir>/slack-voice-replies/<turn>-<hash>/`
+  (0700/0600) until uploaded; `release_spoken_audio` removes it once the
+  upload is sent, dead-lettered or abandoned. Whether Slack plays an
+  uploaded WAV inline on every client is **unverified**.
+
+### Host dependencies
+
+| host | install | resolved under the service manager |
+| --- | --- | --- |
+| macOS Apple Silicon | `brew install ffmpeg` → `/opt/homebrew/bin/ffmpeg` | launchd `PATH` from `scripts/lib/launchd-install.sh`, else the `/opt/homebrew/bin` fallback |
+| macOS Intel | `brew install ffmpeg` → `/usr/local/bin/ffmpeg` | same, `/usr/local/bin` fallback |
+| Debian/Ubuntu | `apt install ffmpeg` → `/usr/bin/ffmpeg` | systemd `PATH`, else `/usr/bin` |
+| Fedora | `dnf install ffmpeg-free` (or `ffmpeg` from RPM Fusion) → `/usr/bin/ffmpeg`; **unverified** here | same |
+
+`ffmpeg` is resolved with `augmentagent_docs::resolve_tool`, like the
+#1293 converters, and killed at its timeout or on cancellation. A missing
+binary is the owner-facing reason "ffmpeg is not installed or not on the
+service PATH (…); install it (`brew install ffmpeg` on macOS, `apt install
+ffmpeg` or `dnf install ffmpeg` on Linux)". The local speech-to-text path
+additionally needs whisper.cpp and its model (`scripts/build-whisper.sh`,
+`vendor/whisper/`), resolved from the working directory as for Telegram
+voice memos. CI uses a fake `ffmpeg` and scripted providers on both hosts.
+Real launchd/systemd qualification of the audio dependencies is #1255.
+
+### Remaining work (#1288 harness, #1297)
+
+- Call `prepare_inbound_with_voice` instead of `prepare_inbound` for owner
+  input, post `transcript_notice()` and `rejection_notice()` in the thread,
+  and run `turn_text()` as the turn in the existing conversation.
+- Decide how the owner requests a spoken reply (a per-turn control or a
+  phrase) and set `ReplyMode::Spoken`; call `enqueue_spoken_answer` instead
+  of `enqueue_answer`, then `release_spoken_audio` after the drain.
+- Add a TTS file adapter (see above) and, for the daemon, configure the STT
+  provider selection instead of the working-directory whisper default.
+
 ## Install-time checks (#1284)
 
 - `auth.test` (bot token) returns `team_id`, `team`, `user_id`, `bot_id`
@@ -505,6 +630,17 @@ line) and `starts_turn()`.
   `augmentagent-cli/tests/slack_files_cli.rs` runs `slack files fetch` end
   to end; `augmentagent-docs/tests/converter_bounds.rs` pins converter
   lookup under a launchd-style PATH and the timeout.
+- `tests/voice_clips.rs` and `tests/voice_replies.rs` (#1297): clip
+  detection, Slack clip fields, transcript into turn text and the owner
+  line, typed text plus images plus a clip, unsupported codec before
+  download, undecodable audio, missing and stuck `ffmpeg`, size/duration/
+  count limits, empty transcript, credit-exhaustion fallback and
+  non-exhaustion failure, STT timeout and cancellation cleanup, non-owner
+  audio never reaching the provider through `admit`; spoken reply as audio
+  plus text mirror delivered once across a restart, text mode, TTS failure
+  and missing provider notes, PCM to WAV, speakable text, audio retention.
+  `augmentagent-cli/tests/slack_voice_cli.rs` runs `slack voice transcribe`
+  and `slack voice speak` end to end.
 - `tests/transport_socket.rs`: ack only after hand-off, rejected and slow
   hand-offs not acked, redelivery with stable id, unknown/malformed frames
   keep the link, response payloads, refresh drain then reconnect, forced

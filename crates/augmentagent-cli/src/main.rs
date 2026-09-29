@@ -94,6 +94,7 @@ mod slack_app;
 mod slack_deliver;
 mod slack_files;
 mod slack_serve;
+mod slack_voice;
 mod status;
 
 #[derive(Parser)]
@@ -1720,6 +1721,13 @@ enum SlackOp {
     Files {
         #[command(subcommand)]
         op: slack_files::SlackFilesOp,
+    },
+    /// Voice clips and spoken replies (#1297): transcribe a message's clips
+    /// through the inbound pipeline, or deliver a spoken reply with its
+    /// text mirror through the outbox.
+    Voice {
+        #[command(subcommand)]
+        op: slack_voice::SlackVoiceOp,
     },
 }
 
@@ -3820,6 +3828,7 @@ async fn main() -> Result<()> {
             SlackOp::App { op } => slack_app::run(op, &store).await,
             SlackOp::Deliver(args) => slack_deliver::run(args, &store).await,
             SlackOp::Files { op } => slack_files::run(op).await,
+            SlackOp::Voice { op } => slack_voice::run(op, &store).await,
             SlackOp::PollOnce { dry_run } => {
                 let (broker, _) = build_broker(&cli, Arc::clone(&store), *dry_run).await?;
                 let ch = build_slack_channel(&cli, store, broker, *dry_run)?;
