@@ -432,7 +432,7 @@ pub fn schedule_modal(
         vec![
             section(format!(
                 "*{}*\nTimes are in *{}* — it is {} now. You confirm the exact time next.",
-                escape(&truncate(subject, 250)),
+                escape(&truncate(subject_or_none(subject), 250)),
                 escape(zone_name),
                 escape(now_shown)
             )),
@@ -485,7 +485,7 @@ pub fn schedule_confirmation(
     let mut body = format!(
         "*{ask}* *{}*?\n{}",
         escape(when),
-        escape(&truncate(subject, 250))
+        escape(&truncate(subject_or_none(subject), 250))
     );
     if let Some(d) = destination {
         body.push_str(&format!(" · goes to {}", escape(&truncate(d, 300))));
@@ -504,6 +504,15 @@ pub fn schedule_confirmation(
         context(format!("Nothing is scheduled until you confirm. Ref `{r}`.")),
     ]);
     (format!("{ask} {when}? Confirm to schedule it."), blocks)
+}
+
+/// A subject for display: `(no subject)` when there is none.
+fn subject_or_none(subject: &str) -> &str {
+    if subject.trim().is_empty() {
+        "(no subject)"
+    } else {
+        subject
+    }
 }
 
 /// The value of a submitted `static_select` in a `view`.
@@ -731,6 +740,23 @@ mod tests {
         let (_, blocks) = card(&at_cap);
         assert_eq!(action_ids(&blocks), vec![APPROVE, REVISE, SKIP, SCHEDULE]);
         assert!(blocks.to_string().contains("refine cap reached"));
+    }
+
+    /// #1291 — a Slack DM has no subject; the schedule modal and its
+    /// confirmation say so instead of drawing empty bold markers.
+    #[test]
+    fn schedule_modal_and_confirmation_name_a_missing_subject() {
+        let ctx = ModalContext {
+            action_id: "a-1".into(),
+            digest: "d".into(),
+            channel: None,
+            ts: None,
+        };
+        let modal = schedule_modal(&ctx, "", "America/New_York", "now", false).to_string();
+        assert!(modal.contains("(no subject)"), "{modal}");
+        assert!(!modal.contains("\"**\\n"), "{modal}");
+        let (_, blocks) = schedule_confirmation("a-1", "d", 1, "then", None, None, " ", false);
+        assert!(blocks.to_string().contains("(no subject)"));
     }
 
     #[test]
