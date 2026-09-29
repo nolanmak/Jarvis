@@ -24,6 +24,7 @@ use tracing::{debug, info, warn};
 
 // #939 — shared PDF/DOCX → text pipeline (pdftotext, then Mistral OCR for
 // scanned PDFs). Lives in a leaf crate so this crate stays below channel-core.
+use augmentagent_docs::inbound::{self, InboundKind};
 use augmentagent_docs::{extract_text, DocKind, OcrClient};
 
 use crate::broker::BrokerState;
@@ -2068,35 +2069,25 @@ pub async fn edit_card_for_action(
 /// than this are downloaded up to `MAX_DOWNLOAD_BYTES` and truncated to the
 /// first `MAX_TEXT_BYTES` bytes — the prompt annotation marks the file as
 /// `TRUNCATED — first X of Y` so the reasoner knows it has the head only.
-const MAX_TEXT_BYTES: u32 = 1_048_576; // 1 MB (matches serenity's Attachment.size u32)
+/// The policy itself lives in `augmentagent_docs::inbound` (#1293) so every
+/// surface shares it; Discord keeps `u32` because serenity's sizes are `u32`.
+#[cfg(test)]
+const MAX_TEXT_BYTES: u32 = inbound::MAX_TEXT_BYTES as u32; // 1 MB
 
 /// Hard cap on text-file attachment size. Files larger than this are dropped
 /// at filter time so we never spend bandwidth downloading them. Sized to leave
 /// headroom above `MAX_TEXT_BYTES` — files in `MAX_TEXT_BYTES..MAX_DOWNLOAD_BYTES`
 /// are accepted and truncated at write time.
-const MAX_DOWNLOAD_BYTES: u32 = 8 * 1_048_576; // 8 MB
+const MAX_DOWNLOAD_BYTES: u32 = inbound::MAX_DOWNLOAD_BYTES as u32; // 8 MB
 
 /// Extensions we accept as text even when Discord omits `content_type`.
 /// Discord populates `content_type` from the upload, which is unreliable for
 /// code/config files, so we fall back to extension here.
-const TEXT_EXT_ALLOWLIST: &[&str] = &[
-    // plain text & docs
-    "txt", "md", "markdown", "rst", "log",
-    // structured data
-    "json", "yaml", "yml", "toml", "csv", "tsv", "xml",
-    // source code
-    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs",
-    "py", "go", "java", "c", "cc", "cpp", "h", "hpp",
-    "cs", "rb", "php", "swift", "kt", "scala",
-    "sh", "bash", "zsh", "sql",
-    "html", "css", "scss", "less",
-    // config
-    "ini", "conf", "cfg", "properties",
-];
+const TEXT_EXT_ALLOWLIST: &[&str] = inbound::TEXT_EXT_ALLOWLIST;
 
 /// Extensions we refuse to ingest as text even if the MIME type matches.
 /// These are formats that commonly contain credentials.
-const TEXT_EXT_DENYLIST: &[&str] = &["env", "pem", "key", "p12", "pfx"];
+const TEXT_EXT_DENYLIST: &[&str] = inbound::TEXT_EXT_DENYLIST;
 
 /// Identify the doc kind from an attachment's content_type and/or filename
 /// extension. Delegates to the shared pipeline crate (#939) so Discord drops,
@@ -2186,107 +2177,63 @@ struct AttachmentPartition {
 /// dropped by each filter.
 ///
 /// Images are unconditionally accepted (no size/extension gate; matches the
-/// pre-existing image-attachment behavior). The text-file gating logic
-/// mirrors `filter_text_attachments` — kept in sync deliberately rather than
-/// delegated, because the rejection reasons need to be produced inline.
+/// pre-existing image-attachment behavior). The rules are the shared
+/// `augmentagent_docs::inbound::classify` (#1293), which Slack uses too.
 fn partition_attachments(attachments: &[Attachment]) -> AttachmentPartition {
     let mut out = AttachmentPartition::default();
     for a in attachments {
-        if a
-            .content_type
-            .as_deref()
-            .is_some_and(|ct| ct.starts_with("image/"))
-        {
-            out.images.push(a.clone());
-            continue;
-        }
-        let ext = std::path::Path::new(&a.filename)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|s| s.to_lowercase());
-        if let Some(e) = ext.as_deref() {
-            if TEXT_EXT_DENYLIST.contains(&e) {
-                out.rejected.push(RejectedAttachment {
-                    filename: a.filename.clone(),
-                    reason: RejectReason::SecurityDenylist,
-                });
+        let reason = match inbound::classify(&a.filename, a.content_type.as_deref(), u64::from(a.size)) {
+            Ok(InboundKind::Image) => {
+                out.images.push(a.clone());
                 continue;
             }
-        }
-        if a.size > MAX_DOWNLOAD_BYTES {
-            out.rejected.push(RejectedAttachment {
-                filename: a.filename.clone(),
-                reason: RejectReason::Oversize { size: a.size },
-            });
-            continue;
-        }
-        // Doc formats (PDF / DOCX / DOC) get routed through the converter
-        // pipeline before joining text_files for the prompt.
-        if doc_kind_for(a).is_some() {
-            out.docs.push(a.clone());
-            continue;
-        }
-        let is_text_mime = a
-            .content_type
-            .as_deref()
-            .is_some_and(|ct| ct.starts_with("text/"));
-        let is_allowlisted_ext = ext
-            .as_deref()
-            .is_some_and(|e| TEXT_EXT_ALLOWLIST.contains(&e));
-        if is_text_mime || is_allowlisted_ext {
-            out.text_files.push(a.clone());
-        } else {
-            out.rejected.push(RejectedAttachment {
-                filename: a.filename.clone(),
-                reason: RejectReason::UnsupportedType {
-                    content_type: a.content_type.as_deref().map(|s| s.to_string()),
-                    ext,
-                },
-            });
-        }
+            Ok(InboundKind::Doc(_)) => {
+                out.docs.push(a.clone());
+                continue;
+            }
+            Ok(InboundKind::Text) => {
+                out.text_files.push(a.clone());
+                continue;
+            }
+            Err(inbound::RejectReason::SecurityDenylist) => RejectReason::SecurityDenylist,
+            Err(inbound::RejectReason::Oversize { .. }) => RejectReason::Oversize { size: a.size },
+            Err(inbound::RejectReason::UnsupportedType { content_type, ext }) => {
+                RejectReason::UnsupportedType { content_type, ext }
+            }
+            // Only produced by surfaces that download inside the pipeline.
+            Err(inbound::RejectReason::Unavailable(_)) => continue,
+        };
+        out.rejected.push(RejectedAttachment {
+            filename: a.filename.clone(),
+            reason,
+        });
     }
     out
-}
-
-fn format_size(bytes: u32) -> String {
-    const MB: f64 = 1_048_576.0;
-    const KB: f64 = 1024.0;
-    let b = bytes as f64;
-    if b >= MB {
-        format!("{:.1} MB", b / MB)
-    } else if b >= KB {
-        format!("{:.0} KB", b / KB)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 /// Render the rejection footer. Returns `None` if there's nothing to surface,
 /// so callers can use `if let Some(footer) = format_rejection_footer(...)`.
 fn format_rejection_footer(rejected: &[RejectedAttachment]) -> Option<String> {
-    if rejected.is_empty() {
-        return None;
-    }
-    let parts: Vec<String> = rejected
+    let shared: Vec<inbound::Rejected> = rejected
         .iter()
-        .map(|r| match &r.reason {
-            RejectReason::Oversize { size } => format!(
-                "{} ({} > {})",
-                r.filename,
-                format_size(*size),
-                format_size(MAX_DOWNLOAD_BYTES),
-            ),
-            RejectReason::SecurityDenylist => format!("{} (security)", r.filename),
-            RejectReason::UnsupportedType { content_type, ext } => {
-                let detail = content_type
-                    .clone()
-                    .or_else(|| ext.clone())
-                    .unwrap_or_else(|| "unknown".to_string());
-                format!("{} (unsupported: {})", r.filename, detail)
-            }
+        .map(|r| inbound::Rejected {
+            filename: r.filename.clone(),
+            reason: match &r.reason {
+                RejectReason::Oversize { size } => inbound::RejectReason::Oversize {
+                    size: u64::from(*size),
+                    limit: u64::from(MAX_DOWNLOAD_BYTES),
+                },
+                RejectReason::SecurityDenylist => inbound::RejectReason::SecurityDenylist,
+                RejectReason::UnsupportedType { content_type, ext } => {
+                    inbound::RejectReason::UnsupportedType {
+                        content_type: content_type.clone(),
+                        ext: ext.clone(),
+                    }
+                }
+            },
         })
         .collect();
-    Some(format!("\u{26A0}\u{FE0F} skipped: {}", parts.join(", ")))
+    inbound::format_rejection_footer(&shared)
 }
 
 /// Label used to annotate prior turns in conversation history when the user
@@ -2311,33 +2258,7 @@ fn attachment_kind_label(attachments: &[Attachment]) -> &'static str {
 /// extension, otherwise derive from the MIME subtype, otherwise fall back to
 /// `bin`.
 fn extension_for(att: &Attachment) -> String {
-    if let Some(ext) = std::path::Path::new(&att.filename)
-        .extension()
-        .and_then(|e| e.to_str())
-    {
-        if !ext.is_empty() {
-            return ext.to_lowercase();
-        }
-    }
-    if let Some(ct) = att.content_type.as_deref() {
-        if let Some(rest) = ct.strip_prefix("image/") {
-            // image/jpeg → jpg; everything else passes through.
-            let ext = match rest {
-                "jpeg" => "jpg",
-                other => other,
-            };
-            return ext.to_string();
-        }
-        // text/* fallback for the common cases. Only kicks in when the
-        // filename has no extension — otherwise the early-return above wins.
-        match ct {
-            "text/plain" => return "txt".into(),
-            "text/markdown" => return "md".into(),
-            "text/csv" => return "csv".into(),
-            _ => {}
-        }
-    }
-    "bin".into()
+    inbound::extension_for(&att.filename, att.content_type.as_deref())
 }
 
 /// Download each attachment to `/tmp/aa-img-<msg_id>-<idx>.<ext>`. Returns the
@@ -2361,32 +2282,15 @@ async fn download_images(attachments: &[Attachment], msg_id: u64) -> Vec<PathBuf
     out
 }
 
-/// A text-file attachment that was downloaded to disk for the reasoner.
-/// `truncated` is true when the file was larger than `MAX_TEXT_BYTES` and we
-/// wrote only the first MB; `original_size` is what Discord reported on the
-/// uploaded attachment.
-#[derive(Debug, Clone)]
-struct DownloadedTextFile {
-    path: PathBuf,
-    truncated: bool,
-    original_size: u32,
-    /// #939 — what the OCR stage did for a converted doc (recovered text /
-    /// unavailable because MISTRAL_API_KEY is unset / failed). Surfaced in
-    /// the prompt so the reasoner never mistakes a scanned PDF's empty
-    /// extraction for an empty document. `None` for plain text files and
-    /// docs whose text layer was fine.
-    note: Option<String>,
-}
+/// A text-file attachment that was downloaded to disk for the reasoner:
+/// the shared representation (#1293). `truncated` is true when the file was
+/// larger than `MAX_TEXT_BYTES`; `original_size` is what Discord reported;
+/// `note` carries the #939 OCR outcome for converted docs.
+type DownloadedTextFile = inbound::TextAttachment;
 
-/// Pure slicing helper for the truncation logic. Extracted so the cap behavior
-/// is unit-testable without standing up a fake HTTP server.
+/// Pure slicing helper for the truncation logic (shared, #1293).
 fn truncate_text_bytes(bytes: &[u8]) -> (&[u8], bool) {
-    let cap = MAX_TEXT_BYTES as usize;
-    if bytes.len() > cap {
-        (&bytes[..cap], true)
-    } else {
-        (bytes, false)
-    }
+    inbound::truncate_text_bytes(bytes)
 }
 
 /// Mirror of `download_images` for text-file attachments. Writes to
@@ -2413,7 +2317,7 @@ async fn download_text_files(
                         Ok(()) => out.push(DownloadedTextFile {
                             path,
                             truncated,
-                            original_size: att.size,
+                            original_size: u64::from(att.size),
                             note: None,
                         }),
                         Err(e) => warn!("write text tempfile {} failed: {e}", path.display()),
@@ -2492,7 +2396,7 @@ async fn extract_doc_attachments(
                         info!(file = %att.filename, "{n}");
                     }
                     let (to_write, truncated) = truncate_text_bytes(text.as_bytes());
-                    let extracted_len = text.len().min(u32::MAX as usize) as u32;
+                    let extracted_len = text.len() as u64;
                     match tokio::fs::write(&out_path, to_write).await {
                         Ok(()) => out.push(DownloadedTextFile {
                             path: out_path,
@@ -2533,49 +2437,7 @@ fn build_prompt(
     images: &[PathBuf],
     text_files: &[DownloadedTextFile],
 ) -> String {
-    if images.is_empty() && text_files.is_empty() {
-        return user_text.to_string();
-    }
-    let mut s = String::new();
-    if !user_text.is_empty() {
-        s.push_str(user_text);
-        s.push_str("\n\n");
-    }
-    if !images.is_empty() {
-        // `IMAGE:` marker lines are the cross-provider convention defined in
-        // `augmentagent_channel_core::images`: claude Reads the path directly
-        // (scope-guard carve-out for /tmp/aa-img-*), a codex failover turns
-        // each marker into a native `-i` attachment, and text-only providers
-        // replace them with an honest note. The prefix is MIRRORED here as a
-        // literal — this crate must stay free of a channel-core dependency
-        // (channel-core depends on us), same pattern as SOCIALAPI_API_KEY_ENV.
-        s.push_str("[attached images to analyze — open each IMAGE path]\n");
-        for path in images {
-            s.push_str(&format!("IMAGE: {}\n", path.display()));
-        }
-    }
-    if !text_files.is_empty() {
-        s.push_str("[attached text files to read]\n");
-        for f in text_files {
-            s.push_str("- ");
-            s.push_str(&f.path.display().to_string());
-            if f.truncated {
-                s.push_str(&format!(
-                    "  (TRUNCATED — first {} of {})",
-                    format_size(MAX_TEXT_BYTES),
-                    format_size(f.original_size),
-                ));
-            }
-            // #939 — OCR outcome for converted docs (recovered / unavailable /
-            // failed). Nothing is appended when the text layer was fine.
-            if let Some(note) = &f.note {
-                s.push_str(&format!("  ({note})"));
-            }
-            s.push('\n');
-        }
-    }
-    s.push_str("\nUse the Read tool to view each attachment and answer based on them.");
-    s
+    inbound::build_prompt(user_text, images, text_files)
 }
 
 /// Layer a pre-formatted `<conversation_history>` block in front of the
