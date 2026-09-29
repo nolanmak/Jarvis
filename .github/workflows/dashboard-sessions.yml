@@ -23,6 +23,13 @@ jobs:
         with:
           node-version: '22'
           cache: npm
+      - name: Record OS, architecture and runtime
+        shell: bash
+        run: |
+          uname -srm
+          if [ "$(uname -s)" = Darwin ]; then sw_vers; fi
+          node --version
+          npm --version
       - run: npm ci
       - run: npm run build
       - run: node --test test/sessionProcesses.test.js
