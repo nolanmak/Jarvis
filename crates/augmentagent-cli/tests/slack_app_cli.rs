@@ -24,7 +24,7 @@ const TICKET: &str = "ticket-test-000";
 const ALL_TOKENS: &[&str] = &[APP, APP2, BOT, BOT2, BOT_OTHER_TEAM, BOT_FEW, BOT_REVOKED];
 
 const ALL_SCOPES: &str = "app_mentions:read,channels:history,channels:read,chat:write,commands,\
-files:read,files:write,groups:history,groups:read,im:history,im:read,mpim:history,mpim:read,\
+files:read,files:write,groups:history,groups:read,im:history,im:read,im:write,mpim:history,mpim:read,\
 reactions:write,users:read";
 
 struct Env {
@@ -230,7 +230,7 @@ fn install_status_verify_rotate_remove_round_trip() {
     let text = String::from_utf8_lossy(&human.stdout);
     assert!(text.contains("Example Test (T00000001)"), "{text}");
     assert!(text.contains("U00000001"), "{text}");
-    assert!(text.contains("all 15 required scopes granted"), "{text}");
+    assert!(text.contains("all 16 required scopes granted"), "{text}");
 
     let v = ok_json(&env.run(&["app", "status", "--json"]));
     let installs = v["installs"].as_array().unwrap();
@@ -495,4 +495,220 @@ fn tokens_cannot_be_passed_as_plain_arguments() {
             .unwrap();
         assert!(!out.status.success(), "{flag} must not exist");
     }
+}
+
+// ---------------------------------------------------------------------------
+// #1286 — `slack app owner …`
+// ---------------------------------------------------------------------------
+
+const OWNER: &str = "U00000002";
+const GUEST: &str = "U00000003";
+const UNKNOWN: &str = "U00000404";
+const OWNER_DM: &str = "D00000002";
+const CONTROL: &str = "C00000001";
+const PUBLIC: &str = "C00000002";
+
+fn slack_user(id: &str, extra: Value) -> String {
+    let mut user = json!({"id": id, "team_id": TEAM, "name": "owner", "real_name": "Test Owner",
+        "deleted": false, "is_bot": false, "is_app_user": false,
+        "is_restricted": false, "is_ultra_restricted": false});
+    for (k, v) in extra.as_object().unwrap() {
+        user[k] = v.clone();
+    }
+    json!({"ok": true, "user": user}).to_string()
+}
+
+fn mock_owner_slack(server: &mut mockito::ServerGuard) {
+    use mockito::Matcher;
+    for (id, body) in [
+        (OWNER, slack_user(OWNER, json!({}))),
+        (GUEST, slack_user(GUEST, json!({"is_restricted": true}))),
+        (
+            UNKNOWN,
+            json!({"ok": false, "error": "user_not_found"}).to_string(),
+        ),
+    ] {
+        server
+            .mock("POST", "/users.info")
+            .match_body(Matcher::UrlEncoded("user".into(), id.into()))
+            .with_body(body)
+            .create();
+    }
+    server
+        .mock("POST", "/conversations.open")
+        .match_body(Matcher::UrlEncoded("users".into(), OWNER.into()))
+        .with_body(json!({"ok": true, "channel": {"id": OWNER_DM}}).to_string())
+        .create();
+    for (id, private) in [(CONTROL, true), (PUBLIC, false)] {
+        server
+            .mock("POST", "/conversations.info")
+            .match_body(Matcher::UrlEncoded("channel".into(), id.into()))
+            .with_body(
+                json!({"ok": true, "channel": {"id": id, "name": "jarvis-control",
+                    "is_channel": true, "is_group": private, "is_private": private,
+                    "is_member": true, "is_archived": false, "is_ext_shared": false}})
+                .to_string(),
+            )
+            .create();
+    }
+}
+
+fn owner_binding(env: &Env) -> Option<augmentagent_store::owner::SurfaceOwnerBinding> {
+    let store = Store::open(env.db()).unwrap();
+    let account = augmentagent_store::SurfaceAccountRef::new(
+        augmentagent_store::SurfacePlatform::new("slack").unwrap(),
+        format!("team:{TEAM}"),
+    )
+    .unwrap();
+    store.surface_owner_binding(&account).unwrap()
+}
+
+#[test]
+fn owner_bind_show_control_and_unbind_round_trip() {
+    let mut env = Env::new();
+    mock_owner_slack(&mut env.server);
+    ok_json(&env.run_stdin(&["app", "install", "--stdin", "--json"], &tokens(APP, BOT)));
+
+    // Before binding: show is local and says unbound.
+    let v = ok_json(&env.run(&["app", "owner", "show", "--json"]));
+    assert_eq!(v["team_id"], json!(TEAM));
+    assert_eq!(v["bound"], json!(false));
+
+    let v = ok_json(&env.run(&["app", "owner", "bind", "--user", OWNER, "--json"]));
+    assert_eq!(v["action"], json!("bound"));
+    assert_eq!(v["team_id"], json!(TEAM));
+    assert_eq!(v["owner"]["user_id"], json!(OWNER));
+    assert_eq!(v["owner"]["name"], json!("owner"));
+    assert_eq!(
+        v["direct_conversation"],
+        json!({"status": "recorded", "value": OWNER_DM})
+    );
+    assert_eq!(v["replaced_owner"], Value::Null);
+    let binding = owner_binding(&env).expect("bound in the database");
+    assert_eq!(binding.owner.sender_id(), OWNER);
+    assert_eq!(
+        binding.direct_conversation().map(|c| c.conversation_id()),
+        Some(OWNER_DM)
+    );
+
+    let human = env.run(&["app", "owner", "bind", "--user", OWNER]);
+    assert!(human.status.success());
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.contains(OWNER) && text.contains(OWNER_DM), "{text}");
+
+    let v = ok_json(&env.run(&[
+        "app",
+        "owner",
+        "control",
+        "set",
+        "--channel",
+        CONTROL,
+        "--json",
+    ]));
+    assert_eq!(v["control_channel"], json!(CONTROL));
+
+    let v = ok_json(&env.run(&["app", "owner", "show", "--json"]));
+    assert_eq!(v["bound"], json!(true));
+    assert_eq!(v["owner_user_id"], json!(OWNER));
+    assert_eq!(v["direct_conversation"], json!(OWNER_DM));
+    assert_eq!(v["control_channel"], json!(CONTROL));
+    assert_eq!(v["bot"]["bot_user_id"], json!("U00000001"));
+    assert_eq!(v["bot"]["bot_id"], json!("B00000001"));
+    assert_eq!(v["rejections"], json!(0));
+    let text = String::from_utf8_lossy(&env.run(&["app", "owner", "show"]).stdout).to_string();
+    assert!(text.contains(OWNER) && text.contains(CONTROL), "{text}");
+
+    // Public channel refused; the existing control channel stays.
+    let v = err_json(
+        &env.run(&[
+            "app",
+            "owner",
+            "control",
+            "set",
+            "--channel",
+            PUBLIC,
+            "--json",
+        ]),
+        "control_channel_ineligible",
+    );
+    assert!(v["message"].as_str().unwrap().contains("public"), "{v}");
+    assert_eq!(
+        owner_binding(&env)
+            .unwrap()
+            .control_channel()
+            .map(|c| c.conversation_id()),
+        Some(CONTROL)
+    );
+
+    let v = ok_json(&env.run(&["app", "owner", "control", "remove", "--json"]));
+    assert_eq!(v["removed"], json!(true));
+    assert_eq!(owner_binding(&env).unwrap().control_channel(), None);
+
+    let v = ok_json(&env.run(&["app", "owner", "unbind", "--json"]));
+    assert_eq!(v["removed"], json!(true));
+    assert!(owner_binding(&env).is_none());
+    let v = ok_json(&env.run(&["app", "owner", "unbind", "--json"]));
+    assert_eq!(v["removed"], json!(false), "unbind is idempotent");
+    env.assert_db_has_no_tokens();
+}
+
+#[test]
+fn owner_bind_refuses_unknown_guest_uninstalled_and_names() {
+    let mut env = Env::new();
+    mock_owner_slack(&mut env.server);
+    err_json(
+        &env.run(&["app", "owner", "bind", "--user", OWNER, "--json"]),
+        "nothing_installed",
+    );
+    ok_json(&env.run_stdin(&["app", "install", "--stdin", "--json"], &tokens(APP, BOT)));
+    let v = err_json(
+        &env.run(&["app", "owner", "bind", "--user", UNKNOWN, "--json"]),
+        "owner_not_found",
+    );
+    assert!(v["recovery"].as_str().unwrap().contains("member ID"), "{v}");
+    let v = err_json(
+        &env.run(&["app", "owner", "bind", "--user", GUEST, "--json"]),
+        "owner_ineligible",
+    );
+    assert!(v["message"].as_str().unwrap().contains("guest"), "{v}");
+    // Names and emails are not identities.
+    err_json(
+        &env.run(&["app", "owner", "bind", "--user", "@owner", "--json"]),
+        "invalid_id",
+    );
+    err_json(
+        &env.run(&[
+            "app",
+            "owner",
+            "bind",
+            "--user",
+            "owner@example.invalid",
+            "--json",
+        ]),
+        "invalid_id",
+    );
+    // The app's own bot user cannot own it.
+    err_json(
+        &env.run(&["app", "owner", "bind", "--user", "U00000001", "--json"]),
+        "owner_ineligible",
+    );
+    err_json(
+        &env.run(&[
+            "app",
+            "owner",
+            "control",
+            "set",
+            "--channel",
+            CONTROL,
+            "--json",
+        ]),
+        "owner_not_bound",
+    );
+    assert!(owner_binding(&env).is_none());
+
+    // Human mode: recovery on stderr, non-zero exit.
+    let out = env.run(&["app", "owner", "bind", "--user", GUEST]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("recovery:"), "{err}");
 }

@@ -22,6 +22,7 @@ use augmentagent_auth::{AuthError as CredentialError, CredentialStore};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use crate::owner_setup::OwnerIneligibility;
 use crate::transport::socket::{ConnectError, SlackConnector};
 use crate::transport::token::{redact, AppLevelToken, BotToken};
 use crate::transport::web::{
@@ -67,6 +68,8 @@ pub const REQUIRED_BOT_SCOPES: &[&str] = &[
     // `message.im` (owner DM) / `conversations.info` on DMs.
     "im:history",
     "im:read",
+    // `conversations.open`: the owner's DM with the app (#1286).
+    "im:write",
     // `message.mpim` / `conversations.info` on group DMs.
     "mpim:history",
     "mpim:read",
@@ -245,6 +248,27 @@ pub enum SlackAppError {
     InvalidApiBase { value: String },
     #[error("{0}")]
     TokenInput(String),
+    // --- #1286 owner binding -------------------------------------------
+    #[error("`{value}` is not a valid Slack {what}")]
+    InvalidId { what: &'static str, value: String },
+    #[error("Slack has no user {user_id} in this workspace")]
+    OwnerNotFound { user_id: String },
+    #[error("user {user_id} cannot be the owner: {}", .reason.describe())]
+    OwnerIneligible {
+        user_id: String,
+        reason: OwnerIneligibility,
+    },
+    #[error("no Slack owner is bound for workspace {team_id}")]
+    OwnerNotBound { team_id: String },
+    #[error("Slack has no conversation {channel_id} visible to the app")]
+    ChannelNotFound { channel_id: String },
+    #[error("{channel_id} cannot be the control channel: {}", .reason.describe())]
+    ControlChannelIneligible {
+        channel_id: String,
+        reason: OwnerIneligibility,
+    },
+    #[error("database: {0}")]
+    Store(String),
 }
 
 impl SlackAppError {
@@ -267,6 +291,13 @@ impl SlackAppError {
             Self::Corrupt { .. } => "corrupt_credentials",
             Self::InvalidApiBase { .. } => "invalid_api_base",
             Self::TokenInput(_) => "token_input",
+            Self::InvalidId { .. } => "invalid_id",
+            Self::OwnerNotFound { .. } => "owner_not_found",
+            Self::OwnerIneligible { .. } => "owner_ineligible",
+            Self::OwnerNotBound { .. } => "owner_not_bound",
+            Self::ChannelNotFound { .. } => "channel_not_found",
+            Self::ControlChannelIneligible { .. } => "control_channel_ineligible",
+            Self::Store(_) => "store",
         }
     }
 
@@ -305,6 +336,25 @@ impl SlackAppError {
             Self::InvalidApiBase { .. } => format!(
                 "Unset {SLACK_API_BASE_ENV}, or set it to an https:// URL (http:// is allowed only for localhost/127.0.0.1 test servers)."
             ),
+            Self::InvalidId { what, .. } => format!("Pass the {what} as Slack shows it (letters and digits only, e.g. from the profile's \"Copy member ID\" or the channel's details). Names and emails are never accepted."),
+            Self::OwnerNotFound { .. } => "Copy your member ID from your Slack profile (\"...\" > \"Copy member ID\") in the workspace the app is installed in, then rerun `augmentagent slack app owner bind --user <member_id>`.".into(),
+            Self::OwnerIneligible { reason, .. } => match reason {
+                OwnerIneligibility::Guest => "Guests (single- and multi-channel) cannot own the agent. Bind a full member of this workspace.".into(),
+                OwnerIneligibility::OtherWorkspace | OwnerIneligibility::External => "Bind a member of the workspace the app is installed in; people from connected workspaces never get owner authority.".into(),
+                OwnerIneligibility::Bot => "Bind a person, not a bot or app user (including this app's own bot user).".into(),
+                OwnerIneligibility::Deactivated => "That account is deactivated. Bind an active member.".into(),
+                _ => "Slack did not report which workspace the user belongs to. Check that the app has the users:read scope, then retry.".into(),
+            },
+            Self::OwnerNotBound { .. } => "Bind the owner first: `augmentagent slack app owner bind --user <member_id>`.".into(),
+            Self::ChannelNotFound { .. } => "Use the channel ID from the channel's details, and invite the app to the private channel first (`/invite @Jarvis`).".into(),
+            Self::ControlChannelIneligible { reason, .. } => match reason {
+                OwnerIneligibility::AppNotMember => "Invite the app to the channel (`/invite @Jarvis`), then rerun.".into(),
+                OwnerIneligibility::PublicChannel => "Use a private channel; public channels cannot be control channels. The DM with the app always works.".into(),
+                OwnerIneligibility::ExternallyShared => "Use a private channel that is not shared with another organization (Slack Connect).".into(),
+                OwnerIneligibility::Archived => "Unarchive the channel or pick another private channel.".into(),
+                _ => "Pick a private channel. DMs and group DMs cannot be control channels; the owner's DM with the app is recorded by `owner bind`.".into(),
+            },
+            Self::Store(_) => "The local database could not be read or written. Check AUGMENTAGENT_DB and disk space, then retry. Nothing else was changed.".into(),
             Self::TokenInput(_) => "Provide tokens on stdin (--stdin, one per line), with --app-token-file/--bot-token-file, or via AUGMENTAGENT_SLACK_APP_TOKEN / AUGMENTAGENT_SLACK_BOT_TOKEN. Tokens are never accepted as plain arguments.".into(),
         }
     }

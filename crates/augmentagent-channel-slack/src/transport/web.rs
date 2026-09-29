@@ -248,6 +248,9 @@ pub trait SlackWebApi: Send + Sync {
     async fn conversation_info(&self, channel_id: &str) -> Result<ConversationInfo, WebApiError>;
     /// `auth.test`: identity and granted scopes of the bound token (#1284).
     async fn auth_test(&self) -> Result<AuthTest, WebApiError>;
+    /// `conversations.open` with one user: the app's DM channel with that
+    /// user (#1286). Needs the `im:write` bot scope.
+    async fn open_direct_conversation(&self, user_id: &str) -> Result<String, WebApiError>;
 
     /// Deferred to #1293/#1294. Default: [`WebApiError::Unsupported`].
     async fn upload_file(&self, _req: UploadFile) -> Result<UploadedFile, WebApiError> {
@@ -586,6 +589,17 @@ impl SlackWebApi for HttpSlackWebApi {
         })
     }
 
+    async fn open_direct_conversation(&self, user_id: &str) -> Result<String, WebApiError> {
+        let v = self
+            .call("conversations.open", Body::Form(&[("users", user_id)]))
+            .await?;
+        v.pointer("/channel/id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| WebApiError::Json("conversations.open: missing channel id".into()))
+    }
+
     async fn auth_test(&self) -> Result<AuthTest, WebApiError> {
         let (v, headers) = self.call_with_headers("auth.test", Body::Form(&[])).await?;
         let scopes = headers
@@ -648,6 +662,9 @@ pub enum RecordedCall {
         channel_id: String,
     },
     AuthTest,
+    OpenDirectConversation {
+        user_id: String,
+    },
     UploadFile {
         filename: String,
         channel: Option<String>,
@@ -668,6 +685,10 @@ pub struct RecordingSlackWebApi {
     users: Mutex<Vec<UserInfo>>,
     conversations: Mutex<Vec<ConversationInfo>>,
     auth_test: Mutex<Option<AuthTest>>,
+    /// Per-user `conversations.open` result: `Ok(dm)` or `Err(slack error)`.
+    direct_conversations: Mutex<Vec<(String, Result<String, String>)>>,
+    /// Per-user `users.info` Slack errors (e.g. `user_not_found`).
+    user_errors: Mutex<Vec<(String, String)>>,
     ts_counter: AtomicU64,
 }
 
@@ -697,6 +718,31 @@ impl RecordingSlackWebApi {
     /// `U00000001` / `B00000001` with scopes unknown.
     pub fn set_auth_test(&self, who: AuthTest) {
         *self.auth_test.lock().unwrap() = Some(who);
+    }
+
+    /// Script `conversations.open` for `user_id`. Default: `D` + the user
+    /// ID without its first character.
+    pub fn set_direct_conversation(&self, user_id: &str, channel_id: &str) {
+        self.direct_conversations
+            .lock()
+            .unwrap()
+            .push((user_id.into(), Ok(channel_id.into())));
+    }
+
+    /// Make `conversations.open` for `user_id` fail with a Slack error.
+    pub fn fail_direct_conversation(&self, user_id: &str, error: &str) {
+        self.direct_conversations
+            .lock()
+            .unwrap()
+            .push((user_id.into(), Err(error.into())));
+    }
+
+    /// Make `users.info` for `user_id` fail with a Slack error.
+    pub fn fail_user(&self, user_id: &str, error: &str) {
+        self.user_errors
+            .lock()
+            .unwrap()
+            .push((user_id.into(), error.into()));
     }
 
     fn record(&self, call: RecordedCall) -> Result<(), WebApiError> {
@@ -784,6 +830,19 @@ impl SlackWebApi for RecordingSlackWebApi {
         self.record(RecordedCall::UserInfo {
             user_id: user_id.into(),
         })?;
+        if let Some((_, error)) = self
+            .user_errors
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(u, _)| u == user_id)
+        {
+            return Err(WebApiError::Slack {
+                error: error.clone(),
+                warning: None,
+            });
+        }
         let known = self
             .users
             .lock()
@@ -843,6 +902,28 @@ impl SlackWebApi for RecordingSlackWebApi {
                 enterprise_id: None,
                 scopes: None,
             }))
+    }
+
+    async fn open_direct_conversation(&self, user_id: &str) -> Result<String, WebApiError> {
+        self.record(RecordedCall::OpenDirectConversation {
+            user_id: user_id.into(),
+        })?;
+        let scripted = self
+            .direct_conversations
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(u, _)| u == user_id)
+            .map(|(_, r)| r.clone());
+        match scripted {
+            Some(Ok(id)) => Ok(id),
+            Some(Err(error)) => Err(WebApiError::Slack {
+                error,
+                warning: None,
+            }),
+            None => Ok(format!("D{}", user_id.get(1..).unwrap_or_default())),
+        }
     }
 
     async fn upload_file(&self, req: UploadFile) -> Result<UploadedFile, WebApiError> {

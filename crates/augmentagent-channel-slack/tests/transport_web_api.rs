@@ -660,3 +660,75 @@ async fn recording_fake_auth_test_is_scriptable_and_recorded() {
         3
     );
 }
+
+// #1286 — the owner's DM with the app, resolved at bind time.
+
+#[tokio::test]
+async fn open_direct_conversation_posts_users_and_returns_the_dm_id() {
+    let mut server = mockito::Server::new_async().await;
+    let mock = server
+        .mock("POST", "/conversations.open")
+        .match_header("authorization", format!("Bearer {BOT}").as_str())
+        .match_header(
+            "content-type",
+            Matcher::Regex("application/x-www-form-urlencoded".into()),
+        )
+        .match_body(Matcher::UrlEncoded("users".into(), "U00000001".into()))
+        .with_body(json!({"ok": true, "channel": {"id": "D00000001"}}).to_string())
+        .expect(1)
+        .create_async()
+        .await;
+    let api = client(&server, Arc::new(RecordingSleeper::default()));
+    assert_eq!(
+        api.open_direct_conversation("U00000001").await.unwrap(),
+        "D00000001"
+    );
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn open_direct_conversation_surfaces_missing_scope() {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("POST", "/conversations.open")
+        .with_body(json!({"ok": false, "error": "missing_scope", "needed": "im:write"}).to_string())
+        .create_async()
+        .await;
+    let api = client(&server, Arc::new(RecordingSleeper::default()));
+    match api.open_direct_conversation("U00000001").await.unwrap_err() {
+        WebApiError::Slack { error, .. } => assert_eq!(error, "missing_scope"),
+        other => panic!("expected slack error, got {other:?}"),
+    }
+    // A response without a channel id is an error, not an empty DM.
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("POST", "/conversations.open")
+        .with_body(json!({"ok": true}).to_string())
+        .create_async()
+        .await;
+    let api = client(&server, Arc::new(RecordingSleeper::default()));
+    assert!(matches!(
+        api.open_direct_conversation("U00000001").await.unwrap_err(),
+        WebApiError::Json(_)
+    ));
+}
+
+#[tokio::test]
+async fn recording_fake_scripts_direct_conversations_and_user_errors() {
+    let api = RecordingSlackWebApi::default();
+    api.set_direct_conversation("U00000001", "D00000009");
+    assert_eq!(
+        api.open_direct_conversation("U00000001").await.unwrap(),
+        "D00000009"
+    );
+    api.fail_user("U00000404", "user_not_found");
+    match api.user_info("U00000404").await.unwrap_err() {
+        WebApiError::Slack { error, .. } => assert_eq!(error, "user_not_found"),
+        other => panic!("expected slack error, got {other:?}"),
+    }
+    api.fail_direct_conversation("U00000002", "missing_scope");
+    assert!(api.open_direct_conversation("U00000002").await.is_err());
+    assert!(api.calls().contains(&RecordedCall::OpenDirectConversation {
+        user_id: "U00000001".into()
+    }));
+}

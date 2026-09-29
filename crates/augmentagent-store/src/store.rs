@@ -637,6 +637,8 @@ impl Store {
         )?;
         // #1285 — durable surface inbox, outbox and catch-up cursors.
         crate::delivery::migrate(conn)?;
+        // #1286 / #1230 — owner binding, control conversations, rejection audit.
+        crate::owner::migrate(conn)?;
         // -------------------------------------------------------------------
         // #45 — Rust-owned schema. Mirrors `src/db.ts::initDb()` exactly
         // (column names, types, NOT NULL, DEFAULT, PRIMARY KEY). Do NOT

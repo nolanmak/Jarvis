@@ -80,6 +80,42 @@ To revoke at Slack (for example after a leak), regenerate the app-level
 token and reinstall the app (or uninstall it from the workspace), then
 `slack app rotate` or `slack app remove`.
 
+## 4. Bind the owner (#1286)
+
+Only the bound owner can start agent turns, press owner cards or run
+`/jarvis`. Authority is the exact workspace + **member ID** pair; display
+names, usernames and emails are never used.
+
+```sh
+# Your member ID: Slack profile > "..." > "Copy member ID"
+augmentagent slack app owner bind --user U0123ABCD
+# Optional private control channel (invite the app first: /invite @Jarvis)
+augmentagent slack app owner control set --channel C0123ABCD
+augmentagent slack app owner show            # local, no network
+augmentagent slack app owner control remove
+augmentagent slack app owner unbind
+```
+
+| Command | What it does |
+| --- | --- |
+| `owner bind --user U… [--team T…] [--json]` | Live check with the stored bot token: `auth.test` still answers for this workspace (and gives the Enterprise Grid ID), and `users.info` shows an active, full member of it. Guests (single- or multi-channel), bots and app users (including this app's bot), deactivated accounts, people from connected organizations and members of other teams are refused. Then records the owner and the owner's DM with the app (`conversations.open`). Binding someone else replaces the previous owner and clears the control channel. Nothing is written unless every check passes. |
+| `owner show [--team T…] [--json]` | Local state: owner, DM, control channel, the app's bot identity, number of audited rejections. |
+| `owner control set --channel C… [--team T…] [--json]` | Live check with `conversations.info`: a private channel, not shared with another organization, not archived, with the app as a member. Replaces any previous control channel. |
+| `owner control remove [--team T…] [--json]` | Stop using the control channel; the DM keeps working. |
+| `owner unbind [--team T…] [--json]` | Remove the binding and its control conversations. Nobody has owner authority until you bind again. Idempotent; works with `--team` even after `slack app remove`. |
+
+**DM rule.** Recording the DM needs the `im:write` scope (in the manifest
+since #1286). If `conversations.open` fails, for example on an app installed
+before that scope was added, bind still succeeds and reports the DM as not
+recorded. Until a later bind records it, any DM with the app **from the
+owner** is accepted; a DM from anyone else is still rejected.
+
+The binding lives in the shared database (`surface_owner_bindings`,
+`surface_control_conversations`), not in the credential store, so it
+behaves the same on macOS and Linux. Rejected input is audited in
+`surface_auth_rejections` (identifiers and a reason code only, never message
+text). Enforcement at runtime arrives with `serve` (#1287).
+
 ## Where credentials live
 
 | Connection | Credential slot | Index | Managed by |

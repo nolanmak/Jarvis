@@ -19,6 +19,7 @@ use augmentagent_channel_slack::app::{
     SlackAppStore, SlackAppSummary, TokenKind, APP_CREDENTIAL_PLATFORM, MANIFEST_JSON,
     REQUIRED_BOT_SCOPES, SLACK_API_BASE_ENV,
 };
+use augmentagent_channel_slack::owner_setup::{self, DirectConversation};
 use augmentagent_channel_slack::transport::{AppLevelToken, BotToken};
 use augmentagent_store::Store;
 use clap::{Args, Subcommand};
@@ -81,6 +82,92 @@ pub enum SlackAppOp {
         #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value_t = false, action = clap::ArgAction::Set)]
         json: bool,
     },
+    /// Who owns the agent on Slack (#1286): bind the owner's member ID,
+    /// choose the private control channel, show or unbind.
+    Owner {
+        #[command(subcommand)]
+        op: OwnerOp,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum OwnerOp {
+    /// Verify a member ID live (full member of the installed workspace, not
+    /// a guest, bot or external user), bind it as the only owner and record
+    /// the owner's DM with the app. Replaces any previous owner.
+    Bind {
+        /// Slack member ID (profile > "Copy member ID"). Names and emails
+        /// are not accepted.
+        #[arg(long, value_name = "MEMBER_ID")]
+        user: String,
+        #[arg(long)]
+        team: Option<String>,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// Show the bound owner, DM, control channel and rejection count
+    /// (local state, no network).
+    Show {
+        #[arg(long)]
+        team: Option<String>,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// Remove the owner binding and its control conversations. Idempotent.
+    Unbind {
+        #[arg(long)]
+        team: Option<String>,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// Choose or clear the owner's private control channel.
+    Control {
+        #[command(subcommand)]
+        op: ControlOp,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ControlOp {
+    /// Verify the channel live (private, not shared with another
+    /// organization, not archived, the app is a member) and make it the
+    /// control channel, replacing any previous one.
+    Set {
+        #[arg(long, value_name = "CHANNEL_ID")]
+        channel: String,
+        #[arg(long)]
+        team: Option<String>,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// Stop using the control channel. The DM with the app keeps working.
+    Remove {
+        #[arg(long)]
+        team: Option<String>,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+}
+
+impl SlackAppOp {
+    fn json(&self) -> bool {
+        match self {
+            SlackAppOp::Manifest => false,
+            SlackAppOp::Install { json, .. }
+            | SlackAppOp::Verify { json, .. }
+            | SlackAppOp::Status { json, .. }
+            | SlackAppOp::Rotate { json, .. }
+            | SlackAppOp::Remove { json, .. } => *json,
+            SlackAppOp::Owner { op } => match op {
+                OwnerOp::Bind { json, .. }
+                | OwnerOp::Show { json, .. }
+                | OwnerOp::Unbind { json, .. } => *json,
+                OwnerOp::Control { op } => match op {
+                    ControlOp::Set { json, .. } | ControlOp::Remove { json, .. } => *json,
+                },
+            },
+        }
+    }
 }
 
 /// Where tokens come from. There is deliberately no flag that takes a token
@@ -307,14 +394,7 @@ fn fail(json_out: bool, e: &SlackAppError) -> ! {
 /// Entry point for `augmentagent slack app …`.
 pub async fn run(op: &SlackAppOp, store: &Store) -> Result<()> {
     let creds = SlackAppStore::default_store();
-    let json_out = match op {
-        SlackAppOp::Manifest => false,
-        SlackAppOp::Install { json, .. }
-        | SlackAppOp::Verify { json, .. }
-        | SlackAppOp::Status { json, .. }
-        | SlackAppOp::Rotate { json, .. }
-        | SlackAppOp::Remove { json, .. } => *json,
-    };
+    let json_out = op.json();
     match run_inner(op, store, &creds).await {
         Ok(()) => Ok(()),
         Err(e) => fail(json_out, &e),
@@ -332,6 +412,7 @@ async fn run_inner(
             print!("{MANIFEST_JSON}");
             Ok(())
         }
+        SlackAppOp::Owner { op } => run_owner(op, store, creds).await,
         SlackAppOp::Install { tokens, json } => {
             let t = resolve_tokens(tokens, &mut std::io::stdin().lock(), &env)?;
             let (Some(app_token), Some(bot_token)) = (t.app, t.bot) else {
@@ -510,6 +591,218 @@ async fn run_inner(
             );
             Ok(())
         }
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn fmt_ms(ms: i64) -> String {
+    match chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms) {
+        Some(t) => t.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        None => "unknown".into(),
+    }
+}
+
+async fn run_owner(
+    op: &OwnerOp,
+    store: &Store,
+    creds: &SlackAppStore,
+) -> Result<(), SlackAppError> {
+    match op {
+        OwnerOp::Bind { user, team, json } => {
+            let connector = connector()?;
+            let out = owner_setup::bind_owner(
+                store,
+                creds,
+                &connector,
+                team.as_deref(),
+                user.trim(),
+                now_ms(),
+            )
+            .await?;
+            let action = if out.replaced_owner.is_some() {
+                "rebound"
+            } else {
+                "bound"
+            };
+            let _ = success(
+                *json,
+                json!({
+                    "ok": true,
+                    "action": action,
+                    "team_id": out.team_id,
+                    "enterprise_id": out.enterprise_id,
+                    "owner": {
+                        "user_id": out.owner_user_id,
+                        "name": out.owner_name,
+                        "real_name": out.owner_real_name,
+                    },
+                    "direct_conversation": out.direct_conversation,
+                    "replaced_owner": out.replaced_owner,
+                    "confirmed_at_ms": out.confirmed_at_ms,
+                }),
+                || {
+                    let who = match (&out.owner_real_name, &out.owner_name) {
+                        (Some(r), Some(n)) => format!("{r} (@{n}, {})", out.owner_user_id),
+                        (_, Some(n)) => format!("@{n} ({})", out.owner_user_id),
+                        _ => out.owner_user_id.clone(),
+                    };
+                    println!("Slack owner {action} for {}: {who}", out.team_id);
+                    if let Some(prev) = &out.replaced_owner {
+                        println!("  replaced:   {prev} (its control channel was cleared)");
+                    }
+                    match &out.direct_conversation {
+                        DirectConversation::Recorded(dm) => {
+                            println!("  DM:         {dm} (the owner's DM with the app)")
+                        }
+                        DirectConversation::Unresolved(why) => println!(
+                            "  DM:         not recorded ({why}); any DM with the app from this owner is accepted. Add the im:write scope and bind again to record it."
+                        ),
+                    }
+                    println!("  identity:   member ID only; names and emails are never used for authority");
+                    println!("Optional: `augmentagent slack app owner control set --channel <private channel id>`.");
+                },
+            );
+            Ok(())
+        }
+        OwnerOp::Show { team, json } => {
+            let st = owner_setup::owner_status(store, creds, team.as_deref())?;
+            let b = st.binding.as_ref();
+            let dm = b
+                .and_then(|b| b.direct_conversation())
+                .map(|c| c.conversation_id().to_string());
+            let channel = b
+                .and_then(|b| b.control_channel())
+                .map(|c| c.conversation_id().to_string());
+            let dm_rule = match (&b, &dm) {
+                (None, _) => Value::Null,
+                (_, Some(_)) => json!("recorded"),
+                (_, None) => json!("any_dm_with_app"),
+            };
+            let _ = success(
+                *json,
+                json!({
+                    "ok": true,
+                    "team_id": st.team_id,
+                    "bound": b.is_some(),
+                    "account": b.map(|b| b.owner.account().account_id().to_string()),
+                    "owner_user_id": b.map(|b| b.owner.sender_id().to_string()),
+                    "confirmed_at_ms": b.map(|b| b.confirmed_at_ms),
+                    "direct_conversation": dm,
+                    "direct_conversation_rule": dm_rule,
+                    "control_channel": channel,
+                    "app_installed": st.bot.is_some(),
+                    "bot": st.bot.as_ref().map(|bot| json!({
+                        "bot_user_id": bot.bot_user_id,
+                        "bot_id": bot.bot_id,
+                        "app_id": bot.app_id,
+                    })),
+                    "rejections": st.rejections,
+                }),
+                || {
+                    let Some(b) = b else {
+                        println!("No Slack owner bound for {}. Run `augmentagent slack app owner bind --user <member_id>`.", st.team_id);
+                        return;
+                    };
+                    println!(
+                        "Slack owner for {} ({})",
+                        st.team_id,
+                        b.owner.account().account_id()
+                    );
+                    println!("  owner:      {}", b.owner.sender_id());
+                    println!("  confirmed:  {}", fmt_ms(b.confirmed_at_ms));
+                    println!(
+                        "  DM:         {}",
+                        dm.clone().unwrap_or_else(|| {
+                            "not recorded; any DM with the app from the owner is accepted".into()
+                        })
+                    );
+                    println!(
+                        "  control:    {}",
+                        channel.clone().unwrap_or_else(|| "none (DM only)".into())
+                    );
+                    match &st.bot {
+                        Some(bot) => println!(
+                            "  bot:        {}{}",
+                            bot.bot_user_id.as_deref().unwrap_or("?"),
+                            bot.bot_id
+                                .as_deref()
+                                .map(|b| format!(", bot {b}"))
+                                .unwrap_or_default()
+                        ),
+                        None => println!("  bot:        app not installed for this workspace"),
+                    }
+                    println!("  rejected:   {} input(s) audited", st.rejections);
+                },
+            );
+            Ok(())
+        }
+        OwnerOp::Unbind { team, json } => {
+            let (team_id, removed) = owner_setup::unbind_owner(store, creds, team.as_deref())?;
+            let _ = success(
+                *json,
+                json!({"ok": true, "team_id": team_id, "removed": removed}),
+                || {
+                    if removed {
+                        println!("Removed the Slack owner binding for {team_id}. Nobody has owner authority there until you bind again.");
+                    } else {
+                        println!("No Slack owner was bound for {team_id}; nothing to remove.");
+                    }
+                },
+            );
+            Ok(())
+        }
+        OwnerOp::Control { op } => match op {
+            ControlOp::Set {
+                channel,
+                team,
+                json,
+            } => {
+                let connector = connector()?;
+                let conv = owner_setup::set_control_channel(
+                    store,
+                    creds,
+                    &connector,
+                    team.as_deref(),
+                    channel.trim(),
+                    now_ms(),
+                )
+                .await?;
+                let team_id = creds.resolve_team(team.as_deref())?;
+                let _ = success(
+                    *json,
+                    json!({"ok": true, "team_id": team_id, "control_channel": conv.conversation_id()}),
+                    || {
+                        println!(
+                            "Control channel for {team_id} is now {} (private; only the owner is authorized there).",
+                            conv.conversation_id()
+                        );
+                    },
+                );
+                Ok(())
+            }
+            ControlOp::Remove { team, json } => {
+                let (team_id, removed) =
+                    owner_setup::remove_control_channel(store, creds, team.as_deref())?;
+                let _ = success(
+                    *json,
+                    json!({"ok": true, "team_id": team_id, "removed": removed}),
+                    || {
+                        if removed {
+                            println!("Control channel cleared for {team_id}; the DM with the app still works.");
+                        } else {
+                            println!("No control channel was set for {team_id}.");
+                        }
+                    },
+                );
+                Ok(())
+            }
+        },
     }
 }
 

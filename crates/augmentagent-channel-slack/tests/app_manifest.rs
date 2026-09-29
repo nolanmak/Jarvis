@@ -103,3 +103,12 @@ fn bot_user_and_slash_command_are_declared() {
         Value::Bool(true)
     );
 }
+
+/// #1286 — `owner bind` records the owner's DM with `conversations.open`,
+/// which needs `im:write`; the manifest must grant it.
+#[test]
+fn owner_dm_scope_is_required_and_granted() {
+    assert!(REQUIRED_BOT_SCOPES.contains(&"im:write"));
+    let granted = strings(&manifest()["oauth_config"]["scopes"]["bot"]);
+    assert!(granted.contains("im:write"));
+}

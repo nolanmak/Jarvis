@@ -52,11 +52,12 @@ jobs:
       # #1226 / #1282 — the transport-neutral surface contracts and the Slack
       # identity/capability mapping must hold on both hosts. #1285 — the
       # durable inbox/outbox restart, reconcile and catch-up tests too, and
-      # their status/doctor visibility.
+      # their status/doctor visibility. #1286 — owner binding, rejection
+      # audit and Slack owner authorization/echo rejection.
       - name: Surface contracts (shared + Slack)
         run: |
-          cargo test -p augmentagent-store --test surface_refs --test surface_sessions --test surface_delivery
-          cargo test -p augmentagent-channel-slack --test surface_contract
+          cargo test -p augmentagent-store --test surface_refs --test surface_sessions --test surface_delivery --test surface_owner
+          cargo test -p augmentagent-channel-slack --test surface_contract --test owner_auth
           cargo test -p augmentagent-cli --test status_delivery
       # #1283 — the Slack Socket Mode transport must build and pass on both
       # hosts (rustls WebSocket, heartbeat/sleep-wake recovery, Web API).
@@ -67,10 +68,11 @@ jobs:
       # #1284 — Slack app install/verify/rotate/remove: manifest contract,
       # credential lifecycle (in-memory store) and the real CLI against a
       # mock Slack with the file credential store. No Keychain, no network.
+      # #1286 — owner bind/show/unbind and control channel selection.
       - name: Slack app credentials and CLI
         run: |
           cargo test -p augmentagent-auth
-          cargo test -p augmentagent-channel-slack --test app_manifest --test app_install
+          cargo test -p augmentagent-channel-slack --test app_manifest --test app_install --test owner_setup
           cargo test -p augmentagent-cli --test slack_app_cli
       - name: Host-dependent CLI surface
         run: >-
