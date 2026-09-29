@@ -21,6 +21,7 @@
 //!                   etc.) are NOT consulted — serve never reads them,
 //!                   so they said nothing about runtime state (#374).
 //!  * **queue**     — `pending_reply_count()` from the store
+//!  * **delivery**  — durable backlog/retry/dead-letter counts per surface (#1285)
 //!
 //! Output is JSON by default when stdout is piped (CI, dashboard shell-out)
 //! and a hand-rolled ASCII table when stdout is a tty (no `comfy-table`
@@ -92,6 +93,7 @@ pub struct StatusDoc {
     pub core_keys: CoreKeys,
     pub channels: BTreeMap<String, ChannelStatus>,
     pub queue: QueueStatus,
+    pub delivery: BTreeMap<String, DeliveryStatus>,
     pub summary: String,
 }
 
@@ -138,6 +140,22 @@ pub struct ChannelStatus {
 pub struct QueueStatus {
     pub pending: i64,
 }
+
+/// #1285 — durable delivery state for one chat surface. Every count is of
+/// rows still needing work except the dead letters, which need the owner.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DeliveryStatus {
+    pub inbound_backlog: i64,
+    pub inbound_dead_letter: i64,
+    pub outbound_backlog: i64,
+    pub outbound_retrying: i64,
+    pub outbound_reconcile: i64,
+    pub outbound_dead_letter: i64,
+}
+
+/// Chat surfaces always listed under `delivery`, with zeros when idle, so a
+/// consumer can tell "nothing pending" from "not reported".
+const DELIVERY_SURFACES: &[&str] = &["discord", "slack", "whatsapp"];
 
 /// Symbolic summary string. Maps onto the issue's exit-code table; see
 /// [`exit_code_for`].
@@ -240,6 +258,12 @@ impl StatusDoc {
             },
             "channels": Value::Object(channels),
             "queue": { "pending": self.queue.pending },
+            "delivery": Value::Object(
+                self.delivery
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.to_json()))
+                    .collect(),
+            ),
             "summary": self.summary,
         })
     }
@@ -257,6 +281,44 @@ impl ChannelStatus {
     }
 }
 
+impl DeliveryStatus {
+    fn to_json(&self) -> Value {
+        json!({
+            "inbound_backlog": self.inbound_backlog,
+            "inbound_dead_letter": self.inbound_dead_letter,
+            "outbound_backlog": self.outbound_backlog,
+            "outbound_retrying": self.outbound_retrying,
+            "outbound_reconcile": self.outbound_reconcile,
+            "outbound_dead_letter": self.outbound_dead_letter,
+        })
+    }
+}
+
+/// Known chat surfaces with zeros, overlaid with whatever the store has
+/// (including platforms outside the known list).
+fn delivery_map(
+    counts: Vec<augmentagent_store::delivery::SurfaceDeliveryCounts>,
+) -> BTreeMap<String, DeliveryStatus> {
+    let mut out: BTreeMap<String, DeliveryStatus> = DELIVERY_SURFACES
+        .iter()
+        .map(|name| (name.to_string(), DeliveryStatus::default()))
+        .collect();
+    for c in counts {
+        out.insert(
+            c.platform,
+            DeliveryStatus {
+                inbound_backlog: c.inbound_backlog,
+                inbound_dead_letter: c.inbound_dead_letter,
+                outbound_backlog: c.outbound_backlog,
+                outbound_retrying: c.outbound_retrying,
+                outbound_reconcile: c.outbound_reconcile,
+                outbound_dead_letter: c.outbound_dead_letter,
+            },
+        );
+    }
+    out
+}
+
 /// One-shot probe + assemble. Public so the CI snapshot test in #14 can
 /// import it directly without spawning the binary.
 pub async fn collect(store: &Store) -> Result<StatusDoc> {
@@ -270,6 +332,11 @@ pub async fn collect(store: &Store) -> Result<StatusDoc> {
     let queue = QueueStatus {
         pending: store.pending_reply_count().context("queue depth")?,
     };
+    let delivery = delivery_map(
+        store
+            .surface_delivery_counts()
+            .context("surface delivery counts")?,
+    );
 
     let summary = classify(&daemon, &dashboard, &core_keys, &channels);
 
@@ -282,6 +349,7 @@ pub async fn collect(store: &Store) -> Result<StatusDoc> {
         core_keys,
         channels,
         queue,
+        delivery,
         summary,
     })
 }
@@ -767,6 +835,20 @@ fn print_table(doc: &StatusDoc, channel_filter: Option<&str>) {
             }
         );
     }
+
+    println!("\ndelivery:");
+    for (name, d) in &doc.delivery {
+        println!(
+            "  {:<10} inbound {} dead {} | outbound {} retrying {} reconcile {} dead {}",
+            name,
+            d.inbound_backlog,
+            d.inbound_dead_letter,
+            d.outbound_backlog,
+            d.outbound_retrying,
+            d.outbound_reconcile,
+            d.outbound_dead_letter
+        );
+    }
 }
 
 fn yn(b: bool) -> &'static str {
@@ -965,6 +1047,40 @@ mod tests {
         // The CI snapshot test in #14 keys off this. Bumping it is a
         // breaking change for the /setup skill.
         assert_eq!(SCHEMA_VERSION, "1");
+    }
+
+    #[test]
+    fn delivery_lists_chat_surfaces_with_zeros_and_keeps_other_platforms() {
+        use augmentagent_store::delivery::SurfaceDeliveryCounts;
+        let map = delivery_map(vec![
+            SurfaceDeliveryCounts {
+                platform: "slack".into(),
+                outbound_dead_letter: 2,
+                ..Default::default()
+            },
+            SurfaceDeliveryCounts {
+                platform: "telegram".into(),
+                inbound_backlog: 1,
+                ..Default::default()
+            },
+        ]);
+        assert_eq!(
+            map.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["discord", "slack", "telegram", "whatsapp"]
+        );
+        assert_eq!(map["slack"].outbound_dead_letter, 2);
+        assert_eq!(map["discord"], DeliveryStatus::default());
+        assert_eq!(
+            map["telegram"].to_json(),
+            json!({
+                "inbound_backlog": 1,
+                "inbound_dead_letter": 0,
+                "outbound_backlog": 0,
+                "outbound_retrying": 0,
+                "outbound_reconcile": 0,
+                "outbound_dead_letter": 0,
+            })
+        );
     }
 
     #[test]

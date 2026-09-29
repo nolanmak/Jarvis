@@ -134,6 +134,32 @@ expression: json
     "reachable": "[volatile]",
     "unit": "augmentagent-dashboard.service"
   },
+  "delivery": {
+    "discord": {
+      "inbound_backlog": 0,
+      "inbound_dead_letter": 0,
+      "outbound_backlog": 0,
+      "outbound_dead_letter": 0,
+      "outbound_reconcile": 0,
+      "outbound_retrying": 0
+    },
+    "slack": {
+      "inbound_backlog": 0,
+      "inbound_dead_letter": 0,
+      "outbound_backlog": 0,
+      "outbound_dead_letter": 0,
+      "outbound_reconcile": 0,
+      "outbound_retrying": 0
+    },
+    "whatsapp": {
+      "inbound_backlog": 0,
+      "inbound_dead_letter": 0,
+      "outbound_backlog": 0,
+      "outbound_dead_letter": 0,
+      "outbound_reconcile": 0,
+      "outbound_retrying": 0
+    }
+  },
   "host": "linux",
   "queue": {
     "pending": 0

@@ -205,6 +205,10 @@ pub async fn run(
     findings.push(check_build_vm());
     // 17. build scratch — admission-limit validity and capacity (#1092)
     findings.push(check_build_scratch());
+    // 18. durable surface delivery — dead letters / unreconciled sends (#1285)
+    if let Some(doc) = &status_doc {
+        findings.push(check_surface_delivery(&doc.delivery));
+    }
 
     // --- Deep checks (off by default).
     if deep {
@@ -1782,6 +1786,42 @@ fn check_per_channel_validate(status_doc: &Option<status::StatusDoc>) -> Vec<Fin
     out
 }
 
+/// #1285 — durable delivery needs the owner when a surface has dead letters
+/// or sends whose provider outcome is unknown. A backlog alone is normal.
+fn check_surface_delivery(
+    delivery: &std::collections::BTreeMap<String, status::DeliveryStatus>,
+) -> Finding {
+    let mut problems = Vec::new();
+    for (name, d) in delivery {
+        let mut parts = Vec::new();
+        if d.outbound_reconcile > 0 {
+            parts.push(format!(
+                "{} send(s) awaiting reconcile",
+                d.outbound_reconcile
+            ));
+        }
+        let dead = d.inbound_dead_letter + d.outbound_dead_letter;
+        if dead > 0 {
+            parts.push(format!("{dead} dead letter(s)"));
+        }
+        if !parts.is_empty() {
+            problems.push(format!("{name}: {}", parts.join(", ")));
+        }
+    }
+    if problems.is_empty() {
+        Finding::ok(
+            "surface_delivery",
+            "no dead letters or unreconciled sends".to_string(),
+        )
+    } else {
+        Finding::warn(
+            "surface_delivery",
+            problems.join("; "),
+            Some("augmentagent status --json"),
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Human-readable table output.
 // ---------------------------------------------------------------------------
@@ -2616,6 +2656,7 @@ mod tests {
             },
             channels,
             queue: status::QueueStatus { pending: 0 },
+            delivery: BTreeMap::new(),
             summary: "ok".to_string(),
         };
         let v = check_per_channel_validate(&Some(doc));
@@ -2635,5 +2676,43 @@ mod tests {
             slack.suggested_cmd.as_deref(),
             Some("augmentagent channel slack arm")
         );
+    }
+
+    #[test]
+    fn surface_delivery_warns_on_dead_letters_and_unreconciled_sends() {
+        let mut delivery = BTreeMap::new();
+        delivery.insert("discord".to_string(), status::DeliveryStatus::default());
+        assert_eq!(
+            check_surface_delivery(&delivery).severity,
+            Severity::Ok,
+            "idle surfaces are healthy"
+        );
+        delivery.insert(
+            "slack".to_string(),
+            status::DeliveryStatus {
+                outbound_backlog: 4,
+                outbound_reconcile: 1,
+                ..Default::default()
+            },
+        );
+        delivery.insert(
+            "whatsapp".to_string(),
+            status::DeliveryStatus {
+                inbound_dead_letter: 1,
+                outbound_dead_letter: 2,
+                ..Default::default()
+            },
+        );
+        let finding = check_surface_delivery(&delivery);
+        assert_eq!(finding.name, "surface_delivery");
+        assert_eq!(finding.severity, Severity::Warn);
+        assert_eq!(
+            finding.message,
+            "slack: 1 send(s) awaiting reconcile; whatsapp: 3 dead letter(s)"
+        );
+        // A plain backlog is normal work in progress, not a warning.
+        delivery.remove("whatsapp");
+        delivery.get_mut("slack").unwrap().outbound_reconcile = 0;
+        assert_eq!(check_surface_delivery(&delivery).severity, Severity::Ok);
     }
 }
