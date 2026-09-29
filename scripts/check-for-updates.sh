@@ -413,7 +413,7 @@ fi
 # Missing one means the PR merges but the daemon keeps the stale embedded copy.
 # scripts/tests/updater-rebuild-trigger.test.sh fails when a new include target
 # outside crates/ is added without being classified here.
-RUST_REBUILD_PATHS='^(crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|schema/|\.env\.example$|scripts/(codex-tool-bridge|codex-command-sandbox|codex-build-vm|build-dependency-proxy|provider-supervisor)\.py$)'
+RUST_REBUILD_PATHS='^(crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|schema/|\.env\.example$|docs/slack-app-manifest\.json$|scripts/(codex-tool-bridge|codex-command-sandbox|codex-build-vm|build-dependency-proxy|provider-supervisor)\.py$)'
 if printf '%s\n' "$CHANGED_FILES" | grep -qE "$RUST_REBUILD_PATHS"; then
   NEEDS_REBUILD=1
 fi
