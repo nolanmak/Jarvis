@@ -53,7 +53,7 @@ fn report_prints_every_row_and_the_open_blockers_from_the_checkout() {
         "supported        voice-clips",
         "unverified-live  acceptance",
         "Open blockers",
-        "host linux (#1325)",
+        "host-acceptance linux (#1300)",
         "host-acceptance macos-arm64 (#1300)",
     ] {
         assert!(text.contains(needle), "`{needle}` missing:\n{text}");

@@ -7,12 +7,7 @@
     {
       "id": "linux",
       "label": "Linux (systemd)",
-      "blockers": [
-        {
-          "issue": 1325,
-          "reason": "Credentials are not persisted on Linux: the credential store has no Linux backend, so tokens stored by `slack app install` are lost when the command exits."
-        }
-      ]
+      "blockers": []
     },
     {
       "id": "macos-arm64",
