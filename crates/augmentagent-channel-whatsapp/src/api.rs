@@ -70,7 +70,7 @@ pub fn default_socket_path() -> PathBuf {
     {
         // Darwin's Unix socket path limit is short. Keep this path stable
         // across terminal and launchd environments, even with a long HOME.
-        return macos_socket_path(users_uid());
+        macos_socket_path(users_uid())
     }
     #[cfg(not(target_os = "macos"))]
     {
