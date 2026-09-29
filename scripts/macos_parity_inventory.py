@@ -48,8 +48,9 @@ def discover(root=ROOT):
                 break
 
     for prefix in ("install", "uninstall"):
-        for path in sorted((root / "scripts").glob(f"{prefix}-*.sh")):
-            add("installer", path.name, path)
+        for suffix in ("sh", "py"):
+            for path in sorted((root / "scripts").glob(f"{prefix}-*.{suffix}")):
+                add("installer", path.name, path)
 
     for path in sorted((root / "src").rglob("*.ts")):
         for method, _quote, route in ROUTE.findall(path.read_text()):

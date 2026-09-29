@@ -158,6 +158,24 @@ one OpenAI-compatible Chat upstream in 9Router with prefix `runpod`, base URL
 `glm-5.3-flash` to its model catalog. Do not declare attachment capabilities
 until they have been verified for that route.
 
+### Native macOS adapter without Docker
+
+Prepare `~/.config/augmentagent/runpod-adapter.env` with `RUNPOD_API_KEY` and
+`ADAPTER_API_KEY`, and `~/.config/augmentagent/runpod-routes.json` with routes
+paused until their live gate passes. Both files must be owned by the service
+user and mode 0600. Run `python3 scripts/install-runpod-adapter.py` from a
+logged-in macOS account. The installer copies the standard-library server to
+private data storage, keeps its existing journal, and installs
+`com.nolanmak.augmentagent.runpod-adapter` on `127.0.0.1:20129`. Secrets are
+loaded by its private Python launcher rather than written to the plist.
+
+Use `augmentagent service status --unit augmentagent-runpod-adapter.service`
+and `augmentagent logs --unit runpod-adapter` to inspect it. Re-run the
+installer after source or configuration changes; use
+`bash scripts/uninstall-runpod-adapter.sh` to stop and remove the LaunchAgent
+while retaining credentials, routes and job state. The live Runpod route and
+paid inference checks below remain explicit operator decisions.
+
 If Jarvis runs on another tailnet machine while the gateway remains on this Mac, set its router `base_url` to the HTTPS `/v1` URL shown by `tailscale serve status` and set `AUGMENTAGENT_MODEL_ROUTER_ALLOWED_HOSTS` to that exact host and port in the daemon environment (`host.ts.net:443` for default HTTPS). Every remote URL, including a `.ts.net` name, requires HTTPS and an exact host-and-port allowlist entry. The router key remains in the private router config. `python3 scripts/tests/verify_codex_redirect.py` runs the real Codex Responses client against two synthetic local servers: the configured origin must receive the throwaway key, while a redirect to a different host and port must receive no credential. Codex CLI 0.154.0 passed this probe locally on 2026-09-18; the pinned version also runs in model-router CI. The daemon host still needs the complete routing and tool workflow acceptance run.
 
 The adapter stores prompt-free job state in `RUNPOD_ADAPTER_JOURNAL` (default `/app/state/jobs.sqlite3`). Mount `/app/state` on owner-private persistent storage so an adapter restart retains Runpod job IDs and unresolved submissions. A caller may send a stable `Idempotency-Key` for one logical turn; repeating it returns HTTP 409 without another Runpod submission. Stock 9Router 0.5.75 dropped that header and translated an upstream 409 into 503. `sidecars/9router/runpod-reconciliation.patch` fixes both on the pinned 9Router source and pins an explicit OpenAI-compatible model so 9Router cannot switch to its capacity adapter. It returns 422 before upstream inference when a current or historical attachment needs a capability the selected model does not declare; its Docker image and Linux installer are described in `docs/model-router.md`. The synthetic installed-router tests passed against the patched local image on 2026-09-18, including unchanged account quota failover and visible attachment refusal. The actual Jarvis host must run that patched build and pass the same checks. The adapter also journals an HMAC digest of each request body (keyed with its private adapter key). It refuses an identical unkeyed request while an earlier job is unresolved, and for one hour after a recorded completion. This survives adapter restarts and prevents immediate gateway/client retries from launching another paid job. An intentional identical request in that hour will also be refused; changed request bodies and adapter-key rotation do not share this guard. The adapter itself returns 409 for an uncertain submission or result rather than a retryable 502.

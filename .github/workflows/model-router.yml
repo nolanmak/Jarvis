@@ -12,7 +12,12 @@ on:
       - 'views/model-*'
       - 'test/modelRouter*'
       - 'scripts/*model-router*'
+      - 'scripts/*runpod-adapter*'
+      - 'scripts/lib/install-launchd-plist.sh'
+      - 'scripts/macos_parity_inventory.py'
+      - 'docs/macos-parity-inventory.json'
       - 'scripts/tests/model_router*'
+      - 'scripts/tests/runpod_adapter_install_test.py'
       - 'scripts/tests/run_model_router_image_fixture.py'
       - 'scripts/tests/verify_codex_redirect.py'
       - 'scripts/tests/test_verify_codex_redirect.py'
@@ -31,7 +36,12 @@ on:
       - 'views/model-*'
       - 'test/modelRouter*'
       - 'scripts/*model-router*'
+      - 'scripts/*runpod-adapter*'
+      - 'scripts/lib/install-launchd-plist.sh'
+      - 'scripts/macos_parity_inventory.py'
+      - 'docs/macos-parity-inventory.json'
       - 'scripts/tests/model_router*'
+      - 'scripts/tests/runpod_adapter_install_test.py'
       - 'scripts/tests/run_model_router_image_fixture.py'
       - 'scripts/tests/verify_codex_redirect.py'
       - 'scripts/tests/test_verify_codex_redirect.py'
@@ -40,6 +50,26 @@ on:
 permissions:
   contents: read
 jobs:
+  installer:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: uname -srm && python3 --version
+      - run: sw_vers
+        if: runner.os == 'macOS'
+      - run: python3 -m unittest discover -s scripts/tests -p model_router_install_test.py -v
+      - run: bash scripts/tests/model-router-uninstall.test.sh
+      - run: python3 -m unittest discover -s scripts/tests -p runpod_adapter_install_test.py -v
+      - run: bash scripts/tests/runpod-adapter-uninstall.test.sh
+      - run: python3 -m unittest discover -s scripts/runpod-adapter -p test_native_configuration.py -v
+      - run: python3 -m unittest discover -s scripts/runpod-adapter -p test_server.py -v
+      - run: python3 -m unittest discover -s scripts/runpod-adapter -p test_verify_deployment.py -v
+      - run: python3 -m unittest scripts.tests.macos_parity_inventory_test -v
   dashboard:
     runs-on: ubuntu-latest
     steps:
