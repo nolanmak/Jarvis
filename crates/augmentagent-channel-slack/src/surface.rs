@@ -335,9 +335,12 @@ pub const SLACK_SHARED_CAPABILITIES: [CapabilityRow<SurfaceCapability>; 11] = [
     ),
     row(
         SurfaceCapability::Send,
-        SupportStatus::Unsupported,
+        SupportStatus::Supported,
         1290,
-        "SlackClient::send_message exists but no owner-driven send path uses the shared refs",
+        "approved contact replies (DM, group DM, channel, in thread) and owner-composed messages \
+         are sent once, as the owner's own account through the Composio user connection, with \
+         a per-action send ledger for retries (contact/, tests/contact_send.rs, \
+         tests/contact_surface.rs); live-workspace identity is unverified",
     ),
     row(SurfaceCapability::Schedule, SupportStatus::Unsupported, 1291, NOT_WIRED),
     row(SurfaceCapability::ModelControl, SupportStatus::Unsupported, 1292, NOT_WIRED),

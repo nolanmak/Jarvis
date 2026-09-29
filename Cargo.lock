@@ -804,6 +804,7 @@ dependencies = [
  "augmentagent-channel-discord-dm",
  "augmentagent-channel-voice",
  "augmentagent-docs",
+ "augmentagent-messages",
  "augmentagent-store",
  "augmentagent-wiki",
  "futures",

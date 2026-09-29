@@ -550,3 +550,19 @@ fn threads_are_supported_now_that_each_thread_is_a_persistent_conversation() {
     assert!(SlackInteraction::Threads.require().is_ok());
     assert!(!parity_blockers().iter().any(|b| b.name == "threads"));
 }
+
+// #1290 — approved replies and owner-composed messages reach Slack contacts,
+// as the owner, through the contact-send path.
+#[test]
+fn send_is_supported_now_that_approved_contact_messages_are_delivered() {
+    assert!(slack_capabilities()
+        .require(SurfaceCapability::Send)
+        .is_ok());
+    let row = SLACK_SHARED_CAPABILITIES
+        .iter()
+        .find(|row| row.key == SurfaceCapability::Send)
+        .unwrap();
+    assert_eq!(row.tracking_issue, 1290);
+    assert!(row.basis.contains("contact_send"), "{}", row.basis);
+    assert!(!parity_blockers().iter().any(|b| b.name == "send"));
+}

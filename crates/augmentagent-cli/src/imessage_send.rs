@@ -88,10 +88,11 @@ impl ReplyApprover {
             return failed("draft is empty after removing card markers; cannot send".into());
         }
 
-        match self
-            .store
-            .claim_action_for_send(action_id, ActionStatus::Pending, "discord")
-        {
+        match self.store.claim_action_for_send(
+            action_id,
+            ActionStatus::Pending,
+            crate::decision_source(),
+        ) {
             Ok(true) => {}
             Ok(false) => return Self::resolved_outcome(&self.store, action_id),
             Err(e) => return failed(format!("claim for send failed: {e}")),
@@ -129,7 +130,7 @@ impl ReplyApprover {
         match self.store.try_resolve_action(
             action_id,
             ActionStatus::Rejected,
-            "discord",
+            crate::decision_source(),
             Some("skipped by approver"),
         ) {
             Ok(true) => {}

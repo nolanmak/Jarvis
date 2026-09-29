@@ -85,6 +85,22 @@ impl CardSurfaces {
     }
 }
 
+tokio::task_local! {
+    static DECIDING_SURFACE: &'static str;
+}
+
+/// #1290 — run `f` (a handler call) as a decision taken on `surface`, so the
+/// handler can record where it came from ([`deciding_surface`]).
+pub async fn deciding<F: std::future::Future>(surface: &'static str, f: F) -> F::Output {
+    DECIDING_SURFACE.scope(surface, f).await
+}
+
+/// The surface the current decision was taken on (`discord`, `slack`), when
+/// the caller said; `None` outside [`deciding`].
+pub fn deciding_surface() -> Option<&'static str> {
+    DECIDING_SURFACE.try_with(|s| *s).ok()
+}
+
 /// The real handler, plus a redraw of every other surface after each verb.
 pub struct SyncingActionHandler {
     origin: &'static str,
@@ -122,38 +138,38 @@ impl SyncingActionHandler {
 #[async_trait]
 impl ApprovalActionHandler for SyncingActionHandler {
     async fn approve(&self, action_id: &str) -> ApprovalActionOutcome {
-        let out = self.inner.approve(action_id).await;
+        let out = deciding(self.origin, self.inner.approve(action_id)).await;
         self.synced(action_id, out).await
     }
     async fn revise(&self, action_id: &str, feedback: &str) -> ApprovalActionOutcome {
-        let out = self.inner.revise(action_id, feedback).await;
+        let out = deciding(self.origin, self.inner.revise(action_id, feedback)).await;
         self.synced(action_id, out).await
     }
     async fn skip(&self, action_id: &str) -> ApprovalActionOutcome {
-        let out = self.inner.skip(action_id).await;
+        let out = deciding(self.origin, self.inner.skip(action_id)).await;
         self.synced(action_id, out).await
     }
     async fn is_resolved(&self, action_id: &str) -> bool {
         self.inner.is_resolved(action_id).await
     }
     async fn schedule(&self, action_id: &str, at_ms: i64) -> ApprovalActionOutcome {
-        let out = self.inner.schedule(action_id, at_ms).await;
+        let out = deciding(self.origin, self.inner.schedule(action_id, at_ms)).await;
         self.synced(action_id, out).await
     }
     async fn send_now(&self, action_id: &str) -> ApprovalActionOutcome {
-        let out = self.inner.send_now(action_id).await;
+        let out = deciding(self.origin, self.inner.send_now(action_id)).await;
         self.synced(action_id, out).await
     }
     async fn cancel_schedule(&self, action_id: &str) -> ApprovalActionOutcome {
-        let out = self.inner.cancel_schedule(action_id).await;
+        let out = deciding(self.origin, self.inner.cancel_schedule(action_id)).await;
         self.synced(action_id, out).await
     }
     async fn back_to_queue(&self, action_id: &str) -> ApprovalActionOutcome {
-        let out = self.inner.back_to_queue(action_id).await;
+        let out = deciding(self.origin, self.inner.back_to_queue(action_id)).await;
         self.synced(action_id, out).await
     }
     async fn recompose(&self, action_id: &str) -> ApprovalActionOutcome {
-        let out = self.inner.recompose(action_id).await;
+        let out = deciding(self.origin, self.inner.recompose(action_id)).await;
         self.synced(action_id, out).await
     }
     async fn is_schedule_live(&self, action_id: &str) -> bool {
@@ -361,6 +377,47 @@ mod tests {
         async fn is_resolved(&self, _: &str) -> bool {
             true
         }
+    }
+
+    /// #1290 — the handler can tell which surface a decision came from, so
+    /// the store records `status_source = slack` for a Slack click instead
+    /// of the old hard-coded `discord`.
+    struct SeesSurface(std::sync::Mutex<Vec<Option<&'static str>>>);
+
+    #[async_trait]
+    impl ApprovalActionHandler for SeesSurface {
+        async fn approve(&self, _: &str) -> ApprovalActionOutcome {
+            self.0.lock().unwrap().push(deciding_surface());
+            ApprovalActionOutcome::Approved
+        }
+        async fn revise(&self, _: &str, _: &str) -> ApprovalActionOutcome {
+            self.0.lock().unwrap().push(deciding_surface());
+            ApprovalActionOutcome::Approved
+        }
+        async fn skip(&self, _: &str) -> ApprovalActionOutcome {
+            self.0.lock().unwrap().push(deciding_surface());
+            ApprovalActionOutcome::Skipped
+        }
+        async fn is_resolved(&self, _: &str) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn the_deciding_surface_is_visible_to_the_handler() {
+        let seen = Arc::new(SeesSurface(std::sync::Mutex::new(Vec::new())));
+        let inner: Arc<dyn ApprovalActionHandler> = seen.clone();
+        // No surface said: callers fall back to their own default.
+        inner.approve("a").await;
+        // The Discord bot's wrapper.
+        let discord = SyncingActionHandler::new("discord", Arc::clone(&inner), CardSurfaces::new());
+        discord.skip("a").await;
+        // The Slack surface calls the handler directly inside its scope.
+        deciding("slack", inner.revise("a", "shorter")).await;
+        assert_eq!(
+            *seen.0.lock().unwrap(),
+            vec![None, Some("discord"), Some("slack")]
+        );
     }
 
     #[tokio::test]

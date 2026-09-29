@@ -346,6 +346,7 @@ pub async fn build_approvals(
     plan: &Plan,
     channel: crate::approval_routing::SlackChannel,
     surfaces: augmentagent_approval_discord::CardSurfaces,
+    wiki_root: Option<PathBuf>,
 ) -> Result<Option<Arc<augmentagent_channel_slack::approvals::SlackApprovals>>> {
     use augmentagent_channel_slack::approvals::{SlackApprovalConfig, SlackApprovals};
     let Plan::Ready { installs, api_base } = plan else {
@@ -386,15 +387,19 @@ pub async fn build_approvals(
         },
     };
     info!(team = %install.creds.team_id, channel = %destination, "slack approvals: cards go here");
-    Ok(Some(Arc::new(SlackApprovals::new(
-        store,
-        web,
-        SlackApprovalConfig {
-            workspace: install.workspace.clone(),
-            channel: destination,
-        },
-        surfaces,
-    ))))
+    Ok(Some(Arc::new(
+        SlackApprovals::new(
+            store,
+            web,
+            SlackApprovalConfig {
+                workspace: install.workspace.clone(),
+                channel: destination,
+            },
+            surfaces,
+        )
+        // #1290 — `compose <person>: …` resolves people through the wiki.
+        .with_wiki_root(wiki_root),
+    )))
 }
 
 /// Plan, build and run the interactive surface as one supervised `serve`

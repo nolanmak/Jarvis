@@ -306,6 +306,11 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
     ) -> anyhow::Result<()> {
         let email = message_to_email(&msg, sub, &workspace.my_user_id);
         self.store.upsert_email(&email)?;
+        if sub.mode == SubscriptionMode::Priority {
+            // #1290 — the reply goes to this conversation and thread.
+            let team = sub.account_id.as_deref().unwrap_or(&workspace.team_id);
+            record_reply_target(&self.store, &email, &msg, sub, team);
+        }
         if self.store.is_email_complete(&email.message_id)? {
             return Ok(());
         }
@@ -849,6 +854,29 @@ pub(crate) fn message_to_email(
     }
 }
 
+/// #1290 — remember where a reply to this message goes (conversation and
+/// thread), so an approved reply lands where the owner saw it. Best effort:
+/// without a row the reply goes to the conversation top level, as before.
+pub(crate) fn record_reply_target(
+    store: &Store,
+    email: &Email,
+    msg: &SlackMessage,
+    sub: &ChannelSubscription,
+    team_id: &str,
+) {
+    let target = crate::contact::ingested_reply_target(
+        &email.message_id,
+        team_id,
+        &sub.channel_id,
+        &sub.display_name,
+        &msg.ts,
+        msg.thread_ts.as_deref(),
+    );
+    if let Err(e) = store.record_slack_send_target(&target) {
+        warn!(message_id = %email.message_id, "could not record the reply target: {e}");
+    }
+}
+
 /// Parse a Slack user id out of the `from` field shape
 /// `"<display> <slack:<user_id>>"`.
 fn extract_slack_id(from: &str) -> Option<String> {
@@ -950,6 +978,23 @@ mod tests {
             thread_ts: None,
             bot_id: None,
         }
+    }
+
+    /// #1290 — an ingested priority message records where its reply goes:
+    /// the thread it is in, or a thread under it in a channel.
+    #[test]
+    fn a_priority_message_records_where_its_reply_goes() {
+        let (store, _f) = tmp_store();
+        let sub = sub_with_mode(SubscriptionMode::Priority);
+        let mut m = sample_msg("100.000002", "in a thread");
+        m.thread_ts = Some("100.000001".into());
+        let e = message_to_email(&m, &sub, "me");
+        record_reply_target(&store, &e, &m, &sub, "T1");
+        let t = store.slack_send_target(&e.message_id).unwrap().unwrap();
+        assert_eq!(t.channel_id, "C1");
+        assert_eq!(t.team_id, "T1");
+        assert_eq!(t.thread_ts.as_deref(), Some("100.000001"));
+        assert_eq!(t.label.as_deref(), Some("#general"));
     }
 
     #[test]

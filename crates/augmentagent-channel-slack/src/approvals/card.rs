@@ -159,6 +159,12 @@ pub struct CardInput<'a> {
     pub status_line: Option<&'a str>,
     /// Recompose is offered on a superseded card with a draft worth keeping.
     pub offer_recompose: bool,
+    /// #1290 — where a Slack contact message goes (`#general · in thread …`).
+    pub destination: Option<&'a str>,
+    /// #1290 — who a Slack contact message is sent as.
+    pub sends_as: Option<&'a str>,
+    /// #1290 — a Slack send that failed after approval can be retried.
+    pub offer_retry: bool,
 }
 
 /// The fallback `text` and the `blocks` of a card.
@@ -180,8 +186,11 @@ pub fn card(input: &CardInput<'_>) -> (String, Value) {
     if let Some(note) = input.note.filter(|n| !n.trim().is_empty()) {
         blocks.push(section(escape(note)));
     }
+    let compose = email.kind == crate::contact::COMPOSE_KIND;
     let kind = if merge {
         "Merge proposal"
+    } else if compose {
+        "New message"
     } else {
         "Reply draft"
     };
@@ -193,10 +202,20 @@ pub fn card(input: &CardInput<'_>) -> (String, Value) {
     blocks.push(json!({
         "type": "section",
         "fields": [
-            {"type": "mrkdwn", "text": format!("*From*\n{}", escape(&truncate(&email.from, 200)))},
+            {"type": "mrkdwn", "text": format!("*{}*\n{}", if compose { "To" } else { "From" }, escape(&truncate(&email.from, 200)))},
             {"type": "mrkdwn", "text": format!("*Ref*\n`{r}`")},
         ]
     }));
+    if input.destination.is_some() || input.sends_as.is_some() {
+        let mut lines = Vec::new();
+        if let Some(d) = input.destination {
+            lines.push(format!("*Goes to* {}", escape(&truncate(d, 300))));
+        }
+        if let Some(who) = input.sends_as {
+            lines.push(format!("*Sends as* {}", escape(&truncate(who, 400))));
+        }
+        blocks.push(section(lines.join("\n")));
+    }
     if !email.body.trim().is_empty() && !merge {
         blocks.push(section(format!(
             "*Their message*\n{}",
@@ -286,7 +305,17 @@ pub fn card(input: &CardInput<'_>) -> (String, Value) {
         }
         Some(line) => {
             blocks.push(section(escape(line)));
-            if input.offer_recompose {
+            if input.offer_retry {
+                let value = control.block_id();
+                blocks.push(json!({
+                    "type": "actions",
+                    "block_id": value,
+                    "elements": [button("Retry send", APPROVE, &value, Some("primary"))],
+                }));
+                blocks.push(context(format!(
+                    "{version} · or reply `approve {r}` to retry — a send that may have landed is looked for first"
+                )));
+            } else if input.offer_recompose {
                 let recompose = ControlRef {
                     action_id: id.to_string(),
                     digest: None,
@@ -303,6 +332,7 @@ pub fn card(input: &CardInput<'_>) -> (String, Value) {
         }
     }
     let text = match input.status_line {
+        None if compose => format!("Approval needed: {subject}"),
         None => format!("Approval needed: {} — from {}", subject, email.from),
         Some(line) => format!("{line} {subject}"),
     };
@@ -455,6 +485,9 @@ mod tests {
             note: None,
             status_line: status,
             offer_recompose: false,
+            destination: None,
+            sends_as: None,
+            offer_retry: false,
         }
     }
 

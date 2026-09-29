@@ -65,7 +65,10 @@ pub use presets::{Preset, MAX_REDRAFT_ITERATIONS, PRESETS};
 // #1289 — what the Slack approval surface reuses unchanged from the Discord
 // card: the needs-input feedback shape and the Revise-result header.
 pub use layout::{fill_feedback, revise_result_prefix};
-pub use sync::{ApprovalCardSurface, CardSurfaces, MultiSurfaceBroker, SyncingActionHandler};
+pub use sync::{
+    deciding, deciding_surface, ApprovalCardSurface, CardSurfaces, MultiSurfaceBroker,
+    SyncingActionHandler,
+};
 
 use async_trait::async_trait;
 use augmentagent_store::Email;

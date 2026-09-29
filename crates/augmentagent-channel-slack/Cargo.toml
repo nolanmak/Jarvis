@@ -13,6 +13,8 @@ augmentagent-channel-core = { path = "../augmentagent-channel-core" }
 augmentagent-channel-discord-dm = { path = "../augmentagent-channel-discord-dm" }
 augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
 augmentagent-wiki = { path = "../augmentagent-wiki" }
+# #1290 — people lookup (wiki identity index) for compose recipients.
+augmentagent-messages = { path = "../augmentagent-messages" }
 # #1293 — shared inbound attachment policy and PDF/DOCX conversion.
 augmentagent-docs = { path = "../augmentagent-docs" }
 # #1297 — the existing Rust speech-to-text seam (`Transcriber`, whisper.cpp)
