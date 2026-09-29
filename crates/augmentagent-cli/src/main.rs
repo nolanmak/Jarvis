@@ -8942,6 +8942,198 @@ async fn run_transcripts_sync(
     Ok(())
 }
 
+/// Keep an advisory lock for the whole Git reconciliation. A second manual or
+/// scheduled invocation must not stage, rebase, or push the same wiki at once.
+fn acquire_wiki_sync_lock(git_dir: &std::path::Path) -> Result<std::fs::File> {
+    let lock_path = git_dir.join("augmentagent-sync.lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&lock_path)
+        .with_context(|| format!("open wiki sync lock {}", lock_path.display()))?;
+    file.try_lock()
+        .context("another wiki sync is running")?;
+    Ok(file)
+}
+
+/// A local filesystem remote is safe for disposable/offline mirrors. A
+/// network push target must be a GitHub owner/repo we can check as private.
+fn wiki_sync_remote(origin: &str) -> Result<Option<String>> {
+    let origin = origin.trim();
+    if origin.starts_with('/') || origin.starts_with("file://") {
+        return Ok(None);
+    }
+    let path = origin
+        .strip_prefix("git@github.com:")
+        .or_else(|| origin.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| origin.strip_prefix("https://github.com/"))
+        .context("wiki push origin must be a private GitHub repo or local filesystem remote")?;
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut parts = path.split('/');
+    let valid = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    };
+    let (Some(owner), Some(repo), None) = (parts.next(), parts.next(), parts.next()) else {
+        anyhow::bail!("wiki push origin is not a GitHub owner/repository path");
+    };
+    if !valid(owner) || !valid(repo) {
+        anyhow::bail!("wiki push origin is not a GitHub owner/repository path");
+    }
+    Ok(Some(format!("{owner}/{repo}")))
+}
+
+async fn verify_private_wiki_remote(wiki_root: &std::path::Path) -> Result<()> {
+    let origins = git_capture(wiki_root, &["remote", "get-url", "--push", "--all", "origin"])
+        .await
+        .context("wiki sync needs an origin push remote")?;
+    if origins.trim().is_empty() {
+        anyhow::bail!("wiki sync needs an origin push target");
+    }
+    for origin in origins.lines() {
+        let Some(repo) = wiki_sync_remote(origin)? else {
+            continue;
+        };
+        let out = tokio::process::Command::new("gh")
+            .args(["repo", "view", &repo, "--json", "isPrivate", "--jq", ".isPrivate"])
+            .env("GH_HOST", "github.com")
+            .output()
+            .await
+            .context("verify wiki origin with gh")?;
+        if !out.status.success() || String::from_utf8_lossy(&out.stdout).trim() != "true" {
+            anyhow::bail!("wiki sync refused: origin `{repo}` is not verified private by gh");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod wiki_sync_lock_tests {
+    use super::{
+        acquire_wiki_sync_lock, git_run_as_committer, verify_private_wiki_remote,
+        wiki_sync_push, wiki_sync_remote,
+    };
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn overlapping_syncs_are_rejected_until_first_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let git_dir = dir.path().join(".git");
+        let first = acquire_wiki_sync_lock(&git_dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(git_dir.join("augmentagent-sync.lock"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        assert!(acquire_wiki_sync_lock(&git_dir).is_err());
+        drop(first);
+        assert!(acquire_wiki_sync_lock(&git_dir).is_ok());
+    }
+
+    #[test]
+    fn github_origin_is_explicitly_identified_for_privacy_check() {
+        assert_eq!(
+            wiki_sync_remote("git@github.com:owner/private-wiki.git").unwrap(),
+            Some("owner/private-wiki".to_string())
+        );
+        assert_eq!(
+            wiki_sync_remote("https://github.com/owner/private-wiki.git").unwrap(),
+            Some("owner/private-wiki".to_string())
+        );
+        assert_eq!(wiki_sync_remote("file:///tmp/wiki.git").unwrap(), None);
+        assert!(wiki_sync_remote("https://example.com/public/wiki.git").is_err());
+        assert!(wiki_sync_remote("https://github.com/owner/repo/extra").is_err());
+    }
+
+    #[tokio::test]
+    async fn disposable_local_git_remote_is_accepted_without_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let wiki = dir.path().join("wiki");
+        let bare = dir.path().join("private-mirror.git");
+        for args in [
+            vec!["init", "-q", "--bare", bare.to_str().unwrap()],
+            vec!["init", "-q", wiki.to_str().unwrap()],
+        ] {
+            assert!(std::process::Command::new("git").args(args).status().unwrap().success());
+        }
+        assert!(std::process::Command::new("git")
+            .args(["-C", wiki.to_str().unwrap(), "remote", "add", "origin", bare.to_str().unwrap()])
+            .status().unwrap().success());
+        let second = dir.path().join("second-mirror.git");
+        git(dir.path(), &["init", "-q", "--bare", second.to_str().unwrap()]);
+        git(&wiki, &["remote", "set-url", "--push", "origin", bare.to_str().unwrap()]);
+        git(&wiki, &["remote", "set-url", "--add", "--push", "origin", second.to_str().unwrap()]);
+        verify_private_wiki_remote(&wiki).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disposable_remote_conflict_preserves_owner_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = dir.path().join("mirror.git");
+        let owner = dir.path().join("owner");
+        let agent = dir.path().join("agent");
+        git(dir.path(), &["init", "-q", "--bare", "--initial-branch=main", bare.to_str().unwrap()]);
+        git(dir.path(), &["clone", "-q", bare.to_str().unwrap(), owner.to_str().unwrap()]);
+        git(&owner, &["config", "user.name", "Test Owner"]);
+        git(&owner, &["config", "user.email", "owner@example.invalid"]);
+        std::fs::write(owner.join("note.md"), "initial\n").unwrap();
+        git(&owner, &["add", "note.md"]);
+        git(&owner, &["commit", "-qm", "initial"]);
+        git(&owner, &["push", "-q", "origin", "main"]);
+
+        git(dir.path(), &["clone", "-q", bare.to_str().unwrap(), agent.to_str().unwrap()]);
+        git(&agent, &["config", "user.name", "Test Agent"]);
+        git(&agent, &["config", "user.email", "agent@example.invalid"]);
+        std::fs::write(agent.join("note.md"), "agent edit\n").unwrap();
+        git(&agent, &["commit", "-qam", "agent edit"]);
+        std::fs::write(owner.join("note.md"), "owner edit\n").unwrap();
+        git(&owner, &["commit", "-qam", "owner edit"]);
+        git(&owner, &["push", "-q", "origin", "main"]);
+
+        assert!(git_run_as_committer(
+            &agent,
+            &["pull", "--rebase", "-X", "ours", "origin", "main"]
+        )
+        .await
+        .unwrap());
+        assert_eq!(std::fs::read_to_string(agent.join("note.md")).unwrap(), "owner edit\n");
+        wiki_sync_push(&agent).await.unwrap();
+        let output = std::process::Command::new("git")
+            .args(["--git-dir", bare.to_str().unwrap(), "show", "main:note.md"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "owner edit\n");
+    }
+}
+
 async fn run_wiki_sync(cli: &Cli, dry_run: bool, no_pull: bool) -> Result<()> {
     let wiki_root = cli
         .wiki_dir
@@ -8959,6 +9151,10 @@ async fn run_wiki_sync(cli: &Cli, dry_run: bool, no_pull: bool) -> Result<()> {
             wiki_root.display()
         );
     }
+
+    let git_dir = git_capture(&wiki_root, &["rev-parse", "--absolute-git-dir"]).await?;
+    let _sync_lock = acquire_wiki_sync_lock(std::path::Path::new(git_dir.trim()))?;
+    verify_private_wiki_remote(&wiki_root).await?;
 
     // Guard: nothing sensitive/non-content may already be tracked.
     let tracked = git_capture(&wiki_root, &["ls-files"]).await?;

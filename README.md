@@ -283,6 +283,39 @@ Git. Their resolved directories are written into the launchd environment, so
 the jobs can find them after login without shell startup files. A missing tool
 or invalid plist stops installation before the existing job is replaced.
 
+The private wiki mirror and finance import are separate, opt-in jobs on macOS:
+
+```bash
+scripts/install-wiki-sync.sh
+scripts/install-finance-sync.sh
+augmentagent service --unit wiki-sync status
+augmentagent service --unit finance-sync status
+augmentagent logs --unit wiki-sync
+augmentagent logs --unit finance-sync
+# Remove either schedule independently:
+scripts/uninstall-wiki-sync.sh
+scripts/uninstall-finance-sync.sh
+```
+
+The wiki runs at :00, :10, … :50 each hour; finance runs at 00:17, 06:17,
+12:17, and 18:17 local time. Run the installers from the checkout containing
+the release binary. Set `AUGMENTAGENT_WIKI_DIR` to an absolute path if the
+private wiki is elsewhere. The jobs run only in the signed-in user's launchd
+session and use that user's login Keychain; configure and verify finance access
+there with `augmentagent doctor --keychain-probe` before enabling its schedule.
+A loaded, idle job is normal between runs.
+The jobs write logs under `${XDG_STATE_HOME:-$HOME/.local/state}/augmentagent/`.
+
+Apple documents that a calendar job missed during sleep runs on wake, with
+multiple missed intervals coalesced into one; a powered-off Mac waits until the
+next designated time. See [Scheduling Timed Jobs](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/ScheduledJobs.html).
+Neither schedule guarantees a run while the user is logged out. A manual
+`augmentagent --wiki-dir ./wiki wiki sync` or `finance sync` runs immediately;
+installing these schedules is what enables recurring runs. The wiki mirror
+backs up wiki content only, not the local database, Keychain tokens, or `.env`.
+Confirm the wiki GitHub origin is private before enabling the mirror; finance
+pages and statement PDFs can contain sensitive information.
+
 `scripts/check-for-updates.sh` runs on a timer: it pulls `origin/main`,
 rebuilds the Rust and Node sides when their sources change, and bounces each
 unit independently. Routine deploys go through this auto-updater — don't
@@ -409,13 +442,14 @@ per seven days, and picks up asynchronous results on subsequent syncs.
 Requesting Statements requires that bank to support the product; Transactions
 can be used alone. Refreshes may incur charges on paid Plaid plans.
 
-Install `scripts/systemd/augmentagent-finance-sync.{service,timer}` in
-`~/.config/systemd/user/`, run `systemctl --user daemon-reload`, then
+On Linux, install `scripts/systemd/augmentagent-finance-sync.{service,timer}`
+in `~/.config/systemd/user/`, run `systemctl --user daemon-reload`, then
 `systemctl --user enable --now augmentagent-finance-sync.timer` for six-hour
-imports. Units assume the checkout is `~/AugmentAgent`. The existing private
-wiki mirror timer handles Git backups. Keep that mirror private: its finance
-pages and optional PDFs contain financial records. Tokens and the local
-transaction database are not backed up by the wiki mirror.
+imports. Units assume the checkout is `~/AugmentAgent`. On macOS, use the
+opt-in installers under [Process management](#process-management). Keep the
+wiki mirror private: its finance pages and optional PDFs contain financial
+records. Tokens and the local transaction database are not backed up by the
+wiki mirror.
 
 `finance export` regenerates KB pages from local records after an interrupted
 export. Query commands require no Plaid credentials and report connection

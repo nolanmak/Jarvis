@@ -66,7 +66,7 @@ impl ServiceOp {
 ///
 /// `unit` is the user-facing alias. `all` expands to every installed
 /// `augmentagent*` unit; bare friendly names (`daemon`, `dashboard`, `updater`,
-/// `digest`, `tone-refresh`, `browser-sidecar`, `tenant:<name>`) are mapped to
+/// `digest`, `wiki-sync`, `finance-sync`, `tone-refresh`, `browser-sidecar`, `tenant:<name>`) are mapped to
 /// the concrete service/timer pair. Anything containing a `.` is forwarded
 /// verbatim so power users can target a specific unit file.
 pub async fn run_service(op: ServiceOp, unit: &str, json: bool) -> Result<()> {
@@ -77,7 +77,7 @@ pub async fn run_service(op: ServiceOp, unit: &str, json: bool) -> Result<()> {
     if units.is_empty() {
         anyhow::bail!(
             "no augmentagent units matched `--unit {unit}` (try `--unit all` or \
-             one of: daemon, dashboard, updater, digest, tone-refresh, \
+             one of: daemon, dashboard, updater, digest, wiki-sync, finance-sync, tone-refresh, \
              browser-sidecar, tenant:<name>)"
         );
     }
@@ -151,6 +151,14 @@ fn resolve_alias(unit: &str) -> Vec<String> {
         "digest" => vec![
             "augmentagent-digest.timer".into(),
             "augmentagent-digest.service".into(),
+        ],
+        "wiki-sync" => vec![
+            "augmentagent-wiki-sync.timer".into(),
+            "augmentagent-wiki-sync.service".into(),
+        ],
+        "finance-sync" => vec![
+            "augmentagent-finance-sync.timer".into(),
+            "augmentagent-finance-sync.service".into(),
         ],
         "tone-refresh" | "tone" => vec![
             "augmentagent-tone-refresh.timer".into(),
@@ -277,7 +285,7 @@ mod launchd {
         if labels.is_empty() {
             anyhow::bail!(
                 "no augmentagent launchd agents matched `--unit {unit}` (try `--unit all` or \
-                 one of: daemon, dashboard, updater, digest, tone-refresh, \
+                 one of: daemon, dashboard, updater, digest, wiki-sync, finance-sync, tone-refresh, \
                  browser-sidecar, tenant:<name>)"
             );
         }
@@ -445,14 +453,28 @@ mod launchd {
     }
 
     /// Same keys as the systemd report so consumers need no branching.
-    fn status_json(label: &str) -> serde_json::Value {
-        let job = launchd_job(label);
-        let installed = plist_path(label).is_some_and(|p| p.exists());
-        let active = if job.running() {
+    pub(super) fn active_state(label: &str, loaded: bool, running: bool) -> &'static str {
+        let scheduled = matches!(
+            label,
+            "com.nolanmak.augmentagent.updater"
+                | "com.nolanmak.augmentagent.digest"
+                | "com.nolanmak.augmentagent.calendar"
+                | "com.nolanmak.augmentagent.research"
+                | "com.nolanmak.augmentagent.wix-sync"
+                | "com.nolanmak.augmentagent.wiki-sync"
+                | "com.nolanmak.augmentagent.finance-sync"
+        );
+        if running || (loaded && scheduled) {
             "active"
         } else {
             "inactive"
-        };
+        }
+    }
+
+    fn status_json(label: &str) -> serde_json::Value {
+        let job = launchd_job(label);
+        let installed = plist_path(label).is_some_and(|p| p.exists());
+        let active = active_state(label, job.loaded, job.running());
         let sub = if job.loaded {
             job.state.clone()
         } else {
@@ -520,6 +542,20 @@ mod tests {
                 "augmentagent-update.service",
             ]
         );
+        assert_eq!(
+            resolve_alias("wiki-sync"),
+            vec![
+                "augmentagent-wiki-sync.timer",
+                "augmentagent-wiki-sync.service"
+            ]
+        );
+        assert_eq!(
+            resolve_alias("finance-sync"),
+            vec![
+                "augmentagent-finance-sync.timer",
+                "augmentagent-finance-sync.service"
+            ]
+        );
     }
 
     #[test]
@@ -550,6 +586,14 @@ mod tests {
     #[test]
     fn launchd_aliases_collapse_timer_pairs_to_one_label() {
         assert_eq!(
+            launchd::resolve_labels("wiki-sync").unwrap(),
+            vec!["com.nolanmak.augmentagent.wiki-sync"]
+        );
+        assert_eq!(
+            launchd::resolve_labels("finance-sync").unwrap(),
+            vec!["com.nolanmak.augmentagent.finance-sync"]
+        );
+        assert_eq!(
             launchd::resolve_labels("updater").unwrap(),
             vec!["com.nolanmak.augmentagent.updater"]
         );
@@ -568,5 +612,21 @@ mod tests {
         );
         // Non-augmentagent units have no macOS job.
         assert!(launchd::resolve_labels("nginx.service").is_err());
+    }
+
+    #[test]
+    fn loaded_idle_schedules_report_active() {
+        assert_eq!(
+            launchd::active_state("com.nolanmak.augmentagent.wiki-sync", true, false),
+            "active"
+        );
+        assert_eq!(
+            launchd::active_state("com.nolanmak.augmentagent.finance-sync", true, false),
+            "active"
+        );
+        assert_eq!(
+            launchd::active_state("com.nolanmak.augmentagent-dashboard", true, false),
+            "inactive"
+        );
     }
 }
