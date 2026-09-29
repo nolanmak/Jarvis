@@ -164,7 +164,8 @@ pub static OWNER_COMMANDS: &[OwnerCommand] = &[
         name: "approvals",
         aliases: &[],
         usage: "approvals | approve <ref> | skip <ref> | revise <ref> <what to change> | \
-             refine <ref> <preset> | recompose <ref> | compose <person>: <message>",
+             refine <ref> <preset> | recompose <ref> | schedule|reschedule <ref> <when> | \
+             send now <ref> | cancel|unschedule <ref> | compose <person>: <message>",
         description: "Pending approvals and the text form of every card button.",
         discord: &[],
         slack: SlackMapping::Approvals,

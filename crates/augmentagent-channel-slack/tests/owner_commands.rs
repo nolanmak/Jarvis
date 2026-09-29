@@ -898,6 +898,9 @@ async fn journal_saves_text_and_names_what_slack_cannot_do_yet() {
         run(&unconfigured, &dm(), &idle, "journal hi").await,
         JOURNAL_NOT_CONFIGURED
     );
+    // `done` is a Slack blocker whether or not the journal is configured.
+    let done_unconfigured = run(&unconfigured, &dm(), &idle, "journal done").await;
+    assert!(done_unconfigured.contains("#1296"), "{done_unconfigured}");
 }
 
 #[tokio::test]

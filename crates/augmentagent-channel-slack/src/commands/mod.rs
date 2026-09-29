@@ -336,15 +336,16 @@ impl SlackCommands {
         };
         match (&self.deps.journal, cmd) {
             (_, JournalCmd::Usage) => JOURNAL_USAGE.to_string(),
+            // Not possible on Slack at all yet, configured or not.
+            (_, JournalCmd::Done { .. }) => "`journal done` composes an entry from the recent \
+                 conversation, and owner conversation history is not available on Slack yet \
+                 (#1296). Nothing was saved. Write the entry directly: `journal <text>`."
+                .into(),
             (None, _) => JOURNAL_NOT_CONFIGURED.to_string(),
             (Some(ops), JournalCmd::Text(text)) => ops
                 .save_text(None, &text)
                 .await
                 .unwrap_or_else(|user_facing| user_facing),
-            (Some(_), JournalCmd::Done { .. }) => "`journal done` composes an entry from the \
-                 recent conversation, and owner conversation history is not available on Slack \
-                 yet (#1296). Nothing was saved. Write the entry directly: `journal <text>`."
-                .into(),
         }
     }
 

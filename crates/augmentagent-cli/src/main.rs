@@ -3517,13 +3517,22 @@ async fn main() -> Result<()> {
                         };
                         let repo_root = std::env::current_dir()
                             .unwrap_or_else(|_| PathBuf::from("."));
-                        let runner = Arc::new(SurfaceGatedRunner {
-                            inner: Arc::new(LoopReasonerRunner {
+                        let inner: Arc<dyn LoopRunner> = match slack_serve::test_loop_runner(
+                            std::env::var(slack_serve::TEST_REPLY_ENV).ok().as_deref(),
+                        ) {
+                            Some(stub) => {
+                                warn!("{} is set: loop prompts are answered by a stand-in, not the reasoner (debug build, local QA only)", slack_serve::TEST_REPLY_ENV);
+                                stub
+                            }
+                            None => Arc::new(LoopReasonerRunner {
                                 reasoner: build_reasoner(),
                                 wiki_root,
                                 repo_root,
                                 allowed_owner_id: std::env::var("DISCORD_ALLOWED_USER_ID").ok(),
                             }),
+                        };
+                        let runner = Arc::new(SurfaceGatedRunner {
+                            inner,
                             slack: slack_ready,
                             discord: token.is_some(),
                         });

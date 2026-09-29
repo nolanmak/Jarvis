@@ -675,6 +675,35 @@ pub fn test_turn_handler(
     ))
 }
 
+/// **Test and local QA only** (#1292): with [`TEST_REPLY_ENV`] set in a
+/// debug build, loop prompts are answered `<prefix> loop ran: <prompt>`
+/// instead of by the reasoner, so a loop can be shown firing into Slack on
+/// a host where no provider can run. Ignored in release builds.
+pub fn test_loop_runner(
+    value: Option<&str>,
+) -> Option<Arc<dyn augmentagent_approval_discord::LoopRunner>> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let prefix = value.map(str::trim).filter(|v| !v.is_empty())?;
+    Some(Arc::new(StubLoopRunner(prefix.to_string())))
+}
+
+struct StubLoopRunner(String);
+
+#[async_trait]
+impl augmentagent_approval_discord::LoopRunner for StubLoopRunner {
+    async fn run_prompt(
+        &self,
+        _request_id: &str,
+        _owner: &str,
+        prompt: &str,
+        _model_profile: Option<&str>,
+    ) -> Result<String> {
+        Ok(format!("{} loop ran: {prompt}", self.0))
+    }
+}
+
 fn stub_handler(
     prefix: &str,
     store: Arc<Store>,
@@ -1159,6 +1188,30 @@ mod tests {
             legacy.text,
             "FAKE-REASONER: hello (legacy route, model qwen)"
         );
+    }
+
+    /// #1292 — local QA can show a loop firing into Slack without a
+    /// provider: the same debug-only override answers loop prompts.
+    #[tokio::test]
+    async fn the_test_override_also_answers_loops_in_debug_builds_only() {
+        let runner = test_loop_runner(Some("FAKE-REASONER:"));
+        if !cfg!(debug_assertions) {
+            assert!(runner.is_none());
+            return;
+        }
+        let answer = runner
+            .unwrap()
+            .run_prompt(
+                "loop:1:created:0",
+                "slack|team:T1|U1",
+                "check the build",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer, "FAKE-REASONER: loop ran: check the build");
+        assert!(test_loop_runner(None).is_none());
+        assert!(test_loop_runner(Some(" ")).is_none());
     }
 
     #[test]
