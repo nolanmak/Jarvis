@@ -3,7 +3,8 @@
 //! Pure tests: no network. Fixtures are synthetic (`T00000001`, `xapp-test-000`).
 
 use augmentagent_channel_slack::transport::event::{
-    parse_envelope, DisconnectReason, Envelope, EnvelopeKind, InteractionKind, SlackEvent,
+    file_refs, parse_envelope, DisconnectReason, Envelope, EnvelopeKind, InteractionKind,
+    SlackEvent,
 };
 use augmentagent_channel_slack::transport::token::{AppLevelToken, BotToken};
 use serde_json::json;
@@ -361,4 +362,65 @@ fn malformed_and_idless_frames_are_errors_not_panics() {
     let text = json!({"type": "events_api", "payload": {}}).to_string();
     let err = parse_envelope(&text).unwrap_err();
     assert!(format!("{err}").contains("envelope_id"), "{err}");
+}
+
+#[test]
+fn attachment_only_file_share_message_carries_every_file_field() {
+    // #1293 — an owner message with files and no text: subtype `file_share`,
+    // empty `text`. Every field the inbound pipeline needs is captured.
+    let text = events_api_envelope(json!({
+        "type": "message",
+        "subtype": "file_share",
+        "channel": "D00000001",
+        "channel_type": "im",
+        "user": "U00000002",
+        "text": "",
+        "ts": "1700000000.000200",
+        "files": [
+            {
+                "id": "F00000001",
+                "name": "Report Q3.pdf",
+                "title": "Report Q3",
+                "mimetype": "application/pdf",
+                "filetype": "pdf",
+                "size": 1234,
+                "mode": "hosted",
+                "is_external": false,
+                "url_private": "https://files.slack.com/files-pri/T00000001-F00000001/report_q3.pdf",
+                "url_private_download": "https://files.slack.com/files-pri/T00000001-F00000001/download/report_q3.pdf"
+            },
+            {"id": "F00000002", "mode": "tombstone"},
+            {"id": "F00000003", "name": "x.png", "file_access": "check_file_info", "is_external": true},
+            {"name": "no id is dropped"}
+        ]
+    }));
+    let env = match parse_envelope(&text).expect("parse") {
+        Envelope::Event(e) => e,
+        other => panic!("expected event, got {other:?}"),
+    };
+    let SlackEvent::Message(m) = &env.event else {
+        panic!("expected message, got {:?}", env.event);
+    };
+    assert_eq!(m.text, "");
+    assert_eq!(m.subtype.as_deref(), Some("file_share"));
+    assert_eq!(m.files.len(), 3);
+    let pdf = &m.files[0];
+    assert_eq!(pdf.id, "F00000001");
+    assert_eq!(pdf.name.as_deref(), Some("Report Q3.pdf"));
+    assert_eq!(pdf.title.as_deref(), Some("Report Q3"));
+    assert_eq!(pdf.mimetype.as_deref(), Some("application/pdf"));
+    assert_eq!(pdf.filetype.as_deref(), Some("pdf"));
+    assert_eq!(pdf.size, Some(1234));
+    assert_eq!(pdf.mode.as_deref(), Some("hosted"));
+    assert!(!pdf.is_external);
+    assert_eq!(
+        pdf.url_private_download.as_deref(),
+        Some("https://files.slack.com/files-pri/T00000001-F00000001/download/report_q3.pdf")
+    );
+    assert_eq!(m.files[1].mode.as_deref(), Some("tombstone"));
+    assert_eq!(m.files[2].file_access.as_deref(), Some("check_file_info"));
+    assert!(m.files[2].is_external);
+    // The same parser reads a history message (CLI `slack files fetch`).
+    let raw = env.payload["event"].clone();
+    assert_eq!(file_refs(&raw), m.files);
 }

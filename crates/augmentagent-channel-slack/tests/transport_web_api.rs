@@ -9,8 +9,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use augmentagent_channel_slack::transport::token::BotToken;
 use augmentagent_channel_slack::transport::web::{
-    AuthTest, HttpSlackWebApi, PostEphemeral, PostMessage, RecordedCall, RecordingSlackWebApi,
-    SlackWebApi, Sleeper, UpdateMessage, WebApiConfig, WebApiError,
+    AuthTest, DownloadRequest, HttpSlackWebApi, PostEphemeral, PostMessage, RecordedCall,
+    RecordingSlackWebApi, SlackWebApi, Sleeper, UpdateMessage, WebApiConfig, WebApiError,
 };
 use mockito::Matcher;
 use serde_json::json;
@@ -476,7 +476,9 @@ async fn token_never_appears_in_debug_or_errors() {
 }
 
 #[tokio::test]
-async fn file_transfer_is_declared_but_deferred() {
+async fn file_download_refuses_a_non_slack_host_without_any_request() {
+    // #1293 made `download_file` real; a URL off the file-host allow-list
+    // (here the old placeholder host) still never leaves the process.
     let mut server = mockito::Server::new_async().await;
     let api = HttpSlackWebApi::new(
         BotToken::new(BOT),
@@ -486,12 +488,19 @@ async fn file_transfer_is_declared_but_deferred() {
         },
     )
     .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("x");
     let err = api
-        .download_file("https://files.slack.test/x")
+        .download_file(DownloadRequest {
+            url: "https://files.slack.test/x",
+            dest: &dest,
+            max_bytes: 10,
+            expected_mimetype: None,
+        })
         .await
         .unwrap_err();
-    assert!(matches!(err, WebApiError::Unsupported(_)), "{err:?}");
-    // No request may leave the process for a deferred method.
+    assert!(matches!(err, WebApiError::FileHostRefused(_)), "{err:?}");
+    assert!(!dest.exists());
     server
         .mock("POST", Matcher::Any)
         .expect(0)

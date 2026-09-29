@@ -176,6 +176,20 @@ pub struct FileRef {
     pub mimetype: Option<String>,
     pub url_private: Option<String>,
     pub size: Option<u64>,
+    // #1293 — what the inbound attachment pipeline needs (file object
+    // fields per https://docs.slack.dev/reference/objects/file-object,
+    // read 2026-09-29).
+    pub title: Option<String>,
+    pub filetype: Option<String>,
+    pub url_private_download: Option<String>,
+    /// `hosted`, `external`, `snippet`, `post`; `tombstone` /
+    /// `hidden_by_limit` for deleted or plan-limited files (the last two
+    /// are from Slack SDK sources, **unverified** in the fetched docs).
+    pub mode: Option<String>,
+    /// `check_file_info` for Slack Connect files whose details need a
+    /// `files.info` call first.
+    pub file_access: Option<String>,
+    pub is_external: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -454,8 +468,10 @@ fn parse_message(inner: Value) -> SlackEvent {
     }
 }
 
-fn message_fields(inner: &Value) -> MessageEvent {
-    let files = inner
+/// The `files` of a message object (an event's `event`, or a message from
+/// `conversations.history`/`replies`). Entries without an `id` are dropped.
+pub fn file_refs(message: &Value) -> Vec<FileRef> {
+    message
         .get("files")
         .and_then(Value::as_array)
         .map(|arr| {
@@ -467,11 +483,24 @@ fn message_fields(inner: &Value) -> MessageEvent {
                         mimetype: str_at(f, &["mimetype"]),
                         url_private: str_at(f, &["url_private"]),
                         size: f.get("size").and_then(Value::as_u64),
+                        title: str_at(f, &["title"]),
+                        filetype: str_at(f, &["filetype"]),
+                        url_private_download: str_at(f, &["url_private_download"]),
+                        mode: str_at(f, &["mode"]),
+                        file_access: str_at(f, &["file_access"]),
+                        is_external: f
+                            .get("is_external")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
                     })
                 })
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+fn message_fields(inner: &Value) -> MessageEvent {
+    let files = file_refs(inner);
     MessageEvent {
         channel: str_at(inner, &["channel"]).unwrap_or_default(),
         channel_type: str_at(inner, &["channel_type"]),

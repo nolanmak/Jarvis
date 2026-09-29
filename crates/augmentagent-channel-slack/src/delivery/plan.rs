@@ -372,7 +372,9 @@ fn classify(op: OutboundOperation, err: &WebApiError) -> Class {
         WebApiError::FileTooLarge { .. }
         | WebApiError::InvalidUpload(_)
         | WebApiError::InvalidRequest(_)
-        | WebApiError::Unsupported(_) => Class::Permanent,
+        | WebApiError::Unsupported(_)
+        | WebApiError::FileHostRefused(_)
+        | WebApiError::DownloadRejected(_) => Class::Permanent,
     }
 }
 
