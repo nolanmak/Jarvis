@@ -267,6 +267,16 @@ so the same commands work on both:
 - `augmentagent service --unit dashboard {start,stop,restart,status}`
 - `augmentagent status`, `augmentagent logs --unit daemon [-f]`, `augmentagent doctor`
 
+The dashboard Sessions page lists `claude` executables owned by the dashboard
+user on Linux and macOS. It shows PID, parent PID, elapsed time and TTY; macOS
+marks cwd unavailable because the bounded `ps` inspection does not expose it.
+Stopping a session requires the start-time identity returned by the list and
+rechecks name and ownership immediately before signaling. A process can still
+exit or be replaced between that final check and the signal; macOS `ps` reports
+start time only to the second, so this is a best-effort guard, not an atomic
+kernel process handle. Use the Sessions page only for sessions started by the
+same account as the dashboard.
+
 `scripts/install-autostart.sh` and `scripts/install-dashboard.sh` write these
 units (or plists); `scripts/install-autostart.sh` accepts
 `AUGMENTAGENT_AUTOSTART_DRY_RUN=true` to register the daemon without it ever
