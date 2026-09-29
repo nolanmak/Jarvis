@@ -88,6 +88,7 @@ mod research;
 mod self_improve;
 mod service;
 mod setup;
+mod slack_app;
 mod status;
 
 #[derive(Parser)]
@@ -1668,6 +1669,13 @@ enum SlackOp {
     PollOnce {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
+    },
+    /// Interactive Slack app (Socket Mode, #1284): manifest, install,
+    /// verify, status, rotate, remove. Separate credentials from the
+    /// Composio connection above; see docs/SLACK-APP.md.
+    App {
+        #[command(subcommand)]
+        op: slack_app::SlackAppOp,
     },
 }
 
@@ -3703,6 +3711,7 @@ async fn main() -> Result<()> {
             }
             SlackOp::Subscriptions { json } => run_slack_subscriptions(store, *json),
             SlackOp::Unsubscribe { id } => run_slack_unsubscribe(store, id.clone()),
+            SlackOp::App { op } => slack_app::run(op, &store).await,
             SlackOp::PollOnce { dry_run } => {
                 let (broker, _) = build_broker(&cli, Arc::clone(&store), *dry_run).await?;
                 let ch = build_slack_channel(&cli, store, broker, *dry_run)?;

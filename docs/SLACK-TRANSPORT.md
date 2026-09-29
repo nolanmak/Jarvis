@@ -165,6 +165,20 @@ Source: https://docs.slack.dev/apis/events-api/using-socket-mode (checked
   them (Slack's `files.getUploadURLExternal` /
   `files.completeUploadExternal` flow, **unverified**).
 
+## Install-time checks (#1284)
+
+- `auth.test` (bot token) returns `team_id`, `team`, `user_id`, `bot_id`
+  **[docs]**. Granted scopes are read from the `x-oauth-scopes` response
+  header, which Slack documents on Web API responses; that it is present on
+  `auth.test` for bot tokens is **unverified**. When it is absent the CLI
+  reports scopes as unknown instead of failing.
+- The app-level token is checked with `apps.connections.open`. The returned
+  one-time URL is dropped immediately; only its `app_id` query parameter is
+  kept. Whether an unused ticket has any side effect is **unverified**.
+- The manifest is `docs/slack-app-manifest.json`; its scope list must equal
+  `REQUIRED_BOT_SCOPES` (`tests/app_manifest.rs`). `commands` is added to
+  the scopes above for the `/jarvis` slash command.
+
 ## macOS and Linux implications
 
 - TLS: `tokio-tungstenite 0.21` with `rustls-tls-webpki-roots`, the exact
@@ -186,7 +200,8 @@ Source: https://docs.slack.dev/apis/events-api/using-socket-mode (checked
 - No sidecar, so no Unix socket path, launchd job or systemd unit is added
   by this issue. The daemon's existing service files (#1245/#1299) cover it.
 - No paths are used by the transport; credentials come from
-  `augmentagent-auth` in #1284.
+  `augmentagent-auth` under `augmentagent/slack-app/<team_id>` (#1284,
+  [`SLACK-APP.md`](SLACK-APP.md)).
 
 ## Tests (all offline, `cargo test -p augmentagent-channel-slack`)
 
@@ -221,3 +236,7 @@ Source: https://docs.slack.dev/apis/events-api/using-socket-mode (checked
 7. Effective per-channel `chat.postMessage` limit and `Retry-After` values.
 8. Real Mac sleep/wake and Wi-Fi change with the daemon under launchd
    (#1300), and a Linux host under systemd.
+9. `x-oauth-scopes` on `auth.test` for a bot token, and the manifest being
+   accepted as-is by Slack's "From a manifest" flow (#1284).
+10. A launchd-run daemon reading the `slack-app` Keychain item written from
+    a terminal (#1246).

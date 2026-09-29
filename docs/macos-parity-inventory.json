@@ -1171,7 +1171,7 @@
       "selected feature credentials or synthetic fixtures"
     ],
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
-    "test_plan": "Run augmentagent slack --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "test_plan": "Run augmentagent slack --help on both hosts, then add a synthetic behavior/guard test for this command. Nested `slack app manifest|install|verify|status|rotate|remove` (#1284): cargo test -p augmentagent-cli --test slack_app_cli (mock Slack, file credential store) on both hosts; Keychain access from a launchd daemon still needs a real-Mac check (#1246).",
     "status": "unverified",
     "evidence": null
   },
