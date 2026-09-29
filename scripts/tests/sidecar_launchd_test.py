@@ -131,6 +131,7 @@ class SidecarLaunchdTests(unittest.TestCase):
             fetch_plist = self.home / 'Library/LaunchAgents/com.nolanmak.augmentagent.fetch.plist'
             installed_fetch = fetch_plist.read_bytes()
             credential = self.home / '.config/augmentagent/fetch.env'
+            credential.parent.mkdir(parents=True, exist_ok=True)
             credential.write_text('FIRECRAWL_API_KEY=synthetic\n')
             credential.chmod(0o644)
             with mock.patch.object(sys, 'argv', ['install-sidecar.py', 'fetch']):
