@@ -296,7 +296,7 @@
       "slack integration dependency when enabled"
     ],
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
-    "test_plan": "Run cargo test -p augmentagent-channel-slack on Linux and macOS; add a synthetic channel contract and controlled real-host check. Interactive surface (#1287): cargo test -p augmentagent-channel-slack --test interactive_surface on both hosts (durable ack-after-persist, owner gate, restart, shutdown, dry-run, live health); real-Mac sleep/wake under launchd is #1300.",
+    "test_plan": "Run cargo test -p augmentagent-channel-slack on Linux and macOS; add a synthetic channel contract and controlled real-host check. Interactive surface (#1287): cargo test -p augmentagent-channel-slack --test interactive_surface on both hosts (durable ack-after-persist, owner gate, restart, shutdown, dry-run, live health); real-Mac sleep/wake under launchd is #1300. Conversation harness (#1288): cargo test -p augmentagent-channel-slack --test conversation_harness --test surface_contract, cargo test -p augmentagent-channel-core --test surface_turn and --lib codex_tools::, cargo test -p augmentagent-store --test surface_sessions, on both hosts, plus bash scripts/tests/aa-wiki-scope-guard.test.sh on Linux (BSD readlink lacks -m for its older cases) (native session per thread, claim before execution, queue, cancel, restart recovery, owner files under the read-only scope-guard carve-out); a real provider session on a real Mac is still unverified.",
     "status": "unverified",
     "evidence": null
   },
@@ -1157,7 +1157,7 @@
       "selected feature credentials or synthetic fixtures"
     ],
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
-    "test_plan": "Run augmentagent serve --help on both hosts, then add a synthetic behavior/guard test for this command. Interactive Slack surface in serve (#1287): cargo test -p augmentagent-cli --test slack_serve_cli (the built serve, Slack only, against a local fake Web API and Socket Mode WebSocket; debug-build turn stub, no reasoner) and --bin augmentagent -- slack_serve:: on both hosts; serve under launchd with the tokens in the login Keychain still needs a real-Mac check (#1246, #1300).",
+    "test_plan": "Run augmentagent serve --help on both hosts, then add a synthetic behavior/guard test for this command. Interactive Slack surface in serve (#1287): cargo test -p augmentagent-cli --test slack_serve_cli (the built serve, Slack only, against a local fake Web API and Socket Mode WebSocket; debug-build turn stub, no reasoner) and --bin augmentagent -- slack_serve:: on both hosts; serve under launchd with the tokens in the login Keychain still needs a real-Mac check (#1246, #1300). Conversation harness in serve (#1288): cargo test -p augmentagent-cli --test slack_serve_cli (sessions, DM thread, cancel, owner file over the built serve with the debug fake agent) and --bin augmentagent -- surface_conformance_tests:: discord_voice_session_tests:: on both hosts.",
     "status": "unverified",
     "evidence": null
   },

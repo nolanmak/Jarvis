@@ -33,10 +33,10 @@ pub use models::{
     ToneProfile, TriageResult, UserLoop, WhatsappDevice,
 };
 pub use store::{
-    DiscordConversation, JournalSyncCursor, NativeConversation,
-    ActionCodeModeFields, ActionWithEmail, PendingActionRow, PendingNudge, RetryableReply,
-    RevisionRecord, Store,
-    StoreError, StoreResult, NUDGE_INTERVAL_MS,
+    ActionCodeModeFields, ActionWithEmail, DiscordConversation, JournalSyncCursor,
+    NativeConversation, PendingActionRow, PendingNudge, RetryableReply, RevisionRecord, Store,
+    StoreError, StoreResult, SurfaceTurnResolution, SurfaceTurnState, SurfaceTurnStatus,
+    NUDGE_INTERVAL_MS,
 };
 
 /// Re-exported so extension crates (`augmentagent-proactive`, …) can write

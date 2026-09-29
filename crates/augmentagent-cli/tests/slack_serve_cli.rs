@@ -4,9 +4,10 @@
 //! the Web API (`AUGMENTAGENT_SLACK_API_BASE`) and an in-test WebSocket
 //! server for Socket Mode. The app is installed and the owner bound through
 //! the real CLI, credentials live in the plaintext test store
-//! (`AUGMENTAGENT_INSECURE_CREDENTIAL_DIR`), and turns are answered by the
-//! debug-build stub (`AUGMENTAGENT_TEST_SLACK_TURN_REPLY`), so no reasoner
-//! or provider is ever called. Tokens and IDs are synthetic.
+//! (`AUGMENTAGENT_INSECURE_CREDENTIAL_DIR`), and turns run the real
+//! conversation harness with the debug-build fake agent
+//! (`AUGMENTAGENT_TEST_SLACK_TURN_REPLY`), so no reasoner or provider is
+//! ever called. Tokens and IDs are synthetic.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -343,9 +344,13 @@ async fn slack_only_serve_answers_the_owner_rejects_a_stranger_and_reports_live_
     mock_slack(&mut server, socket.port).await;
     let answer = server
         .mock("POST", "/chat.postMessage")
-        .match_body(Matcher::PartialJson(
-            json!({"channel": OWNER_DM, "text": "STUB: what is due today?"}),
-        ))
+        .match_body(Matcher::AllOf(vec![
+            Matcher::PartialJson(json!({"channel": OWNER_DM})),
+            // #1288 — the fake agent runs inside the harness's native session.
+            Matcher::Regex(
+                r#""text":"STUB: what is due today\? \(session [0-9a-f-]+, turn 1\)""#.into(),
+            ),
+        ]))
         .with_body(json!({"ok": true, "channel": OWNER_DM, "ts": "1800000000.000001"}).to_string())
         .expect(1)
         .create_async()
@@ -595,9 +600,10 @@ async fn slack_keeps_serving_when_discord_and_whatsapp_fail_to_start() {
     mock_slack(&mut server, socket.port).await;
     let answer = server
         .mock("POST", "/chat.postMessage")
-        .match_body(Matcher::PartialJson(
-            json!({"channel": OWNER_DM, "text": "STUB: still here?"}),
-        ))
+        .match_body(Matcher::AllOf(vec![
+            Matcher::PartialJson(json!({"channel": OWNER_DM})),
+            Matcher::Regex(r#""text":"STUB: still here\? \(session "#.into()),
+        ]))
         .with_body(json!({"ok": true, "channel": OWNER_DM, "ts": "1800000000.000001"}).to_string())
         .expect(1)
         .create_async()
@@ -648,4 +654,203 @@ async fn slack_keeps_serving_when_discord_and_whatsapp_fail_to_start() {
         "token logged:\n{out}"
     );
     answer.assert_async().await;
+}
+
+fn owner_event(envelope_id: &str, event: Value) -> Value {
+    json!({
+        "type": "events_api", "envelope_id": envelope_id, "accepts_response_payload": false,
+        "payload": {
+            "type": "event_callback", "team_id": TEAM, "api_app_id": "A00000001",
+            "event_id": format!("Ev{envelope_id}"), "event_time": 1_800_000_000,
+            "event": event
+        }
+    })
+}
+
+/// `(session <id>, turn <n>)` from a fake-agent answer.
+fn session_turn(text: &str) -> Option<(String, u64)> {
+    let rest = text.split("(session ").nth(1)?;
+    let (id, rest) = rest.split_once(", turn ")?;
+    let n = rest.split(')').next()?.parse().ok()?;
+    Some((id.to_string(), n))
+}
+
+// #1288 — the built `serve` runs owner turns through the shared harness: one
+// native session per Slack conversation that follow-ups resume, a DM thread
+// is its own conversation, `cancel` stops a running turn at once and says so
+// (the status line tells the owner how), and an owner file reaches the
+// agent readable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_runs_owner_turns_through_the_harness_with_sessions_cancel_and_files() {
+    use std::sync::{Arc, Mutex};
+    let mut socket = fake_socket().await;
+    let mut server = mockito::Server::new_async().await;
+    mock_slack(&mut server, socket.port).await;
+    let posts: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let recorded = Arc::clone(&posts);
+    server
+        .mock("POST", "/chat.postMessage")
+        .with_body_from_request(move |req| {
+            let body: Value = serde_json::from_slice(req.body().unwrap()).unwrap();
+            let mut all = recorded.lock().unwrap();
+            all.push(body.clone());
+            json!({"ok": true, "channel": body["channel"],
+                "ts": format!("1800000100.{:06}", all.len())})
+            .to_string()
+            .into()
+        })
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    server
+        .mock("POST", "/chat.update")
+        .with_body_from_request(|req| {
+            let body: Value = serde_json::from_slice(req.body().unwrap()).unwrap();
+            json!({"ok": true, "channel": body["channel"], "ts": body["ts"]})
+                .to_string()
+                .into()
+        })
+        .create_async()
+        .await;
+    server
+        .mock("GET", "/files-pri/T00000001-F00000001/download/notes.txt")
+        .with_header("content-type", "text/plain")
+        .with_body("synthetic notes body\n")
+        .create_async()
+        .await;
+    let file_host = server.host_with_port();
+    let texts = |channel: &str, thread: Option<&str>| -> Vec<String> {
+        posts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p["channel"] == json!(channel) && p["thread_ts"].as_str() == thread)
+            .filter_map(|p| p["text"].as_str().map(str::to_string))
+            .collect()
+    };
+
+    let env = Env::new(server.url());
+    env.install_and_bind();
+    let mut serve = env.serve_with(
+        &["--dry-run", "false"],
+        &[("AUGMENTAGENT_SLACK_TEST_FILE_HOSTS", file_host.as_str())],
+    );
+    eventually("connected", Duration::from_secs(30), || {
+        env.slack_status()["state"] == json!("connected")
+    })
+    .await;
+    let dm_msg = |id: &str, text: &str, ts: &str| {
+        owner_event(
+            id,
+            json!({"type": "message", "channel": OWNER_DM, "channel_type": "im",
+            "user": OWNER, "text": text, "ts": ts}),
+        )
+    };
+    let answered = |channel: &str, thread: Option<&str>, n: usize| {
+        texts(channel, thread)
+            .iter()
+            .filter(|t| t.starts_with("STUB:"))
+            .count()
+            >= n
+    };
+
+    socket
+        .send
+        .send(dm_msg("h1", "first question", "1800000004.000100"))
+        .unwrap();
+    socket.ack().await;
+    eventually("first answer", Duration::from_secs(15), || {
+        answered(OWNER_DM, None, 1)
+    })
+    .await;
+    socket
+        .send
+        .send(dm_msg("h2", "second question", "1800000004.000200"))
+        .unwrap();
+    socket.ack().await;
+    eventually("second answer", Duration::from_secs(15), || {
+        answered(OWNER_DM, None, 2)
+    })
+    .await;
+    let thread = owner_event(
+        "h3",
+        json!({"type": "message", "channel": OWNER_DM,
+        "channel_type": "im", "user": OWNER, "text": "side topic",
+        "ts": "1800000004.000300", "thread_ts": "1800000004.000100"}),
+    );
+    socket.send.send(thread).unwrap();
+    socket.ack().await;
+    eventually("thread answer", Duration::from_secs(15), || {
+        answered(OWNER_DM, Some("1800000004.000100"), 1)
+    })
+    .await;
+    let dm: Vec<(String, u64)> = texts(OWNER_DM, None)
+        .iter()
+        .filter_map(|t| session_turn(t))
+        .collect();
+    let side = session_turn(&texts(OWNER_DM, Some("1800000004.000100"))[1]).unwrap();
+    assert_eq!(dm.len(), 2, "{dm:?}");
+    assert_eq!(dm[0].0, dm[1].0, "the DM is one native session");
+    assert_eq!((dm[0].1, dm[1].1), (1, 2));
+    assert_ne!(side.0, dm[0].0, "a DM thread is its own session");
+    assert_eq!(side.1, 1);
+    assert!(
+        texts(OWNER_DM, None)
+            .iter()
+            .any(|t| t.contains("reply `cancel` to stop")),
+        "the status line says how to cancel: {:?}",
+        texts(OWNER_DM, None)
+    );
+
+    // A slow turn, then `cancel`: stopped at once and reported.
+    socket
+        .send
+        .send(dm_msg("h4", "slow job", "1800000004.000400"))
+        .unwrap();
+    socket.ack().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let sent = Instant::now();
+    socket
+        .send
+        .send(dm_msg("h5", "cancel", "1800000004.000500"))
+        .unwrap();
+    socket.ack().await;
+    eventually("cancel reported", Duration::from_secs(10), || {
+        texts(OWNER_DM, None)
+            .iter()
+            .any(|t| t.starts_with("Stopped."))
+    })
+    .await;
+    assert!(
+        sent.elapsed() < Duration::from_secs(10),
+        "cancel waited for the turn"
+    );
+
+    // An owner file reaches the agent, which can open it.
+    let file = owner_event(
+        "h6",
+        json!({"type": "message", "subtype": "file_share",
+        "channel": OWNER_DM, "channel_type": "im", "user": OWNER, "text": "summarize this",
+        "ts": "1800000004.000600",
+        "files": [{"id": "F00000001", "name": "notes.txt", "mimetype": "text/plain",
+            "size": 21, "mode": "hosted",
+            "url_private_download": format!("{}/files-pri/T00000001-F00000001/download/notes.txt", server.url())}]}),
+    );
+    socket.send.send(file).unwrap();
+    socket.ack().await;
+    eventually("file acknowledged", Duration::from_secs(15), || {
+        texts(OWNER_DM, None)
+            .iter()
+            .any(|t| t.contains("read 00-notes.txt (21 bytes)"))
+    })
+    .await;
+
+    interrupt(&serve);
+    let status = wait_exit(&mut serve, Duration::from_secs(20));
+    let out = logs(serve);
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "serve did not stop cleanly:\n{out}"
+    );
+    assert_no_tokens(&out);
 }

@@ -11,11 +11,15 @@
 //! the daemon after installing, rotating or binding. Owner bindings
 //! themselves are re-read on every event, so an unbind takes effect at once.
 //!
-//! The turn handler is [`QueryTurnHandler`]: a thin adapter over the same
-//! [`QueryHandler`] Discord's query channel answers with (`WikiQuerier`,
-//! one call to the shared reasoner). #1288 replaces it with the full
-//! conversation harness.
+//! #1288 — the turn handler is the shared conversation harness
+//! ([`SlackConversationHarness`]) over the same [`QueryHandler`] Discord
+//! answers with (`WikiQuerier`): same tools, wiki and memory, skills, audit
+//! and provider fallback, and a native Claude/Codex session per Slack
+//! conversation (DM, DM thread, channel thread) that follow-ups resume.
+//! [`build_surface`] turns on the throttled status line (with its `cancel`
+//! hint) and the owner-file pipeline under `<state dir>/slack-inbound`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -24,6 +28,8 @@ use augmentagent_approval_discord::{AuditCtx, QueryHandler};
 use augmentagent_channel_slack::app::{
     api_base_from, SlackAppCredentials, SlackAppError, SlackAppStore, SLACK_API_BASE_ENV,
 };
+use augmentagent_channel_slack::delivery::ProgressConfig;
+use augmentagent_channel_slack::harness::SlackConversationHarness;
 use augmentagent_channel_slack::interactive::{
     report_inactive, SlackInteractiveSurface, SlackSurfaceConfig, SlackTurn, SlackTurnHandler,
     SlackTurnReply, SlackWorkspaceRuntime, SurfaceState,
@@ -32,7 +38,10 @@ use augmentagent_channel_slack::owner::OwnerInputSource;
 use augmentagent_channel_slack::owner_setup::{bot_identity, find_binding};
 use augmentagent_channel_slack::surface::SlackWorkspace;
 use augmentagent_channel_slack::transport::socket::{SlackConnector, SocketConnector};
-use augmentagent_channel_slack::transport::web::{HttpSlackWebApi, SlackWebApi, WebApiConfig};
+use augmentagent_channel_slack::transport::web::{
+    test_file_hosts_from, DownloadLimits, HttpSlackWebApi, SlackWebApi, WebApiConfig,
+    SLACK_TEST_FILE_HOSTS_ENV,
+};
 use augmentagent_store::Store;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -239,6 +248,13 @@ pub fn build_surface(
     // `api_base_from` allows plain http only for a loopback test server; the
     // socket URL such a server hands back is plain ws for the same reason.
     let loopback_test_server = api_base.starts_with("http://");
+    // Test-only loopback file hosts for owner-file downloads (same rule as
+    // `slack files fetch`); anything but loopback host:port is refused.
+    let test_hosts = test_file_hosts_from(std::env::var(SLACK_TEST_FILE_HOSTS_ENV).ok().as_deref())
+        .map_err(|m| anyhow::anyhow!(m))?;
+    if !test_hosts.is_empty() {
+        warn!(hosts = ?test_hosts, "{SLACK_TEST_FILE_HOSTS_ENV} adds loopback test file hosts");
+    }
     let mut workspaces = Vec::new();
     let mut connectors: Vec<Arc<dyn SocketConnector>> = Vec::new();
     let mut apps_seen: Vec<String> = Vec::new();
@@ -247,13 +263,16 @@ pub fn build_surface(
         workspace,
     } in installs
     {
+        let mut limits = DownloadLimits::default();
+        limits.allowed_hosts.extend(test_hosts.iter().cloned());
         let web = HttpSlackWebApi::new(
             c.bot_token.clone(),
             WebApiConfig {
                 base_url: api_base.to_string(),
                 ..WebApiConfig::default()
             },
-        )?;
+        )?
+        .with_download_limits(limits);
         workspaces.push(SlackWorkspaceRuntime {
             workspace: workspace.clone(),
             web: Arc::new(web) as Arc<dyn SlackWebApi>,
@@ -281,6 +300,9 @@ pub fn build_surface(
         handler,
         SlackSurfaceConfig {
             dry_run,
+            // #1288 — a status line per turn that says how to cancel it
+            // (never posted in dry-run).
+            progress: Some(ProgressConfig::default()),
             ..SlackSurfaceConfig::default()
         },
     ))
@@ -350,9 +372,12 @@ pub fn spawn(
         };
         let teams: Vec<String> = installs.iter().map(|i| i.creds.team_id.clone()).collect();
         info!(teams = %teams.join(", "), dry_run, "slack interactive surface starting");
-        let handler = match test_turn_handler(std::env::var(TEST_REPLY_ENV).ok().as_deref()) {
+        let handler = match test_turn_handler(
+            std::env::var(TEST_REPLY_ENV).ok().as_deref(),
+            Arc::clone(&store),
+        ) {
             Some(stub) => {
-                warn!("{TEST_REPLY_ENV} is set: Slack turns are answered by a test stub, not the reasoner (debug build, tests and local QA only)");
+                warn!("{TEST_REPLY_ENV} is set: Slack turns run the real harness with a fake agent, not the reasoner (debug build, tests and local QA only)");
                 stub
             }
             None => make_handler(),
@@ -383,41 +408,15 @@ pub fn spawn(
     })
 }
 
-/// Answers owner messages and `/jarvis` commands through the shared query
-/// path. Interactions (buttons, modals) are #1289 and get no answer here.
-pub struct QueryTurnHandler {
-    pub query: Arc<dyn QueryHandler>,
-}
-
-#[async_trait]
-impl SlackTurnHandler for QueryTurnHandler {
-    async fn handle_turn(&self, turn: &SlackTurn) -> Result<Option<SlackTurnReply>> {
-        if turn.source == OwnerInputSource::Interaction {
-            return Ok(None);
-        }
-        let question = turn.text.trim();
-        if question.is_empty() {
-            return Ok(None);
-        }
-        // Same shape as the WhatsApp control surface: no Discord http,
-        // channel or guild, a per-message session id for audit and handoff
-        // correlation, and `owner_authorized: false` because that flag means
-        // "matched Discord's owner allowlist" and gates Discord-owner tools
-        // (model switch, computer use). Slack's tool permissions are #1288.
-        let ctx = AuditCtx {
-            session_id: format!(
-                "slack:{}:{}",
-                turn.owner.account().account_id(),
-                turn.event_id
-            ),
-            guild_id: None,
-            http: None,
-            channel_id: None,
-            owner_authorized: false,
-        };
-        let answer = self.query.answer(&ctx, question).await?;
-        Ok(Some(SlackTurnReply { text: answer }))
-    }
+/// #1288 — the handler `serve` runs with a wiki: owner turns through the
+/// shared conversation harness, answered by `query` (the same `WikiQuerier`
+/// Discord uses).
+pub fn conversation_handler(
+    store: Arc<Store>,
+    query: Arc<dyn QueryHandler>,
+    wiki_root: PathBuf,
+) -> Arc<dyn SlackTurnHandler> {
+    Arc::new(SlackConversationHarness::new(store, query, wiki_root))
 }
 
 /// Used when `serve` has no `--wiki-dir`: the query path needs one.
@@ -434,44 +433,133 @@ impl SlackTurnHandler for NoQueryHandler {
         }
         Ok(Some(SlackTurnReply {
             text: NO_QUERY_REPLY.to_string(),
+            files: Vec::new(),
         }))
     }
 }
 
-/// **Test and local QA only.** In a debug build, answers every owner turn
-/// with `<value> <question>` instead of calling the reasoner, so the whole
-/// serve path can be exercised end to end on a host where no provider can
-/// run (the CLI providers' process supervisor is Linux-only today, and the
-/// HTTP provider is text-only while query mode needs tools). Ignored in
+/// **Test and local QA only.** In a debug build, owner turns run through the
+/// real conversation harness (native session per conversation, turn claims,
+/// queueing, cancel, restart recovery, owner files) but the agent is
+/// [`StubAgent`] instead of the reasoner, so the whole serve path can be
+/// exercised end to end on a host where no provider can run. Ignored in
 /// release builds.
 pub const TEST_REPLY_ENV: &str = "AUGMENTAGENT_TEST_SLACK_TURN_REPLY";
 
-struct StubTurnHandler {
+/// How long [`StubAgent`] works on a message containing `slow` (so queueing,
+/// `cancel` and restart can be shown).
+pub const TEST_SLOW_TURN: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Stands in for the reasoner behind the harness. It joins the turn's native
+/// session exactly like the Claude CLI adapter (create on the first turn,
+/// resume after), and answers
+/// `<prefix> <first line> (session <id>, turn <n>)`, plus one
+/// `read <file> (<bytes> bytes)` per attachment it could open. `n` counts
+/// the session's turns in a small file under the state directory, so it
+/// survives a daemon restart.
+struct StubAgent {
     prefix: String,
+    counts: PathBuf,
+}
+
+impl StubAgent {
+    fn next_turn(&self, session: &str) -> u64 {
+        let mut counts: std::collections::BTreeMap<String, u64> = std::fs::read(&self.counts)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let n = counts.entry(session.to_string()).or_default();
+        *n += 1;
+        let n = *n;
+        if let Some(parent) = self.counts.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(
+            &self.counts,
+            serde_json::to_vec(&counts).unwrap_or_default(),
+        );
+        n
+    }
 }
 
 #[async_trait]
-impl SlackTurnHandler for StubTurnHandler {
-    async fn handle_turn(&self, turn: &SlackTurn) -> Result<Option<SlackTurnReply>> {
-        let question = turn.text.trim();
-        if turn.source == OwnerInputSource::Interaction || question.is_empty() {
-            return Ok(None);
+impl QueryHandler for StubAgent {
+    async fn answer(&self, _ctx: &AuditCtx, question: &str) -> anyhow::Result<String> {
+        use augmentagent_channel_core::native_session::{Launch, CURRENT};
+        use augmentagent_channel_core::providers::ProviderKind;
+        let session = CURRENT.try_with(Arc::clone)?;
+        let provider = session.provider();
+        let mut lease = session.begin(provider)?;
+        let id = match lease.launch() {
+            Launch::Create {
+                requested_id: Some(id),
+            }
+            | Launch::Resume { id } => id,
+            Launch::Create { requested_id: None } => format!(
+                "{}-thread-{}",
+                if provider == ProviderKind::Codex {
+                    "codex"
+                } else {
+                    "stub"
+                },
+                uuid::Uuid::new_v4()
+            ),
+        };
+        lease.observe(&id)?;
+        if question.contains("slow") {
+            tokio::time::sleep(TEST_SLOW_TURN).await;
         }
-        Ok(Some(SlackTurnReply {
-            text: format!("{} {question}", self.prefix),
-        }))
+        lease.finish()?;
+        let n = self.next_turn(&id);
+        let first = question.lines().next().unwrap_or_default().trim();
+        let mut reply = format!("{} {first} (session {id}, turn {n})", self.prefix);
+        for line in question.lines() {
+            let path = line
+                .strip_prefix("IMAGE: ")
+                .or_else(|| line.strip_prefix("- "))
+                .map(|rest| rest.split("  (").next().unwrap_or(rest));
+            if let Some(path) = path {
+                let path = std::path::Path::new(path);
+                if let (Ok(meta), Some(name)) = (std::fs::metadata(path), path.file_name()) {
+                    reply.push_str(&format!(
+                        "\nread {} ({} bytes)",
+                        name.to_string_lossy(),
+                        meta.len()
+                    ));
+                }
+            }
+        }
+        Ok(reply)
     }
 }
 
 /// The [`TEST_REPLY_ENV`] stand-in, when set in a debug build.
-pub fn test_turn_handler(value: Option<&str>) -> Option<Arc<dyn SlackTurnHandler>> {
+pub fn test_turn_handler(
+    value: Option<&str>,
+    store: Arc<Store>,
+) -> Option<Arc<dyn SlackTurnHandler>> {
     if !cfg!(debug_assertions) {
         return None;
     }
     let prefix = value.map(str::trim).filter(|v| !v.is_empty())?;
-    Some(Arc::new(StubTurnHandler {
+    let state = augmentagent_channel_core::state_dir::state_dir_or(".");
+    Some(stub_handler(
+        prefix,
+        store,
+        state.join("test-slack-turns.json"),
+    ))
+}
+
+fn stub_handler(prefix: &str, store: Arc<Store>, counts: PathBuf) -> Arc<dyn SlackTurnHandler> {
+    let agent = Arc::new(StubAgent {
         prefix: prefix.to_string(),
-    }))
+        counts,
+    });
+    let wiki = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // The owner's model selection is not read: the stub is always Claude.
+    Arc::new(
+        SlackConversationHarness::new(store, agent, wiki).with_selection(Arc::new(|_| Ok(None))),
+    )
 }
 
 /// Run `task` so that neither an error nor a panic escapes: `serve` joins
@@ -505,6 +593,7 @@ mod tests {
     use augmentagent_channel_slack::surface::SlackWorkspace;
     use augmentagent_channel_slack::transport::event::{parse_envelope, Envelope};
     use std::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
 
     const TEAM: &str = "T00000001";
     const T0: i64 = 1_700_000_000_000;
@@ -709,21 +798,28 @@ mod tests {
         );
     }
 
-    // --- adapter ---------------------------------------------------------
+    // --- harness -----------------------------------------------------------
+
+    /// (audit session, owner authorized, Discord context, question, native session)
+    type Seen = (String, bool, bool, String, bool);
 
     #[derive(Default)]
     struct FakeQuery {
-        seen: Mutex<Vec<(String, bool, bool, String)>>,
+        seen: Mutex<Vec<Seen>>,
     }
 
     #[async_trait]
     impl QueryHandler for FakeQuery {
         async fn answer(&self, ctx: &AuditCtx, question: &str) -> anyhow::Result<String> {
+            let native = augmentagent_channel_core::native_session::CURRENT
+                .try_with(|_| ())
+                .is_ok();
             self.seen.lock().unwrap().push((
                 ctx.session_id.clone(),
                 ctx.owner_authorized,
                 ctx.http.is_some() || ctx.channel_id.is_some() || ctx.guild_id.is_some(),
                 question.to_string(),
+                native,
             ));
             Ok(format!("reasoned: {question}"))
         }
@@ -740,54 +836,66 @@ mod tests {
             panic!("parse")
         };
         let ws = SlackWorkspace::new(TEAM, None).unwrap();
+        let event_id = "D00000001:1700000000.000100".to_string();
         SlackTurn {
-            event_id: "D00000001:1700000000.000100".into(),
+            turn_id: augmentagent_channel_slack::interactive::slack_turn_id(
+                &ws.account(),
+                &event_id,
+            ),
+            event_id,
             attempt: 1,
             owner: ws.owner("U00000001").unwrap(),
             conversation: Some(ws.conversation("D00000001", None).unwrap()),
+            session: Some(ws.conversation("D00000001", None).unwrap()),
             source,
             text: text.into(),
+            prompt: text.into(),
+            inbound_dir: None,
+            cancel: CancellationToken::new(),
             envelope: *envelope,
         }
     }
 
+    fn harness(store: Arc<Store>, query: Arc<FakeQuery>) -> SlackConversationHarness {
+        SlackConversationHarness::new(store, query, PathBuf::from("/wiki"))
+            .with_selection(Arc::new(|_| Ok(None)))
+    }
+
+    // #1288 — replaces the single-turn adapter: the turn runs the shared
+    // query path inside a native session, with owner authority (the turn
+    // passed `owner::admit`), no Discord context, and a per-turn audit ID.
     #[tokio::test]
-    async fn query_adapter_calls_the_shared_query_path_without_discord_context() {
+    async fn slack_turns_run_the_shared_query_path_in_a_native_session_as_the_owner() {
+        let (_d, store) = temp_store();
         let query = Arc::new(FakeQuery::default());
-        let handler = QueryTurnHandler {
-            query: query.clone(),
-        };
+        let handler = harness(Arc::new(store), query.clone());
         let reply = handler
             .handle_turn(&turn(OwnerInputSource::Message, "  what is due?  "))
             .await
+            .unwrap()
             .unwrap();
-        assert_eq!(
-            reply,
-            Some(SlackTurnReply {
-                text: "reasoned: what is due?".into()
-            })
-        );
+        assert!(reply.text.starts_with("reasoned: "), "{}", reply.text);
+        assert!(reply.text.contains("what is due?"));
         let seen = query.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 1);
-        let (session, owner_authorized, discord_ctx, question) = &seen[0];
-        assert!(session.starts_with("slack:"), "{session}");
-        assert!(session.contains("D00000001:1700000000.000100"), "{session}");
-        // Owner-only tools (model switch, computer use) stay Discord-gated
-        // until #1288 decides Slack's tool permissions.
-        assert!(!owner_authorized);
+        let (session, owner_authorized, discord_ctx, _question, native) = &seen[0];
+        assert_eq!(session, "slack:T00000001:D00000001:1700000000.000100");
+        assert!(owner_authorized, "Slack owner turns carry owner authority");
         assert!(
             !discord_ctx,
             "no Discord http/channel/guild on a Slack turn"
         );
-        assert_eq!(question, "what is due?");
+        assert!(
+            native,
+            "the agent runs inside the conversation's native session"
+        );
     }
 
     #[tokio::test]
-    async fn query_adapter_skips_empty_text_and_interactions() {
+    async fn the_harness_skips_empty_text_and_interactions() {
+        let (_d, store) = temp_store();
         let query = Arc::new(FakeQuery::default());
-        let handler = QueryTurnHandler {
-            query: query.clone(),
-        };
+        let handler = harness(Arc::new(store), query.clone());
         assert_eq!(
             handler
                 .handle_turn(&turn(OwnerInputSource::Message, "   "))
@@ -818,21 +926,53 @@ mod tests {
     // --- test-only reasoner stand-in --------------------------------------
 
     #[tokio::test]
-    async fn the_test_reply_override_answers_without_a_reasoner_in_debug_builds_only() {
-        let handler = test_turn_handler(Some("FAKE-REASONER:"));
-        if cfg!(debug_assertions) {
-            let reply = handler
-                .expect("honoured in debug builds")
-                .handle_turn(&turn(OwnerInputSource::Message, "status?"))
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(reply.text, "FAKE-REASONER: status?");
-        } else {
-            assert!(handler.is_none(), "never honoured in release builds");
+    async fn the_test_override_runs_the_harness_and_echoes_session_and_turn_in_debug_builds_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("data.db")).unwrap());
+        if !cfg!(debug_assertions) {
+            assert!(
+                test_turn_handler(Some("FAKE-REASONER:"), store).is_none(),
+                "never honoured in release builds"
+            );
+            return;
         }
-        assert!(test_turn_handler(None).is_none());
-        assert!(test_turn_handler(Some("  ")).is_none());
+        assert!(test_turn_handler(Some("FAKE-REASONER:"), Arc::clone(&store)).is_some());
+        let handler = stub_handler(
+            "FAKE-REASONER:",
+            Arc::clone(&store),
+            dir.path().join("counts.json"),
+        );
+        let first = handler
+            .handle_turn(&turn(OwnerInputSource::Message, "status?"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            first.text.starts_with("FAKE-REASONER: status? (session "),
+            "{}",
+            first.text
+        );
+        let mut next = turn(OwnerInputSource::Message, "and now?");
+        next.event_id = "D00000001:1700000000.000200".into();
+        next.turn_id = "slack:T00000001:D00000001:1700000000.000200".into();
+        let second = handler.handle_turn(&next).await.unwrap().unwrap();
+        let session = |t: &str| {
+            t.split("(session ")
+                .nth(1)
+                .unwrap()
+                .split(',')
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            session(&first.text),
+            session(&second.text),
+            "one native session per DM"
+        );
+        assert!(second.text.ends_with("turn 2)"), "{}", second.text);
+        assert!(test_turn_handler(None, Arc::clone(&store)).is_none());
+        assert!(test_turn_handler(Some("  "), store).is_none());
     }
 
     // --- isolation -------------------------------------------------------

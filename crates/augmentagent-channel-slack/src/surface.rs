@@ -373,9 +373,11 @@ pub const SLACK_INTERACTIONS: [CapabilityRow<SlackInteraction>; 9] = [
     ),
     row(
         SlackInteraction::Threads,
-        SupportStatus::Unsupported,
+        SupportStatus::Supported,
         1288,
-        "thread identity is mapped here (thread_ts) but no runtime reads or posts in threads",
+        "each Slack thread (and a top-level control-channel message, which starts one) is a \
+         persistent conversation with its own native session; answers, progress and \
+         follow-ups stay in the thread (interactive.rs, harness.rs)",
     ),
     row(
         SlackInteraction::SlashCommands,

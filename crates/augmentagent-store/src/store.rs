@@ -53,6 +53,53 @@ pub struct NativeConversation {
     pub uncertain: bool,
 }
 
+/// Where one claimed native turn stands (`surface_native_turns.status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceTurnStatus {
+    /// Claimed; the runner has not recorded an outcome (still running, or
+    /// the daemon died mid-turn).
+    Pending,
+    Complete,
+    /// The native agent may have run tools before its result was lost.
+    Uncertain,
+}
+
+/// #1288 — why an unfinished turn was closed without being re-run. The owner
+/// has been told, so the conversation may take its next turn; the turn itself
+/// is never submitted again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceTurnResolution {
+    /// The owner stopped it; the provider process tree was torn down.
+    Cancelled,
+    /// A daemon restart interrupted it.
+    Interrupted,
+}
+
+impl SurfaceTurnResolution {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    fn parse(value: &str) -> StoreResult<Self> {
+        match value {
+            "cancelled" => Ok(Self::Cancelled),
+            "interrupted" => Ok(Self::Interrupted),
+            other => Err(StoreError::InvalidInput(format!(
+                "unknown turn resolution {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceTurnState {
+    pub status: SurfaceTurnStatus,
+    pub resolution: Option<SurfaceTurnResolution>,
+}
+
 /// #900 — an interrupted ShadowNote sync pass, persisted after every page so
 /// a restart resumes pagination instead of replaying the whole batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,9 +225,16 @@ impl Store {
         }
         let mut guard = self.conn.lock().expect("store mutex poisoned");
         let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // #1288 — a resolved turn (cancelled or interrupted, owner told)
+        // stays consumed but no longer blocks the conversation.
         let unfinished: Option<String> = tx.query_row(
-            "SELECT turn_id FROM surface_native_turns WHERE platform = ?1 AND account_id = ?2
-             AND conversation_id = ?3 AND thread_id = ?4 AND status != 'complete' LIMIT 1",
+            "SELECT t.turn_id FROM surface_native_turns t WHERE t.platform = ?1 AND t.account_id = ?2
+             AND t.conversation_id = ?3 AND t.thread_id = ?4 AND t.status != 'complete'
+             AND NOT EXISTS (SELECT 1 FROM surface_turn_resolutions r
+                 WHERE r.platform = t.platform AND r.account_id = t.account_id
+                 AND r.conversation_id = t.conversation_id AND r.thread_id = t.thread_id
+                 AND r.turn_id = t.turn_id)
+             LIMIT 1",
             params![chat.account().platform().as_str(), chat.account().account_id(), chat.conversation_id(), chat.thread_id().unwrap_or("")],
             |row| row.get(0),
         ).optional()?;
@@ -219,6 +273,131 @@ impl Store {
         if changed != 1 {
             return Err(StoreError::InvalidInput("surface native turn is not pending".into()));
         }
+        Ok(())
+    }
+
+    /// Where a claimed turn stands, `None` when it was never claimed.
+    pub fn surface_turn_state(
+        &self,
+        turn: &SurfaceTurnRef,
+    ) -> StoreResult<Option<SurfaceTurnState>> {
+        let chat = turn.conversation();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row: Option<(String, Option<String>)> = guard
+            .query_row(
+                "SELECT t.status, r.resolution FROM surface_native_turns t
+             LEFT JOIN surface_turn_resolutions r ON r.platform = t.platform
+                 AND r.account_id = t.account_id AND r.conversation_id = t.conversation_id
+                 AND r.thread_id = t.thread_id AND r.turn_id = t.turn_id
+             WHERE t.platform = ?1 AND t.account_id = ?2 AND t.conversation_id = ?3
+                 AND t.thread_id = ?4 AND t.turn_id = ?5",
+                params![
+                    chat.account().platform().as_str(),
+                    chat.account().account_id(),
+                    chat.conversation_id(),
+                    chat.thread_id().unwrap_or(""),
+                    turn.turn_id()
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((status, resolution)) = row else {
+            return Ok(None);
+        };
+        let status = match status.as_str() {
+            "pending" => SurfaceTurnStatus::Pending,
+            "complete" => SurfaceTurnStatus::Complete,
+            "uncertain" => SurfaceTurnStatus::Uncertain,
+            other => {
+                return Err(StoreError::InvalidInput(format!(
+                    "unknown turn status {other}"
+                )))
+            }
+        };
+        let resolution = resolution
+            .as_deref()
+            .map(SurfaceTurnResolution::parse)
+            .transpose()?;
+        Ok(Some(SurfaceTurnState { status, resolution }))
+    }
+
+    /// #1288 — close an unfinished (pending or uncertain) turn that will not
+    /// be re-run because the owner stopped it or a restart interrupted it and
+    /// the owner was told. A pending turn becomes `uncertain` (its tools may
+    /// have run); the resolution lets the conversation's next turn proceed.
+    /// The first resolution wins. Discord keeps its own inspect-first rule
+    /// (#1220) and is refused here.
+    pub fn resolve_surface_turn(
+        &self,
+        turn: &SurfaceTurnRef,
+        resolution: SurfaceTurnResolution,
+    ) -> StoreResult<()> {
+        let chat = turn.conversation();
+        if chat.account().platform().as_str() == "discord" {
+            return Err(StoreError::InvalidInput(
+                "Discord native turns are not resolved through the surface API".into(),
+            ));
+        }
+        let cols = params![
+            chat.account().platform().as_str(),
+            chat.account().account_id(),
+            chat.conversation_id(),
+            chat.thread_id().unwrap_or(""),
+            turn.turn_id()
+        ];
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let status: Option<String> = tx
+            .query_row(
+                "SELECT status FROM surface_native_turns WHERE platform = ?1 AND account_id = ?2
+             AND conversation_id = ?3 AND thread_id = ?4 AND turn_id = ?5",
+                cols,
+                |row| row.get(0),
+            )
+            .optional()?;
+        match status.as_deref() {
+            None => {
+                return Err(StoreError::InvalidInput(
+                    "surface native turn was never claimed".into(),
+                ))
+            }
+            Some("complete") => {
+                return Err(StoreError::InvalidInput(
+                    "surface native turn already completed".into(),
+                ))
+            }
+            _ => {}
+        }
+        let now = now_millis();
+        tx.execute(
+            "UPDATE surface_native_turns SET status = 'uncertain', finished_at_ms = ?6
+             WHERE platform = ?1 AND account_id = ?2 AND conversation_id = ?3 AND thread_id = ?4
+             AND turn_id = ?5 AND status = 'pending'",
+            params![
+                chat.account().platform().as_str(),
+                chat.account().account_id(),
+                chat.conversation_id(),
+                chat.thread_id().unwrap_or(""),
+                turn.turn_id(),
+                now
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO surface_turn_resolutions
+             (platform, account_id, conversation_id, thread_id, turn_id, resolution, resolved_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(platform, account_id, conversation_id, thread_id, turn_id) DO NOTHING",
+            params![
+                chat.account().platform().as_str(),
+                chat.account().account_id(),
+                chat.conversation_id(),
+                chat.thread_id().unwrap_or(""),
+                turn.turn_id(),
+                resolution.as_str(),
+                now
+            ],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -636,6 +815,16 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_surface_native_turns_unfinished
             ON surface_native_turns(platform, account_id, conversation_id, thread_id, status);
+            CREATE TABLE IF NOT EXISTS surface_turn_resolutions (
+                platform TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL DEFAULT '',
+                turn_id TEXT NOT NULL,
+                resolution TEXT NOT NULL CHECK(resolution IN ('cancelled', 'interrupted')),
+                resolved_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(platform, account_id, conversation_id, thread_id, turn_id)
+            );
             INSERT INTO surface_conversations
                 (platform, account_id, conversation_id, thread_id, provider, native_session_id, cwd, created_at_ms, uncertain)
             SELECT 'discord', guild_id, channel_id, '', provider, native_session_id, cwd, created_at_ms, uncertain
