@@ -7,7 +7,6 @@
 //! action to `sent` or `error` (#1304).
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use augmentagent_approval_discord::ApprovalActionOutcome;
 use augmentagent_store::{
@@ -372,9 +371,39 @@ pub(crate) fn print_allowlists(store: &Store) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Tell the operator about every failed or unknown send once, through the
+/// same flag-notice surface as other channels. Returns how many were posted.
+pub(crate) async fn notify_outbox_failures(
+    store: &Store,
+    broker: &dyn augmentagent_approval_discord::ApprovalBroker,
+) -> anyhow::Result<usize> {
+    let mut posted = 0;
+    for row in store.unnotified_imessage_outbox_failures()? {
+        let Some(action) = store.get_action_with_email(&row.action_id)? else {
+            store.mark_imessage_outbox_notified(row.id)?;
+            continue;
+        };
+        let detail = action
+            .action
+            .error_message
+            .clone()
+            .or_else(|| row.error_detail.clone())
+            .unwrap_or_else(|| row.status.as_str().to_string());
+        let reason = format!("iMessage reply not delivered: {detail}");
+        if let Err(e) = broker.post_flag_notice(&action.email, &reason).await {
+            tracing::warn!(action_id = %row.action_id, "imessage failure notice failed: {e}");
+            continue; // retried on the next tick
+        }
+        store.mark_imessage_outbox_notified(row.id)?;
+        posted += 1;
+    }
+    Ok(posted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use augmentagent_channel_core::cooldown::CooldownLatch;
     use augmentagent_channel_core::fallback::FallbackReasoner;
     use augmentagent_channel_core::reasoner::{Reasoner, ReasonerOpts};
@@ -439,7 +468,11 @@ mod tests {
     }
 
     fn seed(store: &Store, identifier: &str, draft: &str) -> String {
-        let msg = format!("imessage:{identifier}:7");
+        seed_at(store, identifier, 7, draft)
+    }
+
+    fn seed_at(store: &Store, identifier: &str, idx: usize, draft: &str) -> String {
+        let msg = format!("imessage:{identifier}:{idx}");
         store
             .upsert_email(&Email {
                 attachments: Vec::new(),
@@ -618,5 +651,53 @@ mod tests {
         assert_eq!(a.action.status, "pending");
         assert_eq!(a.action.draft_body.as_deref(), Some("a better reply"));
         assert_eq!(outbox_len(&f.store), 0);
+    }
+
+    #[derive(Default)]
+    struct Notices(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl augmentagent_approval_discord::ApprovalBroker for Notices {
+        async fn post_approval(
+            &self,
+            _: &str,
+            _: &Email,
+            _: &str,
+        ) -> Result<(), augmentagent_approval_discord::ApprovalError> {
+            Ok(())
+        }
+        async fn post_flag_notice(
+            &self,
+            _: &Email,
+            reason: &str,
+        ) -> Result<(), augmentagent_approval_discord::ApprovalError> {
+            self.0.lock().unwrap().push(reason.to_string());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_and_unknown_sends_are_announced_once() {
+        let f = fixture(true);
+        f.store.allow_imessage_outbound(PHONE).unwrap();
+        let a = seed_at(&f.store, PHONE, 1, "one");
+        let b_email = seed_at(&f.store, PHONE, 2, "two");
+        f.approver.run_approve(&a).await;
+        f.approver.run_approve(&b_email).await;
+        let first = f.store.claim_imessage_outbox().unwrap().unwrap();
+        complete(&f.store, first.id, &ImessageSendOutcome::Failed {
+            error_code: Some(22), reason: "x".into() }).unwrap();
+        f.store.claim_imessage_outbox().unwrap().unwrap();
+        f.store
+            .with_conn(|c| c.execute("UPDATE imessage_outbox SET claimed_at_ms = 1 WHERE status = 'claimed'", []))
+            .unwrap();
+        reconcile_outbox(&f.store).unwrap();
+
+        let broker = Notices::default();
+        assert_eq!(notify_outbox_failures(&f.store, &broker).await.unwrap(), 2);
+        let posted = broker.0.lock().unwrap().clone();
+        assert!(posted.iter().any(|m| m.contains("imessage error 22")), "{posted:?}");
+        assert!(posted.iter().any(|m| m.contains("may or may not")), "{posted:?}");
+        assert_eq!(notify_outbox_failures(&f.store, &broker).await.unwrap(), 0);
     }
 }

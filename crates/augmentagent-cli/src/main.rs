@@ -15134,13 +15134,38 @@ async fn imessage_poll_loop(
     wiki_schema: Option<String>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    const POLL_INTERVAL: Duration = Duration::from_secs(30 * 60);
+    // #1304 — outbox expiry and failure notices run on their own short tick
+    // so a failed send is reported within a minute, not a poll interval.
+    const OUTBOX_INTERVAL: Duration = Duration::from_secs(60);
+    let poll_interval = augmentagent_channel_imessage::poll_interval();
     let wiki_capture = augmentagent_channel_imessage::history_wiki_capture_enabled();
-    info!(wiki_capture, "imessage poller started");
-    let mut tick = tokio::time::interval(POLL_INTERVAL);
+    info!(wiki_capture, poll_secs = poll_interval.as_secs(), "imessage poller started");
+    // #1306 — reply cards for conversations on the inbound allowlist.
+    let replier = augmentagent_channel_imessage::ImessageReplier {
+        store: Arc::clone(&store),
+        reasoner: Arc::clone(&reasoner) as Arc<dyn augmentagent_channel_core::Reasoner>,
+        approvals: Arc::clone(&broker),
+        config: augmentagent_channel_imessage::ImessageReplyConfig {
+            wiki_root: wiki_root.clone(),
+            ..Default::default()
+        },
+    };
+    let mut tick = tokio::time::interval(poll_interval);
+    let mut outbox_tick = tokio::time::interval(OUTBOX_INTERVAL);
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
+            _ = outbox_tick.tick() => {
+                if let Err(e) = imessage_send::reconcile_outbox(&store) {
+                    warn!("imessage outbox reconcile failed: {e:#}");
+                }
+                match imessage_send::notify_outbox_failures(&store, broker.as_ref()).await {
+                    Ok(n) if n > 0 => info!(notices = n, "imessage send failures reported"),
+                    Ok(_) => {}
+                    Err(e) => warn!("imessage failure notices failed: {e:#}"),
+                }
+                continue;
+            }
             _ = tick.tick() => {}
         }
         // #888 — reclaim day-old attachment dirs a killed ask left behind (first tick is immediate).
@@ -15183,6 +15208,10 @@ async fn imessage_poll_loop(
                 emails = stats.emails_inserted,
                 "imessage poll ingested new messages"
             );
+        }
+        let replies = replier.handle_deltas(&deltas).await;
+        if replies != augmentagent_channel_imessage::ReplyStats::default() {
+            info!(?replies, "imessage reply triage");
         }
         // #927 — the stubs this sync leaves ARE what the merge scan proposes.
         if let Some(root) = &wiki_root {

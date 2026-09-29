@@ -59,6 +59,22 @@ pub fn send_enabled() -> bool {
     parse_flag(std::env::var(ENV_SEND_ENABLED).ok().as_deref())
 }
 
+/// How often the daemon polls the bundle and drafts reply cards (#1306).
+pub const ENV_POLL_SECS: &str = "AUGMENTAGENT_IMESSAGE_POLL_SECS";
+pub const DEFAULT_POLL_SECS: u64 = 30 * 60;
+
+pub fn poll_interval() -> std::time::Duration {
+    poll_interval_from(std::env::var(ENV_POLL_SECS).ok().as_deref())
+}
+
+fn poll_interval_from(raw: Option<&str>) -> std::time::Duration {
+    let secs = raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_POLL_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
 fn parse_flag(raw: Option<&str>) -> bool {
     matches!(
         raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
@@ -106,4 +122,14 @@ mod tests {
     }
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn poll_interval_is_configurable_with_a_safe_default() {
+        use std::time::Duration;
+        assert_eq!(poll_interval_from(Some("60")), Duration::from_secs(60));
+        assert_eq!(poll_interval_from(Some(" 120 ")), Duration::from_secs(120));
+        for bad in [None, Some(""), Some("0"), Some("-5"), Some("soon")] {
+            assert_eq!(poll_interval_from(bad), Duration::from_secs(1800), "{bad:?}");
+        }
+    }
 }

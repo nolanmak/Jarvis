@@ -209,6 +209,10 @@ const STARTER_SKILLS: &[(&str, &str)] = &[
         "Decide reply/skip/flag for inbound WhatsApp messages.",
     ),
     (
+        "imessage-triage",
+        "Decide reply/skip/flag for inbound iMessages in allowlisted conversations.",
+    ),
+    (
         "draft-archetypes",
         "Reusable reply scaffolds (decline, defer, confirm, intro) for outbound drafts.",
     ),
@@ -240,6 +244,7 @@ mod tests {
         // Pinning the set we ship today; if you add to STARTER_SKILLS, add
         // an assertion here so the prompt change is intentional.
         assert!(reg.contains("email-triage"));
+        assert!(reg.contains("imessage-triage"));
         assert!(!reg.contains("grocery"));
         assert!(reg.contains("wiki-search"));
         assert!(!reg.is_empty());
