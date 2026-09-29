@@ -68,6 +68,7 @@ use crate::delivery::{
 };
 use crate::harness::CANCELLED_REPLY;
 use crate::inbound::{default_inbound_root, prepare_inbound, InboundError, InboundOptions};
+use crate::ingest::SubscribedEventSink;
 use crate::owner::{
     admit, AdmitOutcome, OwnerInput, OwnerInputSink, OwnerInputSource, SlackBotIdentity,
     SlackOwnerAuthorizer,
@@ -854,6 +855,9 @@ struct Ctx {
     approvals: Option<Arc<SlackApprovals>>,
     /// #1292 — owner commands.
     commands: Arc<SlackCommands>,
+    /// #1296 — subscribed-conversation ingestion for events that are not
+    /// owner turns.
+    subscribed: Option<Arc<dyn SubscribedEventSink>>,
 }
 
 impl Ctx {
@@ -920,6 +924,8 @@ pub struct SlackInteractiveSurface {
     /// #1292 — owner commands; `None` uses [`SlackCommandDeps::new`] over
     /// the default model selection file.
     commands: Option<Arc<SlackCommands>>,
+    /// #1296 — where non-turn events of subscribed conversations go.
+    subscribed: Option<Arc<dyn SubscribedEventSink>>,
 }
 
 impl SlackInteractiveSurface {
@@ -940,6 +946,7 @@ impl SlackInteractiveSurface {
             clock: Arc::new(system_now_ms),
             approvals: None,
             commands: None,
+            subscribed: None,
         }
     }
 
@@ -957,6 +964,14 @@ impl SlackInteractiveSurface {
     /// #1292 — run owner commands with these dependencies.
     pub fn with_commands(mut self, commands: Arc<SlackCommands>) -> Self {
         self.commands = Some(commands);
+        self
+    }
+
+    /// #1296 — hand every event the owner gate ignores or rejects (contact
+    /// chatter, edits, deletes, renames in subscribed conversations) to
+    /// `sink` after it is settled for the gate.
+    pub fn with_subscribed_sink(mut self, sink: Arc<dyn SubscribedEventSink>) -> Self {
+        self.subscribed = Some(sink);
         self
     }
 
@@ -1004,6 +1019,7 @@ impl SlackInteractiveSurface {
             running: Mutex::new(HashMap::new()),
             approvals: self.approvals,
             commands,
+            subscribed: self.subscribed,
         });
 
         // This process owns the database: claims and in-flight sends left
@@ -1284,6 +1300,7 @@ async fn process(ctx: &Ctx, claimed: ClaimedInbound, shutdown: &CancellationToke
     match outcome {
         AdmitOutcome::Ignored(reason) => {
             debug!(seq, reason = reason.as_str(), "slack interactive: ignored");
+            observe_subscribed(ctx, &envelope).await;
             settle(ctx, seq);
         }
         AdmitOutcome::Rejected { reason, reply, .. } => {
@@ -1321,6 +1338,7 @@ async fn process(ctx: &Ctx, claimed: ClaimedInbound, shutdown: &CancellationToke
                 )) => post_ephemeral(ctx, &account, channel, user, thread_ts, text).await,
                 None => {}
             }
+            observe_subscribed(ctx, &envelope).await;
             settle(ctx, seq);
         }
         AdmitOutcome::Dispatched => {
@@ -1330,6 +1348,14 @@ async fn process(ctx: &Ctx, claimed: ClaimedInbound, shutdown: &CancellationToke
             };
             run_turn(ctx, claimed, account, input, envelope, shutdown).await;
         }
+    }
+}
+
+/// #1296 — not an owner turn: it may still be a message (or an edit,
+/// delete or rename) in a subscribed conversation.
+async fn observe_subscribed(ctx: &Ctx, envelope: &EventEnvelope) {
+    if let Some(sink) = &ctx.subscribed {
+        sink.observe(envelope).await;
     }
 }
 

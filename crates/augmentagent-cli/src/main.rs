@@ -103,6 +103,8 @@ mod slack_compose;
 mod slack_deliver;
 mod slack_files;
 mod slack_serve;
+// #1296 — subscription management (subscribe / set-mode / unsubscribe).
+mod slack_subscriptions;
 mod slack_voice;
 mod status;
 
@@ -1692,14 +1694,28 @@ enum SlackOp {
         json: bool,
     },
     /// Add or update a subscription in the shared channel_subscriptions table.
+    /// #1296 — the target is a conversation ID, `#channel`, a group DM's
+    /// name, or a person (their DM, resolved through `--wiki-dir` people
+    /// pages). An ambiguous or unknown target changes nothing and exits 1.
     Subscribe {
+        /// Conversation ID (C…/G…/D…), `#name`, group DM name or person.
+        #[arg(value_name = "TARGET")]
         channel_id: String,
         #[arg(long, value_parser = ["priority", "digest", "store_only"])]
         mode: String,
+        /// Display name to store instead of the resolved one.
         #[arg(long)]
         name: Option<String>,
         /// Slack workspace `team_id` the channel belongs to. Required when
         /// multiple workspaces are configured.
+        #[arg(long)]
+        team_id: Option<String>,
+    },
+    /// Change a subscription's mode (#1296). Same targets as `subscribe`.
+    SetMode {
+        target: String,
+        #[arg(long, value_parser = ["priority", "digest", "store_only"])]
+        mode: String,
         #[arg(long)]
         team_id: Option<String>,
     },
@@ -1708,8 +1724,14 @@ enum SlackOp {
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         json: bool,
     },
-    /// Soft-remove a subscription by id.
-    Unsubscribe { id: String },
+    /// Soft-remove a subscription: its row id, or (#1296) the same targets
+    /// as `subscribe`. Its ID and cursor are kept for a later re-subscribe.
+    Unsubscribe {
+        #[arg(value_name = "ID_OR_TARGET")]
+        id: String,
+        #[arg(long)]
+        team_id: Option<String>,
+    },
     /// Run one poll cycle and exit.
     PollOnce {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -2968,7 +2990,9 @@ async fn main() -> Result<()> {
                 Arc::clone(&broker),
                 dry_run,
             ) {
-                Ok(ch) => Some(ch),
+                // #1296 — shared with the interactive surface's live
+                // ingestion of subscribed conversations.
+                Ok(ch) => Some(Arc::new(ch)),
                 Err(e) => {
                     warn!("slack channel disabled: {e:#}");
                     None
@@ -3266,6 +3290,12 @@ async fn main() -> Result<()> {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { digest.run(sd).await }));
             }
+            // #1296 — live Slack events of subscribed conversations go
+            // through the same channel (one record, one triage).
+            let slack_live = slack_ch.as_ref().map(|ch| {
+                Arc::new(augmentagent_channel_slack::ingest::LiveIngest::new(Arc::clone(ch)))
+                    as Arc<dyn augmentagent_channel_slack::ingest::SubscribedEventSink>
+            });
             if let Some(sc) = slack_ch {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { sc.run(sd).await }));
@@ -3308,7 +3338,7 @@ async fn main() -> Result<()> {
                 tasks.push(slack_serve::spawn(
                     Arc::clone(&store),
                     slack_plan,
-                    move || -> Arc<dyn augmentagent_channel_slack::interactive::SlackTurnHandler> {
+                    move |history| -> Arc<dyn augmentagent_channel_slack::interactive::SlackTurnHandler> {
                         match wiki_root {
                             // #1288 — the shared conversation harness over
                             // the same WikiQuerier Discord answers with.
@@ -3323,12 +3353,14 @@ async fn main() -> Result<()> {
                                     false,
                                 )),
                                 root,
+                                history,
                             ),
                             None => Arc::new(slack_serve::NoQueryHandler),
                         }
                     },
                     slack_approvals,
                     slack_commands,
+                    slack_live,
                     dry_run,
                     shutdown.clone(),
                 ));
@@ -3956,10 +3988,36 @@ async fn main() -> Result<()> {
                 run_slack_list_conversations(store, team_id.clone(), types.clone(), *limit, *json).await
             }
             SlackOp::Subscribe { channel_id, mode, name, team_id } => {
-                run_slack_subscribe(store, channel_id.clone(), mode.clone(), name.clone(), team_id.clone())
+                slack_subscriptions::subscribe(
+                    store,
+                    channel_id.clone(),
+                    mode.clone(),
+                    name.clone(),
+                    team_id.clone(),
+                    cli.wiki_dir.clone(),
+                )
+                .await
+            }
+            SlackOp::SetMode { target, mode, team_id } => {
+                slack_subscriptions::set_mode(
+                    store,
+                    target.clone(),
+                    mode.clone(),
+                    team_id.clone(),
+                    cli.wiki_dir.clone(),
+                )
+                .await
             }
             SlackOp::Subscriptions { json } => run_slack_subscriptions(store, *json),
-            SlackOp::Unsubscribe { id } => run_slack_unsubscribe(store, id.clone()),
+            SlackOp::Unsubscribe { id, team_id } => {
+                slack_subscriptions::unsubscribe(
+                    store,
+                    id.clone(),
+                    team_id.clone(),
+                    cli.wiki_dir.clone(),
+                )
+                .await
+            }
             SlackOp::App { op } => slack_app::run(op, &store).await,
             SlackOp::Deliver(args) => slack_deliver::run(args, &store).await,
             SlackOp::Files { op } => slack_files::run(op).await,
@@ -14497,6 +14555,8 @@ async fn slack_command_deps(cli: &Cli) -> augmentagent_channel_slack::commands::
         reasoner: Arc::clone(&reasoner),
     }));
     deps.journal = journal_ops_from_env(cli, &reasoner).await;
+    // #1296 — `subscribe <person>` resolves people through the wiki.
+    deps.wiki_root = cli.wiki_dir.clone();
     deps
 }
 
@@ -17417,58 +17477,6 @@ async fn run_slack_list_conversations(
     Ok(())
 }
 
-fn run_slack_subscribe(
-    store: Arc<Store>,
-    channel_id: String,
-    mode: String,
-    name: Option<String>,
-    team_id: Option<String>,
-) -> Result<()> {
-    use augmentagent_store::SubscriptionMode;
-    let parsed = SubscriptionMode::parse(&mode)
-        .ok_or_else(|| anyhow::anyhow!("invalid mode: {mode}"))?;
-    // Default to the sole configured workspace when --team-id is omitted;
-    // fail loudly if there are multiple so the user can't accidentally bind
-    // the sub to the wrong workspace.
-    let resolved_team = match team_id {
-        Some(t) => t,
-        None => {
-            let workspaces = store
-                .list_active_slack_workspaces()
-                .context("list slack workspaces")?;
-            match workspaces.as_slice() {
-                [w] => w.team_id.clone(),
-                [] => anyhow::bail!(
-                    "no slack workspaces connected — run `augmentagent slack login` or connect via dashboard"
-                ),
-                _ => anyhow::bail!(
-                    "multiple slack workspaces connected — pass --team-id <T...>"
-                ),
-            }
-        }
-    };
-    let display = name.unwrap_or_else(|| channel_id.clone());
-    let sub = store
-        .upsert_subscription(
-            augmentagent_channel_slack::PLATFORM,
-            &channel_id,
-            &display,
-            parsed,
-            Some(&resolved_team),
-        )
-        .context("upsert subscription")?;
-    println!(
-        "subscription id={} platform={} channel_id={} mode={} name={} account_id={}",
-        sub.id,
-        sub.platform,
-        sub.channel_id,
-        sub.mode.as_str(),
-        sub.display_name,
-        resolved_team,
-    );
-    Ok(())
-}
-
 fn run_slack_subscriptions(store: Arc<Store>, json: bool) -> Result<()> {
     let subs = store
         .list_active_subscriptions(augmentagent_channel_slack::PLATFORM)
@@ -17488,14 +17496,6 @@ fn run_slack_subscriptions(store: Arc<Store>, json: bool) -> Result<()> {
             );
         }
     }
-    Ok(())
-}
-
-fn run_slack_unsubscribe(store: Arc<Store>, id: String) -> Result<()> {
-    store
-        .delete_subscription(&id)
-        .context("delete subscription")?;
-    println!("subscription {id} deactivated");
     Ok(())
 }
 

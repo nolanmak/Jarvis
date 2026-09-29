@@ -69,6 +69,7 @@ use augmentagent_store::{
 use tracing::{info, warn};
 
 use crate::delivery::AnswerFile;
+use crate::history::TurnHistory;
 use crate::interactive::{SlackTurn, SlackTurnHandler, SlackTurnReply};
 use crate::owner::OwnerInputSource;
 
@@ -116,6 +117,9 @@ pub struct SlackConversationHarness {
     agent: Arc<dyn QueryHandler>,
     wiki_root: PathBuf,
     selection: ProviderSelection,
+    /// #1296 — earlier transcript for a conversation without a native
+    /// session (history-in-prompt providers such as Qwen/GLM).
+    history: Option<Arc<dyn TurnHistory>>,
 }
 
 impl SlackConversationHarness {
@@ -125,7 +129,15 @@ impl SlackConversationHarness {
             agent,
             wiki_root,
             selection: default_selection(),
+            history: None,
         }
+    }
+
+    /// #1296 — give the agent the conversation's earlier messages when the
+    /// provider has no native session to carry them.
+    pub fn with_history(mut self, history: Arc<dyn TurnHistory>) -> Self {
+        self.history = Some(history);
+        self
     }
 
     pub fn with_selection(mut self, selection: ProviderSelection) -> Self {
@@ -220,9 +232,16 @@ impl SlackTurnHandler for SlackConversationHarness {
             .collect();
         let cwd = self.wiki_root.to_string_lossy().into_owned();
         // A bound conversation continues its own session's provider.
-        let selected = match self.store.surface_conversation(session)? {
+        let bound = self.store.surface_conversation(session)?;
+        let selected = match &bound {
             Some(_) => None,
             None => (self.selection)(session)?,
+        };
+        // #1296 — only a conversation with no native session gets the
+        // transcript (a native session already carries its own).
+        let history = match (&self.history, &bound) {
+            (Some(h), None) => h.history(turn).await,
+            _ => String::new(),
         };
         let outcome = TURN_ENV
             .scope(
@@ -233,7 +252,7 @@ impl SlackTurnHandler for SlackConversationHarness {
                         &self.store,
                         SurfaceTurnRequest {
                             turn: &claim,
-                            history: "",
+                            history: &history,
                             current: turn.prompt.trim(),
                             cwd: &cwd,
                         },

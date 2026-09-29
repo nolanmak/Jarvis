@@ -19,6 +19,8 @@ pub mod app;
 // #1289 — the approval workflow on Slack (cards, clicks, modals, commands).
 pub mod approvals;
 pub mod auth;
+// #1296 — bounded catch-up of subscribed conversations after sleep/restart.
+pub mod catch_up;
 pub mod channel;
 // #1292 — Discord's owner commands on Slack (`/jarvis <command>`).
 pub mod commands;
@@ -28,11 +30,17 @@ pub mod delivery;
 pub mod digest;
 // #1288 — owner turns through the shared agent harness.
 pub mod harness;
+// #1296 — live ingestion of subscribed conversations, reconciled with the poll.
+pub mod ingest;
+// #1296 — Slack conversation history for history-in-prompt providers.
+pub mod history;
 pub mod inbound;
 pub mod interactive;
 pub mod owner;
 pub mod owner_setup;
 pub mod surface;
+// #1296 — subscription management (CLI and the Slack owner command hook).
+pub mod subscriptions;
 pub mod transport;
 pub mod types;
 pub mod voice;

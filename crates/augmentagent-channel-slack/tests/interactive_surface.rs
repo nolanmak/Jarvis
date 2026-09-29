@@ -768,6 +768,73 @@ async fn the_agents_own_echo_is_acked_and_ignored() {
     running.stop().await;
 }
 
+/// #1296 — every event the owner gate does not turn into an agent turn
+/// (contact chatter in a channel the app is in, rejected input, edits) goes
+/// to the subscribed-conversation sink after it is settled; owner turns
+/// never do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_turn_events_reach_the_subscribed_ingestion_sink() {
+    #[derive(Default)]
+    struct Sink(Mutex<Vec<String>>);
+    #[async_trait]
+    impl augmentagent_channel_slack::ingest::SubscribedEventSink for Sink {
+        async fn observe(&self, envelope: &augmentagent_channel_slack::transport::EventEnvelope) {
+            self.0.lock().unwrap().push(envelope.envelope_id.clone());
+        }
+    }
+    let h = Harness::new();
+    let (connector, mut servers) = DuplexConnector::new();
+    let handler = Arc::new(FakeHandler::default());
+    let sink = Arc::new(Sink::default());
+    let running = start(
+        h.surface(Arc::clone(&h.store), connector, handler.clone(), true)
+            .with_subscribed_sink(sink.clone()),
+    );
+    let mut server = Server::accept(&mut servers).await;
+    // A contact in a public channel the app is a member of: ignored by the
+    // gate, observed for ingestion.
+    server
+        .send(&message(
+            "env-chatter",
+            "C00000077",
+            "channel",
+            STRANGER,
+            "standup at 10",
+            "1700000000.000700",
+        ))
+        .await;
+    server.ack().await;
+    // A stranger in the control channel: rejected (and still observed).
+    server
+        .send(&message(
+            "env-stranger",
+            CONTROL,
+            "group",
+            STRANGER,
+            "me too",
+            "1700000000.000800",
+        ))
+        .await;
+    server.ack().await;
+    // The owner in the DM: a turn, never ingestion.
+    server
+        .send(&owner_dm("env-owner", "hi", "1700000000.000900"))
+        .await;
+    server.ack().await;
+    eventually("both non-turn events observed", || {
+        sink.0.lock().unwrap().len() == 2
+    })
+    .await;
+    eventually("owner turn handled", || handler.calls() == 1).await;
+    let mut seen = sink.0.lock().unwrap().clone();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec!["env-chatter".to_string(), "env-stranger".to_string()]
+    );
+    running.stop().await;
+}
+
 // ---------------------------------------------------------------------------
 // Failure, shutdown and restart
 // ---------------------------------------------------------------------------

@@ -15,6 +15,8 @@ pub mod owner;
 pub mod redact;
 // #1290 — Slack contact send targets and the per-action send ledger.
 pub mod slack_contact;
+// #1296 — live/poll reconciliation ledger for subscribed Slack messages.
+pub mod slack_ingest;
 mod store;
 pub mod surface;
 // #1292 — reset, cancel-all and loop pause/resume behind owner commands.

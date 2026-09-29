@@ -67,10 +67,21 @@ fn bot_events_cover_the_required_events_and_their_scopes() {
         ("message.groups", "groups:history"),
         ("message.mpim", "mpim:history"),
         ("app_mention", "app_mentions:read"),
+        ("channel_rename", "channels:read"),
+        ("group_rename", "groups:read"),
     ] {
         if events.contains(event) {
             assert!(scopes.contains(scope), "{event} needs {scope}");
         }
+    }
+}
+
+/// #1296 — renames reach the daemon live, so subscription names (and
+/// search) follow a rename without any ID changing.
+#[test]
+fn rename_events_are_required() {
+    for e in ["channel_rename", "group_rename"] {
+        assert!(REQUIRED_BOT_EVENTS.contains(&e), "{e} is not required");
     }
 }
 

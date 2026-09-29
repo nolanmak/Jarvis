@@ -2450,6 +2450,8 @@ impl Store {
 
         crate::imessage::migrate(conn)?;
         crate::slack_contact::migrate(conn)?;
+        // #1296 — one record per Slack message across live/poll/catch-up.
+        crate::slack_ingest::migrate(conn)?;
 
         Ok(())
     }
