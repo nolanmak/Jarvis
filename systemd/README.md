@@ -29,6 +29,20 @@ systemctl --user is-active augmentagent-renderer
 Run `sidecars/renderer/setup.sh` first (installs node_modules + Chrome
 Headless Shell). Design + roadmap: `docs/REMOTION.md`.
 
+## Fetch and WhatsApp sidecars
+
+Run `sidecars/fetch/setup.sh` and `sidecars/wa-sidecar/setup.sh` before
+installing their units. Each job keeps its socket in the private user runtime
+directory. Fetch keys, if used, go in the owner-private
+`~/.config/augmentagent/fetch.env` described in `docs/MACOS-SIDECARS.md`.
+
+```bash
+cp systemd/augmentagent-fetch.service systemd/augmentagent-wa-sidecar.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now augmentagent-fetch.service augmentagent-wa-sidecar.service
+systemctl --user status augmentagent-fetch.service augmentagent-wa-sidecar.service
+```
+
 ## Browser stack install
 
 ## Install

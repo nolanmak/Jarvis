@@ -325,6 +325,7 @@ dependencies = [
  "augmentagent-store",
  "base64 0.22.1",
  "dashmap 6.1.0",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
@@ -1191,6 +1192,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dashmap 6.1.0",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

@@ -410,13 +410,18 @@ mod macos_browser {
         .render();
 
         let sidecar_dir = repo_root.join("sidecars/browser");
-        let sidecar_args = vec![
-            sidecar_dir.join(".venv/bin/python").to_string_lossy().to_string(),
-            sidecar_dir.join("sidecar.py").to_string_lossy().to_string(),
-        ];
         let sock = augmentagent_browser_client::default_socket_path()
             .to_string_lossy()
             .to_string();
+        let python = sidecar_dir.join(".venv/bin/python").to_string_lossy().to_string();
+        let sidecar_args = vec![
+            python.clone(),
+            repo_root.join("scripts/start-sidecar.py").to_string_lossy().to_string(),
+            "browser".to_string(),
+            sock.clone(),
+            python,
+            sidecar_dir.join("sidecar.py").to_string_lossy().to_string(),
+        ];
         let sidecar_env = [
             ("PATH", path_env),
             ("PYTHONUNBUFFERED", "1".to_string()),
@@ -522,6 +527,7 @@ mod macos_browser {
             assert!(sidecar.contains(
                 "<string>/Users/op/AugmentAgent/sidecars/browser/.venv/bin/python</string>"
             ));
+            assert!(sidecar.contains("/Users/op/AugmentAgent/scripts/start-sidecar.py"));
             assert!(sidecar.contains("<key>AUGMENTAGENT_BROWSER_SOCK</key>"));
             assert!(sidecar.contains("/Users/op/.local/state/augmentagent/browser-sidecar.log"));
         }

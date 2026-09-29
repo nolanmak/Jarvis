@@ -1,0 +1,44 @@
+name: Browser sidecar (Linux + macOS)
+
+on:
+  pull_request:
+    paths:
+      - 'sidecars/browser/**'
+      - 'scripts/start-sidecar.py'
+      - 'crates/augmentagent-browser-client/**'
+      - 'crates/augmentagent-cli/src/installers.rs'
+      - 'systemd/augmentagent-browser-sidecar.service'
+      - '.github/workflows/browser-sidecar.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'sidecars/browser/**'
+      - 'scripts/start-sidecar.py'
+      - 'crates/augmentagent-browser-client/**'
+      - 'crates/augmentagent-cli/src/installers.rs'
+      - 'systemd/augmentagent-browser-sidecar.service'
+      - '.github/workflows/browser-sidecar.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic-page:
+    name: synthetic-page (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: sidecars/browser/requirements.txt
+      - name: Install pinned browser runtime
+        run: bash sidecars/browser/setup.sh
+      - name: Synthetic page and restart contract
+        run: sidecars/browser/.venv/bin/python -m unittest sidecars.browser.test_smoke -v

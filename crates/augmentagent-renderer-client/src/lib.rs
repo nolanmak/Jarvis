@@ -46,11 +46,14 @@ use uuid::Uuid;
 /// Default socket path resolution. Honors `AUGMENTAGENT_RENDERER_SOCK`,
 /// then `${XDG_RUNTIME_DIR}/augmentagent/renderer.sock`, finally
 /// `/run/user/<uid>/augmentagent/renderer.sock` on Linux and
-/// `~/Library/Caches/augmentagent/renderer.sock` elsewhere (#1079; mirrored in
+/// `/tmp/augmentagent-<uid>/renderer.sock` on macOS (mirrored in
 /// `sidecars/renderer/server.mjs`).
 pub fn default_socket_path() -> PathBuf {
     if let Ok(p) = std::env::var("AUGMENTAGENT_RENDERER_SOCK") {
         return PathBuf::from(p);
+    }
+    if cfg!(target_os = "macos") {
+        return PathBuf::from(format!("/tmp/augmentagent-{}/renderer.sock", fallback_uid()));
     }
     let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
         if cfg!(target_os = "linux") {
@@ -69,11 +72,7 @@ pub fn default_socket_path() -> PathBuf {
 }
 
 fn fallback_uid() -> u32 {
-    // Avoid pulling in libc just for getuid(); fall back to env or 1000.
-    std::env::var("UID")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1000)
+    unsafe { libc::getuid() }
 }
 
 /// Errors returned by [`RendererClient`]. The `Sidecar` variant carries the

@@ -43,16 +43,19 @@ use uuid::Uuid;
 /// Default socket path resolution. Honors `AUGMENTAGENT_BROWSER_SOCK`,
 /// then `${XDG_RUNTIME_DIR}/augmentagent/browser.sock`, finally
 /// `/run/user/<uid>/augmentagent/browser.sock` on Linux and
-/// `~/Library/Caches/augmentagent/browser.sock` elsewhere (#1079: macOS has neither
+/// `/tmp/augmentagent-<uid>/browser.sock` on macOS (macOS has neither
 /// `XDG_RUNTIME_DIR` nor `/run/user`; `sidecars/browser/sidecar.py` applies
 /// the same rule).
 pub fn default_socket_path() -> PathBuf {
     if let Ok(p) = std::env::var("AUGMENTAGENT_BROWSER_SOCK") {
         return PathBuf::from(p);
     }
+    if cfg!(target_os = "macos") {
+        return PathBuf::from(format!("/tmp/augmentagent-{}/browser.sock", fallback_uid()));
+    }
     let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
         if cfg!(target_os = "linux") {
-            format!("/run/user/{}", unsafe { libc_getuid() })
+            format!("/run/user/{}", fallback_uid())
         } else {
             // Per-user and the same for launchd agents and terminals, unlike
             // `$TMPDIR`; `/tmp` only when HOME is unset.
@@ -64,13 +67,8 @@ pub fn default_socket_path() -> PathBuf {
     PathBuf::from(runtime).join("augmentagent").join("browser.sock")
 }
 
-#[allow(non_snake_case)]
-unsafe fn libc_getuid() -> u32 {
-    // Avoid pulling in libc just for getuid(); fall back to env or 1000.
-    std::env::var("UID")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1000)
+fn fallback_uid() -> u32 {
+    unsafe { libc::getuid() }
 }
 
 /// Errors returned by [`BrowserClient`]. The `Sidecar` variant carries the

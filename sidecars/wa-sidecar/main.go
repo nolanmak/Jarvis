@@ -44,6 +44,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -64,6 +65,9 @@ import (
 func socketPath() string {
 	if p := os.Getenv("AUGMENTAGENT_WA_SOCK"); p != "" {
 		return p
+	}
+	if runtime.GOOS == "darwin" {
+		return filepath.Join(fmt.Sprintf("/tmp/augmentagent-%d", os.Getuid()), "wa.sock")
 	}
 	runtime := os.Getenv("XDG_RUNTIME_DIR")
 	if runtime == "" {

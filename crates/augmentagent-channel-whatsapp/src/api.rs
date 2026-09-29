@@ -66,6 +66,9 @@ pub fn default_socket_path() -> PathBuf {
             return PathBuf::from(custom);
         }
     }
+    if cfg!(target_os = "macos") {
+        return PathBuf::from(format!("/tmp/augmentagent-{}/wa.sock", users_uid()));
+    }
     if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
         if !runtime.is_empty() {
             return PathBuf::from(runtime).join("augmentagent").join("wa.sock");
