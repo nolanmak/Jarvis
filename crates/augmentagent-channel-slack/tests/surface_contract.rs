@@ -377,10 +377,10 @@ fn an_undeclared_capability_returns_the_typed_unsupported_error() {
             ),
         }
     }
-    // Nothing interactive is wired on Slack yet, so nothing may be claimed.
+    // #1298 — live voice is not proven possible on Slack.
     assert_eq!(
-        declared.require(SurfaceCapability::Query),
-        Err(SurfaceRefError::UnsupportedCapability("query"))
+        declared.require(SurfaceCapability::Voice),
+        Err(SurfaceRefError::UnsupportedCapability("voice"))
     );
     assert_eq!(
         SlackInteraction::LiveVoice.require(),
@@ -587,4 +587,44 @@ fn send_is_supported_now_that_approved_contact_messages_are_delivered() {
     assert_eq!(row.tracking_issue, 1290);
     assert!(row.basis.contains("contact_send"), "{}", row.basis);
     assert!(!parity_blockers().iter().any(|b| b.name == "send"));
+}
+
+// #1300 — the parity gate reconciles the column with what landed: serve
+// (#1287), scheduling (#1291), files in (#1293), answers, uploads and
+// progress edits (#1294) and history (#1296) run on Slack with named tests
+// in docs/slack-parity-matrix.json, and so are notifications (#1295), routed
+// per class through the Slack outbox. Voice clips in serve (#1297) and live
+// voice (#1298) stay blockers.
+#[test]
+fn capabilities_that_landed_with_named_tests_are_supported_and_only_real_gaps_block() {
+    let declared = slack_capabilities();
+    for capability in [
+        SurfaceCapability::Query,
+        SurfaceCapability::Schedule,
+        SurfaceCapability::MediaRead,
+        SurfaceCapability::MediaWrite,
+        SurfaceCapability::History,
+        SurfaceCapability::Notifications,
+    ] {
+        assert!(declared.require(capability).is_ok(), "{capability:?}");
+    }
+    for interaction in [
+        SlackInteraction::FileUpload,
+        SlackInteraction::MessageEdit,
+        SlackInteraction::EphemeralReplies,
+    ] {
+        assert!(interaction.require().is_ok(), "{interaction:?}");
+    }
+    let blockers: Vec<(&str, SupportStatus, u32)> = parity_blockers()
+        .iter()
+        .map(|b| (b.name, b.status, b.tracking_issue))
+        .collect();
+    assert_eq!(
+        blockers,
+        [
+            ("voice", SupportStatus::Unproven, 1298),
+            ("voice_clip", SupportStatus::Unsupported, 1297),
+            ("live_voice", SupportStatus::Unproven, 1298),
+        ]
+    );
 }
