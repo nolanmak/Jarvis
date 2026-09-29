@@ -113,7 +113,10 @@ fn model_text_can_never_ping_anyone() {
         // A link whose URL is a mention is not a link.
         ("[x](<!channel>)", "x (&lt;!channel&gt;)".into()),
         // Not mentions: an address and a longer word.
-        ("mail me@here.example.com", "mail me@here.example.com".into()),
+        (
+            "mail me@here.example.com",
+            "mail me@here.example.com".into(),
+        ),
         ("@heretic", "@heretic".into()),
     ];
     for (input, want) in cases {
