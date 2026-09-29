@@ -65,6 +65,15 @@ jobs:
         run: >-
           cargo test -p augmentagent-channel-slack --lib
           --test transport_events --test transport_socket --test transport_web_api
+      # #1294 — outbound delivery: mrkdwn conversion and mention
+      # neutralisation, lossless splitting, multi-part outbox planning with
+      # restart/reconcile, file upload over a mock Slack, throttled progress
+      # (paused clock), and `slack deliver` end to end. No network.
+      - name: Slack outbound delivery
+        run: |
+          cargo test -p augmentagent-channel-slack --test delivery_format --test delivery_outbox --test delivery_progress --test transport_upload
+          cargo test -p augmentagent-cli --test slack_deliver_cli
+          cargo test -p augmentagent-cli --bin augmentagent -- slack_deliver::
       # #1284 — Slack app install/verify/rotate/remove: manifest contract,
       # credential lifecycle (in-memory store) and the real CLI against a
       # mock Slack with the file credential store. No Keychain, no network.

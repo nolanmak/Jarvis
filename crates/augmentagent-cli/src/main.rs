@@ -91,6 +91,7 @@ mod self_improve;
 mod service;
 mod setup;
 mod slack_app;
+mod slack_deliver;
 mod status;
 
 #[derive(Parser)]
@@ -1708,6 +1709,10 @@ enum SlackOp {
         #[command(subcommand)]
         op: slack_app::SlackAppOp,
     },
+    /// Deliver a Markdown answer (and files) into a Slack conversation or
+    /// thread through the outbox with the installed app (#1294). Re-running
+    /// the same command sends nothing twice.
+    Deliver(slack_deliver::DeliverArgs),
 }
 
 #[derive(Subcommand)]
@@ -3761,6 +3766,7 @@ async fn main() -> Result<()> {
             SlackOp::Subscriptions { json } => run_slack_subscriptions(store, *json),
             SlackOp::Unsubscribe { id } => run_slack_unsubscribe(store, id.clone()),
             SlackOp::App { op } => slack_app::run(op, &store).await,
+            SlackOp::Deliver(args) => slack_deliver::run(args, &store).await,
             SlackOp::PollOnce { dry_run } => {
                 let (broker, _) = build_broker(&cli, Arc::clone(&store), *dry_run).await?;
                 let ch = build_slack_channel(&cli, store, broker, *dry_run)?;

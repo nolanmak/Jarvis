@@ -17,6 +17,7 @@ pub mod api;
 pub mod app;
 pub mod auth;
 pub mod channel;
+pub mod delivery;
 pub mod digest;
 pub mod owner;
 pub mod owner_setup;

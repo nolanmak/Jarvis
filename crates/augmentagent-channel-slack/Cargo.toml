@@ -22,7 +22,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-reqwest = { workspace = true }
+# `stream`: #1294 uploads generated files straight from disk.
+reqwest = { workspace = true, features = ["stream"] }
 uuid = { workspace = true }
 futures = { workspace = true }
 # #1283 — real-time Socket Mode transport. Same version and rustls/webpki
