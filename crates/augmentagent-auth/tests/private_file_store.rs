@@ -353,3 +353,139 @@ fn an_unreachable_legacy_keyring_reads_as_missing_and_never_blocks_writes() {
     store.delete("slack-app", "T00000001").unwrap();
     assert_eq!(store.presence("slack-app", "T00000001"), Presence::Missing);
 }
+
+// --- a legacy keyring that never answers ------------------------------------
+//
+// With keyring's sync Secret Service, a locked collection can start an
+// unlock prompt and wait for a user who is not there (a daemon after reboot,
+// an SSH session). The lookup is bounded, and one timeout or failure turns
+// the legacy store off for the rest of the process (here: for this store and
+// its clones), so N slots never cost N timeouts.
+
+/// `get`/`delete`/`presence` block on a channel that is never signalled.
+struct Hangs {
+    calls: std::sync::atomic::AtomicUsize,
+    rx: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    _tx: std::sync::mpsc::Sender<()>,
+}
+
+impl Hangs {
+    fn new() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self {
+            calls: Default::default(),
+            rx: std::sync::Mutex::new(rx),
+            _tx: tx,
+        }
+    }
+    fn block(&self) {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.rx.lock().unwrap().recv();
+    }
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl CredentialStore for Hangs {
+    fn backend(&self) -> &'static str {
+        "hangs"
+    }
+    fn put(&self, _: &str, _: &str, _: &[u8]) -> Result<(), AuthError> {
+        self.block();
+        Ok(())
+    }
+    fn get(&self, p: &str, a: &str) -> Result<Vec<u8>, AuthError> {
+        self.block();
+        Err(AuthError::NotFound {
+            platform: p.into(),
+            account: a.into(),
+        })
+    }
+    fn delete(&self, _: &str, _: &str) -> Result<(), AuthError> {
+        self.block();
+        Ok(())
+    }
+    fn exists(&self, _: &str, _: &str) -> bool {
+        self.block();
+        false
+    }
+}
+
+#[test]
+fn a_hanging_legacy_keyring_costs_one_bounded_wait_per_process() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let hangs = Arc::new(Hangs::new());
+    let bound = Duration::from_millis(300);
+    let store = PrivateFileCredentialStore::new(tmp.path().join("credentials"))
+        .with_legacy(hangs.clone())
+        .with_legacy_timeout(bound);
+
+    let started = Instant::now();
+    assert!(matches!(
+        store.get("slack-app", "T00000001"),
+        Err(AuthError::NotFound { .. })
+    ));
+    let first = started.elapsed();
+    assert!(first >= bound, "returned before the bound: {first:?}");
+    assert!(first < Duration::from_secs(3), "not bounded: {first:?}");
+    assert_eq!(hangs.calls(), 1);
+
+    // Every later lookup, on this store or a clone, skips the legacy store.
+    let clone = store.clone();
+    let started = Instant::now();
+    assert!(matches!(
+        clone.get("api-key", "GROQ_API_KEY"),
+        Err(AuthError::NotFound { .. })
+    ));
+    assert_eq!(clone.presence("github", "default"), Presence::Missing);
+    clone.delete("github", "default").unwrap();
+    assert!(
+        started.elapsed() < bound,
+        "a second slot waited again: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(hangs.calls(), 1, "the legacy store was consulted again");
+
+    // The file store itself is unaffected.
+    store.put("slack-app", "T00000001", CANARY).unwrap();
+    assert_eq!(clone.get("slack-app", "T00000001").unwrap(), CANARY);
+}
+
+#[test]
+fn a_failing_legacy_keyring_is_consulted_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Counted(AtomicUsize);
+    impl CredentialStore for Counted {
+        fn backend(&self) -> &'static str {
+            "counted"
+        }
+        fn put(&self, _: &str, _: &str, _: &[u8]) -> Result<(), AuthError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(AuthError::Keyring(keyring::Error::NoStorageAccess(
+                Box::new(std::io::Error::other("no session bus")),
+            )))
+        }
+        fn get(&self, p: &str, a: &str) -> Result<Vec<u8>, AuthError> {
+            self.put(p, a, b"")?;
+            unreachable!()
+        }
+        fn delete(&self, p: &str, a: &str) -> Result<(), AuthError> {
+            self.put(p, a, b"")
+        }
+        fn exists(&self, _: &str, _: &str) -> bool {
+            false
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let legacy = Arc::new(Counted(AtomicUsize::new(0)));
+    let store =
+        PrivateFileCredentialStore::new(tmp.path().join("credentials")).with_legacy(legacy.clone());
+    for account in ["T00000001", "T00000002", "T00000003"] {
+        assert!(store.get("slack-app", account).is_err());
+        assert_eq!(store.presence("slack-app", account), Presence::Missing);
+    }
+    store.delete("slack-app", "T00000001").unwrap();
+    assert_eq!(legacy.0.load(Ordering::SeqCst), 1);
+}

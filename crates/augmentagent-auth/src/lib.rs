@@ -211,9 +211,17 @@ fn platform_store() -> Arc<dyn CredentialStore> {
     match linux_credential_dir() {
         // Credentials the shipped binary kept in the Secret Service before
         // #1325 are read through and copied on first use.
-        Some(dir) => Arc::new(
-            PrivateFileCredentialStore::new(dir).with_legacy(Arc::new(KeychainCredentialStore)),
-        ),
+        Some(dir) => {
+            // One switch per process: `default_store` builds a store per
+            // call, and a keyring that timed out once stays off (#1325).
+            static LEGACY_OFF: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>> =
+                std::sync::OnceLock::new();
+            Arc::new(
+                PrivateFileCredentialStore::new(dir)
+                    .with_legacy(Arc::new(KeychainCredentialStore))
+                    .with_legacy_switch(Arc::clone(LEGACY_OFF.get_or_init(Default::default))),
+            )
+        }
         None => Arc::new(UnavailableCredentialStore),
     }
 }
@@ -619,12 +627,29 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), AuthError> {
 /// which the shipped Linux binary resolved to the D-Bus Secret Service) and
 /// copied here when found. Nothing is written to the legacy store; `delete`
 /// clears it too, so a deleted credential cannot come back. A legacy store
-/// that fails (no session bus, a locked collection) counts as missing.
+/// that fails (no session bus) counts as missing.
+///
+/// Each legacy call runs on a helper thread and is abandoned after
+/// [`LEGACY_TIMEOUT`]: a locked Secret Service collection can start an
+/// unlock prompt and wait for a user who is not there. The first timeout or
+/// failure turns the legacy store off for this store and its clones (for
+/// the default store, the whole process), so later slots never wait again.
 #[derive(Clone)]
 pub struct PrivateFileCredentialStore {
     dir: PathBuf,
     legacy: Option<Arc<dyn CredentialStore>>,
+    legacy_timeout: std::time::Duration,
+    /// Set once the legacy store timed out or failed.
+    legacy_off: Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// How long one legacy (Secret Service) lookup may take before it is
+/// treated as unavailable.
+pub const LEGACY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+const LEGACY_RECOVERY: &str = "unlock the login keyring (a desktop login, or \
+     `gnome-keyring-daemon --unlock`) and re-run the command, or enter the credential again \
+     (for Slack: `augmentagent slack app install`)";
 
 impl std::fmt::Debug for PrivateFileCredentialStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -642,6 +667,8 @@ impl PrivateFileCredentialStore {
         Self {
             dir: dir.as_ref().to_path_buf(),
             legacy: None,
+            legacy_timeout: LEGACY_TIMEOUT,
+            legacy_off: Default::default(),
         }
     }
 
@@ -652,17 +679,85 @@ impl PrivateFileCredentialStore {
         self
     }
 
+    /// Test hook: bound each legacy call by `timeout` instead of
+    /// [`LEGACY_TIMEOUT`].
+    #[doc(hidden)]
+    pub fn with_legacy_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.legacy_timeout = timeout;
+        self
+    }
+
+    /// Share the "legacy store is off" switch (the default store uses one
+    /// per process, since `default_store` builds a store per call).
+    #[cfg(target_os = "linux")]
+    fn with_legacy_switch(mut self, off: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.legacy_off = off;
+        self
+    }
+
+    /// Run `call` against the legacy store on a helper thread, bounded by
+    /// the timeout. `None` when there is no legacy store, it is off, it
+    /// timed out or it failed (the last two turn it off). A timed-out
+    /// thread is left to finish on its own; it holds no lock of ours.
+    fn legacy_call<T: Send + 'static>(
+        &self,
+        platform: &str,
+        account: &str,
+        call: impl FnOnce(&dyn CredentialStore) -> Result<T, AuthError> + Send + 'static,
+    ) -> Option<Result<T, AuthError>> {
+        use std::sync::atomic::Ordering;
+        let legacy = Arc::clone(self.legacy.as_ref()?);
+        if self.legacy_off.load(Ordering::SeqCst) {
+            return None;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("legacy-credential-store".into())
+            .spawn(move || {
+                let _ = tx.send(call(legacy.as_ref()));
+            });
+        if let Err(e) = spawned {
+            debug!(error = %e, "legacy credential lookup not started");
+            self.legacy_off.store(true, Ordering::SeqCst);
+            return None;
+        }
+        match rx.recv_timeout(self.legacy_timeout) {
+            Ok(Err(AuthError::NotFound { .. })) => Some(Err(not_found(platform, account))),
+            Ok(Err(e)) => {
+                if !self.legacy_off.swap(true, Ordering::SeqCst) {
+                    debug!(platform, account, error = %e, "legacy credential store unavailable; not consulted again");
+                }
+                None
+            }
+            Ok(ok) => Some(ok),
+            Err(_) => {
+                if !self.legacy_off.swap(true, Ordering::SeqCst) {
+                    tracing::warn!(
+                        platform,
+                        account,
+                        timeout_ms = self.legacy_timeout.as_millis() as u64,
+                        "the legacy keyring (Secret Service) did not answer, so credentials \
+                         still stored only there are treated as missing for the rest of this \
+                         process (#1325); {LEGACY_RECOVERY}"
+                    );
+                }
+                None
+            }
+        }
+    }
+
     /// A slot from the legacy store, copied into this one. `None` when there
     /// is no legacy store, it lacks the slot, or it cannot be read.
     fn migrate(&self, platform: &str, account: &str) -> Option<Vec<u8>> {
-        let legacy = self.legacy.as_ref()?;
-        match legacy.get(platform, account) {
+        let (p, a) = (platform.to_string(), account.to_string());
+        let from = self.legacy.as_ref()?.backend();
+        match self.legacy_call(platform, account, move |l| l.get(&p, &a))? {
             Ok(bytes) => {
                 match self.put(platform, account, &bytes) {
                     Ok(()) => tracing::info!(
                         platform,
                         account,
-                        from = legacy.backend(),
+                        from,
                         "credential copied into the private file store (#1325)"
                     ),
                     Err(e) => tracing::warn!(
@@ -674,11 +769,7 @@ impl PrivateFileCredentialStore {
                 }
                 Some(bytes)
             }
-            Err(AuthError::NotFound { .. }) => None,
-            Err(e) => {
-                debug!(platform, account, error = %e, "legacy credential store unavailable");
-                None
-            }
+            Err(_) => None,
         }
     }
 
@@ -836,10 +927,9 @@ impl CredentialStore for PrivateFileCredentialStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(io_err(e)),
         }
-        if let Some(legacy) = &self.legacy {
-            if let Err(e) = legacy.delete(platform, account) {
-                debug!(platform, account, error = %e, "legacy credential store not cleared");
-            }
+        let (p, a) = (platform.to_string(), account.to_string());
+        if let Some(Err(e)) = self.legacy_call(platform, account, move |l| l.delete(&p, &a)) {
+            debug!(platform, account, error = %e, "legacy credential store not cleared");
         }
         Ok(())
     }
