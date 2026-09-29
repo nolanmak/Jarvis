@@ -3,11 +3,14 @@
 #[cfg(test)]
 mod provider_migration_tests;
 mod model_tool;
+mod voice_tool;
 mod computer_tool;
 #[cfg(test)]
 mod provider_channel_tests;
 #[cfg(test)]
 mod model_switch_sequence_tests;
+#[cfg(test)]
+mod discord_voice_session_tests;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -609,6 +612,9 @@ enum Cmd {
         #[arg(long)]
         readiness: String,
     },
+    /// Internal conversation-bound MCP server for Discord speech.
+    #[command(hide = true)]
+    VoiceTool,
     /// #655/#667 — one live round-trip through the provider fallback chain.
     /// Builds the production reasoner (AUGMENTAGENT_REASONER_CHAIN +
     /// eligibility checks), sends a trivial text-only prompt, and prints the
@@ -2433,6 +2439,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     if let Cmd::ModelTool { channel, ref readiness } = cli.cmd {
         return model_tool::serve(channel, readiness);
+    }
+    if let Cmd::VoiceTool = cli.cmd {
+        return voice_tool::serve();
     }
     if let Cmd::RepoDocs { ref op } = cli.cmd {
         return repo_docs::run(op, cli.wiki_dir.as_deref()).await;
@@ -4378,6 +4387,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Env { ref op, json } => env_cfg::run_env(op, json),
         Cmd::ModelTool { channel, ref readiness } => model_tool::serve(channel, readiness),
+        Cmd::VoiceTool => voice_tool::serve(),
         Cmd::ReasonerSelftest { ref prompt, ref profile, tool_probe } =>
             run_reasoner_selftest(prompt, profile.as_deref(), tool_probe).await,
         Cmd::Install { component } => installers::run_install(component).await,
@@ -9258,6 +9268,11 @@ struct WikiQuerier {
     reasoner: Arc<FallbackReasoner>,
     wiki_root: PathBuf,
     repo_root: PathBuf,
+    conversation_store: Option<Arc<Store>>,
+    conversation_scheduler: Arc<augmentagent_approval_discord::conversation::ConversationScheduler>,
+    voice_enabled: bool,
+    voice_tools: std::sync::OnceLock<Arc<augmentagent_approval_discord::voice_tool::VoiceToolService>>,
+    final_spoken_turns: dashmap::DashMap<String, ()>,
 }
 
 /// #389 — Owner rules travel with EVERY query-mode prompt, injected at
@@ -9398,6 +9413,14 @@ fn extract_md_section<'a>(md: &'a str, heading: &str) -> Option<&'a str> {
 
 #[async_trait]
 impl QueryHandler for WikiQuerier {
+    fn attach_voice_tools(&self, service: Arc<augmentagent_approval_discord::voice_tool::VoiceToolService>) {
+        let _ = self.voice_tools.set(service);
+    }
+
+    fn take_final_spoken(&self, turn_id: &str) -> bool {
+        self.final_spoken_turns.remove(turn_id).is_some()
+    }
+
     async fn selected_model(&self, channel_id: u64) -> Result<Option<String>, String> {
         let store = augmentagent_channel_core::model_selection::SelectionStore::new(
             augmentagent_channel_core::model_selection::config_path());
@@ -9421,6 +9444,16 @@ impl QueryHandler for WikiQuerier {
         enable_newsletter_tools(&mut opts, ctx);
         computer_tool::configure(&mut opts, ctx, &self.repo_root);
         model_tool::configure(&mut opts, ctx, &self.reasoner, &self.repo_root.join("target/release/augmentagent"));
+        let voice_grant = self.voice_tools.get().and_then(|service| {
+            let guild = ctx.guild_id?;
+            let channel = ctx.channel_id?;
+            if !ctx.owner_authorized { return None; }
+            service.grant(&guild.to_string(), &format!("{guild}:{}", channel.get()), &ctx.session_id)
+                .map(|grant| (service, grant))
+        });
+        if let Some((service, grant)) = &voice_grant {
+            voice_tool::configure(&mut opts, grant, service, &std::env::current_exe()?)?;
+        }
         // #132 / #201 — Stamp this request's session id onto every audit
         // record produced by the spawn, and (if we have the bits from the
         // Discord side) plug in a per-request notifier so high-risk tool
@@ -9450,12 +9483,115 @@ impl QueryHandler for WikiQuerier {
         let answer = async {
             let store = augmentagent_channel_core::model_selection::SelectionStore::new(
                 augmentagent_channel_core::model_selection::config_path());
-            let selected = store.selected(ctx.channel_id.as_ref().map(|channel| channel.get().to_string()).as_deref())?;
+            let selected = match augmentagent_channel_core::native_session::CURRENT
+                .try_with(|session| session.provider()) {
+                Ok(provider) => Some(provider),
+                Err(_) => store.selected(ctx.channel_id.as_ref().map(|channel| channel.get().to_string()).as_deref())?,
+            };
             augmentagent_channel_core::model_selection::SELECTED_PROFILE
                 .scope(selected, self.reasoner.call_transcript(&opts, &prompt)).await
         }.await;
+        if answer.is_ok() &&
+            voice_grant.as_ref().is_some_and(|(_, grant)| grant.final_spoken()) {
+            self.final_spoken_turns.insert(ctx.session_id.clone(), ());
+        }
         sweep_imessage_attachments(&opts.env);
         answer
+    }
+
+    async fn answer_turn(
+        &self,
+        ctx: &augmentagent_approval_discord::AuditCtx,
+        history: &str,
+        current: &str,
+    ) -> anyhow::Result<String> {
+        let legacy_prompt = || {
+            if history.is_empty() { current.to_string() }
+            else { format!("{history}\n\nuser's current message:\n{current}") }
+        };
+        let (Some(guild_id), Some(channel_id), Some(store)) =
+            (ctx.guild_id, ctx.channel_id, self.conversation_store.as_ref())
+        else {
+            return self.answer(ctx, &legacy_prompt()).await;
+        };
+        if !self.voice_enabled || !ctx.owner_authorized {
+            return self.answer(ctx, &legacy_prompt()).await;
+        }
+        let guild = guild_id.to_string();
+        let channel = channel_id.get().to_string();
+        let conversation = format!("{guild}:{channel}");
+        self.conversation_scheduler.submit(&conversation, &ctx.session_id, || async {
+            use augmentagent_channel_core::{
+                native_session::{NativeSession, CURRENT},
+                providers::ProviderKind,
+            };
+            let binding = store.discord_conversation(&guild, &channel)?;
+            if binding.as_ref().is_some_and(|item| item.uncertain) {
+                anyhow::bail!("Native conversation has an uncertain turn; inspect it before continuing");
+            }
+            let selection = augmentagent_channel_core::model_selection::SelectionStore::new(
+                augmentagent_channel_core::model_selection::config_path()
+            ).selected(Some(&channel))?;
+            let provider = if let Some(item) = &binding {
+                let bound = match item.provider.as_str() {
+                    "claude" => ProviderKind::Claude,
+                    "codex" => ProviderKind::Codex,
+                    _ => anyhow::bail!("Unsupported bound native provider"),
+                };
+                if selection.is_some_and(|selected| selected != bound) {
+                    anyhow::bail!("Model selection conflicts with bound native session; explicitly end or migrate the conversation");
+                }
+                bound
+            } else {
+                let selected = selection.unwrap_or(ProviderKind::Claude);
+                if !matches!(selected, ProviderKind::Claude | ProviderKind::Codex) {
+                    // The voice flag does not migrate unrelated model profiles.
+                    // Keep their existing text route until the owner explicitly
+                    // selects a native Claude/Codex conversation.
+                    return self.answer(ctx, &legacy_prompt()).await;
+                }
+                selected
+            };
+            let session = NativeSession::from_id(provider,
+                binding.as_ref().map(|item| item.native_session_id.clone()))?;
+            let prompt = if binding.is_some() { current.to_string() } else { legacy_prompt() };
+            // Persist the claim before the CLI can run tools. If the daemon
+            // dies before recording a result or native ID, restart must not
+            // silently submit this Discord turn a second time.
+            store.claim_discord_turn(&guild, &channel, &ctx.session_id)?;
+            let handler_dispatched_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+            tracing::info!(turn_id = %ctx.session_id, %guild, %channel,
+                handler_dispatched_at_ms, "Discord native turn handler dispatched");
+            let answer = CURRENT.scope(Arc::clone(&session), self.answer(ctx, &prompt)).await;
+            let answer_completed_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+            tracing::info!(turn_id = %ctx.session_id, %guild, %channel,
+                ?handler_dispatched_at_ms, ?answer_completed_at_ms,
+                native_submitted_at_ms = ?session.native_submitted_at_ms(),
+                first_text_output_at_ms = ?session.first_text_output_at_ms(),
+                "Discord native turn timing");
+            if let Some(id) = session.id() {
+                if binding.is_none() {
+                    store.bind_discord_conversation(&augmentagent_store::DiscordConversation {
+                        guild_id: guild.clone(), channel_id: channel.clone(),
+                        provider: provider.name().to_string(), native_session_id: id,
+                        cwd: self.wiki_root.to_string_lossy().into_owned(),
+                        uncertain: session.is_uncertain(),
+                    })?;
+                } else if session.is_uncertain() {
+                    store.mark_discord_conversation_uncertain(&guild, &channel)?;
+                }
+            }
+            // A refusal before NativeSession::begin has no native side effects.
+            // Preserve this turn ID as consumed, but let a later turn proceed.
+            // A dropped lease marks the session uncertain and blocks replay.
+            store.finish_discord_turn(
+                &guild, &channel, &ctx.session_id,
+                !session.is_uncertain(),
+            )?;
+            answer
+        }).await.map_err(anyhow::Error::msg)
     }
 
     async fn model_command(&self, channel_id: u64, text: &str) -> Option<String> {
@@ -9464,6 +9600,37 @@ impl QueryHandler for WikiQuerier {
         run_command(&store, &channel_id.to_string(), text, |profile| {
             model_profile_ready(&self.reasoner, profile)
         })
+    }
+
+    async fn model_command_in_guild(
+        &self,
+        guild_id: Option<u64>,
+        channel_id: u64,
+        text: &str,
+    ) -> Option<String> {
+        if self.voice_enabled {
+            if let (Some(guild), Some(store)) = (guild_id, self.conversation_store.as_ref()) {
+                match store.discord_conversation(&guild.to_string(), &channel_id.to_string()) {
+                    Ok(Some(binding)) => {
+                        let mut words = text.split_whitespace();
+                        if matches!(words.next(), Some("/model" | "model")) {
+                            let args: Vec<_> = words.collect();
+                            let same = matches!(args.as_slice(), ["set", name] | [name]
+                                if *name == binding.provider);
+                            if !same && !matches!(args.as_slice(), [] | ["help"] | ["list"] | ["status"]) {
+                                return Some(format!(
+                                    "This conversation is bound to native {} session {}. Switching models would start a different session; the current binding stays unchanged.",
+                                    binding.provider, binding.native_session_id
+                                ));
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => return Some(format!("Model selection unavailable: {error}")),
+                }
+            }
+        }
+        self.model_command(channel_id, text).await
     }
 }
 
@@ -9643,7 +9810,9 @@ mod query_delivery_contract_tests {
             (ProviderKind::Claude, primary.clone()),
             (ProviderKind::Codex, Arc::new(augmentagent_channel_core::codex::CodexCliReasoner::openai())),
         ], CooldownLatch::at(repo.join("cooldowns.json"))));
-        let handler = WikiQuerier { reasoner: reasoner.clone(), wiki_root: wiki.clone(), repo_root: repo.into() };
+        let handler = WikiQuerier { reasoner: reasoner.clone(), wiki_root: wiki.clone(), repo_root: repo.into(),
+            conversation_store: None, conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()), voice_enabled: false,
+            voice_tools: std::sync::OnceLock::new(), final_spoken_turns: dashmap::DashMap::new() };
         for turn in 0..2 {
             let mut ctx = augmentagent_approval_discord::AuditCtx::empty();
             ctx.session_id = format!("synthetic-channel:synthetic-turn-{turn}");
@@ -9703,7 +9872,9 @@ mod query_delivery_contract_tests {
                 marker: format!("ATTACH: {}", document.display()),
             }))], CooldownLatch::at(fixture.path().join("cooldowns.json"))));
         let handler = WikiQuerier { reasoner: reasoner.clone(), wiki_root: wiki.clone(),
-            repo_root: fixture.path().to_path_buf() };
+            repo_root: fixture.path().to_path_buf(), conversation_store: None,
+            conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()), voice_enabled: false,
+            voice_tools: std::sync::OnceLock::new(), final_spoken_turns: dashmap::DashMap::new() };
         let mut context = augmentagent_approval_discord::AuditCtx::empty();
         context.session_id = "synthetic-channel:synthetic-turn".into();
         let answer = handler.answer(&context, "Deliver the original synthetic document").await.unwrap();
@@ -13309,6 +13480,21 @@ fn format_local_send_time(at_ms: i64) -> String {
     }
 }
 
+fn resolve_discord_voice_socket(
+    enabled: bool,
+    explicit: Option<std::ffi::OsString>,
+    runtime: Option<std::ffi::OsString>,
+) -> Result<Option<PathBuf>> {
+    if !enabled { return Ok(None); }
+    let path = explicit.filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| runtime.filter(|value| !value.is_empty())
+            .map(|value| PathBuf::from(value).join("augmentagent/discord-voice.sock")))
+        .context("Discord voice needs AUGMENTAGENT_DISCORD_VOICE_SOCKET or XDG_RUNTIME_DIR")?;
+    anyhow::ensure!(path.is_absolute(), "Discord voice socket path must be absolute");
+    Ok(Some(path))
+}
+
 async fn build_broker(
     cli: &Cli,
     store: Arc<Store>,
@@ -13340,6 +13526,9 @@ async fn build_broker(
         .and_then(|s| s.parse().ok());
 
     let reasoner = build_reasoner();
+    let voice_enabled = std::env::var("AUGMENTAGENT_DISCORD_VOICE_ENABLED").as_deref() == Ok("1");
+    let voice_socket_path = resolve_discord_voice_socket(voice_enabled,
+        std::env::var_os("AUGMENTAGENT_DISCORD_VOICE_SOCKET"), std::env::var_os("XDG_RUNTIME_DIR"))?;
 
     let repo_root = std::env::current_dir().context("current_dir")?;
     let query_handler: Option<Arc<dyn QueryHandler>> = cli.wiki_dir.as_ref().map(|root| {
@@ -13347,6 +13536,11 @@ async fn build_broker(
             reasoner: Arc::clone(&reasoner),
             wiki_root: root.clone(),
             repo_root: repo_root.clone(),
+            conversation_store: Some(Arc::clone(&store)),
+            conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()),
+            voice_enabled,
+            voice_tools: std::sync::OnceLock::new(),
+            final_spoken_turns: dashmap::DashMap::new(),
         };
         Arc::new(q) as Arc<dyn QueryHandler>
     });
@@ -13434,6 +13628,7 @@ async fn build_broker(
         loop_parser,
         wiki_root: cli.wiki_dir.clone(),
         journal_ops,
+        voice_socket_path,
     })
     .await
     .context("start discord broker")?;

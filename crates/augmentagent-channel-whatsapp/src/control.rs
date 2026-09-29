@@ -213,6 +213,7 @@ impl WhatsappControlSurface {
                 // and durable handoff without conflating separate chat turns.
                 let audit_ctx = AuditCtx {
                     session_id: msg.stable_id(),
+                    guild_id: None,
                     http: None,
                     channel_id: None,
                     // #1110 added this field and updated the Discord and CLI

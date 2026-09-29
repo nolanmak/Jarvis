@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -28,6 +28,19 @@ pub enum StoreError {
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
+
+/// A Discord text conversation bound to one real native agent session.
+/// Audit request IDs are deliberately not stored here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscordConversation {
+    pub guild_id: String,
+    pub channel_id: String,
+    pub provider: String,
+    pub native_session_id: String,
+    pub cwd: String,
+    /// The previous native turn may have run tools before its result was lost.
+    pub uncertain: bool,
+}
 
 /// #900 — an interrupted ShadowNote sync pass, persisted after every page so
 /// a restart resumes pagination instead of replaying the whole batch.
@@ -56,6 +69,157 @@ pub struct Store {
 }
 
 impl Store {
+    /// Claim a Discord text or finalized speech turn before invoking a native
+    /// agent. A pending/uncertain row after restart blocks automatic replay.
+    pub fn claim_discord_turn(
+        &self,
+        guild_id: &str,
+        channel_id: &str,
+        turn_id: &str,
+    ) -> StoreResult<()> {
+        if [guild_id, channel_id, turn_id].iter().any(|value| value.trim().is_empty()) {
+            return Err(StoreError::InvalidInput("Discord turn identity is required".into()));
+        }
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let unfinished: Option<String> = tx.query_row(
+            "SELECT turn_id FROM discord_native_turns \
+             WHERE guild_id = ?1 AND channel_id = ?2 AND status != 'complete' LIMIT 1",
+            params![guild_id, channel_id],
+            |row| row.get(0),
+        ).optional()?;
+        if let Some(prior) = unfinished {
+            return Err(StoreError::InvalidInput(format!(
+                "Discord native turn {prior} is uncertain; inspect it before continuing"
+            )));
+        }
+        let inserted = tx.execute(
+            "INSERT INTO discord_native_turns \
+             (guild_id, channel_id, turn_id, status, created_at_ms) \
+             VALUES (?1, ?2, ?3, 'pending', ?4) \
+             ON CONFLICT(guild_id, channel_id, turn_id) DO NOTHING",
+            params![guild_id, channel_id, turn_id, now_millis()],
+        )?;
+        if inserted == 0 {
+            return Err(StoreError::InvalidInput("Discord native turn was already submitted".into()));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Only the native runner that claimed a pending turn can resolve it.
+    pub fn finish_discord_turn(
+        &self,
+        guild_id: &str,
+        channel_id: &str,
+        turn_id: &str,
+        success: bool,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let status = if success { "complete" } else { "uncertain" };
+        let changed = guard.execute(
+            "UPDATE discord_native_turns SET status = ?4, finished_at_ms = ?5 \
+             WHERE guild_id = ?1 AND channel_id = ?2 AND turn_id = ?3 AND status = 'pending'",
+            params![guild_id, channel_id, turn_id, status, now_millis()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidInput("Discord native turn is not pending".into()));
+        }
+        Ok(())
+    }
+
+    /// First writer wins. A voice join may repeat the exact binding, but may
+    /// not silently fork a text conversation or bind one native session twice.
+    pub fn bind_discord_conversation(&self, binding: &DiscordConversation) -> StoreResult<()> {
+        if binding.guild_id.trim().is_empty()
+            || binding.channel_id.trim().is_empty()
+            || binding.native_session_id.trim().is_empty()
+            || binding.cwd.trim().is_empty()
+            || !matches!(binding.provider.as_str(), "codex" | "claude")
+        {
+            return Err(StoreError::InvalidInput(
+                "invalid Discord conversation binding".into(),
+            ));
+        }
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO discord_conversations \
+             (guild_id, channel_id, provider, native_session_id, cwd, created_at_ms, uncertain) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(guild_id, channel_id) DO NOTHING",
+            params![
+                binding.guild_id,
+                binding.channel_id,
+                binding.provider,
+                binding.native_session_id,
+                binding.cwd,
+                now_millis(),
+                binding.uncertain as i64
+            ],
+        )?;
+        let persisted = guard.query_row(
+            "SELECT guild_id, channel_id, provider, native_session_id, cwd, uncertain \
+             FROM discord_conversations WHERE guild_id = ?1 AND channel_id = ?2",
+            params![binding.guild_id, binding.channel_id],
+            |row| {
+                Ok(DiscordConversation {
+                    guild_id: row.get(0)?,
+                    channel_id: row.get(1)?,
+                    provider: row.get(2)?,
+                    native_session_id: row.get(3)?,
+                    cwd: row.get(4)?,
+                    uncertain: row.get::<_, i64>(5)? != 0,
+                })
+            },
+        )?;
+        if &persisted != binding {
+            return Err(StoreError::InvalidInput(
+                "Discord conversation is already bound to another native session".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn discord_conversation(
+        &self,
+        guild_id: &str,
+        channel_id: &str,
+    ) -> StoreResult<Option<DiscordConversation>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        Ok(guard.query_row(
+            "SELECT guild_id, channel_id, provider, native_session_id, cwd, uncertain \
+             FROM discord_conversations WHERE guild_id = ?1 AND channel_id = ?2",
+            params![guild_id, channel_id],
+            |row| {
+                Ok(DiscordConversation {
+                    guild_id: row.get(0)?,
+                    channel_id: row.get(1)?,
+                    provider: row.get(2)?,
+                    native_session_id: row.get(3)?,
+                    cwd: row.get(4)?,
+                    uncertain: row.get::<_, i64>(5)? != 0,
+                })
+            },
+        )
+        .optional()?)
+    }
+
+    pub fn mark_discord_conversation_uncertain(
+        &self,
+        guild_id: &str,
+        channel_id: &str,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let changed = guard.execute(
+            "UPDATE discord_conversations SET uncertain = 1 WHERE guild_id = ?1 AND channel_id = ?2",
+            params![guild_id, channel_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::InvalidInput("Discord conversation is not bound".into()));
+        }
+        Ok(())
+    }
+
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         let path_buf = path.as_ref().to_path_buf();
         let conn = Connection::open(path)?;
@@ -245,6 +409,32 @@ impl Store {
     /// its own CREATE TABLE IF NOT EXISTS in `initDb()` so the dashboard can
     /// boot even if the Rust daemon hasn't run yet (concurrent systemd start).
     fn migrate(conn: &Connection) -> StoreResult<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS discord_conversations (\
+                guild_id TEXT NOT NULL,\
+                channel_id TEXT NOT NULL,\
+                provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude')),\
+                native_session_id TEXT NOT NULL,\
+                cwd TEXT NOT NULL,\
+                created_at_ms INTEGER NOT NULL,\
+                uncertain INTEGER NOT NULL DEFAULT 0 CHECK(uncertain IN (0, 1)),\
+                PRIMARY KEY(guild_id, channel_id),\
+                UNIQUE(provider, native_session_id)\
+            )",
+        )?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS discord_native_turns (\
+                guild_id TEXT NOT NULL,\
+                channel_id TEXT NOT NULL,\
+                turn_id TEXT NOT NULL,\
+                status TEXT NOT NULL CHECK(status IN ('pending', 'complete', 'uncertain')),\
+                created_at_ms INTEGER NOT NULL,\
+                finished_at_ms INTEGER,\
+                PRIMARY KEY(guild_id, channel_id, turn_id)\
+            );\
+            CREATE INDEX IF NOT EXISTS idx_discord_native_turns_unfinished \
+            ON discord_native_turns(guild_id, channel_id, status)",
+        )?;
         // -------------------------------------------------------------------
         // #45 — Rust-owned schema. Mirrors `src/db.ts::initDb()` exactly
         // (column names, types, NOT NULL, DEFAULT, PRIMARY KEY). Do NOT

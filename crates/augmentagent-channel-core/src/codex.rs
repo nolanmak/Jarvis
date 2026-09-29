@@ -202,6 +202,12 @@ impl CodexCliReasoner {
         clean: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> anyhow::Result<String> {
         let provider = self.provider_name();
+        let mut native_lease = crate::native_session::CURRENT
+            .try_with(|session| std::sync::Arc::clone(session))
+            .ok()
+            .map(|session| session.begin(self.kind))
+            .transpose()?;
+        let native_launch = native_lease.as_ref().map(|lease| lease.launch());
         let router = crate::model_router::current()?.filter(|r| r.enabled() || self.kind != ProviderKind::Codex);
         if matches!(self.kind, ProviderKind::Qwen | ProviderKind::Glm) && router.is_none() {
             return Err(ReasonerError::Local { message: "Runpod model requires a configured 9Router endpoint".into() }.into());
@@ -267,7 +273,6 @@ impl CodexCliReasoner {
             "--skip-git-repo-check".into(),
             "--ignore-user-config".into(),
             "--ignore-rules".into(),
-            "--ephemeral".into(),
             "--strict-config".into(),
             "-c".into(),
             "approval_policy=never".into(),
@@ -281,6 +286,12 @@ impl CodexCliReasoner {
             "-m".into(),
             model.clone(),
         ];
+        if native_launch.is_none() {
+            args.push("--ephemeral".into());
+        }
+        if matches!(native_launch.as_ref(), Some(crate::native_session::Launch::Resume { .. })) {
+            args.insert(1, "resume".into());
+        }
         if let Some(router) = &router {
             for value in router.codex_overrides() { args.extend(["-c".into(), value]); }
         }
@@ -300,8 +311,12 @@ impl CodexCliReasoner {
             args.push("-c".into());
             args.push(config.clone());
         }
-        args.push("-C".into());
-        args.push(bridge.native_cwd.to_string_lossy().into_owned());
+        if let Some(crate::native_session::Launch::Resume { id }) = &native_launch {
+            args.push(id.clone());
+        } else {
+            args.push("-C".into());
+            args.push(bridge.native_cwd.to_string_lossy().into_owned());
+        }
         // "-" = read the prompt from stdin, mirroring the claude spawn shape.
         args.push("-".into());
 
@@ -310,6 +325,9 @@ impl CodexCliReasoner {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if matches!(native_launch.as_ref(), Some(crate::native_session::Launch::Resume { .. })) {
+            cmd.current_dir(&bridge.native_cwd);
+        }
 
         // Always a clean env (the #128 posture): OS essentials + CODEX_HOME
         // + exactly the secrets this backend needs, JIT-loaded. The daemon's
@@ -321,6 +339,7 @@ impl CodexCliReasoner {
             }
         }
         cmd.env("CODEX_HOME", codex_home());
+        for (key, value) in &bridge.voice_env { cmd.env(key, value); }
         if let Some(key) = crate::secret_loader::load_provider_key("CODEX_API_KEY") {
             cmd.env("CODEX_API_KEY", key);
         }
@@ -349,6 +368,7 @@ impl CodexCliReasoner {
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(user_message.as_bytes()).await?;
             stdin.shutdown().await?;
+            if let Some(lease) = native_lease.as_ref() { lease.observe_native_submission(); }
         }
 
         // Drain stderr CONCURRENTLY (#655 review): a child writing >64KB of
@@ -393,6 +413,13 @@ impl CodexCliReasoner {
                 continue;
             };
             let kind = v.get("type").and_then(|t| t.as_str());
+            if kind == Some("thread.started") {
+                if let (Some(lease), Some(id)) =
+                    (native_lease.as_mut(), v.get("thread_id").and_then(|value| value.as_str()))
+                {
+                    lease.observe(id)?;
+                }
+            }
             if kind.is_some_and(|k| k.starts_with("turn.") || k.starts_with("item.")) {
                 turn_began = true;
             }
@@ -414,6 +441,9 @@ impl CodexCliReasoner {
                             item.and_then(|i| i.get("text")).and_then(|t| t.as_str())
                         {
                             if !text.trim().is_empty() {
+                                if let Some(lease) = native_lease.as_ref() {
+                                    lease.observe_first_text_output();
+                                }
                                 messages.push(text.to_string());
                             }
                         }
@@ -467,6 +497,9 @@ impl CodexCliReasoner {
             // ordinary text (the claude failure shape). Catch it here too.
             if crate::reasoner::is_rate_limited(&final_text) {
                 return Err(turn_error(provider, FailureClass::Quota, capability, final_text));
+            }
+            if let Some(lease) = native_lease {
+                lease.finish()?;
             }
             return Ok(final_text);
         }
@@ -658,6 +691,24 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
         assert_eq!(got, "{\"decision\":\"reply\"}", "LastBlock keeps the final message");
         let all = r.call_transcript(&opts(), "classify this").await.unwrap();
         assert!(all.contains("scratch note") && all.contains("decision"));
+    }
+
+    #[tokio::test]
+    async fn native_codex_records_first_nonempty_assistant_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(&dir, "fake-codex-first-text", r#"
+cat >/dev/null
+echo '{"type":"thread.started","thread_id":"synthetic-thread"}'
+echo '{"type":"item.completed","item":{"type":"reasoning","text":"private"}}'
+echo '{"type":"item.completed","item":{"type":"agent_message","text":"visible answer"}}'
+"#);
+        let session = crate::native_session::NativeSession::new(ProviderKind::Codex).unwrap();
+        let answer = crate::native_session::CURRENT.scope(std::sync::Arc::clone(&session),
+            CodexCliReasoner::with_bin(bin).call(&opts(), "synthetic input")).await.unwrap();
+        assert_eq!(answer, "visible answer");
+        assert!(session.first_text_output_at_ms().unwrap() >=
+            session.native_submitted_at_ms().unwrap());
+        assert_eq!(session.id().as_deref(), Some("synthetic-thread"));
     }
 
     /// #1047 — a codex call writes exactly one usage row: provider `codex`,

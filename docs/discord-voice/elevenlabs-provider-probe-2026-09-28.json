@@ -1,0 +1,22 @@
+{
+  "recordedAtUtc": "2026-09-28T23:57:33Z",
+  "evidence": "direct-live-provider-probe",
+  "runtime": "Node 24.17.0 on QA host",
+  "provider": "elevenlabs",
+  "stt": {
+    "adapter": "sidecars/discord-voice/src/stt.ts",
+    "model": "scribe_v2_realtime",
+    "inputSource": "ElevenLabs TTS phrase resampled from 24 kHz to 16 kHz mono PCM",
+    "audioFormat": "16 kHz mono linear16, sent in paced 20 ms chunks followed by 2.5 seconds of silence",
+    "observedEvents": ["partial", "partial", "partial", "partial", "partial", "partial", "final"],
+    "committedTranscript": "Hello there. I am testing the live speech recognition system with a complete sentence."
+  },
+  "tts": {
+    "adapter": "sidecars/discord-voice/src/tts.ts",
+    "model": "eleven_flash_v2_5",
+    "inputText": "Hello there. I am testing the live speech recognition system with a complete sentence.",
+    "audioFormat": "24 kHz mono linear16",
+    "receivedBytes": 234058
+  },
+  "limits": "This proves live ElevenLabs STT/TTS protocol and credential access on the QA host. It does not prove Discord DAVE receive/playback, remote audibility, native-session continuity, or credit-exhaustion failover against a real depleted account."
+}

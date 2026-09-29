@@ -9,6 +9,9 @@
 //! still `pending`, across daemon restarts, unlimited timeouts.
 
 pub mod attachments;
+pub mod conversation;
+pub mod voice_bridge;
+pub mod voice_tool;
 mod broker;
 mod custom_id;
 mod event_handler;
@@ -368,9 +371,42 @@ pub trait ApprovalActionHandler: Send + Sync {
 pub trait QueryHandler: Send + Sync {
     async fn answer(&self, ctx: &AuditCtx, question: &str) -> anyhow::Result<String>;
 
+    /// Attach the private voice-tool endpoint after the Discord gateway has
+    /// connected. Non-voice query handlers keep the default no-op behavior.
+    fn attach_voice_tools(&self, _service: std::sync::Arc<voice_tool::VoiceToolService>) {}
+
+    /// Consume an explicit final-output marker from the agent's speech tool.
+    /// Only the native query handler that issued the grant can return true.
+    fn take_final_spoken(&self, _turn_id: &str) -> bool { false }
+
+    /// The current turn and optional migration history are separate so a
+    /// native session can include history only when it is first created.
+    async fn answer_turn(
+        &self,
+        ctx: &AuditCtx,
+        history: &str,
+        current: &str,
+    ) -> anyhow::Result<String> {
+        let prompt = if history.is_empty() {
+            current.to_string()
+        } else {
+            format!("{history}\n\nuser's current message:\n{current}")
+        };
+        self.answer(ctx, &prompt).await
+    }
+
     /// Owner-only deterministic control command, intercepted before history,
     /// attachments or model inference. `None` means an ordinary message.
     async fn model_command(&self, _channel_id: u64, _text: &str) -> Option<String> { None }
+
+    async fn model_command_in_guild(
+        &self,
+        _guild_id: Option<u64>,
+        channel_id: u64,
+        text: &str,
+    ) -> Option<String> {
+        self.model_command(channel_id, text).await
+    }
 
     /// Model selected for a new scheduled loop in this conversation.
     async fn selected_model(&self, _channel_id: u64) -> Result<Option<String>, String> { Ok(None) }
@@ -387,6 +423,7 @@ pub trait QueryHandler: Send + Sync {
 /// workspace cycle.
 pub struct AuditCtx {
     pub session_id: String,
+    pub guild_id: Option<u64>,
     pub http: Option<std::sync::Arc<serenity::http::Http>>,
     pub channel_id: Option<serenity::model::id::ChannelId>,
     /// True only when Discord has an explicit owner allowlist and this author matched it.
@@ -399,6 +436,7 @@ impl AuditCtx {
     pub fn empty() -> Self {
         Self {
             session_id: String::from("-"),
+            guild_id: None,
             http: None,
             channel_id: None,
             owner_authorized: false,

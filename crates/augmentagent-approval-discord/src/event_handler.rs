@@ -9,12 +9,16 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serenity::all::{
-    ActionRowComponent, Attachment, ButtonKind, ChannelId, Context, CreateAttachment,
+    ActionRowComponent, Attachment, ButtonKind, Channel, ChannelId, ChannelType, CommandDataOptionValue,
+    CommandInteraction, CommandOptionType, Context, CreateAttachment, CreateCommand,
+    CreateCommandOption,
     CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
-    CreateMessage, EditMessage, EventHandler, GetMessages, Http, Interaction, Message, MessageId,
-    MessageReference, Ready, UserId,
+    CreateMessage, EditInteractionResponse, EditMessage, EventHandler, GetMessages, Http, Interaction, Message, MessageId,
+    MessageReference, Ready, UserId, VoiceServerUpdateEvent, VoiceState,
 };
 use tracing::{debug, info, warn};
 
@@ -30,8 +34,37 @@ use crate::layout::{
     split_needs_input, SCHEDULE_CUSTOM_VALUE,
 };
 use crate::ApprovalActionOutcome;
+use crate::voice_bridge::VoiceBinding;
 
 const DISCORD_MSG_LIMIT: usize = 1900;
+static NEXT_VOICE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_voice_generation() -> u64 {
+    let millis = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    NEXT_VOICE_GENERATION.fetch_max(millis.saturating_mul(1000), Ordering::SeqCst);
+    NEXT_VOICE_GENERATION.fetch_add(1, Ordering::SeqCst)
+}
+
+fn voice_command() -> CreateCommand {
+    CreateCommand::new("voice")
+        .description("Connect this conversation to your current voice channel")
+        .add_option(CreateCommandOption::new(CommandOptionType::SubCommand, "start", "Join your voice channel")
+            .add_sub_option(CreateCommandOption::new(CommandOptionType::String, "agent", "Claude or Codex")
+                .add_string_choice("Claude", "claude")
+                .add_string_choice("Codex", "codex"))
+            .add_sub_option(CreateCommandOption::new(CommandOptionType::String, "stt", "Speech recognition provider")
+                .add_string_choice("Deepgram", "deepgram").add_string_choice("ElevenLabs", "elevenlabs"))
+            .add_sub_option(CreateCommandOption::new(CommandOptionType::String, "tts", "Spoken reply provider")
+                .add_string_choice("Deepgram", "deepgram").add_string_choice("ElevenLabs", "elevenlabs")))
+        .add_option(CreateCommandOption::new(CommandOptionType::SubCommand, "provider", "Switch speech vendors in this conversation")
+            .add_sub_option(CreateCommandOption::new(CommandOptionType::String, "stt", "Speech recognition provider")
+                .add_string_choice("Deepgram", "deepgram").add_string_choice("ElevenLabs", "elevenlabs"))
+            .add_sub_option(CreateCommandOption::new(CommandOptionType::String, "tts", "Spoken reply provider")
+                .add_string_choice("Deepgram", "deepgram").add_string_choice("ElevenLabs", "elevenlabs")))
+        .add_option(CreateCommandOption::new(CommandOptionType::SubCommand, "status", "Show voice binding and native session"))
+        .add_option(CreateCommandOption::new(CommandOptionType::SubCommand, "stop", "Leave voice and keep text context"))
+        .add_option(CreateCommandOption::new(CommandOptionType::SubCommand, "interrupt", "Stop the current spoken reply"))
+}
 
 /// Fail-closed owner-allowlist check (#303). Returns `true` only when an
 /// allowlist is configured (`DISCORD_ALLOWED_USER_ID`) *and* the actor matches
@@ -43,8 +76,220 @@ fn is_authorized(allowed_user_id: Option<UserId>, actor: UserId) -> bool {
     matches!(allowed_user_id, Some(allowed) if allowed == actor)
 }
 
+fn is_query_thread(kind: ChannelType, parent: Option<ChannelId>, query: ChannelId) -> bool {
+    matches!(kind, ChannelType::NewsThread | ChannelType::PublicThread | ChannelType::PrivateThread)
+        && parent == Some(query)
+}
+
+async fn is_query_conversation(ctx: &Context, msg: &Message, query: Option<ChannelId>) -> bool {
+    is_query_channel(ctx, msg.guild_id, msg.channel_id, query).await
+}
+
+async fn is_query_channel(
+    ctx: &Context,
+    guild_id: Option<serenity::all::GuildId>,
+    channel_id: ChannelId,
+    query: Option<ChannelId>,
+) -> bool {
+    let Some(query) = query else { return false; };
+    if channel_id == query { return true; }
+    let Some(guild_id) = guild_id else { return false; };
+    if let Some(guild) = ctx.cache.guild(guild_id) {
+        if let Some(thread) = guild.threads.iter().find(|thread| thread.id == channel_id) {
+            return is_query_thread(thread.kind, thread.parent_id, query);
+        }
+    }
+    match channel_id.to_channel(&ctx.http).await {
+        Ok(Channel::Guild(channel)) => is_query_thread(channel.kind, channel.parent_id, query),
+        _ => false,
+    }
+}
+
 pub struct Handler {
     pub state: Arc<BrokerState>,
+}
+
+impl Handler {
+    async fn voice_command_reply(&self, ctx: &Context, command: &CommandInteraction) -> String {
+        if !is_authorized(self.state.allowed_user_id, command.user.id) {
+            return "Only the configured owner can control Discord voice.".into();
+        }
+        if !self.state.voice_enabled {
+            return "Discord voice is disabled on this bot.".into();
+        }
+        let Some(guild_id) = command.guild_id else {
+            return "Voice requires a server channel; group calls and DMs are unsupported.".into();
+        };
+        if !is_query_channel(ctx, Some(guild_id), command.channel_id, self.state.query_channel_id).await {
+            return "Run `/voice` from the configured conversation channel or one of its threads.".into();
+        }
+        let Some(bridge) = &self.state.voice_bridge else {
+            return "Voice sidecar is unavailable. Check its service and Unix socket, then retry.".into();
+        };
+        let Some(option) = command.data.options.first() else {
+            return "Use `/voice start`, `provider`, `status`, `stop`, or `interrupt`.".into();
+        };
+        let guild = guild_id.get().to_string();
+        let conversation = format!("{}:{}", guild_id.get(), command.channel_id.get());
+        let speech_option = |name: &str| -> Option<String> {
+            let CommandDataOptionValue::SubCommand(options) = &option.value else { return None; };
+            options.iter().find_map(|item| {
+                if item.name != name { return None; }
+                match &item.value {
+                    CommandDataOptionValue::String(value) if matches!(value.as_str(), "deepgram" | "elevenlabs") => Some(value.clone()),
+                    _ => None,
+                }
+            })
+        };
+        match option.name.as_str() {
+            "start" => {
+                if !bridge.is_connected() {
+                    return format!("Voice sidecar is {}. Check its service and retry after it reconnects.", bridge.transport_status());
+                }
+                let requested_agent = match &option.value {
+                    CommandDataOptionValue::SubCommand(options) => options.iter().find_map(|item| {
+                        if item.name == "agent" {
+                            if let CommandDataOptionValue::String(value) = &item.value {
+                                return Some(value.as_str());
+                            }
+                        }
+                        None
+                    }),
+                    _ => None,
+                };
+                let Some(store) = &self.state.store else {
+                    return "Voice conversation storage is unavailable.".into();
+                };
+                let owner_voice = ctx.cache.guild(guild_id)
+                    .and_then(|guild| guild.voice_states.get(&command.user.id).and_then(|state| state.channel_id));
+                let Some(voice_channel) = owner_voice else {
+                    return "Join an existing server voice channel, then run `/voice start` here.".into();
+                };
+                match voice_channel.to_channel(&ctx.http).await {
+                    Ok(Channel::Guild(channel)) if channel.kind == ChannelType::Voice => {},
+                    _ => return "Join a regular server voice channel; Stage channels are unsupported.".into(),
+                }
+                let channel = command.channel_id.get().to_string();
+                let mut bound = match store.discord_conversation(&guild, &channel) {
+                    Ok(bound) => bound,
+                    Err(error) => return format!("Could not read voice conversation: {error}"),
+                };
+                if let Some(existing) = &bound {
+                    if existing.uncertain {
+                        return "The native conversation has an uncertain turn. Inspect it before starting voice.".into();
+                    }
+                    if requested_agent.is_some_and(|agent| agent != existing.provider) {
+                        return format!("This conversation is already bound to {} session {}; starting another agent would break continuity.",
+                            existing.provider, existing.native_session_id);
+                    }
+                } else {
+                    let Some(handler) = &self.state.query_handler else {
+                        return "Native agent routing is unavailable.".into();
+                    };
+                    if let Some(agent) = requested_agent {
+                        if !matches!(agent, "claude" | "codex") {
+                            return "Choose Claude or Codex for a new voice conversation.".into();
+                        }
+                        let _ = handler.model_command_in_guild(Some(guild_id.get()),
+                            command.channel_id.get(), &format!("/model set {agent}")).await;
+                        if handler.selected_model(command.channel_id.get()).await.ok().flatten().as_deref() != Some(agent) {
+                            return format!("Could not select {agent} for this conversation; use `/model set {agent}` first.");
+                        }
+                    }
+                    let history = fetch_conversation_context(ctx, command.channel_id,
+                        MessageId::new(command.id.get()), self.state.bot_user_id.get().copied(),
+                        self.state.allowed_user_id).await;
+                    let audit = crate::AuditCtx {
+                        session_id: format!("{}:voice-start-{}", channel, command.id.get()),
+                        guild_id: Some(guild_id.get()), http: Some(Arc::clone(&ctx.http)),
+                        channel_id: Some(command.channel_id), owner_authorized: true,
+                    };
+                    if let Err(error) = handler.answer_turn(&audit, &history,
+                        "Start a voice conversation with me. Respond with a brief greeting.").await {
+                        return format!("Could not initialize native voice conversation: {error}");
+                    }
+                    bound = match store.discord_conversation(&guild, &channel) {
+                        Ok(Some(bound)) => Some(bound),
+                        Ok(None) => return "The native agent did not report a session ID; voice was not started.".into(),
+                        Err(error) => return format!("Could not read native session: {error}"),
+                    };
+                }
+                let bound = bound.expect("native session was created or already bound");
+                let Some(bot_id) = self.state.bot_user_id.get() else {
+                    return "Discord bot is still connecting; retry shortly.".into();
+                };
+                let binding = VoiceBinding {
+                    guild_id: guild.clone(), conversation_id: conversation.clone(),
+                    text_channel_id: channel.clone(),
+                    voice_channel_id: voice_channel.get().to_string(),
+                    owner_id: command.user.id.get().to_string(),
+                    bot_user_id: bot_id.get().to_string(),
+                    generation: next_voice_generation(),
+                    stt_provider: speech_option("stt"),
+                    tts_provider: speech_option("tts"),
+                };
+                match bridge.start(binding).await {
+                    Ok(()) => format!("Joining <#{}> for this conversation. Native {} session {} is bound; listening will begin when the voice connection is ready.",
+                        voice_channel.get(), bound.provider, bound.native_session_id),
+                    Err(error) => format!("Could not start Discord voice: {error}"),
+                }
+            }
+            "provider" => {
+                let Some(mut binding) = bridge.binding(&guild) else {
+                    return "Start voice in this conversation before switching providers.".into();
+                };
+                if binding.conversation_id != conversation {
+                    return format!("Voice is bound to {} in this server.", binding.conversation_id);
+                }
+                let stt = speech_option("stt");
+                let tts = speech_option("tts");
+                if stt.is_none() && tts.is_none() {
+                    return "Choose STT, TTS, or both providers to switch.".into();
+                }
+                if let Some(stt) = stt { binding.stt_provider = Some(stt); }
+                if let Some(tts) = tts { binding.tts_provider = Some(tts); }
+                if let Err(error) = bridge.stop(&guild, &conversation).await {
+                    return format!("Could not stop voice before switching providers: {error}");
+                }
+                binding.generation = next_voice_generation();
+                match bridge.start(binding.clone()).await {
+                    Ok(()) => format!("Switching speech providers in the same conversation: STT {}, TTS {}. Rejoining <#{}>.",
+                        binding.stt_provider.as_deref().unwrap_or("default"),
+                        binding.tts_provider.as_deref().unwrap_or("default"), binding.voice_channel_id),
+                    Err(error) => format!("Voice stopped, but the new providers could not start: {error}. The text session remains available."),
+                }
+            }
+            "status" => {
+                let Some(binding) = bridge.binding(&guild) else {
+                    return format!("Voice is {}; the text conversation remains available.",
+                        if bridge.transport_status() == "reconnecting" { "reconnecting" } else { "stopped" });
+                };
+                if binding.conversation_id != conversation {
+                    return format!("Voice is bound to {} in this server.", binding.conversation_id);
+                }
+                let session = self.state.store.as_ref()
+                    .and_then(|store| store.discord_conversation(&guild, &command.channel_id.get().to_string()).ok().flatten());
+                let audio_state = bridge.status(&guild, &conversation).await
+                    .unwrap_or_else(|_| "disconnected".into());
+                match session {
+                    Some(session) => format!("Voice binding: <#{}> ↔ <#{}>. Native {} session {}. Audio state: {}. Speech: STT {}, TTS {}.",
+                        command.channel_id.get(), binding.voice_channel_id, session.provider, session.native_session_id, audio_state,
+                        binding.stt_provider.as_deref().unwrap_or("default"),
+                        binding.tts_provider.as_deref().unwrap_or("default")),
+                    None => "Voice binding is active, but its native session could not be read.".into(),
+                }
+            }
+            "stop" => match bridge.stop(&guild, &conversation).await {
+                Ok(()) => "Voice stopped. Continue typing here in the same native session.".into(),
+                Err(error) => format!("Could not stop Discord voice: {error}"),
+            },
+            "interrupt" => match bridge.interrupt(&guild, &conversation).await {
+                Ok(()) => "Current spoken reply interrupted.".into(),
+                Err(error) => format!("Could not interrupt Discord voice: {error}"),
+            },
+            _ => "Use `/voice start`, `provider`, `status`, `stop`, or `interrupt`.".into(),
+        }
+    }
 }
 
 #[serenity::async_trait]
@@ -56,7 +301,26 @@ impl EventHandler for Handler {
         // context for follow-ups.
         let bot_user_id = ready.user.id;
         let _ = self.state.bot_user_id.set(bot_user_id);
+        if let Some(bridge) = &self.state.voice_bridge {
+            bridge.set_shard(ctx.shard.clone()).await;
+        }
         self.state.mark_ready();
+
+        if self.state.voice_enabled {
+            if let Some(query) = self.state.query_channel_id {
+                let http = Arc::clone(&ctx.http);
+                tokio::spawn(async move {
+                    match query.to_channel(&http).await {
+                        Ok(Channel::Guild(channel)) => {
+                            if let Err(error) = channel.guild_id.create_command(&http, voice_command()).await {
+                                warn!("could not register Discord voice command: {error}");
+                            }
+                        }
+                        _ => warn!("could not find Discord guild for voice command registration"),
+                    }
+                });
+            }
+        }
 
         // One-shot scrollback sweep: delete approval cards whose actions are
         // already resolved. Catches cards left from previous runs or from
@@ -70,6 +334,42 @@ impl EventHandler for Handler {
         }
     }
 
+    async fn voice_state_update(&self, _ctx: Context, _old: Option<VoiceState>, new: VoiceState) {
+        let Some(bridge) = &self.state.voice_bridge else { return; };
+        let Some(guild_id) = new.guild_id else { return; };
+        let guild = guild_id.get().to_string();
+        let user = new.user_id.get().to_string();
+        let channel = new.channel_id.map(|id| id.get().to_string());
+        if let Some(binding) = bridge.binding(&guild) {
+            if user == binding.owner_id && channel.as_deref() != Some(&binding.voice_channel_id) {
+                if let Err(error) = bridge.stop(&guild, &binding.conversation_id).await {
+                    warn!("could not detach Discord voice after owner departure: {error}");
+                }
+                return;
+            }
+        }
+        if let Err(error) = bridge.forward_voice_state(
+            &guild, &user, channel.as_deref(), &new.session_id,
+        ).await {
+            warn!("could not forward Discord voice state to sidecar: {error}");
+        }
+    }
+
+    async fn voice_server_update(&self, _ctx: Context, event: VoiceServerUpdateEvent) {
+        let Some(bridge) = &self.state.voice_bridge else { return; };
+        let Some(guild_id) = event.guild_id else { return; };
+        let guild = guild_id.get().to_string();
+        if let Some(endpoint) = event.endpoint {
+            if let Err(error) = bridge.forward_voice_server(&guild, &endpoint, &event.token).await {
+                warn!("could not forward Discord voice server update to sidecar: {error}");
+            }
+        } else if let Some(binding) = bridge.binding(&guild) {
+            if let Err(error) = bridge.stop(&guild, &binding.conversation_id).await {
+                warn!("could not detach Discord voice after endpoint loss: {error}");
+            }
+        }
+    }
+
     async fn message(&self, ctx: Context, msg: Message) {
         if msg.author.bot {
             return;
@@ -77,15 +377,6 @@ impl EventHandler for Handler {
         let Some(handler) = &self.state.query_handler else {
             return;
         };
-
-        let is_dm = msg.guild_id.is_none();
-        let in_query_channel = self
-            .state
-            .query_channel_id
-            .is_some_and(|cid| cid == msg.channel_id);
-        if !is_dm && !in_query_channel {
-            return;
-        }
 
         if !is_authorized(self.state.allowed_user_id, msg.author.id) {
             debug!(
@@ -96,11 +387,19 @@ impl EventHandler for Handler {
             return;
         }
 
+        let is_dm = msg.guild_id.is_none();
+        let in_query_channel = is_query_conversation(&ctx, &msg, self.state.query_channel_id).await;
+        if !is_dm && !in_query_channel {
+            return;
+        }
+
         let user_text = msg.content.trim().to_string();
         // Model selection is an owner control, never part of the model prompt.
         // This runs after the existing fail-closed allowlist and before any
         // attachment download or history collection.
-        if let Some(reply) = handler.model_command(msg.channel_id.get(), &user_text).await {
+        if let Some(reply) = handler.model_command_in_guild(
+            msg.guild_id.map(|guild| guild.get()), msg.channel_id.get(), &user_text
+        ).await {
             let builder = CreateMessage::new().content(reply)
                 .reference_message(MessageReference::from((msg.channel_id, msg.id)));
             if let Err(error) = msg.channel_id.send_message(&ctx.http, builder).await {
@@ -260,9 +559,11 @@ impl EventHandler for Handler {
         let http = ctx.http.clone();
         let channel_id = msg.channel_id;
         let msg_id = msg.id;
+        let guild_id = msg.guild_id.map(|guild| guild.get());
         let bot_user_id = self.state.bot_user_id.get().copied();
         let allowed_user_id = self.state.allowed_user_id;
         let wiki_root = self.state.wiki_root.clone();
+        let voice_bridge = self.state.voice_bridge.clone();
 
         info!(%channel_id, %msg_id, "discord query received");
         tokio::spawn(async move {
@@ -287,12 +588,7 @@ impl EventHandler for Handler {
             let extracted_docs = extract_doc_attachments(&docs, msg_id.get()).await;
             downloaded_txts.extend(extracted_docs);
 
-            let prompt = build_prompt_with_context(
-                &history,
-                &user_text,
-                &downloaded_imgs,
-                &downloaded_txts,
-            );
+            let current = build_prompt(&user_text, &downloaded_imgs, &downloaded_txts);
 
             // #125: Liveness signal. Discord's typing indicator auto-expires
             // after ~10s, so we kick one off immediately and re-broadcast on a
@@ -306,12 +602,16 @@ impl EventHandler for Handler {
             // high-risk tool calls (Write/Edit/Bash/...).
             let audit_ctx = crate::AuditCtx {
                 session_id: format!("{}:{}", channel_id, msg_id),
+                guild_id,
                 http: Some(http.clone()),
                 channel_id: Some(channel_id),
                 owner_authorized: allowed_user_id.is_some(),
             };
-            let result =
-                run_with_typing(&http, channel_id, handler.answer(&audit_ctx, &prompt)).await;
+            let result = run_with_typing(
+                &http,
+                channel_id,
+                handler.answer_turn(&audit_ctx, &history, &current),
+            ).await;
             info!(%channel_id, %msg_id, success = result.is_ok(), "discord query completed");
 
             // Best-effort cleanup. Tempfiles aren't load-bearing for the reply
@@ -349,6 +649,20 @@ impl EventHandler for Handler {
                         "wiki answer chunk",
                     )
                     .await;
+                    let final_spoken = handler.take_final_spoken(&audit_ctx.session_id);
+                    if !final_spoken && !answer.trim().is_empty() && answer.len() <= 12_000 {
+                        if let (Some(bridge), Some(guild)) = (&voice_bridge, guild_id) {
+                            let guild = guild.to_string();
+                            let conversation = format!("{guild}:{}", channel_id.get());
+                            if bridge.binding(&guild).as_ref().is_some_and(|binding|
+                                binding.conversation_id == conversation) {
+                                if let Err(error) = bridge.speak(&guild, &conversation,
+                                    &format!("{}:final", audit_ctx.session_id), &answer).await {
+                                    warn!("could not speak Discord text reply: {error}");
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     let mut err_msg = format!("wiki query failed: {e}");
@@ -369,6 +683,20 @@ impl EventHandler for Handler {
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         match interaction {
+            Interaction::Command(command) if command.data.name == "voice" => {
+                let defer = CreateInteractionResponse::Defer(
+                    CreateInteractionResponseMessage::new().ephemeral(true),
+                );
+                if let Err(error) = command.create_response(&ctx.http, defer).await {
+                    warn!("could not acknowledge Discord voice command: {error}");
+                    return;
+                }
+                let reply = self.voice_command_reply(&ctx, &command).await;
+                if let Err(error) = command.edit_response(&ctx.http,
+                    EditInteractionResponse::new().content(reply)).await {
+                    warn!("could not post Discord voice command result: {error}");
+                }
+            }
             Interaction::Component(comp) => {
                 let Some(cid) = CustomId::parse(&comp.data.custom_id) else {
                     debug!("unrecognized custom_id: {}", comp.data.custom_id);
@@ -2253,6 +2581,7 @@ fn build_prompt(
 /// Layer a pre-formatted `<conversation_history>` block in front of the
 /// current-turn prompt. If `history` is empty, falls through to the bare
 /// `build_prompt` so first-turn messages match prior behavior exactly.
+#[cfg(test)]
 fn build_prompt_with_context(
     history: &str,
     user_text: &str,
@@ -2559,6 +2888,17 @@ fn hard_split(s: &str, max: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use augmentagent_docs::doc_command_for;
+
+    #[test]
+    fn query_threads_are_separate_conversations_under_the_configured_channel() {
+        let query = ChannelId::new(10);
+        for kind in [ChannelType::PublicThread, ChannelType::PrivateThread, ChannelType::NewsThread] {
+            assert!(is_query_thread(kind, Some(query), query));
+            assert!(!is_query_thread(kind, Some(ChannelId::new(11)), query));
+        }
+        assert!(!is_query_thread(ChannelType::Text, Some(query), query));
+        assert!(!is_query_thread(ChannelType::Voice, Some(query), query));
+    }
 
     #[tokio::test]
     async fn stalled_typing_request_does_not_block_answer() {

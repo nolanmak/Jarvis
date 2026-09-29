@@ -299,8 +299,10 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -996,6 +998,7 @@ dependencies = [
  "chrono-tz",
  "clap",
  "cron",
+ "dashmap 6.1.0",
  "dotenvy",
  "insta",
  "libc",

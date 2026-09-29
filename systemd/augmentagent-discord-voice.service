@@ -1,0 +1,21 @@
+[Unit]
+Description=AugmentAgent Discord voice audio sidecar (Node 24)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/AugmentAgent/sidecars/discord-voice
+# Dedicated file: do not load the daemon's .env (it contains the bot token).
+EnvironmentFile=%h/.config/augmentagent/discord-voice.env
+Environment=AUGMENTAGENT_DISCORD_VOICE_SOCKET=%t/augmentagent/discord-voice.sock
+Environment=NODE_ENV=production
+ExecStartPre=/usr/bin/install -d -m 0700 %t/augmentagent
+ExecStart=%h/AugmentAgent/sidecars/discord-voice/node_modules/node/bin/node %h/AugmentAgent/sidecars/discord-voice/dist/src/main.js
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+LimitNOFILE=4096
+
+[Install]
+WantedBy=default.target
