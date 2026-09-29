@@ -37,7 +37,7 @@ impl Rig {
     fn fake_claude(&self, reply: &str) -> PathBuf {
         let text = serde_json::to_string(reply).unwrap();
         let script = format!(
-            "#!/usr/bin/env bash\ncat >/dev/null\necho \"$*\" >> \"{calls}\"\ncat <<'EOF'\n\
+            "#!/usr/bin/env bash\ncat >/dev/null\necho call >> \"{calls}\"\ncat <<'EOF'\n\
              {{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":{text}}}]}}}}\n\
              {{\"type\":\"result\",\"result\":{text}}}\nEOF\n",
             calls = self.path("claude-calls").display(),
