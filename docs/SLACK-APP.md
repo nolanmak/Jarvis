@@ -155,7 +155,7 @@ What it does:
   text, PDF/DOCX) are handed to the agent read-only for that one request.
 - Anyone else gets the fixed rejection: back in their DM with the app, or
   as an ephemeral message in a channel. It never reaches the reasoner.
-  Buttons and modals get no answer yet (#1289).
+  The same applies to their clicks on approval cards (#1289).
 - `serve` is a dry run unless started with `--dry-run false`: turns still
   run, but every send is recorded in the outbox as sent with a `dry-run:`
   provider ID and no Slack method is called.
@@ -193,6 +193,36 @@ seen. `AUGMENTAGENT_SLACK_TEST_FILE_HOSTS` (loopback `host:port` only) lets
 it download attachments from a local fake.
 `crates/augmentagent-cli/tests/slack_serve_cli.rs` runs `serve` that way
 against a local fake Slack.
+
+## 6. Approvals on Slack (#1289)
+
+With the app installed and an owner bound, `serve` posts approval cards to
+Slack: your DM with the app, or your bound control channel with
+`AUGMENTAGENT_SLACK_APPROVAL_CHANNEL=control`. Every card has the draft,
+**Approve & Send**, **Revise** (a form), **Skip**, **Quick refine…**, and
+**Provide missing info** when the draft needs a detail from you. They make
+the same decisions as the Discord card, through the same code.
+
+- The card changes in place: once decided it says what happened (sent,
+  skipped, superseded and why) instead of offering buttons. A decision on
+  Discord updates the Slack card and a decision on Slack updates the Discord
+  card; a second click anywhere is told "Already sent." (or the reason).
+- Every card prints a short reference, e.g. `3f2a9c1b`, and the text
+  commands that work without buttons: `approve 3f2a9c1b`, `skip 3f2a9c1b`,
+  `revise 3f2a9c1b <what to change>`, `refine 3f2a9c1b shorter`,
+  `recompose 3f2a9c1b`. `approvals` lists what is pending. Other messages
+  (including "send the report…") still go to the agent.
+- If a click reaches the daemon late (the Mac was asleep), the Revise form
+  cannot open any more; you get a message with the text command instead.
+- Routing: `AUGMENTAGENT_APPROVAL_SURFACES=slack` (Slack only, no Discord
+  token needed), `discord`, or `discord,slack`; unset sends cards to every
+  configured surface. The approvals need `COMPOSIO_API_KEY` for Gmail and
+  calendar cards, and a connected Composio Slack workspace to send Slack
+  contact replies. Scheduling a send (#1291) is still Discord-only.
+
+For local QA only, a **debug build** sends Composio Slack calls to a
+loopback fake when `AUGMENTAGENT_TEST_COMPOSIO_BASE=http://127.0.0.1:<port>`
+is set (release builds and non-loopback values ignore it).
 
 ## Where credentials live
 

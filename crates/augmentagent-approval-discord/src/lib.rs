@@ -26,6 +26,9 @@ pub mod register;
 mod status_bus;
 mod surface;
 mod presets;
+// #1289 — outcome copy and cross-surface card sync shared with Slack.
+pub mod outcome;
+pub mod sync;
 // #501 — deterministic send-time parsing. Public module: the event handler's
 // select/modal arms resolve here, and `augmentagent-channel-core` re-exports
 // it for the query-mode `--send-at` flag (#502) — channel-core depends on
@@ -59,6 +62,10 @@ pub use nudge::NudgeScheduler;
 pub use status_bus::{StatusBus, StatusChanged};
 pub use surface::{ApprovalSurface, ComposedSurface};
 pub use presets::{Preset, MAX_REDRAFT_ITERATIONS, PRESETS};
+// #1289 — what the Slack approval surface reuses unchanged from the Discord
+// card: the needs-input feedback shape and the Revise-result header.
+pub use layout::{fill_feedback, revise_result_prefix};
+pub use sync::{ApprovalCardSurface, CardSurfaces, MultiSurfaceBroker, SyncingActionHandler};
 
 use async_trait::async_trait;
 use augmentagent_store::Email;

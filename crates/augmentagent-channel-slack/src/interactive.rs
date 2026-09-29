@@ -57,6 +57,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::approvals::SlackApprovals;
 use crate::delivery::ProgressMessage;
 use crate::delivery::{
     enqueue_answer, Answer, AnswerFile, DispatchOutcome, PlanOptions, ProgressConfig,
@@ -191,6 +192,9 @@ pub struct SlackSurfaceConfig {
     /// #1293/#1288 — where owner files are stored for a turn. `None` uses
     /// `<state dir>/slack-inbound`.
     pub inbound: Option<InboundOptions>,
+    /// #1289 — how often live approval cards are reconciled against the
+    /// store (and once at start), when approvals are wired.
+    pub approval_sweep: Duration,
     /// #1294/#1288 — the throttled status line during a turn. `None` posts
     /// none. Never posted in dry-run.
     pub progress: Option<ProgressConfig>,
@@ -212,6 +216,7 @@ impl Default for SlackSurfaceConfig {
             socket: SocketModeConfig::default(),
             inbound: None,
             progress: None,
+            approval_sweep: Duration::from_secs(60),
         }
     }
 }
@@ -579,7 +584,19 @@ fn envelope_conversation(e: &EventEnvelope) -> (String, Option<String>) {
             x.thread_ts.as_deref().filter(|t| *t != x.ts),
         ),
         SlackEvent::MessageDeleted(d) => (Some(d.channel.as_str()), None),
-        SlackEvent::Interaction(i) => (i.channel_id.as_deref(), None),
+        // #1289 — each interaction is its own lane: a card click never waits
+        // behind an agent turn in the same DM (its modal trigger lives three
+        // seconds), and two clicks race only in the store's compare-and-swap.
+        SlackEvent::Interaction(i) => {
+            return (
+                i.channel_id
+                    .as_deref()
+                    .filter(|c| !c.is_empty())
+                    .unwrap_or(NO_CONVERSATION)
+                    .to_string(),
+                Some(format!("interaction:{}", e.stable_id())),
+            )
+        }
         SlackEvent::SlashCommand(c) => (c.channel_id.as_deref(), None),
         SlackEvent::File(f) => (f.channel_id.as_deref(), None),
         SlackEvent::AppHome(h) => (h.channel.as_deref(), None),
@@ -799,6 +816,8 @@ struct Ctx {
     /// #1288 — the running turn of each conversation, by storage key, so a
     /// `cancel` there can stop it.
     running: Mutex<HashMap<String, CancellationToken>>,
+    /// #1289 — approval clicks, modals and commands.
+    approvals: Option<Arc<SlackApprovals>>,
 }
 
 impl Ctx {
@@ -859,6 +878,9 @@ pub struct SlackInteractiveSurface {
     handler: Arc<dyn SlackTurnHandler>,
     config: SlackSurfaceConfig,
     clock: Clock,
+    /// #1289 — the approval surface card clicks, modal submissions and
+    /// approval text commands go to.
+    approvals: Option<Arc<SlackApprovals>>,
 }
 
 impl SlackInteractiveSurface {
@@ -877,11 +899,18 @@ impl SlackInteractiveSurface {
             handler,
             config,
             clock: Arc::new(system_now_ms),
+            approvals: None,
         }
     }
 
     pub fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// #1289 — route approval clicks, modals and commands to `approvals`.
+    pub fn with_approvals(mut self, approvals: Arc<SlackApprovals>) -> Self {
+        self.approvals = Some(approvals);
         self
     }
 
@@ -921,6 +950,7 @@ impl SlackInteractiveSurface {
             send_wake: Notify::new(),
             inbound,
             running: Mutex::new(HashMap::new()),
+            approvals: self.approvals,
         });
 
         // This process owns the database: claims and in-flight sends left
@@ -978,6 +1008,13 @@ impl SlackInteractiveSurface {
             let sd = shutdown.clone();
             tasks.push(tokio::spawn(async move { health_loop(ctx, sd).await }));
         }
+        if let Some(approvals) = ctx.approvals.clone() {
+            let every = ctx.config.approval_sweep;
+            let sd = shutdown.clone();
+            tasks.push(tokio::spawn(async move {
+                approval_sweep_loop(approvals, every, sd).await
+            }));
+        }
 
         shutdown.cancelled().await;
         for task in tasks {
@@ -989,6 +1026,26 @@ impl SlackInteractiveSurface {
         health.persist(&ctx.store);
         info!("slack interactive: stopped");
         Ok(())
+    }
+}
+
+/// #1289 — redraw approval cards whose action moved on while nothing was
+/// watching: at start (a restart), then periodically.
+async fn approval_sweep_loop(
+    approvals: Arc<SlackApprovals>,
+    every: Duration,
+    shutdown: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            _ = approvals.reconcile() => {}
+        }
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(every) => {}
+        }
     }
 }
 
@@ -1222,6 +1279,34 @@ async fn run_turn(
     let text = turn_text(&envelope.event);
     let session = answer_conversation(&account, &input, &envelope);
     let files = message_files(&envelope.event).to_vec();
+    // #1289 — approval clicks, modal submissions and text commands are
+    // decisions, never agent turns.
+    if let Some(approvals) = ctx.approvals.clone() {
+        if let SlackEvent::Interaction(i) = &envelope.event {
+            if approvals.handle_interaction(i).await {
+                settle(ctx, claimed.seq);
+                return;
+            }
+        } else if files.is_empty() && !is_cancel_command(&text) {
+            if let Some(reply) = approvals.handle_command(&text).await {
+                match &session {
+                    Some(conversation) => {
+                        let turn = answer_turn_id(&claimed.event_id);
+                        if let Err(e) = enqueue(ctx, conversation, &turn, &reply) {
+                            release(ctx, claimed.seq, &format!("enqueue approval answer: {e}"));
+                            return;
+                        }
+                    }
+                    None => warn!(
+                        seq = claimed.seq,
+                        "slack interactive: approval answer has nowhere to go"
+                    ),
+                }
+                settle(ctx, claimed.seq);
+                return;
+            }
+        }
+    }
     if input.source != OwnerInputSource::Interaction && files.is_empty() && is_cancel_command(&text)
     {
         cancel_running(ctx, &claimed, session.as_ref());

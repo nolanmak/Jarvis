@@ -42,20 +42,54 @@ pub struct SlackClient {
     base_url: String,
 }
 
+/// **Tests and local QA only.** In a debug build, a loopback Composio base
+/// URL (`http://127.0.0.1:<port>`) that every [`SlackClient::new`] uses
+/// instead of the real Composio backend, so the Slack contact-reply send
+/// can be shown end to end against a local fake. Ignored in release builds
+/// and for any non-loopback value.
+pub const TEST_COMPOSIO_BASE_ENV: &str = "AUGMENTAGENT_TEST_COMPOSIO_BASE";
+
+/// The [`TEST_COMPOSIO_BASE_ENV`] override, when it may apply.
+pub fn test_composio_base(value: Option<&str>) -> Option<String> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let v = value.map(str::trim).filter(|v| !v.is_empty())?;
+    let url = reqwest::Url::parse(v).ok()?;
+    let loopback = match url.host_str()? {
+        "localhost" => true,
+        h => h
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback()),
+    };
+    (url.scheme() == "http" && loopback).then(|| v.trim_end_matches('/').to_string())
+}
+
 impl SlackClient {
     pub fn new(auth: SlackAuth) -> Result<Self, SlackError> {
         let http = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
+        let base_url = match test_composio_base(
+            std::env::var(TEST_COMPOSIO_BASE_ENV).ok().as_deref(),
+        ) {
+            Some(base) => {
+                tracing::warn!("{TEST_COMPOSIO_BASE_ENV} is set: Composio Slack calls go to a local test server (debug build only)");
+                base
+            }
+            None => DEFAULT_BASE_URL.into(),
+        };
         Ok(Self {
             auth,
             http,
-            base_url: DEFAULT_BASE_URL.into(),
+            base_url,
         })
     }
 
-    /// Testing-only constructor — override the Composio base URL for mockito.
-    #[cfg(test)]
+    /// Point the client at another Composio base URL (tests: a mock
+    /// server).
     pub fn with_base_url(auth: SlackAuth, base_url: impl Into<String>) -> Self {
         Self {
             auth,
@@ -329,6 +363,27 @@ fn find_by_keys<'a>(value: &'a Value, fields: &[&str]) -> Option<&'a Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_test_composio_base_is_debug_only_and_loopback_only() {
+        use super::test_composio_base as base;
+        if !cfg!(debug_assertions) {
+            assert_eq!(base(Some("http://127.0.0.1:9")), None);
+            return;
+        }
+        assert_eq!(
+            base(Some("http://127.0.0.1:9/")).as_deref(),
+            Some("http://127.0.0.1:9")
+        );
+        assert_eq!(
+            base(Some("http://localhost:9")).as_deref(),
+            Some("http://localhost:9")
+        );
+        assert_eq!(base(Some("http://example.com")), None);
+        assert_eq!(base(Some("https://127.0.0.1:9")), None);
+        assert_eq!(base(Some("")), None);
+        assert_eq!(base(None), None);
+    }
+
     use super::*;
 
     fn test_auth() -> SlackAuth {

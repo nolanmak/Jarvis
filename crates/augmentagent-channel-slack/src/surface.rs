@@ -326,9 +326,12 @@ pub const SLACK_SHARED_CAPABILITIES: [CapabilityRow<SurfaceCapability>; 11] = [
     row(SurfaceCapability::Query, SupportStatus::Unsupported, 1287, NOT_WIRED),
     row(
         SurfaceCapability::Approve,
-        SupportStatus::Unsupported,
+        SupportStatus::Supported,
         1289,
-        "Slack contact-reply approvals are posted through the Discord ApprovalBroker (channel.rs)",
+        "approval cards post to the owner DM or control channel and every decision (approve, \
+         skip, revise, presets, missing info, recompose) runs the shared ApprovalActionHandler \
+         with cross-surface redraw (approvals/, tests/approval_surface.rs); scheduling \
+         controls are #1291",
     ),
     row(
         SurfaceCapability::Send,
@@ -361,15 +364,17 @@ pub const SLACK_SHARED_CAPABILITIES: [CapabilityRow<SurfaceCapability>; 11] = [
 pub const SLACK_INTERACTIONS: [CapabilityRow<SlackInteraction>; 9] = [
     row(
         SlackInteraction::Buttons,
-        SupportStatus::Unsupported,
+        SupportStatus::Supported,
         1289,
-        NOT_WIRED,
+        "approval card buttons and the quick-refine select (block_actions), owner-gated and \
+         resolved exactly once (approvals/, tests/approval_surface.rs)",
     ),
     row(
         SlackInteraction::Modals,
-        SupportStatus::Unsupported,
+        SupportStatus::Supported,
         1289,
-        NOT_WIRED,
+        "revise and missing-info modals (views.open + view_submission), with a fresh-message \
+         fallback when the trigger expired (approvals/, tests/approval_surface.rs)",
     ),
     row(
         SlackInteraction::Threads,

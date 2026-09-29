@@ -854,3 +854,279 @@ async fn serve_runs_owner_turns_through_the_harness_with_sessions_cancel_and_fil
     );
     assert_no_tokens(&out);
 }
+
+// ---------------------------------------------------------------------------
+// #1289 — approvals on Slack, through the built `serve`
+// ---------------------------------------------------------------------------
+
+/// Every call to one Slack Web API method, recorded, answered `ok`.
+async fn record_method(
+    server: &mut mockito::ServerGuard,
+    method: &str,
+) -> std::sync::Arc<std::sync::Mutex<Vec<Value>>> {
+    use std::sync::{Arc, Mutex};
+    let calls: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let recorded = Arc::clone(&calls);
+    server
+        .mock("POST", format!("/{method}").as_str())
+        .with_body_from_request(move |req| {
+            let body: Value = serde_json::from_slice(req.body().unwrap()).unwrap_or(Value::Null);
+            let mut all = recorded.lock().unwrap();
+            all.push(body.clone());
+            let ts = body["ts"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("1800000200.{:06}", all.len()));
+            json!({"ok": true, "channel": body["channel"], "ts": ts, "message_ts": ts})
+                .to_string()
+                .into()
+        })
+        .create_async()
+        .await;
+    calls
+}
+
+fn interactive_click(
+    envelope_id: &str,
+    user: &str,
+    channel: &str,
+    ts: &str,
+    action: &str,
+    block_id: &str,
+) -> Value {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    json!({
+        "type": "interactive", "envelope_id": envelope_id, "accepts_response_payload": false,
+        "payload": {
+            "type": "block_actions", "trigger_id": format!("trigger-{envelope_id}"),
+            "team": {"id": TEAM}, "user": {"id": user, "team_id": TEAM},
+            "channel": {"id": channel}, "message": {"ts": ts},
+            "container": {"type": "message", "message_ts": ts, "channel_id": channel},
+            "actions": [{"action_id": action, "block_id": block_id, "type": "button",
+                "value": block_id, "action_ts": format!("{}.{:06}", now / 1000, (now % 1000) * 1000)}]
+        }
+    })
+}
+
+// Slack-only (no Discord token): a pending Slack contact reply is carded in
+// the owner's DM by the daemon's own queue, an Approve click sends it once
+// through the real ReplyApprover (Composio mocked through the debug-only
+// base URL) and the card is edited in place, and a second click is told it
+// was already sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slack_only_serve_posts_an_approval_card_and_an_approve_click_sends_once() {
+    let mut socket = fake_socket().await;
+    let mut server = mockito::Server::new_async().await;
+    mock_slack(&mut server, socket.port).await;
+    let posts = record_method(&mut server, "chat.postMessage").await;
+    let updates = record_method(&mut server, "chat.update").await;
+    let ephemerals = record_method(&mut server, "chat.postEphemeral").await;
+
+    let mut composio = mockito::Server::new_async().await;
+    composio
+        .mock("POST", "/api/v3/tools/execute/SLACK_FETCH_TEAM_INFO")
+        .with_body(json!({"successful": true, "data": {"team": {"id": "T00000009", "name": "Contacts Example"}}}).to_string())
+        .create_async()
+        .await;
+    composio
+        .mock(
+            "POST",
+            Matcher::Regex("^/api/v3/tools/execute/SLACK_(RETRIEVE|AUTH|USERS).*".into()),
+        )
+        .with_body(json!({"successful": true, "data": {"user_id": "U00000009"}}).to_string())
+        .create_async()
+        .await;
+    let contact_send = composio
+        .mock("POST", "/api/v3/tools/execute/SLACK_SEND_MESSAGE")
+        .match_body(Matcher::PartialJson(
+            json!({"arguments": {"channel": "C00000009", "text": "Sure — Tuesday works."}}),
+        ))
+        .with_body(
+            json!({"successful": true, "data": {"ok": true, "ts": "1800000300.000001"}})
+                .to_string(),
+        )
+        .expect(1)
+        .create_async()
+        .await;
+
+    let env = Env::new(server.url());
+    env.install_and_bind();
+    let out = env
+        .cmd(&[
+            "slack",
+            "persist-auth",
+            "--entity-id",
+            "entity-test",
+            "--connection-id",
+            "conn-test",
+            "--composio-api-key",
+            "composio-test-000",
+        ])
+        .env("AUGMENTAGENT_TEST_COMPOSIO_BASE", composio.url())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A drafted contact reply waiting for approval, as the Slack channel
+    // stores it (the drafting itself needs a reasoner).
+    let action_id = {
+        let store = augmentagent_store::Store::open(env.db()).unwrap();
+        let email = augmentagent_store::Email {
+            message_id: "slack:C00000009:1800000000.000100".into(),
+            thread_id: Some("C00000009".into()),
+            from: "Contact Example <slack:U00000009>".into(),
+            to: String::new(),
+            cc: String::new(),
+            attachments: Vec::new(),
+            subject: "Lunch next week?".into(),
+            body: "Are you free for lunch next week?".into(),
+            date: String::new(),
+            account_entity_id: Some("slack:team:T00000009".into()),
+            platform: "slack".into(),
+            kind: "dm".into(),
+        };
+        store.upsert_email(&email).unwrap();
+        store
+            .log_action(
+                &email.message_id,
+                email.thread_id.as_deref(),
+                &email.from,
+                &email.subject,
+                Some(&email.body),
+                Some("Sure — Tuesday works."),
+                augmentagent_store::ActionStatus::Pending,
+            )
+            .unwrap()
+    };
+
+    let composio_url = composio.url();
+    let mut serve = env.serve_with(
+        &["--dry-run", "false"],
+        &[
+            ("COMPOSIO_API_KEY", "composio-test-000"),
+            ("AUGMENTAGENT_TEST_COMPOSIO_BASE", composio_url.as_str()),
+        ],
+    );
+    let card_posted = || {
+        posts.lock().unwrap().iter().any(|p| {
+            p["channel"] == json!(OWNER_DM) && p["blocks"].to_string().contains("aa_approve")
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !card_posted() {
+        if Instant::now() > deadline {
+            panic!("no approval card was posted:\n{}", logs(serve));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let card = posts
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|p| p["blocks"].to_string().contains("aa_approve"))
+        .cloned()
+        .unwrap();
+    assert!(card["blocks"]
+        .to_string()
+        .contains(&format!("approve {}", &action_id[..8])));
+    let block_id = card["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == "actions")
+        .unwrap()["block_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let card_ts = {
+        let conn = rusqlite::Connection::open(env.db()).unwrap();
+        conn.query_row(
+            "SELECT message_id FROM surface_approval_cards WHERE action_id = ?1",
+            [&action_id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+    eventually("connected", Duration::from_secs(30), || {
+        env.slack_status()["state"] == json!("connected")
+    })
+    .await;
+
+    socket
+        .send
+        .send(interactive_click(
+            "env-a1",
+            OWNER,
+            OWNER_DM,
+            &card_ts,
+            "aa_approve",
+            &block_id,
+        ))
+        .unwrap();
+    assert_eq!(socket.ack().await, "env-a1");
+    eventually("approve answered", Duration::from_secs(15), || {
+        ephemerals
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e["text"] == json!("Approved — sending."))
+    })
+    .await;
+    assert!(contact_send.matched(), "the contact reply was sent");
+    assert!(
+        updates
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|u| u["ts"] == json!(card_ts) && u["blocks"].to_string().contains("Sent.")),
+        "the card was edited in place"
+    );
+
+    socket
+        .send
+        .send(interactive_click(
+            "env-a2",
+            OWNER,
+            OWNER_DM,
+            &card_ts,
+            "aa_approve",
+            &block_id,
+        ))
+        .unwrap();
+    assert_eq!(socket.ack().await, "env-a2");
+    eventually("second click answered", Duration::from_secs(15), || {
+        ephemerals
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e["text"] == json!("Already sent."))
+    })
+    .await;
+
+    interrupt(&serve);
+    let exit = wait_exit(&mut serve, Duration::from_secs(20));
+    let out = logs(serve);
+    assert!(
+        exit.is_some_and(|s| s.success()),
+        "serve did not stop cleanly:\n{out}"
+    );
+    assert!(out.contains("approval cards go to these surfaces"), "{out}");
+    assert_no_tokens(&out);
+    contact_send.assert_async().await;
+    let status: String = rusqlite::Connection::open(env.db())
+        .unwrap()
+        .query_row(
+            "SELECT status FROM actions WHERE id = ?1",
+            [&action_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "sent");
+}

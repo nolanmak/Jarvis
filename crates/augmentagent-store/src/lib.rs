@@ -4,6 +4,8 @@
 //! Opens the database in WAL journal mode so the Express dashboard can read
 //! concurrently.
 
+// #1289 — durable approval-card pointers per surface.
+pub mod approval_cards;
 pub mod delivery;
 pub mod imessage;
 pub mod models;
@@ -26,11 +28,10 @@ pub use surface::{
 
 pub use models::{
     Account, ActionRecord, ActionStatus, AgentPrRun, AgentRepo, ChannelSubscription,
-    ConnectionRequestRow, DriveAccount, Email, FriendWatch, LearnedPattern,
-    LinkedInConnectionSync, OwnPost, PhoneIdentity, RateAuditRow,
-    RateEvent, RateHalt, RateWarmup, ScheduledPost, ScheduledPostStatus, SlackWorkspace,
-    SocialapiAccount, SocialapiWebhookEvent, SubscriptionMode, TelegramBot, ToneExample,
-    ToneProfile, TriageResult, UserLoop, WhatsappDevice,
+    ConnectionRequestRow, DriveAccount, Email, FriendWatch, LearnedPattern, LinkedInConnectionSync,
+    OwnPost, PhoneIdentity, RateAuditRow, RateEvent, RateHalt, RateWarmup, ScheduledPost,
+    ScheduledPostStatus, SlackWorkspace, SocialapiAccount, SocialapiWebhookEvent, SubscriptionMode,
+    TelegramBot, ToneExample, ToneProfile, TriageResult, UserLoop, WhatsappDevice,
 };
 pub use store::{
     ActionCodeModeFields, ActionWithEmail, DiscordConversation, JournalSyncCursor,

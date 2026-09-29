@@ -35,6 +35,10 @@ use crate::layout::{
     split_needs_input, SCHEDULE_CUSTOM_VALUE,
 };
 use crate::ApprovalActionOutcome;
+// #1289 — outcome copy shared with the Slack approval surface.
+use crate::outcome::{describe, offers_recompose, redraft_produced_no_card};
+#[cfg(test)]
+use crate::outcome::resolved_message;
 use crate::voice_bridge::VoiceBinding;
 
 const DISCORD_MSG_LIMIT: usize = 1900;
@@ -1605,23 +1609,6 @@ async fn ack_ephemeral(
     }
 }
 
-/// #1190 — did a redraft entry point (Revise/FillAsk modal submit, or the
-/// QuickRefine select) fail to repost a new approval card, leaving the owner
-/// with no durable signal? True for `Failed`/`NotFound`: `revise` returned no
-/// draft, `repost` is `None`, the old card stays, and the ONLY trace is an
-/// ephemeral followup a coincidental 🚩 triage notice can visually displace —
-/// so those two warrant a durable in-channel notice. False for `Revised` (a
-/// fresh card is reposted) and `AlreadyResolved` (the stale card is deleted and
-/// the ephemeral explains why), and false for every other outcome, none of
-/// which a redraft path can produce. Pure so the decision is exhaustively
-/// unit-testable — a new `ApprovalActionOutcome` variant forces a choice here.
-fn redraft_produced_no_card(outcome: &ApprovalActionOutcome) -> bool {
-    matches!(
-        outcome,
-        ApprovalActionOutcome::Failed { .. } | ApprovalActionOutcome::NotFound
-    )
-}
-
 /// #1190 — build the durable no-card notice for a redraft outcome, if one is
 /// warranted. Returns `Some` for exactly the outcomes [`redraft_produced_no_card`]
 /// flags (`Failed`/`NotFound`), and — critically — does so REGARDLESS of whether
@@ -1638,103 +1625,6 @@ fn redraft_no_card_notice(
 ) -> Option<CreateMessage> {
     redraft_produced_no_card(outcome)
         .then(|| revise_failure_notice(snapshot_email, &describe(outcome)))
-}
-
-fn describe(outcome: &ApprovalActionOutcome) -> String {
-    match outcome {
-        ApprovalActionOutcome::NotFound => {
-            "No record of that approval — it may have been cleared.".into()
-        }
-        ApprovalActionOutcome::AlreadyResolved { status, detail } => {
-            resolved_message(status, detail.as_deref())
-        }
-        ApprovalActionOutcome::Approved => "Approved — sending.".into(),
-        ApprovalActionOutcome::Skipped => "Skipped — draft discarded.".into(),
-        ApprovalActionOutcome::Revised { .. } => "Revising — new draft posted below.".into(),
-        ApprovalActionOutcome::Scheduled { local, .. } => {
-            format!("Scheduled — sends {local}.")
-        }
-        ApprovalActionOutcome::Unscheduled => {
-            "Back in the queue — approval card reposted.".into()
-        }
-        ApprovalActionOutcome::CancelledSchedule => {
-            "Schedule cancelled — draft discarded.".into()
-        }
-        ApprovalActionOutcome::Recomposed => {
-            "Recomposed — a fresh approval card is posted below. It won't be \
-             auto-retired again."
-                .into()
-        }
-        ApprovalActionOutcome::Failed { message } => format!("Failed: {message}"),
-    }
-}
-
-/// #1203 — should the #1199 recovery ephemeral carry a one-click **Recompose**
-/// button for this terminal outcome? Pure so it is exhaustively testable; the
-/// serenity button construction stays a thin wrapper over it.
-///
-/// True only for a `superseded` row whose reason is NOT the empty-draft case
-/// (#484: there is literally nothing to recompose — the button would post an
-/// empty card). Every other supersede reason (already replied, bulk sender,
-/// newer version, `stale`, unknown) is a legitimate owner override: they may
-/// still want the drafted reply, so offer the button. The CLI handler defends
-/// the empty-draft edge again (a `stale`-reasoned row could in theory carry an
-/// empty draft), returning `Failed` rather than carding a blank.
-///
-/// False for every non-superseded terminal status and for a `None` detail
-/// (reason unknown → don't guess a draft exists; the owner can act on the
-/// newest card, per the #1199 pointer).
-fn offers_recompose(status: &str, detail: Option<&str>) -> bool {
-    status == "superseded"
-        && detail.is_some_and(|reason| !reason.contains("empty draft body"))
-}
-
-/// #1199 — render a terminal `AlreadyResolved { status, detail }` as
-/// owner-actionable copy. `detail` is the raw `actions.errorMessage` the store
-/// persisted (the specific supersede reason for a `superseded` row; unused for
-/// the other terminal statuses).
-///
-/// Before #1199 every terminal state collapsed to `Already resolved
-/// (superseded).`, which never said *why* the card was gone and offered no
-/// recovery path. Now the reason is surfaced and each class points at the
-/// owner's real next step:
-///   - already replied (reconcile Rule 1 / replied-after-scheduling) → the
-///     thread is handled, nothing to send;
-///   - bulk/automated sender (Rule 2) → no reply was needed;
-///   - empty draft body (Rule 3 / #484) → recompose;
-///   - newer manual reply / follow-up compose / `stale` / unknown reason →
-///     act on the newest card for this thread.
-///
-/// `detail == None` (row gone, or no stored message) falls through to the
-/// "newest card" pointer, which is the safe default for a `superseded` row and
-/// never panics.
-fn resolved_message(status: &str, detail: Option<&str>) -> String {
-    match status {
-        "superseded" => {
-            let reason = detail.unwrap_or_default();
-            if reason.contains("already replied")
-                || reason.contains("replied on this thread after scheduling")
-            {
-                "You already handled this thread, so the draft was retired — nothing left to send."
-                    .into()
-            } else if reason.contains("bulk/automated") {
-                "Retired — bulk/automated sender, no reply needed.".into()
-            } else if reason.contains("empty draft body") {
-                "The draft was empty, so it was cleared — recompose if you meant to reply.".into()
-            } else {
-                // "superseded by manual reply", "superseded by follow-up
-                // compose", "superseded: stale", or any unrecognized reason.
-                "A newer version replaced this draft. Act on the newest card for this thread."
-                    .into()
-            }
-        }
-        "sent" => "Already sent.".into(),
-        "scheduled" => "Already scheduled — see the scheduled notice.".into(),
-        "sending" => "Already sending — a send is in flight.".into(),
-        "skipped" | "rejected" => "Already skipped — draft discarded.".into(),
-        "cancelled" => "Schedule already cancelled.".into(),
-        other => format!("Already resolved ({other})."),
-    }
 }
 
 /// Ephemeral followup on a deferred MODAL interaction (#501). Mirror of

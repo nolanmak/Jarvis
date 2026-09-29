@@ -387,9 +387,27 @@ fn an_undeclared_capability_returns_the_typed_unsupported_error() {
         Err(SurfaceRefError::UnsupportedCapability("live_voice"))
     );
     assert_eq!(
-        SlackInteraction::Buttons.require(),
-        Err(SurfaceRefError::UnsupportedCapability("buttons"))
+        SlackInteraction::SlashCommands.require(),
+        Err(SurfaceRefError::UnsupportedCapability("slash_commands"))
     );
+}
+
+// #1289 — approvals run on Slack: cards with buttons, modals for revise and
+// missing info, decisions through the shared handler.
+#[test]
+fn approvals_buttons_and_modals_are_supported_now_that_slack_has_approval_cards() {
+    assert!(slack_capabilities()
+        .require(SurfaceCapability::Approve)
+        .is_ok());
+    assert_eq!(SlackInteraction::Buttons.status(), SupportStatus::Supported);
+    assert_eq!(SlackInteraction::Modals.status(), SupportStatus::Supported);
+    let blockers = parity_blockers();
+    for name in ["approve", "buttons", "modals"] {
+        assert!(
+            !blockers.iter().any(|b| b.name == name),
+            "{name} still a blocker"
+        );
+    }
 }
 
 #[test]

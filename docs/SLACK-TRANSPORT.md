@@ -790,6 +790,92 @@ the shared scenario in `surface_conformance.rs` run against Discord and
 Slack (`augmentagent-cli` `surface_conformance_tests`), and the built
 `serve` in `augmentagent-cli/tests/slack_serve_cli.rs`.
 
+## Approvals (#1289)
+
+Code: `crates/augmentagent-channel-slack/src/approvals/` (cards, clicks,
+modals, text commands), `crates/augmentagent-approval-discord/src/sync.rs`
+(cross-surface redraw, multi-surface posting) and `outcome.rs` (the owner
+copy both surfaces render), `crates/augmentagent-store/src/approval_cards.rs`
+(card pointers), wired in `serve` by `crates/augmentagent-cli/src/slack_serve.rs`
+and `approval_routing.rs`. Operator view: [`SLACK-APP.md`](SLACK-APP.md)
+section 6.
+
+- **Same decisions as Discord.** Card clicks, modal submissions and text
+  commands call the daemon's one `ApprovalActionHandler` (`ReplyApprover`),
+  the object the Discord bot calls: send, skip, revise, quick-refine preset
+  (capped at `MAX_REDRAFT_ITERATIONS`), missing info (`fill_feedback`),
+  recompose. Revise records the #37 triple and the #34 counter; a redraft
+  that changes nothing leaves the #1190 durable notice. Replies use
+  `outcome::describe` / `resolved_message`, so a stale or superseded card
+  explains itself with the #1199 recovery pointer and offers Recompose
+  (#1203) exactly where Discord does.
+- **Card.** Block Kit: subject, sender, their message, the draft, needs-input
+  and assumed-facts sections, then Approve & Send / Revise / Skip, Provide
+  missing info (when asked), the Quick refine select (until the cap), and a
+  context line with the short reference and the text commands
+  (`approve 3f2a9c1b`, `skip …`, `revise … <what to change>`,
+  `refine … shorter`, `recompose …`, `approvals` for the queue). Every
+  control's `block_id` is `aa|<action_id>|<draft digest>`.
+- **In place.** Every card posted is recorded in `surface_approval_cards`
+  (channel, `ts`, action, draft digest, last status). A decision anywhere
+  edits every Slack card of that action with `chat.update`; a newer card for
+  the same action (a reminder, a recompose) turns the older one into a
+  pointer to it, so one card is actionable.
+- **Exactly once.** The handler's store transitions are compare-and-swap
+  (`claim_action_for_send`, `try_resolve_action`, `refresh_pending_draft`,
+  `recompose_action`); Slack contact replies claim before sending since
+  #1289. A second click on any surface gets the already-resolved reply with
+  its reason. Each interaction is recorded in a dispatch lane of its own, so
+  two clicks race only in that compare-and-swap and a click never waits
+  behind an agent turn.
+- **Right draft.** A click on a card whose digest no longer matches the
+  action's draft (it was revised elsewhere, or repointed) is refused and the
+  card redrawn; nothing is decided on a draft the owner did not see.
+- **Cross-surface.** `CardSurfaces` holds the running card surfaces. A Slack
+  decision asks Discord to redraw (`DiscordApprovalBroker` edits the card it
+  finds by button ID in the last 100 channel messages: current draft while
+  pending, buttons removed and the state line once decided); the Discord bot
+  is given `SyncingActionHandler("discord", …)`, so a Discord decision
+  redraws the Slack cards. WhatsApp has no card surface in `serve` yet; it
+  joins by implementing `ApprovalCardSurface` and registering.
+- **Sweep.** At start and every 60 s the surface redraws live cards whose
+  action moved on while nothing watched (reconcile supersede, dashboard,
+  expiry, a crash between decision and redraw).
+- **Acknowledgement deadline.** The Socket Mode ack goes out as soon as the
+  envelope is persisted, before any decision runs (test
+  `simultaneous_clicks_on_slack_and_discord_send_once_and_the_ack_does_not_wait`
+  acks while a send is held). Opening a modal needs the `trigger_id`, which
+  Slack documents as valid for three seconds. If the click is handled
+  later than that by the Slack `action_ts` (the Mac slept between ack and
+  dispatch, or the daemon restarted), no modal is attempted: the owner gets a
+  fresh message with the text command; a decision still runs once and is
+  answered with a fresh message instead of an ephemeral one. A `views.open`
+  error falls back the same way.
+- **Routing.** `AUGMENTAGENT_APPROVAL_SURFACES` = `discord`, `slack`, or
+  both (unset: every configured surface). Slack cards go to the owner DM
+  (`AUGMENTAGENT_SLACK_APPROVAL_CHANNEL=dm`, default) or the bound control
+  channel (`control`). Slack-only needs no Discord credential. Scheduled
+  sends (#1291) and their notices stay on Discord; the Slack card draws no
+  schedule control.
+
+Verified here (offline): everything above against `RecordingSlackWebApi`
+and the built `serve` against a mock Web API. **Unverified until a real
+workspace:** the three-second `trigger_id` window and the exact
+`expired_trigger_id` error, Block Kit rendering and limits as Slack
+enforces them (section 3000 characters, 75-character option text, 100
+options), `chat.update` on a message in the app DM, ephemeral delivery in
+the app DM, and whether Slack delivers a click made while the socket was
+down after it reconnects.
+
+Tests: `tests/approval_surface.rs` (the real dispatch path; a store-backed
+handler with the daemon's compare-and-swap semantics and a fake reasoner;
+Discord as a recording card surface plus `SyncingActionHandler`),
+`augmentagent-store/tests/surface_approval_cards.rs`,
+`augmentagent-approval-discord` `sync::`/`outcome::`, `augmentagent-cli`
+`slack_approval_tests::` (the real `ReplyApprover` against a mock Composio)
+and `slack_serve_cli.rs`
+`slack_only_serve_posts_an_approval_card_and_an_approve_click_sends_once`.
+
 ## Remaining live verification (owner, test workspace)
 
 1. App-level token scope (`connections:write`) and `apps.connections.open`

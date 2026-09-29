@@ -13,6 +13,8 @@ mod model_switch_sequence_tests;
 mod discord_voice_session_tests;
 #[cfg(test)]
 mod surface_conformance_tests;
+#[cfg(test)]
+mod slack_approval_tests;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -92,6 +94,7 @@ mod research;
 mod self_improve;
 mod service;
 mod setup;
+mod approval_routing;
 mod slack_app;
 mod slack_deliver;
 mod slack_files;
@@ -2749,7 +2752,60 @@ async fn main() -> Result<()> {
             // surfaces that are configured (Slack alone, for one): report it
             // and run without the Discord approval broker, as an unset
             // DISCORD_BOT_TOKEN already does.
-            let (broker, approver) = match build_broker(&cli, Arc::clone(&store), dry_run).await {
+            // #1289 — approvals on Slack: plan the interactive Slack surface
+            // once, build its approval surface, and route cards to Discord,
+            // Slack or both (`AUGMENTAGENT_APPROVAL_SURFACES`).
+            let card_surfaces = augmentagent_approval_discord::CardSurfaces::new();
+            let routing = approval_routing::Routing::from_env().unwrap_or_else(|word| {
+                tracing::error!(
+                    "{}=`{word}` is not discord or slack; routing approvals to every configured surface",
+                    approval_routing::SURFACES_ENV
+                );
+                approval_routing::Routing::AUTO
+            });
+            let slack_plan = match slack_serve::plan_from_env(Arc::clone(&store)).await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    warn!("slack interactive plan failed: {e:#}");
+                    None
+                }
+            };
+            let slack_approvals = match (&slack_plan, dry_run || !routing.slack) {
+                (Some(plan), false) => match approval_routing::SlackChannel::from_env() {
+                    Ok(channel) => match slack_serve::build_approvals(
+                        Arc::clone(&store),
+                        plan,
+                        channel,
+                        card_surfaces.clone(),
+                    )
+                    .await
+                    {
+                        Ok(a) => a,
+                        Err(e) => {
+                            tracing::error!("slack approvals disabled: {e:#}");
+                            None
+                        }
+                    },
+                    Err(word) => {
+                        tracing::error!(
+                            "slack approvals disabled: {}=`{word}` is not dm or control",
+                            approval_routing::SLACK_CHANNEL_ENV
+                        );
+                        None
+                    }
+                },
+                _ => None,
+            };
+            let (broker, approver) = match build_approval_surfaces(
+                &cli,
+                Arc::clone(&store),
+                dry_run,
+                routing,
+                slack_approvals.clone(),
+                card_surfaces.clone(),
+            )
+            .await
+            {
                 Ok(pair) => pair,
                 Err(e) => {
                     tracing::error!(
@@ -3206,8 +3262,11 @@ async fn main() -> Result<()> {
             {
                 let store_q = Arc::clone(&store);
                 let wiki_root = cli.wiki_dir.clone();
+                // Only a surface that got the approval handler takes clicks.
+                let slack_approvals = slack_approvals.filter(|_| approver.is_some());
                 tasks.push(slack_serve::spawn(
                     Arc::clone(&store),
+                    slack_plan,
                     move || -> Arc<dyn augmentagent_channel_slack::interactive::SlackTurnHandler> {
                         match wiki_root {
                             // #1288 — the shared conversation harness over
@@ -3227,6 +3286,7 @@ async fn main() -> Result<()> {
                             None => Arc::new(slack_serve::NoQueryHandler),
                         }
                     },
+                    slack_approvals,
                     dry_run,
                     shutdown.clone(),
                 ));
@@ -7463,7 +7523,12 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
             continue;
         }
         // Rule 2 — bulk/marketing sender. Cheap, purely local, so check first.
-        if !is_human_sender(&row.from_email, &row.body) {
+        // #1289 — not for Slack contact replies: their `from` is a name and
+        // a Slack user ID (`Name <slack:U…>`), never an address, so the rule
+        // would retire every one of them. (Other chat platforms share the
+        // shape; they are outside #1289 and keep the old behaviour.)
+        let addressless = row.platform == augmentagent_channel_slack::PLATFORM;
+        if !addressless && !is_human_sender(&row.from_email, &row.body) {
             info!(
                 action_id = %row.id,
                 from = %row.from_email,
@@ -12469,6 +12534,22 @@ impl ReplyApprover {
         // #785 — scrub the card-only assumes marker before it ships.
         let owned = augmentagent_approval_discord::strip_assumes_for_send(body);
         let body = owned.as_str();
+        // #1289 — claim the row (`pending → sending`) before the send. The
+        // card can be clicked on Slack and Discord at once (or twice on
+        // one); the status read above is not a gate. The loser reports the
+        // winner's state and sends nothing.
+        match self
+            .store
+            .claim_action_for_send(action_id, ActionStatus::Pending, "discord")
+        {
+            Ok(true) => {}
+            Ok(false) => return Self::resolved_outcome(&self.store, action_id),
+            Err(e) => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("claim for send failed: {e}"),
+                }
+            }
+        }
         match slack.send_message(channel_id, body).await {
             Ok(ts) => {
                 let _ = self.store.update_action_status(
@@ -12517,13 +12598,19 @@ impl ReplyApprover {
                 };
             }
         };
-        let _ = self.store.update_action_status(
-            action_id,
-            ActionStatus::Pending,
-            Some(&redraft),
-            None,
-        );
+        // #1289 — only while still pending: a decision that landed during
+        // the redraft (on any surface) must not be stomped back to pending.
+        match self.store.refresh_pending_draft(action_id, &redraft) {
+            Ok(true) => {}
+            Ok(false) => return Self::resolved_outcome(&self.store, action_id),
+            Err(e) => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("revise: could not store the new draft: {e}"),
+                }
+            }
+        }
         tracing::info!(action_id, "slack revise: new draft persisted");
+        let _ = self.store.reset_nudge_schedule(action_id);
         ApprovalActionOutcome::Revised {
             email: action.email,
             draft: redraft,
@@ -12535,12 +12622,22 @@ impl ReplyApprover {
         action_id: &str,
         action: augmentagent_store::ActionWithEmail,
     ) -> ApprovalActionOutcome {
-        let _ = self.store.update_action_status(
+        // #1289 — resolve via CAS: a skip racing an approval (or a second
+        // surface) must never overwrite a send in flight or already done.
+        match self.store.try_resolve_action(
             action_id,
             ActionStatus::Rejected,
-            None,
+            "discord",
             Some("skipped by approver"),
-        );
+        ) {
+            Ok(true) => {}
+            Ok(false) => return Self::resolved_outcome(&self.store, action_id),
+            Err(e) => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("skip: resolve failed: {e}"),
+                }
+            }
+        }
         let _ = self
             .store
             .mark_email_processed(&action.email.message_id, TriageResult::Reply);
@@ -13869,16 +13966,171 @@ async fn build_broker(
     store: Arc<Store>,
     dry_run: bool,
 ) -> Result<(Arc<dyn ApprovalBroker>, Option<Arc<ReplyApprover>>)> {
+    // One-shot commands post to Discord only, exactly as before #1289;
+    // `serve` adds the Slack approval surface through
+    // `build_approval_surfaces`.
+    build_approval_surfaces(
+        cli,
+        store,
+        dry_run,
+        approval_routing::Routing {
+            discord: true,
+            slack: false,
+        },
+        None,
+        augmentagent_approval_discord::CardSurfaces::new(),
+    )
+    .await
+}
+
+/// #1289 — the approval surfaces `serve` posts cards to and resolves
+/// decisions from: Discord (when `DISCORD_BOT_TOKEN` is set and routed),
+/// Slack (when `slack` is given and routed), or both. Every surface runs the
+/// same `ReplyApprover`; a decision on one redraws the others' cards
+/// through `surfaces`. Slack-only needs no Discord credential. With only
+/// Discord, the Discord bot gets the approver directly, exactly as before.
+async fn build_approval_surfaces(
+    cli: &Cli,
+    store: Arc<Store>,
+    dry_run: bool,
+    routing: approval_routing::Routing,
+    slack: Option<Arc<augmentagent_channel_slack::approvals::SlackApprovals>>,
+    surfaces: augmentagent_approval_discord::CardSurfaces,
+) -> Result<(Arc<dyn ApprovalBroker>, Option<Arc<ReplyApprover>>)> {
     if dry_run {
         return Ok((Arc::new(NoopBroker), None));
     }
-    let token = match std::env::var("DISCORD_BOT_TOKEN") {
-        Ok(t) => t,
-        Err(_) => {
-            warn!("DISCORD_BOT_TOKEN unset; approval broker disabled (replies will error)");
-            return Ok((Arc::new(NoopBroker), None));
-        }
+    let slack = slack.filter(|_| routing.slack);
+    let token = if routing.discord {
+        std::env::var("DISCORD_BOT_TOKEN").ok()
+    } else {
+        info!(
+            "approval cards are not routed to Discord ({})",
+            approval_routing::SURFACES_ENV
+        );
+        None
     };
+    if token.is_none() && slack.is_none() {
+        if routing.discord {
+            warn!("DISCORD_BOT_TOKEN unset; approval broker disabled (replies will error)");
+        } else {
+            warn!("no routed approval surface is configured; approval broker disabled");
+        }
+        return Ok((Arc::new(NoopBroker), None));
+    }
+
+    let reasoner = build_reasoner();
+    let repo_root = std::env::current_dir().context("current_dir")?;
+
+    // Approval action handler: needs Composio for send/delete/create_draft,
+    // reasoner for revise, and the skill body for the redraft prompt.
+    // #1289 — Slack approvals decide without it (a Gmail or calendar card
+    // then fails with Composio's error, as it would with a bad key); with
+    // Discord alone it stays required, as before.
+    let api_key = match (std::env::var("COMPOSIO_API_KEY"), &slack) {
+        (Ok(key), _) => key,
+        (Err(_), Some(_)) => {
+            warn!("COMPOSIO_API_KEY unset: approvals of Gmail and calendar cards will fail until it is set");
+            String::new()
+        }
+        (Err(_), None) => anyhow::bail!("COMPOSIO_API_KEY env var required"),
+    };
+    let calendar = Arc::new(
+        augmentagent_channel_calendar::ComposioCalendarClient::new(api_key.clone()),
+    );
+    let gmail = Arc::new(ComposioClient::new(api_key));
+    let skill_dir = cli.skill_dir.clone();
+    let draft_skill = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap_or_default();
+    // LinkedIn voyager client is optional. Present iff we can load auth; if
+    // the file is missing or malformed the daemon stays up and just can't
+    // send LinkedIn replies (Gmail-only mode).
+    let linkedin = load_linkedin_client(&repo_root);
+
+    let discord = load_discord_client();
+    let slack_clients = load_slack_clients(&store);
+    let telegram = load_telegram_bot_clients(&store);
+    let github = load_github_client();
+    let socialapi = load_socialapi_client(&store);
+    // Keep handles for the broker before `store` is moved into the approver:
+    // the #37 Revise-triple capture.
+    let store_for_broker = Arc::clone(&store);
+    let approver = Arc::new(ReplyApprover {
+        store,
+        gmail,
+        calendar,
+        linkedin,
+        discord,
+        slack: slack_clients,
+        telegram,
+        github,
+        socialapi,
+        reasoner: Arc::clone(&reasoner),
+        draft_skill,
+        wiki_root: cli.wiki_dir.clone(),
+        nudge: std::sync::OnceLock::new(),
+        broker: std::sync::OnceLock::new(),
+        imessage: imessage_send::ImessageSendConfig::from_env(),
+    });
+
+    let mut brokers: Vec<(&'static str, Arc<dyn ApprovalBroker>)> = Vec::new();
+    if let Some(token) = token {
+        // With Slack beside it, Discord decisions redraw the Slack cards.
+        let handler: Arc<dyn ApprovalActionHandler> = match &slack {
+            Some(_) => Arc::new(augmentagent_approval_discord::SyncingActionHandler::new(
+                "discord",
+                Arc::clone(&approver) as Arc<dyn ApprovalActionHandler>,
+                surfaces.clone(),
+            )),
+            None => Arc::clone(&approver) as Arc<dyn ApprovalActionHandler>,
+        };
+        match start_discord_broker(cli, store_for_broker, token, handler, &reasoner, &repo_root)
+            .await
+        {
+            Ok(discord) => {
+                let discord = Arc::new(discord);
+                let card: Arc<dyn augmentagent_approval_discord::ApprovalCardSurface> =
+                    discord.clone();
+                surfaces.register(&card);
+                brokers.push(("discord", discord as Arc<dyn ApprovalBroker>));
+            }
+            // #1287 / #1289 — a Discord failure must not take the Slack
+            // approvals down with it.
+            Err(e) if slack.is_some() => tracing::error!(
+                "discord approval broker disabled: {e:#}. Approvals continue on Slack; fix the \
+                 Discord settings and restart the daemon."
+            ),
+            Err(e) => return Err(e),
+        }
+    }
+    if let Some(slack) = slack {
+        slack.set_handler(Arc::clone(&approver) as Arc<dyn ApprovalActionHandler>);
+        slack.register();
+        brokers.push(("slack", slack as Arc<dyn ApprovalBroker>));
+    }
+    let names: Vec<&str> = brokers.iter().map(|(n, _)| *n).collect();
+    info!(surfaces = %names.join(","), "approval cards go to these surfaces");
+    let broker: Arc<dyn ApprovalBroker> = if brokers.len() == 1 {
+        brokers.pop().expect("one broker").1
+    } else {
+        Arc::new(augmentagent_approval_discord::MultiSurfaceBroker::new(brokers))
+    };
+    // #501 — hand the approver a Weak broker handle so the schedule verbs
+    // can post/delete the scheduled notice and repost cards. Weak for the
+    // same cycle-break reason as `nudge` (the broker's event handler holds
+    // this approver strongly).
+    approver.broker.set(Arc::downgrade(&broker)).ok();
+    Ok((broker, Some(approver)))
+}
+
+/// Start the Discord bot with `handler` resolving its card clicks.
+async fn start_discord_broker(
+    cli: &Cli,
+    store: Arc<Store>,
+    token: String,
+    handler: Arc<dyn ApprovalActionHandler>,
+    reasoner: &Arc<FallbackReasoner>,
+    repo_root: &Path,
+) -> Result<DiscordApprovalBroker> {
     let channel_id: u64 = std::env::var("DISCORD_CHANNEL_ID")
         .context("DISCORD_CHANNEL_ID env var required")?
         .parse()
@@ -13894,45 +14146,19 @@ async fn build_broker(
         .ok()
         .and_then(|s| s.parse().ok());
 
-    let reasoner = build_reasoner();
     let voice_enabled = std::env::var("AUGMENTAGENT_DISCORD_VOICE_ENABLED").as_deref() == Ok("1");
     let voice_socket_path = resolve_discord_voice_socket(voice_enabled,
         std::env::var_os("AUGMENTAGENT_DISCORD_VOICE_SOCKET"), std::env::var_os("XDG_RUNTIME_DIR"))?;
 
-    let repo_root = std::env::current_dir().context("current_dir")?;
     let query_handler: Option<Arc<dyn QueryHandler>> = cli.wiki_dir.as_ref().map(|root| {
         Arc::new(wiki_querier(
-            Arc::clone(&reasoner),
+            Arc::clone(reasoner),
             root.clone(),
-            repo_root.clone(),
+            repo_root.to_path_buf(),
             Arc::clone(&store),
             voice_enabled,
         )) as Arc<dyn QueryHandler>
     });
-
-    // Approval action handler: needs Composio for send/delete/create_draft,
-    // reasoner for revise, and the skill body for the redraft prompt.
-    let api_key =
-        std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
-    let calendar = Arc::new(
-        augmentagent_channel_calendar::ComposioCalendarClient::new(api_key.clone()),
-    );
-    let gmail = Arc::new(ComposioClient::new(api_key));
-    let skill_dir = cli.skill_dir.clone();
-    let draft_skill = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap_or_default();
-    // LinkedIn voyager client is optional. Present iff we can load auth; if
-    // the file is missing or malformed the daemon stays up and just can't
-    // send LinkedIn replies (Gmail-only mode).
-    let linkedin = load_linkedin_client(&repo_root);
-
-    let discord = load_discord_client();
-    let slack = load_slack_clients(&store);
-    let telegram = load_telegram_bot_clients(&store);
-    let github = load_github_client();
-    let socialapi = load_socialapi_client(&store);
-    // Keep handles for the broker before `store` is moved into the approver:
-    // the #37 Revise-triple capture.
-    let store_for_broker = Arc::clone(&store);
     // #428 — `!journal` write-back bridge. Present iff SHADOWNOTE_* config
     // exists (keyring/env); without it the command replies with the
     // not-configured notice and the daemon is otherwise unaffected.
@@ -13945,7 +14171,7 @@ async fn build_broker(
                     .and_then(|_| std::fs::read_to_string("schema/wiki-skill.md").ok());
                 Some(Arc::new(CliJournalOps {
                     runtime,
-                    reasoner: Arc::clone(&reasoner),
+                    reasoner: Arc::clone(reasoner),
                     wiki_root: cli.wiki_dir.clone(),
                     wiki_schema,
                 }))
@@ -13959,52 +14185,26 @@ async fn build_broker(
                 None
             }
         };
-    let approver = Arc::new(ReplyApprover {
-        store,
-        gmail,
-        calendar,
-        linkedin,
-        discord,
-        slack,
-        telegram,
-        github,
-        socialapi,
-        reasoner: Arc::clone(&reasoner),
-        draft_skill,
-        wiki_root: cli.wiki_dir.clone(),
-        nudge: std::sync::OnceLock::new(),
-        broker: std::sync::OnceLock::new(),
-        imessage: imessage_send::ImessageSendConfig::from_env(),
-    });
-
-    let approver_for_broker = Arc::clone(&approver);
     let loop_parser: Option<Arc<dyn augmentagent_approval_discord::LoopCommandParser>> = Some(
         Arc::new(LoopReasonerParser {
-            reasoner: Arc::clone(&reasoner),
+            reasoner: Arc::clone(reasoner),
         }),
     );
-    let broker = DiscordApprovalBroker::start(DiscordConfig {
+    DiscordApprovalBroker::start(DiscordConfig {
         bot_token: token,
         channel_id,
         query_channel_id,
         allowed_user_id,
         query_handler,
-        action_handler: Some(approver_for_broker),
-        store: Some(store_for_broker),
+        action_handler: Some(handler),
+        store: Some(store),
         loop_parser,
         wiki_root: cli.wiki_dir.clone(),
         journal_ops,
         voice_socket_path,
     })
     .await
-    .context("start discord broker")?;
-    let broker: Arc<dyn ApprovalBroker> = Arc::new(broker);
-    // #501 — hand the approver a Weak broker handle so the schedule verbs
-    // can post/delete the scheduled notice and repost cards. Weak for the
-    // same cycle-break reason as `nudge` (the broker's event handler holds
-    // this approver strongly).
-    approver.broker.set(Arc::downgrade(&broker)).ok();
-    Ok((broker, Some(approver)))
+    .context("start discord broker")
 }
 
 fn build_channel(
