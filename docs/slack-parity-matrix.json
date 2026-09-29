@@ -1,0 +1,575 @@
+{
+  "schema": 1,
+  "epic": 1281,
+  "gate_issue": 1300,
+  "acceptance_procedure": "docs/SLACK-RUNBOOK.md section 11 (owner acceptance script)",
+  "hosts": [
+    {
+      "id": "linux",
+      "label": "Linux (systemd)",
+      "blockers": [
+        {
+          "issue": 1325,
+          "reason": "Credentials are not persisted on Linux: the credential store has no Linux backend, so tokens stored by `slack app install` are lost when the command exits."
+        }
+      ]
+    },
+    {
+      "id": "macos-arm64",
+      "label": "macOS, Apple Silicon",
+      "blockers": [
+        {
+          "issue": 1252,
+          "reason": "The CLI provider supervisor (scripts/provider-supervisor.py) relies on Linux prctl and exits 125 on macOS, so no claude or codex turn, digest, audit or review notice can run on a Mac until descendant cleanup is ported."
+        }
+      ]
+    },
+    {
+      "id": "macos-x86_64",
+      "label": "macOS, Intel (qualified separately)",
+      "blockers": [
+        {
+          "issue": 1252,
+          "reason": "The CLI provider supervisor (scripts/provider-supervisor.py) relies on Linux prctl and exits 125 on macOS, so no claude or codex turn, digest, audit or review notice can run on a Mac until descendant cleanup is ported."
+        }
+      ]
+    }
+  ],
+  "rows": [
+    {
+      "id": "surface-contracts",
+      "capability": "Transport-neutral identity, capabilities and feature matrix",
+      "issues": [1282],
+      "capabilities": [],
+      "status": "supported",
+      "tests": [
+        {"package": "augmentagent-channel-slack", "target": "test:surface_contract", "name": "slack_account_is_the_team_plus_enterprise_where_present"},
+        {"package": "augmentagent-channel-slack", "target": "test:surface_contract", "name": "look_alike_ids_on_slack_whatsapp_and_discord_stay_isolated"},
+        {"package": "augmentagent-channel-slack", "target": "test:surface_contract", "name": "every_capability_is_declared_and_live_voice_is_unproven"},
+        {"package": "augmentagent-channel-slack", "target": "test:surface_contract", "name": "a_missing_slack_mapping_fails_the_completeness_check"},
+        {"package": "augmentagent-store", "target": "test:surface_refs", "name": "conversation_keys_preserve_opaque_ids_and_separate_platforms_accounts_and_threads"},
+        {"package": "augmentagent-channel-slack", "target": "test:parity_matrix", "name": "the_checked_in_matrix_passes_every_check"}
+      ],
+      "acceptance_steps": [],
+      "host_evidence": {"linux": null, "macos-arm64": null, "macos-x86_64": null}
+    },
+    {
+      "id": "transport",
+      "capability": "Real-time transport, verified limits and scopes",
+      "issues": [1283],
+      "capabilities": [],
+      "status": "unverified-live",
+      "live_reason": "Socket Mode and the Web API are tested against in-memory and mock Slack only; the limits and scopes in docs/SLACK-TRANSPORT.md come from Slack's documentation and have not been checked against a real workspace (the live hello probe in transport_socket is opt-in and ignored in CI).",
+      "tests": [
+        {"package": "augmentagent-channel-slack", "target": "test:transport_socket", "name": "envelope_is_acknowledged_only_after_the_sink_accepts_it"},
+        {"package": "augmentagent-channel-slack", "target": "test:transport_socket", "name": "heartbeat_detects_a_dead_socket_without_tcp_timeout"},
+        {"package": "augmentagent-channel-slack", "target": "test:transport_socket", "name": "forced_close_reconnects_with_bounded_jitter"},
+        {"package": "augmentagent-channel-slack", "target": "test:transport_events", "name": "message_event_is_typed_and_carries_a_stable_event_id"},
+        {"package": "augmentagent-channel-slack", "target": "test:transport_web_api", "name": "rate_limit_429_waits_for_retry_after_then_retries"},
+        {"package": "augmentagent-channel-slack", "target": "test:transport_web_api", "name": "auth_test_reports_identity_and_granted_scopes_from_the_header"},
+        {"package": "augmentagent-channel-slack", "target": "test:app_manifest", "name": "bot_scopes_are_exactly_the_required_set"}
+      ],
+      "acceptance_steps": [3, 5],
+      "host_evidence": {"linux": null, "macos-arm64": null, "macos-x86_64": null}
+    },
+    {
+      "id": "app-install",
+      "capability": "App install, credentials and CLI lifecycle",
+      "issues": [1284, 1299],
+      "capabilities": [],
+      "status": "supported",
+      "tests": [
+        {"package": "augmentagent-channel-slack", "target": "test:app_install", "name": "install_with_valid_tokens_stores_both_and_reports_identity"},
+        {"package": "augmentagent-channel-slack", "target": "test:app_install", "name": "install_rejects_missing_scopes_by_name_and_stores_nothing"},
+        {"package": "augmentagent-channel-slack", "target": "test:app_install", "name": "rotate_to_a_token_from_another_workspace_is_refused_and_keeps_old_credentials"},
+        {"package": "augmentagent-channel-slack", "target": "test:app_install", "name": "remove_deletes_credentials_and_index_and_is_idempotent"},
+        {"package": "augmentagent-cli", "target": "test:slack_app_cli", "name": "install_status_verify_rotate_remove_round_trip"},
+        {"package": "augmentagent-cli", "target": "test:slack_app_cli", "name": "tokens_cannot_be_passed_as_plain_arguments"}
+      ],
+      "acceptance_steps": [3, 20, 23],
+      "host_evidence": {"linux": null, "macos-arm64": null, "macos-x86_64": null}
+    },
+    {
+      "id": "recovery",
+      "capability": "Disconnect/restart/sleep recovery, durable delivery and deduplication",
+      "issues": [1285, 1299],
+      "capabilities": [],
+      "status": "supported",
+      "tests": [
+        {"package": "augmentagent-store", "target": "test:surface_delivery", "name": "same_event_delivered_twice_is_one_record_and_one_turn"},
+        {"package": "augmentagent-store", "target": "test:surface_delivery", "name": "crash_after_persist_before_ack_replays_exactly_once"},
+        {"package": "augmentagent-store", "target": "test:surface_delivery", "name": "crash_after_provider_accepted_send_does_not_send_twice"},
+        {"package": "augmentagent-store", "target": "test:surface_delivery", "name": "multi_hour_gap_catch_up_is_bounded_ordered_and_deduplicated"},
+        {"package": "augmentagent-channel-slack", "target": "test:transport_socket", "name": "wall_clock_jump_after_sleep_forces_an_immediate_reconnect"},
+        {"package": "augmentagent-channel-slack", "target": "test:interactive_surface", "name": "restart_mid_turn_recovers_the_event_exactly_once"},
+        {"package": "augmentagent-channel-slack", "target": "test:delivery_outbox", "name": "restart_between_parts_resumes_without_duplicates"},
+        {"package": "augmentagent-channel-slack", "target": "test:upgrade_state", "name": "upgrading_and_restarting_keeps_pending_work_owner_install_and_health"}
+      ],
+      "acceptance_steps": [15, 16, 17, 21, 24],
+      "host_evidence": {"linux": null, "macos-arm64": null, "macos-x86_64": null}
+    },
+    {
+      "id": "owner-authority",
+      "capability": "Owner authority, DM and control channel, echo rejection",
+      "issues": [1286],
+      "capabilities": [],
+      "status": "supported",
+      "tests": [
+        {"package": "augmentagent-channel-slack", "target": "test:owner_auth", "name": "owner_dm_is_accepted"},
+        {"package": "augmentagent-channel-slack", "target": "test:owner_auth", "name": "owner_in_control_channel_is_accepted"},
+        {"package": "augmentagent-channel-slack", "target": "test:owner_auth", "name": "non_owner_dm_with_the_app_is_rejected"},
+        {"package": "augmentagent-channel-slack", "target": "test:owner_auth", "name": "own_bot_echo_produces_no_turn"},
+        {"package": "augmentagent-channel-slack", "target": "test:owner_auth", "name": "rejected_input_never_reaches_the_harness_and_is_audited"},
+        {"package": "augmentagent-channel-slack", "target": "test:owner_setup", "name": "bind_verifies_the_user_and_records_owner_and_dm"},
+        {"package": "augmentagent-channel-slack", "target": "test:owner_setup", "name": "control_channel_must_be_a_private_unshared_channel_the_app_is_in"},
+        {"package": "augmentagent-store", "target": "test:surface_owner", "name": "binding_round_trips_across_reopen_with_control_conversations"}
+      ],
+      "acceptance_steps": [4, 8, 9],
+      "host_evidence": {"linux": null, "macos-arm64": null, "macos-x86_64": null}
+    },
+    {
+      "id": "immediate-interaction",
+      "capability": "Immediate interaction; any combination of surfaces",
+      "issues": [1287],
+      "capabilities": [
+        "query",
+        "ephemeral_replies"
+      ],
+      "status": "supported",
+      "tests": [
+        {"package": "augmentagent-channel-slack", "target": "test:interactive_surface", "name": "owner_dm_begins_handling_within_one_second_and_the_answer_is_posted"},
+        {"package": "augmentagent-channel-slack", "target": "test:interactive_surface", "name": "non_owner_gets_one_rejection_reply_and_never_reaches_the_handler"},
+        {"package": "augmentagent-channel-slack", "target": "test:interactive_surface", "name": "redelivered_envelope_produces_one_turn_and_one_answer"},
+        {"package": "augmentagent-cli", "target": "test:slack_serve_cli", "name": "slack_only_serve_answers_the_owner_rejects_a_stranger_and_reports_live_health"},
+        {"package": "augmentagent-cli", "target": "test:slack_serve_cli", "name": "slack_keeps_serving_when_discord_and_whatsapp_fail_to_start"},
+        {"package": "augmentagent-cli", "target": "bin:augmentagent", "name": "a_failing_or_panicking_surface_never_fails_serve"}
+      ],
+      "acceptance_steps": [5, 6, 18, 19],
+      "host_evidence": {"linux": null, "macos-arm64": null, "macos-x86_64": null}
+    },
+    {
+      "id": "shared-harness",
+      "capability": "Same tools, memory, skills, sessions, fallback, audit and permissions",
+      "issues": [1288],
+      "capabilities": [],
+      "status": "supported",
+      "tests": [
+        {"package": "augmentagent-cli", "target": "bin:augmentagent", "name": "slack_turns_run_the_shared_query_path_in_a_native_session_as_the_owner"},
+        {"package": "augmentagent-cli", "target": "bin:augmentagent", "name": "slack_conversation_turns_pass_the_shared_session_conformance_scenario"},
+        {"package": "augmentagent-channel-slack", "target": "test:conversation_harness", "name": "the_shared_session_conformance_scenario_passes_for_slack"},
+        {"package": "augmentagent-channel-slack", "target": "test:conversation_harness", "name": "an_owner_file_reaches_the_agent_as_discords_attachment_input_and_is_readable_by_the_guard_path"},
+        {"package": "augmentagent-channel-core", "target": "test:surface_turn", "name": "turn_env_reaches_the_agent_inside_the_turn_only"},
+        {"package": "augmentagent-channel-slack", "target": "test:conversation_history", "name": "a_history_in_prompt_provider_keeps_multi_turn_context_on_slack"}
+      ],
+      "acceptance_steps": [6],
+      "host_evidence": {"linux": null, "macos-arm64": null, "macos-x86_64": null}
+    },
+    {
+      "id": "conversation-lifecycle",
+      "capability": "Follow-ups, threads, queueing, cancellation, clarification, handoffs",
+      "issues": [1288, 1285],
+      "capabilities": [
+        "threads"
+      ],
+      "status": "supported",
+      "tests": [
+        {"package": "augmentagent-channel-slack", "target": "test:conversation_harness", "name": "a_thread_follow_up_continues_its_native_session_and_a_new_thread_starts_another"},
+        {"package": "augmentagent-channel-slack", "target": "test:conversation_harness", "name": "a_message_during_a_running_turn_waits_and_then_continues_the_session"},
+        {"package": "augmentagent-channel-slack", "target": "test:conversation_harness", "name": "cancel_stops_the_running_turn_reports_it_and_the_thread_continues"},
+        {"package": "augmentagent-channel-slack", "target": "test:conversation_harness", "name": "restart_mid_turn_reports_the_interruption_once_and_the_thread_keeps_its_session"},
+        {"package": "augmentagent-channel-core", "target": "test:surface_turn", "name": "a_follow_up_resumes_the_conversations_native_session_and_history_is_sent_once"},
+        {"package": "augmentagent-channel-slack", "target": "test:surface_contract", "name": "threads_are_supported_now_that_each_thread_is_a_persistent_conversation"}
+      ],
+      "acceptance_steps": [7, 15],
+      "host_evidence": {"linux": null, "macos-arm64": null, "macos-x86_64": null}
+    },
+    {
+      "id": "approvals",
+      "capability": "Every approval kind; revise, presets, skip, recompose; cross-surface resolution",
+      "issues": [1289],
+      "capabilities": [
+        "approve",
+        "buttons",
+        "modals"
+      ],
+      "status": "supported",
+      "tests": [
+        {"package": "augmentagent-channel-slack", "target": "test:approval_surface", "name": "approve_sends_once_updates_the_card_in_place_and_a_second_click_is_already_sent"},
+        {"package": "augmentagent-channel-slack", "target": "test:approval_surface", "name": "skip_discards_the_draft_and_the_card_says_so"},
+        {"package": "augmentagent-channel-slack", "target": "test:approval_surface", "name": "revise_opens_a_modal_and_the_submission_redraws_the_same_card"},
+        {"package": "augmentagent-channel-slack", "target": "test:approval_surface", "name": "a_preset_redrafts_with_its_feedback_and_stops_at_the_cap"},
+        {"package": "augmentagent-channel-slack", "target": "test:approval_surface", "name": "missing_info_opens_one_input_per_ask_and_rewrites_with_the_values"},
+        {"package": "augmentagent-channel-slack", "target": "test:approval_surface", "name": "a_superseded_card_explains_why_and_recompose_restores_a_fresh_card"},
+        {"package": "augmentagent-channel-slack", "target": "test:approval_surface", "name": "simultaneous_clicks_on_slack_and_discord_send_once_and_the_ack_does_not_wait"},
+        {"package": "augmentagent-approval-discord", "target": "lib", "name": "every_verb_redraws_the_other_surfaces_but_never_the_origin"},
+        {"package": "augmentagent-cli", "target": "test:slack_serve_cli", "name": "slack_only_serve_posts_an_approval_card_and_an_approve_click_sends_once"}
+      ],
+      "acceptance_steps": [11],
+      "host_evidence": {"linux": null, "macos-arm64": null, "macos-x86_64": null}
+    },
+    {
+      "id": "contact-send",
+      "capability": "Slack contact replies and new compose; actual send dispatch",
+      "issues": [1290, 1296],
+      "capabilities": [
+        "send"
+      ],
+      "status": "supported",
+      "tests": [
+        {"package": "augmentagent-channel-slack", "target": "test:contact_send", "name": "an_approved_channel_reply_lands_in_the_thread_as_the_owner_and_is_recorded"},
+        {"package": "augmentagent-channel-slack", "target": "test:contact_send", "name": "two_approvals_at_once_send_once"},
+        {"package": "augmentagent-channel-slack", "target": "test:contact_send", "name": "a_lost_response_that_landed_is_found_on_retry_and_not_sent_again"},
+        {"package": "augmentagent-channel-slack", "target": "test:contact_send", "name": "a_composed_message_is_carded_with_its_destination_then_sent_once_after_approval"},
+        {"package": "augmentagent-channel-slack", "target": "test:contact_send", "name": "unknown_recipients_fail_closed"},
+        {"package": "augmentagent-channel-slack", "target": "test:contact_separation", "name": "an_agent_answer_and_its_tool_output_never_reach_a_contact_only_the_approved_draft_does"},
+        {"package": "augmentagent-store", "target": "test:slack_contact_sends", "name": "a_sent_row_is_never_attempted_again"},
+        {"package": "augmentagent-cli", "target": "bin:augmentagent", "name": "an_approved_slack_reply_is_sent_as_the_owner_in_its_thread_and_recorded_as_slack"}
+      ],
+      "acceptance_steps": [11],
+      "host_evidence": {"linux": null, "macos-arm64": null, "macos-x86_64": null}
+    },
+    {
+      "id": "scheduling",
+      "capability": "Schedule send, send now, cancel, back to queue, timezone handling",
+      "issues": [1291],
+      "capabilities": [
+        "schedule"
+      ],
+      "status": "supported",
+      "tests": [
+        {"package": "augmentagent-channel-slack", "target": "test:approval_scheduling", "name": "schedule_shows_the_resolved_time_with_its_zone_and_arms_only_after_confirmation"},
+        {"package": "augmentagent-channel-slack", "target": "test:approval_scheduling", "name": "daylight_saving_gaps_and_overlaps_are_shown_before_confirmation"},
+        {"package": "augmentagent-channel-slack", "target": "test:approval_scheduling", "name": "send_now_on_the_notice_sends_once_and_the_notice_says_sent"},
+        {"package": "augmentagent-channel-slack", "target": "test:approval_scheduling", "name": "cancel_on_the_notice_discards_it_and_the_notice_says_cancelled"},
+        {"package": "augmentagent-channel-slack", "target": "test:approval_scheduling", "name": "back_to_queue_repost_an_actionable_card_and_retires_the_notice"},
+        {"package": "augmentagent-cli", "target": "bin:augmentagent", "name": "a_slack_reply_scheduled_on_slack_fires_once_at_its_time_as_the_owner_and_the_notice_says_sent"},
+        {"package": "augmentagent-cli", "target": "bin:augmentagent", "name": "a_host_asleep_past_the_fire_time_sends_within_the_window_and_requeues_beyond_it"}
+      ],
+      "acceptance_steps": [11],
+      "host_evidence": {"linux": null, "macos-arm64": null, "macos-x86_64": null}
+    },
+    {
+      "id": "owner-commands",
+      "capability": "Model selection, loops, reminders, journal, process controls and help",
+      "issues": [1292],
+      "capabilities": [
+        "model_control",
+        "process_control",
+        "slash_commands"
+      ],
+      "status": "supported",
+      "tests": [
+        {"package": "augmentagent-channel-slack", "target": "test:owner_commands", "name": "help_is_generated_from_the_shared_registry"},
+        {"package": "augmentagent-channel-slack", "target": "test:owner_commands", "name": "model_selection_persists_per_conversation_across_restart"},
+        {"package": "augmentagent-channel-slack", "target": "test:owner_commands", "name": "loops_are_created_for_this_slack_conversation_and_managed_by_id"},
+        {"package": "augmentagent-channel-slack", "target": "test:owner_commands", "name": "a_reminder_posted_to_slack_says_how_to_close_it"},
+        {"package": "augmentagent-channel-slack", "target": "test:owner_commands", "name": "journal_saves_text_and_names_what_slack_cannot_do_yet"},
+        {"package": "augmentagent-channel-slack", "target": "test:owner_commands", "name": "processes_are_listed_and_stopped_through_the_process_walker"},
+        {"package": "augmentagent-approval-discord", "target": "test:owner_command_registry", "name": "every_discord_command_has_a_slack_mapping_or_a_named_blocker"},
+        {"package": "augmentagent-channel-slack", "target": "test:owner_commands_surface", "name": "commands_never_queue_behind_a_running_turn_and_cancel_all_drops_the_queue"}
+      ],
+      "acceptance_steps": [10, 11],
+      "host_evidence": {"linux": null, "macos-arm64": null, "macos-x86_64": null}
+    },
+    {
+      "id": "files-in",
+      "capability": "Images, text/code files, PDF/DOCX and attachment-only input",
+      "issues": [1293],
+      "capabilities": [
+        "media_read"
+      ],
+      "status": "supported",
+      "tests": [
+        {"package": "augmentagent-channel-slack", "target": "test:inbound_files", "name": "image_text_pdf_and_docx_reach_the_prompt_like_discord"},
+        {"package": "augmentagent-channel-slack", "target": "test:inbound_files", "name": "attachment_only_message_starts_a_turn"},
+        {"package": "augmentagent-channel-slack", "target": "test:inbound_files", "name": "oversized_and_unsupported_files_are_rejected_before_download"},
+        {"package": "augmentagent-channel-slack", "target": "test:transport_download", "name": "redirect_to_a_foreign_host_is_refused_and_the_token_never_sent"},
+        {"package": "augmentagent-cli", "target": "test:slack_files_cli", "name": "fetch_builds_the_turn_for_an_attachment_only_message_and_cleans_up"}
+      ],
+      "acceptance_steps": [12],
+      "host_evidence": {"linux": null, "macos-arm64": null, "macos-x86_64": null}
+    },
+    {
+      "id": "answers-out",
+      "capability": "Full answers, generated files, progress, errors and delivery state",
+      "issues": [1294, 1285],
+      "capabilities": [
+        "media_write",
+        "file_upload",
+        "message_edit"
+      ],
+      "status": "supported",
+      "tests": [
+        {"package": "augmentagent-channel-slack", "target": "test:delivery_outbox", "name": "full_answer_and_file_land_in_order_in_the_thread"},
+        {"package": "augmentagent-channel-slack", "target": "test:delivery_outbox", "name": "dead_lettered_part_abandons_the_rest_and_sends_one_notice"},
+        {"package": "augmentagent-channel-slack", "target": "test:delivery_format", "name": "long_answer_splits_at_paragraph_boundaries"},
+        {"package": "augmentagent-channel-slack", "target": "test:delivery_format", "name": "model_text_can_never_ping_anyone"},
+        {"package": "augmentagent-channel-slack", "target": "test:delivery_progress", "name": "post_creates_the_status_message_in_the_thread_then_edits_it"},
+        {"package": "augmentagent-channel-slack", "target": "test:delivery_progress", "name": "edits_are_coalesced_to_one_per_interval_and_the_latest_wins"},
+        {"package": "augmentagent-channel-slack", "target": "test:transport_upload", "name": "upload_streams_a_path_with_spaces_and_unicode_into_the_thread"},
+        {"package": "augmentagent-channel-slack", "target": "test:interactive_surface", "name": "a_failed_turn_tells_the_owner_without_leaking_the_error"},
+        {"package": "augmentagent-cli", "target": "test:slack_deliver_cli", "name": "deliver_splits_neutralises_uploads_and_a_rerun_sends_nothing"},
+        {"package": "augmentagent-cli", "target": "test:status_delivery", "name": "status_json_reports_delivery_counts_per_surface"}
+      ],
+      "acceptance_steps": [6, 12],
+      "host_evidence": {"linux": null, "macos-arm64": null, "macos-x86_64": null}
+    },
+    {
+      "id": "notifications",
+      "capability": "Digests, reminders, nudges, audit, health, review and background notifications",
+      "issues": [1295],
+      "capabilities": [
+        "notifications"
+      ],
+      "status": "supported",
+      "tests": [
+        {"package": "augmentagent-channel-slack", "target": "test:notifications", "name": "a_notification_reaches_the_owner_dm_once_with_its_content"},
+        {"package": "augmentagent-channel-slack", "target": "test:notifications", "name": "the_control_channel_can_be_the_destination"},
+        {"package": "augmentagent-channel-slack", "target": "test:notifications", "name": "notifications_queued_through_a_suspension_are_marked_late_and_paced_on_wake"},
+        {"package": "augmentagent-channel-slack", "target": "test:notifications", "name": "a_slack_failure_is_visible_in_the_delivery_counts"},
+        {"package": "augmentagent-cli", "target": "bin:augmentagent", "name": "registry_covers_every_producer_in_the_code"},
+        {"package": "augmentagent-cli", "target": "bin:augmentagent", "name": "every_routed_producer_reaches_slack_with_its_content"},
+        {"package": "augmentagent-cli", "target": "bin:augmentagent", "name": "slack_only_needs_no_discord_credentials"},
+        {"package": "augmentagent-cli", "target": "bin:augmentagent", "name": "a_failing_discord_does_not_block_slack_and_is_reported"},
+        {"package": "augmentagent-channel-slack", "target": "test:owner_commands", "name": "a_due_loop_fires_into_its_slack_conversation_on_the_scheduler_clock"}
+      ],
+      "acceptance_steps": [13],
+      "host_evidence": {"linux": null, "macos-arm64": null, "macos-x86_64": null}
+    },
+    {
+      "id": "subscriptions",
+      "capability": "Subscriptions, identity, search and live/ingest reconciliation",
+      "issues": [1296],
+      "capabilities": [
+        "history"
+      ],
+      "status": "supported",
+      "tests": [
+        {"package": "augmentagent-channel-slack", "target": "test:ingest_reconcile", "name": "live_then_poll_stores_and_triages_once"},
+        {"package": "augmentagent-channel-slack", "target": "test:ingest_reconcile", "name": "racing_live_and_poll_make_one_decision"},
+        {"package": "augmentagent-channel-slack", "target": "test:ingest_reconcile", "name": "edits_apply_once_from_either_path"},
+        {"package": "augmentagent-channel-slack", "target": "test:ingest_migration", "name": "existing_slack_rows_keep_their_ids_and_cursors"},
+        {"package": "augmentagent-channel-slack", "target": "test:ingest_catch_up", "name": "catch_up_after_a_suspension_is_bounded_ordered_and_deduplicated"},
+        {"package": "augmentagent-channel-slack", "target": "test:subscriptions_manage", "name": "subscribe_a_channel_by_name_then_change_mode_then_unsubscribe"},
+        {"package": "augmentagent-channel-slack", "target": "test:search_identity", "name": "a_slack_channel_message_is_found_by_person_and_channel"},
+        {"package": "augmentagent-channel-slack", "target": "test:conversation_history", "name": "a_thread_turn_reads_that_thread_bounded_and_owner_only"},
+        {"package": "augmentagent-cli", "target": "test:slack_subscriptions_cli", "name": "subscriptions_are_managed_by_name_person_or_id"}
+      ],
+      "acceptance_steps": [],
+      "host_evidence": {"linux": null, "macos-arm64": null, "macos-x86_64": null}
+    },
+    {
+      "id": "voice-clips",
+      "capability": "Voice clips, transcription and spoken replies",
+      "issues": [1297],
+      "capabilities": [
+        "voice_clip"
+      ],
+      "status": "blocked",
+      "blocker": {
+        "issue": 1297,
+        "reason": "The voice-clip pipeline runs only through `augmentagent slack voice`: serve's turn path does not transcribe clips yet, and release builds have no text-to-speech provider for spoken replies."
+      },
+      "tests": [
+        {"package": "augmentagent-channel-slack", "target": "test:voice_clips", "name": "clip_is_transcribed_into_turn_text_with_a_transcript_line"},
+        {"package": "augmentagent-channel-slack", "target": "test:voice_clips", "name": "non_owner_audio_never_reaches_the_speech_provider"},
+        {"package": "augmentagent-channel-slack", "target": "test:voice_replies", "name": "spoken_reply_is_an_audio_upload_plus_the_text_mirror_delivered_once"},
+        {"package": "augmentagent-cli", "target": "test:slack_voice_cli", "name": "transcribe_prints_the_transcript_and_turn_text_and_cleans_up"},
+        {"package": "augmentagent-cli", "target": "test:slack_voice_cli", "name": "speak_uploads_audio_with_a_text_mirror_once"}
+      ],
+      "acceptance_steps": [14],
+      "host_evidence": {"linux": null, "macos-arm64": null, "macos-x86_64": null}
+    },
+    {
+      "id": "live-voice",
+      "capability": "Live two-way voice",
+      "issues": [1298],
+      "capabilities": [
+        "voice",
+        "live_voice"
+      ],
+      "status": "blocked",
+      "blocker": {
+        "issue": 1298,
+        "reason": "No documented Slack API lets an app join a huddle or carry call audio (docs/SLACK-LIVE-VOICE.md). Stays open until a real owner audio session works or the owner changes the requirement."
+      },
+      "tests": [
+        {"package": "augmentagent-channel-slack", "target": "test:surface_contract", "name": "live_voice_stays_an_open_blocker_backed_by_the_dated_feasibility_record"},
+        {"package": "augmentagent-channel-slack", "target": "test:owner_commands", "name": "voice_names_the_live_voice_blocker"}
+      ],
+      "acceptance_steps": [14],
+      "host_evidence": {"linux": null, "macos-arm64": null, "macos-x86_64": null}
+    },
+    {
+      "id": "operations",
+      "capability": "Installation, status/doctor, service management, upgrades and rollback on both hosts",
+      "issues": [1299],
+      "capabilities": [],
+      "status": "supported",
+      "tests": [
+        {"package": "augmentagent-cli", "target": "test:slack_ops_cli", "name": "status_and_doctor_name_each_missing_setup_step_with_its_recovery"},
+        {"package": "augmentagent-cli", "target": "test:slack_ops_cli", "name": "the_running_daemon_reports_its_store_and_workarounds_and_logs_stay_clean"},
+        {"package": "augmentagent-cli", "target": "test:runbook_commands", "name": "every_runbook_command_exists_in_the_cli"},
+        {"package": "augmentagent-cli", "target": "test:runbook_commands", "name": "the_runbook_covers_every_lifecycle_step"},
+        {"package": "augmentagent-channel-slack", "target": "test:upgrade_state", "name": "an_older_binary_still_opens_and_writes_the_upgraded_database"}
+      ],
+      "acceptance_steps": [1, 2, 5, 21, 22, 23],
+      "host_evidence": {"linux": null, "macos-arm64": null, "macos-x86_64": null}
+    },
+    {
+      "id": "acceptance",
+      "capability": "Shared parity suite, real-host acceptance on macOS and Linux, 24-hour soak",
+      "issues": [1300, 1282],
+      "capabilities": [],
+      "status": "unverified-live",
+      "live_reason": "Real owner acceptance and the 24-hour soak (with Mac sleep/wake and a network change) need a real Linux host and a real Mac; the procedure is docs/SLACK-RUNBOOK.md section 11. CI and mocks never satisfy them.",
+      "tests": [
+        {"package": "augmentagent-channel-slack", "target": "test:parity_matrix", "name": "the_checked_in_matrix_passes_every_check"},
+        {"package": "augmentagent-channel-slack", "target": "test:parity_matrix", "name": "every_shared_scenario_runs_for_slack_and_names_each_other_surface"},
+        {"package": "augmentagent-cli", "target": "bin:augmentagent", "name": "discord_conversation_turns_pass_the_shared_session_conformance_scenario"}
+      ],
+      "acceptance_steps": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24],
+      "host_evidence": {"linux": null, "macos-arm64": null, "macos-x86_64": null}
+    }
+  ],
+  "shared_scenarios": [
+    {
+      "id": "native-session-conformance",
+      "title": "One native session per conversation: follow-ups resume it, turns never share one, restart keeps it",
+      "shared": [
+        {"package": "augmentagent-channel-core", "target": "test:surface_turn", "name": "a_follow_up_resumes_the_conversations_native_session_and_history_is_sent_once"},
+        {"package": "augmentagent-channel-core", "target": "test:surface_turn", "name": "the_claim_is_persisted_before_the_agent_runs_and_a_duplicate_never_runs_twice"}
+      ],
+      "surfaces": {
+        "slack": {
+          "tests": [
+            {"package": "augmentagent-cli", "target": "bin:augmentagent", "name": "slack_conversation_turns_pass_the_shared_session_conformance_scenario"},
+            {"package": "augmentagent-channel-slack", "target": "test:conversation_harness", "name": "the_shared_session_conformance_scenario_passes_for_slack"}
+          ]
+        },
+        "discord": {
+          "tests": [
+            {"package": "augmentagent-cli", "target": "bin:augmentagent", "name": "discord_conversation_turns_pass_the_shared_session_conformance_scenario"}
+          ]
+        },
+        "whatsapp": {
+          "gap": {
+            "issue": 1225,
+            "reason": "WhatsApp has no owner conversation adapter on the shared session harness on main."
+          }
+        }
+      }
+    },
+    {
+      "id": "approval-sync",
+      "title": "An approval decided on one surface resolves once and redraws the card everywhere else",
+      "shared": [
+        {"package": "augmentagent-approval-discord", "target": "lib", "name": "cards_and_notices_reach_every_surface"},
+        {"package": "augmentagent-approval-discord", "target": "lib", "name": "every_verb_redraws_the_other_surfaces_but_never_the_origin"},
+        {"package": "augmentagent-approval-discord", "target": "lib", "name": "a_dropped_surface_is_forgotten"},
+        {"package": "augmentagent-store", "target": "test:surface_approval_cards", "name": "live_cards_come_back_with_the_actions_current_truth"}
+      ],
+      "surfaces": {
+        "slack": {
+          "tests": [
+            {"package": "augmentagent-channel-slack", "target": "test:approval_surface", "name": "a_decision_on_discord_redraws_the_slack_card_and_slack_then_says_already_sent"},
+            {"package": "augmentagent-channel-slack", "target": "test:approval_surface", "name": "simultaneous_clicks_on_slack_and_discord_send_once_and_the_ack_does_not_wait"},
+            {"package": "augmentagent-channel-slack", "target": "test:approval_scheduling", "name": "a_discord_decision_redraws_the_slack_notice"}
+          ]
+        },
+        "discord": {
+          "tests": [
+            {"package": "augmentagent-approval-discord", "target": "lib", "name": "the_deciding_surface_is_visible_to_the_handler"},
+            {"package": "augmentagent-cli", "target": "bin:augmentagent", "name": "a_discord_click_on_a_slack_reply_is_recorded_as_discord"},
+            {"package": "augmentagent-cli", "target": "bin:augmentagent", "name": "a_discord_click_on_a_slack_scheduled_send_redraws_the_slack_notice"}
+          ]
+        },
+        "whatsapp": {
+          "tests": [
+            {"package": "augmentagent-channel-whatsapp", "target": "lib", "name": "parses_approve_synonyms"},
+            {"package": "augmentagent-channel-whatsapp", "target": "lib", "name": "parses_revise_with_feedback"},
+            {"package": "augmentagent-channel-whatsapp", "target": "lib", "name": "render_card_contains_verbs_and_draft"}
+          ],
+          "gap": {
+            "issue": 1225,
+            "reason": "The WhatsApp control chat runs the same approval verbs but registers no approval card surface, so a decision elsewhere does not redraw its card."
+          }
+        }
+      }
+    },
+    {
+      "id": "owner-command-registry",
+      "title": "Every Discord owner command is in the shared registry and has a Slack mapping or a named blocker",
+      "shared": [
+        {"package": "augmentagent-store", "target": "test:surface_commands", "name": "reset_forgets_the_session_and_unblocks_a_conversation_left_uncertain"},
+        {"package": "augmentagent-store", "target": "test:surface_commands", "name": "cancel_all_drops_only_the_messages_still_queued_in_that_conversation"}
+      ],
+      "surfaces": {
+        "slack": {
+          "tests": [
+            {"package": "augmentagent-approval-discord", "target": "test:owner_command_registry", "name": "every_discord_command_has_a_slack_mapping_or_a_named_blocker"},
+            {"package": "augmentagent-channel-slack", "target": "test:owner_commands", "name": "help_is_generated_from_the_shared_registry"},
+            {"package": "augmentagent-channel-slack", "target": "test:owner_commands_surface", "name": "slash_help_and_an_unknown_command_are_answered_from_the_registry"}
+          ]
+        },
+        "discord": {
+          "tests": [
+            {"package": "augmentagent-approval-discord", "target": "test:owner_command_registry", "name": "the_scanner_finds_every_owner_command_discord_dispatches_today"},
+            {"package": "augmentagent-approval-discord", "target": "test:owner_command_registry", "name": "every_discord_owner_command_is_in_the_registry"},
+            {"package": "augmentagent-approval-discord", "target": "test:owner_command_registry", "name": "a_new_discord_command_without_a_registry_entry_fails_coverage"}
+          ]
+        },
+        "whatsapp": {
+          "tests": [
+            {"package": "augmentagent-channel-whatsapp", "target": "lib", "name": "free_text_is_a_query"}
+          ],
+          "gap": {
+            "issue": 1225,
+            "reason": "The WhatsApp control chat parses its own verbs and free-text queries; it is not on the shared owner-command registry."
+          }
+        }
+      }
+    },
+    {
+      "id": "durable-delivery",
+      "title": "Inbound events and outbound sends are persisted, deduplicated and replayed once across a crash or restart",
+      "shared": [
+        {"package": "augmentagent-store", "target": "test:surface_delivery", "name": "same_event_delivered_twice_is_one_record_and_one_turn"},
+        {"package": "augmentagent-store", "target": "test:surface_delivery", "name": "enqueueing_one_idempotency_key_twice_is_one_send"},
+        {"package": "augmentagent-store", "target": "test:surface_delivery", "name": "crash_after_provider_accepted_send_does_not_send_twice"},
+        {"package": "augmentagent-store", "target": "test:surface_delivery", "name": "slack_and_whatsapp_events_with_look_alike_ids_are_distinct"},
+        {"package": "augmentagent-store", "target": "test:surface_delivery", "name": "platform_scoped_inbound_claims_leave_other_surfaces_events_alone"}
+      ],
+      "surfaces": {
+        "slack": {
+          "tests": [
+            {"package": "augmentagent-channel-slack", "target": "test:delivery_outbox", "name": "restart_between_parts_resumes_without_duplicates"},
+            {"package": "augmentagent-channel-slack", "target": "test:delivery_outbox", "name": "crash_mid_send_is_reconciled_never_resent_blindly"},
+            {"package": "augmentagent-channel-slack", "target": "test:interactive_surface", "name": "redelivered_envelope_produces_one_turn_and_one_answer"}
+          ]
+        },
+        "discord": {
+          "tests": [
+            {"package": "augmentagent-store", "target": "test:discord_conversation", "name": "pending_turn_survives_restart_and_prevents_replay_without_a_native_id"},
+            {"package": "augmentagent-store", "target": "test:discord_conversation", "name": "completed_turn_allows_next_turn_but_rejects_duplicate_after_restart"}
+          ],
+          "gap": {
+            "issue": 1285,
+            "reason": "Discord deduplicates turns through discord_conversations; its answers post through serenity, not the shared outbox."
+          }
+        },
+        "whatsapp": {
+          "gap": {
+            "issue": 1225,
+            "reason": "WhatsApp sends go through the sidecar and its outbound allowlist, not the shared outbox; only the store-level isolation tests above cover WhatsApp references."
+          }
+        }
+      }
+    }
+  ],
+  "regression_suites": [
+    {"surface": "discord", "package": "augmentagent-approval-discord", "target": "lib"},
+    {"surface": "discord", "package": "augmentagent-approval-discord", "target": "test:owner_command_registry"},
+    {"surface": "whatsapp", "package": "augmentagent-channel-whatsapp", "target": "lib"}
+  ]
+}

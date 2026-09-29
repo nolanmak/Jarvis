@@ -223,6 +223,26 @@ jobs:
           cargo test -p augmentagent-store --test surface_delivery
           cargo test -p augmentagent-channel-slack --test notifications
           cargo test -p augmentagent-cli --bin augmentagent -- notify_tests::
+      # #1300 — the Slack parity gate. The executable matrix
+      # (docs/slack-parity-matrix.json) must pass its check against this
+      # tree and the Slack capability tables; then every named test it
+      # lists (each epic row, and the shared scenarios run for Slack,
+      # Discord and WhatsApp) plus the Discord and WhatsApp regression
+      # suites run from that one list, on both hosts. No network.
+      - name: Slack parity gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=target/debug/augmentagent
+          cargo test -p augmentagent-channel-slack --test parity_matrix
+          cargo test -p augmentagent-cli --test slack_parity_cli
+          "$bin" slack parity report
+          "$bin" slack parity commands > "$RUNNER_TEMP/slack-parity.sh"
+          while IFS= read -r cmd; do
+            echo "::group::$cmd"
+            eval "$cmd" < /dev/null
+            echo "::endgroup::"
+          done < "$RUNNER_TEMP/slack-parity.sh"
       - name: Host-dependent CLI surface
         run: >-
           cargo test -p augmentagent-cli --bin augmentagent --

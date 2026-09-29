@@ -105,6 +105,7 @@ mod slack_app;
 mod slack_compose;
 mod slack_deliver;
 mod slack_files;
+mod slack_parity;
 mod slack_serve;
 // #1296 — subscription management (subscribe / set-mode / unsubscribe).
 mod slack_subscriptions;
@@ -1773,6 +1774,13 @@ enum SlackOp {
     /// (#1290). Never sends: it stores a pending approval whose card shows
     /// the destination and sender; only Approve sends, as the owner.
     Compose(slack_compose::ComposeArgs),
+    /// The Slack parity matrix (#1300): `report [--json]` checks it and
+    /// prints every row, its status and the open blockers; `commands`
+    /// prints the cargo lines CI runs. Read-only.
+    Parity {
+        #[command(subcommand)]
+        op: slack_parity::SlackParityOp,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2577,6 +2585,16 @@ async fn main() -> Result<()> {
             &handoff_prune::daemon_state,
             &mut std::io::stdout().lock(),
         );
+    }
+    // #1300 — the parity report reads the checked-in matrix only.
+    if let Cmd::Slack {
+        op: SlackOp::Parity { ref op },
+    } = cli.cmd
+    {
+        return match slack_parity::run(op)? {
+            0 => Ok(()),
+            code => std::process::exit(code),
+        };
     }
     let db_path = cli
         .db
@@ -4032,6 +4050,7 @@ async fn main() -> Result<()> {
             SlackOp::Deliver(args) => slack_deliver::run(args, &store).await,
             SlackOp::Files { op } => slack_files::run(op).await,
             SlackOp::Voice { op } => slack_voice::run(op, &store).await,
+            SlackOp::Parity { .. } => unreachable!("handled before the store opens"),
             SlackOp::Compose(args) => {
                 let out = slack_compose::run(
                     &store,

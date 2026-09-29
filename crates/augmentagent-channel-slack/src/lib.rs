@@ -40,6 +40,8 @@ pub mod interactive;
 pub mod notify;
 pub mod owner;
 pub mod owner_setup;
+// #1300 — the executable parity matrix, its checks and the acceptance report.
+pub mod parity;
 pub mod surface;
 // #1296 — subscription management (CLI and the Slack owner command hook).
 pub mod subscriptions;

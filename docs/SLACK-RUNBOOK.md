@@ -358,6 +358,19 @@ with a test workspace. Record the result of every step with the commit,
 number depends on that issue; until it lands, record the observed result as
 pending, not as a pass or a fail.
 
+**What is left.** From the checkout, `augmentagent slack parity report`
+prints the executable parity matrix (`docs/slack-parity-matrix.json`): one
+row per epic capability with its owning issues, named tests, status
+(`supported`, `blocked` with its issue, or `unverified-live`) and per-host
+acceptance, followed by every open blocker. `augmentagent slack parity report
+--json` gives the same as JSON. It exits non-zero when the matrix no longer
+matches the source tree or the Slack capability tables. Each matrix row lists
+the steps below that exercise it (`acceptance_steps`). When a host passes
+them, fill that row's `host_evidence` for the host with the full commit, OS
+version, `uname -m`, the commands run, an artifact path, `"result": "pass"`
+and the date; the check rejects anything incomplete. A CI or mocked pass is
+never host evidence.
+
 1. **Baseline.** Run `git rev-parse HEAD`, `uname -m`, then
    `augmentagent doctor --json`. Expect `credential_backend` ok and
    persistent (Linux: pending #1325), and no `config.*` errors.
