@@ -41,6 +41,8 @@ impl Default for ImessageReplyConfig {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ReplyStats {
+    pub own_sends: usize,
+    pub manual_replies: usize,
     pub cards: usize,
     pub skipped: usize,
     pub flagged: usize,
@@ -89,10 +91,81 @@ enum Handled {
     Flagged,
 }
 
+/// True when every new entry is the agent's own send coming back, so the
+/// delta holds nothing new to learn from (#1307).
+pub fn only_own_sends(store: &Store, delta: &PollDelta) -> bool {
+    let (own, _) = split_own_entries(store, delta);
+    own > 0 && own == delta.new_entries.len()
+}
+
+/// How close an entry's timestamp must be to an outbox row's completion for
+/// the entry to be that send. The bundle carries no message guid.
+const OWN_SEND_WINDOW_MS: i64 = 10 * 60_000;
+
+/// Split the delta's `me` entries into (agent's own sends, manual replies).
+/// Each sent outbox row accounts for at most one entry.
+fn split_own_entries(store: &Store, delta: &PollDelta) -> (usize, usize) {
+    let mine: Vec<&crate::bundle::MessageEntry> = delta
+        .new_entries
+        .iter()
+        .map(|(_, e)| e)
+        .filter(|e| e.sender == "me")
+        .collect();
+    if mine.is_empty() {
+        return (0, 0);
+    }
+    let conv = &delta.conversation;
+    let mut rows = Vec::new();
+    for target in std::iter::once(&conv.identifier).chain(conv.chat_guid.as_ref()) {
+        match store.sent_imessage_outbox_for_target(target, 0) {
+            Ok(r) => rows.extend(r),
+            Err(e) => warn!("imessage outbox lookup failed: {e}"),
+        }
+    }
+    let mut used = std::collections::HashSet::new();
+    let mut own = 0;
+    for entry in &mine {
+        let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&entry.timestamp) else {
+            continue;
+        };
+        let ts = ts.timestamp_millis();
+        let hit = rows.iter().find(|r| {
+            !used.contains(&r.id)
+                && r.body == entry.body
+                && r.completed_at_ms
+                    .is_some_and(|c| (ts - c).abs() <= OWN_SEND_WINDOW_MS)
+        });
+        if let Some(r) = hit {
+            used.insert(r.id);
+            own += 1;
+        }
+    }
+    (own, mine.len() - own)
+}
+
 impl ImessageReplier {
     pub async fn handle_deltas(&self, deltas: &[PollDelta]) -> ReplyStats {
         let mut stats = ReplyStats::default();
         for delta in deltas {
+            if !delta.first_run {
+                let (own, manual) = split_own_entries(&self.store, delta);
+                stats.own_sends += own;
+                stats.manual_replies += manual;
+                if manual > 0 {
+                    // The operator answered by hand; the pending draft is stale.
+                    let thread = format!("imessage:{}", delta.conversation.identifier);
+                    match self
+                        .store
+                        .mark_pending_drafts_superseded_by_thread(&thread, "superseded by manual reply")
+                    {
+                        Ok(ids) => stats.superseded += ids.len(),
+                        Err(e) => {
+                            warn!("imessage supersede on manual reply failed: {e}");
+                            stats.errors += 1;
+                        }
+                    }
+                }
+            }
             let Some(email) = reply_email(delta) else {
                 continue;
             };
@@ -459,5 +532,173 @@ mod tests {
         assert!(e.body.contains("first") && e.body.contains("second"));
         assert!(e.body.contains("] me\nmine"));
         assert_eq!(e.from, PHONE);
+    }
+
+    // ---- #1307: own sends and manual replies coming back from the bundle ----
+
+    use augmentagent_store::{ImessageSendOutcome, ImessageTargetKind, NewImessageOutboxItem};
+
+    /// A sent outbox row for `body`, completed at `completed_ms`.
+    fn sent_row(store: &Store, action_id: &str, body: &str, completed_ms: i64) {
+        store
+            .enqueue_imessage_outbox(&NewImessageOutboxItem {
+                action_id,
+                target: PHONE,
+                target_kind: ImessageTargetKind::Handle,
+                service: "iMessage",
+                body,
+            })
+            .unwrap();
+        let c = store.claim_imessage_outbox().unwrap().unwrap();
+        store
+            .complete_imessage_outbox(c.id, &ImessageSendOutcome::Sent { message_guid: None })
+            .unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE imessage_outbox SET completed_at_ms = ?1 WHERE id = ?2",
+                    augmentagent_store::rusqlite::params![completed_ms, c.id],
+                )
+            })
+            .unwrap();
+    }
+
+    fn ts_ms(ts: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(ts).unwrap().timestamp_millis()
+    }
+
+    fn pending_card(store: &Store, idx: usize) -> String {
+        let d = one_to_one(&[(PHONE, "earlier?")]);
+        let conv = &d.conversation;
+        let e = synthetic_imessage_email(conv, idx, &d.new_entries[0].1);
+        store.upsert_email(&e).unwrap();
+        store
+            .log_action(&e.message_id, e.thread_id.as_deref(), &e.from, &e.subject,
+                        Some(&e.body), Some("draft"), ActionStatus::Pending)
+            .unwrap()
+    }
+
+    const TS: &str = "2026-09-29T12:00:00-04:00";
+
+    #[tokio::test]
+    async fn own_sent_message_is_not_treated_as_new_inbound() {
+        let f = fx();
+        f.store.allow_imessage_inbound(PHONE).unwrap();
+        let card = pending_card(&f.store, 1);
+        sent_row(&f.store, "sent-action", "on my way", ts_ms(TS) + 2_000);
+        let d = one_to_one(&[("me", "on my way")]);
+        ingest(&f.store, &d);
+        let r = Scripted::new(&[REPLY, "x"]);
+        let stats = replier(&f, r.clone()).handle_deltas(&[d]).await;
+        assert_eq!(stats.own_sends, 1);
+        assert_eq!(stats.manual_replies, 0);
+        assert_eq!(stats.cards, 0);
+        assert_eq!(r.calls(), 0);
+        let a = f.store.get_action_with_email(&card).unwrap().unwrap();
+        assert_eq!(a.action.status, "pending", "own send must not retire other cards");
+    }
+
+    #[tokio::test]
+    async fn same_body_outside_the_window_is_a_manual_reply() {
+        let f = fx();
+        let card = pending_card(&f.store, 1);
+        sent_row(&f.store, "sent-action", "on my way", ts_ms(TS) - 11 * 60_000);
+        let d = one_to_one(&[("me", "on my way")]);
+        ingest(&f.store, &d);
+        let stats = replier(&f, Scripted::new(&[])).handle_deltas(&[d]).await;
+        assert_eq!((stats.own_sends, stats.manual_replies), (0, 1));
+        let a = f.store.get_action_with_email(&card).unwrap().unwrap();
+        assert_eq!(a.action.status, "superseded");
+    }
+
+    #[tokio::test]
+    async fn manual_reply_supersedes_pending_card_with_reason() {
+        let f = fx();
+        let card = pending_card(&f.store, 1);
+        let d = one_to_one(&[("me", "typed it myself")]);
+        ingest(&f.store, &d);
+        let stats = replier(&f, Scripted::new(&[])).handle_deltas(&[d]).await;
+        assert_eq!(stats.manual_replies, 1);
+        let a = f.store.get_action_with_email(&card).unwrap().unwrap();
+        assert_eq!(a.action.status, "superseded");
+        assert_eq!(a.action.error_message.as_deref(), Some("superseded by manual reply"));
+    }
+
+    #[tokio::test]
+    async fn manual_reply_leaves_a_sending_action_alone() {
+        let f = fx();
+        let card = pending_card(&f.store, 1);
+        f.store
+            .claim_action_for_send(&card, ActionStatus::Pending, "t")
+            .unwrap();
+        let d = one_to_one(&[("me", "typed it myself")]);
+        ingest(&f.store, &d);
+        replier(&f, Scripted::new(&[])).handle_deltas(&[d]).await;
+        let a = f.store.get_action_with_email(&card).unwrap().unwrap();
+        assert_eq!(a.action.status, "sending");
+    }
+
+    #[tokio::test]
+    async fn one_outbox_row_matches_one_entry_only() {
+        let f = fx();
+        sent_row(&f.store, "sent-action", "ok", ts_ms(TS));
+        let d = one_to_one(&[("me", "ok"), ("me", "ok")]);
+        ingest(&f.store, &d);
+        let stats = replier(&f, Scripted::new(&[])).handle_deltas(&[d]).await;
+        assert_eq!((stats.own_sends, stats.manual_replies), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn polling_the_same_bundle_twice_changes_nothing_the_second_time() {
+        let f = fx();
+        f.store.allow_imessage_inbound(PHONE).unwrap();
+        let root = f._dir.path().join("bundle");
+        let conv_dir = root.join("conversations").join("alex");
+        std::fs::create_dir_all(&conv_dir).unwrap();
+        std::fs::write(
+            root.join("conversations/index.json"),
+            serde_json::json!({PHONE: {"identifier": PHONE, "dir": "alex", "title": "Alex",
+                                       "participants": [PHONE], "service": "iMessage"}})
+                .to_string(),
+        )
+        .unwrap();
+        let md = |entries: &str| format!("---\ntitle: Alex\n---\n{entries}");
+        std::fs::write(conv_dir.join("messages.md"),
+                       md("### [2026-09-29T11:00:00-04:00] +15555550100\nhello\n")).unwrap(); // pii-ok
+        let bundle = crate::Bundle::open(&root);
+        crate::poll_once(&bundle, &f.store).unwrap(); // first sync: history only
+        std::fs::write(conv_dir.join("messages.md"), md(
+            "### [2026-09-29T11:00:00-04:00] +15555550100\nhello\n\n\
+             ### [2026-09-29T12:00:00-04:00] +15555550100\nfree tonight?\n")).unwrap(); // pii-ok
+        let rep = replier(&f, Scripted::new(&[REPLY, "yes"]));
+        let (_, d1) = crate::poll_once(&bundle, &f.store).unwrap();
+        assert_eq!(rep.handle_deltas(&d1).await.cards, 1);
+        let snapshot = |s: &Store| -> Vec<(String, String)> {
+            s.with_conn(|c| {
+                let mut st = c.prepare("SELECT id, status FROM actions ORDER BY id")?;
+                let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect()
+            })
+            .unwrap()
+        };
+        let emails = |s: &Store| -> i64 {
+            s.with_conn(|c| c.query_row("SELECT COUNT(*) FROM emails", [], |r| r.get(0))).unwrap()
+        };
+        let (before, n_before) = (snapshot(&f.store), emails(&f.store));
+        let (_, d2) = crate::poll_once(&bundle, &f.store).unwrap();
+        assert_eq!(rep.handle_deltas(&d2).await, ReplyStats::default());
+        assert_eq!(snapshot(&f.store), before);
+        assert_eq!(emails(&f.store), n_before);
+    }
+
+    #[test]
+    fn delta_of_only_own_sends_is_recognised_for_capture_skipping() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("d.db")).unwrap();
+        sent_row(&store, "a", "on my way", ts_ms(TS));
+        let own = one_to_one(&[("me", "on my way")]);
+        let mixed = one_to_one(&[("me", "on my way"), (PHONE, "great")]);
+        assert!(only_own_sends(&store, &own));
+        assert!(!only_own_sends(&store, &mixed));
     }
 }

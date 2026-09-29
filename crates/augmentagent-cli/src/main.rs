@@ -15225,7 +15225,11 @@ async fn imessage_poll_loop(
         let (Some(root), Some(schema)) = (&wiki_root, &wiki_schema) else {
             continue;
         };
-        for delta in deltas.iter().filter(|d| !d.first_run) {
+        // #1307 — the agent's own sends coming back teach nothing new.
+        for delta in deltas
+            .iter()
+            .filter(|d| !d.first_run && !augmentagent_channel_imessage::only_own_sends(&store, d))
+        {
             augmentagent_channel_core::ingest::spawn_ingest(
                 Arc::clone(&reasoner),
                 root.clone(),
