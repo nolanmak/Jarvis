@@ -439,6 +439,9 @@ mod tests {
                         "participants": [SMS_PHONE], "service": "SMS"},
             "chat900": {"identifier": "chat900", "dir": "c", "title": "G",
                         "participants": [PHONE, SMS_PHONE], "service": "iMessage"},
+            "chat901": {"identifier": "chat901", "dir": "d", "title": "H",
+                        "participants": [PHONE, SMS_PHONE], "service": "iMessage",
+                        "chat_guid": "any;+;chat901"},
         });
         std::fs::write(
             bundle.join("conversations/index.json"),
@@ -585,6 +588,24 @@ mod tests {
             assert_eq!(status(&f.store, &id), "pending");
         }
         assert_eq!(outbox_len(&f.store), 0);
+    }
+
+    #[tokio::test]
+    async fn group_with_guid_needs_its_own_allowlist_entry_then_queues_by_guid() {
+        let f = fixture(true);
+        f.store.allow_imessage_outbound(PHONE).unwrap();
+        let id = seed(&f.store, "chat901", "see you all there");
+        let msg = failed_message(f.approver.run_approve(&id).await);
+        assert!(msg.contains("allow-outbound chat901"), "{msg}");
+        assert_eq!(outbox_len(&f.store), 0);
+        f.store.allow_imessage_outbound("chat901").unwrap();
+        assert!(matches!(
+            f.approver.run_approve(&id).await,
+            ApprovalActionOutcome::Approved
+        ));
+        let row = f.store.list_imessage_outbox(1).unwrap().remove(0);
+        assert_eq!(row.target, "any;+;chat901");
+        assert_eq!(row.target_kind, ImessageTargetKind::ChatGuid);
     }
 
     #[tokio::test]

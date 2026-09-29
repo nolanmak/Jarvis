@@ -439,6 +439,16 @@ def sync(db_path, out_dir, state_path, contacts=None, s3=None):
 
     con = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
     cur = con.cursor()
+    # The chat guid is the only way to address a group when sending (#1308).
+    # Copied verbatim from chat.db, never built: macOS 26 uses `any;…`.
+    guids = {}
+    for identifier, guid in cur.execute("SELECT chat_identifier, guid FROM chat"):
+        if identifier and guid:
+            guids.setdefault(slugify(identifier), guid)
+    for ident, entry in index.items():
+        if not entry.get("chat_guid") and guids.get(ident):
+            entry["chat_guid"] = guids[ident]
+            renamed = True  # the index must be rewritten
     rows = cur.execute(
         "SELECT m.ROWID, m.text, m.attributedBody, m.date, m.is_from_me,"
         " h.id, c.ROWID, c.chat_identifier, c.display_name, c.service_name,"
@@ -476,6 +486,8 @@ def sync(db_path, out_dir, state_path, contacts=None, s3=None):
                 "service": service or "iMessage",
                 "participants": participants,
             }
+            if guids.get(ident):
+                entry["chat_guid"] = guids[ident]
             entry.update(_naming(
                 ident, display_name, service, participants, contacts, index,
             ))

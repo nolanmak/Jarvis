@@ -155,6 +155,39 @@ mod tests {
     }
 
     #[test]
+    fn group_with_exported_guid_is_addressed_by_that_guid() {
+        let mut g = conv("chat123456", "iMessage", &[PHONE, MAIL]);
+        g.chat_guid = Some("any;+;chat123456".into());
+        let t = resolve_target("imessage:chat123456", &[g]).unwrap();
+        assert_eq!(t.kind, ImessageTargetKind::ChatGuid);
+        assert_eq!(t.target, "any;+;chat123456");
+        assert_eq!(t.conversation, "chat123456");
+    }
+
+    #[test]
+    fn one_to_one_with_guid_still_sends_by_handle() {
+        let mut c = conv(PHONE, "iMessage", &[PHONE]);
+        c.chat_guid = Some(format!("any;-;{PHONE}"));
+        let t = resolve_target(&format!("imessage:{PHONE}"), &[c]).unwrap();
+        assert_eq!(t.kind, ImessageTargetKind::Handle);
+        assert_eq!(t.target, PHONE);
+    }
+
+    #[test]
+    fn index_without_chat_guid_still_parses() {
+        let raw = r#"{"chat1":{"identifier":"chat1","dir":"g","title":"G",
+                     "participants":["a","b"],"service":"iMessage"}}"#;
+        let map: std::collections::BTreeMap<String, Conversation> =
+            serde_json::from_str(raw).unwrap();
+        let convs: Vec<_> = map.into_values().collect();
+        assert_eq!(convs[0].chat_guid, None);
+        assert_eq!(
+            resolve_target("imessage:chat1", &convs),
+            Err(TargetError::GroupUnsupported)
+        );
+    }
+
+    #[test]
     fn sms_and_rcs_are_refused() {
         for svc in ["SMS", "RCS"] {
             let convs = [conv(PHONE, svc, &[PHONE])];
