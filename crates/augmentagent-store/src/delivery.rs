@@ -123,6 +123,27 @@ pub(crate) fn migrate(conn: &Connection) -> StoreResult<()> {
             PRIMARY KEY(platform, account_id, conversation_id, thread_id)
         );"#,
     )?;
+    // #1294: when the last attempt was claimed (lower bound for a provider
+    // history lookup) and how many reconcile lookups failed. Additive.
+    for (column, ddl) in [
+        (
+            "last_claimed_at_ms",
+            "ALTER TABLE surface_outbox ADD COLUMN last_claimed_at_ms INTEGER",
+        ),
+        (
+            "reconcile_lookups",
+            "ALTER TABLE surface_outbox ADD COLUMN reconcile_lookups INTEGER NOT NULL DEFAULT 0",
+        ),
+    ] {
+        let exists: bool = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('surface_outbox') WHERE name = ?1",
+            params![column],
+            |r| r.get::<_, i64>(0).map(|n| n > 0),
+        )?;
+        if !exists {
+            conn.execute(ddl, [])?;
+        }
+    }
     Ok(())
 }
 
@@ -645,6 +666,11 @@ pub struct OutboundSend {
     pub fell_back: bool,
     pub provider_message_id: Option<String>,
     pub last_error: Option<String>,
+    /// When the latest attempt was claimed; a provider lookup for a lost
+    /// outcome never needs to look earlier than this.
+    pub last_claimed_at_ms: Option<i64>,
+    /// Failed reconcile lookups since the send last went to `reconcile`.
+    pub reconcile_lookups: u32,
 }
 
 /// Exponential backoff: `base * 2^(attempt - 1)`, capped at `max_delay_ms`.
@@ -690,7 +716,8 @@ pub struct ReconcileReport {
 
 const SEND_COLUMNS: &str = "id, platform, account_id, conversation_id, thread_id, idempotency_key,
     operation, target_message_id, payload, status, attempts, max_attempts, next_attempt_at_ms,
-    interaction_expires_at_ms, fell_back, provider_message_id, last_error";
+    interaction_expires_at_ms, fell_back, provider_message_id, last_error, last_claimed_at_ms,
+    reconcile_lookups";
 
 fn send_from_row(r: &Row<'_>) -> rusqlite::Result<StoreResult<OutboundSend>> {
     let conversation = conversation_at(r, 1)?;
@@ -707,6 +734,8 @@ fn send_from_row(r: &Row<'_>) -> rusqlite::Result<StoreResult<OutboundSend>> {
     let fell_back: bool = r.get::<_, i64>(14)? != 0;
     let provider_message_id: Option<String> = r.get(15)?;
     let last_error: Option<String> = r.get(16)?;
+    let last_claimed_at_ms: Option<i64> = r.get(17)?;
+    let reconcile_lookups: u32 = r.get(18)?;
     Ok((|| {
         Ok(OutboundSend {
             id,
@@ -723,6 +752,8 @@ fn send_from_row(r: &Row<'_>) -> rusqlite::Result<StoreResult<OutboundSend>> {
             fell_back,
             provider_message_id,
             last_error,
+            last_claimed_at_ms,
+            reconcile_lookups,
         })
     })())
 }
@@ -843,7 +874,8 @@ impl Store {
             )?;
             tx.execute(
                 "UPDATE surface_outbox
-                 SET status = 'sending', attempts = attempts + 1, updated_at_ms = ?2
+                 SET status = 'sending', attempts = attempts + 1, updated_at_ms = ?2,
+                     last_claimed_at_ms = ?2
                  WHERE id = ?1",
                 params![id, now_ms],
             )?;
@@ -952,6 +984,111 @@ impl Store {
         })
     }
 
+    /// Sends of one account awaiting reconcile whose next lookup is due
+    /// (`next_attempt_at_ms <= now_ms`), oldest first.
+    pub fn outbound_sends_awaiting_reconcile_for(
+        &self,
+        account: &SurfaceAccountRef,
+        now_ms: i64,
+    ) -> StoreResult<Vec<OutboundSend>> {
+        read(self, |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {SEND_COLUMNS} FROM surface_outbox
+                 WHERE status = 'reconcile' AND platform = ?1 AND account_id = ?2
+                   AND next_attempt_at_ms <= ?3
+                 ORDER BY id"
+            ))?;
+            let rows = stmt
+                .query_map(
+                    params![account.platform().as_str(), account.account_id(), now_ms],
+                    send_from_row,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.into_iter().collect()
+        })
+    }
+
+    /// A reconcile lookup could not settle the send. It stays in
+    /// `reconcile` until `next_lookup_at_ms`. With `count_lookup` the
+    /// failure is counted, and once `max_lookups` failures have accrued the
+    /// send is dead-lettered so its conversation is no longer held.
+    pub fn defer_outbound_reconcile(
+        &self,
+        id: i64,
+        error: &str,
+        next_lookup_at_ms: i64,
+        count_lookup: bool,
+        max_lookups: u32,
+        now_ms: i64,
+    ) -> StoreResult<SendStatus> {
+        write_tx(self, |tx| {
+            let Some(send) = load_send(tx, id)? else {
+                return Err(invalid("unknown outbound send"));
+            };
+            if send.status != SendStatus::Reconcile {
+                return Err(invalid("outbound send is not awaiting reconcile"));
+            }
+            let lookups = send.reconcile_lookups + u32::from(count_lookup);
+            let status = if count_lookup && lookups >= max_lookups.max(1) {
+                SendStatus::DeadLetter
+            } else {
+                SendStatus::Reconcile
+            };
+            tx.execute(
+                "UPDATE surface_outbox
+                 SET status = ?2, last_error = ?3, next_attempt_at_ms = ?4,
+                     reconcile_lookups = ?5, updated_at_ms = ?6
+                 WHERE id = ?1",
+                params![
+                    id,
+                    status.as_str(),
+                    error,
+                    next_lookup_at_ms,
+                    lookups,
+                    now_ms
+                ],
+            )?;
+            Ok(status)
+        })
+    }
+
+    /// Every send of one account whose idempotency key starts with
+    /// `prefix` (compared literally), in enqueue order. An empty `statuses`
+    /// means any status.
+    pub fn outbound_sends_with_key_prefix(
+        &self,
+        account: &SurfaceAccountRef,
+        prefix: &str,
+        statuses: &[SendStatus],
+    ) -> StoreResult<Vec<OutboundSend>> {
+        // Status names are fixed identifiers from `SendStatus::as_str`.
+        let status_filter = if statuses.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<String> = statuses
+                .iter()
+                .map(|s| format!("'{}'", s.as_str()))
+                .collect();
+            format!("AND status IN ({})", names.join(", "))
+        };
+        read(self, |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {SEND_COLUMNS} FROM surface_outbox
+                 WHERE platform = ?1 AND account_id = ?2
+                   AND substr(idempotency_key, 1, length(?3)) = ?3
+                   {status_filter}
+                 ORDER BY id"
+            ))?;
+            let rows = stmt
+                .query_map(
+                    params![account.platform().as_str(), account.account_id(), prefix],
+                    send_from_row,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.into_iter().collect()
+        })
+    }
+
     /// Apply a reconcile answer. Returns the send's resulting status.
     pub fn resolve_outbound_reconcile(
         &self,
@@ -989,7 +1126,7 @@ impl Store {
                     tx.execute(
                         "UPDATE surface_outbox
                          SET status = ?2, next_attempt_at_ms = ?3, updated_at_ms = ?3,
-                             last_error = 'not delivered before restart'
+                             last_error = 'not delivered before restart', reconcile_lookups = 0
                          WHERE id = ?1",
                         params![id, status.as_str(), now_ms],
                     )?;

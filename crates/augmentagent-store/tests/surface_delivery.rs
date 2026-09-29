@@ -1176,3 +1176,205 @@ fn uncertain_send_goes_to_reconcile_and_holds_its_conversation() {
         .mark_outbound_uncertain(first.id, "again", T0 + 2)
         .is_err());
 }
+
+// ---------------------------------------------------------------------------
+// #1294 — bounded reconcile lookups and per-turn key queries for the Slack
+// dispatcher.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn claim_time_is_recorded_and_reconcile_lookups_are_bounded() {
+    let (_dir, _path, store) = temp_store();
+    let chat = slack("C00000001");
+    store.enqueue_outbound_send(&send(&chat, "p1"), T0).unwrap();
+    let claimed = store
+        .claim_next_outbound_send_for(chat.account(), T0 + 7)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.last_claimed_at_ms, Some(T0 + 7));
+    assert_eq!(claimed.reconcile_lookups, 0);
+    store
+        .mark_outbound_uncertain(claimed.id, "timeout", T0 + 8)
+        .unwrap();
+
+    let due = store
+        .outbound_sends_awaiting_reconcile_for(chat.account(), T0 + 8)
+        .unwrap();
+    assert_eq!(due.len(), 1);
+    // Another account never sees it.
+    let other = conv("slack", "team:T00000002", "C00000001", None);
+    assert!(store
+        .outbound_sends_awaiting_reconcile_for(other.account(), T0 + 8)
+        .unwrap()
+        .is_empty());
+
+    // A failed lookup counts and backs off.
+    let status = store
+        .defer_outbound_reconcile(
+            claimed.id,
+            "history: ratelimited",
+            T0 + 5_000,
+            true,
+            2,
+            T0 + 9,
+        )
+        .unwrap();
+    assert_eq!(status, SendStatus::Reconcile);
+    assert!(store
+        .outbound_sends_awaiting_reconcile_for(chat.account(), T0 + 4_999)
+        .unwrap()
+        .is_empty());
+    let due = store
+        .outbound_sends_awaiting_reconcile_for(chat.account(), T0 + 5_000)
+        .unwrap();
+    assert_eq!(due[0].reconcile_lookups, 1);
+    assert_eq!(due[0].last_error.as_deref(), Some("history: ratelimited"));
+
+    // "Too early to tell" waits without spending the budget.
+    store
+        .defer_outbound_reconcile(
+            claimed.id,
+            "not visible yet",
+            T0 + 6_000,
+            false,
+            2,
+            T0 + 5_000,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .outbound_send(claimed.id)
+            .unwrap()
+            .unwrap()
+            .reconcile_lookups,
+        1
+    );
+
+    // The budget runs out: dead letter, which unblocks the conversation.
+    let status = store
+        .defer_outbound_reconcile(
+            claimed.id,
+            "history: fatal_error",
+            T0 + 9_000,
+            true,
+            2,
+            T0 + 6_000,
+        )
+        .unwrap();
+    assert_eq!(status, SendStatus::DeadLetter);
+    assert!(store
+        .outbound_sends_awaiting_reconcile_for(chat.account(), T0 + HOUR_MS)
+        .unwrap()
+        .is_empty());
+    // Only a send awaiting reconcile can be deferred.
+    assert!(store
+        .defer_outbound_reconcile(claimed.id, "x", T0, true, 2, T0)
+        .is_err());
+}
+
+#[test]
+fn requeue_after_reconcile_resets_the_lookup_budget() {
+    let (_dir, _path, store) = temp_store();
+    let chat = slack("C00000001");
+    store.enqueue_outbound_send(&send(&chat, "p1"), T0).unwrap();
+    let claimed = store.claim_next_outbound_send(T0).unwrap().unwrap();
+    store
+        .mark_outbound_uncertain(claimed.id, "timeout", T0)
+        .unwrap();
+    store
+        .defer_outbound_reconcile(claimed.id, "lookup failed", T0 + 1, true, 5, T0)
+        .unwrap();
+    assert_eq!(
+        store
+            .resolve_outbound_reconcile(claimed.id, &ReconcileOutcome::NotDelivered, T0 + 2)
+            .unwrap(),
+        SendStatus::Queued
+    );
+    let again = store.claim_next_outbound_send(T0 + 2).unwrap().unwrap();
+    assert_eq!(again.reconcile_lookups, 0);
+    assert_eq!(again.last_claimed_at_ms, Some(T0 + 2));
+}
+
+#[test]
+fn key_prefix_query_is_exact_per_account_and_filters_status() {
+    let (_dir, _path, store) = temp_store();
+    let chat = slack("C00000001");
+    let other = conv("slack", "team:T00000002", "C00000001", None);
+    for key in [
+        "turn:a:text:0",
+        "turn:a:text:1",
+        "turn:a_:text:0",
+        "turn:ab:text:0",
+    ] {
+        store.enqueue_outbound_send(&send(&chat, key), T0).unwrap();
+    }
+    store
+        .enqueue_outbound_send(&send(&other, "turn:a:text:0"), T0)
+        .unwrap();
+    let first = store
+        .claim_next_outbound_send_for(chat.account(), T0)
+        .unwrap()
+        .unwrap();
+    store
+        .mark_outbound_failed(first.id, "channel_not_found", false, &POLICY, T0)
+        .unwrap();
+
+    let all = store
+        .outbound_sends_with_key_prefix(chat.account(), "turn:a:", &[])
+        .unwrap();
+    let keys: Vec<&str> = all.iter().map(|s| s.idempotency_key.as_str()).collect();
+    assert_eq!(
+        keys,
+        ["turn:a:text:0", "turn:a:text:1"],
+        "`_` is not a wildcard"
+    );
+    let dead = store
+        .outbound_sends_with_key_prefix(chat.account(), "turn:", &[SendStatus::DeadLetter])
+        .unwrap();
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].idempotency_key, "turn:a:text:0");
+}
+
+#[test]
+fn outbox_created_before_the_lookup_columns_is_migrated_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"CREATE TABLE surface_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform TEXT NOT NULL, account_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL, thread_id TEXT NOT NULL DEFAULT '',
+                idempotency_key TEXT NOT NULL,
+                operation TEXT NOT NULL CHECK(operation IN ('post', 'update', 'upload', 'interaction_response')),
+                target_message_id TEXT, payload TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued'
+                    CHECK(status IN ('queued', 'sending', 'reconcile', 'sent', 'failed', 'dead_letter', 'abandoned')),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL CHECK(max_attempts >= 1),
+                next_attempt_at_ms INTEGER NOT NULL, interaction_expires_at_ms INTEGER,
+                fell_back INTEGER NOT NULL DEFAULT 0 CHECK(fell_back IN (0, 1)),
+                provider_message_id TEXT, last_error TEXT,
+                created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, sent_at_ms INTEGER,
+                UNIQUE(platform, account_id, idempotency_key));
+            INSERT INTO surface_outbox (platform, account_id, conversation_id, idempotency_key,
+                operation, payload, status, attempts, max_attempts, next_attempt_at_ms,
+                created_at_ms, updated_at_ms)
+            VALUES ('slack', 'team:T00000001', 'C00000001', 'old-1', 'post', '{}', 'reconcile',
+                1, 3, 0, 0, 0);"#,
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    let chat = slack("C00000001");
+    let due = store
+        .outbound_sends_awaiting_reconcile_for(chat.account(), T0)
+        .unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].last_claimed_at_ms, None);
+    assert_eq!(due[0].reconcile_lookups, 0);
+    drop(store);
+    // Reopening is a no-op.
+    Store::open(&path).unwrap();
+}
