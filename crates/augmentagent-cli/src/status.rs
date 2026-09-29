@@ -23,8 +23,8 @@
 //!  * **queue**     — `pending_reply_count()` from the store
 //!  * **delivery**  — durable backlog/retry/dead-letter counts per surface (#1285)
 //!  * **interactive** — live listener health of interactive chat surfaces
-//!                   (#1287), from the report the daemon writes; separate
-//!                   from `channels.slack`, which is Composio ingestion
+//!    (#1287), from the report the daemon writes; not `channels.slack`,
+//!    which is Composio ingestion
 //!
 //! Output is JSON by default when stdout is piped (CI, dashboard shell-out)
 //! and a hand-rolled ASCII table when stdout is a tty (no `comfy-table`
@@ -273,7 +273,10 @@ fn collect_interactive(store: &Store, now_ms: i64) -> Result<BTreeMap<String, In
             .surface_owner_bindings(&platform)
             .context("surface owner bindings")?
             .is_empty();
-        out.insert(name.to_string(), interactive_status(report, owner_bound, now_ms));
+        out.insert(
+            name.to_string(),
+            interactive_status(report, owner_bound, now_ms),
+        );
     }
     Ok(out)
 }
@@ -1083,7 +1086,10 @@ mod tests {
             cerebras: true,
             discord_bot: true,
         };
-        assert_eq!(classify(&d, &dash, &c, &empty_channels(), &BTreeMap::new()), summary::DAEMON_DOWN);
+        assert_eq!(
+            classify(&d, &dash, &c, &empty_channels(), &BTreeMap::new()),
+            summary::DAEMON_DOWN
+        );
     }
 
     #[test]
@@ -1105,7 +1111,10 @@ mod tests {
             cerebras: true,
             discord_bot: true,
         };
-        assert_eq!(classify(&d, &dash, &c, &empty_channels(), &BTreeMap::new()), summary::DASHBOARD_DOWN);
+        assert_eq!(
+            classify(&d, &dash, &c, &empty_channels(), &BTreeMap::new()),
+            summary::DASHBOARD_DOWN
+        );
     }
 
     #[test]
@@ -1131,7 +1140,10 @@ mod tests {
         for &n in KNOWN_CHANNELS {
             channels.insert(n.to_string(), ch(false));
         }
-        assert_eq!(classify(&d, &dash, &c, &channels, &BTreeMap::new()), summary::NEEDS_SETUP);
+        assert_eq!(
+            classify(&d, &dash, &c, &channels, &BTreeMap::new()),
+            summary::NEEDS_SETUP
+        );
     }
 
     #[test]
@@ -1157,7 +1169,10 @@ mod tests {
         for &n in KNOWN_CHANNELS {
             channels.insert(n.to_string(), ch(false));
         }
-        assert_eq!(classify(&d, &dash, &c, &channels, &BTreeMap::new()), summary::DEGRADED);
+        assert_eq!(
+            classify(&d, &dash, &c, &channels, &BTreeMap::new()),
+            summary::DEGRADED
+        );
     }
 
     #[test]
@@ -1183,7 +1198,10 @@ mod tests {
         for &n in KNOWN_CHANNELS {
             channels.insert(n.to_string(), ch(n == "gmail"));
         }
-        assert_eq!(classify(&d, &dash, &c, &channels, &BTreeMap::new()), summary::OK);
+        assert_eq!(
+            classify(&d, &dash, &c, &channels, &BTreeMap::new()),
+            summary::OK
+        );
     }
 
     #[test]
@@ -1262,7 +1280,6 @@ mod tests {
         );
     }
 
-
     // --- #1287 interactive surfaces --------------------------------------
 
     use augmentagent_store::surface_health::SurfaceListenerHealth;
@@ -1298,7 +1315,10 @@ mod tests {
         let s = interactive_status(None, true, NOW_MS);
         assert_eq!(s.state, "disconnected");
         assert!(!s.healthy);
-        assert!(s.recovery.unwrap().contains("service --unit daemon restart"));
+        assert!(s
+            .recovery
+            .unwrap()
+            .contains("service --unit daemon restart"));
     }
 
     #[test]
@@ -1335,15 +1355,34 @@ mod tests {
         assert_eq!(s.state, "disabled");
     }
 
-    fn ok_daemon() -> (DaemonStatus, DashboardStatus, CoreKeys, BTreeMap<String, ChannelStatus>) {
+    fn ok_daemon() -> (
+        DaemonStatus,
+        DashboardStatus,
+        CoreKeys,
+        BTreeMap<String, ChannelStatus>,
+    ) {
         let mut channels = BTreeMap::new();
         for &n in KNOWN_CHANNELS {
             channels.insert(n.to_string(), ch(n == "gmail"));
         }
         (
-            DaemonStatus { unit: "x".into(), active: true, since_unix: 0 },
-            DashboardStatus { unit: "x".into(), active: true, port: 3000, reachable: true },
-            CoreKeys { composio: true, groq: true, cerebras: false, discord_bot: false },
+            DaemonStatus {
+                unit: "x".into(),
+                active: true,
+                since_unix: 0,
+            },
+            DashboardStatus {
+                unit: "x".into(),
+                active: true,
+                port: 3000,
+                reachable: true,
+            },
+            CoreKeys {
+                composio: true,
+                groq: true,
+                cerebras: false,
+                discord_bot: false,
+            },
             channels,
         )
     }
@@ -1356,14 +1395,23 @@ mod tests {
             "slack".to_string(),
             interactive_status(Some(report("reconnecting", 1_000)), true, NOW_MS),
         );
-        assert_eq!(classify(&d, &dash, &c, &channels, &interactive), summary::DEGRADED);
+        assert_eq!(
+            classify(&d, &dash, &c, &channels, &interactive),
+            summary::DEGRADED
+        );
         interactive.insert(
             "slack".to_string(),
             interactive_status(Some(report("connected", 1_000)), true, NOW_MS),
         );
-        assert_eq!(classify(&d, &dash, &c, &channels, &interactive), summary::OK);
+        assert_eq!(
+            classify(&d, &dash, &c, &channels, &interactive),
+            summary::OK
+        );
         interactive.insert("slack".to_string(), interactive_status(None, false, NOW_MS));
-        assert_eq!(classify(&d, &dash, &c, &channels, &interactive), summary::OK);
+        assert_eq!(
+            classify(&d, &dash, &c, &channels, &interactive),
+            summary::OK
+        );
     }
 
     #[test]
@@ -1371,8 +1419,16 @@ mod tests {
         let s = interactive_status(Some(report("connected", 1_000)), true, NOW_MS);
         let v = s.to_json();
         for key in [
-            "state", "healthy", "detail", "recovery", "workspaces", "dry_run",
-            "last_event_unix", "last_send_unix", "state_since_unix", "heartbeat_unix",
+            "state",
+            "healthy",
+            "detail",
+            "recovery",
+            "workspaces",
+            "dry_run",
+            "last_event_unix",
+            "last_send_unix",
+            "state_since_unix",
+            "heartbeat_unix",
         ] {
             assert!(v.get(key).is_some(), "missing {key}");
         }

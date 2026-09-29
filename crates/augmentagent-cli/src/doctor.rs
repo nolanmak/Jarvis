@@ -2715,7 +2715,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn interactive_surface_is_reported_apart_from_composio_and_never_ok_when_down() {
         use crate::status::InteractiveStatus;
@@ -2749,7 +2748,11 @@ mod tests {
 
         for quiet in ["not_configured", "disabled"] {
             m.get_mut("slack").unwrap().state = quiet.into();
-            assert_eq!(check_interactive_surfaces(&m)[0].severity, Severity::Ok, "{quiet}");
+            assert_eq!(
+                check_interactive_surfaces(&m)[0].severity,
+                Severity::Ok,
+                "{quiet}"
+            );
         }
     }
 

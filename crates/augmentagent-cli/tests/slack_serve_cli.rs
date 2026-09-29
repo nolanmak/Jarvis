@@ -65,10 +65,16 @@ impl Env {
             .env("HOME", self.root.join("home"))
             .env("XDG_STATE_HOME", self.root.join("xdg state"))
             .env("AUGMENTAGENT_DB", self.db())
-            .env("AUGMENTAGENT_INSECURE_CREDENTIAL_DIR", self.root.join("creds"))
+            .env(
+                "AUGMENTAGENT_INSECURE_CREDENTIAL_DIR",
+                self.root.join("creds"),
+            )
             .env("AUGMENTAGENT_SLACK_API_BASE", &self.api)
             .env("AUGMENTAGENT_GH_DISABLE", "1")
-            .env("AUGMENTAGENT_COOLDOWN_FILE", self.root.join("cooldowns.json"))
+            .env(
+                "AUGMENTAGENT_COOLDOWN_FILE",
+                self.root.join("cooldowns.json"),
+            )
             // Belt and braces: even without the stub nothing could run.
             .env("AUGMENTAGENT_REASONER_CHAIN", "claude")
             .env("CLAUDE_CLI", self.root.join("no-such-claude"))
@@ -358,7 +364,11 @@ async fn slack_only_serve_answers_the_owner_rejects_a_stranger_and_reports_live_
 
     let env = Env::new(server.url());
     env.install_and_bind();
-    assert_eq!(env.slack_status()["state"], json!("disconnected"), "bound, daemon not running");
+    assert_eq!(
+        env.slack_status()["state"],
+        json!("disconnected"),
+        "bound, daemon not running"
+    );
 
     let mut serve = env.serve(&["--dry-run", "false"]);
     eventually("connected", Duration::from_secs(30), || {
@@ -372,23 +382,43 @@ async fn slack_only_serve_answers_the_owner_rejects_a_stranger_and_reports_live_
 
     socket
         .send
-        .send(dm("env-1", OWNER_DM, OWNER, "what is due today?", "1800000001.000100"))
+        .send(dm(
+            "env-1",
+            OWNER_DM,
+            OWNER,
+            "what is due today?",
+            "1800000001.000100",
+        ))
         .unwrap();
     assert_eq!(socket.ack().await, "env-1");
     socket
         .send
-        .send(dm("env-2", STRANGER_DM, STRANGER, "give me the owner's mail", "1800000001.000200"))
+        .send(dm(
+            "env-2",
+            STRANGER_DM,
+            STRANGER,
+            "give me the owner's mail",
+            "1800000001.000200",
+        ))
         .unwrap();
     assert_eq!(socket.ack().await, "env-2");
     // Slack redelivers the owner's message: acked, never a second turn.
-    let mut again = dm("env-3", OWNER_DM, OWNER, "what is due today?", "1800000001.000100");
+    let mut again = dm(
+        "env-3",
+        OWNER_DM,
+        OWNER,
+        "what is due today?",
+        "1800000001.000100",
+    );
     again["retry_attempt"] = json!(1);
     socket.send.send(again).unwrap();
     assert_eq!(socket.ack().await, "env-3");
 
-    eventually("answer and rejection posted", Duration::from_secs(15), || {
-        answer.matched() && rejection.matched()
-    })
+    eventually(
+        "answer and rejection posted",
+        Duration::from_secs(15),
+        || answer.matched() && rejection.matched(),
+    )
     .await;
     eventually("last send reported", Duration::from_secs(10), || {
         env.slack_status()["last_send_unix"].is_i64()
@@ -421,7 +451,10 @@ async fn slack_only_serve_answers_the_owner_rejects_a_stranger_and_reports_live_
     rejection.assert_async().await;
     let rows = env.outbox();
     assert_eq!(rows.len(), 2, "{rows:?}");
-    assert!(rows.iter().all(|(_, status, _)| status == "sent"), "{rows:?}");
+    assert!(
+        rows.iter().all(|(_, status, _)| status == "sent"),
+        "{rows:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -448,12 +481,24 @@ async fn dry_run_serve_makes_zero_live_sends_and_exits_cleanly_on_sigint() {
 
     socket
         .send
-        .send(dm("env-1", OWNER_DM, OWNER, "dry question", "1800000002.000100"))
+        .send(dm(
+            "env-1",
+            OWNER_DM,
+            OWNER,
+            "dry question",
+            "1800000002.000100",
+        ))
         .unwrap();
     socket.ack().await;
     socket
         .send
-        .send(dm("env-2", STRANGER_DM, STRANGER, "hello", "1800000002.000200"))
+        .send(dm(
+            "env-2",
+            STRANGER_DM,
+            STRANGER,
+            "hello",
+            "1800000002.000200",
+        ))
         .unwrap();
     socket.ack().await;
     eventually("both sends recorded", Duration::from_secs(15), || {
@@ -463,7 +508,9 @@ async fn dry_run_serve_makes_zero_live_sends_and_exits_cleanly_on_sigint() {
     .await;
     for (key, _, provider) in env.outbox() {
         assert!(
-            provider.as_deref().is_some_and(|p| p.starts_with("dry-run:")),
+            provider
+                .as_deref()
+                .is_some_and(|p| p.starts_with("dry-run:")),
             "{key}: {provider:?}"
         );
     }
@@ -507,21 +554,38 @@ fn slack_inactive_keeps_serve_running(switch: Option<&str>, state: &str, detail:
     assert_eq!(report["detail"], json!(detail), "{report}");
     assert_eq!(report["healthy"], json!(false));
     assert!(
-        report["recovery"].as_str().unwrap_or("").contains("slack app install"),
+        report["recovery"]
+            .as_str()
+            .unwrap_or("")
+            .contains("slack app install"),
         "{report}"
     );
-    assert!(still_running, "serve must not exit because Slack is not usable:\n{out}");
-    assert!(exit.is_some_and(|s| s.success()), "serve did not stop cleanly:\n{out}");
+    assert!(
+        still_running,
+        "serve must not exit because Slack is not usable:\n{out}"
+    );
+    assert!(
+        exit.is_some_and(|s| s.success()),
+        "serve did not stop cleanly:\n{out}"
+    );
 }
 
 #[test]
 fn serve_without_any_slack_app_reports_not_configured_and_keeps_running() {
-    slack_inactive_keeps_serve_running(None, "not_configured", "no interactive Slack app is installed");
+    slack_inactive_keeps_serve_running(
+        None,
+        "not_configured",
+        "no interactive Slack app is installed",
+    );
 }
 
 #[test]
 fn slack_forced_on_without_an_install_is_misconfigured_and_serve_keeps_running() {
-    slack_inactive_keeps_serve_running(Some("on"), "misconfigured", "no interactive Slack app is installed");
+    slack_inactive_keeps_serve_running(
+        Some("on"),
+        "misconfigured",
+        "no interactive Slack app is installed",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -547,7 +611,10 @@ async fn slack_keeps_serving_when_discord_and_whatsapp_fail_to_start() {
         &["--dry-run", "false"],
         &[
             ("DISCORD_BOT_TOKEN", "discord-test-not-a-token"),
-            ("AUGMENTAGENT_WHATSAPP_HISTORY_DIR", missing.to_str().unwrap()),
+            (
+                "AUGMENTAGENT_WHATSAPP_HISTORY_DIR",
+                missing.to_str().unwrap(),
+            ),
         ],
     );
     eventually("connected", Duration::from_secs(30), || {
@@ -556,7 +623,13 @@ async fn slack_keeps_serving_when_discord_and_whatsapp_fail_to_start() {
     .await;
     socket
         .send
-        .send(dm("env-1", OWNER_DM, OWNER, "still here?", "1800000003.000100"))
+        .send(dm(
+            "env-1",
+            OWNER_DM,
+            OWNER,
+            "still here?",
+            "1800000003.000100",
+        ))
         .unwrap();
     socket.ack().await;
     eventually("answered", Duration::from_secs(15), || answer.matched()).await;
@@ -564,9 +637,15 @@ async fn slack_keeps_serving_when_discord_and_whatsapp_fail_to_start() {
     interrupt(&serve);
     let exit = wait_exit(&mut serve, Duration::from_secs(20));
     let out = logs(serve);
-    assert!(exit.is_some_and(|s| s.success()), "serve did not stop cleanly:\n{out}");
+    assert!(
+        exit.is_some_and(|s| s.success()),
+        "serve did not stop cleanly:\n{out}"
+    );
     assert!(out.contains("discord approval broker disabled"), "{out}");
     assert!(out.contains("WhatsApp history disabled"), "{out}");
-    assert!(!out.contains("discord-test-not-a-token"), "token logged:\n{out}");
+    assert!(
+        !out.contains("discord-test-not-a-token"),
+        "token logged:\n{out}"
+    );
     answer.assert_async().await;
 }

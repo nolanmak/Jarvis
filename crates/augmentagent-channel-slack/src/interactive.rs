@@ -49,14 +49,16 @@ use augmentagent_store::delivery::{
 };
 use augmentagent_store::surface_health::SurfaceListenerHealth;
 use augmentagent_store::{
-    Store, StoreResult, SurfaceAccountRef, SurfaceConversationRef, SurfaceOwnerRef,
-    SurfacePlatform,
+    Store, StoreResult, SurfaceAccountRef, SurfaceConversationRef, SurfaceOwnerRef, SurfacePlatform,
 };
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::delivery::{
+    enqueue_answer, Answer, DispatchOutcome, PlanOptions, SlackOutboxDispatcher,
+};
 use crate::owner::{
     admit, AdmitOutcome, OwnerInput, OwnerInputSink, OwnerInputSource, SlackBotIdentity,
     SlackOwnerAuthorizer,
@@ -69,7 +71,6 @@ use crate::transport::socket::{
     Ack, ConnectionState, HandoffError, SlackDelivery, SlackEventSink, SocketConnector,
     SocketModeClient, SocketModeConfig,
 };
-use crate::delivery::{enqueue_answer, Answer, DispatchOutcome, PlanOptions, SlackOutboxDispatcher};
 use crate::transport::web::{PostEphemeral, SlackWebApi};
 
 /// A report older than this means the daemon that wrote it stopped.
@@ -347,7 +348,11 @@ impl SlackSurfaceHealth {
             let described = match state {
                 ConnectionState::Idle | ConnectionState::Connecting { .. } => {
                     if *ever_connected {
-                        (SurfaceState::Reconnecting, None, Some(RECONNECTING_RECOVERY.into()))
+                        (
+                            SurfaceState::Reconnecting,
+                            None,
+                            Some(RECONNECTING_RECOVERY.into()),
+                        )
                     } else {
                         (SurfaceState::Connecting, None, None)
                     }
@@ -358,7 +363,9 @@ impl SlackSurfaceHealth {
                     Some(reason.clone()),
                     Some(RECONNECTING_RECOVERY.into()),
                 ),
-                ConnectionState::Stopped { fatal: Some(reason) } => (
+                ConnectionState::Stopped {
+                    fatal: Some(reason),
+                } => (
                     SurfaceState::Disconnected,
                     Some(reason.clone()),
                     Some(fatal_recovery(reason)),
@@ -367,7 +374,7 @@ impl SlackSurfaceHealth {
             };
             if worst
                 .as_ref()
-                .map_or(true, |(w, _, _)| described.0.rank() < w.rank())
+                .is_none_or(|(w, _, _)| described.0.rank() < w.rank())
             {
                 worst = Some(described);
             }
@@ -727,7 +734,11 @@ impl SlackEventSink for DurableSink {
                 Ok(Ack::empty())
             }
             Ok(InboundRecordOutcome::Duplicate { seq, status }) => {
-                debug!(seq, status = status.as_str(), "slack interactive: duplicate event acked");
+                debug!(
+                    seq,
+                    status = status.as_str(),
+                    "slack interactive: duplicate event acked"
+                );
                 Ok(Ack::empty())
             }
             Err(e) => {
@@ -987,7 +998,10 @@ async fn process(ctx: &Ctx, claimed: ClaimedInbound, shutdown: &CancellationToke
     {
         Some(Envelope::Event(e)) => *e,
         _ => {
-            warn!(seq, "slack interactive: stored event is unreadable; dropping it");
+            warn!(
+                seq,
+                "slack interactive: stored event is unreadable; dropping it"
+            );
             settle(ctx, seq);
             return;
         }
@@ -1151,8 +1165,9 @@ async fn send_loop(ctx: Arc<Ctx>, shutdown: CancellationToken) {
 /// Deliver this workspace's due sends with the shared dispatcher, which
 /// also reconciles uncertain sends and settles broken turns.
 async fn drain(ctx: &Ctx, runtime: &SlackWorkspaceRuntime) {
-    let dispatcher = SlackOutboxDispatcher::new(&ctx.store, runtime.web.as_ref(), &runtime.workspace)
-        .with_retry_policy(ctx.config.retry);
+    let dispatcher =
+        SlackOutboxDispatcher::new(&ctx.store, runtime.web.as_ref(), &runtime.workspace)
+            .with_retry_policy(ctx.config.retry);
     match dispatcher.drain(ctx.now()).await {
         Ok(done) => {
             for d in done {
@@ -1160,7 +1175,9 @@ async fn drain(ctx: &Ctx, runtime: &SlackWorkspaceRuntime) {
                     DispatchOutcome::Sent { .. } | DispatchOutcome::Reconciled { .. } => {
                         ctx.health.sent(ctx.now())
                     }
-                    ref other => debug!(key = %d.idempotency_key, outcome = ?other, "slack interactive: send not delivered yet"),
+                    ref other => {
+                        debug!(key = %d.idempotency_key, outcome = ?other, "slack interactive: send not delivered yet")
+                    }
                 }
             }
         }

@@ -87,7 +87,9 @@ impl DuplexConnector {
 impl SocketConnector for DuplexConnector {
     async fn connect(&self, _cancel: &CancellationToken) -> Result<BoxedWebSocket, ConnectError> {
         if self.fatal {
-            return Err(ConnectError::Fatal("apps.connections.open: invalid_auth".into()));
+            return Err(ConnectError::Fatal(
+                "apps.connections.open: invalid_auth".into(),
+            ));
         }
         let (client_half, server_half) = tokio::io::duplex(256 * 1024);
         let server = WebSocketStream::from_raw_socket(server_half, Role::Server, None).await;
@@ -95,7 +97,10 @@ impl SocketConnector for DuplexConnector {
             return Err(ConnectError::Transient("test stopped listening".into()));
         }
         let boxed: Box<dyn AsyncIo> = Box::new(client_half);
-        Ok(WebSocketStream::from_raw_socket(MaybeTlsStream::Plain(boxed), Role::Client, None).await)
+        Ok(
+            WebSocketStream::from_raw_socket(MaybeTlsStream::Plain(boxed), Role::Client, None)
+                .await,
+        )
     }
 }
 
@@ -178,7 +183,9 @@ fn bot() -> SlackBotIdentity {
 
 fn bind_owner(store: &Store) {
     let ws = workspace();
-    store.bind_surface_owner(&ws.owner(OWNER).unwrap(), T0).unwrap();
+    store
+        .bind_surface_owner(&ws.owner(OWNER).unwrap(), T0)
+        .unwrap();
     store
         .set_surface_control_conversation(
             &ws.conversation(DM, None).unwrap(),
@@ -326,7 +333,14 @@ fn hello() -> Message {
     )
 }
 
-fn message(envelope_id: &str, channel: &str, channel_type: &str, user: &str, text: &str, ts: &str) -> Value {
+fn message(
+    envelope_id: &str,
+    channel: &str,
+    channel_type: &str,
+    user: &str,
+    text: &str,
+    ts: &str,
+) -> Value {
     json!({
         "type": "events_api",
         "envelope_id": envelope_id,
@@ -365,7 +379,10 @@ impl Server {
     }
 
     async fn send(&mut self, frame: &Value) {
-        self.ws.send(Message::Text(frame.to_string())).await.unwrap();
+        self.ws
+            .send(Message::Text(frame.to_string()))
+            .await
+            .unwrap();
     }
 
     /// The next ack frame's envelope id (pings and pongs skipped).
@@ -440,13 +457,21 @@ async fn owner_dm_begins_handling_within_one_second_and_the_answer_is_posted() {
     let running = start(h.surface(Arc::clone(&h.store), connector, handler.clone(), false));
 
     let mut server = Server::accept(&mut servers).await;
-    eventually("connected", || h.health_state().as_deref() == Some("connected")).await;
+    eventually("connected", || {
+        h.health_state().as_deref() == Some("connected")
+    })
+    .await;
 
     let sent_at = Instant::now();
-    server.send(&owner_dm("env-1", "what is on today?", "1700000000.000100")).await;
+    server
+        .send(&owner_dm("env-1", "what is on today?", "1700000000.000100"))
+        .await;
     assert_eq!(server.ack().await, "env-1");
     // Acked means persisted: the durable log already has this message.
-    assert!(!not_persisted_yet(&h.store, &format!("{DM}:1700000000.000100")));
+    assert!(!not_persisted_yet(
+        &h.store,
+        &format!("{DM}:1700000000.000100")
+    ));
 
     eventually("handler called", || handler.calls() == 1).await;
     let started = handler.turns.lock().unwrap()[0].1;
@@ -506,7 +531,14 @@ async fn control_channel_message_is_answered_in_its_thread() {
     let mut server = Server::accept(&mut servers).await;
 
     server
-        .send(&message("env-1", CONTROL, "group", OWNER, "status?", "1700000000.000200"))
+        .send(&message(
+            "env-1",
+            CONTROL,
+            "group",
+            OWNER,
+            "status?",
+            "1700000000.000200",
+        ))
         .await;
     server.ack().await;
     eventually("answer posted", || h.posts().len() == 1).await;
@@ -555,19 +587,36 @@ async fn non_owner_gets_one_rejection_reply_and_never_reaches_the_handler() {
 
     // A stranger DMs the app: the reply goes back in that DM.
     server
-        .send(&message("env-1", STRANGER_DM, "im", STRANGER, "give me the owner's mail", "1700000000.000300"))
+        .send(&message(
+            "env-1",
+            STRANGER_DM,
+            "im",
+            STRANGER,
+            "give me the owner's mail",
+            "1700000000.000300",
+        ))
         .await;
     server.ack().await;
     // A stranger in the private control channel: ephemeral, only they see it.
     server
-        .send(&message("env-2", CONTROL, "group", STRANGER, "me too", "1700000000.000400"))
+        .send(&message(
+            "env-2",
+            CONTROL,
+            "group",
+            STRANGER,
+            "me too",
+            "1700000000.000400",
+        ))
         .await;
     server.ack().await;
 
     eventually("rejection DM", || h.posts().len() == 1).await;
     eventually("rejection ephemeral", || h.ephemerals().len() == 1).await;
     let post = &h.posts()[0];
-    assert_eq!((post.channel.as_str(), post.text.as_str()), (STRANGER_DM, REJECTION_REPLY));
+    assert_eq!(
+        (post.channel.as_str(), post.text.as_str()),
+        (STRANGER_DM, REJECTION_REPLY)
+    );
     let eph = &h.ephemerals()[0];
     assert_eq!(
         (eph.channel.as_str(), eph.user.as_str(), eph.text.as_str()),
@@ -593,7 +642,14 @@ async fn the_agents_own_echo_is_acked_and_ignored() {
     let running = start(h.surface(Arc::clone(&h.store), connector, handler.clone(), false));
     let mut server = Server::accept(&mut servers).await;
 
-    let mut echo = message("env-1", DM, "im", BOT_USER, "answer: hi", "1700000000.000500");
+    let mut echo = message(
+        "env-1",
+        DM,
+        "im",
+        BOT_USER,
+        "answer: hi",
+        "1700000000.000500",
+    );
     echo["payload"]["event"]["bot_id"] = json!("B00000001");
     server.send(&echo).await;
     server.ack().await;
@@ -619,13 +675,21 @@ async fn a_failed_turn_tells_the_owner_without_leaking_the_error() {
     let running = start(h.surface(Arc::clone(&h.store), connector, handler.clone(), false));
     let mut server = Server::accept(&mut servers).await;
 
-    server.send(&owner_dm("env-1", "boom", "1700000000.000100")).await;
+    server
+        .send(&owner_dm("env-1", "boom", "1700000000.000100"))
+        .await;
     server.ack().await;
     eventually("failure notice", || h.posts().len() == 1).await;
     let text = &h.posts()[0].text;
-    assert!(!text.contains("internal detail"), "error detail leaked: {text}");
+    assert!(
+        !text.contains("internal detail"),
+        "error detail leaked: {text}"
+    );
     assert!(text.to_lowercase().contains("went wrong"), "{text}");
-    assert_eq!(h.inbound_status(&format!("{DM}:1700000000.000100")), "handled");
+    assert_eq!(
+        h.inbound_status(&format!("{DM}:1700000000.000100")),
+        "handled"
+    );
     running.stop().await;
 }
 
@@ -637,7 +701,9 @@ async fn shutdown_during_a_pending_turn_stops_cleanly_and_leaves_the_event_claim
     let running = start(h.surface(Arc::clone(&h.store), connector, handler.clone(), false));
     let mut server = Server::accept(&mut servers).await;
 
-    server.send(&owner_dm("env-1", "slow one", "1700000000.000100")).await;
+    server
+        .send(&owner_dm("env-1", "slow one", "1700000000.000100"))
+        .await;
     server.ack().await;
     eventually("turn pending", || handler.calls() == 1).await;
     let event_id = format!("{DM}:1700000000.000100");
@@ -645,7 +711,11 @@ async fn shutdown_during_a_pending_turn_stops_cleanly_and_leaves_the_event_claim
 
     running.stop().await;
     assert!(h.web.calls().is_empty(), "no answer for an unfinished turn");
-    assert_eq!(h.inbound_status(&event_id), "received", "released for the next run");
+    assert_eq!(
+        h.inbound_status(&event_id),
+        "received",
+        "released for the next run"
+    );
     assert_eq!(h.health_state().as_deref(), Some("stopped"));
     let again = h
         .store
@@ -669,7 +739,9 @@ async fn restart_mid_turn_recovers_the_event_exactly_once() {
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(surface.run(shutdown.clone()));
         let mut server = Server::accept(&mut servers).await;
-        server.send(&owner_dm("env-1", "survive a crash", "1700000000.000100")).await;
+        server
+            .send(&owner_dm("env-1", "survive a crash", "1700000000.000100"))
+            .await;
         server.ack().await;
         eventually("turn pending", || handler.calls() == 1).await;
         task.abort();
@@ -715,7 +787,13 @@ async fn restart_after_the_answer_was_queued_sends_it_without_a_second_turn() {
         let handler = FakeHandler::holding();
         let running = start(h.surface(h.reopen(), connector, handler.clone(), false));
         let mut server = Server::accept(&mut servers).await;
-        server.send(&owner_dm("env-1", "queued before the crash", "1700000000.000100")).await;
+        server
+            .send(&owner_dm(
+                "env-1",
+                "queued before the crash",
+                "1700000000.000100",
+            ))
+            .await;
         server.ack().await;
         eventually("turn pending", || handler.calls() == 1).await;
         running.stop().await;
@@ -733,7 +811,8 @@ async fn restart_after_the_answer_was_queued_sends_it_without_a_second_turn() {
                 DM,
                 // The shared outbox dispatcher's key and payload (#1294).
                 format!("turn:{event_id}:text:0"),
-                json!({"text": "answer: queued before the crash", "part": 1, "parts": 1}).to_string()
+                json!({"text": "answer: queued before the crash", "part": 1, "parts": 1})
+                    .to_string()
             ],
         )
         .unwrap();
@@ -745,7 +824,11 @@ async fn restart_after_the_answer_was_queued_sends_it_without_a_second_turn() {
     eventually("queued answer sent", || h.posts().len() == 1).await;
     eventually("event handled", || h.inbound_status(&event_id) == "handled").await;
     running.stop().await;
-    assert_eq!(handler.calls(), 0, "the answer already existed; no second turn");
+    assert_eq!(
+        handler.calls(),
+        0,
+        "the answer already existed; no second turn"
+    );
     assert_eq!(h.posts()[0].text, "answer: queued before the crash");
 }
 
@@ -761,10 +844,19 @@ async fn dry_run_makes_zero_live_sends_and_records_them_as_dry_run() {
     let running = start(h.surface(Arc::clone(&h.store), connector, handler.clone(), true));
     let mut server = Server::accept(&mut servers).await;
 
-    server.send(&owner_dm("env-1", "dry question", "1700000000.000100")).await;
+    server
+        .send(&owner_dm("env-1", "dry question", "1700000000.000100"))
+        .await;
     server.ack().await;
     server
-        .send(&message("env-2", STRANGER_DM, "im", STRANGER, "hi", "1700000000.000200"))
+        .send(&message(
+            "env-2",
+            STRANGER_DM,
+            "im",
+            STRANGER,
+            "hi",
+            "1700000000.000200",
+        ))
         .await;
     server.ack().await;
     eventually("both sends settled", || {
@@ -785,7 +877,9 @@ async fn dry_run_makes_zero_live_sends_and_records_them_as_dry_run() {
     );
     for (key, _, provider_id) in h.outbox() {
         assert!(
-            provider_id.as_deref().is_some_and(|p| p.starts_with("dry-run:")),
+            provider_id
+                .as_deref()
+                .is_some_and(|p| p.starts_with("dry-run:")),
             "{key} recorded as {provider_id:?}"
         );
     }
@@ -823,7 +917,16 @@ fn not_configured_and_disabled_are_reported_with_recovery() {
     assert!(h.recovery.unwrap().contains("slack app install"));
     assert!(!SurfaceState::NotConfigured.is_healthy());
 
-    report_inactive(&store, SurfaceState::Disabled, "disabled by AUGMENTAGENT_SLACK_INTERACTIVE=0", None, &[TEAM.to_string()], false, T0 + 1).unwrap();
+    report_inactive(
+        &store,
+        SurfaceState::Disabled,
+        "disabled by AUGMENTAGENT_SLACK_INTERACTIVE=0",
+        None,
+        &[TEAM.to_string()],
+        false,
+        T0 + 1,
+    )
+    .unwrap();
     let h = store
         .surface_listener_health(&SurfacePlatform::new("slack").unwrap())
         .unwrap()
@@ -844,28 +947,43 @@ async fn connecting_connected_reconnecting_and_stopped_are_live_states() {
         .await
         .unwrap()
         .unwrap();
-    eventually("connecting reported", || h.health_state().as_deref() == Some("connecting")).await;
+    eventually("connecting reported", || {
+        h.health_state().as_deref() == Some("connecting")
+    })
+    .await;
     let mut server = Server { ws };
     server.ws.send(hello()).await.unwrap();
-    eventually("connected", || h.health_state().as_deref() == Some("connected")).await;
+    eventually("connected", || {
+        h.health_state().as_deref() == Some("connected")
+    })
+    .await;
     assert!(SurfaceState::Connected.is_healthy());
 
     // The fake Slack drops the socket: reconnecting, never healthy, and the
     // operator is told what the daemon is doing about it.
     drop(server);
-    eventually("reconnecting", || h.health_state().as_deref() == Some("reconnecting")).await;
+    eventually("reconnecting", || {
+        h.health_state().as_deref() == Some("reconnecting")
+    })
+    .await;
     let report = h
         .store
         .surface_listener_health(&SurfacePlatform::new("slack").unwrap())
         .unwrap()
         .unwrap();
     assert!(
-        report.recovery.as_deref().is_some_and(|r| r.contains("retries")),
+        report
+            .recovery
+            .as_deref()
+            .is_some_and(|r| r.contains("retries")),
         "{report:?}"
     );
     // It comes back.
     let _server = Server::accept(&mut servers).await;
-    eventually("connected again", || h.health_state().as_deref() == Some("connected")).await;
+    eventually("connected again", || {
+        h.health_state().as_deref() == Some("connected")
+    })
+    .await;
     running.stop().await;
     assert_eq!(h.health_state().as_deref(), Some("stopped"));
 }
@@ -880,7 +998,10 @@ async fn a_rejected_app_token_is_disconnected_with_recovery_and_does_not_end_the
         handler.clone(),
         false,
     ));
-    eventually("disconnected", || h.health_state().as_deref() == Some("disconnected")).await;
+    eventually("disconnected", || {
+        h.health_state().as_deref() == Some("disconnected")
+    })
+    .await;
     let health = h
         .store
         .surface_listener_health(&SurfacePlatform::new("slack").unwrap())
@@ -889,7 +1010,10 @@ async fn a_rejected_app_token_is_disconnected_with_recovery_and_does_not_end_the
     assert!(health.detail.unwrap().contains("invalid_auth"));
     let recovery = health.recovery.unwrap();
     assert!(recovery.contains("slack app rotate"), "{recovery}");
-    assert!(!running.task.is_finished(), "a dead listener must not end the surface");
+    assert!(
+        !running.task.is_finished(),
+        "a dead listener must not end the surface"
+    );
     running.stop().await;
 }
 

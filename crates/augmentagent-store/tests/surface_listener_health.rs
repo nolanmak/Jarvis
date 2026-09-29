@@ -64,7 +64,10 @@ fn report_round_trips_and_a_later_report_replaces_it() {
         reader.surface_listener_health(&slack()).unwrap(),
         Some(reconnecting.clone())
     );
-    assert_eq!(reader.all_surface_listener_health().unwrap(), vec![reconnecting]);
+    assert_eq!(
+        reader.all_surface_listener_health().unwrap(),
+        vec![reconnecting]
+    );
 }
 
 #[test]

@@ -113,7 +113,10 @@ fn app_error(e: &SlackAppError, workspaces: Vec<String>) -> Plan {
     inactive(
         SurfaceState::Misconfigured,
         e.to_string(),
-        Some(format!("{} Then restart the daemon (`augmentagent service --unit daemon restart`).", e.recovery())),
+        Some(format!(
+            "{} Then restart the daemon (`augmentagent service --unit daemon restart`).",
+            e.recovery()
+        )),
         workspaces,
     )
 }
@@ -194,7 +197,9 @@ pub fn plan(
         };
         match apps.load(team) {
             Ok(Some(creds)) => installs.push(ReadyInstall { creds, workspace }),
-            Ok(None) => warn!(team = %team, "slack interactive: install index lists a team with no credentials"),
+            Ok(None) => {
+                warn!(team = %team, "slack interactive: install index lists a team with no credentials")
+            }
             Err(e) => return app_error(&e, teams.clone()),
         }
     }
@@ -237,7 +242,11 @@ pub fn build_surface(
     let mut workspaces = Vec::new();
     let mut connectors: Vec<Arc<dyn SocketConnector>> = Vec::new();
     let mut apps_seen: Vec<String> = Vec::new();
-    for ReadyInstall { creds: c, workspace } in installs {
+    for ReadyInstall {
+        creds: c,
+        workspace,
+    } in installs
+    {
         let web = HttpSlackWebApi::new(
             c.bot_token.clone(),
             WebApiConfig {
@@ -322,7 +331,9 @@ pub fn spawn(
                         recovery = recovery.as_deref().unwrap_or(""),
                         "slack interactive surface misconfigured"
                     ),
-                    _ => info!(state = state.as_str(), detail = %detail, "slack interactive surface not started"),
+                    _ => {
+                        info!(state = state.as_str(), detail = %detail, "slack interactive surface not started")
+                    }
                 }
                 report_inactive(
                     &store,
@@ -346,7 +357,13 @@ pub fn spawn(
             }
             None => make_handler(),
         };
-        let surface = match build_surface(Arc::clone(&store), &installs, &api_base, handler, dry_run) {
+        let surface = match build_surface(
+            Arc::clone(&store),
+            &installs,
+            &api_base,
+            handler,
+            dry_run,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 let detail = format!("could not start the Slack listener: {e:#}");
@@ -388,7 +405,11 @@ impl SlackTurnHandler for QueryTurnHandler {
         // "matched Discord's owner allowlist" and gates Discord-owner tools
         // (model switch, computer use). Slack's tool permissions are #1288.
         let ctx = AuditCtx {
-            session_id: format!("slack:{}:{}", turn.owner.account().account_id(), turn.event_id),
+            session_id: format!(
+                "slack:{}:{}",
+                turn.owner.account().account_id(),
+                turn.event_id
+            ),
             guild_id: None,
             http: None,
             channel_id: None,
@@ -464,7 +485,9 @@ where
         // through this one.
         match tokio::spawn(task).await {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => error!(task = name, error = %format!("{e:#}"), "surface stopped with an error; other surfaces keep running"),
+            Ok(Err(e)) => {
+                error!(task = name, error = %format!("{e:#}"), "surface stopped with an error; other surfaces keep running")
+            }
             Err(_) => error!(task = name, "surface panicked; other surfaces keep running"),
         }
         Ok(())
@@ -475,7 +498,9 @@ where
 mod tests {
     use super::*;
     use augmentagent_auth::{CredentialStore, MemoryCredentialStore};
-    use augmentagent_channel_slack::app::{parse_app_token, parse_bot_token, APP_CREDENTIAL_PLATFORM};
+    use augmentagent_channel_slack::app::{
+        parse_app_token, parse_bot_token, APP_CREDENTIAL_PLATFORM,
+    };
     use augmentagent_channel_slack::owner::OwnerInputSource;
     use augmentagent_channel_slack::surface::SlackWorkspace;
     use augmentagent_channel_slack::transport::event::{parse_envelope, Envelope};
@@ -510,7 +535,9 @@ mod tests {
 
     fn bind(store: &Store, team: &str) {
         let ws = SlackWorkspace::new(team, None).unwrap();
-        store.bind_surface_owner(&ws.owner("U00000001").unwrap(), T0).unwrap();
+        store
+            .bind_surface_owner(&ws.owner("U00000001").unwrap(), T0)
+            .unwrap();
     }
 
     /// Fails the test if anything reads the credential store.
@@ -601,8 +628,7 @@ mod tests {
     fn an_unreadable_switch_is_misconfigured() {
         let (_d, store) = temp_store();
         let apps = SlackAppStore::new(Arc::new(Untouchable));
-        let (state, detail, recovery) =
-            inactive(plan(Err("maybe".into()), &apps, &store, None));
+        let (state, detail, recovery) = inactive(plan(Err("maybe".into()), &apps, &store, None));
         assert_eq!(state, SurfaceState::Misconfigured);
         assert!(detail.contains("maybe"));
         assert!(recovery.unwrap().contains(ENABLE_ENV));
@@ -653,7 +679,10 @@ mod tests {
                         .collect::<Vec<_>>(),
                     [TEAM]
                 );
-                assert_eq!(installs[0].workspace.account().account_id(), "team:T00000001");
+                assert_eq!(
+                    installs[0].workspace.account().account_id(),
+                    "team:T00000001"
+                );
                 assert_eq!(api_base, "http://127.0.0.1:9");
             }
             Plan::Inactive { detail, .. } => panic!("not ready: {detail}"),
@@ -666,7 +695,9 @@ mod tests {
         let apps = SlackAppStore::new(Arc::new(MemoryCredentialStore::default()));
         apps.save(&creds(TEAM)).unwrap();
         let ws = SlackWorkspace::new(TEAM, Some("E00000001")).unwrap();
-        store.bind_surface_owner(&ws.owner("U00000001").unwrap(), T0).unwrap();
+        store
+            .bind_surface_owner(&ws.owner("U00000001").unwrap(), T0)
+            .unwrap();
         let Plan::Ready { installs, .. } =
             plan(Ok(Switch::Auto), &apps, &store, Some("http://127.0.0.1:9"))
         else {
@@ -744,7 +775,10 @@ mod tests {
         // Owner-only tools (model switch, computer use) stay Discord-gated
         // until #1288 decides Slack's tool permissions.
         assert!(!owner_authorized);
-        assert!(!discord_ctx, "no Discord http/channel/guild on a Slack turn");
+        assert!(
+            !discord_ctx,
+            "no Discord http/channel/guild on a Slack turn"
+        );
         assert_eq!(question, "what is due?");
     }
 
@@ -780,7 +814,6 @@ mod tests {
             .unwrap();
         assert_eq!(reply.text, NO_QUERY_REPLY);
     }
-
 
     // --- test-only reasoner stand-in --------------------------------------
 

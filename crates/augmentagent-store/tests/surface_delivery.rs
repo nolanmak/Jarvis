@@ -1393,7 +1393,10 @@ fn platform_scoped_inbound_claims_leave_other_surfaces_events_alone() {
         .record_inbound_event(&event(&wa_chat, "wa-1", T0), T0)
         .unwrap();
     store
-        .record_inbound_event(&event(&slack_chat, "D00000001:1700000000.000100", T0 + 1), T0)
+        .record_inbound_event(
+            &event(&slack_chat, "D00000001:1700000000.000100", T0 + 1),
+            T0,
+        )
         .unwrap();
     let slack_platform = SurfacePlatform::new("slack").unwrap();
 
