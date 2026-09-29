@@ -49,8 +49,8 @@ jobs:
       - name: Build exact sidecar used by Rust contract tests
         working-directory: sidecars/wa-sidecar
         run: |
-          go build -mod=readonly -trimpath -o "$RUNNER_TEMP/wa-sidecar" .
-          echo "AUGMENTAGENT_WA_SIDECAR_TEST_BIN=$RUNNER_TEMP/wa-sidecar" >> "$GITHUB_ENV"
+          ./setup.sh
+          echo "AUGMENTAGENT_WA_SIDECAR_TEST_BIN=$PWD/wa-sidecar" >> "$GITHUB_ENV"
       - name: Rust channel and real Go-process contract tests
         run: cargo test -p augmentagent-channel-whatsapp
       - name: WhatsApp account CLI behavior tests
