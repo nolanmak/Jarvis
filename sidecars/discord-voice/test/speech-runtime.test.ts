@@ -141,6 +141,34 @@ test('ElevenLabs quota event switches STT after an established stream without re
   }
 });
 
+test('credit fallback stays within three failed STT connection attempts', async () => {
+  let alternateAttempts = 0;
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0,
+    verifyClient: (info, callback) => {
+      if (info.req.url?.startsWith('/v2/listen')) callback(false, 402);
+      else { alternateAttempts++; callback(false, 500); }
+    } });
+  await new Promise<void>(resolve => server.once('listening', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('expected TCP address');
+  const frames: Array<Record<string, unknown>> = [];
+  const audio = new VoiceAudio(fakeConnection(), binding, {
+    sttProvider: 'deepgram', ttsProvider: 'deepgram', sttKey: 'dg-test', ttsKey: 'dg-test',
+    elevenLabsKey: 'el-test', sttEndpoint: `ws://127.0.0.1:${address.port}`,
+    sttRetryDelays: [1, 2, 4],
+  }, frame => { frames.push(frame as Record<string, unknown>); return true; });
+  try {
+    await audio.start();
+    assert.equal(alternateAttempts, 3);
+    assert.equal(audio.status, 'stopped');
+    assert.equal(frames.filter(frame => frame.kind === 'audio_failure').length, 1);
+    assert.equal(frames.filter(frame => frame.kind === 'transcript').length, 0);
+  } finally {
+    audio.stop();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
 test('three failed STT reconnect attempts end with one visible failure and stopped audio', async () => {
   const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
   await new Promise<void>(resolve => server.once('listening', resolve));

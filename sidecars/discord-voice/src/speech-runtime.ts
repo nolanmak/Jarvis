@@ -278,8 +278,8 @@ export class VoiceAudio {
       this.activeSttProvider = fallback;
       this.emitProviderChange('STT', fallback);
     }
-    for (const milliseconds of switchNow ? [0, ...(this.config.sttRetryDelays ?? [1000, 2000, 4000])]
-      : (this.config.sttRetryDelays ?? [1000, 2000, 4000])) {
+    const retryDelays = this.config.sttRetryDelays ?? [1000, 2000, 4000];
+    for (const milliseconds of switchNow ? [0, ...retryDelays.slice(0, 2)] : retryDelays) {
       try {
         await wait(milliseconds, undefined, { signal: this.retryAbort.signal });
       } catch { return; }
