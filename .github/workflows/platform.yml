@@ -55,6 +55,12 @@ jobs:
         run: |
           cargo test -p augmentagent-store --test surface_refs --test surface_sessions
           cargo test -p augmentagent-channel-slack --test surface_contract
+      # #1283 — the Slack Socket Mode transport must build and pass on both
+      # hosts (rustls WebSocket, heartbeat/sleep-wake recovery, Web API).
+      - name: Slack transport
+        run: >-
+          cargo test -p augmentagent-channel-slack --lib
+          --test transport_events --test transport_socket --test transport_web_api
       - name: Host-dependent CLI surface
         run: >-
           cargo test -p augmentagent-cli --bin augmentagent --
