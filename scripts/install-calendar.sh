@@ -26,15 +26,25 @@ esac
   || die "AUGMENTAGENT_CALENDAR_INTERVAL_MIN must be 1-60 (got '$INTERVAL_MIN')"
 
 install_macos() {
+  source "$REPO_ROOT/scripts/lib/launchd-install.sh"
   local PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
   local LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/augmentagent"  # #1079: same dir as Linux
   mkdir -p "$LOG_DIR"
   mkdir -p "$(dirname "$PLIST")"
 
-  local LAUNCH_PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+  local REASONER_TOOLS LAUNCH_PATH
+  REASONER_TOOLS="$(launchd_reasoner_tools "$REPO_ROOT")"
+  LAUNCH_PATH="$(launchd_service_path node deno jq $REASONER_TOOLS)"
 
+  local REPO_ROOT_XML HOME_XML LOG_DIR_XML LAUNCH_PATH_XML
+  REPO_ROOT_XML="$(launchd_xml_escape "$REPO_ROOT")"
+  HOME_XML="$(launchd_xml_escape "$HOME")"
+  LOG_DIR_XML="$(launchd_xml_escape "$LOG_DIR")"
+  LAUNCH_PATH_XML="$(launchd_xml_escape "${LAUNCH_PATH:-}")"
+  local CANDIDATE
+  CANDIDATE="$(launchd_candidate "$PLIST")"
   log "Writing plist: $PLIST (every ${INTERVAL_MIN} min)"
-  cat > "$PLIST" <<PLIST_EOF
+  cat > "$CANDIDATE" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -43,46 +53,33 @@ install_macos() {
     <string>$LABEL</string>
 
     <key>WorkingDirectory</key>
-    <string>$REPO_ROOT</string>
+    <string>$REPO_ROOT_XML</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>$REPO_ROOT/scripts/calendar-poll.sh</string>
+        <string>$REPO_ROOT_XML/scripts/calendar-poll.sh</string>
     </array>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>$LAUNCH_PATH</string>
+        <string>$LAUNCH_PATH_XML</string>
         <key>HOME</key>
-        <string>$HOME</string>
+        <string>$HOME_XML</string>
     </dict>
 
     <key>StartInterval</key>
     <integer>$((INTERVAL_MIN * 60))</integer>
 
     <key>StandardOutPath</key>
-    <string>$LOG_DIR/calendar.stdout.log</string>
+    <string>$LOG_DIR_XML/calendar.stdout.log</string>
 
     <key>StandardErrorPath</key>
-    <string>$LOG_DIR/calendar.stderr.log</string>
+    <string>$LOG_DIR_XML/calendar.stderr.log</string>
 </dict>
 </plist>
 PLIST_EOF
-
-  local UID_NUM
-  UID_NUM="$(id -u)"
-  local DOMAIN="gui/$UID_NUM"
-
-  if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
-    log "Previous calendar agent found — bootout first"
-    launchctl bootout "$DOMAIN/$LABEL" || true
-    sleep 1
-  fi
-
-  log "Bootstrapping calendar agent"
-  launchctl bootstrap "$DOMAIN" "$PLIST"
-  launchctl enable "$DOMAIN/$LABEL"
+  launchd_install "$LABEL" "$PLIST" "$CANDIDATE" false
 
   log "Installed."
   log "  Label:     $LABEL"
