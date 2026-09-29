@@ -766,6 +766,8 @@ async fn a_card_is_posted_to_the_owner_dm_with_controls_and_text_commands() {
     let r = &id[..8];
     assert!(blocks.contains(&format!("approve {r}")), "{blocks}");
     assert!(blocks.contains(&format!("revise {r}")), "{blocks}");
+    // `<…>` is a link in mrkdwn: placeholders are escaped.
+    assert!(blocks.contains("&lt;what to change&gt;"), "{blocks}");
     assert!(blocks.contains("Sure — Tuesday works."));
     assert!(blocks.contains("Lunch next week?"));
     let (channel, ts, block_id) = card_of(&h, &id);
@@ -1307,6 +1309,14 @@ async fn text_commands_with_explicit_references_work_without_controls() {
         .into_iter()
         .find(|p| p.text.contains("Pending approvals"))
         .unwrap();
+    // The answer is Markdown the outbox converts once: bold, not italic,
+    // and `<`/`&` escaped exactly once.
+    assert!(
+        queue.text.starts_with("*Pending approvals* (2)"),
+        "{}",
+        queue.text
+    );
+    assert!(!queue.text.contains("&amp;"), "{}", queue.text);
     assert!(
         queue.text.contains(&r) && queue.text.contains(&other[..8]),
         "{}",
@@ -1545,6 +1555,43 @@ async fn a_non_owner_click_is_rejected_and_changes_nothing() {
     running.stop().await;
 }
 
+// A refused click in a DM is answered in that DM, top level: the dispatch
+// lane an interaction runs in is not a Slack thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_click_in_a_dm_is_answered_top_level_not_in_a_lane_thread() {
+    let h = Harness::new();
+    let approvals = h.approvals(Arc::clone(&h.store), DM);
+    let (id, email) = h.pending("Lunch next week?", "Sure — Tuesday works.");
+    approvals.post_approval(&id, &email, "x").await.unwrap();
+    let (channel, ts, block_id) = card_of(&h, &id);
+    let (running, mut server) = connected(&h, &approvals).await;
+    server
+        .deliver(&block_action(
+            "env-n2",
+            STRANGER,
+            &channel,
+            &ts,
+            card::APPROVE,
+            &block_id,
+            None,
+            &click_ts(0),
+        ))
+        .await;
+    eventually("rejection", || {
+        h.posts().iter().any(|p| p.text == REJECTION_REPLY)
+    })
+    .await;
+    let rejection = h
+        .posts()
+        .into_iter()
+        .find(|p| p.text == REJECTION_REPLY)
+        .unwrap();
+    assert_eq!(rejection.channel, DM);
+    assert_eq!(rejection.thread_ts, None, "{rejection:?}");
+    assert!(h.handler.sends().is_empty());
+    running.stop().await;
+}
+
 // ---------------------------------------------------------------------------
 // Restart and late clicks
 // ---------------------------------------------------------------------------
@@ -1633,6 +1680,11 @@ async fn a_click_handled_after_the_mac_slept_gets_a_fresh_message() {
         .find(|p| p.text.contains("could not open"))
         .unwrap();
     assert_eq!(fresh.channel, DM);
+    assert!(
+        !fresh.text.contains("<what"),
+        "mrkdwn-escaped: {}",
+        fresh.text
+    );
     assert!(
         fresh.text.contains(&format!("revise {}", &id[..8])),
         "{}",

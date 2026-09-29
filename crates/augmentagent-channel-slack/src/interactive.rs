@@ -560,6 +560,10 @@ fn thread_of(m: &MessageEvent) -> Option<&str> {
         .filter(|t| !t.is_empty() && *t != m.ts)
 }
 
+/// #1289 — the lane (stored thread) prefix each interaction is recorded
+/// under; never a Slack thread.
+const INTERACTION_LANE: &str = "interaction:";
+
 /// Placeholder conversation for events that happen outside any channel
 /// (modal submissions, App Home).
 const NO_CONVERSATION: &str = "_none";
@@ -594,7 +598,7 @@ fn envelope_conversation(e: &EventEnvelope) -> (String, Option<String>) {
                     .filter(|c| !c.is_empty())
                     .unwrap_or(NO_CONVERSATION)
                     .to_string(),
-                Some(format!("interaction:{}", e.stable_id())),
+                Some(format!("{INTERACTION_LANE}{}", e.stable_id())),
             )
         }
         SlackEvent::SlashCommand(c) => (c.channel_id.as_deref(), None),
@@ -1239,7 +1243,18 @@ async fn process(ctx: &Ctx, claimed: ClaimedInbound, shutdown: &CancellationToke
             match target {
                 Some((text, RejectionReply::InDm)) => {
                     let turn = rejection_turn_id(&claimed.event_id);
-                    if let Err(e) = enqueue(ctx, &claimed.conversation, &turn, text) {
+                    // #1289 — an interaction's dispatch lane is not a Slack
+                    // thread: answer it top level in the DM.
+                    let conversation = match claimed.conversation.thread_id() {
+                        Some(t) if t.starts_with(INTERACTION_LANE) => SurfaceConversationRef::new(
+                            account.clone(),
+                            claimed.conversation.conversation_id(),
+                            None,
+                        )
+                        .unwrap_or_else(|_| claimed.conversation.clone()),
+                        _ => claimed.conversation.clone(),
+                    };
+                    if let Err(e) = enqueue(ctx, &conversation, &turn, text) {
                         release(ctx, seq, &format!("enqueue rejection: {e}"));
                         return;
                     }

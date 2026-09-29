@@ -277,7 +277,7 @@ pub fn card(input: &CardInput<'_>) -> (String, Value) {
             blocks.push(json!({"type": "actions", "block_id": value, "elements": elements}));
             let mut commands = format!("Or reply: `approve {r}` · `skip {r}`");
             if !merge {
-                commands.push_str(&format!(" · `revise {r} <what to change>`"));
+                commands.push_str(&format!(" · `revise {r} &lt;what to change&gt;`"));
                 if !at_cap {
                     commands.push_str(&format!(" · `refine {r} shorter`"));
                 }

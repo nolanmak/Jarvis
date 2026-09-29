@@ -441,8 +441,13 @@ impl SlackApprovals {
     // Answers
     // -----------------------------------------------------------------
 
+    /// `text` is plain text (plus `*bold*`/`_italic_`/backticks): `&`, `<`
+    /// and `>` are escaped here, so a placeholder like `<what to change>`
+    /// is never read as a Slack link.
     async fn reply(&self, to: &ReplyTo, text: &str, recompose_for: Option<&str>) {
         let blocks = card::reply_blocks(text, recompose_for);
+        let text = crate::delivery::mrkdwn::escape(text);
+        let text = text.as_str();
         let result = match (&to.user, to.fresh) {
             (Some(user), false) => self
                 .web
@@ -986,13 +991,15 @@ impl SlackApprovals {
         Some(format!("{text}{recover}"))
     }
 
-    /// The pending queue with each approval's reference.
+    /// The pending queue with each approval's reference, as Markdown (text
+    /// command answers go through the outbox's Markdown → mrkdwn step).
     fn queue(&self) -> String {
         let rows = self.store.oldest_pending_actions(20).unwrap_or_default();
         if rows.is_empty() {
             return "No approvals are pending.".into();
         }
-        let mut s = format!("*Pending approvals* ({})\n", rows.len());
+        // Markdown: the outbox converts it to mrkdwn (and escapes) once.
+        let mut s = format!("**Pending approvals** ({})\n", rows.len());
         for (id, from, subject, age_ms) in rows {
             let hours = age_ms / 3_600_000;
             let age = if hours >= 24 {
@@ -1003,10 +1010,8 @@ impl SlackApprovals {
                 format!("{}m", age_ms / 60_000)
             };
             s.push_str(&format!(
-                "• `{}` — {} — {} · {age}\n",
-                card::short_ref(&id),
-                crate::delivery::mrkdwn::escape(&from),
-                crate::delivery::mrkdwn::escape(&subject)
+                "• `{}` — {from} — {subject} · {age}\n",
+                card::short_ref(&id)
             ));
         }
         s.push_str("Reply `approve <ref>`, `skip <ref>` or `revise <ref> <what to change>`.");
