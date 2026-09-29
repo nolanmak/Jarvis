@@ -18,11 +18,17 @@
 //! for [`UploadSource::Path`]) to the returned pre-signed URL, then
 //! `files.completeUploadExternal` to share it into the channel/thread. The
 //! bot token is never sent to the upload URL, and the URL itself is treated
-//! as a secret. `download_file` is still [`WebApiError::Unsupported`] (#1293).
+//! as a secret.
+//!
+//! [`SlackWebApi::download_file`] (#1293) is an authenticated GET of a file's
+//! `url_private(_download)`, streamed into a new private file with the size
+//! cap enforced while streaming. Only [`SLACK_FILE_HOSTS`] (plus loopback
+//! test hosts) are contacted; redirects are followed by hand so the token
+//! never reaches another host and a redirect off the allow-list is refused.
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -84,8 +90,10 @@ pub enum WebApiError {
     Json(String),
     #[error("{0} is not implemented by this client")]
     Unsupported(&'static str),
-    /// Refused before any request: larger than [`UploadLimits::max_bytes`].
-    #[error("file is {size} bytes; the upload limit is {limit} bytes")]
+    /// An upload refused before any request (larger than
+    /// [`UploadLimits::max_bytes`]), or a download stopped at
+    /// [`DownloadRequest::max_bytes`] (`size` = bytes seen so far).
+    #[error("file is {size} bytes; the limit is {limit} bytes")]
     FileTooLarge { size: u64, limit: u64 },
     /// Refused locally: missing/unreadable/empty file, blank name, or an
     /// upload URL that is not https (the URL is never echoed).
@@ -102,6 +110,13 @@ pub enum WebApiError {
         step: &'static str,
         source: Box<WebApiError>,
     },
+    /// A download URL (or a redirect) pointing off the Slack file-host
+    /// allow-list; nothing was sent there. Carries the reason, never a URL.
+    #[error("file download refused: {0}")]
+    FileHostRefused(String),
+    /// The file host answered, but not with the file (e.g. a sign-in page).
+    #[error("file download rejected: {0}")]
+    DownloadRejected(String),
 }
 
 impl WebApiError {
@@ -337,6 +352,119 @@ impl Default for UploadLimits {
     }
 }
 
+/// Hosts that serve Slack file contents (`url_private`,
+/// `url_private_download`). Source: https://docs.slack.dev/reference/objects/file-object
+/// and https://docs.slack.dev/messaging/working-with-files (read 2026-09-29):
+/// both example URLs are `https://files.slack.com/files-pri/…`, and both
+/// fields "require an authorization header of the form: Authorization:
+/// Bearer A_VALID_TOKEN" with `files:read`. Other hosts (GovSlack,
+/// Enterprise Grid, a CDN after redirect) are **unverified** and therefore
+/// refused until observed live.
+pub const SLACK_FILE_HOSTS: &[&str] = &["files.slack.com"];
+
+/// Test-only: comma-separated loopback `host:port` entries added to the
+/// file-host allow-list (plain http allowed for them). Anything that is not
+/// loopback with an explicit port is refused.
+pub const SLACK_TEST_FILE_HOSTS_ENV: &str = "AUGMENTAGENT_SLACK_TEST_FILE_HOSTS";
+
+/// One file to fetch (#1293).
+#[derive(Debug, Clone, Copy)]
+pub struct DownloadRequest<'a> {
+    /// The file's `url_private_download` (preferred) or `url_private`.
+    pub url: &'a str,
+    /// New file to create (must not exist); created `0600`.
+    pub dest: &'a Path,
+    /// Refuse and delete once more than this many bytes arrive.
+    pub max_bytes: u64,
+    /// The file's Slack `mimetype`. An HTML answer for a non-HTML file is
+    /// Slack's sign-in page (missing `files:read` or a bad token).
+    pub expected_mimetype: Option<&'a str>,
+}
+
+/// Bounds for [`SlackWebApi::download_file`] on the HTTP client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadLimits {
+    /// `host` (https, default port) or loopback `host:port` (http allowed)
+    /// entries. Default: [`SLACK_FILE_HOSTS`].
+    pub allowed_hosts: Vec<String>,
+    /// Upper bound for the whole transfer, redirects included.
+    pub transfer_timeout: Duration,
+    /// Redirect hops followed before giving up.
+    pub max_redirects: u32,
+}
+
+impl Default for DownloadLimits {
+    fn default() -> Self {
+        Self {
+            allowed_hosts: SLACK_FILE_HOSTS.iter().map(|h| h.to_string()).collect(),
+            transfer_timeout: Duration::from_secs(120),
+            max_redirects: 3,
+        }
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Parse [`SLACK_TEST_FILE_HOSTS_ENV`]: loopback `host:port` entries only.
+pub fn test_file_hosts_from(value: Option<&str>) -> Result<Vec<String>, String> {
+    let Some(v) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    v.split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(|entry| {
+            let bad = || {
+                format!("{SLACK_TEST_FILE_HOSTS_ENV} entry `{entry}` is not a loopback host:port")
+            };
+            let url = reqwest::Url::parse(&format!("http://{entry}/")).map_err(|_| bad())?;
+            let host = url.host_str().ok_or_else(bad)?;
+            if !is_loopback_host(host) || url.port().is_none() || url.path() != "/" {
+                return Err(bad());
+            }
+            Ok(entry.to_ascii_lowercase())
+        })
+        .collect()
+}
+
+/// Whether `url` may be fetched with the bot token given `allowed` hosts.
+/// The reason in `Err` never contains the URL.
+pub fn file_host_allowed(url: &str, allowed: &[String]) -> Result<reqwest::Url, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| "not a URL".to_string())?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("the URL carries credentials".into());
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "the URL has no host".to_string())?
+        .to_ascii_lowercase();
+    let port = parsed.port();
+    let listed = allowed.iter().any(|entry| {
+        let entry = entry.to_ascii_lowercase();
+        match port {
+            // An explicit port must be listed as `host:port`.
+            Some(p) => entry == format!("{host}:{p}"),
+            None => entry == host,
+        }
+    });
+    if !listed {
+        return Err(format!("`{host}` is not a Slack file host"));
+    }
+    match parsed.scheme() {
+        "https" => Ok(parsed),
+        // Plain http only for a loopback test host listed with its port.
+        "http" if is_loopback_host(&host) && port.is_some() => Ok(parsed),
+        _ => Err("the URL is not https".into()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Trait
 // ---------------------------------------------------------------------------
@@ -388,8 +516,10 @@ pub trait SlackWebApi: Send + Sync {
         Err(WebApiError::Unsupported("conversations_replies"))
     }
 
-    /// Deferred to #1293. Default: [`WebApiError::Unsupported`].
-    async fn download_file(&self, _url_private: &str) -> Result<Vec<u8>, WebApiError> {
+    /// Stream a file's contents into `req.dest` (#1293); returns the bytes
+    /// written. `dest` is never left behind on error. Needs `files:read`.
+    /// Default: [`WebApiError::Unsupported`].
+    async fn download_file(&self, _req: DownloadRequest<'_>) -> Result<u64, WebApiError> {
         Err(WebApiError::Unsupported("download_file"))
     }
 }
@@ -411,6 +541,10 @@ struct Inner {
     http: reqwest::Client,
     config: WebApiConfig,
     upload: UploadLimits,
+    download: DownloadLimits,
+    /// No automatic redirects: [`HttpSlackWebApi::download_file`] follows
+    /// them by hand to apply the host allow-list to every hop.
+    download_http: reqwest::Client,
     sleeper: Arc<dyn Sleeper>,
 }
 
@@ -435,12 +569,18 @@ impl HttpSlackWebApi {
             .timeout(config.request_timeout)
             .build()
             .map_err(WebApiError::transport)?;
+        let download_http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(WebApiError::transport)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 token,
                 http,
                 config,
                 upload: UploadLimits::default(),
+                download: DownloadLimits::default(),
+                download_http,
                 sleeper: Arc::new(TokioSleeper),
             }),
             cancel: CancellationToken::new(),
@@ -458,6 +598,13 @@ impl HttpSlackWebApi {
     pub fn with_upload_limits(mut self, limits: UploadLimits) -> Self {
         let inner = Arc::get_mut(&mut self.inner).expect("with_upload_limits before any clone");
         inner.upload = limits;
+        self
+    }
+
+    /// Replace the download bounds (host allow-list, timeout, redirects).
+    pub fn with_download_limits(mut self, limits: DownloadLimits) -> Self {
+        let inner = Arc::get_mut(&mut self.inner).expect("with_download_limits before any clone");
+        inner.download = limits;
         self
     }
 
@@ -798,6 +945,159 @@ fn view_ref(v: &Value, method: &str) -> Result<ViewRef, WebApiError> {
     })
 }
 
+impl HttpSlackWebApi {
+    /// The whole download, bounded by `transfer_timeout` and the cancel
+    /// token. On any error the destination is removed.
+    async fn download_to(&self, req: DownloadRequest<'_>) -> Result<u64, WebApiError> {
+        if self.cancel.is_cancelled() {
+            return Err(WebApiError::Cancelled);
+        }
+        let first = file_host_allowed(req.url, &self.inner.download.allowed_hosts)
+            .map_err(WebApiError::FileHostRefused)?;
+        let file = create_new_private(req.dest).map_err(|e| {
+            WebApiError::InvalidRequest(format!("cannot create download file: {e}"))
+        })?;
+        let file = tokio::fs::File::from_std(file);
+        let timeout = self.inner.download.transfer_timeout;
+        let result = tokio::select! {
+            _ = self.cancel.cancelled() => Err(WebApiError::Cancelled),
+            r = tokio::time::timeout(timeout, self.fetch_into(first, file, &req)) => match r {
+                Err(_elapsed) => Err(WebApiError::Timeout),
+                Ok(r) => r,
+            },
+        };
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(req.dest).await;
+        }
+        result
+    }
+
+    async fn fetch_into(
+        &self,
+        first: reqwest::Url,
+        mut file: tokio::fs::File,
+        req: &DownloadRequest<'_>,
+    ) -> Result<u64, WebApiError> {
+        use tokio::io::AsyncWriteExt;
+        let limits = &self.inner.download;
+        let origin_host = first.host_str().map(str::to_ascii_lowercase);
+        let origin_port = first.port_or_known_default();
+        let mut url = first;
+        let mut hops = 0u32;
+        let mut attempt = 0u32;
+        let max_attempts = self.inner.config.max_attempts.max(1);
+        let response = loop {
+            // The token goes only to the host the caller named: a redirect
+            // to another (allow-listed) host is fetched without it.
+            let same_origin = url.host_str().map(str::to_ascii_lowercase) == origin_host
+                && url.port_or_known_default() == origin_port;
+            let mut request = self.inner.download_http.get(url.clone());
+            if same_origin {
+                request = request.bearer_auth(self.inner.token.expose_secret());
+            }
+            let response = request.send().await.map_err(WebApiError::transport)?;
+            let status = response.status();
+            if status.is_redirection() {
+                hops += 1;
+                if hops > limits.max_redirects {
+                    return Err(WebApiError::FileHostRefused(format!(
+                        "more than {} redirects",
+                        limits.max_redirects
+                    )));
+                }
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| {
+                        WebApiError::FileHostRefused("redirect without a location".into())
+                    })?;
+                let next = url.join(location).map_err(|_| {
+                    WebApiError::FileHostRefused("redirect to an invalid URL".into())
+                })?;
+                url = file_host_allowed(next.as_str(), &limits.allowed_hosts).map_err(|why| {
+                    WebApiError::FileHostRefused(format!("redirect refused: {why}"))
+                })?;
+                debug!(hops, "slack file download: following redirect");
+                continue;
+            }
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                attempt += 1;
+                let retry_after =
+                    parse_retry_after(response.headers()).unwrap_or(Duration::from_secs(1));
+                if retry_after > self.inner.config.max_retry_after || attempt >= max_attempts {
+                    return Err(WebApiError::RateLimited { retry_after });
+                }
+                debug!(
+                    attempt,
+                    ?retry_after,
+                    "slack file download rate limited; waiting"
+                );
+                self.inner.sleeper.sleep(retry_after).await;
+                continue;
+            }
+            if !status.is_success() {
+                let text = response.text().await.unwrap_or_default();
+                let mut excerpt: String = redact(&text).chars().take(200).collect();
+                if excerpt.is_empty() {
+                    excerpt.push_str("<empty>");
+                }
+                return Err(WebApiError::Http {
+                    status: status.as_u16(),
+                    body: excerpt,
+                });
+            }
+            break response;
+        };
+
+        let served_html = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| {
+                ct.trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("text/html")
+            });
+        let wanted_html = req
+            .expected_mimetype
+            .is_some_and(|m| m.to_ascii_lowercase().starts_with("text/html"));
+        if served_html && !wanted_html {
+            return Err(WebApiError::DownloadRejected(
+                "Slack answered with a web page instead of the file; the bot token may lack the files:read scope or access to this file".into(),
+            ));
+        }
+        if let Some(len) = response.content_length() {
+            if len > req.max_bytes {
+                return Err(WebApiError::FileTooLarge {
+                    size: len,
+                    limit: req.max_bytes,
+                });
+            }
+        }
+        let mut response = response;
+        let mut written = 0u64;
+        while let Some(chunk) = response.chunk().await.map_err(WebApiError::transport)? {
+            written += chunk.len() as u64;
+            if written > req.max_bytes {
+                return Err(WebApiError::FileTooLarge {
+                    size: written,
+                    limit: req.max_bytes,
+                });
+            }
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| WebApiError::InvalidRequest(format!("write download file: {e}")))?;
+        }
+        file.flush()
+            .await
+            .and(file.sync_all().await)
+            .map_err(|e| WebApiError::InvalidRequest(format!("write download file: {e}")))?;
+        debug!(bytes = written, "slack file download complete");
+        Ok(written)
+    }
+}
+
 #[async_trait]
 impl SlackWebApi for HttpSlackWebApi {
     async fn post_message(&self, req: PostMessage) -> Result<PostedMessage, WebApiError> {
@@ -1016,6 +1316,10 @@ impl SlackWebApi for HttpSlackWebApi {
             .await
     }
 
+    async fn download_file(&self, req: DownloadRequest<'_>) -> Result<u64, WebApiError> {
+        self.download_to(req).await
+    }
+
     async fn auth_test(&self) -> Result<AuthTest, WebApiError> {
         let (v, headers) = self.call_with_headers("auth.test", Body::Form(&[])).await?;
         let scopes = headers
@@ -1128,6 +1432,8 @@ pub struct RecordingSlackWebApi {
     /// Posts that land but whose reply is replaced by this error.
     lost_responses: Mutex<VecDeque<WebApiError>>,
     messages: Mutex<Vec<FakeMessage>>,
+    /// Scripted file contents by URL for `download_file`.
+    files: Mutex<Vec<(String, Vec<u8>)>>,
     ts_counter: AtomicU64,
 }
 
@@ -1188,6 +1494,11 @@ impl RecordingSlackWebApi {
     /// `err`, as when a reply is lost after Slack accepted the message.
     pub fn push_lost_response(&self, err: WebApiError) {
         self.lost_responses.lock().unwrap().push_back(err);
+    }
+
+    /// Serve `bytes` for `download_file(url)`. Unknown URLs get HTTP 404.
+    pub fn add_file(&self, url: &str, bytes: Vec<u8>) {
+        self.files.lock().unwrap().push((url.into(), bytes));
     }
 
     /// Messages that were delivered, in order.
@@ -1492,10 +1803,54 @@ impl SlackWebApi for RecordingSlackWebApi {
         })
     }
 
-    async fn download_file(&self, url_private: &str) -> Result<Vec<u8>, WebApiError> {
+    async fn download_file(&self, req: DownloadRequest<'_>) -> Result<u64, WebApiError> {
         self.record(RecordedCall::DownloadFile {
-            url_private: url_private.into(),
+            url_private: req.url.into(),
         })?;
-        Ok(Vec::new())
+        let bytes = self
+            .files
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(u, _)| u == req.url)
+            .map(|(_, b)| b.clone())
+            .ok_or(WebApiError::Http {
+                status: 404,
+                body: "file_not_found".into(),
+            })?;
+        let size = bytes.len() as u64;
+        if size > req.max_bytes {
+            return Err(WebApiError::FileTooLarge {
+                size,
+                limit: req.max_bytes,
+            });
+        }
+        write_new_private(req.dest, &bytes).map_err(|e| {
+            WebApiError::InvalidRequest(format!("cannot create download file: {e}"))
+        })?;
+        Ok(size)
     }
+}
+
+/// Create `path` exclusively with mode 0600 (never through a symlink).
+fn create_new_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn write_new_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = create_new_private(path)?;
+    if let Err(e) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(())
 }

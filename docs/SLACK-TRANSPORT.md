@@ -163,7 +163,7 @@ Source: https://docs.slack.dev/apis/events-api/using-socket-mode (checked
 - Every call is bounded by `request_timeout` (15 s) and by the
   `CancellationToken` bound with `HttpSlackWebApi::scoped`.
 - `upload_file` is implemented (#1294, see "Outbound delivery" below).
-  `download_file` still returns `WebApiError::Unsupported`; #1293 owns it.
+  `download_file` is implemented (#1293, see "Inbound files" below).
 
 ## Outbound delivery (#1294)
 
@@ -325,6 +325,112 @@ newest text wins, identical text is not re-sent, a rate-limited edit waits
 minute"), per method per workspace. Progress edits are best effort and not
 written to the outbox.
 
+## Inbound files (#1293)
+
+Code: `HttpSlackWebApi::download_file` in `transport/web.rs`, the pipeline
+in `crates/augmentagent-channel-slack/src/inbound.rs`, the shared policy in
+`crates/augmentagent-docs/src/inbound.rs` (Discord's rules, moved there
+unchanged and used by both surfaces) and the bounded converter lookup in
+`crates/augmentagent-docs/src/lib.rs`. Not wired into `serve` yet
+(#1287/#1288); the operator path is `augmentagent slack files fetch
+--channel C… --ts TS [--json]`.
+
+### Download
+
+Sources: https://docs.slack.dev/reference/objects/file-object and
+https://docs.slack.dev/messaging/working-with-files (read 2026-09-29).
+
+- **[docs]** `url_private` and `url_private_download` "require an
+  authorization header of the form: Authorization: Bearer A_VALID_TOKEN"
+  with at least `files:read` (already in the manifest). Both example URLs
+  are `https://files.slack.com/files-pri/…`. `url_private_download` is
+  preferred, `url_private` is the fallback.
+- **Host allow-list:** `SLACK_FILE_HOSTS = ["files.slack.com"]`, https on
+  the default port only. Any other host (GovSlack, Enterprise Grid, a CDN
+  Slack might redirect to) is **unverified** and refused until observed
+  live; the list is one constant. Subdomain and suffix tricks, credentials
+  in the URL and other ports are refused
+  (`only_documented_slack_file_hosts_are_allowed_by_default`).
+- **Redirects** are followed by hand (reqwest's automatic redirects are
+  off for downloads), at most 3 hops. Every hop must be on the allow-list,
+  otherwise the download fails with `FileHostRefused` before anything is
+  sent there. The bot token is sent only to the host the caller named; a
+  hop to a different allow-listed host is fetched without it. Whether Slack
+  redirects file downloads at all is **unverified**.
+- **Size cap while streaming:** a `Content-Length` over the cap is refused
+  before the body; otherwise bytes are counted as they arrive and the
+  transfer stops just past the cap. The destination is created exclusively
+  with mode 0600 and removed on every error, timeout and cancellation.
+- **Sign-in page:** an HTML answer for a file whose Slack `mimetype` is not
+  HTML is refused (`DownloadRejected`, hint: `files:read`). That Slack
+  answers a bad or under-scoped token this way is commonly reported and
+  **unverified** here.
+- Bounded by `DownloadLimits::transfer_timeout` (120 s, whole transfer
+  including redirects) and the client's cancel token; 429 is retried after
+  `Retry-After` like other calls. The rate-limit tier for file downloads is
+  not documented on the fetched pages (**unverified**).
+- Test hosts: `AUGMENTAGENT_SLACK_TEST_FILE_HOSTS` adds loopback
+  `host:port` entries (plain http allowed for exactly those); anything else
+  in it is an error. It exists only for the local mock in tests and QA.
+
+### Pipeline
+
+`inbound::prepare_inbound(api, text, files, &InboundOptions, &cancel)`
+returns an `InboundMessage` with the same pieces Discord feeds the
+reasoner: `prompt` from the shared `build_prompt` (`IMAGE:` markers, text
+path list with `TRUNCATED`/OCR notes), `images`, `text_files`, plus
+`accepted`, `rejected` and `rejection_notice()` (the shared "⚠️ skipped: …"
+line) and `starts_turn()`.
+
+- Types and limits are Discord's: images (any `image/*`), text/code by MIME
+  or extension allow-list, PDF/DOCX/DOC through pdftotext/pandoc (+ OCR for
+  scanned PDFs when `MISTRAL_API_KEY` is set), credential formats
+  (`.env`, `.pem`, …) refused, 8 MiB cap for text/documents, text truncated
+  to 1 MiB. Slack also caps images at 20 MiB (`MAX_IMAGE_BYTES`) because the
+  download is streamed on our side; Discord does not apply that cap.
+- Refused before any download: unsupported/credential types, a declared
+  size over the cap, deleted (`mode: tombstone`), plan-hidden
+  (`hidden_by_limit`), external files, Slack Connect files that need
+  `files.info` (`file_access: check_file_info`), a missing download link,
+  and more than 10 files per message. Download and conversion failures are
+  reported per file ("couldn't download: timed out", "couldn't read the
+  document: pdftotext is not installed …"); the other files still arrive.
+- An attachment-only message (`subtype: file_share`, empty text) starts a
+  turn; a message whose files were all refused and that has no text only
+  gets the notice (`starts_turn() == false`).
+- **Storage:** `<state dir>/slack-inbound/msg-XXXX/` (the shared
+  `state_dir()`: `$XDG_STATE_HOME/augmentagent` or
+  `~/.local/state/augmentagent`, same rule on Linux and macOS, never
+  `/tmp`). The root is created 0700 and refused if it is a symlink or owned
+  by another user; each message gets its own 0700 directory; files are
+  0600. The directory is removed when the `InboundMessage` is dropped or
+  `cleanup()` is called, on failure, and on cancellation. Retention beyond
+  the turn is #995 and must change every surface together.
+- **File names** come from `sanitize_filename`, a pure function (same
+  result on both hosts): last path component only, `[A-Za-z0-9._-]` kept,
+  everything else `_`, no leading dots, bounded length, and a two-digit
+  per-message index prefix so names that differ only by case or Unicode
+  normalisation never collide on a case-insensitive APFS volume. The
+  original name is kept for the owner-facing summary.
+- **Converters** are resolved by `augmentagent_docs::resolve_tool`, the
+  same path Discord's pipeline now uses: the process `PATH` (set by
+  `scripts/lib/launchd-install.sh` and the systemd units), then
+  `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin` for a launchd
+  job whose plist has no `PATH`. A missing tool is an immediate error with
+  an install hint; a converter is killed after 120 s (`kill_on_drop`, also
+  on cancellation).
+
+### Remaining work for serve (#1287/#1288)
+
+- Call `prepare_inbound` for owner `message`/`file_share` events after the
+  owner check (#1286), post `rejection_notice()` in the thread, and skip the
+  reasoner when `!starts_turn()`.
+- The wiki-ask scope guard (`scripts/aa-wiki-scope-guard.sh` and its Codex
+  mirror in `codex_tools.rs`) allows the reasoner's `Read` only on Discord's
+  `/tmp/aa-{img,txt,doc}-*` names; a read-only carve-out for
+  `<state dir>/slack-inbound/msg-*/NN-*` is needed when the dispatcher runs
+  a Claude turn on these files.
+
 ## Install-time checks (#1284)
 
 - `auth.test` (bot token) returns `team_id`, `team`, `user_id`, `bot_id`
@@ -370,7 +476,7 @@ written to the outbox.
 - `tests/transport_web_api.rs`: bearer + JSON bodies, form-encoded lookups,
   `ok:false` errors, 429/`Retry-After` retry and caps, timeout, cancellation
   (including during a rate-limit wait), token never in Debug/errors,
-  deferred file transfer, recording fake.
+  a non-Slack download host refused without a request, recording fake.
 - `tests/transport_upload.rs` (#1294): each upload step against a mock
   Slack; step 1 fails, transfer cut off midway, upload host 5xx, completion
   fails, size/empty/missing file, stalled transfer timeout and cancel, rate
@@ -384,6 +490,21 @@ written to the outbox.
   failing midway,
   paused-clock progress throttling. `augmentagent-cli/tests/slack_deliver_cli.rs`
   runs `slack deliver` end to end.
+- `tests/transport_download.rs` (#1293): bearer token only to allow-listed
+  hosts, same-host / other-allowed-host / foreign-host redirects, redirect
+  loops, `Content-Length` and streaming size caps, sign-in page, 429 retry
+  and cap, HTTP errors redacted, stalled transfer timeout, cancellation,
+  existing destination never overwritten, no partial file left behind.
+- `tests/inbound_files.rs` (#1293): image + text + PDF + DOCX in one
+  message reaching the Discord-shaped prompt, attachment-only message,
+  rejections before download (oversize, unsupported, credential formats,
+  deleted/external/Slack Connect/no link), a file larger than declared,
+  truncation, missing and stuck converters, case-colliding and hostile
+  names, too many files, download timeout and cancellation cleanup,
+  private permissions, symlinked root refused.
+  `augmentagent-cli/tests/slack_files_cli.rs` runs `slack files fetch` end
+  to end; `augmentagent-docs/tests/converter_bounds.rs` pins converter
+  lookup under a launchd-style PATH and the timeout.
 - `tests/transport_socket.rs`: ack only after hand-off, rejected and slow
   hand-offs not acked, redelivery with stable id, unknown/malformed frames
   keep the link, response payloads, refresh drain then reconnect, forced

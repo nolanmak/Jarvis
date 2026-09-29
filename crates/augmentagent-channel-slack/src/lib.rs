@@ -19,6 +19,7 @@ pub mod auth;
 pub mod channel;
 pub mod delivery;
 pub mod digest;
+pub mod inbound;
 pub mod owner;
 pub mod owner_setup;
 pub mod surface;

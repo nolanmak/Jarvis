@@ -13,6 +13,11 @@ augmentagent-channel-core = { path = "../augmentagent-channel-core" }
 augmentagent-channel-discord-dm = { path = "../augmentagent-channel-discord-dm" }
 augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
 augmentagent-wiki = { path = "../augmentagent-wiki" }
+# #1293 — shared inbound attachment policy and PDF/DOCX conversion.
+augmentagent-docs = { path = "../augmentagent-docs" }
+# Private per-message directories and the owner check on their root.
+tempfile = "3"
+libc = "0.2"
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }
