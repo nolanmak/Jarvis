@@ -186,6 +186,27 @@ pub struct ConversationInfo {
     pub raw: Value,
 }
 
+/// `auth.test` result: who the token belongs to and what it was granted.
+///
+/// `scopes` comes from the `x-oauth-scopes` response header (Slack
+/// documentation, not yet verified live — `docs/SLACK-TRANSPORT.md`); it is
+/// `None` when the header is absent, which callers must report as
+/// "unknown", never as "no scopes".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthTest {
+    pub team_id: String,
+    pub team: Option<String>,
+    pub url: Option<String>,
+    /// The bot user for a bot token.
+    pub user_id: String,
+    pub user: Option<String>,
+    pub bot_id: Option<String>,
+    /// Present only if Slack includes it in the response.
+    pub app_id: Option<String>,
+    pub enterprise_id: Option<String>,
+    pub scopes: Option<Vec<String>>,
+}
+
 /// Declared for #1293/#1294; not implemented in this crate yet.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UploadFile {
@@ -225,6 +246,8 @@ pub trait SlackWebApi: Send + Sync {
     async fn add_reaction(&self, channel: &str, ts: &str, name: &str) -> Result<(), WebApiError>;
     async fn user_info(&self, user_id: &str) -> Result<UserInfo, WebApiError>;
     async fn conversation_info(&self, channel_id: &str) -> Result<ConversationInfo, WebApiError>;
+    /// `auth.test`: identity and granted scopes of the bound token (#1284).
+    async fn auth_test(&self) -> Result<AuthTest, WebApiError>;
 
     /// Deferred to #1293/#1294. Default: [`WebApiError::Unsupported`].
     async fn upload_file(&self, _req: UploadFile) -> Result<UploadedFile, WebApiError> {
@@ -309,6 +332,14 @@ impl HttpSlackWebApi {
     }
 
     async fn call(&self, method: &str, body: Body<'_>) -> Result<Value, WebApiError> {
+        self.call_with_headers(method, body).await.map(|(v, _)| v)
+    }
+
+    async fn call_with_headers(
+        &self,
+        method: &str,
+        body: Body<'_>,
+    ) -> Result<(Value, reqwest::header::HeaderMap), WebApiError> {
         let url = format!(
             "{}/{}",
             self.inner.config.base_url.trim_end_matches('/'),
@@ -345,7 +376,8 @@ impl HttpSlackWebApi {
                 },
             };
             let status = response.status();
-            let retry_after = parse_retry_after(response.headers());
+            let headers = response.headers().clone();
+            let retry_after = parse_retry_after(&headers);
             let text = tokio::select! {
                 _ = self.cancel.cancelled() => return Err(WebApiError::Cancelled),
                 t = tokio::time::timeout(self.inner.config.request_timeout, response.text()) => match t {
@@ -403,7 +435,7 @@ impl HttpSlackWebApi {
                 if let Some(w) = value.get("warning").and_then(Value::as_str) {
                     warn!(method, warning = w, "slack warning");
                 }
-                return Ok(value);
+                return Ok((value, headers));
             }
             let error = value
                 .get("error")
@@ -553,6 +585,33 @@ impl SlackWebApi for HttpSlackWebApi {
             raw: c.clone(),
         })
     }
+
+    async fn auth_test(&self) -> Result<AuthTest, WebApiError> {
+        let (v, headers) = self.call_with_headers("auth.test", Body::Form(&[])).await?;
+        let scopes = headers
+            .get("x-oauth-scopes")
+            .and_then(|h| h.to_str().ok())
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            });
+        Ok(AuthTest {
+            team_id: str_field(&v, "team_id")
+                .ok_or_else(|| WebApiError::Json("auth.test: missing team_id".into()))?,
+            team: str_field(&v, "team"),
+            url: str_field(&v, "url"),
+            user_id: str_field(&v, "user_id")
+                .ok_or_else(|| WebApiError::Json("auth.test: missing user_id".into()))?,
+            user: str_field(&v, "user"),
+            bot_id: str_field(&v, "bot_id"),
+            app_id: str_field(&v, "app_id"),
+            enterprise_id: str_field(&v, "enterprise_id"),
+            scopes,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -588,6 +647,7 @@ pub enum RecordedCall {
     ConversationInfo {
         channel_id: String,
     },
+    AuthTest,
     UploadFile {
         filename: String,
         channel: Option<String>,
@@ -607,6 +667,7 @@ pub struct RecordingSlackWebApi {
     errors: Mutex<VecDeque<WebApiError>>,
     users: Mutex<Vec<UserInfo>>,
     conversations: Mutex<Vec<ConversationInfo>>,
+    auth_test: Mutex<Option<AuthTest>>,
     ts_counter: AtomicU64,
 }
 
@@ -630,6 +691,12 @@ impl RecordingSlackWebApi {
 
     pub fn add_conversation(&self, conversation: ConversationInfo) {
         self.conversations.lock().unwrap().push(conversation);
+    }
+
+    /// Script the `auth.test` answer. Default: synthetic `T00000001` /
+    /// `U00000001` / `B00000001` with scopes unknown.
+    pub fn set_auth_test(&self, who: AuthTest) {
+        *self.auth_test.lock().unwrap() = Some(who);
     }
 
     fn record(&self, call: RecordedCall) -> Result<(), WebApiError> {
@@ -756,6 +823,26 @@ impl SlackWebApi for RecordingSlackWebApi {
             user: None,
             raw: Value::Null,
         }))
+    }
+
+    async fn auth_test(&self) -> Result<AuthTest, WebApiError> {
+        self.record(RecordedCall::AuthTest)?;
+        Ok(self
+            .auth_test
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| AuthTest {
+                team_id: "T00000001".into(),
+                team: Some("Example Test".into()),
+                url: None,
+                user_id: "U00000001".into(),
+                user: Some("jarvis".into()),
+                bot_id: Some("B00000001".into()),
+                app_id: None,
+                enterprise_id: None,
+                scopes: None,
+            }))
     }
 
     async fn upload_file(&self, req: UploadFile) -> Result<UploadedFile, WebApiError> {
