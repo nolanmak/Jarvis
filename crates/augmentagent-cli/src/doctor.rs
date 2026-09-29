@@ -14,6 +14,9 @@
 //!   * `per_channel_validate` — one finding per configured channel, sourced
 //!                              from `status::collect` (read-only).
 //!
+//! `--deep` also compares granted with required Slack bot scopes from the
+//! stored install record (`slack_app.scopes`, #1299; reads the record).
+//!
 //! `--fix` is intentionally NOT implemented here — it lands as a follow-up
 //! issue. Ordinary and `--deep` checks stay read-only. `--keychain-probe` is
 //! the explicit exception: it writes, reads and deletes one synthetic item.
@@ -211,13 +214,33 @@ pub async fn run(
         // 19. interactive surfaces — live listener health, apart from the
         // Composio ingestion `channels.slack` reports (#1287)
         findings.extend(check_interactive_surfaces(&doc.interactive));
+        // 20. #1299 — Slack credentials present vs proven usable by the
+        // daemon, and configuration issues (Discord broker off, plaintext
+        // credential store) with their recovery.
+        if let Some(slack) = doc.interactive.get("slack") {
+            findings.push(check_slack_credentials(slack, cfg!(target_os = "macos")));
+        }
+        findings.extend(check_config_issues(&doc.config_issues));
     }
+    // 21. #1299 / #1325 — the credential backend this process uses.
+    findings.push(check_credential_backend(
+        &augmentagent_auth::describe_default_store(),
+    ));
 
     // --- Deep checks (off by default).
     if deep {
         findings.push(check_composio_api().await);
         findings.push(check_cerebras_models().await);
         findings.extend(check_per_channel_validate(&status_doc));
+        // #1299 — granted vs required Slack scopes from the install record.
+        // Reads the stored record (the Keychain on macOS), so `--deep` only.
+        if status_doc
+            .as_ref()
+            .and_then(|d| d.interactive.get("slack"))
+            .is_some_and(|s| s.app_installed == Some(true))
+        {
+            findings.extend(slack_scope_findings(load_slack_install_summaries()));
+        }
     }
 
     // Tally severities.
@@ -1858,6 +1881,179 @@ fn check_interactive_surfaces(
         .collect()
 }
 
+/// #1299 / #1325 — which credential backend this process uses. Plaintext
+/// files are an error outside tests; a backend that forgets credentials when
+/// the process exits (keyring v3 without a Linux backend) is a warning.
+fn check_credential_backend(d: &augmentagent_auth::BackendDescription) -> Finding {
+    const NAME: &str = "credential_backend";
+    if d.insecure {
+        return Finding::error(
+            NAME,
+            format!(
+                "{} is set: credentials are plaintext files ({}), for tests and local QA only",
+                augmentagent_auth::INSECURE_FILE_STORE_ENV,
+                d.backend
+            ),
+            Some(status::INSECURE_STORE_RECOVERY),
+        );
+    }
+    if !d.persistent {
+        return Finding::warn(
+            NAME,
+            format!(
+                "{}: {}",
+                d.backend,
+                d.note
+                    .as_deref()
+                    .unwrap_or("credentials do not persist (#1325)")
+            ),
+            Some(
+                "credentials stored on this host (including `augmentagent slack app install`) do \
+                 not survive the command that stored them until #1325 enables a persistent \
+                 backend; run the Slack surface on macOS meanwhile",
+            ),
+        );
+    }
+    Finding::ok(NAME, format!("{} (persistent)", d.backend))
+}
+
+/// #1299 — one finding per configuration issue from `status`, with its
+/// recovery; a single ok finding when there are none.
+fn check_config_issues(issues: &[status::ConfigIssue]) -> Vec<Finding> {
+    if issues.is_empty() {
+        return vec![Finding::ok(
+            "config_issues",
+            "no configuration issues found".to_string(),
+        )];
+    }
+    issues
+        .iter()
+        .map(|i| {
+            let name = format!("config.{}", i.id);
+            let message = format!("{} (reported by {})", i.detail, i.source);
+            if i.severity == "error" {
+                Finding::error(&name, message, i.recovery.as_deref())
+            } else {
+                Finding::warn(&name, message, i.recovery.as_deref())
+            }
+        })
+        .collect()
+}
+
+/// #1299 — Slack app credentials: present here vs proven usable by the
+/// running daemon (#1246/#1272 semantics: never claim usable without proof;
+/// only the daemon's fresh `connected` report is proof).
+fn check_slack_credentials(i: &status::InteractiveStatus, macos: bool) -> Finding {
+    const NAME: &str = "interactive.slack.credentials";
+    match i.credentials.as_str() {
+        "usable" => Finding::ok(
+            NAME,
+            "usable: the running daemon read the stored tokens and Slack accepted them".to_string(),
+        ),
+        "present" => {
+            let fix = if macos {
+                "augmentagent doctor --keychain-probe, then augmentagent service --unit daemon \
+                 restart (the daemon needs your login session to read the Keychain)"
+            } else {
+                "augmentagent service --unit daemon restart, then augmentagent status"
+            };
+            Finding::warn(
+                NAME,
+                "stored, but not yet proven readable by the running daemon (it has not \
+                 connected with them)"
+                    .to_string(),
+                Some(fix),
+            )
+        }
+        "unreadable" => Finding::warn(
+            NAME,
+            "this process cannot read the credential store, so whether the Slack app is \
+             installed is unknown"
+                .to_string(),
+            Some(status::UNREADABLE_RECOVERY),
+        ),
+        _ if i.owner_bound => Finding::warn(
+            NAME,
+            "an owner is bound but no Slack app credentials are visible to this process"
+                .to_string(),
+            Some("augmentagent slack app install --stdin"),
+        ),
+        _ => Finding::ok(NAME, "no Slack app installed".to_string()),
+    }
+}
+
+/// #1299 — granted vs required bot scopes from the stored install records
+/// (`--deep`: reads the records, which on macOS reads the Keychain).
+fn slack_scope_findings(
+    installs: std::result::Result<
+        Vec<augmentagent_channel_slack::app::SlackAppSummary>,
+        augmentagent_channel_slack::app::SlackAppError,
+    >,
+) -> Vec<Finding> {
+    const NAME: &str = "slack_app.scopes";
+    let installs = match installs {
+        Ok(v) => v,
+        Err(e) => {
+            return vec![Finding::error(
+                NAME,
+                format!("could not read the stored Slack install: {e}"),
+                Some(&e.recovery()),
+            )]
+        }
+    };
+    let required = augmentagent_channel_slack::app::REQUIRED_BOT_SCOPES.len();
+    installs
+        .into_iter()
+        .map(|s| match (&s.scopes, &s.missing_scopes) {
+            (Some(granted), Some(missing)) if missing.is_empty() => Finding::ok(
+                NAME,
+                format!(
+                    "{}: all {required} required scopes granted ({} total)",
+                    s.team_id,
+                    granted.len()
+                ),
+            ),
+            (_, Some(missing)) => Finding::error(
+                NAME,
+                format!(
+                    "{}: missing required scopes: {}",
+                    s.team_id,
+                    missing.join(", ")
+                ),
+                Some(&format!(
+                    "Add {} under OAuth & Permissions > Bot Token Scopes at api.slack.com/apps \
+                     (or recreate the app from `augmentagent slack app manifest`), reinstall the \
+                     app to the workspace, store the new bot token with `augmentagent slack app \
+                     rotate --stdin`, then restart the daemon",
+                    missing.join(", ")
+                )),
+            ),
+            _ => Finding::warn(
+                NAME,
+                format!(
+                    "{}: granted scopes unknown (not recorded at install)",
+                    s.team_id
+                ),
+                Some("augmentagent slack app verify"),
+            ),
+        })
+        .collect()
+}
+
+fn load_slack_install_summaries() -> std::result::Result<
+    Vec<augmentagent_channel_slack::app::SlackAppSummary>,
+    augmentagent_channel_slack::app::SlackAppError,
+> {
+    let apps = augmentagent_channel_slack::app::SlackAppStore::default_store();
+    let mut out = Vec::new();
+    for team in apps.teams()? {
+        if let Some(c) = apps.load(&team)? {
+            out.push(c.summary());
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Human-readable table output.
 // ---------------------------------------------------------------------------
@@ -1902,17 +2098,44 @@ fn print_table(findings: &[Finding], ok: usize, warn: usize, error: usize) {
 mod tests {
     use super::*;
 
+    /// Write a fake `security` script without this test process holding a
+    /// write descriptor on it: tests on other threads fork, a child forked
+    /// while `std::fs::write` has the file open keeps the descriptor until it
+    /// execs, and exec of a file open for writing fails on Linux with ETXTBSY
+    /// (the probe then reports "security command could not start"). A short
+    /// `sh` child writes the bytes instead (same fix as converter_bounds.rs).
+    #[cfg(unix)]
+    fn write_stub(path: &std::path::Path, script: impl AsRef<str>) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let mut writer = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("cat > \"$1\"")
+            .arg("sh")
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sh to write the stub");
+        writer
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_ref().as_bytes())
+            .unwrap();
+        assert!(writer.wait().unwrap().success());
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn macos_keychain_configuration_does_not_claim_credential_access() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let security = dir.path().join("security");
-        std::fs::write(
+        write_stub(
             &security,
             "#!/bin/sh\nprintf 'synthetic-canary-secret\\n'\nexit 0\n",
-        )
-        .unwrap();
+        );
         std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o700)).unwrap();
         let finding = check_keychain_configuration_with(&security, Duration::from_secs(2)).await;
         assert_eq!(finding.severity, Severity::Warn);
@@ -1923,16 +2146,15 @@ mod tests {
             .to_string()
             .contains("synthetic-canary-secret"));
 
-        std::fs::write(
+        write_stub(
             &security,
             "#!/bin/sh\necho synthetic-canary-secret >&2\nexit 1\n",
-        )
-        .unwrap();
+        );
         let denied = check_keychain_configuration_with(&security, Duration::from_secs(2)).await;
         assert_eq!(denied.severity, Severity::Error);
         assert!(!denied.message.contains("synthetic-canary-secret"));
 
-        std::fs::write(&security, "#!/bin/sh\nsleep 1\n").unwrap();
+        write_stub(&security, "#!/bin/sh\nsleep 1\n");
         let timed_out =
             check_keychain_configuration_with(&security, Duration::from_millis(20)).await;
         assert_eq!(timed_out.severity, Severity::Warn);
@@ -1961,7 +2183,7 @@ mod tests {
               \n esac\necho synthetic-canary-secret >&2\n",
             item = item.display(),
         );
-        std::fs::write(&security, script).unwrap();
+        write_stub(&security, script);
         std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o700)).unwrap();
         let finding = check_keychain_probe_with(&security, Duration::from_secs(2)).await;
         assert_eq!(finding.severity, Severity::Ok, "{}", finding.message);
@@ -1987,7 +2209,7 @@ mod tests {
               \n esac\n",
             item = item.display(),
         );
-        std::fs::write(&security, script).unwrap();
+        write_stub(&security, script);
         std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o700)).unwrap();
         let finding = check_keychain_probe_with(&security, Duration::from_secs(2)).await;
         assert_eq!(finding.severity, Severity::Error);
@@ -2014,7 +2236,7 @@ mod tests {
               \n esac\n",
             item = item.display(),
         );
-        std::fs::write(&security, script).unwrap();
+        write_stub(&security, script);
         std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o700)).unwrap();
         let finding = check_keychain_probe_with(&security, Duration::from_secs(2)).await;
         assert_eq!(finding.severity, Severity::Error);
@@ -2041,7 +2263,7 @@ mod tests {
               \n esac\n",
             item = item.display(),
         );
-        std::fs::write(&security, script).unwrap();
+        write_stub(&security, script);
         std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o700)).unwrap();
         let missing = check_keychain_probe_with(&security, Duration::from_secs(2)).await;
         assert_eq!(missing.severity, Severity::Error);
@@ -2055,7 +2277,7 @@ mod tests {
               \n esac\n",
             item = item.display(),
         );
-        std::fs::write(&security, script).unwrap();
+        write_stub(&security, script);
         let timed_out = check_keychain_probe_with(&security, Duration::from_millis(50)).await;
         assert_eq!(timed_out.severity, Severity::Error);
         assert!(timed_out.message.contains("timed out"));
@@ -2694,6 +2916,14 @@ mod tests {
             queue: status::QueueStatus { pending: 0 },
             delivery: BTreeMap::new(),
             interactive: BTreeMap::new(),
+            credentials: status::CredentialsStatus {
+                backend: "macos-keychain".into(),
+                persistent: true,
+                insecure_file_store: false,
+                note: None,
+            },
+            daemon_report: None,
+            config_issues: Vec::new(),
             summary: "ok".to_string(),
         };
         let v = check_per_channel_validate(&Some(doc));
@@ -2792,5 +3022,208 @@ mod tests {
         delivery.remove("whatsapp");
         delivery.get_mut("slack").unwrap().outbound_reconcile = 0;
         assert_eq!(check_surface_delivery(&delivery).severity, Severity::Ok);
+    }
+
+    // --- #1299 -------------------------------------------------------------
+
+    fn backend(
+        backend: &'static str,
+        persistent: bool,
+        insecure: bool,
+    ) -> augmentagent_auth::BackendDescription {
+        augmentagent_auth::BackendDescription {
+            backend,
+            persistent,
+            insecure,
+            note: (!persistent).then(|| "not persistent (#1325)".to_string()),
+        }
+    }
+
+    #[test]
+    fn credential_backend_is_named_and_insecure_or_volatile_stores_are_flagged() {
+        let ok = check_credential_backend(&backend("macos-keychain", true, false));
+        assert_eq!(ok.name, "credential_backend");
+        assert_eq!(ok.severity, Severity::Ok);
+        assert!(ok.message.contains("macos-keychain"));
+
+        let insecure = check_credential_backend(&backend("insecure-file", true, true));
+        assert_eq!(insecure.severity, Severity::Error);
+        assert!(insecure
+            .message
+            .contains("AUGMENTAGENT_INSECURE_CREDENTIAL_DIR"));
+        assert!(insecure
+            .suggested_cmd
+            .as_deref()
+            .unwrap()
+            .contains("unset AUGMENTAGENT_INSECURE_CREDENTIAL_DIR"));
+
+        let volatile = check_credential_backend(&backend("keyring-mock", false, false));
+        assert_eq!(volatile.severity, Severity::Warn);
+        assert!(volatile.message.contains("keyring-mock"));
+        assert!(volatile.message.contains("#1325"));
+        assert!(volatile.suggested_cmd.is_some());
+    }
+
+    #[test]
+    fn every_config_issue_becomes_a_finding_with_its_recovery() {
+        let issues = vec![
+            status::ConfigIssue {
+                id: "discord.approval_broker".into(),
+                source: "cli",
+                severity: "warn".into(),
+                detail: "DISCORD_BOT_TOKEN is set but DISCORD_CHANNEL_ID is not".into(),
+                recovery: Some(status::DISCORD_BROKER_RECOVERY.into()),
+            },
+            status::ConfigIssue {
+                id: "daemon.insecure_file_store".into(),
+                source: "daemon",
+                severity: "error".into(),
+                detail: "plaintext".into(),
+                recovery: Some(status::INSECURE_STORE_RECOVERY.into()),
+            },
+        ];
+        let f = check_config_issues(&issues);
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[0].name, "config.discord.approval_broker");
+        assert_eq!(f[0].severity, Severity::Warn);
+        assert!(f[0]
+            .suggested_cmd
+            .as_deref()
+            .unwrap()
+            .contains("DISCORD_CHANNEL_ID"));
+        assert_eq!(f[1].name, "config.daemon.insecure_file_store");
+        assert_eq!(f[1].severity, Severity::Error);
+        let none = check_config_issues(&[]);
+        assert_eq!(none.len(), 1);
+        assert_eq!(none[0].severity, Severity::Ok);
+    }
+
+    fn slack_status(credentials: &str, app: bool, owner: bool) -> status::InteractiveStatus {
+        status::InteractiveStatus {
+            state: if credentials == "usable" {
+                "connected"
+            } else {
+                "disconnected"
+            }
+            .into(),
+            healthy: credentials == "usable",
+            app_installed: Some(app),
+            owner_bound: owner,
+            credentials: credentials.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn slack_credentials_are_never_ok_as_usable_without_the_daemons_proof() {
+        let usable = check_slack_credentials(&slack_status("usable", true, true), true);
+        assert_eq!(usable.name, "interactive.slack.credentials");
+        assert_eq!(usable.severity, Severity::Ok);
+        assert!(usable.message.contains("usable"));
+
+        let mac = check_slack_credentials(&slack_status("present", true, true), true);
+        assert_eq!(mac.severity, Severity::Warn);
+        assert!(mac.message.contains("not yet proven"));
+        assert!(mac
+            .suggested_cmd
+            .as_deref()
+            .unwrap()
+            .contains("augmentagent doctor --keychain-probe"));
+        let linux = check_slack_credentials(&slack_status("present", true, true), false);
+        assert!(linux
+            .suggested_cmd
+            .as_deref()
+            .unwrap()
+            .contains("service --unit daemon restart"));
+
+        let missing = check_slack_credentials(&slack_status("missing", false, false), true);
+        assert_eq!(
+            missing.severity,
+            Severity::Ok,
+            "nothing installed is not a fault"
+        );
+        assert!(missing.message.contains("no Slack app"));
+        let orphan = check_slack_credentials(&slack_status("missing", false, true), true);
+        assert_eq!(
+            orphan.severity,
+            Severity::Warn,
+            "an owner without an install"
+        );
+        assert!(orphan
+            .suggested_cmd
+            .as_deref()
+            .unwrap()
+            .contains("slack app install --stdin"));
+    }
+
+    #[test]
+    fn an_unreadable_credential_store_is_never_reported_as_nothing_installed() {
+        let mut s = slack_status("unreadable", false, false);
+        s.app_installed = None;
+        let f = check_slack_credentials(&s, true);
+        assert_eq!(f.severity, Severity::Warn);
+        assert!(f.message.contains("cannot read"), "{}", f.message);
+        assert!(f
+            .suggested_cmd
+            .as_deref()
+            .unwrap()
+            .contains("augmentagent doctor --keychain-probe"));
+    }
+
+    fn summary(scopes: Option<Vec<&str>>) -> augmentagent_channel_slack::app::SlackAppSummary {
+        let scopes: Option<Vec<String>> =
+            scopes.map(|v| v.into_iter().map(str::to_string).collect());
+        augmentagent_channel_slack::app::SlackAppSummary {
+            team_id: "T00000001".into(),
+            team_name: None,
+            team_url: None,
+            bot_user_id: "U0000000B".into(),
+            bot_user_name: None,
+            bot_id: None,
+            app_id: None,
+            missing_scopes: scopes
+                .as_deref()
+                .map(augmentagent_channel_slack::app::missing_scopes),
+            scopes,
+            installed_at: 1,
+            verified_at: None,
+            rotated_at: None,
+        }
+    }
+
+    #[test]
+    fn slack_scopes_compare_the_stored_grant_with_the_required_set() {
+        use augmentagent_channel_slack::app::REQUIRED_BOT_SCOPES;
+        let all = summary(Some(REQUIRED_BOT_SCOPES.to_vec()));
+        let f = slack_scope_findings(Ok(vec![all]));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].name, "slack_app.scopes");
+        assert_eq!(f[0].severity, Severity::Ok);
+        assert!(f[0].message.contains("T00000001"));
+
+        let few = summary(Some(vec!["chat:write"]));
+        let f = slack_scope_findings(Ok(vec![few]));
+        assert_eq!(f[0].severity, Severity::Error);
+        assert!(f[0].message.contains("im:history"), "{}", f[0].message);
+        assert!(f[0]
+            .suggested_cmd
+            .as_deref()
+            .unwrap()
+            .contains("slack app rotate --stdin"));
+
+        let unknown = slack_scope_findings(Ok(vec![summary(None)]));
+        assert_eq!(unknown[0].severity, Severity::Warn);
+        assert!(unknown[0]
+            .suggested_cmd
+            .as_deref()
+            .unwrap()
+            .contains("slack app verify"));
+
+        assert!(slack_scope_findings(Ok(Vec::new())).is_empty());
+        let err = slack_scope_findings(Err(augmentagent_channel_slack::app::SlackAppError::Store(
+            "denied".into(),
+        )));
+        assert_eq!(err[0].severity, Severity::Error);
+        assert!(err[0].suggested_cmd.is_some());
     }
 }

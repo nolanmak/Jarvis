@@ -73,6 +73,14 @@ impl RedditAuth {
     pub fn exists() -> bool {
         Auth::exists(AUTH_KEYCHAIN_PLATFORM, AUTH_ACCOUNT)
     }
+
+    /// #1299 — present, missing or unreadable (the store refused).
+    pub fn presence() -> augmentagent_auth::Presence {
+        Auth::presence(AUTH_KEYCHAIN_PLATFORM, AUTH_ACCOUNT)
+    }
+
+    /// The credential slot `presence` probes, as `(platform, account)`.
+    pub const SLOT: (&'static str, &'static str) = (AUTH_KEYCHAIN_PLATFORM, AUTH_ACCOUNT);
 }
 
 /// Build the Reddit consent URL for the dashboard bootstrap (step 1).

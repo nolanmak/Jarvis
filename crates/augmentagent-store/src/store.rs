@@ -129,7 +129,10 @@ fn lost_migration_race(e: &StoreError) -> bool {
     };
     if matches!(
         code.code,
-        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+        rusqlite::ErrorCode::DatabaseBusy
+            | rusqlite::ErrorCode::DatabaseLocked
+            // #1299 — the other migrator changed the schema under us.
+            | rusqlite::ErrorCode::SchemaChanged
     ) {
         return true;
     }
@@ -868,6 +871,8 @@ impl Store {
         crate::surface_health::migrate(conn)?;
         // #1289 — approval-card pointers per surface.
         crate::approval_cards::migrate(conn)?;
+        // #1299 — the daemon's own start report (credential backend, notices).
+        crate::daemon_report::migrate(conn)?;
         // -------------------------------------------------------------------
         // #45 — Rust-owned schema. Mirrors `src/db.ts::initDb()` exactly
         // (column names, types, NOT NULL, DEFAULT, PRIMARY KEY). Do NOT
@@ -8472,6 +8477,41 @@ pub(crate) fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod migration_race_tests {
+    use super::*;
+
+    fn failure(code: std::os::raw::c_int, message: &str) -> StoreError {
+        StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            Some(message.into()),
+        ))
+    }
+
+    /// #1299 — another process adding a column while this one migrates can
+    /// surface as SQLITE_SCHEMA ("database schema has changed"); that is a
+    /// lost race to retry, like a lock or a duplicate column.
+    #[test]
+    fn a_schema_change_by_another_migrator_is_a_lost_race() {
+        assert!(lost_migration_race(&failure(
+            rusqlite::ffi::SQLITE_SCHEMA,
+            "database schema has changed"
+        )));
+        assert!(lost_migration_race(&failure(
+            rusqlite::ffi::SQLITE_BUSY,
+            "database is locked"
+        )));
+        assert!(lost_migration_race(&failure(
+            rusqlite::ffi::SQLITE_ERROR,
+            "duplicate column name: reconnects"
+        )));
+        assert!(!lost_migration_race(&failure(
+            rusqlite::ffi::SQLITE_ERROR,
+            "no such table: actions"
+        )));
+    }
 }
 
 #[cfg(test)]

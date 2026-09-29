@@ -72,11 +72,68 @@ impl Auth {
         default_store().delete(platform, account)
     }
 
-    /// True when an entry exists. Does not decrypt or read the secret, so
-    /// it does not trigger the macOS "allow access" prompt.
+    /// True only when the entry is known to exist ([`Presence::Present`]).
+    /// On macOS this reads the item (keyring 3 has no attribute-only
+    /// lookup), which can show the Keychain "allow access" prompt for a
+    /// binary the item does not trust. A store this process cannot read
+    /// counts as absent; use [`Auth::presence`] to tell the two apart.
     pub fn exists(platform: &str, account: &str) -> bool {
         default_store().exists(platform, account)
     }
+
+    /// #1299 — present, missing, or unreadable from this process.
+    pub fn presence(platform: &str, account: &str) -> Presence {
+        default_store().presence(platform, account)
+    }
+}
+
+/// #1299 — whether a credential slot exists, as far as this process can
+/// tell. `Unreadable` means the store refused or failed (a locked or
+/// unavailable Keychain, a session without access to it); it says nothing
+/// about whether the item exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Presence {
+    Present,
+    Missing,
+    /// Sanitized reason from the platform store. Never secret bytes.
+    Unreadable(String),
+}
+
+/// Longest `Presence::Unreadable` reason kept.
+const MAX_REASON: usize = 200;
+
+/// Map a keyring lookup result to [`Presence`]. `NoEntry` is missing; an
+/// ambiguous match or a non-UTF-8 secret still proves an item is there;
+/// every other error is unreadable, with the platform's message (bounded,
+/// never the secret) as the reason.
+pub fn presence_from_keyring(result: Result<(), keyring::Error>) -> Presence {
+    let reason = match result {
+        Ok(()) => return Presence::Present,
+        Err(keyring::Error::NoEntry) => return Presence::Missing,
+        Err(keyring::Error::Ambiguous(_)) | Err(keyring::Error::BadEncoding(_)) => {
+            return Presence::Present
+        }
+        Err(keyring::Error::NoStorageAccess(e)) => {
+            format!("no access to the credential store: {e}")
+        }
+        Err(keyring::Error::PlatformFailure(e)) => format!("credential store failure: {e}"),
+        Err(keyring::Error::TooLong(attr, _)) => format!("invalid credential key: {attr} too long"),
+        Err(keyring::Error::Invalid(attr, why)) => format!("invalid credential key {attr}: {why}"),
+        Err(e) => format!("credential store error: {e}"),
+    };
+    Presence::Unreadable(bounded(&reason))
+}
+
+fn bounded(reason: &str) -> String {
+    let one_line = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.len() <= MAX_REASON {
+        return one_line;
+    }
+    let mut end = MAX_REASON;
+    while !one_line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &one_line[..end])
 }
 
 /// Where credentials live. Object-safe so callers hold an
@@ -89,7 +146,18 @@ pub trait CredentialStore: Send + Sync {
     fn get(&self, platform: &str, account: &str) -> Result<Vec<u8>, AuthError>;
     /// Idempotent: a missing entry is success.
     fn delete(&self, platform: &str, account: &str) -> Result<(), AuthError>;
+    /// True only when the entry is known to exist. May read the item.
     fn exists(&self, platform: &str, account: &str) -> bool;
+    /// #1299 — present, missing or unreadable. Stores that can tell an
+    /// unreadable store from a missing entry override this; the default
+    /// follows [`exists`](Self::exists).
+    fn presence(&self, platform: &str, account: &str) -> Presence {
+        if self.exists(platform, account) {
+            Presence::Present
+        } else {
+            Presence::Missing
+        }
+    }
 }
 
 /// The store the process should use: [`FileCredentialStore`] when
@@ -113,6 +181,65 @@ pub fn store_for_override(dir: Option<&OsStr>) -> Arc<dyn CredentialStore> {
             Arc::new(FileCredentialStore::new(Path::new(dir)))
         }
         None => Arc::new(KeychainCredentialStore),
+    }
+}
+
+/// #1299 / #1325 — which credential backend a process uses, for `doctor` and
+/// `status`. Never contains a secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendDescription {
+    /// `macos-keychain`, `secret-service`, `keyutils`, `keyring-mock`,
+    /// `insecure-file`, …
+    pub backend: &'static str,
+    /// Credentials outlive the process that stored them.
+    pub persistent: bool,
+    /// Plaintext files from [`INSECURE_FILE_STORE_ENV`].
+    pub insecure: bool,
+    /// Caveat for the operator, when there is one.
+    pub note: Option<String>,
+}
+
+/// Describe the store [`default_store`] selects in this process.
+pub fn describe_default_store() -> BackendDescription {
+    describe_store_for_override(std::env::var_os(INSECURE_FILE_STORE_ENV).as_deref())
+}
+
+/// Pure counterpart of [`describe_default_store`], same rule as
+/// [`store_for_override`]. Reads nothing from the store.
+pub fn describe_store_for_override(dir: Option<&OsStr>) -> BackendDescription {
+    if dir.is_some_and(|d| !d.is_empty()) {
+        return BackendDescription {
+            backend: "insecure-file",
+            persistent: true,
+            insecure: true,
+            note: Some(format!(
+                "{INSECURE_FILE_STORE_ENV} is set: credentials are plaintext files (tests and \
+                 local QA only)"
+            )),
+        };
+    }
+    use keyring::credential::CredentialPersistence;
+    let persistence = keyring::default::default_credential_builder().persistence();
+    let persistent = matches!(persistence, CredentialPersistence::UntilDelete);
+    let backend = if cfg!(target_os = "macos") {
+        "macos-keychain"
+    } else {
+        match persistence {
+            CredentialPersistence::UntilDelete => "platform-keyring",
+            CredentialPersistence::UntilReboot => "keyutils",
+            _ => "keyring-mock",
+        }
+    };
+    let note = (!persistent).then(|| {
+        "credentials do not outlive the process that stored them: the keyring crate is built \
+         without a persistent backend for this OS (#1325)"
+            .to_string()
+    });
+    BackendDescription {
+        backend,
+        persistent,
+        insecure: false,
+        note,
     }
 }
 
@@ -156,11 +283,19 @@ impl CredentialStore for KeychainCredentialStore {
     }
 
     fn exists(&self, platform: &str, account: &str) -> bool {
+        self.presence(platform, account) == Presence::Present
+    }
+
+    /// On macOS keyring 3's attribute lookup reads the item, so this is a
+    /// read (which may prompt); any failure other than "no such item" is
+    /// `Unreadable`, never `Present` (#1299).
+    fn presence(&self, platform: &str, account: &str) -> Presence {
         let entry = match entry_for(platform, account) {
             Ok(e) => e,
-            Err(_) => return false,
+            Err(AuthError::Keyring(e)) => return presence_from_keyring(Err(e)),
+            Err(e) => return Presence::Unreadable(bounded(&e.to_string())),
         };
-        !matches!(entry.get_attributes(), Err(keyring::Error::NoEntry))
+        presence_from_keyring(entry.get_attributes().map(|_| ()))
     }
 }
 
@@ -327,9 +462,22 @@ impl CredentialStore for FileCredentialStore {
     }
 
     fn exists(&self, platform: &str, account: &str) -> bool {
-        self.path_for(platform, account)
-            .map(|p| p.is_file())
-            .unwrap_or(false)
+        self.presence(platform, account) == Presence::Present
+    }
+
+    fn presence(&self, platform: &str, account: &str) -> Presence {
+        let path = match self.path_for(platform, account) {
+            Ok(p) => p,
+            Err(e) => return Presence::Unreadable(bounded(&e.to_string())),
+        };
+        match std::fs::metadata(&path) {
+            Ok(m) if m.is_file() => Presence::Present,
+            Ok(_) => Presence::Missing,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Presence::Missing,
+            Err(e) => {
+                Presence::Unreadable(bounded(&format!("credential file store: {}", e.kind())))
+            }
+        }
     }
 }
 

@@ -16,9 +16,36 @@ use augmentagent_docs::{
     convert_doc_to_text_with, extract_text_with, resolve_tool, ConvertOptions, DocKind,
 };
 
+/// Write an executable script without this process ever holding a write
+/// descriptor on it. Tests run on parallel threads that fork children; a
+/// child forked while `std::fs::write` has the file open inherits that
+/// descriptor until it execs, and on Linux exec'ing a file some process has
+/// open for writing fails with ETXTBSY ("Text file busy"). Renaming a temp
+/// file into place does not help (same inode, same open descriptor), so the
+/// bytes are written by a short-lived `sh` child instead: once it has been
+/// waited for, nobody holds the file open for writing.
 fn fake_tool(dir: &Path, name: &str, script: &str) -> PathBuf {
+    use std::io::Write;
     let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+    let mut writer = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("cat > \"$1\"")
+        .arg("sh")
+        .arg(&path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sh to write the fake tool");
+    writer
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("#!/bin/sh\n{script}\n").as_bytes())
+        .unwrap();
+    assert!(
+        writer.wait().unwrap().success(),
+        "writing {}",
+        path.display()
+    );
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
@@ -150,4 +177,38 @@ async fn failing_converter_reports_exit_status_and_stderr() {
         err.contains("pandoc exited") && err.contains("bad docx"),
         "{err}"
     );
+}
+
+/// ETXTBSY regression (#1334 class): fake tools written on some threads are
+/// executed at once while other threads keep forking. With the tool written
+/// through `std::fs::write` in this process this failed on Linux with "Text
+/// file busy"; every exec must now succeed.
+#[test]
+fn fake_tools_run_while_other_threads_fork() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    // ETXTBSY is Linux behavior; elsewhere (macOS execs of fresh scripts are
+    // slow) a short run keeps the helper covered.
+    let (threads, rounds) = if cfg!(target_os = "linux") {
+        (8, 25)
+    } else {
+        (4, 5)
+    };
+    let threads: Vec<_> = (0..threads)
+        .map(|t| {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                for i in 0..rounds {
+                    let tool = fake_tool(&root, &format!("tool-{t}-{i}"), "exit 0");
+                    let out = std::process::Command::new(&tool)
+                        .output()
+                        .unwrap_or_else(|e| panic!("exec {}: {e}", tool.display()));
+                    assert!(out.status.success());
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().expect("no exec failed");
+    }
 }
