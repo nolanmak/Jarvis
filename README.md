@@ -275,6 +275,14 @@ sending. Logs land under `~/.local/state/augmentagent*/` on both. The daemon uni
 the bot's Message Content intent, and more Claude calls per email — finish
 the [Quickstart](#quickstart) first.
 
+On macOS, run the installers from a shell where the required tools are on
+`PATH`. The daemon installer checks Node, Deno, jq, and only the CLI providers
+selected by `AUGMENTAGENT_REASONER_CHAIN` (from the environment or `.env`).
+The dashboard installer checks Node; the updater checks Cargo, Node, npm, and
+Git. Their resolved directories are written into the launchd environment, so
+the jobs can find them after login without shell startup files. A missing tool
+or invalid plist stops installation before the existing job is replaced.
+
 `scripts/check-for-updates.sh` runs on a timer: it pulls `origin/main`,
 rebuilds the Rust and Node sides when their sources change, and bounces each
 unit independently. Routine deploys go through this auto-updater — don't

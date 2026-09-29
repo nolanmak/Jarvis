@@ -22,14 +22,16 @@ bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n     %s\n' "$1" "${2:-}"; }
 # run-rs.sh and a release binary before writing anything.
 make_case() {
   TMP=$(mktemp -d); export TMP
-  mkdir -p "$TMP/repo/scripts" "$TMP/repo/target/release" "$TMP/bin" "$TMP/home"
+  mkdir -p "$TMP/repo/scripts/lib" "$TMP/repo/target/release" "$TMP/bin" "$TMP/home"
   cp "$REPO_ROOT/scripts/install-autostart.sh" "$REPO_ROOT/scripts/install-tenant.sh" "$TMP/repo/scripts/"
+  cp "$REPO_ROOT/scripts/lib/launchd-install.sh" "$TMP/repo/scripts/lib/"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/repo/scripts/run-rs.sh"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/repo/target/release/augmentagent"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/bin/systemctl"
   # The unit cases render the Linux branch on any host (#1079: CI runs macOS too).
   printf '#!/usr/bin/env bash\necho Linux\n' > "$TMP/bin/uname"
   printf '#!/usr/bin/env bash\necho Linger=yes\n' > "$TMP/bin/loginctl"
+  for tool in node deno jq claude; do printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/bin/$tool"; done
   chmod +x "$TMP/repo/scripts/"*.sh "$TMP/repo/target/release/augmentagent" "$TMP/bin/"*
   UNIT="$TMP/home/.config/systemd/user/augmentagent.service"
   TENANT_UNIT="$TMP/home/.config/systemd/user/augmentagent-tenant-t1.service"

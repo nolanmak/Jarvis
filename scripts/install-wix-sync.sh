@@ -31,24 +31,43 @@ case "$HOUR" in ''|*[!0-9]*) die "hour must be 0-23 (got '$HOUR')";; esac
 case "$MINUTE" in ''|*[!0-9]*) die "minute must be 0-59 (got '$MINUTE')";; esac
 
 install_macos() {
+  source "$REPO_ROOT/scripts/lib/launchd-install.sh"
   local PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
   local LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/augmentagent"  # #1079: same dir as Linux
   mkdir -p "$LOG_DIR" "$(dirname "$PLIST")"
 
+  local LAUNCH_PATH
+  LAUNCH_PATH="$(launchd_service_path node)"
+
+  local REPO_ROOT_XML HOME_XML LOG_DIR_XML LAUNCH_PATH_XML NODE_XML
+  REPO_ROOT_XML="$(launchd_xml_escape "$REPO_ROOT")"
+  HOME_XML="$(launchd_xml_escape "$HOME")"
+  LOG_DIR_XML="$(launchd_xml_escape "$LOG_DIR")"
+  LAUNCH_PATH_XML="$(launchd_xml_escape "${LAUNCH_PATH:-}")"
+  NODE_XML="$(launchd_xml_escape "$(command -v node 2>/dev/null || true)")"
+  local CANDIDATE
+  CANDIDATE="$(launchd_candidate "$PLIST")"
   log "Writing plist: $PLIST (daily at ${HOUR}:$(printf '%02d' "$MINUTE"))"
-  cat > "$PLIST" <<PLIST_EOF
+  cat > "$CANDIDATE" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
     <string>$LABEL</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>$LAUNCH_PATH_XML</string>
+        <key>HOME</key>
+        <string>$HOME_XML</string>
+    </dict>
     <key>WorkingDirectory</key>
-    <string>$REPO_ROOT</string>
+    <string>$REPO_ROOT_XML</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$(command -v node)</string>
-        <string>$REPO_ROOT/scripts/wix-events-sync.mjs</string>
+        <string>$NODE_XML</string>
+        <string>$REPO_ROOT_XML/scripts/wix-events-sync.mjs</string>
     </array>
     <key>StartCalendarInterval</key>
     <dict>
@@ -56,15 +75,14 @@ install_macos() {
         <key>Minute</key><integer>$MINUTE</integer>
     </dict>
     <key>StandardOutPath</key>
-    <string>$LOG_DIR/wix-sync.log</string>
+    <string>$LOG_DIR_XML/wix-sync.log</string>
     <key>StandardErrorPath</key>
-    <string>$LOG_DIR/wix-sync.log</string>
+    <string>$LOG_DIR_XML/wix-sync.log</string>
 </dict>
 </plist>
 PLIST_EOF
+  launchd_install "$LABEL" "$PLIST" "$CANDIDATE" false
 
-  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$PLIST"
   log "Installed. Log: $LOG_DIR/wix-sync.log"
 }
 

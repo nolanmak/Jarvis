@@ -45,6 +45,7 @@ die() { printf '\033[1;31m[install-autostart ERR]\033[0m %s\n' "$*" >&2; exit 1;
   || die "release binary missing — run: cargo build --release -p augmentagent-cli"
 
 install_macos() {
+  source "$REPO_ROOT/scripts/lib/launchd-install.sh"
   local PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
   local LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/augmentagent"  # #1079: same dir as Linux
   mkdir -p "$LOG_DIR"
@@ -52,10 +53,19 @@ install_macos() {
 
   # Build PATH that works for a graphical login (launchd inherits /usr/bin:/bin by default).
   # Include the usual suspects so `claude`, `cargo`, `node`, Homebrew, etc. are found.
-  local LAUNCH_PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+  local REASONER_TOOLS LAUNCH_PATH
+  REASONER_TOOLS="$(launchd_reasoner_tools "$REPO_ROOT")"
+  LAUNCH_PATH="$(launchd_service_path node deno jq $REASONER_TOOLS)"
 
+  local REPO_ROOT_XML HOME_XML LOG_DIR_XML LAUNCH_PATH_XML
+  REPO_ROOT_XML="$(launchd_xml_escape "$REPO_ROOT")"
+  HOME_XML="$(launchd_xml_escape "$HOME")"
+  LOG_DIR_XML="$(launchd_xml_escape "$LOG_DIR")"
+  LAUNCH_PATH_XML="$(launchd_xml_escape "${LAUNCH_PATH:-}")"
+  local CANDIDATE
+  CANDIDATE="$(launchd_candidate "$PLIST")"
   log "Writing plist: $PLIST"
-  cat > "$PLIST" <<PLIST_EOF
+  cat > "$CANDIDATE" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -64,11 +74,11 @@ install_macos() {
     <string>$LABEL</string>
 
     <key>WorkingDirectory</key>
-    <string>$REPO_ROOT</string>
+    <string>$REPO_ROOT_XML</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>$REPO_ROOT/scripts/run-rs.sh</string>
+        <string>$REPO_ROOT_XML/scripts/run-rs.sh</string>
         <string>--wiki-dir</string>
         <string>./wiki</string>
         <string>serve</string>
@@ -79,11 +89,11 @@ install_macos() {
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>$LAUNCH_PATH</string>
+        <string>$LAUNCH_PATH_XML</string>
         <key>RUST_LOG</key>
         <string>info</string>
         <key>HOME</key>
-        <string>$HOME</string>
+        <string>$HOME_XML</string>
     </dict>
 
     <key>RunAtLoad</key>
@@ -101,34 +111,20 @@ install_macos() {
     <integer>10</integer>
 
     <key>StandardOutPath</key>
-    <string>$LOG_DIR/stdout.log</string>
+    <string>$LOG_DIR_XML/stdout.log</string>
 
     <key>StandardErrorPath</key>
-    <string>$LOG_DIR/stderr.log</string>
+    <string>$LOG_DIR_XML/stderr.log</string>
 </dict>
 </plist>
 PLIST_EOF
-
-  local UID_NUM
-  UID_NUM="$(id -u)"
-  local DOMAIN="gui/$UID_NUM"
-
-  if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
-    log "Previous agent found — bootout first"
-    launchctl bootout "$DOMAIN/$LABEL" || true
-    sleep 1
-  fi
-
-  log "Bootstrapping agent"
-  launchctl bootstrap "$DOMAIN" "$PLIST"
-  launchctl enable "$DOMAIN/$LABEL"
-  launchctl kickstart -k "$DOMAIN/$LABEL"
+  launchd_install "$LABEL" "$PLIST" "$CANDIDATE" true
 
   log "Installed."
   log "  Label:     $LABEL"
   log "  Plist:     $PLIST"
   log "  Logs:      $LOG_DIR/"
-  log "  Status:    launchctl print $DOMAIN/$LABEL | head -30"
+  log "  Status:    launchctl print gui/$(id -u)/$LABEL | head -30"
   log "  Uninstall: ./scripts/uninstall-autostart.sh"
 }
 
