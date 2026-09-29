@@ -1038,6 +1038,42 @@ async fn an_owner_file_reaches_the_agent_as_discords_attachment_input_and_is_rea
     running.stop().await;
 }
 
+/// Outbox rows: (idempotency key, text, provider message id).
+fn outbox(h: &Harness) -> Vec<(String, String, Option<String>)> {
+    let conn = rusqlite::Connection::open(&h.path).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT idempotency_key, payload, provider_message_id FROM surface_outbox ORDER BY id",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([], |r| {
+            let payload: String = r.get(1)?;
+            let text = serde_json::from_str::<Value>(&payload)
+                .ok()
+                .and_then(|v| v["text"].as_str().map(str::to_string))
+                .unwrap_or_default();
+            Ok((r.get(0)?, text, r.get(2)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    rows
+}
+
+fn all_dry_run(h: &Harness) -> bool {
+    let rows = outbox(h);
+    !rows.is_empty()
+        && rows
+            .iter()
+            .all(|(_, _, id)| id.as_deref().is_some_and(|p| p.starts_with("dry-run:")))
+}
+
+// Dry run: the turn runs through the harness, its answer and a `cancel`
+// reply are recorded as `dry-run:` sends, and nothing (answer, status line
+// or its edits) reaches Slack. The `cancel` is sent only once the first
+// turn has finished (its answer is in the outbox), so it deterministically
+// finds nothing running; cancelling a running dry-run turn is the next test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dry_run_runs_the_turn_but_makes_zero_live_sends_including_progress() {
     let h = Harness::new();
@@ -1053,17 +1089,60 @@ async fn dry_run_runs_the_turn_but_makes_zero_live_sends_including_progress() {
     server
         .deliver(&owner_dm("e1", "dry question", "1700000700.000100"))
         .await;
+    eventually("turn answered (dry-run)", || {
+        h.inbound_status(&format!("{DM}:1700000700.000100")) == "handled"
+            && outbox(&h).iter().any(|(_, t, _)| t.starts_with("session="))
+    })
+    .await;
+    assert_eq!(provider.calls().len(), 1, "the turn still runs in dry-run");
     server
         .deliver(&owner_dm("e2", "cancel", "1700000700.000200"))
         .await;
-    eventually("handled", || {
-        h.inbound_status(&format!("{DM}:1700000700.000100")) == "handled"
-            && h.inbound_status(&format!("{DM}:1700000700.000200")) == "handled"
+    eventually("cancel answered and every send recorded as dry-run", || {
+        outbox(&h)
+            .iter()
+            .any(|(_, t, _)| t == NOTHING_TO_CANCEL_REPLY)
+            && all_dry_run(&h)
     })
     .await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
     running.stop().await;
-    assert_eq!(provider.calls().len(), 1, "the turn still runs in dry-run");
+    assert_eq!(provider.calls().len(), 1);
+    assert!(
+        h.live_calls().is_empty(),
+        "dry-run sent live: {:?}",
+        h.live_calls()
+    );
+}
+
+// The race the previous test used to hit by accident, made deterministic:
+// a `cancel` while a dry-run turn is running stops it, and the stop is
+// recorded, not sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dry_run_cancel_of_a_running_turn_is_recorded_and_nothing_is_sent() {
+    let h = Harness::new();
+    let provider = Arc::new(RecordingNativeProvider::new(ProviderKind::Claude).holding_on("slow"));
+    let (connector, mut servers) = DuplexConnector::new();
+    let running = start(h.surface(
+        Arc::clone(&h.store),
+        connector,
+        harness_for(&h.store, FakeAgent::new(Arc::clone(&provider)), &h.wiki),
+        h.config(true, true),
+    ));
+    let mut server = Server::accept(&mut servers).await;
+    server
+        .deliver(&owner_dm("e1", "slow dry question", "1700000750.000100"))
+        .await;
+    eventually("turn running", || provider.observed_ids().len() == 1).await;
+    server
+        .deliver(&owner_dm("e2", "cancel", "1700000750.000200"))
+        .await;
+    eventually("stop recorded as dry-run", || {
+        outbox(&h).iter().any(|(_, t, _)| t == CANCELLED_REPLY) && all_dry_run(&h)
+    })
+    .await;
+    running.stop().await;
+    assert_eq!(provider.dropped_mid_turn(), 1);
+    assert!(provider.calls().is_empty());
     assert!(
         h.live_calls().is_empty(),
         "dry-run sent live: {:?}",
