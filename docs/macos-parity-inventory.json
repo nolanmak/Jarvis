@@ -3062,7 +3062,7 @@
     ],
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1255",
     "test_plan": "Run discord-voice synthetic contract and managed-service lifecycle on native Mac and Linux.",
-    "status": "unverified",
+    "status": "in_progress",
     "evidence": null
   },
   {
@@ -3240,7 +3240,7 @@
     ],
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1255",
     "test_plan": "Install the equivalent of augmentagent-discord-voice.service in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
-    "status": "unverified",
+    "status": "in_progress",
     "evidence": null
   },
   {
@@ -3324,7 +3324,7 @@
     ],
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1255",
     "test_plan": "Install the equivalent of augmentagent-telegram-capture.service in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
-    "status": "unverified",
+    "status": "in_progress",
     "evidence": null
   },
   {
