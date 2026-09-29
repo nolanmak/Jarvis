@@ -221,7 +221,7 @@ the same decisions as the Discord card, through the same code.
   token needed), `discord`, or `discord,slack`; unset sends cards to every
   configured surface. The approvals need `COMPOSIO_API_KEY` for Gmail and
   calendar cards, and a connected Composio Slack workspace to send Slack
-  contact replies. Scheduling a send (#1291) is still Discord-only.
+  contact replies. Scheduled sends are in section 8.
 
 For local QA only, a **debug build** sends Composio Slack calls to a
 loopback fake when `AUGMENTAGENT_TEST_COMPOSIO_BASE=http://127.0.0.1:<port>`
@@ -249,6 +249,49 @@ id). If the connection has no user id, Approve refuses to send.
   send** (or `approve <ref>`). A send whose outcome is unknown is looked for
   in the conversation before it is sent again; if it cannot be checked you
   are asked to look first.
+
+## 8. Scheduled sends (#1291)
+
+Every pending card (except merge proposals) has **Schedule…**. It opens a
+form: pick a preset (in 1 hour, in 3 hours, tonight 7pm, tomorrow 9am or
+2pm, next Monday 9am) or type a time (`tomorrow 9am`, `fri 14:30`, `in 3h`,
+`7pm`, `2026-10-01 09:00`, or an exact time with its offset). Nothing is
+armed by the form: you get the resolved time with its zone, e.g. **Wed Sep
+30, 9:00 AM EDT (America/New_York)**, and where it goes, and only
+**Confirm schedule** arms it.
+
+- A bare hour (`tomorrow 9`) asks whether you mean 9am or 9pm; a time that
+  has passed, less than 2 minutes away or more than 60 days out is refused.
+- Daylight saving: a time that does not exist (clocks spring forward) moves
+  an hour later and the confirmation says so; a time that happens twice
+  (clocks fall back) uses the first and the confirmation names the second
+  and how to pick it (`2026-11-01T01:30:00-05:00`).
+- Once armed, the card itself becomes the scheduled notice: when, where, as
+  whom, with **Send now**, **Reschedule…**, **Back to queue** (a fresh
+  approval card) and **Cancel schedule**. It keeps saying what happened —
+  sent, cancelled, back in the queue, moved — whether that was decided here,
+  on Discord, or by the daemon's scheduler. Discord shows its own notice for
+  the same send.
+- Text commands with the card's reference: `schedule <ref> <when>` shows the
+  resolved time and `confirm <ref>` arms it (the preview lasts 10 minutes);
+  `reschedule <ref> <when>` then `confirm <ref>`; `sendnow <ref>` (or `send
+  now <ref>`), `requeue <ref>`, `cancel <ref>`.
+- The daemon's scheduler sends it, never Slack's own scheduled messages: at
+  the time, with the same claim, destination, identity (**as you**), send
+  log and **Retry send** as an approved reply, once — also across a daemon
+  restart.
+- **Zone.** Times are read and shown in `AUGMENTAGENT_TIMEZONE` (an IANA
+  name such as `America/New_York`), else `TZ` when it names one, else the
+  host's zone name, else UTC. Only the name comes from the host; the rules
+  are compiled into the daemon, so macOS and Linux agree.
+- **Missed schedules.** If the Mac was asleep (or the daemon stopped) at
+  the time, a send found up to 30 minutes late goes out when it wakes;
+  later than that it is **not** sent: it goes back to the queue with a
+  fresh card and you get a notice saying so. Set
+  `AUGMENTAGENT_SCHEDULED_SEND_MISSED_WINDOW_SECS` to change the window
+  (minimum 120) or to `off` to always send late. The same policy applies to
+  scheduled emails. A send whose Slack connection is gone at the time is
+  also returned to the queue with the reason.
 
 ## Where credentials live
 

@@ -34,19 +34,33 @@
 //!   command instead; decisions still run, and their answer is a fresh
 //!   message rather than an ephemeral one the owner might never see.
 //!
-//! Scheduling controls (#1291) are not drawn on Slack yet; scheduled notices
-//! stay on Discord (`post_scheduled_notice` keeps the no-notice default).
+//! * **Scheduled sends (#1291).** A pending card offers *Schedule…*: a
+//!   modal (a preset or free text, read in the owner's zone), then a
+//!   confirmation showing the resolved time with its zone and any
+//!   daylight-saving adjustment; only *Confirm* arms it, through the same
+//!   handler verb Discord's Schedule select calls. The armed action's card
+//!   is redrawn in place as the scheduled notice (*Send now*,
+//!   *Reschedule…*, *Back to queue*, *Cancel schedule*), and redrawn again
+//!   whenever the action moves — sent by the daemon's scheduler, cancelled,
+//!   back in the queue, rescheduled — here or on Discord. Every control has
+//!   a text command with an explicit reference (`schedule <ref> <when>` then
+//!   `confirm <ref>`, `reschedule <ref> <when>`, `sendnow <ref>`,
+//!   `requeue <ref>`, `cancel <ref>`). The daemon's scheduler is the only
+//!   thing that fires a scheduled send; Slack's own scheduled messages are
+//!   never used.
 
 pub mod card;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use augmentagent_approval_discord::outcome::{
     card_status_line, describe, offers_recompose, redraft_produced_no_card,
 };
+use augmentagent_approval_discord::timeparse::{self, Zone};
 use augmentagent_approval_discord::{
     append_envelope_markers, deciding, fill_feedback, revise_result_prefix, split_needs_input,
     ApprovalActionHandler, ApprovalActionOutcome, ApprovalBroker, ApprovalCardSurface,
@@ -78,6 +92,9 @@ pub const REFINE_LIMIT_REPLY: &str =
     "Refine limit reached for this draft — Approve, Skip, or use Revise for a free-form edit.";
 pub const REVISED_REPLY: &str = "Revised — the card now shows the new draft.";
 pub const NO_VALUES_REPLY: &str = "No values supplied — draft unchanged.";
+
+/// #1291 — how long a `schedule <ref> <when>` preview waits for `confirm`.
+pub const PREVIEW_TTL_MS: i64 = 10 * 60 * 1000;
 
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
@@ -118,6 +135,20 @@ pub struct SlackApprovals {
     /// #1290 — the wiki whose people pages compose recipients resolve
     /// through. `None`: only subscribed channels can be composed to.
     wiki_root: Option<PathBuf>,
+    /// #1291 — the zone send times are read and shown in.
+    zone: Zone,
+    /// #1291 — `schedule <ref> <when>` previews awaiting `confirm <ref>`,
+    /// by action. In memory: a restart simply asks for the preview again.
+    previews: Mutex<HashMap<String, Preview>>,
+}
+
+/// #1291 — a resolved send time the owner has not confirmed yet.
+#[derive(Debug, Clone)]
+struct Preview {
+    at_ms: i64,
+    digest: String,
+    reschedule: bool,
+    expires_ms: i64,
 }
 
 /// The decision a control or command asks for.
@@ -128,6 +159,23 @@ enum Verb {
     Revise(String),
     Refine(String),
     Recompose,
+    /// #1291 — arm a schedule at this instant (already confirmed).
+    Schedule(i64),
+    /// #1291 — move an armed schedule to this instant (already confirmed).
+    Reschedule(i64),
+    SendNow,
+    CancelSchedule,
+    BackToQueue,
+}
+
+impl Verb {
+    /// The notice's verbs act on an armed schedule only.
+    fn needs_schedule(&self) -> bool {
+        matches!(
+            self,
+            Verb::Reschedule(_) | Verb::SendNow | Verb::CancelSchedule | Verb::BackToQueue
+        )
+    }
 }
 
 /// Where the answer to a decision goes.
@@ -153,6 +201,8 @@ impl SlackApprovals {
             surfaces,
             clock: Arc::new(system_now_ms),
             wiki_root: None,
+            zone: timeparse::owner_zone(),
+            previews: Mutex::new(HashMap::new()),
         }
     }
 
@@ -165,6 +215,22 @@ impl SlackApprovals {
     pub fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// #1291 — the zone send times are read and shown in.
+    pub fn with_timezone(mut self, zone: Zone) -> Self {
+        self.zone = zone;
+        self
+    }
+
+    /// The zone send times are read and shown in.
+    pub fn timezone(&self) -> Zone {
+        self.zone
+    }
+
+    /// `Wed Sep 30, 9:00 AM EDT (America/New_York)`.
+    fn when(&self, at_ms: i64) -> String {
+        timeparse::describe_send_time(at_ms, &self.zone)
     }
 
     /// The business logic every decision goes through. Set once.
@@ -221,6 +287,17 @@ impl SlackApprovals {
 
     /// `(text, blocks, digest, status)` for the action's current state.
     fn render(&self, row: &ActionWithEmail, note: Option<&str>) -> (String, Value, String, String) {
+        self.render_as(row, note, None)
+    }
+
+    /// [`Self::render`], drawn as if the action were in `status_override`
+    /// (a card the handler asked for while its CAS has not run yet).
+    fn render_as(
+        &self,
+        row: &ActionWithEmail,
+        note: Option<&str>,
+        status_override: Option<&str>,
+    ) -> (String, Value, String, String) {
         let action_id = row.action.id.as_str();
         let stored = row.action.draft_body.clone().unwrap_or_default();
         let digest = card::draft_digest(&stored);
@@ -231,9 +308,20 @@ impl SlackApprovals {
             &row.email.from,
             None,
         );
-        let status = row.action.status.clone();
+        let status = status_override
+            .map(str::to_string)
+            .unwrap_or_else(|| row.action.status.clone());
         let detail = row.action.error_message.as_deref();
-        let line = card_status_line(&status, detail);
+        // #1291 — an armed schedule is drawn as its notice, not a state line.
+        let scheduled_for = (status == "scheduled")
+            .then(|| self.store.action_scheduled_at(action_id).ok().flatten())
+            .flatten()
+            .map(|at| self.when(at));
+        let line = if scheduled_for.is_some() {
+            None
+        } else {
+            card_status_line(&status, detail)
+        };
         let (destination, sends_as) = self.contact_lines(&row.email);
         let (text, blocks) = card::card(&CardInput {
             action_id,
@@ -246,7 +334,8 @@ impl SlackApprovals {
             offer_recompose: offers_recompose(&status, detail),
             destination: destination.as_deref(),
             sends_as: sends_as.as_deref(),
-            offer_retry: self.offers_retry(row),
+            offer_retry: status_override.is_none() && self.offers_retry(row),
+            scheduled_for: scheduled_for.as_deref(),
         });
         (text, blocks, digest, status)
     }
@@ -283,15 +372,21 @@ impl SlackApprovals {
     /// Post a new card for `action_id` and record where it went. Older live
     /// cards for the same action are marked replaced and redrawn to point
     /// at the new one, so exactly one Slack card is actionable.
+    ///
+    /// `as_pending` draws an actionable card whatever the action's state:
+    /// the handler asks for one (back to queue, recompose) *before* its CAS
+    /// moves the action to pending. If that CAS loses, the stored status
+    /// differs from the drawn one and the next redraw corrects the card.
     async fn post_card(
         &self,
         action_id: &str,
         email: &Email,
         draft: &str,
         note: Option<&str>,
+        as_pending: bool,
     ) -> Result<(), ApprovalError> {
         let (text, blocks, digest, status) = match self.load(action_id) {
-            Some(row) => self.render(&row, note),
+            Some(row) => self.render_as(&row, note, as_pending.then_some("pending")),
             // A caller that has not persisted the action (tests, tools):
             // draw what it passed.
             None => {
@@ -309,6 +404,7 @@ impl SlackApprovals {
                     destination: destination.as_deref(),
                     sends_as: sends_as.as_deref(),
                     offer_retry: false,
+                    scheduled_for: None,
                 });
                 (text, blocks, digest, "pending".to_string())
             }
@@ -408,7 +504,8 @@ impl SlackApprovals {
                 let (text, blocks, digest, status) = self.render(&row, note);
                 // `sending` is transient: keep the card in the sweep until
                 // the send settles. A retryable failed send is still live.
-                let state = if status == "pending" || status == "sending" || self.offers_retry(&row)
+                let state = if matches!(status.as_str(), "pending" | "sending" | "scheduled")
+                    || self.offers_retry(&row)
                 {
                     ApprovalCardState::Live
                 } else {
@@ -527,9 +624,13 @@ impl SlackApprovals {
         }
     }
 
-    fn outcome_reply(outcome: &ApprovalActionOutcome) -> (String, bool) {
+    fn outcome_reply(&self, outcome: &ApprovalActionOutcome) -> (String, bool) {
         let text = match outcome {
             ApprovalActionOutcome::Revised { .. } => REVISED_REPLY.to_string(),
+            // #1291 — the time as Slack shows it, with its zone.
+            ApprovalActionOutcome::Scheduled { at_ms, .. } => {
+                format!("Scheduled — sends {}.", self.when(*at_ms))
+            }
             other => describe(other),
         };
         let recompose = matches!(
@@ -582,6 +683,36 @@ impl SlackApprovals {
                 // daemon's broker, which includes this surface).
                 let out = handler.recompose(action_id).await;
                 self.surfaces.redraw_except(SURFACE, action_id).await;
+                out
+            }
+            Verb::Schedule(at_ms) => {
+                self.previews.lock().unwrap().remove(action_id);
+                let out = handler.schedule(action_id, *at_ms).await;
+                self.sync(action_id, None).await;
+                out
+            }
+            Verb::Reschedule(at_ms) => {
+                self.previews.lock().unwrap().remove(action_id);
+                let out = handler.reschedule(action_id, *at_ms).await;
+                self.sync(action_id, None).await;
+                out
+            }
+            Verb::SendNow => {
+                let out = handler.send_now(action_id).await;
+                self.sync(action_id, None).await;
+                out
+            }
+            Verb::CancelSchedule => {
+                let out = handler.cancel_schedule(action_id).await;
+                self.sync(action_id, None).await;
+                out
+            }
+            Verb::BackToQueue => {
+                // The handler posts the fresh card (through the daemon's
+                // broker, which includes this surface); the redraw settles
+                // it once the CAS has run.
+                let out = handler.back_to_queue(action_id).await;
+                self.sync(action_id, None).await;
                 out
             }
             Verb::Revise(feedback) => self.redraft(handler, action_id, feedback, None).await,
@@ -688,7 +819,10 @@ impl SlackApprovals {
             }),
             InteractionKind::ViewSubmission => matches!(
                 interaction.callback_id.as_deref(),
-                Some(card::REVISE_MODAL) | Some(card::FILL_MODAL)
+                Some(card::REVISE_MODAL)
+                    | Some(card::FILL_MODAL)
+                    | Some(card::SCHEDULE_MODAL)
+                    | Some(card::RESCHEDULE_MODAL)
             ),
             _ => false,
         }
@@ -763,6 +897,26 @@ impl SlackApprovals {
                     .await;
                 return;
             }
+            card::SCHEDULE | card::RESCHEDULE => {
+                self.open_schedule_modal(i, &control, action.action_id == card::RESCHEDULE, &to)
+                    .await;
+                return;
+            }
+            card::SCHEDULE_CONFIRM | card::RESCHEDULE_CONFIRM => {
+                let Some(at_ms) = action.value.as_deref().and_then(|v| v.parse::<i64>().ok())
+                else {
+                    debug!("slack approvals: a confirm without its time");
+                    return;
+                };
+                if action.action_id == card::SCHEDULE_CONFIRM {
+                    Verb::Schedule(at_ms)
+                } else {
+                    Verb::Reschedule(at_ms)
+                }
+            }
+            card::SEND_NOW => Verb::SendNow,
+            card::UNSCHEDULE => Verb::BackToQueue,
+            card::CANCEL_SCHEDULE => Verb::CancelSchedule,
             other => {
                 debug!(action = other, "slack approvals: unknown control");
                 return;
@@ -773,8 +927,13 @@ impl SlackApprovals {
             self.redraw_own(id, None).await;
             return;
         }
+        if let Some(text) = self.not_scheduled(id, &verb) {
+            self.reply(&to, &text, None).await;
+            self.redraw_own(id, None).await;
+            return;
+        }
         let outcome = self.decide(id, &verb).await;
-        let (mut text, recompose) = Self::outcome_reply(&outcome);
+        let (mut text, recompose) = self.outcome_reply(&outcome);
         if late {
             text = format!("{text}\n_(Your click on `{r}` reached me late — the Mac may have been asleep — so this answer is a new message.)_");
         }
@@ -813,7 +972,7 @@ impl SlackApprovals {
                 status: row.action.status.clone(),
                 detail: row.action.error_message.clone(),
             };
-            let (text, recompose) = Self::outcome_reply(&outcome);
+            let (text, recompose) = self.outcome_reply(&outcome);
             self.reply(to, &text, recompose.then_some(id)).await;
             self.redraw_own(id, None).await;
             return;
@@ -878,6 +1037,294 @@ impl SlackApprovals {
         }
     }
 
+    // -----------------------------------------------------------------
+    // #1291 — scheduling
+    // -----------------------------------------------------------------
+
+    /// For a verb that acts on an armed schedule, the answer when the
+    /// action is back in the queue instead (a click on an old notice, a
+    /// command on the wrong ref). Other states go through the handler,
+    /// whose answer says what happened (`Already sent.`).
+    fn not_scheduled(&self, action_id: &str, verb: &Verb) -> Option<String> {
+        if !verb.needs_schedule() {
+            return None;
+        }
+        let row = self.load(action_id)?;
+        (row.action.status == "pending").then(|| {
+            format!(
+                "`{}` is not scheduled — it is waiting for approval on its card. Nothing changed.",
+                card::short_ref(action_id)
+            )
+        })
+    }
+
+    /// A preset token or typed text → `(instant, daylight-saving note)`, on
+    /// this surface's clock and zone, with the confirmation checks (past,
+    /// too soon, too far, am/pm).
+    fn resolve_time(
+        &self,
+        preset: Option<&str>,
+        text: Option<&str>,
+    ) -> Result<(i64, Option<String>), String> {
+        let now_ms = self.now();
+        let now = timeparse::at_in(now_ms, &self.zone);
+        if let Some(token) = preset {
+            let at_ms = timeparse::resolve_token_in(token, now)?;
+            if at_ms <= now_ms {
+                return Err("that time has already passed — give a time in the future".into());
+            }
+            timeparse::validate_send_at(at_ms, now_ms)?;
+            return Ok((at_ms, None));
+        }
+        let Some(text) = text.map(str::trim).filter(|t| !t.is_empty()) else {
+            return Err(
+                "Pick a time or type one, e.g. `tomorrow 9am`, `fri 14:30` or `in 3h`.".into(),
+            );
+        };
+        let resolved =
+            timeparse::resolve_send_at_in(text, now).map_err(|e| e.message().to_string())?;
+        Ok((
+            resolved.at_ms,
+            timeparse::describe_dst(&resolved, &self.zone),
+        ))
+    }
+
+    /// Schedule… / Reschedule… on a card: open the modal (a late click
+    /// gets the text command instead).
+    async fn open_schedule_modal(
+        &self,
+        i: &Interaction,
+        control: &ControlRef,
+        reschedule: bool,
+        to: &ReplyTo,
+    ) {
+        let id = control.action_id.as_str();
+        let r = card::short_ref(id);
+        let Some(row) = self.load(id) else {
+            self.reply(to, &describe(&ApprovalActionOutcome::NotFound), None)
+                .await;
+            return;
+        };
+        let wanted = if reschedule { "scheduled" } else { "pending" };
+        if row.action.status != wanted {
+            let text = if reschedule && row.action.status == "pending" {
+                self.not_scheduled(id, &Verb::Reschedule(0))
+                    .unwrap_or_default()
+            } else {
+                self.outcome_reply(&ApprovalActionOutcome::AlreadyResolved {
+                    status: row.action.status.clone(),
+                    detail: row.action.error_message.clone(),
+                })
+                .0
+            };
+            self.reply(to, &text, None).await;
+            self.redraw_own(id, None).await;
+            return;
+        }
+        if !reschedule && self.draft_changed(control) {
+            self.reply(to, STALE_DRAFT_REPLY, None).await;
+            self.redraw_own(id, None).await;
+            return;
+        }
+        let verb = if reschedule { "reschedule" } else { "schedule" };
+        let fallback = format!(
+            "The {verb} form could not open because the click reached me after Slack's 3-second window (the Mac may have been asleep). Click again, or reply `{verb} {r} <when>` (e.g. `{verb} {r} tomorrow 9am`)."
+        );
+        let draft = row.action.draft_body.clone().unwrap_or_default();
+        let (Some(trigger), false) = (i.trigger_id.as_deref(), to.fresh) else {
+            self.reply(
+                &ReplyTo {
+                    channel: to.channel.clone(),
+                    user: None,
+                    fresh: true,
+                },
+                &fallback,
+                None,
+            )
+            .await;
+            return;
+        };
+        let ctx = ModalContext {
+            action_id: id.to_string(),
+            digest: card::draft_digest(&draft),
+            channel: i.channel_id.clone(),
+            ts: i.message_ts.clone(),
+        };
+        let now_shown = timeparse::at_in(self.now(), &self.zone)
+            .format("%a %b %-d, %-I:%M %p %Z")
+            .to_string();
+        let view = card::schedule_modal(
+            &ctx,
+            &row.email.subject,
+            self.zone.name(),
+            &now_shown,
+            reschedule,
+        );
+        if let Err(e) = self.web.open_modal(trigger, view).await {
+            warn!(action_id = id, "slack approvals: views.open failed: {e}");
+            self.reply(
+                &ReplyTo {
+                    channel: to.channel.clone(),
+                    user: None,
+                    fresh: true,
+                },
+                &fallback,
+                None,
+            )
+            .await;
+        }
+    }
+
+    /// The schedule modal was submitted: resolve the time and ask for
+    /// confirmation. Nothing is armed here.
+    async fn schedule_submission(
+        &self,
+        view: &Value,
+        ctx: &ModalContext,
+        reschedule: bool,
+        to: &ReplyTo,
+    ) {
+        let preset = card::view_selected(view, "preset", "preset");
+        let text = card::view_value(view, "when", "when");
+        let (at_ms, dst) = match self.resolve_time(preset.as_deref(), text.as_deref()) {
+            Ok(t) => t,
+            Err(message) => {
+                self.reply(to, &message, None).await;
+                return;
+            }
+        };
+        let Some(row) = self.load(&ctx.action_id) else {
+            self.reply(to, &describe(&ApprovalActionOutcome::NotFound), None)
+                .await;
+            return;
+        };
+        let destination = self.contact_lines(&row.email).0;
+        let (text, blocks) = card::schedule_confirmation(
+            &ctx.action_id,
+            &ctx.digest,
+            at_ms,
+            &self.when(at_ms),
+            dst.as_deref(),
+            destination.as_deref(),
+            &row.email.subject,
+            reschedule,
+        );
+        self.reply_blocks(to, &text, blocks).await;
+    }
+
+    /// An ephemeral (or fresh) answer with its own blocks.
+    async fn reply_blocks(&self, to: &ReplyTo, text: &str, blocks: Value) {
+        let text = crate::delivery::mrkdwn::escape(text);
+        let result = match (&to.user, to.fresh) {
+            (Some(user), false) => self
+                .web
+                .post_ephemeral(PostEphemeral {
+                    channel: to.channel.clone(),
+                    user: user.clone(),
+                    text,
+                    blocks: Some(blocks),
+                    thread_ts: None,
+                })
+                .await
+                .map(|_| ()),
+            _ => self
+                .web
+                .post_message(PostMessage {
+                    channel: to.channel.clone(),
+                    text,
+                    blocks: Some(blocks),
+                    unfurl_links: Some(false),
+                    link_names: Some(false),
+                    ..PostMessage::default()
+                })
+                .await
+                .map(|_| ()),
+        };
+        if let Err(e) = result {
+            warn!("slack approvals: could not answer the owner: {e}");
+        }
+    }
+
+    /// `schedule <ref> <when>` / `reschedule <ref> <when>`: the preview.
+    fn preview_command(&self, action_id: &str, when: &str, reschedule: bool) -> String {
+        let r = card::short_ref(action_id);
+        let verb = if reschedule { "reschedule" } else { "schedule" };
+        if when.trim().is_empty() {
+            return format!("Say when: `{verb} {r} tomorrow 9am` (or `fri 14:30`, `in 3h`).");
+        }
+        let Some(row) = self.load(action_id) else {
+            return describe(&ApprovalActionOutcome::NotFound);
+        };
+        let wanted = if reschedule { "scheduled" } else { "pending" };
+        if row.action.status != wanted {
+            if reschedule && row.action.status == "pending" {
+                return self
+                    .not_scheduled(action_id, &Verb::Reschedule(0))
+                    .unwrap_or_default();
+            }
+            return self
+                .outcome_reply(&ApprovalActionOutcome::AlreadyResolved {
+                    status: row.action.status,
+                    detail: row.action.error_message,
+                })
+                .0;
+        }
+        let (at_ms, dst) = match self.resolve_time(None, Some(when)) {
+            Ok(t) => t,
+            Err(message) => return format!("Not scheduled: {message}"),
+        };
+        let digest = card::draft_digest(row.action.draft_body.as_deref().unwrap_or_default());
+        self.previews.lock().unwrap().insert(
+            action_id.to_string(),
+            Preview {
+                at_ms,
+                digest,
+                reschedule,
+                expires_ms: self.now() + PREVIEW_TTL_MS,
+            },
+        );
+        let what = if reschedule { "Move it to" } else { "Sends" };
+        let dest = self
+            .contact_lines(&row.email)
+            .0
+            .map(|d| format!(" · goes to {d}"))
+            .unwrap_or_default();
+        let note = dst.map(|n| format!("\n⚠️ {n}")).unwrap_or_default();
+        format!(
+            "{what} **{}**{dest}.{note}\nReply `confirm {r}` within 10 minutes to {verb} it; nothing is scheduled until you do.",
+            self.when(at_ms)
+        )
+    }
+
+    /// `confirm <ref>`: arm (or move) the previewed time.
+    async fn confirm_command(&self, action_id: &str) -> String {
+        let r = card::short_ref(action_id);
+        let preview = self.previews.lock().unwrap().get(action_id).cloned();
+        let Some(p) = preview.filter(|p| p.expires_ms > self.now()) else {
+            self.previews.lock().unwrap().remove(action_id);
+            return format!(
+                "Nothing to confirm for `{r}` — send `schedule {r} <when>` (or `reschedule {r} <when>`) first."
+            );
+        };
+        let current = self
+            .load(action_id)
+            .map(|row| card::draft_digest(row.action.draft_body.as_deref().unwrap_or_default()));
+        if current.is_some_and(|d| d != p.digest) {
+            self.previews.lock().unwrap().remove(action_id);
+            self.redraw_own(action_id, None).await;
+            return format!(
+                "The draft changed since that preview, so nothing was scheduled. Check the card and send `schedule {r} <when>` again."
+            );
+        }
+        let verb = if p.reschedule {
+            Verb::Reschedule(p.at_ms)
+        } else {
+            Verb::Schedule(p.at_ms)
+        };
+        let outcome = self.decide(action_id, &verb).await;
+        self.outcome_reply(&outcome).0
+    }
+
     async fn view_submission(&self, i: &Interaction) {
         let Some(view) = i.view.as_ref() else {
             return;
@@ -898,6 +1345,14 @@ impl SlackApprovals {
             user: i.user_id.clone(),
             fresh: false,
         };
+        if matches!(
+            i.callback_id.as_deref(),
+            Some(card::SCHEDULE_MODAL) | Some(card::RESCHEDULE_MODAL)
+        ) {
+            let reschedule = i.callback_id.as_deref() == Some(card::RESCHEDULE_MODAL);
+            self.schedule_submission(view, &ctx, reschedule, &to).await;
+            return;
+        }
         let feedback = if i.callback_id.as_deref() == Some(card::FILL_MODAL) {
             let needs = self
                 .load(&ctx.action_id)
@@ -928,7 +1383,7 @@ impl SlackApprovals {
             }
         };
         let outcome = self.decide(&ctx.action_id, &Verb::Revise(feedback)).await;
-        let (text, recompose) = Self::outcome_reply(&outcome);
+        let (text, recompose) = self.outcome_reply(&outcome);
         self.reply(&to, &text, recompose.then_some(ctx.action_id.as_str()))
             .await;
     }
@@ -955,6 +1410,13 @@ impl SlackApprovals {
         if rest.is_empty() && matches!(word.as_str(), "approvals" | "pending") {
             return Some(self.queue());
         }
+        // #1291 — `send now <ref>` is Send now, not Approve.
+        let (word, rest) = match (word.as_str(), rest.split_once(char::is_whitespace)) {
+            ("send", Some((now, r))) if now.eq_ignore_ascii_case("now") => {
+                ("sendnow".to_string(), r.trim())
+            }
+            _ => (word, rest),
+        };
         let known = matches!(
             word.as_str(),
             "approve"
@@ -966,6 +1428,13 @@ impl SlackApprovals {
                 | "edit"
                 | "refine"
                 | "recompose"
+                | "schedule"
+                | "reschedule"
+                | "confirm"
+                | "sendnow"
+                | "cancel"
+                | "unschedule"
+                | "requeue"
         );
         if !known {
             return None;
@@ -1016,6 +1485,12 @@ impl SlackApprovals {
             }
         };
         let verb = match word.as_str() {
+            "schedule" => return Some(self.preview_command(&action_id, arg, false)),
+            "reschedule" => return Some(self.preview_command(&action_id, arg, true)),
+            "confirm" => return Some(self.confirm_command(&action_id).await),
+            "sendnow" => Verb::SendNow,
+            "cancel" => Verb::CancelSchedule,
+            "unschedule" | "requeue" => Verb::BackToQueue,
             "approve" | "send" => Verb::Approve,
             "skip" | "reject" | "decline" => Verb::Skip,
             "recompose" => Verb::Recompose,
@@ -1037,8 +1512,11 @@ impl SlackApprovals {
                 Verb::Refine(preset)
             }
         };
+        if let Some(text) = self.not_scheduled(&action_id, &verb) {
+            return Some(text);
+        }
         let outcome = self.decide(&action_id, &verb).await;
-        let (text, _) = Self::outcome_reply(&outcome);
+        let (text, _) = self.outcome_reply(&outcome);
         let recover = match &outcome {
             ApprovalActionOutcome::AlreadyResolved { status, detail }
                 if offers_recompose(status, detail.as_deref()) =>
@@ -1080,7 +1558,7 @@ impl SlackApprovals {
                 recipient,
             } => {
                 let r = card::short_ref(&action_id);
-                if let Err(e) = self.post_card(&action_id, &email, &body, None).await {
+                if let Err(e) = self.post_card(&action_id, &email, &body, None, false).await {
                     warn!(action_id, "slack compose: card not posted: {e}");
                     return format!(
                         "The message to **{}** is waiting for approval, but its card could not \
@@ -1141,7 +1619,9 @@ impl SlackApprovals {
                 card::short_ref(&id)
             ));
         }
-        s.push_str("Reply `approve <ref>`, `skip <ref>` or `revise <ref> <what to change>`.");
+        s.push_str(
+            "Reply `approve <ref>`, `skip <ref>`, `revise <ref> <what to change>` or `schedule <ref> <when>`.",
+        );
         s
     }
 }
@@ -1160,7 +1640,7 @@ impl ApprovalBroker for SlackApprovals {
             .next()
             .filter(|l| l.starts_with("🔔 "))
             .map(str::to_string);
-        self.post_card(action_id, email, draft, note.as_deref())
+        self.post_card(action_id, email, draft, note.as_deref(), false)
             .await
     }
 
@@ -1171,8 +1651,38 @@ impl ApprovalBroker for SlackApprovals {
         draft: &str,
         _redraft_count: u32,
     ) -> Result<Option<(u64, u64)>, ApprovalError> {
-        self.post_card(action_id, email, draft, None).await?;
+        self.post_card(action_id, email, draft, None, true).await?;
         // Slack messages have no Discord ids to hand back.
+        Ok(None)
+    }
+
+    /// #1291 — the scheduled notice *is* the card, redrawn in place through
+    /// its stored pointer. An action with no Slack card yet (armed from the
+    /// CLI, or carded only on Discord) gets one, drawn as the notice.
+    async fn post_scheduled_notice(
+        &self,
+        action_id: &str,
+        email: &Email,
+        _sends_at_local: &str,
+        _sends_at_ms: i64,
+        _to_display: &str,
+    ) -> Result<Option<(u64, u64)>, ApprovalError> {
+        let live = self
+            .store
+            .approval_cards_for_action(&Self::platform(), action_id)
+            .unwrap_or_default()
+            .into_iter()
+            .any(|c| c.state != ApprovalCardState::Replaced);
+        if live {
+            self.redraw_own(action_id, None).await;
+        } else {
+            let draft = self
+                .load(action_id)
+                .and_then(|r| r.action.draft_body)
+                .unwrap_or_default();
+            self.post_card(action_id, email, &draft, None, false)
+                .await?;
+        }
         Ok(None)
     }
 

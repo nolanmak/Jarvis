@@ -156,6 +156,10 @@ impl ApprovalActionHandler for SyncingActionHandler {
         let out = deciding(self.origin, self.inner.schedule(action_id, at_ms)).await;
         self.synced(action_id, out).await
     }
+    async fn reschedule(&self, action_id: &str, at_ms: i64) -> ApprovalActionOutcome {
+        let out = deciding(self.origin, self.inner.reschedule(action_id, at_ms)).await;
+        self.synced(action_id, out).await
+    }
     async fn send_now(&self, action_id: &str) -> ApprovalActionOutcome {
         let out = deciding(self.origin, self.inner.send_now(action_id)).await;
         self.synced(action_id, out).await
@@ -386,6 +390,13 @@ mod tests {
 
     #[async_trait]
     impl ApprovalActionHandler for SeesSurface {
+        async fn reschedule(&self, _: &str, _: i64) -> ApprovalActionOutcome {
+            self.0.lock().unwrap().push(deciding_surface());
+            ApprovalActionOutcome::Scheduled {
+                at_ms: 5,
+                local: String::new(),
+            }
+        }
         async fn approve(&self, _: &str) -> ApprovalActionOutcome {
             self.0.lock().unwrap().push(deciding_surface());
             ApprovalActionOutcome::Approved
@@ -414,9 +425,11 @@ mod tests {
         discord.skip("a").await;
         // The Slack surface calls the handler directly inside its scope.
         deciding("slack", inner.revise("a", "shorter")).await;
+        // #1291 — a reschedule from Discord is recorded as Discord.
+        discord.reschedule("a", 5).await;
         assert_eq!(
             *seen.0.lock().unwrap(),
-            vec![None, Some("discord"), Some("slack")]
+            vec![None, Some("discord"), Some("slack"), Some("discord")]
         );
     }
 
@@ -443,6 +456,12 @@ mod tests {
         handler.skip("a2").await;
         handler.revise("a3", "shorter").await;
         handler.recompose("a4").await;
+        // #1291 — the schedule verbs redraw too, reschedule included.
+        handler.schedule("a6", 1).await;
+        handler.reschedule("a7", 2).await;
+        handler.send_now("a8").await;
+        handler.cancel_schedule("a9").await;
+        handler.back_to_queue("a10").await;
         // A read never redraws.
         assert!(handler.is_resolved("a5").await);
 
@@ -453,6 +472,11 @@ mod tests {
                 ("a2".into(), "discord".into()),
                 ("a3".into(), "discord".into()),
                 ("a4".into(), "discord".into()),
+                ("a6".into(), "discord".into()),
+                ("a7".into(), "discord".into()),
+                ("a8".into(), "discord".into()),
+                ("a9".into(), "discord".into()),
+                ("a10".into(), "discord".into()),
             ]
         );
         assert!(

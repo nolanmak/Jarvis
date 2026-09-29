@@ -6435,6 +6435,29 @@ impl Store {
         Ok(n == 1)
     }
 
+    /// #1291 — Reschedule: move an armed schedule's fire time,
+    /// `scheduled → scheduled`, CAS-gated on the row still being armed (a
+    /// claim, cancel or back-to-queue that got there first wins). Re-stamps
+    /// `status_updated_at`, which is the engine's arming moment for the
+    /// "did the owner reply since?" guard: rescheduling is re-arming.
+    pub fn reschedule_action(
+        &self,
+        action_id: &str,
+        at_ms: i64,
+        source: &str,
+    ) -> StoreResult<bool> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE actions \
+                SET scheduledAtMs = ?2, \
+                    status_source = ?3, status_updated_at = ?4, updatedAt = ?4 \
+              WHERE id = ?1 AND status = 'scheduled'",
+            params![action_id, at_ms, source, now],
+        )?;
+        Ok(n == 1)
+    }
+
     /// Back to queue: `scheduled → pending`, clearing the proposal AND the
     /// notice pointers. The row re-enters the queue as the ACTIVE card
     /// (nudgeCount 1, next re-nudge one interval out) because the caller has
@@ -10218,6 +10241,42 @@ mod tests {
         assert!(s
             .claim_due_action_for_send(&id, now + 86_500_000, "engine")
             .unwrap());
+    }
+
+    /// #1291 — Reschedule moves an armed schedule's fire time in place; it
+    /// never touches a row that is not armed (sent, sending, pending).
+    #[test]
+    fn reschedule_moves_only_an_armed_schedule() {
+        let (s, _f) = fresh_store();
+        let id = pending_action(&s, "m-resched-1");
+        assert!(
+            !s.reschedule_action(&id, 5_000_000, "slack").unwrap(),
+            "a pending row is not rescheduled (it has no schedule)"
+        );
+        s.schedule_action(&id, 1_000_000, "discord").unwrap();
+        s.set_action_notice(&id, "chan-1", "msg-1").unwrap();
+        assert!(s.reschedule_action(&id, 2_000_000, "slack").unwrap());
+        let (status, at, _) = raw_action_row(&s, &id);
+        assert_eq!(status, "scheduled");
+        assert_eq!(at, Some(2_000_000));
+        assert_eq!(
+            s.action_status_source(&id).unwrap().as_deref(),
+            Some("slack")
+        );
+        // The old fire time no longer claims it.
+        assert!(!s
+            .claim_due_action_for_send(&id, 1_500_000, "engine")
+            .unwrap());
+        assert!(s
+            .claim_due_action_for_send(&id, 2_000_000, "engine")
+            .unwrap());
+        assert!(
+            !s.reschedule_action(&id, 3_000_000, "slack").unwrap(),
+            "a row mid-send is never moved"
+        );
+        let (status, at, _) = raw_action_row(&s, &id);
+        assert_eq!(status, "sending");
+        assert_eq!(at, Some(2_000_000));
     }
 
     #[test]

@@ -15,6 +15,8 @@ mod discord_voice_session_tests;
 mod surface_conformance_tests;
 #[cfg(test)]
 mod slack_approval_tests;
+#[cfg(test)]
+mod slack_schedule_tests;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -3135,15 +3137,28 @@ async fn main() -> Result<()> {
             // flagging rows stuck mid-send from a previous crash.
             match std::env::var("COMPOSIO_API_KEY") {
                 Ok(api_key) => {
-                    let engine = augmentagent_channel_email::ScheduledSendEngine::new(
+                    let mut engine = augmentagent_channel_email::ScheduledSendEngine::new(
                         Arc::clone(&store),
                         Arc::new(ComposioClient::new(api_key)),
                         Arc::clone(&broker),
                         dry_run,
                     )
-                    .with_tick(Duration::from_secs(
-                        scheduled_send_interval_secs_from_env(),
-                    ));
+                    .with_tick(Duration::from_secs(scheduled_send_interval_secs_from_env()))
+                    // #1291 — the missed-schedule window (a send found later
+                    // than this after sleep or downtime goes back to the
+                    // queue), Slack contact sends fired through the approver
+                    // (same claim, ledger and identity as Approve), and the
+                    // cards on every surface redrawn when a send fires.
+                    .with_missed_window(augmentagent_channel_email::missed_window_from(
+                        std::env::var(augmentagent_channel_email::MISSED_WINDOW_ENV)
+                            .ok()
+                            .as_deref(),
+                    ))
+                    .with_card_surfaces(card_surfaces.clone());
+                    if let Some(approver) = approver.as_ref() {
+                        engine = engine.with_platform_sender(Arc::clone(approver)
+                            as Arc<dyn augmentagent_channel_email::ScheduledPlatformSender>);
+                    }
                     let sd = shutdown.clone();
                     tasks.push(tokio::spawn(async move { engine.run(sd).await }));
                 }
@@ -12557,6 +12572,22 @@ impl ReplyApprover {
         _action_id: &str,
         action: augmentagent_store::ActionWithEmail,
     ) -> ApprovalActionOutcome {
+        self.send_slack(
+            action,
+            augmentagent_channel_slack::contact::ContactClaim::Approval,
+            decision_source(),
+        )
+        .await
+    }
+
+    /// #1291 — one Slack contact send, whichever transition claims it: an
+    /// approval, Send now on a scheduled send, or the scheduler firing it.
+    async fn send_slack(
+        &self,
+        action: augmentagent_store::ActionWithEmail,
+        claim: augmentagent_channel_slack::contact::ContactClaim,
+        source: &str,
+    ) -> ApprovalActionOutcome {
         let client = augmentagent_channel_slack::contact::reply_target(&self.store, &action.email)
             .ok()
             .and_then(|t| self.slack.get(&t.team_id).cloned())
@@ -12564,11 +12595,12 @@ impl ReplyApprover {
         let api = client
             .as_deref()
             .map(|c| c as &dyn augmentagent_channel_slack::contact::ContactSendApi);
-        augmentagent_channel_slack::contact::approve_contact_message(
+        augmentagent_channel_slack::contact::send_contact_message(
             &self.store,
             api,
             &action,
-            decision_source(),
+            source,
+            claim,
         )
         .await
     }
@@ -12806,6 +12838,10 @@ impl ApprovalActionHandler for ReplyApprover {
         self.run_send_now(action_id).await
     }
 
+    async fn reschedule(&self, action_id: &str, at_ms: i64) -> ApprovalActionOutcome {
+        self.run_reschedule(action_id, at_ms).await
+    }
+
     async fn cancel_schedule(&self, action_id: &str) -> ApprovalActionOutcome {
         self.run_cancel_schedule(action_id).await
     }
@@ -12824,6 +12860,51 @@ impl ApprovalActionHandler for ReplyApprover {
         match self.handle_load(action_id) {
             Some(a) => matches!(a.action.status.as_str(), "scheduled" | "sending"),
             None => false,
+        }
+    }
+}
+
+/// #1291 — the shared scheduler hands due Slack contact sends here.
+#[async_trait]
+impl augmentagent_channel_email::ScheduledPlatformSender for ReplyApprover {
+    fn handles(&self, platform: &str) -> bool {
+        platform == augmentagent_channel_slack::PLATFORM
+    }
+
+    /// The due-gated claim and the same send as an approval
+    /// (`send_contact_message`): destination, owner identity, send ledger
+    /// and retry. Answered from the row's state afterwards, so a refusal
+    /// before the claim (no connection, no identity) is told apart from a
+    /// claimed send that failed.
+    async fn fire_due(
+        &self,
+        action_id: &str,
+        now_ms: i64,
+    ) -> augmentagent_channel_email::PlatformFire {
+        use augmentagent_channel_email::PlatformFire;
+        let Some(action) = self.handle_load(action_id) else {
+            return PlatformFire::LostClaim;
+        };
+        let out = self
+            .send_slack(
+                action,
+                augmentagent_channel_slack::contact::ContactClaim::Due { now_ms },
+                "scheduled-send-engine",
+            )
+            .await;
+        match out {
+            ApprovalActionOutcome::Approved => PlatformFire::Sent,
+            ApprovalActionOutcome::Failed { message } => {
+                let still_armed = self
+                    .handle_load(action_id)
+                    .is_some_and(|a| a.action.status == "scheduled");
+                if still_armed {
+                    PlatformFire::NotStarted(message)
+                } else {
+                    PlatformFire::Failed(message)
+                }
+            }
+            _ => PlatformFire::LostClaim,
         }
     }
 }
@@ -13562,17 +13643,37 @@ impl ReplyApprover {
         // BEFORE arming, or the engine would claim the row at fire time and
         // flip it straight to a retry-exempt error. Same dispatch ladder as
         // run_approve.
-        let non_gmail = matches!(
+        // #1291 — Slack contact messages are scheduled too: the engine
+        // hands them to the Slack sender (`ScheduledPlatformSender`).
+        let slack = action.email.platform == augmentagent_channel_slack::PLATFORM;
+        let unsupported = matches!(
             action.email.platform.as_str(),
-            "discord" | "slack" | "telegram" | "github" | "gcal"
+            "discord" | "telegram" | "github" | "gcal"
         ) || action.email.platform == augmentagent_channel_socialapi::PLATFORM
             || is_linkedin_email(&action.email);
-        if non_gmail {
+        if unsupported {
             return ApprovalActionOutcome::Failed {
-                message: "scheduling is only supported for email drafts".into(),
+                message: "scheduling is only supported for email drafts and Slack messages".into(),
             };
         }
-        if action.draft_id.is_none() {
+        if slack {
+            // Refuse before arming what could never be sent.
+            if let Err(message) =
+                augmentagent_channel_slack::contact::reply_target(&self.store, &action.email)
+            {
+                return ApprovalActionOutcome::Failed { message };
+            }
+            if action
+                .action
+                .draft_body
+                .as_deref()
+                .is_none_or(|d| d.trim().is_empty())
+            {
+                return ApprovalActionOutcome::Failed {
+                    message: "no draft to send; cannot schedule".into(),
+                };
+            }
+        } else if action.draft_id.is_none() {
             return ApprovalActionOutcome::Failed {
                 message: "no draftId on action; cannot schedule".into(),
             };
@@ -13646,6 +13747,24 @@ impl ReplyApprover {
     /// through `pending` — that would re-enter the nudge queue and, after
     /// #502, re-arm the proposal.
     async fn run_send_now(&self, action_id: &str) -> ApprovalActionOutcome {
+        // #1291 — a Slack contact send: the contact path claims it from
+        // `scheduled` and sends it with its ledger, as an approval would.
+        if let Some(action) = self
+            .handle_load(action_id)
+            .filter(|a| a.email.platform == augmentagent_channel_slack::PLATFORM)
+        {
+            let outcome = self
+                .send_slack(
+                    action,
+                    augmentagent_channel_slack::contact::ContactClaim::SendNow,
+                    decision_source(),
+                )
+                .await;
+            if !matches!(outcome, ApprovalActionOutcome::AlreadyResolved { .. }) {
+                self.delete_stored_notice(action_id).await;
+            }
+            return outcome;
+        }
         match self.store.claim_action_for_send(
             action_id,
             ActionStatus::Scheduled,
@@ -13706,6 +13825,64 @@ impl ReplyApprover {
         // a no-op.
         self.delete_stored_notice(action_id).await;
         outcome
+    }
+
+    /// #1291 — Reschedule: move an armed schedule to `at_ms`. The central
+    /// time guard and a CAS on the row still being armed; then the old
+    /// scheduled notice is retired and a new one posted for the new time
+    /// (Discord posts a fresh notice; Slack redraws its card in place).
+    async fn run_reschedule(&self, action_id: &str, at_ms: i64) -> ApprovalActionOutcome {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if let Err(message) = augmentagent_channel_core::timeparse::validate_send_at(at_ms, now_ms)
+        {
+            return ApprovalActionOutcome::Failed { message };
+        }
+        let Some(action) = self.handle_load(action_id) else {
+            return ApprovalActionOutcome::NotFound;
+        };
+        match self
+            .store
+            .reschedule_action(action_id, at_ms, decision_source())
+        {
+            Ok(true) => {}
+            Ok(false) => return Self::resolved_outcome(&self.store, action_id),
+            Err(e) => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("reschedule failed: {e}"),
+                }
+            }
+        }
+        self.delete_stored_notice(action_id).await;
+        let local = format_local_send_time(at_ms);
+        let to_display = self
+            .store
+            .get_action_envelope(action_id)
+            .ok()
+            .flatten()
+            .and_then(|env| env.to)
+            .unwrap_or_else(|| action.email.from.clone());
+        if let Some(broker) = self.broker_handle() {
+            match broker
+                .post_scheduled_notice(action_id, &action.email, &local, at_ms, &to_display)
+                .await
+            {
+                Ok(Some((c, m))) => {
+                    if let Err(e) =
+                        self.store
+                            .set_action_notice(action_id, &c.to_string(), &m.to_string())
+                    {
+                        tracing::warn!(
+                            action_id,
+                            "reschedule: persist notice pointers failed: {e}"
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(action_id, "reschedule: post notice failed: {e}"),
+            }
+        }
+        tracing::info!(action_id, at_ms, local = %local, "schedule moved via approval handler");
+        ApprovalActionOutcome::Scheduled { at_ms, local }
     }
 
     /// #501 — Cancel from the scheduled notice: `scheduled → rejected` with

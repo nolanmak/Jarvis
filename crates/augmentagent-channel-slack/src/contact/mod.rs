@@ -9,11 +9,13 @@
 //! DM between two people anyway. See `docs/SLACK-TRANSPORT.md`, "Contact
 //! sends (#1290)", for the evidence and what is still unverified.
 //!
-//! **Only through an approved card.** [`approve_contact_message`] is the one
-//! function that posts to a contact. It sends the stored draft of an action
-//! it has just claimed (`pending → sending`, or `error → sending` for a
-//! retry of a failed send), to the destination recorded when the draft or
-//! compose was made. Nothing the agent says in the owner's conversation,
+//! **Only through an approved card.** [`send_contact_message`] (and its
+//! approval form [`approve_contact_message`]) is the one function that posts
+//! to a contact. It sends the stored draft of an action it has just claimed
+//! (`pending → sending`, `error → sending` for a retry of a failed send, or
+//! — #1291 — `scheduled → sending` for Send now and for the daemon's
+//! scheduler once the schedule is due), to the destination recorded when the
+//! draft or compose was made. Nothing the agent says in the owner's conversation,
 //! and no tool output, has a path here: the owner's answers go out through
 //! the app's outbox to the owner's own conversation.
 //!
@@ -280,6 +282,60 @@ fn plain_destination(row: &SlackContactSend, target: &SlackSendTarget) -> String
     describe_destination(&t)
 }
 
+/// #1291 — which transition claims the action for a send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContactClaim {
+    /// An Approve: a pending card, or the retry of a failed send.
+    Approval,
+    /// Send now on a scheduled send, whatever its time.
+    SendNow,
+    /// The daemon's scheduler, only once the schedule is due at `now_ms`.
+    Due { now_ms: i64 },
+}
+
+/// Send the draft of a Slack contact action claimed by `claim`, exactly
+/// once: the same destination, identity, send ledger and retry for an
+/// approval, a scheduled send firing and Send now.
+pub async fn send_contact_message(
+    store: &Store,
+    api: Option<&dyn ContactSendApi>,
+    action: &ActionWithEmail,
+    source: &str,
+    claim: ContactClaim,
+) -> ApprovalActionOutcome {
+    let action_id = action.action.id.as_str();
+    // Which transition claims it: a pending card, the retry of a send that
+    // failed (the ledger says so), or an armed schedule. Anything else is
+    // decided already.
+    let previous = match store.slack_contact_send(action_id) {
+        Ok(p) => p,
+        Err(e) => return failed(format!("reading the send ledger: {e}")),
+    };
+    let status = action.action.status.as_str();
+    let from = match (claim, status) {
+        (ContactClaim::Approval, "pending") => ActionStatus::Pending,
+        (ContactClaim::Approval, "error")
+            if previous
+                .as_ref()
+                .is_some_and(|p| p.status != SlackSendStatus::Sent) =>
+        {
+            ActionStatus::Error
+        }
+        (ContactClaim::SendNow | ContactClaim::Due { .. }, "scheduled") => ActionStatus::Scheduled,
+        _ => return resolved(store, action_id),
+    };
+    // A schedule that is not due (rescheduled since the scheduler looked)
+    // is left alone before anything else is checked.
+    if let ContactClaim::Due { now_ms } = claim {
+        match store.action_scheduled_at(action_id) {
+            Ok(Some(at)) if at <= now_ms => {}
+            Ok(_) => return resolved(store, action_id),
+            Err(e) => return failed(format!("reading the schedule: {e}")),
+        }
+    }
+    send_claimed(store, api, action, source, claim, from).await
+}
+
 /// Send the draft of an approved Slack contact action, exactly once.
 ///
 /// `action` is the row as loaded; `source` is the surface that decided
@@ -292,25 +348,20 @@ pub async fn approve_contact_message(
     action: &ActionWithEmail,
     source: &str,
 ) -> ApprovalActionOutcome {
-    let action_id = action.action.id.as_str();
-    // Which transition claims it: a pending card, or the retry of a send
-    // that failed (the ledger says so). Anything else is decided already.
-    let previous = match store.slack_contact_send(action_id) {
-        Ok(p) => p,
-        Err(e) => return failed(format!("reading the send ledger: {e}")),
-    };
-    let from = match action.action.status.as_str() {
-        "pending" => ActionStatus::Pending,
-        "error"
-            if previous
-                .as_ref()
-                .is_some_and(|p| p.status != SlackSendStatus::Sent) =>
-        {
-            ActionStatus::Error
-        }
-        _ => return resolved(store, action_id),
-    };
+    send_contact_message(store, api, action, source, ContactClaim::Approval).await
+}
 
+/// Everything after the choice of transition: the checks that must pass
+/// before anything is claimed, the claim, the ledger and the post.
+async fn send_claimed(
+    store: &Store,
+    api: Option<&dyn ContactSendApi>,
+    action: &ActionWithEmail,
+    source: &str,
+    claim: ContactClaim,
+    from: ActionStatus,
+) -> ApprovalActionOutcome {
+    let action_id = action.action.id.as_str();
     let target = match reply_target(store, &action.email) {
         Ok(t) => t,
         Err(e) => return failed(e),
@@ -335,7 +386,13 @@ pub async fn approve_contact_message(
         return failed("no draft to send");
     }
 
-    match store.claim_action_for_send(action_id, from, source) {
+    let claimed = match claim {
+        // Due-gated: a reschedule that landed since the scheduler's due
+        // list was read must not fire at the old time.
+        ContactClaim::Due { now_ms } => store.claim_due_action_for_send(action_id, now_ms, source),
+        _ => store.claim_action_for_send(action_id, from, source),
+    };
+    match claimed {
         Ok(true) => {}
         Ok(false) => return resolved(store, action_id),
         Err(e) => return failed(format!("claim for send failed: {e}")),

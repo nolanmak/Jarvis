@@ -342,6 +342,17 @@ pub trait ApprovalActionHandler: Send + Sync {
         }
     }
 
+    /// #1291 — "Reschedule": move an armed schedule to `at_ms`
+    /// (`scheduled → scheduled`, CAS-gated on the row still being armed).
+    /// The impl owns the central time guard and replaces the scheduled
+    /// notices. Default: unsupported.
+    async fn reschedule(&self, action_id: &str, at_ms: i64) -> ApprovalActionOutcome {
+        let _ = (action_id, at_ms);
+        ApprovalActionOutcome::Failed {
+            message: "rescheduling is not supported by this handler".into(),
+        }
+    }
+
     /// #1203 — "Recompose" on the recovery ephemeral: restore a superseded
     /// draft (`superseded → pending`, card reposted, row exempted from the
     /// reconcile sweep). Default `Failed`: handlers without a store/broker

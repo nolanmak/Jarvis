@@ -28,6 +28,16 @@ pub const REFINE: &str = "aa_refine";
 pub const RECOMPOSE: &str = "aa_recompose";
 pub const REVISE_MODAL: &str = "aa_revise_modal";
 pub const FILL_MODAL: &str = "aa_fill_modal";
+// #1291 — scheduled sends.
+pub const SCHEDULE: &str = "aa_schedule";
+pub const SCHEDULE_CONFIRM: &str = "aa_schedule_confirm";
+pub const SEND_NOW: &str = "aa_send_now";
+pub const RESCHEDULE: &str = "aa_reschedule";
+pub const RESCHEDULE_CONFIRM: &str = "aa_reschedule_confirm";
+pub const UNSCHEDULE: &str = "aa_unschedule";
+pub const CANCEL_SCHEDULE: &str = "aa_cancel_schedule";
+pub const SCHEDULE_MODAL: &str = "aa_schedule_modal";
+pub const RESCHEDULE_MODAL: &str = "aa_reschedule_modal";
 
 /// Length of the short action reference printed on cards.
 pub const SHORT_REF_LEN: usize = 8;
@@ -165,6 +175,10 @@ pub struct CardInput<'a> {
     pub sends_as: Option<&'a str>,
     /// #1290 — a Slack send that failed after approval can be retried.
     pub offer_retry: bool,
+    /// #1291 — the action is an armed scheduled send; this is its fire time
+    /// as shown (`Wed Sep 30, 9:00 AM EDT (America/New_York)`). The card is
+    /// then drawn as the scheduled notice.
+    pub scheduled_for: Option<&'a str>,
 }
 
 /// The fallback `text` and the `blocks` of a card.
@@ -193,6 +207,12 @@ pub fn card(input: &CardInput<'_>) -> (String, Value) {
         "New message"
     } else {
         "Reply draft"
+    };
+    // #1291 — an armed scheduled send is drawn as the scheduled notice.
+    let kind = if input.status_line.is_none() && input.scheduled_for.is_some() {
+        "🗓️ Scheduled send"
+    } else {
+        kind
     };
     blocks.push(section(format!(
         "*{kind}* · {}\n*{}*",
@@ -270,6 +290,9 @@ pub fn card(input: &CardInput<'_>) -> (String, Value) {
         action_id: id.to_string(),
         digest: Some(input.digest.to_string()),
     };
+    if let (None, Some(when)) = (input.status_line, input.scheduled_for) {
+        return scheduled_notice(input, &subject, &version, &control, when, blocks);
+    }
     match input.status_line {
         None => {
             let value = control.block_id();
@@ -285,6 +308,9 @@ pub fn card(input: &CardInput<'_>) -> (String, Value) {
                     button("Skip", SKIP, &value, None),
                 ]
             };
+            if !merge {
+                elements.push(button("Schedule…", SCHEDULE, &value, None));
+            }
             if !merge && !needs.is_empty() {
                 elements.push(button("Provide missing info", FILL, &value, Some("danger")));
             }
@@ -306,6 +332,7 @@ pub fn card(input: &CardInput<'_>) -> (String, Value) {
                 if !at_cap {
                     commands.push_str(&format!(" · `refine {r} shorter`"));
                 }
+                commands.push_str(&format!(" · `schedule {r} tomorrow 9am`"));
             }
             blocks.push(context(format!("{version} · {commands}")));
         }
@@ -343,6 +370,159 @@ pub fn card(input: &CardInput<'_>) -> (String, Value) {
         Some(line) => format!("{line} {subject}"),
     };
     (truncate(&text, 3000), Value::Array(blocks))
+}
+
+/// #1291 — the card of an armed scheduled send: when it goes, where, as
+/// whom, and the four ways to change that (Send now, Reschedule, Back to
+/// queue, Cancel), with their text commands.
+fn scheduled_notice(
+    input: &CardInput<'_>,
+    subject: &str,
+    version: &str,
+    control: &ControlRef,
+    when: &str,
+    mut blocks: Vec<Value>,
+) -> (String, Value) {
+    let r = short_ref(input.action_id);
+    blocks.push(section(format!("*Sends* {}", escape(when))));
+    let value = control.block_id();
+    blocks.push(json!({
+        "type": "actions",
+        "block_id": value,
+        "elements": [
+            button("Send now", SEND_NOW, &value, Some("primary")),
+            button("Reschedule…", RESCHEDULE, &value, None),
+            button("Back to queue", UNSCHEDULE, &value, None),
+            button("Cancel schedule", CANCEL_SCHEDULE, &value, Some("danger")),
+        ],
+    }));
+    blocks.push(context(format!(
+        "{version} · Or reply: `sendnow {r}` · `reschedule {r} &lt;when&gt;` · `requeue {r}` · `cancel {r}`"
+    )));
+    let text = format!("Scheduled: {subject} — sends {when}");
+    (truncate(&text, 3000), Value::Array(blocks))
+}
+
+/// #1291 — the Schedule (or Reschedule) modal: a preset or a typed time,
+/// read in `zone_name`. Nothing is armed by submitting it; the owner
+/// confirms the resolved time next.
+pub fn schedule_modal(
+    ctx: &ModalContext,
+    subject: &str,
+    zone_name: &str,
+    now_shown: &str,
+    reschedule: bool,
+) -> Value {
+    let (callback, title) = if reschedule {
+        (RESCHEDULE_MODAL, "Reschedule send")
+    } else {
+        (SCHEDULE_MODAL, "Schedule send")
+    };
+    let options: Vec<Value> = augmentagent_approval_discord::timeparse::SCHEDULE_PRESETS
+        .iter()
+        .map(|(label, token)| {
+            json!({"text": {"type": "plain_text", "text": truncate(label, 75)}, "value": token})
+        })
+        .collect();
+    modal_shell(
+        callback,
+        title,
+        "Preview",
+        ctx,
+        vec![
+            section(format!(
+                "*{}*\nTimes are in *{}* — it is {} now. You confirm the exact time next.",
+                escape(&truncate(subject_or_none(subject), 250)),
+                escape(zone_name),
+                escape(now_shown)
+            )),
+            json!({
+                "type": "input",
+                "block_id": "preset",
+                "optional": true,
+                "label": {"type": "plain_text", "text": "Pick a time"},
+                "element": {"type": "static_select", "action_id": "preset",
+                            "placeholder": {"type": "plain_text", "text": "Choose…"},
+                            "options": options},
+            }),
+            json!({
+                "type": "input",
+                "block_id": "when",
+                "optional": true,
+                "label": {"type": "plain_text", "text": "…or type one"},
+                "hint": {"type": "plain_text", "text": "tomorrow 9am · fri 14:30 · in 3h · 7pm · 2026-10-01 09:00"},
+                "element": {"type": "plain_text_input", "action_id": "when",
+                            "placeholder": {"type": "plain_text", "text": "tomorrow 9am"}},
+            }),
+        ],
+    )
+}
+
+/// #1291 — the confirmation shown before a schedule is armed (or moved):
+/// the resolved time with its zone, any daylight-saving note, where it goes,
+/// and one Confirm button carrying the instant. `(text, blocks)`.
+#[allow(clippy::too_many_arguments)]
+pub fn schedule_confirmation(
+    action_id: &str,
+    digest: &str,
+    at_ms: i64,
+    when: &str,
+    dst_note: Option<&str>,
+    destination: Option<&str>,
+    subject: &str,
+    reschedule: bool,
+) -> (String, Value) {
+    let r = short_ref(action_id);
+    let (ask, confirm, control) = if reschedule {
+        ("Move this send to", "Confirm new time", RESCHEDULE_CONFIRM)
+    } else {
+        (
+            "Schedule this send for",
+            "Confirm schedule",
+            SCHEDULE_CONFIRM,
+        )
+    };
+    let mut body = format!(
+        "*{ask}* *{}*?\n{}",
+        escape(when),
+        escape(&truncate(subject_or_none(subject), 250))
+    );
+    if let Some(d) = destination {
+        body.push_str(&format!(" · goes to {}", escape(&truncate(d, 300))));
+    }
+    if let Some(note) = dst_note {
+        body.push_str(&format!("\n⚠️ {}", escape(note)));
+    }
+    let control_ref = ControlRef {
+        action_id: action_id.to_string(),
+        digest: Some(digest.to_string()),
+    };
+    let blocks = json!([
+        section(body),
+        {"type": "actions", "block_id": control_ref.block_id(),
+         "elements": [button(confirm, control, &at_ms.to_string(), Some("primary"))]},
+        context(format!("Nothing is scheduled until you confirm. Ref `{r}`.")),
+    ]);
+    (format!("{ask} {when}? Confirm to schedule it."), blocks)
+}
+
+/// A subject for display: `(no subject)` when there is none.
+fn subject_or_none(subject: &str) -> &str {
+    if subject.trim().is_empty() {
+        "(no subject)"
+    } else {
+        subject
+    }
+}
+
+/// The value of a submitted `static_select` in a `view`.
+pub fn view_selected(view: &Value, block_id: &str, action_id: &str) -> Option<String> {
+    view.pointer(&format!(
+        "/state/values/{block_id}/{action_id}/selected_option/value"
+    ))
+    .and_then(Value::as_str)
+    .filter(|s| !s.is_empty())
+    .map(str::to_string)
 }
 
 /// A card that a newer card for the same action replaced.
@@ -494,6 +674,7 @@ mod tests {
             destination: None,
             sends_as: None,
             offer_retry: false,
+            scheduled_for: None,
         }
     }
 
@@ -529,7 +710,10 @@ mod tests {
         let e = email();
         let (text, blocks) = card(&input(&e, None));
         assert!(text.contains("Lunch?"));
-        assert_eq!(action_ids(&blocks), vec![APPROVE, REVISE, SKIP, REFINE]);
+        assert_eq!(
+            action_ids(&blocks),
+            vec![APPROVE, REVISE, SKIP, SCHEDULE, REFINE]
+        );
         let all = blocks.to_string();
         assert!(all.contains("approve 3f2a9c1b"), "{all}");
         assert!(all.contains("revise 3f2a9c1b"));
@@ -554,8 +738,25 @@ mod tests {
         let mut at_cap = input(&e, None);
         at_cap.redraft_count = MAX_REDRAFT_ITERATIONS;
         let (_, blocks) = card(&at_cap);
-        assert_eq!(action_ids(&blocks), vec![APPROVE, REVISE, SKIP]);
+        assert_eq!(action_ids(&blocks), vec![APPROVE, REVISE, SKIP, SCHEDULE]);
         assert!(blocks.to_string().contains("refine cap reached"));
+    }
+
+    /// #1291 — a Slack DM has no subject; the schedule modal and its
+    /// confirmation say so instead of drawing empty bold markers.
+    #[test]
+    fn schedule_modal_and_confirmation_name_a_missing_subject() {
+        let ctx = ModalContext {
+            action_id: "a-1".into(),
+            digest: "d".into(),
+            channel: None,
+            ts: None,
+        };
+        let modal = schedule_modal(&ctx, "", "America/New_York", "now", false).to_string();
+        assert!(modal.contains("(no subject)"), "{modal}");
+        assert!(!modal.contains("\"**\\n"), "{modal}");
+        let (_, blocks) = schedule_confirmation("a-1", "d", 1, "then", None, None, " ", false);
+        assert!(blocks.to_string().contains("(no subject)"));
     }
 
     #[test]

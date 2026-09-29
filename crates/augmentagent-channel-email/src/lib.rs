@@ -25,8 +25,9 @@ pub use outbound::{
     ACTION_ID_HEADER,
 };
 pub use scheduled::{
-    record_self_send, ScheduledSendEngine, TickSummary, RETRY_EXEMPT_RETRY_COUNT,
-    SEND_DRAFT_TIMEOUT,
+    missed_window_from, record_self_send, PlatformFire, ScheduledPlatformSender,
+    ScheduledSendEngine, TickSummary, DEFAULT_MISSED_WINDOW, MISSED_WINDOW_ENV,
+    RETRY_EXEMPT_RETRY_COUNT, SEND_DRAFT_TIMEOUT,
 };
 pub use sigextract::{
     detect_signature_block, is_human_sender, is_meeting_invite, signature_patch, ExtractedFields,
