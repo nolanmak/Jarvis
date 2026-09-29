@@ -635,6 +635,8 @@ impl Store {
                     AND conversation_id = NEW.channel_id AND thread_id = '' AND turn_id = NEW.turn_id;
             END;"#,
         )?;
+        // #1285 — durable surface inbox, outbox and catch-up cursors.
+        crate::delivery::migrate(conn)?;
         // -------------------------------------------------------------------
         // #45 — Rust-owned schema. Mirrors `src/db.ts::initDb()` exactly
         // (column names, types, NOT NULL, DEFAULT, PRIMARY KEY). Do NOT

@@ -4,6 +4,7 @@
 //! Opens the database in WAL journal mode so the Express dashboard can read
 //! concurrently.
 
+pub mod delivery;
 pub mod models;
 pub mod notes;
 pub mod redact;
