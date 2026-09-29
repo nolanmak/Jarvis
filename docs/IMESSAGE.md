@@ -250,10 +250,20 @@ queued and finished sends without bodies or recipients.
 
 ### Install the sender on the Mac
 
-The sender needs Full Disk Access to read `chat.db` (the same Python grant as
-the exporter) and Automation permission to control Messages. macOS asks for
-Automation the first time it sends; run the first send by hand so you can
-accept the prompt.
+The sender needs two macOS permissions, and which program they attach to
+depends on how the job is started:
+
+| Started by | Full Disk Access (read `chat.db`) | Automation (control Messages) |
+|---|---|---|
+| launchd (`schedule.py --job send`) | the Python the installer prints | `osascript`, prompted on first send |
+| cron | `cron` | `cron` → Messages, in System Settings › Privacy & Security › Automation |
+
+A missing Full Disk Access grant makes the sender stop before claiming
+anything, with a message naming Full Disk Access. A missing Automation grant
+shows up as `osascript timed out` on the reply's error, because macOS cannot
+show the permission prompt to a background job; the reply is marked failed,
+not retried. Run the first send by hand from a terminal to accept prompts,
+and check both grants before relying on the schedule.
 
 For an agent on the same Mac:
 
