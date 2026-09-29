@@ -10,9 +10,28 @@
 //!
 //! Payload is opaque bytes — each channel serializes its own credential
 //! shape (typically JSON).
+//!
+//! #1284 adds an injectable seam, [`CredentialStore`], so callers (and their
+//! tests) can swap the backend: [`KeychainCredentialStore`] is the platform
+//! keyring, [`MemoryCredentialStore`] is for unit tests, and
+//! [`FileCredentialStore`] is an explicitly insecure plaintext directory used
+//! only when [`INSECURE_FILE_STORE_ENV`] is set (end-to-end CLI tests and
+//! local QA against a mock Slack; never for real secrets). The static
+//! [`Auth`] helpers go through [`default_store`], so every channel honours
+//! the same override.
+
+use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, Once};
 
 use thiserror::Error;
 use tracing::debug;
+
+/// When set to a non-empty directory path, [`default_store`] stores
+/// credentials as plaintext files under it instead of the Keychain/keyring.
+/// Test and QA use only: the files are owner-only but unencrypted.
+pub const INSECURE_FILE_STORE_ENV: &str = "AUGMENTAGENT_INSECURE_CREDENTIAL_DIR";
 
 /// Convention for single-account platforms (one LinkedIn profile, one
 /// default Slack workspace). Multi-account channels pass their own
@@ -32,37 +51,100 @@ pub enum AuthError {
     Keyring(#[from] keyring::Error),
 }
 
-/// Credential store. Stateless — all methods take (platform, account) keys.
+/// Credential store. Stateless — all methods take (platform, account) keys
+/// and go through [`default_store`].
 pub struct Auth;
 
 impl Auth {
     /// Store opaque bytes at `service=augmentagent/<platform>`, `user=<account>`.
     /// Overwrites any existing entry.
     pub fn put(platform: &str, account: &str, payload: &[u8]) -> Result<(), AuthError> {
+        default_store().put(platform, account, payload)
+    }
+
+    /// Retrieve bytes. Returns [`AuthError::NotFound`] when the entry is missing.
+    pub fn get(platform: &str, account: &str) -> Result<Vec<u8>, AuthError> {
+        default_store().get(platform, account)
+    }
+
+    /// Delete an entry. Idempotent — a missing entry is treated as success.
+    pub fn delete(platform: &str, account: &str) -> Result<(), AuthError> {
+        default_store().delete(platform, account)
+    }
+
+    /// True when an entry exists. Does not decrypt or read the secret, so
+    /// it does not trigger the macOS "allow access" prompt.
+    pub fn exists(platform: &str, account: &str) -> bool {
+        default_store().exists(platform, account)
+    }
+}
+
+/// Where credentials live. Object-safe so callers hold an
+/// `Arc<dyn CredentialStore>` and tests inject [`MemoryCredentialStore`].
+pub trait CredentialStore: Send + Sync {
+    /// Short backend label for status output (`keychain`, `memory`,
+    /// `insecure-file`). Never contains a secret.
+    fn backend(&self) -> &'static str;
+    fn put(&self, platform: &str, account: &str, payload: &[u8]) -> Result<(), AuthError>;
+    fn get(&self, platform: &str, account: &str) -> Result<Vec<u8>, AuthError>;
+    /// Idempotent: a missing entry is success.
+    fn delete(&self, platform: &str, account: &str) -> Result<(), AuthError>;
+    fn exists(&self, platform: &str, account: &str) -> bool;
+}
+
+/// The store the process should use: [`FileCredentialStore`] when
+/// [`INSECURE_FILE_STORE_ENV`] is set, otherwise the platform keyring.
+pub fn default_store() -> Arc<dyn CredentialStore> {
+    store_for_override(std::env::var_os(INSECURE_FILE_STORE_ENV).as_deref())
+}
+
+/// Pure selection rule behind [`default_store`] (testable without touching
+/// the process environment). An empty value means "not set".
+pub fn store_for_override(dir: Option<&OsStr>) -> Arc<dyn CredentialStore> {
+    match dir.filter(|d| !d.is_empty()) {
+        Some(dir) => {
+            static WARN: Once = Once::new();
+            WARN.call_once(|| {
+                tracing::warn!(
+                    "{INSECURE_FILE_STORE_ENV} is set: credentials are stored as plaintext \
+                     files, not in the Keychain/keyring (tests and local QA only)"
+                );
+            });
+            Arc::new(FileCredentialStore::new(Path::new(dir)))
+        }
+        None => Arc::new(KeychainCredentialStore),
+    }
+}
+
+/// macOS Keychain / platform keyring via the `keyring` crate.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KeychainCredentialStore;
+
+impl CredentialStore for KeychainCredentialStore {
+    fn backend(&self) -> &'static str {
+        "keychain"
+    }
+
+    fn put(&self, platform: &str, account: &str, payload: &[u8]) -> Result<(), AuthError> {
         let entry = entry_for(platform, account)?;
         entry.set_secret(payload)?;
         debug!(platform, account, bytes = payload.len(), "auth put");
         Ok(())
     }
 
-    /// Retrieve bytes. Returns [`AuthError::NotFound`] when the entry is missing.
-    pub fn get(platform: &str, account: &str) -> Result<Vec<u8>, AuthError> {
+    fn get(&self, platform: &str, account: &str) -> Result<Vec<u8>, AuthError> {
         let entry = entry_for(platform, account)?;
         match entry.get_secret() {
             Ok(bytes) => {
                 debug!(platform, account, bytes = bytes.len(), "auth get");
                 Ok(bytes)
             }
-            Err(keyring::Error::NoEntry) => Err(AuthError::NotFound {
-                platform: platform.into(),
-                account: account.into(),
-            }),
+            Err(keyring::Error::NoEntry) => Err(not_found(platform, account)),
             Err(e) => Err(AuthError::Keyring(e)),
         }
     }
 
-    /// Delete an entry. Idempotent — a missing entry is treated as success.
-    pub fn delete(platform: &str, account: &str) -> Result<(), AuthError> {
+    fn delete(&self, platform: &str, account: &str) -> Result<(), AuthError> {
         let entry = entry_for(platform, account)?;
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => {
@@ -73,14 +155,188 @@ impl Auth {
         }
     }
 
-    /// True when an entry exists. Does not decrypt or read the secret, so
-    /// it does not trigger the macOS "allow access" prompt.
-    pub fn exists(platform: &str, account: &str) -> bool {
+    fn exists(&self, platform: &str, account: &str) -> bool {
         let entry = match entry_for(platform, account) {
             Ok(e) => e,
             Err(_) => return false,
         };
         !matches!(entry.get_attributes(), Err(keyring::Error::NoEntry))
+    }
+}
+
+type Slots = BTreeMap<(String, String), Vec<u8>>;
+
+/// In-process store for tests. Slots are shared across clones.
+#[derive(Debug, Default, Clone)]
+pub struct MemoryCredentialStore {
+    slots: Arc<Mutex<Slots>>,
+}
+
+impl MemoryCredentialStore {
+    /// Every stored payload, for tests that assert what was (not) written.
+    pub fn payloads(&self) -> Vec<Vec<u8>> {
+        self.slots.lock().unwrap().values().cloned().collect()
+    }
+}
+
+impl CredentialStore for MemoryCredentialStore {
+    fn backend(&self) -> &'static str {
+        "memory"
+    }
+
+    fn put(&self, platform: &str, account: &str, payload: &[u8]) -> Result<(), AuthError> {
+        self.slots
+            .lock()
+            .unwrap()
+            .insert((platform.into(), account.into()), payload.to_vec());
+        Ok(())
+    }
+
+    fn get(&self, platform: &str, account: &str) -> Result<Vec<u8>, AuthError> {
+        self.slots
+            .lock()
+            .unwrap()
+            .get(&(platform.into(), account.into()))
+            .cloned()
+            .ok_or_else(|| not_found(platform, account))
+    }
+
+    fn delete(&self, platform: &str, account: &str) -> Result<(), AuthError> {
+        self.slots
+            .lock()
+            .unwrap()
+            .remove(&(platform.to_string(), account.to_string()));
+        Ok(())
+    }
+
+    fn exists(&self, platform: &str, account: &str) -> bool {
+        self.slots
+            .lock()
+            .unwrap()
+            .contains_key(&(platform.into(), account.into()))
+    }
+}
+
+/// Plaintext files at `<dir>/<platform>/<account>` (percent-encoded), dir
+/// `0700` and files `0600` on Unix. **Insecure** — for tests and local QA
+/// only; selected by [`INSECURE_FILE_STORE_ENV`].
+#[derive(Debug, Clone)]
+pub struct FileCredentialStore {
+    dir: PathBuf,
+}
+
+impl FileCredentialStore {
+    pub fn new(dir: impl AsRef<Path>) -> Self {
+        Self {
+            dir: dir.as_ref().to_path_buf(),
+        }
+    }
+
+    fn path_for(&self, platform: &str, account: &str) -> Result<PathBuf, AuthError> {
+        Ok(self
+            .dir
+            .join(encode_component("platform", platform)?)
+            .join(encode_component("account", account)?))
+    }
+}
+
+fn encode_component(what: &str, raw: &str) -> Result<String, AuthError> {
+    if raw.is_empty() || raw == "." || raw == ".." {
+        return Err(AuthError::Keyring(keyring::Error::Invalid(
+            what.into(),
+            format!("{raw:?} is not a valid credential key"),
+        )));
+    }
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    Ok(out)
+}
+
+fn io_err(e: std::io::Error) -> AuthError {
+    AuthError::Keyring(keyring::Error::PlatformFailure(Box::new(e)))
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
+impl CredentialStore for FileCredentialStore {
+    fn backend(&self) -> &'static str {
+        "insecure-file"
+    }
+
+    fn put(&self, platform: &str, account: &str, payload: &[u8]) -> Result<(), AuthError> {
+        let path = self.path_for(platform, account)?;
+        let parent = path.parent().expect("path has a platform directory");
+        std::fs::create_dir_all(parent).map_err(io_err)?;
+        set_mode(&self.dir, 0o700).map_err(io_err)?;
+        set_mode(parent, 0o700).map_err(io_err)?;
+        let tmp = parent.join(format!(
+            ".{}.tmp-{}",
+            path.file_name().unwrap().to_string_lossy(),
+            std::process::id()
+        ));
+        {
+            use std::io::Write;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp).map_err(io_err)?;
+            f.write_all(payload).map_err(io_err)?;
+            f.sync_all().map_err(io_err)?;
+        }
+        set_mode(&tmp, 0o600).map_err(io_err)?;
+        std::fs::rename(&tmp, &path).map_err(io_err)?;
+        debug!(platform, account, bytes = payload.len(), "auth put (file)");
+        Ok(())
+    }
+
+    fn get(&self, platform: &str, account: &str) -> Result<Vec<u8>, AuthError> {
+        let path = self.path_for(platform, account)?;
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(not_found(platform, account)),
+            Err(e) => Err(io_err(e)),
+        }
+    }
+
+    fn delete(&self, platform: &str, account: &str) -> Result<(), AuthError> {
+        let path = self.path_for(platform, account)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(io_err(e)),
+        }
+    }
+
+    fn exists(&self, platform: &str, account: &str) -> bool {
+        self.path_for(platform, account)
+            .map(|p| p.is_file())
+            .unwrap_or(false)
+    }
+}
+
+fn not_found(platform: &str, account: &str) -> AuthError {
+    AuthError::NotFound {
+        platform: platform.into(),
+        account: account.into(),
     }
 }
 
