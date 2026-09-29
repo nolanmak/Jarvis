@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -21,7 +22,7 @@ func exchange(t *testing.T, request string) rpcResponse {
 	t.Helper()
 	server, client := net.Pipe()
 	defer client.Close()
-	s := &sidecar{conn: server}
+	s := &sidecar{}
 	go s.serveConn(server)
 	if err := client.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		t.Fatal(err)
@@ -72,7 +73,7 @@ func TestOfflineStatusAndSendAreHonest(t *testing.T) {
 func TestBadFrameDoesNotPoisonNextRequest(t *testing.T) {
 	server, client := net.Pipe()
 	defer client.Close()
-	go (&sidecar{conn: server}).serveConn(server)
+	go (&sidecar{}).serveConn(server)
 	client.SetDeadline(time.Now().Add(2 * time.Second))
 	if _, err := client.Write([]byte("not-json\n" +
 		`{"version":1,"request_id":"good","op":"status","params":{}}` + "\n")); err != nil {
@@ -99,7 +100,7 @@ func TestBadFrameDoesNotPoisonNextRequest(t *testing.T) {
 func TestFragmentedRequestIsReassembled(t *testing.T) {
 	server, client := net.Pipe()
 	defer client.Close()
-	go (&sidecar{conn: server}).serveConn(server)
+	go (&sidecar{}).serveConn(server)
 	client.SetDeadline(time.Now().Add(2 * time.Second))
 	go func() {
 		for _, part := range []string{`{"version":1,"request_id":`, `"split","op":"status",`, "\"params\":{}}\n"} {
@@ -123,7 +124,7 @@ func TestFragmentedRequestIsReassembled(t *testing.T) {
 func TestOversizedFrameFailsVisibly(t *testing.T) {
 	server, client := net.Pipe()
 	defer client.Close()
-	go (&sidecar{conn: server}).serveConn(server)
+	go (&sidecar{}).serveConn(server)
 	client.SetDeadline(time.Now().Add(2 * time.Second))
 	request := `{"version":1,"request_id":"large","op":"status","params":{"padding":"` + strings.Repeat("x", 4*1024*1024) + `"}}` + "\n"
 	go func() { _, _ = client.Write([]byte(request)) }()
@@ -160,11 +161,133 @@ func TestQRCodeIsBufferedForLateClient(t *testing.T) {
 	}
 }
 
+func TestTwoClientsGetTheirOwnResponsesAndLifecycleEvents(t *testing.T) {
+	s := &sidecar{}
+	firstServer, firstClient := net.Pipe()
+	defer firstClient.Close()
+	secondServer, secondClient := net.Pipe()
+	defer secondClient.Close()
+	go s.serveConn(firstServer)
+	firstClient.SetDeadline(time.Now().Add(2 * time.Second))
+	firstReader := bufio.NewReader(firstClient)
+	request := `{"version":1,"request_id":"same-id","op":"status","params":{}}` + "\n"
+	if _, err := firstClient.Write([]byte(request)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := firstReader.ReadBytes('\n'); err != nil {
+		t.Fatal(err)
+	}
+	go s.serveConn(secondServer)
+	secondClient.SetDeadline(time.Now().Add(2 * time.Second))
+	secondReader := bufio.NewReader(secondClient)
+	if _, err := secondClient.Write([]byte(request)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := secondReader.ReadBytes('\n'); err != nil {
+		t.Fatal(err)
+	}
+
+	// A CLI request cannot steal the daemon's response, even when request IDs
+	// happen to match. The daemon must also keep receiving lifecycle events.
+	if _, err := firstClient.Write([]byte(request)); err != nil {
+		t.Fatal(err)
+	}
+	response, err := firstReader.ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("first client lost its response after second connected: %v", err)
+	}
+	var frame rpcResponse
+	if err := json.Unmarshal(response, &frame); err != nil || !frame.OK || frame.RequestID != "same-id" {
+		t.Fatalf("wrong first response: %s (%v)", response, err)
+	}
+
+	readEvent := func(reader *bufio.Reader) <-chan map[string]interface{} {
+		result := make(chan map[string]interface{}, 1)
+		go func() {
+			line, err := reader.ReadBytes('\n')
+			if err != nil {
+				result <- map[string]interface{}{"error": err.Error()}
+				return
+			}
+			var event map[string]interface{}
+			_ = json.Unmarshal(line, &event)
+			result <- event
+		}()
+		return result
+	}
+	firstEvent := readEvent(firstReader)
+	secondEvent := readEvent(secondReader)
+	s.emitEvent(map[string]interface{}{"event": "connected"})
+	for _, event := range []map[string]interface{}{<-firstEvent, <-secondEvent} {
+		if event["event"] != "connected" {
+			t.Fatalf("client lost lifecycle event: %+v", event)
+		}
+	}
+	secondClient.Close()
+	if _, err := firstClient.Write([]byte(request)); err != nil {
+		t.Fatal(err)
+	}
+	if response, err := firstReader.ReadBytes('\n'); err != nil {
+		t.Fatalf("daemon connection died when CLI disconnected: %v", err)
+	} else if err := json.Unmarshal(response, &frame); err != nil || !frame.OK {
+		t.Fatalf("bad response after CLI disconnected: %s (%v)", response, err)
+	}
+}
+
+func TestSecondSidecarCannotReplaceActiveSocket(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "wa.sock")
+	owner, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	if replacement, err := listenSocket(sock); err == nil {
+		replacement.Close()
+		t.Fatal("second sidecar replaced an active socket")
+	}
+	client, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatalf("original socket became unavailable: %v", err)
+	}
+	client.Close()
+}
+
+func TestSidecarCanReplaceStaleSocket(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "wa.sock")
+	stale, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.(*net.UnixListener).SetUnlinkOnClose(false)
+	stale.Close()
+	listener, err := listenSocket(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacement, err := listenSocket(sock); err == nil {
+		replacement.Close()
+		t.Fatal("concurrent sidecar acquired an owned socket")
+	}
+	client, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatalf("stale socket was not replaced: %v", err)
+	}
+	client.Close()
+	listener.Close()
+	restarted, err := listenSocket(sock)
+	if err != nil {
+		t.Fatalf("socket lock was not released on shutdown: %v", err)
+	}
+	restarted.Close()
+}
+
 func TestMediaAndQuoteMetadataReachTheWire(t *testing.T) {
 	server, client := net.Pipe()
 	defer server.Close()
 	defer client.Close()
-	s := &sidecar{conn: server}
+	s := &sidecar{}
+	s.registerConn(server)
+	defer s.unregisterConn(server)
 	chat, _ := types.ParseJID("15551234567@s.whatsapp.net")
 	event := &events.Message{
 		Info: types.MessageInfo{
@@ -207,7 +330,9 @@ func TestDeliveryReceiptAndDisconnectReachTheWire(t *testing.T) {
 	server, client := net.Pipe()
 	defer server.Close()
 	defer client.Close()
-	s := &sidecar{conn: server}
+	s := &sidecar{}
+	s.registerConn(server)
+	defer s.unregisterConn(server)
 	chat, _ := types.ParseJID("15551234567@s.whatsapp.net")
 	go func() {
 		s.handleWAEvent(&events.Receipt{

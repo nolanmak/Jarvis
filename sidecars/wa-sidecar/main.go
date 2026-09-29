@@ -30,9 +30,9 @@
 // logs a QR. On pairing, whatsmeow persists the session and emits
 // `pair-success`; subsequent starts reconnect. Server logout emits `logged-out`.
 //
-// Concurrency: one accepted connection at a time. Each request line is
-// dispatched on its own goroutine; writes are serialized by a mutex.
-// Daemon/CLI multiplexing and durable replay are tracked in #1229.
+// Concurrency: the daemon and CLI may connect at the same time. Responses
+// return only to their requesting connection; lifecycle events reach both.
+// Durable replay across disconnected clients is tracked in #1229.
 package main
 
 import (
@@ -139,58 +139,93 @@ type rpcResponse struct {
 
 type sidecar struct {
 	client *whatsmeow.Client
-	// writeMu serializes all frames written to the active connection.
+	// writeMu protects clients/lastQR and serializes writes to each socket.
 	writeMu sync.Mutex
-	conn    net.Conn
+	clients map[net.Conn]struct{}
 	lastQR  string
 	logger  waLog.Logger
 }
 
-func (s *sidecar) writeFrame(v interface{}) {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if s.conn == nil {
-		return
-	}
+func (s *sidecar) marshalFrame(v interface{}) []byte {
 	b, err := json.Marshal(v)
 	if err != nil {
 		if s.logger != nil {
 			s.logger.Errorf("marshal frame: %v", err)
 		}
+		return nil
+	}
+	return append(b, '\n')
+}
+
+// Caller holds writeMu. A failed client cannot hold up later events.
+func (s *sidecar) writeLocked(conn net.Conn, frame []byte) {
+	if frame == nil {
 		return
 	}
-	b = append(b, '\n')
-	_ = s.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	if _, err := s.conn.Write(b); err != nil {
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write(frame); err != nil {
 		if s.logger != nil {
 			s.logger.Warnf("write frame: %v", err)
 		}
+		delete(s.clients, conn)
+		_ = conn.Close()
 	}
+}
+
+func (s *sidecar) writeFrameTo(conn net.Conn, v interface{}) {
+	frame := s.marshalFrame(v)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if _, connected := s.clients[conn]; connected {
+		s.writeLocked(conn, frame)
+	}
+}
+
+func (s *sidecar) registerConn(conn net.Conn) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.clients == nil {
+		s.clients = make(map[net.Conn]struct{})
+	}
+	s.clients[conn] = struct{}{}
+	if s.lastQR != "" {
+		s.writeLocked(conn, s.marshalFrame(map[string]interface{}{
+			"version": 1, "event": "qr", "code": s.lastQR,
+		}))
+	}
+}
+
+func (s *sidecar) unregisterConn(conn net.Conn) {
+	s.writeMu.Lock()
+	delete(s.clients, conn)
+	s.writeMu.Unlock()
+	_ = conn.Close()
 }
 
 func (s *sidecar) emitEvent(ev map[string]interface{}) {
 	ev["version"] = 1
+	frame := s.marshalFrame(ev)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if ev["event"] == "qr" {
 		if code, ok := ev["code"].(string); ok {
-			s.writeMu.Lock()
 			s.lastQR = code
-			s.writeMu.Unlock()
 		}
 	}
 	if ev["event"] == "pair-success" || ev["event"] == "logged-out" {
-		s.writeMu.Lock()
 		s.lastQR = ""
-		s.writeMu.Unlock()
 	}
-	s.writeFrame(ev)
+	for conn := range s.clients {
+		s.writeLocked(conn, frame)
+	}
 }
 
-func (s *sidecar) ok(reqID string, result interface{}) {
-	s.writeFrame(rpcResponse{Version: 1, RequestID: reqID, OK: true, Result: result})
+func (s *sidecar) ok(conn net.Conn, reqID string, result interface{}) {
+	s.writeFrameTo(conn, rpcResponse{Version: 1, RequestID: reqID, OK: true, Result: result})
 }
 
-func (s *sidecar) fail(reqID, kind, msg string) {
-	s.writeFrame(rpcResponse{
+func (s *sidecar) fail(conn net.Conn, reqID, kind, msg string) {
+	s.writeFrameTo(conn, rpcResponse{
 		Version:   1,
 		RequestID: reqID,
 		OK:        false,
@@ -365,28 +400,28 @@ func mediaDescriptor(m *waE2E.Message) interface{} {
 // Op dispatch
 // ---------------------------------------------------------------------------
 
-func (s *sidecar) dispatch(req rpcRequest) {
+func (s *sidecar) dispatch(conn net.Conn, req rpcRequest) {
 	if req.Version != 1 {
-		s.fail(req.RequestID, "BadRequest", "unsupported protocol version")
+		s.fail(conn, req.RequestID, "BadRequest", "unsupported protocol version")
 		return
 	}
 	switch req.Op {
 	case "status":
-		s.opStatus(req)
+		s.opStatus(conn, req)
 	case "list_chats":
-		s.opListChats(req)
+		s.opListChats(conn, req)
 	case "fetch_history":
-		s.opFetchHistory(req)
+		s.opFetchHistory(conn, req)
 	case "send_text":
-		s.opSendText(req)
+		s.opSendText(conn, req)
 	default:
-		s.fail(req.RequestID, "BadRequest", "unknown op: "+req.Op)
+		s.fail(conn, req.RequestID, "BadRequest", "unknown op: "+req.Op)
 	}
 }
 
-func (s *sidecar) opStatus(req rpcRequest) {
+func (s *sidecar) opStatus(conn net.Conn, req rpcRequest) {
 	if s.client == nil {
-		s.ok(req.RequestID, map[string]interface{}{
+		s.ok(conn, req.RequestID, map[string]interface{}{
 			"paired": false, "connected": false, "device_jid": "",
 		})
 		return
@@ -397,14 +432,14 @@ func (s *sidecar) opStatus(req rpcRequest) {
 	if s.client.Store.ID != nil {
 		deviceJID = s.client.Store.ID.String()
 	}
-	s.ok(req.RequestID, map[string]interface{}{
+	s.ok(conn, req.RequestID, map[string]interface{}{
 		"paired":     paired,
 		"connected":  connected,
 		"device_jid": deviceJID,
 	})
 }
 
-func (s *sidecar) opListChats(req rpcRequest) {
+func (s *sidecar) opListChats(conn net.Conn, req rpcRequest) {
 	var p struct {
 		Limit int `json:"limit"`
 	}
@@ -413,7 +448,7 @@ func (s *sidecar) opListChats(req rpcRequest) {
 		p.Limit = 50
 	}
 	if s.client == nil || s.client.Store.ID == nil {
-		s.fail(req.RequestID, "NotPaired", "no linked device")
+		s.fail(conn, req.RequestID, "NotPaired", "no linked device")
 		return
 	}
 	// whatsmeow doesn't expose a server-side chat list; the closest source
@@ -423,7 +458,7 @@ func (s *sidecar) opListChats(req rpcRequest) {
 	defer cancel()
 	contacts, err := s.client.Store.Contacts.GetAllContacts(ctx)
 	if err != nil {
-		s.fail(req.RequestID, "Internal", "GetAllContacts: "+err.Error())
+		s.fail(conn, req.RequestID, "Internal", "GetAllContacts: "+err.Error())
 		return
 	}
 	chats := make([]map[string]interface{}, 0, len(contacts))
@@ -444,43 +479,43 @@ func (s *sidecar) opListChats(req rpcRequest) {
 			break
 		}
 	}
-	s.ok(req.RequestID, map[string]interface{}{"chats": chats})
+	s.ok(conn, req.RequestID, map[string]interface{}{"chats": chats})
 }
 
-func (s *sidecar) opFetchHistory(req rpcRequest) {
+func (s *sidecar) opFetchHistory(conn net.Conn, req rpcRequest) {
 	var p struct {
 		ChatJID string `json:"chat_jid"`
 		Limit   int    `json:"limit"`
 	}
 	if err := json.Unmarshal(req.Params, &p); err != nil || p.ChatJID == "" {
-		s.fail(req.RequestID, "BadRequest", "chat_jid required")
+		s.fail(conn, req.RequestID, "BadRequest", "chat_jid required")
 		return
 	}
 	// This process has no durable history store yet. A successful empty result
 	// would tell the caller that a chat has no messages, which is false.
-	s.fail(req.RequestID, "Unavailable", "chat history is not stored by this sidecar")
+	s.fail(conn, req.RequestID, "Unavailable", "chat history is not stored by this sidecar")
 }
 
-func (s *sidecar) opSendText(req rpcRequest) {
+func (s *sidecar) opSendText(conn net.Conn, req rpcRequest) {
 	var p struct {
 		ChatJID string `json:"chat_jid"`
 		Text    string `json:"text"`
 	}
 	if err := json.Unmarshal(req.Params, &p); err != nil || p.ChatJID == "" || p.Text == "" {
-		s.fail(req.RequestID, "BadRequest", "chat_jid and text required")
+		s.fail(conn, req.RequestID, "BadRequest", "chat_jid and text required")
 		return
 	}
 	if s.client == nil || s.client.Store.ID == nil {
-		s.fail(req.RequestID, "NotPaired", "no linked device")
+		s.fail(conn, req.RequestID, "NotPaired", "no linked device")
 		return
 	}
 	if !s.client.IsConnected() {
-		s.fail(req.RequestID, "NotConnected", "websocket not connected")
+		s.fail(conn, req.RequestID, "NotConnected", "websocket not connected")
 		return
 	}
 	jid, err := types.ParseJID(p.ChatJID)
 	if err != nil {
-		s.fail(req.RequestID, "BadRequest", "bad jid: "+err.Error())
+		s.fail(conn, req.RequestID, "BadRequest", "bad jid: "+err.Error())
 		return
 	}
 	msg := &waE2E.Message{Conversation: &p.Text}
@@ -488,10 +523,10 @@ func (s *sidecar) opSendText(req rpcRequest) {
 	defer cancel()
 	resp, err := s.client.SendMessage(ctx, jid, msg)
 	if err != nil {
-		s.fail(req.RequestID, "SendFailed", err.Error())
+		s.fail(conn, req.RequestID, "SendFailed", err.Error())
 		return
 	}
-	s.ok(req.RequestID, map[string]interface{}{"message_id": resp.ID})
+	s.ok(conn, req.RequestID, map[string]interface{}{"message_id": resp.ID})
 }
 
 // ---------------------------------------------------------------------------
@@ -499,19 +534,8 @@ func (s *sidecar) opSendText(req rpcRequest) {
 // ---------------------------------------------------------------------------
 
 func (s *sidecar) serveConn(conn net.Conn) {
-	s.writeMu.Lock()
-	s.conn = conn
-	lastQR := s.lastQR
-	s.writeMu.Unlock()
-	if lastQR != "" {
-		s.writeFrame(map[string]interface{}{"version": 1, "event": "qr", "code": lastQR})
-	}
-	defer func() {
-		s.writeMu.Lock()
-		s.conn = nil
-		s.writeMu.Unlock()
-		_ = conn.Close()
-	}()
+	s.registerConn(conn)
+	defer s.unregisterConn(conn)
 
 	scanner := bufio.NewScanner(conn)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
@@ -522,13 +546,13 @@ func (s *sidecar) serveConn(conn net.Conn) {
 		}
 		var req rpcRequest
 		if err := json.Unmarshal(line, &req); err != nil {
-			s.fail("", "BadRequest", "bad json: "+err.Error())
+			s.fail(conn, "", "BadRequest", "bad json: "+err.Error())
 			continue
 		}
-		go s.dispatch(req)
+		go s.dispatch(conn, req)
 	}
 	if err := scanner.Err(); err != nil {
-		s.fail("", "BadRequest", "invalid or oversized request frame")
+		s.fail(conn, "", "BadRequest", "invalid or oversized request frame")
 	}
 }
 
@@ -596,6 +620,60 @@ func main() {
 	serve(s)
 }
 
+type ownedSocket struct {
+	net.Listener
+	lock *os.File
+}
+
+func (s *ownedSocket) Close() error {
+	err := s.Listener.Close()
+	_ = syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
+	_ = s.lock.Close()
+	return err
+}
+
+func listenSocket(sock string) (net.Listener, error) {
+	// Hold a per-socket process lock through the listener lifetime. Without
+	// this, two simultaneous starts can both decide an old socket is stale.
+	lock, err := os.OpenFile(sock+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("open sidecar socket lock: %w", err)
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = lock.Close()
+		return nil, fmt.Errorf("sidecar socket is already owned: %w", err)
+	}
+	keepLock := false
+	defer func() {
+		if !keepLock {
+			_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+			_ = lock.Close()
+		}
+	}()
+	if info, err := os.Lstat(sock); err == nil {
+		if info.Mode()&os.ModeSocket == 0 {
+			return nil, fmt.Errorf("refusing to replace non-socket path %s", sock)
+		}
+		// A CLI can attach to the running sidecar. Starting another sidecar
+		// must not remove its active listening socket.
+		if conn, dialErr := net.DialTimeout("unix", sock, 250*time.Millisecond); dialErr == nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("sidecar already listening on %s", sock)
+		}
+		if err := os.Remove(sock); err != nil {
+			return nil, fmt.Errorf("remove stale socket: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("inspect socket path: %w", err)
+	}
+	listener, err := net.Listen("unix", sock)
+	if err != nil {
+		return nil, err
+	}
+	keepLock = true
+	return &ownedSocket{Listener: listener, lock: lock}, nil
+}
+
 func serve(s *sidecar) {
 	logger := s.logger
 	// UDS listener.
@@ -604,22 +682,9 @@ func serve(s *sidecar) {
 		logger.Errorf("mkdir sock dir: %v", err)
 		os.Exit(1)
 	}
-	if info, err := os.Lstat(sock); err == nil {
-		if info.Mode()&os.ModeSocket == 0 {
-			logger.Errorf("refusing to replace non-socket path %s", sock)
-			os.Exit(1)
-		}
-		if err := os.Remove(sock); err != nil {
-			logger.Errorf("remove stale socket: %v", err)
-			os.Exit(1)
-		}
-	} else if !os.IsNotExist(err) {
-		logger.Errorf("inspect socket path: %v", err)
-		os.Exit(1)
-	}
-	ln, err := net.Listen("unix", sock)
+	ln, err := listenSocket(sock)
 	if err != nil {
-		logger.Errorf("listen %s: %v", sock, err)
+		logger.Errorf("listen: %v", err)
 		os.Exit(1)
 	}
 	if err := os.Chmod(sock, 0o600); err != nil {
@@ -648,8 +713,6 @@ func serve(s *sidecar) {
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
-		// One client (the daemon) at a time — serve synchronously so a new
-		// connection replaces the old write target cleanly.
-		s.serveConn(conn)
+		go s.serveConn(conn)
 	}
 }

@@ -78,8 +78,11 @@ WhatsApp bans bot-like accounts aggressively. The channel is conservative:
 
 ## Operational notes
 
-- The sidecar currently serves one socket client at a time. Multiplexing the
-  daemon and CLI and replaying disconnected events are tracked in #1229.
+- The sidecar serves the daemon and CLI concurrently. Requests return only to
+  their requesting client; live events reach all connected clients. Durable
+  replay after a client disconnects remains tracked in #1229.
+- Starting a second sidecar fails while the socket is active; only a stale
+  socket is removed on startup.
 - The sidecar reconnects whatsmeow internally; if the websocket drops,
   `send_text` returns `NotConnected` and the next inbound event re-arms it.
 - Supervised installation and health checks are tracked in #1243.

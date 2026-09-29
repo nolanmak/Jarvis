@@ -43,6 +43,9 @@ async fn compiled_go_process_matches_rust_wire_contract() {
     assert!(socket.exists(), "sidecar did not create its socket");
     let (events, _receiver) = mpsc::channel(8);
     let client = WaClient::connect(&socket, events).await.unwrap();
+    let (cli_events, _cli_receiver) = mpsc::channel(8);
+    let cli_client = WaClient::connect(&socket, cli_events).await.unwrap();
+    assert_eq!(cli_client.status().await.unwrap()["paired"], false);
     let (status, concurrent_send) = tokio::join!(
         client.status(),
         client.send_text("1@s.whatsapp.net", "hello")
@@ -58,6 +61,8 @@ async fn compiled_go_process_matches_rust_wire_contract() {
         client.fetch_chat_history("1@s.whatsapp.net", 10).await.unwrap_err(),
         WaError::Sidecar { kind, .. } if kind == "Unavailable"
     ));
+    drop(cli_client);
+    assert_eq!(client.status().await.unwrap()["connected"], false);
     drop(client);
 
     let stream = UnixStream::connect(&socket).await.unwrap();
