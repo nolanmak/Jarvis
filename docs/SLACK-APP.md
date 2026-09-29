@@ -25,7 +25,10 @@ workspace, and paste the JSON. The manifest:
 
 - enables **Socket Mode** and **interactivity** with no request URLs;
 - subscribes to `app_mention`, `message.im`, `message.channels`,
-  `message.groups` and `message.mpim`;
+  `message.groups` and `message.mpim`, plus `channel_rename` and
+  `group_rename` so subscription names follow a rename (#1296; an app
+  created from an older manifest needs these two events added under **Event
+  Subscriptions**, no new scopes);
 - declares the `/jarvis` slash command;
 - requests exactly the bot scopes in `REQUIRED_BOT_SCOPES`
   (`crates/augmentagent-channel-slack/src/app.rs`), no user scopes. A test

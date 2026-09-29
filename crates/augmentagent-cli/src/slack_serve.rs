@@ -42,7 +42,10 @@ use augmentagent_channel_slack::app::{
 };
 use augmentagent_channel_slack::commands::{slack_selection, SlackCommandDeps, SlackCommands};
 use augmentagent_channel_slack::delivery::ProgressConfig;
+use augmentagent_channel_slack::catch_up::SubscribedCatchUp;
 use augmentagent_channel_slack::harness::SlackConversationHarness;
+use augmentagent_channel_slack::history::{SlackConversationHistory, TurnHistory};
+use augmentagent_channel_slack::ingest::SubscribedEventSink;
 use augmentagent_channel_slack::interactive::{
     report_inactive, SlackInteractiveSurface, SlackSurfaceConfig, SlackTurn, SlackTurnHandler,
     SlackTurnReply, SlackWorkspaceRuntime, SurfaceState,
@@ -249,6 +252,28 @@ pub fn plan(
     Plan::Ready { installs, api_base }
 }
 
+/// #1296 — one bot-token Web API client per ready install, for the
+/// subscribed-conversation catch-up and the harness history.
+pub fn web_runtimes(installs: &[ReadyInstall], api_base: &str) -> Result<Vec<SlackWorkspaceRuntime>> {
+    installs
+        .iter()
+        .map(|i| {
+            let web = HttpSlackWebApi::new(
+                i.creds.bot_token.clone(),
+                WebApiConfig {
+                    base_url: api_base.to_string(),
+                    ..WebApiConfig::default()
+                },
+            )?;
+            Ok(SlackWorkspaceRuntime {
+                workspace: i.workspace.clone(),
+                web: Arc::new(web) as Arc<dyn SlackWebApi>,
+                bot: bot_identity(&i.creds),
+            })
+        })
+        .collect()
+}
+
 /// Build the surface for a ready plan: one Web API client per workspace and
 /// one Socket Mode listener per distinct app.
 pub fn build_surface(
@@ -419,13 +444,22 @@ pub async fn build_approvals(
 /// `planned` is the plan `serve` already made (to build the approval
 /// surface); `None` plans here. `approvals`, when set, receives card
 /// clicks, modal submissions and approval text commands.
+///
+/// #1296 — `make_handler` gets the Slack conversation-history provider (for
+/// history-in-prompt providers). `subscribed`, when set, receives every
+/// event that is not an owner turn (live ingestion of subscribed
+/// conversations), and the bounded catch-up of subscribed conversations runs
+/// alongside the surface.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     store: Arc<Store>,
     planned: Option<Plan>,
-    make_handler: impl FnOnce() -> Arc<dyn SlackTurnHandler> + Send + 'static,
+    make_handler: impl FnOnce(Option<Arc<dyn TurnHistory>>) -> Arc<dyn SlackTurnHandler>
+        + Send
+        + 'static,
     approvals: Option<Arc<augmentagent_channel_slack::approvals::SlackApprovals>>,
     commands: Option<Arc<SlackCommands>>,
+    subscribed: Option<Arc<dyn SubscribedEventSink>>,
     dry_run: bool,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<Result<()>> {
@@ -466,6 +500,10 @@ pub fn spawn(
         };
         let teams: Vec<String> = installs.iter().map(|i| i.creds.team_id.clone()).collect();
         info!(teams = %teams.join(", "), dry_run, "slack interactive surface starting");
+        let runtimes = web_runtimes(&installs, &api_base).unwrap_or_else(|e| {
+            warn!("slack history and catch-up clients unavailable: {e:#}");
+            Vec::new()
+        });
         let handler = match test_turn_handler(
             std::env::var(TEST_REPLY_ENV).ok().as_deref(),
             Arc::clone(&store),
@@ -474,7 +512,11 @@ pub fn spawn(
                 warn!("{TEST_REPLY_ENV} is set: Slack turns run the real harness with a fake agent, not the reasoner (debug build, tests and local QA only)");
                 stub
             }
-            None => make_handler(),
+            None => make_handler(
+                (!runtimes.is_empty()).then(|| {
+                    Arc::new(SlackConversationHistory::new(&runtimes)) as Arc<dyn TurnHistory>
+                }),
+            ),
         };
         let surface = match build_surface(
             Arc::clone(&store),
@@ -506,25 +548,53 @@ pub fn spawn(
             Some(c) => surface.with_commands(c),
             None => surface,
         };
-        surface.run(shutdown).await
+        // #1296 — live ingestion of subscribed conversations, and the
+        // bounded catch-up after a sleep or restart that feeds it.
+        let (surface, catch_up) = match subscribed {
+            Some(sink) => {
+                let catch_up = SubscribedCatchUp::new(
+                    Arc::clone(&store),
+                    runtimes
+                        .iter()
+                        .map(|r| (r.workspace.clone(), Arc::clone(&r.web)))
+                        .collect(),
+                );
+                let sd = shutdown.clone();
+                (
+                    surface.with_subscribed_sink(sink),
+                    Some(tokio::spawn(async move { catch_up.run(sd).await })),
+                )
+            }
+            None => (surface, None),
+        };
+        let result = surface.run(shutdown).await;
+        if let Some(task) = catch_up {
+            let _ = task.await;
+        }
+        result
     })
 }
 
 /// #1288 — the handler `serve` runs with a wiki: owner turns through the
 /// shared conversation harness, answered by `query` (the same `WikiQuerier`
-/// Discord uses).
+/// Discord uses). #1296 — `history` gives history-in-prompt providers the
+/// conversation's earlier messages.
 pub fn conversation_handler(
     store: Arc<Store>,
     query: Arc<dyn QueryHandler>,
     wiki_root: PathBuf,
+    history: Option<Arc<dyn TurnHistory>>,
 ) -> Arc<dyn SlackTurnHandler> {
     // #1292 — each conversation's own `model` choice (then its channel's,
     // then the daemon default), from the same file `/model` writes.
-    Arc::new(
-        SlackConversationHarness::new(store, query, wiki_root).with_selection(slack_selection(
-            augmentagent_channel_core::model_selection::config_path(),
-        )),
-    )
+    let harness = SlackConversationHarness::new(store, query, wiki_root).with_selection(
+        slack_selection(augmentagent_channel_core::model_selection::config_path()),
+    );
+    // #1296 — history for history-in-prompt providers.
+    Arc::new(match history {
+        Some(h) => harness.with_history(h),
+        None => harness,
+    })
 }
 
 /// #1292 — the owner commands `serve` runs on Slack.

@@ -165,6 +165,22 @@ jobs:
           cargo test -p augmentagent-channel-email --lib -- scheduled::
           cargo test -p augmentagent-channel-slack --test approval_scheduling --test contact_send
           cargo test -p augmentagent-cli --bin augmentagent -- slack_schedule_tests::
+      # #1296 — subscribed Slack conversations: one record and one triage
+      # whichever path (live event, Composio poll, catch-up) sees a message
+      # first; edits/deletes once; thread replies attach to their parent;
+      # renames keep IDs; an existing Slack DB migrates with IDs and cursors
+      # unchanged; bounded catch-up after a fake-clock suspension;
+      # subscription management by name/person/ID (library, Slack command
+      # hook and the real CLI against a mock Composio); harness history;
+      # search by person and channel. Temporary stores, no network.
+      - name: Slack subscriptions, reconciliation and search
+        run: |
+          cargo test -p augmentagent-store --lib -- slack_ingest::
+          cargo test -p augmentagent-messages --lib -- handles:: extract::
+          cargo test -p augmentagent-channel-slack --test ingest_reconcile --test ingest_migration --test ingest_catch_up
+          cargo test -p augmentagent-channel-slack --test subscriptions_manage --test conversation_history --test search_identity
+          cargo test -p augmentagent-channel-slack --test interactive_surface --test app_manifest
+          cargo test -p augmentagent-cli --test slack_subscriptions_cli
       # #1284 — Slack app install/verify/rotate/remove: manifest contract,
       # credential lifecycle (in-memory store) and the real CLI against a
       # mock Slack with the file credential store. No Keychain, no network.

@@ -86,6 +86,10 @@ pub const REQUIRED_BOT_EVENTS: &[&str] = &[
     "message.groups",
     "message.im",
     "message.mpim",
+    // #1296 — keep subscription names current (`channels:read` /
+    // `groups:read`, already granted).
+    "channel_rename",
+    "group_rename",
 ];
 
 // ---------------------------------------------------------------------------
