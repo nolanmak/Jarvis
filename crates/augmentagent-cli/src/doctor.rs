@@ -15,10 +15,11 @@
 //!                              from `status::collect` (read-only).
 //!
 //! `--fix` is intentionally NOT implemented here — it lands as a follow-up
-//! issue. Doctor stays strictly read-only.
+//! issue. Ordinary and `--deep` checks stay read-only. `--keychain-probe` is
+//! the explicit exception: it writes, reads and deletes one synthetic item.
 //!
-//! Linux-only by design — uses `secret-tool` (libsecret) and probes the
-//! systemd-user dashboard unit indirectly through `status`.
+//! Linux uses `secret-tool`; macOS checks Keychain configuration separately
+//! from an explicitly requested credential-access probe.
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -111,7 +112,12 @@ impl Finding {
 }
 
 /// Entry point. `json = None` auto-detects (JSON when stdout piped).
-pub async fn run(store: Arc<Store>, json: Option<bool>, deep: bool) -> Result<i32> {
+pub async fn run(
+    store: Arc<Store>,
+    json: Option<bool>,
+    deep: bool,
+    keychain_probe: bool,
+) -> Result<i32> {
     let mut findings: Vec<Finding> = Vec::new();
 
     // --- Compose the status aggregator. Doctor doesn't duplicate status's
@@ -136,6 +142,14 @@ pub async fn run(store: Arc<Store>, json: Option<bool>, deep: bool) -> Result<i3
     findings.push(check_sqlite_migrated().await);
     // 3. keyring_reachable — secret-tool present + libsecret reachable
     findings.push(check_keyring_reachable().await);
+    if keychain_probe {
+        findings.push(if cfg!(target_os = "macos") {
+            check_keychain_probe_with(std::path::Path::new("security"), Duration::from_secs(30))
+                .await
+        } else {
+            Finding::error("keychain_access", "--keychain-probe requires macOS", None)
+        });
+    }
     if cfg!(target_os = "macos") {
         findings.push(check_launchd_agents());
     }
@@ -357,42 +371,138 @@ async fn check_keyring_reachable() -> Finding {
     }
 }
 
-/// #1079 — macOS: the `keyring` crate uses the login Keychain. `security
-/// default-keychain` answers whether one is configured for this session.
+/// `security default-keychain` only proves configuration, not credential read.
 async fn check_keychain_reachable() -> Finding {
-    let res = timeout(
-        SUBPROCESS_TIMEOUT,
-        Command::new("security").arg("default-keychain").output(),
-    )
-    .await;
+    check_keychain_configuration_with(std::path::Path::new("security"), SUBPROCESS_TIMEOUT).await
+}
+
+async fn check_keychain_configuration_with(bin: &std::path::Path, limit: Duration) -> Finding {
+    let mut command = Command::new(bin);
+    command.arg("default-keychain").kill_on_drop(true);
+    let res = timeout(limit, command.output()).await;
     match res {
-        Ok(Ok(out)) if out.status.success() => Finding::ok(
+        Ok(Ok(out)) if out.status.success() => Finding::warn(
             "keyring_reachable",
-            format!(
-                "login Keychain reachable ({})",
-                String::from_utf8_lossy(&out.stdout)
-                    .trim()
-                    .trim_matches('"')
-            ),
+            "default Keychain configured; credential access unverified".to_string(),
+            Some("augmentagent doctor --keychain-probe"),
         ),
-        Ok(Ok(out)) => Finding::error(
+        Ok(Ok(_out)) => Finding::error(
             "keyring_reachable",
-            format!(
-                "no default Keychain: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-            Some("security default-keychain -s login.keychain-db"),
+            "default Keychain unavailable or access denied".to_string(),
+            Some("check the login Keychain in Keychain Access, then rerun doctor"),
         ),
         Ok(Err(e)) => Finding::error(
             "keyring_reachable",
-            format!("`security` could not run: {e}"),
-            None,
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "macOS security command not found".to_string()
+            } else {
+                "could not run macOS security command".to_string()
+            },
+            Some("verify Xcode command-line tools and /usr/bin/security"),
         ),
         Err(_) => Finding::warn(
             "keyring_reachable",
-            "security timed out after 2s".to_string(),
+            "security default-keychain timed out; credential access unverified".to_string(),
             None,
         ),
+    }
+}
+
+/// Run a bounded native Keychain operation without echoing the command's
+/// output. The disposable item is not a production credential.
+async fn keychain_step(
+    bin: &std::path::Path,
+    args: &[&str],
+    limit: Duration,
+) -> std::result::Result<std::process::Output, &'static str> {
+    let mut command = Command::new(bin);
+    command.args(args).kill_on_drop(true);
+    match timeout(limit, command.output()).await {
+        Ok(Ok(out)) if out.status.success() => Ok(out),
+        Ok(Ok(out)) => {
+            let diagnostic = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
+            if diagnostic.contains("could not be found") || diagnostic.contains("item not found") {
+                Err("missing")
+            } else {
+                Err("denied or locked")
+            }
+        }
+        Ok(Err(_)) => Err("security command could not start"),
+        Err(_) => Err("timed out"),
+    }
+}
+
+async fn check_keychain_probe_with(bin: &std::path::Path, limit: Duration) -> Finding {
+    let service = format!("augmentagent/doctor-probe-{}", uuid::Uuid::new_v4());
+    let value = uuid::Uuid::new_v4().to_string();
+    let account = "synthetic";
+    let add = keychain_step(
+        bin,
+        &[
+            "add-generic-password",
+            "-a",
+            account,
+            "-s",
+            &service,
+            "-w",
+            &value,
+        ],
+        limit,
+    )
+    .await;
+    let read = if add.is_ok() {
+        Some(
+            keychain_step(
+                bin,
+                &["find-generic-password", "-a", account, "-s", &service, "-w"],
+                limit,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    // Attempt cleanup even if add reported a failure: a killed process may
+    // have written the item before the command timed out.
+    let cleanup = keychain_step(
+        bin,
+        &["delete-generic-password", "-a", account, "-s", &service],
+        limit,
+    )
+    .await;
+    if cleanup.is_err() && add.is_ok() {
+        let recovery = format!("security delete-generic-password -a synthetic -s {service}");
+        return Finding::error(
+            "keychain_access",
+            "synthetic Keychain item cleanup could not be verified",
+            Some(&recovery),
+        );
+    }
+    if let Err(reason) = add {
+        return Finding::error(
+            "keychain_access",
+            format!("Keychain credential write {reason}"),
+            Some("unlock login Keychain and check Jarvis access in Keychain Access"),
+        );
+    }
+    match read {
+        Some(Ok(output)) if String::from_utf8_lossy(&output.stdout).trim_end() == value => {
+            Finding::ok(
+                "keychain_access",
+                "synthetic Keychain credential write/read/delete verified",
+            )
+        }
+        Some(Ok(_)) => Finding::error(
+            "keychain_access",
+            "synthetic Keychain credential read returned a different value",
+            None,
+        ),
+        Some(Err(reason)) => Finding::error(
+            "keychain_access",
+            format!("Keychain credential read {reason}"),
+            Some("unlock login Keychain and check Jarvis access in Keychain Access"),
+        ),
+        None => unreachable!("a successful add always attempts a read"),
     }
 }
 
@@ -1715,6 +1825,166 @@ fn print_table(findings: &[Finding], ok: usize, warn: usize, error: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn macos_keychain_configuration_does_not_claim_credential_access() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let security = dir.path().join("security");
+        std::fs::write(
+            &security,
+            "#!/bin/sh\nprintf 'synthetic-canary-secret\\n'\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let finding = check_keychain_configuration_with(&security, Duration::from_secs(2)).await;
+        assert_eq!(finding.severity, Severity::Warn);
+        assert!(finding.message.contains("unverified"));
+        assert!(!finding.message.contains("synthetic-canary-secret"));
+        assert!(!finding
+            .to_json()
+            .to_string()
+            .contains("synthetic-canary-secret"));
+
+        std::fs::write(
+            &security,
+            "#!/bin/sh\necho synthetic-canary-secret >&2\nexit 1\n",
+        )
+        .unwrap();
+        let denied = check_keychain_configuration_with(&security, Duration::from_secs(2)).await;
+        assert_eq!(denied.severity, Severity::Error);
+        assert!(!denied.message.contains("synthetic-canary-secret"));
+
+        std::fs::write(&security, "#!/bin/sh\nsleep 1\n").unwrap();
+        let timed_out =
+            check_keychain_configuration_with(&security, Duration::from_millis(20)).await;
+        assert_eq!(timed_out.severity, Severity::Warn);
+        assert!(timed_out.message.contains("timed out"));
+
+        let missing_binary = check_keychain_configuration_with(
+            std::path::Path::new("/nonexistent-synthetic-security"),
+            Duration::from_millis(100),
+        )
+        .await;
+        assert_eq!(missing_binary.severity, Severity::Error);
+        assert!(missing_binary.message.contains("not found"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn macos_keychain_probe_reads_and_deletes_disposable_credential() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let security = dir.path().join("security");
+        let item = dir.path().join("item");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  add-generic-password) printf '%s' \"$7\" > '{item}' ;;
+              \n  find-generic-password) cat '{item}' ;;
+              \n  delete-generic-password) rm '{item}' ;;
+              \n esac\necho synthetic-canary-secret >&2\n",
+            item = item.display(),
+        );
+        std::fs::write(&security, script).unwrap();
+        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let finding = check_keychain_probe_with(&security, Duration::from_secs(2)).await;
+        assert_eq!(finding.severity, Severity::Ok, "{}", finding.message);
+        assert!(!item.exists());
+        assert!(!finding.message.contains("synthetic-canary-secret"));
+        assert!(!finding
+            .to_json()
+            .to_string()
+            .contains("synthetic-canary-secret"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn macos_keychain_probe_reports_denied_read_and_cleans_up() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let security = dir.path().join("security");
+        let item = dir.path().join("item");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  add-generic-password) printf '%s' \"$7\" > '{item}' ;;
+              \n  find-generic-password) echo synthetic-canary-secret >&2; exit 1 ;;
+              \n  delete-generic-password) rm '{item}' ;;
+              \n esac\n",
+            item = item.display(),
+        );
+        std::fs::write(&security, script).unwrap();
+        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let finding = check_keychain_probe_with(&security, Duration::from_secs(2)).await;
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(finding.message.contains("read"), "{}", finding.message);
+        assert!(!item.exists());
+        assert!(!finding.message.contains("synthetic-canary-secret"));
+        assert!(!finding
+            .to_json()
+            .to_string()
+            .contains("synthetic-canary-secret"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn macos_keychain_probe_surfaces_unverified_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let security = dir.path().join("security");
+        let item = dir.path().join("item");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  add-generic-password) printf '%s' \"$7\" > '{item}' ;;
+              \n  find-generic-password) cat '{item}' ;;
+              \n  delete-generic-password) exit 1 ;;
+              \n esac\n",
+            item = item.display(),
+        );
+        std::fs::write(&security, script).unwrap();
+        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let finding = check_keychain_probe_with(&security, Duration::from_secs(2)).await;
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(finding.message.contains("cleanup"));
+        assert!(finding
+            .suggested_cmd
+            .as_deref()
+            .unwrap()
+            .contains("delete-generic-password"));
+        assert!(item.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn macos_keychain_probe_distinguishes_missing_and_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let security = dir.path().join("security");
+        let item = dir.path().join("item");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  add-generic-password) printf '%s' \"$7\" > '{item}' ;;
+              \n  find-generic-password) echo 'The specified item could not be found in the keychain.' >&2; exit 1 ;;
+              \n  delete-generic-password) rm '{item}' ;;
+              \n esac\n",
+            item = item.display(),
+        );
+        std::fs::write(&security, script).unwrap();
+        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let missing = check_keychain_probe_with(&security, Duration::from_secs(2)).await;
+        assert_eq!(missing.severity, Severity::Error);
+        assert!(missing.message.contains("missing"));
+        assert!(!item.exists());
+
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  add-generic-password) printf '%s' \"$7\" > '{item}' ;;
+              \n  find-generic-password) sleep 1 ;;
+              \n  delete-generic-password) rm '{item}' ;;
+              \n esac\n",
+            item = item.display(),
+        );
+        std::fs::write(&security, script).unwrap();
+        let timed_out = check_keychain_probe_with(&security, Duration::from_millis(50)).await;
+        assert_eq!(timed_out.severity, Severity::Error);
+        assert!(timed_out.message.contains("timed out"));
+        assert!(!item.exists());
+    }
     use std::collections::BTreeMap;
 
     #[test]
