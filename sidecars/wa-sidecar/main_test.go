@@ -15,6 +15,18 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 )
 
+func shortTestSocket(t *testing.T) string {
+	t.Helper()
+	// Go's t.TempDir includes the test name; on macOS that can exceed the
+	// smaller Unix-socket path limit before the listener is even created.
+	dir, err := os.MkdirTemp("/tmp", "wa-sock-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, "wa.sock")
+}
+
 // These exercise the actual NDJSON dispatcher while the WhatsApp network is
 // absent. A connected Rust client must get explicit failures, not a made-up
 // empty history or a successful reply in a protocol it cannot understand.
@@ -67,6 +79,21 @@ func TestOfflineStatusAndSendAreHonest(t *testing.T) {
 	sent := exchange(t, `{"version":1,"request_id":"x1","op":"send_text","params":{"chat_jid":"1@s.whatsapp.net","text":"hi"}}`)
 	if sent.OK || sent.Error == nil || sent.Error.Kind != "NotPaired" {
 		t.Fatalf("offline send must fail: %+v", sent)
+	}
+}
+
+func TestPairingAndLogoutOpsFailSafelyWithoutADevice(t *testing.T) {
+	pair := exchange(t, `{"version":1,"request_id":"p1","op":"start_pairing","params":{}}`)
+	if pair.OK || pair.Error == nil || pair.Error.Kind != "NotConnected" {
+		t.Fatalf("offline pairing must report unavailable transport: %+v", pair)
+	}
+	missing := exchange(t, `{"version":1,"request_id":"u1","op":"logout","params":{}}`)
+	if missing.OK || missing.Error == nil || missing.Error.Kind != "BadRequest" || !strings.Contains(missing.Error.Message, "expected_device_jid") {
+		t.Fatalf("logout must require an exact device identity: %+v", missing)
+	}
+	logout := exchange(t, `{"version":1,"request_id":"u2","op":"logout","params":{"expected_device_jid":"1:2@s.whatsapp.net"}}`)
+	if logout.OK || logout.Error == nil || logout.Error.Kind != "NotPaired" {
+		t.Fatalf("offline logout must not claim it unlinked a device: %+v", logout)
 	}
 }
 
@@ -235,7 +262,7 @@ func TestTwoClientsGetTheirOwnResponsesAndLifecycleEvents(t *testing.T) {
 }
 
 func TestSecondSidecarCannotReplaceActiveSocket(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "wa.sock")
+	sock := shortTestSocket(t)
 	owner, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatal(err)
@@ -253,7 +280,7 @@ func TestSecondSidecarCannotReplaceActiveSocket(t *testing.T) {
 }
 
 func TestSidecarCanReplaceStaleSocket(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "wa.sock")
+	sock := shortTestSocket(t)
 	stale, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatal(err)

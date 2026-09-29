@@ -1,9 +1,10 @@
 # AugmentAgent WhatsApp sidecar
 
 Go sidecar (`go.mau.fi/whatsmeow`) that owns the WhatsApp linked-device
-session. The Rust daemon talks to it via NDJSON over
-`${XDG_RUNTIME_DIR}/augmentagent/wa.sock` — same wire shape as the browser
-sidecar (`sidecars/browser/`).
+session. The Rust daemon talks to it via NDJSON over a private Unix socket.
+Linux uses `${XDG_RUNTIME_DIR}/augmentagent/wa.sock` when available. macOS
+uses `/tmp/augmentagent-<uid>/wa.sock` to fit Darwin's socket path limit;
+the directory is owner-only. `AUGMENTAGENT_WA_SOCK` overrides either default.
 
 Implements [#12](https://github.com/nolanmak/AugmentAgent/issues/12) (DM
 channel) and [#102](https://github.com/nolanmak/AugmentAgent/issues/102)
@@ -32,8 +33,8 @@ sidecars/wa-sidecar/
 NDJSON over a Unix stream socket. See the `main.go` package doc and
 `crates/augmentagent-channel-whatsapp/src/api.rs` for the exact envelope.
 
-**Methods (request/response):** `status`, `list_chats`, `fetch_history`,
-`send_text`.
+**Methods (request/response):** `status`, `start_pairing`, `logout`,
+`list_chats`, `fetch_history`, `send_text`.
 
 **Events (sidecar-initiated):** `qr`, `pair-success`, `connected`,
 `logged-out`, `received-message`, `receipt`. Message events include optional
@@ -55,13 +56,14 @@ AUGMENTAGENT_WA_SIDECAR_TEST_BIN="$PWD/wa-sidecar" \
   cargo test -p augmentagent-channel-whatsapp --test sidecar_contract
 ```
 
-The pairing CLI is not yet implemented. The sidecar buffers its latest QR for
-a connecting client and never prints the pairing secret to service logs.
+The [pairing CLI](../../docs/WHATSAPP-LIVE.md) displays the buffered QR to a
+connecting client and never prints the pairing secret to service logs.
 
 The whatsmeow session persists to
-`~/.local/state/augmentagent/whatsmeow.db`; subsequent sidecar starts
-reconnect silently. A server-side logout emits `logged-out`; #1228 wires the
-CLI and device-state reconciliation.
+`~/.local/state/augmentagent/whatsmeow.db` by default (or
+`AUGMENTAGENT_WA_STORE`); subsequent sidecar starts
+reconnect silently. Both server-side and operator-initiated logout emit
+`logged-out`; the CLI reconciles the device index after pairing or unlinking.
 
 ## Ban-risk gate (#40 / #74 / #102)
 

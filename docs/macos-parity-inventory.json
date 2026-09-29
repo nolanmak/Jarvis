@@ -666,8 +666,8 @@
       "Rust CLI",
       "selected feature credentials or synthetic fixtures"
     ],
-    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
-    "test_plan": "Run augmentagent embeddings --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1319",
+    "test_plan": "Resolve the pinned ort-sys Intel macOS build failure, then run CLI and local embedding smoke tests on Apple Silicon and Intel macOS CI and real hosts; retain Linux regression coverage.",
     "status": "unverified",
     "evidence": null
   },
@@ -1338,8 +1338,8 @@
       "Rust CLI",
       "selected feature credentials or synthetic fixtures"
     ],
-    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
-    "test_plan": "Run augmentagent whatsapp --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1228",
+    "test_plan": "Run whatsapp_cli behavior tests on Linux and Apple Silicon CI; Intel Go/Rust sidecar contracts run now, with Intel CLI blocked by #1319. Restore Intel CLI tests after that fix. On real Macs pair, status, re-pair and unlink, then probe launchd keychain access.",
     "status": "unverified",
     "evidence": null
   },
@@ -3046,7 +3046,7 @@
       "private socket/state"
     ],
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1256",
-    "test_plan": "Run wa-sidecar synthetic contract and managed-service lifecycle on native Mac and Linux.",
+    "test_plan": "Run Go race/vet/build and the compiled Go-to-Rust socket contract on Linux, Apple Silicon and Intel macOS CI; verify managed-service lifecycle on native Mac and Linux.",
     "status": "unverified",
     "evidence": null
   },

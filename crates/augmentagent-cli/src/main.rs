@@ -63,6 +63,7 @@ use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
 mod whatsapp_history;
+mod whatsapp_cmd;
 mod messages_cmd;
 mod embeddings_cmd;
 mod triage_prefilter_cmd;
@@ -281,8 +282,7 @@ enum Cmd {
         #[command(subcommand)]
         op: TelegramBotOp,
     },
-    /// WhatsApp channel via whatsmeow Go sidecar (#74). All ops are stubs in
-    /// foundation/swarm-v1; impls land in the whatsapp feature PR.
+    /// WhatsApp channel via whatsmeow Go sidecar.
     Whatsapp {
         #[command(subcommand)]
         op: WhatsappOp,
@@ -1030,6 +1030,12 @@ enum WhatsappOp {
     Login {
         #[arg(long)]
         phone: String,
+        /// Use the linked account's self-chat as the owner control chat.
+        #[arg(long, action = clap::ArgAction::SetTrue, conflicts_with = "owner_jid", required_unless_present = "owner_jid")]
+        self_chat: bool,
+        /// Owner's personal JID for a dedicated Jarvis WhatsApp account.
+        #[arg(long, conflicts_with = "self_chat", required_unless_present = "self_chat")]
+        owner_jid: Option<String>,
         #[arg(long, default_value_t = 60)]
         timeout_secs: u64,
     },
@@ -1038,7 +1044,7 @@ enum WhatsappOp {
         json: bool,
     },
     Devices {
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        #[arg(long, action = clap::ArgAction::SetTrue)]
         json: bool,
     },
     Unlink {
@@ -1047,7 +1053,7 @@ enum WhatsappOp {
     ListChats {
         #[arg(long, default_value_t = 50)]
         limit: u32,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        #[arg(long, action = clap::ArgAction::SetTrue)]
         json: bool,
     },
     Subscribe {
@@ -1058,7 +1064,7 @@ enum WhatsappOp {
         name: Option<String>,
     },
     Subscriptions {
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        #[arg(long, action = clap::ArgAction::SetTrue)]
         json: bool,
     },
     Unsubscribe {
@@ -3775,23 +3781,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
-        Cmd::Whatsapp { op } => match op {
-            WhatsappOp::Login { .. }
-            | WhatsappOp::Status { .. }
-            | WhatsappOp::Devices { .. }
-            | WhatsappOp::Unlink { .. }
-            | WhatsappOp::ListChats { .. }
-            | WhatsappOp::Subscribe { .. }
-            | WhatsappOp::Subscriptions { .. }
-            | WhatsappOp::Unsubscribe { .. }
-            | WhatsappOp::AllowOutbound { .. }
-            | WhatsappOp::DenyOutbound { .. }
-            | WhatsappOp::AllowInbound { .. }
-            | WhatsappOp::DenyInbound { .. }
-            | WhatsappOp::PollOnce { .. } => {
-                unimplemented!("see issue #74 (whatsapp feature PR)")
-            }
-        },
+        Cmd::Whatsapp { op } => whatsapp_cmd::run(op, store).await,
         Cmd::Journal { op } => match op {
             JournalOp::PollOnce { dry_run } => {
                 run_journal_poll_once(cli.wiki_dir.clone(), store, dry_run, None, false, false).await?;
