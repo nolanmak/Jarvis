@@ -302,6 +302,13 @@ Quality/Fast map (`AUGMENTAGENT_MODEL_<PROVIDER>_<TIER>`). `augmentagent
 doctor` reports both; `--deep` also flags a Cerebras pin that has left the
 provider's catalog.
 
+On macOS, the default `doctor` Keychain check reports only whether a default
+Keychain is configured. Use `augmentagent doctor --keychain-probe` when you
+want to test credential access: it writes, reads and deletes one disposable
+synthetic item and may prompt for Keychain access. Run it in the same login
+session as the launchd agent. A successful terminal probe does not itself
+establish that a restarted agent can read a selected integration's credential.
+
 ## Contributing
 
 Branch + PR only — never push to `main` (the auto-updater watches it).

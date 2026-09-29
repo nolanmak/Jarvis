@@ -603,6 +603,10 @@ enum Cmd {
         /// check; per-channel validate summaries sourced from `status`).
         #[arg(long, default_value_t = false)]
         deep: bool,
+        /// Explicitly write, read and delete one disposable macOS Keychain
+        /// item to test credential access. May trigger a Keychain prompt.
+        #[arg(long, default_value_t = false)]
+        keychain_probe: bool,
     },
     /// Internal conversation-bound MCP server for owner model control.
     #[command(hide = true)]
@@ -4381,8 +4385,8 @@ async fn main() -> Result<()> {
             let code = autopr_health::run(&root, notify, json).await?;
             std::process::exit(code);
         }
-        Cmd::Doctor { json, deep } => {
-            let code = doctor::run(store, json, deep).await?;
+        Cmd::Doctor { json, deep, keychain_probe } => {
+            let code = doctor::run(store, json, deep, keychain_probe).await?;
             std::process::exit(code);
         }
         Cmd::Env { ref op, json } => env_cfg::run_env(op, json),
