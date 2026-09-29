@@ -66,6 +66,9 @@ func socketPath() string {
 	if p := os.Getenv("AUGMENTAGENT_WA_SOCK"); p != "" {
 		return p
 	}
+	if runtime.GOOS == "darwin" {
+		return socketPathFor("darwin", os.Getuid(), "", false)
+	}
 	xdgRuntime := os.Getenv("XDG_RUNTIME_DIR")
 	linuxRuntime := fmt.Sprintf("/run/user/%d", os.Getuid())
 	info, err := os.Stat(linuxRuntime)
