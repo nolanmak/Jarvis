@@ -54,6 +54,10 @@ jobs:
       - name: Rust channel and real Go-process contract tests
         run: cargo test -p augmentagent-channel-whatsapp
       - name: WhatsApp account CLI behavior tests
+        # The existing embeddings dependency (ort-sys 2.0.0-rc.13) has no
+        # x86_64-apple-darwin prebuilt runtime. Track the Intel CLI host
+        # blocker in #1319; Go and Rust channel tests still run.
+        if: matrix.os != 'macos-15-intel'
         run: cargo test -p augmentagent-cli --test whatsapp_cli
       - name: Rust channel lint
         run: cargo clippy --no-deps -p augmentagent-channel-whatsapp --all-targets -- -D warnings
