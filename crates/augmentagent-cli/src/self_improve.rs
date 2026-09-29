@@ -6446,8 +6446,20 @@ async fn reclaim_worktree(repo_root: &Path, worktree: &Path, branch: &str) {
 /// run refused. Teaching that preflight to ignore the pipeline's own worktree
 /// is what makes a real lock necessary.
 struct RunLock {
-    /// Held only for its `Drop`: closing the fd releases the `flock`.
+    /// Held only for its `Drop`, which releases the `flock`.
     _file: std::fs::File,
+}
+
+impl Drop for RunLock {
+    /// Unlock explicitly instead of relying on close. The lock belongs to
+    /// the open file description, and a child forked by another thread
+    /// shares it until it execs, so closing our fd alone can leave the
+    /// lock held after the run has finished.
+    fn drop(&mut self) {
+        // SAFETY: `_file` still owns the fd; `flock` neither reads nor
+        // writes through it.
+        unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 impl RunLock {
@@ -12367,6 +12379,25 @@ CODEX-REVIEW: lgtm").0);
             RunLock::try_acquire(&path).unwrap().is_some(),
             "the lock must be free again once the holding run finishes"
         );
+    }
+
+    #[test]
+    fn run_lock_releases_even_while_a_duplicate_fd_is_still_open() {
+        // A child forked by another thread holds a duplicate of the locked
+        // fd until it execs. `flock` locks belong to the open file
+        // description, so closing only our copy left the lock held and the
+        // test above failed about one run in three under parallel load.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("self-improve.lock");
+
+        let lock = RunLock::try_acquire(&path).unwrap().expect("first run takes the lock");
+        let inherited = lock._file.try_clone().unwrap();
+        drop(lock);
+        assert!(
+            RunLock::try_acquire(&path).unwrap().is_some(),
+            "a finished run must release the lock even if a forked child still has the fd"
+        );
+        drop(inherited);
     }
 
     // ---- #812: a crashed run must not wedge the loop forever ----
