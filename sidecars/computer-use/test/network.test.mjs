@@ -55,7 +55,6 @@ test("real TLS connection uses the pinned address and rejects a rebinding answer
   const certificate = await fs.readFile(cert);
   const tls = { key: await fs.readFile(key), cert: certificate };
   let goodHits = 0,
-    badHits = 0,
     calls = 0;
   const good = https.createServer(tls, (_req, res) => {
     goodHits++;
@@ -64,16 +63,9 @@ test("real TLS connection uses the pinned address and rejects a rebinding answer
   });
   await new Promise((r) => good.listen(0, "127.0.0.1", r));
   const port = good.address().port;
-  const bad = https.createServer(tls, (_req, res) => {
-    badHits++;
-    res.end("PRIVATE");
-  });
-  await new Promise((r) => bad.listen(port, "127.0.0.2", r));
   t.after(async () => {
-    await Promise.all([
-      new Promise((r) => good.close(r)),
-      new Promise((r) => bad.close(r)),
-    ]);
+    good.closeAllConnections();
+    await new Promise((r) => good.close(r));
     await fs.rm(dir, { recursive: true, force: true });
   });
   const origin = `https://fixture.test:${port}`;
@@ -109,7 +101,7 @@ test("real TLS connection uses the pinned address and rejects a rebinding answer
     forward(req, ["fixture.test"], options),
     /address_blocked/,
   );
-  assert.equal(badHits, 0);
+  assert.equal(goodHits, 1, "rebinding must be denied before another request reaches the fixture");
 });
 test("reserved IPv6 destinations never qualify as public egress", async () => {
   for (const address of [

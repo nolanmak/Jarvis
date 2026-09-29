@@ -6,24 +6,31 @@ rendered text and screenshots. It attaches to the owner's existing Chrome
 through the shared NewsletterBuddy bridge; it never launches a replacement
 profile. No NewsletterBuddy research run is needed.
 
-## Install on the Linux host
+## Install on macOS or Linux
 
-1. Run `npm ci` in this directory. Codex must already be signed in with access
+1. Install Node.js 22 or later and Python 3, then run `npm ci` in this directory. The Python launcher holds a kernel `flock(2)` lease across `exec` into Node; the `flock` command is not needed. Codex must already be signed in with access
    to `gpt-6-astra`; the worker does not silently substitute another model.
 2. Set `NEWSLETTER_CHROME_SHARED_BRIDGE=true` for the newsletter browser
    worker (NewsletterBuddy PR #29). Both workers must use the same bridge
    directory and lock directory. Leave the bridge itself running to retain
    Chrome's consented upstream connection.
-3. Link `systemd/augmentagent-computer-use.service` as a user unit with
+3. On macOS, run `scripts/install-computer-use.sh` from the repo. It installs a private per-user LaunchAgent, starts the worker, and prints the bridge readiness instruction if the bridge directory is absent. `scripts/uninstall-computer-use.sh` stops and removes that job. Set `JARVIS_COMPUTER_STATE`, `JARVIS_COMPUTER_SOCKET`, `JARVIS_COMPUTER_CHROME_BRIDGE`, and `JARVIS_COMPUTER_LOCK_DIRECTORY` to absolute paths before installation to customize its configuration. Re-run the installer to update the plist. On Linux, link `systemd/augmentagent-computer-use.service` as a user unit with
    `systemctl --user link /absolute/repo/systemd/augmentagent-computer-use.service`. Adjust
    its absolute paths if this installation uses a different layout. Enable
-   and start it. It creates an owner-only state directory, credential and Unix
+   and start it. Both service managers run `sidecars/computer-use/start.sh` and create an owner-only state directory, credential and Unix
    socket. Jarvis resolves its client path through the shared state-directory
    resolver; `JARVIS_COMPUTER_STATE` and `JARVIS_COMPUTER_SOCKET` override it.
 4. Deploy the updated Jarvis binary. Authorized Discord conversations and
    direct local `wiki ask` invocations receive `computer_task`. Non-owner
    correspondents do not receive the tool. The parent cannot provide the
    trusted conversation identity or read the service credential through it.
+
+`augmentagent service --unit augmentagent-computer-use.service status` reports
+launchd/systemd state; `augmentagent logs --unit computer-use` reads the worker
+log. The updater installs dependencies and restarts the worker only when its
+optional service is installed. The bridge may be absent at boot: the worker
+remains available and reports `chrome_debugging_required` on research tasks
+until the shared bridge and existing-Chrome consent are ready.
 
 Existing Chrome debugging consent is browser-enforced. If the bridge is not
 ready, enable the existing-session debugging setting in
