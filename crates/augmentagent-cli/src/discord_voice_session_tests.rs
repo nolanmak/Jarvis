@@ -8,13 +8,38 @@ use std::sync::Mutex;
 
 #[test]
 fn voice_socket_defaults_to_private_user_runtime_and_requires_absolute_path() {
-    assert_eq!(resolve_discord_voice_socket(false, None, None).unwrap(), None);
-    assert_eq!(resolve_discord_voice_socket(true, None, Some("/run/user/1000".into())).unwrap(),
+    assert_eq!(resolve_discord_voice_socket_for_platform(false, None, None, false).unwrap(), None);
+    assert_eq!(resolve_discord_voice_socket_for_platform(true, None, Some("/run/user/1000".into()), false).unwrap(),
         Some(PathBuf::from("/run/user/1000/augmentagent/discord-voice.sock")));
-    assert_eq!(resolve_discord_voice_socket(true, Some("/private/voice.sock".into()),
-        Some("/run/user/1000".into())).unwrap(), Some(PathBuf::from("/private/voice.sock")));
-    assert!(resolve_discord_voice_socket(true, None, None).is_err());
-    assert!(resolve_discord_voice_socket(true, Some("relative.sock".into()), None).is_err());
+    assert_eq!(resolve_discord_voice_socket_for_platform(true, Some("/private/voice.sock".into()),
+        Some("/run/user/1000".into()), false).unwrap(), Some(PathBuf::from("/private/voice.sock")));
+    assert!(resolve_discord_voice_socket_for_platform(true, None, None, false).is_err());
+    assert!(resolve_discord_voice_socket_for_platform(true, Some("relative.sock".into()), None, false).is_err());
+}
+
+#[test]
+fn mac_voice_socket_matches_managed_sidecar_without_xdg_runtime() {
+    let uid = unsafe { libc::getuid() };
+    let expected = PathBuf::from(format!("/tmp/augmentagent-{uid}/discord-voice.sock"));
+    assert_eq!(
+        resolve_discord_voice_socket_for_platform(true, None, None, true).unwrap(),
+        Some(expected.clone())
+    );
+    assert_eq!(
+        resolve_discord_voice_socket_for_platform(true, None, Some("/tmp/xdg".into()), true).unwrap(),
+        Some(expected)
+    );
+    assert_eq!(
+        resolve_discord_voice_socket_for_platform(true, Some("/tmp/explicit.sock".into()), None, true).unwrap(),
+        Some(PathBuf::from("/tmp/explicit.sock"))
+    );
+    assert_eq!(
+        resolve_discord_voice_socket_for_platform(false, None, None, true).unwrap(),
+        None
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(resolve_discord_voice_socket(true, None, None).unwrap(),
+               Some(PathBuf::from(format!("/tmp/augmentagent-{uid}/discord-voice.sock"))));
 }
 
 struct McpCaptureFixture(Arc<Mutex<Vec<(Option<serde_json::Value>, Vec<String>)>>>);

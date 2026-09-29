@@ -13779,9 +13779,21 @@ fn resolve_discord_voice_socket(
     explicit: Option<std::ffi::OsString>,
     runtime: Option<std::ffi::OsString>,
 ) -> Result<Option<PathBuf>> {
+    resolve_discord_voice_socket_for_platform(enabled, explicit, runtime, cfg!(target_os = "macos"))
+}
+
+fn resolve_discord_voice_socket_for_platform(
+    enabled: bool,
+    explicit: Option<std::ffi::OsString>,
+    runtime: Option<std::ffi::OsString>,
+    macos: bool,
+) -> Result<Option<PathBuf>> {
     if !enabled { return Ok(None); }
     let path = explicit.filter(|value| !value.is_empty())
         .map(PathBuf::from)
+        .or_else(|| macos.then(|| PathBuf::from(format!(
+            "/tmp/augmentagent-{}/discord-voice.sock", unsafe { libc::getuid() }
+        ))))
         .or_else(|| runtime.filter(|value| !value.is_empty())
             .map(|value| PathBuf::from(value).join("augmentagent/discord-voice.sock")))
         .context("Discord voice needs AUGMENTAGENT_DISCORD_VOICE_SOCKET or XDG_RUNTIME_DIR")?;
