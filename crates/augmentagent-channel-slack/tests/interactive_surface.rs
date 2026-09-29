@@ -110,6 +110,8 @@ impl SocketConnector for DuplexConnector {
 struct FakeHandler {
     turns: Mutex<Vec<(SlackTurn, Instant)>>,
     hold: AtomicBool,
+    /// Hold only turns whose text contains "slow".
+    hold_slow: AtomicBool,
     release: Notify,
     fail: AtomicBool,
     started: Notify,
@@ -146,7 +148,9 @@ impl SlackTurnHandler for FakeHandler {
             .unwrap()
             .push((turn.clone(), Instant::now()));
         self.started.notify_one();
-        if self.hold.load(Ordering::SeqCst) {
+        if self.hold.load(Ordering::SeqCst)
+            || (self.hold_slow.load(Ordering::SeqCst) && turn.text.contains("slow"))
+        {
             self.release.notified().await;
         }
         if self.fail.load(Ordering::SeqCst) {
@@ -570,6 +574,107 @@ async fn redelivered_envelope_produces_one_turn_and_one_answer() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(handler.calls(), 1);
     assert_eq!(h.posts().len(), 1);
+    running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_turn_in_one_conversation_does_not_hold_up_another() {
+    let h = Harness::new();
+    let (connector, mut servers) = DuplexConnector::new();
+    let handler = Arc::new(FakeHandler::default());
+    handler.hold_slow.store(true, Ordering::SeqCst);
+    let running = start(h.surface(Arc::clone(&h.store), connector, handler.clone(), false));
+    let mut server = Server::accept(&mut servers).await;
+
+    // A long turn in the DM...
+    server
+        .send(&owner_dm(
+            "env-1",
+            "a slow research question",
+            "1700000000.000100",
+        ))
+        .await;
+    server.ack().await;
+    eventually("slow turn running", || handler.calls() == 1).await;
+    // ...while the owner asks something in the control channel and a
+    // stranger writes to the app.
+    let sent_at = Instant::now();
+    server
+        .send(&message(
+            "env-2",
+            CONTROL,
+            "group",
+            OWNER,
+            "quick one",
+            "1700000000.000200",
+        ))
+        .await;
+    server.ack().await;
+    server
+        .send(&message(
+            "env-3",
+            STRANGER_DM,
+            "im",
+            STRANGER,
+            "hello?",
+            "1700000000.000300",
+        ))
+        .await;
+    server.ack().await;
+
+    eventually("second turn started", || handler.calls() == 2).await;
+    let started = handler.turns.lock().unwrap()[1].1;
+    assert!(
+        started.duration_since(sent_at) < Duration::from_secs(1),
+        "blocked for {:?}",
+        started.duration_since(sent_at)
+    );
+    eventually("quick answer and rejection posted", || h.posts().len() == 2).await;
+    let texts: Vec<String> = h.posts().iter().map(|p| p.text.clone()).collect();
+    assert!(
+        texts.contains(&"answer: quick one".to_string()),
+        "{texts:?}"
+    );
+    assert!(texts.contains(&REJECTION_REPLY.to_string()), "{texts:?}");
+
+    handler.release.notify_one();
+    eventually("slow answer posted", || h.posts().len() == 3).await;
+    running.stop().await;
+}
+
+// A second message in the same conversation still waits for the first:
+// per-conversation order is the store's guarantee.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turns_in_one_conversation_stay_in_order() {
+    let h = Harness::new();
+    let (connector, mut servers) = DuplexConnector::new();
+    let handler = Arc::new(FakeHandler::default());
+    handler.hold_slow.store(true, Ordering::SeqCst);
+    let running = start(h.surface(Arc::clone(&h.store), connector, handler.clone(), false));
+    let mut server = Server::accept(&mut servers).await;
+
+    server
+        .send(&owner_dm("env-1", "slow first", "1700000000.000100"))
+        .await;
+    server.ack().await;
+    server
+        .send(&owner_dm("env-2", "second", "1700000000.000200"))
+        .await;
+    server.ack().await;
+    eventually("first turn running", || handler.calls() == 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        handler.calls(),
+        1,
+        "the DM's second message waits for its first"
+    );
+    handler.release.notify_one();
+    eventually("both answered in order", || h.posts().len() == 2).await;
+    assert_eq!(
+        handler.texts(),
+        vec!["slow first".to_string(), "second".to_string()]
+    );
+    assert_eq!(h.posts()[0].text, "answer: slow first");
     running.stop().await;
 }
 

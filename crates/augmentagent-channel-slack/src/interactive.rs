@@ -147,6 +147,8 @@ pub struct SlackSurfaceConfig {
     pub max_inbound_attempts: u32,
     /// Attempts per outbound send.
     pub max_send_attempts: u32,
+    /// Turns (in different conversations) that may run at once.
+    pub max_concurrent_turns: usize,
     pub retry: RetryPolicy,
     /// Fallback wake for the dispatcher and sender (retries, recovered rows).
     pub idle_poll: Duration,
@@ -161,6 +163,7 @@ impl Default for SlackSurfaceConfig {
             dry_run: false,
             max_inbound_attempts: 3,
             max_send_attempts: 5,
+            max_concurrent_turns: 4,
             retry: RetryPolicy {
                 base_delay_ms: 2_000,
                 max_delay_ms: 300_000,
@@ -904,12 +907,15 @@ async fn health_loop(ctx: Arc<Ctx>, shutdown: CancellationToken) {
     }
 }
 
+/// Claims and runs events, up to [`SlackSurfaceConfig::max_concurrent_turns`]
+/// at once. The store never hands out a second event of a conversation
+/// (thread) that has one claimed, so turns run concurrently across
+/// conversations and strictly in order within one.
 async fn dispatch_loop(ctx: Arc<Ctx>, shutdown: CancellationToken) {
+    let mut running = tokio::task::JoinSet::new();
+    let limit = ctx.config.max_concurrent_turns.max(1);
     loop {
-        loop {
-            if shutdown.is_cancelled() {
-                return;
-            }
+        while running.len() < limit && !shutdown.is_cancelled() {
             let claimed = match ctx.store.claim_next_inbound_event_for(
                 &ctx.platform,
                 ctx.now(),
@@ -922,12 +928,26 @@ async fn dispatch_loop(ctx: Arc<Ctx>, shutdown: CancellationToken) {
                     break;
                 }
             };
-            process(&ctx, claimed, &shutdown).await;
+            let ctx = Arc::clone(&ctx);
+            let sd = shutdown.clone();
+            running.spawn(async move { process(&ctx, claimed, &sd).await });
         }
         tokio::select! {
-            _ = shutdown.cancelled() => return,
+            _ = shutdown.cancelled() => break,
             _ = ctx.dispatch_wake.notified() => {}
+            // A finished event may unblock the next one in its conversation.
+            Some(done) = running.join_next(), if !running.is_empty() => {
+                if let Err(e) = done {
+                    warn!(error = %e, "slack interactive: event task ended abnormally");
+                }
+            }
             _ = tokio::time::sleep(ctx.config.idle_poll) => {}
+        }
+    }
+    // Each running event sees the shutdown and releases its claim.
+    while let Some(done) = running.join_next().await {
+        if let Err(e) = done {
+            warn!(error = %e, "slack interactive: event task ended abnormally");
         }
     }
 }

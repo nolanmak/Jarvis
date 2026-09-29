@@ -560,7 +560,11 @@ Code: `crates/augmentagent-channel-slack/src/interactive.rs`, wired by
   lets the client acknowledge it. A store failure leaves it unacknowledged.
   Duplicates are acknowledged and dropped.
 - **Dispatcher.** Woken by each new row (fallback poll 5 s), it claims
-  Slack's events only (`claim_next_inbound_event_for`), re-parses the
+  Slack's events only (`claim_next_inbound_event_for`) and runs up to four
+  at once: the store never hands out a second event of a conversation or
+  thread that has one claimed, so a slow turn in the DM does not hold up
+  the control channel or a rejection, and one conversation stays in order.
+  Each event: re-parse the
   stored frame, reloads the owner bindings and runs `owner::admit`. Owner
   input goes to a `SlackTurnHandler`; rejections are replied to (DM through
   the outbox, channel via `chat.postEphemeral`, which history cannot
