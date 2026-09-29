@@ -612,7 +612,8 @@ enum Cmd {
         #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         json: Option<bool>,
         /// Add slower probes (Composio whoami ping; Cerebras model-catalog
-        /// check; per-channel validate summaries sourced from `status`).
+        /// check; per-channel validate summaries sourced from `status`;
+        /// granted vs required Slack app scopes from the stored install).
         #[arg(long, default_value_t = false)]
         deep: bool,
         /// Explicitly write, read and delete one disposable macOS Keychain
@@ -2796,6 +2797,7 @@ async fn main() -> Result<()> {
                 },
                 _ => None,
             };
+            let mut broker_error = None;
             let (broker, approver) = match build_approval_surfaces(
                 &cli,
                 Arc::clone(&store),
@@ -2812,9 +2814,12 @@ async fn main() -> Result<()> {
                         "discord approval broker disabled: {e:#}. Other surfaces keep running; \
                          fix the Discord settings and restart the daemon."
                     );
+                    broker_error = Some(format!("{e:#}"));
                     (Arc::new(NoopBroker) as Arc<dyn ApprovalBroker>, None)
                 }
             };
+            // #1299 — make this start visible to `status`/`doctor`.
+            status::record_daemon_start(&store, dry_run, broker_error.as_deref());
             // Default (no_email=false) keeps the exact prod path: build + `?`
             // propagate + unconditional spawn. `--no-email true` makes a
             // tenant agent that runs Discord/GitHub/Meetup/Drive only.

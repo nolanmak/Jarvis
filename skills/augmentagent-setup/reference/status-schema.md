@@ -73,9 +73,29 @@ they must agree.
       "last_event_unix": 1747856000,
       "last_send_unix": 1747856002,
       "state_since_unix": 1747850000,
-      "heartbeat_unix": 1747856070
+      "heartbeat_unix": 1747856070,
+      "app_installed": true,
+      "owner_bound": true,
+      "credentials": "usable",
+      "reconnects": 0
     }
   },
+  "credentials": {
+    "backend": "macos-keychain",
+    "persistent": true,
+    "insecure_file_store": false,
+    "note": null
+  },
+  "daemon_report": {
+    "pid": 4242,
+    "running": true,
+    "started_unix": 1747850000,
+    "dry_run": false,
+    "credential_backend": "macos-keychain",
+    "credential_persistent": true,
+    "insecure_file_store": false
+  },
+  "config_issues": [],
   "summary": "ok"
 }
 ```
@@ -225,7 +245,8 @@ from `channels.slack`, which describes Composio ingestion only.
   `disconnected` (the listener gave up, or the daemon stopped reporting),
   `stopped` (clean shutdown). Treat unknown values as not healthy.
 - `healthy` (boolean): true only for `connected` with a fresh report. A
-  live state whose `heartbeat_unix` is more than 60 s old is reported as
+  live state whose `heartbeat_unix` is more than 60 s old, or (#1299) whose
+  reporting daemon pid is no longer running, is reported as
   `disconnected`, never as the state it last claimed.
 - `detail` (string or null): why, for the operator. Never a secret.
 - `recovery` (string or null): what to do; surface it verbatim.
@@ -239,6 +260,78 @@ A surface that is supposed to run (`state` not `not_configured` or
 `degraded`. `augmentagent doctor` reports `interactive.slack`: ok when
 connected, not configured or disabled; error when misconfigured; warn
 otherwise, with `recovery` as the suggested action.
+
+Added in #1299 (additive; still schema `"1"`):
+
+- `app_installed` (boolean): the Slack app's install index exists in this
+  process's credential store (checked without reading a secret, so no
+  Keychain prompt).
+- `owner_bound` (boolean): an owner binding exists in the database.
+- `credentials` (string): `missing` (no install visible to this process),
+  `present` (stored, not yet proven readable by the running daemon) or
+  `usable` (the daemon's fresh `connected` report proves it read the tokens
+  and Slack accepted them). Never `usable` without that proof.
+- `reconnects` (integer or null): times the daemon that wrote the report
+  entered `reconnecting`; resets when a new daemon process reports; `null`
+  without a report.
+
+Without a daemon report, `detail` and `recovery` name the first missing
+setup step: `no interactive Slack app is installed` (install, then bind),
+`the Slack app is installed but no owner is bound` (bind, then restart), an
+owner bound without an install (install), or, with both done, the daemon
+has not reported (restart). `doctor` adds `interactive.slack.credentials`
+(ok when usable or nothing is installed; warn when present but unproven,
+suggesting `augmentagent doctor --keychain-probe` on macOS or a restart on
+Linux) and, with `--deep`, `slack_app.scopes` (granted versus required bot
+scopes from the stored install record).
+
+### credentials
+
+Added in #1299 (additive). The credential backend of the process that ran
+`status` (`augmentagent_auth::describe_default_store`).
+
+- `backend` (string): `macos-keychain`, `platform-keyring`, `keyutils`,
+  `keyring-mock` (keyring built without a persistent backend for this OS,
+  today's Linux build, #1325) or `insecure-file`
+  (`AUGMENTAGENT_INSECURE_CREDENTIAL_DIR`).
+- `persistent` (boolean): credentials outlive the process that stored them.
+- `insecure_file_store` (boolean): plaintext test store in use.
+- `note` (string or null): caveat for the operator.
+
+`doctor` reports the same as `credential_backend`: error for the plaintext
+store, warn when not persistent.
+
+### daemon_report
+
+Added in #1299 (additive). `null` until a daemon records a start. What
+`serve` recorded when it last started (`daemon_runtime_report` table):
+
+- `pid` (integer), `started_unix` (integer), `dry_run` (boolean).
+- `running` (boolean): that pid is alive now. When false the report is
+  history and contributes no `config_issues`.
+- `credential_backend`, `credential_persistent`, `insecure_file_store`: as
+  in `credentials`, for the daemon's own environment.
+
+### config_issues
+
+Added in #1299 (additive). Configuration problems, each with a fix. An
+array (possibly empty) of objects:
+
+- `id` (string): `discord.approval_broker` (a `DISCORD_BOT_TOKEN` without a
+  numeric `DISCORD_CHANNEL_ID`: serve runs without the Discord approval
+  broker), `credentials.insecure_file_store` (this process uses the
+  plaintext store), `daemon.insecure_file_store` (the running daemon does).
+  Treat unknown ids as opaque.
+- `source` (string): `cli` (found from this process's environment, which
+  includes `.env` in the working directory, like the daemon's) or `daemon`
+  (recorded by the running daemon at startup).
+- `severity` (string): `warn` or `error`.
+- `detail` (string): what is wrong. Never a secret.
+- `recovery` (string or null): what to do; surface it verbatim.
+
+Any entry turns an otherwise `ok` summary into `degraded`. `doctor`
+reports one `config.<id>` finding per entry with `recovery` as the
+suggested action, or a single ok `config_issues` finding when empty.
 
 ## Stability promise
 
@@ -272,6 +365,9 @@ otherwise, with `recovery` as the suggested action.
   about it.
 - `interactive.<surface>` drives the "is Jarvis listening" answer: trust
   `healthy`, show `detail` and `recovery` when it is false.
+- `config_issues` are listed with their `recovery` before anything else on
+  the Partial branch; `credentials.insecure_file_store` or
+  `daemon_report.insecure_file_store` true is always called out.
 
 ## Related issues
 

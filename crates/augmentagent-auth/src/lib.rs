@@ -116,6 +116,65 @@ pub fn store_for_override(dir: Option<&OsStr>) -> Arc<dyn CredentialStore> {
     }
 }
 
+/// #1299 / #1325 — which credential backend a process uses, for `doctor` and
+/// `status`. Never contains a secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendDescription {
+    /// `macos-keychain`, `secret-service`, `keyutils`, `keyring-mock`,
+    /// `insecure-file`, …
+    pub backend: &'static str,
+    /// Credentials outlive the process that stored them.
+    pub persistent: bool,
+    /// Plaintext files from [`INSECURE_FILE_STORE_ENV`].
+    pub insecure: bool,
+    /// Caveat for the operator, when there is one.
+    pub note: Option<String>,
+}
+
+/// Describe the store [`default_store`] selects in this process.
+pub fn describe_default_store() -> BackendDescription {
+    describe_store_for_override(std::env::var_os(INSECURE_FILE_STORE_ENV).as_deref())
+}
+
+/// Pure counterpart of [`describe_default_store`], same rule as
+/// [`store_for_override`]. Reads nothing from the store.
+pub fn describe_store_for_override(dir: Option<&OsStr>) -> BackendDescription {
+    if dir.is_some_and(|d| !d.is_empty()) {
+        return BackendDescription {
+            backend: "insecure-file",
+            persistent: true,
+            insecure: true,
+            note: Some(format!(
+                "{INSECURE_FILE_STORE_ENV} is set: credentials are plaintext files (tests and \
+                 local QA only)"
+            )),
+        };
+    }
+    use keyring::credential::CredentialPersistence;
+    let persistence = keyring::default::default_credential_builder().persistence();
+    let persistent = matches!(persistence, CredentialPersistence::UntilDelete);
+    let backend = if cfg!(target_os = "macos") {
+        "macos-keychain"
+    } else {
+        match persistence {
+            CredentialPersistence::UntilDelete => "platform-keyring",
+            CredentialPersistence::UntilReboot => "keyutils",
+            _ => "keyring-mock",
+        }
+    };
+    let note = (!persistent).then(|| {
+        "credentials do not outlive the process that stored them: the keyring crate is built \
+         without a persistent backend for this OS (#1325)"
+            .to_string()
+    });
+    BackendDescription {
+        backend,
+        persistent,
+        insecure: false,
+        note,
+    }
+}
+
 /// macOS Keychain / platform keyring via the `keyring` crate.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct KeychainCredentialStore;

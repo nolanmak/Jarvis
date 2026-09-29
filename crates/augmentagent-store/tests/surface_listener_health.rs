@@ -104,3 +104,69 @@ fn concurrent_opens_of_a_fresh_database_all_succeed() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// #1299 — reconnect count, kept by the store from the reported states so the
+// surface itself needs no new field.
+// ---------------------------------------------------------------------------
+
+fn with(state: &str, pid: u32, at: i64) -> SurfaceListenerHealth {
+    let mut h = connected();
+    h.state = state.into();
+    h.pid = pid;
+    h.heartbeat_at_ms = at;
+    h
+}
+
+#[test]
+fn reconnects_count_entries_into_reconnecting_for_the_reporting_daemon() {
+    let (_dir, _path, store) = temp_store();
+    assert_eq!(store.surface_listener_reconnects(&slack()).unwrap(), None);
+
+    store
+        .put_surface_listener_health(&with("connecting", 7, T0))
+        .unwrap();
+    store
+        .put_surface_listener_health(&with("connected", 7, T0 + 1))
+        .unwrap();
+    assert_eq!(
+        store.surface_listener_reconnects(&slack()).unwrap(),
+        Some(0)
+    );
+
+    // One outage, reported by several heartbeats, is one reconnect.
+    for at in [T0 + 2, T0 + 3, T0 + 4] {
+        store
+            .put_surface_listener_health(&with("reconnecting", 7, at))
+            .unwrap();
+    }
+    store
+        .put_surface_listener_health(&with("connected", 7, T0 + 5))
+        .unwrap();
+    store
+        .put_surface_listener_health(&with("reconnecting", 7, T0 + 6))
+        .unwrap();
+    store
+        .put_surface_listener_health(&with("connected", 7, T0 + 7))
+        .unwrap();
+    assert_eq!(
+        store.surface_listener_reconnects(&slack()).unwrap(),
+        Some(2)
+    );
+
+    // A new daemon process starts counting again.
+    store
+        .put_surface_listener_health(&with("connecting", 8, T0 + 8))
+        .unwrap();
+    assert_eq!(
+        store.surface_listener_reconnects(&slack()).unwrap(),
+        Some(0)
+    );
+    store
+        .put_surface_listener_health(&with("reconnecting", 8, T0 + 9))
+        .unwrap();
+    assert_eq!(
+        store.surface_listener_reconnects(&slack()).unwrap(),
+        Some(1)
+    );
+}

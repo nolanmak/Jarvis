@@ -98,6 +98,12 @@ pub struct StatusDoc {
     pub queue: QueueStatus,
     pub delivery: BTreeMap<String, DeliveryStatus>,
     pub interactive: BTreeMap<String, InteractiveStatus>,
+    /// #1299 — the credential backend this process uses.
+    pub credentials: CredentialsStatus,
+    /// #1299 — what the daemon recorded at its last start.
+    pub daemon_report: Option<DaemonReportStatus>,
+    /// #1299 — configuration problems, each with a recovery step.
+    pub config_issues: Vec<ConfigIssue>,
     pub summary: String,
 }
 
@@ -165,7 +171,7 @@ const DELIVERY_SURFACES: &[&str] = &["discord", "slack", "whatsapp"];
 /// reported it. `healthy` is true only for a `connected` listener whose
 /// report is fresh; a report that stopped being refreshed reads as
 /// `disconnected`, never as the last state it claimed.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InteractiveStatus {
     /// `not_configured`, `disabled`, `misconfigured`, `connecting`,
     /// `connected`, `reconnecting`, `disconnected` or `stopped`.
@@ -180,6 +186,32 @@ pub struct InteractiveStatus {
     pub last_send_unix: Option<i64>,
     pub state_since_unix: Option<i64>,
     pub heartbeat_unix: Option<i64>,
+    /// #1299 — an install record exists in this process's credential store
+    /// (checked without reading the secret).
+    pub app_installed: bool,
+    /// #1299 — an owner binding exists in the database.
+    pub owner_bound: bool,
+    /// #1299 — `missing` (no install record visible here), `present`
+    /// (stored, not yet proven usable by the running daemon) or `usable`
+    /// (the daemon's fresh `connected` report proves it read them and Slack
+    /// accepted the app-level token). Never `usable` without that proof.
+    pub credentials: String,
+    /// #1299 — entries into `reconnecting` by the daemon that wrote the
+    /// report; `None` without a report.
+    pub reconnects: Option<i64>,
+}
+
+/// #1299 — what `status` knows about the Slack setup besides the daemon's
+/// report.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SlackSetup {
+    pub app_installed: bool,
+    pub owner_bound: bool,
+    pub reconnects: Option<i64>,
+    /// Whether the process that wrote the report is still alive; `None`
+    /// when unknown (no report). A dead reporter's live state is not
+    /// trusted even while its heartbeat is fresh.
+    pub reporter_running: Option<bool>,
 }
 
 /// Interactive surfaces always listed under `interactive`.
@@ -187,19 +219,40 @@ const INTERACTIVE_SURFACES: &[&str] = &["slack"];
 
 const RESTART_DAEMON: &str = "augmentagent service --unit daemon restart";
 
-/// Fold the daemon's last report (if any) into what `status` shows.
-/// `owner_bound`: a Slack owner binding exists, so the surface is expected
-/// to run once the daemon starts.
+const INSTALL_RECOVERY: &str =
+    "Install the Slack app (`augmentagent slack app install --stdin`, see \
+     docs/SLACK-RUNBOOK.md), bind yourself with `augmentagent slack app owner bind --user \
+     <member_id>`, then start the daemon (`augmentagent service --unit daemon restart`).";
+
+/// Fold the daemon's last report (if any) into what `status` shows. Without
+/// a report, the detail names the first missing setup step (#1299).
 pub fn interactive_status(
     report: Option<augmentagent_store::surface_health::SurfaceListenerHealth>,
-    owner_bound: bool,
+    setup: SlackSetup,
     now_ms: i64,
 ) -> InteractiveStatus {
     use augmentagent_channel_slack::interactive::{SurfaceState, STALE_AFTER};
     let secs = |ms: i64| ms / 1000;
+    let unproven = if setup.app_installed {
+        "present"
+    } else {
+        "missing"
+    };
+    let base = InteractiveStatus {
+        app_installed: setup.app_installed,
+        owner_bound: setup.owner_bound,
+        credentials: unproven.into(),
+        ..Default::default()
+    };
     let Some(r) = report else {
-        return if owner_bound {
-            InteractiveStatus {
+        let not_configured = |detail: &str, recovery: String| InteractiveStatus {
+            state: SurfaceState::NotConfigured.as_str().into(),
+            detail: Some(detail.into()),
+            recovery: Some(recovery),
+            ..base.clone()
+        };
+        return match (setup.app_installed, setup.owner_bound) {
+            (true, true) => InteractiveStatus {
                 state: SurfaceState::Disconnected.as_str().into(),
                 detail: Some(
                     "the daemon has not reported this surface (it is not running, or it \
@@ -208,22 +261,30 @@ pub fn interactive_status(
                 ),
                 recovery: Some(format!(
                     "Start or restart the daemon (`{RESTART_DAEMON}`); if it is running, \
-                     check `augmentagent logs`."
+                     check `augmentagent logs --unit daemon`."
                 )),
-                ..Default::default()
-            }
-        } else {
-            InteractiveStatus {
-                state: SurfaceState::NotConfigured.as_str().into(),
-                detail: Some("no Slack owner is bound".into()),
-                recovery: Some(
-                    "Install the Slack app (`augmentagent slack app install --stdin`, see \
-                     docs/SLACK-APP.md), bind yourself with `augmentagent slack app owner bind \
-                     --user <member_id>`, then start the daemon."
-                        .into(),
+                ..base
+            },
+            (false, false) => not_configured(
+                "no interactive Slack app is installed",
+                INSTALL_RECOVERY.into(),
+            ),
+            (true, false) => not_configured(
+                "the Slack app is installed but no owner is bound",
+                format!(
+                    "Bind yourself as owner: `augmentagent slack app owner bind --user \
+                     <member_id>` (add --team <team_id> when several workspaces are \
+                     installed), then restart the daemon (`{RESTART_DAEMON}`)."
                 ),
-                ..Default::default()
-            }
+            ),
+            (false, true) => not_configured(
+                "an owner is bound but no Slack app is installed (or its credentials are not \
+                 visible to this process)",
+                format!(
+                    "Install the Slack app (`augmentagent slack app install --stdin`, see \
+                     docs/SLACK-RUNBOOK.md), then restart the daemon (`{RESTART_DAEMON}`)."
+                ),
+            ),
         };
     };
     let mut out = InteractiveStatus {
@@ -237,10 +298,21 @@ pub fn interactive_status(
         last_send_unix: r.last_send_at_ms.map(secs),
         state_since_unix: Some(secs(r.state_since_ms)),
         heartbeat_unix: Some(secs(r.heartbeat_at_ms)),
+        reconnects: setup.reconnects,
+        ..base
     };
     let live = SurfaceState::parse(&r.state).is_some_and(SurfaceState::is_live);
     let age_ms = now_ms.saturating_sub(r.heartbeat_at_ms);
-    if live && age_ms > STALE_AFTER.as_millis() as i64 {
+    if live && setup.reporter_running == Some(false) {
+        out.state = SurfaceState::Disconnected.as_str().into();
+        out.detail = Some(format!(
+            "the daemon that reported it (pid {}) is no longer running; its last report was `{}`",
+            r.pid, r.state
+        ));
+        out.recovery = Some(format!(
+            "Start the daemon (`{RESTART_DAEMON}`) and check `augmentagent logs --unit daemon`."
+        ));
+    } else if live && age_ms > STALE_AFTER.as_millis() as i64 {
         out.state = SurfaceState::Disconnected.as_str().into();
         out.detail = Some(format!(
             "no heartbeat from the daemon (pid {}) for {}s; its last report was `{}`",
@@ -250,11 +322,256 @@ pub fn interactive_status(
         ));
         out.recovery = Some(format!(
             "The daemon is not running or is stuck. Restart it (`{RESTART_DAEMON}`) and check \
-             `augmentagent logs`."
+             `augmentagent logs --unit daemon`."
         ));
     }
     out.healthy = SurfaceState::parse(&out.state).is_some_and(SurfaceState::is_healthy);
+    if out.healthy {
+        out.credentials = "usable".into();
+    }
     out
+}
+
+// ---------------------------------------------------------------------------
+// #1299 — credential backend, the daemon's start report, config issues.
+// ---------------------------------------------------------------------------
+
+/// The credential backend this `status` process uses (`default_store`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialsStatus {
+    pub backend: String,
+    pub persistent: bool,
+    pub insecure_file_store: bool,
+    pub note: Option<String>,
+}
+
+impl From<&augmentagent_auth::BackendDescription> for CredentialsStatus {
+    fn from(d: &augmentagent_auth::BackendDescription) -> Self {
+        Self {
+            backend: d.backend.to_string(),
+            persistent: d.persistent,
+            insecure_file_store: d.insecure,
+            note: d.note.clone(),
+        }
+    }
+}
+
+impl CredentialsStatus {
+    fn to_json(&self) -> Value {
+        json!({
+            "backend": self.backend,
+            "persistent": self.persistent,
+            "insecure_file_store": self.insecure_file_store,
+            "note": self.note,
+        })
+    }
+}
+
+/// The daemon's own record of its last start (`daemon_runtime_report`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonReportStatus {
+    pub pid: u32,
+    /// The recorded pid is alive, so the report describes a running daemon.
+    pub running: bool,
+    pub started_unix: i64,
+    pub dry_run: bool,
+    pub credential_backend: String,
+    pub credential_persistent: bool,
+    pub insecure_file_store: bool,
+}
+
+impl DaemonReportStatus {
+    pub fn from_report(
+        r: &augmentagent_store::daemon_report::DaemonRuntimeReport,
+        running: bool,
+    ) -> Self {
+        Self {
+            pid: r.pid,
+            running,
+            started_unix: r.started_at_ms / 1000,
+            dry_run: r.dry_run,
+            credential_backend: r.credential_backend.clone(),
+            credential_persistent: r.credential_persistent,
+            insecure_file_store: r.insecure_credential_store,
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "pid": self.pid,
+            "running": self.running,
+            "started_unix": self.started_unix,
+            "dry_run": self.dry_run,
+            "credential_backend": self.credential_backend,
+            "credential_persistent": self.credential_persistent,
+            "insecure_file_store": self.insecure_file_store,
+        })
+    }
+}
+
+/// A configuration problem and how to fix it. `source` is `cli` (found by
+/// this process from its environment) or `daemon` (recorded by the running
+/// daemon at startup).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigIssue {
+    pub id: String,
+    pub source: &'static str,
+    /// `warn` or `error`.
+    pub severity: String,
+    pub detail: String,
+    pub recovery: Option<String>,
+}
+
+impl ConfigIssue {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "source": self.source,
+            "severity": self.severity,
+            "detail": self.detail,
+            "recovery": self.recovery,
+        })
+    }
+}
+
+pub const DISCORD_BROKER_ISSUE: &str = "discord.approval_broker";
+pub const INSECURE_STORE_ISSUE: &str = "credentials.insecure_file_store";
+pub const DAEMON_INSECURE_STORE_ISSUE: &str = "daemon.insecure_file_store";
+
+/// What `serve` does with Discord settings (`build_broker`): a bot token
+/// without a numeric `DISCORD_CHANNEL_ID` leaves serve running with no
+/// Discord approval broker (#1333), which only its log said. `None` when
+/// the settings are usable or Discord is not configured. Never echoes the
+/// token.
+pub fn discord_broker_issue(token: Option<&str>, channel_id: Option<&str>) -> Option<String> {
+    token.filter(|t| !t.trim().is_empty())?;
+    match channel_id.map(str::trim).filter(|c| !c.is_empty()) {
+        None => Some("DISCORD_BOT_TOKEN is set but DISCORD_CHANNEL_ID is not".into()),
+        Some(c) if c.parse::<u64>().is_err() => Some(
+            "DISCORD_BOT_TOKEN is set but DISCORD_CHANNEL_ID is not a numeric channel ID".into(),
+        ),
+        Some(_) => None,
+    }
+}
+
+pub const DISCORD_BROKER_RECOVERY: &str = "Set DISCORD_CHANNEL_ID in .env to the numeric ID of \
+     the Discord approvals channel (or remove DISCORD_BOT_TOKEN if you do not use Discord), then \
+     restart the daemon (`augmentagent service --unit daemon restart`).";
+
+pub const INSECURE_STORE_RECOVERY: &str = "unset AUGMENTAGENT_INSECURE_CREDENTIAL_DIR (remove \
+     it from .env and the service environment), store the Slack app in the Keychain/keyring with \
+     `augmentagent slack app install --stdin`, then restart the daemon (`augmentagent service \
+     --unit daemon restart`).";
+
+/// Issues this process can see from its own environment (which, like the
+/// daemon's, includes `.env` from the working directory).
+pub fn static_config_issues(
+    env: &dyn Fn(&str) -> Option<String>,
+    credentials: &augmentagent_auth::BackendDescription,
+) -> Vec<ConfigIssue> {
+    let mut out = Vec::new();
+    if let Some(why) = discord_broker_issue(
+        env("DISCORD_BOT_TOKEN").as_deref(),
+        env("DISCORD_CHANNEL_ID").as_deref(),
+    ) {
+        out.push(ConfigIssue {
+            id: DISCORD_BROKER_ISSUE.into(),
+            source: "cli",
+            severity: "warn".into(),
+            detail: format!(
+                "{why}: serve runs without the Discord approval broker, so Discord approvals \
+                 and queries are off (other surfaces keep running)"
+            ),
+            recovery: Some(DISCORD_BROKER_RECOVERY.into()),
+        });
+    }
+    if credentials.insecure {
+        out.push(ConfigIssue {
+            id: INSECURE_STORE_ISSUE.into(),
+            source: "cli",
+            severity: "error".into(),
+            detail: format!(
+                "{} is set for this process: credentials are read from and written to plaintext \
+                 files (tests and local QA only)",
+                augmentagent_auth::INSECURE_FILE_STORE_ENV
+            ),
+            recovery: Some(INSECURE_STORE_RECOVERY.into()),
+        });
+    }
+    out
+}
+
+/// Issues from the daemon's start report; only while that daemon runs.
+pub fn daemon_issues(
+    report: Option<&augmentagent_store::daemon_report::DaemonRuntimeReport>,
+    running: bool,
+) -> Vec<ConfigIssue> {
+    let Some(r) = report.filter(|_| running) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if r.insecure_credential_store {
+        out.push(ConfigIssue {
+            id: DAEMON_INSECURE_STORE_ISSUE.into(),
+            source: "daemon",
+            severity: "error".into(),
+            detail: format!(
+                "the running daemon (pid {}) reads its credentials from plaintext files: {} was \
+                 set when it started",
+                r.pid,
+                augmentagent_auth::INSECURE_FILE_STORE_ENV
+            ),
+            recovery: Some(INSECURE_STORE_RECOVERY.into()),
+        });
+    }
+    out.extend(r.notices.iter().map(|n| ConfigIssue {
+        id: n.id.clone(),
+        source: "daemon",
+        severity: n.severity.clone(),
+        detail: n.detail.clone(),
+        recovery: n.recovery.clone(),
+    }));
+    out
+}
+
+/// #1299 — `serve` records how it started, so `status` and `doctor` in
+/// another process can flag a daemon on the plaintext credential store and
+/// the Discord approval broker it had to leave off. Never fails serve.
+pub fn record_daemon_start(store: &Store, dry_run: bool, discord_broker_error: Option<&str>) {
+    let backend = augmentagent_auth::describe_default_store();
+    let mut notices = Vec::new();
+    if let Some(err) = discord_broker_error {
+        notices.push(augmentagent_store::daemon_report::DaemonNotice {
+            id: DISCORD_BROKER_ISSUE.into(),
+            severity: "warn".into(),
+            detail: format!(
+                "the Discord approval broker is off: {err}. Discord approvals and queries do \
+                 not work; other surfaces keep running"
+            ),
+            recovery: Some(if err.contains("DISCORD_CHANNEL_ID") {
+                DISCORD_BROKER_RECOVERY.into()
+            } else {
+                "Fix the Discord setting named above in .env, then restart the daemon \
+                 (`augmentagent service --unit daemon restart`)."
+                    .into()
+            }),
+        });
+    }
+    let report = augmentagent_store::daemon_report::DaemonRuntimeReport {
+        pid: std::process::id(),
+        started_at_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0),
+        dry_run,
+        credential_backend: backend.backend.to_string(),
+        credential_persistent: backend.persistent,
+        insecure_credential_store: backend.insecure,
+        notices,
+    };
+    if let Err(e) = store.put_daemon_runtime_report(&report) {
+        tracing::warn!(error = %e, "could not record the daemon start report for status");
+    }
 }
 
 /// A surface that is supposed to run but is not healthy.
@@ -273,10 +590,20 @@ fn collect_interactive(store: &Store, now_ms: i64) -> Result<BTreeMap<String, In
             .surface_owner_bindings(&platform)
             .context("surface owner bindings")?
             .is_empty();
-        out.insert(
-            name.to_string(),
-            interactive_status(report, owner_bound, now_ms),
-        );
+        let setup = SlackSetup {
+            // The install index slot, checked without reading any secret (no
+            // Keychain prompt). Same store the daemon's `slack app` code uses.
+            app_installed: augmentagent_auth::Auth::exists(
+                augmentagent_channel_slack::app::APP_CREDENTIAL_PLATFORM,
+                augmentagent_channel_slack::app::APP_INDEX_ACCOUNT,
+            ),
+            owner_bound,
+            reconnects: store
+                .surface_listener_reconnects(&platform)
+                .context("surface listener reconnects")?,
+            reporter_running: report.as_ref().map(|r| crate::platform::pid_alive(r.pid)),
+        };
+        out.insert(name.to_string(), interactive_status(report, setup, now_ms));
     }
     Ok(out)
 }
@@ -394,6 +721,9 @@ impl StatusDoc {
                     .map(|(k, v)| (k.clone(), v.to_json()))
                     .collect(),
             ),
+            "credentials": self.credentials.to_json(),
+            "daemon_report": self.daemon_report.as_ref().map(DaemonReportStatus::to_json),
+            "config_issues": self.config_issues.iter().map(ConfigIssue::to_json).collect::<Vec<_>>(),
             "summary": self.summary,
         })
     }
@@ -424,6 +754,10 @@ impl InteractiveStatus {
             "last_send_unix": self.last_send_unix,
             "state_since_unix": self.state_since_unix,
             "heartbeat_unix": self.heartbeat_unix,
+            "app_installed": self.app_installed,
+            "owner_bound": self.owner_bound,
+            "credentials": self.credentials,
+            "reconnects": self.reconnects,
         })
     }
 }
@@ -491,7 +825,28 @@ pub async fn collect(store: &Store) -> Result<StatusDoc> {
         .unwrap_or(0);
     let interactive = collect_interactive(store, now_ms)?;
 
-    let summary = classify(&daemon, &dashboard, &core_keys, &channels, &interactive);
+    let backend = augmentagent_auth::describe_default_store();
+    let env = |k: &str| std::env::var(k).ok();
+    let mut config_issues = static_config_issues(&env, &backend);
+    let report = store
+        .daemon_runtime_report()
+        .context("daemon runtime report")?;
+    let running = report
+        .as_ref()
+        .is_some_and(|r| crate::platform::pid_alive(r.pid));
+    config_issues.extend(daemon_issues(report.as_ref(), running));
+    let daemon_report = report
+        .as_ref()
+        .map(|r| DaemonReportStatus::from_report(r, running));
+
+    let summary = classify(
+        &daemon,
+        &dashboard,
+        &core_keys,
+        &channels,
+        &interactive,
+        &config_issues,
+    );
 
     Ok(StatusDoc {
         schema_version: SCHEMA_VERSION.to_string(),
@@ -504,6 +859,9 @@ pub async fn collect(store: &Store) -> Result<StatusDoc> {
         queue,
         delivery,
         interactive,
+        credentials: CredentialsStatus::from(&backend),
+        daemon_report,
+        config_issues,
         summary,
     })
 }
@@ -913,6 +1271,7 @@ fn classify(
     core: &CoreKeys,
     channels: &BTreeMap<String, ChannelStatus>,
     interactive: &BTreeMap<String, InteractiveStatus>,
+    config_issues: &[ConfigIssue],
 ) -> String {
     if !daemon.active {
         return summary::DAEMON_DOWN.into();
@@ -930,6 +1289,10 @@ fn classify(
     }
     // #1287 — a configured interactive surface whose listener is down.
     if interactive.values().any(interactive_needs_attention) {
+        return summary::DEGRADED.into();
+    }
+    // #1299 — a configuration problem the operator has to fix.
+    if !config_issues.is_empty() {
         return summary::DEGRADED.into();
     }
     summary::OK.into()
@@ -1030,6 +1393,51 @@ fn print_interactive(doc: &StatusDoc) {
         if let Some(recovery) = &i.recovery {
             println!("  {:<10} fix: {recovery}", "");
         }
+        println!(
+            "  {:<10} app installed {} | owner bound {} | credentials {} | reconnects {}",
+            "",
+            yn(i.app_installed),
+            yn(i.owner_bound),
+            i.credentials,
+            i.reconnects
+                .map_or_else(|| "-".to_string(), |n| n.to_string()),
+        );
+    }
+    println!(
+        "\ncredentials: {}{}{}",
+        doc.credentials.backend,
+        if doc.credentials.persistent {
+            ""
+        } else {
+            " (NOT persistent)"
+        },
+        if doc.credentials.insecure_file_store {
+            " (INSECURE plaintext files)"
+        } else {
+            ""
+        },
+    );
+    if let Some(d) = &doc.daemon_report {
+        println!(
+            "daemon report: pid {} {} | credentials {}{}",
+            d.pid,
+            if d.running { "running" } else { "not running" },
+            d.credential_backend,
+            if d.insecure_file_store {
+                " (INSECURE plaintext files)"
+            } else {
+                ""
+            },
+        );
+    }
+    if !doc.config_issues.is_empty() {
+        println!("\nconfig issues:");
+        for i in &doc.config_issues {
+            println!("  [{}] {} ({}): {}", i.severity, i.id, i.source, i.detail);
+            if let Some(r) = &i.recovery {
+                println!("      fix: {r}");
+            }
+        }
     }
 }
 
@@ -1087,7 +1495,7 @@ mod tests {
             discord_bot: true,
         };
         assert_eq!(
-            classify(&d, &dash, &c, &empty_channels(), &BTreeMap::new()),
+            classify(&d, &dash, &c, &empty_channels(), &BTreeMap::new(), &[]),
             summary::DAEMON_DOWN
         );
     }
@@ -1112,7 +1520,7 @@ mod tests {
             discord_bot: true,
         };
         assert_eq!(
-            classify(&d, &dash, &c, &empty_channels(), &BTreeMap::new()),
+            classify(&d, &dash, &c, &empty_channels(), &BTreeMap::new(), &[]),
             summary::DASHBOARD_DOWN
         );
     }
@@ -1141,7 +1549,7 @@ mod tests {
             channels.insert(n.to_string(), ch(false));
         }
         assert_eq!(
-            classify(&d, &dash, &c, &channels, &BTreeMap::new()),
+            classify(&d, &dash, &c, &channels, &BTreeMap::new(), &[]),
             summary::NEEDS_SETUP
         );
     }
@@ -1170,7 +1578,7 @@ mod tests {
             channels.insert(n.to_string(), ch(false));
         }
         assert_eq!(
-            classify(&d, &dash, &c, &channels, &BTreeMap::new()),
+            classify(&d, &dash, &c, &channels, &BTreeMap::new(), &[]),
             summary::DEGRADED
         );
     }
@@ -1199,7 +1607,7 @@ mod tests {
             channels.insert(n.to_string(), ch(n == "gmail"));
         }
         assert_eq!(
-            classify(&d, &dash, &c, &channels, &BTreeMap::new()),
+            classify(&d, &dash, &c, &channels, &BTreeMap::new(), &[]),
             summary::OK
         );
     }
@@ -1286,6 +1694,15 @@ mod tests {
 
     const NOW_MS: i64 = 1_700_000_100_000;
 
+    fn setup(app_installed: bool, owner_bound: bool) -> SlackSetup {
+        SlackSetup {
+            app_installed,
+            owner_bound,
+            reconnects: None,
+            reporter_running: None,
+        }
+    }
+
     fn report(state: &str, heartbeat_age_ms: i64) -> SurfaceListenerHealth {
         SurfaceListenerHealth {
             platform: augmentagent_store::SurfacePlatform::new("slack").unwrap(),
@@ -1304,7 +1721,7 @@ mod tests {
 
     #[test]
     fn interactive_without_a_report_or_owner_is_not_configured() {
-        let s = interactive_status(None, false, NOW_MS);
+        let s = interactive_status(None, setup(false, false), NOW_MS);
         assert_eq!(s.state, "not_configured");
         assert!(!s.healthy);
         assert!(s.recovery.unwrap().contains("slack app install"));
@@ -1312,7 +1729,7 @@ mod tests {
 
     #[test]
     fn interactive_with_an_owner_but_no_report_is_disconnected() {
-        let s = interactive_status(None, true, NOW_MS);
+        let s = interactive_status(None, setup(true, true), NOW_MS);
         assert_eq!(s.state, "disconnected");
         assert!(!s.healthy);
         assert!(s
@@ -1323,7 +1740,7 @@ mod tests {
 
     #[test]
     fn a_fresh_connected_report_is_healthy_with_times_in_seconds() {
-        let s = interactive_status(Some(report("connected", 1_000)), true, NOW_MS);
+        let s = interactive_status(Some(report("connected", 1_000)), setup(true, true), NOW_MS);
         assert_eq!(s.state, "connected");
         assert!(s.healthy);
         assert_eq!(s.last_event_unix, Some((NOW_MS - 5_000) / 1000));
@@ -1333,7 +1750,11 @@ mod tests {
 
     #[test]
     fn a_connected_report_with_a_stale_heartbeat_is_never_healthy() {
-        let s = interactive_status(Some(report("connected", 10 * 60_000)), true, NOW_MS);
+        let s = interactive_status(
+            Some(report("connected", 10 * 60_000)),
+            setup(true, true),
+            NOW_MS,
+        );
         assert_eq!(s.state, "disconnected");
         assert!(!s.healthy);
         assert!(s.detail.unwrap().contains("heartbeat"));
@@ -1342,16 +1763,24 @@ mod tests {
 
     #[test]
     fn reconnecting_and_misconfigured_are_not_healthy_and_keep_recovery() {
-        let s = interactive_status(Some(report("reconnecting", 1_000)), true, NOW_MS);
+        let s = interactive_status(
+            Some(report("reconnecting", 1_000)),
+            setup(true, true),
+            NOW_MS,
+        );
         assert!(!s.healthy);
         assert_eq!(s.state, "reconnecting");
         let mut bad = report("misconfigured", 1_000);
         bad.recovery = Some("Bind yourself as owner".into());
-        let s = interactive_status(Some(bad), false, NOW_MS);
+        let s = interactive_status(Some(bad), setup(false, false), NOW_MS);
         assert_eq!(s.state, "misconfigured");
         assert_eq!(s.recovery.as_deref(), Some("Bind yourself as owner"));
         // An inactive report never goes stale: nothing is meant to run.
-        let s = interactive_status(Some(report("disabled", 10 * 60_000)), true, NOW_MS);
+        let s = interactive_status(
+            Some(report("disabled", 10 * 60_000)),
+            setup(true, true),
+            NOW_MS,
+        );
         assert_eq!(s.state, "disabled");
     }
 
@@ -1393,30 +1822,37 @@ mod tests {
         let mut interactive = BTreeMap::new();
         interactive.insert(
             "slack".to_string(),
-            interactive_status(Some(report("reconnecting", 1_000)), true, NOW_MS),
+            interactive_status(
+                Some(report("reconnecting", 1_000)),
+                setup(true, true),
+                NOW_MS,
+            ),
         );
         assert_eq!(
-            classify(&d, &dash, &c, &channels, &interactive),
+            classify(&d, &dash, &c, &channels, &interactive, &[]),
             summary::DEGRADED
         );
         interactive.insert(
             "slack".to_string(),
-            interactive_status(Some(report("connected", 1_000)), true, NOW_MS),
+            interactive_status(Some(report("connected", 1_000)), setup(true, true), NOW_MS),
         );
         assert_eq!(
-            classify(&d, &dash, &c, &channels, &interactive),
+            classify(&d, &dash, &c, &channels, &interactive, &[]),
             summary::OK
         );
-        interactive.insert("slack".to_string(), interactive_status(None, false, NOW_MS));
+        interactive.insert(
+            "slack".to_string(),
+            interactive_status(None, setup(false, false), NOW_MS),
+        );
         assert_eq!(
-            classify(&d, &dash, &c, &channels, &interactive),
+            classify(&d, &dash, &c, &channels, &interactive, &[]),
             summary::OK
         );
     }
 
     #[test]
     fn interactive_json_shape() {
-        let s = interactive_status(Some(report("connected", 1_000)), true, NOW_MS);
+        let s = interactive_status(Some(report("connected", 1_000)), setup(true, true), NOW_MS);
         let v = s.to_json();
         for key in [
             "state",
@@ -1431,6 +1867,264 @@ mod tests {
             "heartbeat_unix",
         ] {
             assert!(v.get(key).is_some(), "missing {key}");
+        }
+    }
+
+    // --- #1299 Slack diagnostics -----------------------------------------
+
+    #[test]
+    fn with_nothing_installed_the_detail_names_the_install_step() {
+        let s = interactive_status(None, setup(false, false), NOW_MS);
+        assert_eq!(s.state, "not_configured");
+        assert_eq!(
+            s.detail.as_deref(),
+            Some("no interactive Slack app is installed")
+        );
+        assert!(s.recovery.unwrap().contains("slack app install --stdin"));
+        assert!(!s.app_installed && !s.owner_bound);
+        assert_eq!(s.credentials, "missing");
+    }
+
+    #[test]
+    fn installed_without_an_owner_names_the_bind_step_not_the_install() {
+        let s = interactive_status(None, setup(true, false), NOW_MS);
+        assert_eq!(s.state, "not_configured");
+        assert_eq!(
+            s.detail.as_deref(),
+            Some("the Slack app is installed but no owner is bound")
+        );
+        let recovery = s.recovery.unwrap();
+        assert!(
+            recovery.contains("slack app owner bind --user"),
+            "{recovery}"
+        );
+        assert!(!recovery.contains("slack app install"), "{recovery}");
+        assert!(s.app_installed && !s.owner_bound);
+        assert_eq!(s.credentials, "present");
+    }
+
+    #[test]
+    fn an_owner_without_an_install_names_the_install_step() {
+        let s = interactive_status(None, setup(false, true), NOW_MS);
+        assert_eq!(s.state, "not_configured");
+        assert!(s.detail.unwrap().contains("no Slack app is installed"));
+        assert!(s.recovery.unwrap().contains("slack app install --stdin"));
+    }
+
+    #[test]
+    fn credentials_are_usable_only_when_a_fresh_connected_report_proves_it() {
+        let usable =
+            interactive_status(Some(report("connected", 1_000)), setup(true, true), NOW_MS);
+        assert_eq!(usable.credentials, "usable");
+        for (r, why) in [
+            (Some(report("connected", 10 * 60_000)), "stale report"),
+            (Some(report("reconnecting", 1_000)), "reconnecting"),
+            (Some(report("connecting", 1_000)), "connecting"),
+            (Some(report("misconfigured", 1_000)), "misconfigured"),
+            (None, "no report"),
+        ] {
+            let s = interactive_status(r, setup(true, true), NOW_MS);
+            assert_eq!(s.credentials, "present", "{why}");
+        }
+        // The daemon proved them even if this process cannot see them.
+        let s = interactive_status(Some(report("connected", 1_000)), setup(false, true), NOW_MS);
+        assert_eq!(s.credentials, "usable");
+    }
+
+    #[test]
+    fn a_live_report_from_a_daemon_that_is_gone_is_disconnected_at_once() {
+        // Heartbeat still fresh, but the pid that wrote it has exited (a
+        // SIGTERM or crash leaves no `stopped` report): not healthy.
+        let mut gone = setup(true, true);
+        gone.reporter_running = Some(false);
+        for state in ["connected", "reconnecting", "connecting"] {
+            let s = interactive_status(Some(report(state, 1_000)), gone.clone(), NOW_MS);
+            assert_eq!(s.state, "disconnected", "{state}");
+            assert!(!s.healthy);
+            assert_eq!(s.credentials, "present");
+            assert!(s.detail.unwrap().contains("pid 4242"));
+            assert!(s
+                .recovery
+                .unwrap()
+                .contains("service --unit daemon restart"));
+        }
+        // An inactive report is kept as written.
+        let s = interactive_status(Some(report("stopped", 1_000)), gone.clone(), NOW_MS);
+        assert_eq!(s.state, "stopped");
+        // Unknown liveness falls back to the heartbeat rule.
+        let s = interactive_status(Some(report("connected", 1_000)), setup(true, true), NOW_MS);
+        assert!(s.healthy);
+        let mut alive = setup(true, true);
+        alive.reporter_running = Some(true);
+        let s = interactive_status(Some(report("connected", 1_000)), alive, NOW_MS);
+        assert!(s.healthy);
+    }
+
+    #[test]
+    fn reconnects_come_from_the_store_and_are_null_without_a_report() {
+        let mut with_count = setup(true, true);
+        with_count.reconnects = Some(3);
+        let s = interactive_status(Some(report("connected", 1_000)), with_count.clone(), NOW_MS);
+        assert_eq!(s.reconnects, Some(3));
+        let s = interactive_status(None, with_count, NOW_MS);
+        assert_eq!(s.reconnects, None);
+    }
+
+    fn env_of(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    fn keychain() -> augmentagent_auth::BackendDescription {
+        augmentagent_auth::BackendDescription {
+            backend: "macos-keychain",
+            persistent: true,
+            insecure: false,
+            note: None,
+        }
+    }
+
+    #[test]
+    fn a_discord_token_without_a_usable_channel_id_is_a_config_issue_with_recovery() {
+        for env in [
+            env_of(&[("DISCORD_BOT_TOKEN", "synthetic-not-a-token")]),
+            env_of(&[
+                ("DISCORD_BOT_TOKEN", "synthetic-not-a-token"),
+                ("DISCORD_CHANNEL_ID", "general"),
+            ]),
+        ] {
+            let issues = static_config_issues(&env, &keychain());
+            let i = issues
+                .iter()
+                .find(|i| i.id == "discord.approval_broker")
+                .expect("discord issue");
+            assert_eq!(i.source, "cli");
+            assert_eq!(i.severity, "warn");
+            assert!(i.detail.contains("DISCORD_CHANNEL_ID"));
+            assert!(
+                !i.detail.contains("synthetic-not-a-token"),
+                "never echo the token"
+            );
+            assert!(i
+                .recovery
+                .as_deref()
+                .unwrap()
+                .contains("service --unit daemon restart"));
+        }
+        for fine in [
+            env_of(&[]),
+            env_of(&[("DISCORD_BOT_TOKEN", "")]),
+            env_of(&[
+                ("DISCORD_BOT_TOKEN", "synthetic-not-a-token"),
+                ("DISCORD_CHANNEL_ID", "123456789"),
+            ]),
+        ] {
+            assert!(static_config_issues(&fine, &keychain()).is_empty());
+        }
+    }
+
+    #[test]
+    fn the_insecure_credential_store_in_this_process_is_an_error_issue() {
+        let insecure =
+            augmentagent_auth::describe_store_for_override(Some(std::ffi::OsStr::new("/x")));
+        let issues = static_config_issues(&env_of(&[]), &insecure);
+        let i = issues
+            .iter()
+            .find(|i| i.id == "credentials.insecure_file_store")
+            .expect("insecure issue");
+        assert_eq!(i.severity, "error");
+        assert!(i.detail.contains("AUGMENTAGENT_INSECURE_CREDENTIAL_DIR"));
+        assert!(i
+            .recovery
+            .as_deref()
+            .unwrap()
+            .contains("unset AUGMENTAGENT_INSECURE_CREDENTIAL_DIR"));
+    }
+
+    fn daemon_report(insecure: bool) -> augmentagent_store::daemon_report::DaemonRuntimeReport {
+        augmentagent_store::daemon_report::DaemonRuntimeReport {
+            pid: 4242,
+            started_at_ms: NOW_MS - 60_000,
+            dry_run: false,
+            credential_backend: if insecure {
+                "insecure-file"
+            } else {
+                "macos-keychain"
+            }
+            .into(),
+            credential_persistent: true,
+            insecure_credential_store: insecure,
+            notices: vec![augmentagent_store::daemon_report::DaemonNotice {
+                id: "discord.approval_broker".into(),
+                severity: "warn".into(),
+                detail: "Discord approval broker disabled".into(),
+                recovery: Some("Set DISCORD_CHANNEL_ID".into()),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_running_daemons_report_adds_its_notices_and_flags_an_insecure_store() {
+        let r = daemon_report(true);
+        let issues = daemon_issues(Some(&r), true);
+        let ids: Vec<&str> = issues.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["daemon.insecure_file_store", "discord.approval_broker"]
+        );
+        assert!(issues.iter().all(|i| i.source == "daemon"));
+        assert_eq!(issues[0].severity, "error");
+        // A daemon that is no longer running reports nothing current.
+        assert!(daemon_issues(Some(&r), false).is_empty());
+        assert!(daemon_issues(None, true).is_empty());
+        let clean = daemon_issues(Some(&daemon_report(false)), true);
+        assert_eq!(clean.len(), 1);
+    }
+
+    #[test]
+    fn any_config_issue_degrades_an_otherwise_ok_summary() {
+        let (d, dash, c, channels) = ok_daemon();
+        let interactive = BTreeMap::new();
+        let issues = daemon_issues(Some(&daemon_report(false)), true);
+        assert_eq!(
+            classify(&d, &dash, &c, &channels, &interactive, &issues),
+            summary::DEGRADED
+        );
+    }
+
+    #[test]
+    fn json_carries_the_1299_fields() {
+        let mut with_count = setup(true, true);
+        with_count.reconnects = Some(2);
+        let v = interactive_status(Some(report("connected", 1_000)), with_count, NOW_MS).to_json();
+        assert_eq!(v["app_installed"], true);
+        assert_eq!(v["owner_bound"], true);
+        assert_eq!(v["credentials"], "usable");
+        assert_eq!(v["reconnects"], 2);
+        let issue = &daemon_issues(Some(&daemon_report(true)), true)[0];
+        let j = issue.to_json();
+        for key in ["id", "source", "severity", "detail", "recovery"] {
+            assert!(j.get(key).is_some(), "missing {key}");
+        }
+        let d = DaemonReportStatus::from_report(&daemon_report(true), true).to_json();
+        for key in [
+            "pid",
+            "running",
+            "started_unix",
+            "dry_run",
+            "credential_backend",
+            "credential_persistent",
+            "insecure_file_store",
+        ] {
+            assert!(d.get(key).is_some(), "missing {key}");
+        }
+        let c = CredentialsStatus::from(&keychain()).to_json();
+        for key in ["backend", "persistent", "insecure_file_store", "note"] {
+            assert!(c.get(key).is_some(), "missing {key}");
         }
     }
 

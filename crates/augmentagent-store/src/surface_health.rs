@@ -8,7 +8,10 @@
 //! down rather than trust the last state it wrote.
 //!
 //! `state` is an opaque, surface-defined word (`connected`, `reconnecting`,
-//! `misconfigured`, …) so new surfaces need no schema change.
+//! `misconfigured`, …) so new surfaces need no schema change. The one word
+//! the store interprets is `reconnecting` (#1299): each entry into it by the
+//! same reporting process adds one to `reconnects`, which a new process
+//! resets, so `status` can show how often the current daemon lost its link.
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -32,8 +35,23 @@ pub(crate) fn migrate(conn: &Connection) -> StoreResult<()> {
             pid INTEGER NOT NULL
         );"#,
     )?;
+    // #1299 — additive column; a database from before it keeps its rows and
+    // reads 0 until the next state change.
+    let has_reconnects: bool = conn
+        .prepare(
+            "SELECT 1 FROM pragma_table_info('surface_listener_health') WHERE name = 'reconnects'",
+        )?
+        .exists([])?;
+    if !has_reconnects {
+        conn.execute_batch(
+            "ALTER TABLE surface_listener_health ADD COLUMN reconnects INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
     Ok(())
 }
+
+/// The state word whose entries [`Store::surface_listener_reconnects`] counts.
+pub const RECONNECTING_STATE: &str = "reconnecting";
 
 /// One surface's latest self-report.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,9 +91,14 @@ impl Store {
             conn.execute(
                 "INSERT INTO surface_listener_health
                  (platform, state, detail, recovery, workspaces, dry_run, last_event_at_ms,
-                  last_send_at_ms, state_since_ms, heartbeat_at_ms, pid)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                  last_send_at_ms, state_since_ms, heartbeat_at_ms, pid, reconnects)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?2 = ?12)
                  ON CONFLICT(platform) DO UPDATE SET
+                   reconnects = CASE
+                     WHEN surface_listener_health.pid <> excluded.pid THEN excluded.reconnects
+                     WHEN excluded.state = ?12 AND surface_listener_health.state <> ?12
+                       THEN surface_listener_health.reconnects + 1
+                     ELSE surface_listener_health.reconnects END,
                    state = excluded.state, detail = excluded.detail,
                    recovery = excluded.recovery, workspaces = excluded.workspaces,
                    dry_run = excluded.dry_run, last_event_at_ms = excluded.last_event_at_ms,
@@ -94,6 +117,7 @@ impl Store {
                     health.state_since_ms,
                     health.heartbeat_at_ms,
                     health.pid,
+                    RECONNECTING_STATE,
                 ],
             )
         })?;
@@ -114,6 +138,22 @@ impl Store {
             .optional()
         })?;
         row.map(RawRow::parse).transpose()
+    }
+
+    /// #1299 — how many times the process that wrote `platform`'s current
+    /// report entered `reconnecting`. `None` when the surface never reported.
+    pub fn surface_listener_reconnects(
+        &self,
+        platform: &SurfacePlatform,
+    ) -> StoreResult<Option<i64>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT reconnects FROM surface_listener_health WHERE platform = ?1",
+                params![platform.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+        })
     }
 
     /// Every surface's latest report, by platform name.
