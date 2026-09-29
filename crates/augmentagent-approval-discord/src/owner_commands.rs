@@ -160,6 +160,37 @@ pub static OWNER_COMMANDS: &[OwnerCommand] = &[
         slack: SlackMapping::Command,
         plain: PlainText::Exact,
     },
+    // #1296 — Slack subscription management (no Discord counterpart: Discord
+    // subscriptions are managed from the CLI).
+    OwnerCommand {
+        name: "subscriptions",
+        aliases: &[],
+        usage: "subscriptions [list] | subscriptions mode <target> <priority|digest|store_only>",
+        description: "The Slack conversations Jarvis ingests (channels, group DMs, DMs) and \
+             their modes.",
+        discord: &[],
+        slack: SlackMapping::Command,
+        plain: PlainText::Exact,
+    },
+    OwnerCommand {
+        name: "subscribe",
+        aliases: &[],
+        usage: "subscribe <#channel | person | group DM | ID> [priority|digest|store_only]",
+        description: "Start ingesting a Slack conversation (default digest). Names resolve \
+             through the conversation list and the wiki; an ambiguous name asks.",
+        discord: &[],
+        slack: SlackMapping::Command,
+        plain: PlainText::Sigil,
+    },
+    OwnerCommand {
+        name: "unsubscribe",
+        aliases: &[],
+        usage: "unsubscribe <#channel | person | group DM | ID>",
+        description: "Stop ingesting a Slack conversation; what was stored stays searchable.",
+        discord: &[],
+        slack: SlackMapping::Command,
+        plain: PlainText::Sigil,
+    },
     OwnerCommand {
         name: "approvals",
         aliases: &[],

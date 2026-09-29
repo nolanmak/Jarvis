@@ -86,6 +86,26 @@ pub struct SlackCommandDeps {
     /// ShadowNote write-back; `None` answers with the not-configured notice.
     pub journal: Option<Arc<dyn JournalOps>>,
     pub processes: ProcessControl,
+    /// #1296 — people pages for `subscribe <person>`.
+    pub wiki_root: Option<PathBuf>,
+    /// #1296 — the workspace's conversation list (the Composio user
+    /// connection) for name resolution; `None` or `None` returned: IDs and
+    /// subscribed names only.
+    pub subscription_directory: Option<SubscriptionDirectory>,
+}
+
+/// #1296 — the conversation list for a workspace (team ID).
+pub type SubscriptionDirectory = Arc<
+    dyn Fn(&str) -> Option<Arc<dyn crate::subscriptions::ConversationDirectory>> + Send + Sync,
+>;
+
+/// The Composio connection of `team`, when one is stored.
+pub fn composio_directory() -> SubscriptionDirectory {
+    Arc::new(|team: &str| {
+        let auth = crate::auth::SlackAuth::load_for_team(team).ok()?;
+        let client = crate::api::SlackClient::new(auth).ok()?;
+        Some(Arc::new(client) as Arc<dyn crate::subscriptions::ConversationDirectory>)
+    })
 }
 
 impl SlackCommandDeps {
@@ -104,6 +124,8 @@ impl SlackCommandDeps {
             loop_parser: None,
             journal: None,
             processes: ProcessControl::default(),
+            wiki_root: None,
+            subscription_directory: Some(composio_directory()),
         }
     }
 }
@@ -286,6 +308,9 @@ impl SlackCommands {
             "processes" => processes::command(&self.deps.processes, args).await,
             "reset" => self.reset(cx),
             "cancel" => self.cancel_all(cx, args),
+            "subscriptions" => self.subscriptions(cx, args).await,
+            "subscribe" => self.subscriptions(cx, &format!("subscribe {args}")).await,
+            "unsubscribe" => self.subscriptions(cx, &format!("unsubscribe {args}")).await,
             _ => help_text(),
         }
     }
@@ -346,6 +371,26 @@ impl SlackCommands {
                 .save_text(None, &text)
                 .await
                 .unwrap_or_else(|user_facing| user_facing),
+        }
+    }
+
+    /// #1296 — subscription management, the same API as the CLI.
+    async fn subscriptions(&self, cx: &CommandContext<'_>, args: &str) -> String {
+        use crate::subscriptions::{run_command, SubscriptionManager};
+        let team = match crate::surface::SlackWorkspace::from_account(cx.conversation.account()) {
+            Ok(w) => w.team_id().to_string(),
+            Err(e) => return format!("Subscriptions are managed per Slack workspace: {e}"),
+        };
+        let directory = self
+            .deps
+            .subscription_directory
+            .as_ref()
+            .and_then(|d| d(&team));
+        let manager = SubscriptionManager::new(&self.store, &team)
+            .with_wiki_root(self.deps.wiki_root.clone());
+        match &directory {
+            Some(d) => run_command(&manager.with_directory(d.as_ref()), args).await,
+            None => run_command(&manager, args).await,
         }
     }
 

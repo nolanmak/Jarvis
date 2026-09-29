@@ -14555,6 +14555,8 @@ async fn slack_command_deps(cli: &Cli) -> augmentagent_channel_slack::commands::
         reasoner: Arc::clone(&reasoner),
     }));
     deps.journal = journal_ops_from_env(cli, &reasoner).await;
+    // #1296 — `subscribe <person>` resolves people through the wiki.
+    deps.wiki_root = cli.wiki_dir.clone();
     deps
 }
 

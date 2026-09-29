@@ -326,3 +326,78 @@ async fn the_slack_command_hook_speaks_text() {
     let out = run_command(&m, "frobnicate").await;
     assert!(out.contains("subscribe <"), "{out}");
 }
+
+/// #1296 × #1292 — the same operations as owner commands on Slack
+/// (`/jarvis subscribe …`, `!unsubscribe …`, `subscriptions`), through the
+/// shared command registry.
+#[tokio::test]
+async fn subscription_owner_commands_run_through_the_registry() {
+    use augmentagent_channel_slack::commands::{
+        recognize, CommandContext, ConversationControl, SlackCommandDeps, SlackCommands,
+    };
+    use augmentagent_channel_slack::surface::SlackWorkspace;
+    use augmentagent_store::SurfaceConversationRef;
+    use std::sync::Arc;
+
+    struct Idle;
+    impl ConversationControl for Idle {
+        fn is_running(&self, _: &SurfaceConversationRef) -> bool {
+            false
+        }
+        fn cancel_running(&self, _: &SurfaceConversationRef) -> bool {
+            false
+        }
+    }
+    let w = world();
+    let store = Arc::new(Store::open(w.store.db_path()).unwrap());
+    let mut deps = SlackCommandDeps::new(w.wiki.join("model-selection.json"));
+    deps.wiki_root = Some(w.wiki.clone());
+    deps.subscription_directory = Some(Arc::new(|team: &str| {
+        assert_eq!(team, TEAM);
+        Some(Arc::new(directory())
+            as Arc<
+                dyn augmentagent_channel_slack::subscriptions::ConversationDirectory,
+            >)
+    }));
+    let commands = SlackCommands::new(store, deps);
+    let ws = SlackWorkspace::new(TEAM, None).unwrap();
+    let owner = ws.owner("U000000A").unwrap();
+    let dm = ws.conversation("D0000099", None).unwrap();
+    let run = |text: &'static str, slash: bool| {
+        let commands = &commands;
+        let owner = &owner;
+        let dm = &dm;
+        async move {
+            let r = recognize(text, slash).unwrap_or_else(|| panic!("{text} is a command"));
+            commands
+                .execute(
+                    &r,
+                    &CommandContext {
+                        owner,
+                        conversation: dm,
+                        control: &Idle,
+                        now_ms: 0,
+                    },
+                )
+                .await
+        }
+    };
+    let out = run("subscribe #launch priority", true).await;
+    assert!(
+        out.contains("Subscribed to #launch (`C0000002`) in priority mode."),
+        "{out}"
+    );
+    let out = run("!subscribe Alice", false).await;
+    assert!(out.contains("DM with Alice Example"), "{out}");
+    let out = run("subscriptions", false).await;
+    assert!(out.contains("#launch") && out.contains("D0000007"), "{out}");
+    let out = run("subscriptions mode #launch digest", true).await;
+    assert!(out.contains("is now digest (was priority)"), "{out}");
+    let out = run("!subscribe #design", false).await;
+    assert!(out.starts_with("Which one?"), "{out}");
+    let out = run("unsubscribe #launch", true).await;
+    assert!(out.contains("Unsubscribed from #launch"), "{out}");
+    assert_eq!(w.active().len(), 1);
+    // A sentence that starts with the word is a question for the agent.
+    assert!(recognize("subscribe me to the newsletter please", false).is_none());
+}
