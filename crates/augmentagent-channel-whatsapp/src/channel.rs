@@ -227,6 +227,9 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                             WaEvent::ReceivedMessage { message } => {
                                 inbox.lock().await.push(message);
                             }
+                            WaEvent::Receipt { chat, message_ids, receipt_type, .. } => {
+                                debug!(?chat, ?message_ids, %receipt_type, "whatsapp delivery receipt");
+                            }
                             WaEvent::LoggedOut { reason } => {
                                 warn!(%reason, "whatsapp device logged out — re-pair required");
                                 if !phone.is_empty() {
@@ -237,6 +240,7 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                                 info!(%device_jid, %user_jid, "whatsapp pair-success");
                             }
                             WaEvent::Connected => info!("whatsapp sidecar connected"),
+                            WaEvent::Disconnected => warn!("whatsapp sidecar disconnected"),
                             WaEvent::Qr { .. } => {
                                 // QR is only meaningful during `whatsapp login`;
                                 // ignore here.
@@ -981,6 +985,7 @@ mod tests {
             text: text.into(),
             timestamp: 1776630000,
             from_me: false,
+            metadata: Default::default(),
         }
     }
 

@@ -14,7 +14,7 @@ augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
 augmentagent-wiki = { path = "../augmentagent-wiki" }
 
 tokio = { workspace = true }
-tokio-util = { workspace = true }
+tokio-util = { workspace = true, features = ["codec"] }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -24,6 +24,8 @@ serde_json = { workspace = true }
 reqwest = { workspace = true }
 uuid = { workspace = true }
 time = { workspace = true }
+libc = "0.2"
+futures = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

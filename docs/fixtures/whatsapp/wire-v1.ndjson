@@ -1,0 +1,3 @@
+{"version":1,"request_id":"golden-status","op":"status","params":{}}
+{"version":1,"request_id":"golden-status","ok":true,"result":{"paired":false,"connected":false,"device_jid":""}}
+{"version":1,"event":"received-message","id":"image-1","chat":"15551234567@s.whatsapp.net","sender":"15551234567@s.whatsapp.net","push_name":"Owner","text":"look at this","timestamp":100,"from_me":false,"quoted_message_id":"quoted-1","mentioned_jids":["2@s.whatsapp.net"],"media":{"kind":"image","mime_type":"image/png","size":123},"is_edit":false,"is_revoke":false,"is_view_once":false,"is_ephemeral":false}

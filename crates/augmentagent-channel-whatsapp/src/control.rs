@@ -124,37 +124,37 @@ impl WhatsappControlSurface {
         chat_jid == self.config.control_chat_jid
     }
 
-    /// All three outbound gates in one place. Returns `Err(ApprovalError)`
-    /// with a human reason when a send must be refused.
-    fn check_send_gate(&self, chat_jid: &str) -> Result<(), ApprovalError> {
+    /// All three outbound gates in one place, with a human reason on refusal.
+    fn check_send_gate(&self, chat_jid: &str) -> Result<(), String> {
         if !control_enabled() {
-            return Err(ApprovalError::Discord(
+            return Err(
                 "AUGMENTAGENT_WHATSAPP_CONTROL_ENABLED is not set — \
                  WhatsApp control surface is disabled (ban-risk gate)"
                     .into(),
-            ));
+            );
         }
         if !self.is_control_chat(chat_jid) {
-            return Err(ApprovalError::Discord(format!(
+            return Err(format!(
                 "{chat_jid} is not the designated control chat; refusing to send"
-            )));
+            ));
         }
         match self.store.is_whatsapp_outbound_allowed(chat_jid) {
             Ok(true) => Ok(()),
-            Ok(false) => Err(ApprovalError::Discord(format!(
+            Ok(false) => Err(format!(
                 "{chat_jid} not in whatsapp_outbound_allowlist; \
                  run `augmentagent whatsapp allow-outbound {chat_jid}`"
-            ))),
-            Err(e) => Err(ApprovalError::Discord(format!(
+            )),
+            Err(e) => Err(format!(
                 "outbound allowlist check failed: {e}"
-            ))),
+            )),
         }
     }
 
     /// Send text to the control chat, enforcing all gates.
     async fn send_to_control(&self, text: &str) -> Result<(), ApprovalError> {
         let jid = self.config.control_chat_jid.clone();
-        self.check_send_gate(&jid)?;
+        self.check_send_gate(&jid)
+            .map_err(ApprovalError::Discord)?;
         self.client
             .send_text(&jid, text)
             .await

@@ -920,6 +920,8 @@ dependencies = [
  "augmentagent-channel-core",
  "augmentagent-store",
  "augmentagent-wiki",
+ "futures",
+ "libc",
  "mockito",
  "reqwest",
  "rusqlite",

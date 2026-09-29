@@ -10,9 +10,9 @@
 //! **Request / response (methods):**
 //!
 //! ```text
-//! Request  : {"request_id":"<uuid>","op":"send_text","params":{...}}
-//! Success  : {"request_id":"...","ok":true,"result":{...}}
-//! Failure  : {"request_id":"...","ok":false,
+//! Request  : {"version":1,"request_id":"<uuid>","op":"send_text","params":{...}}
+//! Success  : {"version":1,"request_id":"...","ok":true,"result":{...}}
+//! Failure  : {"version":1,"request_id":"...","ok":false,
 //!             "error":{"kind":"NotPaired"|"NotConnected"|"SendFailed"
 //!                            |"BadRequest"|"Internal","message":"..."}}
 //! ```
@@ -20,12 +20,12 @@
 //! **Events (sidecar-initiated, no `request_id`):**
 //!
 //! ```text
-//! {"event":"received-message","id":"...","chat":"...","sender":"...",
+//! {"version":1,"event":"received-message","id":"...","chat":"...","sender":"...",
 //!  "push_name":"...","text":"...","timestamp":1776630000,"from_me":false}
-//! {"event":"qr","code":"2@..."}
-//! {"event":"pair-success","device_jid":"...","user_jid":"..."}
-//! {"event":"connected"}
-//! {"event":"logged-out","reason":"..."}
+//! {"version":1,"event":"qr","code":"2@..."}
+//! {"version":1,"event":"pair-success","device_jid":"...","user_jid":"..."}
+//! {"version":1,"event":"connected"}
+//! {"version":1,"event":"logged-out","reason":"..."}
 //! ```
 //!
 //! The reader task demultiplexes: frames with a `request_id` wake the matching
@@ -37,43 +37,53 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio_util::codec::{FramedRead, LinesCodec};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::types::{WaContact, WaEvent, WaMessage};
 
+const PROTOCOL_VERSION: u32 = 1;
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Default UDS path. `${XDG_RUNTIME_DIR}/augmentagent/wa.sock`, falling back to
-/// `/run/user/<uid>/...` then `/tmp/...` so headless / CI hosts still work.
+/// `/run/user/<uid>/...` then `/tmp/augmentagent-<uid>/...` so headless
+/// hosts use a private, account-specific directory.
 /// Overridable via `AUGMENTAGENT_WA_SOCK` (parity with the browser sidecar's
 /// `AUGMENTAGENT_BROWSER_SOCK`).
 pub fn default_socket_path() -> PathBuf {
     if let Ok(custom) = std::env::var("AUGMENTAGENT_WA_SOCK") {
-        return PathBuf::from(custom);
-    }
-    let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
-        // SAFETY: getuid is always-available libc; fall back to /tmp.
-        match std::fs::metadata("/run/user") {
-            Ok(_) => format!("/run/user/{}", users_uid()),
-            Err(_) => "/tmp".to_string(),
+        if !custom.is_empty() {
+            return PathBuf::from(custom);
         }
-    });
-    PathBuf::from(runtime).join("augmentagent").join("wa.sock")
+    }
+    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        if !runtime.is_empty() {
+            return PathBuf::from(runtime).join("augmentagent").join("wa.sock");
+        }
+    }
+    let uid = users_uid();
+    let runtime = PathBuf::from(format!("/run/user/{uid}"));
+    if runtime.is_dir() {
+        runtime.join("augmentagent").join("wa.sock")
+    } else {
+        PathBuf::from(format!("/tmp/augmentagent-{uid}")).join("wa.sock")
+    }
 }
 
 fn users_uid() -> u32 {
-    // `id -u` without pulling the `users`/`libc` crate. Falls back to 1000.
-    std::fs::read_to_string("/proc/self/loginuid")
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .filter(|&u| u != u32::MAX)
-        .unwrap_or(1000)
+    // SAFETY: geteuid has no inputs or side effects and is available on the
+    // Unix platforms that support this Unix-domain socket client.
+    unsafe { libc::geteuid() }
 }
 
 #[derive(Debug, Error)]
@@ -94,11 +104,16 @@ pub enum WaError {
     ChannelClosed,
     #[error("config: {0}")]
     Config(String),
+    #[error("protocol: {0}")]
+    Protocol(String),
+    #[error("sidecar request timed out")]
+    Timeout,
 }
 
 /// Sidecar request frame.
 #[derive(Debug, Serialize)]
 struct RpcRequest<'a> {
+    version: u32,
     request_id: String,
     op: &'a str,
     params: Value,
@@ -107,6 +122,7 @@ struct RpcRequest<'a> {
 /// Sidecar response frame (method replies only — events are a separate shape).
 #[derive(Debug, Deserialize)]
 struct RpcResponse {
+    version: u32,
     request_id: String,
     #[serde(default)]
     ok: bool,
@@ -124,7 +140,19 @@ struct RpcError {
     message: String,
 }
 
-type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<RpcResponse>>>>;
+type Pending = Arc<StdMutex<HashMap<String, oneshot::Sender<Result<RpcResponse, WaError>>>>>;
+
+/// An aborted caller must not leave a waiter in the shared request map.
+struct PendingRequest {
+    pending: Pending,
+    id: String,
+}
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.id);
+    }
+}
 
 /// Connected JSON-RPC client + a background reader task that splits responses
 /// from events. Cheap to `clone()` — the inner write half and pending map are
@@ -151,24 +179,24 @@ impl WaClient {
                 source,
             })?;
         let (read, write) = stream.into_split();
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let pending: Pending = Arc::new(StdMutex::new(HashMap::new()));
         let pending_reader = Arc::clone(&pending);
 
         tokio::spawn(async move {
-            let mut lines = BufReader::new(read).lines();
+            let mut lines = FramedRead::new(read, LinesCodec::new_with_max_length(4 * 1024 * 1024));
             loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => {
+                match lines.next().await {
+                    Some(Ok(line)) => {
                         if line.trim().is_empty() {
                             continue;
                         }
                         Self::dispatch_frame(&line, &pending_reader, &events).await;
                     }
-                    Ok(None) => {
+                    None => {
                         debug!("wa sidecar closed the connection");
                         break;
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         warn!("wa sidecar read error: {e}");
                         break;
                     }
@@ -176,7 +204,7 @@ impl WaClient {
             }
             // Drain pending waiters so callers get ChannelClosed instead of
             // hanging forever once the sidecar dies.
-            let mut guard = pending_reader.lock().await;
+            let mut guard = pending_reader.lock().unwrap();
             guard.clear();
         });
 
@@ -192,22 +220,45 @@ impl WaClient {
         let value: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => {
-                warn!("wa sidecar sent unparseable frame: {e}; line={line}");
+                warn!("wa sidecar sent unparseable frame: {e}");
                 return;
             }
         };
         if value.get("request_id").is_some() {
+            let request_id = value
+                .get("request_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             match serde_json::from_value::<RpcResponse>(value) {
                 Ok(resp) => {
                     let id = resp.request_id.clone();
-                    if let Some(tx) = pending.lock().await.remove(&id) {
-                        let _ = tx.send(resp);
+                    if let Some(tx) = pending.lock().unwrap().remove(&id) {
+                        let reply = if resp.version == PROTOCOL_VERSION {
+                            Ok(resp)
+                        } else {
+                            Err(WaError::Protocol(format!(
+                                "unsupported response version {}",
+                                resp.version
+                            )))
+                        };
+                        let _ = tx.send(reply);
                     } else {
                         debug!(request_id = %id, "wa response with no waiter (timed out?)");
                     }
                 }
-                Err(e) => warn!("wa response decode failed: {e}"),
+                Err(e) => {
+                    if let Some(id) = request_id {
+                        if let Some(tx) = pending.lock().unwrap().remove(&id) {
+                            let _ =
+                                tx.send(Err(WaError::Protocol(format!("invalid response: {e}"))));
+                        }
+                    }
+                }
             }
+            return;
+        }
+        if value.get("version").and_then(Value::as_u64) != Some(u64::from(PROTOCOL_VERSION)) {
+            warn!("wa event has unsupported protocol version");
             return;
         }
         match serde_json::from_value::<WaEvent>(value) {
@@ -222,14 +273,25 @@ impl WaClient {
 
     /// Issue one method call and await the typed result.
     async fn call(&self, op: &str, params: Value) -> Result<Value, WaError> {
+        self.call_with_timeout(op, params, REQUEST_TIMEOUT).await
+    }
+
+    async fn call_with_timeout(
+        &self,
+        op: &str,
+        params: Value,
+        timeout: std::time::Duration,
+    ) -> Result<Value, WaError> {
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
-        self.pending
-            .lock()
-            .await
-            .insert(request_id.clone(), tx);
+        self.pending.lock().unwrap().insert(request_id.clone(), tx);
+        let _pending_request = PendingRequest {
+            pending: Arc::clone(&self.pending),
+            id: request_id.clone(),
+        };
 
         let frame = RpcRequest {
+            version: PROTOCOL_VERSION,
             request_id: request_id.clone(),
             op,
             params,
@@ -239,13 +301,16 @@ impl WaClient {
         {
             let mut w = self.write.lock().await;
             if let Err(e) = w.write_all(&line).await {
-                self.pending.lock().await.remove(&request_id);
                 return Err(e.into());
             }
             w.flush().await?;
         }
 
-        let resp = rx.await.map_err(|_| WaError::ChannelClosed)?;
+        let resp = match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(reply)) => reply?,
+            Ok(Err(_)) => return Err(WaError::ChannelClosed),
+            Err(_) => return Err(WaError::Timeout),
+        };
         if resp.ok {
             Ok(resp.result.unwrap_or(Value::Null))
         } else {
@@ -265,10 +330,7 @@ impl WaClient {
         let v = self
             .call("list_chats", serde_json::json!({ "limit": limit }))
             .await?;
-        let chats = v
-            .get("chats")
-            .cloned()
-            .unwrap_or(Value::Array(Vec::new()));
+        let chats = v.get("chats").cloned().unwrap_or(Value::Array(Vec::new()));
         Ok(serde_json::from_value(chats)?)
     }
 
@@ -333,8 +395,11 @@ mod tests {
             while let Ok(Some(line)) = lines.next_line().await {
                 let req: Value = serde_json::from_str(&line).unwrap();
                 for out in responder(req) {
-                    write.write_all(out.as_bytes()).await.unwrap();
-                    write.write_all(b"\n").await.unwrap();
+                    if write.write_all(out.as_bytes()).await.is_err()
+                        || write.write_all(b"\n").await.is_err()
+                    {
+                        return;
+                    }
                 }
             }
         });
@@ -351,8 +416,10 @@ mod tests {
         mock_sidecar(path.clone(), |req| {
             let id = req["request_id"].as_str().unwrap().to_string();
             assert_eq!(req["op"], "send_text");
+            assert_eq!(req["version"], PROTOCOL_VERSION);
             assert_eq!(req["params"]["chat_jid"], "15551234567@s.whatsapp.net");
             vec![serde_json::json!({
+                "version": PROTOCOL_VERSION,
                 "request_id": id,
                 "ok": true,
                 "result": { "message_id": "3EB0SENT" }
@@ -379,6 +446,7 @@ mod tests {
         mock_sidecar(path.clone(), |req| {
             let id = req["request_id"].as_str().unwrap().to_string();
             vec![serde_json::json!({
+                "version": PROTOCOL_VERSION,
                 "request_id": id,
                 "ok": false,
                 "error": { "kind": "NotPaired", "message": "no linked device" }
@@ -390,7 +458,10 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel(8);
         let client = WaClient::connect(&path, tx).await.unwrap();
-        let err = client.send_text("x@s.whatsapp.net", "hi").await.unwrap_err();
+        let err = client
+            .send_text("x@s.whatsapp.net", "hi")
+            .await
+            .unwrap_err();
         match err {
             WaError::Sidecar { kind, message } => {
                 assert_eq!(kind, "NotPaired");
@@ -409,10 +480,12 @@ mod tests {
             // Reply to the call, then push an unsolicited inbound message.
             vec![
                 serde_json::json!({
+                    "version": PROTOCOL_VERSION,
                     "request_id": id, "ok": true, "result": { "chats": [] }
                 })
                 .to_string(),
                 serde_json::json!({
+                    "version": PROTOCOL_VERSION,
                     "event": "received-message",
                     "id": "INBOUND1",
                     "chat": "15551234567@s.whatsapp.net",
@@ -456,13 +529,171 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn mismatched_response_version_fails_without_waiting_for_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sock(&dir, "wa.sock");
+        mock_sidecar(path.clone(), |req| {
+            vec![serde_json::json!({
+                "version": 999,
+                "request_id": req["request_id"],
+                "ok": true,
+                "result": {"paired": false}
+            })
+            .to_string()]
+        })
+        .await;
+        let (tx, _rx) = mpsc::channel(8);
+        let client = WaClient::connect(&path, tx).await.unwrap();
+        let result = client.status().await;
+        assert!(matches!(result, Err(WaError::Protocol(_))));
+        assert!(client.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn timed_out_and_cancelled_calls_remove_their_waiters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sock(&dir, "wa.sock");
+        mock_sidecar(path.clone(), |_req| Vec::new()).await;
+        let (tx, _rx) = mpsc::channel(8);
+        let client = WaClient::connect(&path, tx).await.unwrap();
+        let result = client
+            .call_with_timeout(
+                "status",
+                serde_json::json!({}),
+                std::time::Duration::from_millis(10),
+            )
+            .await;
+        assert!(matches!(result, Err(WaError::Timeout)));
+        assert!(client.pending.lock().unwrap().is_empty());
+
+        let waiting = {
+            let client = client.clone();
+            tokio::spawn(async move { client.status().await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if !client.pending.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        waiting.abort();
+        let _ = waiting.await;
+        assert!(client.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_responses_are_matched_by_request_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sock(&dir, "wa.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let first: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let second: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            for req in [&second, &first] {
+                let reply = serde_json::json!({
+                    "version": PROTOCOL_VERSION,
+                    "request_id": req["request_id"],
+                    "ok": true,
+                    "result": {"op": req["op"]}
+                });
+                write
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let (tx, _rx) = mpsc::channel(8);
+        let client = WaClient::connect(&path, tx).await.unwrap();
+        let (first, second) = tokio::join!(
+            client.call("first", serde_json::json!({})),
+            client.call("second", serde_json::json!({}))
+        );
+        assert_eq!(first.unwrap()["op"], "first");
+        assert_eq!(second.unwrap()["op"], "second");
+    }
+
+    #[tokio::test]
+    async fn oversized_response_closes_pending_call_instead_of_allocating_unboundedly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sock(&dir, "wa.sock");
+        mock_sidecar(path.clone(), |req| {
+            vec![serde_json::json!({
+                "version": PROTOCOL_VERSION,
+                "request_id": req["request_id"],
+                "ok": true,
+                "result": {"padding": "x".repeat(4 * 1024 * 1024)}
+            })
+            .to_string()]
+        })
+        .await;
+        let (tx, _rx) = mpsc::channel(8);
+        let client = WaClient::connect(&path, tx).await.unwrap();
+        assert!(matches!(client.status().await, Err(WaError::ChannelClosed)));
+    }
+
+    #[tokio::test]
+    async fn socket_close_wakes_a_pending_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sock(&dir, "wa.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, _write) = stream.into_split();
+            let _ = BufReader::new(read).lines().next_line().await;
+            // Both halves close here, before a response is sent.
+        });
+        let (tx, _rx) = mpsc::channel(8);
+        let client = WaClient::connect(&path, tx).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), client.status())
+            .await
+            .unwrap();
+        assert!(matches!(result, Err(WaError::ChannelClosed)));
+    }
+
     #[test]
     fn default_socket_path_respects_env_override() {
         std::env::set_var("AUGMENTAGENT_WA_SOCK", "/tmp/custom-wa.sock");
-        assert_eq!(
-            default_socket_path(),
-            PathBuf::from("/tmp/custom-wa.sock")
-        );
+        assert_eq!(default_socket_path(), PathBuf::from("/tmp/custom-wa.sock"));
         std::env::remove_var("AUGMENTAGENT_WA_SOCK");
+    }
+
+    #[test]
+    fn shared_wire_v1_fixture_decodes_and_preserves_media() {
+        let lines: Vec<&str> = include_str!("../../../docs/fixtures/whatsapp/wire-v1.ndjson")
+            .lines()
+            .collect();
+        assert_eq!(lines.len(), 3);
+        let expected_request: Value = serde_json::from_str(lines[0]).unwrap();
+        let actual_request = serde_json::to_value(RpcRequest {
+            version: PROTOCOL_VERSION,
+            request_id: "golden-status".into(),
+            op: "status",
+            params: serde_json::json!({}),
+        })
+        .unwrap();
+        assert_eq!(actual_request, expected_request);
+        let response: RpcResponse = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(response.version, PROTOCOL_VERSION);
+        assert_eq!(response.result.unwrap()["paired"], false);
+        let event: WaEvent = serde_json::from_str(lines[2]).unwrap();
+        let WaEvent::ReceivedMessage { message } = event else {
+            panic!("fixture must be a received message");
+        };
+        assert_eq!(message.metadata.quoted_message_id, "quoted-1");
+        assert_eq!(message.metadata.mentioned_jids, ["2@s.whatsapp.net"]);
+        let media = message.metadata.media.unwrap();
+        assert_eq!(media.kind, "image");
+        assert_eq!(media.mime_type, "image/png");
+        assert_eq!(media.size, 123);
     }
 }
