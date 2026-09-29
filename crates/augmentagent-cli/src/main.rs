@@ -9210,9 +9210,23 @@ async fn run_transcripts_sync(
     Ok(())
 }
 
+/// Held for the whole Git reconciliation; dropping it releases the lock.
+struct WikiSyncLock {
+    file: std::fs::File,
+}
+
+impl Drop for WikiSyncLock {
+    /// Unlock explicitly: the lock belongs to the open file description,
+    /// which a child forked by another thread shares until it execs, so
+    /// closing our fd alone can leave the lock held.
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
 /// Keep an advisory lock for the whole Git reconciliation. A second manual or
 /// scheduled invocation must not stage, rebase, or push the same wiki at once.
-fn acquire_wiki_sync_lock(git_dir: &std::path::Path) -> Result<std::fs::File> {
+fn acquire_wiki_sync_lock(git_dir: &std::path::Path) -> Result<WikiSyncLock> {
     let lock_path = git_dir.join("augmentagent-sync.lock");
     let mut options = std::fs::OpenOptions::new();
     options.create(true).truncate(false).write(true);
@@ -9226,7 +9240,7 @@ fn acquire_wiki_sync_lock(git_dir: &std::path::Path) -> Result<std::fs::File> {
         .with_context(|| format!("open wiki sync lock {}", lock_path.display()))?;
     file.try_lock()
         .context("another wiki sync is running")?;
-    Ok(file)
+    Ok(WikiSyncLock { file })
 }
 
 /// A local filesystem remote is safe for disposable/offline mirrors. A
@@ -9323,6 +9337,21 @@ mod wiki_sync_lock_tests {
         assert!(acquire_wiki_sync_lock(&git_dir).is_err());
         drop(first);
         assert!(acquire_wiki_sync_lock(&git_dir).is_ok());
+    }
+
+    #[test]
+    fn finished_sync_releases_the_lock_while_a_duplicate_fd_is_open() {
+        // A child forked by another thread shares the locked file
+        // description until it execs; closing only our fd kept the lock and
+        // made the test above flaky under parallel load.
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        let first = acquire_wiki_sync_lock(&git_dir).unwrap();
+        let inherited = first.file.try_clone().unwrap();
+        drop(first);
+        assert!(acquire_wiki_sync_lock(&git_dir).is_ok());
+        drop(inherited);
     }
 
     #[test]
