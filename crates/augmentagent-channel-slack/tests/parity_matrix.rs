@@ -304,9 +304,9 @@ fn no_row_claims_real_host_evidence_yet() {
             row.id
         );
     }
-    // Linux cannot keep credentials until #1325 lands.
+    // Linux credentials persist since #1325; only real-host acceptance remains.
     let linux = &m.hosts[0];
-    assert!(linux.blockers.iter().any(|b| b.issue == 1325));
+    assert!(linux.blockers.is_empty(), "{:?}", linux.blockers);
     // No provider call can run under the CLI supervisor on macOS until #1252.
     for mac in &m.hosts[1..] {
         assert!(mac.blockers.iter().any(|b| b.issue == 1252), "{}", mac.id);
@@ -436,10 +436,9 @@ fn the_report_lists_every_row_and_every_open_blocker() {
         "#1295",
         "#1297",
         "#1298",
-        "#1325",
         "host macos-arm64 (#1252)",
         "Open blockers",
-        "host linux",
+        "host-acceptance linux",
         "real-host acceptance not recorded",
         "docs/SLACK-RUNBOOK.md section 11",
         "approval-sync/whatsapp",
@@ -476,7 +475,8 @@ fn the_json_report_carries_statuses_blockers_and_the_check_result() {
     for (kind, subject) in [
         ("blocked", "live-voice"),
         ("unverified-live", "transport"),
-        ("host", "linux"),
+        ("host", "macos-arm64"),
+        ("host-acceptance", "linux"),
         ("host-acceptance", "macos-x86_64"),
         ("shared-suite-gap", "durable-delivery/whatsapp"),
     ] {
