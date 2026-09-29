@@ -1324,6 +1324,36 @@ impl Store {
             [],
         )?;
 
+        // #1317 — heartbeat run log (one row per due attempt) and the
+        // single-row lease that keeps the daemon and `heartbeat run-once`
+        // from running the same check at once.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS heartbeat_runs (\
+                 id              INTEGER PRIMARY KEY AUTOINCREMENT,\
+                 started_at_ms   INTEGER NOT NULL,\
+                 finished_at_ms  INTEGER,\
+                 status          TEXT NOT NULL,\
+                 reason          TEXT,\
+                 message         TEXT,\
+                 message_hash    TEXT,\
+                 duration_ms     INTEGER\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_heartbeat_runs_started \
+                ON heartbeat_runs(started_at_ms)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS heartbeat_lease (\
+                 id             INTEGER PRIMARY KEY CHECK (id = 1),\
+                 holder         TEXT NOT NULL,\
+                 expires_at_ms  INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+
         // #79 — Twitter/X GraphQL queryId cache (rotated by X every 2-6 wk).
         conn.execute(
             "CREATE TABLE IF NOT EXISTS twitter_query_ids (\

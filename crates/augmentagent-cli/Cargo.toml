@@ -47,6 +47,7 @@ augmentagent-wiki = { path = "../augmentagent-wiki" }
 augmentagent-browser-client = { path = "../augmentagent-browser-client" }
 augmentagent-renderer-client = { path = "../augmentagent-renderer-client" }
 augmentagent-proactive = { path = "../augmentagent-proactive" }
+augmentagent-heartbeat = { path = "../augmentagent-heartbeat" }
 augmentagent-channel-voice = { path = "../augmentagent-channel-voice" }
 augmentagent-channel-fotw = { path = "../augmentagent-channel-fotw" }
 augmentagent-content-adapter = { path = "../augmentagent-content-adapter" }

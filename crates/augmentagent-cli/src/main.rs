@@ -78,6 +78,7 @@ mod gmail_attach;
 mod repo_docs;
 mod finance;
 mod handoff_prune;
+mod heartbeat_cmd;
 mod installers;
 mod logs;
 mod newsletter;
@@ -698,6 +699,14 @@ enum Cmd {
     Loop {
         #[command(subcommand)]
         op: loop_cmd::LoopOp,
+    },
+    /// #1317 — the heartbeat: a periodic open-ended check-in that reads
+    /// `<wiki>/HEARTBEAT.md` and stays silent unless something needs the
+    /// operator. `run-once` wakes it now; `status --check` is a liveness
+    /// probe for cron or an external healthcheck.
+    Heartbeat {
+        #[command(subcommand)]
+        op: heartbeat_cmd::HeartbeatOp,
     },
     /// #175 — list + signal `claude` CLI processes on this host. Addresses
     /// orphan Claude Code sessions whose `/loop` skill kept firing after the
@@ -2932,6 +2941,24 @@ async fn main() -> Result<()> {
             } else {
                 info!("proactive runner disabled: --wiki-dir not set");
             }
+            // #1317 — heartbeat: a periodic open-ended check-in against
+            // `<wiki>/HEARTBEAT.md`, silent unless something needs the
+            // operator. Opt-in via AUGMENTAGENT_HEARTBEAT_ENABLED.
+            let heartbeat = augmentagent_heartbeat::HeartbeatConfig::from_env();
+            match heartbeat_cmd::serve_decision(&heartbeat, cli.wiki_dir.as_deref(), dry_run) {
+                Ok(wiki_root) => {
+                    let runner = augmentagent_heartbeat::HeartbeatRunner::new(
+                        Arc::clone(&store),
+                        Arc::clone(&broker),
+                        build_reasoner(),
+                        wiki_root,
+                        heartbeat,
+                    );
+                    let sd = shutdown.clone();
+                    tasks.push(tokio::spawn(async move { runner.run(sd).await }));
+                }
+                Err(why) => info!("heartbeat disabled: {why}"),
+            }
             // #58 — scheduled-post fire loop. 1-min serve tick: T-30min
             // preview card → T-0 publish via the per-platform poster, every
             // step gated by the merged RateGovernor (#83). Inert until a
@@ -4403,6 +4430,7 @@ async fn main() -> Result<()> {
             json,
         } => logs::run_logs(unit, follow, lines, since, json).await,
         Cmd::Loop { op } => loop_cmd::run(store, op).await,
+        Cmd::Heartbeat { ref op } => heartbeat_cmd::run(&cli, store, op).await,
         Cmd::Loops { op } => loops::run(op).await,
         Cmd::Service { op, ref unit, json } => service::run_service(op, unit, json).await,
         Cmd::Setup { ref op } => setup::run_setup(op).await,

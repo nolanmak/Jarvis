@@ -37,6 +37,9 @@ personal wiki, and social/posting integrations.
 - **Proactive CRM.** A scheduled engine surfaces stale contacts, unmet
   commitments, and upcoming events as nudges, backed by a markdown
   person-wiki with an identity index (email/phone/handles → person).
+- **Heartbeat.** An opt-in periodic check-in reads your `HEARTBEAT.md`
+  checklist plus recent activity and stays silent unless something needs you,
+  with a liveness probe for external monitoring. See [Heartbeat](docs/HEARTBEAT.md).
 - **Self-improvement & scheduling.** A `self-improve` mode can pick up
   `agent-fixable` issues and open draft PRs; a user-facing `/loop` command
   registers cron-style recurring agent tasks.

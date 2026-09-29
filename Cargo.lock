@@ -992,6 +992,7 @@ dependencies = [
  "augmentagent-docs",
  "augmentagent-embeddings",
  "augmentagent-finance",
+ "augmentagent-heartbeat",
  "augmentagent-loops",
  "augmentagent-messages",
  "augmentagent-proactive",
@@ -1097,6 +1098,26 @@ dependencies = [
  "tokio",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "augmentagent-heartbeat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-approval-discord",
+ "augmentagent-channel-core",
+ "augmentagent-store",
+ "chrono",
+ "chrono-tz",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
