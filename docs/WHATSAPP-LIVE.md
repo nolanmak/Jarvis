@@ -29,6 +29,12 @@ an auth JSON file path before login. Jarvis writes it atomically with private
 file permissions. The sidecar's `AUGMENTAGENT_WA_STORE` file must also persist
 across restarts. Neither file belongs in Git.
 
+On macOS, the sidecar and CLI share `/tmp/augmentagent-<uid>/wa.sock` by
+default. Keep `AUGMENTAGENT_WA_STORE` in a persistent private directory;
+temporary files are not suitable for the linked-device session. Pairing from a
+Terminal does not prove a launchd-run daemon can read that credential; use the
+macOS keychain access probe in `doctor` before relying on a managed service.
+
 ## Allow chats
 
 Inbound reading requires `augmentagent whatsapp allow-inbound

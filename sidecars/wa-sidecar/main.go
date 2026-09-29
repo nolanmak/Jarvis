@@ -44,6 +44,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -65,14 +66,25 @@ func socketPath() string {
 	if p := os.Getenv("AUGMENTAGENT_WA_SOCK"); p != "" {
 		return p
 	}
-	runtime := os.Getenv("XDG_RUNTIME_DIR")
-	if runtime == "" {
-		runtime = fmt.Sprintf("/run/user/%d", os.Getuid())
-		if info, err := os.Stat(runtime); err != nil || !info.IsDir() {
-			return filepath.Join(fmt.Sprintf("/tmp/augmentagent-%d", os.Getuid()), "wa.sock")
-		}
+	xdgRuntime := os.Getenv("XDG_RUNTIME_DIR")
+	linuxRuntime := fmt.Sprintf("/run/user/%d", os.Getuid())
+	info, err := os.Stat(linuxRuntime)
+	return socketPathFor(runtime.GOOS, os.Getuid(), xdgRuntime, err == nil && info.IsDir())
+}
+
+func socketPathFor(goos string, uid int, xdgRuntime string, linuxRuntimeExists bool) string {
+	// Darwin's Unix-socket path limit is shorter than Linux's. A short,
+	// per-user private directory also works when HOME contains spaces/Unicode.
+	if goos == "darwin" {
+		return filepath.Join(fmt.Sprintf("/tmp/augmentagent-%d", uid), "wa.sock")
 	}
-	return filepath.Join(runtime, "augmentagent", "wa.sock")
+	if xdgRuntime != "" {
+		return filepath.Join(xdgRuntime, "augmentagent", "wa.sock")
+	}
+	if linuxRuntimeExists {
+		return filepath.Join(fmt.Sprintf("/run/user/%d", uid), "augmentagent", "wa.sock")
+	}
+	return filepath.Join(fmt.Sprintf("/tmp/augmentagent-%d", uid), "wa.sock")
 }
 
 // The WhatsApp session and socket must be inaccessible to other local users.

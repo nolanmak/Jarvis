@@ -5,6 +5,8 @@ on:
     paths:
       - 'sidecars/wa-sidecar/**'
       - 'crates/augmentagent-channel-whatsapp/**'
+      - 'crates/augmentagent-cli/src/whatsapp_cmd.rs'
+      - 'crates/augmentagent-cli/tests/whatsapp_cli.rs'
       - 'docs/fixtures/whatsapp/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -15,7 +17,11 @@ permissions:
 
 jobs:
   wire-contract:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     env:
       CARGO_BUILD_JOBS: 2
@@ -47,5 +53,7 @@ jobs:
           echo "AUGMENTAGENT_WA_SIDECAR_TEST_BIN=$RUNNER_TEMP/wa-sidecar" >> "$GITHUB_ENV"
       - name: Rust channel and real Go-process contract tests
         run: cargo test -p augmentagent-channel-whatsapp
+      - name: WhatsApp account CLI behavior tests
+        run: cargo test -p augmentagent-cli --test whatsapp_cli
       - name: Rust channel lint
         run: cargo clippy --no-deps -p augmentagent-channel-whatsapp --all-targets -- -D warnings

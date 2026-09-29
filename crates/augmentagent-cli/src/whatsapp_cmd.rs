@@ -18,6 +18,9 @@ impl Drop for OwnedSidecar {
     fn drop(&mut self) {
         // The pairing subprocess is temporary. The daemon's own sidecar,
         // if already running, is never owned or stopped by this command.
+        if !matches!(self.0.try_wait(), Ok(None)) {
+            return;
+        }
         unsafe {
             libc::kill(self.0.id() as i32, libc::SIGTERM);
         }

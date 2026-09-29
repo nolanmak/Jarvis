@@ -131,6 +131,8 @@ impl WhatsappAuth {
             file.write_all(&serde_json::to_vec(self)?)?;
             file.sync_all()?;
             std::fs::rename(&temporary, path)?;
+            #[cfg(unix)]
+            std::fs::File::open(parent)?.sync_all()?;
             Ok::<(), AuthError>(())
         })();
         if result.is_err() {

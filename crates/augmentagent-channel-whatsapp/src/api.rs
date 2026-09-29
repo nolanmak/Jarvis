@@ -55,9 +55,9 @@ use crate::types::{WaContact, WaEvent, WaMessage};
 const PROTOCOL_VERSION: u32 = 1;
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Default UDS path. `${XDG_RUNTIME_DIR}/augmentagent/wa.sock`, falling back to
-/// `/run/user/<uid>/...` then `/tmp/augmentagent-<uid>/...` so headless
-/// hosts use a private, account-specific directory.
+/// Default UDS path. Linux uses `${XDG_RUNTIME_DIR}/augmentagent/wa.sock`,
+/// then `/run/user/<uid>/...` or a private `/tmp/augmentagent-<uid>/...`.
+/// macOS uses the short private `/tmp/augmentagent-<uid>/wa.sock` path.
 /// Overridable via `AUGMENTAGENT_WA_SOCK` (parity with the browser sidecar's
 /// `AUGMENTAGENT_BROWSER_SOCK`).
 pub fn default_socket_path() -> PathBuf {
@@ -66,18 +66,32 @@ pub fn default_socket_path() -> PathBuf {
             return PathBuf::from(custom);
         }
     }
-    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
-        if !runtime.is_empty() {
-            return PathBuf::from(runtime).join("augmentagent").join("wa.sock");
+    #[cfg(target_os = "macos")]
+    {
+        // Darwin's Unix socket path limit is short. Keep this path stable
+        // across terminal and launchd environments, even with a long HOME.
+        return macos_socket_path(users_uid());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+            if !runtime.is_empty() {
+                return PathBuf::from(runtime).join("augmentagent").join("wa.sock");
+            }
+        }
+        let uid = users_uid();
+        let runtime = PathBuf::from(format!("/run/user/{uid}"));
+        if runtime.is_dir() {
+            runtime.join("augmentagent").join("wa.sock")
+        } else {
+            PathBuf::from(format!("/tmp/augmentagent-{uid}")).join("wa.sock")
         }
     }
-    let uid = users_uid();
-    let runtime = PathBuf::from(format!("/run/user/{uid}"));
-    if runtime.is_dir() {
-        runtime.join("augmentagent").join("wa.sock")
-    } else {
-        PathBuf::from(format!("/tmp/augmentagent-{uid}")).join("wa.sock")
-    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_socket_path(uid: u32) -> PathBuf {
+    PathBuf::from(format!("/tmp/augmentagent-{uid}/wa.sock"))
 }
 
 fn users_uid() -> u32 {
@@ -704,6 +718,14 @@ mod tests {
         std::env::set_var("AUGMENTAGENT_WA_SOCK", "/tmp/custom-wa.sock");
         assert_eq!(default_socket_path(), PathBuf::from("/tmp/custom-wa.sock"));
         std::env::remove_var("AUGMENTAGENT_WA_SOCK");
+    }
+
+    #[test]
+    fn macos_socket_path_is_short_and_independent_of_home() {
+        assert_eq!(
+            macos_socket_path(501),
+            PathBuf::from("/tmp/augmentagent-501/wa.sock")
+        );
     }
 
     #[test]

@@ -84,9 +84,11 @@ fn fake_sidecar(
 #[test]
 fn login_handles_rotated_qr_and_persists_only_the_expected_phone() {
     let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("data.db");
+    let state = dir.path().join("Mac Home ü with spaces");
+    std::fs::create_dir(&state).unwrap();
+    let db = state.join("data.db");
     let socket = dir.path().join("wa.sock");
-    let auth = dir.path().join("auth.json");
+    let auth = state.join("auth.json");
     let server = fake_sidecar(&socket, false, true);
     let output = Command::new(env!("CARGO_BIN_EXE_augmentagent"))
         .arg("--db")
