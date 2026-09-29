@@ -311,7 +311,7 @@ async fn run_inner(args: &DeliverArgs, store: &Store) -> Result<bool, Failure> {
         }
         for r in &rows {
             println!(
-                "  {:<32} {:<7} {:<11} {}{}",
+                "  {:<42} {:<7} {:<11} {}{}",
                 r["idempotency_key"].as_str().unwrap_or(""),
                 r["operation"].as_str().unwrap_or(""),
                 r["status"].as_str().unwrap_or(""),
