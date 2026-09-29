@@ -2212,6 +2212,8 @@ impl Store {
              );",
         )?;
 
+        crate::imessage::migrate(conn)?;
+
         Ok(())
     }
 
@@ -6468,6 +6470,8 @@ impl Store {
     /// these to a retry-exempt 'error' and notifies; it must NEVER resend
     /// them, because the crash window includes "Composio accepted the send
     /// and we died before recording it".
+    /// iMessage rows are excluded: their `sending` window lasts until the
+    /// Mac-side sender reports, and the outbox owns their recovery (#1304).
     pub fn stuck_sending_actions(
         &self,
         now_ms: i64,
@@ -6476,7 +6480,8 @@ impl Store {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = guard.prepare(
             "SELECT id FROM actions \
-              WHERE status = 'sending' AND updatedAt <= ?1",
+              WHERE status = 'sending' AND updatedAt <= ?1 \
+                AND id NOT IN (SELECT action_id FROM imessage_outbox)",
         )?;
         let ids = stmt
             .query_map(params![now_ms - grace_ms], |r| r.get::<_, String>(0))?
@@ -8224,7 +8229,7 @@ fn ms_to_rfc3339(ms: i64) -> String {
         .unwrap_or_default()
 }
 
-fn now_millis() -> i64 {
+pub(crate) fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)

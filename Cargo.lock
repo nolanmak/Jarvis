@@ -593,6 +593,8 @@ name = "augmentagent-channel-imessage"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "augmentagent-approval-discord",
  "augmentagent-channel-core",
  "augmentagent-store",
  "augmentagent-wiki",

@@ -67,6 +67,7 @@ mod messages_cmd;
 mod embeddings_cmd;
 mod triage_prefilter_cmd;
 mod apple_notes;
+mod imessage_send;
 mod autopr_eval;
 mod autopr_health;
 mod channel_router;
@@ -1250,6 +1251,27 @@ enum ImessageOp {
         /// The `s3://<bucket>/<key>` from an `[attachment: …]` line.
         s3_uri: String,
     },
+    /// Send outbox used by the Mac-side sender (#1304).
+    Outbox {
+        #[command(subcommand)]
+        op: imessage_send::OutboxOp,
+    },
+    /// Allow approved replies to be sent to a conversation (its
+    /// `chat_identifier`, e.g. a phone number).
+    AllowOutbound { identifier: String },
+    /// Stop sends to a conversation.
+    DenyOutbound { identifier: String },
+    /// Draft reply cards for new messages in a conversation (#1306).
+    AllowInbound { identifier: String },
+    /// Stop drafting reply cards for a conversation.
+    DenyInbound { identifier: String },
+    /// Print both allowlists.
+    Allowlist,
+    /// Approve one pending iMessage card from the terminal: the same checks
+    /// and outbox queueing as the card's Approve button.
+    Approve { action_id: String },
+    /// Skip one pending iMessage card from the terminal.
+    Skip { action_id: String },
 }
 
 #[derive(Subcommand)]
@@ -3913,6 +3935,26 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             ImessageOp::FetchAttachment { s3_uri } => run_imessage_fetch_attachment(s3_uri).await,
+            ImessageOp::Outbox { op } => imessage_send::run_outbox(&store, op),
+            ImessageOp::AllowOutbound { identifier } => {
+                imessage_send::set_allowlist(&store, true, true, identifier)
+            }
+            ImessageOp::DenyOutbound { identifier } => {
+                imessage_send::set_allowlist(&store, true, false, identifier)
+            }
+            ImessageOp::AllowInbound { identifier } => {
+                imessage_send::set_allowlist(&store, false, true, identifier)
+            }
+            ImessageOp::DenyInbound { identifier } => {
+                imessage_send::set_allowlist(&store, false, false, identifier)
+            }
+            ImessageOp::Allowlist => imessage_send::print_allowlists(&store),
+            ImessageOp::Approve { action_id } => {
+                imessage_send::run_cli_resolve(Arc::clone(&store), action_id, true).await
+            }
+            ImessageOp::Skip { action_id } => {
+                imessage_send::run_cli_resolve(Arc::clone(&store), action_id, false).await
+            }
         },
         Cmd::Calendar { op } => match op {
             CalendarOp::Backfill { .. } => {
@@ -11615,6 +11657,8 @@ struct ReplyApprover {
     /// a strong back-reference would cycle). Empty in dry-run / one-shot
     /// commands — every use is best-effort.
     broker: std::sync::OnceLock<std::sync::Weak<dyn ApprovalBroker>>,
+    /// #1303 — bundle location and kill-switch for iMessage replies.
+    imessage: imessage_send::ImessageSendConfig,
 }
 
 impl ReplyApprover {
@@ -12225,14 +12269,14 @@ impl ReplyApprover {
         }
     }
 
-    async fn revise_telegram(
+    /// Telegram and iMessage keep no server-side draft: regenerate locally
+    /// and put the row back to Pending so the card re-renders.
+    async fn revise_without_server_draft(
         &self,
         action_id: &str,
         feedback: &str,
         action: augmentagent_store::ActionWithEmail,
     ) -> ApprovalActionOutcome {
-        // Telegram has no server-side draft — just regenerate locally and
-        // bounce the action row back to Pending so the broker re-renders.
         let previous_draft = action.action.draft_body.clone().unwrap_or_default();
         let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
         let prompt = augmentagent_channel_core::prompt::redraft_message(
@@ -12254,7 +12298,7 @@ impl ReplyApprover {
             Some(&redraft),
             None,
         );
-        tracing::info!(action_id, "telegram revise: new draft persisted");
+        tracing::info!(action_id, platform = %action.email.platform, "revise: new draft persisted");
         ApprovalActionOutcome::Revised {
             email: action.email,
             draft: redraft,
@@ -12650,6 +12694,9 @@ impl ReplyApprover {
         if action.email.platform == "gcal" {
             return self.approve_gcal(action_id, action).await;
         }
+        if action.email.platform == imessage_send::PLATFORM {
+            return self.approve_imessage(action_id, action).await;
+        }
         if is_linkedin_email(&action.email) {
             return self.approve_linkedin(action_id, action).await;
         }
@@ -13006,6 +13053,9 @@ impl ReplyApprover {
         if action.email.platform == augmentagent_channel_socialapi::PLATFORM {
             return self.skip_socialapi(action_id, action);
         }
+        if action.email.platform == imessage_send::PLATFORM {
+            return self.skip_imessage(action_id, action);
+        }
         if is_linkedin_email(&action.email) {
             return self.skip_linkedin(action_id, action);
         }
@@ -13078,13 +13128,20 @@ impl ReplyApprover {
             return self.revise_slack(action_id, feedback, action).await;
         }
         if action.email.platform == "telegram" {
-            return self.revise_telegram(action_id, feedback, action).await;
+            return self
+                .revise_without_server_draft(action_id, feedback, action)
+                .await;
         }
         if action.email.platform == "github" {
             return self.revise_github(action_id, feedback, action).await;
         }
         if action.email.platform == augmentagent_channel_socialapi::PLATFORM {
             return self.revise_socialapi(action_id, feedback, action).await;
+        }
+        if action.email.platform == imessage_send::PLATFORM {
+            return self
+                .revise_without_server_draft(action_id, feedback, action)
+                .await;
         }
         if is_linkedin_email(&action.email) {
             return self.revise_linkedin(action_id, feedback, action).await;
@@ -13846,6 +13903,7 @@ async fn build_broker(
         wiki_root: cli.wiki_dir.clone(),
         nudge: std::sync::OnceLock::new(),
         broker: std::sync::OnceLock::new(),
+        imessage: imessage_send::ImessageSendConfig::from_env(),
     });
 
     let approver_for_broker = Arc::clone(&approver);
@@ -15096,13 +15154,38 @@ async fn imessage_poll_loop(
     wiki_schema: Option<String>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    const POLL_INTERVAL: Duration = Duration::from_secs(30 * 60);
+    // #1304 — outbox expiry and failure notices run on their own short tick
+    // so a failed send is reported within a minute, not a poll interval.
+    const OUTBOX_INTERVAL: Duration = Duration::from_secs(60);
+    let poll_interval = augmentagent_channel_imessage::poll_interval();
     let wiki_capture = augmentagent_channel_imessage::history_wiki_capture_enabled();
-    info!(wiki_capture, "imessage poller started");
-    let mut tick = tokio::time::interval(POLL_INTERVAL);
+    info!(wiki_capture, poll_secs = poll_interval.as_secs(), "imessage poller started");
+    // #1306 — reply cards for conversations on the inbound allowlist.
+    let replier = augmentagent_channel_imessage::ImessageReplier {
+        store: Arc::clone(&store),
+        reasoner: Arc::clone(&reasoner) as Arc<dyn augmentagent_channel_core::Reasoner>,
+        approvals: Arc::clone(&broker),
+        config: augmentagent_channel_imessage::ImessageReplyConfig {
+            wiki_root: wiki_root.clone(),
+            ..Default::default()
+        },
+    };
+    let mut tick = tokio::time::interval(poll_interval);
+    let mut outbox_tick = tokio::time::interval(OUTBOX_INTERVAL);
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
+            _ = outbox_tick.tick() => {
+                if let Err(e) = imessage_send::reconcile_outbox(&store) {
+                    warn!("imessage outbox reconcile failed: {e:#}");
+                }
+                match imessage_send::notify_outbox_failures(&store, broker.as_ref()).await {
+                    Ok(n) if n > 0 => info!(notices = n, "imessage send failures reported"),
+                    Ok(_) => {}
+                    Err(e) => warn!("imessage failure notices failed: {e:#}"),
+                }
+                continue;
+            }
             _ = tick.tick() => {}
         }
         // #888 — reclaim day-old attachment dirs a killed ask left behind (first tick is immediate).
@@ -15146,6 +15229,10 @@ async fn imessage_poll_loop(
                 "imessage poll ingested new messages"
             );
         }
+        let replies = replier.handle_deltas(&deltas).await;
+        if replies != augmentagent_channel_imessage::ReplyStats::default() {
+            info!(?replies, "imessage reply triage");
+        }
         // #927 — the stubs this sync leaves ARE what the merge scan proposes.
         if let Some(root) = &wiki_root {
             if let Err(e) = propose_high_confidence_merges(root, &store, broker.as_ref()).await {
@@ -15158,7 +15245,11 @@ async fn imessage_poll_loop(
         let (Some(root), Some(schema)) = (&wiki_root, &wiki_schema) else {
             continue;
         };
-        for delta in deltas.iter().filter(|d| !d.first_run) {
+        // #1307 — the agent's own sends coming back teach nothing new.
+        for delta in deltas
+            .iter()
+            .filter(|d| !d.first_run && !augmentagent_channel_imessage::only_own_sends(&store, d))
+        {
             augmentagent_channel_core::ingest::spawn_ingest(
                 Arc::clone(&reasoner),
                 root.clone(),
@@ -19988,24 +20079,7 @@ mod stale_reconcile_tests {
     /// broker `OnceLock` empty, the happy path is a pure store CAS (no card
     /// repost).
     fn approver_with_store(store: Arc<Store>) -> ReplyApprover {
-        ReplyApprover {
-            store,
-            gmail: Arc::new(ComposioClient::new("test-key".into())),
-            calendar: Arc::new(augmentagent_channel_calendar::ComposioCalendarClient::new(
-                "test-key".into(),
-            )),
-            linkedin: None,
-            discord: None,
-            slack: Default::default(),
-            telegram: Default::default(),
-            github: None,
-            socialapi: None,
-            reasoner: Arc::new(FallbackReasoner::claude_only()),
-            draft_skill: String::new(),
-            wiki_root: None,
-            nudge: std::sync::OnceLock::new(),
-            broker: std::sync::OnceLock::new(),
-        }
+        crate::test_support::approver_with_store(store)
     }
 
     /// AC6 — the CLI recompose handler's four decision branches: unknown id,
@@ -20621,6 +20695,34 @@ mod identity_merge_tests {
                 );
             }
             other => panic!("expected AlreadyResolved, got {other:?}"),
+        }
+    }
+}
+
+/// Test builders shared by sibling modules (`imessage_send`).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn approver_with_store(store: Arc<Store>) -> ReplyApprover {
+        ReplyApprover {
+            store,
+            gmail: Arc::new(ComposioClient::new("test-key".into())),
+            calendar: Arc::new(augmentagent_channel_calendar::ComposioCalendarClient::new(
+                "test-key".into(),
+            )),
+            linkedin: None,
+            discord: None,
+            slack: Default::default(),
+            telegram: Default::default(),
+            github: None,
+            socialapi: None,
+            reasoner: Arc::new(FallbackReasoner::claude_only()),
+            draft_skill: String::new(),
+            wiki_root: None,
+            nudge: std::sync::OnceLock::new(),
+            broker: std::sync::OnceLock::new(),
+            imessage: Default::default(),
         }
     }
 }

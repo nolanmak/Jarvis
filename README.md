@@ -19,8 +19,10 @@ personal wiki, and social/posting integrations.
 - **Many channels.** Email (Gmail), Discord, Slack, Telegram, LinkedIn,
   WhatsApp, Twitter/X, Instagram, Reddit, GitHub, Linear, Notion, Calendly,
   Google Calendar, Google Drive, Meetup, and a voice-capture channel.
-- **iMessage history.** A bundled Mac exporter and scheduler import texting
-  history locally or over SSH, without a second repository. See
+- **iMessage history and replies.** A bundled Mac exporter and scheduler import
+  texting history locally or over SSH, without a second repository. Opted-in
+  conversations get reply cards; approved replies are sent by a sender job on
+  the Mac and confirmed in the Messages database. See
   [iMessage setup](docs/IMESSAGE.md).
 - **WhatsApp history.** Export WhatsApp Desktop conversations into searchable
   history and incremental wiki capture, with local or SSH setup and support for

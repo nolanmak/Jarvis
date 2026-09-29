@@ -783,6 +783,7 @@ mod tests {
             title: "John Smith".into(),
             participants: vec!["+14155550123".into()],
             service: "iMessage".into(),
+            chat_guid: None,
         };
         let entry = |i: usize, body: &str| {
             (
