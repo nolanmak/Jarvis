@@ -126,6 +126,13 @@ class VoiceLaunchdTests(unittest.TestCase):
             credential.write_text('DISCORD_BOT_TOKEN=synthetic\n')
             with self.assertRaisesRegex(SystemExit, 'invalid or duplicate key'):
                 installer.validate_voice_credentials(credential)
+            credential.unlink()
+            target = Path(scratch) / 'outside.env'
+            target.write_text('DEEPGRAM_API_KEY=synthetic\n')
+            target.chmod(0o600)
+            credential.symlink_to(target)
+            with self.assertRaisesRegex(SystemExit, 'safely'):
+                installer.validate_voice_credentials(credential)
 
     def test_voice_jobs_render_with_private_separate_configuration(self):
         with tempfile.TemporaryDirectory(prefix='jarvis-voice-launchd-') as scratch:

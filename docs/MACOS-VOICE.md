@@ -36,6 +36,9 @@ and a singleton lease. Enable the main daemon's
 `AUGMENTAGENT_DISCORD_VOICE_ENABLED=1` only after the sidecar is ready; its Mac
 socket default matches the installer. Existing owner allowlists and approval
 controls still apply.
+The updater rebuilds and restarts this service only when the installed voice
+source changes. A failed dependency install or restart withholds its build
+stamp for retry.
 
 ## Telegram capture
 
@@ -61,6 +64,8 @@ the loaded service. Opt in with a controlled test Telegram bot through the
 existing `augmentagent voice login` command and keep the chat allowlist in
 `~/.config/augmentagent/telegram-allowed-chats.json`. A missing token causes
 `voice serve` to exit cleanly, as on Linux.
+After a Rust update, the updater restarts a running installed capture listener;
+it leaves an installed but idle listener alone.
 
 For either job, use `augmentagent service --unit augmentagent-discord-voice.service restart`
 or the corresponding Telegram capture unit after changing credentials or

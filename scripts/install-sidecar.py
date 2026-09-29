@@ -75,7 +75,10 @@ def validate_fetch_credentials(path):
 def validate_voice_credentials(path):
     if not path.exists() and not path.is_symlink():
         raise SystemExit('create a private discord-voice.env before installing')
-    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, 'O_NOFOLLOW', 0))
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, 'O_NOFOLLOW', 0))
+    except OSError as error:
+        raise SystemExit('voice credential file cannot be opened safely') from error
     with os.fdopen(descriptor, 'rb') as stream:
         info = os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:

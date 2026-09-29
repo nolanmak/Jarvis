@@ -26,7 +26,10 @@ def load_credentials(path, allowed_keys, label, required=False, allow_blank=Fals
     parent = path.parent.lstat()
     if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid() or parent.st_mode & 0o077:
         raise SystemExit(f'{label} credential directory must be owner-private')
-    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, 'O_NOFOLLOW', 0))
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, 'O_NOFOLLOW', 0))
+    except OSError as error:
+        raise SystemExit(f'{label} credential file cannot be opened safely') from error
     with os.fdopen(descriptor, 'rb') as stream:
         info = os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:

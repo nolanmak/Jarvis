@@ -176,6 +176,66 @@ STUB
   fi
   rm -rf "$TMP"
 done
+make_case sidecars/discord-voice/src/main.ts
+printf '#!/usr/bin/env bash\necho Darwin\n' > "$TMP/bin/uname"
+chmod +x "$TMP/bin/uname"
+mkdir -p "$TMP/Library/LaunchAgents"
+touch "$TMP/Library/LaunchAgents/com.nolanmak.augmentagent.discord-voice.plist"
+cat > "$TMP/bin/launchctl" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+  print)
+    pid=100
+    [ -f "$STUB_DIR/voice-kicked" ] && pid=101
+    printf '\tstate = running\n\tpid = %s\n' "$pid"
+    ;;
+  kickstart)
+    printf '%s\n' "$*" >> "$STUB_DIR/voice-launchctl-calls"
+    touch "$STUB_DIR/voice-kicked"
+    ;;
+esac
+STUB
+chmod +x "$TMP/bin/launchctl"
+updater_rebuilt || true
+if grep -q 'sidecars/discord-voice ci' "$TMP/npm-calls" 2>/dev/null &&
+    grep -q 'sidecars/discord-voice run build' "$TMP/npm-calls" 2>/dev/null &&
+    grep -q 'kickstart -k gui/.*/com.nolanmak.augmentagent.discord-voice' "$TMP/voice-launchctl-calls" 2>/dev/null; then
+  ok "rebuilds and restarts installed macOS Discord voice after source update"
+else
+  bad "rebuilds and restarts installed macOS Discord voice after source update" "missing npm ci/build or launchctl restart"
+fi
+rm -rf "$TMP"
+make_case crates/augmentagent-channel-voice/src/lib.rs
+printf '#!/usr/bin/env bash\necho Darwin\n' > "$TMP/bin/uname"
+chmod +x "$TMP/bin/uname"
+mkdir -p "$TMP/Library/LaunchAgents"
+touch "$TMP/Library/LaunchAgents/com.nolanmak.augmentagent.telegram-capture.plist"
+cat > "$TMP/bin/launchctl" <<'STUB'
+#!/usr/bin/env bash
+label="${*: -1}"
+marker=daemon
+case "$label" in *telegram-capture) marker=telegram ;; esac
+case "$1" in
+  print)
+    pid=100
+    [ -f "$STUB_DIR/$marker-kicked" ] && pid=101
+    printf '\tstate = running\n\tpid = %s\n' "$pid"
+    ;;
+  kickstart)
+    printf '%s\n' "$*" >> "$STUB_DIR/voice-launchctl-calls"
+    touch "$STUB_DIR/$marker-kicked"
+    ;;
+esac
+STUB
+chmod +x "$TMP/bin/launchctl"
+updater_rebuilt || true
+if grep -q 'kickstart -k gui/.*/com.nolanmak.augmentagent.telegram-capture' "$TMP/voice-launchctl-calls" 2>/dev/null &&
+    [ -s "$TMP/state/augmentagent/built-commit" ]; then
+  ok "restarts installed macOS Telegram capture after a Rust voice update"
+else
+  bad "restarts installed macOS Telegram capture after a Rust voice update" "capture kept the old release binary"
+fi
+rm -rf "$TMP"
 make_case sidecars/fetch/src/index.ts
 cat > "$TMP/bin/systemctl" <<'STUB'
 #!/usr/bin/env bash
