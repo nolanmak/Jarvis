@@ -169,8 +169,8 @@ Source: https://docs.slack.dev/apis/events-api/using-socket-mode (checked
 
 Code: `crates/augmentagent-channel-slack/src/delivery/` (`mrkdwn.rs`,
 `split.rs`, `plan.rs`, `progress.rs`) and `HttpSlackWebApi::upload_file` in
-`transport/web.rs`. Not wired into `serve` yet (#1287/#1288); the operator
-path is `augmentagent slack deliver`.
+`transport/web.rs`. The interactive surface in `serve` (#1287) delivers its
+answers through it; the operator path is `augmentagent slack deliver`.
 
 ### Formatting and mentions
 
@@ -542,11 +542,54 @@ with identifiers and a reason code only, never message text.
 - Every rejected user sees the same short text; no reply is offered for an
   unbound workspace, an enterprise mismatch or a payload without an actor.
 
-`admit()` is the gate `serve` (#1287) puts in front of the harness: owner
+`admit()` is the gate `serve` (#1287) puts in front of the turn handler: owner
 input goes to an `OwnerInputSink`, rejections are audited before it returns.
 Field names used for team and sharing checks come from the Events API,
 interactivity and slash-command reference pages; like the rest of this file
 they are unconfirmed against a live workspace (item 11 below).
+
+## Interactive surface in `serve` (#1287)
+
+Code: `crates/augmentagent-channel-slack/src/interactive.rs`, wired by
+`crates/augmentagent-cli/src/slack_serve.rs`. Operator view:
+[`SLACK-APP.md`](SLACK-APP.md) section 5.
+
+- **Ack after persist.** The Socket Mode sink records every envelope with
+  `record_inbound_event` (messages keyed `<channel>:<ts>`, mentions
+  `mention:<channel>:<ts>`, everything else by `stable_id()`) and only then
+  lets the client acknowledge it. A store failure leaves it unacknowledged.
+  Duplicates are acknowledged and dropped.
+- **Dispatcher.** Woken by each new row (fallback poll 5 s), it claims
+  Slack's events only (`claim_next_inbound_event_for`), re-parses the
+  stored frame, reloads the owner bindings and runs `owner::admit`. Owner
+  input goes to a `SlackTurnHandler`; rejections are replied to (DM through
+  the outbox, channel via `chat.postEphemeral`, which history cannot
+  reconcile) and never reach the handler; ignored events are settled.
+- **Replies.** `delivery::enqueue_answer` with the event ID as the turn ID,
+  then `SlackOutboxDispatcher::drain` per workspace (dry run: sends are
+  claimed and marked sent with `dry-run:<id>`). A failed turn posts one
+  generic notice; the error stays in the log.
+- **Restart and shutdown.** `recover_surface_delivery` runs at start.
+  Shutdown during a turn drops the handler future and releases the event.
+  A replayed event (`attempt > 1`) whose answer parts already exist is
+  settled without calling the handler.
+- **Health.** Listener states, last event and last send are written to
+  `surface_listener_health` on every change and every 15 s. `status` treats
+  a live state older than 60 s as `disconnected`.
+- **Turn handler seam.** `SlackTurnHandler::handle_turn(&SlackTurn) ->
+  Option<SlackTurnReply>` is text in, Markdown out. `serve` plugs in
+  `QueryTurnHandler`, an adapter over the Discord crate's `QueryHandler`
+  (`WikiQuerier::answer`, one shared-reasoner call) with an `AuditCtx`
+  carrying a `slack:<account>:<event>` session ID, no Discord http, channel
+  or guild, and `owner_authorized: false` (the WhatsApp precedent: that flag
+  grants Discord-owner tools). #1288 replaces the adapter with the full
+  harness (sessions, history, tools and permissions, follow-ups, progress).
+
+Tests: `tests/interactive_surface.rs` (the real client, sink, dispatcher and
+outbox over an in-memory WebSocket with `RecordingSlackWebApi`, a fake turn
+handler and an hour-long fallback poll) and
+`augmentagent-cli/tests/slack_serve_cli.rs` (the built binary, Slack only,
+against a mock Web API and a local WebSocket).
 
 ## Remaining live verification (owner, test workspace)
 

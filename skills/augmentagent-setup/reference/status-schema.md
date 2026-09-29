@@ -62,6 +62,20 @@ they must agree.
     "slack":    { "inbound_backlog": 1, "inbound_dead_letter": 0, "outbound_backlog": 3, "outbound_retrying": 1, "outbound_reconcile": 1, "outbound_dead_letter": 0 },
     "whatsapp": { "inbound_backlog": 0, "inbound_dead_letter": 0, "outbound_backlog": 0, "outbound_retrying": 0, "outbound_reconcile": 0, "outbound_dead_letter": 1 }
   },
+  "interactive": {
+    "slack": {
+      "state": "connected",
+      "healthy": true,
+      "detail": null,
+      "recovery": null,
+      "workspaces": ["T00000001"],
+      "dry_run": false,
+      "last_event_unix": 1747856000,
+      "last_send_unix": 1747856002,
+      "state_since_unix": 1747850000,
+      "heartbeat_unix": 1747856070
+    }
+  },
   "summary": "ok"
 }
 ```
@@ -198,6 +212,34 @@ with rows in the durable log is added. All values are integers.
 `augmentagent doctor` reports a `surface_delivery` warning when any surface
 has dead letters or sends awaiting reconcile.
 
+### interactive
+
+Added in #1287 (additive; still schema `"1"`). Live health of each
+interactive chat surface, from the report the running daemon writes
+(`surface_listener_health`). `slack` is always present. This is separate
+from `channels.slack`, which describes Composio ingestion only.
+
+- `state` (string): `not_configured` (no app installed or no owner bound),
+  `disabled` (`AUGMENTAGENT_SLACK_INTERACTIVE=0`), `misconfigured` (enabled
+  but cannot start), `connecting`, `connected`, `reconnecting`,
+  `disconnected` (the listener gave up, or the daemon stopped reporting),
+  `stopped` (clean shutdown). Treat unknown values as not healthy.
+- `healthy` (boolean): true only for `connected` with a fresh report. A
+  live state whose `heartbeat_unix` is more than 60 s old is reported as
+  `disconnected`, never as the state it last claimed.
+- `detail` (string or null): why, for the operator. Never a secret.
+- `recovery` (string or null): what to do; surface it verbatim.
+- `workspaces` (array of strings): Slack team IDs served.
+- `dry_run` (boolean): sends are recorded, not made.
+- `last_event_unix`, `last_send_unix`, `state_since_unix`,
+  `heartbeat_unix` (integer or null): unix seconds.
+
+A surface that is supposed to run (`state` not `not_configured` or
+`disabled`) and is not healthy turns an otherwise `ok` summary into
+`degraded`. `augmentagent doctor` reports `interactive.slack`: ok when
+connected, not configured or disabled; error when misconfigured; warn
+otherwise, with `recovery` as the suggested action.
+
 ## Stability promise
 
 `schema_version: "1"` means:
@@ -228,6 +270,8 @@ has dead letters or sends awaiting reconcile.
   `armed` rather than re-deriving them.
 - `queue.pending` is informational unless the user explicitly asks
   about it.
+- `interactive.<surface>` drives the "is Jarvis listening" answer: trust
+  `healthy`, show `detail` and `recovery` when it is false.
 
 ## Related issues
 

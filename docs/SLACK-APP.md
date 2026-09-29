@@ -7,9 +7,8 @@ Transport decisions (Socket Mode, scopes, tokens) are in
 
 Jarvis talks to Slack in real time through a first-party **Slack app over
 Socket Mode**. The app needs no public URL. This page covers creating the
-app and managing its credentials with `augmentagent slack app …`. Wiring
-the app into `serve` is #1287; until then an installed app is stored and
-verified but not yet listened to.
+app and managing its credentials with `augmentagent slack app …`; section 5
+covers what `serve` does with it (#1287).
 
 ## 1. Create the app from the manifest
 
@@ -114,7 +113,72 @@ The binding lives in the shared database (`surface_owner_bindings`,
 `surface_control_conversations`), not in the credential store, so it
 behaves the same on macOS and Linux. Rejected input is audited in
 `surface_auth_rejections` (identifiers and a reason code only, never message
-text). Enforcement at runtime arrives with `serve` (#1287).
+text). `serve` enforces the binding on every event (#1287), re-reading it
+each time, so an unbind takes effect at once.
+
+## 5. Run it in `serve` (#1287)
+
+`augmentagent serve` starts the interactive surface when an app is installed
+**and** an owner is bound for the same workspace. Nothing else is needed:
+no Discord token or IDs, no WhatsApp state, no Composio key. It is
+independent of Composio ingestion and the Slack digest, which keep their own
+cadence. Configuration is read at startup, so restart the daemon
+(`augmentagent service --unit daemon restart`) after `install`, `rotate` or
+`owner bind`.
+
+| `AUGMENTAGENT_SLACK_INTERACTIVE` | Effect |
+| --- | --- |
+| unset or `auto` | Run when installed and bound; otherwise report `not_configured` |
+| `1`, `true`, `on`, `yes` | Run; missing setup is reported as `misconfigured` (an error in `doctor`) |
+| `0`, `false`, `off`, `no` | Do not run; report `disabled`. The credential store is not read |
+
+What it does:
+
+- One Socket Mode link per app. Each envelope is written to the durable
+  inbox before it is acknowledged, and the dispatcher is woken at once, so
+  an owner message starts a turn immediately; no poll or triage timer is
+  involved. A redelivered message is acknowledged and never a second turn.
+- Owner messages in the DM with the app or the control channel, and
+  `/jarvis` commands, are answered through the same query path as Discord's
+  query channel (the wiki-backed query handler and the shared reasoner),
+  which needs `serve --wiki-dir`; without it the owner is told how to turn
+  queries on. Answers go through the durable outbox and the #1294 delivery
+  path (mrkdwn, splitting, reconcile). A DM is answered in the DM; a
+  control-channel message is answered in a thread under it.
+- Anyone else gets the fixed rejection: back in their DM with the app, or
+  as an ephemeral message in a channel. It never reaches the reasoner.
+  Buttons and modals get no answer yet (#1289).
+- `serve` is a dry run unless started with `--dry-run false`: turns still
+  run, but every send is recorded in the outbox as sent with a `dry-run:`
+  provider ID and no Slack method is called.
+- On SIGINT a turn in progress is abandoned and its event returned to the
+  inbox. If the process ends any other way (SIGTERM from `launchctl` or
+  `systemctl`, a crash), the claim is recovered at the next start. Either
+  way the event is handled once more; if its answer was already queued,
+  that answer is sent and the turn is not run again.
+- A Slack failure never stops `serve`, and a Discord or WhatsApp
+  configuration error no longer stops Slack.
+
+`augmentagent status` reports it under `interactive.slack`, separately from
+`channels.slack` (Composio ingestion): `state` is one of `not_configured`,
+`disabled`, `misconfigured`, `connecting`, `connected`, `reconnecting`,
+`disconnected` or `stopped`, with `last_event_unix`, `last_send_unix`, and
+`detail`/`recovery` when something needs doing. Only a `connected` listener
+whose daemon is still reporting is `healthy`; a report older than 60 s reads
+as `disconnected`. `doctor` has the matching `interactive.slack` check.
+
+The surface runs inside the existing daemon process, so the existing
+launchd and systemd service files start it; no unit, job, socket or path is
+added. Under launchd the daemon reads the tokens from the login Keychain,
+which needs the user's login session; whether a launchd-run daemon can read
+an item written from a terminal is still unverified (#1246), so check
+`status` after the first start on a Mac.
+
+For tests and local QA only, a **debug build** answers every owner turn with
+`<value> <question>` instead of calling the reasoner when
+`AUGMENTAGENT_TEST_SLACK_TURN_REPLY` is set (release builds ignore it).
+`crates/augmentagent-cli/tests/slack_serve_cli.rs` runs `serve` that way
+against a local fake Slack.
 
 ## Where credentials live
 
