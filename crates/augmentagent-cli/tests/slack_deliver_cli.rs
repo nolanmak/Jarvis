@@ -144,9 +144,9 @@ fn mock_slack(server: &mut mockito::ServerGuard, seen: &Arc<Seen>) {
         .match_header("authorization", format!("Bearer {BOT}").as_str())
         .with_header(
             "x-oauth-scopes",
-            "app_mentions:read,channels:history,channels:read,chat:write,commands,files:read,\
-files:write,groups:history,groups:read,im:history,im:read,mpim:history,mpim:read,\
-reactions:write,users:read",
+            augmentagent_channel_slack::app::REQUIRED_BOT_SCOPES
+                .join(",")
+                .as_str(),
         )
         .with_body(
             json!({"ok": true, "team": "Example Test", "user": "jarvis", "team_id": TEAM,
