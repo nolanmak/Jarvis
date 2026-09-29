@@ -102,6 +102,11 @@ pub trait SpeechToText: Send + Sync {
     fn provider(&self) -> &str;
     /// The transcript; may be empty when nothing was said.
     async fn transcribe(&self, wav: &Path) -> Result<String, SpeechError>;
+    /// `Err(reason)` when this provider cannot run on this host at all, so
+    /// a clip is refused before it is downloaded.
+    fn readiness(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Container of synthesised audio.
@@ -194,6 +199,16 @@ impl SttStack {
         self.primary.provider()
     }
 
+    /// The credit-exhaustion fallback, if one is configured.
+    pub fn alternate_provider(&self) -> Option<&str> {
+        self.alternate.as_ref().map(|a| a.provider())
+    }
+
+    /// Whether the primary provider can run on this host.
+    pub fn readiness(&self) -> Result<(), String> {
+        self.primary.readiness()
+    }
+
     /// Transcribe with the sidecar's fallback rule. On an error after a
     /// switch, `switched_from` is in the result's error message context via
     /// [`FallbackFailure`].
@@ -258,6 +273,11 @@ impl TtsStack {
         self.primary.provider()
     }
 
+    /// The credit-exhaustion fallback, if one is configured.
+    pub fn alternate_provider(&self) -> Option<&str> {
+        self.alternate.as_ref().map(|a| a.provider())
+    }
+
     /// Synthesise with the sidecar's fallback rule.
     pub async fn synthesize(
         &self,
@@ -299,6 +319,24 @@ impl TtsStack {
     }
 }
 
+impl std::fmt::Debug for SttStack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SttStack")
+            .field("primary", &self.primary.provider())
+            .field("alternate", &self.alternate.as_ref().map(|a| a.provider()))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for TtsStack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TtsStack")
+            .field("primary", &self.primary.provider())
+            .field("alternate", &self.alternate_provider())
+            .finish()
+    }
+}
+
 /// The last provider error, and the provider switched away from, if any.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FallbackFailure {
@@ -327,6 +365,43 @@ impl FallbackFailure {
             s.push_str(&format!(" after switching from {from}"));
         }
         s
+    }
+}
+
+/// A speech-to-text provider that is not set up on this host (for example
+/// whisper.cpp not built): every clip is refused before download with
+/// `reason`, and nothing is ever transcribed.
+pub struct UnconfiguredStt {
+    name: String,
+    reason: String,
+}
+
+impl UnconfiguredStt {
+    pub fn new(name: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl SpeechToText for UnconfiguredStt {
+    fn provider(&self) -> &str {
+        &self.name
+    }
+
+    fn readiness(&self) -> Result<(), String> {
+        Err(self.reason.clone())
+    }
+
+    async fn transcribe(&self, _wav: &Path) -> Result<String, SpeechError> {
+        Err(SpeechError::new(
+            self.name.clone(),
+            SpeechOperation::Stt,
+            NOT_CONFIGURED,
+            self.reason.clone(),
+        ))
     }
 }
 

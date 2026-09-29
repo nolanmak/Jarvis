@@ -593,8 +593,8 @@ fn send_is_supported_now_that_approved_contact_messages_are_delivered() {
 // (#1287), scheduling (#1291), files in (#1293), answers, uploads and
 // progress edits (#1294) and history (#1296) run on Slack with named tests
 // in docs/slack-parity-matrix.json, and so are notifications (#1295), routed
-// per class through the Slack outbox. Voice clips in serve (#1297) and live
-// voice (#1298) stay blockers.
+// per class through the Slack outbox. Voice clips and spoken replies run in
+// serve (#1297); live voice (#1298) stays the only blocker.
 #[test]
 fn capabilities_that_landed_with_named_tests_are_supported_and_only_real_gaps_block() {
     let declared = slack_capabilities();
@@ -612,6 +612,7 @@ fn capabilities_that_landed_with_named_tests_are_supported_and_only_real_gaps_bl
         SlackInteraction::FileUpload,
         SlackInteraction::MessageEdit,
         SlackInteraction::EphemeralReplies,
+        SlackInteraction::VoiceClip,
     ] {
         assert!(interaction.require().is_ok(), "{interaction:?}");
     }
@@ -623,8 +624,25 @@ fn capabilities_that_landed_with_named_tests_are_supported_and_only_real_gaps_bl
         blockers,
         [
             ("voice", SupportStatus::Unproven, 1298),
-            ("voice_clip", SupportStatus::Unsupported, 1297),
             ("live_voice", SupportStatus::Unproven, 1298),
         ]
     );
+}
+
+// #1297 — voice clips become turns in serve and `voice on` answers with audio
+// plus text; the row cites the serve-path tests. Live voice is untouched.
+#[test]
+fn voice_clips_are_supported_in_serve_and_live_voice_stays_blocked() {
+    let row = SLACK_INTERACTIONS
+        .iter()
+        .find(|row| row.key == SlackInteraction::VoiceClip)
+        .unwrap();
+    assert_eq!(row.status, SupportStatus::Supported);
+    assert_eq!(row.tracking_issue, 1297);
+    assert!(row.basis.contains("voice_surface"), "{}", row.basis);
+    assert!(SlackInteraction::VoiceClip.require().is_ok());
+    assert!(SlackInteraction::LiveVoice.require().is_err());
+    assert!(slack_capabilities()
+        .require(SurfaceCapability::Voice)
+        .is_err());
 }

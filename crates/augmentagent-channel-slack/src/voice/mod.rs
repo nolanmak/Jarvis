@@ -27,6 +27,7 @@
 
 pub mod audio;
 pub mod fake;
+pub mod providers;
 pub mod reply;
 pub mod speech;
 
@@ -69,6 +70,78 @@ impl Default for ClipLimits {
             max_duration: MAX_CLIP_DURATION,
             max_clips: MAX_CLIPS_PER_MESSAGE,
             stt_timeout: STT_TIMEOUT,
+        }
+    }
+}
+
+/// The daemon's speech setup for the live surface (`serve`): clips from
+/// the owner are transcribed with `stt`, and answers in a conversation whose
+/// reply mode is spoken (`voice on`) are synthesised with `tts`.
+#[derive(Clone, Debug)]
+pub struct SlackVoice {
+    /// Always present: an unconfigured provider
+    /// ([`speech::UnconfiguredStt`]) makes every clip an owner-facing
+    /// "can't be transcribed" notice instead of a silent "unsupported".
+    pub stt: SttStack,
+    /// `None`: spoken replies arrive as text with a note saying why.
+    pub tts: Option<TtsStack>,
+    /// `ffmpeg` lookup and timeout.
+    pub tools: ConvertOptions,
+    pub limits: ClipLimits,
+    /// Where synthesised audio waits for its upload.
+    pub replies: reply::SpokenReplyOptions,
+}
+
+/// What `voice status` reports: the provider in use, or why there is none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VoiceReadiness {
+    pub stt: Result<String, String>,
+    pub tts: Result<String, String>,
+}
+
+fn describe(primary: &str, alternate: Option<&str>) -> String {
+    match alternate {
+        Some(alt) => format!("{primary} (then {alt} if {primary} runs out of credit)"),
+        None => primary.to_string(),
+    }
+}
+
+impl SlackVoice {
+    /// Default `ffmpeg` lookup and limits.
+    pub fn new(stt: SttStack, tts: Option<TtsStack>, replies_root: PathBuf) -> Self {
+        Self {
+            stt,
+            tts,
+            tools: ConvertOptions {
+                timeout: DECODE_TIMEOUT,
+                ..ConvertOptions::default()
+            },
+            limits: ClipLimits::default(),
+            replies: reply::SpokenReplyOptions::new(replies_root),
+        }
+    }
+
+    /// The pipeline's view of this setup.
+    pub fn inbound(&self) -> VoiceInbound<'_> {
+        VoiceInbound {
+            stt: &self.stt,
+            tools: self.tools.clone(),
+            limits: self.limits.clone(),
+        }
+    }
+
+    /// Readiness from the stacks themselves (a missing TTS stack gives a
+    /// generic reason; `serve` reports the configuration's own).
+    pub fn readiness(&self) -> VoiceReadiness {
+        VoiceReadiness {
+            stt: self
+                .stt
+                .readiness()
+                .map(|()| describe(self.stt.primary_provider(), self.stt.alternate_provider())),
+            tts: match &self.tts {
+                Some(t) => Ok(describe(t.primary_provider(), t.alternate_provider())),
+                None => Err("no text-to-speech provider is configured".into()),
+            },
         }
     }
 }

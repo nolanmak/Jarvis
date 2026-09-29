@@ -438,8 +438,8 @@ line) and `starts_turn()`.
 Asynchronous voice only: a recorded clip in, an uploaded audio reply out,
 in the same conversation and thread as typed turns. This is **not** live
 voice; that stays an open blocker ([`SLACK-LIVE-VOICE.md`](SLACK-LIVE-VOICE.md),
-#1298). Code: `crates/augmentagent-channel-slack/src/voice/`. Not wired into
-`serve` yet (#1288).
+#1298). Code: `crates/augmentagent-channel-slack/src/voice/`. Wired into
+`serve` (see [In serve](#in-serve-1297) below).
 
 ### What Slack sends (file object, read 2026-09-29)
 
@@ -495,10 +495,16 @@ have no request/response mode for a recorded file. The Rust seam is
   (`augmentagent_channel_voice::Transcriber`, whisper.cpp under
   `vendor/whisper`, used for Telegram voice memos). This is what `slack voice
   transcribe` uses in a release build.
-- No TTS provider has a Rust file adapter yet, so spoken replies need one
-  before they work outside tests: either a request/response `synthesize`
-  op on the sidecar's IPC or a Rust port of its two TTS calls, reusing its
-  env names and fallback. Tracked as remaining work on #1297.
+- `voice::providers::HttpTts` is the Rust text-to-speech adapter: the
+  request/response form of the sidecar's two vendors with the same choices
+  (Deepgram `POST /v1/speak?model=aura-2-thalia-en&encoding=linear16&sample_rate=24000&container=none`,
+  text in the sidecar's 1800-character chunks; ElevenLabs
+  `POST /v1/text-to-speech/<voice>/stream?output_format=pcm_24000`, model
+  `eleven_flash_v2_5`), 24 kHz PCM out, 30 s per request. HTTP status is the
+  error code (`402`, or ElevenLabs `quota_exceeded` in the JSON body, is
+  credit exhaustion); messages never carry a key or URL. Tested against a
+  local mock (`tests/voice_tts_http.rs`: success, chunking, 402 and
+  `quota_exceeded` fallback, 5xx without fallback, timeout, empty audio).
 
 `voice::fake::{ScriptedStt, ScriptedTts}` are offline fakes for tests; the
 CLI selects them only in a debug build through
@@ -547,16 +553,45 @@ additionally needs whisper.cpp and its model (`scripts/build-whisper.sh`,
 voice memos. CI uses a fake `ffmpeg` and scripted providers on both hosts.
 Real launchd/systemd qualification of the audio dependencies is #1255.
 
-### Remaining work (#1288 harness, #1297)
+### In serve (#1297)
 
-- Call `prepare_inbound_with_voice` instead of `prepare_inbound` for owner
-  input, post `transcript_notice()` and `rejection_notice()` in the thread,
-  and run `turn_text()` as the turn in the existing conversation.
-- Decide how the owner requests a spoken reply (a per-turn control or a
-  phrase) and set `ReplyMode::Spoken`; call `enqueue_spoken_answer` instead
-  of `enqueue_answer`, then `release_spoken_audio` after the drain.
-- Add a TTS file adapter (see above) and, for the daemon, configure the STT
-  provider selection instead of the working-directory whisper default.
+`SlackSurfaceConfig::voice` (`serve` always sets it):
+
+- an owner message with clips runs `prepare_inbound_with_voice` after
+  `owner::admit` dispatched it; the transcript notice is queued first
+  (`turn:transcript:<event>:…`, so a replay never posts it twice), then the
+  transcript runs as a normal turn in the same conversation and native
+  session. Non-owner audio is rejected by the gate and never downloaded or
+  transcribed (`tests/voice_surface.rs`);
+- when speech-to-text is not set up, a clip is refused **before download**
+  with "voice clips can't be transcribed on this host: <why>; type the message
+  instead", and no turn runs;
+- `voice on` / `voice off` (also `!voice …`, `/jarvis voice …`) store the
+  conversation's reply mode in the store (`surface_reply_modes`, keyed by the
+  conversation storage key); a thread without its own choice inherits its
+  channel's or DM's. Every answer reads it: spoken answers go through
+  `enqueue_spoken_answer` (full text mirror plus `spoken-reply.wav`, once),
+  a TTS failure or missing provider still delivers the text with a note, and
+  the stored audio is released once its upload is settled. `voice status`
+  shows the mode, both providers and the live-voice blocker (#1298).
+  Failed and cancelled turns are always text.
+
+Daemon-level provider selection (read once at start; restart the daemon
+after a change):
+
+| setting | values | default |
+| --- | --- | --- |
+| `AUGMENTAGENT_SLACK_STT_PROVIDER` | `whisper-cpp`, `off` | `whisper-cpp` |
+| `AUGMENTAGENT_WHISPER_BIN` / `AUGMENTAGENT_WHISPER_MODEL` | paths | `<working dir>/vendor/whisper/main`, `…/models/ggml-medium.en.bin` (`scripts/build-whisper.sh`) |
+| `AUGMENTAGENT_SLACK_TTS_PROVIDER` | `deepgram`, `elevenlabs`, `off` | `AUGMENTAGENT_DISCORD_TTS_PROVIDER`, else `deepgram` |
+| `DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` | the sidecar's credential names | unset: spoken replies are text with a note |
+
+The other TTS vendor is the credit fallback when its key (and, for
+ElevenLabs, the voice ID) is set, exactly as in the sidecar. Deepgram and
+ElevenLabs speech-to-text for clips is not ported: clips use whisper.cpp.
+Debug builds only: `AUGMENTAGENT_TEST_SLACK_SPEECH` swaps in the scripted
+fakes and `AUGMENTAGENT_TEST_SLACK_TTS_ENDPOINT` (loopback `http://` only)
+points the real TTS adapter at a local mock; release builds ignore both.
 
 ## Install-time checks (#1284)
 

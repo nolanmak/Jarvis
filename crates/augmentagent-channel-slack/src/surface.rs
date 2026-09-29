@@ -471,11 +471,13 @@ pub const SLACK_INTERACTIONS: [CapabilityRow<SlackInteraction>; 9] = [
     ),
     row(
         SlackInteraction::VoiceClip,
-        SupportStatus::Unsupported,
+        SupportStatus::Supported,
         1297,
-        "clips are transcribed and spoken replies delivered by the voice pipeline and \
-         `augmentagent slack voice` (voice/, tests/voice_clips.rs), but serve's turn path \
-         does not transcribe clips yet and release builds have no text-to-speech provider",
+        "owner clips are transcribed into a turn in the same conversation with the \
+         transcript shown first, and `voice on` answers with an uploaded audio file plus the \
+         text through the Rust Deepgram/ElevenLabs adapter (voice/, interactive.rs, \
+         tests/voice_surface.rs, tests/voice_tts_http.rs, tests/voice_clips.rs); live voice \
+         is separate (#1298)",
     ),
     row(
         SlackInteraction::LiveVoice,

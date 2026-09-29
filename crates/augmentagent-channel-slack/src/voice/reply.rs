@@ -65,6 +65,60 @@ impl FromStr for ReplyMode {
     }
 }
 
+impl ReplyMode {
+    /// The word stored per conversation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReplyMode::Text => "text",
+            ReplyMode::Spoken => "spoken",
+        }
+    }
+}
+
+/// The conversation's own `voice on|off` choice, else (for a thread) its
+/// channel's or DM's, else [`ReplyMode::Text`]. Read for every answer, so a
+/// change applies to the next one and survives a restart.
+pub fn reply_mode_for(
+    store: &Store,
+    conversation: &SurfaceConversationRef,
+) -> Result<ReplyMode, StoreError> {
+    Ok(reply_mode_source(store, conversation)?.0)
+}
+
+/// [`reply_mode_for`] and whether it was inherited from the parent
+/// conversation (a thread's channel or DM).
+pub fn reply_mode_source(
+    store: &Store,
+    conversation: &SurfaceConversationRef,
+) -> Result<(ReplyMode, bool), StoreError> {
+    let parse = |s: String| s.parse::<ReplyMode>().unwrap_or_default();
+    if let Some(own) = store.surface_reply_mode(conversation)? {
+        return Ok((parse(own), false));
+    }
+    if conversation.thread_id().is_some() {
+        let parent = SurfaceConversationRef::new(
+            conversation.account().clone(),
+            conversation.conversation_id(),
+            None,
+        )
+        .map_err(|e| StoreError::InvalidInput(e.to_string()))?;
+        if let Some(inherited) = store.surface_reply_mode(&parent)? {
+            return Ok((parse(inherited), true));
+        }
+    }
+    Ok((ReplyMode::Text, false))
+}
+
+/// Store `mode` for exactly `conversation` (`voice on|off`).
+pub fn set_reply_mode(
+    store: &Store,
+    conversation: &SurfaceConversationRef,
+    mode: ReplyMode,
+    now_ms: i64,
+) -> Result<(), StoreError> {
+    store.set_surface_reply_mode(conversation, Some(mode.as_str()), now_ms)
+}
+
 /// `<state dir>/slack-voice-replies`, `None` without `HOME`.
 pub fn default_spoken_reply_root() -> Option<PathBuf> {
     augmentagent_channel_core::state_dir::state_dir().map(|d| d.join(SLACK_VOICE_REPLIES_DIR))

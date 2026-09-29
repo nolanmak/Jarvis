@@ -67,7 +67,9 @@ use crate::delivery::{
     SlackOutboxDispatcher,
 };
 use crate::harness::CANCELLED_REPLY;
-use crate::inbound::{default_inbound_root, prepare_inbound, InboundError, InboundOptions};
+use crate::inbound::{
+    default_inbound_root, prepare_inbound_with_voice, InboundError, InboundOptions,
+};
 use crate::ingest::SubscribedEventSink;
 use crate::owner::{
     admit, AdmitOutcome, OwnerInput, OwnerInputSink, OwnerInputSource, SlackBotIdentity,
@@ -82,6 +84,11 @@ use crate::transport::socket::{
     SocketModeClient, SocketModeConfig,
 };
 use crate::transport::web::{PostEphemeral, SlackWebApi};
+use crate::voice::reply::{
+    enqueue_spoken_answer, release_spoken_audio, reply_mode_for, spoken_audio_key, ReplyMode,
+    SpokenAnswer,
+};
+use crate::voice::SlackVoice;
 
 /// A report older than this means the daemon that wrote it stopped.
 pub const STALE_AFTER: Duration = Duration::from_secs(60);
@@ -202,6 +209,11 @@ pub struct SlackSurfaceConfig {
     /// #1294/#1288 — the throttled status line during a turn. `None` posts
     /// none. Never posted in dry-run.
     pub progress: Option<ProgressConfig>,
+    /// #1297 — owner voice clips are transcribed into the turn (with the
+    /// transcript shown first), and answers in a conversation set to
+    /// `voice on` are delivered as audio plus the text mirror. `None`: clips
+    /// are refused as unsupported files and answers are text only.
+    pub voice: Option<SlackVoice>,
 }
 
 impl Default for SlackSurfaceConfig {
@@ -220,6 +232,7 @@ impl Default for SlackSurfaceConfig {
             socket: SocketModeConfig::default(),
             inbound: None,
             progress: None,
+            voice: None,
             approval_sweep: Duration::from_secs(60),
         }
     }
@@ -827,6 +840,13 @@ fn answer_turn_id(event_id: &str) -> String {
     event_id.to_string()
 }
 
+/// #1297 — turn ID of the transcript notice posted before a clip's turn
+/// runs (its own keys, so a replay never posts it twice and the answer's
+/// replay check is unaffected).
+fn transcript_turn_id(event_id: &str) -> String {
+    format!("transcript:{event_id}")
+}
+
 /// Turn ID of a rejection posted in a DM.
 fn rejection_turn_id(event_id: &str) -> String {
     format!("reject:{event_id}")
@@ -1223,6 +1243,67 @@ fn enqueue_with_files(
     Ok(())
 }
 
+/// #1297 — queue an answer as a spoken reply: the full text mirror, then
+/// the synthesised audio (text with a note when synthesis fails), under the
+/// turn's keys. A shutdown during synthesis queues the text alone so the
+/// answer is never lost.
+async fn enqueue_spoken(
+    ctx: &Ctx,
+    conversation: &SurfaceConversationRef,
+    turn_id: &str,
+    markdown: &str,
+    files: &[AnswerFile],
+    shutdown: &CancellationToken,
+) -> anyhow::Result<()> {
+    let Some(voice) = ctx.config.voice.as_ref() else {
+        return enqueue_with_files(ctx, conversation, turn_id, markdown, files);
+    };
+    let mut opts = voice.replies.clone();
+    opts.plan = PlanOptions {
+        max_attempts: ctx.config.max_send_attempts,
+        ..PlanOptions::default()
+    };
+    let answer = SpokenAnswer {
+        turn_id,
+        markdown,
+        files,
+        mode: ReplyMode::Spoken,
+    };
+    let spoken = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => {
+            info!(turn = turn_id, "slack interactive: shutdown during speech; queueing the text only");
+            return enqueue_with_files(ctx, conversation, turn_id, markdown, files);
+        }
+        r = enqueue_spoken_answer(
+            &ctx.store, conversation, &answer, voice.tts.as_ref(), &opts, ctx.now(),
+        ) => r?,
+    };
+    info!(turn = turn_id, speech = ?spoken.speech, "slack interactive: spoken reply queued");
+    ctx.send_wake.notify_one();
+    Ok(())
+}
+
+/// #1297 — once a spoken reply's audio upload is settled (sent, dead
+/// letter or abandoned), remove the stored file.
+fn release_spoken(ctx: &Ctx, account: &SurfaceAccountRef, key: &str) {
+    let Some(voice) = ctx.config.voice.as_ref() else {
+        return;
+    };
+    let Some(turn) = key
+        .strip_prefix("turn:")
+        .and_then(|k| k.strip_suffix(":file:0"))
+    else {
+        return;
+    };
+    if spoken_audio_key(turn) != key {
+        return;
+    }
+    if let Err(e) = release_spoken_audio(&ctx.store, account, turn, &voice.replies.root) {
+        warn!(error = %e, "slack interactive: could not remove a sent spoken reply");
+    }
+}
+
 /// Authorizer from the current bindings (so an unbind takes effect on the
 /// next event), with each installed workspace's bot identity for echo
 /// detection.
@@ -1569,16 +1650,31 @@ async fn run_registered_turn(
                         opts.root = root;
                     }
                 }
+                // #1297 — owner clips are transcribed (only here, after
+                // `admit` dispatched the event).
+                let voice = ctx.config.voice.as_ref().map(SlackVoice::inbound);
                 let prepared = tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => {
                         release(ctx, seq, "cancelled by shutdown");
                         return;
                     }
-                    r = prepare_inbound(web.as_ref(), &text, &files, &opts, &cancel) => r,
+                    r = prepare_inbound_with_voice(
+                        web.as_ref(), &text, &files, &opts, voice.as_ref(), &cancel,
+                    ) => r,
                 };
                 match prepared {
                     Ok(message) => {
+                        // What was heard, shown before the answer.
+                        if let (Some(notice), Some(conversation)) =
+                            (message.transcript_notice(), &session)
+                        {
+                            let turn = transcript_turn_id(&claimed.event_id);
+                            if let Err(e) = enqueue(ctx, conversation, &turn, &notice) {
+                                release(ctx, seq, &format!("enqueue transcript: {e}"));
+                                return;
+                            }
+                        }
                         footer = message.rejection_notice();
                         prompt = message.prompt.clone();
                         inbound = Some(message);
@@ -1692,18 +1788,19 @@ async fn run_registered_turn(
     if let Some(progress) = progress {
         progress.finish(Some(status.to_string())).await;
     }
-    let (mut text, files) = match result {
+    let stopped = cancel.is_cancelled();
+    let (mut text, files, answered) = match result {
         Ok(Some(reply)) if !reply.text.trim().is_empty() || !reply.files.is_empty() => {
-            (reply.text, reply.files)
+            (reply.text, reply.files, !stopped)
         }
         Ok(_) if footer.is_none() => {
             settle(ctx, seq);
             return;
         }
-        Ok(_) => (String::new(), Vec::new()),
+        Ok(_) => (String::new(), Vec::new(), false),
         Err(e) => {
             warn!(seq, error = %format!("{e:#}"), "slack interactive: turn failed");
-            (TURN_FAILED_REPLY.to_string(), Vec::new())
+            (TURN_FAILED_REPLY.to_string(), Vec::new(), false)
         }
     };
     if let Some(footer) = footer {
@@ -1715,7 +1812,19 @@ async fn run_registered_turn(
     match session {
         Some(conversation) => {
             let turn = answer_turn_id(&claimed.event_id);
-            if let Err(e) = enqueue_with_files(ctx, &conversation, &turn, &text, &files) {
+            // #1297 — `voice on` here: the answer is also spoken.
+            let spoken = answered
+                && ctx.config.voice.is_some()
+                && reply_mode_for(&ctx.store, &conversation).unwrap_or_else(|e| {
+                    warn!(seq, error = %e, "slack interactive: reply mode unreadable; answering in text");
+                    ReplyMode::Text
+                }) == ReplyMode::Spoken;
+            let queued = if spoken {
+                enqueue_spoken(ctx, &conversation, &turn, &text, &files, shutdown).await
+            } else {
+                enqueue_with_files(ctx, &conversation, &turn, &text, &files)
+            };
+            if let Err(e) = queued {
                 warn!(seq, error = %e, "slack interactive: could not queue the answer");
                 release(ctx, seq, &format!("enqueue answer: {e}"));
                 return;
@@ -1758,7 +1867,9 @@ async fn drain(ctx: &Ctx, runtime: &SlackWorkspaceRuntime) {
             .with_retry_policy(ctx.config.retry);
     match dispatcher.drain(ctx.now()).await {
         Ok(done) => {
+            let account = runtime.workspace.account();
             for d in done {
+                release_spoken(ctx, &account, &d.idempotency_key);
                 match d.outcome {
                     DispatchOutcome::Sent { .. } | DispatchOutcome::Reconciled { .. } => {
                         ctx.health.sent(ctx.now())
@@ -1796,7 +1907,10 @@ fn record_dry_run(ctx: &Ctx, runtime: &SlackWorkspaceRuntime) {
             .store
             .mark_outbound_sent(send.id, &format!("dry-run:{}", send.id), ctx.now())
         {
-            Ok(()) => ctx.health.sent(ctx.now()),
+            Ok(()) => {
+                ctx.health.sent(ctx.now());
+                release_spoken(ctx, &account, &send.idempotency_key);
+            }
             Err(e) => {
                 warn!(id = send.id, error = %e, "slack interactive: could not record dry-run send");
                 return;

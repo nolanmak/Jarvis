@@ -50,6 +50,7 @@ fn report_prints_every_row_and_the_open_blockers_from_the_checkout() {
     for needle in [
         "supported        approvals",
         "blocked          live-voice",
+        "supported        voice-clips",
         "unverified-live  acceptance",
         "Open blockers",
         "host linux (#1325)",

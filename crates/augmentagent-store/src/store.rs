@@ -873,6 +873,8 @@ impl Store {
         crate::approval_cards::migrate(conn)?;
         // #1299 — the daemon's own start report (credential backend, notices).
         crate::daemon_report::migrate(conn)?;
+        // #1297 — per-conversation reply mode (`voice on|off` on Slack).
+        crate::surface_reply_modes::migrate(conn)?;
         // -------------------------------------------------------------------
         // #45 — Rust-owned schema. Mirrors `src/db.ts::initDb()` exactly
         // (column names, types, NOT NULL, DEFAULT, PRIMARY KEY). Do NOT

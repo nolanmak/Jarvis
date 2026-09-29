@@ -64,8 +64,7 @@ pub struct OwnerCommand {
 /// Live voice on Slack (#1298).
 pub const LIVE_VOICE_BLOCKER: &str = "Live voice needs the app to join a huddle or call, and no \
      documented Slack API allows that (#1298, docs/SLACK-LIVE-VOICE.md). Voice clips in and \
-     spoken replies (#1297) are asynchronous and do not replace it; spoken replies are not yet \
-     switchable from the live Slack surface.";
+     spoken replies (#1297, `voice on`) are asynchronous and do not replace it.";
 
 pub static OWNER_COMMANDS: &[OwnerCommand] = &[
     OwnerCommand {
@@ -131,13 +130,15 @@ pub static OWNER_COMMANDS: &[OwnerCommand] = &[
     OwnerCommand {
         name: "voice",
         aliases: &[],
-        usage: "voice",
-        description: "Live voice (Discord's `/voice`).",
+        usage: "voice [on | off | status]",
+        description: "Spoken replies in this conversation (#1297): `voice on` answers with an \
+             audio file plus the full text, `voice off` goes back to text, `voice status` shows \
+             the mode and the speech providers. Voice clips you send are always transcribed. \
+             Live voice (Discord's `/voice` in a call) is not possible on Slack (#1298).",
         discord: &["/voice"],
-        slack: SlackMapping::Blocked {
-            issue: 1298,
-            reason: LIVE_VOICE_BLOCKER,
-        },
+        // #1297 — Slack's `voice` is the spoken-reply switch; live voice
+        // stays the #1298 blocker, which `voice status` names.
+        slack: SlackMapping::Command,
         plain: PlainText::Sigil,
     },
     OwnerCommand {
