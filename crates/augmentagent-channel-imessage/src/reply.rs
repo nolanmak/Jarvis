@@ -102,6 +102,29 @@ pub fn only_own_sends(store: &Store, delta: &PollDelta) -> bool {
 /// the entry to be that send. The bundle carries no message guid.
 const OWN_SEND_WINDOW_MS: i64 = 10 * 60_000;
 
+/// In the self-chat, each send also arrives as an incoming copy from the
+/// operator's own handle. A newest entry that matches a sent outbox row is
+/// that echo, not someone writing in.
+fn newest_is_echo_of_own_send(store: &Store, delta: &PollDelta) -> bool {
+    let Some((_, newest)) = delta.new_entries.last() else {
+        return false;
+    };
+    let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&newest.timestamp) else {
+        return false;
+    };
+    let ts = ts.timestamp_millis();
+    let conv = &delta.conversation;
+    std::iter::once(&conv.identifier)
+        .chain(conv.chat_guid.as_ref())
+        .filter_map(|t| store.sent_imessage_outbox_for_target(t, 0).ok())
+        .flatten()
+        .any(|r| {
+            r.body == newest.body
+                && r.completed_at_ms
+                    .is_some_and(|c| (ts - c).abs() <= OWN_SEND_WINDOW_MS)
+        })
+}
+
 /// Split the delta's `me` entries into (agent's own sends, manual replies).
 /// Each sent outbox row accounts for at most one entry.
 fn split_own_entries(store: &Store, delta: &PollDelta) -> (usize, usize) {
@@ -169,6 +192,9 @@ impl ImessageReplier {
             let Some(email) = reply_email(delta) else {
                 continue;
             };
+            if newest_is_echo_of_own_send(&self.store, delta) {
+                continue;
+            }
             match self
                 .store
                 .is_imessage_inbound_allowed(&delta.conversation.identifier)
@@ -689,6 +715,21 @@ mod tests {
         assert_eq!(rep.handle_deltas(&d2).await, ReplyStats::default());
         assert_eq!(snapshot(&f.store), before);
         assert_eq!(emails(&f.store), n_before);
+    }
+
+    #[tokio::test]
+    async fn self_chat_echo_of_an_agent_send_posts_no_card() {
+        // In the self-chat every send also arrives as an incoming copy from
+        // the operator's own handle; it must not trigger a reply to itself.
+        let f = fx();
+        f.store.allow_imessage_inbound(PHONE).unwrap();
+        sent_row(&f.store, "sent-action", "on my way", ts_ms(TS));
+        let d = one_to_one(&[("me", "on my way"), (PHONE, "on my way")]);
+        ingest(&f.store, &d);
+        let r = Scripted::new(&[REPLY, "x"]);
+        let stats = replier(&f, r.clone()).handle_deltas(&[d]).await;
+        assert_eq!(r.calls(), 0);
+        assert_eq!(stats.cards, 0);
     }
 
     #[test]
