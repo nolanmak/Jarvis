@@ -93,3 +93,6 @@ __pycache__/
 # and braces for anyone pointing the env overrides at the working tree.
 token-usage.jsonl
 tool-audit.log
+
+# Compiled WhatsApp sidecar — built into the source tree by setup.sh.
+sidecars/wa-sidecar/wa-sidecar
