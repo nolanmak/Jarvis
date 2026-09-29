@@ -96,6 +96,8 @@ mod service;
 mod setup;
 mod approval_routing;
 mod slack_app;
+// #1290 — compose a new Slack message for approval.
+mod slack_compose;
 mod slack_deliver;
 mod slack_files;
 mod slack_serve;
@@ -1734,6 +1736,10 @@ enum SlackOp {
         #[command(subcommand)]
         op: slack_voice::SlackVoiceOp,
     },
+    /// Propose a new Slack message to a person or subscribed channel
+    /// (#1290). Never sends: it stores a pending approval whose card shows
+    /// the destination and sender; only Approve sends, as the owner.
+    Compose(slack_compose::ComposeArgs),
 }
 
 #[derive(Subcommand)]
@@ -2777,6 +2783,7 @@ async fn main() -> Result<()> {
                         plan,
                         channel,
                         card_surfaces.clone(),
+                        cli.wiki_dir.clone(),
                     )
                     .await
                     {
@@ -3895,6 +3902,18 @@ async fn main() -> Result<()> {
             SlackOp::Deliver(args) => slack_deliver::run(args, &store).await,
             SlackOp::Files { op } => slack_files::run(op).await,
             SlackOp::Voice { op } => slack_voice::run(op, &store).await,
+            SlackOp::Compose(args) => {
+                let out = slack_compose::run(
+                    &store,
+                    cli.wiki_dir.as_deref(),
+                    &args.to,
+                    &args.text,
+                    args.team_id.as_deref(),
+                    args.dry_run,
+                )?;
+                println!("{out}");
+                Ok(())
+            }
             SlackOp::PollOnce { dry_run } => {
                 let (broker, _) = build_broker(&cli, Arc::clone(&store), *dry_run).await?;
                 let ch = build_slack_channel(&cli, store, broker, *dry_run)?;
@@ -7136,6 +7155,14 @@ async fn run_gmail_update_draft(
 /// the only non-dead-end one.
 fn send_at_proposal_is_live(at_ms: i64, now_ms: i64) -> bool {
     at_ms > now_ms + augmentagent_channel_core::timeparse::MIN_LEAD_MS
+}
+
+/// #1290 — the surface a decision was taken on, recorded as the action's
+/// `status_source`. Slack decisions run inside `deciding("slack", …)` and
+/// Discord's (beside Slack) inside `deciding("discord", …)`; the Discord bot
+/// on its own calls the approver directly, so the default stays `discord`.
+fn decision_source() -> &'static str {
+    augmentagent_approval_discord::deciding_surface().unwrap_or("discord")
 }
 
 fn record_self_send(
@@ -12511,70 +12538,31 @@ impl ReplyApprover {
         None
     }
 
+    /// #1290 — send an approved Slack contact message (a reply or a
+    /// compose) once, as the owner, through the Composio user connection:
+    /// `augmentagent_channel_slack::contact` owns the claim, the send ledger
+    /// (retry without duplication), thread targeting, formatting and the
+    /// Slack self-send record. Also the retry of a send that failed after
+    /// approval (`error` with an unfinished ledger row).
     async fn approve_slack(
         &self,
-        action_id: &str,
+        _action_id: &str,
         action: augmentagent_store::ActionWithEmail,
     ) -> ApprovalActionOutcome {
-        let Some(slack) = self.resolve_slack_client(&action.email) else {
-            return ApprovalActionOutcome::Failed {
-                message: "Slack workspace not available; reconnect in dashboard or `augmentagent slack login`".into(),
-            };
-        };
-        let Some(channel_id) = action.email.thread_id.as_deref() else {
-            return ApprovalActionOutcome::Failed {
-                message: "no channel id on email; cannot send".into(),
-            };
-        };
-        let Some(body) = action.action.draft_body.as_deref() else {
-            return ApprovalActionOutcome::Failed {
-                message: "no draft body on action; cannot send".into(),
-            };
-        };
-        // #785 — scrub the card-only assumes marker before it ships.
-        let owned = augmentagent_approval_discord::strip_assumes_for_send(body);
-        let body = owned.as_str();
-        // #1289 — claim the row (`pending → sending`) before the send. The
-        // card can be clicked on Slack and Discord at once (or twice on
-        // one); the status read above is not a gate. The loser reports the
-        // winner's state and sends nothing.
-        match self
-            .store
-            .claim_action_for_send(action_id, ActionStatus::Pending, "discord")
-        {
-            Ok(true) => {}
-            Ok(false) => return Self::resolved_outcome(&self.store, action_id),
-            Err(e) => {
-                return ApprovalActionOutcome::Failed {
-                    message: format!("claim for send failed: {e}"),
-                }
-            }
-        }
-        match slack.send_message(channel_id, body).await {
-            Ok(ts) => {
-                let _ = self.store.update_action_status(
-                    action_id,
-                    ActionStatus::Sent,
-                    Some(body),
-                    None,
-                );
-                let _ = self
-                    .store
-                    .mark_email_processed(&action.email.message_id, TriageResult::Reply);
-                tracing::info!(action_id, ts, "slack reply sent via approval handler");
-                ApprovalActionOutcome::Approved
-            }
-            Err(e) => {
-                let msg = format!("slack send_message: {e}");
-                let _ = self.store.update_action_status(
-                    action_id,
-                    ActionStatus::Error,
-                    None,
-                    Some(&msg),
-                );
-                ApprovalActionOutcome::Failed { message: msg }
-            }
-        }
+        let client = augmentagent_channel_slack::contact::reply_target(&self.store, &action.email)
+            .ok()
+            .and_then(|t| self.slack.get(&t.team_id).cloned())
+            .or_else(|| self.resolve_slack_client(&action.email));
+        let api = client
+            .as_deref()
+            .map(|c| c as &dyn augmentagent_channel_slack::contact::ContactSendApi);
+        augmentagent_channel_slack::contact::approve_contact_message(
+            &self.store,
+            api,
+            &action,
+            decision_source(),
+        )
+        .await
     }
 
     async fn revise_slack(
@@ -12627,7 +12615,7 @@ impl ReplyApprover {
         match self.store.try_resolve_action(
             action_id,
             ActionStatus::Rejected,
-            "discord",
+            decision_source(),
             Some("skipped by approver"),
         ) {
             Ok(true) => {}
@@ -12837,6 +12825,12 @@ impl ReplyApprover {
         let Some(action) = self.handle_load(action_id) else {
             return ApprovalActionOutcome::NotFound;
         };
+        // #1290 — a Slack contact send that failed after approval is retried
+        // by approving again; the contact path decides whether the row is
+        // retryable and never sends a delivered message twice.
+        if action.email.platform == "slack" && action.action.status == "error" {
+            return self.approve_slack(action_id, action).await;
+        }
         if action.action.status != "pending" {
             return ApprovalActionOutcome::AlreadyResolved {
                 status: action.action.status,
@@ -12911,7 +12905,7 @@ impl ReplyApprover {
         match self.store.claim_action_for_send(
             action_id,
             ActionStatus::Pending,
-            "discord",
+            decision_source(),
         ) {
             Ok(true) => {}
             Ok(false) => {
@@ -12965,7 +12959,7 @@ impl ReplyApprover {
                 // stamp is the caller's policy — see the doc comment.
                 let stamp = retry_exempt_on_error
                     .then_some(augmentagent_channel_email::RETRY_EXEMPT_RETRY_COUNT);
-                let _ = self.store.finish_send_error(action_id, &msg, stamp, "discord");
+                let _ = self.store.finish_send_error(action_id, &msg, stamp, decision_source());
                 return ApprovalActionOutcome::Failed { message: msg };
             }
             Err(_elapsed) => {
@@ -12979,7 +12973,7 @@ impl ReplyApprover {
                     action_id,
                     &msg,
                     Some(augmentagent_channel_email::RETRY_EXEMPT_RETRY_COUNT),
-                    "discord",
+                    decision_source(),
                 );
                 return ApprovalActionOutcome::Failed { message: msg };
             }
@@ -12994,7 +12988,7 @@ impl ReplyApprover {
             Some(entity_id),
             Some(action_id),
         );
-        let _ = self.store.finish_send_sent(action_id, "discord");
+        let _ = self.store.finish_send_sent(action_id, decision_source());
         let _ = self
             .store
             .mark_email_processed(&action.email.message_id, TriageResult::Reply);
@@ -13104,7 +13098,7 @@ impl ReplyApprover {
         // CAS `pending → sending` before ANY write — the wiki's or this row's:
         // a double-click must not run the merge twice (the second would fail on
         // the deleted stub), nor a racing Skip reject one that ran.
-        match store.claim_action_for_send(action_id, ActionStatus::Pending, "discord") {
+        match store.claim_action_for_send(action_id, ActionStatus::Pending, decision_source()) {
             Ok(true) => {}
             Ok(false) => {
                 return Self::resolved_outcome(store, action_id);
@@ -13151,7 +13145,7 @@ impl ReplyApprover {
     /// is the CAS off `pending`, whose `rejected` stops the scan re-proposing.
     fn skip_identity_merge(store: &Store, action_id: &str) -> ApprovalActionOutcome {
         let reason = Some("merge declined by approver");
-        match store.try_resolve_action(action_id, ActionStatus::Rejected, "discord", reason) {
+        match store.try_resolve_action(action_id, ActionStatus::Rejected, decision_source(), reason) {
             Ok(true) => ApprovalActionOutcome::Skipped,
             Ok(false) => Self::resolved_outcome(store, action_id),
             Err(e) => ApprovalActionOutcome::Failed {
@@ -13241,7 +13235,7 @@ impl ReplyApprover {
         match self.store.try_resolve_action(
             action_id,
             ActionStatus::Rejected,
-            "discord",
+            decision_source(),
             Some("skipped by approver"),
         ) {
             Ok(true) => {}
@@ -13578,7 +13572,7 @@ impl ReplyApprover {
         // CAS `pending → scheduled`: a double-pick's loser (or a racing
         // Approve / supersede) reports the fresh status and runs no side
         // effects — never a second schedule.
-        match self.store.schedule_action(action_id, at_ms, "discord") {
+        match self.store.schedule_action(action_id, at_ms, decision_source()) {
             Ok(true) => {}
             Ok(false) => {
                 return Self::resolved_outcome(&self.store, action_id);
@@ -13647,7 +13641,7 @@ impl ReplyApprover {
         match self.store.claim_action_for_send(
             action_id,
             ActionStatus::Scheduled,
-            "discord",
+            decision_source(),
         ) {
             Ok(true) => {}
             Ok(false) => {
@@ -13668,7 +13662,7 @@ impl ReplyApprover {
                 action_id,
                 "send now: action row disappeared after claim",
                 Some(augmentagent_channel_email::RETRY_EXEMPT_RETRY_COUNT),
-                "discord",
+                decision_source(),
             );
             self.delete_stored_notice(action_id).await;
             return ApprovalActionOutcome::NotFound;
@@ -13686,7 +13680,7 @@ impl ReplyApprover {
                 action_id,
                 msg,
                 Some(augmentagent_channel_email::RETRY_EXEMPT_RETRY_COUNT),
-                "discord",
+                decision_source(),
             );
             self.delete_stored_notice(action_id).await;
             return ApprovalActionOutcome::Failed {
@@ -13720,7 +13714,7 @@ impl ReplyApprover {
         match self.store.cancel_scheduled_action(
             action_id,
             "schedule cancelled by approver",
-            "discord",
+            decision_source(),
         ) {
             Ok(true) => {}
             Ok(false) => {
@@ -13803,7 +13797,7 @@ impl ReplyApprover {
                 }
             }
         }
-        let cas = self.store.unschedule_action(action_id, "discord");
+        let cas = self.store.unschedule_action(action_id, decision_source());
         if !matches!(cas, Ok(true)) {
             // The row never became pending (Send Now / cancel / engine fire
             // / supersede won meanwhile) — take the pre-posted card back
@@ -13897,7 +13891,7 @@ impl ReplyApprover {
             }
         }
 
-        let cas = self.store.recompose_action(action_id, "discord");
+        let cas = self.store.recompose_action(action_id, decision_source());
         if !matches!(cas, Ok(true)) {
             // The row never became pending (a racing surface resolved it, or
             // it was no longer superseded) — take the pre-posted card back

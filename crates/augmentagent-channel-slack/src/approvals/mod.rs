@@ -39,6 +39,7 @@
 
 pub mod card;
 
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -47,7 +48,7 @@ use augmentagent_approval_discord::outcome::{
     card_status_line, describe, offers_recompose, redraft_produced_no_card,
 };
 use augmentagent_approval_discord::{
-    append_envelope_markers, fill_feedback, revise_result_prefix, split_needs_input,
+    append_envelope_markers, deciding, fill_feedback, revise_result_prefix, split_needs_input,
     ApprovalActionHandler, ApprovalActionOutcome, ApprovalBroker, ApprovalCardSurface,
     ApprovalError, CardSurfaces, MAX_REDRAFT_ITERATIONS, PRESETS,
 };
@@ -114,6 +115,9 @@ pub struct SlackApprovals {
     handler: OnceLock<Arc<dyn ApprovalActionHandler>>,
     surfaces: CardSurfaces,
     clock: Clock,
+    /// #1290 — the wiki whose people pages compose recipients resolve
+    /// through. `None`: only subscribed channels can be composed to.
+    wiki_root: Option<PathBuf>,
 }
 
 /// The decision a control or command asks for.
@@ -148,7 +152,14 @@ impl SlackApprovals {
             handler: OnceLock::new(),
             surfaces,
             clock: Arc::new(system_now_ms),
+            wiki_root: None,
         }
+    }
+
+    /// #1290 — resolve compose recipients through this wiki's people pages.
+    pub fn with_wiki_root(mut self, wiki_root: Option<PathBuf>) -> Self {
+        self.wiki_root = wiki_root;
+        self
     }
 
     pub fn with_clock(mut self, clock: Clock) -> Self {
@@ -223,6 +234,7 @@ impl SlackApprovals {
         let status = row.action.status.clone();
         let detail = row.action.error_message.as_deref();
         let line = card_status_line(&status, detail);
+        let (destination, sends_as) = self.contact_lines(&row.email);
         let (text, blocks) = card::card(&CardInput {
             action_id,
             email: &row.email,
@@ -232,8 +244,40 @@ impl SlackApprovals {
             note: if line.is_none() { note } else { None },
             status_line: line.as_deref(),
             offer_recompose: offers_recompose(&status, detail),
+            destination: destination.as_deref(),
+            sends_as: sends_as.as_deref(),
+            offer_retry: self.offers_retry(row),
         });
         (text, blocks, digest, status)
+    }
+
+    /// #1290 — where a Slack contact message goes and who sends it.
+    fn contact_lines(&self, email: &Email) -> (Option<String>, Option<String>) {
+        if email.platform != crate::PLATFORM {
+            return (None, None);
+        }
+        let destination = crate::contact::reply_target(&self.store, email)
+            .ok()
+            .map(|t| crate::contact::describe_destination(&t));
+        (
+            destination,
+            crate::contact::sends_as_line(&self.store, email),
+        )
+    }
+
+    /// #1290 — a Slack contact send that failed after approval (the ledger
+    /// has an unfinished attempt) can be approved again.
+    fn offers_retry(&self, row: &ActionWithEmail) -> bool {
+        row.email.platform == crate::PLATFORM
+            && row.action.status == "error"
+            && self
+                .store
+                .slack_contact_send(&row.action.id)
+                .ok()
+                .flatten()
+                .is_some_and(|s| {
+                    s.status != augmentagent_store::slack_contact::SlackSendStatus::Sent
+                })
     }
 
     /// Post a new card for `action_id` and record where it went. Older live
@@ -252,6 +296,7 @@ impl SlackApprovals {
             // draw what it passed.
             None => {
                 let digest = card::draft_digest(draft);
+                let (destination, sends_as) = self.contact_lines(email);
                 let (text, blocks) = card::card(&CardInput {
                     action_id,
                     email,
@@ -261,6 +306,9 @@ impl SlackApprovals {
                     note,
                     status_line: None,
                     offer_recompose: false,
+                    destination: destination.as_deref(),
+                    sends_as: sends_as.as_deref(),
+                    offer_retry: false,
                 });
                 (text, blocks, digest, "pending".to_string())
             }
@@ -359,8 +407,9 @@ impl SlackApprovals {
             Some(row) => {
                 let (text, blocks, digest, status) = self.render(&row, note);
                 // `sending` is transient: keep the card in the sweep until
-                // the send settles.
-                let state = if status == "pending" || status == "sending" {
+                // the send settles. A retryable failed send is still live.
+                let state = if status == "pending" || status == "sending" || self.offers_retry(&row)
+                {
                     ApprovalCardState::Live
                 } else {
                     ApprovalCardState::Settled
@@ -507,6 +556,16 @@ impl SlackApprovals {
                 message: NO_HANDLER_REPLY.into(),
             };
         };
+        // #1290 — the handler records this surface as the decision's source.
+        deciding(SURFACE, self.decide_inner(&handler, action_id, verb)).await
+    }
+
+    async fn decide_inner(
+        &self,
+        handler: &Arc<dyn ApprovalActionHandler>,
+        action_id: &str,
+        verb: &Verb,
+    ) -> ApprovalActionOutcome {
         match verb {
             Verb::Approve => {
                 let out = handler.approve(action_id).await;
@@ -525,7 +584,7 @@ impl SlackApprovals {
                 self.surfaces.redraw_except(SURFACE, action_id).await;
                 out
             }
-            Verb::Revise(feedback) => self.redraft(&handler, action_id, feedback, None).await,
+            Verb::Revise(feedback) => self.redraft(handler, action_id, feedback, None).await,
             Verb::Refine(preset_id) => {
                 let Some(preset) = PRESETS.iter().find(|p| p.id == preset_id) else {
                     return ApprovalActionOutcome::Failed {
@@ -537,7 +596,7 @@ impl SlackApprovals {
                         message: REFINE_LIMIT_REPLY.into(),
                     };
                 }
-                self.redraft(&handler, action_id, preset.feedback, Some(preset.id))
+                self.redraft(handler, action_id, preset.feedback, Some(preset.id))
                     .await
             }
         }
@@ -884,6 +943,9 @@ impl SlackApprovals {
     /// `approvals` for the pending queue. `None` when `text` is not an
     /// approval command (it goes to the agent instead).
     pub async fn handle_command(&self, text: &str) -> Option<String> {
+        if let Some(cmd) = crate::contact::compose::parse_compose_command(text) {
+            return Some(self.compose_command(cmd).await);
+        }
         let t = text.trim().trim_start_matches(['!', '/']).trim();
         let (word, rest) = match t.split_once(char::is_whitespace) {
             Some((w, r)) => (w, r.trim()),
@@ -989,6 +1051,71 @@ impl SlackApprovals {
             _ => String::new(),
         };
         Some(format!("{text}{recover}"))
+    }
+
+    /// #1290 — `compose <person or #channel>: <message>`: resolve the
+    /// recipient and post a card showing the destination and the sender.
+    /// Never sends; an ambiguous recipient is asked about and an unknown one
+    /// is refused, with nothing stored. Markdown answer.
+    async fn compose_command(&self, cmd: crate::contact::compose::ComposeCommand) -> String {
+        use crate::contact::compose::{self as c, ComposeCommand, ComposeOutcome};
+        let ComposeCommand::Request { recipient, body } = cmd else {
+            return c::COMPOSE_USAGE.to_string();
+        };
+        let team = match c::compose_workspace(&self.store, Some(self.config.workspace.team_id())) {
+            Ok(t) => t,
+            Err(e) => return format!("Not sent: {e}."),
+        };
+        match c::compose(
+            &self.store,
+            self.wiki_root.as_deref(),
+            &team,
+            &recipient,
+            &body,
+            false,
+        ) {
+            ComposeOutcome::Card {
+                action_id,
+                email,
+                recipient,
+            } => {
+                let r = card::short_ref(&action_id);
+                if let Err(e) = self.post_card(&action_id, &email, &body, None).await {
+                    warn!(action_id, "slack compose: card not posted: {e}");
+                    return format!(
+                        "The message to **{}** is waiting for approval, but its card could not \
+                         be posted ({e}). Reply `approvals` to see it. Nothing was sent.",
+                        recipient.label()
+                    );
+                }
+                if let Err(e) = self.store.record_nudge(
+                    &action_id,
+                    self.now() + augmentagent_store::NUDGE_INTERVAL_MS,
+                ) {
+                    warn!(action_id, "slack compose: record_nudge failed: {e}");
+                }
+                format!(
+                    "Card posted for a new Slack message to **{}**. Check where it goes and who \
+                     sends it; nothing is sent until you approve it (`approve {r}`).",
+                    recipient.label()
+                )
+            }
+            ComposeOutcome::Preview { recipient } => {
+                format!(
+                    "Would write to **{}**. Nothing was stored or sent.",
+                    recipient.label()
+                )
+            }
+            ComposeOutcome::Ambiguous { query, candidates } => {
+                let list: Vec<String> = candidates.iter().map(|c| format!("• {c}")).collect();
+                format!(
+                    "Which one? “{query}” matches:\n{}\nSay the full name or the page, e.g. \
+                     `compose <page>: …`. Nothing was sent.",
+                    list.join("\n")
+                )
+            }
+            ComposeOutcome::Unknown { reason, .. } => format!("Not sent: {reason}."),
+        }
     }
 
     /// The pending queue with each approval's reference, as Markdown (text

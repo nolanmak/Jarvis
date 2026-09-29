@@ -224,6 +224,29 @@ For local QA only, a **debug build** sends Composio Slack calls to a
 loopback fake when `AUGMENTAGENT_TEST_COMPOSIO_BASE=http://127.0.0.1:<port>`
 is set (release builds and non-loopback values ignore it).
 
+## 7. Replying to and writing to Slack contacts (#1290)
+
+Contact messages are always sent **as you**, through the Composio Slack
+connection (`augmentagent slack persist-auth`), never as the app. Every
+Slack card says where the message goes (**Goes to** `#general · in thread
+…`, `DM with Alice Example`) and who sends it (**Sends as** your Slack user
+id). If the connection has no user id, Approve refuses to send.
+
+- A drafted reply goes back to the conversation it answers: in the thread
+  the message was in, under the message in a channel, top level in a DM.
+- To write a new message, reply `compose <person or #channel>: <message>`
+  in your DM with the app (for example `compose Alice Example: lunch
+  Thursday?`). People are looked up in the wiki's people pages (their
+  `identities: slack:` id); channels must be subscribed. If the name
+  matches more than one person you are asked which; an unknown name is
+  refused. Nothing is sent until you approve the card. The agent (or a
+  shell) can do the same with `augmentagent slack compose --to … --text …`
+  (`--dry-run` only resolves).
+- If a send fails after you approve, the card says why and offers **Retry
+  send** (or `approve <ref>`). A send whose outcome is unknown is looked for
+  in the conversation before it is sent again; if it cannot be checked you
+  are asked to look first.
+
 ## Where credentials live
 
 | Connection | Credential slot | Index | Managed by |

@@ -876,6 +876,126 @@ Discord as a recording card surface plus `SyncingActionHandler`),
 and `slack_serve_cli.rs`
 `slack_only_serve_posts_an_approval_card_and_an_approve_click_sends_once`.
 
+## Contact sends (#1290)
+
+Code: `crates/augmentagent-channel-slack/src/contact/` (the send path and
+compose), `crates/augmentagent-store/src/slack_contact.rs` (send targets and
+the send ledger), `SlackClient`'s `ContactSendApi` in `api.rs`, and
+`ReplyApprover::approve_slack` / `slack_compose.rs` in the CLI.
+
+### Who sends a contact message
+
+Decision: **the owner's own Slack account, through the Composio user
+connection, with `as_user: true`. Never the interactive app's bot.**
+
+| Connection | Token | Used for |
+| --- | --- | --- |
+| Composio Slack connection (`augmentagent slack persist-auth`, one per workspace, `SlackAuth`) | the owner's OAuth user connection, held by Composio | ingesting subscribed conversations and every contact send |
+| Interactive Slack app (`augmentagent slack app install`) | `<bot-token>` and `<app-token>` | the owner's DM and control channel only: cards, answers, files |
+
+Evidence (read 2026-09-29):
+
+- Composio, Slack toolkit (docs.composio.dev/toolkits/slack): "Composio
+  supports two toolkits: **Slack** (authenticate as a user for
+  workspace-level actions) and **Slackbot** (authenticate as a bot…)";
+  "Slack can post as the app; Slackbot posts as the bot user"; and for
+  `SLACK_SEND_MESSAGE`: "For the Slack toolkit, set `as_user=True` to post as
+  the authenticated user." Before #1290 the reply path did not pass
+  `as_user`, so by Composio's own description it could have posted as the
+  Composio app. It now always passes `as_user: true` and
+  `link_names: false`, and `thread_ts` for a threaded reply ("Use `ts` of
+  the parent message, not another reply").
+- Slack, `chat.postMessage` (docs.slack.dev/reference/methods/chat.postMessage):
+  `as_user` is "(Legacy) Pass true to post the message as the authed user
+  instead of as a bot"; posting with a user ID as `channel` opens a direct
+  message conversation "if it isn't open already"; and "bot users cannot
+  post to a direct message conversation between two users" — so the app bot
+  could not reply in a contact's DM even if it were used.
+- The Composio connection's Slack user id (`SlackAuth.user_id`, from
+  `auth.test` at `persist-auth`) is the identity the card shows and the send
+  ledger records (`identity = owner_user`, `sender_user_id`). With no user
+  id the send is refused before anything is claimed; with no Composio
+  connection for the workspace it is refused too. There is no fallback to the
+  bot.
+- After a send, the posted message's `user` / `bot_id` from the response are
+  recorded. If Slack attributes it to another user, or marks it with a
+  `bot_id`, the action is still `sent` (it went out) but carries the warning
+  in its error message and the daemon logs an error, so it is never silent.
+
+**Unverified until a real workspace:** how Slack attributes an `as_user`
+post made through Composio's Slack app (user, app badge, `bot_id` on the
+message), whether `SLACK_SEND_MESSAGE` to a user id opens the owner's DM with
+that person, and the exact response shape Composio relays. The code handles
+both answers conservatively (warning, not silence).
+
+### Destination and thread
+
+- Replies: at ingest, each priority message records a send target
+  (`slack_send_targets`): its conversation, and `thread_ts` = the thread it
+  is in, or for a top-level message in a channel the message itself (a
+  reply to one person does not land in the whole channel). A DM or group DM
+  is answered top level. Rows drafted before #1290 have no target: the reply
+  goes to their conversation top level, as before.
+- New messages: `compose <person or #channel>: <message>` in the owner's
+  Slack conversation, or `augmentagent slack compose --to … --text …` (the
+  agent's tool path; the daemon's queue posts its card). A person is
+  resolved through the wiki identity layer (`people/*.md` `identities:
+  slack:`, via `augmentagent_messages::people`): full name, first or last
+  name, page, or Slack user id. Two or more matches are asked about; no match
+  or a person without a Slack identity is refused; nothing is stored in
+  either case. A channel must be one this workspace is subscribed to.
+  `--dry-run` resolves and stores nothing.
+- The card shows **Goes to** (`#general · in thread …`, `DM with Alice
+  Example`) and **Sends as** (the owner's Slack user id through the Composio
+  user connection) before anything is sent; a composed card says **To**.
+
+### Exactly once, and retries
+
+- Approve claims the action (`pending → sending`) and then the send ledger
+  (`slack_contact_sends`, one row per action) records the attempt before the
+  post. A second approval on any surface loses the claim.
+- A refused send (Composio 4xx, `successful: false`, connection refused)
+  records `failed`; nothing was posted. A timeout, a lost or unreadable
+  response or a 5xx records `unknown`. Either leaves the action `error` and
+  the Slack card shows **Retry send** (and `approve <ref>`).
+- A retry claims `error → sending`. If the previous attempt is `unknown` (or
+  a crash left it `sending`), the conversation (or the thread) is read first
+  (`SLACK_FETCH_CONVERSATION_HISTORY` / `SLACK_FETCH_MESSAGE_THREAD_FROM_A_CONVERSATION`)
+  for a message by the owner with exactly the text sent; if found, it is
+  recorded as sent and nothing is posted. If the conversation cannot be read
+  (or it is a new DM whose id Slack never returned), nothing is posted, the
+  row becomes `unverified` and the owner is asked to look; the next approval
+  sends. A `sent` row is never posted again.
+- Documented limitation: the lookup matches exact text. If Slack stored the
+  text differently from what was sent, an `unknown` attempt that did land is
+  not found and the retry posts a second copy.
+
+### Formatting and separation
+
+- The draft is converted with `delivery::markdown_to_mrkdwn`: bold, italics,
+  links (`<url|text>`), lists; `&`, `<`, `>` are escaped, so `<!here>`,
+  `<!channel>` and `<@U…>` in model text notify nobody, and `@channel` /
+  `@here` get a word joiner. `link_names` is false.
+- `approve_contact_message` is the only function that posts to a contact,
+  and it posts only the stored draft of an action it has just claimed, to
+  the recorded destination. The owner's conversation is answered by the
+  app bot through the outbox, to the owner's DM or control channel only.
+  Tests (`contact_surface.rs`
+  `control_conversation_text_is_never_a_contact_send`) feed agent-answer and
+  tool-output text into the approval surface and show it never reaches the
+  contact path; only the approved card's draft does.
+- `status_source` now names the surface that decided (`slack` or
+  `discord`, via `augmentagent_approval_discord::deciding`), and a delivered
+  message is recorded in `self_sent_messages` with `platform = slack`
+  (`slack:<channel>:<ts>`), not as a Gmail send.
+
+Tests: `augmentagent-store/tests/slack_contact_sends.rs`,
+`augmentagent-channel-slack/tests/contact_send.rs` (dispatch against a
+recording fake of the Composio connection), `tests/contact_surface.rs` (the
+approval surface with the real contact path), `api::` (the Composio request
+and error classification against a mock), and `augmentagent-cli`
+`slack_approval_tests::` (the real `ReplyApprover` against a mock Composio).
+
 ## Remaining live verification (owner, test workspace)
 
 1. App-level token scope (`connections:write`) and `apps.connections.open`

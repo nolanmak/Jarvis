@@ -140,6 +140,17 @@ jobs:
           cargo test -p augmentagent-approval-discord --lib -- sync:: outcome::
           cargo test -p augmentagent-channel-slack --test approval_surface
           cargo test -p augmentagent-cli --bin augmentagent -- slack_approval_tests:: approval_routing::
+      # #1290 — Slack contact replies and compose: thread targeting, sending
+      # as the owner through the Composio user connection (never the bot),
+      # the per-action send ledger (retry without duplication), compose
+      # through the wiki identity layer (ambiguous asks, unknown refuses),
+      # and nothing from the owner's conversation reaching a contact.
+      - name: Slack contact sends
+        run: |
+          cargo test -p augmentagent-store --test slack_contact_sends
+          cargo test -p augmentagent-channel-slack --test contact_send --test contact_surface --test contact_separation --test surface_contract
+          cargo test -p augmentagent-channel-slack --lib -- api:: channel:: contact::
+          cargo test -p augmentagent-approval-discord --lib -- sync::
       # #1284 — Slack app install/verify/rotate/remove: manifest contract,
       # credential lifecycle (in-memory store) and the real CLI against a
       # mock Slack with the file credential store. No Keychain, no network.

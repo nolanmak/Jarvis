@@ -20,6 +20,8 @@ pub mod app;
 pub mod approvals;
 pub mod auth;
 pub mod channel;
+// #1290 — approved replies and new messages to Slack contacts.
+pub mod contact;
 pub mod delivery;
 pub mod digest;
 // #1288 — owner turns through the shared agent harness.

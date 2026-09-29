@@ -2444,6 +2444,7 @@ impl Store {
         )?;
 
         crate::imessage::migrate(conn)?;
+        crate::slack_contact::migrate(conn)?;
 
         Ok(())
     }

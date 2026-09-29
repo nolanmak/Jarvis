@@ -188,3 +188,197 @@ fn the_stale_card_sweep_does_not_retire_a_slack_contact_reply_as_bulk_mail() {
     assert_eq!(crate::reconcile_stale_approvals_tick(&store).unwrap(), 0);
     assert_eq!(status(&store, &id), "pending");
 }
+
+// ---------------------------------------------------------------------------
+// #1290 — dispatch through the real ReplyApprover
+// ---------------------------------------------------------------------------
+
+fn with_thread_target(store: &Store, id: &str) {
+    let a = store.get_action_with_email(id).unwrap().unwrap();
+    store
+        .record_slack_send_target(&augmentagent_channel_slack::contact::ingested_reply_target(
+            &a.email.message_id,
+            TEAM,
+            "C00000009",
+            "#general",
+            "1700000000.000100",
+            Some("1700000000.000050"),
+        ))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn an_approved_slack_reply_is_sent_as_the_owner_in_its_thread_and_recorded_as_slack() {
+    let (_d, store) = store();
+    let id = pending_slack_reply(&store);
+    with_thread_target(&store, &id);
+    let mut server = mockito::Server::new_async().await;
+    let send = server
+        .mock("POST", "/api/v3/tools/execute/SLACK_SEND_MESSAGE")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "user_id": "entity-test",
+            "arguments": {"channel": "C00000009", "thread_ts": "1700000000.000050",
+                          "as_user": true, "link_names": false,
+                          "text": "Sure — Tuesday works."}
+        })))
+        .with_body(
+            r#"{"successful": true, "data": {"ok": true, "channel": "C00000009",
+                "ts": "1700000001.000100", "message": {"user": "U00000009"}}}"#,
+        )
+        .expect(1)
+        .create_async()
+        .await;
+    let approver = approver(Arc::clone(&store), &server.url());
+    // The click came from Slack.
+    let out = augmentagent_approval_discord::deciding("slack", approver.approve(&id)).await;
+    assert!(matches!(out, ApprovalActionOutcome::Approved), "{out:?}");
+    send.assert_async().await;
+    assert_eq!(status(&store, &id), "sent");
+    assert_eq!(
+        store.action_status_source(&id).unwrap().as_deref(),
+        Some("slack")
+    );
+    assert_eq!(
+        store
+            .self_sent_message_platform("slack:C00000009:1700000001.000100")
+            .unwrap()
+            .as_deref(),
+        Some("slack"),
+        "recorded as a Slack self-send, not Gmail"
+    );
+    let ledger = store.slack_contact_send(&id).unwrap().unwrap();
+    assert_eq!(ledger.sender_user_id, "U00000009");
+    assert_eq!(ledger.observed_user.as_deref(), Some("U00000009"));
+}
+
+#[tokio::test]
+async fn a_discord_click_on_a_slack_reply_is_recorded_as_discord() {
+    let (_d, store) = store();
+    let id = pending_slack_reply(&store);
+    let mut server = mockito::Server::new_async().await;
+    let sends = send_mock(&mut server, 1).await;
+    let approver = approver(Arc::clone(&store), &server.url());
+    // The Discord bot calls the approver directly (no Slack beside it).
+    assert!(matches!(
+        approver.approve(&id).await,
+        ApprovalActionOutcome::Approved
+    ));
+    sends.assert_async().await;
+    assert_eq!(
+        store.action_status_source(&id).unwrap().as_deref(),
+        Some("discord")
+    );
+}
+
+#[tokio::test]
+async fn a_failed_slack_send_is_retried_from_the_errored_card_and_sent_once() {
+    let (_d, store) = store();
+    let id = pending_slack_reply(&store);
+    let mut server = mockito::Server::new_async().await;
+    let refused = server
+        .mock("POST", "/api/v3/tools/execute/SLACK_SEND_MESSAGE")
+        .with_body(r#"{"successful": false, "error": "ratelimited"}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    let approver = approver(Arc::clone(&store), &server.url());
+    assert!(matches!(
+        approver.approve(&id).await,
+        ApprovalActionOutcome::Failed { .. }
+    ));
+    refused.assert_async().await;
+    refused.remove_async().await;
+    assert_eq!(status(&store, &id), "error");
+
+    let sends = send_mock(&mut server, 1).await;
+    assert!(matches!(
+        approver.approve(&id).await,
+        ApprovalActionOutcome::Approved
+    ));
+    assert!(matches!(
+        approver.approve(&id).await,
+        ApprovalActionOutcome::AlreadyResolved { .. }
+    ));
+    sends.assert_async().await;
+    assert_eq!(status(&store, &id), "sent");
+}
+
+#[tokio::test]
+async fn a_slack_connection_without_a_known_owner_account_sends_nothing() {
+    let (_d, store) = store();
+    let id = pending_slack_reply(&store);
+    let mut server = mockito::Server::new_async().await;
+    let sends = send_mock(&mut server, 0).await;
+    let mut approver = crate::test_support::approver_with_store(Arc::clone(&store));
+    let auth = SlackAuth {
+        entity_id: "entity-test".into(),
+        connection_id: "conn-test".into(),
+        team_id: TEAM.into(),
+        team_name: "Example".into(),
+        user_id: String::new(),
+        composio_api_key: "test-key".into(),
+    };
+    approver.slack.insert(
+        TEAM.into(),
+        Arc::new(SlackClient::with_base_url(auth, server.url())),
+    );
+    assert!(matches!(
+        approver.approve(&id).await,
+        ApprovalActionOutcome::Failed { .. }
+    ));
+    sends.assert_async().await;
+    assert_eq!(status(&store, &id), "pending");
+}
+
+fn wiki_with_people(dir: &std::path::Path) -> std::path::PathBuf {
+    let wiki = dir.join("wiki");
+    let people = wiki.join("people");
+    std::fs::create_dir_all(&people).unwrap();
+    for (slug, title, id) in [
+        ("alice-example", "Alice Example", "U0000000A"),
+        ("alex-one", "Alex One", "U0000000B"),
+        ("alex-two", "Alex Two", "U0000000C"),
+    ] {
+        std::fs::write(
+            people.join(format!("{slug}.md")),
+            format!("---\nkind: person\nidentities:\n  slack: {id}\n---\n# {title}\n"),
+        )
+        .unwrap();
+    }
+    wiki
+}
+
+#[test]
+fn slack_compose_from_the_cli_cards_a_pending_message_and_never_sends() {
+    let (d, store) = store();
+    store
+        .upsert_slack_workspace(TEAM, "Example", "entity-test", "conn-test", "U00000009")
+        .unwrap();
+    let wiki = wiki_with_people(d.path());
+    // Dry run: resolved, nothing stored.
+    let preview =
+        crate::slack_compose::run(&store, Some(&wiki), "alice", "Hi", None, true).unwrap();
+    assert!(preview.contains("Alice Example"), "{preview}");
+    assert!(store.oldest_pending_actions(10).unwrap().is_empty());
+    // Ambiguous and unknown recipients are errors; nothing stored.
+    let ambiguous = crate::slack_compose::run(&store, Some(&wiki), "Alex", "Hi", None, false)
+        .unwrap_err()
+        .to_string();
+    assert!(ambiguous.contains("Alex One"), "{ambiguous}");
+    assert!(
+        crate::slack_compose::run(&store, Some(&wiki), "Nobody Here", "Hi", None, false).is_err()
+    );
+    assert!(store.oldest_pending_actions(10).unwrap().is_empty());
+    // A real compose: one pending action with its destination, no send.
+    let out =
+        crate::slack_compose::run(&store, Some(&wiki), "Alice Example", "Hi", None, false).unwrap();
+    let pending = store.oldest_pending_actions(10).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(out.contains(&pending[0].0[..8]), "{out}");
+    let a = store.get_action_with_email(&pending[0].0).unwrap().unwrap();
+    assert_eq!(a.email.platform, "slack");
+    assert_eq!(a.email.kind, "compose");
+    // The stale-card sweep leaves a composed card alone.
+    assert_eq!(crate::reconcile_stale_approvals_tick(&store).unwrap(), 0);
+    assert_eq!(status(&store, &pending[0].0), "pending");
+}
