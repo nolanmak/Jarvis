@@ -41,6 +41,14 @@ class PrivacyGateTests(unittest.TestCase):
                 self.write("fixture.txt", "person" + "@" + domain)
                 self.assertEqual(self.scan("fixture.txt").returncode, 1)
 
+    def test_git_ssh_protocol_identifier_is_not_a_mailbox(self):
+        for value in ["git@github.com:owner/repo.git", "ssh://git@github.com/owner/repo.git"]:
+            with self.subTest(value=value):
+                self.write("fixture.txt", value)
+                self.assertEqual(self.scan("fixture.txt").returncode, 0)
+        self.write("fixture.txt", "person" + "@github.com")
+        self.assertEqual(self.scan("fixture.txt").returncode, 1)
+
     def test_personal_mailbox_cannot_be_exempted_by_a_fixture_marker(self):
         for domain in ["gmail.com", "GMAIL.COM", "outlook.com", "proton.me"]:
             with self.subTest(domain=domain):

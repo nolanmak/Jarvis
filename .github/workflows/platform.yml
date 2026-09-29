@@ -80,4 +80,4 @@ jobs:
             echo "::endgroup::"
           done
       - name: Launchd installer contract tests
-        run: python3 -m unittest scripts.tests.launchd_installers_test -v
+        run: python3 -m unittest scripts.tests.launchd_installers_test scripts.tests.scheduled_sync_installers_test -v

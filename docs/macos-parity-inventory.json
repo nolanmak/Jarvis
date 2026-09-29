@@ -1442,6 +1442,22 @@
     "evidence": null
   },
   {
+    "id": "installer:install-finance-sync.sh",
+    "source": "scripts/install-finance-sync.sh",
+    "linux_baseline": "Linux finance sync uses the existing systemd user service/timer pair; this Mac-only script leaves it intact.",
+    "macos_target": "Mac install-finance-sync.sh manages only the opt-in finance LaunchAgent idempotently with private paths and observable status/logs.",
+    "prerequisites": [
+      "release CLI",
+      "private wiki",
+      "signed-in launchd user session",
+      "feature credentials when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1250",
+    "test_plan": "Run scheduled_sync_installers_test for install-finance-sync.sh in a disposable home, then verify two real Mac triggers and sleep/wake behavior.",
+    "status": "in_progress",
+    "evidence": null
+  },
+  {
     "id": "installer:install-git-hooks.sh",
     "source": "scripts/install-git-hooks.sh",
     "linux_baseline": "Linux install-git-hooks.sh installs or removes its matching component.",
@@ -1481,6 +1497,22 @@
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1254",
     "test_plan": "Run install-tenant.sh against stubbed systemd and launchd in a disposable home; check file, state and rollback.",
     "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "installer:install-wiki-sync.sh",
+    "source": "scripts/install-wiki-sync.sh",
+    "linux_baseline": "Linux wiki sync uses the existing systemd user service/timer pair; this Mac-only script leaves it intact.",
+    "macos_target": "Mac install-wiki-sync.sh manages only the opt-in wiki LaunchAgent idempotently with private paths and observable status/logs.",
+    "prerequisites": [
+      "release CLI",
+      "private wiki",
+      "signed-in launchd user session",
+      "feature credentials when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1250",
+    "test_plan": "Run scheduled_sync_installers_test for install-wiki-sync.sh in a disposable home, then verify two real Mac triggers and sleep/wake behavior.",
+    "status": "in_progress",
     "evidence": null
   },
   {
@@ -1554,6 +1586,22 @@
     "evidence": null
   },
   {
+    "id": "installer:uninstall-finance-sync.sh",
+    "source": "scripts/uninstall-finance-sync.sh",
+    "linux_baseline": "Linux finance sync uses the existing systemd user service/timer pair; this Mac-only script leaves it intact.",
+    "macos_target": "Mac uninstall-finance-sync.sh manages only the opt-in finance LaunchAgent idempotently with private paths and observable status/logs.",
+    "prerequisites": [
+      "release CLI",
+      "private wiki",
+      "signed-in launchd user session",
+      "feature credentials when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1250",
+    "test_plan": "Run scheduled_sync_installers_test for uninstall-finance-sync.sh in a disposable home, then verify two real Mac triggers and sleep/wake behavior.",
+    "status": "in_progress",
+    "evidence": null
+  },
+  {
     "id": "installer:uninstall-research.sh",
     "source": "scripts/uninstall-research.sh",
     "linux_baseline": "Linux uninstall-research.sh installs or removes its matching component.",
@@ -1579,6 +1627,22 @@
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1254",
     "test_plan": "Run uninstall-tenant.sh against stubbed systemd and launchd in a disposable home; check file, state and rollback.",
     "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "installer:uninstall-wiki-sync.sh",
+    "source": "scripts/uninstall-wiki-sync.sh",
+    "linux_baseline": "Linux wiki sync uses the existing systemd user service/timer pair; this Mac-only script leaves it intact.",
+    "macos_target": "Mac uninstall-wiki-sync.sh manages only the opt-in wiki LaunchAgent idempotently with private paths and observable status/logs.",
+    "prerequisites": [
+      "release CLI",
+      "private wiki",
+      "signed-in launchd user session",
+      "feature credentials when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1250",
+    "test_plan": "Run scheduled_sync_installers_test for uninstall-wiki-sync.sh in a disposable home, then verify two real Mac triggers and sleep/wake behavior.",
+    "status": "in_progress",
     "evidence": null
   },
   {
