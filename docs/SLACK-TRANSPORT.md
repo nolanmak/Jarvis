@@ -223,19 +223,65 @@ Source: https://docs.slack.dev/messaging/formatting-message-text (read
   "augmentagent_delivery", "event_payload": {"idempotency_key": …}}` so a
   send whose outcome was lost can be found in history. **[docs]** the
   `metadata` argument is "JSON object with event_type and event_payload
-  fields"; sending it as a JSON object in a JSON body is **unverified**. The
-  Slack `SendReconciler` that looks it up (`conversations.history` /
-  `conversations.replies`) is not implemented yet; until it is, a part in
-  `reconcile` holds the rest of its conversation and is visible in status.
+  fields"; sending it as a JSON object in a JSON body is **unverified**.
 - Failure classes (dispatcher in `plan.rs`): rate limit / transient Slack
   error / HTTP 5xx → retried after `max(backoff, Retry-After)`; upload failed
   before completion → retried whole; timeout or lost connection on a post or
   completion → `reconcile` (never resent blindly); other Slack errors, HTTP
   4xx, bad file → `dead_letter`.
+- **A turn with a hole is closed.** When a text or file part of a turn is
+  dead-lettered or abandoned, every part of that turn not yet sent is
+  abandoned and one notice (`turn:<id>:notice`, sent once, same
+  conversation/thread) says ":warning: This answer could not be delivered in
+  full. N of M parts arrived; the rest was not sent." It runs right after a
+  part dead-letters and again at the start of every drain, so a restart in
+  between still sends the notice exactly once.
 - **[docs]** `chat.postMessage` allows "1 message per second to a specific
   channel" with bursts; the dispatcher does not pace itself and relies on
   429/`Retry-After`. Effective behaviour for a 10-part answer is
   **unverified** live.
+
+### Reconciling a send whose outcome was lost
+
+`delivery/reconcile.rs` (`SlackSendReconciler`, also usable as the store's
+`SendReconciler`); the dispatcher runs it before every claim.
+
+- Sources: https://docs.slack.dev/reference/methods/conversations.history,
+  https://docs.slack.dev/reference/methods/conversations.replies (read
+  2026-09-29). **[docs]** both take `channel`, `cursor`,
+  `include_all_metadata` ("Return all metadata associated with this
+  message", default false), `inclusive`, `latest`, `limit` and `oldest`
+  ("Only messages after this Unix timestamp"); `conversations.replies` also
+  takes `ts` (the thread's parent). Form-encoded and JSON are accepted; sent
+  form-encoded. History returns "the most recent messages … first"; replies
+  returns the parent first, then replies in order. Paging via
+  `has_more` + `response_metadata.next_cursor`. Scopes: the `*:history`
+  scopes already in the manifest. Rate limit: Tier 3 ("50+ per minute") for
+  Marketplace and internal apps; non-Marketplace commercially distributed
+  apps get 1 request per minute with `limit` ≤ 15 (not our case: Jarvis is a
+  single-workspace internal app).
+- That history messages carry the `metadata` object
+  (`{event_type, event_payload}`) we set when `include_all_metadata=true`
+  is **unverified** live; the fetched pages do not show the field in the
+  response example.
+- Query: `conversations.replies` for a part in a thread, otherwise
+  `conversations.history`; `oldest` = the send's last claim time minus 60 s
+  (host clock skew); `include_all_metadata=true`; 200 messages per page, at
+  most 5 pages.
+- Found (event type `augmentagent_delivery` and the part's key) → `sent`
+  with that `ts`. All pages read, key absent, and the claim is at least 30 s
+  old (settle window) → requeued for exactly one resend. Key absent inside
+  the settle window → looked up again when it ends (not counted as a
+  failure). Lookup error or page budget exhausted → failed lookup, retried
+  after 5 s, 10 s, 20 s … (cap 5 min); after 5 failed lookups the part is
+  dead-lettered, which closes the turn with the notice above, so a
+  conversation is never held forever.
+- Uploads: the `files.completeUploadExternal` result is not recorded when
+  its reply is lost, and the file-share message carries none of our
+  metadata, so an uncertain upload is treated as not delivered once the
+  settle window has passed and uploaded again. Worst case: one duplicate
+  file, never a missing one. `chat.update` parts are idempotent and simply
+  redone.
 
 ### File upload
 
@@ -332,7 +378,10 @@ written to the outbox.
 - `tests/delivery_format.rs`, `tests/delivery_outbox.rs`,
   `tests/delivery_progress.rs` (#1294): conversion table and mention
   neutralisation, splitting invariants, restart between parts, crash
-  mid-send reconciled, rate limit mid-answer, upload failing midway,
+  mid-send reconciled (found / not found / lookup errors / budget
+  exhausted / uploads), dead-lettered or abandoned part closing the turn
+  with one notice (also across a restart), rate limit mid-answer, upload
+  failing midway,
   paused-clock progress throttling. `augmentagent-cli/tests/slack_deliver_cli.rs`
   runs `slack deliver` end to end.
 - `tests/transport_socket.rs`: ack only after hand-off, rejected and slow
@@ -403,7 +452,10 @@ they are unconfirmed against a live workspace (item 11 below).
     interactions, `is_ext_shared_channel` on Events API callbacks, and whether
     the app receives both `message` and `app_mention` for one post in a
     control channel.
-12. #1294: the unit of the 4,000-character text limit; `link_names` default;
+12. #1294: whether history/replies return our `metadata` with
+    `include_all_metadata=true`, and how quickly a just-posted message is
+    visible there (the 30 s settle window assumes well under that); the
+    unit of the 4,000-character text limit; `link_names` default;
     `metadata` accepted as a JSON object; the upload URL working without
     an `Authorization` header; the per-file size limit; a real 10-part
     answer and a PDF/PNG upload landing in a thread in order; a launchd-run
