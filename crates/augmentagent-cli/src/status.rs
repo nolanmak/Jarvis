@@ -22,6 +22,9 @@
 //!                   so they said nothing about runtime state (#374).
 //!  * **queue**     — `pending_reply_count()` from the store
 //!  * **delivery**  — durable backlog/retry/dead-letter counts per surface (#1285)
+//!  * **interactive** — live listener health of interactive chat surfaces
+//!                   (#1287), from the report the daemon writes; separate
+//!                   from `channels.slack`, which is Composio ingestion
 //!
 //! Output is JSON by default when stdout is piped (CI, dashboard shell-out)
 //! and a hand-rolled ASCII table when stdout is a tty (no `comfy-table`
@@ -94,6 +97,7 @@ pub struct StatusDoc {
     pub channels: BTreeMap<String, ChannelStatus>,
     pub queue: QueueStatus,
     pub delivery: BTreeMap<String, DeliveryStatus>,
+    pub interactive: BTreeMap<String, InteractiveStatus>,
     pub summary: String,
 }
 
@@ -156,6 +160,123 @@ pub struct DeliveryStatus {
 /// Chat surfaces always listed under `delivery`, with zeros when idle, so a
 /// consumer can tell "nothing pending" from "not reported".
 const DELIVERY_SURFACES: &[&str] = &["discord", "slack", "whatsapp"];
+
+/// #1287 — one interactive surface's live listener, as the daemon last
+/// reported it. `healthy` is true only for a `connected` listener whose
+/// report is fresh; a report that stopped being refreshed reads as
+/// `disconnected`, never as the last state it claimed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct InteractiveStatus {
+    /// `not_configured`, `disabled`, `misconfigured`, `connecting`,
+    /// `connected`, `reconnecting`, `disconnected` or `stopped`.
+    pub state: String,
+    pub healthy: bool,
+    pub detail: Option<String>,
+    /// What the operator should do when the state needs action.
+    pub recovery: Option<String>,
+    pub workspaces: Vec<String>,
+    pub dry_run: bool,
+    pub last_event_unix: Option<i64>,
+    pub last_send_unix: Option<i64>,
+    pub state_since_unix: Option<i64>,
+    pub heartbeat_unix: Option<i64>,
+}
+
+/// Interactive surfaces always listed under `interactive`.
+const INTERACTIVE_SURFACES: &[&str] = &["slack"];
+
+const RESTART_DAEMON: &str = "augmentagent service --unit daemon restart";
+
+/// Fold the daemon's last report (if any) into what `status` shows.
+/// `owner_bound`: a Slack owner binding exists, so the surface is expected
+/// to run once the daemon starts.
+pub fn interactive_status(
+    report: Option<augmentagent_store::surface_health::SurfaceListenerHealth>,
+    owner_bound: bool,
+    now_ms: i64,
+) -> InteractiveStatus {
+    use augmentagent_channel_slack::interactive::{SurfaceState, STALE_AFTER};
+    let secs = |ms: i64| ms / 1000;
+    let Some(r) = report else {
+        return if owner_bound {
+            InteractiveStatus {
+                state: SurfaceState::Disconnected.as_str().into(),
+                detail: Some(
+                    "the daemon has not reported this surface (it is not running, or it \
+                     predates the interactive Slack surface)"
+                        .into(),
+                ),
+                recovery: Some(format!(
+                    "Start or restart the daemon (`{RESTART_DAEMON}`); if it is running, \
+                     check `augmentagent logs`."
+                )),
+                ..Default::default()
+            }
+        } else {
+            InteractiveStatus {
+                state: SurfaceState::NotConfigured.as_str().into(),
+                detail: Some("no Slack owner is bound".into()),
+                recovery: Some(
+                    "Install the Slack app (`augmentagent slack app install --stdin`, see \
+                     docs/SLACK-APP.md), bind yourself with `augmentagent slack app owner bind \
+                     --user <member_id>`, then start the daemon."
+                        .into(),
+                ),
+                ..Default::default()
+            }
+        };
+    };
+    let mut out = InteractiveStatus {
+        state: r.state.clone(),
+        healthy: false,
+        detail: r.detail.clone(),
+        recovery: r.recovery.clone(),
+        workspaces: r.workspaces.clone(),
+        dry_run: r.dry_run,
+        last_event_unix: r.last_event_at_ms.map(secs),
+        last_send_unix: r.last_send_at_ms.map(secs),
+        state_since_unix: Some(secs(r.state_since_ms)),
+        heartbeat_unix: Some(secs(r.heartbeat_at_ms)),
+    };
+    let live = SurfaceState::parse(&r.state).is_some_and(SurfaceState::is_live);
+    let age_ms = now_ms.saturating_sub(r.heartbeat_at_ms);
+    if live && age_ms > STALE_AFTER.as_millis() as i64 {
+        out.state = SurfaceState::Disconnected.as_str().into();
+        out.detail = Some(format!(
+            "no heartbeat from the daemon (pid {}) for {}s; its last report was `{}`",
+            r.pid,
+            age_ms / 1000,
+            r.state
+        ));
+        out.recovery = Some(format!(
+            "The daemon is not running or is stuck. Restart it (`{RESTART_DAEMON}`) and check \
+             `augmentagent logs`."
+        ));
+    }
+    out.healthy = SurfaceState::parse(&out.state).is_some_and(SurfaceState::is_healthy);
+    out
+}
+
+/// A surface that is supposed to run but is not healthy.
+fn interactive_needs_attention(s: &InteractiveStatus) -> bool {
+    !s.healthy && !matches!(s.state.as_str(), "not_configured" | "disabled")
+}
+
+fn collect_interactive(store: &Store, now_ms: i64) -> Result<BTreeMap<String, InteractiveStatus>> {
+    let mut out = BTreeMap::new();
+    for &name in INTERACTIVE_SURFACES {
+        let platform = augmentagent_store::SurfacePlatform::new(name).expect("static platform");
+        let report = store
+            .surface_listener_health(&platform)
+            .context("interactive surface health")?;
+        let owner_bound = !store
+            .surface_owner_bindings(&platform)
+            .context("surface owner bindings")?
+            .is_empty();
+        out.insert(name.to_string(), interactive_status(report, owner_bound, now_ms));
+    }
+    Ok(out)
+}
 
 /// Symbolic summary string. Maps onto the issue's exit-code table; see
 /// [`exit_code_for`].
@@ -264,6 +385,12 @@ impl StatusDoc {
                     .map(|(k, v)| (k.clone(), v.to_json()))
                     .collect(),
             ),
+            "interactive": Value::Object(
+                self.interactive
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.to_json()))
+                    .collect(),
+            ),
             "summary": self.summary,
         })
     }
@@ -277,6 +404,23 @@ impl ChannelStatus {
             "accounts": self.accounts,
             "last_poll_unix": self.last_poll_unix,
             "needs": self.needs,
+        })
+    }
+}
+
+impl InteractiveStatus {
+    fn to_json(&self) -> Value {
+        json!({
+            "state": self.state,
+            "healthy": self.healthy,
+            "detail": self.detail,
+            "recovery": self.recovery,
+            "workspaces": self.workspaces,
+            "dry_run": self.dry_run,
+            "last_event_unix": self.last_event_unix,
+            "last_send_unix": self.last_send_unix,
+            "state_since_unix": self.state_since_unix,
+            "heartbeat_unix": self.heartbeat_unix,
         })
     }
 }
@@ -338,7 +482,13 @@ pub async fn collect(store: &Store) -> Result<StatusDoc> {
             .context("surface delivery counts")?,
     );
 
-    let summary = classify(&daemon, &dashboard, &core_keys, &channels);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let interactive = collect_interactive(store, now_ms)?;
+
+    let summary = classify(&daemon, &dashboard, &core_keys, &channels, &interactive);
 
     Ok(StatusDoc {
         schema_version: SCHEMA_VERSION.to_string(),
@@ -350,6 +500,7 @@ pub async fn collect(store: &Store) -> Result<StatusDoc> {
         channels,
         queue,
         delivery,
+        interactive,
         summary,
     })
 }
@@ -758,6 +909,7 @@ fn classify(
     dashboard: &DashboardStatus,
     core: &CoreKeys,
     channels: &BTreeMap<String, ChannelStatus>,
+    interactive: &BTreeMap<String, InteractiveStatus>,
 ) -> String {
     if !daemon.active {
         return summary::DAEMON_DOWN.into();
@@ -771,6 +923,10 @@ fn classify(
         return summary::NEEDS_SETUP.into();
     }
     if !any_core_key || !any_channel {
+        return summary::DEGRADED.into();
+    }
+    // #1287 — a configured interactive surface whose listener is down.
+    if interactive.values().any(interactive_needs_attention) {
         return summary::DEGRADED.into();
     }
     summary::OK.into()
@@ -849,6 +1005,29 @@ fn print_table(doc: &StatusDoc, channel_filter: Option<&str>) {
             d.outbound_dead_letter
         );
     }
+    print_interactive(doc);
+}
+
+fn print_interactive(doc: &StatusDoc) {
+    println!("\ninteractive:");
+    for (name, i) in &doc.interactive {
+        let when = |t: Option<i64>| t.map_or_else(|| "never".to_string(), |t| t.to_string());
+        println!(
+            "  {:<10} {}{} | last event {} | last send {}{}",
+            name,
+            i.state,
+            if i.healthy { " (healthy)" } else { "" },
+            when(i.last_event_unix),
+            when(i.last_send_unix),
+            if i.dry_run { " | dry-run" } else { "" },
+        );
+        if let Some(detail) = &i.detail {
+            println!("  {:<10} {detail}", "");
+        }
+        if let Some(recovery) = &i.recovery {
+            println!("  {:<10} fix: {recovery}", "");
+        }
+    }
 }
 
 fn yn(b: bool) -> &'static str {
@@ -904,7 +1083,7 @@ mod tests {
             cerebras: true,
             discord_bot: true,
         };
-        assert_eq!(classify(&d, &dash, &c, &empty_channels()), summary::DAEMON_DOWN);
+        assert_eq!(classify(&d, &dash, &c, &empty_channels(), &BTreeMap::new()), summary::DAEMON_DOWN);
     }
 
     #[test]
@@ -926,7 +1105,7 @@ mod tests {
             cerebras: true,
             discord_bot: true,
         };
-        assert_eq!(classify(&d, &dash, &c, &empty_channels()), summary::DASHBOARD_DOWN);
+        assert_eq!(classify(&d, &dash, &c, &empty_channels(), &BTreeMap::new()), summary::DASHBOARD_DOWN);
     }
 
     #[test]
@@ -952,7 +1131,7 @@ mod tests {
         for &n in KNOWN_CHANNELS {
             channels.insert(n.to_string(), ch(false));
         }
-        assert_eq!(classify(&d, &dash, &c, &channels), summary::NEEDS_SETUP);
+        assert_eq!(classify(&d, &dash, &c, &channels, &BTreeMap::new()), summary::NEEDS_SETUP);
     }
 
     #[test]
@@ -978,7 +1157,7 @@ mod tests {
         for &n in KNOWN_CHANNELS {
             channels.insert(n.to_string(), ch(false));
         }
-        assert_eq!(classify(&d, &dash, &c, &channels), summary::DEGRADED);
+        assert_eq!(classify(&d, &dash, &c, &channels, &BTreeMap::new()), summary::DEGRADED);
     }
 
     #[test]
@@ -1004,7 +1183,7 @@ mod tests {
         for &n in KNOWN_CHANNELS {
             channels.insert(n.to_string(), ch(n == "gmail"));
         }
-        assert_eq!(classify(&d, &dash, &c, &channels), summary::OK);
+        assert_eq!(classify(&d, &dash, &c, &channels, &BTreeMap::new()), summary::OK);
     }
 
     #[test]
@@ -1081,6 +1260,122 @@ mod tests {
                 "outbound_dead_letter": 0,
             })
         );
+    }
+
+
+    // --- #1287 interactive surfaces --------------------------------------
+
+    use augmentagent_store::surface_health::SurfaceListenerHealth;
+
+    const NOW_MS: i64 = 1_700_000_100_000;
+
+    fn report(state: &str, heartbeat_age_ms: i64) -> SurfaceListenerHealth {
+        SurfaceListenerHealth {
+            platform: augmentagent_store::SurfacePlatform::new("slack").unwrap(),
+            state: state.into(),
+            detail: None,
+            recovery: None,
+            workspaces: vec!["T00000001".into()],
+            dry_run: false,
+            last_event_at_ms: Some(NOW_MS - 5_000),
+            last_send_at_ms: Some(NOW_MS - 4_000),
+            state_since_ms: NOW_MS - 60_000,
+            heartbeat_at_ms: NOW_MS - heartbeat_age_ms,
+            pid: 4242,
+        }
+    }
+
+    #[test]
+    fn interactive_without_a_report_or_owner_is_not_configured() {
+        let s = interactive_status(None, false, NOW_MS);
+        assert_eq!(s.state, "not_configured");
+        assert!(!s.healthy);
+        assert!(s.recovery.unwrap().contains("slack app install"));
+    }
+
+    #[test]
+    fn interactive_with_an_owner_but_no_report_is_disconnected() {
+        let s = interactive_status(None, true, NOW_MS);
+        assert_eq!(s.state, "disconnected");
+        assert!(!s.healthy);
+        assert!(s.recovery.unwrap().contains("service --unit daemon restart"));
+    }
+
+    #[test]
+    fn a_fresh_connected_report_is_healthy_with_times_in_seconds() {
+        let s = interactive_status(Some(report("connected", 1_000)), true, NOW_MS);
+        assert_eq!(s.state, "connected");
+        assert!(s.healthy);
+        assert_eq!(s.last_event_unix, Some((NOW_MS - 5_000) / 1000));
+        assert_eq!(s.last_send_unix, Some((NOW_MS - 4_000) / 1000));
+        assert_eq!(s.workspaces, vec!["T00000001".to_string()]);
+    }
+
+    #[test]
+    fn a_connected_report_with_a_stale_heartbeat_is_never_healthy() {
+        let s = interactive_status(Some(report("connected", 10 * 60_000)), true, NOW_MS);
+        assert_eq!(s.state, "disconnected");
+        assert!(!s.healthy);
+        assert!(s.detail.unwrap().contains("heartbeat"));
+        assert!(s.recovery.unwrap().contains("restart"));
+    }
+
+    #[test]
+    fn reconnecting_and_misconfigured_are_not_healthy_and_keep_recovery() {
+        let s = interactive_status(Some(report("reconnecting", 1_000)), true, NOW_MS);
+        assert!(!s.healthy);
+        assert_eq!(s.state, "reconnecting");
+        let mut bad = report("misconfigured", 1_000);
+        bad.recovery = Some("Bind yourself as owner".into());
+        let s = interactive_status(Some(bad), false, NOW_MS);
+        assert_eq!(s.state, "misconfigured");
+        assert_eq!(s.recovery.as_deref(), Some("Bind yourself as owner"));
+        // An inactive report never goes stale: nothing is meant to run.
+        let s = interactive_status(Some(report("disabled", 10 * 60_000)), true, NOW_MS);
+        assert_eq!(s.state, "disabled");
+    }
+
+    fn ok_daemon() -> (DaemonStatus, DashboardStatus, CoreKeys, BTreeMap<String, ChannelStatus>) {
+        let mut channels = BTreeMap::new();
+        for &n in KNOWN_CHANNELS {
+            channels.insert(n.to_string(), ch(n == "gmail"));
+        }
+        (
+            DaemonStatus { unit: "x".into(), active: true, since_unix: 0 },
+            DashboardStatus { unit: "x".into(), active: true, port: 3000, reachable: true },
+            CoreKeys { composio: true, groq: true, cerebras: false, discord_bot: false },
+            channels,
+        )
+    }
+
+    #[test]
+    fn an_unhealthy_enabled_interactive_surface_degrades_the_summary() {
+        let (d, dash, c, channels) = ok_daemon();
+        let mut interactive = BTreeMap::new();
+        interactive.insert(
+            "slack".to_string(),
+            interactive_status(Some(report("reconnecting", 1_000)), true, NOW_MS),
+        );
+        assert_eq!(classify(&d, &dash, &c, &channels, &interactive), summary::DEGRADED);
+        interactive.insert(
+            "slack".to_string(),
+            interactive_status(Some(report("connected", 1_000)), true, NOW_MS),
+        );
+        assert_eq!(classify(&d, &dash, &c, &channels, &interactive), summary::OK);
+        interactive.insert("slack".to_string(), interactive_status(None, false, NOW_MS));
+        assert_eq!(classify(&d, &dash, &c, &channels, &interactive), summary::OK);
+    }
+
+    #[test]
+    fn interactive_json_shape() {
+        let s = interactive_status(Some(report("connected", 1_000)), true, NOW_MS);
+        let v = s.to_json();
+        for key in [
+            "state", "healthy", "detail", "recovery", "workspaces", "dry_run",
+            "last_event_unix", "last_send_unix", "state_since_unix", "heartbeat_unix",
+        ] {
+            assert!(v.get(key).is_some(), "missing {key}");
+        }
     }
 
     #[test]

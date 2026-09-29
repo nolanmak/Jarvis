@@ -208,6 +208,9 @@ pub async fn run(
     // 18. durable surface delivery — dead letters / unreconciled sends (#1285)
     if let Some(doc) = &status_doc {
         findings.push(check_surface_delivery(&doc.delivery));
+        // 19. interactive surfaces — live listener health, apart from the
+        // Composio ingestion `channels.slack` reports (#1287)
+        findings.extend(check_interactive_surfaces(&doc.interactive));
     }
 
     // --- Deep checks (off by default).
@@ -1822,6 +1825,39 @@ fn check_surface_delivery(
     }
 }
 
+/// #1287 — one finding per interactive surface from its live listener
+/// report. Healthy only when connected; `not_configured` and `disabled` are
+/// informational; a misconfiguration is an error because the operator
+/// asked for something that cannot start.
+fn check_interactive_surfaces(
+    interactive: &std::collections::BTreeMap<String, status::InteractiveStatus>,
+) -> Vec<Finding> {
+    interactive
+        .iter()
+        .map(|(name, i)| {
+            let check = format!("interactive.{name}");
+            let mut message = i.state.clone();
+            if let Some(detail) = &i.detail {
+                message.push_str(&format!(": {detail}"));
+            }
+            match i.state.as_str() {
+                _ if i.healthy => Finding::ok(
+                    &check,
+                    format!(
+                        "connected; last event {}, last send {}{}",
+                        i.last_event_unix.map_or("never".into(), |t| t.to_string()),
+                        i.last_send_unix.map_or("never".into(), |t| t.to_string()),
+                        if i.dry_run { " (dry-run)" } else { "" }
+                    ),
+                ),
+                "not_configured" | "disabled" => Finding::ok(&check, message),
+                "misconfigured" => Finding::error(&check, message, i.recovery.as_deref()),
+                _ => Finding::warn(&check, message, i.recovery.as_deref()),
+            }
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Human-readable table output.
 // ---------------------------------------------------------------------------
@@ -2657,6 +2693,7 @@ mod tests {
             channels,
             queue: status::QueueStatus { pending: 0 },
             delivery: BTreeMap::new(),
+            interactive: BTreeMap::new(),
             summary: "ok".to_string(),
         };
         let v = check_per_channel_validate(&Some(doc));
@@ -2676,6 +2713,44 @@ mod tests {
             slack.suggested_cmd.as_deref(),
             Some("augmentagent channel slack arm")
         );
+    }
+
+
+    #[test]
+    fn interactive_surface_is_reported_apart_from_composio_and_never_ok_when_down() {
+        use crate::status::InteractiveStatus;
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(
+            "slack".to_string(),
+            InteractiveStatus {
+                state: "connected".into(),
+                healthy: true,
+                last_event_unix: Some(1_700_000_000),
+                ..Default::default()
+            },
+        );
+        let f = check_interactive_surfaces(&m);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].name, "interactive.slack");
+        assert_eq!(f[0].severity, Severity::Ok);
+
+        m.get_mut("slack").unwrap().state = "reconnecting".into();
+        m.get_mut("slack").unwrap().healthy = false;
+        m.get_mut("slack").unwrap().detail = Some("socket closed".into());
+        m.get_mut("slack").unwrap().recovery = Some("check the network".into());
+        let f = check_interactive_surfaces(&m);
+        assert_eq!(f[0].severity, Severity::Warn);
+        assert!(f[0].message.contains("reconnecting"));
+        assert!(f[0].message.contains("socket closed"));
+        assert_eq!(f[0].suggested_cmd.as_deref(), Some("check the network"));
+
+        m.get_mut("slack").unwrap().state = "misconfigured".into();
+        assert_eq!(check_interactive_surfaces(&m)[0].severity, Severity::Error);
+
+        for quiet in ["not_configured", "disabled"] {
+            m.get_mut("slack").unwrap().state = quiet.into();
+            assert_eq!(check_interactive_surfaces(&m)[0].severity, Severity::Ok, "{quiet}");
+        }
     }
 
     #[test]
