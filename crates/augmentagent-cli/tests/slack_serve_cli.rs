@@ -113,9 +113,14 @@ impl Env {
     }
 
     fn serve(&self, extra: &[&str]) -> Child {
+        self.serve_with(extra, &[])
+    }
+
+    fn serve_with(&self, extra: &[&str], env: &[(&str, &str)]) -> Child {
         let mut args = vec!["serve", "--no-email", "true"];
         args.extend_from_slice(extra);
         self.cmd(&args)
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -123,18 +128,24 @@ impl Env {
             .unwrap()
     }
 
+    /// `status --json`. A second process opening the database while the
+    /// daemon is mid-migration can see `database is locked` (Store::open
+    /// switches to WAL before its busy timeout applies), so retry briefly.
     fn status(&self) -> Value {
-        let out = self
-            .cmd(&["status", "--json", "true"])
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
-        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
-            panic!(
-                "status JSON: {e}\n{}",
-                String::from_utf8_lossy(&out.stderr)
-            )
-        })
+        let mut last = String::new();
+        for _ in 0..20 {
+            let out = self
+                .cmd(&["status", "--json", "true"])
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            match serde_json::from_slice(&out.stdout) {
+                Ok(v) => return v,
+                Err(e) => last = format!("{e}: {}", String::from_utf8_lossy(&out.stderr)),
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("status JSON never parsed: {last}");
     }
 
     fn slack_status(&self) -> Value {
@@ -397,14 +408,11 @@ async fn slack_only_serve_answers_the_owner_rejects_a_stranger_and_reports_live_
     assert!(env.slack_status()["recovery"].is_string());
 
     interrupt(&serve);
-    eventually("stopped", Duration::from_secs(15), || {
-        env.slack_status()["state"] == json!("stopped")
-    })
-    .await;
-    // Live-mode serve has another task that does not always exit on SIGINT
-    // (reproduced with the Slack surface off); do not wait on it here.
-    let _ = wait_exit(&mut serve, Duration::from_secs(5));
+    let status = wait_exit(&mut serve, Duration::from_secs(20));
     let out = logs(serve);
+    let status = status.unwrap_or_else(|| panic!("serve did not exit on SIGINT:\n{out}"));
+    assert!(status.success(), "serve exited {status}:\n{out}");
+    assert_eq!(env.slack_status()["state"], json!("stopped"));
     assert_no_tokens(&out);
     assert!(out.contains("slack interactive: stopped"), "{out}");
     assert!(!out.contains("discord approval broker disabled"), "{out}");
@@ -470,30 +478,95 @@ async fn dry_run_serve_makes_zero_live_sends_and_exits_cleanly_on_sigint() {
     any_send.assert_async().await;
 }
 
-#[test]
-fn serve_without_any_slack_app_reports_not_configured_and_keeps_running() {
+/// Slack failing (not set up, or forced on without an install) never stops
+/// `serve`: the surface reports why and how to fix it.
+fn slack_inactive_keeps_serve_running(switch: Option<&str>, state: &str, detail: &str) {
     let env = Env::new("http://127.0.0.1:9".into());
-    let mut serve = env.serve(&[]);
+    let extra: Vec<(&str, &str)> = switch
+        .map(|v| vec![("AUGMENTAGENT_SLACK_INTERACTIVE", v)])
+        .unwrap_or_default();
+    let mut serve = env.serve_with(&[], &extra);
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut state = Value::Null;
+    let mut report = Value::Null;
     while Instant::now() < deadline {
-        state = env.slack_status();
+        report = env.slack_status();
         // The daemon's own report (it has a heartbeat), not status's
         // fallback for "nothing reported".
-        if state["state"] == json!("not_configured") && state["heartbeat_unix"].is_i64() {
+        if report["state"] == json!(state) && report["heartbeat_unix"].is_i64() {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     let still_running = serve.try_wait().unwrap().is_none();
-    interrupt(&serve);
-    let _ = wait_exit(&mut serve, Duration::from_secs(20));
+    if still_running {
+        interrupt(&serve);
+    }
+    let exit = wait_exit(&mut serve, Duration::from_secs(20));
     let out = logs(serve);
-    assert_eq!(state["state"], json!("not_configured"), "{state}\n{out}");
-    assert_eq!(state["detail"], json!("no interactive Slack app is installed"), "{state}");
+    assert_eq!(report["state"], json!(state), "{report}\n{out}");
+    assert_eq!(report["detail"], json!(detail), "{report}");
+    assert_eq!(report["healthy"], json!(false));
     assert!(
-        state["recovery"].as_str().unwrap_or("").contains("slack app install"),
-        "{state}"
+        report["recovery"].as_str().unwrap_or("").contains("slack app install"),
+        "{report}"
     );
-    assert!(still_running, "serve must not exit because Slack is not configured:\n{out}");
+    assert!(still_running, "serve must not exit because Slack is not usable:\n{out}");
+    assert!(exit.is_some_and(|s| s.success()), "serve did not stop cleanly:\n{out}");
+}
+
+#[test]
+fn serve_without_any_slack_app_reports_not_configured_and_keeps_running() {
+    slack_inactive_keeps_serve_running(None, "not_configured", "no interactive Slack app is installed");
+}
+
+#[test]
+fn slack_forced_on_without_an_install_is_misconfigured_and_serve_keeps_running() {
+    slack_inactive_keeps_serve_running(Some("on"), "misconfigured", "no interactive Slack app is installed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slack_keeps_serving_when_discord_and_whatsapp_fail_to_start() {
+    let mut socket = fake_socket().await;
+    let mut server = mockito::Server::new_async().await;
+    mock_slack(&mut server, socket.port).await;
+    let answer = server
+        .mock("POST", "/chat.postMessage")
+        .match_body(Matcher::PartialJson(
+            json!({"channel": OWNER_DM, "text": "STUB: still here?"}),
+        ))
+        .with_body(json!({"ok": true, "channel": OWNER_DM, "ts": "1800000000.000001"}).to_string())
+        .expect(1)
+        .create_async()
+        .await;
+    let env = Env::new(server.url());
+    env.install_and_bind();
+    let missing = env.root.join("no such whatsapp export");
+    // Discord: a token without the channel ID its broker requires (fails
+    // before any connection). WhatsApp: an export directory that is absent.
+    let mut serve = env.serve_with(
+        &["--dry-run", "false"],
+        &[
+            ("DISCORD_BOT_TOKEN", "discord-test-not-a-token"),
+            ("AUGMENTAGENT_WHATSAPP_HISTORY_DIR", missing.to_str().unwrap()),
+        ],
+    );
+    eventually("connected", Duration::from_secs(30), || {
+        env.slack_status()["state"] == json!("connected")
+    })
+    .await;
+    socket
+        .send
+        .send(dm("env-1", OWNER_DM, OWNER, "still here?", "1800000003.000100"))
+        .unwrap();
+    socket.ack().await;
+    eventually("answered", Duration::from_secs(15), || answer.matched()).await;
+
+    interrupt(&serve);
+    let exit = wait_exit(&mut serve, Duration::from_secs(20));
+    let out = logs(serve);
+    assert!(exit.is_some_and(|s| s.success()), "serve did not stop cleanly:\n{out}");
+    assert!(out.contains("discord approval broker disabled"), "{out}");
+    assert!(out.contains("WhatsApp history disabled"), "{out}");
+    assert!(!out.contains("discord-test-not-a-token"), "token logged:\n{out}");
+    answer.assert_async().await;
 }
