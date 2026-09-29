@@ -25,16 +25,33 @@ fn an_empty_override_means_the_platform_store() {
 fn the_platform_store_reports_its_persistence() {
     let d = describe_store_for_override(None);
     assert!(!d.insecure);
+    assert_ne!(d.backend, "insecure-file");
+
+    // Which backend the `keyring` crate resolves to depends on how it was
+    // compiled — feature unification across the workspace flips Linux between
+    // its in-memory mock, keyutils and a persistent platform keyring. What must
+    // hold for every one of them is the label -> persistence -> note mapping,
+    // so that `doctor` never claims a volatile store outlives the process.
+    match d.backend {
+        "macos-keychain" | "platform-keyring" => {
+            assert!(d.persistent, "{} keeps credentials after exit", d.backend);
+            assert!(d.note.is_none(), "a persistent backend needs no caveat");
+        }
+        "keyutils" | "keyring-mock" => {
+            assert!(!d.persistent, "{} is volatile", d.backend);
+            assert!(
+                d.note.as_deref().unwrap_or("").contains("#1325"),
+                "a volatile backend must point the operator at #1325"
+            );
+        }
+        other => panic!("unexpected credential backend label {other:?}"),
+    }
+    assert_eq!(
+        d.note.is_some(),
+        !d.persistent,
+        "a caveat is shown exactly when credentials do not outlive the process"
+    );
     if cfg!(target_os = "macos") {
         assert_eq!(d.backend, "macos-keychain");
-        assert!(d.persistent);
-    } else if cfg!(target_os = "linux") {
-        // Pinned limitation (#1325): keyring v3 is built without a Linux
-        // backend, so it falls back to its in-memory mock and nothing a CLI
-        // command stores survives the process. Doctor must say so; when
-        // #1325 enables a persistent backend this assertion changes with it.
-        assert_eq!(d.backend, "keyring-mock");
-        assert!(!d.persistent);
-        assert!(d.note.as_deref().unwrap_or("").contains("#1325"));
     }
 }
