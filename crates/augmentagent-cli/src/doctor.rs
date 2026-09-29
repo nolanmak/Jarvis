@@ -2098,17 +2098,44 @@ fn print_table(findings: &[Finding], ok: usize, warn: usize, error: usize) {
 mod tests {
     use super::*;
 
+    /// Write a fake `security` script without this test process holding a
+    /// write descriptor on it: tests on other threads fork, a child forked
+    /// while `std::fs::write` has the file open keeps the descriptor until it
+    /// execs, and exec of a file open for writing fails on Linux with ETXTBSY
+    /// (the probe then reports "security command could not start"). A short
+    /// `sh` child writes the bytes instead (same fix as converter_bounds.rs).
+    #[cfg(unix)]
+    fn write_stub(path: &std::path::Path, script: impl AsRef<str>) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let mut writer = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("cat > \"$1\"")
+            .arg("sh")
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sh to write the stub");
+        writer
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_ref().as_bytes())
+            .unwrap();
+        assert!(writer.wait().unwrap().success());
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn macos_keychain_configuration_does_not_claim_credential_access() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let security = dir.path().join("security");
-        std::fs::write(
+        write_stub(
             &security,
             "#!/bin/sh\nprintf 'synthetic-canary-secret\\n'\nexit 0\n",
-        )
-        .unwrap();
+        );
         std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o700)).unwrap();
         let finding = check_keychain_configuration_with(&security, Duration::from_secs(2)).await;
         assert_eq!(finding.severity, Severity::Warn);
@@ -2119,16 +2146,15 @@ mod tests {
             .to_string()
             .contains("synthetic-canary-secret"));
 
-        std::fs::write(
+        write_stub(
             &security,
             "#!/bin/sh\necho synthetic-canary-secret >&2\nexit 1\n",
-        )
-        .unwrap();
+        );
         let denied = check_keychain_configuration_with(&security, Duration::from_secs(2)).await;
         assert_eq!(denied.severity, Severity::Error);
         assert!(!denied.message.contains("synthetic-canary-secret"));
 
-        std::fs::write(&security, "#!/bin/sh\nsleep 1\n").unwrap();
+        write_stub(&security, "#!/bin/sh\nsleep 1\n");
         let timed_out =
             check_keychain_configuration_with(&security, Duration::from_millis(20)).await;
         assert_eq!(timed_out.severity, Severity::Warn);
@@ -2157,7 +2183,7 @@ mod tests {
               \n esac\necho synthetic-canary-secret >&2\n",
             item = item.display(),
         );
-        std::fs::write(&security, script).unwrap();
+        write_stub(&security, script);
         std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o700)).unwrap();
         let finding = check_keychain_probe_with(&security, Duration::from_secs(2)).await;
         assert_eq!(finding.severity, Severity::Ok, "{}", finding.message);
@@ -2183,7 +2209,7 @@ mod tests {
               \n esac\n",
             item = item.display(),
         );
-        std::fs::write(&security, script).unwrap();
+        write_stub(&security, script);
         std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o700)).unwrap();
         let finding = check_keychain_probe_with(&security, Duration::from_secs(2)).await;
         assert_eq!(finding.severity, Severity::Error);
@@ -2210,7 +2236,7 @@ mod tests {
               \n esac\n",
             item = item.display(),
         );
-        std::fs::write(&security, script).unwrap();
+        write_stub(&security, script);
         std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o700)).unwrap();
         let finding = check_keychain_probe_with(&security, Duration::from_secs(2)).await;
         assert_eq!(finding.severity, Severity::Error);
@@ -2237,7 +2263,7 @@ mod tests {
               \n esac\n",
             item = item.display(),
         );
-        std::fs::write(&security, script).unwrap();
+        write_stub(&security, script);
         std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o700)).unwrap();
         let missing = check_keychain_probe_with(&security, Duration::from_secs(2)).await;
         assert_eq!(missing.severity, Severity::Error);
@@ -2251,7 +2277,7 @@ mod tests {
               \n esac\n",
             item = item.display(),
         );
-        std::fs::write(&security, script).unwrap();
+        write_stub(&security, script);
         let timed_out = check_keychain_probe_with(&security, Duration::from_millis(50)).await;
         assert_eq!(timed_out.severity, Severity::Error);
         assert!(timed_out.message.contains("timed out"));
