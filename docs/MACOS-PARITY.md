@@ -14,7 +14,9 @@ Every row is **unverified**. Source presence proves only that a capability
 needs parity work; it does not prove it works on Linux or macOS. The Linux
 baseline descriptions are hypotheses to check against current behavior. The
 `owner_issue` and `test_plan` fields make that work assignable; `evidence`
-stays empty until a test or real-host artifact supports a result.
+stays empty until a test or real-host artifact supports a result. To mark a
+row `verified`, evidence must include a 40-character commit SHA, macOS
+version, CPU architecture, exact test command, passing result and artifact.
 
 The collector currently identifies top-level CLI commands and literal routes.
 Nested CLI operations, dynamic routes, dashboard/PWA user journeys, model

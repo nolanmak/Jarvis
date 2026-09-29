@@ -51,17 +51,32 @@ def discover(root=ROOT):
         for path in sorted((root / "scripts").glob(f"{prefix}-*.sh")):
             add("installer", path.name, path)
 
-    for path in sorted((root / "src").glob("*.ts")):
+    for path in sorted((root / "src").rglob("*.ts")):
         for method, _quote, route in ROUTE.findall(path.read_text()):
             # The same path on different routers is a separate contract.
-            add("route", f"{path.stem}:{method.upper()}:{route}", path)
+            module = path.relative_to(root / "src").with_suffix("").as_posix()
+            add("route", f"{module}:{method.upper()}:{route}", path)
 
     for name in ("codex-tool-bridge.py", "codex-command-sandbox.py",
                  "codex-build-vm.py", "provider-supervisor.py"):
         path = root / "scripts" / name
-        add("tool", name, path)
+        if path.is_file():
+            add("tool", name, path)
 
     return found
+
+
+def valid_evidence(evidence):
+    if not isinstance(evidence, dict):
+        return False
+    required = ("commit", "macos_version", "architecture", "test_command", "result", "artifact")
+    if any(not isinstance(evidence.get(key), str) or
+           evidence[key].strip().lower() in ("", "todo", "tbd", "...") for key in required):
+        return False
+    return (re.fullmatch(r"[0-9a-f]{40}", evidence["commit"]) is not None
+            and evidence["macos_version"].lower().startswith("macos ")
+            and evidence["architecture"] in ("arm64", "x86_64")
+            and evidence["result"] == "pass")
 
 
 def validate(rows, found):
@@ -85,7 +100,7 @@ def validate(rows, found):
                 errors.append(f"{identifier} has no {key}")
         if row.get("status") not in ("unverified", "gap", "in_progress", "verified"):
             errors.append(f"invalid status: {identifier}")
-        if row.get("status") == "verified" and not row.get("evidence"):
+        if row.get("status") == "verified" and not valid_evidence(row.get("evidence")):
             errors.append(f"verified without evidence: {identifier}")
     return errors
 
