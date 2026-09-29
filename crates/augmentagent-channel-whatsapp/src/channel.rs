@@ -1110,7 +1110,7 @@ mod tests {
         use tokio::net::UnixListener;
 
         let (store, _f) = tmp_store();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new().prefix("wa-inbox-").tempdir_in("/tmp").unwrap();
         let socket = dir.path().join("wa.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let observed_store = Arc::clone(&store);
@@ -1157,7 +1157,7 @@ mod tests {
         use tokio::net::UnixListener;
 
         let (store, _f) = tmp_store();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new().prefix("wa-inbox-").tempdir_in("/tmp").unwrap();
         let socket = dir.path().join("wa.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         tokio::spawn(async move {
