@@ -14,8 +14,8 @@ use augmentagent_channel_slack::contact::compose::{
     compose, resolve_recipient, ComposeOutcome, Recipient, Resolution,
 };
 use augmentagent_channel_slack::contact::{
-    approve_contact_message, ingested_reply_target, reply_target, ContactSendApi, ContactSendError,
-    OutgoingContactMessage, PostedContactMessage,
+    approve_contact_message, ingested_reply_target, reply_target, send_contact_message,
+    ContactClaim, ContactSendApi, ContactSendError, OutgoingContactMessage, PostedContactMessage,
 };
 use augmentagent_store::slack_contact::{
     SlackConversationKind, SlackSendIdentity, SlackSendStatus,
@@ -885,5 +885,201 @@ fn ingested_targets_thread_channel_replies_and_keep_dms_top_level() {
     assert_eq!(
         (t.kind, t.thread_ts.as_deref()),
         (SlackConversationKind::GroupDm, None)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #1291 — scheduled sends go through the same path
+// ---------------------------------------------------------------------------
+
+const ENGINE: &str = "scheduled-send-engine";
+
+async fn send(
+    fx: &Fx,
+    api: &Arc<FakeComposio>,
+    id: &str,
+    claim: ContactClaim,
+    source: &str,
+) -> ApprovalActionOutcome {
+    let action = row(fx, id);
+    send_contact_message(
+        &fx.store,
+        Some(api.as_ref() as &dyn ContactSendApi),
+        &action,
+        source,
+        claim,
+    )
+    .await
+}
+
+fn scheduled_reply(fx: &Fx, draft: &str, at_ms: i64) -> String {
+    let id = pending_reply(fx, CHANNEL, "#general", Some(PARENT_TS), draft);
+    assert!(fx.store.schedule_action(&id, at_ms, "slack").unwrap());
+    id
+}
+
+#[tokio::test]
+async fn a_scheduled_reply_fires_once_when_due_as_the_owner_in_its_thread_with_the_send_ledger() {
+    let fx = fx();
+    let api = FakeComposio::new();
+    let id = scheduled_reply(&fx, "See you at nine.", 1_000_000);
+
+    // Approve on an armed schedule is not a send.
+    assert!(matches!(
+        approve(&fx, &api, &id).await,
+        ApprovalActionOutcome::AlreadyResolved { status, .. } if status == "scheduled"
+    ));
+    // Not due yet: nothing is claimed or posted.
+    assert!(matches!(
+        send(&fx, &api, &id, ContactClaim::Due { now_ms: 999_999 }, ENGINE).await,
+        ApprovalActionOutcome::AlreadyResolved { status, .. } if status == "scheduled"
+    ));
+    assert!(api.requests().is_empty());
+    assert_eq!(row(&fx, &id).action.status, "scheduled");
+
+    // Due: one post, same destination and identity as an immediate send.
+    let out = send(
+        &fx,
+        &api,
+        &id,
+        ContactClaim::Due { now_ms: 1_000_000 },
+        ENGINE,
+    )
+    .await;
+    assert!(matches!(out, ApprovalActionOutcome::Approved), "{out:?}");
+    let landed = api.landed();
+    assert_eq!(landed.len(), 1);
+    assert_eq!(landed[0].channel, CHANNEL);
+    assert_eq!(landed[0].thread_ts.as_deref(), Some(PARENT_TS));
+    assert_eq!(landed[0].user, OWNER);
+    assert_eq!(landed[0].text, "See you at nine.");
+    assert_eq!(row(&fx, &id).action.status, "sent");
+    assert_eq!(status_source(&fx, &id).as_deref(), Some(ENGINE));
+    let ledger = fx.store.slack_contact_send(&id).unwrap().unwrap();
+    assert_eq!(ledger.identity, SlackSendIdentity::OwnerUser);
+    assert_eq!(ledger.sender_user_id, OWNER);
+    assert_eq!(ledger.status, SlackSendStatus::Sent);
+
+    // A second tick (or a restarted daemon) sends nothing.
+    assert!(matches!(
+        send(&fx, &api, &id, ContactClaim::Due { now_ms: 2_000_000 }, ENGINE).await,
+        ApprovalActionOutcome::AlreadyResolved { status, .. } if status == "sent"
+    ));
+    assert_eq!(api.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn send_now_claims_a_scheduled_reply_whatever_its_time_and_the_timer_then_finds_nothing() {
+    let fx = fx();
+    let api = FakeComposio::new();
+    let id = scheduled_reply(&fx, "Now, please.", 9_000_000_000_000);
+    // Send now on a row that is not scheduled is refused.
+    let pending = pending_reply(&fx, "C00000008", "#random", None, "Not scheduled.");
+    assert!(matches!(
+        send(&fx, &api, &pending, ContactClaim::SendNow, "slack").await,
+        ApprovalActionOutcome::AlreadyResolved { status, .. } if status == "pending"
+    ));
+    assert!(api.requests().is_empty());
+
+    let out = send(&fx, &api, &id, ContactClaim::SendNow, "slack").await;
+    assert!(matches!(out, ApprovalActionOutcome::Approved), "{out:?}");
+    assert_eq!(api.landed().len(), 1);
+    assert_eq!(status_source(&fx, &id).as_deref(), Some("slack"));
+    assert!(matches!(
+        send(
+            &fx,
+            &api,
+            &id,
+            ContactClaim::Due {
+                now_ms: 9_000_000_000_000
+            },
+            ENGINE
+        )
+        .await,
+        ApprovalActionOutcome::AlreadyResolved { .. }
+    ));
+    assert_eq!(api.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn send_now_racing_the_scheduler_sends_once() {
+    let fx = fx();
+    let api = FakeComposio::new();
+    let id = scheduled_reply(&fx, "Exactly once.", 1_000_000);
+    let (a, b) = tokio::join!(
+        send(&fx, &api, &id, ContactClaim::SendNow, "slack"),
+        send(
+            &fx,
+            &api,
+            &id,
+            ContactClaim::Due { now_ms: 1_000_000 },
+            ENGINE
+        )
+    );
+    let sent = [&a, &b]
+        .iter()
+        .filter(|o| matches!(o, ApprovalActionOutcome::Approved))
+        .count();
+    assert_eq!(sent, 1, "{a:?} / {b:?}");
+    assert_eq!(api.requests().len(), 1);
+    assert_eq!(row(&fx, &id).action.status, "sent");
+}
+
+#[tokio::test]
+async fn a_scheduled_send_slack_refused_is_retried_from_the_card_and_sent_once() {
+    let fx = fx();
+    let api = FakeComposio::new();
+    let id = scheduled_reply(&fx, "Retry after refusal.", 1_000_000);
+    api.script(Script::Refuse);
+    assert!(matches!(
+        send(
+            &fx,
+            &api,
+            &id,
+            ContactClaim::Due { now_ms: 1_000_000 },
+            ENGINE
+        )
+        .await,
+        ApprovalActionOutcome::Failed { .. }
+    ));
+    assert_eq!(row(&fx, &id).action.status, "error");
+    assert!(api.landed().is_empty());
+    // The errored card's Retry is an approval, exactly as for an immediate send.
+    assert!(matches!(
+        approve(&fx, &api, &id).await,
+        ApprovalActionOutcome::Approved
+    ));
+    assert_eq!(api.landed().len(), 1);
+    assert!(matches!(
+        approve(&fx, &api, &id).await,
+        ApprovalActionOutcome::AlreadyResolved { .. }
+    ));
+    assert_eq!(api.landed().len(), 1);
+}
+
+#[tokio::test]
+async fn a_scheduled_send_that_cannot_start_leaves_the_schedule_armed_and_posts_nothing() {
+    let fx = fx();
+    let api = Arc::new(FakeComposio {
+        owner: None,
+        ..FakeComposio::default()
+    });
+    let id = scheduled_reply(&fx, "No identity.", 1_000_000);
+    assert!(matches!(
+        send(
+            &fx,
+            &api,
+            &id,
+            ContactClaim::Due { now_ms: 1_000_000 },
+            ENGINE
+        )
+        .await,
+        ApprovalActionOutcome::Failed { .. }
+    ));
+    assert!(api.requests().is_empty());
+    assert_eq!(
+        row(&fx, &id).action.status,
+        "scheduled",
+        "a refusal before the claim leaves the row as it was"
     );
 }

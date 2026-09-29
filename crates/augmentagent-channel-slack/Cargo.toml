@@ -47,3 +47,6 @@ tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 mockito = "1"
 rusqlite = { workspace = true }
+# #1291 — America/New_York fixtures for the scheduling tests.
+chrono = { workspace = true }
+chrono-tz = { workspace = true }

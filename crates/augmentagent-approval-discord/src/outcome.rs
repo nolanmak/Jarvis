@@ -129,6 +129,11 @@ pub fn card_status_line(status: &str, detail: Option<&str>) -> Option<String> {
         "pending" => return None,
         "sending" => "⏳ Sending…".to_string(),
         "sent" => "✅ Sent.".to_string(),
+        // #1291 — Cancel on a scheduled send stores `rejected` with its
+        // reason; say what actually happened.
+        "rejected" if detail.is_some_and(|d| d.contains("schedule cancelled")) => {
+            "🚫 Schedule cancelled — draft discarded.".to_string()
+        }
         "skipped" | "rejected" => "⏭️ Skipped — draft discarded.".to_string(),
         "scheduled" => "🗓️ Scheduled — see the scheduled notice.".to_string(),
         "cancelled" => "🚫 Schedule cancelled — draft discarded.".to_string(),
@@ -145,6 +150,17 @@ pub fn card_status_line(status: &str, detail: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1291 — a cancelled schedule is stored as `rejected` with the
+    /// cancel reason; its card says the schedule was cancelled, not that
+    /// the draft was skipped.
+    #[test]
+    fn a_cancelled_schedule_says_so() {
+        let line = card_status_line("rejected", Some("schedule cancelled by approver")).unwrap();
+        assert!(line.contains("Schedule cancelled"), "{line}");
+        let skipped = card_status_line("rejected", Some("skipped by approver")).unwrap();
+        assert!(skipped.contains("Skipped"), "{skipped}");
+    }
 
     #[test]
     fn a_pending_card_has_no_status_line() {

@@ -23,6 +23,9 @@ chrono = { workspace = true }
 # #231 — cron-style /loop scheduling (timezone-aware via IANA db).
 cron = { workspace = true }
 chrono-tz = { workspace = true }
+# #1291 — the host zone's IANA *name* (CoreFoundation on macOS, /etc/localtime
+# on Linux); its rules come from chrono-tz, never from host zoneinfo files.
+iana-time-zone = "0.1"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 dashmap = { workspace = true }
