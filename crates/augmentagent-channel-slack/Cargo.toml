@@ -24,8 +24,15 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
 uuid = { workspace = true }
+futures = { workspace = true }
+# #1283 — real-time Socket Mode transport. Same version and rustls/webpki
+# TLS backend the workspace already resolves for serenity and the Discord
+# voice bridge, so no new TLS stack and no system OpenSSL.
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Paused-clock Socket Mode tests (heartbeat, backoff, sleep/wake).
+tokio = { workspace = true, features = ["test-util"] }
 mockito = "1"
 rusqlite = { workspace = true }
