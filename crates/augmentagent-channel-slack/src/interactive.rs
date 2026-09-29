@@ -58,6 +58,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::approvals::SlackApprovals;
+use crate::commands::{
+    recognize, CommandContext, ConversationControl, Recognized, SlackCommandDeps, SlackCommands,
+};
 use crate::delivery::ProgressMessage;
 use crate::delivery::{
     enqueue_answer, Answer, AnswerFile, DispatchOutcome, PlanOptions, ProgressConfig,
@@ -674,6 +677,33 @@ fn message_files(event: &SlackEvent) -> &[FileRef] {
     }
 }
 
+/// #1292 — the private-lane prefix of an owner command, so `status`,
+/// `model`, `cancel all` and the rest never wait behind a running turn.
+const COMMAND_LANE: &str = "cmd:";
+
+/// Lanes that are dispatch keys, never Slack threads: a reply to input
+/// recorded under one goes top level in its channel.
+fn is_private_lane(thread: &str) -> bool {
+    thread.starts_with(INTERACTION_LANE)
+        || thread.starts_with(COMMAND_LANE)
+        || thread.starts_with("cancel:")
+}
+
+/// A private lane for an owner command (see [`crate::commands::recognize`]).
+fn command_lane(e: &EventEnvelope) -> Option<String> {
+    match &e.event {
+        SlackEvent::Message(m) | SlackEvent::ThreadReply(m)
+            if m.files.is_empty() && !m.ts.is_empty() && recognize(&m.text, false).is_some() =>
+        {
+            Some(format!("{COMMAND_LANE}{}", m.ts))
+        }
+        SlackEvent::SlashCommand(c) if recognize(&c.text, true).is_some() => {
+            Some(format!("{COMMAND_LANE}{}", e.stable_id()))
+        }
+        _ => None,
+    }
+}
+
 /// A private lane for a cancel command (see [`envelope_conversation`]).
 fn cancel_lane(e: &EventEnvelope) -> Option<String> {
     match &e.event {
@@ -691,7 +721,7 @@ fn cancel_lane(e: &EventEnvelope) -> Option<String> {
 
 fn inbound_record(e: &EventEnvelope, now_ms: i64) -> anyhow::Result<NewInboundEvent> {
     let (channel, thread) = envelope_conversation(e);
-    let thread = cancel_lane(e).or(thread);
+    let thread = cancel_lane(e).or_else(|| command_lane(e)).or(thread);
     let conversation = SurfaceConversationRef::new(envelope_account(e), channel, thread)
         .context("inbound conversation")?;
     Ok(NewInboundEvent {
@@ -822,6 +852,8 @@ struct Ctx {
     running: Mutex<HashMap<String, CancellationToken>>,
     /// #1289 — approval clicks, modals and commands.
     approvals: Option<Arc<SlackApprovals>>,
+    /// #1292 — owner commands.
+    commands: Arc<SlackCommands>,
 }
 
 impl Ctx {
@@ -885,6 +917,9 @@ pub struct SlackInteractiveSurface {
     /// #1289 — the approval surface card clicks, modal submissions and
     /// approval text commands go to.
     approvals: Option<Arc<SlackApprovals>>,
+    /// #1292 — owner commands; `None` uses [`SlackCommandDeps::new`] over
+    /// the default model selection file.
+    commands: Option<Arc<SlackCommands>>,
 }
 
 impl SlackInteractiveSurface {
@@ -904,6 +939,7 @@ impl SlackInteractiveSurface {
             config,
             clock: Arc::new(system_now_ms),
             approvals: None,
+            commands: None,
         }
     }
 
@@ -915,6 +951,12 @@ impl SlackInteractiveSurface {
     /// #1289 — route approval clicks, modals and commands to `approvals`.
     pub fn with_approvals(mut self, approvals: Arc<SlackApprovals>) -> Self {
         self.approvals = Some(approvals);
+        self
+    }
+
+    /// #1292 — run owner commands with these dependencies.
+    pub fn with_commands(mut self, commands: Arc<SlackCommands>) -> Self {
+        self.commands = Some(commands);
         self
     }
 
@@ -938,6 +980,12 @@ impl SlackInteractiveSurface {
             .inbound
             .clone()
             .or_else(|| default_inbound_root().map(InboundOptions::new));
+        let commands = self.commands.unwrap_or_else(|| {
+            Arc::new(SlackCommands::new(
+                Arc::clone(&self.store),
+                SlackCommandDeps::new(augmentagent_channel_core::model_selection::config_path()),
+            ))
+        });
         let ctx = Arc::new(Ctx {
             store: Arc::clone(&self.store),
             platform: platform(),
@@ -955,6 +1003,7 @@ impl SlackInteractiveSurface {
             inbound,
             running: Mutex::new(HashMap::new()),
             approvals: self.approvals,
+            commands,
         });
 
         // This process owns the database: claims and in-flight sends left
@@ -1243,10 +1292,11 @@ async fn process(ctx: &Ctx, claimed: ClaimedInbound, shutdown: &CancellationToke
             match target {
                 Some((text, RejectionReply::InDm)) => {
                     let turn = rejection_turn_id(&claimed.event_id);
-                    // #1289 — an interaction's dispatch lane is not a Slack
-                    // thread: answer it top level in the DM.
+                    // #1289/#1292 — a private dispatch lane (interaction,
+                    // command, cancel) is not a Slack thread: answer it top
+                    // level in the DM.
                     let conversation = match claimed.conversation.thread_id() {
-                        Some(t) if t.starts_with(INTERACTION_LANE) => SurfaceConversationRef::new(
+                        Some(t) if is_private_lane(t) => SurfaceConversationRef::new(
                             account.clone(),
                             claimed.conversation.conversation_id(),
                             None,
@@ -1294,6 +1344,15 @@ async fn run_turn(
     let text = turn_text(&envelope.event);
     let session = answer_conversation(&account, &input, &envelope);
     let files = message_files(&envelope.event).to_vec();
+    // #1292 — owner commands answer at once (their own lane) and never
+    // reach the agent.
+    if input.source != OwnerInputSource::Interaction && files.is_empty() {
+        let via_slash = input.source == OwnerInputSource::SlashCommand;
+        if let Some(recognized) = recognize(&text, via_slash) {
+            run_command(ctx, &claimed, &input, session.as_ref(), &recognized).await;
+            return;
+        }
+    }
     // #1289 — approval clicks, modal submissions and text commands are
     // decisions, never agent turns.
     if let Some(approvals) = ctx.approvals.clone() {
@@ -1344,6 +1403,73 @@ async fn run_turn(
     if let Some(key) = key {
         ctx.running.lock().unwrap().remove(&key);
     }
+}
+
+/// The surface's running turns, as the commands see them.
+struct RunningTurns<'a>(&'a Ctx);
+
+impl ConversationControl for RunningTurns<'_> {
+    fn is_running(&self, conversation: &SurfaceConversationRef) -> bool {
+        self.0
+            .running
+            .lock()
+            .unwrap()
+            .contains_key(&conversation.storage_key())
+    }
+
+    fn cancel_running(&self, conversation: &SurfaceConversationRef) -> bool {
+        let token = self
+            .0
+            .running
+            .lock()
+            .unwrap()
+            .get(&conversation.storage_key())
+            .cloned();
+        match token {
+            Some(token) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// #1292 — run an owner command and queue its reply in the conversation.
+async fn run_command(
+    ctx: &Ctx,
+    claimed: &ClaimedInbound,
+    input: &OwnerInput,
+    session: Option<&SurfaceConversationRef>,
+    recognized: &Recognized,
+) {
+    let seq = claimed.seq;
+    let Some(conversation) = session else {
+        warn!(
+            seq,
+            "slack interactive: owner command has nowhere to answer"
+        );
+        settle(ctx, seq);
+        return;
+    };
+    let reply = ctx
+        .commands
+        .execute(
+            recognized,
+            &CommandContext {
+                owner: &input.owner,
+                conversation,
+                control: &RunningTurns(ctx),
+                now_ms: ctx.now(),
+            },
+        )
+        .await;
+    let turn = answer_turn_id(&claimed.event_id);
+    if let Err(e) = enqueue(ctx, conversation, &turn, &reply) {
+        release(ctx, seq, &format!("enqueue command reply: {e}"));
+        return;
+    }
+    settle(ctx, seq);
 }
 
 /// `cancel` / `stop`: stop the running turn in this conversation. The

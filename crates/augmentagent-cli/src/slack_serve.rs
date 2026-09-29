@@ -24,6 +24,12 @@
 //! `approval_routing`), and the surface routes card clicks, modals and
 //! approval text commands to it. `serve` plans once ([`plan_from_env`]) so
 //! the credential store is read once for both.
+//!
+//! #1292 — owner commands (`/jarvis <command>` and their plain-text forms):
+//! [`slack_commands`] over the daemon's model selection file, model
+//! readiness, loop parser and journal bridge, handed to [`spawn`]. The
+//! harness reads the same selection file per conversation
+//! ([`conversation_handler`]).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,6 +40,7 @@ use augmentagent_approval_discord::{AuditCtx, QueryHandler};
 use augmentagent_channel_slack::app::{
     api_base_from, SlackAppCredentials, SlackAppError, SlackAppStore, SLACK_API_BASE_ENV,
 };
+use augmentagent_channel_slack::commands::{slack_selection, SlackCommandDeps, SlackCommands};
 use augmentagent_channel_slack::delivery::ProgressConfig;
 use augmentagent_channel_slack::harness::SlackConversationHarness;
 use augmentagent_channel_slack::interactive::{
@@ -412,11 +419,13 @@ pub async fn build_approvals(
 /// `planned` is the plan `serve` already made (to build the approval
 /// surface); `None` plans here. `approvals`, when set, receives card
 /// clicks, modal submissions and approval text commands.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     store: Arc<Store>,
     planned: Option<Plan>,
     make_handler: impl FnOnce() -> Arc<dyn SlackTurnHandler> + Send + 'static,
     approvals: Option<Arc<augmentagent_channel_slack::approvals::SlackApprovals>>,
+    commands: Option<Arc<SlackCommands>>,
     dry_run: bool,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<Result<()>> {
@@ -493,6 +502,10 @@ pub fn spawn(
             Some(a) => surface.with_approvals(a),
             None => surface,
         };
+        let surface = match commands {
+            Some(c) => surface.with_commands(c),
+            None => surface,
+        };
         surface.run(shutdown).await
     })
 }
@@ -505,7 +518,18 @@ pub fn conversation_handler(
     query: Arc<dyn QueryHandler>,
     wiki_root: PathBuf,
 ) -> Arc<dyn SlackTurnHandler> {
-    Arc::new(SlackConversationHarness::new(store, query, wiki_root))
+    // #1292 — each conversation's own `model` choice (then its channel's,
+    // then the daemon default), from the same file `/model` writes.
+    Arc::new(
+        SlackConversationHarness::new(store, query, wiki_root).with_selection(slack_selection(
+            augmentagent_channel_core::model_selection::config_path(),
+        )),
+    )
+}
+
+/// #1292 — the owner commands `serve` runs on Slack.
+pub fn slack_commands(store: Arc<Store>, deps: SlackCommandDeps) -> Arc<SlackCommands> {
+    Arc::new(SlackCommands::new(store, deps))
 }
 
 /// Used when `serve` has no `--wiki-dir`: the query path needs one.
@@ -576,7 +600,18 @@ impl QueryHandler for StubAgent {
     async fn answer(&self, _ctx: &AuditCtx, question: &str) -> anyhow::Result<String> {
         use augmentagent_channel_core::native_session::{Launch, CURRENT};
         use augmentagent_channel_core::providers::ProviderKind;
-        let session = CURRENT.try_with(Arc::clone)?;
+        let Ok(session) = CURRENT.try_with(Arc::clone) else {
+            // #1292 — qwen/glm have no native session: the legacy route,
+            // with the conversation's selection.
+            let model = augmentagent_channel_core::model_selection::conversation_selection()
+                .flatten()
+                .map_or("default", |k| k.name());
+            let first = question.lines().next().unwrap_or_default().trim();
+            return Ok(format!(
+                "{} {first} (legacy route, model {model})",
+                self.prefix
+            ));
+        };
         let provider = session.provider();
         let mut lease = session.begin(provider)?;
         let id = match lease.launch() {
@@ -636,18 +671,25 @@ pub fn test_turn_handler(
         prefix,
         store,
         state.join("test-slack-turns.json"),
+        augmentagent_channel_core::model_selection::config_path(),
     ))
 }
 
-fn stub_handler(prefix: &str, store: Arc<Store>, counts: PathBuf) -> Arc<dyn SlackTurnHandler> {
+fn stub_handler(
+    prefix: &str,
+    store: Arc<Store>,
+    counts: PathBuf,
+    selection: PathBuf,
+) -> Arc<dyn SlackTurnHandler> {
     let agent = Arc::new(StubAgent {
         prefix: prefix.to_string(),
         counts,
     });
     let wiki = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    // The owner's model selection is not read: the stub is always Claude.
+    // #1292 — the owner's per-conversation model selection, as in `serve`.
     Arc::new(
-        SlackConversationHarness::new(store, agent, wiki).with_selection(Arc::new(|_| Ok(None))),
+        SlackConversationHarness::new(store, agent, wiki)
+            .with_selection(slack_selection(selection)),
     )
 }
 
@@ -1030,6 +1072,7 @@ mod tests {
             "FAKE-REASONER:",
             Arc::clone(&store),
             dir.path().join("counts.json"),
+            dir.path().join("model-selection.json"),
         );
         let first = handler
             .handle_turn(&turn(OwnerInputSource::Message, "status?"))
@@ -1062,6 +1105,71 @@ mod tests {
         assert!(second.text.ends_with("turn 2)"), "{}", second.text);
         assert!(test_turn_handler(None, Arc::clone(&store)).is_none());
         assert!(test_turn_handler(Some("  "), store).is_none());
+    }
+
+    /// #1292 — the QA stand-in honours the owner's per-conversation model,
+    /// natively for Claude/Codex and on the legacy route for the others.
+    #[tokio::test]
+    async fn the_test_override_uses_the_conversations_model_selection() {
+        use augmentagent_channel_core::model_selection::SelectionStore;
+        use augmentagent_channel_core::providers::ProviderKind;
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("data.db")).unwrap());
+        let selection = dir.path().join("model-selection.json");
+        let dm = SlackWorkspace::new(TEAM, None)
+            .unwrap()
+            .conversation("D00000001", None)
+            .unwrap();
+        SelectionStore::new(&selection)
+            .set(Some(&dm.storage_key()), Some(ProviderKind::Codex))
+            .unwrap();
+        let handler = stub_handler(
+            "FAKE-REASONER:",
+            Arc::clone(&store),
+            dir.path().join("counts.json"),
+            selection.clone(),
+        );
+        let reply = handler
+            .handle_turn(&turn(OwnerInputSource::Message, "hello"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            reply.text.contains("(session codex-thread-"),
+            "{}",
+            reply.text
+        );
+
+        // qwen has no native session: the legacy route, with the selection.
+        let other = dir.path().join("other.json");
+        SelectionStore::new(&other)
+            .set(Some(&dm.storage_key()), Some(ProviderKind::Qwen))
+            .unwrap();
+        let store = Arc::new(Store::open(dir.path().join("other.db")).unwrap());
+        let handler = stub_handler("FAKE-REASONER:", store, dir.path().join("c2.json"), other);
+        let legacy = handler
+            .handle_turn(&turn(OwnerInputSource::Message, "hello"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            legacy.text,
+            "FAKE-REASONER: hello (legacy route, model qwen)"
+        );
+    }
+
+    #[test]
+    fn serve_wires_owner_commands_with_the_daemons_selection_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("data.db")).unwrap());
+        let deps = augmentagent_channel_slack::commands::SlackCommandDeps::new(
+            dir.path().join("sel.json"),
+        );
+        // Builds without touching the network or the credential store.
+        let _commands = slack_commands(store, deps);
     }
 
     // --- isolation -------------------------------------------------------

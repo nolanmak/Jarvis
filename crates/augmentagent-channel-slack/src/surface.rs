@@ -343,8 +343,23 @@ pub const SLACK_SHARED_CAPABILITIES: [CapabilityRow<SurfaceCapability>; 11] = [
          tests/contact_surface.rs); live-workspace identity is unverified",
     ),
     row(SurfaceCapability::Schedule, SupportStatus::Unsupported, 1291, NOT_WIRED),
-    row(SurfaceCapability::ModelControl, SupportStatus::Unsupported, 1292, NOT_WIRED),
-    row(SurfaceCapability::ProcessControl, SupportStatus::Unsupported, 1292, NOT_WIRED),
+    row(
+        SurfaceCapability::ModelControl,
+        SupportStatus::Supported,
+        1292,
+        "`model` (and `/jarvis model`) shows and sets the model per conversation on the \
+         transport-neutral key, persisted across restarts and used by the next turn; `reset` \
+         starts a new native session (commands/, tests/owner_commands.rs, \
+         tests/owner_commands_surface.rs)",
+    ),
+    row(
+        SurfaceCapability::ProcessControl,
+        SupportStatus::Supported,
+        1292,
+        "`processes` lists and stops `claude` CLI processes through the cross-platform walker \
+         and says so when it cannot run on the host; `cancel all` stops the running turn and \
+         drops the queue (commands/, tests/owner_commands.rs, tests/owner_commands_surface.rs)",
+    ),
     row(SurfaceCapability::MediaRead, SupportStatus::Unsupported, 1293, NOT_WIRED),
     row(SurfaceCapability::MediaWrite, SupportStatus::Unsupported, 1294, NOT_WIRED),
     row(
@@ -389,9 +404,11 @@ pub const SLACK_INTERACTIONS: [CapabilityRow<SlackInteraction>; 9] = [
     ),
     row(
         SlackInteraction::SlashCommands,
-        SupportStatus::Unsupported,
+        SupportStatus::Supported,
         1292,
-        NOT_WIRED,
+        "`/jarvis <command>` runs every owner command in the shared registry (help generated \
+         from it), in a private lane that never queues behind a turn; other text still talks \
+         to Jarvis (commands/, tests/owner_commands.rs, tests/owner_commands_surface.rs)",
     ),
     row(
         SlackInteraction::FileUpload,

@@ -386,10 +386,32 @@ fn an_undeclared_capability_returns_the_typed_unsupported_error() {
         SlackInteraction::LiveVoice.require(),
         Err(SurfaceRefError::UnsupportedCapability("live_voice"))
     );
-    assert_eq!(
-        SlackInteraction::SlashCommands.require(),
-        Err(SurfaceRefError::UnsupportedCapability("slash_commands"))
-    );
+}
+
+// #1292 — `/jarvis` and the owner commands (model, process control) run on
+// Slack; live voice stays a named blocker.
+#[test]
+fn owner_commands_model_and_process_control_are_supported_on_slack() {
+    let declared = slack_capabilities();
+    assert!(SlackInteraction::SlashCommands.require().is_ok());
+    assert!(declared.require(SurfaceCapability::ModelControl).is_ok());
+    assert!(declared.require(SurfaceCapability::ProcessControl).is_ok());
+    for key in [
+        SurfaceCapability::ModelControl,
+        SurfaceCapability::ProcessControl,
+    ] {
+        let row = SLACK_SHARED_CAPABILITIES
+            .iter()
+            .find(|row| row.key == key)
+            .unwrap();
+        assert_eq!(row.tracking_issue, 1292);
+        assert!(row.basis.contains("owner_commands"), "{}", row.basis);
+    }
+    assert!(parity_blockers().iter().all(|b| !matches!(
+        b.name,
+        "slash_commands" | "model_control" | "process_control"
+    )));
+    assert!(parity_blockers().iter().any(|b| b.name == "live_voice"));
 }
 
 // #1289 — approvals run on Slack: cards with buttons, modals for revise and

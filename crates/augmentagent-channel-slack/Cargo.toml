@@ -20,6 +20,9 @@ augmentagent-docs = { path = "../augmentagent-docs" }
 # #1297 — the existing Rust speech-to-text seam (`Transcriber`, whisper.cpp)
 # that Slack voice clips plug into.
 augmentagent-channel-voice = { path = "../augmentagent-channel-voice" }
+# #1292 — `processes` lists and stops `claude` CLI processes through the
+# shared cross-platform walker (`ps` on macOS, no `/proc` reads here).
+augmentagent-loops = { path = "../augmentagent-loops" }
 # Private per-message directories and the owner check on their root.
 tempfile = "3"
 libc = "0.2"
