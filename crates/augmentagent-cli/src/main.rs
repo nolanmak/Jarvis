@@ -2419,12 +2419,12 @@ enum RatelimitOp {
 /// systemd's `TimeoutStopSec` so the drain always ends before SIGKILL does.
 const DRAIN_BUDGET: Duration = Duration::from_secs(20);
 
-/// Join the daemon's tasks after cancellation, bounded (#1071). Letting a cancelled
-/// runner return drops its `ProcessGroup`, which retires that call's marker; a runner
-/// wedged in a call that never returns must not hold the stop open, so the budget
-/// expires and the next start's orphan pass clears what was left. One budget covers
-/// the whole join deliberately: it bounds the stop, which is what `TimeoutStopSec`
-/// measures — per-task budgets would multiply into a wait systemd would SIGKILL.
+/// Join the daemon's tasks after cancellation, bounded (#1071). Letting a cancelled runner
+/// return drops its `ProcessGroup`, which retires that call's marker; a runner wedged in a
+/// call that never returns must not hold the stop open, so the budget expires and the next
+/// start's orphan pass clears what was left. One budget covers the whole join deliberately:
+/// it bounds the stop, which is what `TimeoutStopSec` measures — per-task budgets would
+/// multiply into a wait systemd would SIGKILL.
 async fn drain_daemon_tasks(tasks: Vec<tokio::task::JoinHandle<Result<()>>>, budget: Duration) -> Result<()> {
     let drained = tokio::time::timeout(budget, async {
         for handle in tasks { handle.await??; }
@@ -2895,8 +2895,8 @@ async fn main() -> Result<()> {
                     s2.cancel();
                 }
             });
-            // #1071 — a stop or restart sends SIGTERM. Without this the process
-            // dies at once and every in-flight call leaves a lifecycle marker.
+            // #1071 — a stop or restart sends SIGTERM. Without this the process dies at
+            // once and every in-flight call leaves a lifecycle marker.
             let s3 = shutdown.clone();
             tokio::spawn(async move {
                 match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
@@ -2918,8 +2918,7 @@ async fn main() -> Result<()> {
                 // #1036 — also reap Codex VM build sessions left by a killed
                 // bridge (and any VM still running for them), hourly.
                 Some(std::sync::Arc::new(augmentagent_channel_core::build_scratch::sweep_and_log)),
-                // #1071 — the loop's start also clears markers orphaned by a
-                // previous instance that died mid-call.
+                // #1071 — its start also clears markers orphaned by a dead instance.
                 augmentagent_channel_core::handoff::LivenessEnv::probe(),
             )));
 
@@ -20225,8 +20224,8 @@ mod identity_merge_tests {
 
 /// #1071, the reported shape: one runner returns once cancelled (its `ProcessGroup` drops,
 /// retiring that marker), one is wedged in a provider call that never returns. An unbounded
-/// join waits on the wedged one forever, so the budget must expire and leave the rest to
-/// the next start's orphan pass.
+/// join waits on the wedged one forever, so the budget must expire and leave the rest to the
+/// next start's orphan pass.
 #[cfg(test)]
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_wedged_runner_cannot_hold_the_stop_open_past_the_budget() {
@@ -20234,8 +20233,8 @@ async fn a_wedged_runner_cannot_hold_the_stop_open_past_the_budget() {
     let shutdown = CancellationToken::new();
     let retired = Arc::new(AtomicBool::new(false));
     let (flag, sd) = (Arc::clone(&retired), shutdown.clone());
-    shutdown.cancel();
     let started = tokio::time::Instant::now();
+    shutdown.cancel();
     drain_daemon_tasks(vec![
         tokio::spawn(async move { sd.cancelled().await; flag.store(true, Ordering::SeqCst); Ok(()) }),
         tokio::spawn(async { std::future::pending().await })], DRAIN_BUDGET).await.unwrap();

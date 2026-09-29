@@ -501,15 +501,15 @@ fn is_request_name(name: &OsStr) -> bool {
         && name.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
 }
 
-/// What one orphan pass saw (#1071). `kept_legacy` (pre-#1071, recording no writer to
-/// judge) is counted apart because no pass can ever clear one: `doctor` reports that
-/// backlog, which unlike the others never drains itself.
+/// What one orphan pass saw (#1071). `kept_legacy` (pre-#1071, recording no writer to judge)
+/// is counted apart because no pass can ever clear one: `doctor` reports that backlog, which
+/// unlike the others never drains itself.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct OrphanReport { pub cleared: u64, pub kept_live: u64, pub kept_legacy: u64, pub kept_unproven: u64 }
 
-/// Clear lifecycle markers left by a call that cannot still be running (#1071).
-/// `dry_run` reads only. Only markers are cleared; a cleared request rejoins the
-/// normal sweep path, where an unsettled journal still waits on an operator.
+/// Clear lifecycle markers left by a call that cannot still be running (#1071). `dry_run`
+/// reads only. Only markers are cleared; a cleared request rejoins the normal sweep path,
+/// where an unsettled journal still waits on an operator.
 pub fn clear_orphaned_markers(root: &Path, env: &LivenessEnv, dry_run: bool) -> anyhow::Result<OrphanReport> {
     use crate::process_tree::Liveness;
     let mut report = OrphanReport::default();
@@ -695,13 +695,13 @@ pub async fn run_sweep_loop(root: Option<PathBuf>, grace: Duration, interval: Du
             return Ok(());
         }
     }
-    // #1071 — once, before the first pass and before any channel can start a provider:
-    // clear markers left by a daemon that died mid-call. A cleared request then takes
-    // the normal idle → grace → confirm path.
+    // #1071 — once, before the first pass and before any channel can start a provider: clear
+    // markers left by a daemon that died mid-call. A cleared request then takes the normal
+    // idle → grace → confirm path.
     if let Some(root) = root.clone() {
         match tokio::task::spawn_blocking(move || clear_orphaned_markers(&root, &liveness, false)).await {
-            Ok(Ok(r)) => tracing::info!(cleared = r.cleared, kept_live = r.kept_live,
-                kept_legacy = r.kept_legacy, kept_unproven = r.kept_unproven, "handoff orphaned marker pass"),
+            Ok(Ok(r)) => tracing::info!(cleared = r.cleared, kept_live = r.kept_live, kept_legacy = r.kept_legacy,
+                kept_unproven = r.kept_unproven, "handoff orphaned marker pass"),
             Ok(Err(error)) => tracing::warn!("handoff orphaned marker pass failed: {error:#}"),
             Err(error) => tracing::warn!("handoff orphaned marker task failed: {error}"),
         }
@@ -1343,11 +1343,11 @@ for line in sys.stdin:
         assert_eq!((report.entries, report.kept()), (12, 10));
     }
 
-    /// #1071, the reported case through the path the daemon runs: a `systemctl restart`
-    /// killed the previous instance mid-call and left a marker; starting the successor's
-    /// sweep loop — nothing else — must retire it. A live call's marker and a pre-#1071
-    /// one stay. Deliberately *not* a reboot: the markers name this same boot, so only
-    /// the realistic restart cgroup reading can decide them.
+    /// #1071, the reported case through the path the daemon runs: a `systemctl restart` killed
+    /// the previous instance mid-call and left a marker; starting the successor's sweep loop —
+    /// nothing else — must retire it. A live call's marker and a pre-#1071 one stay.
+    /// Deliberately *not* a reboot: the markers name this same boot, so only the realistic
+    /// restart cgroup reading can decide them.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_restart_retires_the_marker_the_previous_instance_orphaned() {
         let (_temp, root) = private_root();
@@ -1383,8 +1383,8 @@ for line in sys.stdin:
         tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
         assert!(live.with_extension("active").exists() && legacy.with_extension("active").exists());
         assert_eq!(std::fs::read_to_string(&orphan).unwrap(), kept, "the journal must be left for recovery");
-        // The cleared request rejoins the sweep from a fresh grace period (removing
-        // the marker moved the mtime), then becomes removable like any other.
+        // The cleared request rejoins the sweep from a fresh grace period (removing the
+        // marker moved the mtime), then becomes removable like any other.
         assert_eq!(sweep_finished(&root, GRACE, true).unwrap().kept_recent, 1);
         age(&orphan, TWO_DAYS);
         let swept = sweep_finished(&root, GRACE, false).unwrap();
