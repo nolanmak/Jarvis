@@ -52,6 +52,9 @@ fn file(id: &str, name: &str, mimetype: &str, size: u64) -> FileRef {
         mode: Some("hosted".into()),
         file_access: None,
         is_external: false,
+        subtype: None,
+        media_display_type: None,
+        duration_ms: None,
     }
 }
 

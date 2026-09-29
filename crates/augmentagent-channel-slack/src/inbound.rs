@@ -21,6 +21,11 @@
 //! the directory, matching Discord's per-turn cleanup until #995 defines
 //! shared retention. The serve dispatcher (#1287/#1288) calls this for an
 //! owner message; `augmentagent slack files fetch` is the operator path.
+//!
+//! #1297: [`prepare_inbound_with_voice`] also transcribes audio and video
+//! clips (see [`crate::voice`]); the transcript joins the turn text and the
+//! clip is deleted once transcribed. [`prepare_inbound`] is the same call
+//! without a speech stack, so clips stay "unsupported" there.
 
 use std::path::{Path, PathBuf};
 
@@ -35,6 +40,8 @@ use tracing::{debug, warn};
 
 use crate::transport::event::FileRef;
 use crate::transport::web::{DownloadRequest, SlackWebApi, WebApiError};
+use crate::voice::audio::{clip_format, format_duration, ClipFormat, SUPPORTED_SUMMARY};
+use crate::voice::{transcribe_clip, ClipOutcome, ClipTranscript, VoiceInbound};
 
 /// Directory name under the shared state dir.
 pub const SLACK_INBOUND_DIR: &str = "slack-inbound";
@@ -107,6 +114,8 @@ pub struct InboundMessage {
     pub text_files: Vec<TextAttachment>,
     pub accepted: Vec<AcceptedFile>,
     pub rejected: Vec<Rejected>,
+    /// Voice clips transcribed for this turn (#1297), in message order.
+    pub transcripts: Vec<ClipTranscript>,
     dir: Option<tempfile::TempDir>,
 }
 
@@ -114,7 +123,34 @@ impl InboundMessage {
     /// Whether the reasoner has anything to work with. A message whose files
     /// were all refused and that has no text only gets the notice.
     pub fn starts_turn(&self) -> bool {
-        !self.user_text.is_empty() || !self.images.is_empty() || !self.text_files.is_empty()
+        !self.user_text.is_empty()
+            || !self.transcripts.is_empty()
+            || !self.images.is_empty()
+            || !self.text_files.is_empty()
+    }
+
+    /// What the owner said: the typed text, then each clip's transcript,
+    /// separated by blank lines. The prompt is built from this.
+    pub fn turn_text(&self) -> String {
+        std::iter::once(self.user_text.as_str())
+            .chain(self.transcripts.iter().map(|t| t.text.as_str()))
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// The transcript line(s) to show the owner, `None` without clips.
+    pub fn transcript_notice(&self) -> Option<String> {
+        if self.transcripts.is_empty() {
+            return None;
+        }
+        Some(
+            self.transcripts
+                .iter()
+                .map(ClipTranscript::notice_line)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
     }
 
     /// Owner-facing "skipped: …" line, `None` when nothing was refused.
@@ -225,6 +261,95 @@ pub async fn prepare_inbound(
     opts: &InboundOptions,
     cancel: &CancellationToken,
 ) -> Result<InboundMessage, InboundError> {
+    prepare_inbound_with_voice(api, text, files, opts, None, cancel).await
+}
+
+/// Create the private per-message directory on first use.
+fn message_dir(msg: &mut InboundMessage, opts: &InboundOptions) -> Result<PathBuf, InboundError> {
+    if msg.dir.is_none() {
+        private_root(&opts.root)?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("msg-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        let dir = builder
+            .tempdir_in(&opts.root)
+            .map_err(|e| InboundError::Storage(format!("cannot create message dir: {e}")))?;
+        msg.dir = Some(dir);
+    }
+    Ok(msg
+        .dir
+        .as_ref()
+        .expect("created above")
+        .path()
+        .to_path_buf())
+}
+
+/// Stream one file to `dest`. `Ok(Err(reason))` is an owner-facing refusal.
+async fn download(
+    api: &dyn SlackWebApi,
+    f: &FileRef,
+    url: &str,
+    dest: &Path,
+    cap: u64,
+    cancel: &CancellationToken,
+) -> Result<Result<u64, RejectReason>, InboundError> {
+    let request = DownloadRequest {
+        url,
+        dest,
+        max_bytes: cap,
+        expected_mimetype: f.mimetype.as_deref(),
+    };
+    let downloaded = tokio::select! {
+        _ = cancel.cancelled() => {
+            let _ = std::fs::remove_file(dest);
+            return Err(InboundError::Cancelled);
+        }
+        r = api.download_file(request) => r,
+    };
+    match downloaded {
+        Ok(n) => Ok(Ok(n)),
+        Err(e) => {
+            let _ = std::fs::remove_file(dest);
+            if matches!(e.root(), WebApiError::Cancelled) {
+                return Err(InboundError::Cancelled);
+            }
+            warn!(file_id = %f.id, error = %e, "slack inbound download failed");
+            Ok(Err(match e.root() {
+                WebApiError::FileTooLarge { size, limit } => RejectReason::Oversize {
+                    size: *size,
+                    limit: *limit,
+                },
+                other => RejectReason::Unavailable(download_reason(other)),
+            }))
+        }
+    }
+}
+
+/// On-disk name for the `index`-th file: sanitized, with a usable extension
+/// (the image bridge, converters and ffmpeg key off it).
+fn disk_path(dir: &Path, index: usize, name: &str, mimetype: Option<&str>) -> PathBuf {
+    let disk_name = if Path::new(name).extension().is_some() {
+        name.to_string()
+    } else {
+        format!("{name}.{}", extension_for(name, mimetype))
+    };
+    dir.join(sanitize_filename(index, &disk_name))
+}
+
+/// [`prepare_inbound`] that also transcribes voice clips when `voice` is
+/// given (#1297). Call it only for input `owner::admit` dispatched.
+pub async fn prepare_inbound_with_voice(
+    api: &dyn SlackWebApi,
+    text: &str,
+    files: &[FileRef],
+    opts: &InboundOptions,
+    voice: Option<&VoiceInbound<'_>>,
+    cancel: &CancellationToken,
+) -> Result<InboundMessage, InboundError> {
     let user_text = text.trim().to_string();
     let mut msg = InboundMessage {
         user_text,
@@ -233,8 +358,10 @@ pub async fn prepare_inbound(
         text_files: Vec::new(),
         accepted: Vec::new(),
         rejected: Vec::new(),
+        transcripts: Vec::new(),
         dir: None,
     };
+    let mut clips_seen = 0usize;
     let reject = |msg: &mut InboundMessage, name: &str, reason: RejectReason| {
         msg.rejected.push(Rejected {
             filename: name.to_string(),
@@ -262,6 +389,69 @@ pub async fn prepare_inbound(
             continue;
         }
         let declared = f.size.unwrap_or(0);
+        if let (Some(voice), Some(format)) = (voice, clip_format(f)) {
+            let media = match format {
+                ClipFormat::Supported(media) => media,
+                ClipFormat::Unsupported(detail) => {
+                    let why =
+                        format!("unsupported audio format ({detail}); send {SUPPORTED_SUMMARY}");
+                    reject(&mut msg, &name, RejectReason::Unavailable(why));
+                    continue;
+                }
+            };
+            let limits = &voice.limits;
+            clips_seen += 1;
+            if clips_seen > limits.max_clips {
+                let why = format!("more than {} voice clips per message", limits.max_clips);
+                reject(&mut msg, &name, RejectReason::Unavailable(why));
+                continue;
+            }
+            if declared > limits.max_bytes {
+                let limit = limits.max_bytes;
+                reject(
+                    &mut msg,
+                    &name,
+                    RejectReason::Oversize {
+                        size: declared,
+                        limit,
+                    },
+                );
+                continue;
+            }
+            let max_ms = limits.max_duration.as_millis() as u64;
+            if f.duration_ms.is_some_and(|d| d > max_ms) {
+                let why = format!("voice clip longer than {}", format_duration(max_ms));
+                reject(&mut msg, &name, RejectReason::Unavailable(why));
+                continue;
+            }
+            let Some(url) = f
+                .url_private_download
+                .as_deref()
+                .or(f.url_private.as_deref())
+            else {
+                let why = "Slack sent no download link".to_string();
+                reject(&mut msg, &name, RejectReason::Unavailable(why));
+                continue;
+            };
+            let dir = message_dir(&mut msg, opts)?;
+            let dest = disk_path(&dir, index, &name, f.mimetype.as_deref());
+            let bytes = match download(api, f, url, &dest, limits.max_bytes, cancel).await? {
+                Ok(n) => n,
+                Err(reason) => {
+                    reject(&mut msg, &name, reason);
+                    continue;
+                }
+            };
+            debug!(file_id = %f.id, bytes, media = media.as_str(), "slack voice clip downloaded");
+            match transcribe_clip(voice, &f.id, &name, media, &dest, cancel).await {
+                ClipOutcome::Transcript(t) => msg.transcripts.push(t),
+                ClipOutcome::Rejected(why) => {
+                    reject(&mut msg, &name, RejectReason::Unavailable(why));
+                }
+                ClipOutcome::Cancelled => return Err(InboundError::Cancelled),
+            }
+            continue;
+        }
         let kind = match classify(&name, f.mimetype.as_deref(), declared) {
             Ok(kind) => kind,
             Err(reason) => {
@@ -291,62 +481,11 @@ pub async fn prepare_inbound(
             continue;
         };
 
-        if msg.dir.is_none() {
-            private_root(&opts.root)?;
-            let mut builder = tempfile::Builder::new();
-            builder.prefix("msg-");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                builder.permissions(std::fs::Permissions::from_mode(0o700));
-            }
-            let dir = builder
-                .tempdir_in(&opts.root)
-                .map_err(|e| InboundError::Storage(format!("cannot create message dir: {e}")))?;
-            msg.dir = Some(dir);
-        }
-        let dir = msg
-            .dir
-            .as_ref()
-            .expect("created above")
-            .path()
-            .to_path_buf();
-        // Keep a usable extension (the codex image bridge and the converters
-        // key off it) even when the name has none.
-        let disk_name = if Path::new(&name).extension().is_some() {
-            name.clone()
-        } else {
-            format!("{name}.{}", extension_for(&name, f.mimetype.as_deref()))
-        };
-        let dest = dir.join(sanitize_filename(index, &disk_name));
-        let request = DownloadRequest {
-            url,
-            dest: &dest,
-            max_bytes: cap,
-            expected_mimetype: f.mimetype.as_deref(),
-        };
-        let downloaded = tokio::select! {
-            _ = cancel.cancelled() => {
-                let _ = std::fs::remove_file(&dest);
-                return Err(InboundError::Cancelled);
-            }
-            r = api.download_file(request) => r,
-        };
-        let bytes = match downloaded {
+        let dir = message_dir(&mut msg, opts)?;
+        let dest = disk_path(&dir, index, &name, f.mimetype.as_deref());
+        let bytes = match download(api, f, url, &dest, cap, cancel).await? {
             Ok(n) => n,
-            Err(e) => {
-                let _ = std::fs::remove_file(&dest);
-                if matches!(e.root(), WebApiError::Cancelled) {
-                    return Err(InboundError::Cancelled);
-                }
-                warn!(file_id = %f.id, error = %e, "slack inbound download failed");
-                let reason = match e.root() {
-                    WebApiError::FileTooLarge { size, limit } => RejectReason::Oversize {
-                        size: *size,
-                        limit: *limit,
-                    },
-                    other => RejectReason::Unavailable(download_reason(other)),
-                };
+            Err(reason) => {
                 reject(&mut msg, &name, reason);
                 continue;
             }
@@ -432,7 +571,7 @@ pub async fn prepare_inbound(
         });
     }
 
-    msg.prompt = build_prompt(&msg.user_text, &msg.images, &msg.text_files);
+    msg.prompt = build_prompt(&msg.turn_text(), &msg.images, &msg.text_files);
     Ok(msg)
 }
 

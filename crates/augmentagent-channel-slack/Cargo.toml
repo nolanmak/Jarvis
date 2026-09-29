@@ -15,6 +15,9 @@ augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
 augmentagent-wiki = { path = "../augmentagent-wiki" }
 # #1293 — shared inbound attachment policy and PDF/DOCX conversion.
 augmentagent-docs = { path = "../augmentagent-docs" }
+# #1297 — the existing Rust speech-to-text seam (`Transcriber`, whisper.cpp)
+# that Slack voice clips plug into.
+augmentagent-channel-voice = { path = "../augmentagent-channel-voice" }
 # Private per-message directories and the owner check on their root.
 tempfile = "3"
 libc = "0.2"

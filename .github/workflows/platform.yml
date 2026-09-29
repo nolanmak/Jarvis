@@ -99,6 +99,17 @@ jobs:
           cargo test -p augmentagent-channel-slack --test interactive_surface
           cargo test -p augmentagent-cli --test slack_serve_cli
           cargo test -p augmentagent-cli --bin augmentagent -- slack_serve::
+      # #1297 — Slack voice clips and spoken replies: clip detection,
+      # download + fake ffmpeg decode + scripted speech providers (credit
+      # fallback, failures, limits, cleanup), non-owner audio never reaching
+      # a provider through admit, spoken replies as audio + text mirror
+      # delivered once, and `slack voice transcribe|speak` end to end against
+      # a mock Slack. Synthetic audio, no network, no paid provider.
+      - name: Slack voice clips and spoken replies
+        run: |
+          cargo test -p augmentagent-channel-slack --test voice_clips --test voice_replies
+          cargo test -p augmentagent-cli --test slack_voice_cli
+          cargo test -p augmentagent-cli --bin augmentagent -- slack_voice::
       # #1284 — Slack app install/verify/rotate/remove: manifest contract,
       # credential lifecycle (in-memory store) and the real CLI against a
       # mock Slack with the file credential store. No Keychain, no network.

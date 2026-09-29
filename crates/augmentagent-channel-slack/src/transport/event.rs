@@ -190,6 +190,12 @@ pub struct FileRef {
     /// `files.info` call first.
     pub file_access: Option<String>,
     pub is_external: bool,
+    // #1297 — audio/video clip fields (file object docs, read 2026-09-29):
+    // `subtype` is `slack_audio` / `slack_video` for clips recorded in
+    // Slack; `duration_ms` is the media length Slack declares.
+    pub subtype: Option<String>,
+    pub media_display_type: Option<String>,
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -492,6 +498,9 @@ pub fn file_refs(message: &Value) -> Vec<FileRef> {
                             .get("is_external")
                             .and_then(Value::as_bool)
                             .unwrap_or(false),
+                        subtype: str_at(f, &["subtype"]),
+                        media_display_type: str_at(f, &["media_display_type"]),
+                        duration_ms: f.get("duration_ms").and_then(Value::as_u64),
                     })
                 })
                 .collect()

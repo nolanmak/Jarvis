@@ -27,6 +27,7 @@ pub mod owner_setup;
 pub mod surface;
 pub mod transport;
 pub mod types;
+pub mod voice;
 
 pub use api::{SlackClient, SlackError};
 pub use auth::{SlackAuth, KEYCHAIN_PLATFORM};
