@@ -113,7 +113,7 @@ fn model_text_can_never_ping_anyone() {
         // A link whose URL is a mention is not a link.
         ("[x](<!channel>)", "x (&lt;!channel&gt;)".into()),
         // Not mentions: an address and a longer word.
-        ("mail me@here.com", "mail me@here.com".into()),
+        ("mail me@here.example.com", "mail me@here.example.com".into()),
         ("@heretic", "@heretic".into()),
     ];
     for (input, want) in cases {
@@ -161,7 +161,7 @@ fn check_invariants(source: &str, max: usize, parts: &[MessagePart]) {
 #[test]
 fn documented_limits_are_the_ones_used() {
     assert_eq!(SLACK_TEXT_LIMIT, 4_000);
-    assert!(DEFAULT_PART_CHARS < SLACK_TEXT_LIMIT);
+    const { assert!(DEFAULT_PART_CHARS < SLACK_TEXT_LIMIT) };
 }
 
 #[test]
