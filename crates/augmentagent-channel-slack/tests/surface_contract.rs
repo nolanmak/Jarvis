@@ -5,7 +5,8 @@
 use augmentagent_channel_slack::surface::{
     missing_rows, parity_blockers, slack_capabilities, slack_message, slack_reply_target,
     CapabilityRow, SlackInteraction, SlackMessageId, SlackWorkspace, SupportStatus,
-    SLACK_INTERACTIONS, SLACK_SHARED_CAPABILITIES, SLACK_SURFACE_PLATFORM,
+    LIVE_VOICE_FEASIBILITY_RECORD, SLACK_INTERACTIONS, SLACK_SHARED_CAPABILITIES,
+    SLACK_SURFACE_PLATFORM,
 };
 use augmentagent_store::{
     NativeConversation, Store, SurfaceAccountRef, SurfaceCapability, SurfaceConversationRef,
@@ -409,6 +410,79 @@ fn every_row_that_is_not_supported_is_listed_as_a_parity_blocker() {
         .expect("live voice is a blocker");
     assert_eq!(live_voice.status, SupportStatus::Unproven);
     assert_eq!(live_voice.tracking_issue, 1298);
+}
+
+/// #1298 — live voice is an open parity blocker backed by a dated record.
+///
+/// The record found no Slack API that lets an app join a huddle or carry
+/// call audio. Flipping either voice row needs a real owner session that
+/// exchanged audio both ways, a named behavior test, and an updated record;
+/// this test fails until all three move together.
+#[test]
+fn live_voice_stays_an_open_blocker_backed_by_the_dated_feasibility_record() {
+    let shared = SLACK_SHARED_CAPABILITIES
+        .iter()
+        .find(|row| row.key == SurfaceCapability::Voice)
+        .unwrap();
+    let live = SLACK_INTERACTIONS
+        .iter()
+        .find(|row| row.key == SlackInteraction::LiveVoice)
+        .unwrap();
+    for (name, status, issue, basis) in [
+        ("voice", shared.status, shared.tracking_issue, shared.basis),
+        ("live_voice", live.status, live.tracking_issue, live.basis),
+    ] {
+        assert_eq!(
+            status,
+            SupportStatus::Unproven,
+            "{name}: live voice may leave Unproven only with a real owner audio \
+             session, a named behavior test and an updated {LIVE_VOICE_FEASIBILITY_RECORD}"
+        );
+        assert_eq!(issue, 1298, "{name}");
+        assert!(
+            basis.contains(LIVE_VOICE_FEASIBILITY_RECORD),
+            "{name} basis must cite the feasibility record: {basis}"
+        );
+        // Voice clips (#1297) never stand in for live voice.
+        assert!(basis.contains("#1297"), "{name}: {basis}");
+    }
+
+    let blockers = parity_blockers();
+    for name in ["voice", "live_voice"] {
+        let blocker = blockers
+            .iter()
+            .find(|blocker| blocker.name == name)
+            .unwrap_or_else(|| panic!("{name} is not listed as a parity blocker"));
+        assert_eq!(blocker.status, SupportStatus::Unproven);
+        assert_eq!(blocker.tracking_issue, 1298);
+    }
+
+    // The checked-in record states the same status as the code, with the
+    // date it was checked, so neither can change without the other.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(LIVE_VOICE_FEASIBILITY_RECORD);
+    let record = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    let recorded = record
+        .lines()
+        .find_map(|line| line.strip_prefix("Recorded status: "))
+        .expect("record has a `Recorded status:` line");
+    assert_eq!(recorded.trim(), format!("`{:?}`", live.status));
+    let checked = record
+        .lines()
+        .find_map(|line| line.strip_prefix("Checked: "))
+        .expect("record has a `Checked:` line");
+    let date = checked.trim();
+    assert!(
+        date.len() == 10
+            && date.bytes().enumerate().all(|(index, byte)| match index {
+                4 | 7 => byte == b'-',
+                _ => byte.is_ascii_digit(),
+            }),
+        "Checked: must be an ISO date, got {date:?}"
+    );
+    assert!(record.contains("Part of #1298"));
 }
 
 #[test]
