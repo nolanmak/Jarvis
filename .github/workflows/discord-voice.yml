@@ -10,6 +10,7 @@ on:
       - 'crates/augmentagent-store/**'
       - 'docs/discord-voice/**'
       - 'systemd/augmentagent-discord-voice.service'
+      - 'scripts/tests/voice_package_platform_test.py'
       - '.github/workflows/discord-voice.yml'
   push:
     branches: [main]
@@ -21,6 +22,7 @@ on:
       - 'crates/augmentagent-store/**'
       - 'docs/discord-voice/**'
       - 'systemd/augmentagent-discord-voice.service'
+      - 'scripts/tests/voice_package_platform_test.py'
       - '.github/workflows/discord-voice.yml'
 
 permissions:
@@ -28,13 +30,24 @@ permissions:
 
 jobs:
   sidecar:
-    runs-on: ubuntu-latest
+    name: sidecar (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
     timeout-minutes: 20
     defaults:
       run:
         working-directory: sidecars/discord-voice
     steps:
       - uses: actions/checkout@v4
+      - name: Record native target
+        run: uname -srm
+        working-directory: .
+      - name: Check required package portability
+        run: python3 -m unittest scripts.tests.voice_package_platform_test -v
+        working-directory: .
       - uses: actions/setup-node@v4
         with:
           node-version: '24.17.0'
@@ -48,7 +61,12 @@ jobs:
       # remain explicit opt-in verification, never synthetic CI success.
 
   rust:
-    runs-on: ubuntu-latest
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -58,5 +76,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: discord-voice
-      - run: cargo test -p augmentagent-approval-discord -p augmentagent-channel-core -p augmentagent-store --locked
+      - run: cargo test -p augmentagent-approval-discord -p augmentagent-channel-core -p augmentagent-channel-voice -p augmentagent-store --locked
       - run: cargo test -p augmentagent-cli --bin augmentagent --locked -- --test-threads=1
