@@ -372,6 +372,26 @@ impl WaClient {
     pub async fn status(&self) -> Result<Value, WaError> {
         self.call("status", serde_json::json!({})).await
     }
+
+    /// Start or resume QR pairing on the sidecar's single linked-device store.
+    pub async fn start_pairing(&self) -> Result<(), WaError> {
+        self.call("start_pairing", serde_json::json!({})).await?;
+        Ok(())
+    }
+
+    /// Remove exactly the linked device the operator selected. The sidecar
+    /// rejects a stale or different device JID before contacting WhatsApp.
+    pub async fn logout(&self, expected_device_jid: &str) -> Result<(), WaError> {
+        if expected_device_jid.trim().is_empty() {
+            return Err(WaError::Config("expected device JID is required".into()));
+        }
+        self.call(
+            "logout",
+            serde_json::json!({ "expected_device_jid": expected_device_jid }),
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -437,6 +457,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mid, "3EB0SENT");
+    }
+
+    #[tokio::test]
+    async fn pairing_and_logout_use_explicit_sidecar_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sock(&dir, "wa.sock");
+        mock_sidecar(path.clone(), |req| {
+            let id = req["request_id"].as_str().unwrap();
+            assert!(matches!(req["op"].as_str(), Some("start_pairing" | "logout")));
+            if req["op"] == "logout" {
+                assert_eq!(req["params"]["expected_device_jid"], "15551234567:2@s.whatsapp.net");
+            }
+            vec![serde_json::json!({"version": PROTOCOL_VERSION, "request_id": id, "ok": true, "result": {}}).to_string()]
+        }).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (tx, _rx) = mpsc::channel(8);
+        let client = WaClient::connect(&path, tx).await.unwrap();
+        client.start_pairing().await.unwrap();
+        client.logout("15551234567:2@s.whatsapp.net").await.unwrap();
     }
 
     #[tokio::test]

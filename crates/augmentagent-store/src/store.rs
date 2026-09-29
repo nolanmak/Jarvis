@@ -53,6 +53,16 @@ pub struct NativeConversation {
     pub uncertain: bool,
 }
 
+/// Explicit owner/control identity for one linked WhatsApp device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhatsappOwnerConfig {
+    pub phone: String,
+    pub owner_jid: String,
+    pub control_chat_jid: String,
+    /// `self_chat` or `dedicated`.
+    pub mode: String,
+}
+
 /// #900 — an interrupted ShadowNote sync pass, persisted after every page so
 /// a restart resumes pagination instead of replaying the whole batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1112,6 +1122,16 @@ impl Store {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_whatsapp_devices_active \
                 ON whatsapp_devices(active)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS whatsapp_owner_config (\
+                 phone TEXT PRIMARY KEY REFERENCES whatsapp_devices(phone) ON DELETE CASCADE,\
+                 owner_jid TEXT NOT NULL,\
+                 control_chat_jid TEXT NOT NULL,\
+                 mode TEXT NOT NULL CHECK(mode IN ('self_chat', 'dedicated')),\
+                 updated_at_ms INTEGER NOT NULL\
+             )",
             [],
         )?;
         conn.execute(
@@ -5021,6 +5041,43 @@ impl Store {
             )
             .optional()?;
         Ok(row)
+    }
+
+    pub fn set_whatsapp_owner_config(&self, config: &WhatsappOwnerConfig) -> StoreResult<()> {
+        let expected_self = format!("{}@s.whatsapp.net", config.phone);
+        if config.phone.is_empty()
+            || !config.phone.bytes().all(|b| b.is_ascii_digit())
+            || config.owner_jid != config.control_chat_jid
+            || !config.owner_jid.ends_with("@s.whatsapp.net")
+            || config.owner_jid.matches('@').count() != 1
+            || config.owner_jid.starts_with('@')
+            || !config.owner_jid.split('@').next().unwrap_or("").bytes().all(|b| b.is_ascii_digit())
+            || !matches!(config.mode.as_str(), "self_chat" | "dedicated")
+            || (config.mode == "self_chat") != (config.owner_jid == expected_self)
+        {
+            return Err(StoreError::InvalidInput("invalid WhatsApp owner/control identity".into()));
+        }
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO whatsapp_owner_config (phone, owner_jid, control_chat_jid, mode, updated_at_ms)\
+             VALUES (?1, ?2, ?3, ?4, ?5)\
+             ON CONFLICT(phone) DO UPDATE SET owner_jid=excluded.owner_jid,\
+                 control_chat_jid=excluded.control_chat_jid, mode=excluded.mode,\
+                 updated_at_ms=excluded.updated_at_ms",
+            params![config.phone, config.owner_jid, config.control_chat_jid, config.mode, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    pub fn whatsapp_owner_config(&self, phone: &str) -> StoreResult<Option<WhatsappOwnerConfig>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        Ok(guard.query_row(
+            "SELECT phone, owner_jid, control_chat_jid, mode FROM whatsapp_owner_config WHERE phone = ?1",
+            params![phone],
+            |row| Ok(WhatsappOwnerConfig {
+                phone: row.get(0)?, owner_jid: row.get(1)?, control_chat_jid: row.get(2)?, mode: row.get(3)?,
+            }),
+        ).optional()?)
     }
 
     /// Mark a device logged-out (sidecar emitted `logged-out`). Keeps the row

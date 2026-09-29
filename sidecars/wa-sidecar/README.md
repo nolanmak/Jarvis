@@ -32,8 +32,8 @@ sidecars/wa-sidecar/
 NDJSON over a Unix stream socket. See the `main.go` package doc and
 `crates/augmentagent-channel-whatsapp/src/api.rs` for the exact envelope.
 
-**Methods (request/response):** `status`, `list_chats`, `fetch_history`,
-`send_text`.
+**Methods (request/response):** `status`, `start_pairing`, `logout`,
+`list_chats`, `fetch_history`, `send_text`.
 
 **Events (sidecar-initiated):** `qr`, `pair-success`, `connected`,
 `logged-out`, `received-message`, `receipt`. Message events include optional
@@ -55,13 +55,13 @@ AUGMENTAGENT_WA_SIDECAR_TEST_BIN="$PWD/wa-sidecar" \
   cargo test -p augmentagent-channel-whatsapp --test sidecar_contract
 ```
 
-The pairing CLI is not yet implemented. The sidecar buffers its latest QR for
-a connecting client and never prints the pairing secret to service logs.
+The [pairing CLI](../../docs/WHATSAPP-LIVE.md) displays the buffered QR to a
+connecting client and never prints the pairing secret to service logs.
 
 The whatsmeow session persists to
 `~/.local/state/augmentagent/whatsmeow.db`; subsequent sidecar starts
-reconnect silently. A server-side logout emits `logged-out`; #1228 wires the
-CLI and device-state reconciliation.
+reconnect silently. Both server-side and operator-initiated logout emit
+`logged-out`; the CLI reconciles the device index after pairing or unlinking.
 
 ## Ban-risk gate (#40 / #74 / #102)
 

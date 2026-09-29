@@ -23,7 +23,7 @@
 //	   "push_name":"...","text":"...","timestamp":1700000000,"from_me":false}
 //	  {"version":1,"event":"receipt","chat":"...","message_ids":["..."],...}
 //
-// Ops: status, list_chats, fetch_history, send_text.
+// Ops: status, start_pairing, logout, list_chats, fetch_history, send_text.
 //
 // Lifecycle: on first run with no stored session the sidecar emits `qr`
 // events and retains the latest one for the pairing CLI (#1228). It never
@@ -138,7 +138,9 @@ type rpcResponse struct {
 // ---------------------------------------------------------------------------
 
 type sidecar struct {
-	client *whatsmeow.Client
+	client  *whatsmeow.Client
+	pairMu  sync.Mutex
+	pairing bool
 	// writeMu protects clients/lastQR and serializes writes to each socket.
 	writeMu sync.Mutex
 	clients map[net.Conn]struct{}
@@ -408,6 +410,10 @@ func (s *sidecar) dispatch(conn net.Conn, req rpcRequest) {
 	switch req.Op {
 	case "status":
 		s.opStatus(conn, req)
+	case "start_pairing":
+		s.opStartPairing(conn, req)
+	case "logout":
+		s.opLogout(conn, req)
 	case "list_chats":
 		s.opListChats(conn, req)
 	case "fetch_history":
@@ -417,6 +423,79 @@ func (s *sidecar) dispatch(conn net.Conn, req rpcRequest) {
 	default:
 		s.fail(conn, req.RequestID, "BadRequest", "unknown op: "+req.Op)
 	}
+}
+
+func (s *sidecar) startPairing() error {
+	if s.client == nil {
+		return fmt.Errorf("whatsapp client is unavailable")
+	}
+	s.pairMu.Lock()
+	defer s.pairMu.Unlock()
+	if s.client.Store.ID != nil || s.pairing {
+		return nil
+	}
+	qrChan, err := s.client.GetQRChannel(context.Background())
+	if err != nil {
+		return err
+	}
+	if err := s.client.Connect(); err != nil {
+		return err
+	}
+	s.pairing = true
+	go func() {
+		defer func() {
+			s.pairMu.Lock()
+			s.pairing = false
+			s.pairMu.Unlock()
+		}()
+		for evt := range qrChan {
+			if evt.Event == "code" {
+				// Never print the QR or session material into service logs.
+				s.emitEvent(map[string]interface{}{"event": "qr", "code": evt.Code})
+			} else if s.logger != nil {
+				s.logger.Infof("pair flow: %s", evt.Event)
+			}
+		}
+	}()
+	return nil
+}
+
+func (s *sidecar) opStartPairing(conn net.Conn, req rpcRequest) {
+	if s.client == nil {
+		s.fail(conn, req.RequestID, "NotConnected", "whatsapp client is unavailable")
+		return
+	}
+	if err := s.startPairing(); err != nil {
+		s.fail(conn, req.RequestID, "NotConnected", "start pairing: "+err.Error())
+		return
+	}
+	s.ok(conn, req.RequestID, map[string]interface{}{"paired": s.client.Store.ID != nil})
+}
+
+func (s *sidecar) opLogout(conn net.Conn, req rpcRequest) {
+	var params struct {
+		ExpectedDeviceJID string `json:"expected_device_jid"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil || params.ExpectedDeviceJID == "" {
+		s.fail(conn, req.RequestID, "BadRequest", "expected_device_jid required")
+		return
+	}
+	if s.client == nil || s.client.Store.ID == nil {
+		s.fail(conn, req.RequestID, "NotPaired", "no linked device")
+		return
+	}
+	if actual := s.client.Store.ID.String(); actual != params.ExpectedDeviceJID {
+		s.fail(conn, req.RequestID, "BadRequest", "linked device does not match expected_device_jid")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.client.Logout(ctx); err != nil {
+		s.fail(conn, req.RequestID, "LogoutFailed", err.Error())
+		return
+	}
+	s.emitEvent(map[string]interface{}{"event": "logged-out", "reason": "user_initiated"})
+	s.ok(conn, req.RequestID, map[string]interface{}{"unlinked_device_jid": params.ExpectedDeviceJID})
 }
 
 func (s *sidecar) opStatus(conn net.Conn, req rpcRequest) {
@@ -587,29 +666,10 @@ func main() {
 
 	// Pairing vs. reconnect.
 	if client.Store.ID == nil {
-		qrChan, err := client.GetQRChannel(context.Background())
-		if err != nil {
-			logger.Errorf("start QR pairing: %v", err)
+		if err := s.startPairing(); err != nil {
+			logger.Errorf("start pairing: %v", err)
 			os.Exit(1)
 		}
-		if err := client.Connect(); err != nil {
-			logger.Errorf("connect (pairing): %v", err)
-			os.Exit(1)
-		}
-		go func() {
-			for evt := range qrChan {
-				if evt.Event == "code" {
-					// Keep the latest code for a CLI that connects after pairing began.
-					// Never print QR/session material into service logs.
-					s.emitEvent(map[string]interface{}{
-						"event": "qr",
-						"code":  evt.Code,
-					})
-				} else {
-					logger.Infof("pair flow: %s", evt.Event)
-				}
-			}
-		}()
 	} else {
 		if err := client.Connect(); err != nil {
 			logger.Errorf("connect (reconnect): %v", err)

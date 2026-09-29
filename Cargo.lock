@@ -985,6 +985,7 @@ dependencies = [
  "augmentagent-channel-telegram-bot",
  "augmentagent-channel-twitter",
  "augmentagent-channel-voice",
+ "augmentagent-channel-whatsapp",
  "augmentagent-channel-whatsapp-history",
  "augmentagent-content-adapter",
  "augmentagent-docs",
@@ -1005,6 +1006,7 @@ dependencies = [
  "insta",
  "libc",
  "mockito",
+ "qrcode",
  "quick-xml",
  "reqwest",
  "rusqlite",
@@ -4045,6 +4047,12 @@ dependencies = [
  "quote",
  "syn 1.0.109",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-xml"

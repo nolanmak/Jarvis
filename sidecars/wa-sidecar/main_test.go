@@ -70,6 +70,21 @@ func TestOfflineStatusAndSendAreHonest(t *testing.T) {
 	}
 }
 
+func TestPairingAndLogoutOpsFailSafelyWithoutADevice(t *testing.T) {
+	pair := exchange(t, `{"version":1,"request_id":"p1","op":"start_pairing","params":{}}`)
+	if pair.OK || pair.Error == nil || pair.Error.Kind != "NotConnected" {
+		t.Fatalf("offline pairing must report unavailable transport: %+v", pair)
+	}
+	missing := exchange(t, `{"version":1,"request_id":"u1","op":"logout","params":{}}`)
+	if missing.OK || missing.Error == nil || missing.Error.Kind != "BadRequest" || !strings.Contains(missing.Error.Message, "expected_device_jid") {
+		t.Fatalf("logout must require an exact device identity: %+v", missing)
+	}
+	logout := exchange(t, `{"version":1,"request_id":"u2","op":"logout","params":{"expected_device_jid":"1:2@s.whatsapp.net"}}`)
+	if logout.OK || logout.Error == nil || logout.Error.Kind != "NotPaired" {
+		t.Fatalf("offline logout must not claim it unlinked a device: %+v", logout)
+	}
+}
+
 func TestBadFrameDoesNotPoisonNextRequest(t *testing.T) {
 	server, client := net.Pipe()
 	defer client.Close()

@@ -25,6 +25,9 @@ personal wiki, and social/posting integrations.
 - **WhatsApp history.** Export WhatsApp Desktop conversations into searchable
   history and incremental wiki capture, with local or SSH setup and support for
   existing private Git feeds. See [WhatsApp history setup](docs/WHATSAPP-HISTORY.md).
+- **Live WhatsApp setup.** Link a phone with a QR scan and configure the owner
+  chat; the interactive daemon integration is still in progress. See
+  [live WhatsApp setup](docs/WHATSAPP-LIVE.md).
 - **Apple Notes.** A bundled Mac exporter turns your notes into a private,
   git-versioned Markdown bundle (edits show as diffs, secrets are scrubbed
   before anything is written) that the agent ingests. See
@@ -32,8 +35,8 @@ personal wiki, and social/posting integrations.
 - **SocialAPI.ai backend.** An official unified REST integration for
   cross-posting and reading/replying to comments + DMs across connected
   social accounts. See [SocialAPI.ai integration](#socialapiai-integration).
-- **Approval surfaces.** Discord is the primary control surface; a WhatsApp
-  control surface and a PWA + Web Push surface are also available.
+- **Approval surfaces.** Discord is the primary control surface; a PWA + Web
+  Push surface is also available. WhatsApp control is under development.
 - **Proactive CRM.** A scheduled engine surfaces stale contacts, unmet
   commitments, and upcoming events as nudges, backed by a markdown
   person-wiki with an identity index (email/phone/handles → person).
