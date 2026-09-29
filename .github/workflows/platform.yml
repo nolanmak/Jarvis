@@ -214,6 +214,15 @@ jobs:
           cargo test -p augmentagent-approval-discord --test owner_command_registry
           cargo test -p augmentagent-channel-slack --test owner_commands --test owner_commands_surface --test surface_contract
           cargo test -p augmentagent-cli --bin augmentagent -- slack_serve::
+      # #1295 — proactive notifications on Slack: the producer registry
+      # (every posting site registered), per-class Discord/Slack routing,
+      # Slack-only, one surface failing, and the outbox's dedupe, pacing and
+      # late marking after a suspension on a fake clock.
+      - name: Slack notifications
+        run: |
+          cargo test -p augmentagent-store --test surface_delivery
+          cargo test -p augmentagent-channel-slack --test notifications
+          cargo test -p augmentagent-cli --bin augmentagent -- notify_tests::
       - name: Host-dependent CLI surface
         run: >-
           cargo test -p augmentagent-cli --bin augmentagent --

@@ -397,27 +397,15 @@ pub async fn build_approvals(
             ..WebApiConfig::default()
         },
     )?);
-    let binding = find_binding(&store, &install.creds.team_id)?
-        .ok_or_else(|| anyhow::anyhow!("no owner is bound for {}", install.creds.team_id))?;
-    let destination = match channel {
-        crate::approval_routing::SlackChannel::Control => binding
-            .control_channel()
-            .map(|c| c.conversation_id().to_string())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "{} is `control` but no control channel is bound; run `augmentagent slack \
-                     app owner control set --channel <id>` or use `dm`",
-                    crate::approval_routing::SLACK_CHANNEL_ENV
-                )
-            })?,
-        crate::approval_routing::SlackChannel::Dm => match binding.direct_conversation() {
-            Some(dm) => dm.conversation_id().to_string(),
-            None => web
-                .open_direct_conversation(binding.owner.sender_id())
-                .await
-                .map_err(|e| anyhow::anyhow!("could not open the owner's DM for approvals: {e}"))?,
-        },
-    };
+    let destination = owner_channel(
+        &store,
+        install,
+        web.as_ref(),
+        channel,
+        "approvals",
+        crate::approval_routing::SLACK_CHANNEL_ENV,
+    )
+    .await?;
     info!(team = %install.creds.team_id, channel = %destination, "slack approvals: cards go here");
     Ok(Some(Arc::new(
         SlackApprovals::new(
@@ -432,6 +420,80 @@ pub async fn build_approvals(
         // #1290 — `compose <person>: …` resolves people through the wiki.
         .with_wiki_root(wiki_root),
     )))
+}
+
+/// The owner's DM or the bound control channel of `install`, for approval
+/// cards (#1289) and notifications (#1295). A DM that was never recorded is
+/// opened with `conversations.open`. `what` and `env` name the caller and
+/// its setting in errors.
+async fn owner_channel(
+    store: &Store,
+    install: &ReadyInstall,
+    web: &dyn SlackWebApi,
+    channel: crate::approval_routing::SlackChannel,
+    what: &str,
+    env: &str,
+) -> Result<String> {
+    let binding = find_binding(store, &install.creds.team_id)?
+        .ok_or_else(|| anyhow::anyhow!("no owner is bound for {}", install.creds.team_id))?;
+    Ok(match channel {
+        crate::approval_routing::SlackChannel::Control => binding
+            .control_channel()
+            .map(|c| c.conversation_id().to_string())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{env} is `control` but no control channel is bound; run `augmentagent slack \
+                     app owner control set --channel <id>` or use `dm`"
+                )
+            })?,
+        crate::approval_routing::SlackChannel::Dm => match binding.direct_conversation() {
+            Some(dm) => dm.conversation_id().to_string(),
+            None => web
+                .open_direct_conversation(binding.owner.sender_id())
+                .await
+                .map_err(|e| anyhow::anyhow!("could not open the owner's DM for {what}: {e}"))?,
+        },
+    })
+}
+
+/// #1295 — where Slack notifications go: the owner's DM or control channel
+/// of the first bound install (sorted by team, as approvals). `Ok(None)`
+/// when the interactive Slack app is not ready (not installed, no owner,
+/// or turned off), which the notification router reports as "not
+/// configured", not as a failure.
+pub async fn notify_destination(
+    store: Arc<Store>,
+    channel: crate::approval_routing::SlackChannel,
+) -> Result<Option<augmentagent_store::SurfaceConversationRef>> {
+    let plan = plan_from_env(Arc::clone(&store)).await?;
+    let Plan::Ready { installs, api_base } = &plan else {
+        return Ok(None);
+    };
+    let Some(install) = installs
+        .iter()
+        .min_by(|a, b| a.creds.team_id.cmp(&b.creds.team_id))
+    else {
+        return Ok(None);
+    };
+    let web = HttpSlackWebApi::new(
+        install.creds.bot_token.clone(),
+        WebApiConfig {
+            base_url: api_base.clone(),
+            ..WebApiConfig::default()
+        },
+    )?;
+    let id = owner_channel(
+        &store,
+        install,
+        &web,
+        channel,
+        "notifications",
+        crate::notify::SLACK_CHANNEL_ENV,
+    )
+    .await?;
+    Ok(Some(install.workspace.conversation(&id, None).map_err(
+        |e| anyhow::anyhow!("Slack notification destination: {e}"),
+    )?))
 }
 
 /// Plan, build and run the interactive surface as one supervised `serve`

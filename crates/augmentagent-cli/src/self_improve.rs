@@ -1588,7 +1588,7 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
                         issue = candidate.issue,
                         "merge sweep: merged an already-approved draft"
                     );
-                    notify_discord(&format!(
+                    notify_review(&format!(
                         "✅ auto-PR merged (sweep): #{} for issue #{}",
                         candidate.pr, candidate.issue
                     ))
@@ -2677,26 +2677,17 @@ fn automerge_receipt_ok(gated: Option<&str>, independent_approved: bool, flag: O
     }
 }
 
-/// Post a short notice to the owner's Discord webhook, best-effort (#851
-/// visibility gap: draft PRs sat unseen for three days). A webhook failure
-/// must never fail the run — the PR already exists.
-async fn notify_discord(text: &str) {
-    let Ok(url) = std::env::var("DISCORD_WEBHOOK_URL") else { return };
-    if url.trim().is_empty() {
-        return;
-    }
-    let body = serde_json::json!({ "content": truncate(text, 1800) });
-    match reqwest::Client::new()
-        .post(url.trim())
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => {}
-        Ok(r) => warn!(status = %r.status(), "draft-PR discord notice rejected"),
-        Err(e) => warn!("draft-PR discord notice failed: {e}"),
-    }
+/// Post a short notice to the owner, best-effort (#851 visibility gap:
+/// draft PRs sat unseen for three days). #1295 — routed like every review
+/// result: the Discord webhook (`DISCORD_WEBHOOK_URL`) and/or Slack, per
+/// `AUGMENTAGENT_NOTIFY_SURFACES[_REVIEW]`. A failed delivery must never
+/// fail the run — the PR already exists; the router logs it.
+async fn notify_review(text: &str) {
+    let _ = crate::notify::notify_owner(crate::notify::Notice::new(
+        "self_improve",
+        truncate(text, 1800),
+    ))
+    .await;
 }
 
 /// Issue number encoded in an agent branch name (`agent-fix/issue-845` → 845).
@@ -5185,7 +5176,7 @@ async fn hold_unreviewable(
             Ok(()) => {
                 close_gave_up_pr(repo_root, pr, issue, body).await;
                 note_stood_down(&path, pr, issue, why);
-                notify_discord(&format!(
+                notify_review(&format!(
                     "📝 auto-PR stood down on draft #{pr} (issue #{issue}), it needs a human: {}",
                     why.headline()
                 ))
@@ -6283,7 +6274,7 @@ async fn resume_draft_pr(
             let complexity_ok = complexity.auto_mergeable() || (independent.codex_approved() && codex_unlocks_hard());
             if !(enabled && complexity_ok && !issue.research_filed) {
                 cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
-                notify_discord(&format!(
+                notify_review(&format!(
                     "📝 resumed draft has double LGTM but needs a human merge: {} — PR #{pr}",
                     issue.title
                 ))
@@ -6313,7 +6304,11 @@ async fn resume_draft_pr(
             if !ok {
                 warn!(pr, "gh pr merge exited non-zero but the PR is MERGED; treating as success: {e}");
             }
-            notify_discord(&format!("✅ resumed draft merged: {} — PR #{pr}", issue.title)).await;
+            notify_review(&format!(
+                "✅ resumed draft merged: {} — PR #{pr}",
+                issue.title
+            ))
+            .await;
             return Ok(RunReport::built(format!("PR #{pr}: resumed and MERGED")));
         }
 
@@ -6340,7 +6335,7 @@ async fn resume_draft_pr(
                 label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
                 close_gave_up_pr(repo_root, pr, issue.number, &gave_up_close_comment(pr, issue.number, attempts.n, &independent.notes)).await;
             }
-            notify_discord(&format!(
+            notify_review(&format!(
                 "📝 resumed draft still needs review after {rounds_done} rounds: {} — PR #{pr}",
                 issue.title
             ))
@@ -7810,7 +7805,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     let pr_url = stdout.trim().to_string();
     if !automerge {
         // Visibility (#851): drafts sat unseen for three days. Tell the owner.
-        notify_discord(&format!(
+        notify_review(&format!(
             "📝 auto-PR needs review: {} — {pr_url}\n{}",
             issue.title,
             truncate(&merge_note, 300)
@@ -7920,7 +7915,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 .await;
             }
             let _ = run(&gh, &["pr", "comment", &n.to_string(), "--body", &why], repo_root).await;
-            notify_discord(&format!(
+            notify_review(&format!(
                 "📝 auto-PR needs review: {} — {pr_url}\n{why}",
                 issue.title
             ))
@@ -7992,7 +7987,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             issue.number
         )));
     }
-    notify_discord(&format!("✅ auto-PR merged: {} — {pr_url}", issue.title)).await;
+    notify_review(&format!("✅ auto-PR merged: {} — {pr_url}", issue.title)).await;
     Ok(RunReport::built(format!(
         "issue #{}: PR auto-merged (owner-authored) — {pr_url}",
         issue.number

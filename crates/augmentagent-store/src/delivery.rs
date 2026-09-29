@@ -796,6 +796,18 @@ impl Store {
         send: &NewOutboundSend,
         now_ms: i64,
     ) -> StoreResult<EnqueueOutcome> {
+        self.enqueue_outbound_send_at(send, now_ms, now_ms)
+    }
+
+    /// [`enqueue_outbound_send`](Self::enqueue_outbound_send), first due at
+    /// `due_at_ms` instead of now (#1295: paced notifications). A duplicate
+    /// key keeps its existing schedule.
+    pub fn enqueue_outbound_send_at(
+        &self,
+        send: &NewOutboundSend,
+        now_ms: i64,
+        due_at_ms: i64,
+    ) -> StoreResult<EnqueueOutcome> {
         required(&send.idempotency_key, "idempotency key")?;
         if send.max_attempts == 0 {
             return Err(invalid("max_attempts must be at least 1"));
@@ -810,7 +822,7 @@ impl Store {
                  (platform, account_id, conversation_id, thread_id, idempotency_key, operation,
                   target_message_id, payload, max_attempts, next_attempt_at_ms,
                   interaction_expires_at_ms, created_at_ms, updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?10, ?10)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?12, ?11, ?10, ?10)
                  ON CONFLICT(platform, account_id, idempotency_key) DO NOTHING",
                 params![
                     c.platform,
@@ -823,7 +835,8 @@ impl Store {
                     send.payload,
                     send.max_attempts,
                     now_ms,
-                    send.interaction_expires_at_ms
+                    send.interaction_expires_at_ms,
+                    due_at_ms
                 ],
             )?;
             let (id, status): (i64, String) = tx.query_row(
@@ -986,6 +999,29 @@ impl Store {
                 changed,
                 "outbound send cannot be abandoned in its current state",
             )
+        })
+    }
+
+    /// Move a send that has not gone out (`queued` or `failed`) to
+    /// `next_attempt_at_ms`, optionally replacing its payload. Not an
+    /// attempt. `false` when the send is in flight, settled or unknown.
+    /// #1295: a notification held through a suspension is re-paced and
+    /// marked late before it is sent.
+    pub fn reschedule_outbound_send(
+        &self,
+        id: i64,
+        payload: Option<&str>,
+        next_attempt_at_ms: i64,
+        now_ms: i64,
+    ) -> StoreResult<bool> {
+        write_tx(self, |tx| {
+            let changed = tx.execute(
+                "UPDATE surface_outbox
+                 SET next_attempt_at_ms = ?2, payload = COALESCE(?3, payload), updated_at_ms = ?4
+                 WHERE id = ?1 AND status IN ('queued', 'failed')",
+                params![id, next_attempt_at_ms, payload, now_ms],
+            )?;
+            Ok(changed == 1)
         })
     }
 

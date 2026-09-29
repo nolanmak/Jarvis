@@ -1413,3 +1413,76 @@ fn platform_scoped_inbound_claims_leave_other_surfaces_events_alone() {
     let wa = store.claim_next_inbound_event(T0, 5).unwrap().unwrap();
     assert_eq!(wa.event_id, "wa-1");
 }
+
+/// #1295 — a send can be queued for later (a paced notification) and a
+/// queued send can be moved and rewritten before it goes out (a
+/// notification held through a suspension is re-paced and marked late).
+#[test]
+fn a_send_queued_for_later_is_not_due_until_then() {
+    let (_dir, _path, store) = temp_store();
+    let dm = slack("D00000001");
+    let at = T0 + 5_000;
+    let id = match store
+        .enqueue_outbound_send_at(&send(&dm, "turn:notify:a:text:0"), T0, at)
+        .unwrap()
+    {
+        EnqueueOutcome::Queued { id } => id,
+        other => panic!("expected queued, got {other:?}"),
+    };
+    assert_eq!(
+        store.outbound_send(id).unwrap().unwrap().next_attempt_at_ms,
+        at
+    );
+    assert!(store.claim_next_outbound_send(at - 1).unwrap().is_none());
+    assert_eq!(store.claim_next_outbound_send(at).unwrap().unwrap().id, id);
+    // Same key again: a duplicate, the schedule is not moved.
+    assert!(matches!(
+        store
+            .enqueue_outbound_send_at(&send(&dm, "turn:notify:a:text:0"), T0, T0)
+            .unwrap(),
+        EnqueueOutcome::Duplicate { .. }
+    ));
+}
+
+#[test]
+fn reschedule_moves_and_rewrites_only_sends_that_have_not_gone_out() {
+    let (_dir, _path, store) = temp_store();
+    let dm = slack("D00000001");
+    let queued = match store.enqueue_outbound_send(&send(&dm, "k-1"), T0).unwrap() {
+        EnqueueOutcome::Queued { id } => id,
+        other => panic!("{other:?}"),
+    };
+    assert!(store
+        .reschedule_outbound_send(queued, Some("{\"text\":\"late\"}"), T0 + 9_000, T0 + 1)
+        .unwrap());
+    let row = store.outbound_send(queued).unwrap().unwrap();
+    assert_eq!(row.next_attempt_at_ms, T0 + 9_000);
+    assert_eq!(row.payload, "{\"text\":\"late\"}");
+    assert_eq!(row.attempts, 0, "rescheduling is not an attempt");
+    // Payload untouched when None.
+    assert!(store
+        .reschedule_outbound_send(queued, None, T0 + 10_000, T0 + 2)
+        .unwrap());
+    assert_eq!(
+        store.outbound_send(queued).unwrap().unwrap().payload,
+        "{\"text\":\"late\"}"
+    );
+    // In flight or sent: left alone.
+    let claimed = store
+        .claim_next_outbound_send(T0 + 10_000)
+        .unwrap()
+        .unwrap();
+    assert!(!store
+        .reschedule_outbound_send(claimed.id, Some("x"), T0 + 99_000, T0 + 3)
+        .unwrap());
+    store
+        .mark_outbound_sent(claimed.id, "1.000001", T0 + 10_001)
+        .unwrap();
+    assert!(!store
+        .reschedule_outbound_send(claimed.id, Some("x"), T0 + 99_000, T0 + 4)
+        .unwrap());
+    assert_eq!(
+        store.outbound_send(claimed.id).unwrap().unwrap().status,
+        SendStatus::Sent
+    );
+}

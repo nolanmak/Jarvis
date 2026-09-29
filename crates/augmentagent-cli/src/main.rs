@@ -17,6 +17,8 @@ mod surface_conformance_tests;
 mod slack_approval_tests;
 #[cfg(test)]
 mod slack_schedule_tests;
+#[cfg(test)]
+mod notify_tests;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -89,6 +91,7 @@ mod heartbeat_cmd;
 mod installers;
 mod logs;
 mod newsletter;
+mod notify;
 mod loop_cmd;
 mod loops;
 mod platform;
@@ -227,8 +230,10 @@ enum Cmd {
         /// Window size in hours. Defaults to 24.
         #[arg(long, default_value_t = 24)]
         since: u32,
-        /// Also post to DISCORD_CHANNEL_ID (uses DISCORD_BOT_TOKEN). Otherwise stdout only.
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        /// Also deliver it: to DISCORD_CHANNEL_ID (uses DISCORD_BOT_TOKEN)
+        /// and/or the owner's Slack DM, per AUGMENTAGENT_NOTIFY_SURFACES
+        /// (#1295). `--post` is the same flag. Otherwise stdout only.
+        #[arg(long, alias = "post", default_value_t = false, action = clap::ArgAction::Set)]
         post_discord: bool,
     },
     /// Daily automated research: pull recent arXiv AI/agent papers + the
@@ -239,8 +244,10 @@ enum Cmd {
         /// Look-back window in hours for arXiv submissions / leapmodel commits.
         #[arg(long, default_value_t = 24)]
         since_hours: u32,
-        /// Also post the digest to DISCORD_CHANNEL_ID. Otherwise stdout only.
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        /// Also deliver the digest: to DISCORD_CHANNEL_ID and/or the
+        /// owner's Slack DM, per AUGMENTAGENT_NOTIFY_SURFACES (#1295).
+        /// `--post` is the same flag. Otherwise stdout only.
+        #[arg(long, alias = "post", default_value_t = false, action = clap::ArgAction::Set)]
         post_discord: bool,
         /// Dry-run (default true): print the issues that would be filed and
         /// the digest, but create no GitHub issues.
@@ -600,7 +607,8 @@ enum Cmd {
     /// timer with `--notify` so an outage announces itself instead of
     /// waiting to be noticed. Exit 1 when anything is an alert.
     AutoprHealth {
-        /// Post the findings to Discord (DISCORD_WEBHOOK_URL). Silent when healthy.
+        /// Post the findings to Discord (DISCORD_WEBHOOK_URL) and/or Slack, per
+        /// AUGMENTAGENT_NOTIFY_SURFACES (#1295). Silent when healthy.
         #[arg(long, default_value_t = false)]
         notify: bool,
         /// Machine-readable output.
@@ -2607,6 +2615,8 @@ async fn main() -> Result<()> {
     }
     info!(db = %db_path.display(), "opening store");
     let store = Arc::new(Store::open(&db_path).context("open store")?);
+    // #1295 — proactive notifications go to Discord and/or Slack.
+    notify::install(notify::NotifyRouter::from_env(Some(Arc::clone(&store))));
 
     // Wiki page freshness (#642): the post-ingest index rebuild stamps every
     // entry with the age of its cited evidence. Installed here, once, so the
@@ -7949,10 +7959,12 @@ async fn run_digest(
     println!("{digest}");
 
     if post_discord {
-        post_digest_to_discord(&digest)
+        // #1295 — Discord and/or Slack per AUGMENTAGENT_NOTIFY_SURFACES.
+        notify::notify_owner(notify::Notice::new("email_digest", digest.clone()))
             .await
-            .context("post_digest_to_discord")?;
-        info!("digest posted to Discord");
+            .into_result()
+            .context("post digest")?;
+        info!("digest delivered");
     }
     Ok(())
 }
@@ -7985,31 +7997,6 @@ fn truncate(s: &str, max: usize) -> String {
         }
         format!("{}...", &s[..end])
     }
-}
-
-/// Post the digest text to DISCORD_CHANNEL_ID using a bare serenity::Http
-/// client (no gateway, no state). Works as a one-shot from a cron-like job.
-/// Splits on paragraph boundaries for Discord's 2000-char limit.
-pub(crate) async fn post_digest_to_discord(digest: &str) -> Result<()> {
-    use serenity::all::{ChannelId, CreateMessage};
-    use serenity::http::Http;
-
-    let token = std::env::var("DISCORD_BOT_TOKEN").context("DISCORD_BOT_TOKEN env var required")?;
-    let channel_id: u64 = std::env::var("DISCORD_CHANNEL_ID")
-        .context("DISCORD_CHANNEL_ID env var required")?
-        .parse()
-        .context("DISCORD_CHANNEL_ID must be numeric")?;
-
-    let http = Http::new(&token);
-    let channel = ChannelId::new(channel_id);
-
-    for chunk in augmentagent_approval_discord::chunk_for_discord(digest) {
-        channel
-            .send_message(&http, CreateMessage::new().content(chunk))
-            .await
-            .context("discord send_message")?;
-    }
-    Ok(())
 }
 
 async fn run_resume_ingest(cli: &Cli, file: PathBuf) -> Result<()> {
@@ -10082,12 +10069,19 @@ impl QueryHandler for WikiQuerier {
         // Discord side) plug in a per-request notifier so high-risk tool
         // calls ping back to the originating channel.
         opts.session_id = Some(ctx.session_id.clone());
-        if let (Some(http), Some(channel_id)) = (ctx.http.clone(), ctx.channel_id) {
-            opts.audit_notifier = Some(std::sync::Arc::new(DiscordAuditNotifier {
-                http,
-                channel_id,
-            }));
-        }
+        // #1295 — to the Discord channel the request came from (when it
+        // came from Discord) and to Slack, per AUGMENTAGENT_NOTIFY_SURFACES.
+        let origin = match (ctx.http.clone(), ctx.channel_id) {
+            (Some(http), Some(channel_id)) => {
+                Some(Arc::new(notify::DiscordChannelSink::new(http, channel_id))
+                    as Arc<dyn notify::NotificationSink>)
+            }
+            _ => None,
+        };
+        opts.audit_notifier = Some(Arc::new(notify::RoutedAuditNotifier::new(
+            notify::router(),
+            origin,
+        )));
         // #389 — prepend the owner's standing rules as a highest-priority
         // block so they apply on the first attempt, every turn.
         let prompt = match owner_rules_block(&self.wiki_root) {
@@ -10493,32 +10487,6 @@ mod query_delivery_contract_tests {
         assert_eq!(attachments[0].filename, "Synthetic report.pdf");
         assert_eq!(attachments[0].data, original);
         assert_eq!(reasoner.usage(), vec![("claude", 1, 1)]);
-    }
-}
-
-/// Bridge: turns the raw serenity bits in `AuditCtx` into a channel-core
-/// [`AuditNotifier`] impl. Lives in the CLI crate because it's the only
-/// crate that depends on BOTH the discord crate (for `serenity` + `AuditCtx`)
-/// and channel-core (for the trait). Sees `&AuditRecord` directly so it can
-/// reuse [`augmentagent_channel_core::format_notice`] verbatim.
-#[derive(Debug, Clone)]
-struct DiscordAuditNotifier {
-    http: std::sync::Arc<serenity::http::Http>,
-    channel_id: serenity::model::id::ChannelId,
-}
-
-#[async_trait]
-impl augmentagent_channel_core::AuditNotifier for DiscordAuditNotifier {
-    async fn notify(
-        &self,
-        _session_id: &str,
-        record: &augmentagent_channel_core::AuditRecord,
-    ) {
-        let body = augmentagent_channel_core::format_notice(record);
-        let builder = serenity::builder::CreateMessage::new().content(body);
-        if let Err(e) = self.channel_id.send_message(&*self.http, builder).await {
-            tracing::warn!("tool-audit notify failed: {e}");
-        }
     }
 }
 
@@ -18836,53 +18804,23 @@ async fn run_calendar_poll_once(
     let mut channel = CalendarChannel::new(store, gcal, reasoner, config);
     match build_calendar_alert_sink() {
         Some(sink) => channel = channel.with_alert_sink(sink),
-        None => info!("calendar alerts: DISCORD_BOT_TOKEN/DISCORD_CHANNEL_ID unset; alert delivery disabled"),
+        None => info!("calendar alerts: no notification surface is configured (Discord bot channel or Slack app); alert delivery disabled"),
     }
     let outcome = channel.poll_once().await?;
     println!("{:#?}", outcome);
     Ok(())
 }
 
-/// #396/#397 — Discord transport for calendar alerts. Bare HTTP client (no
-/// gateway, no state), same pattern as `post_digest_to_discord`, aimed at
-/// the shared DISCORD_CHANNEL_ID.
-struct DiscordAlertSink {
-    http: serenity::http::Http,
-    channel: serenity::all::ChannelId,
-}
-
-#[async_trait]
-impl augmentagent_channel_calendar::AlertSink for DiscordAlertSink {
-    async fn send(&self, text: &str) -> anyhow::Result<()> {
-        use serenity::all::CreateMessage;
-        for chunk in augmentagent_approval_discord::chunk_for_discord(text) {
-            self.channel
-                .send_message(&self.http, CreateMessage::new().content(chunk))
-                .await
-                .context("discord send_message")?;
-        }
-        Ok(())
-    }
-}
-
+/// #396/#397 — calendar alerts. #1295: routed to Discord (the shared
+/// DISCORD_CHANNEL_ID) and/or Slack per AUGMENTAGENT_NOTIFY_SURFACES;
+/// `None` when no routed surface is configured.
 fn build_calendar_alert_sink(
 ) -> Option<Arc<dyn augmentagent_channel_calendar::AlertSink>> {
-    let token = std::env::var("DISCORD_BOT_TOKEN").ok()?;
-    let cid = std::env::var("DISCORD_CHANNEL_ID").ok()?;
-    if token.trim().is_empty() {
+    let router = notify::router();
+    if !router.has_route("calendar_alert") {
         return None;
     }
-    let cid: u64 = match cid.trim().parse() {
-        Ok(v) => v,
-        Err(_) => {
-            warn!("calendar alerts: DISCORD_CHANNEL_ID is not numeric; alert delivery disabled");
-            return None;
-        }
-    };
-    Some(Arc::new(DiscordAlertSink {
-        http: serenity::http::Http::new(&token),
-        channel: serenity::all::ChannelId::new(cid),
-    }))
+    Some(Arc::new(notify::RoutedAlertSink::new(router)))
 }
 
 /// #399 — read-only schedule lookup for query mode ("what's on my calendar
