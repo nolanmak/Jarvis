@@ -34,7 +34,7 @@ NDJSON over a Unix stream socket. See the `main.go` package doc and
 `crates/augmentagent-channel-whatsapp/src/api.rs` for the exact envelope.
 
 **Methods (request/response):** `status`, `start_pairing`, `logout`,
-`list_chats`, `fetch_history`, `send_text`.
+`list_chats`, `fetch_history`, `send_text`, `replay_events`, `ack_events`.
 
 **Events (sidecar-initiated):** `qr`, `pair-success`, `connected`,
 `logged-out`, `received-message`, `receipt`. Message events include optional
@@ -81,8 +81,13 @@ WhatsApp bans bot-like accounts aggressively. The channel is conservative:
 ## Operational notes
 
 - The sidecar serves the daemon and CLI concurrently. Requests return only to
-  their requesting client; live events reach all connected clients. Durable
-  replay after a client disconnects remains tracked in #1229.
+  their requesting client; live events reach all connected clients. Received
+  messages are stored in a private SQLite journal before socket delivery.
+  `replay_events` reads unacknowledged messages in sequence; `ack_events`
+  advances one sequence after the daemon has committed it. `status` reports
+  pending events and journal failures. The daemon-side replay/ack consumer and
+  outbound delivery ledger remain tracked in #1229. WhatsApp itself may not
+  provide every message missed while this sidecar is offline.
 - Starting a second sidecar fails while the socket is active; only a stale
   socket is removed on startup.
 - The sidecar reconnects whatsmeow internally; if the websocket drops,
