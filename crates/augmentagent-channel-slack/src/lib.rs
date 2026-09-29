@@ -36,6 +36,8 @@ pub mod ingest;
 pub mod history;
 pub mod inbound;
 pub mod interactive;
+// #1295 — proactive notifications to the owner's DM or control channel.
+pub mod notify;
 pub mod owner;
 pub mod owner_setup;
 pub mod surface;

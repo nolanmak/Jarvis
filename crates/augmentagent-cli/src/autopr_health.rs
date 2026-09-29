@@ -819,7 +819,7 @@ pub async fn run(repo_root: &Path, notify: bool, json: bool) -> anyhow::Result<i
 
     if notify {
         if let Some(text) = report(&findings) {
-            notify_discord(&text).await;
+            notify_owner_of(&text).await;
         }
     }
 
@@ -828,24 +828,13 @@ pub async fn run(repo_root: &Path, notify: bool, json: bool) -> anyhow::Result<i
     ))
 }
 
-async fn notify_discord(text: &str) {
-    let Ok(url) = std::env::var("DISCORD_WEBHOOK_URL") else {
-        return;
-    };
-    if url.trim().is_empty() {
-        return;
-    }
+/// #1295 — routed like every health alert: the Discord webhook
+/// (`DISCORD_WEBHOOK_URL`) and/or Slack, per
+/// `AUGMENTAGENT_NOTIFY_SURFACES[_HEALTH]`. Best-effort; the router logs a
+/// failed surface.
+async fn notify_owner_of(text: &str) {
     let clipped: String = text.chars().take(1800).collect();
-    let body = serde_json::json!({ "content": clipped });
-    if let Err(e) = reqwest::Client::new()
-        .post(url.trim())
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-    {
-        tracing::warn!("autopr-health: Discord notify failed: {e}");
-    }
+    let _ = crate::notify::notify_owner(crate::notify::Notice::new("autopr_health", clipped)).await;
 }
 
 #[cfg(test)]

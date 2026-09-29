@@ -44,6 +44,22 @@ into the service definition, and do not need to.
 | `AUGMENTAGENT_APPROVAL_SURFACES` unset or `auto` | Approval cards go to every configured surface (Discord and/or Slack) |
 | `AUGMENTAGENT_APPROVAL_SURFACES=slack` (or `discord`, `discord,slack`) | Approval cards go only to the named surfaces; with `slack` alone the Discord broker is not started and a Discord token without `DISCORD_CHANNEL_ID` is not an issue |
 | `AUGMENTAGENT_SLACK_APPROVAL_CHANNEL` unset or `dm`, or `control` | Where Slack approval cards are posted: the owner DM (default) or the control channel (section 4) |
+| `AUGMENTAGENT_NOTIFY_SURFACES` unset or `auto` | Proactive notifications (digests, research results, calendar reminders, tool audit notices, health alerts, review results) go to every configured surface |
+| `AUGMENTAGENT_NOTIFY_SURFACES=slack` (or `discord`, `discord,slack`) | Notifications go only to the named surfaces; Slack alone needs no Discord credential |
+| `AUGMENTAGENT_NOTIFY_SURFACES_<CLASS>` (`DIGEST`, `RESEARCH`, `REMINDER`, `AUDIT`, `HEALTH`, `REVIEW`) | The same, for one class; overrides `AUGMENTAGENT_NOTIFY_SURFACES` |
+| `AUGMENTAGENT_SLACK_NOTIFY_CHANNEL` unset or `dm`, or `control` | Where Slack notifications are posted: the owner DM (default) or the control channel |
+| `AUGMENTAGENT_NOTIFY_LATE_AFTER_SECS` (default `300`) | A notification delivered later than this after it was due is marked late |
+
+**Notifications (#1295).** Slack notifications are queued on the durable
+outbox and sent by the daemon, so a scheduled one-shot (`digest --post true`,
+`research --post true`, `calendar poll-once`, `autopr-health --notify`) queues
+them even while the daemon is stopped or the Mac sleeps. When the daemon
+runs again they go out one about every second (never a burst), each marked
+late when it waited longer than the threshold, and a producer that runs
+twice posts once. Discord keeps its destinations (`DISCORD_CHANNEL_ID`,
+`DISCORD_WEBHOOK_URL`, the channel a request came from); a failure on one
+surface never stops the other and is logged. Slack failures show in
+`status` as outbox retries and dead letters.
 
 Never set `AUGMENTAGENT_INSECURE_CREDENTIAL_DIR` or
 `AUGMENTAGENT_SLACK_API_BASE` outside tests: the first stores every

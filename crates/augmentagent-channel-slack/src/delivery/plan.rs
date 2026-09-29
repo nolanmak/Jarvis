@@ -422,12 +422,16 @@ impl<'a> SlackOutboxDispatcher<'a> {
         Ok(out.into_iter().next())
     }
 
-    /// Settle broken turns, then until nothing of this workspace is due at
+    /// Pace held notifications ([`crate::notify`]), settle broken turns, then
+    /// until nothing of this workspace is due at
     /// `now_ms`: resolve due `reconcile` sends, then claim and send the next.
     /// Stops by construction: failed sends and deferred lookups are due
     /// later.
     pub async fn drain(&self, now_ms: i64) -> StoreResult<Vec<Dispatched>> {
         let mut out = Vec::new();
+        // #1295 — notifications held through a suspension are marked late
+        // and re-paced before anything is claimed, so waking never bursts.
+        crate::notify::catch_up_notifications(self.store, &self.account, now_ms)?;
         self.settle_broken_turns(now_ms, &mut out)?;
         loop {
             self.reconcile_due(now_ms, &mut out).await?;

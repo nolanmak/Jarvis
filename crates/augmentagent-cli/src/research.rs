@@ -224,7 +224,9 @@ pub(crate) async fn run_research(
         let msg = "🔬 **Daily research** — nothing new on arXiv or leapmodel in the window.";
         println!("{msg}");
         if post_discord {
-            crate::post_digest_to_discord(msg).await?;
+            crate::notify::notify_owner(crate::notify::Notice::new("research_digest", msg))
+                .await
+                .into_result()?;
         }
         return Ok(());
     }
@@ -298,10 +300,15 @@ pub(crate) async fn run_research(
     let digest = build_digest(&cfg, &fresh, &commits, &created, &also_noted, dry_run);
     println!("{digest}");
     if post_discord {
-        crate::post_digest_to_discord(&digest)
-            .await
-            .context("posting research digest to Discord")?;
-        info!("research: digest posted to Discord");
+        // #1295 — to Discord and/or Slack per AUGMENTAGENT_NOTIFY_SURFACES.
+        crate::notify::notify_owner(crate::notify::Notice::new(
+            "research_digest",
+            digest.clone(),
+        ))
+        .await
+        .into_result()
+        .context("posting research digest")?;
+        info!("research: digest delivered");
     }
 
     Ok(())
