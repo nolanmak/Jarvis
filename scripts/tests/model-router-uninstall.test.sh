@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo="$(cd "$(dirname "$0")/../.." && pwd)"
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT
+mkdir -p "$scratch/bin" "$scratch/home/Library/LaunchAgents" "$scratch/config/augmentagent" "$scratch/data/augmentagent/9router/data"
+cat > "$scratch/bin/uname" <<'EOF'
+#!/bin/sh
+printf 'Darwin\n'
+EOF
+cat > "$scratch/bin/launchctl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$TEST_LAUNCHCTL_CALLS"
+EOF
+chmod +x "$scratch/bin/"*
+export HOME="$scratch/home" XDG_CONFIG_HOME="$scratch/config" XDG_DATA_HOME="$scratch/data"
+export PATH="$scratch/bin:$PATH" TEST_LAUNCHCTL_CALLS="$scratch/calls"
+plist="$HOME/Library/LaunchAgents/com.nolanmak.augmentagent.model-router.plist"
+printf 'plist' > "$plist"
+printf 'secret' > "$XDG_CONFIG_HOME/augmentagent/9router.env"
+printf 'account' > "$XDG_DATA_HOME/augmentagent/9router/data/accounts.json"
+bash "$repo/scripts/uninstall-model-router.sh"
+test ! -e "$plist"
+test "$(cat "$XDG_CONFIG_HOME/augmentagent/9router.env")" = secret
+test "$(cat "$XDG_DATA_HOME/augmentagent/9router/data/accounts.json")" = account
+grep -Eq 'bootout gui/[0-9]+/com.nolanmak.augmentagent.model-router' "$TEST_LAUNCHCTL_CALLS"
+bash "$repo/scripts/uninstall-model-router.sh"
+printf 'model-router uninstall: pass\n'

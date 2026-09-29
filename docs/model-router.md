@@ -7,16 +7,16 @@ approval hooks, handoff journals, and provider attribution remain in the agent.
 
 ## Install and connect
 
-On Linux, as the user who runs the agent:
+As the user who runs the agent, on Linux or macOS:
 
 ```sh
 python3 scripts/install-model-router.py
 ```
 
-The installer requires Node.js 22+, npm, Git and systemd user services. It pins
+The installer requires Node.js 22+, npm, Git, Python 3, and either systemd user services on Linux or a logged-in launchd user session on macOS. It pins
 9Router to `17c4cc76877bd1755030a8414f8d0083f48dcccf` (0.5.75), installs dependencies
 using the committed lockfile, builds its standalone server, and starts
-`augmentagent-model-router.service` on **127.0.0.1:20128**. Install both the Claude
+`augmentagent-model-router.service` on Linux or `com.nolanmak.augmentagent.model-router` on macOS, bound to **127.0.0.1:20128**. The macOS LaunchAgent reads its owner-private credential file through a Python launcher; the plist contains paths and public settings only. Install both the Claude
 and Codex CLIs for the corresponding routes. Re-running the installer preserves
 accounts, API keys and the selected route. `--built-source PATH` can reuse an
 already built checkout at the pinned commit during local development. The
@@ -86,7 +86,8 @@ operations or change the existing failover policy for content/local failures.
 ## Verify and roll back
 
 ```sh
-systemctl --user status augmentagent-model-router.service
+./target/release/augmentagent service status --unit augmentagent-model-router.service
+./target/release/augmentagent logs --unit model-router --lines 100
 npm test
 cargo test -p augmentagent-channel-core --lib
 python3 -m unittest discover -s scripts/tests -p '*_test.py'
@@ -130,7 +131,12 @@ declaration is not proof that the deployed model handles that input; the live
 attachment acceptance test remains required before enabling the profile.
 
 To roll back, select **Existing CLI accounts (9Router off)**. Then optionally stop
-`augmentagent-model-router.service`; stored accounts are retained. If the router
+`augmentagent-model-router.service`; stored accounts are retained. On macOS,
+use `augmentagent service stop --unit augmentagent-model-router.service`, then
+`bash scripts/uninstall-model-router.sh` to remove the LaunchAgent while retaining
+accounts and keys. `augmentagent service status --unit augmentagent-model-router.service`
+and `augmentagent logs --unit model-router` show service state and logs on either
+platform. If the router
 is unavailable, the dashboard still lets you save the direct route. Malformed
 configuration fails closed rather than silently sending requests via another
 account.

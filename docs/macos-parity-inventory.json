@@ -1488,6 +1488,22 @@
     "evidence": null
   },
   {
+    "id": "installer:install-model-router.py",
+    "source": "scripts/install-model-router.py",
+    "linux_baseline": "Linux installs the pinned 9Router service and preserves its account data on reinstall.",
+    "macos_target": "Mac installs the same pinned router as a private LaunchAgent with loopback-only access and retained credentials.",
+    "prerequisites": [
+      "Node.js 22 or later",
+      "Python 3",
+      "pinned 9Router source and lockfile",
+      "signed-in launchd user session"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1257",
+    "test_plan": "Run model_router_install_test on native Mac and Linux with a synthetic pinned build, then verify real launchd health and account routing.",
+    "status": "in_progress",
+    "evidence": null
+  },
+  {
     "id": "installer:install-research.sh",
     "source": "scripts/install-research.sh",
     "linux_baseline": "Linux install-research.sh installs or removes its matching component.",
@@ -1499,6 +1515,21 @@
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1245",
     "test_plan": "Run install-research.sh against stubbed systemd and launchd in a disposable home; check file, state and rollback.",
     "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "installer:install-runpod-adapter.py",
+    "source": "scripts/install-runpod-adapter.py",
+    "linux_baseline": "Linux can run the optional local Runpod adapter with private credentials, routes and durable journal.",
+    "macos_target": "Mac installs the same adapter as a loopback-only LaunchAgent with retained private journal and credentials.",
+    "prerequisites": [
+      "Python 3",
+      "private Runpod credentials and routes",
+      "signed-in launchd user session"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1257",
+    "test_plan": "Run runpod_adapter_install_test and native adapter configuration on Mac and Linux; then verify a controlled real route and restart.",
+    "status": "in_progress",
     "evidence": null
   },
   {
@@ -1632,6 +1663,20 @@
     "evidence": null
   },
   {
+    "id": "installer:uninstall-model-router.sh",
+    "source": "scripts/uninstall-model-router.sh",
+    "linux_baseline": "Linux disables and removes the optional model-router user service without deleting accounts.",
+    "macos_target": "Mac stops and removes only the router LaunchAgent and retains private account and credential state.",
+    "prerequisites": [
+      "signed-in launchd user session",
+      "private test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1257",
+    "test_plan": "Run model-router-uninstall.test.sh on Mac and Linux and verify an installed service stops without modifying account data.",
+    "status": "in_progress",
+    "evidence": null
+  },
+  {
     "id": "installer:uninstall-research.sh",
     "source": "scripts/uninstall-research.sh",
     "linux_baseline": "Linux uninstall-research.sh installs or removes its matching component.",
@@ -1643,6 +1688,20 @@
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1245",
     "test_plan": "Run uninstall-research.sh against stubbed systemd and launchd in a disposable home; check file, state and rollback.",
     "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "installer:uninstall-runpod-adapter.sh",
+    "source": "scripts/uninstall-runpod-adapter.sh",
+    "linux_baseline": "Linux stops the optional adapter unit without deleting private job state.",
+    "macos_target": "Mac removes only the adapter LaunchAgent and retains routes, keys and job journal.",
+    "prerequisites": [
+      "signed-in launchd user session",
+      "private test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1257",
+    "test_plan": "Run runpod-adapter-uninstall.test.sh in a disposable home, then verify real launchctl state and journal retention.",
+    "status": "in_progress",
     "evidence": null
   },
   {
@@ -3180,7 +3239,7 @@
     ],
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1257",
     "test_plan": "Install the equivalent of augmentagent-runpod-adapter.service in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
-    "status": "unverified",
+    "status": "in_progress",
     "evidence": null
   },
   {
