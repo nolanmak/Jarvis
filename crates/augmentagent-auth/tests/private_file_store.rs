@@ -153,7 +153,7 @@ fn a_corrupt_or_truncated_slot_is_an_error_not_a_secret() {
     let truncated = good[..good.len() - 3].to_vec();
     let mut flipped = good.clone();
     *flipped.last_mut().unwrap() ^= 0x01;
-    let garbage = b"xoxb-not-an-envelope".to_vec();
+    let garbage = b"not-an-envelope".to_vec();
     for (label, bytes) in [
         ("truncated", truncated),
         ("bit flip", flipped),
