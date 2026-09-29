@@ -23,7 +23,8 @@
 //	   "push_name":"...","text":"...","timestamp":1700000000,"from_me":false}
 //	  {"version":1,"event":"receipt","chat":"...","message_ids":["..."],...}
 //
-// Ops: status, start_pairing, logout, list_chats, fetch_history, send_text.
+// Ops: status, start_pairing, logout, list_chats, fetch_history, send_text,
+// replay_events, ack_events.
 //
 // Lifecycle: on first run with no stored session the sidecar emits `qr`
 // events and retains the latest one for the pairing CLI (#1228). It never
@@ -32,7 +33,9 @@
 //
 // Concurrency: the daemon and CLI may connect at the same time. Responses
 // return only to their requesting connection; lifecycle events reach both.
-// Durable replay across disconnected clients is tracked in #1229.
+// Received messages are journaled before live fan-out. The daemon must replay
+// and acknowledge them after its own durable commit; consumer wiring and the
+// outbound delivery ledger are tracked in #1229.
 package main
 
 import (
@@ -46,6 +49,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -153,9 +157,11 @@ type rpcResponse struct {
 // ---------------------------------------------------------------------------
 
 type sidecar struct {
-	client  *whatsmeow.Client
-	pairMu  sync.Mutex
-	pairing bool
+	client          *whatsmeow.Client
+	journal         *eventJournal
+	journalFailures atomic.Uint64
+	pairMu          sync.Mutex
+	pairing         bool
 	// writeMu protects clients/lastQR and serializes writes to each socket.
 	writeMu sync.Mutex
 	clients map[net.Conn]struct{}
@@ -221,6 +227,30 @@ func (s *sidecar) unregisterConn(conn net.Conn) {
 
 func (s *sidecar) emitEvent(ev map[string]interface{}) {
 	ev["version"] = 1
+	if ev["event"] == "received-message" && s.journal != nil {
+		account := ""
+		if s.client != nil && s.client.Store.ID != nil {
+			account = s.client.Store.ID.String()
+		}
+		chat, _ := ev["chat"].(string)
+		messageID, _ := ev["id"].(string)
+		payload, err := json.Marshal(ev)
+		if err != nil {
+			s.journalFailures.Add(1)
+			s.logger.Errorf("marshal inbound WhatsApp event: %v", err)
+			return
+		}
+		seq, fresh, err := s.journal.appendMessage(account, chat, messageID, payload)
+		if err != nil {
+			s.journalFailures.Add(1)
+			s.logger.Errorf("persist inbound WhatsApp event before delivery: %v", err)
+			return
+		}
+		if !fresh {
+			return
+		}
+		ev["seq"] = seq
+	}
 	frame := s.marshalFrame(ev)
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -435,6 +465,10 @@ func (s *sidecar) dispatch(conn net.Conn, req rpcRequest) {
 		s.opFetchHistory(conn, req)
 	case "send_text":
 		s.opSendText(conn, req)
+	case "replay_events":
+		s.opReplayEvents(conn, req)
+	case "ack_events":
+		s.opAckEvents(conn, req)
 	default:
 		s.fail(conn, req.RequestID, "BadRequest", "unknown op: "+req.Op)
 	}
@@ -514,10 +548,21 @@ func (s *sidecar) opLogout(conn net.Conn, req rpcRequest) {
 }
 
 func (s *sidecar) opStatus(conn net.Conn, req rpcRequest) {
+	journalStatus := map[string]interface{}{}
+	if s.journal != nil {
+		journalStatus["event_journal_failures"] = s.journalFailures.Load()
+		if acked, err := s.journal.acked(); err == nil {
+			journalStatus["events_acked_through"] = acked
+		}
+		if pending, err := s.journal.pendingCount(); err == nil {
+			journalStatus["events_pending"] = pending
+		}
+	}
 	if s.client == nil {
-		s.ok(conn, req.RequestID, map[string]interface{}{
-			"paired": false, "connected": false, "device_jid": "",
-		})
+		journalStatus["paired"] = false
+		journalStatus["connected"] = false
+		journalStatus["device_jid"] = ""
+		s.ok(conn, req.RequestID, journalStatus)
 		return
 	}
 	paired := s.client.Store.ID != nil
@@ -526,11 +571,71 @@ func (s *sidecar) opStatus(conn net.Conn, req rpcRequest) {
 	if s.client.Store.ID != nil {
 		deviceJID = s.client.Store.ID.String()
 	}
-	s.ok(conn, req.RequestID, map[string]interface{}{
-		"paired":     paired,
-		"connected":  connected,
-		"device_jid": deviceJID,
-	})
+	journalStatus["paired"] = paired
+	journalStatus["connected"] = connected
+	journalStatus["device_jid"] = deviceJID
+	s.ok(conn, req.RequestID, journalStatus)
+}
+
+func (s *sidecar) opReplayEvents(conn net.Conn, req rpcRequest) {
+	if s.journal == nil {
+		s.fail(conn, req.RequestID, "Unavailable", "event journal is not configured")
+		return
+	}
+	var p struct {
+		After int64 `json:"after"`
+		Limit int   `json:"limit"`
+	}
+	if err := json.Unmarshal(req.Params, &p); err != nil {
+		s.fail(conn, req.RequestID, "BadRequest", "invalid replay parameters")
+		return
+	}
+	if p.Limit == 0 {
+		p.Limit = 100
+	}
+	acked, err := s.journal.acked()
+	if err != nil {
+		s.fail(conn, req.RequestID, "Internal", "read event cursor failed")
+		return
+	}
+	if p.After < acked {
+		p.After = acked
+	}
+	rows, err := s.journal.readAfter(p.After, p.Limit)
+	if err != nil {
+		s.fail(conn, req.RequestID, "BadRequest", err.Error())
+		return
+	}
+	events := make([]map[string]interface{}, 0, len(rows))
+	for _, row := range rows {
+		var event map[string]interface{}
+		if err := json.Unmarshal(row.Payload, &event); err != nil {
+			s.fail(conn, req.RequestID, "Internal", "stored event is corrupt")
+			return
+		}
+		event["seq"] = row.Seq
+		events = append(events, event)
+	}
+	s.ok(conn, req.RequestID, map[string]interface{}{"events": events})
+}
+
+func (s *sidecar) opAckEvents(conn net.Conn, req rpcRequest) {
+	if s.journal == nil {
+		s.fail(conn, req.RequestID, "Unavailable", "event journal is not configured")
+		return
+	}
+	var p struct {
+		Through int64 `json:"through"`
+	}
+	if err := json.Unmarshal(req.Params, &p); err != nil {
+		s.fail(conn, req.RequestID, "BadRequest", "invalid ack parameters")
+		return
+	}
+	if err := s.journal.ackThrough(p.Through); err != nil {
+		s.fail(conn, req.RequestID, "BadRequest", err.Error())
+		return
+	}
+	s.ok(conn, req.RequestID, map[string]interface{}{"acked_through": p.Through})
 }
 
 func (s *sidecar) opListChats(conn net.Conn, req rpcRequest) {
@@ -676,7 +781,13 @@ func main() {
 	}
 
 	client := whatsmeow.NewClient(deviceStore, logger)
-	s := &sidecar{client: client, logger: logger}
+	journal, err := openEventJournal(storePath() + ".events")
+	if err != nil {
+		logger.Errorf("open durable WhatsApp event journal: %v", err)
+		os.Exit(1)
+	}
+	defer journal.Close()
+	s := &sidecar{client: client, journal: journal, logger: logger}
 	client.AddEventHandler(s.handleWAEvent)
 
 	// Pairing vs. reconnect.

@@ -154,6 +154,14 @@ struct RpcError {
     message: String,
 }
 
+/// One message read from the sidecar's persistent inbound journal.
+/// A caller must commit the message locally before acknowledging `seq`.
+#[derive(Debug)]
+pub struct ReplayedWaEvent {
+    pub seq: u64,
+    pub event: WaEvent,
+}
+
 type Pending = Arc<StdMutex<HashMap<String, oneshot::Sender<Result<RpcResponse, WaError>>>>>;
 
 /// An aborted caller must not leave a waiter in the shared request map.
@@ -406,6 +414,50 @@ impl WaClient {
         .await?;
         Ok(())
     }
+
+    /// Read unacknowledged journal events in sidecar sequence order.
+    pub async fn replay_events(
+        &self,
+        after: u64,
+        limit: u32,
+    ) -> Result<Vec<ReplayedWaEvent>, WaError> {
+        if limit == 0 || limit > 1000 {
+            return Err(WaError::Config("replay limit must be 1–1000".into()));
+        }
+        let result = self
+            .call("replay_events", serde_json::json!({"after": after, "limit": limit}))
+            .await?;
+        let frames = result
+            .get("events")
+            .and_then(Value::as_array)
+            .ok_or_else(|| WaError::Protocol("replay_events omitted events array".into()))?;
+        frames
+            .iter()
+            .map(|frame| {
+                let seq = frame
+                    .get("seq")
+                    .and_then(Value::as_u64)
+                    .filter(|seq| *seq > 0)
+                    .ok_or_else(|| {
+                        WaError::Protocol("replayed event omitted positive sequence".into())
+                    })?;
+                let event = serde_json::from_value::<WaEvent>(frame.clone())?;
+                if !matches!(event, WaEvent::ReceivedMessage { .. }) {
+                    return Err(WaError::Protocol("replay contained a non-message event".into()));
+                }
+                Ok(ReplayedWaEvent { seq, event })
+            })
+            .collect()
+    }
+
+    /// Advance exactly one sequence after the daemon's durable commit.
+    pub async fn ack_event(&self, seq: u64) -> Result<(), WaError> {
+        if seq == 0 {
+            return Err(WaError::Config("ack sequence must be positive".into()));
+        }
+        self.call("ack_events", serde_json::json!({"through": seq})).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -490,6 +542,34 @@ mod tests {
         let client = WaClient::connect(&path, tx).await.unwrap();
         client.start_pairing().await.unwrap();
         client.logout("15551234567:2@s.whatsapp.net").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_event_is_typed_and_ack_uses_its_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sock(&dir, "wa.sock");
+        mock_sidecar(path.clone(), |req| {
+            let id = req["request_id"].as_str().unwrap();
+            let result = match req["op"].as_str().unwrap() {
+                "replay_events" => {
+                    assert_eq!(req["params"]["after"], 0);
+                    serde_json::json!({"events": [{"version": 1, "seq": 7, "event": "received-message", "id": "m7", "chat": "1@s.whatsapp.net", "sender": "1@s.whatsapp.net", "text": "hello", "timestamp": 1700000000}]})
+                }
+                "ack_events" => {
+                    assert_eq!(req["params"]["through"], 7);
+                    serde_json::json!({"acked_through": 7})
+                }
+                other => panic!("unexpected op: {other}"),
+            };
+            vec![serde_json::json!({"version": 1, "request_id": id, "ok": true, "result": result}).to_string()]
+        }).await;
+        let (tx, _rx) = mpsc::channel(8);
+        let client = WaClient::connect(&path, tx).await.unwrap();
+        let replayed = client.replay_events(0, 10).await.unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].seq, 7);
+        assert!(matches!(replayed[0].event, WaEvent::ReceivedMessage { .. }));
+        client.ack_event(replayed[0].seq).await.unwrap();
     }
 
     #[tokio::test]

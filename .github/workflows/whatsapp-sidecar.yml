@@ -59,5 +59,7 @@ jobs:
         # blocker in #1319; Go and Rust channel tests still run.
         if: matrix.os != 'macos-15-intel'
         run: cargo test -p augmentagent-cli --test whatsapp_cli
+      - name: Durable inbound store tests
+        run: cargo test -p augmentagent-store --test whatsapp_inbound
       - name: Rust channel lint
         run: cargo clippy --no-deps -p augmentagent-channel-whatsapp --all-targets -- -D warnings
