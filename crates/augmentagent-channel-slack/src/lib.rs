@@ -12,6 +12,7 @@ pub mod api;
 pub mod auth;
 pub mod channel;
 pub mod digest;
+pub mod surface;
 pub mod types;
 
 pub use api::{SlackClient, SlackError};

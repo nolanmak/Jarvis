@@ -312,6 +312,21 @@ pub enum SurfaceCapability {
 }
 
 impl SurfaceCapability {
+    /// Every capability, so a surface can prove its declaration is complete.
+    pub const ALL: [SurfaceCapability; 11] = [
+        Self::Query,
+        Self::Approve,
+        Self::Send,
+        Self::Schedule,
+        Self::ModelControl,
+        Self::ProcessControl,
+        Self::MediaRead,
+        Self::MediaWrite,
+        Self::History,
+        Self::Notifications,
+        Self::Voice,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Query => "query",

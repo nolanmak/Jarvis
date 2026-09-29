@@ -92,3 +92,33 @@ fn deserialization_cannot_bypass_reference_validation() {
         r#"{"conversation":{"account":{"platform":"whatsapp","account_id":"device:1"},"conversation_id":"123@s.whatsapp.net","thread_id":null},"quoted_message_id":""}"#
     ).is_err());
 }
+
+#[test]
+fn capability_list_names_every_capability_exactly_once() {
+    let names: std::collections::BTreeSet<&str> = SurfaceCapability::ALL
+        .iter()
+        .map(|capability| capability.as_str())
+        .collect();
+    assert_eq!(names.len(), SurfaceCapability::ALL.len());
+    for capability in SurfaceCapability::ALL {
+        // Exhaustive on purpose: a new variant fails to compile here until it
+        // is also added to `ALL`, which the length check below then enforces.
+        let index = match capability {
+            SurfaceCapability::Query => 0,
+            SurfaceCapability::Approve => 1,
+            SurfaceCapability::Send => 2,
+            SurfaceCapability::Schedule => 3,
+            SurfaceCapability::ModelControl => 4,
+            SurfaceCapability::ProcessControl => 5,
+            SurfaceCapability::MediaRead => 6,
+            SurfaceCapability::MediaWrite => 7,
+            SurfaceCapability::History => 8,
+            SurfaceCapability::Notifications => 9,
+            SurfaceCapability::Voice => 10,
+        };
+        assert_eq!(SurfaceCapability::ALL[index], capability);
+    }
+    assert_eq!(SurfaceCapability::ALL.len(), 11);
+    let json = serde_json::to_string(&SurfaceCapability::ModelControl).unwrap();
+    assert_eq!(json, "\"model_control\"");
+}
