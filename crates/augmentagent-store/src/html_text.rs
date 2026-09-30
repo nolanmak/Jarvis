@@ -39,7 +39,7 @@ pub fn contains_markup(s: &str) -> bool {
         } else {
             i + 1
         };
-        bytes.get(name_at).is_some_and(u8::is_ascii_alphabetic) && s[name_at..].contains('>')
+        bytes.get(name_at).is_some_and(u8::is_ascii_alphabetic) && tag_end(bytes, i).is_some()
     })
 }
 
@@ -75,7 +75,7 @@ fn convert(html: &str, mode: Mode) -> String {
     let mut anchors: Vec<(String, usize)> = Vec::new();
     while i < bytes.len() {
         if bytes[i] == b'<' {
-            let Some(rel) = html[i..].find('>') else {
+            let Some(rel) = tag_end(bytes, i) else {
                 // A bare `<` with no `>` after it is text, not a tag. A reader
                 // wants the remainder; the index dropped it pre-#1366 and keeps
                 // doing so — a truncated tail changes which documents match.
@@ -159,6 +159,32 @@ fn convert(html: &str, mode: Mode) -> String {
         result.push('\n');
     }
     result
+}
+
+/// Offset from the `<` at `open` to the `>` that closes that tag, skipping any
+/// `>` inside a quoted attribute value so `<div title="1 > 0">` is one tag and
+/// not a tag plus the literal text `0">`. `None` if never terminated. A quote
+/// only opens a value right after `=`, so a stray apostrophe cannot swallow the
+/// rest of the mail.
+fn tag_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut j = open + 1;
+    let mut after_eq = false;
+    while j < bytes.len() {
+        let b = bytes[j];
+        if b == b'>' {
+            return Some(j - open);
+        }
+        if after_eq && (b == b'"' || b == b'\'') {
+            j += bytes[j + 1..].iter().position(|c| *c == b)? + 1;
+            after_eq = false;
+        } else if b == b'=' {
+            after_eq = true;
+        } else if !b.is_ascii_whitespace() {
+            after_eq = false;
+        }
+        j += 1;
+    }
+    None
 }
 
 /// `href` target of an `<a>`, matched on `lower` but read out of `raw` so the
@@ -282,10 +308,32 @@ mod tests {
         // The reported leak: HTML mail built from tags `looks_like_html` omits.
         assert!(contains_markup("<article>Update</article>"));
         assert!(!looks_like_html("<article>Update</article>"));
-        // Prose with arithmetic is not markup.
+        // Prose with arithmetic is not markup: `<` must be followed by a name
+        // *and* a terminator, so neither comparison nor a chain of them counts.
         assert!(!contains_markup("a < b and 5 < 6, right?"));
+        assert!(!contains_markup("a < b > c"));
         assert!(!contains_markup("plain text"));
         // Tag-shaped but never terminated: nothing to strip.
         assert!(!contains_markup("<article"));
+    }
+
+    /// A `>` inside a quoted attribute value does not end the tag — finding the
+    /// end with the first `>` leaked `0">Update` onto the card.
+    #[test]
+    fn a_quoted_angle_bracket_does_not_end_the_tag() {
+        for html in [
+            r#"<div title="1 > 0">Update</div>"#,
+            r#"<div title='1 > 0'>Update</div>"#,
+            r#"<div data-x="a>b" title="c>d">Update</div>"#,
+        ] {
+            assert_eq!(html_to_text_for_display(html).trim(), "Update", "{html}");
+            assert_eq!(html_to_text(html).trim(), "Update", "{html}");
+        }
+        // An anchor whose earlier attribute hides a `>` still yields its target.
+        assert_eq!(
+            html_to_text_for_display(r#"<a title="x > y" href="https://example.com/p">go</a>"#)
+                .trim(),
+            "go (https://example.com/p)"
+        );
     }
 }

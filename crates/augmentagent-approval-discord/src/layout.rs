@@ -941,11 +941,9 @@ fn truncate_within(s: &str, max: usize) -> String {
 /// image-only newsletter) converts to nothing, and the card says so instead of
 /// falling back to the tags.
 ///
-/// Converting here rather than preferring a `text/plain` alternative upstream
-/// is not a choice this repo gets to make: nothing here parses MIME. Composio
-/// flattens the message and `gmail::FetchMessage.body` takes the one string it
-/// returns, so there is no parts tree to pick a plaintext sibling out of — the
-/// HTML alternative *is* the body by the time our code sees it
+/// Preferring a `text/plain` alternative upstream instead is not available:
+/// Composio flattens the message into one body string, so by the time our code
+/// sees it the HTML alternative *is* the body
 /// (`composio_flattens_html_into_the_only_body_field` pins that).
 fn plain(body: &str) -> Cow<'_, str> {
     if !contains_markup(body) {
@@ -1026,27 +1024,28 @@ mod tests {
 
     const MARKUP_LEAKS: [&str; 6] = ["<div", "<html", "class=", "style=", "&nbsp;", "&amp;"];
 
-    /// The reported case, end to end — and asserted against the WHOLE
-    /// serialized card, not just the description, so the attachment and
-    /// envelope blocks an HTML mail also carries are covered by the same scan.
+    /// The reported case, end to end — asserted against the WHOLE serialized
+    /// card, not just the description, so the attachment and envelope blocks an
+    /// HTML mail also carries fall under the same scan. The #1188 in-place edit
+    /// (`redraw_cards`) shares `approval_embed_and_rows`, and is checked here so
+    /// a future split of the two builders cannot reopen the leak.
     #[test]
     fn every_rendered_field_of_an_html_card_is_plain_text() {
         let mut e = email();
         e.body = APPLE_MAIL_HTML.to_string();
         e.attachments = vec!["application/pdf rollout.pdf".into()];
-        let card = json(&approval_message(
-            "act-h1",
-            &e,
-            "Tuesday works.\n[to: peer@example.com]\n[attachment: rollout.pdf]",
-            0,
-        ));
-        let d = description(&approval_message("act-h1", &e, "Tuesday works.", 0));
-        assert!(d.contains("the rollout slipped to Tuesday"), "{d}");
-        assert!(d.contains("Are we still shipping Monday?"), "{d}");
-        // The link target survives in readable form.
-        assert!(d.contains("https://docs.example.com/rollout"), "{d}");
-        for leak in MARKUP_LEAKS {
-            assert!(!card.contains(leak), "markup {leak} leaked: {card}");
+        let draft = "Tuesday works.\n[to: peer@example.com]\n[attachment: rollout.pdf]";
+        let posted = json(&approval_message("act-h1", &e, draft, 0));
+        let edit = approval_edit_message("act-h1", &e, draft, 0);
+        let edited = serde_json::to_string(&edit).unwrap();
+        for card in [&posted, &edited] {
+            assert!(card.contains("the rollout slipped to Tuesday"), "{card}");
+            assert!(card.contains("Are we still shipping Monday?"), "{card}");
+            // The link target survives in readable form.
+            assert!(card.contains("https://docs.example.com/rollout"), "{card}");
+            for leak in MARKUP_LEAKS {
+                assert!(!card.contains(leak), "markup {leak} leaked: {card}");
+            }
         }
     }
 
@@ -1073,23 +1072,6 @@ mod tests {
         let out = format_body(body, "noted");
         assert!(out.starts_with(NO_TEXT_BODY), "{out}");
         assert!(!out.contains("<img"), "markup leaked: {out}");
-    }
-
-    /// The #1188 in-place edit (`redraw_cards`) is the other body-showing
-    /// surface. It shares `approval_embed_and_rows`, so it strips too — pinned
-    /// so a future split of the two builders cannot reopen the leak.
-    #[test]
-    fn the_redrawn_card_strips_markup_too() {
-        let mut e = email();
-        e.body = APPLE_MAIL_HTML.to_string();
-        let edit = approval_edit_message("act-h3", &e, "Tuesday works.", 0);
-        let v: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&edit).unwrap()).unwrap();
-        let d = v["embeds"][0]["description"].as_str().unwrap();
-        assert!(d.contains("rollout slipped to Tuesday"), "{d}");
-        for leak in MARKUP_LEAKS {
-            assert!(!d.contains(leak), "markup {leak} leaked into the edit: {d}");
-        }
     }
 
     #[test]
