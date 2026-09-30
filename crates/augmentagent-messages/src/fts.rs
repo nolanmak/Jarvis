@@ -13,6 +13,15 @@
 use augmentagent_store::rusqlite::{params, Connection};
 use serde::Serialize;
 
+// #1366 — the converter moved to `augmentagent-store` so the Discord renderer
+// shares this stripping instead of growing a third stripper. The index still
+// calls `html_to_text`, byte-identical to the copy that lived here; the
+// reader-facing extras (link targets, spacing, typographic entities) live only
+// in `html_to_text_for_display`, which no indexing path calls.
+// `prepare_html_output_is_stable` pins the unchanged behaviour.
+pub use augmentagent_store::html_text::html_to_text;
+use augmentagent_store::html_text::looks_like_html;
+
 /// Per-message cap on prepared body text.
 pub const MAX_BODY_BYTES: usize = 32 * 1024;
 
@@ -24,129 +33,6 @@ pub struct FtsDoc {
     /// Email subject (email only).
     pub subject: String,
     pub body: String,
-}
-
-fn looks_like_html(s: &str) -> bool {
-    let head: String = s
-        .chars()
-        .take(4000)
-        .collect::<String>()
-        .to_ascii_lowercase();
-    [
-        "<html", "<body", "<div", "<table", "<p>", "<p ", "<br", "<span", "</a>",
-    ]
-    .iter()
-    .any(|t| head.contains(t))
-}
-
-/// Visible text of an HTML document: tags removed, `<script>`/`<style>`/
-/// `<head>` contents dropped, block tags as line breaks, common entities
-/// decoded. Tag names and attribute values never reach the output.
-pub fn html_to_text(html: &str) -> String {
-    let mut out = String::with_capacity(html.len() / 3);
-    let lower = html.to_ascii_lowercase();
-    let mut i = 0usize;
-    let bytes = html.as_bytes();
-    while i < bytes.len() {
-        if bytes[i] == b'<' {
-            let Some(rel) = html[i..].find('>') else {
-                break;
-            };
-            let tag = &lower[i + 1..i + rel];
-            let name: String = tag
-                .trim_start_matches('/')
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric())
-                .collect();
-            let closing = tag.starts_with('/');
-            i += rel + 1;
-            if !closing && matches!(name.as_str(), "script" | "style" | "head" | "title") {
-                let end_tag = format!("</{name}");
-                match lower[i..].find(&end_tag) {
-                    Some(end) => {
-                        i += end;
-                        if let Some(gt) = html[i..].find('>') {
-                            i += gt + 1;
-                        }
-                    }
-                    None => break,
-                }
-                continue;
-            }
-            if matches!(
-                name.as_str(),
-                "br" | "p"
-                    | "div"
-                    | "tr"
-                    | "li"
-                    | "h1"
-                    | "h2"
-                    | "h3"
-                    | "h4"
-                    | "table"
-                    | "blockquote"
-            ) {
-                out.push('\n');
-            } else {
-                out.push(' ');
-            }
-        } else {
-            let next = html[i..].find('<').map_or(bytes.len(), |n| i + n);
-            out.push_str(&html[i..next]);
-            i = next;
-        }
-    }
-    let decoded = decode_entities(&out);
-    let mut result = String::with_capacity(decoded.len());
-    for line in decoded.lines() {
-        let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
-        if !collapsed.is_empty() {
-            result.push_str(&collapsed);
-            result.push('\n');
-        }
-    }
-    result
-}
-
-fn decode_entities(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(amp) = rest.find('&') {
-        out.push_str(&rest[..amp]);
-        rest = &rest[amp..];
-        let semi = rest.as_bytes().iter().take(12).position(|b| *b == b';');
-        let Some(semi) = semi else {
-            out.push('&');
-            rest = &rest[1..];
-            continue;
-        };
-        let ent = &rest[1..semi];
-        let rep = match ent {
-            "amp" => Some('&'),
-            "lt" => Some('<'),
-            "gt" => Some('>'),
-            "quot" => Some('"'),
-            "apos" | "#39" => Some('\''),
-            "nbsp" | "#160" => Some(' '),
-            _ => ent
-                .strip_prefix("#x")
-                .and_then(|h| u32::from_str_radix(h, 16).ok())
-                .or_else(|| ent.strip_prefix('#').and_then(|d| d.parse().ok()))
-                .and_then(char::from_u32),
-        };
-        match rep {
-            Some(c) => {
-                out.push(c);
-                rest = &rest[semi + 1..];
-            }
-            None => {
-                out.push('&');
-                rest = &rest[1..];
-            }
-        }
-    }
-    out.push_str(rest);
-    out
 }
 
 /// `[attachment: <type> <filename> <location>]` → `<filename>`.
@@ -320,6 +206,20 @@ mod tests {
     use crate::index::{check, drain};
     use augmentagent_store::{Email, Store};
     use std::time::Duration;
+
+    /// #1366 moved this converter to `augmentagent-store` and added a second,
+    /// reader-facing mode. A body already in the FTS table must keep matching
+    /// the same queries as one indexed after the move, so the prepared text is
+    /// pinned byte for byte.
+    #[test]
+    fn prepare_html_output_is_stable() {
+        let html = r#"<html><head><style>p{color:red}</style></head><body>
+            <p>Rollout &amp; runbook</p><p></p>
+            <div>See <a href="https://docs.example.com/x">the docs</a> &mdash; ready.</div>
+            </body></html>"#;
+        let doc = prepare("gmail", None, None, "Rollout", html);
+        assert_eq!(doc.body, "Rollout & runbook\nSee the docs &mdash; ready.");
+    }
 
     fn store() -> (tempfile::TempDir, Store) {
         let d = tempfile::tempdir().unwrap();

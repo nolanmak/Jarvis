@@ -3,6 +3,9 @@
 //! Serenity's model builders are verbose; we build simple component collections
 //! here so the broker stays readable.
 
+use std::borrow::Cow;
+
+use augmentagent_store::html_text::{contains_markup, html_to_text_for_display};
 use augmentagent_store::Email;
 use serenity::all::{
     ActionRowComponent, ButtonStyle, CreateActionRow, CreateButton, CreateEmbed, CreateEmbedFooter,
@@ -265,7 +268,8 @@ fn label_for(kind: &str) -> &'static str {
 pub fn flag_notice_message(email: &Email, reason: &str) -> CreateMessage {
     let subject = truncate(&email.subject, 256);
     let from = truncate(&email.from, 200);
-    let reason = truncate(reason, 500);
+    // #1366 — several callers pass a whole email body through the reason slot.
+    let reason = truncate(&plain(reason), 500);
     let content = format!(
         "🚩 **Important** — from `{from}`\n**{subject}**\n_reason: {reason}_"
     );
@@ -286,7 +290,7 @@ pub fn flag_notice_message(email: &Email, reason: &str) -> CreateMessage {
 /// the owner must still be told, so the notice degrades to a subject-less form
 /// rather than being suppressed.
 pub fn revise_failure_notice(email: Option<&Email>, reason: &str) -> CreateMessage {
-    let reason = truncate(reason, 500);
+    let reason = truncate(&plain(reason), 500);
     let subject_clause = match email {
         Some(e) => format!(" for **{}**", truncate(&e.subject, 256)),
         None => String::new(),
@@ -344,6 +348,15 @@ pub fn approval_edit_message(
 /// and its component rows, minus the final `CreateMessage`/`EditMessage`
 /// wrapper. Keeping the two entry points on this one builder is what
 /// guarantees a redrawn card and a freshly posted one render identically.
+///
+/// #1366 — this is the crate's ONLY reader of `Email.body`, and posted cards
+/// plus #1188 in-place edits (`broker::redraw_cards`) both route through here,
+/// so one `plain` call covers every card. Inbound text reaches Discord only
+/// one other way, a reason string, and both reason renderers
+/// ([`flag_notice_message`], [`revise_failure_notice`]) convert too — that is
+/// the complete set. `post_digest`'s default forwards a summary to
+/// `post_flag_notice`, hence through the first. `outcome`'s reason helpers
+/// emit fixed copy keyed off stored `errorMessage` substrings, never a body.
 fn approval_embed_and_rows(
     action_id: &str,
     email: &Email,
@@ -744,7 +757,11 @@ fn format_body(email_body: &str, draft: &str) -> String {
         markers.len() + 1 // the newline rejoining prose and markers
     };
     let rest = budget.saturating_sub(reserved);
-    let email_part = truncate_within(email_body, rest / 2);
+    // #1366: strip BEFORE the budget split, so truncation spends the card on
+    // prose rather than a `<head>` preamble. The draft is left as written — it
+    // is agent-authored plain text whose `<!--aa:needs-input-->` fence and
+    // `[to:]`/`[cc:]` markers a converter would eat.
+    let email_part = truncate_within(&plain(email_body), rest / 2);
     let mut draft_part = truncate_within(&prose, rest - email_part.len());
     if !markers.is_empty() {
         if !draft_part.is_empty() {
@@ -912,6 +929,29 @@ fn truncate_within(s: &str, max: usize) -> String {
     }
 }
 
+/// #1366 — readable text for a Discord surface. An HTML-only body (Apple Mail
+/// and friends) otherwise posts its own markup: `<div>` wrappers, `style=`
+/// attributes and `&nbsp;` instead of prose. Render-only — stored, wiki and
+/// indexed copies keep the original. Markup is detected by shape
+/// ([`contains_markup`]) rather than a tag list, since a body the sniffer
+/// misses is posted verbatim. A body that is *all* markup (tracking pixel,
+/// image-only newsletter) converts to nothing, and the card says so instead of
+/// falling back to the tags.
+fn plain(body: &str) -> Cow<'_, str> {
+    if !contains_markup(body) {
+        return Cow::Borrowed(body);
+    }
+    let text = html_to_text_for_display(body);
+    if text.trim().is_empty() {
+        Cow::Borrowed(NO_TEXT_BODY)
+    } else {
+        Cow::Owned(text)
+    }
+}
+
+/// Stand-in for a body whose markup carries no readable text at all.
+const NO_TEXT_BODY: &str = "_(no text content — HTML-only message)_";
+
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -959,6 +999,90 @@ mod tests {
         let s = "aéb"; // é = 2 bytes, total 4 bytes
         let t = truncate(s, 3);
         assert!(t.is_char_boundary(t.len()));
+    }
+
+    // #1366: HTML-only mail renders as prose, not as its own markup.
+
+    /// Apple-Mail-shaped HTML-only body: preamble, attribute-laden `<div>` per
+    /// line, `&nbsp;` separators, quoted reply in a `<blockquote>`.
+    const APPLE_MAIL_HTML: &str = r#"<html><head><style type="text/css">body{font-family:Helvetica}</style></head>
+        <body style="word-wrap:break-word">
+        <div class="apple-mail-dark-mode" style="color:#1d1d1f">Hi there &mdash; the rollout slipped to Tuesday.</div>
+        <div class="apple-mail-dark-mode" style="color:#1d1d1f">&nbsp;</div>
+        <div style="color:#1d1d1f">Docs &amp; runbook are at <a href="https://docs.example.com/rollout">the usual place</a>.</div>
+        <blockquote type="cite"><div>On Sep 29, 2026, at 09:12, peer@example.com wrote:</div>
+          <div><div>Are we still shipping Monday?</div></div></blockquote>
+        </body></html>"#;
+
+    const MARKUP_LEAKS: [&str; 6] = ["<div", "<html", "class=", "style=", "&nbsp;", "&amp;"];
+
+    #[test]
+    fn html_only_body_renders_as_prose_on_the_card() {
+        let mut e = email();
+        e.body = APPLE_MAIL_HTML.to_string();
+        let d = description(&approval_message("act-h1", &e, "Tuesday works.", 0));
+        assert!(d.contains("the rollout slipped to Tuesday"), "{d}");
+        assert!(d.contains("Are we still shipping Monday?"), "{d}");
+        // The link target survives in readable form.
+        assert!(d.contains("https://docs.example.com/rollout"), "{d}");
+        for leak in MARKUP_LEAKS {
+            assert!(!d.contains(leak), "markup {leak} leaked into the card: {d}");
+        }
+    }
+
+    #[test]
+    fn flag_notice_strips_markup_from_the_reason() {
+        // `post_digest` and the engagement path forward a whole body here.
+        let content = json(&flag_notice_message(&email(), APPLE_MAIL_HTML));
+        assert!(content.contains("rollout slipped to Tuesday"), "{content}");
+        for leak in ["<div", "class=", "style=", "&nbsp;"] {
+            assert!(!content.contains(leak), "markup {leak} leaked: {content}");
+        }
+    }
+
+    #[test]
+    fn plain_text_body_is_untouched() {
+        // No sniffer false positives: prose renders byte-identically to pre-#1366.
+        let body = "Hi there,\n\nCan we move to Tuesday? a < b either way.\n\nThanks";
+        assert_eq!(format_body(body, "Sure."), format!("{body}{SEPARATOR}Sure."));
+    }
+
+    #[test]
+    fn all_markup_body_says_so_instead_of_posting_the_tags() {
+        let body = r#"<html><body><img src="https://t.example.com/p.gif" width="1"></body></html>"#;
+        let out = format_body(body, "noted");
+        assert!(out.starts_with(NO_TEXT_BODY), "{out}");
+        assert!(!out.contains("<img"), "markup leaked: {out}");
+    }
+
+    /// The #1188 in-place edit (`redraw_cards`) is the other body-showing
+    /// surface. It shares `approval_embed_and_rows`, so it strips too — pinned
+    /// so a future split of the two builders cannot reopen the leak.
+    #[test]
+    fn the_redrawn_card_strips_markup_too() {
+        let mut e = email();
+        e.body = APPLE_MAIL_HTML.to_string();
+        let edit = approval_edit_message("act-h3", &e, "Tuesday works.", 0);
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&edit).unwrap()).unwrap();
+        let d = v["embeds"][0]["description"].as_str().unwrap();
+        assert!(d.contains("rollout slipped to Tuesday"), "{d}");
+        for leak in MARKUP_LEAKS {
+            assert!(!d.contains(leak), "markup {leak} leaked into the edit: {d}");
+        }
+    }
+
+    /// The fixed tag list `looks_like_html` inherited from the FTS index does
+    /// not name `<article>`, and a body it misses used to post verbatim.
+    #[test]
+    fn html_the_fixed_tag_list_misses_is_still_converted() {
+        let mut e = email();
+        e.body = "<article><header>Q3 wrap</header>Numbers are in &amp; good.</article>".into();
+        let d = description(&approval_message("act-h2", &e, "Thanks.", 0));
+        assert!(d.contains("Numbers are in & good."), "{d}");
+        for leak in ["<article", "<header", "&amp;"] {
+            assert!(!d.contains(leak), "markup {leak} leaked into the card: {d}");
+        }
     }
 
     #[test]
