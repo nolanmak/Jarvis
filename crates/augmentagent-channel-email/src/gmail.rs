@@ -1085,6 +1085,30 @@ mod tests {
         );
     }
 
+    /// #1366 — "prefer the `text/plain` alternative" is not implementable
+    /// here: a `multipart/alternative` message arrives already flattened to
+    /// one `messageText`, and when that string is the HTML alternative there
+    /// is no sibling part in the response to choose instead. Hence the fix
+    /// converts at the render boundary. If Composio ever starts returning a
+    /// parts tree, this test is where the selection logic belongs.
+    #[test]
+    fn composio_flattens_html_into_the_only_body_field() {
+        let v = serde_json::json!({
+            "messageId": "m-alt",
+            "sender": "peer@example.com",
+            "messageText": "<html><body><div>Rollout slipped.</div></body></html>",
+            "payload": {"headers": [
+                {"name": "Content-Type", "value": "multipart/alternative; boundary=b1"}
+            ]}
+        });
+        let m: super::FetchMessage = serde_json::from_value(v).unwrap();
+        let e = m.into_email("acct").unwrap();
+        assert_eq!(e.body, "<html><body><div>Rollout slipped.</div></body></html>");
+        // No plaintext sibling is exposed, and `alternative` is not an
+        // attachment shape either.
+        assert!(e.attachments.is_empty());
+    }
+
     #[test]
     fn fetch_message_falls_back_to_the_to_header_and_tolerates_absent_payload() {
         // No top-level `to` → dig it out of the raw headers.

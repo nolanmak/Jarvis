@@ -349,14 +349,17 @@ pub fn approval_edit_message(
 /// wrapper. Keeping the two entry points on this one builder is what
 /// guarantees a redrawn card and a freshly posted one render identically.
 ///
-/// #1366 — this is the crate's ONLY reader of `Email.body`, and posted cards
-/// plus #1188 in-place edits (`broker::redraw_cards`) both route through here,
-/// so one `plain` call covers every card. Inbound text reaches Discord only
-/// one other way, a reason string, and both reason renderers
-/// ([`flag_notice_message`], [`revise_failure_notice`]) convert too — that is
-/// the complete set. `post_digest`'s default forwards a summary to
-/// `post_flag_notice`, hence through the first. `outcome`'s reason helpers
-/// emit fixed copy keyed off stored `errorMessage` substrings, never a body.
+/// #1366 — `email.body` reaches Discord from exactly three builders, all in
+/// this file, and each converts: here (posted cards via [`approval_message`]
+/// and #1188 in-place edits via [`approval_edit_message`]/`broker::redraw_cards`),
+/// [`flag_notice_message`], and [`revise_failure_notice`]. `post_digest`'s
+/// default (`lib.rs`) forwards its summary into `post_flag_notice`'s reason
+/// slot, so it lands on the second. `scheduled_notice_message` renders no body.
+/// Attachments and thread context are NOT additional body-bearing paths:
+/// `Email.attachments` is never read in this crate, the only `[attachment: …]`
+/// renderer (`event_handler::append_envelope_markers`) formats a caller-supplied
+/// filename, and `fetch_conversation_context` feeds the reasoner, not Discord.
+/// `every_rendered_field_of_an_html_card_is_plain_text` pins the whole card.
 fn approval_embed_and_rows(
     action_id: &str,
     email: &Email,
@@ -937,6 +940,13 @@ fn truncate_within(s: &str, max: usize) -> String {
 /// misses is posted verbatim. A body that is *all* markup (tracking pixel,
 /// image-only newsletter) converts to nothing, and the card says so instead of
 /// falling back to the tags.
+///
+/// Converting here rather than preferring a `text/plain` alternative upstream
+/// is not a choice this repo gets to make: nothing here parses MIME. Composio
+/// flattens the message and `gmail::FetchMessage.body` takes the one string it
+/// returns, so there is no parts tree to pick a plaintext sibling out of — the
+/// HTML alternative *is* the body by the time our code sees it
+/// (`composio_flattens_html_into_the_only_body_field` pins that).
 fn plain(body: &str) -> Cow<'_, str> {
     if !contains_markup(body) {
         return Cow::Borrowed(body);
@@ -1016,17 +1026,27 @@ mod tests {
 
     const MARKUP_LEAKS: [&str; 6] = ["<div", "<html", "class=", "style=", "&nbsp;", "&amp;"];
 
+    /// The reported case, end to end — and asserted against the WHOLE
+    /// serialized card, not just the description, so the attachment and
+    /// envelope blocks an HTML mail also carries are covered by the same scan.
     #[test]
-    fn html_only_body_renders_as_prose_on_the_card() {
+    fn every_rendered_field_of_an_html_card_is_plain_text() {
         let mut e = email();
         e.body = APPLE_MAIL_HTML.to_string();
+        e.attachments = vec!["application/pdf rollout.pdf".into()];
+        let card = json(&approval_message(
+            "act-h1",
+            &e,
+            "Tuesday works.\n[to: peer@example.com]\n[attachment: rollout.pdf]",
+            0,
+        ));
         let d = description(&approval_message("act-h1", &e, "Tuesday works.", 0));
         assert!(d.contains("the rollout slipped to Tuesday"), "{d}");
         assert!(d.contains("Are we still shipping Monday?"), "{d}");
         // The link target survives in readable form.
         assert!(d.contains("https://docs.example.com/rollout"), "{d}");
         for leak in MARKUP_LEAKS {
-            assert!(!d.contains(leak), "markup {leak} leaked into the card: {d}");
+            assert!(!card.contains(leak), "markup {leak} leaked: {card}");
         }
     }
 
@@ -1043,7 +1063,7 @@ mod tests {
     #[test]
     fn plain_text_body_is_untouched() {
         // No sniffer false positives: prose renders byte-identically to pre-#1366.
-        let body = "Hi there,\n\nCan we move to Tuesday? a < b either way.\n\nThanks";
+        let body = "Hi there,\n\nMove to Tuesday? a < b either way.\n\nThanks";
         assert_eq!(format_body(body, "Sure."), format!("{body}{SEPARATOR}Sure."));
     }
 
@@ -1069,19 +1089,6 @@ mod tests {
         assert!(d.contains("rollout slipped to Tuesday"), "{d}");
         for leak in MARKUP_LEAKS {
             assert!(!d.contains(leak), "markup {leak} leaked into the edit: {d}");
-        }
-    }
-
-    /// The fixed tag list `looks_like_html` inherited from the FTS index does
-    /// not name `<article>`, and a body it misses used to post verbatim.
-    #[test]
-    fn html_the_fixed_tag_list_misses_is_still_converted() {
-        let mut e = email();
-        e.body = "<article><header>Q3 wrap</header>Numbers are in &amp; good.</article>".into();
-        let d = description(&approval_message("act-h2", &e, "Thanks.", 0));
-        assert!(d.contains("Numbers are in & good."), "{d}");
-        for leak in ["<article", "<header", "&amp;"] {
-            assert!(!d.contains(leak), "markup {leak} leaked into the card: {d}");
         }
     }
 

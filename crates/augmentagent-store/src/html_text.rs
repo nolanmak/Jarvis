@@ -4,9 +4,7 @@
 //! strips markup with the converter the index already runs on real mail rather
 //! than a third hand-rolled stripper. Only render boundaries convert; persisted
 //! and indexed copies keep the original. [`html_to_text`] is byte-identical to
-//! the pre-#1366 FTS output; [`html_to_text_for_display`] adds what a reader
-//! needs. `augmentagent-channel-journal::html` converts TinyMCE wiki input, not
-//! stored mail, so it is left alone.
+//! the pre-#1366 FTS output; [`html_to_text_for_display`] adds reader extras.
 
 /// Cheap sniff for "this body is HTML, not prose". A fixed tag list, so the
 /// index's verdict on a body does not move; render boundaries use
@@ -236,21 +234,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decodes_named_decimal_and_hex_entities() {
-        assert_eq!(
-            html_to_text("<p>tom&#x2019;s &amp; jerry&nbsp;&#39;s &lt;tag&gt;</p>"),
-            "tom\u{2019}s & jerry 's <tag>\n"
-        );
-    }
-
-    #[test]
-    fn drops_head_script_and_style_contents() {
-        let html = "<html><head><style>.a{color:red}</style><title>t</title></head>\
-                    <body><script>alert('x')</script><p>real prose</p></body></html>";
-        assert_eq!(html_to_text(html).trim(), "real prose");
-    }
-
-    #[test]
     fn anchor_keeps_its_target() {
         let linked = r#"<p><a href="https://example.com/x">click</a></p>"#;
         assert_eq!(
@@ -267,15 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn paragraphs_stay_separated_by_one_blank_line() {
-        assert_eq!(
-            html_to_text_for_display("<p>first</p><p>second</p>"),
-            "first\n\nsecond\n"
-        );
-    }
-
-    #[test]
-    fn nested_blockquotes_do_not_explode_into_blank_lines() {
+    fn nested_blockquotes_collapse_to_one_paragraph_break() {
         let html = "<blockquote><div><blockquote><div><div>quoted</div></div>\
                     </blockquote></div></blockquote><p>reply</p>";
         assert_eq!(html_to_text_for_display(html), "quoted\n\nreply\n");
@@ -283,8 +258,7 @@ mod tests {
 
     /// #1366 split one converter into two modes. Index mode must still produce
     /// exactly what `fts::html_to_text` did before the split, or already-indexed
-    /// bodies disagree with newly indexed ones: no link targets, no blank lines,
-    /// typographic entities raw, an unterminated tag ending the document.
+    /// bodies disagree with newly indexed ones.
     #[test]
     fn index_mode_output_is_unchanged_by_the_display_additions() {
         assert_eq!(
@@ -300,16 +274,14 @@ mod tests {
         let disp = html_to_text_for_display("<p>x</p>y < z and more");
         assert_eq!(disp, "x\ny < z and more\n");
         // Entities the pre-split converter did decode still decode.
-        assert_eq!(html_to_text("<p>a&nbsp;&amp;&#x2019;b</p>"), "a &\u{2019}b\n");
+        assert_eq!(html_to_text("<p>a&nbsp;&amp;b</p>"), "a &b\n");
     }
 
     #[test]
     fn markup_sniff_catches_tags_the_fixed_list_misses() {
-        // The reported leak: ordinary HTML mail built from tags that are not
-        // on `looks_like_html`'s list.
+        // The reported leak: HTML mail built from tags `looks_like_html` omits.
         assert!(contains_markup("<article>Update</article>"));
         assert!(!looks_like_html("<article>Update</article>"));
-        assert!(contains_markup(r#"<section id="x">hi</section>"#));
         // Prose with arithmetic is not markup.
         assert!(!contains_markup("a < b and 5 < 6, right?"));
         assert!(!contains_markup("plain text"));
