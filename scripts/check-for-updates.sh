@@ -116,14 +116,66 @@ apply_update() {
   # The browser worker is a separate long-running process with npm dependencies.
   # Deploy it only on hosts where the optional unit is installed.
   if [ "${NEEDS_COMPUTER_REBUILD:-1}" -eq 1 ] && [ -d "$REPO_ROOT/sidecars/computer-use" ] &&
-      [ "$(uname -s)" = Linux ] && systemctl --user cat augmentagent-computer-use.service >/dev/null 2>&1; then
+      { { [ "$(uname -s)" = Linux ] && systemctl --user cat augmentagent-computer-use.service >/dev/null 2>&1; } ||
+        { [ "$(uname -s)" = Darwin ] && [ -f "$HOME/Library/LaunchAgents/com.nolanmak.augmentagent.computer-use.plist" ]; }; }; then
     if ! (cd "$REPO_ROOT/sidecars/computer-use" && npm ci >> "$LOG" 2>&1); then
       log "COMPUTER WORKER INSTALL FAILED — withholding build stamp"
       return 1
     fi
-    systemctl --user daemon-reload >> "$LOG" 2>&1 || return 1
-    restart_unit augmentagent-computer-use.service || RESTART_FAILURES=$((RESTART_FAILURES + 1))
+    if [ "$(uname -s)" = Linux ]; then
+      systemctl --user daemon-reload >> "$LOG" 2>&1 || return 1
+      restart_unit augmentagent-computer-use.service || RESTART_FAILURES=$((RESTART_FAILURES + 1))
+    elif launchctl print "gui/$(id -u)/com.nolanmak.augmentagent.computer-use" >/dev/null 2>&1; then
+      restart_agent com.nolanmak.augmentagent.computer-use || RESTART_FAILURES=$((RESTART_FAILURES + 1))
+    else
+      log "computer-use launchd plist is installed but not loaded; dependencies updated, restart required after loading"
+      RESTART_FAILURES=$((RESTART_FAILURES + 1))
+    fi
   fi
+
+  # Optional sidecars are rebuilt one at a time, only on hosts with a
+  # registered job. The setup scripts use pinned dependency locks. A failed
+  # build or restart withholds the stamp so the next updater tick can retry.
+  local sidecar need label unit installed
+  for sidecar in browser renderer fetch wa-sidecar; do
+    case "$sidecar" in
+      browser) need="${NEEDS_BROWSER_REBUILD:-0}" ;;
+      renderer) need="${NEEDS_RENDERER_REBUILD:-0}" ;;
+      fetch) need="${NEEDS_FETCH_REBUILD:-0}" ;;
+      wa-sidecar) need="${NEEDS_WA_SIDECAR_REBUILD:-0}" ;;
+    esac
+    [ "$need" -eq 1 ] || continue
+    if [ "$sidecar" = browser ]; then
+      label="com.nolanmak.augmentagent.browser-sidecar"
+      unit="augmentagent-browser-sidecar.service"
+    else
+      label="com.nolanmak.augmentagent.$sidecar"
+      unit="augmentagent-$sidecar.service"
+    fi
+    installed=false
+    if [ "$(uname -s)" = Darwin ] && [ -f "$HOME/Library/LaunchAgents/$label.plist" ]; then
+      installed=true
+    elif [ "$(uname -s)" = Linux ] && systemctl --user cat "$unit" >/dev/null 2>&1; then
+      installed=true
+    fi
+    [ "$installed" = true ] || continue
+    log "rebuilding installed $sidecar sidecar"
+    if ! (cd "$REPO_ROOT/sidecars/$sidecar" && bash setup.sh >> "$LOG" 2>&1); then
+      log "$sidecar setup failed; withholding build stamp"
+      return 1
+    fi
+    if [ "$(uname -s)" = Darwin ]; then
+      if [ "$sidecar" = browser ] && [ "${NEEDS_BROWSER_REINSTALL:-0}" -eq 1 ]; then
+        if ! "$REPO_ROOT/target/release/augmentagent" install browser-sidecar >> "$LOG" 2>&1; then
+          log "browser LaunchAgent refresh failed; withholding build stamp"
+          return 1
+        fi
+      fi
+      if ! restart_agent "$label"; then RESTART_FAILURES=$((RESTART_FAILURES + 1)); fi
+    elif ! restart_unit "$unit"; then
+      RESTART_FAILURES=$((RESTART_FAILURES + 1))
+    fi
+  done
 
   # Restart services so the new binary / config takes effect.
   case "$(uname -s)" in
@@ -255,6 +307,11 @@ if [ "$LOCAL" = "$REMOTE" ]; then
   log "checkout up to date ($LOCAL) but artifacts last built from '${BUILT:-none}' — forcing rebuild/restart"
   NEEDS_REBUILD=1
   NEEDS_DASHBOARD_REBUILD=1
+  NEEDS_RENDERER_REBUILD=1
+  NEEDS_FETCH_REBUILD=1
+  NEEDS_WA_SIDECAR_REBUILD=1
+  NEEDS_BROWSER_REBUILD=1
+  NEEDS_BROWSER_REINSTALL=1
   apply_update "$LOCAL"
   exit 0
 fi
@@ -307,6 +364,11 @@ if ! git merge-base --is-ancestor "$LOCAL" "$REMOTE"; then
     # rather than trusting a diff range that no longer applies.
     NEEDS_REBUILD=1
     NEEDS_NODE_REBUILD=1
+    NEEDS_RENDERER_REBUILD=1
+    NEEDS_FETCH_REBUILD=1
+    NEEDS_WA_SIDECAR_REBUILD=1
+    NEEDS_BROWSER_REBUILD=1
+    NEEDS_BROWSER_REINSTALL=1
     apply_update "$LOCAL"
     exit 0
   fi
@@ -321,6 +383,26 @@ CHANGED_FILES=$(git diff --name-only "$LOCAL" "$REMOTE")
 NEEDS_REBUILD=0
 NEEDS_DASHBOARD_REBUILD=0
 NEEDS_COMPUTER_REBUILD=0
+NEEDS_RENDERER_REBUILD=0
+NEEDS_FETCH_REBUILD=0
+NEEDS_WA_SIDECAR_REBUILD=0
+NEEDS_BROWSER_REBUILD=0
+NEEDS_BROWSER_REINSTALL=0
+if printf '%s\n' "$CHANGED_FILES" | grep -qE '^(sidecars/browser/|scripts/start-sidecar\.py$|crates/augmentagent-browser-client/src/lib\.rs$|crates/augmentagent-cli/src/installers\.rs$)'; then
+  NEEDS_BROWSER_REBUILD=1
+fi
+if printf '%s\n' "$CHANGED_FILES" | grep -qE '^(scripts/start-sidecar\.py$|crates/augmentagent-browser-client/src/lib\.rs$|crates/augmentagent-cli/src/installers\.rs$)'; then
+  NEEDS_BROWSER_REINSTALL=1
+fi
+if printf '%s\n' "$CHANGED_FILES" | grep -qE '^(sidecars/renderer/|scripts/start-sidecar\.py$)'; then
+  NEEDS_RENDERER_REBUILD=1
+fi
+if printf '%s\n' "$CHANGED_FILES" | grep -qE '^(sidecars/fetch/|scripts/start-sidecar\.py$)'; then
+  NEEDS_FETCH_REBUILD=1
+fi
+if printf '%s\n' "$CHANGED_FILES" | grep -q '^sidecars/wa-sidecar/'; then
+  NEEDS_WA_SIDECAR_REBUILD=1
+fi
 if printf '%s\n' "$CHANGED_FILES" | grep -qE '^(sidecars/computer-use/|systemd/augmentagent-computer-use.service$)'; then
   NEEDS_COMPUTER_REBUILD=1
 fi
@@ -331,7 +413,7 @@ fi
 # Missing one means the PR merges but the daemon keeps the stale embedded copy.
 # scripts/tests/updater-rebuild-trigger.test.sh fails when a new include target
 # outside crates/ is added without being classified here.
-RUST_REBUILD_PATHS='^(crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|schema/|\.env\.example$|scripts/(codex-tool-bridge|codex-command-sandbox|codex-build-vm|build-dependency-proxy|provider-supervisor)\.py$)'
+RUST_REBUILD_PATHS='^(crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|schema/|\.env\.example$|docs/slack-app-manifest\.json$|scripts/(codex-tool-bridge|codex-command-sandbox|codex-build-vm|build-dependency-proxy|provider-supervisor)\.py$)'
 if printf '%s\n' "$CHANGED_FILES" | grep -qE "$RUST_REBUILD_PATHS"; then
   NEEDS_REBUILD=1
 fi

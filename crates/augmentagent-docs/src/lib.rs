@@ -21,7 +21,9 @@
 //! depends on approval-discord — the pipeline can't live in core without a
 //! dependency cycle.
 
-use std::path::Path;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
@@ -100,15 +102,121 @@ pub fn doc_command_for(kind: DocKind, in_path: &Path) -> (&'static str, Vec<Stri
     }
 }
 
+/// Upper bound for one converter run. A stuck pdftotext/pandoc is killed
+/// and the turn gets an error instead of hanging.
+pub const CONVERT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Directories searched after `PATH`. A launchd job gets
+/// `/usr/bin:/bin:/usr/sbin:/sbin` unless its plist sets `PATH`
+/// (`scripts/lib/launchd-install.sh` does, systemd units do too); these
+/// cover Homebrew on Apple Silicon and Intel and the distro locations when a
+/// service was installed without them.
+pub const SERVICE_TOOL_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
+
+/// How stage 1 finds and bounds its converter.
+#[derive(Debug, Clone)]
+pub struct ConvertOptions {
+    /// `PATH` to search; `None` = only `fallback_dirs`.
+    pub search_path: Option<OsString>,
+    /// Searched after `search_path`, in order.
+    pub fallback_dirs: Vec<PathBuf>,
+    pub timeout: Duration,
+}
+
+impl Default for ConvertOptions {
+    /// The process `PATH`, then [`SERVICE_TOOL_DIRS`], bounded by
+    /// [`CONVERT_TIMEOUT`].
+    fn default() -> Self {
+        Self {
+            search_path: std::env::var_os("PATH"),
+            fallback_dirs: SERVICE_TOOL_DIRS.iter().map(PathBuf::from).collect(),
+            timeout: CONVERT_TIMEOUT,
+        }
+    }
+}
+
+/// First executable regular file named `program` on the search path, then in
+/// the fallback directories.
+pub fn resolve_tool(program: &str, opts: &ConvertOptions) -> Option<PathBuf> {
+    let on_path = opts
+        .search_path
+        .as_deref()
+        .map(|p| std::env::split_paths(p).collect::<Vec<_>>())
+        .unwrap_or_default();
+    on_path
+        .into_iter()
+        .chain(opts.fallback_dirs.iter().cloned())
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(program))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_file()
+    }
+}
+
+fn install_hint(program: &str) -> &'static str {
+    match program {
+        "pdftotext" => "install poppler (`brew install poppler` on macOS, `apt install poppler-utils` on Linux)",
+        "pandoc" => "install pandoc (`brew install pandoc` on macOS, `apt install pandoc` on Linux)",
+        _ => "install it",
+    }
+}
+
 /// Stage 1: shell out to the converter and return the extracted text. Errors
 /// include: binary missing, non-zero exit, unreadable input.
 pub async fn convert_doc_to_text(kind: DocKind, in_path: &Path) -> anyhow::Result<String> {
+    convert_doc_to_text_with(kind, in_path, &ConvertOptions::default()).await
+}
+
+/// [`convert_doc_to_text`] with explicit tool lookup and timeout.
+pub async fn convert_doc_to_text_with(
+    kind: DocKind,
+    in_path: &Path,
+    opts: &ConvertOptions,
+) -> anyhow::Result<String> {
     let (program, args) = doc_command_for(kind, in_path);
-    let output = tokio::process::Command::new(program)
+    let Some(binary) = resolve_tool(program, opts) else {
+        let dirs: Vec<String> = opts
+            .fallback_dirs
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect();
+        anyhow::bail!(
+            "{program} is not installed or not on the service PATH (also looked in {}); {}",
+            if dirs.is_empty() {
+                "no other directories".to_string()
+            } else {
+                dirs.join(", ")
+            },
+            install_hint(program)
+        );
+    };
+    // kill_on_drop: when the timeout (or a cancelled turn) drops the future,
+    // the converter is killed instead of running on in the background.
+    let run = tokio::process::Command::new(&binary)
         .args(&args)
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("spawn {program}: {e}"))?;
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let output = match tokio::time::timeout(opts.timeout, run).await {
+        Err(_elapsed) => anyhow::bail!(
+            "{program} timed out after {}s and was stopped",
+            opts.timeout.as_secs_f32()
+        ),
+        Ok(result) => result.map_err(|e| anyhow::anyhow!("spawn {program}: {e}"))?,
+    };
     if !output.status.success() {
         anyhow::bail!(
             "{program} exited with {}: {}",
@@ -206,13 +314,23 @@ pub async fn extract_text(
     in_path: &Path,
     ocr: Option<&OcrClient>,
 ) -> anyhow::Result<Extracted> {
+    extract_text_with(kind, in_path, ocr, &ConvertOptions::default()).await
+}
+
+/// [`extract_text`] with explicit converter lookup and timeout (#1293).
+pub async fn extract_text_with(
+    kind: DocKind,
+    in_path: &Path,
+    ocr: Option<&OcrClient>,
+    opts: &ConvertOptions,
+) -> anyhow::Result<Extracted> {
     // A missing input is a caller bug regardless of kind; surface it before
     // the converter produces a confusing "no such file" of its own.
     if !tokio::fs::try_exists(in_path).await.unwrap_or(false) {
         anyhow::bail!("document not found: {}", in_path.display());
     }
 
-    let stage1 = convert_doc_to_text(kind, in_path).await;
+    let stage1 = convert_doc_to_text_with(kind, in_path, opts).await;
 
     if !kind.ocr_eligible() {
         return Ok(Extracted {
@@ -280,3 +398,4 @@ pub fn resolve_api_key(keyring: Option<String>, env: Option<String>) -> Option<S
 }
 
 pub mod delivery;
+pub mod inbound;

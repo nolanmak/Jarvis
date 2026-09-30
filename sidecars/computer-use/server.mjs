@@ -6,6 +6,8 @@ import {
   chmodSync,
   existsSync,
   unlinkSync,
+  fstatSync,
+  statSync,
 } from "node:fs";
 import { join } from "node:path";
 import { randomBytes, timingSafeEqual, createHash } from "node:crypto";
@@ -14,8 +16,6 @@ import { BrowserSession } from "./browser.mjs";
 import { runModel } from "./runner.mjs";
 import { loadPolicy, checkUpgrade } from "./upgrade.mjs";
 import { validateEvidence, redactObservation } from "./evidence.mjs";
-import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
 
 const stateDirectory = process.env.JARVIS_COMPUTER_STATE;
 const socket = process.env.JARVIS_COMPUTER_SOCKET;
@@ -29,33 +29,15 @@ if (
   throw Error("absolute_configuration_paths_required");
 process.umask(0o077);
 mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
-// Kernel lease survives neither crashes nor reboot, unlike a PID file. Only
-// its holder may recover tasks or replace the Unix socket.
-if (process.env.JARVIS_COMPUTER_LOCKED !== "1") {
-  const child = spawn(
-    "flock",
-    [
-      "--nonblock",
-      join(stateDirectory, "worker.lock"),
-      process.execPath,
-      fileURLToPath(import.meta.url),
-    ],
-    {
-      env: { ...process.env, JARVIS_COMPUTER_LOCKED: "1" },
-      stdio: "inherit",
-      detached: true,
-    },
-  );
-  for (const signal of ["SIGTERM", "SIGINT"])
-    process.on(signal, () => {
-      try {
-        process.kill(-child.pid, signal);
-      } catch {}
-    });
-  child.on("error", () => process.exit(1));
-  child.on("exit", (code) => process.exit(code ?? 1));
-  await new Promise(() => {});
-}
+// The launcher inherits a flock(2)-held descriptor into this process. Verify
+// it names the current lock before recovering tasks or touching the socket.
+const leaseFd = Number(process.env.JARVIS_COMPUTER_LOCK_FD);
+if (!Number.isInteger(leaseFd) || leaseFd < 3)
+  throw Error("worker_requires_lease_launcher");
+const held = fstatSync(leaseFd);
+const named = statSync(join(stateDirectory, "worker.lock"));
+if (!held.isFile() || held.dev !== named.dev || held.ino !== named.ino)
+  throw Error("worker_lease_mismatch");
 const tokenFile = join(stateDirectory, "token");
 if (!existsSync(tokenFile))
   writeFileSync(tokenFile, randomBytes(32).toString("hex"), { mode: 0o600 });

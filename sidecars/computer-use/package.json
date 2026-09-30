@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "start": "node server.mjs"
+    "start": "bash start.sh"
   },
   "dependencies": {
     "playwright": "1.63.0"

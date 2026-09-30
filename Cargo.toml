@@ -35,6 +35,7 @@ members = [
     "crates/augmentagent-channel-deft",
     "crates/augmentagent-content-adapter",
     "crates/augmentagent-proactive",
+    "crates/augmentagent-heartbeat",
     "crates/augmentagent-browser-client",
     "crates/augmentagent-renderer-client",
     "crates/augmentagent-approval-discord",

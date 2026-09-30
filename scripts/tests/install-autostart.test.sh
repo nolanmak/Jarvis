@@ -22,14 +22,16 @@ bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n     %s\n' "$1" "${2:-}"; }
 # run-rs.sh and a release binary before writing anything.
 make_case() {
   TMP=$(mktemp -d); export TMP
-  mkdir -p "$TMP/repo/scripts" "$TMP/repo/target/release" "$TMP/bin" "$TMP/home"
+  mkdir -p "$TMP/repo/scripts/lib" "$TMP/repo/target/release" "$TMP/bin" "$TMP/home"
   cp "$REPO_ROOT/scripts/install-autostart.sh" "$REPO_ROOT/scripts/install-tenant.sh" "$TMP/repo/scripts/"
+  cp "$REPO_ROOT/scripts/lib/launchd-install.sh" "$TMP/repo/scripts/lib/"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/repo/scripts/run-rs.sh"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/repo/target/release/augmentagent"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/bin/systemctl"
   # The unit cases render the Linux branch on any host (#1079: CI runs macOS too).
   printf '#!/usr/bin/env bash\necho Linux\n' > "$TMP/bin/uname"
   printf '#!/usr/bin/env bash\necho Linger=yes\n' > "$TMP/bin/loginctl"
+  for tool in node deno jq claude; do printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/bin/$tool"; done
   chmod +x "$TMP/repo/scripts/"*.sh "$TMP/repo/target/release/augmentagent" "$TMP/bin/"*
   UNIT="$TMP/home/.config/systemd/user/augmentagent.service"
   TENANT_UNIT="$TMP/home/.config/systemd/user/augmentagent-tenant-t1.service"
@@ -138,6 +140,34 @@ if command -v plutil >/dev/null 2>&1; then
 else
   printf '  skip plutil not installed; lint step skipped\n'
 fi
+rm -rf "$TMP"
+
+# --- Slack surface settings (#1299) ------------------------------------------
+# The Slack surface runs inside serve: no extra unit or job. Its settings
+# (AUGMENTAGENT_SLACK_INTERACTIVE, …) come from the checkout's .env, which
+# serve loads from its working directory, so the service definition must
+# point its working directory at the checkout and carry no Slack setting or
+# token of its own.
+echo "install-autostart.sh Slack settings come from the checkout .env (#1299):"
+make_case
+run_installer install-autostart.sh
+has_line "$UNIT" "WorkingDirectory=$TMP/repo" \
+  && ok "unit runs serve from the checkout (reads its .env)" \
+  || bad "unit runs serve from the checkout (reads its .env)" "$(grep WorkingDirectory "$UNIT")"
+grep -qi slack "$UNIT" && bad "unit carries no Slack setting or token" "$(grep -i slack "$UNIT")" \
+  || ok "unit carries no Slack setting or token"
+rm -rf "$TMP"
+make_case
+printf '#!/usr/bin/env bash\necho Darwin\n' > "$TMP/bin/uname"
+printf '#!/usr/bin/env bash\n[ "$1" = print ] && exit 113\nexit 0\n' > "$TMP/bin/launchctl"
+chmod +x "$TMP/bin/uname" "$TMP/bin/launchctl"
+PLIST="$TMP/home/Library/LaunchAgents/com.nolanmak.augmentagent.plist"
+run_installer install-autostart.sh
+awk '/<key>WorkingDirectory<\/key>/{getline; print; exit}' "$PLIST" | grep -qF "<string>$TMP/repo</string>" \
+  && ok "plist runs serve from the checkout (reads its .env)" \
+  || bad "plist runs serve from the checkout (reads its .env)" "$(grep -A1 WorkingDirectory "$PLIST")"
+grep -qi slack "$PLIST" && bad "plist carries no Slack setting or token" "$(grep -i slack "$PLIST")" \
+  || ok "plist carries no Slack setting or token"
 rm -rf "$TMP"
 
 # --- tenant unit ------------------------------------------------------------

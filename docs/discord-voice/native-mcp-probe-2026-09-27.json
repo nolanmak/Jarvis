@@ -1,0 +1,56 @@
+{
+  "date": "2026-09-27",
+  "environment": "disposable native CLI sessions, synthetic local Unix socket; no Discord or speech provider calls",
+  "codex_version": "0.156.1",
+  "claude_version": "2.1.281",
+  "calls": [
+    {
+      "agent": "codex",
+      "tool": "voice_status",
+      "arguments": {},
+      "observed_result": {
+        "state": "probe-listening",
+        "receipt": null
+      }
+    },
+    {
+      "agent": "codex",
+      "tool": "speak",
+      "arguments": {
+        "text": "SYNTHETIC_VOICE_1220",
+        "utterance_id": "final"
+      },
+      "observed_result": {
+        "state": null,
+        "receipt": {
+          "status": "queued",
+          "utteranceId": "final"
+        }
+      }
+    },
+    {
+      "agent": "claude",
+      "tool": "voice_status",
+      "arguments": {},
+      "observed_result": {
+        "state": "probe-listening",
+        "receipt": null
+      }
+    },
+    {
+      "agent": "claude",
+      "tool": "speak",
+      "arguments": {
+        "text": "SYNTHETIC_VOICE_1220",
+        "utterance_id": "final"
+      },
+      "observed_result": {
+        "state": null,
+        "receipt": {
+          "status": "queued",
+          "utteranceId": "final"
+        }
+      }
+    }
+  ]
+}

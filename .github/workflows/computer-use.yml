@@ -3,13 +3,22 @@ on:
   pull_request:
     paths:
       - 'sidecars/computer-use/**'
+      - 'scripts/install-computer-use.sh'
+      - 'scripts/uninstall-computer-use.sh'
+      - 'scripts/tests/computer-use-launchd.test.sh'
+      - 'scripts/check-for-updates.sh'
       - 'scripts/codex-tool-bridge.py'
       - 'scripts/tests/codex_tool_bridge_test.py'
       - 'crates/augmentagent-cli/src/computer_tool.rs'
       - '.github/workflows/computer-use.yml'
 jobs:
   browser:
-    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -20,6 +29,16 @@ jobs:
       - run: npm ci
         working-directory: sidecars/computer-use
       - run: npx playwright install --with-deps chrome
+        if: runner.os == 'Linux'
         working-directory: sidecars/computer-use
+      - run: npx playwright install chrome
+        if: runner.os == 'macOS'
+        working-directory: sidecars/computer-use
+      - run: uname -srm && node --version && npm --version && python3 --version
       - run: npm test
+        if: runner.os == 'Linux'
         working-directory: sidecars/computer-use
+      - run: node --test --test-concurrency=1 test/*.test.mjs
+        if: runner.os == 'macOS'
+        working-directory: sidecars/computer-use
+      - run: bash scripts/tests/computer-use-launchd.test.sh

@@ -138,6 +138,59 @@ expect_block "A non-ASCII digit lookalike is blocked under a UTF-8 locale" \
 expect_block "A non-ASCII session file name is blocked under a UTF-8 locale" \
   Read file_path $'/tmp/aa-imsg/4242-17/n\xc3\xa9.jpeg' "$I_ENV" "LANG=en_US.UTF-8"
 
+# #1288 — files the owner sent on Slack: Read only, directly inside this
+# turn's own <state dir>/slack-inbound/msg-* directory, named NN-<name>
+# (the inbound pipeline's sanitized shape). The state dir may contain spaces
+# and non-ASCII characters.
+SLACK_ROOT="$TMP/state dir \xc3\xbc/augmentagent/slack-inbound"
+SLACK_ROOT=$(printf "$SLACK_ROOT")
+SLACK_DIR="$SLACK_ROOT/msg-Ab12Cd"
+mkdir -p "$SLACK_DIR" "$SLACK_ROOT/msg-Other1" "$TMP/elsewhere" "$TMP/state/augmentagent/other"
+echo hi > "$SLACK_DIR/00-notes.txt"
+echo hi > "$SLACK_DIR/notes.txt"
+echo hi > "$SLACK_ROOT/msg-Other1/00-notes.txt"
+echo hi > "$SLACK_ROOT/00-stray.txt"
+echo hi > "$TMP/elsewhere/00-secret.txt"
+echo hi > "$TMP/state/augmentagent/other/00-x.txt"
+ln -s "$TMP/elsewhere" "$SLACK_ROOT/msg-Link01"
+S_ENV="AUGMENTAGENT_SLACK_INBOUND_DIR=$SLACK_DIR"
+expect_allow "Read of this turn's Slack file is allowed" \
+  Read file_path "$SLACK_DIR/00-notes.txt" "$S_ENV"
+expect_allow "Read of a converted document in this turn's dir is allowed" \
+  Read file_path "$SLACK_DIR/01-report.pdf.txt" "$S_ENV"
+expect_allow "Read of this turn's Slack file is allowed under a UTF-8 locale" \
+  Read file_path "$SLACK_DIR/00-notes.txt" "$S_ENV" "LANG=en_US.UTF-8"
+expect_block "Read of a Slack file without the turn's env is blocked" \
+  Read file_path "$SLACK_DIR/00-notes.txt"
+for tool in Write Edit; do
+  expect_block "$tool of a Slack file is blocked" \
+    "$tool" file_path "$SLACK_DIR/00-notes.txt" "$S_ENV"
+done
+for tool in Glob Grep; do
+  expect_block "$tool over the Slack turn dir is blocked" \
+    "$tool" path "$SLACK_DIR" "$S_ENV"
+done
+expect_block "Read of another message's Slack dir is blocked" \
+  Read file_path "$SLACK_ROOT/msg-Other1/00-notes.txt" "$S_ENV"
+expect_block "Read escaping the turn dir via .. is blocked" \
+  Read file_path "$SLACK_DIR/../msg-Other1/00-notes.txt" "$S_ENV"
+expect_block "Read of a file directly under slack-inbound is blocked" \
+  Read file_path "$SLACK_ROOT/00-stray.txt" "$S_ENV"
+expect_block "Read of other state files is blocked" \
+  Read file_path "$SLACK_ROOT/../data.db" "$S_ENV"
+expect_block "Read of a name without the NN- prefix is blocked" \
+  Read file_path "$SLACK_DIR/notes.txt" "$S_ENV"
+expect_block "Read of a nested path in the turn dir is blocked" \
+  Read file_path "$SLACK_DIR/00-sub/00-notes.txt" "$S_ENV"
+expect_block "An env naming the slack-inbound root grants nothing" \
+  Read file_path "$SLACK_ROOT/00-stray.txt" "AUGMENTAGENT_SLACK_INBOUND_DIR=$SLACK_ROOT"
+expect_block "An env naming a non-Slack dir grants nothing" \
+  Read file_path "$TMP/state/augmentagent/other/00-x.txt" "AUGMENTAGENT_SLACK_INBOUND_DIR=$TMP/state/augmentagent/other"
+expect_block "A relative env grants nothing" \
+  Read file_path "$SLACK_DIR/00-notes.txt" "AUGMENTAGENT_SLACK_INBOUND_DIR=slack-inbound/msg-Ab12Cd"
+expect_block "A msg dir that is a symlink elsewhere grants nothing" \
+  Read file_path "$SLACK_ROOT/msg-Link01/00-secret.txt" "AUGMENTAGENT_SLACK_INBOUND_DIR=$SLACK_ROOT/msg-Link01"
+
 # #1078 — instruction/config files Claude Code or Codex auto-load must not be
 # model-writable inside the wiki: a planted one would steer every later wiki
 # call and survive in the private mirror. Case-insensitive, any path component,

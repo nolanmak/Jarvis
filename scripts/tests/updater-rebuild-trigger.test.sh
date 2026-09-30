@@ -22,6 +22,7 @@ bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n     %s\n' "$1" "${2:-}"; }
 # not change a production binary, so they must not cost a release rebuild.
 # A new include outside crates/ must be classified here or trigger a rebuild.
 TEST_ONLY_EMBEDS=(
+  docs/fixtures/whatsapp/wire-v1.ndjson
   docs/reasoner-capabilities.json
   eval/autopr-cases.json
   eval/last-run.json
@@ -137,12 +138,180 @@ else
   bad "deploys dependencies and restarts browser worker on sidecar changes" "sidecar would keep stale code/dependencies"
 fi
 rm -rf "$TMP"
+for sidecar in browser renderer fetch wa-sidecar; do
+  make_case "sidecars/$sidecar/source.fixture"
+  printf '#!/usr/bin/env bash\necho Darwin\n' > "$TMP/bin/uname"
+  chmod +x "$TMP/bin/uname"
+  cat > "$TMP/work/sidecars/$sidecar/setup.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "$PWD" >> "$STUB_DIR/sidecar-build-calls"
+exit 0
+STUB
+  chmod +x "$TMP/work/sidecars/$sidecar/setup.sh"
+  mkdir -p "$TMP/Library/LaunchAgents"
+  label="$sidecar"
+  [ "$sidecar" = browser ] && label=browser-sidecar
+  touch "$TMP/Library/LaunchAgents/com.nolanmak.augmentagent.$label.plist"
+  cat > "$TMP/bin/launchctl" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+  print)
+    pid=100
+    [ -f "$STUB_DIR/sidecar-kicked" ] && pid=101
+    printf '\tstate = running\n\tpid = %s\n' "$pid"
+    ;;
+  kickstart)
+    printf '%s\n' "$*" >> "$STUB_DIR/sidecar-launchctl-calls"
+    touch "$STUB_DIR/sidecar-kicked"
+    ;;
+esac
+STUB
+  chmod +x "$TMP/bin/launchctl"
+  updater_rebuilt || true
+  if grep -q "sidecars/$sidecar" "$TMP/sidecar-build-calls" 2>/dev/null &&
+      grep -q "kickstart -k gui/.*/com.nolanmak.augmentagent.$label" "$TMP/sidecar-launchctl-calls" 2>/dev/null; then
+    ok "rebuilds and restarts installed macOS $sidecar after source update"
+  else
+    bad "rebuilds and restarts installed macOS $sidecar after source update" "missing setup or launchctl kickstart"
+  fi
+  rm -rf "$TMP"
+done
+make_case sidecars/fetch/src/index.ts
+cat > "$TMP/bin/systemctl" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_DIR/service-calls"
+case "$*" in
+  *list-unit-files*) echo 'augmentagent-fetch.service enabled enabled' ;;
+  *show*) [ -s "$STUB_DIR/fetch-pid" ] || echo 100 > "$STUB_DIR/fetch-pid"; cat "$STUB_DIR/fetch-pid" ;;
+  *restart*) echo 101 > "$STUB_DIR/fetch-pid" ;;
+  *is-active*|*cat*) exit 0 ;;
+esac
+STUB
+chmod +x "$TMP/bin/systemctl"
+cat > "$TMP/work/sidecars/fetch/setup.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "$PWD" >> "$STUB_DIR/sidecar-build-calls"
+exit 0
+STUB
+chmod +x "$TMP/work/sidecars/fetch/setup.sh"
+updater_rebuilt || true
+if grep -q 'sidecars/fetch' "$TMP/sidecar-build-calls" 2>/dev/null &&
+    grep -q 'restart augmentagent-fetch.service' "$TMP/service-calls" 2>/dev/null; then
+  ok "rebuilds and restarts an installed Linux fetch sidecar"
+else
+  bad "rebuilds and restarts an installed Linux fetch sidecar" "build=$(cat "$TMP/sidecar-build-calls" 2>/dev/null); services=$(cat "$TMP/service-calls" 2>/dev/null | tail -n 4); update=$(tail -n 3 "$TMP/state/augmentagent/update.log" 2>/dev/null)"
+fi
+rm -rf "$TMP"
+make_case crates/augmentagent-cli/src/installers.rs
+printf '#!/usr/bin/env bash\necho Darwin\n' > "$TMP/bin/uname"
+chmod +x "$TMP/bin/uname"
+mkdir -p "$TMP/Library/LaunchAgents" "$TMP/work/sidecars/browser" "$TMP/work/target/release"
+touch "$TMP/Library/LaunchAgents/com.nolanmak.augmentagent.browser-sidecar.plist"
+cat > "$TMP/work/sidecars/browser/setup.sh" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+cat > "$TMP/work/target/release/augmentagent" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_DIR/browser-install-calls"
+exit 0
+STUB
+cat > "$TMP/bin/launchctl" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+  print)
+    pid=100
+    [ -f "$STUB_DIR/browser-kicked" ] && pid=101
+    printf '\tstate = running\n\tpid = %s\n' "$pid"
+    ;;
+  kickstart) touch "$STUB_DIR/browser-kicked" ;;
+esac
+STUB
+chmod +x "$TMP/work/sidecars/browser/setup.sh" "$TMP/work/target/release/augmentagent" "$TMP/bin/launchctl"
+updater_rebuilt || true
+if grep -q '^install browser-sidecar$' "$TMP/browser-install-calls" 2>/dev/null; then
+  ok "refreshes installed macOS browser plists when the installer changes"
+else
+  bad "refreshes installed macOS browser plists when the installer changes" "old socket path would remain loaded"
+fi
+rm -rf "$TMP"
+make_case sidecars/fetch/src/index.ts
+printf '#!/usr/bin/env bash\necho Darwin\n' > "$TMP/bin/uname"
+chmod +x "$TMP/bin/uname"
+cat > "$TMP/work/sidecars/fetch/setup.sh" <<'STUB'
+#!/usr/bin/env bash
+echo called >> "$STUB_DIR/sidecar-build-calls"
+STUB
+chmod +x "$TMP/work/sidecars/fetch/setup.sh"
+updater_rebuilt || true
+if [ ! -e "$TMP/sidecar-build-calls" ]; then
+  ok "does not rebuild an uninstalled macOS fetch sidecar"
+else
+  bad "does not rebuild an uninstalled macOS fetch sidecar" "optional setup ran without an installed plist"
+fi
+rm -rf "$TMP"
+make_case sidecars/fetch/src/index.ts
+printf '#!/usr/bin/env bash\necho Darwin\n' > "$TMP/bin/uname"
+chmod +x "$TMP/bin/uname"
+mkdir -p "$TMP/Library/LaunchAgents"
+touch "$TMP/Library/LaunchAgents/com.nolanmak.augmentagent.fetch.plist"
+cat > "$TMP/work/sidecars/fetch/setup.sh" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+chmod +x "$TMP/work/sidecars/fetch/setup.sh"
+updater_rebuilt || true
+if [ ! -e "$TMP/state/augmentagent/built-commit" ]; then
+  ok "withholds build stamp when an installed sidecar dependency fails"
+else
+  bad "withholds build stamp when an installed sidecar dependency fails" "a failed setup was marked deployed"
+fi
+rm -rf "$TMP"
+make_case sidecars/computer-use/server.mjs
+printf '#!/usr/bin/env bash\necho Darwin\n' > "$TMP/bin/uname"
+chmod +x "$TMP/bin/uname"
+mkdir -p "$TMP/Library/LaunchAgents"
+touch "$TMP/Library/LaunchAgents/com.nolanmak.augmentagent.computer-use.plist"
+cat > "$TMP/bin/launchctl" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+  print)
+    pid=100
+    [ -f "$STUB_DIR/computer-kicked" ] && pid=101
+    printf '\tstate = running\n\tpid = %s\n' "$pid"
+    ;;
+  kickstart)
+    printf '%s\n' "$*" >> "$STUB_DIR/computer-launchctl-calls"
+    touch "$STUB_DIR/computer-kicked"
+    ;;
+esac
+STUB
+chmod +x "$TMP/bin/launchctl"
+updater_rebuilt || true
+if grep -q 'sidecars/computer-use ci' "$TMP/npm-calls" 2>/dev/null &&
+    grep -q 'kickstart -k gui/.*/com.nolanmak.augmentagent.computer-use' "$TMP/computer-launchctl-calls" 2>/dev/null; then
+  ok "restarts an installed macOS computer-use worker after dependency update"
+else
+  bad "restarts an installed macOS computer-use worker after dependency update" "missing npm ci or launchctl kickstart"
+fi
+rm -rf "$TMP"
+make_case sidecars/computer-use/server.mjs
+printf '#!/usr/bin/env bash\necho Darwin\n' > "$TMP/bin/uname"
+chmod +x "$TMP/bin/uname"
+updater_rebuilt || true
+if ! grep -q 'sidecars/computer-use ci' "$TMP/npm-calls" 2>/dev/null; then
+  ok "does not deploy an uninstalled macOS computer-use worker"
+else
+  bad "does not deploy an uninstalled macOS computer-use worker" "npm ci ran without a launchd plist"
+fi
+rm -rf "$TMP"
 echo "include drift guard:"
-mapfile -t EMBEDS < <(
+EMBEDS=()
+while IFS= read -r embedded; do EMBEDS+=("$embedded"); done < <(
   cd "$REPO_ROOT" && grep -rnoE 'include_(str|bytes)!\("[^"]*"\)' crates/ \
     | while IFS=: read -r file _line match; do
         rel=$(printf '%s' "$match" | sed -E 's/^include_(str|bytes)!\("//; s/"\)$//')
-        realpath -m --relative-to=. "$(dirname "$file")/$rel"
+        python3 -c 'import os,sys; print(os.path.relpath(os.path.join(os.path.dirname(sys.argv[1]), sys.argv[2])))' "$file" "$rel"
       done | grep -v '^crates/' | sort -u
 )
 [ "${#EMBEDS[@]}" -gt 0 ] && ok "found ${#EMBEDS[@]} embedded files outside crates/" \

@@ -5,15 +5,18 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serenity::all::{ChannelId, GatewayIntents, MessageId, UserId};
+use serenity::all::{ChannelId, EditMessage, GatewayIntents, MessageId, UserId};
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
 use augmentagent_store::{Email, Store};
 
 use crate::event_handler::Handler;
-use crate::layout::{approval_message, flag_notice_message, scheduled_notice_message};
+use crate::layout::{
+    approval_edit_message, approval_message, flag_notice_message, scheduled_notice_message,
+};
 use crate::loops::LoopCommandParser;
+use crate::voice_bridge::VoiceBridge;
 use crate::{ApprovalActionHandler, ApprovalBroker, ApprovalError, JournalOps, QueryHandler};
 
 #[derive(Clone)]
@@ -46,6 +49,9 @@ pub struct DiscordConfig {
     /// Bridge into the cli's ShadowNote journaling flow (#428). `None`
     /// leaves `!journal` answering with a not-configured notice.
     pub journal_ops: Option<Arc<dyn JournalOps>>,
+    /// Private Unix socket for the Discord voice sidecar. Voice remains off
+    /// when this is unset.
+    pub voice_socket_path: Option<std::path::PathBuf>,
 }
 
 pub(crate) struct BrokerState {
@@ -64,6 +70,8 @@ pub(crate) struct BrokerState {
     pub(crate) wiki_root: Option<std::path::PathBuf>,
     /// ShadowNote journaling bridge for `!journal` (#428).
     pub(crate) journal_ops: Option<Arc<dyn JournalOps>>,
+    pub(crate) voice_bridge: Option<Arc<VoiceBridge>>,
+    pub(crate) voice_enabled: bool,
     /// Populated once, from the first `Ready` event. Used to distinguish the
     /// bot's own messages from the user's when building conversation context.
     pub(crate) bot_user_id: std::sync::OnceLock<UserId>,
@@ -81,6 +89,8 @@ impl BrokerState {
         loop_parser: Option<Arc<dyn LoopCommandParser>>,
         wiki_root: Option<std::path::PathBuf>,
         journal_ops: Option<Arc<dyn JournalOps>>,
+        voice_bridge: Option<Arc<VoiceBridge>>,
+        voice_enabled: bool,
     ) -> Self {
         Self {
             ready: Arc::new(Notify::new()),
@@ -94,6 +104,8 @@ impl BrokerState {
             loop_parser,
             wiki_root,
             journal_ops,
+            voice_bridge,
+            voice_enabled,
             bot_user_id: std::sync::OnceLock::new(),
         }
     }
@@ -115,6 +127,9 @@ impl BrokerState {
 pub struct DiscordApprovalBroker {
     http: Arc<serenity::http::Http>,
     channel_id: ChannelId,
+    /// #1289 — read when another surface decided an action, to redraw the
+    /// Discord card from the action's current state. `None`: no redraw.
+    store: Option<Arc<Store>>,
 }
 
 impl DiscordApprovalBroker {
@@ -123,6 +138,15 @@ impl DiscordApprovalBroker {
     /// issued.
     pub async fn start(config: DiscordConfig) -> Result<Self, ApprovalError> {
         let approval_channel = ChannelId::new(config.channel_id);
+        let voice_bridge = if let Some(path) = &config.voice_socket_path {
+            match VoiceBridge::connect(path).await {
+                Ok(bridge) => Some(bridge),
+                Err(error) => {
+                    warn!("Discord voice sidecar unavailable: {error}");
+                    None
+                }
+            }
+        } else { None };
         let state = Arc::new(BrokerState::new(
             approval_channel,
             config.query_channel_id.map(ChannelId::new),
@@ -133,6 +157,8 @@ impl DiscordApprovalBroker {
             config.loop_parser.clone(),
             config.wiki_root.clone(),
             config.journal_ops.clone(),
+            voice_bridge,
+            config.voice_socket_path.is_some(),
         ));
 
         if state.allowed_user_id.is_none() {
@@ -148,6 +174,9 @@ impl DiscordApprovalBroker {
         if config.query_handler.is_some() {
             intents |= GatewayIntents::MESSAGE_CONTENT | GatewayIntents::DIRECT_MESSAGES;
         }
+        if config.voice_socket_path.is_some() {
+            intents |= GatewayIntents::GUILD_VOICE_STATES;
+        }
 
         let handler = Handler {
             state: Arc::clone(&state),
@@ -158,6 +187,12 @@ impl DiscordApprovalBroker {
             .await?;
 
         let http = Arc::clone(&client.http);
+        if let (Some(bridge), Some(query)) = (&state.voice_bridge, &config.query_handler) {
+            bridge.set_turn_handler(Arc::clone(query), Arc::clone(&http)).await;
+            let tools = crate::voice_tool::VoiceToolService::start(bridge).await
+                .map_err(|error| ApprovalError::Discord(format!("voice tool socket: {error}")))?;
+            query.attach_voice_tools(tools);
+        }
 
         tokio::spawn(async move {
             if let Err(e) = client.start().await {
@@ -179,6 +214,7 @@ impl DiscordApprovalBroker {
         Ok(Self {
             http,
             channel_id: approval_channel,
+            store: config.store.clone(),
         })
     }
 }
@@ -269,5 +305,56 @@ impl ApprovalBroker for DiscordApprovalBroker {
             .delete_message(&*self.http, MessageId::new(message_id))
             .await
             .map_err(|e| ApprovalError::Discord(e.to_string()))
+    }
+}
+
+/// #1289 — a decision taken on another surface (Slack) redraws the Discord
+/// card in place: a still-pending action (a revise elsewhere) gets the
+/// current draft; a decided one loses its buttons and says what happened,
+/// with the #1199 recovery pointer for a superseded draft. The card is found
+/// the same way the startup sweep finds it (its button IDs in the last 100
+/// channel messages), so no Discord message ID has to be stored. A card
+/// Discord itself resolved is already gone and is simply not found.
+#[async_trait]
+impl crate::sync::ApprovalCardSurface for DiscordApprovalBroker {
+    fn surface_name(&self) -> &'static str {
+        "discord"
+    }
+
+    async fn redraw_cards(&self, action_id: &str, origin: &str) {
+        let Some(store) = self.store.as_deref() else {
+            return;
+        };
+        let row = match store.get_action_with_email(action_id) {
+            Ok(Some(row)) => row,
+            Ok(None) => return,
+            Err(e) => {
+                warn!(action_id, "discord redraw: could not load the action: {e}");
+                return;
+            }
+        };
+        let status = row.action.status.as_str();
+        let edit =
+            match crate::outcome::card_status_line(status, row.action.error_message.as_deref()) {
+                None => {
+                    let count = store.redraft_count(action_id).unwrap_or(0);
+                    let draft = crate::append_envelope_markers(
+                        row.action.draft_body.clone().unwrap_or_default(),
+                        Some(store),
+                        action_id,
+                        &row.email.from,
+                        None,
+                    );
+                    approval_edit_message(action_id, &row.email, &draft, count)
+                }
+                Some(line) => EditMessage::new()
+                    .content(format!("{line} _(decided on {origin})_"))
+                    .components(vec![]),
+            };
+        match crate::edit_card_for_action(&self.http, self.channel_id, action_id, edit).await {
+            Ok(true) => info!(action_id, origin, "discord card redrawn"),
+            Ok(false) => {}
+            Err(e) => warn!(action_id, "discord redraw failed: {e:#}"),
+        }
     }
 }

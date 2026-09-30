@@ -1,0 +1,21 @@
+[Unit]
+Description=AugmentAgent layered fetch sidecar
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/AugmentAgent/sidecars/fetch
+Environment=NODE_ENV=production
+Environment=FETCH_SOCKET=%t/augmentagent/fetch.sock
+Environment=AUGMENTAGENT_FETCH_CREDENTIALS=%h/.config/augmentagent/fetch.env
+Environment=DOTENV_CONFIG_PATH=/dev/null
+ExecStartPre=/usr/bin/mkdir -p %t/augmentagent
+ExecStartPre=/usr/bin/chmod 700 %t/augmentagent
+ExecStart=/usr/bin/python3 %h/AugmentAgent/scripts/start-sidecar.py fetch %t/augmentagent/fetch.sock /usr/bin/node %h/AugmentAgent/sidecars/fetch/dist/index.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:%S/augmentagent/fetch.log
+StandardError=append:%S/augmentagent/fetch.log
+
+[Install]
+WantedBy=default.target

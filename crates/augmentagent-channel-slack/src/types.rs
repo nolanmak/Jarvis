@@ -71,6 +71,18 @@ pub struct SlackMessage {
     /// Slack marks app/bot messages with a bot_id.
     #[serde(default)]
     pub bot_id: Option<String>,
+    /// #1296 — present when the message was edited; `edited.ts` makes the
+    /// edit idempotent across the poll and live paths.
+    #[serde(default)]
+    pub edited: Option<SlackEdited>,
+}
+
+/// `message.edited` (`{"user": "U…", "ts": "…"}`).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SlackEdited {
+    #[serde(default)]
+    pub user: Option<String>,
+    pub ts: String,
 }
 
 impl SlackMessage {

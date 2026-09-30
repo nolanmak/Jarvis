@@ -49,11 +49,222 @@ jobs:
         run: cargo build --workspace --locked
       - name: Process walker + sidecar clients
         run: cargo test -p augmentagent-loops -p augmentagent-browser-client -p augmentagent-renderer-client
+      # #1226 / #1282 — the transport-neutral surface contracts and the Slack
+      # identity/capability mapping must hold on both hosts. #1285 — the
+      # durable inbox/outbox restart, reconcile and catch-up tests too, and
+      # their status/doctor visibility. #1286 — owner binding, rejection
+      # audit and Slack owner authorization/echo rejection.
+      - name: Surface contracts (shared + Slack)
+        run: |
+          cargo test -p augmentagent-store --test surface_refs --test surface_sessions --test surface_delivery --test surface_owner
+          cargo test -p augmentagent-channel-slack --test surface_contract --test owner_auth
+          cargo test -p augmentagent-cli --test status_delivery
+      # #1283 — the Slack Socket Mode transport must build and pass on both
+      # hosts (rustls WebSocket, heartbeat/sleep-wake recovery, Web API).
+      - name: Slack transport
+        run: >-
+          cargo test -p augmentagent-channel-slack --lib
+          --test transport_events --test transport_socket --test transport_web_api
+      # #1294 — outbound delivery: mrkdwn conversion and mention
+      # neutralisation, lossless splitting, multi-part outbox planning with
+      # restart/reconcile, file upload over a mock Slack, throttled progress
+      # (paused clock), and `slack deliver` end to end. No network.
+      - name: Slack outbound delivery
+        run: |
+          cargo test -p augmentagent-channel-slack --test delivery_format --test delivery_outbox --test delivery_progress --test transport_upload
+          cargo test -p augmentagent-cli --test slack_deliver_cli
+          cargo test -p augmentagent-cli --bin augmentagent -- slack_deliver::
+      # #1293 — owner-sent files: authenticated download from Slack file
+      # hosts only (redirects, size cap while streaming, timeout, cancel),
+      # the inbound pipeline (images, text, PDF/DOCX via fake converters,
+      # attachment-only messages, rejections, cleanup, case-colliding names),
+      # the shared attachment policy and bounded converter lookup, Discord's
+      # partition/prompt on the shared policy, and `slack files fetch` end to
+      # end against a mock Slack. No network.
+      - name: Slack inbound files
+        run: |
+          cargo test -p augmentagent-docs --lib inbound::
+          cargo test -p augmentagent-docs --test converter_bounds
+          cargo test -p augmentagent-channel-slack --test transport_download --test inbound_files
+          cargo test -p augmentagent-approval-discord --lib -- event_handler:: attachments::
+          cargo test -p augmentagent-cli --test slack_files_cli
+      # #1287 — the interactive Slack surface on its real dispatch path
+      # (Socket Mode over an in-memory WebSocket, durable inbox/outbox, owner
+      # gate, restart/shutdown/dry-run), the listener-health store, the serve
+      # wiring, and the built `serve` running Slack only against a local fake
+      # Slack, including Discord/WhatsApp failing beside it. No network.
+      - name: Slack interactive surface in serve
+        run: |
+          cargo test -p augmentagent-store --test surface_listener_health
+          cargo test -p augmentagent-channel-slack --test interactive_surface
+          cargo test -p augmentagent-cli --test slack_serve_cli
+          cargo test -p augmentagent-cli --bin augmentagent -- slack_serve::
+      # #1297 — Slack voice clips and spoken replies: clip detection,
+      # download + fake ffmpeg decode + scripted speech providers (credit
+      # fallback, failures, limits, cleanup), non-owner audio never reaching
+      # a provider through admit, spoken replies as audio + text mirror
+      # delivered once, and `slack voice transcribe|speak` end to end against
+      # a mock Slack. Synthetic audio, no network, no paid provider.
+      # In serve: owner clips as turns with the transcript shown, `voice
+      # on|off|status` persisted per conversation, spoken answers on the real
+      # dispatch path, and the Rust TTS adapter against a local HTTP mock.
+      - name: Slack voice clips and spoken replies
+        run: |
+          cargo test -p augmentagent-channel-slack --test voice_clips --test voice_replies
+          cargo test -p augmentagent-channel-slack --test voice_surface --test voice_tts_http
+          cargo test -p augmentagent-store --test surface_reply_modes
+          cargo test -p augmentagent-cli --test slack_voice_cli
+          cargo test -p augmentagent-cli --bin augmentagent -- slack_voice::
+      # #1288 — Slack owner turns through the shared harness: native session
+      # per conversation, claim before execution, queueing, cancel, restart
+      # recovery, owner files under the read-only scope-guard carve-out, and
+      # the shared session conformance scenario against Discord and Slack.
+      - name: Slack conversation harness
+        run: |
+          cargo test -p augmentagent-store --test surface_sessions
+          cargo test -p augmentagent-channel-core --test surface_turn
+          cargo test -p augmentagent-channel-core --lib -- codex_tools::tests::scope_guard_carve_outs_mirror_the_read_allowance_definition codex_tools::tests::scope_guard_and_definition_agree_on_slack_inbound_files codex_tools::tests::slack_inbound_dir_must_be_a_real_turn_directory codex_tools::tests::read_allowances_include_the_slack_turn_dir_only_when_named
+          cargo test -p augmentagent-channel-slack --test conversation_harness
+          cargo test -p augmentagent-cli --bin augmentagent -- surface_conformance_tests:: discord_voice_session_tests:: newsletter::
+      # The real scope-guard script, including the Slack inbound carve-out
+      # (#1288). Linux only: on macOS the script's older cases rely on GNU
+      # `readlink -m`, which BSD readlink lacks; the Slack carve-out itself
+      # is covered on both hosts by the codex_tools tests above, which run
+      # the same script.
+      - name: Wiki scope guard script (Linux)
+        if: runner.os == 'Linux'
+        run: bash scripts/tests/aa-wiki-scope-guard.test.sh
+      # #1289 — approvals on Slack: cards, clicks, modals, presets, text
+      # commands and recompose through the shared handler on the real
+      # dispatch path; card pointers; cross-surface redraw with one send
+      # across Slack and Discord; Slack contact replies claimed before
+      # sending; and the built Slack-only `serve` carding and sending once.
+      - name: Slack approvals
+        run: |
+          cargo test -p augmentagent-store --test surface_approval_cards
+          cargo test -p augmentagent-approval-discord --lib -- sync:: outcome::
+          cargo test -p augmentagent-channel-slack --test approval_surface
+          cargo test -p augmentagent-cli --bin augmentagent -- slack_approval_tests:: approval_routing::
+      # #1290 — Slack contact replies and compose: thread targeting, sending
+      # as the owner through the Composio user connection (never the bot),
+      # the per-action send ledger (retry without duplication), compose
+      # through the wiki identity layer (ambiguous asks, unknown refuses),
+      # and nothing from the owner's conversation reaching a contact.
+      - name: Slack contact sends
+        run: |
+          cargo test -p augmentagent-store --test slack_contact_sends
+          cargo test -p augmentagent-channel-slack --test contact_send --test contact_surface --test contact_separation --test surface_contract
+          cargo test -p augmentagent-channel-slack --lib -- api:: channel:: contact::
+          cargo test -p augmentagent-approval-discord --lib -- sync::
+      # #1291 — scheduled sends on Slack: schedule/confirm/reschedule/send
+      # now/back to queue/cancel on cards and as text commands, the resolved
+      # time with its zone (compiled-in tz rules, so both hosts agree), DST
+      # gap and overlap, the notice redrawn in place and across surfaces, and
+      # the shared scheduler with a fake clock: fires once (also across
+      # restart), missed-schedule window, Slack sends through the contact
+      # ledger. No network, no wall-clock waits.
+      - name: Slack scheduled sends
+        run: |
+          cargo test -p augmentagent-approval-discord --lib -- timeparse:: sync:: outcome::
+          cargo test -p augmentagent-store --lib -- reschedule_moves_only_an_armed_schedule
+          cargo test -p augmentagent-channel-email --lib -- scheduled::
+          cargo test -p augmentagent-channel-slack --test approval_scheduling --test contact_send
+          cargo test -p augmentagent-cli --bin augmentagent -- slack_schedule_tests::
+      # #1296 — subscribed Slack conversations: one record and one triage
+      # whichever path (live event, Composio poll, catch-up) sees a message
+      # first; edits/deletes once; thread replies attach to their parent;
+      # renames keep IDs; an existing Slack DB migrates with IDs and cursors
+      # unchanged; bounded catch-up after a fake-clock suspension;
+      # subscription management by name/person/ID (library, Slack command
+      # hook and the real CLI against a mock Composio); harness history;
+      # search by person and channel. Temporary stores, no network.
+      - name: Slack subscriptions, reconciliation and search
+        run: |
+          cargo test -p augmentagent-store --lib -- slack_ingest::
+          cargo test -p augmentagent-messages --lib -- handles:: extract::
+          cargo test -p augmentagent-channel-slack --test ingest_reconcile --test ingest_migration --test ingest_catch_up
+          cargo test -p augmentagent-channel-slack --test subscriptions_manage --test conversation_history --test search_identity
+          cargo test -p augmentagent-channel-slack --test interactive_surface --test app_manifest
+          cargo test -p augmentagent-cli --test slack_subscriptions_cli
+      # #1284 — Slack app install/verify/rotate/remove: manifest contract,
+      # credential lifecycle (in-memory store) and the real CLI against a
+      # mock Slack with the file credential store. No Keychain, no network.
+      # #1286 — owner bind/show/unbind and control channel selection.
+      - name: Slack app credentials and CLI
+        run: |
+          cargo test -p augmentagent-auth
+          cargo test -p augmentagent-channel-slack --test app_manifest --test app_install --test owner_setup
+          cargo test -p augmentagent-cli --test slack_app_cli
+      # #1325 — credentials persist on Linux. The owner-only file store
+      # (0700/0600, atomic writes, corrupt slots, redaction, one-way
+      # read-through from the legacy keyring, a second process reading what
+      # the first wrote) on both hosts; on Linux, the same through the
+      # default store for the auth crate alone and for the real binary with
+      # the workspace's keyring features (`slack app install` in one
+      # process, `slack app status`/`status`/`doctor` in the next). No D-Bus
+      # session, no keyring, no network; the macOS CLI test is ignored there.
+      - name: Credential persistence (#1325)
+        run: |
+          cargo test -p augmentagent-auth --test private_file_store --test linux_default_store --test backend_description --test credential_store
+          cargo test -p augmentagent-cli --test linux_credential_persistence
+      # #1299 — Slack operations: status/doctor setup steps, credential
+      # backend and plaintext-store flags, the daemon's start report
+      # (Discord broker off), reconnect count, a log scan for synthetic
+      # tokens and message bodies, upgrade/rollback of a pre-#1299 state,
+      # and every runbook command parsed by the real CLI. No network, no
+      # Keychain (the auth crate's backend test runs in the step above).
+      - name: Slack operations, upgrade and runbook
+        run: |
+          cargo test -p augmentagent-store --test daemon_runtime_report
+          cargo test -p augmentagent-channel-slack --test upgrade_state
+          cargo test -p augmentagent-cli --test slack_ops_cli --test runbook_commands --test status_schema
+      # #1292 — Discord's owner commands on Slack: the shared registry
+      # against Discord's dispatcher (every command mapped or a named
+      # blocker), parse/authorize/execute/persist/reply per command, the
+      # private command lane, reset (new native session), cancel all,
+      # per-conversation model selection across restart, loop delivery to a
+      # Slack destination on a paused clock, and the process walker.
+      - name: Slack owner commands
+        run: |
+          cargo test -p augmentagent-store --test surface_commands
+          cargo test -p augmentagent-channel-core --lib -- model_selection::
+          cargo test -p augmentagent-approval-discord --test owner_command_registry
+          cargo test -p augmentagent-channel-slack --test owner_commands --test owner_commands_surface --test surface_contract
+          cargo test -p augmentagent-cli --bin augmentagent -- slack_serve::
+      # #1295 — proactive notifications on Slack: the producer registry
+      # (every posting site registered), per-class Discord/Slack routing,
+      # Slack-only, one surface failing, and the outbox's dedupe, pacing and
+      # late marking after a suspension on a fake clock.
+      - name: Slack notifications
+        run: |
+          cargo test -p augmentagent-store --test surface_delivery
+          cargo test -p augmentagent-channel-slack --test notifications
+          cargo test -p augmentagent-cli --bin augmentagent -- notify_tests::
+      # #1300 — the Slack parity gate. The executable matrix
+      # (docs/slack-parity-matrix.json) must pass its check against this
+      # tree and the Slack capability tables; then every named test it
+      # lists (each epic row, and the shared scenarios run for Slack,
+      # Discord and WhatsApp) plus the Discord and WhatsApp regression
+      # suites run from that one list, on both hosts. No network.
+      - name: Slack parity gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=target/debug/augmentagent
+          cargo test -p augmentagent-channel-slack --test parity_matrix
+          cargo test -p augmentagent-cli --test slack_parity_cli
+          "$bin" slack parity report
+          "$bin" slack parity commands > "$RUNNER_TEMP/slack-parity.sh"
+          while IFS= read -r cmd; do
+            echo "::group::$cmd"
+            eval "$cmd" < /dev/null
+            echo "::endgroup::"
+          done < "$RUNNER_TEMP/slack-parity.sh"
       - name: Host-dependent CLI surface
         run: >-
           cargo test -p augmentagent-cli --bin augmentagent --
           platform:: service:: logs:: status:: installers:: handoff_prune::
-          doctor:: autopr_eval:: autopr_health::
+          doctor:: autopr_eval:: autopr_health:: slack_app::
       - name: CLI smoke on this host
         shell: bash
         run: |
@@ -68,6 +279,10 @@ jobs:
             "$bin" service --unit daemon status
             "$bin" service --unit daemon --json status
           fi
+      - name: macOS parity inventory guard
+        run: python3 -m unittest scripts.tests.macos_parity_inventory_test -v
+      - name: Sidecar installer and socket ownership contracts
+        run: python3 -m unittest scripts.tests.sidecar_launchd_test scripts.tests.sidecar_socket_owner_test -v
       - name: Updater + installer shell suites
         shell: bash
         run: |
@@ -77,3 +292,21 @@ jobs:
             bash "scripts/tests/$t.test.sh"
             echo "::endgroup::"
           done
+          bash scripts/tests/updater-rebuild-trigger.test.sh
+      - name: Launchd installer contract tests
+        run: python3 -m unittest scripts.tests.launchd_installers_test scripts.tests.scheduled_sync_installers_test -v
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Fetch sidecar protocol and synthetic page
+        working-directory: sidecars/fetch
+        run: |
+          npm ci
+          npm test
+      - name: Renderer synthetic media artifact
+        working-directory: sidecars/renderer
+        run: |
+          npm ci
+          node --input-type=module -e "import('@remotion/renderer').then(m => m.ensureBrowser())"
+          cd ../..
+          python3 -m unittest sidecars.renderer.test_smoke -v

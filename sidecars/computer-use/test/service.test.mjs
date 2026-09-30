@@ -8,7 +8,7 @@ import { rpc } from "../rpc.mjs";
 test("service rejects forged callers, preserves owner scope and keeps state private", async (t) => {
   const dir = await mkdtemp(join(tmpdir(), "computer-service-"));
   const socket = join(dir, "worker.sock");
-  const child = spawn(process.execPath, ["server.mjs"], {
+  const child = spawn("bash", ["start.sh"], {
     env: {
       ...process.env,
       JARVIS_COMPUTER_STATE: dir,

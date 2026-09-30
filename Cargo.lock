@@ -291,6 +291,7 @@ dependencies = [
  "chrono-tz",
  "cron",
  "dashmap 6.1.0",
+ "iana-time-zone",
  "libc",
  "reqwest",
  "serde",
@@ -299,8 +300,10 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -308,6 +311,7 @@ name = "augmentagent-auth"
 version = "0.1.0"
 dependencies = [
  "keyring",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -322,6 +326,7 @@ dependencies = [
  "augmentagent-store",
  "base64 0.22.1",
  "dashmap 6.1.0",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
@@ -590,6 +595,8 @@ name = "augmentagent-channel-imessage"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "augmentagent-approval-discord",
  "augmentagent-channel-core",
  "augmentagent-store",
  "augmentagent-wiki",
@@ -796,8 +803,16 @@ dependencies = [
  "augmentagent-auth",
  "augmentagent-channel-core",
  "augmentagent-channel-discord-dm",
+ "augmentagent-channel-voice",
+ "augmentagent-docs",
+ "augmentagent-loops",
+ "augmentagent-messages",
  "augmentagent-store",
  "augmentagent-wiki",
+ "chrono",
+ "chrono-tz",
+ "futures",
+ "libc",
  "mockito",
  "reqwest",
  "rusqlite",
@@ -806,6 +821,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "tracing",
  "uuid",
@@ -918,6 +934,8 @@ dependencies = [
  "augmentagent-channel-core",
  "augmentagent-store",
  "augmentagent-wiki",
+ "futures",
+ "libc",
  "mockito",
  "reqwest",
  "rusqlite",
@@ -986,6 +1004,7 @@ dependencies = [
  "augmentagent-docs",
  "augmentagent-embeddings",
  "augmentagent-finance",
+ "augmentagent-heartbeat",
  "augmentagent-loops",
  "augmentagent-messages",
  "augmentagent-proactive",
@@ -996,7 +1015,9 @@ dependencies = [
  "chrono-tz",
  "clap",
  "cron",
+ "dashmap 6.1.0",
  "dotenvy",
+ "futures",
  "insta",
  "libc",
  "mockito",
@@ -1009,6 +1030,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
@@ -1093,6 +1115,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "augmentagent-heartbeat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-approval-discord",
+ "augmentagent-channel-core",
+ "augmentagent-store",
+ "chrono",
+ "chrono-tz",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "augmentagent-loops"
 version = "0.1.0"
 dependencies = [
@@ -1162,6 +1204,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dashmap 6.1.0",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

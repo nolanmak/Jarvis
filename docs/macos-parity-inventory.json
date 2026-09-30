@@ -1,0 +1,3470 @@
+[
+  {
+    "id": "channel:apple-notes",
+    "source": "crates/augmentagent-channel-apple-notes/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-apple-notes with its configured integrations.",
+    "macos_target": "Mac builds and runs apple-notes with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "apple-notes integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-apple-notes on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:calendar",
+    "source": "crates/augmentagent-channel-calendar/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-calendar with its configured integrations.",
+    "macos_target": "Mac builds and runs calendar with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "calendar integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-calendar on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:calendly",
+    "source": "crates/augmentagent-channel-calendly/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-calendly with its configured integrations.",
+    "macos_target": "Mac builds and runs calendly with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "calendly integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-calendly on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:contacts",
+    "source": "crates/augmentagent-channel-contacts/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-contacts with its configured integrations.",
+    "macos_target": "Mac builds and runs contacts with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "contacts integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-contacts on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:deft",
+    "source": "crates/augmentagent-channel-deft/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-deft with its configured integrations.",
+    "macos_target": "Mac builds and runs deft with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "deft integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-deft on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:discord-dm",
+    "source": "crates/augmentagent-channel-discord-dm/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-discord-dm with its configured integrations.",
+    "macos_target": "Mac builds and runs discord-dm with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "discord-dm integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-discord-dm on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:email",
+    "source": "crates/augmentagent-channel-email/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-email with its configured integrations.",
+    "macos_target": "Mac builds and runs email with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "email integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-email on Linux and macOS; add a synthetic channel contract and controlled real-host check. Scheduled-send engine (#1291): cargo test -p augmentagent-channel-email --lib -- scheduled:: on both hosts (fake clock: missed-schedule window within/beyond, window off, restart between schedule and fire sends once, non-Gmail rows through their platform sender, card redraws); a real Mac sleeping through a fire time is still unverified.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:fotw",
+    "source": "crates/augmentagent-channel-fotw/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-fotw with its configured integrations.",
+    "macos_target": "Mac builds and runs fotw with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "fotw integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-fotw on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:gdrive",
+    "source": "crates/augmentagent-channel-gdrive/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-gdrive with its configured integrations.",
+    "macos_target": "Mac builds and runs gdrive with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "gdrive integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-gdrive on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:github",
+    "source": "crates/augmentagent-channel-github/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-github with its configured integrations.",
+    "macos_target": "Mac builds and runs github with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "github integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-github on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:imessage",
+    "source": "crates/augmentagent-channel-imessage/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-imessage with its configured integrations.",
+    "macos_target": "Mac builds and runs imessage with matching ingest, reply cards, outbox sends, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "imessage integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1309",
+    "test_plan": "cargo test -p augmentagent-channel-imessage on macOS and Linux; augmentagent imessage poll-once against a real bundle on macOS; send acceptance D1/D2 in #1309.",
+    "status": "verified",
+    "evidence": {
+      "commit": "57b1a8414545476db61b54f1c51dc776a70c5035",
+      "macos_version": "macOS 26.4 (25E246)",
+      "architecture": "arm64",
+      "test_command": "cargo test -p augmentagent-channel-imessage (54 passed); augmentagent imessage poll-once (735 conversations, 68811 messages ingested)",
+      "result": "pass",
+      "artifact": "https://github.com/nolanmak/Jarvis/issues/1309"
+    }
+  },
+  {
+    "id": "channel:instagram",
+    "source": "crates/augmentagent-channel-instagram/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-instagram with its configured integrations.",
+    "macos_target": "Mac builds and runs instagram with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "instagram integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-instagram on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:journal",
+    "source": "crates/augmentagent-channel-journal/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-journal with its configured integrations.",
+    "macos_target": "Mac builds and runs journal with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "journal integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-journal on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:linear",
+    "source": "crates/augmentagent-channel-linear/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-linear with its configured integrations.",
+    "macos_target": "Mac builds and runs linear with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "linear integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-linear on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:linkedin",
+    "source": "crates/augmentagent-channel-linkedin/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-linkedin with its configured integrations.",
+    "macos_target": "Mac builds and runs linkedin with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "linkedin integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-linkedin on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:luma",
+    "source": "crates/augmentagent-channel-luma/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-luma with its configured integrations.",
+    "macos_target": "Mac builds and runs luma with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "luma integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-luma on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:meetup",
+    "source": "crates/augmentagent-channel-meetup/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-meetup with its configured integrations.",
+    "macos_target": "Mac builds and runs meetup with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "meetup integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-meetup on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:notion",
+    "source": "crates/augmentagent-channel-notion/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-notion with its configured integrations.",
+    "macos_target": "Mac builds and runs notion with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "notion integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-notion on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:partiful",
+    "source": "crates/augmentagent-channel-partiful/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-partiful with its configured integrations.",
+    "macos_target": "Mac builds and runs partiful with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "partiful integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-partiful on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:reddit",
+    "source": "crates/augmentagent-channel-reddit/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-reddit with its configured integrations.",
+    "macos_target": "Mac builds and runs reddit with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "reddit integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-reddit on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:slack",
+    "source": "crates/augmentagent-channel-slack/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-slack with its configured integrations.",
+    "macos_target": "Mac builds and runs slack with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "slack integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-slack on Linux and macOS; add a synthetic channel contract and controlled real-host check. Interactive surface (#1287): cargo test -p augmentagent-channel-slack --test interactive_surface on both hosts (durable ack-after-persist, owner gate, restart, shutdown, dry-run, live health); real-Mac sleep/wake under launchd is #1300. Conversation harness (#1288): cargo test -p augmentagent-channel-slack --test conversation_harness --test surface_contract, cargo test -p augmentagent-channel-core --test surface_turn and --lib codex_tools::, cargo test -p augmentagent-store --test surface_sessions, on both hosts, plus bash scripts/tests/aa-wiki-scope-guard.test.sh on Linux (BSD readlink lacks -m for its older cases) (native session per thread, claim before execution, queue, cancel, restart recovery, owner files under the read-only scope-guard carve-out); a real provider session on a real Mac is still unverified. Approvals (#1289): cargo test -p augmentagent-channel-slack --test approval_surface --test surface_contract, cargo test -p augmentagent-store --test surface_approval_cards and cargo test -p augmentagent-approval-discord --lib -- sync:: outcome:: on both hosts (cards in the owner DM, approve/skip/revise modal/preset/missing info/recompose/supersede, in-place chat.update, one send across Slack and Discord, non-owner click, restart, late click after a suspended clock); a real workspace (trigger_id window, Block Kit limits, chat.update in the app DM) and a real Mac waking from sleep are still unverified. Contact sends (#1290): cargo test -p augmentagent-channel-slack --test contact_send --test contact_surface --test surface_contract --lib -- api:: channel:: contact:: and cargo test -p augmentagent-store --test slack_contact_sends on both hosts (approved replies to DM, group DM and channel land in the right thread as the owner through the Composio user connection with as_user, never the app bot; compose resolves people through the wiki identity layer, prompts on ambiguity, fails closed on unknown; one send across double approval, refused sends and lost responses via the per-action send ledger; @channel/@here neutralised); how a real workspace attributes an as_user post, and the DM opened by posting to a user id, are still unverified (#1300). Scheduled sends (#1291): cargo test -p augmentagent-channel-slack --test approval_scheduling --test contact_send, cargo test -p augmentagent-approval-discord --lib -- timeparse:: sync:: outcome::, cargo test -p augmentagent-channel-email --lib -- scheduled:: and cargo test -p augmentagent-cli --bin augmentagent -- slack_schedule_tests:: on both hosts (fake clock: schedule modal and text commands show the resolved time with its IANA zone from the compiled-in chrono-tz database before confirmation, am/pm prompt, past/too-soon refusal, DST gap and overlap; the card becomes the scheduled notice in place and follows sent/cancelled/back in queue/rescheduled from Slack, Discord and the scheduler; the shared scheduler fires the Slack send once with the Approve claim, ledger and owner identity, across restart; missed-schedule window returns a send found too late to the queue and tells the owner); a real Mac actually sleeping through a fire time under launchd, and a real workspace, are still unverified (#1300). Subscriptions and live/poll reconciliation (#1296): cargo test -p augmentagent-channel-slack --test ingest_reconcile --test ingest_migration --test ingest_catch_up --test subscriptions_manage --test conversation_history --test search_identity, cargo test -p augmentagent-store --lib -- slack_ingest:: and cargo test -p augmentagent-messages --lib -- handles:: extract:: on both hosts (temporary stores, counting reasoner, fake clock: one record and one triage whichever of live event, Composio poll or catch-up sees a message first; edits and deletes once; thread replies attach to the parent; renames keep IDs; an existing Slack database keeps IDs and cursors; bounded, rate-limit-aware catch-up after a fake-clock suspension; people/channel identity in search); catch-up after a real Mac sleeps under launchd, real Socket Mode delivery of channel messages and renames, and a real workspace's history ordering are still unverified (#1300). Proactive notifications (#1295): cargo test -p augmentagent-channel-slack --test notifications on both hosts (owner DM/control channel via the outbox, dedupe, pacing, late marking and re-pacing after a suspension on a fake clock); delivery after a real Mac sleep under launchd still needs a real-Mac check (#1300). Parity gate (#1300): cargo test -p augmentagent-channel-slack --test parity_matrix --test surface_contract on both hosts, and the platform workflow's Slack parity gate step runs every named test in docs/slack-parity-matrix.json plus the Discord and WhatsApp regression suites; every row's real-host evidence (Linux, macOS Apple Silicon, macOS Intel) is still pending.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:socialapi",
+    "source": "crates/augmentagent-channel-socialapi/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-socialapi with its configured integrations.",
+    "macos_target": "Mac builds and runs socialapi with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "socialapi integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-socialapi on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:telegram-bot",
+    "source": "crates/augmentagent-channel-telegram-bot/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-telegram-bot with its configured integrations.",
+    "macos_target": "Mac builds and runs telegram-bot with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "telegram-bot integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-telegram-bot on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:twitter",
+    "source": "crates/augmentagent-channel-twitter/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-twitter with its configured integrations.",
+    "macos_target": "Mac builds and runs twitter with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "twitter integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-twitter on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:voice",
+    "source": "crates/augmentagent-channel-voice/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-voice with its configured integrations.",
+    "macos_target": "Mac builds and runs voice with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "voice integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1255",
+    "test_plan": "Run cargo test -p augmentagent-channel-voice on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:whatsapp",
+    "source": "crates/augmentagent-channel-whatsapp/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-whatsapp with its configured integrations.",
+    "macos_target": "Mac builds and runs whatsapp with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "whatsapp integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-whatsapp on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "channel:whatsapp-history",
+    "source": "crates/augmentagent-channel-whatsapp-history/Cargo.toml",
+    "linux_baseline": "Linux builds and runs crates/augmentagent-channel-whatsapp-history with its configured integrations.",
+    "macos_target": "Mac builds and runs whatsapp-history with matching ingest, authorization and recovery.",
+    "prerequisites": [
+      "Rust CLI",
+      "whatsapp-history integration dependency when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run cargo test -p augmentagent-channel-whatsapp-history on Linux and macOS; add a synthetic channel contract and controlled real-host check.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:accounts-backfill-emails",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent accounts-backfill-emails; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent accounts-backfill-emails with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent accounts-backfill-emails --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:accounts-list",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent accounts-list; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent accounts-list with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent accounts-list --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:apple-notes",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent apple-notes; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent apple-notes with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent apple-notes --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:approvals",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent approvals; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent approvals with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent approvals --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:autopr",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent autopr; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent autopr with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent autopr --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:autopr-eval",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent autopr-eval; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent autopr-eval with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent autopr-eval --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:autopr-health",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent autopr-health; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent autopr-health with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent autopr-health --help on both hosts, then add a synthetic behavior/guard test for this command. #1295: --notify routes the alert to the Discord webhook and/or Slack (AUGMENTAGENT_NOTIFY_SURFACES_HEALTH); covered by notify_tests:: on both hosts.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:backfill-signatures",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent backfill-signatures; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent backfill-signatures with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent backfill-signatures --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:browser",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent browser; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent browser with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent browser --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:calendar",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent calendar; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent calendar with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent calendar --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:channel",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent channel; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent channel with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent channel --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:code-mode",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent code-mode; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent code-mode with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent code-mode --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:compose",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent compose; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent compose with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent compose --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:contacts",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent contacts; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent contacts with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent contacts --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:deft",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent deft; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent deft with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent deft --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:digest",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent digest; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent digest with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent digest --help on both hosts, then add a synthetic behavior/guard test for this command. #1295: --post true routes the digest to Discord and/or Slack (AUGMENTAGENT_NOTIFY_SURFACES); covered by notify_tests:: on both hosts.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:discord",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent discord; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent discord with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent discord --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:doc",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent doc; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent doc with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent doc --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:doctor",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent doctor; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent doctor with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Run augmentagent doctor --help on both hosts, then add a synthetic behavior/guard test for this command. Slack diagnostics (#1299: credential_backend, interactive.slack.credentials, config.<id>, --deep slack_app.scopes): cargo test -p augmentagent-cli --test slack_ops_cli --test runbook_commands and --bin augmentagent -- doctor:: on both hosts; real Keychain-from-launchd proof stays with #1246/#1300.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:drafts",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent drafts; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent drafts with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent drafts --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:embeddings",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent embeddings; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent embeddings with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent embeddings --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:engagement",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent engagement; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent engagement with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent engagement --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:env",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent env; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent env with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent env --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:finance",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent finance; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent finance with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent finance --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:gdrive",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent gdrive; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent gdrive with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent gdrive --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:github",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent github; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent github with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent github --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:gmail",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent gmail; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent gmail with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent gmail --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:handoff-prune",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent handoff-prune; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent handoff-prune with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent handoff-prune --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:heartbeat",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent heartbeat; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent heartbeat with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1317",
+    "test_plan": "Run augmentagent heartbeat --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:imessage",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent imessage; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent imessage (sync, poll-once, outbox, allowlists, approve/skip) with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1309",
+    "test_plan": "cargo test -p augmentagent-cli --test imessage_outbox_cli; real-host send acceptance with the agent on macOS (D1) and on Linux over SSH (D2) in #1309.",
+    "status": "verified",
+    "evidence": {
+      "commit": "57b1a8414545476db61b54f1c51dc776a70c5035",
+      "macos_version": "macOS 26.4 (25E246)",
+      "architecture": "arm64",
+      "test_command": "cargo test -p augmentagent-cli --test imessage_outbox_cli (13 passed); D1 acceptance AC-1..AC-6 via augmentagent imessage approve/outbox and scripts/imessage/send.py",
+      "result": "pass",
+      "artifact": "https://github.com/nolanmak/Jarvis/issues/1309"
+    }
+  },
+  {
+    "id": "cli:install",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent install; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent install with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1245",
+    "test_plan": "Run augmentagent install --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:journal",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent journal; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent journal with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent journal --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:linkedin",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent linkedin; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent linkedin with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent linkedin --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:logs",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent logs; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent logs with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1245",
+    "test_plan": "Run augmentagent logs --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:logs-prune",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent logs-prune; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent logs-prune with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent logs-prune --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:loop",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent loop; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent loop with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent loop --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:loops",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent loops; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent loops with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1252",
+    "test_plan": "Run augmentagent loops --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:meetup",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent meetup; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent meetup with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent meetup --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:messages",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent messages; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent messages with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent messages --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:model-tool",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent model-tool; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent model-tool with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent model-tool --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:newsletter",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent newsletter; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent newsletter with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent newsletter --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:person",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent person; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent person with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent person --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:poll-once",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent poll-once; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent poll-once with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent poll-once --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:proactive",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent proactive; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent proactive with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent proactive --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:ratelimit",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent ratelimit; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent ratelimit with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent ratelimit --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:reasoner-selftest",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent reasoner-selftest; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent reasoner-selftest with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent reasoner-selftest --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:reddit",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent reddit; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent reddit with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent reddit --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:render",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent render; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent render with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent render --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:repo-docs",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent repo-docs; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent repo-docs with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent repo-docs --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:repos",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent repos; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent repos with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent repos --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:research",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent research; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent research with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent research --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:resume",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent resume; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent resume with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent resume --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:schedule-post",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent schedule-post; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent schedule-post with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent schedule-post --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:self-improve",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent self-improve; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent self-improve with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1251",
+    "test_plan": "Run augmentagent self-improve --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:serve",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent serve; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent serve with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent serve --help on both hosts, then add a synthetic behavior/guard test for this command. Interactive Slack surface in serve (#1287): cargo test -p augmentagent-cli --test slack_serve_cli (the built serve, Slack only, against a local fake Web API and Socket Mode WebSocket; debug-build turn stub, no reasoner) and --bin augmentagent -- slack_serve:: on both hosts; serve under launchd with the tokens in the login Keychain still needs a real-Mac check (#1246, #1300). Conversation harness in serve (#1288): cargo test -p augmentagent-cli --test slack_serve_cli (sessions, DM thread, cancel, owner file over the built serve with the debug fake agent) and --bin augmentagent -- surface_conformance_tests:: discord_voice_session_tests:: on both hosts. Approvals on Slack in serve (#1289): cargo test -p augmentagent-cli --test slack_serve_cli (Slack-only serve posts a card for a pending Slack contact reply and an approve click sends it once through the real ReplyApprover against a mock Composio via the debug-only AUGMENTAGENT_TEST_COMPOSIO_BASE) and --bin augmentagent -- slack_approval_tests:: approval_routing:: on both hosts; Discord redraw of a Slack-decided card is covered only by the shared sync tests, not a live Discord. Contact sends in serve (#1290): cargo test -p augmentagent-cli --bin augmentagent -- slack_approval_tests:: (the real ReplyApprover sends a Slack reply once as the owner in its thread with as_user, records status_source slack/discord by deciding surface and a Slack self-send, retries a failed send once, refuses without a known owner account) and --test slack_serve_cli on both hosts. Notification routing (#1295): cargo test -p augmentagent-cli --bin augmentagent -- notify_tests:: on both hosts (producer registry completeness, per-class Discord/Slack routing, Slack-only, one surface failing).",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:service",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent service; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent service with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1245",
+    "test_plan": "Run augmentagent service --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:setup",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent setup; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent setup with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent setup --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:slack",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent slack; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent slack with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent slack --help on both hosts, then add a synthetic behavior/guard test for this command. Nested `slack app manifest|install|verify|status|rotate|remove` (#1284): cargo test -p augmentagent-cli --test slack_app_cli (mock Slack, file credential store) on both hosts; Keychain access from a launchd daemon still needs a real-Mac check (#1246). Nested `slack app owner bind|show|unbind` and `slack app owner control set|remove` (#1286): same test file plus cargo test -p augmentagent-channel-slack --test owner_setup --test owner_auth on both hosts; owner binding lives in the shared database, so no host-specific path or credential. Nested `slack deliver` (#1294): cargo test -p augmentagent-cli --test slack_deliver_cli (mock Slack, file credential store, temp DB, paths with spaces and Unicode) on both hosts; real-workspace delivery and a launchd-run daemon reading generated files are still unverified (#1300). Nested `slack files fetch` (#1293): cargo test -p augmentagent-cli --test slack_files_cli (mock Slack Web API and loopback file host via the test-only AUGMENTAGENT_SLACK_TEST_FILE_HOSTS, file credential store, temp state dir, fake pdftotext on PATH) plus cargo test -p augmentagent-channel-slack --test inbound_files --test transport_download and cargo test -p augmentagent-docs --test converter_bounds on both hosts; downloads from a real workspace, the files.slack.com host and redirect behaviour, and converter lookup under a real launchd PATH are still unverified (#1300). Nested `slack voice transcribe|speak` (#1297): cargo test -p augmentagent-cli --test slack_voice_cli (mock Slack Web API and loopback file host, file credential store, temp state dir and DB, fake ffmpeg on PATH, offline speech fakes via the debug-build-only AUGMENTAGENT_TEST_SLACK_SPEECH) plus cargo test -p augmentagent-channel-slack --test voice_clips --test voice_replies on both hosts; ffmpeg resolution under a real launchd/systemd PATH on Apple Silicon, Intel and Linux (#1255), real clips from a Slack workspace, inline playback of the uploaded WAV and any real STT/TTS provider are still unverified (#1300). Nested `slack compose --to --text [--team-id] [--dry-run]` (#1290): cargo test -p augmentagent-cli --bin augmentagent -- slack_approval_tests:: on both hosts (stores a pending approval with its destination and never sends; ambiguous and unknown recipients store nothing; dry run stores nothing); a real workspace is still unverified. Nested `slack subscribe <target> --mode`, `slack set-mode <target> --mode` and `slack unsubscribe <id|target>` (#1296): cargo test -p augmentagent-cli --test slack_subscriptions_cli (mock Composio via the debug-build-only AUGMENTAGENT_TEST_COMPOSIO_BASE, file credential store, temp DB and wiki with spaces and Unicode) on both hosts (channel by name, DM by person through the wiki, group DM by name, ID with --name, ambiguous and unknown targets exit 1 and change nothing); a real workspace's conversation list is still unverified. Nested `slack parity report [--json] [--matrix <file>] [--root <dir>]` and `slack parity commands` (#1300): cargo test -p augmentagent-cli --test slack_parity_cli plus cargo test -p augmentagent-channel-slack --test parity_matrix on both hosts (read-only; the checked-in matrix passes, a broken copy exits 1 naming its violation, commands prints the cargo lines the platform workflow runs); real-host acceptance is recorded per host in docs/slack-parity-matrix.json from the runbook script and is still pending on every host.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:socialapi",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent socialapi; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent socialapi with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent socialapi --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:status",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent status; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent status with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Run augmentagent status --help on both hosts, then add a synthetic behavior/guard test for this command. `interactive.slack` live listener health (#1287): cargo test -p augmentagent-cli --test slack_serve_cli --test status_schema and --bin augmentagent -- status:: doctor:: on both hosts. #1299 fields (interactive.slack app_installed/owner_bound/credentials/reconnects, credentials, daemon_report, config_issues): cargo test -p augmentagent-cli --test slack_ops_cli on both hosts.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:telegram-bot",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent telegram-bot; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent telegram-bot with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent telegram-bot --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:token-usage",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent token-usage; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent token-usage with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent token-usage --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:tone",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent tone; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent tone with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent tone --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:transcripts",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent transcripts; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent transcripts with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent transcripts --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:triage-prefilter",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent triage-prefilter; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent triage-prefilter with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent triage-prefilter --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:twitter",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent twitter; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent twitter with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent twitter --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:uninstall",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent uninstall; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent uninstall with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1245",
+    "test_plan": "Run augmentagent uninstall --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:voice",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent voice; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent voice with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent voice --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:voice-tool",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent voice-tool; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent voice-tool with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent voice-tool --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:whatsapp",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent whatsapp; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent whatsapp with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent whatsapp --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:whatsapp-history",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent whatsapp-history; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent whatsapp-history with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent whatsapp-history --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:wiki",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent wiki; record its command-specific effects and authorization.",
+    "macos_target": "Mac exposes augmentagent wiki with the same results, side effects and guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent wiki --help on both hosts, then add a synthetic behavior/guard test for this command.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "installer:install-autostart.sh",
+    "source": "scripts/install-autostart.sh",
+    "linux_baseline": "Linux install-autostart.sh installs or removes its matching component.",
+    "macos_target": "Mac install-autostart.sh installs or removes that component idempotently without changing unrelated services.",
+    "prerequisites": [
+      "feature-specific runtime",
+      "private test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1245",
+    "test_plan": "Run install-autostart.sh against stubbed systemd and launchd in a disposable home; check file, state and rollback.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "installer:install-autoupdate.sh",
+    "source": "scripts/install-autoupdate.sh",
+    "linux_baseline": "Linux install-autoupdate.sh installs or removes its matching component.",
+    "macos_target": "Mac install-autoupdate.sh installs or removes that component idempotently without changing unrelated services.",
+    "prerequisites": [
+      "feature-specific runtime",
+      "private test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1245",
+    "test_plan": "Run install-autoupdate.sh against stubbed systemd and launchd in a disposable home; check file, state and rollback.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "installer:install-calendar.sh",
+    "source": "scripts/install-calendar.sh",
+    "linux_baseline": "Linux install-calendar.sh installs or removes its matching component.",
+    "macos_target": "Mac install-calendar.sh installs or removes that component idempotently without changing unrelated services.",
+    "prerequisites": [
+      "feature-specific runtime",
+      "private test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1245",
+    "test_plan": "Run install-calendar.sh against stubbed systemd and launchd in a disposable home; check file, state and rollback.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "installer:install-computer-use.sh",
+    "source": "scripts/install-computer-use.sh",
+    "linux_baseline": "Linux installs the optional computer-use worker as a systemd user unit.",
+    "macos_target": "Mac installs the same worker as a private per-user LaunchAgent with configurable absolute paths.",
+    "prerequisites": [
+      "Node.js 22 or later",
+      "Python 3",
+      "signed-in launchd user session",
+      "shared Chrome bridge for research"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1249",
+    "test_plan": "Run computer-use-launchd.test.sh with a disposable home on both CI platforms, then verify install, restart, status and bridge readiness on a real Mac.",
+    "status": "in_progress",
+    "evidence": null
+  },
+  {
+    "id": "installer:install-dashboard.sh",
+    "source": "scripts/install-dashboard.sh",
+    "linux_baseline": "Linux install-dashboard.sh installs or removes its matching component.",
+    "macos_target": "Mac install-dashboard.sh installs or removes that component idempotently without changing unrelated services.",
+    "prerequisites": [
+      "feature-specific runtime",
+      "private test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1245",
+    "test_plan": "Run install-dashboard.sh against stubbed systemd and launchd in a disposable home; check file, state and rollback.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "installer:install-digest.sh",
+    "source": "scripts/install-digest.sh",
+    "linux_baseline": "Linux install-digest.sh installs or removes its matching component.",
+    "macos_target": "Mac install-digest.sh installs or removes that component idempotently without changing unrelated services.",
+    "prerequisites": [
+      "feature-specific runtime",
+      "private test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1245",
+    "test_plan": "Run install-digest.sh against stubbed systemd and launchd in a disposable home; check file, state and rollback.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "installer:install-finance-sync.sh",
+    "source": "scripts/install-finance-sync.sh",
+    "linux_baseline": "Linux finance sync uses the existing systemd user service/timer pair; this Mac-only script leaves it intact.",
+    "macos_target": "Mac install-finance-sync.sh manages only the opt-in finance LaunchAgent idempotently with private paths and observable status/logs.",
+    "prerequisites": [
+      "release CLI",
+      "private wiki",
+      "signed-in launchd user session",
+      "feature credentials when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1250",
+    "test_plan": "Run scheduled_sync_installers_test for install-finance-sync.sh in a disposable home, then verify two real Mac triggers and sleep/wake behavior.",
+    "status": "in_progress",
+    "evidence": null
+  },
+  {
+    "id": "installer:install-git-hooks.sh",
+    "source": "scripts/install-git-hooks.sh",
+    "linux_baseline": "Linux install-git-hooks.sh installs or removes its matching component.",
+    "macos_target": "Mac install-git-hooks.sh installs or removes that component idempotently without changing unrelated services.",
+    "prerequisites": [
+      "feature-specific runtime",
+      "private test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1245",
+    "test_plan": "Run install-git-hooks.sh against stubbed systemd and launchd in a disposable home; check file, state and rollback.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "installer:install-model-router.py",
+    "source": "scripts/install-model-router.py",
+    "linux_baseline": "Linux installs the pinned 9Router service and preserves its account data on reinstall.",
+    "macos_target": "Mac installs the same pinned router as a private LaunchAgent with loopback-only access and retained credentials.",
+    "prerequisites": [
+      "Node.js 22 or later",
+      "Python 3",
+      "pinned 9Router source and lockfile",
+      "signed-in launchd user session"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1257",
+    "test_plan": "Run model_router_install_test on native Mac and Linux with a synthetic pinned build, then verify real launchd health and account routing.",
+    "status": "in_progress",
+    "evidence": null
+  },
+  {
+    "id": "installer:install-research.sh",
+    "source": "scripts/install-research.sh",
+    "linux_baseline": "Linux install-research.sh installs or removes its matching component.",
+    "macos_target": "Mac install-research.sh installs or removes that component idempotently without changing unrelated services.",
+    "prerequisites": [
+      "feature-specific runtime",
+      "private test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1245",
+    "test_plan": "Run install-research.sh against stubbed systemd and launchd in a disposable home; check file, state and rollback.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "installer:install-runpod-adapter.py",
+    "source": "scripts/install-runpod-adapter.py",
+    "linux_baseline": "Linux can run the optional local Runpod adapter with private credentials, routes and durable journal.",
+    "macos_target": "Mac installs the same adapter as a loopback-only LaunchAgent with retained private journal and credentials.",
+    "prerequisites": [
+      "Python 3",
+      "private Runpod credentials and routes",
+      "signed-in launchd user session"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1257",
+    "test_plan": "Run runpod_adapter_install_test and native adapter configuration on Mac and Linux; then verify a controlled real route and restart.",
+    "status": "in_progress",
+    "evidence": null
+  },
+  {
+    "id": "installer:install-sidecar.py",
+    "source": "scripts/install-sidecar.py",
+    "linux_baseline": "Linux runs renderer and optional sidecars under user services.",
+    "macos_target": "Mac installs renderer, fetch and WhatsApp as private, restartable LaunchAgents.",
+    "prerequisites": [
+      "sidecar-specific pinned build",
+      "signed-in launchd user session",
+      "private socket and state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1256",
+    "test_plan": "Run sidecar_launchd_test on Mac and Linux, then verify real service health and restart on Mac.",
+    "status": "in_progress",
+    "evidence": null
+  },
+  {
+    "id": "installer:install-tenant.sh",
+    "source": "scripts/install-tenant.sh",
+    "linux_baseline": "Linux install-tenant.sh installs or removes its matching component.",
+    "macos_target": "Mac install-tenant.sh installs or removes that component idempotently without changing unrelated services.",
+    "prerequisites": [
+      "feature-specific runtime",
+      "private test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1254",
+    "test_plan": "Run install-tenant.sh against stubbed systemd and launchd in a disposable home; check file, state and rollback.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "installer:install-wiki-sync.sh",
+    "source": "scripts/install-wiki-sync.sh",
+    "linux_baseline": "Linux wiki sync uses the existing systemd user service/timer pair; this Mac-only script leaves it intact.",
+    "macos_target": "Mac install-wiki-sync.sh manages only the opt-in wiki LaunchAgent idempotently with private paths and observable status/logs.",
+    "prerequisites": [
+      "release CLI",
+      "private wiki",
+      "signed-in launchd user session",
+      "feature credentials when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1250",
+    "test_plan": "Run scheduled_sync_installers_test for install-wiki-sync.sh in a disposable home, then verify two real Mac triggers and sleep/wake behavior.",
+    "status": "in_progress",
+    "evidence": null
+  },
+  {
+    "id": "installer:install-wix-sync.sh",
+    "source": "scripts/install-wix-sync.sh",
+    "linux_baseline": "Linux install-wix-sync.sh installs or removes its matching component.",
+    "macos_target": "Mac install-wix-sync.sh installs or removes that component idempotently without changing unrelated services.",
+    "prerequisites": [
+      "feature-specific runtime",
+      "private test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1245",
+    "test_plan": "Run install-wix-sync.sh against stubbed systemd and launchd in a disposable home; check file, state and rollback.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "installer:uninstall-autostart.sh",
+    "source": "scripts/uninstall-autostart.sh",
+    "linux_baseline": "Linux uninstall-autostart.sh installs or removes its matching component.",
+    "macos_target": "Mac uninstall-autostart.sh installs or removes that component idempotently without changing unrelated services.",
+    "prerequisites": [
+      "feature-specific runtime",
+      "private test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1245",
+    "test_plan": "Run uninstall-autostart.sh against stubbed systemd and launchd in a disposable home; check file, state and rollback.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "installer:uninstall-autoupdate.sh",
+    "source": "scripts/uninstall-autoupdate.sh",
+    "linux_baseline": "Linux uninstall-autoupdate.sh installs or removes its matching component.",
+    "macos_target": "Mac uninstall-autoupdate.sh installs or removes that component idempotently without changing unrelated services.",
+    "prerequisites": [
+      "feature-specific runtime",
+      "private test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1245",
+    "test_plan": "Run uninstall-autoupdate.sh against stubbed systemd and launchd in a disposable home; check file, state and rollback.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "installer:uninstall-calendar.sh",
+    "source": "scripts/uninstall-calendar.sh",
+    "linux_baseline": "Linux uninstall-calendar.sh installs or removes its matching component.",
+    "macos_target": "Mac uninstall-calendar.sh installs or removes that component idempotently without changing unrelated services.",
+    "prerequisites": [
+      "feature-specific runtime",
+      "private test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1245",
+    "test_plan": "Run uninstall-calendar.sh against stubbed systemd and launchd in a disposable home; check file, state and rollback.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "installer:uninstall-computer-use.sh",
+    "source": "scripts/uninstall-computer-use.sh",
+    "linux_baseline": "Linux disables and unlinks the optional computer-use systemd unit.",
+    "macos_target": "Mac stops and removes only the computer-use LaunchAgent, keeping user task state.",
+    "prerequisites": [
+      "signed-in launchd user session",
+      "private test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1249",
+    "test_plan": "Run computer-use-launchd.test.sh for install, reinstall and uninstall in a disposable home, then check live launchctl state on a real Mac.",
+    "status": "in_progress",
+    "evidence": null
+  },
+  {
+    "id": "installer:uninstall-digest.sh",
+    "source": "scripts/uninstall-digest.sh",
+    "linux_baseline": "Linux uninstall-digest.sh installs or removes its matching component.",
+    "macos_target": "Mac uninstall-digest.sh installs or removes that component idempotently without changing unrelated services.",
+    "prerequisites": [
+      "feature-specific runtime",
+      "private test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1245",
+    "test_plan": "Run uninstall-digest.sh against stubbed systemd and launchd in a disposable home; check file, state and rollback.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "installer:uninstall-finance-sync.sh",
+    "source": "scripts/uninstall-finance-sync.sh",
+    "linux_baseline": "Linux finance sync uses the existing systemd user service/timer pair; this Mac-only script leaves it intact.",
+    "macos_target": "Mac uninstall-finance-sync.sh manages only the opt-in finance LaunchAgent idempotently with private paths and observable status/logs.",
+    "prerequisites": [
+      "release CLI",
+      "private wiki",
+      "signed-in launchd user session",
+      "feature credentials when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1250",
+    "test_plan": "Run scheduled_sync_installers_test for uninstall-finance-sync.sh in a disposable home, then verify two real Mac triggers and sleep/wake behavior.",
+    "status": "in_progress",
+    "evidence": null
+  },
+  {
+    "id": "installer:uninstall-model-router.sh",
+    "source": "scripts/uninstall-model-router.sh",
+    "linux_baseline": "Linux disables and removes the optional model-router user service without deleting accounts.",
+    "macos_target": "Mac stops and removes only the router LaunchAgent and retains private account and credential state.",
+    "prerequisites": [
+      "signed-in launchd user session",
+      "private test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1257",
+    "test_plan": "Run model-router-uninstall.test.sh on Mac and Linux and verify an installed service stops without modifying account data.",
+    "status": "in_progress",
+    "evidence": null
+  },
+  {
+    "id": "installer:uninstall-research.sh",
+    "source": "scripts/uninstall-research.sh",
+    "linux_baseline": "Linux uninstall-research.sh installs or removes its matching component.",
+    "macos_target": "Mac uninstall-research.sh installs or removes that component idempotently without changing unrelated services.",
+    "prerequisites": [
+      "feature-specific runtime",
+      "private test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1245",
+    "test_plan": "Run uninstall-research.sh against stubbed systemd and launchd in a disposable home; check file, state and rollback.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "installer:uninstall-runpod-adapter.sh",
+    "source": "scripts/uninstall-runpod-adapter.sh",
+    "linux_baseline": "Linux stops the optional adapter unit without deleting private job state.",
+    "macos_target": "Mac removes only the adapter LaunchAgent and retains routes, keys and job journal.",
+    "prerequisites": [
+      "signed-in launchd user session",
+      "private test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1257",
+    "test_plan": "Run runpod-adapter-uninstall.test.sh in a disposable home, then verify real launchctl state and journal retention.",
+    "status": "in_progress",
+    "evidence": null
+  },
+  {
+    "id": "installer:uninstall-sidecar.sh",
+    "source": "scripts/uninstall-sidecar.sh",
+    "linux_baseline": "Linux removes optional user sidecar jobs without deleting sessions.",
+    "macos_target": "Mac removes only the selected LaunchAgent and retains private sessions and state.",
+    "prerequisites": [
+      "signed-in launchd user session",
+      "private test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1256",
+    "test_plan": "Run sidecar_launchd_test in a disposable home on Mac and Linux, then verify real launchctl state.",
+    "status": "in_progress",
+    "evidence": null
+  },
+  {
+    "id": "installer:uninstall-tenant.sh",
+    "source": "scripts/uninstall-tenant.sh",
+    "linux_baseline": "Linux uninstall-tenant.sh installs or removes its matching component.",
+    "macos_target": "Mac uninstall-tenant.sh installs or removes that component idempotently without changing unrelated services.",
+    "prerequisites": [
+      "feature-specific runtime",
+      "private test home"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1254",
+    "test_plan": "Run uninstall-tenant.sh against stubbed systemd and launchd in a disposable home; check file, state and rollback.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "installer:uninstall-wiki-sync.sh",
+    "source": "scripts/uninstall-wiki-sync.sh",
+    "linux_baseline": "Linux wiki sync uses the existing systemd user service/timer pair; this Mac-only script leaves it intact.",
+    "macos_target": "Mac uninstall-wiki-sync.sh manages only the opt-in wiki LaunchAgent idempotently with private paths and observable status/logs.",
+    "prerequisites": [
+      "release CLI",
+      "private wiki",
+      "signed-in launchd user session",
+      "feature credentials when enabled"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1250",
+    "test_plan": "Run scheduled_sync_installers_test for uninstall-wiki-sync.sh in a disposable home, then verify two real Mac triggers and sleep/wake behavior.",
+    "status": "in_progress",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard-server:GET:/login",
+    "source": "src/dashboard-server.ts",
+    "linux_baseline": "Linux dashboard serves GET /login with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /login with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /login in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard-server:POST:/login",
+    "source": "src/dashboard-server.ts",
+    "linux_baseline": "Linux dashboard serves POST /login with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /login with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /login in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:DELETE:/api/oauth/gmail/:id",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves DELETE /api/oauth/gmail/:id with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves DELETE /api/oauth/gmail/:id with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise DELETE /api/oauth/gmail/:id in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:DELETE:/api/oauth/googledrive/:id",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves DELETE /api/oauth/googledrive/:id with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves DELETE /api/oauth/googledrive/:id with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise DELETE /api/oauth/googledrive/:id in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:DELETE:/api/repos/:owner/:name",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves DELETE /api/repos/:owner/:name with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves DELETE /api/repos/:owner/:name with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise DELETE /api/repos/:owner/:name in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:DELETE:/api/senders/:id",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves DELETE /api/senders/:id with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves DELETE /api/senders/:id with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise DELETE /api/senders/:id in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:DELETE:/api/slack/workspaces/:teamId",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves DELETE /api/slack/workspaces/:teamId with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves DELETE /api/slack/workspaces/:teamId with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise DELETE /api/slack/workspaces/:teamId in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:DELETE:/api/socialapi/accounts/:id",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves DELETE /api/socialapi/accounts/:id with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves DELETE /api/socialapi/accounts/:id with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise DELETE /api/socialapi/accounts/:id in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:DELETE:/api/subscriptions/:id",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves DELETE /api/subscriptions/:id with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves DELETE /api/subscriptions/:id with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise DELETE /api/subscriptions/:id in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET / with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET / with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET / in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/api/actions",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /api/actions with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /api/actions with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /api/actions in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/api/actions/:id/preview",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /api/actions/:id/preview with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /api/actions/:id/preview with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /api/actions/:id/preview in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/api/audit",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /api/audit with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /api/audit with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /api/audit in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/api/config/status",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /api/config/status with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /api/config/status with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /api/config/status in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/api/discord/dms",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /api/discord/dms with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /api/discord/dms with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /api/discord/dms in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/api/discord/guilds",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /api/discord/guilds with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /api/discord/guilds with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /api/discord/guilds in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/api/discord/guilds/:id/channels",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /api/discord/guilds/:id/channels with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /api/discord/guilds/:id/channels with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /api/discord/guilds/:id/channels in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/api/discord/status",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /api/discord/status with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /api/discord/status with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /api/discord/status in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/api/oauth/calendar/status",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /api/oauth/calendar/status with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /api/oauth/calendar/status with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /api/oauth/calendar/status in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/api/oauth/gmail/status",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /api/oauth/gmail/status with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /api/oauth/gmail/status with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /api/oauth/gmail/status in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/api/oauth/googledrive/status",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /api/oauth/googledrive/status with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /api/oauth/googledrive/status with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /api/oauth/googledrive/status in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/api/repos",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /api/repos with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /api/repos with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /api/repos in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/api/repos/runs",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /api/repos/runs with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /api/repos/runs with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /api/repos/runs in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/api/sessions",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /api/sessions with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /api/sessions with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1248",
+    "test_plan": "Exercise GET /api/sessions in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/api/slack/conversations",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /api/slack/conversations with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /api/slack/conversations with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /api/slack/conversations in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/api/slack/workspaces",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /api/slack/workspaces with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /api/slack/workspaces with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /api/slack/workspaces in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/api/slack/workspaces/:teamId/channels",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /api/slack/workspaces/:teamId/channels with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /api/slack/workspaces/:teamId/channels with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /api/slack/workspaces/:teamId/channels in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/api/stats",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /api/stats with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /api/stats with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /api/stats in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/api/subscriptions",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /api/subscriptions with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /api/subscriptions with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /api/subscriptions in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/audit",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /audit with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /audit with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /audit in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/dashboard",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /dashboard with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /dashboard with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /dashboard in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/history",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /history with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /history with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /history in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/oauth/calendar/callback",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /oauth/calendar/callback with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /oauth/calendar/callback with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /oauth/calendar/callback in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/oauth/calendar/start",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /oauth/calendar/start with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /oauth/calendar/start with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /oauth/calendar/start in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/oauth/gmail/callback",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /oauth/gmail/callback with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /oauth/gmail/callback with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /oauth/gmail/callback in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/oauth/gmail/start",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /oauth/gmail/start with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /oauth/gmail/start with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /oauth/gmail/start in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/oauth/googledrive/callback",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /oauth/googledrive/callback with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /oauth/googledrive/callback with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /oauth/googledrive/callback in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/oauth/googledrive/start",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /oauth/googledrive/start with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /oauth/googledrive/start with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /oauth/googledrive/start in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/oauth/slack/callback",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /oauth/slack/callback with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /oauth/slack/callback with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /oauth/slack/callback in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/oauth/slack/start",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /oauth/slack/start with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /oauth/slack/start with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /oauth/slack/start in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/oauth/socialapi/callback",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /oauth/socialapi/callback with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /oauth/socialapi/callback with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /oauth/socialapi/callback in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/oauth/socialapi/start",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /oauth/socialapi/start with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /oauth/socialapi/start with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /oauth/socialapi/start in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/relationships",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /relationships with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /relationships with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /relationships in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/relationships/:slug",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /relationships/:slug with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /relationships/:slug with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /relationships/:slug in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/repos",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /repos with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /repos with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /repos in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/resume",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /resume with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /resume with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /resume in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/sessions",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /sessions with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /sessions with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1248",
+    "test_plan": "Exercise GET /sessions in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/settings",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /settings with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /settings with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /settings in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/subscriptions",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /subscriptions with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /subscriptions with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /subscriptions in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:PATCH:/api/senders/:id/toggle",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves PATCH /api/senders/:id/toggle with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves PATCH /api/senders/:id/toggle with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise PATCH /api/senders/:id/toggle in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:PATCH:/api/socialapi/accounts/:id/toggle",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves PATCH /api/socialapi/accounts/:id/toggle with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves PATCH /api/socialapi/accounts/:id/toggle with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise PATCH /api/socialapi/accounts/:id/toggle in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:POST:/api/ask",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves POST /api/ask with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /api/ask with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /api/ask in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:POST:/api/config",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves POST /api/config with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /api/config with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /api/config in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:POST:/api/discord/creds",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves POST /api/discord/creds with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /api/discord/creds with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /api/discord/creds in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:POST:/api/repos",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves POST /api/repos with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /api/repos with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /api/repos in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:POST:/api/repos/runs/:id/:decision",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves POST /api/repos/runs/:id/:decision with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /api/repos/runs/:id/:decision with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /api/repos/runs/:id/:decision in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:POST:/api/resume",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves POST /api/resume with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /api/resume with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /api/resume in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:POST:/api/senders",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves POST /api/senders with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /api/senders with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /api/senders in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:POST:/api/sessions/:pid/stop",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves POST /api/sessions/:pid/stop with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /api/sessions/:pid/stop with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1248",
+    "test_plan": "Exercise POST /api/sessions/:pid/stop in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:POST:/api/slack/workspaces/:teamId/subscribe",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves POST /api/slack/workspaces/:teamId/subscribe with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /api/slack/workspaces/:teamId/subscribe with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /api/slack/workspaces/:teamId/subscribe in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:POST:/api/socialapi/key",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves POST /api/socialapi/key with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /api/socialapi/key with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /api/socialapi/key in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:POST:/api/socialapi/key/clear",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves POST /api/socialapi/key/clear with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /api/socialapi/key/clear with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /api/socialapi/key/clear in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:POST:/api/socialapi/sync",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves POST /api/socialapi/sync with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /api/socialapi/sync with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /api/socialapi/sync in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:POST:/api/subscriptions",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves POST /api/subscriptions with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /api/subscriptions with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /api/subscriptions in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:POST:/api/webhook/github",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves POST /api/webhook/github with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /api/webhook/github with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /api/webhook/github in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:POST:/relationships/:id/dismiss",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves POST /relationships/:id/dismiss with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /relationships/:id/dismiss with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /relationships/:id/dismiss in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:POST:/relationships/:id/draft",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves POST /relationships/:id/draft with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /relationships/:id/draft with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /relationships/:id/draft in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:POST:/relationships/:id/snooze",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves POST /relationships/:id/snooze with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /relationships/:id/snooze with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /relationships/:id/snooze in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:POST:/relationships/person/:slug/cadence",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves POST /relationships/person/:slug/cadence with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /relationships/person/:slug/cadence with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /relationships/person/:slug/cadence in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:POST:/relationships/person/:slug/mute",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves POST /relationships/person/:slug/mute with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /relationships/person/:slug/mute with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /relationships/person/:slug/mute in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:POST:/relationships/person/:slug/unmute",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves POST /relationships/person/:slug/unmute with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /relationships/person/:slug/unmute with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /relationships/person/:slug/unmute in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:POST:/relationships/rule/:kind/mute",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves POST /relationships/rule/:kind/mute with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /relationships/rule/:kind/mute with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /relationships/rule/:kind/mute in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:POST:/relationships/rule/:kind/unmute",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves POST /relationships/rule/:kind/unmute with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /relationships/rule/:kind/unmute with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /relationships/rule/:kind/unmute in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:PUT:/api/subscriptions/:id",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves PUT /api/subscriptions/:id with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves PUT /api/subscriptions/:id with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise PUT /api/subscriptions/:id in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:index:GET:/login",
+    "source": "src/index.ts",
+    "linux_baseline": "Linux dashboard serves GET /login with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /login with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /login in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:index:POST:/login",
+    "source": "src/index.ts",
+    "linux_baseline": "Linux dashboard serves POST /login with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /login with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /login in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:modelRouterRoutes:GET:/model-accounts",
+    "source": "src/modelRouterRoutes.ts",
+    "linux_baseline": "Linux dashboard serves GET /model-accounts with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /model-accounts with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /model-accounts in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:modelRouterRoutes:POST:/model-accounts/accounts/:id",
+    "source": "src/modelRouterRoutes.ts",
+    "linux_baseline": "Linux dashboard serves POST /model-accounts/accounts/:id with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /model-accounts/accounts/:id with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /model-accounts/accounts/:id in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:modelRouterRoutes:POST:/model-accounts/complete",
+    "source": "src/modelRouterRoutes.ts",
+    "linux_baseline": "Linux dashboard serves POST /model-accounts/complete with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /model-accounts/complete with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /model-accounts/complete in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:modelRouterRoutes:POST:/model-accounts/connect",
+    "source": "src/modelRouterRoutes.ts",
+    "linux_baseline": "Linux dashboard serves POST /model-accounts/connect with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /model-accounts/connect with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /model-accounts/connect in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:modelRouterRoutes:POST:/model-accounts/settings",
+    "source": "src/modelRouterRoutes.ts",
+    "linux_baseline": "Linux dashboard serves POST /model-accounts/settings with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /model-accounts/settings with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /model-accounts/settings in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:webhooks:POST:/webhooks/calendly",
+    "source": "src/webhooks.ts",
+    "linux_baseline": "Linux dashboard serves POST /webhooks/calendly with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /webhooks/calendly with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /webhooks/calendly in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:webhooks:POST:/webhooks/deft/:secret",
+    "source": "src/webhooks.ts",
+    "linux_baseline": "Linux dashboard serves POST /webhooks/deft/:secret with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /webhooks/deft/:secret with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /webhooks/deft/:secret in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:webhooks:POST:/webhooks/linear",
+    "source": "src/webhooks.ts",
+    "linux_baseline": "Linux dashboard serves POST /webhooks/linear with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /webhooks/linear with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /webhooks/linear in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:webhooks:POST:/webhooks/notion",
+    "source": "src/webhooks.ts",
+    "linux_baseline": "Linux dashboard serves POST /webhooks/notion with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /webhooks/notion with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /webhooks/notion in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:webhooks:POST:/webhooks/socialapi",
+    "source": "src/webhooks.ts",
+    "linux_baseline": "Linux dashboard serves POST /webhooks/socialapi with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves POST /webhooks/socialapi with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise POST /webhooks/socialapi in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "sidecar:9router",
+    "source": "sidecars/9router/README.md",
+    "linux_baseline": "Linux can provision and operate the 9router sidecar.",
+    "macos_target": "Mac can provision, operate and recover the 9router sidecar with the same contract.",
+    "prerequisites": [
+      "sidecar-specific runtime",
+      "private socket/state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1257",
+    "test_plan": "Run 9router synthetic contract and managed-service lifecycle on native Mac and Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "sidecar:browser",
+    "source": "sidecars/browser/README.md",
+    "linux_baseline": "Linux can provision and operate the browser sidecar.",
+    "macos_target": "Mac can provision, operate and recover the browser sidecar with the same contract.",
+    "prerequisites": [
+      "sidecar-specific runtime",
+      "private socket/state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1256",
+    "test_plan": "Run browser synthetic contract and managed-service lifecycle on native Mac and Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "sidecar:code-mode-runner",
+    "source": "sidecars/code-mode-runner/README.md",
+    "linux_baseline": "Linux can provision and operate the code-mode-runner sidecar.",
+    "macos_target": "Mac can provision, operate and recover the code-mode-runner sidecar with the same contract.",
+    "prerequisites": [
+      "sidecar-specific runtime",
+      "private socket/state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1251",
+    "test_plan": "Run code-mode-runner synthetic contract and managed-service lifecycle on native Mac and Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "sidecar:computer-use",
+    "source": "sidecars/computer-use/README.md",
+    "linux_baseline": "Linux can provision and operate the computer-use sidecar.",
+    "macos_target": "Mac can provision, operate and recover the computer-use sidecar with the same contract.",
+    "prerequisites": [
+      "sidecar-specific runtime",
+      "private socket/state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1249",
+    "test_plan": "Run computer-use synthetic contract and managed-service lifecycle on native Mac and Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "sidecar:discord-voice",
+    "source": "sidecars/discord-voice/package.json",
+    "linux_baseline": "Linux can provision and operate the discord-voice sidecar.",
+    "macos_target": "Mac can provision, operate and recover the discord-voice sidecar with the same contract.",
+    "prerequisites": [
+      "sidecar-specific runtime",
+      "private socket/state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1255",
+    "test_plan": "Run discord-voice synthetic contract and managed-service lifecycle on native Mac and Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "sidecar:fetch",
+    "source": "sidecars/fetch/README.md",
+    "linux_baseline": "Linux can provision and operate the fetch sidecar.",
+    "macos_target": "Mac can provision, operate and recover the fetch sidecar with the same contract.",
+    "prerequisites": [
+      "sidecar-specific runtime",
+      "private socket/state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1256",
+    "test_plan": "Run fetch synthetic contract and managed-service lifecycle on native Mac and Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "sidecar:renderer",
+    "source": "sidecars/renderer/README.md",
+    "linux_baseline": "Linux can provision and operate the renderer sidecar.",
+    "macos_target": "Mac can provision, operate and recover the renderer sidecar with the same contract.",
+    "prerequisites": [
+      "sidecar-specific runtime",
+      "private socket/state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1256",
+    "test_plan": "Run renderer synthetic contract and managed-service lifecycle on native Mac and Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "sidecar:wa-sidecar",
+    "source": "sidecars/wa-sidecar/README.md",
+    "linux_baseline": "Linux can provision and operate the wa-sidecar sidecar.",
+    "macos_target": "Mac can provision, operate and recover the wa-sidecar sidecar with the same contract.",
+    "prerequisites": [
+      "sidecar-specific runtime",
+      "private socket/state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1256",
+    "test_plan": "Run wa-sidecar synthetic contract and managed-service lifecycle on native Mac and Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "tool:codex-build-vm.py",
+    "source": "scripts/codex-build-vm.py",
+    "linux_baseline": "Linux uses codex-build-vm.py with existing scope and cleanup guarantees.",
+    "macos_target": "Mac provides equivalent guarded codex-build-vm.py behavior.",
+    "prerequisites": [
+      "platform security backend"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1253",
+    "test_plan": "Run synthetic allowed/denied and cancellation probes for codex-build-vm.py on native Mac and Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "tool:codex-command-sandbox.py",
+    "source": "scripts/codex-command-sandbox.py",
+    "linux_baseline": "Linux uses codex-command-sandbox.py with existing scope and cleanup guarantees.",
+    "macos_target": "Mac provides equivalent guarded codex-command-sandbox.py behavior.",
+    "prerequisites": [
+      "platform security backend"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1251",
+    "test_plan": "Run synthetic allowed/denied and cancellation probes for codex-command-sandbox.py on native Mac and Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "tool:codex-tool-bridge.py",
+    "source": "scripts/codex-tool-bridge.py",
+    "linux_baseline": "Linux uses codex-tool-bridge.py with existing scope and cleanup guarantees.",
+    "macos_target": "Mac provides equivalent guarded codex-tool-bridge.py behavior.",
+    "prerequisites": [
+      "platform security backend"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1251",
+    "test_plan": "Run synthetic allowed/denied and cancellation probes for codex-tool-bridge.py on native Mac and Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "tool:provider-supervisor.py",
+    "source": "scripts/provider-supervisor.py",
+    "linux_baseline": "Linux uses provider-supervisor.py with existing scope and cleanup guarantees.",
+    "macos_target": "Mac provides equivalent guarded provider-supervisor.py behavior.",
+    "prerequisites": [
+      "platform security backend"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1252",
+    "test_plan": "Run synthetic allowed/denied and cancellation probes for provider-supervisor.py on native Mac and Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-autopr-health.service",
+    "source": "scripts/systemd/augmentagent-autopr-health.service",
+    "linux_baseline": "Linux has the augmentagent-autopr-health.service systemd job with its current start/schedule and recovery behavior.",
+    "macos_target": "Mac has a managed launchd equivalent of augmentagent-autopr-health.service with matching user-visible behavior.",
+    "prerequisites": [
+      "supported service manager",
+      "feature-specific runtime and private state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1253",
+    "test_plan": "Install the equivalent of augmentagent-autopr-health.service in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-autopr-health.timer",
+    "source": "scripts/systemd/augmentagent-autopr-health.timer",
+    "linux_baseline": "Linux has the augmentagent-autopr-health.timer systemd job with its current start/schedule and recovery behavior.",
+    "macos_target": "Mac has a managed launchd equivalent of augmentagent-autopr-health.timer with matching user-visible behavior.",
+    "prerequisites": [
+      "supported service manager",
+      "feature-specific runtime and private state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1253",
+    "test_plan": "Install the equivalent of augmentagent-autopr-health.timer in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-browser-sidecar.service",
+    "source": "systemd/augmentagent-browser-sidecar.service",
+    "linux_baseline": "Linux has the augmentagent-browser-sidecar.service systemd job with its current start/schedule and recovery behavior.",
+    "macos_target": "Mac has a managed launchd equivalent of augmentagent-browser-sidecar.service with matching user-visible behavior.",
+    "prerequisites": [
+      "supported service manager",
+      "feature-specific runtime and private state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1256",
+    "test_plan": "Install the equivalent of augmentagent-browser-sidecar.service in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-chromium.service",
+    "source": "systemd/augmentagent-chromium.service",
+    "linux_baseline": "Linux has the augmentagent-chromium.service systemd job with its current start/schedule and recovery behavior.",
+    "macos_target": "Mac has a managed launchd equivalent of augmentagent-chromium.service with matching user-visible behavior.",
+    "prerequisites": [
+      "supported service manager",
+      "feature-specific runtime and private state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1256",
+    "test_plan": "Install the equivalent of augmentagent-chromium.service in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-computer-use.service",
+    "source": "systemd/augmentagent-computer-use.service",
+    "linux_baseline": "Linux has the augmentagent-computer-use.service systemd job with its current start/schedule and recovery behavior.",
+    "macos_target": "Mac has a managed launchd equivalent of augmentagent-computer-use.service with matching user-visible behavior.",
+    "prerequisites": [
+      "supported service manager",
+      "feature-specific runtime and private state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1249",
+    "test_plan": "Install the equivalent of augmentagent-computer-use.service in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-discord-voice.service",
+    "source": "systemd/augmentagent-discord-voice.service",
+    "linux_baseline": "Linux has the augmentagent-discord-voice.service systemd job with its current start/schedule and recovery behavior.",
+    "macos_target": "Mac has a managed launchd equivalent of augmentagent-discord-voice.service with matching user-visible behavior.",
+    "prerequisites": [
+      "supported service manager",
+      "feature-specific runtime and private state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1255",
+    "test_plan": "Install the equivalent of augmentagent-discord-voice.service in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-fetch.service",
+    "source": "systemd/augmentagent-fetch.service",
+    "linux_baseline": "Linux runs the layered fetch worker as a private user service.",
+    "macos_target": "Mac runs the same fetch protocol as a private, restartable LaunchAgent.",
+    "prerequisites": [
+      "Node 22 and pinned fetch build",
+      "private socket and optional credentials"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1256",
+    "test_plan": "Run sidecar launchd, updater and fetch socket contracts on native Mac and Linux; check real launchd health.",
+    "status": "in_progress",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-finance-sync.service",
+    "source": "scripts/systemd/augmentagent-finance-sync.service",
+    "linux_baseline": "Linux has the augmentagent-finance-sync.service systemd job with its current start/schedule and recovery behavior.",
+    "macos_target": "Mac has a managed launchd equivalent of augmentagent-finance-sync.service with matching user-visible behavior.",
+    "prerequisites": [
+      "supported service manager",
+      "feature-specific runtime and private state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1250",
+    "test_plan": "Install the equivalent of augmentagent-finance-sync.service in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-finance-sync.timer",
+    "source": "scripts/systemd/augmentagent-finance-sync.timer",
+    "linux_baseline": "Linux has the augmentagent-finance-sync.timer systemd job with its current start/schedule and recovery behavior.",
+    "macos_target": "Mac has a managed launchd equivalent of augmentagent-finance-sync.timer with matching user-visible behavior.",
+    "prerequisites": [
+      "supported service manager",
+      "feature-specific runtime and private state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1250",
+    "test_plan": "Install the equivalent of augmentagent-finance-sync.timer in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-renderer.service",
+    "source": "systemd/augmentagent-renderer.service",
+    "linux_baseline": "Linux has the augmentagent-renderer.service systemd job with its current start/schedule and recovery behavior.",
+    "macos_target": "Mac has a managed launchd equivalent of augmentagent-renderer.service with matching user-visible behavior.",
+    "prerequisites": [
+      "supported service manager",
+      "feature-specific runtime and private state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1256",
+    "test_plan": "Install the equivalent of augmentagent-renderer.service in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-runpod-adapter.service",
+    "source": "scripts/systemd/augmentagent-runpod-adapter.service",
+    "linux_baseline": "Linux has the augmentagent-runpod-adapter.service systemd job with its current start/schedule and recovery behavior.",
+    "macos_target": "Mac has a managed launchd equivalent of augmentagent-runpod-adapter.service with matching user-visible behavior.",
+    "prerequisites": [
+      "supported service manager",
+      "feature-specific runtime and private state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1257",
+    "test_plan": "Install the equivalent of augmentagent-runpod-adapter.service in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
+    "status": "in_progress",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-telegram-capture.service",
+    "source": "systemd/augmentagent-telegram-capture.service",
+    "linux_baseline": "Linux has the augmentagent-telegram-capture.service systemd job with its current start/schedule and recovery behavior.",
+    "macos_target": "Mac has a managed launchd equivalent of augmentagent-telegram-capture.service with matching user-visible behavior.",
+    "prerequisites": [
+      "supported service manager",
+      "feature-specific runtime and private state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1255",
+    "test_plan": "Install the equivalent of augmentagent-telegram-capture.service in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-tone-refresh.service",
+    "source": "systemd/augmentagent-tone-refresh.service",
+    "linux_baseline": "Linux has the augmentagent-tone-refresh.service systemd job with its current start/schedule and recovery behavior.",
+    "macos_target": "Mac has a managed launchd equivalent of augmentagent-tone-refresh.service with matching user-visible behavior.",
+    "prerequisites": [
+      "supported service manager",
+      "feature-specific runtime and private state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Install the equivalent of augmentagent-tone-refresh.service in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-tone-refresh.timer",
+    "source": "systemd/augmentagent-tone-refresh.timer",
+    "linux_baseline": "Linux has the augmentagent-tone-refresh.timer systemd job with its current start/schedule and recovery behavior.",
+    "macos_target": "Mac has a managed launchd equivalent of augmentagent-tone-refresh.timer with matching user-visible behavior.",
+    "prerequisites": [
+      "supported service manager",
+      "feature-specific runtime and private state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Install the equivalent of augmentagent-tone-refresh.timer in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-transcripts-sync.service",
+    "source": "scripts/systemd/augmentagent-transcripts-sync.service",
+    "linux_baseline": "Linux has the augmentagent-transcripts-sync.service systemd job with its current start/schedule and recovery behavior.",
+    "macos_target": "Mac has a managed launchd equivalent of augmentagent-transcripts-sync.service with matching user-visible behavior.",
+    "prerequisites": [
+      "supported service manager",
+      "feature-specific runtime and private state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Install the equivalent of augmentagent-transcripts-sync.service in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-transcripts-sync.timer",
+    "source": "scripts/systemd/augmentagent-transcripts-sync.timer",
+    "linux_baseline": "Linux has the augmentagent-transcripts-sync.timer systemd job with its current start/schedule and recovery behavior.",
+    "macos_target": "Mac has a managed launchd equivalent of augmentagent-transcripts-sync.timer with matching user-visible behavior.",
+    "prerequisites": [
+      "supported service manager",
+      "feature-specific runtime and private state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Install the equivalent of augmentagent-transcripts-sync.timer in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-wiki-sync.service",
+    "source": "scripts/systemd/augmentagent-wiki-sync.service",
+    "linux_baseline": "Linux has the augmentagent-wiki-sync.service systemd job with its current start/schedule and recovery behavior.",
+    "macos_target": "Mac has a managed launchd equivalent of augmentagent-wiki-sync.service with matching user-visible behavior.",
+    "prerequisites": [
+      "supported service manager",
+      "feature-specific runtime and private state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1250",
+    "test_plan": "Install the equivalent of augmentagent-wiki-sync.service in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-wiki-sync.timer",
+    "source": "scripts/systemd/augmentagent-wiki-sync.timer",
+    "linux_baseline": "Linux has the augmentagent-wiki-sync.timer systemd job with its current start/schedule and recovery behavior.",
+    "macos_target": "Mac has a managed launchd equivalent of augmentagent-wiki-sync.timer with matching user-visible behavior.",
+    "prerequisites": [
+      "supported service manager",
+      "feature-specific runtime and private state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1250",
+    "test_plan": "Install the equivalent of augmentagent-wiki-sync.timer in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-wa-sidecar.service",
+    "source": "systemd/augmentagent-wa-sidecar.service",
+    "linux_baseline": "Linux runs the WhatsApp linked-device worker as a private user service.",
+    "macos_target": "Mac runs the same worker as a private, restartable LaunchAgent without deleting sessions.",
+    "prerequisites": [
+      "pinned Go sidecar build",
+      "private socket and session store"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1256",
+    "test_plan": "Run Go wire and launcher contracts on native Mac and Linux; verify controlled test-account pairing separately.",
+    "status": "in_progress",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-wix-sync.service",
+    "source": "systemd/augmentagent-wix-sync.service",
+    "linux_baseline": "Linux has the augmentagent-wix-sync.service systemd job with its current start/schedule and recovery behavior.",
+    "macos_target": "Mac has a managed launchd equivalent of augmentagent-wix-sync.service with matching user-visible behavior.",
+    "prerequisites": [
+      "supported service manager",
+      "feature-specific runtime and private state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Install the equivalent of augmentagent-wix-sync.service in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-wix-sync.timer",
+    "source": "systemd/augmentagent-wix-sync.timer",
+    "linux_baseline": "Linux has the augmentagent-wix-sync.timer systemd job with its current start/schedule and recovery behavior.",
+    "macos_target": "Mac has a managed launchd equivalent of augmentagent-wix-sync.timer with matching user-visible behavior.",
+    "prerequisites": [
+      "supported service manager",
+      "feature-specific runtime and private state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Install the equivalent of augmentagent-wix-sync.timer in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-xvfb.service",
+    "source": "systemd/augmentagent-xvfb.service",
+    "linux_baseline": "Linux has the augmentagent-xvfb.service systemd job with its current start/schedule and recovery behavior.",
+    "macos_target": "Mac has a managed launchd equivalent of augmentagent-xvfb.service with matching user-visible behavior.",
+    "prerequisites": [
+      "supported service manager",
+      "feature-specific runtime and private state"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1256",
+    "test_plan": "Install the equivalent of augmentagent-xvfb.service in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
+    "status": "unverified",
+    "evidence": null
+  }
+]

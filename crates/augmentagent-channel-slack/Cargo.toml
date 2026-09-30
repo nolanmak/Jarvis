@@ -13,6 +13,19 @@ augmentagent-channel-core = { path = "../augmentagent-channel-core" }
 augmentagent-channel-discord-dm = { path = "../augmentagent-channel-discord-dm" }
 augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
 augmentagent-wiki = { path = "../augmentagent-wiki" }
+# #1290 — people lookup (wiki identity index) for compose recipients.
+augmentagent-messages = { path = "../augmentagent-messages" }
+# #1293 — shared inbound attachment policy and PDF/DOCX conversion.
+augmentagent-docs = { path = "../augmentagent-docs" }
+# #1297 — the existing Rust speech-to-text seam (`Transcriber`, whisper.cpp)
+# that Slack voice clips plug into.
+augmentagent-channel-voice = { path = "../augmentagent-channel-voice" }
+# #1292 — `processes` lists and stops `claude` CLI processes through the
+# shared cross-platform walker (`ps` on macOS, no `/proc` reads here).
+augmentagent-loops = { path = "../augmentagent-loops" }
+# Private per-message directories and the owner check on their root.
+tempfile = "3"
+libc = "0.2"
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -22,10 +35,21 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-reqwest = { workspace = true }
+# `stream`: #1294 uploads generated files straight from disk.
+reqwest = { workspace = true, features = ["stream"] }
 uuid = { workspace = true }
+futures = { workspace = true }
+# #1283 — real-time Socket Mode transport. Same version and rustls/webpki
+# TLS backend the workspace already resolves for serenity and the Discord
+# voice bridge, so no new TLS stack and no system OpenSSL.
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Paused-clock Socket Mode tests (heartbeat, backoff, sleep/wake).
+tokio = { workspace = true, features = ["test-util"] }
 mockito = "1"
 rusqlite = { workspace = true }
+# #1291 — America/New_York fixtures for the scheduling tests.
+chrono = { workspace = true }
+chrono-tz = { workspace = true }

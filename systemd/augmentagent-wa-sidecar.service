@@ -1,0 +1,18 @@
+[Unit]
+Description=AugmentAgent WhatsApp linked-device sidecar
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/AugmentAgent/sidecars/wa-sidecar
+Environment=AUGMENTAGENT_WA_SOCK=%t/augmentagent/wa.sock
+ExecStartPre=/usr/bin/mkdir -p %t/augmentagent
+ExecStartPre=/usr/bin/chmod 700 %t/augmentagent
+ExecStart=%h/AugmentAgent/sidecars/wa-sidecar/wa-sidecar
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:%S/augmentagent/wa-sidecar.log
+StandardError=append:%S/augmentagent/wa-sidecar.log
+
+[Install]
+WantedBy=default.target

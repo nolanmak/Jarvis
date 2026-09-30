@@ -47,6 +47,7 @@ augmentagent-wiki = { path = "../augmentagent-wiki" }
 augmentagent-browser-client = { path = "../augmentagent-browser-client" }
 augmentagent-renderer-client = { path = "../augmentagent-renderer-client" }
 augmentagent-proactive = { path = "../augmentagent-proactive" }
+augmentagent-heartbeat = { path = "../augmentagent-heartbeat" }
 augmentagent-channel-voice = { path = "../augmentagent-channel-voice" }
 augmentagent-channel-fotw = { path = "../augmentagent-channel-fotw" }
 augmentagent-content-adapter = { path = "../augmentagent-content-adapter" }
@@ -72,6 +73,7 @@ cron = { workspace = true }
 chrono-tz = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+dashmap = { workspace = true }
 sha2 = "0.10.9"
 # #1 — `status` subcommand probes the dashboard's `/api/v1/stats` for proof
 # of life. Workspace `reqwest` is `default-features = false` + `rustls-tls`,
@@ -104,3 +106,7 @@ rusqlite = { workspace = true }
 # #160 — `deft login` tests stub the Deftform `whoami()` HTTP probe so the
 # CLI's reject-on-bad-token path is exercised without a real workspace.
 mockito = "1"
+# #1287 — the serve end-to-end test plays Slack's Socket Mode WebSocket.
+# Same version the workspace already resolves (serenity, the Slack crate).
+tokio-tungstenite = "0.21"
+futures = { workspace = true }

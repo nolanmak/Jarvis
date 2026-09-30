@@ -85,6 +85,10 @@ pub fn canonical(raw: &str) -> String {
     if let Some(urn) = inner.strip_prefix("linkedin:") {
         return format!("linkedin:{}", urn.trim());
     }
+    // #1296 — Slack rows store `Name <slack:U…>` (the wiki identity form).
+    if let Some(id) = inner.strip_prefix("slack:") {
+        return format!("slack:{}", id.trim());
+    }
     if let Some(rest) = inner.strip_prefix("socialapi:") {
         // socialapi:<network>:<id>
         if let Some((network, id)) = rest.split_once(':') {
@@ -155,6 +159,8 @@ mod tests {
     fn tagged_platform_ids() {
         assert_eq!(canonical("Alice <discord:123456789>"), "discord:123456789");
         assert_eq!(canonical("me <discord:42>"), "discord:42");
+        assert_eq!(canonical("alice <slack:U0000000B>"), "slack:U0000000B");
+        assert_eq!(canonical("U0000000B <slack:U0000000B>"), "slack:U0000000B");
         assert_eq!(
             canonical("Pat <linkedin:urn:li:fsd_profile:ABC>"),
             "linkedin:urn:li:fsd_profile:ABC"

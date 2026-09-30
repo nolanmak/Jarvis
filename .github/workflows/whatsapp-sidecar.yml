@@ -1,0 +1,56 @@
+name: WhatsApp sidecar contract
+
+on:
+  pull_request:
+    paths:
+      - 'sidecars/wa-sidecar/**'
+      - 'crates/augmentagent-channel-whatsapp/**'
+      - 'docs/fixtures/whatsapp/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/whatsapp-sidecar.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  wire-contract:
+    name: wire-contract (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      GOMAXPROCS: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: sidecars/wa-sidecar/go.sum
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Go tests, race checks and vet
+        working-directory: sidecars/wa-sidecar
+        run: |
+          go mod verify
+          go test -mod=readonly ./...
+          go test -mod=readonly -race ./...
+          go vet -mod=readonly ./...
+      - name: Build exact sidecar used by Rust contract tests
+        working-directory: sidecars/wa-sidecar
+        run: |
+          go build -mod=readonly -trimpath -o "$RUNNER_TEMP/wa-sidecar" .
+          echo "AUGMENTAGENT_WA_SIDECAR_TEST_BIN=$RUNNER_TEMP/wa-sidecar" >> "$GITHUB_ENV"
+      - name: Rust channel and real Go-process contract tests
+        run: cargo test -p augmentagent-channel-whatsapp
+      - name: Rust channel lint
+        run: cargo clippy --no-deps -p augmentagent-channel-whatsapp --all-targets -- -D warnings

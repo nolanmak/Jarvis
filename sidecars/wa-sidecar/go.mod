@@ -1,17 +1,43 @@
-module github.com/nolanmak/AugmentAgent/sidecars/wa-sidecar
+module github.com/nolanmak/Jarvis/sidecars/wa-sidecar
 
-go 1.22
+go 1.26.0
 
-// Build (once a Go toolchain is present on the box):
-//   cd sidecars/wa-sidecar && go mod tidy && go build -o wa-sidecar .
-//
-// `go mod tidy` resolves exact pinned versions + generates go.sum. We don't
-// commit go.sum here because it can't be produced without the toolchain on
-// this host (see #74 — Go sidecar build pending; Rust side + JSON-RPC
-// contract + mock-socket tests are complete and verified).
+toolchain go1.27.1
+
+// The whatsmeow revision and transitive checksums are pinned in go.sum.
 require (
-	github.com/mdp/qrterminal/v3 v3.2.0
-	go.mau.fi/whatsmeow v0.0.0-20240901000000-000000000000
-	google.golang.org/protobuf v1.34.2
+	go.mau.fi/whatsmeow v0.0.0-20260928140511-35f522c88ce3
+	google.golang.org/protobuf v1.36.12 // indirect
 	modernc.org/sqlite v1.30.0
+)
+
+require (
+	filippo.io/edwards25519 v1.2.0 // indirect
+	github.com/beeper/argo-go v1.1.2 // indirect
+	github.com/coder/websocket v1.8.15 // indirect
+	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/elliotchance/orderedmap/v3 v3.1.0 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
+	github.com/mattn/go-colorable v0.1.14 // indirect
+	github.com/mattn/go-isatty v0.0.20 // indirect
+	github.com/ncruces/go-strftime v0.1.9 // indirect
+	github.com/petermattis/goid v0.0.0-20260820044319-269ab09b5261 // indirect
+	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	github.com/rs/zerolog v1.35.1 // indirect
+	github.com/vektah/gqlparser/v2 v2.5.27 // indirect
+	go.mau.fi/libsignal v0.2.2 // indirect
+	go.mau.fi/util v0.10.1 // indirect
+	golang.org/x/crypto v0.57.0 // indirect
+	golang.org/x/exp v0.0.0-20260908205506-85c1c2202aba // indirect
+	golang.org/x/net v0.59.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
+	modernc.org/gc/v3 v3.0.0-20240107210532-573471604cb6 // indirect
+	modernc.org/libc v1.50.9 // indirect
+	modernc.org/mathutil v1.6.0 // indirect
+	modernc.org/memory v1.8.0 // indirect
+	modernc.org/strutil v1.2.0 // indirect
+	modernc.org/token v1.1.0 // indirect
 )

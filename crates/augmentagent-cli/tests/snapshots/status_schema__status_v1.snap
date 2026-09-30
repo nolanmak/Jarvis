@@ -117,24 +117,84 @@ expression: json
       "needs": "[volatile]"
     }
   },
+  "config_issues": [
+    {
+      "detail": "AUGMENTAGENT_INSECURE_CREDENTIAL_DIR is set for this process: credentials are read from and written to plaintext files (tests and local QA only)",
+      "id": "credentials.insecure_file_store",
+      "recovery": "unset AUGMENTAGENT_INSECURE_CREDENTIAL_DIR (remove it from .env and the service environment), store the Slack app in the Keychain/keyring with `augmentagent slack app install --stdin`, then restart the daemon (`augmentagent service --unit daemon restart`).",
+      "severity": "error",
+      "source": "cli"
+    }
+  ],
   "core_keys": {
     "cerebras": false,
     "composio": false,
     "discord_bot": false,
     "groq": false
   },
+  "credentials": {
+    "backend": "insecure-file",
+    "insecure_file_store": true,
+    "note": "AUGMENTAGENT_INSECURE_CREDENTIAL_DIR is set: credentials are plaintext files (tests and local QA only)",
+    "persistent": true
+  },
   "daemon": {
     "active": "[volatile]",
     "since_unix": "[volatile]",
     "unit": "augmentagent.service"
   },
+  "daemon_report": null,
   "dashboard": {
     "active": "[volatile]",
     "port": 3000,
     "reachable": "[volatile]",
     "unit": "augmentagent-dashboard.service"
   },
+  "delivery": {
+    "discord": {
+      "inbound_backlog": 0,
+      "inbound_dead_letter": 0,
+      "outbound_backlog": 0,
+      "outbound_dead_letter": 0,
+      "outbound_reconcile": 0,
+      "outbound_retrying": 0
+    },
+    "slack": {
+      "inbound_backlog": 0,
+      "inbound_dead_letter": 0,
+      "outbound_backlog": 0,
+      "outbound_dead_letter": 0,
+      "outbound_reconcile": 0,
+      "outbound_retrying": 0
+    },
+    "whatsapp": {
+      "inbound_backlog": 0,
+      "inbound_dead_letter": 0,
+      "outbound_backlog": 0,
+      "outbound_dead_letter": 0,
+      "outbound_reconcile": 0,
+      "outbound_retrying": 0
+    }
+  },
   "host": "linux",
+  "interactive": {
+    "slack": {
+      "app_installed": false,
+      "credentials": "missing",
+      "detail": "no interactive Slack app is installed",
+      "dry_run": false,
+      "healthy": false,
+      "heartbeat_unix": null,
+      "last_event_unix": null,
+      "last_send_unix": null,
+      "owner_bound": false,
+      "reconnects": null,
+      "recovery": "Install the Slack app (`augmentagent slack app install --stdin`, see docs/SLACK-RUNBOOK.md), bind yourself with `augmentagent slack app owner bind --user <member_id>`, then start the daemon (`augmentagent service --unit daemon restart`).",
+      "state": "not_configured",
+      "state_since_unix": null,
+      "workspaces": []
+    }
+  },
   "queue": {
     "pending": 0
   },

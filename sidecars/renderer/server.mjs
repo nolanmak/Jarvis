@@ -31,9 +31,7 @@
  */
 
 import { createServer } from 'node:net';
-import { mkdir, stat, unlink } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
-import os from 'node:os';
+import { chmod, lstat, mkdir, stat, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
@@ -48,14 +46,15 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // ---------------------------------------------------------------------------
 
 // #1079 — macOS has no /run/user; match augmentagent-renderer-client's fallback.
-const RUNTIME =
-  process.env.XDG_RUNTIME_DIR ||
-  (process.platform === 'linux'
-    ? `/run/user/${process.getuid?.() ?? 1000}`
-    : path.join(os.homedir(), 'Library', 'Caches'));
 const SOCK_PATH =
   process.env.AUGMENTAGENT_RENDERER_SOCK ||
-  path.join(RUNTIME, 'augmentagent', 'renderer.sock');
+  (process.platform === 'darwin'
+    ? path.join('/tmp', `augmentagent-${process.getuid?.() ?? 0}`, 'renderer.sock')
+    : process.env.XDG_RUNTIME_DIR
+    ? path.join(process.env.XDG_RUNTIME_DIR, 'augmentagent', 'renderer.sock')
+    : process.platform === 'linux'
+      ? path.join(`/run/user/${process.getuid?.() ?? 1000}`, 'augmentagent', 'renderer.sock')
+      : path.join('/tmp', `augmentagent-${process.getuid?.() ?? 0}`, 'renderer.sock'));
 
 const ENTRY = path.join(__dirname, 'src', 'index.ts');
 const COMPOSITION_ID = process.env.AUGMENTAGENT_RENDERER_COMPOSITION || 'ShortCard';
@@ -312,11 +311,12 @@ function handleClient(sock) {
 }
 
 async function serve() {
-  await mkdir(path.dirname(SOCK_PATH), { recursive: true });
-  if (existsSync(SOCK_PATH)) {
-    await unlink(SOCK_PATH).catch(() => {});
+  const runtime = path.dirname(SOCK_PATH);
+  await mkdir(runtime, { recursive: true, mode: 0o700 });
+  const info = await lstat(runtime);
+  if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) {
+    throw new Error('renderer socket directory must be owner-private');
   }
-
   const server = createServer(handleClient);
 
   await new Promise((resolve, reject) => {
@@ -326,6 +326,8 @@ async function serve() {
       resolve();
     });
   });
+  await chmod(SOCK_PATH, 0o600);
+  const owned = await lstat(SOCK_PATH);
   log('INFO', `listening on ${SOCK_PATH} (composition=${COMPOSITION_ID})`);
 
   // Warm the bundle so the first real render isn't also paying bundle cost.
@@ -336,7 +338,10 @@ async function serve() {
   const shutdown = async (signal) => {
     log('INFO', `shutdown signal received: ${signal}`);
     server.close();
-    await unlink(SOCK_PATH).catch(() => {});
+    const current = await lstat(SOCK_PATH).catch(() => null);
+    if (current?.isSocket() && current.dev === owned.dev && current.ino === owned.ino) {
+      await unlink(SOCK_PATH).catch(() => {});
+    }
     process.exit(0);
   };
   process.on('SIGINT', () => shutdown('SIGINT'));

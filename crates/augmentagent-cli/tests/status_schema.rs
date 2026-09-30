@@ -125,6 +125,8 @@ const ENV_VARS_TO_CLEAR: &[&str] = &[
     "AUGMENTAGENT_INSTAGRAM_AUTH",
     "AUGMENTAGENT_TWITTER_AUTH",
     "CARDDAV_URL",
+    // #1299 — Discord broker settings feed `config_issues`.
+    "DISCORD_CHANNEL_ID",
 ];
 
 #[test]
@@ -163,6 +165,14 @@ fn status_json_matches_locked_schema_v1() {
     for k in ENV_VARS_TO_CLEAR {
         cmd.env_remove(k);
     }
+    // #1299 — never the real Keychain: `interactive.slack.app_installed`
+    // probes the credential store. An empty plaintext test store makes the
+    // shape deterministic (and shows the `credentials` / `config_issues`
+    // fields populated: the test store is itself a config issue).
+    cmd.env(
+        "AUGMENTAGENT_INSECURE_CREDENTIAL_DIR",
+        tmp.path().join("credentials"),
+    );
 
     let out = cmd.output().expect("spawn augmentagent status");
     // `status` exits non-zero on a "needs setup" / "daemon down" box

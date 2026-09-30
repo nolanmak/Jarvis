@@ -65,7 +65,7 @@
           tb.innerHTML = '<tr><td colspan="7" class="px-4 py-6 text-center text-gray-500">No claude processes running.</td></tr>';
         } else {
           tb.innerHTML = rows.map(function (r) {
-            const cwdShort = truncate(r.cwd, 50);
+            const cwdShort = r.cwd ? truncate(r.cwd, 50) : 'Unavailable';
             const cmdShort = truncate(r.cmd, 80);
             return '<tr class="border-b border-gray-800/50">' +
               '<td class="px-4 py-2 font-mono">' + esc(r.pid) + '</td>' +
@@ -75,7 +75,7 @@
               '<td class="px-4 py-2 text-gray-400 font-mono text-xs" title="' + esc(r.cwd) + '">' + esc(cwdShort) + '</td>' +
               '<td class="px-4 py-2 text-gray-400 font-mono text-xs" title="' + esc(r.cmd) + '">' + esc(cmdShort) + '</td>' +
               '<td class="px-4 py-2 text-right">' +
-                '<button onclick="killSession(' + esc(r.pid) + ', event)" ' +
+                '<button data-session-pid="' + esc(r.pid) + '" data-session-started="' + esc(r.started) + '" ' +
                 '   class="text-xs px-2 py-1 rounded bg-red-900/40 text-red-300 border border-red-700/50 hover:bg-red-900/70">' +
                 '  Kill' +
                 '</button>' +
@@ -92,7 +92,12 @@
       }
     }
 
-    window.killSession = async function (pid, ev) {
+    document.getElementById('session-rows').addEventListener('click', function (ev) {
+      const button = ev.target.closest('button[data-session-pid]');
+      if (button) window.killSession(Number(button.dataset.sessionPid), button.dataset.sessionStarted, ev);
+    });
+
+    window.killSession = async function (pid, started, ev) {
       const force = !!(ev && ev.shiftKey);
       const label = force ? 'SIGKILL' : 'SIGTERM';
       if (!confirm('Send ' + label + ' to PID ' + pid + '?')) return;
@@ -100,7 +105,7 @@
         const res = await fetch('/api/sessions/' + encodeURIComponent(pid) + '/stop', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ force: force }),
+          body: JSON.stringify({ force: force, started: started }),
         });
         if (!res.ok) {
           let msg = 'HTTP ' + res.status;

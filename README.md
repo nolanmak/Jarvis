@@ -19,8 +19,10 @@ personal wiki, and social/posting integrations.
 - **Many channels.** Email (Gmail), Discord, Slack, Telegram, LinkedIn,
   WhatsApp, Twitter/X, Instagram, Reddit, GitHub, Linear, Notion, Calendly,
   Google Calendar, Google Drive, Meetup, and a voice-capture channel.
-- **iMessage history.** A bundled Mac exporter and scheduler import texting
-  history locally or over SSH, without a second repository. See
+- **iMessage history and replies.** A bundled Mac exporter and scheduler import
+  texting history locally or over SSH, without a second repository. Opted-in
+  conversations get reply cards; approved replies are sent by a sender job on
+  the Mac and confirmed in the Messages database. See
   [iMessage setup](docs/IMESSAGE.md).
 - **WhatsApp history.** Export WhatsApp Desktop conversations into searchable
   history and incremental wiki capture, with local or SSH setup and support for
@@ -37,6 +39,9 @@ personal wiki, and social/posting integrations.
 - **Proactive CRM.** A scheduled engine surfaces stale contacts, unmet
   commitments, and upcoming events as nudges, backed by a markdown
   person-wiki with an identity index (email/phone/handles → person).
+- **Heartbeat.** An opt-in periodic check-in reads your `HEARTBEAT.md`
+  checklist plus recent activity and stays silent unless something needs you,
+  with a liveness probe for external monitoring. See [Heartbeat](docs/HEARTBEAT.md).
 - **Self-improvement & scheduling.** A `self-improve` mode can pick up
   `agent-fixable` issues and open draft PRs; a user-facing `/loop` command
   registers cron-style recurring agent tasks.
@@ -267,6 +272,16 @@ so the same commands work on both:
 - `augmentagent service --unit dashboard {start,stop,restart,status}`
 - `augmentagent status`, `augmentagent logs --unit daemon [-f]`, `augmentagent doctor`
 
+The dashboard Sessions page lists `claude` executables owned by the dashboard
+user on Linux and macOS. It shows PID, parent PID, elapsed time and TTY; macOS
+marks cwd unavailable because the bounded `ps` inspection does not expose it.
+Stopping a session requires the start-time identity returned by the list and
+rechecks name and ownership immediately before signaling. A process can still
+exit or be replaced between that final check and the signal; macOS `ps` reports
+start time only to the second, so this is a best-effort guard, not an atomic
+kernel process handle. Use the Sessions page only for sessions started by the
+same account as the dashboard.
+
 `scripts/install-autostart.sh` and `scripts/install-dashboard.sh` write these
 units (or plists); `scripts/install-autostart.sh` accepts
 `AUGMENTAGENT_AUTOSTART_DRY_RUN=true` to register the daemon without it ever
@@ -274,6 +289,47 @@ sending. Logs land under `~/.local/state/augmentagent*/` on both. The daemon uni
 (`--wiki-dir ./wiki serve --dry-run false`), which also needs `jq` on `PATH`,
 the bot's Message Content intent, and more Claude calls per email — finish
 the [Quickstart](#quickstart) first.
+
+On macOS, run the installers from a shell where the required tools are on
+`PATH`. The daemon installer checks Node, Deno, jq, and only the CLI providers
+selected by `AUGMENTAGENT_REASONER_CHAIN` (from the environment or `.env`).
+The dashboard installer checks Node; the updater checks Cargo, Node, npm, and
+Git. Their resolved directories are written into the launchd environment, so
+the jobs can find them after login without shell startup files. A missing tool
+or invalid plist stops installation before the existing job is replaced.
+
+The private wiki mirror and finance import are separate, opt-in jobs on macOS:
+
+```bash
+scripts/install-wiki-sync.sh
+scripts/install-finance-sync.sh
+augmentagent service --unit wiki-sync status
+augmentagent service --unit finance-sync status
+augmentagent logs --unit wiki-sync
+augmentagent logs --unit finance-sync
+# Remove either schedule independently:
+scripts/uninstall-wiki-sync.sh
+scripts/uninstall-finance-sync.sh
+```
+
+The wiki runs at :00, :10, … :50 each hour; finance runs at 00:17, 06:17,
+12:17, and 18:17 local time. Run the installers from the checkout containing
+the release binary. Set `AUGMENTAGENT_WIKI_DIR` to an absolute path if the
+private wiki is elsewhere. The jobs run only in the signed-in user's launchd
+session and use that user's login Keychain; configure and verify finance access
+there with `augmentagent doctor --keychain-probe` before enabling its schedule.
+A loaded, idle job is normal between runs.
+The jobs write logs under `${XDG_STATE_HOME:-$HOME/.local/state}/augmentagent/`.
+
+Apple documents that a calendar job missed during sleep runs on wake, with
+multiple missed intervals coalesced into one; a powered-off Mac waits until the
+next designated time. See [Scheduling Timed Jobs](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/ScheduledJobs.html).
+Neither schedule guarantees a run while the user is logged out. A manual
+`augmentagent --wiki-dir ./wiki wiki sync` or `finance sync` runs immediately;
+installing these schedules is what enables recurring runs. The wiki mirror
+backs up wiki content only, not the local database, Keychain tokens, or `.env`.
+Confirm the wiki GitHub origin is private before enabling the mirror; finance
+pages and statement PDFs can contain sensitive information.
 
 `scripts/check-for-updates.sh` runs on a timer: it pulls `origin/main`,
 rebuilds the Rust and Node sides when their sources change, and bounces each
@@ -293,6 +349,13 @@ chain & model tiers" block in `.env.example` documents the provider chain
 Quality/Fast map (`AUGMENTAGENT_MODEL_<PROVIDER>_<TIER>`). `augmentagent
 doctor` reports both; `--deep` also flags a Cerebras pin that has left the
 provider's catalog.
+
+On macOS, the default `doctor` Keychain check reports only whether a default
+Keychain is configured. Use `augmentagent doctor --keychain-probe` when you
+want to test credential access: it writes, reads and deletes one disposable
+synthetic item and may prompt for Keychain access. Run it in the same login
+session as the launchd agent. A successful terminal probe does not itself
+establish that a restarted agent can read a selected integration's credential.
 
 ## Contributing
 
@@ -394,13 +457,14 @@ per seven days, and picks up asynchronous results on subsequent syncs.
 Requesting Statements requires that bank to support the product; Transactions
 can be used alone. Refreshes may incur charges on paid Plaid plans.
 
-Install `scripts/systemd/augmentagent-finance-sync.{service,timer}` in
-`~/.config/systemd/user/`, run `systemctl --user daemon-reload`, then
+On Linux, install `scripts/systemd/augmentagent-finance-sync.{service,timer}`
+in `~/.config/systemd/user/`, run `systemctl --user daemon-reload`, then
 `systemctl --user enable --now augmentagent-finance-sync.timer` for six-hour
-imports. Units assume the checkout is `~/AugmentAgent`. The existing private
-wiki mirror timer handles Git backups. Keep that mirror private: its finance
-pages and optional PDFs contain financial records. Tokens and the local
-transaction database are not backed up by the wiki mirror.
+imports. Units assume the checkout is `~/AugmentAgent`. On macOS, use the
+opt-in installers under [Process management](#process-management). Keep the
+wiki mirror private: its finance pages and optional PDFs contain financial
+records. Tokens and the local transaction database are not backed up by the
+wiki mirror.
 
 `finance export` regenerates KB pages from local records after an interrupted
 export. Query commands require no Plaid credentials and report connection

@@ -9,17 +9,22 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serenity::all::{
-    ActionRowComponent, Attachment, ButtonKind, ChannelId, Context, CreateAttachment,
+    ActionRowComponent, Attachment, ButtonKind, Channel, ChannelId, ChannelType, CommandDataOptionValue,
+    CommandInteraction, CommandOptionType, Context, CreateAttachment, CreateCommand,
+    CreateCommandOption,
     CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
-    CreateMessage, EditMessage, EventHandler, GetMessages, Http, Interaction, Message, MessageId,
-    MessageReference, Ready, UserId,
+    CreateMessage, EditInteractionResponse, EditMessage, EventHandler, GetMessages, Http, Interaction, Message, MessageId,
+    MessageReference, Ready, UserId, VoiceServerUpdateEvent, VoiceState,
 };
 use tracing::{debug, info, warn};
 
 // #939 — shared PDF/DOCX → text pipeline (pdftotext, then Mistral OCR for
 // scanned PDFs). Lives in a leaf crate so this crate stays below channel-core.
+use augmentagent_docs::inbound::{self, InboundKind};
 use augmentagent_docs::{extract_text, DocKind, OcrClient};
 
 use crate::broker::BrokerState;
@@ -30,8 +35,41 @@ use crate::layout::{
     split_needs_input, SCHEDULE_CUSTOM_VALUE,
 };
 use crate::ApprovalActionOutcome;
+// #1289 — outcome copy shared with the Slack approval surface.
+use crate::outcome::{describe, offers_recompose, redraft_produced_no_card};
+#[cfg(test)]
+use crate::outcome::resolved_message;
+use crate::voice_bridge::VoiceBinding;
 
 const DISCORD_MSG_LIMIT: usize = 1900;
+static NEXT_VOICE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_voice_generation() -> u64 {
+    let millis = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    NEXT_VOICE_GENERATION.fetch_max(millis.saturating_mul(1000), Ordering::SeqCst);
+    NEXT_VOICE_GENERATION.fetch_add(1, Ordering::SeqCst)
+}
+
+fn voice_command() -> CreateCommand {
+    CreateCommand::new("voice")
+        .description("Connect this conversation to your current voice channel")
+        .add_option(CreateCommandOption::new(CommandOptionType::SubCommand, "start", "Join your voice channel")
+            .add_sub_option(CreateCommandOption::new(CommandOptionType::String, "agent", "Claude or Codex")
+                .add_string_choice("Claude", "claude")
+                .add_string_choice("Codex", "codex"))
+            .add_sub_option(CreateCommandOption::new(CommandOptionType::String, "stt", "Speech recognition provider")
+                .add_string_choice("Deepgram", "deepgram").add_string_choice("ElevenLabs", "elevenlabs"))
+            .add_sub_option(CreateCommandOption::new(CommandOptionType::String, "tts", "Spoken reply provider")
+                .add_string_choice("Deepgram", "deepgram").add_string_choice("ElevenLabs", "elevenlabs")))
+        .add_option(CreateCommandOption::new(CommandOptionType::SubCommand, "provider", "Switch speech vendors in this conversation")
+            .add_sub_option(CreateCommandOption::new(CommandOptionType::String, "stt", "Speech recognition provider")
+                .add_string_choice("Deepgram", "deepgram").add_string_choice("ElevenLabs", "elevenlabs"))
+            .add_sub_option(CreateCommandOption::new(CommandOptionType::String, "tts", "Spoken reply provider")
+                .add_string_choice("Deepgram", "deepgram").add_string_choice("ElevenLabs", "elevenlabs")))
+        .add_option(CreateCommandOption::new(CommandOptionType::SubCommand, "status", "Show voice binding and native session"))
+        .add_option(CreateCommandOption::new(CommandOptionType::SubCommand, "stop", "Leave voice and keep text context"))
+        .add_option(CreateCommandOption::new(CommandOptionType::SubCommand, "interrupt", "Stop the current spoken reply"))
+}
 
 /// Fail-closed owner-allowlist check (#303). Returns `true` only when an
 /// allowlist is configured (`DISCORD_ALLOWED_USER_ID`) *and* the actor matches
@@ -43,8 +81,220 @@ fn is_authorized(allowed_user_id: Option<UserId>, actor: UserId) -> bool {
     matches!(allowed_user_id, Some(allowed) if allowed == actor)
 }
 
+fn is_query_thread(kind: ChannelType, parent: Option<ChannelId>, query: ChannelId) -> bool {
+    matches!(kind, ChannelType::NewsThread | ChannelType::PublicThread | ChannelType::PrivateThread)
+        && parent == Some(query)
+}
+
+async fn is_query_conversation(ctx: &Context, msg: &Message, query: Option<ChannelId>) -> bool {
+    is_query_channel(ctx, msg.guild_id, msg.channel_id, query).await
+}
+
+async fn is_query_channel(
+    ctx: &Context,
+    guild_id: Option<serenity::all::GuildId>,
+    channel_id: ChannelId,
+    query: Option<ChannelId>,
+) -> bool {
+    let Some(query) = query else { return false; };
+    if channel_id == query { return true; }
+    let Some(guild_id) = guild_id else { return false; };
+    if let Some(guild) = ctx.cache.guild(guild_id) {
+        if let Some(thread) = guild.threads.iter().find(|thread| thread.id == channel_id) {
+            return is_query_thread(thread.kind, thread.parent_id, query);
+        }
+    }
+    match channel_id.to_channel(&ctx.http).await {
+        Ok(Channel::Guild(channel)) => is_query_thread(channel.kind, channel.parent_id, query),
+        _ => false,
+    }
+}
+
 pub struct Handler {
     pub state: Arc<BrokerState>,
+}
+
+impl Handler {
+    async fn voice_command_reply(&self, ctx: &Context, command: &CommandInteraction) -> String {
+        if !is_authorized(self.state.allowed_user_id, command.user.id) {
+            return "Only the configured owner can control Discord voice.".into();
+        }
+        if !self.state.voice_enabled {
+            return "Discord voice is disabled on this bot.".into();
+        }
+        let Some(guild_id) = command.guild_id else {
+            return "Voice requires a server channel; group calls and DMs are unsupported.".into();
+        };
+        if !is_query_channel(ctx, Some(guild_id), command.channel_id, self.state.query_channel_id).await {
+            return "Run `/voice` from the configured conversation channel or one of its threads.".into();
+        }
+        let Some(bridge) = &self.state.voice_bridge else {
+            return "Voice sidecar is unavailable. Check its service and Unix socket, then retry.".into();
+        };
+        let Some(option) = command.data.options.first() else {
+            return "Use `/voice start`, `provider`, `status`, `stop`, or `interrupt`.".into();
+        };
+        let guild = guild_id.get().to_string();
+        let conversation = format!("{}:{}", guild_id.get(), command.channel_id.get());
+        let speech_option = |name: &str| -> Option<String> {
+            let CommandDataOptionValue::SubCommand(options) = &option.value else { return None; };
+            options.iter().find_map(|item| {
+                if item.name != name { return None; }
+                match &item.value {
+                    CommandDataOptionValue::String(value) if matches!(value.as_str(), "deepgram" | "elevenlabs") => Some(value.clone()),
+                    _ => None,
+                }
+            })
+        };
+        match option.name.as_str() {
+            "start" => {
+                if !bridge.is_connected() {
+                    return format!("Voice sidecar is {}. Check its service and retry after it reconnects.", bridge.transport_status());
+                }
+                let requested_agent = match &option.value {
+                    CommandDataOptionValue::SubCommand(options) => options.iter().find_map(|item| {
+                        if item.name == "agent" {
+                            if let CommandDataOptionValue::String(value) = &item.value {
+                                return Some(value.as_str());
+                            }
+                        }
+                        None
+                    }),
+                    _ => None,
+                };
+                let Some(store) = &self.state.store else {
+                    return "Voice conversation storage is unavailable.".into();
+                };
+                let owner_voice = ctx.cache.guild(guild_id)
+                    .and_then(|guild| guild.voice_states.get(&command.user.id).and_then(|state| state.channel_id));
+                let Some(voice_channel) = owner_voice else {
+                    return "Join an existing server voice channel, then run `/voice start` here.".into();
+                };
+                match voice_channel.to_channel(&ctx.http).await {
+                    Ok(Channel::Guild(channel)) if channel.kind == ChannelType::Voice => {},
+                    _ => return "Join a regular server voice channel; Stage channels are unsupported.".into(),
+                }
+                let channel = command.channel_id.get().to_string();
+                let mut bound = match store.discord_conversation(&guild, &channel) {
+                    Ok(bound) => bound,
+                    Err(error) => return format!("Could not read voice conversation: {error}"),
+                };
+                if let Some(existing) = &bound {
+                    if existing.uncertain {
+                        return "The native conversation has an uncertain turn. Inspect it before starting voice.".into();
+                    }
+                    if requested_agent.is_some_and(|agent| agent != existing.provider) {
+                        return format!("This conversation is already bound to {} session {}; starting another agent would break continuity.",
+                            existing.provider, existing.native_session_id);
+                    }
+                } else {
+                    let Some(handler) = &self.state.query_handler else {
+                        return "Native agent routing is unavailable.".into();
+                    };
+                    if let Some(agent) = requested_agent {
+                        if !matches!(agent, "claude" | "codex") {
+                            return "Choose Claude or Codex for a new voice conversation.".into();
+                        }
+                        let _ = handler.model_command_in_guild(Some(guild_id.get()),
+                            command.channel_id.get(), &format!("/model set {agent}")).await;
+                        if handler.selected_model(command.channel_id.get()).await.ok().flatten().as_deref() != Some(agent) {
+                            return format!("Could not select {agent} for this conversation; use `/model set {agent}` first.");
+                        }
+                    }
+                    let history = fetch_conversation_context(ctx, command.channel_id,
+                        MessageId::new(command.id.get()), self.state.bot_user_id.get().copied(),
+                        self.state.allowed_user_id).await;
+                    let audit = crate::AuditCtx {
+                        session_id: format!("{}:voice-start-{}", channel, command.id.get()),
+                        guild_id: Some(guild_id.get()), http: Some(Arc::clone(&ctx.http)),
+                        channel_id: Some(command.channel_id), owner_authorized: true,
+                    };
+                    if let Err(error) = handler.answer_turn(&audit, &history,
+                        "Start a voice conversation with me. Respond with a brief greeting.").await {
+                        return format!("Could not initialize native voice conversation: {error}");
+                    }
+                    bound = match store.discord_conversation(&guild, &channel) {
+                        Ok(Some(bound)) => Some(bound),
+                        Ok(None) => return "The native agent did not report a session ID; voice was not started.".into(),
+                        Err(error) => return format!("Could not read native session: {error}"),
+                    };
+                }
+                let bound = bound.expect("native session was created or already bound");
+                let Some(bot_id) = self.state.bot_user_id.get() else {
+                    return "Discord bot is still connecting; retry shortly.".into();
+                };
+                let binding = VoiceBinding {
+                    guild_id: guild.clone(), conversation_id: conversation.clone(),
+                    text_channel_id: channel.clone(),
+                    voice_channel_id: voice_channel.get().to_string(),
+                    owner_id: command.user.id.get().to_string(),
+                    bot_user_id: bot_id.get().to_string(),
+                    generation: next_voice_generation(),
+                    stt_provider: speech_option("stt"),
+                    tts_provider: speech_option("tts"),
+                };
+                match bridge.start(binding).await {
+                    Ok(()) => format!("Joining <#{}> for this conversation. Native {} session {} is bound; listening will begin when the voice connection is ready.",
+                        voice_channel.get(), bound.provider, bound.native_session_id),
+                    Err(error) => format!("Could not start Discord voice: {error}"),
+                }
+            }
+            "provider" => {
+                let Some(mut binding) = bridge.binding(&guild) else {
+                    return "Start voice in this conversation before switching providers.".into();
+                };
+                if binding.conversation_id != conversation {
+                    return format!("Voice is bound to {} in this server.", binding.conversation_id);
+                }
+                let stt = speech_option("stt");
+                let tts = speech_option("tts");
+                if stt.is_none() && tts.is_none() {
+                    return "Choose STT, TTS, or both providers to switch.".into();
+                }
+                if let Some(stt) = stt { binding.stt_provider = Some(stt); }
+                if let Some(tts) = tts { binding.tts_provider = Some(tts); }
+                if let Err(error) = bridge.stop(&guild, &conversation).await {
+                    return format!("Could not stop voice before switching providers: {error}");
+                }
+                binding.generation = next_voice_generation();
+                match bridge.start(binding.clone()).await {
+                    Ok(()) => format!("Switching speech providers in the same conversation: STT {}, TTS {}. Rejoining <#{}>.",
+                        binding.stt_provider.as_deref().unwrap_or("default"),
+                        binding.tts_provider.as_deref().unwrap_or("default"), binding.voice_channel_id),
+                    Err(error) => format!("Voice stopped, but the new providers could not start: {error}. The text session remains available."),
+                }
+            }
+            "status" => {
+                let Some(binding) = bridge.binding(&guild) else {
+                    return format!("Voice is {}; the text conversation remains available.",
+                        if bridge.transport_status() == "reconnecting" { "reconnecting" } else { "stopped" });
+                };
+                if binding.conversation_id != conversation {
+                    return format!("Voice is bound to {} in this server.", binding.conversation_id);
+                }
+                let session = self.state.store.as_ref()
+                    .and_then(|store| store.discord_conversation(&guild, &command.channel_id.get().to_string()).ok().flatten());
+                let audio_state = bridge.status(&guild, &conversation).await
+                    .unwrap_or_else(|_| "disconnected".into());
+                match session {
+                    Some(session) => format!("Voice binding: <#{}> ↔ <#{}>. Native {} session {}. Audio state: {}. Speech: STT {}, TTS {}.",
+                        command.channel_id.get(), binding.voice_channel_id, session.provider, session.native_session_id, audio_state,
+                        binding.stt_provider.as_deref().unwrap_or("default"),
+                        binding.tts_provider.as_deref().unwrap_or("default")),
+                    None => "Voice binding is active, but its native session could not be read.".into(),
+                }
+            }
+            "stop" => match bridge.stop(&guild, &conversation).await {
+                Ok(()) => "Voice stopped. Continue typing here in the same native session.".into(),
+                Err(error) => format!("Could not stop Discord voice: {error}"),
+            },
+            "interrupt" => match bridge.interrupt(&guild, &conversation).await {
+                Ok(()) => "Current spoken reply interrupted.".into(),
+                Err(error) => format!("Could not interrupt Discord voice: {error}"),
+            },
+            _ => "Use `/voice start`, `provider`, `status`, `stop`, or `interrupt`.".into(),
+        }
+    }
 }
 
 #[serenity::async_trait]
@@ -56,7 +306,26 @@ impl EventHandler for Handler {
         // context for follow-ups.
         let bot_user_id = ready.user.id;
         let _ = self.state.bot_user_id.set(bot_user_id);
+        if let Some(bridge) = &self.state.voice_bridge {
+            bridge.set_shard(ctx.shard.clone()).await;
+        }
         self.state.mark_ready();
+
+        if self.state.voice_enabled {
+            if let Some(query) = self.state.query_channel_id {
+                let http = Arc::clone(&ctx.http);
+                tokio::spawn(async move {
+                    match query.to_channel(&http).await {
+                        Ok(Channel::Guild(channel)) => {
+                            if let Err(error) = channel.guild_id.create_command(&http, voice_command()).await {
+                                warn!("could not register Discord voice command: {error}");
+                            }
+                        }
+                        _ => warn!("could not find Discord guild for voice command registration"),
+                    }
+                });
+            }
+        }
 
         // One-shot scrollback sweep: delete approval cards whose actions are
         // already resolved. Catches cards left from previous runs or from
@@ -70,6 +339,42 @@ impl EventHandler for Handler {
         }
     }
 
+    async fn voice_state_update(&self, _ctx: Context, _old: Option<VoiceState>, new: VoiceState) {
+        let Some(bridge) = &self.state.voice_bridge else { return; };
+        let Some(guild_id) = new.guild_id else { return; };
+        let guild = guild_id.get().to_string();
+        let user = new.user_id.get().to_string();
+        let channel = new.channel_id.map(|id| id.get().to_string());
+        if let Some(binding) = bridge.binding(&guild) {
+            if user == binding.owner_id && channel.as_deref() != Some(&binding.voice_channel_id) {
+                if let Err(error) = bridge.stop(&guild, &binding.conversation_id).await {
+                    warn!("could not detach Discord voice after owner departure: {error}");
+                }
+                return;
+            }
+        }
+        if let Err(error) = bridge.forward_voice_state(
+            &guild, &user, channel.as_deref(), &new.session_id,
+        ).await {
+            warn!("could not forward Discord voice state to sidecar: {error}");
+        }
+    }
+
+    async fn voice_server_update(&self, _ctx: Context, event: VoiceServerUpdateEvent) {
+        let Some(bridge) = &self.state.voice_bridge else { return; };
+        let Some(guild_id) = event.guild_id else { return; };
+        let guild = guild_id.get().to_string();
+        if let Some(endpoint) = event.endpoint {
+            if let Err(error) = bridge.forward_voice_server(&guild, &endpoint, &event.token).await {
+                warn!("could not forward Discord voice server update to sidecar: {error}");
+            }
+        } else if let Some(binding) = bridge.binding(&guild) {
+            if let Err(error) = bridge.stop(&guild, &binding.conversation_id).await {
+                warn!("could not detach Discord voice after endpoint loss: {error}");
+            }
+        }
+    }
+
     async fn message(&self, ctx: Context, msg: Message) {
         if msg.author.bot {
             return;
@@ -77,15 +382,6 @@ impl EventHandler for Handler {
         let Some(handler) = &self.state.query_handler else {
             return;
         };
-
-        let is_dm = msg.guild_id.is_none();
-        let in_query_channel = self
-            .state
-            .query_channel_id
-            .is_some_and(|cid| cid == msg.channel_id);
-        if !is_dm && !in_query_channel {
-            return;
-        }
 
         if !is_authorized(self.state.allowed_user_id, msg.author.id) {
             debug!(
@@ -96,11 +392,19 @@ impl EventHandler for Handler {
             return;
         }
 
+        let is_dm = msg.guild_id.is_none();
+        let in_query_channel = is_query_conversation(&ctx, &msg, self.state.query_channel_id).await;
+        if !is_dm && !in_query_channel {
+            return;
+        }
+
         let user_text = msg.content.trim().to_string();
         // Model selection is an owner control, never part of the model prompt.
         // This runs after the existing fail-closed allowlist and before any
         // attachment download or history collection.
-        if let Some(reply) = handler.model_command(msg.channel_id.get(), &user_text).await {
+        if let Some(reply) = handler.model_command_in_guild(
+            msg.guild_id.map(|guild| guild.get()), msg.channel_id.get(), &user_text
+        ).await {
             let builder = CreateMessage::new().content(reply)
                 .reference_message(MessageReference::from((msg.channel_id, msg.id)));
             if let Err(error) = msg.channel_id.send_message(&ctx.http, builder).await {
@@ -260,9 +564,11 @@ impl EventHandler for Handler {
         let http = ctx.http.clone();
         let channel_id = msg.channel_id;
         let msg_id = msg.id;
+        let guild_id = msg.guild_id.map(|guild| guild.get());
         let bot_user_id = self.state.bot_user_id.get().copied();
         let allowed_user_id = self.state.allowed_user_id;
         let wiki_root = self.state.wiki_root.clone();
+        let voice_bridge = self.state.voice_bridge.clone();
 
         info!(%channel_id, %msg_id, "discord query received");
         tokio::spawn(async move {
@@ -287,12 +593,7 @@ impl EventHandler for Handler {
             let extracted_docs = extract_doc_attachments(&docs, msg_id.get()).await;
             downloaded_txts.extend(extracted_docs);
 
-            let prompt = build_prompt_with_context(
-                &history,
-                &user_text,
-                &downloaded_imgs,
-                &downloaded_txts,
-            );
+            let current = build_prompt(&user_text, &downloaded_imgs, &downloaded_txts);
 
             // #125: Liveness signal. Discord's typing indicator auto-expires
             // after ~10s, so we kick one off immediately and re-broadcast on a
@@ -306,12 +607,16 @@ impl EventHandler for Handler {
             // high-risk tool calls (Write/Edit/Bash/...).
             let audit_ctx = crate::AuditCtx {
                 session_id: format!("{}:{}", channel_id, msg_id),
+                guild_id,
                 http: Some(http.clone()),
                 channel_id: Some(channel_id),
                 owner_authorized: allowed_user_id.is_some(),
             };
-            let result =
-                run_with_typing(&http, channel_id, handler.answer(&audit_ctx, &prompt)).await;
+            let result = run_with_typing(
+                &http,
+                channel_id,
+                handler.answer_turn(&audit_ctx, &history, &current),
+            ).await;
             info!(%channel_id, %msg_id, success = result.is_ok(), "discord query completed");
 
             // Best-effort cleanup. Tempfiles aren't load-bearing for the reply
@@ -349,6 +654,20 @@ impl EventHandler for Handler {
                         "wiki answer chunk",
                     )
                     .await;
+                    let final_spoken = handler.take_final_spoken(&audit_ctx.session_id);
+                    if !final_spoken && !answer.trim().is_empty() && answer.len() <= 12_000 {
+                        if let (Some(bridge), Some(guild)) = (&voice_bridge, guild_id) {
+                            let guild = guild.to_string();
+                            let conversation = format!("{guild}:{}", channel_id.get());
+                            if bridge.binding(&guild).as_ref().is_some_and(|binding|
+                                binding.conversation_id == conversation) {
+                                if let Err(error) = bridge.speak(&guild, &conversation,
+                                    &format!("{}:final", audit_ctx.session_id), &answer).await {
+                                    warn!("could not speak Discord text reply: {error}");
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     let mut err_msg = format!("wiki query failed: {e}");
@@ -369,6 +688,20 @@ impl EventHandler for Handler {
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         match interaction {
+            Interaction::Command(command) if command.data.name == "voice" => {
+                let defer = CreateInteractionResponse::Defer(
+                    CreateInteractionResponseMessage::new().ephemeral(true),
+                );
+                if let Err(error) = command.create_response(&ctx.http, defer).await {
+                    warn!("could not acknowledge Discord voice command: {error}");
+                    return;
+                }
+                let reply = self.voice_command_reply(&ctx, &command).await;
+                if let Err(error) = command.edit_response(&ctx.http,
+                    EditInteractionResponse::new().content(reply)).await {
+                    warn!("could not post Discord voice command result: {error}");
+                }
+            }
             Interaction::Component(comp) => {
                 let Some(cid) = CustomId::parse(&comp.data.custom_id) else {
                     debug!("unrecognized custom_id: {}", comp.data.custom_id);
@@ -1276,23 +1609,6 @@ async fn ack_ephemeral(
     }
 }
 
-/// #1190 — did a redraft entry point (Revise/FillAsk modal submit, or the
-/// QuickRefine select) fail to repost a new approval card, leaving the owner
-/// with no durable signal? True for `Failed`/`NotFound`: `revise` returned no
-/// draft, `repost` is `None`, the old card stays, and the ONLY trace is an
-/// ephemeral followup a coincidental 🚩 triage notice can visually displace —
-/// so those two warrant a durable in-channel notice. False for `Revised` (a
-/// fresh card is reposted) and `AlreadyResolved` (the stale card is deleted and
-/// the ephemeral explains why), and false for every other outcome, none of
-/// which a redraft path can produce. Pure so the decision is exhaustively
-/// unit-testable — a new `ApprovalActionOutcome` variant forces a choice here.
-fn redraft_produced_no_card(outcome: &ApprovalActionOutcome) -> bool {
-    matches!(
-        outcome,
-        ApprovalActionOutcome::Failed { .. } | ApprovalActionOutcome::NotFound
-    )
-}
-
 /// #1190 — build the durable no-card notice for a redraft outcome, if one is
 /// warranted. Returns `Some` for exactly the outcomes [`redraft_produced_no_card`]
 /// flags (`Failed`/`NotFound`), and — critically — does so REGARDLESS of whether
@@ -1309,103 +1625,6 @@ fn redraft_no_card_notice(
 ) -> Option<CreateMessage> {
     redraft_produced_no_card(outcome)
         .then(|| revise_failure_notice(snapshot_email, &describe(outcome)))
-}
-
-fn describe(outcome: &ApprovalActionOutcome) -> String {
-    match outcome {
-        ApprovalActionOutcome::NotFound => {
-            "No record of that approval — it may have been cleared.".into()
-        }
-        ApprovalActionOutcome::AlreadyResolved { status, detail } => {
-            resolved_message(status, detail.as_deref())
-        }
-        ApprovalActionOutcome::Approved => "Approved — sending.".into(),
-        ApprovalActionOutcome::Skipped => "Skipped — draft discarded.".into(),
-        ApprovalActionOutcome::Revised { .. } => "Revising — new draft posted below.".into(),
-        ApprovalActionOutcome::Scheduled { local, .. } => {
-            format!("Scheduled — sends {local}.")
-        }
-        ApprovalActionOutcome::Unscheduled => {
-            "Back in the queue — approval card reposted.".into()
-        }
-        ApprovalActionOutcome::CancelledSchedule => {
-            "Schedule cancelled — draft discarded.".into()
-        }
-        ApprovalActionOutcome::Recomposed => {
-            "Recomposed — a fresh approval card is posted below. It won't be \
-             auto-retired again."
-                .into()
-        }
-        ApprovalActionOutcome::Failed { message } => format!("Failed: {message}"),
-    }
-}
-
-/// #1203 — should the #1199 recovery ephemeral carry a one-click **Recompose**
-/// button for this terminal outcome? Pure so it is exhaustively testable; the
-/// serenity button construction stays a thin wrapper over it.
-///
-/// True only for a `superseded` row whose reason is NOT the empty-draft case
-/// (#484: there is literally nothing to recompose — the button would post an
-/// empty card). Every other supersede reason (already replied, bulk sender,
-/// newer version, `stale`, unknown) is a legitimate owner override: they may
-/// still want the drafted reply, so offer the button. The CLI handler defends
-/// the empty-draft edge again (a `stale`-reasoned row could in theory carry an
-/// empty draft), returning `Failed` rather than carding a blank.
-///
-/// False for every non-superseded terminal status and for a `None` detail
-/// (reason unknown → don't guess a draft exists; the owner can act on the
-/// newest card, per the #1199 pointer).
-fn offers_recompose(status: &str, detail: Option<&str>) -> bool {
-    status == "superseded"
-        && detail.is_some_and(|reason| !reason.contains("empty draft body"))
-}
-
-/// #1199 — render a terminal `AlreadyResolved { status, detail }` as
-/// owner-actionable copy. `detail` is the raw `actions.errorMessage` the store
-/// persisted (the specific supersede reason for a `superseded` row; unused for
-/// the other terminal statuses).
-///
-/// Before #1199 every terminal state collapsed to `Already resolved
-/// (superseded).`, which never said *why* the card was gone and offered no
-/// recovery path. Now the reason is surfaced and each class points at the
-/// owner's real next step:
-///   - already replied (reconcile Rule 1 / replied-after-scheduling) → the
-///     thread is handled, nothing to send;
-///   - bulk/automated sender (Rule 2) → no reply was needed;
-///   - empty draft body (Rule 3 / #484) → recompose;
-///   - newer manual reply / follow-up compose / `stale` / unknown reason →
-///     act on the newest card for this thread.
-///
-/// `detail == None` (row gone, or no stored message) falls through to the
-/// "newest card" pointer, which is the safe default for a `superseded` row and
-/// never panics.
-fn resolved_message(status: &str, detail: Option<&str>) -> String {
-    match status {
-        "superseded" => {
-            let reason = detail.unwrap_or_default();
-            if reason.contains("already replied")
-                || reason.contains("replied on this thread after scheduling")
-            {
-                "You already handled this thread, so the draft was retired — nothing left to send."
-                    .into()
-            } else if reason.contains("bulk/automated") {
-                "Retired — bulk/automated sender, no reply needed.".into()
-            } else if reason.contains("empty draft body") {
-                "The draft was empty, so it was cleared — recompose if you meant to reply.".into()
-            } else {
-                // "superseded by manual reply", "superseded by follow-up
-                // compose", "superseded: stale", or any unrecognized reason.
-                "A newer version replaced this draft. Act on the newest card for this thread."
-                    .into()
-            }
-        }
-        "sent" => "Already sent.".into(),
-        "scheduled" => "Already scheduled — see the scheduled notice.".into(),
-        "sending" => "Already sending — a send is in flight.".into(),
-        "skipped" | "rejected" => "Already skipped — draft discarded.".into(),
-        "cancelled" => "Schedule already cancelled.".into(),
-        other => format!("Already resolved ({other})."),
-    }
 }
 
 /// Ephemeral followup on a deferred MODAL interaction (#501). Mirror of
@@ -1740,35 +1959,25 @@ pub async fn edit_card_for_action(
 /// than this are downloaded up to `MAX_DOWNLOAD_BYTES` and truncated to the
 /// first `MAX_TEXT_BYTES` bytes — the prompt annotation marks the file as
 /// `TRUNCATED — first X of Y` so the reasoner knows it has the head only.
-const MAX_TEXT_BYTES: u32 = 1_048_576; // 1 MB (matches serenity's Attachment.size u32)
+/// The policy itself lives in `augmentagent_docs::inbound` (#1293) so every
+/// surface shares it; Discord keeps `u32` because serenity's sizes are `u32`.
+#[cfg(test)]
+const MAX_TEXT_BYTES: u32 = inbound::MAX_TEXT_BYTES as u32; // 1 MB
 
 /// Hard cap on text-file attachment size. Files larger than this are dropped
 /// at filter time so we never spend bandwidth downloading them. Sized to leave
 /// headroom above `MAX_TEXT_BYTES` — files in `MAX_TEXT_BYTES..MAX_DOWNLOAD_BYTES`
 /// are accepted and truncated at write time.
-const MAX_DOWNLOAD_BYTES: u32 = 8 * 1_048_576; // 8 MB
+const MAX_DOWNLOAD_BYTES: u32 = inbound::MAX_DOWNLOAD_BYTES as u32; // 8 MB
 
 /// Extensions we accept as text even when Discord omits `content_type`.
 /// Discord populates `content_type` from the upload, which is unreliable for
 /// code/config files, so we fall back to extension here.
-const TEXT_EXT_ALLOWLIST: &[&str] = &[
-    // plain text & docs
-    "txt", "md", "markdown", "rst", "log",
-    // structured data
-    "json", "yaml", "yml", "toml", "csv", "tsv", "xml",
-    // source code
-    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs",
-    "py", "go", "java", "c", "cc", "cpp", "h", "hpp",
-    "cs", "rb", "php", "swift", "kt", "scala",
-    "sh", "bash", "zsh", "sql",
-    "html", "css", "scss", "less",
-    // config
-    "ini", "conf", "cfg", "properties",
-];
+const TEXT_EXT_ALLOWLIST: &[&str] = inbound::TEXT_EXT_ALLOWLIST;
 
 /// Extensions we refuse to ingest as text even if the MIME type matches.
 /// These are formats that commonly contain credentials.
-const TEXT_EXT_DENYLIST: &[&str] = &["env", "pem", "key", "p12", "pfx"];
+const TEXT_EXT_DENYLIST: &[&str] = inbound::TEXT_EXT_DENYLIST;
 
 /// Identify the doc kind from an attachment's content_type and/or filename
 /// extension. Delegates to the shared pipeline crate (#939) so Discord drops,
@@ -1858,107 +2067,63 @@ struct AttachmentPartition {
 /// dropped by each filter.
 ///
 /// Images are unconditionally accepted (no size/extension gate; matches the
-/// pre-existing image-attachment behavior). The text-file gating logic
-/// mirrors `filter_text_attachments` — kept in sync deliberately rather than
-/// delegated, because the rejection reasons need to be produced inline.
+/// pre-existing image-attachment behavior). The rules are the shared
+/// `augmentagent_docs::inbound::classify` (#1293), which Slack uses too.
 fn partition_attachments(attachments: &[Attachment]) -> AttachmentPartition {
     let mut out = AttachmentPartition::default();
     for a in attachments {
-        if a
-            .content_type
-            .as_deref()
-            .is_some_and(|ct| ct.starts_with("image/"))
-        {
-            out.images.push(a.clone());
-            continue;
-        }
-        let ext = std::path::Path::new(&a.filename)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|s| s.to_lowercase());
-        if let Some(e) = ext.as_deref() {
-            if TEXT_EXT_DENYLIST.contains(&e) {
-                out.rejected.push(RejectedAttachment {
-                    filename: a.filename.clone(),
-                    reason: RejectReason::SecurityDenylist,
-                });
+        let reason = match inbound::classify(&a.filename, a.content_type.as_deref(), u64::from(a.size)) {
+            Ok(InboundKind::Image) => {
+                out.images.push(a.clone());
                 continue;
             }
-        }
-        if a.size > MAX_DOWNLOAD_BYTES {
-            out.rejected.push(RejectedAttachment {
-                filename: a.filename.clone(),
-                reason: RejectReason::Oversize { size: a.size },
-            });
-            continue;
-        }
-        // Doc formats (PDF / DOCX / DOC) get routed through the converter
-        // pipeline before joining text_files for the prompt.
-        if doc_kind_for(a).is_some() {
-            out.docs.push(a.clone());
-            continue;
-        }
-        let is_text_mime = a
-            .content_type
-            .as_deref()
-            .is_some_and(|ct| ct.starts_with("text/"));
-        let is_allowlisted_ext = ext
-            .as_deref()
-            .is_some_and(|e| TEXT_EXT_ALLOWLIST.contains(&e));
-        if is_text_mime || is_allowlisted_ext {
-            out.text_files.push(a.clone());
-        } else {
-            out.rejected.push(RejectedAttachment {
-                filename: a.filename.clone(),
-                reason: RejectReason::UnsupportedType {
-                    content_type: a.content_type.as_deref().map(|s| s.to_string()),
-                    ext,
-                },
-            });
-        }
+            Ok(InboundKind::Doc(_)) => {
+                out.docs.push(a.clone());
+                continue;
+            }
+            Ok(InboundKind::Text) => {
+                out.text_files.push(a.clone());
+                continue;
+            }
+            Err(inbound::RejectReason::SecurityDenylist) => RejectReason::SecurityDenylist,
+            Err(inbound::RejectReason::Oversize { .. }) => RejectReason::Oversize { size: a.size },
+            Err(inbound::RejectReason::UnsupportedType { content_type, ext }) => {
+                RejectReason::UnsupportedType { content_type, ext }
+            }
+            // Only produced by surfaces that download inside the pipeline.
+            Err(inbound::RejectReason::Unavailable(_)) => continue,
+        };
+        out.rejected.push(RejectedAttachment {
+            filename: a.filename.clone(),
+            reason,
+        });
     }
     out
-}
-
-fn format_size(bytes: u32) -> String {
-    const MB: f64 = 1_048_576.0;
-    const KB: f64 = 1024.0;
-    let b = bytes as f64;
-    if b >= MB {
-        format!("{:.1} MB", b / MB)
-    } else if b >= KB {
-        format!("{:.0} KB", b / KB)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 /// Render the rejection footer. Returns `None` if there's nothing to surface,
 /// so callers can use `if let Some(footer) = format_rejection_footer(...)`.
 fn format_rejection_footer(rejected: &[RejectedAttachment]) -> Option<String> {
-    if rejected.is_empty() {
-        return None;
-    }
-    let parts: Vec<String> = rejected
+    let shared: Vec<inbound::Rejected> = rejected
         .iter()
-        .map(|r| match &r.reason {
-            RejectReason::Oversize { size } => format!(
-                "{} ({} > {})",
-                r.filename,
-                format_size(*size),
-                format_size(MAX_DOWNLOAD_BYTES),
-            ),
-            RejectReason::SecurityDenylist => format!("{} (security)", r.filename),
-            RejectReason::UnsupportedType { content_type, ext } => {
-                let detail = content_type
-                    .clone()
-                    .or_else(|| ext.clone())
-                    .unwrap_or_else(|| "unknown".to_string());
-                format!("{} (unsupported: {})", r.filename, detail)
-            }
+        .map(|r| inbound::Rejected {
+            filename: r.filename.clone(),
+            reason: match &r.reason {
+                RejectReason::Oversize { size } => inbound::RejectReason::Oversize {
+                    size: u64::from(*size),
+                    limit: u64::from(MAX_DOWNLOAD_BYTES),
+                },
+                RejectReason::SecurityDenylist => inbound::RejectReason::SecurityDenylist,
+                RejectReason::UnsupportedType { content_type, ext } => {
+                    inbound::RejectReason::UnsupportedType {
+                        content_type: content_type.clone(),
+                        ext: ext.clone(),
+                    }
+                }
+            },
         })
         .collect();
-    Some(format!("\u{26A0}\u{FE0F} skipped: {}", parts.join(", ")))
+    inbound::format_rejection_footer(&shared)
 }
 
 /// Label used to annotate prior turns in conversation history when the user
@@ -1983,33 +2148,7 @@ fn attachment_kind_label(attachments: &[Attachment]) -> &'static str {
 /// extension, otherwise derive from the MIME subtype, otherwise fall back to
 /// `bin`.
 fn extension_for(att: &Attachment) -> String {
-    if let Some(ext) = std::path::Path::new(&att.filename)
-        .extension()
-        .and_then(|e| e.to_str())
-    {
-        if !ext.is_empty() {
-            return ext.to_lowercase();
-        }
-    }
-    if let Some(ct) = att.content_type.as_deref() {
-        if let Some(rest) = ct.strip_prefix("image/") {
-            // image/jpeg → jpg; everything else passes through.
-            let ext = match rest {
-                "jpeg" => "jpg",
-                other => other,
-            };
-            return ext.to_string();
-        }
-        // text/* fallback for the common cases. Only kicks in when the
-        // filename has no extension — otherwise the early-return above wins.
-        match ct {
-            "text/plain" => return "txt".into(),
-            "text/markdown" => return "md".into(),
-            "text/csv" => return "csv".into(),
-            _ => {}
-        }
-    }
-    "bin".into()
+    inbound::extension_for(&att.filename, att.content_type.as_deref())
 }
 
 /// Download each attachment to `/tmp/aa-img-<msg_id>-<idx>.<ext>`. Returns the
@@ -2033,32 +2172,15 @@ async fn download_images(attachments: &[Attachment], msg_id: u64) -> Vec<PathBuf
     out
 }
 
-/// A text-file attachment that was downloaded to disk for the reasoner.
-/// `truncated` is true when the file was larger than `MAX_TEXT_BYTES` and we
-/// wrote only the first MB; `original_size` is what Discord reported on the
-/// uploaded attachment.
-#[derive(Debug, Clone)]
-struct DownloadedTextFile {
-    path: PathBuf,
-    truncated: bool,
-    original_size: u32,
-    /// #939 — what the OCR stage did for a converted doc (recovered text /
-    /// unavailable because MISTRAL_API_KEY is unset / failed). Surfaced in
-    /// the prompt so the reasoner never mistakes a scanned PDF's empty
-    /// extraction for an empty document. `None` for plain text files and
-    /// docs whose text layer was fine.
-    note: Option<String>,
-}
+/// A text-file attachment that was downloaded to disk for the reasoner:
+/// the shared representation (#1293). `truncated` is true when the file was
+/// larger than `MAX_TEXT_BYTES`; `original_size` is what Discord reported;
+/// `note` carries the #939 OCR outcome for converted docs.
+type DownloadedTextFile = inbound::TextAttachment;
 
-/// Pure slicing helper for the truncation logic. Extracted so the cap behavior
-/// is unit-testable without standing up a fake HTTP server.
+/// Pure slicing helper for the truncation logic (shared, #1293).
 fn truncate_text_bytes(bytes: &[u8]) -> (&[u8], bool) {
-    let cap = MAX_TEXT_BYTES as usize;
-    if bytes.len() > cap {
-        (&bytes[..cap], true)
-    } else {
-        (bytes, false)
-    }
+    inbound::truncate_text_bytes(bytes)
 }
 
 /// Mirror of `download_images` for text-file attachments. Writes to
@@ -2085,7 +2207,7 @@ async fn download_text_files(
                         Ok(()) => out.push(DownloadedTextFile {
                             path,
                             truncated,
-                            original_size: att.size,
+                            original_size: u64::from(att.size),
                             note: None,
                         }),
                         Err(e) => warn!("write text tempfile {} failed: {e}", path.display()),
@@ -2164,7 +2286,7 @@ async fn extract_doc_attachments(
                         info!(file = %att.filename, "{n}");
                     }
                     let (to_write, truncated) = truncate_text_bytes(text.as_bytes());
-                    let extracted_len = text.len().min(u32::MAX as usize) as u32;
+                    let extracted_len = text.len() as u64;
                     match tokio::fs::write(&out_path, to_write).await {
                         Ok(()) => out.push(DownloadedTextFile {
                             path: out_path,
@@ -2205,54 +2327,13 @@ fn build_prompt(
     images: &[PathBuf],
     text_files: &[DownloadedTextFile],
 ) -> String {
-    if images.is_empty() && text_files.is_empty() {
-        return user_text.to_string();
-    }
-    let mut s = String::new();
-    if !user_text.is_empty() {
-        s.push_str(user_text);
-        s.push_str("\n\n");
-    }
-    if !images.is_empty() {
-        // `IMAGE:` marker lines are the cross-provider convention defined in
-        // `augmentagent_channel_core::images`: claude Reads the path directly
-        // (scope-guard carve-out for /tmp/aa-img-*), a codex failover turns
-        // each marker into a native `-i` attachment, and text-only providers
-        // replace them with an honest note. The prefix is MIRRORED here as a
-        // literal — this crate must stay free of a channel-core dependency
-        // (channel-core depends on us), same pattern as SOCIALAPI_API_KEY_ENV.
-        s.push_str("[attached images to analyze — open each IMAGE path]\n");
-        for path in images {
-            s.push_str(&format!("IMAGE: {}\n", path.display()));
-        }
-    }
-    if !text_files.is_empty() {
-        s.push_str("[attached text files to read]\n");
-        for f in text_files {
-            s.push_str("- ");
-            s.push_str(&f.path.display().to_string());
-            if f.truncated {
-                s.push_str(&format!(
-                    "  (TRUNCATED — first {} of {})",
-                    format_size(MAX_TEXT_BYTES),
-                    format_size(f.original_size),
-                ));
-            }
-            // #939 — OCR outcome for converted docs (recovered / unavailable /
-            // failed). Nothing is appended when the text layer was fine.
-            if let Some(note) = &f.note {
-                s.push_str(&format!("  ({note})"));
-            }
-            s.push('\n');
-        }
-    }
-    s.push_str("\nUse the Read tool to view each attachment and answer based on them.");
-    s
+    inbound::build_prompt(user_text, images, text_files)
 }
 
 /// Layer a pre-formatted `<conversation_history>` block in front of the
 /// current-turn prompt. If `history` is empty, falls through to the bare
 /// `build_prompt` so first-turn messages match prior behavior exactly.
+#[cfg(test)]
 fn build_prompt_with_context(
     history: &str,
     user_text: &str,
@@ -2559,6 +2640,17 @@ fn hard_split(s: &str, max: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use augmentagent_docs::doc_command_for;
+
+    #[test]
+    fn query_threads_are_separate_conversations_under_the_configured_channel() {
+        let query = ChannelId::new(10);
+        for kind in [ChannelType::PublicThread, ChannelType::PrivateThread, ChannelType::NewsThread] {
+            assert!(is_query_thread(kind, Some(query), query));
+            assert!(!is_query_thread(kind, Some(ChannelId::new(11)), query));
+        }
+        assert!(!is_query_thread(ChannelType::Text, Some(query), query));
+        assert!(!is_query_thread(ChannelType::Voice, Some(query), query));
+    }
 
     #[tokio::test]
     async fn stalled_typing_request_does_not_block_answer() {

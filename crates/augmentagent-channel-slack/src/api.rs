@@ -42,20 +42,54 @@ pub struct SlackClient {
     base_url: String,
 }
 
+/// **Tests and local QA only.** In a debug build, a loopback Composio base
+/// URL (`http://127.0.0.1:<port>`) that every [`SlackClient::new`] uses
+/// instead of the real Composio backend, so the Slack contact-reply send
+/// can be shown end to end against a local fake. Ignored in release builds
+/// and for any non-loopback value.
+pub const TEST_COMPOSIO_BASE_ENV: &str = "AUGMENTAGENT_TEST_COMPOSIO_BASE";
+
+/// The [`TEST_COMPOSIO_BASE_ENV`] override, when it may apply.
+pub fn test_composio_base(value: Option<&str>) -> Option<String> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let v = value.map(str::trim).filter(|v| !v.is_empty())?;
+    let url = reqwest::Url::parse(v).ok()?;
+    let loopback = match url.host_str()? {
+        "localhost" => true,
+        h => h
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback()),
+    };
+    (url.scheme() == "http" && loopback).then(|| v.trim_end_matches('/').to_string())
+}
+
 impl SlackClient {
     pub fn new(auth: SlackAuth) -> Result<Self, SlackError> {
         let http = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
+        let base_url = match test_composio_base(
+            std::env::var(TEST_COMPOSIO_BASE_ENV).ok().as_deref(),
+        ) {
+            Some(base) => {
+                tracing::warn!("{TEST_COMPOSIO_BASE_ENV} is set: Composio Slack calls go to a local test server (debug build only)");
+                base
+            }
+            None => DEFAULT_BASE_URL.into(),
+        };
         Ok(Self {
             auth,
             http,
-            base_url: DEFAULT_BASE_URL.into(),
+            base_url,
         })
     }
 
-    /// Testing-only constructor — override the Composio base URL for mockito.
-    #[cfg(test)]
+    /// Point the client at another Composio base URL (tests: a mock
+    /// server).
     pub fn with_base_url(auth: SlackAuth, base_url: impl Into<String>) -> Self {
         Self {
             auth,
@@ -124,23 +158,6 @@ impl SlackClient {
             }
         }
         Ok(out)
-    }
-
-    /// `SLACK_SEND_MESSAGE` — post text to a channel/DM.
-    pub async fn send_message(
-        &self,
-        channel_id: &str,
-        text: &str,
-    ) -> Result<String, SlackError> {
-        let resp = self
-            .execute(
-                "SLACK_SEND_MESSAGE",
-                json!({ "channel": channel_id, "text": text }),
-            )
-            .await?;
-        // Slack's chat.postMessage returns { ok, ts, channel, message }.
-        find_string(&resp, &["ts"])
-            .ok_or_else(|| SlackError::Slack("send_message returned no ts".into()))
     }
 
     /// `SLACK_FETCH_TEAM_INFO` — workspace metadata (team id, name, domain).
@@ -279,6 +296,127 @@ impl SlackClient {
     }
 }
 
+/// #1290 — the Composio *user* connection is the owner's own Slack account:
+/// contact messages go out through it with `as_user: true` ("For the Slack
+/// toolkit, set `as_user=True` to post as the authenticated user",
+/// docs.composio.dev/toolkits/slack, read 2026-09-29), never through the
+/// interactive app's bot token.
+#[async_trait::async_trait]
+impl crate::contact::ContactSendApi for SlackClient {
+    fn owner_user_id(&self) -> Option<String> {
+        Some(self.auth.user_id.clone()).filter(|u| !u.trim().is_empty())
+    }
+
+    async fn post_as_owner(
+        &self,
+        message: &crate::contact::OutgoingContactMessage,
+    ) -> Result<crate::contact::PostedContactMessage, crate::contact::ContactSendError> {
+        use crate::contact::ContactSendError::{Rejected, Unknown};
+        let mut args = json!({
+            "channel": message.channel,
+            "text": message.text,
+            "as_user": true,
+            // Model text never links user groups or `@channel`.
+            "link_names": false,
+        });
+        if let Some(ts) = &message.thread_ts {
+            args["thread_ts"] = json!(ts);
+        }
+        let url = format!("{}/api/v3/tools/execute/SLACK_SEND_MESSAGE", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .header("x-api-key", &self.auth.composio_api_key)
+            .json(&json!({"user_id": self.auth.entity_id, "arguments": args}))
+            .send()
+            .await
+            .map_err(|e| {
+                // A connection that was never made carried nothing to Slack.
+                if e.is_connect() && !e.is_timeout() {
+                    Rejected(format!("could not reach Composio: {e}"))
+                } else {
+                    Unknown(format!("Composio request failed: {e}"))
+                }
+            })?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| Unknown(format!("Composio response unreadable: {e}")))?;
+        if status.is_client_error() {
+            return Err(Rejected(format!(
+                "SLACK_SEND_MESSAGE → {status}: {}",
+                truncate(&text, 300)
+            )));
+        }
+        if !status.is_success() {
+            return Err(Unknown(format!(
+                "SLACK_SEND_MESSAGE → {status}: {}",
+                truncate(&text, 300)
+            )));
+        }
+        let v: Value = serde_json::from_str(&text)
+            .map_err(|e| Unknown(format!("Composio response is not JSON: {e}")))?;
+        if v.get("successful").and_then(Value::as_bool) == Some(false) {
+            let err = v
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("composio reported failure");
+            return Err(Rejected(err.to_string()));
+        }
+        let ts = find_string(&v, &["ts"])
+            .ok_or_else(|| Unknown("SLACK_SEND_MESSAGE returned no ts".into()))?;
+        let channel = find_string(&v, &["channel"]).unwrap_or_else(|| message.channel.clone());
+        let posted = find_value(&v, &["message"]);
+        let field = |k: &str| {
+            posted
+                .and_then(|m| m.get(k))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        Ok(crate::contact::PostedContactMessage {
+            channel,
+            ts,
+            user: field("user"),
+            bot_id: field("bot_id"),
+        })
+    }
+
+    async fn find_owner_message(
+        &self,
+        channel: &str,
+        thread_ts: Option<&str>,
+        oldest_ts: &str,
+        owner_user_id: &str,
+        text: &str,
+    ) -> Result<Option<String>, crate::contact::ContactSendError> {
+        let (action, args) = match thread_ts {
+            Some(ts) => (
+                "SLACK_FETCH_MESSAGE_THREAD_FROM_A_CONVERSATION",
+                json!({"channel": channel, "ts": ts, "oldest": oldest_ts, "limit": 200}),
+            ),
+            None => (
+                "SLACK_FETCH_CONVERSATION_HISTORY",
+                json!({"channel": channel, "oldest": oldest_ts, "limit": 200}),
+            ),
+        };
+        let resp = self
+            .execute(action, args)
+            .await
+            .map_err(|e| crate::contact::ContactSendError::Unknown(e.to_string()))?;
+        let messages = find_array(&resp, &["messages"]).ok_or_else(|| {
+            crate::contact::ContactSendError::Unknown(format!("{action} returned no messages"))
+        })?;
+        Ok(messages.iter().find_map(|m| {
+            let by_owner = m.get("user").and_then(Value::as_str) == Some(owner_user_id);
+            let same = m.get("text").and_then(Value::as_str) == Some(text);
+            (by_owner && same)
+                .then(|| m.get("ts").and_then(Value::as_str).map(str::to_string))
+                .flatten()
+        }))
+    }
+}
+
 /// Find a nested array by walking through common Composio wrapper keys
 /// (`data`, `response_data`) until we hit `field`.
 fn find_array<'a>(value: &'a Value, fields: &[&str]) -> Option<&'a Vec<Value>> {
@@ -329,6 +467,27 @@ fn find_by_keys<'a>(value: &'a Value, fields: &[&str]) -> Option<&'a Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_test_composio_base_is_debug_only_and_loopback_only() {
+        use super::test_composio_base as base;
+        if !cfg!(debug_assertions) {
+            assert_eq!(base(Some("http://127.0.0.1:9")), None);
+            return;
+        }
+        assert_eq!(
+            base(Some("http://127.0.0.1:9/")).as_deref(),
+            Some("http://127.0.0.1:9")
+        );
+        assert_eq!(
+            base(Some("http://localhost:9")).as_deref(),
+            Some("http://localhost:9")
+        );
+        assert_eq!(base(Some("http://example.com")), None);
+        assert_eq!(base(Some("https://127.0.0.1:9")), None);
+        assert_eq!(base(Some("")), None);
+        assert_eq!(base(None), None);
+    }
+
     use super::*;
 
     fn test_auth() -> SlackAuth {
@@ -399,50 +558,170 @@ mod tests {
         assert!(!msgs[1].is_default_user_message());
     }
 
-    #[tokio::test]
-    async fn send_message_returns_ts() {
-        let mut server = mockito::Server::new_async().await;
-        let body = json!({
-            "successful": true,
-            "data": {
-                "response_data": {
-                    "ok": true,
-                    "ts": "1234567890.000001",
-                    "channel": "C1"
-                }
-            }
-        });
-        let _m = server
-            .mock("POST", "/api/v3/tools/execute/SLACK_SEND_MESSAGE")
-            .with_status(200)
-            .with_body(body.to_string())
-            .create_async()
-            .await;
+    // ---------------------------------------------------------------
+    // #1290 — contact sends through the Composio user connection
+    // ---------------------------------------------------------------
 
-        let client = SlackClient::with_base_url(test_auth(), server.url());
-        let ts = client.send_message("C1", "hello").await.unwrap();
-        assert_eq!(ts, "1234567890.000001");
+    use crate::contact::{ContactSendApi, ContactSendError, OutgoingContactMessage};
+    use mockito::Matcher;
+
+    fn msg(thread: Option<&str>) -> OutgoingContactMessage {
+        OutgoingContactMessage {
+            channel: "C1".into(),
+            thread_ts: thread.map(str::to_string),
+            text: "*Yes*".into(),
+        }
     }
 
     #[tokio::test]
-    async fn unsuccessful_response_surfaces_error() {
+    async fn a_contact_message_is_posted_as_the_user_in_its_thread() {
         let mut server = mockito::Server::new_async().await;
-        let body = json!({
-            "successful": false,
-            "error": "not_in_channel"
-        });
-        let _m = server
+        let m = server
             .mock("POST", "/api/v3/tools/execute/SLACK_SEND_MESSAGE")
-            .with_status(200)
-            .with_body(body.to_string())
+            .match_body(Matcher::PartialJson(json!({
+                "user_id": "eid",
+                "arguments": {"channel": "C1", "text": "*Yes*", "thread_ts": "1.000100",
+                              "as_user": true, "link_names": false}
+            })))
+            .with_body(
+                json!({"successful": true, "data": {"ok": true, "channel": "C1",
+                    "ts": "2.000001", "message": {"user": "U1", "text": "*Yes*"}}})
+                .to_string(),
+            )
+            .expect(1)
             .create_async()
             .await;
-
         let client = SlackClient::with_base_url(test_auth(), server.url());
-        let err = client.send_message("C1", "hi").await.unwrap_err();
-        match err {
-            SlackError::Composio(msg) => assert!(msg.contains("not_in_channel")),
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert_eq!(client.owner_user_id().as_deref(), Some("U1"));
+        let posted = client.post_as_owner(&msg(Some("1.000100"))).await.unwrap();
+        m.assert_async().await;
+        assert_eq!(posted.ts, "2.000001");
+        assert_eq!(posted.channel, "C1");
+        assert_eq!(posted.user.as_deref(), Some("U1"));
+        assert_eq!(posted.bot_id, None);
+    }
+
+    #[tokio::test]
+    async fn a_top_level_message_carries_no_thread_and_a_bot_attribution_is_reported() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/v3/tools/execute/SLACK_SEND_MESSAGE")
+            .match_request(|r| {
+                let body: Value = serde_json::from_slice(r.body().unwrap()).unwrap();
+                body["arguments"].get("thread_ts").is_none()
+            })
+            .with_body(
+                json!({"successful": true, "data": {"response_data": {"ok": true, "channel": "C1",
+                    "ts": "2.000002", "message": {"bot_id": "B1", "text": "x"}}}})
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let client = SlackClient::with_base_url(test_auth(), server.url());
+        let posted = client.post_as_owner(&msg(None)).await.unwrap();
+        assert_eq!(posted.bot_id.as_deref(), Some("B1"));
+        assert_eq!(posted.user, None);
+    }
+
+    #[tokio::test]
+    async fn send_failures_say_whether_the_message_may_have_landed() {
+        let mut server = mockito::Server::new_async().await;
+        let client = SlackClient::with_base_url(test_auth(), server.url());
+        let refused = server
+            .mock("POST", "/api/v3/tools/execute/SLACK_SEND_MESSAGE")
+            .with_body(json!({"successful": false, "error": "channel_not_found"}).to_string())
+            .create_async()
+            .await;
+        assert!(matches!(
+            client.post_as_owner(&msg(None)).await,
+            Err(ContactSendError::Rejected(e)) if e.contains("channel_not_found")
+        ));
+        refused.remove_async().await;
+        let bad_request = server
+            .mock("POST", "/api/v3/tools/execute/SLACK_SEND_MESSAGE")
+            .with_status(400)
+            .with_body("bad")
+            .create_async()
+            .await;
+        assert!(matches!(
+            client.post_as_owner(&msg(None)).await,
+            Err(ContactSendError::Rejected(_))
+        ));
+        bad_request.remove_async().await;
+        let server_error = server
+            .mock("POST", "/api/v3/tools/execute/SLACK_SEND_MESSAGE")
+            .with_status(502)
+            .with_body("gateway")
+            .create_async()
+            .await;
+        assert!(matches!(
+            client.post_as_owner(&msg(None)).await,
+            Err(ContactSendError::Unknown(_))
+        ));
+        server_error.remove_async().await;
+        let no_ts = server
+            .mock("POST", "/api/v3/tools/execute/SLACK_SEND_MESSAGE")
+            .with_body(json!({"successful": true, "data": {}}).to_string())
+            .create_async()
+            .await;
+        assert!(matches!(
+            client.post_as_owner(&msg(None)).await,
+            Err(ContactSendError::Unknown(_))
+        ));
+        no_ts.remove_async().await;
+        // Nothing listening: the request never left this host.
+        let closed = SlackClient::with_base_url(test_auth(), "http://127.0.0.1:9");
+        assert!(matches!(
+            closed.post_as_owner(&msg(None)).await,
+            Err(ContactSendError::Rejected(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_earlier_attempt_is_found_in_the_thread_or_the_channel() {
+        let mut server = mockito::Server::new_async().await;
+        let _thread = server
+            .mock(
+                "POST",
+                "/api/v3/tools/execute/SLACK_FETCH_MESSAGE_THREAD_FROM_A_CONVERSATION",
+            )
+            .match_body(Matcher::PartialJson(json!({
+                "arguments": {"channel": "C1", "ts": "1.000100", "oldest": "0.500000"}
+            })))
+            .with_body(
+                json!({"successful": true, "data": {"messages": [
+                    {"type": "message", "user": "U2", "text": "*Yes*", "ts": "1.000200"},
+                    {"type": "message", "user": "U1", "text": "*Yes*", "ts": "1.000300"}
+                ]}})
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let _history = server
+            .mock("POST", "/api/v3/tools/execute/SLACK_FETCH_CONVERSATION_HISTORY")
+            .with_body(
+                json!({"successful": true, "data": {"messages": [
+                    {"type": "message", "user": "U1", "text": "other", "ts": "1.000400"}
+                ]}})
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let client = SlackClient::with_base_url(test_auth(), server.url());
+        assert_eq!(
+            client
+                .find_owner_message("C1", Some("1.000100"), "0.500000", "U1", "*Yes*")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1.000300")
+        );
+        assert_eq!(
+            client
+                .find_owner_message("C1", None, "0.500000", "U1", "*Yes*")
+                .await
+                .unwrap(),
+            None
+        );
     }
 }

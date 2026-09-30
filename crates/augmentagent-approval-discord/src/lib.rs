@@ -9,6 +9,9 @@
 //! still `pending`, across daemon restarts, unlimited timeouts.
 
 pub mod attachments;
+pub mod conversation;
+pub mod voice_bridge;
+pub mod voice_tool;
 mod broker;
 mod custom_id;
 mod event_handler;
@@ -16,6 +19,8 @@ mod journal_cmd;
 mod layout;
 mod loops;
 mod nudge;
+// #1292 — the shared owner-command registry (Discord triggers, Slack mapping).
+pub mod owner_commands;
 mod process_loops;
 // #994 — register (casing) audit for outbound drafts. Public: the delivery
 // layer checks receipts here and `gmail compose` gates its body on them.
@@ -23,6 +28,9 @@ pub mod register;
 mod status_bus;
 mod surface;
 mod presets;
+// #1289 — outcome copy and cross-surface card sync shared with Slack.
+pub mod outcome;
+pub mod sync;
 // #501 — deterministic send-time parsing. Public module: the event handler's
 // select/modal arms resolve here, and `augmentagent-channel-core` re-exports
 // it for the query-mode `--send-at` flag (#502) — channel-core depends on
@@ -52,10 +60,19 @@ pub use loops::{
     next_cron_firing_ms, normalize_and_validate_cron, parse_interval, pause_after_failures,
     validate_tz, LoopCommandParser, LoopPoster, LoopRunner, LoopScheduler, ParsedLoop,
 };
+// #1292 — Slack's loop command reuses the deterministic grammar and checks.
+pub use loops::{parse_create_args, validate_parsed};
 pub use nudge::NudgeScheduler;
 pub use status_bus::{StatusBus, StatusChanged};
 pub use surface::{ApprovalSurface, ComposedSurface};
 pub use presets::{Preset, MAX_REDRAFT_ITERATIONS, PRESETS};
+// #1289 — what the Slack approval surface reuses unchanged from the Discord
+// card: the needs-input feedback shape and the Revise-result header.
+pub use layout::{fill_feedback, revise_result_prefix};
+pub use sync::{
+    deciding, deciding_surface, ApprovalCardSurface, CardSurfaces, MultiSurfaceBroker,
+    SyncingActionHandler,
+};
 
 use async_trait::async_trait;
 use augmentagent_store::Email;
@@ -329,6 +346,17 @@ pub trait ApprovalActionHandler: Send + Sync {
         }
     }
 
+    /// #1291 — "Reschedule": move an armed schedule to `at_ms`
+    /// (`scheduled → scheduled`, CAS-gated on the row still being armed).
+    /// The impl owns the central time guard and replaces the scheduled
+    /// notices. Default: unsupported.
+    async fn reschedule(&self, action_id: &str, at_ms: i64) -> ApprovalActionOutcome {
+        let _ = (action_id, at_ms);
+        ApprovalActionOutcome::Failed {
+            message: "rescheduling is not supported by this handler".into(),
+        }
+    }
+
     /// #1203 — "Recompose" on the recovery ephemeral: restore a superseded
     /// draft (`superseded → pending`, card reposted, row exempted from the
     /// reconcile sweep). Default `Failed`: handlers without a store/broker
@@ -368,9 +396,42 @@ pub trait ApprovalActionHandler: Send + Sync {
 pub trait QueryHandler: Send + Sync {
     async fn answer(&self, ctx: &AuditCtx, question: &str) -> anyhow::Result<String>;
 
+    /// Attach the private voice-tool endpoint after the Discord gateway has
+    /// connected. Non-voice query handlers keep the default no-op behavior.
+    fn attach_voice_tools(&self, _service: std::sync::Arc<voice_tool::VoiceToolService>) {}
+
+    /// Consume an explicit final-output marker from the agent's speech tool.
+    /// Only the native query handler that issued the grant can return true.
+    fn take_final_spoken(&self, _turn_id: &str) -> bool { false }
+
+    /// The current turn and optional migration history are separate so a
+    /// native session can include history only when it is first created.
+    async fn answer_turn(
+        &self,
+        ctx: &AuditCtx,
+        history: &str,
+        current: &str,
+    ) -> anyhow::Result<String> {
+        let prompt = if history.is_empty() {
+            current.to_string()
+        } else {
+            format!("{history}\n\nuser's current message:\n{current}")
+        };
+        self.answer(ctx, &prompt).await
+    }
+
     /// Owner-only deterministic control command, intercepted before history,
     /// attachments or model inference. `None` means an ordinary message.
     async fn model_command(&self, _channel_id: u64, _text: &str) -> Option<String> { None }
+
+    async fn model_command_in_guild(
+        &self,
+        _guild_id: Option<u64>,
+        channel_id: u64,
+        text: &str,
+    ) -> Option<String> {
+        self.model_command(channel_id, text).await
+    }
 
     /// Model selected for a new scheduled loop in this conversation.
     async fn selected_model(&self, _channel_id: u64) -> Result<Option<String>, String> { Ok(None) }
@@ -387,6 +448,7 @@ pub trait QueryHandler: Send + Sync {
 /// workspace cycle.
 pub struct AuditCtx {
     pub session_id: String,
+    pub guild_id: Option<u64>,
     pub http: Option<std::sync::Arc<serenity::http::Http>>,
     pub channel_id: Option<serenity::model::id::ChannelId>,
     /// True only when Discord has an explicit owner allowlist and this author matched it.
@@ -399,6 +461,7 @@ impl AuditCtx {
     pub fn empty() -> Self {
         Self {
             session_id: String::from("-"),
+            guild_id: None,
             http: None,
             channel_id: None,
             owner_authorized: false,

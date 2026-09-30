@@ -136,6 +136,16 @@ pub fn resolve_token_in<Tz: TimeZone>(token: &str, now: DateTime<Tz>) -> Result<
 /// Rejections return an error message listing the accepted formats so the
 /// ephemeral Discord error is self-serve.
 pub fn parse_send_at_in<Tz: TimeZone>(input: &str, now: DateTime<Tz>) -> Result<i64, String> {
+    parse_core(input, now).map(|(at, _)| at)
+}
+
+/// [`parse_send_at_in`] plus how DST adjusted the wall time (#1291). One
+/// grammar for both, so the confirmation path can never resolve a different
+/// instant than the Discord modal and `--send-at`.
+fn parse_core<Tz: TimeZone>(
+    input: &str,
+    now: DateTime<Tz>,
+) -> Result<(i64, Option<DstAdjustment>), String> {
     let raw = input.trim();
     if raw.is_empty() {
         return Err(format_error());
@@ -143,7 +153,7 @@ pub fn parse_send_at_in<Tz: TimeZone>(input: &str, now: DateTime<Tz>) -> Result<
     // Absolute instant with an explicit offset — timezone-independent, parsed
     // before any case-folding.
     if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
-        return Ok(dt.timestamp_millis());
+        return Ok((dt.timestamp_millis(), None));
     }
 
     let s = raw.to_ascii_lowercase();
@@ -153,7 +163,7 @@ pub fn parse_send_at_in<Tz: TimeZone>(input: &str, now: DateTime<Tz>) -> Result<
 
     // "YYYY-MM-DD HH:MM" — owner-local wall time.
     if let Ok(ndt) = NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M") {
-        return Ok(resolve_wall_time(&tz, ndt));
+        return Ok(resolve_wall_time_adj(&tz, ndt));
     }
 
     // "in Nm/Nh/Nd" — instant math. `parse_offset` caps the multiply, but a
@@ -161,7 +171,10 @@ pub fn parse_send_at_in<Tz: TimeZone>(input: &str, now: DateTime<Tz>) -> Result<
     // parse error, never a panic (#501 review).
     if let Some(rest) = s.strip_prefix("in ") {
         let delta = parse_offset(rest.trim()).ok_or_else(format_error)?;
-        return now_ms.checked_add(delta).ok_or_else(format_error);
+        return now_ms
+            .checked_add(delta)
+            .map(|at| (at, None))
+            .ok_or_else(format_error);
     }
 
     // "tomorrow [time]" — calendar day, default 09:00.
@@ -172,7 +185,10 @@ pub fn parse_send_at_in<Tz: TimeZone>(input: &str, now: DateTime<Tz>) -> Result<
         } else {
             parse_time_of_day(rest).ok_or_else(format_error)?
         };
-        return Ok(resolve_wall_time(&tz, add_days(today, 1).and_time(time)));
+        return Ok(resolve_wall_time_adj(
+            &tz,
+            add_days(today, 1).and_time(time),
+        ));
     }
 
     // Weekday name [time] — next occurrence, strictly 1..=7 days ahead (a
@@ -187,14 +203,20 @@ pub fn parse_send_at_in<Tz: TimeZone>(input: &str, now: DateTime<Tz>) -> Result<
         let current = i64::from(today.weekday().num_days_from_monday());
         let diff = (target - current).rem_euclid(7);
         let ahead = if diff == 0 { 7 } else { diff as u64 };
-        return Ok(resolve_wall_time(&tz, add_days(today, ahead).and_time(time)));
+        return Ok(resolve_wall_time_adj(
+            &tz,
+            add_days(today, ahead).and_time(time),
+        ));
     }
 
     // Bare time — today, or tomorrow if that instant is already past.
     if let Some(time) = parse_time_of_day(&s) {
-        let at = resolve_wall_time(&tz, today.and_time(time));
-        if at <= now_ms {
-            return Ok(resolve_wall_time(&tz, add_days(today, 1).and_time(time)));
+        let at = resolve_wall_time_adj(&tz, today.and_time(time));
+        if at.0 <= now_ms {
+            return Ok(resolve_wall_time_adj(
+                &tz,
+                add_days(today, 1).and_time(time),
+            ));
         }
         return Ok(at);
     }
@@ -207,15 +229,33 @@ pub fn parse_send_at_in<Tz: TimeZone>(input: &str, now: DateTime<Tz>) -> Result<
 /// gap → shift forward one hour (the gap is one hour in every IANA zone the
 /// owner plausibly lives in).
 fn resolve_wall_time<Tz: TimeZone>(tz: &Tz, ndt: NaiveDateTime) -> i64 {
+    resolve_wall_time_adj(tz, ndt).0
+}
+
+/// [`resolve_wall_time`] plus the adjustment it made, if any.
+fn resolve_wall_time_adj<Tz: TimeZone>(
+    tz: &Tz,
+    ndt: NaiveDateTime,
+) -> (i64, Option<DstAdjustment>) {
     match tz.from_local_datetime(&ndt) {
-        LocalResult::Single(dt) => dt.timestamp_millis(),
-        LocalResult::Ambiguous(earliest, _) => earliest.timestamp_millis(),
+        LocalResult::Single(dt) => (dt.timestamp_millis(), None),
+        LocalResult::Ambiguous(earliest, latest) => (
+            earliest.timestamp_millis(),
+            Some(DstAdjustment::Repeated {
+                later_ms: latest.timestamp_millis(),
+            }),
+        ),
         LocalResult::None => match tz.from_local_datetime(&(ndt + Duration::hours(1))) {
-            LocalResult::Single(dt) => dt.timestamp_millis(),
-            LocalResult::Ambiguous(earliest, _) => earliest.timestamp_millis(),
+            LocalResult::Single(dt) => (dt.timestamp_millis(), Some(DstAdjustment::Skipped)),
+            LocalResult::Ambiguous(earliest, _) => {
+                (earliest.timestamp_millis(), Some(DstAdjustment::Skipped))
+            }
             // Unreachable with real tz data (gaps are one hour); fall back to
             // reading the wall time as UTC rather than failing the schedule.
-            LocalResult::None => chrono::Utc.from_utc_datetime(&ndt).timestamp_millis(),
+            LocalResult::None => (
+                chrono::Utc.from_utc_datetime(&ndt).timestamp_millis(),
+                Some(DstAdjustment::Skipped),
+            ),
         },
     }
 }
@@ -322,4 +362,365 @@ fn format_error() -> String {
      \"fri 14:30\", \"in 3h\", \"7pm\", \"2026-09-01 09:00\", or RFC3339 \
      with offset"
         .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// #1291 — the owner's zone, confirmation-grade resolution, display.
+// ---------------------------------------------------------------------------
+
+/// The IANA zone type every surface that shows a send time uses. Zone rules
+/// come from the database compiled into `chrono-tz`, never from the host's
+/// zoneinfo files, so macOS and Linux resolve the same wall time to the same
+/// instant.
+pub use chrono_tz::Tz as Zone;
+
+/// The preset send times every surface offers, label → the symbolic token
+/// [`resolve_token_in`] resolves at click time (Discord's Schedule select
+/// uses the same tokens).
+pub const SCHEDULE_PRESETS: &[(&str, &str)] = &[
+    ("In 1 hour", "in1h"),
+    ("In 3 hours", "in3h"),
+    ("Tonight 7pm", "tonight-1900"),
+    ("Tomorrow 9am", "tomorrow-0900"),
+    ("Tomorrow 2pm", "tomorrow-1400"),
+    ("Next Monday 9am", "next-monday-0900"),
+];
+
+/// Names the owner's zone (`America/New_York`). Wins over the host zone.
+pub const TIMEZONE_ENV: &str = "AUGMENTAGENT_TIMEZONE";
+
+/// How a wall time was adjusted for daylight saving (#499 policy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DstAdjustment {
+    /// The wall time happens twice (clocks fall back); the first reading is
+    /// used. `later_ms` is the second one.
+    Repeated { later_ms: i64 },
+    /// The wall time never happens (clocks spring forward); it moved one
+    /// hour later.
+    Skipped,
+}
+
+/// A send time ready to be confirmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedSendAt {
+    pub at_ms: i64,
+    pub dst: Option<DstAdjustment>,
+}
+
+/// Why a send time could not be resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendAtError {
+    /// The text could mean more than one time; the message asks which.
+    Ambiguous(String),
+    /// Unparseable, already past, too soon or too far out.
+    Invalid(String),
+}
+
+impl SendAtError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Ambiguous(m) | Self::Invalid(m) => m,
+        }
+    }
+}
+
+/// `name` as an IANA zone (`America/New_York`, or POSIX `TZ` style
+/// `:America/New_York`).
+pub fn zone_named(name: &str) -> Option<Zone> {
+    let name = name.trim();
+    let name = name.strip_prefix(':').unwrap_or(name).trim();
+    if name.is_empty() {
+        return None;
+    }
+    name.parse::<Zone>().ok()
+}
+
+/// The owner's zone: [`TIMEZONE_ENV`], else the `TZ` variable when it names
+/// an IANA zone, else the host's configured zone name, else UTC. Only the
+/// *name* comes from the host; its rules come from the compiled-in database.
+pub fn owner_zone() -> Zone {
+    let configured = std::env::var(TIMEZONE_ENV).ok();
+    if let Some(bad) = configured.as_deref().filter(|c| zone_named(c).is_none()) {
+        tracing::warn!("{TIMEZONE_ENV}=`{bad}` is not an IANA zone name; using the host zone");
+    }
+    // The host zone's *name*: CoreFoundation on macOS, /etc/localtime's
+    // link (or /etc/timezone) on Linux. Its rules still come from chrono-tz.
+    let host = iana_time_zone::get_timezone().ok();
+    let zone = owner_zone_from(
+        configured.as_deref(),
+        std::env::var("TZ").ok().as_deref(),
+        host.as_deref(),
+    );
+    if zone == chrono_tz::UTC && host.as_deref().and_then(zone_named).is_none() {
+        tracing::warn!(
+            "could not tell the owner's time zone; send times use UTC. Set {TIMEZONE_ENV} \
+             (for example America/New_York)"
+        );
+    }
+    zone
+}
+
+/// [`owner_zone`] over explicit inputs (tests).
+pub fn owner_zone_from(configured: Option<&str>, tz_env: Option<&str>, host: Option<&str>) -> Zone {
+    [configured, tz_env, host]
+        .into_iter()
+        .flatten()
+        .find_map(zone_named)
+        .unwrap_or(chrono_tz::UTC)
+}
+
+/// Epoch-ms as a moment in `zone`.
+pub fn at_in(ms: i64, zone: &Zone) -> DateTime<Zone> {
+    zone.timestamp_millis_opt(ms).single().unwrap_or_else(|| {
+        chrono::Utc
+            .timestamp_millis_opt(0)
+            .unwrap()
+            .with_timezone(zone)
+    })
+}
+
+/// A send time the way every confirmation and notice shows it:
+/// `Wed Sep 30, 9:00 AM EDT (America/New_York)`.
+pub fn describe_send_time(at_ms: i64, zone: &Zone) -> String {
+    format!(
+        "{} ({})",
+        at_in(at_ms, zone).format("%a %b %-d, %-I:%M %p %Z"),
+        zone.name()
+    )
+}
+
+/// The sentence a confirmation adds when daylight saving moved or doubled
+/// the requested wall time. `None` when it did not.
+pub fn describe_dst(resolved: &ResolvedSendAt, zone: &Zone) -> Option<String> {
+    let at = at_in(resolved.at_ms, zone);
+    match resolved.dst? {
+        DstAdjustment::Skipped => {
+            // The wall time asked for: one hour before the shifted reading.
+            let asked = at.naive_local() - Duration::hours(1);
+            Some(format!(
+                "Clocks spring forward that night: {} does not exist, so it sends an hour later, at {}.",
+                asked.format("%-I:%M %p"),
+                at.format("%-I:%M %p %Z")
+            ))
+        }
+        DstAdjustment::Repeated { later_ms } => {
+            let later = at_in(later_ms, zone);
+            Some(format!(
+                "Clocks fall back that night, so {} happens twice. This is the first ({}); for \
+                 the second ({}) give the time with its offset, e.g. `{}`.",
+                at.format("%-I:%M %p"),
+                at.format("%-I:%M %p %Z"),
+                later.format("%-I:%M %p %Z"),
+                later.format("%Y-%m-%dT%H:%M:%S%:z")
+            ))
+        }
+    }
+}
+
+/// `"tomorrow 9"` / `"fri 9"` / `"9"`: the hour a bare number names, when
+/// the text is otherwise a time the parser would accept with am/pm.
+fn bare_hour(s: &str) -> Option<(String, u32)> {
+    let s = s.trim().to_ascii_lowercase();
+    let (prefix, rest) = if let Some(rest) = s.strip_prefix("tomorrow") {
+        ("tomorrow ".to_string(), rest.trim().to_string())
+    } else if let Some((_, rest)) = parse_weekday_prefix(&s) {
+        let word = s.split_whitespace().next().unwrap_or_default();
+        (format!("{word} "), rest.to_string())
+    } else {
+        (String::new(), s.clone())
+    };
+    let h: u32 = rest.parse().ok()?;
+    (1..=12).contains(&h).then_some((prefix, h))
+}
+
+/// Resolve free text to a send time the owner can confirm: the
+/// [`parse_send_at_in`] grammar, plus the checks a confirmation needs. A
+/// bare hour without am/pm asks which; a time already past, too soon or
+/// beyond the horizon is refused ([`validate_send_at`]). DST follows the
+/// #499 policy and is reported in [`ResolvedSendAt::dst`].
+pub fn resolve_send_at_in<Tz: TimeZone>(
+    input: &str,
+    now: DateTime<Tz>,
+) -> Result<ResolvedSendAt, SendAtError> {
+    if let Some((prefix, h)) = bare_hour(input) {
+        return Err(SendAtError::Ambiguous(format!(
+            "“{}” could be {h}am or {h}pm — say which, e.g. `{prefix}{h}am` or `{prefix}{h}pm` \
+             (or 24-hour `{prefix}{h:02}:00`).",
+            input.trim()
+        )));
+    }
+    let now_ms = now.timestamp_millis();
+    let (at_ms, dst) = parse_core(input, now).map_err(SendAtError::Invalid)?;
+    if at_ms <= now_ms {
+        return Err(SendAtError::Invalid(
+            "that time has already passed — give a time in the future".into(),
+        ));
+    }
+    validate_send_at(at_ms, now_ms).map_err(SendAtError::Invalid)?;
+    Ok(ResolvedSendAt { at_ms, dst })
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+    use chrono_tz::America::New_York;
+
+    fn ny(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Zone> {
+        New_York
+            .with_ymd_and_hms(y, mo, d, h, mi, 0)
+            .single()
+            .expect("unambiguous fixture")
+    }
+
+    fn utc_ms(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> i64 {
+        chrono::Utc
+            .with_ymd_and_hms(y, mo, d, h, mi, 0)
+            .unwrap()
+            .timestamp_millis()
+    }
+
+    #[test]
+    fn tomorrow_9am_resolves_in_the_owner_zone_and_is_shown_with_it() {
+        let now = ny(2026, 9, 29, 10, 0);
+        let r = resolve_send_at_in("tomorrow 9am", now).unwrap();
+        assert_eq!(r.at_ms, utc_ms(2026, 9, 30, 13, 0));
+        assert_eq!(r.dst, None);
+        assert_eq!(
+            describe_send_time(r.at_ms, &New_York),
+            "Wed Sep 30, 9:00 AM EDT (America/New_York)"
+        );
+    }
+
+    #[test]
+    fn a_bare_hour_asks_whether_am_or_pm_instead_of_guessing() {
+        let now = ny(2026, 9, 29, 10, 0);
+        for text in ["tomorrow 9", "fri 9", "9"] {
+            match resolve_send_at_in(text, now) {
+                Err(SendAtError::Ambiguous(m)) => {
+                    assert!(m.contains("9am") && m.contains("9pm"), "{text}: {m}")
+                }
+                other => panic!("{text}: expected a prompt, got {other:?}"),
+            }
+        }
+        // Unparseable text is refused with the accepted formats, not a prompt.
+        assert!(matches!(
+            resolve_send_at_in("whenever", now),
+            Err(SendAtError::Invalid(m)) if m.contains("tomorrow 9am")
+        ));
+    }
+
+    #[test]
+    fn a_time_already_past_is_refused_not_rolled_forward() {
+        let now = ny(2026, 9, 29, 10, 0);
+        match resolve_send_at_in("2026-09-28 09:00", now) {
+            Err(SendAtError::Invalid(m)) => assert!(m.contains("already passed"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        match resolve_send_at_in("2026-09-29T09:00:00-04:00", now) {
+            Err(SendAtError::Invalid(m)) => assert!(m.contains("already passed"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        // Too soon and too far keep the central guard's wording.
+        assert!(matches!(
+            resolve_send_at_in("in 1m", now),
+            Err(SendAtError::Invalid(m)) if m.contains("too soon")
+        ));
+        assert!(matches!(
+            resolve_send_at_in("in 90d", now),
+            Err(SendAtError::Invalid(m)) if m.contains("too far")
+        ));
+    }
+
+    #[test]
+    fn a_spring_forward_gap_moves_one_hour_later_and_says_so() {
+        // 2026-03-08 02:00 EST → 03:00 EDT in New York.
+        let now = ny(2026, 3, 7, 12, 0);
+        let r = resolve_send_at_in("tomorrow 2:30am", now).unwrap();
+        assert_eq!(r.at_ms, utc_ms(2026, 3, 8, 7, 30));
+        assert_eq!(r.dst, Some(DstAdjustment::Skipped));
+        assert_eq!(
+            describe_send_time(r.at_ms, &New_York),
+            "Sun Mar 8, 3:30 AM EDT (America/New_York)"
+        );
+        let note = describe_dst(&r, &New_York).unwrap();
+        assert!(note.contains("2:30 AM does not exist"), "{note}");
+        // A calendar day, not now + 24h, across the transition.
+        let nine = resolve_send_at_in("tomorrow 9am", now).unwrap();
+        assert_eq!(nine.at_ms, utc_ms(2026, 3, 8, 13, 0));
+        assert_eq!(nine.dst, None);
+    }
+
+    #[test]
+    fn a_fall_back_overlap_uses_the_first_reading_and_names_the_second() {
+        // 2026-11-01 02:00 EDT → 01:00 EST in New York: 1:30 happens twice.
+        let now = ny(2026, 10, 31, 12, 0);
+        let r = resolve_send_at_in("tomorrow 1:30am", now).unwrap();
+        assert_eq!(r.at_ms, utc_ms(2026, 11, 1, 5, 30));
+        assert_eq!(
+            r.dst,
+            Some(DstAdjustment::Repeated {
+                later_ms: utc_ms(2026, 11, 1, 6, 30)
+            })
+        );
+        assert_eq!(
+            describe_send_time(r.at_ms, &New_York),
+            "Sun Nov 1, 1:30 AM EDT (America/New_York)"
+        );
+        let note = describe_dst(&r, &New_York).unwrap();
+        assert!(note.contains("happens twice"), "{note}");
+        assert!(note.contains("1:30 AM EST"), "names the second: {note}");
+        // The owner can pick the second reading with an explicit offset.
+        let later = resolve_send_at_in("2026-11-01T01:30:00-05:00", now).unwrap();
+        assert_eq!(later.at_ms, utc_ms(2026, 11, 1, 6, 30));
+    }
+
+    #[test]
+    fn the_legacy_parser_is_unchanged_by_the_dst_reporting() {
+        let now = ny(2026, 3, 7, 12, 0);
+        assert_eq!(
+            parse_send_at_in("tomorrow 2:30am", now).unwrap(),
+            utc_ms(2026, 3, 8, 7, 30)
+        );
+        let fall = ny(2026, 10, 31, 12, 0);
+        assert_eq!(
+            parse_send_at_in("tomorrow 1:30am", fall).unwrap(),
+            utc_ms(2026, 11, 1, 5, 30)
+        );
+    }
+
+    #[test]
+    fn the_owner_zone_is_named_not_read_from_host_zoneinfo_files() {
+        // Configured wins; POSIX `:Zone` form is accepted.
+        assert_eq!(
+            owner_zone_from(Some("Europe/Berlin"), Some("Asia/Tokyo"), Some("UTC")),
+            chrono_tz::Europe::Berlin
+        );
+        assert_eq!(
+            owner_zone_from(None, Some(":Asia/Tokyo"), Some("UTC")),
+            chrono_tz::Asia::Tokyo
+        );
+        // TZ that is not an IANA name (a POSIX rule string) falls through to
+        // the host zone name.
+        assert_eq!(
+            owner_zone_from(
+                None,
+                Some("EST5EDT,M3.2.0,M11.1.0"),
+                Some("America/Chicago")
+            ),
+            chrono_tz::America::Chicago
+        );
+        // A bad configured name falls through too; nothing left means UTC.
+        assert_eq!(
+            owner_zone_from(Some("Mars/Olympus"), None, None),
+            chrono_tz::UTC
+        );
+        assert_eq!(zone_named(" America/New_York "), Some(New_York));
+        assert_eq!(zone_named("nope"), None);
+        // The same instant renders identically whatever the host is: the
+        // rules are compiled in.
+        assert_eq!(
+            describe_send_time(utc_ms(2026, 1, 15, 14, 0), &New_York),
+            "Thu Jan 15, 9:00 AM EST (America/New_York)"
+        );
+    }
 }

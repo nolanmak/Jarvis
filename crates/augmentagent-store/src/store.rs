@@ -2,11 +2,12 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::redact;
+use crate::surface::{SurfaceConversationRef, SurfaceTurnRef};
 
 use crate::models::{
     Account, ActionRecord, ActionStatus, AgentPrRun, AgentRepo, ChannelSubscription,
@@ -29,6 +30,76 @@ pub enum StoreError {
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
+/// A Discord text conversation bound to one real native agent session.
+/// Audit request IDs are deliberately not stored here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscordConversation {
+    pub guild_id: String,
+    pub channel_id: String,
+    pub provider: String,
+    pub native_session_id: String,
+    pub cwd: String,
+    /// The previous native turn may have run tools before its result was lost.
+    pub uncertain: bool,
+}
+
+/// A transport-owned conversation bound to one native agent session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeConversation {
+    pub conversation: SurfaceConversationRef,
+    pub provider: String,
+    pub native_session_id: String,
+    pub cwd: String,
+    pub uncertain: bool,
+}
+
+/// Where one claimed native turn stands (`surface_native_turns.status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceTurnStatus {
+    /// Claimed; the runner has not recorded an outcome (still running, or
+    /// the daemon died mid-turn).
+    Pending,
+    Complete,
+    /// The native agent may have run tools before its result was lost.
+    Uncertain,
+}
+
+/// #1288 — why an unfinished turn was closed without being re-run. The owner
+/// has been told, so the conversation may take its next turn; the turn itself
+/// is never submitted again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceTurnResolution {
+    /// The owner stopped it; the provider process tree was torn down.
+    Cancelled,
+    /// A daemon restart interrupted it.
+    Interrupted,
+}
+
+impl SurfaceTurnResolution {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    fn parse(value: &str) -> StoreResult<Self> {
+        match value {
+            "cancelled" => Ok(Self::Cancelled),
+            "interrupted" => Ok(Self::Interrupted),
+            other => Err(StoreError::InvalidInput(format!(
+                "unknown turn resolution {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceTurnState {
+    pub status: SurfaceTurnStatus,
+    pub resolution: Option<SurfaceTurnResolution>,
+}
+
 /// #900 — an interrupted ShadowNote sync pass, persisted after every page so
 /// a restart resumes pagination instead of replaying the whole batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,22 +121,469 @@ pub struct JournalSyncCursor {
 /// selected by the drain and would strand at `processed = 0` forever.
 pub const SOCIALAPI_WEBHOOK_KINDS: [&str; 2] = ["dm", "comment"];
 
+/// A migration step that failed only because another process was
+/// migrating the same file at the same time.
+fn lost_migration_race(e: &StoreError) -> bool {
+    let StoreError::Sqlite(rusqlite::Error::SqliteFailure(code, message)) = e else {
+        return false;
+    };
+    if matches!(
+        code.code,
+        rusqlite::ErrorCode::DatabaseBusy
+            | rusqlite::ErrorCode::DatabaseLocked
+            // #1299 — the other migrator changed the schema under us.
+            | rusqlite::ErrorCode::SchemaChanged
+    ) {
+        return true;
+    }
+    message
+        .as_deref()
+        .is_some_and(|m| m.contains("duplicate column name") || m.contains("already exists"))
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
     path: std::path::PathBuf,
 }
 
+fn surface_conversation_row(
+    conn: &Connection,
+    chat: &SurfaceConversationRef,
+) -> StoreResult<Option<NativeConversation>> {
+    Ok(conn.query_row(
+        "SELECT provider, native_session_id, cwd, uncertain FROM surface_conversations
+         WHERE platform = ?1 AND account_id = ?2 AND conversation_id = ?3 AND thread_id = ?4",
+        params![chat.account().platform().as_str(), chat.account().account_id(), chat.conversation_id(), chat.thread_id().unwrap_or("")],
+        |row| Ok(NativeConversation {
+            conversation: chat.clone(),
+            provider: row.get(0)?,
+            native_session_id: row.get(1)?,
+            cwd: row.get(2)?,
+            uncertain: row.get::<_, i64>(3)? != 0,
+        }),
+    ).optional()?)
+}
+
 impl Store {
+    pub fn bind_surface_conversation(&self, binding: &NativeConversation) -> StoreResult<()> {
+        let chat = &binding.conversation;
+        if chat.account().platform().as_str() == "discord" && chat.thread_id().is_none() {
+            return self.bind_discord_conversation(&DiscordConversation {
+                guild_id: chat.account().account_id().into(),
+                channel_id: chat.conversation_id().into(),
+                provider: binding.provider.clone(),
+                native_session_id: binding.native_session_id.clone(),
+                cwd: binding.cwd.clone(),
+                uncertain: binding.uncertain,
+            });
+        }
+        if binding.native_session_id.trim().is_empty()
+            || binding.cwd.trim().is_empty()
+            || !matches!(binding.provider.as_str(), "codex" | "claude")
+        {
+            return Err(StoreError::InvalidInput("invalid surface conversation binding".into()));
+        }
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO surface_conversations
+             (platform, account_id, conversation_id, thread_id, provider, native_session_id, cwd, created_at_ms, uncertain)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(platform, account_id, conversation_id, thread_id) DO NOTHING",
+            params![chat.account().platform().as_str(), chat.account().account_id(), chat.conversation_id(),
+                chat.thread_id().unwrap_or(""), binding.provider, binding.native_session_id,
+                binding.cwd, now_millis(), binding.uncertain as i64],
+        )?;
+        let persisted = surface_conversation_row(&guard, chat)?;
+        if persisted.as_ref() != Some(binding) {
+            return Err(StoreError::InvalidInput("surface conversation is already bound to another native session".into()));
+        }
+        Ok(())
+    }
+
+    pub fn surface_conversation(&self, chat: &SurfaceConversationRef) -> StoreResult<Option<NativeConversation>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        surface_conversation_row(&guard, chat)
+    }
+
+    pub fn mark_surface_conversation_uncertain(&self, chat: &SurfaceConversationRef) -> StoreResult<()> {
+        if chat.account().platform().as_str() == "discord" && chat.thread_id().is_none() {
+            return self.mark_discord_conversation_uncertain(chat.account().account_id(), chat.conversation_id());
+        }
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let changed = guard.execute(
+            "UPDATE surface_conversations SET uncertain = 1
+             WHERE platform = ?1 AND account_id = ?2 AND conversation_id = ?3 AND thread_id = ?4",
+            params![chat.account().platform().as_str(), chat.account().account_id(), chat.conversation_id(), chat.thread_id().unwrap_or("")],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::InvalidInput("surface conversation is not bound".into()));
+        }
+        Ok(())
+    }
+
+    pub fn claim_surface_turn(&self, turn: &SurfaceTurnRef) -> StoreResult<()> {
+        let chat = turn.conversation();
+        if chat.account().platform().as_str() == "discord" && chat.thread_id().is_none() {
+            return self.claim_discord_turn(chat.account().account_id(), chat.conversation_id(), turn.turn_id());
+        }
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // #1288 — a resolved turn (cancelled or interrupted, owner told)
+        // stays consumed but no longer blocks the conversation.
+        let unfinished: Option<String> = tx.query_row(
+            "SELECT t.turn_id FROM surface_native_turns t WHERE t.platform = ?1 AND t.account_id = ?2
+             AND t.conversation_id = ?3 AND t.thread_id = ?4 AND t.status != 'complete'
+             AND NOT EXISTS (SELECT 1 FROM surface_turn_resolutions r
+                 WHERE r.platform = t.platform AND r.account_id = t.account_id
+                 AND r.conversation_id = t.conversation_id AND r.thread_id = t.thread_id
+                 AND r.turn_id = t.turn_id)
+             LIMIT 1",
+            params![chat.account().platform().as_str(), chat.account().account_id(), chat.conversation_id(), chat.thread_id().unwrap_or("")],
+            |row| row.get(0),
+        ).optional()?;
+        if let Some(prior) = unfinished {
+            return Err(StoreError::InvalidInput(format!("surface native turn {prior} is uncertain; inspect it before continuing")));
+        }
+        let inserted = tx.execute(
+            "INSERT INTO surface_native_turns
+             (platform, account_id, conversation_id, thread_id, turn_id, status, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)
+             ON CONFLICT(platform, account_id, conversation_id, thread_id, turn_id) DO NOTHING",
+            params![chat.account().platform().as_str(), chat.account().account_id(), chat.conversation_id(),
+                chat.thread_id().unwrap_or(""), turn.turn_id(), now_millis()],
+        )?;
+        if inserted == 0 {
+            return Err(StoreError::InvalidInput("surface native turn was already submitted".into()));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn finish_surface_turn(&self, turn: &SurfaceTurnRef, success: bool) -> StoreResult<()> {
+        let chat = turn.conversation();
+        if chat.account().platform().as_str() == "discord" && chat.thread_id().is_none() {
+            return self.finish_discord_turn(chat.account().account_id(), chat.conversation_id(), turn.turn_id(), success);
+        }
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let status = if success { "complete" } else { "uncertain" };
+        let changed = guard.execute(
+            "UPDATE surface_native_turns SET status = ?6, finished_at_ms = ?7
+             WHERE platform = ?1 AND account_id = ?2 AND conversation_id = ?3 AND thread_id = ?4
+             AND turn_id = ?5 AND status = 'pending'",
+            params![chat.account().platform().as_str(), chat.account().account_id(), chat.conversation_id(),
+                chat.thread_id().unwrap_or(""), turn.turn_id(), status, now_millis()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidInput("surface native turn is not pending".into()));
+        }
+        Ok(())
+    }
+
+    /// Where a claimed turn stands, `None` when it was never claimed.
+    pub fn surface_turn_state(
+        &self,
+        turn: &SurfaceTurnRef,
+    ) -> StoreResult<Option<SurfaceTurnState>> {
+        let chat = turn.conversation();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row: Option<(String, Option<String>)> = guard
+            .query_row(
+                "SELECT t.status, r.resolution FROM surface_native_turns t
+             LEFT JOIN surface_turn_resolutions r ON r.platform = t.platform
+                 AND r.account_id = t.account_id AND r.conversation_id = t.conversation_id
+                 AND r.thread_id = t.thread_id AND r.turn_id = t.turn_id
+             WHERE t.platform = ?1 AND t.account_id = ?2 AND t.conversation_id = ?3
+                 AND t.thread_id = ?4 AND t.turn_id = ?5",
+                params![
+                    chat.account().platform().as_str(),
+                    chat.account().account_id(),
+                    chat.conversation_id(),
+                    chat.thread_id().unwrap_or(""),
+                    turn.turn_id()
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((status, resolution)) = row else {
+            return Ok(None);
+        };
+        let status = match status.as_str() {
+            "pending" => SurfaceTurnStatus::Pending,
+            "complete" => SurfaceTurnStatus::Complete,
+            "uncertain" => SurfaceTurnStatus::Uncertain,
+            other => {
+                return Err(StoreError::InvalidInput(format!(
+                    "unknown turn status {other}"
+                )))
+            }
+        };
+        let resolution = resolution
+            .as_deref()
+            .map(SurfaceTurnResolution::parse)
+            .transpose()?;
+        Ok(Some(SurfaceTurnState { status, resolution }))
+    }
+
+    /// #1288 — close an unfinished (pending or uncertain) turn that will not
+    /// be re-run because the owner stopped it or a restart interrupted it and
+    /// the owner was told. A pending turn becomes `uncertain` (its tools may
+    /// have run); the resolution lets the conversation's next turn proceed.
+    /// The first resolution wins. Discord keeps its own inspect-first rule
+    /// (#1220) and is refused here.
+    pub fn resolve_surface_turn(
+        &self,
+        turn: &SurfaceTurnRef,
+        resolution: SurfaceTurnResolution,
+    ) -> StoreResult<()> {
+        let chat = turn.conversation();
+        if chat.account().platform().as_str() == "discord" {
+            return Err(StoreError::InvalidInput(
+                "Discord native turns are not resolved through the surface API".into(),
+            ));
+        }
+        let cols = params![
+            chat.account().platform().as_str(),
+            chat.account().account_id(),
+            chat.conversation_id(),
+            chat.thread_id().unwrap_or(""),
+            turn.turn_id()
+        ];
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let status: Option<String> = tx
+            .query_row(
+                "SELECT status FROM surface_native_turns WHERE platform = ?1 AND account_id = ?2
+             AND conversation_id = ?3 AND thread_id = ?4 AND turn_id = ?5",
+                cols,
+                |row| row.get(0),
+            )
+            .optional()?;
+        match status.as_deref() {
+            None => {
+                return Err(StoreError::InvalidInput(
+                    "surface native turn was never claimed".into(),
+                ))
+            }
+            Some("complete") => {
+                return Err(StoreError::InvalidInput(
+                    "surface native turn already completed".into(),
+                ))
+            }
+            _ => {}
+        }
+        let now = now_millis();
+        tx.execute(
+            "UPDATE surface_native_turns SET status = 'uncertain', finished_at_ms = ?6
+             WHERE platform = ?1 AND account_id = ?2 AND conversation_id = ?3 AND thread_id = ?4
+             AND turn_id = ?5 AND status = 'pending'",
+            params![
+                chat.account().platform().as_str(),
+                chat.account().account_id(),
+                chat.conversation_id(),
+                chat.thread_id().unwrap_or(""),
+                turn.turn_id(),
+                now
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO surface_turn_resolutions
+             (platform, account_id, conversation_id, thread_id, turn_id, resolution, resolved_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(platform, account_id, conversation_id, thread_id, turn_id) DO NOTHING",
+            params![
+                chat.account().platform().as_str(),
+                chat.account().account_id(),
+                chat.conversation_id(),
+                chat.thread_id().unwrap_or(""),
+                turn.turn_id(),
+                resolution.as_str(),
+                now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Claim a Discord text or finalized speech turn before invoking a native
+    /// agent. A pending/uncertain row after restart blocks automatic replay.
+    pub fn claim_discord_turn(
+        &self,
+        guild_id: &str,
+        channel_id: &str,
+        turn_id: &str,
+    ) -> StoreResult<()> {
+        if [guild_id, channel_id, turn_id].iter().any(|value| value.trim().is_empty()) {
+            return Err(StoreError::InvalidInput("Discord turn identity is required".into()));
+        }
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let unfinished: Option<String> = tx.query_row(
+            "SELECT turn_id FROM discord_native_turns \
+             WHERE guild_id = ?1 AND channel_id = ?2 AND status != 'complete' LIMIT 1",
+            params![guild_id, channel_id],
+            |row| row.get(0),
+        ).optional()?;
+        if let Some(prior) = unfinished {
+            return Err(StoreError::InvalidInput(format!(
+                "Discord native turn {prior} is uncertain; inspect it before continuing"
+            )));
+        }
+        let inserted = tx.execute(
+            "INSERT INTO discord_native_turns \
+             (guild_id, channel_id, turn_id, status, created_at_ms) \
+             VALUES (?1, ?2, ?3, 'pending', ?4) \
+             ON CONFLICT(guild_id, channel_id, turn_id) DO NOTHING",
+            params![guild_id, channel_id, turn_id, now_millis()],
+        )?;
+        if inserted == 0 {
+            return Err(StoreError::InvalidInput("Discord native turn was already submitted".into()));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Only the native runner that claimed a pending turn can resolve it.
+    pub fn finish_discord_turn(
+        &self,
+        guild_id: &str,
+        channel_id: &str,
+        turn_id: &str,
+        success: bool,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let status = if success { "complete" } else { "uncertain" };
+        let changed = guard.execute(
+            "UPDATE discord_native_turns SET status = ?4, finished_at_ms = ?5 \
+             WHERE guild_id = ?1 AND channel_id = ?2 AND turn_id = ?3 AND status = 'pending'",
+            params![guild_id, channel_id, turn_id, status, now_millis()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidInput("Discord native turn is not pending".into()));
+        }
+        Ok(())
+    }
+
+    /// First writer wins. A voice join may repeat the exact binding, but may
+    /// not silently fork a text conversation or bind one native session twice.
+    pub fn bind_discord_conversation(&self, binding: &DiscordConversation) -> StoreResult<()> {
+        if binding.guild_id.trim().is_empty()
+            || binding.channel_id.trim().is_empty()
+            || binding.native_session_id.trim().is_empty()
+            || binding.cwd.trim().is_empty()
+            || !matches!(binding.provider.as_str(), "codex" | "claude")
+        {
+            return Err(StoreError::InvalidInput(
+                "invalid Discord conversation binding".into(),
+            ));
+        }
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO discord_conversations \
+             (guild_id, channel_id, provider, native_session_id, cwd, created_at_ms, uncertain) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(guild_id, channel_id) DO NOTHING",
+            params![
+                binding.guild_id,
+                binding.channel_id,
+                binding.provider,
+                binding.native_session_id,
+                binding.cwd,
+                now_millis(),
+                binding.uncertain as i64
+            ],
+        )?;
+        let persisted = guard.query_row(
+            "SELECT guild_id, channel_id, provider, native_session_id, cwd, uncertain \
+             FROM discord_conversations WHERE guild_id = ?1 AND channel_id = ?2",
+            params![binding.guild_id, binding.channel_id],
+            |row| {
+                Ok(DiscordConversation {
+                    guild_id: row.get(0)?,
+                    channel_id: row.get(1)?,
+                    provider: row.get(2)?,
+                    native_session_id: row.get(3)?,
+                    cwd: row.get(4)?,
+                    uncertain: row.get::<_, i64>(5)? != 0,
+                })
+            },
+        )?;
+        if &persisted != binding {
+            return Err(StoreError::InvalidInput(
+                "Discord conversation is already bound to another native session".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn discord_conversation(
+        &self,
+        guild_id: &str,
+        channel_id: &str,
+    ) -> StoreResult<Option<DiscordConversation>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        Ok(guard.query_row(
+            "SELECT guild_id, channel_id, provider, native_session_id, cwd, uncertain \
+             FROM discord_conversations WHERE guild_id = ?1 AND channel_id = ?2",
+            params![guild_id, channel_id],
+            |row| {
+                Ok(DiscordConversation {
+                    guild_id: row.get(0)?,
+                    channel_id: row.get(1)?,
+                    provider: row.get(2)?,
+                    native_session_id: row.get(3)?,
+                    cwd: row.get(4)?,
+                    uncertain: row.get::<_, i64>(5)? != 0,
+                })
+            },
+        )
+        .optional()?)
+    }
+
+    pub fn mark_discord_conversation_uncertain(
+        &self,
+        guild_id: &str,
+        channel_id: &str,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let changed = guard.execute(
+            "UPDATE discord_conversations SET uncertain = 1 WHERE guild_id = ?1 AND channel_id = ?2",
+            params![guild_id, channel_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::InvalidInput("Discord conversation is not bound".into()));
+        }
+        Ok(())
+    }
+
+    /// Open (creating if needed) and migrate. Another process may be
+    /// migrating the same file at the same moment (`status` while the
+    /// daemon starts, #1287); `migrate` is idempotent but not serialised
+    /// across processes, so losing that race (a lock, or a column/table the
+    /// other process just added) is retried briefly instead of failing.
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
-        let path_buf = path.as_ref().to_path_buf();
+        let path = path.as_ref();
+        let mut attempt = 0u64;
+        loop {
+            match Self::open_once(path) {
+                Err(e) if attempt < 20 && lost_migration_race(&e) => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis((25 * attempt).min(250)));
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn open_once(path: &Path) -> StoreResult<Self> {
         let conn = Connection::open(path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Busy timeout first: switching to WAL and migrating take locks.
         conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Self::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
-            path: path_buf,
+            path: path.to_path_buf(),
         })
     }
 
@@ -245,6 +763,118 @@ impl Store {
     /// its own CREATE TABLE IF NOT EXISTS in `initDb()` so the dashboard can
     /// boot even if the Rust daemon hasn't run yet (concurrent systemd start).
     fn migrate(conn: &Connection) -> StoreResult<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS discord_conversations (\
+                guild_id TEXT NOT NULL,\
+                channel_id TEXT NOT NULL,\
+                provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude')),\
+                native_session_id TEXT NOT NULL,\
+                cwd TEXT NOT NULL,\
+                created_at_ms INTEGER NOT NULL,\
+                uncertain INTEGER NOT NULL DEFAULT 0 CHECK(uncertain IN (0, 1)),\
+                PRIMARY KEY(guild_id, channel_id),\
+                UNIQUE(provider, native_session_id)\
+            )",
+        )?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS discord_native_turns (\
+                guild_id TEXT NOT NULL,\
+                channel_id TEXT NOT NULL,\
+                turn_id TEXT NOT NULL,\
+                status TEXT NOT NULL CHECK(status IN ('pending', 'complete', 'uncertain')),\
+                created_at_ms INTEGER NOT NULL,\
+                finished_at_ms INTEGER,\
+                PRIMARY KEY(guild_id, channel_id, turn_id)\
+            );\
+            CREATE INDEX IF NOT EXISTS idx_discord_native_turns_unfinished \
+            ON discord_native_turns(guild_id, channel_id, status)",
+        )?;
+        // The old Discord tables remain the compatibility API. Triggers keep
+        // their writes visible to all surfaces, including after migration.
+        conn.execute_batch(
+            r#"CREATE TABLE IF NOT EXISTS surface_conversations (
+                platform TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL DEFAULT '',
+                provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude')),
+                native_session_id TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                uncertain INTEGER NOT NULL DEFAULT 0 CHECK(uncertain IN (0, 1)),
+                PRIMARY KEY(platform, account_id, conversation_id, thread_id),
+                UNIQUE(provider, native_session_id)
+            );
+            CREATE TABLE IF NOT EXISTS surface_native_turns (
+                platform TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL DEFAULT '',
+                turn_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('pending', 'complete', 'uncertain')),
+                created_at_ms INTEGER NOT NULL,
+                finished_at_ms INTEGER,
+                PRIMARY KEY(platform, account_id, conversation_id, thread_id, turn_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_surface_native_turns_unfinished
+            ON surface_native_turns(platform, account_id, conversation_id, thread_id, status);
+            CREATE TABLE IF NOT EXISTS surface_turn_resolutions (
+                platform TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL DEFAULT '',
+                turn_id TEXT NOT NULL,
+                resolution TEXT NOT NULL CHECK(resolution IN ('cancelled', 'interrupted')),
+                resolved_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(platform, account_id, conversation_id, thread_id, turn_id)
+            );
+            INSERT INTO surface_conversations
+                (platform, account_id, conversation_id, thread_id, provider, native_session_id, cwd, created_at_ms, uncertain)
+            SELECT 'discord', guild_id, channel_id, '', provider, native_session_id, cwd, created_at_ms, uncertain
+            FROM discord_conversations WHERE true
+            ON CONFLICT(platform, account_id, conversation_id, thread_id) DO NOTHING;
+            INSERT INTO surface_native_turns
+                (platform, account_id, conversation_id, thread_id, turn_id, status, created_at_ms, finished_at_ms)
+            SELECT 'discord', guild_id, channel_id, '', turn_id, status, created_at_ms, finished_at_ms
+            FROM discord_native_turns WHERE true
+            ON CONFLICT(platform, account_id, conversation_id, thread_id, turn_id) DO NOTHING;
+            CREATE TRIGGER IF NOT EXISTS discord_conversation_surface_insert
+            AFTER INSERT ON discord_conversations BEGIN
+                INSERT INTO surface_conversations
+                    (platform, account_id, conversation_id, thread_id, provider, native_session_id, cwd, created_at_ms, uncertain)
+                VALUES ('discord', NEW.guild_id, NEW.channel_id, '', NEW.provider, NEW.native_session_id, NEW.cwd, NEW.created_at_ms, NEW.uncertain);
+            END;
+            CREATE TRIGGER IF NOT EXISTS discord_conversation_surface_uncertain
+            AFTER UPDATE OF uncertain ON discord_conversations BEGIN
+                UPDATE surface_conversations SET uncertain = NEW.uncertain
+                WHERE platform = 'discord' AND account_id = NEW.guild_id
+                    AND conversation_id = NEW.channel_id AND thread_id = '';
+            END;
+            CREATE TRIGGER IF NOT EXISTS discord_turn_surface_insert
+            AFTER INSERT ON discord_native_turns BEGIN
+                INSERT INTO surface_native_turns
+                    (platform, account_id, conversation_id, thread_id, turn_id, status, created_at_ms, finished_at_ms)
+                VALUES ('discord', NEW.guild_id, NEW.channel_id, '', NEW.turn_id, NEW.status, NEW.created_at_ms, NEW.finished_at_ms);
+            END;
+            CREATE TRIGGER IF NOT EXISTS discord_turn_surface_finish
+            AFTER UPDATE OF status ON discord_native_turns BEGIN
+                UPDATE surface_native_turns SET status = NEW.status, finished_at_ms = NEW.finished_at_ms
+                WHERE platform = 'discord' AND account_id = NEW.guild_id
+                    AND conversation_id = NEW.channel_id AND thread_id = '' AND turn_id = NEW.turn_id;
+            END;"#,
+        )?;
+        // #1285 — durable surface inbox, outbox and catch-up cursors.
+        crate::delivery::migrate(conn)?;
+        // #1286 / #1230 — owner binding, control conversations, rejection audit.
+        crate::owner::migrate(conn)?;
+        // #1287 — live listener health reported by interactive surfaces.
+        crate::surface_health::migrate(conn)?;
+        // #1289 — approval-card pointers per surface.
+        crate::approval_cards::migrate(conn)?;
+        // #1299 — the daemon's own start report (credential backend, notices).
+        crate::daemon_report::migrate(conn)?;
+        // #1297 — per-conversation reply mode (`voice on|off` on Slack).
+        crate::surface_reply_modes::migrate(conn)?;
         // -------------------------------------------------------------------
         // #45 — Rust-owned schema. Mirrors `src/db.ts::initDb()` exactly
         // (column names, types, NOT NULL, DEFAULT, PRIMARY KEY). Do NOT
@@ -928,6 +1558,36 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS proactive_scan_runs (\
                  scan_id         TEXT PRIMARY KEY,\
                  last_run_at_ms  INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+
+        // #1317 — heartbeat run log (one row per due attempt) and the
+        // single-row lease that keeps the daemon and `heartbeat run-once`
+        // from running the same check at once.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS heartbeat_runs (\
+                 id              INTEGER PRIMARY KEY AUTOINCREMENT,\
+                 started_at_ms   INTEGER NOT NULL,\
+                 finished_at_ms  INTEGER,\
+                 status          TEXT NOT NULL,\
+                 reason          TEXT,\
+                 message         TEXT,\
+                 message_hash    TEXT,\
+                 duration_ms     INTEGER\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_heartbeat_runs_started \
+                ON heartbeat_runs(started_at_ms)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS heartbeat_lease (\
+                 id             INTEGER PRIMARY KEY CHECK (id = 1),\
+                 holder         TEXT NOT NULL,\
+                 expires_at_ms  INTEGER NOT NULL\
              )",
             [],
         )?;
@@ -1789,6 +2449,11 @@ impl Store {
                  tokenize = 'porter unicode61 remove_diacritics 2'\
              );",
         )?;
+
+        crate::imessage::migrate(conn)?;
+        crate::slack_contact::migrate(conn)?;
+        // #1296 — one record per Slack message across live/poll/catch-up.
+        crate::slack_ingest::migrate(conn)?;
 
         Ok(())
     }
@@ -3435,7 +4100,8 @@ impl Store {
                     COALESCE(a.originalBody, ''), \
                     (a.draftBody IS NULL OR TRIM(a.draftBody, ' \t\r\n') = ''), \
                     e.receivedAt, \
-                    (a.recomposedAtMs IS NOT NULL) \
+                    (a.recomposedAtMs IS NOT NULL), \
+                    COALESCE(e.platform, '') \
                FROM actions a \
                LEFT JOIN emails e ON a.messageId = e.messageId \
               WHERE a.status = 'pending' \
@@ -3453,6 +4119,7 @@ impl Store {
                 draft_empty: r.get(5)?,
                 received_at: r.get(6)?,
                 recomposed: r.get(7)?,
+                platform: r.get(8)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -5772,6 +6439,29 @@ impl Store {
         Ok(n == 1)
     }
 
+    /// #1291 — Reschedule: move an armed schedule's fire time,
+    /// `scheduled → scheduled`, CAS-gated on the row still being armed (a
+    /// claim, cancel or back-to-queue that got there first wins). Re-stamps
+    /// `status_updated_at`, which is the engine's arming moment for the
+    /// "did the owner reply since?" guard: rescheduling is re-arming.
+    pub fn reschedule_action(
+        &self,
+        action_id: &str,
+        at_ms: i64,
+        source: &str,
+    ) -> StoreResult<bool> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE actions \
+                SET scheduledAtMs = ?2, \
+                    status_source = ?3, status_updated_at = ?4, updatedAt = ?4 \
+              WHERE id = ?1 AND status = 'scheduled'",
+            params![action_id, at_ms, source, now],
+        )?;
+        Ok(n == 1)
+    }
+
     /// Back to queue: `scheduled → pending`, clearing the proposal AND the
     /// notice pointers. The row re-enters the queue as the ACTIVE card
     /// (nudgeCount 1, next re-nudge one interval out) because the caller has
@@ -6046,6 +6736,8 @@ impl Store {
     /// these to a retry-exempt 'error' and notifies; it must NEVER resend
     /// them, because the crash window includes "Composio accepted the send
     /// and we died before recording it".
+    /// iMessage rows are excluded: their `sending` window lasts until the
+    /// Mac-side sender reports, and the outbox owns their recovery (#1304).
     pub fn stuck_sending_actions(
         &self,
         now_ms: i64,
@@ -6054,7 +6746,8 @@ impl Store {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = guard.prepare(
             "SELECT id FROM actions \
-              WHERE status = 'sending' AND updatedAt <= ?1",
+              WHERE status = 'sending' AND updatedAt <= ?1 \
+                AND id NOT IN (SELECT action_id FROM imessage_outbox)",
         )?;
         let ids = stmt
             .query_map(params![now_ms - grace_ms], |r| r.get::<_, String>(0))?
@@ -7620,6 +8313,10 @@ pub struct PendingActionRow {
     /// Rule 2 for it: the owner explicitly overrode the auto-retirement, so it
     /// must survive the next tick. Per-row, never a global switch.
     pub recomposed: bool,
+    /// #1289 — the inbound's platform (`emails.platform`; empty when the
+    /// join finds no email). The bulk-sender rule reads an email address,
+    /// which a Slack contact's `from` never is.
+    pub platform: String,
 }
 
 /// #48 — the three code-mode columns on `actions`, returned by
@@ -7802,11 +8499,46 @@ fn ms_to_rfc3339(ms: i64) -> String {
         .unwrap_or_default()
 }
 
-fn now_millis() -> i64 {
+pub(crate) fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod migration_race_tests {
+    use super::*;
+
+    fn failure(code: std::os::raw::c_int, message: &str) -> StoreError {
+        StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            Some(message.into()),
+        ))
+    }
+
+    /// #1299 — another process adding a column while this one migrates can
+    /// surface as SQLITE_SCHEMA ("database schema has changed"); that is a
+    /// lost race to retry, like a lock or a duplicate column.
+    #[test]
+    fn a_schema_change_by_another_migrator_is_a_lost_race() {
+        assert!(lost_migration_race(&failure(
+            rusqlite::ffi::SQLITE_SCHEMA,
+            "database schema has changed"
+        )));
+        assert!(lost_migration_race(&failure(
+            rusqlite::ffi::SQLITE_BUSY,
+            "database is locked"
+        )));
+        assert!(lost_migration_race(&failure(
+            rusqlite::ffi::SQLITE_ERROR,
+            "duplicate column name: reconnects"
+        )));
+        assert!(!lost_migration_race(&failure(
+            rusqlite::ffi::SQLITE_ERROR,
+            "no such table: actions"
+        )));
+    }
 }
 
 #[cfg(test)]
@@ -9513,6 +10245,42 @@ mod tests {
         assert!(s
             .claim_due_action_for_send(&id, now + 86_500_000, "engine")
             .unwrap());
+    }
+
+    /// #1291 — Reschedule moves an armed schedule's fire time in place; it
+    /// never touches a row that is not armed (sent, sending, pending).
+    #[test]
+    fn reschedule_moves_only_an_armed_schedule() {
+        let (s, _f) = fresh_store();
+        let id = pending_action(&s, "m-resched-1");
+        assert!(
+            !s.reschedule_action(&id, 5_000_000, "slack").unwrap(),
+            "a pending row is not rescheduled (it has no schedule)"
+        );
+        s.schedule_action(&id, 1_000_000, "discord").unwrap();
+        s.set_action_notice(&id, "chan-1", "msg-1").unwrap();
+        assert!(s.reschedule_action(&id, 2_000_000, "slack").unwrap());
+        let (status, at, _) = raw_action_row(&s, &id);
+        assert_eq!(status, "scheduled");
+        assert_eq!(at, Some(2_000_000));
+        assert_eq!(
+            s.action_status_source(&id).unwrap().as_deref(),
+            Some("slack")
+        );
+        // The old fire time no longer claims it.
+        assert!(!s
+            .claim_due_action_for_send(&id, 1_500_000, "engine")
+            .unwrap());
+        assert!(s
+            .claim_due_action_for_send(&id, 2_000_000, "engine")
+            .unwrap());
+        assert!(
+            !s.reschedule_action(&id, 3_000_000, "slack").unwrap(),
+            "a row mid-send is never moved"
+        );
+        let (status, at, _) = raw_action_row(&s, &id);
+        assert_eq!(status, "sending");
+        assert_eq!(at, Some(2_000_000));
     }
 
     #[test]

@@ -33,8 +33,11 @@ use augmentagent_store::{
 };
 use augmentagent_wiki::IdentityIndex;
 
+use augmentagent_store::slack_ingest::{SlackIngestSource, SlackMessageKey, SlackRecordOutcome};
+
 use crate::api::{SlackClient, SlackError};
 use crate::auth::SlackAuth;
+use crate::ingest::TRIAGE_STALE_AFTER_MS;
 use crate::types::SlackMessage;
 use crate::{ACCOUNT_ENTITY_ID_PREFIX, PLATFORM};
 
@@ -44,6 +47,14 @@ pub struct WorkspaceClient {
     pub team_id: String,
     pub client: Arc<SlackClient>,
     pub my_user_id: String,
+}
+
+/// The workspace a poll page belongs to: its team and the Composio user
+/// whose own messages are skipped.
+#[derive(Debug, Clone, Copy)]
+struct WorkspaceRef<'a> {
+    team_id: &'a str,
+    my_user_id: &'a str,
 }
 
 /// Mirror LinkedIn + Discord's 4h cadence; Slack's API has very generous
@@ -98,6 +109,8 @@ pub struct SlackChannel<R: Reasoner> {
     /// so tests can swap in a recorder; production defaults to
     /// [`GhCliIssueRunner`] which shells out to the `gh` binary on PATH.
     gh_issue_runner: Arc<dyn GhIssueRunner>,
+    /// #1296 — ledger timestamps (triage claims, tombstones); tests pin it.
+    clock: crate::ingest::Clock,
 }
 
 impl<R: Reasoner + 'static> SlackChannel<R> {
@@ -131,7 +144,18 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
             identity_index,
             wiki_schema,
             gh_issue_runner: Arc::new(GhCliIssueRunner::new()),
+            clock: Arc::new(crate::ingest::system_now_ms),
         }
+    }
+
+    /// #1296 — the clock the reconciliation ledger is written with.
+    pub fn with_clock(mut self, clock: crate::ingest::Clock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    pub(crate) fn now_ms(&self) -> i64 {
+        (self.clock)()
     }
 
     /// Swap the gh-CLI runner used for I7 code-mode postmortem issues.
@@ -196,7 +220,14 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
                         Err(e) => error!("slack poll failed: {e:#}"),
                     }
                     let jitter = jitter_secs();
-                    tokio::time::sleep(Duration::from_secs(jitter)).await;
+                    // #1287: the jitter can be an hour; shutdown must not wait.
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {
+                            info!("slack channel: shutdown signal received");
+                            return Ok(());
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(jitter)) => {}
+                    }
                 }
             }
         }
@@ -259,6 +290,29 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
             Err(e) => return Err(e.into()),
         };
 
+        let team = sub
+            .account_id
+            .clone()
+            .unwrap_or_else(|| workspace.team_id.clone());
+        self.ingest_polled(sub, &team, &workspace.my_user_id, messages, outcome)
+            .await
+    }
+
+    /// #1296 — ingest one poll page (Slack order: newest first) for `sub`
+    /// and advance its cursor. Public so the reconciliation tests drive the
+    /// poll path without a Composio server.
+    pub async fn ingest_polled(
+        &self,
+        sub: &ChannelSubscription,
+        team_id: &str,
+        my_user_id: &str,
+        messages: Vec<SlackMessage>,
+        outcome: &mut PollOutcome,
+    ) -> anyhow::Result<()> {
+        let workspace = WorkspaceRef {
+            team_id,
+            my_user_id,
+        };
         // Slack returns newest-first; process oldest→newest so last_seen stays monotonic.
         let mut messages = messages;
         messages.reverse();
@@ -268,7 +322,7 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
         for msg in messages {
             newest_seen = Some(msg.ts.clone());
 
-            if msg.user.as_deref() == Some(workspace.my_user_id.as_str()) {
+            if msg.user.as_deref() == Some(workspace.my_user_id) {
                 continue;
             }
             if !msg.is_default_user_message() {
@@ -278,7 +332,7 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
                 continue;
             }
 
-            if let Err(e) = self.handle_message(sub, workspace, msg, outcome).await {
+            if let Err(e) = self.handle_message(sub, &workspace, msg, outcome).await {
                 outcome.errors += 1;
                 error!(sub_id = %sub.id, "handle_message failed: {e:#}");
             }
@@ -293,29 +347,120 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
     async fn handle_message(
         &self,
         sub: &ChannelSubscription,
-        workspace: &WorkspaceClient,
+        workspace: &WorkspaceRef<'_>,
         msg: SlackMessage,
         outcome: &mut PollOutcome,
     ) -> anyhow::Result<()> {
-        let email = message_to_email(&msg, sub, &workspace.my_user_id);
-        self.store.upsert_email(&email)?;
-        if self.store.is_email_complete(&email.message_id)? {
-            return Ok(());
+        let team = sub.account_id.as_deref().unwrap_or(workspace.team_id);
+        let (_, job) = self.record_message(
+            sub,
+            team,
+            workspace.my_user_id,
+            &msg,
+            SlackIngestSource::Poll,
+            outcome,
+        )?;
+        if let Some(email) = job {
+            self.triage_claimed(email, outcome).await?;
         }
+        Ok(())
+    }
 
+    /// #1296 — store `msg` once (whichever path saw it first), apply an edit
+    /// it carries once, and dispatch by the subscription's mode. Returns the
+    /// record outcome and, for a priority message whose triage this call
+    /// claimed, the stored row to triage (with [`Self::triage_claimed`]).
+    pub(crate) fn record_message(
+        &self,
+        sub: &ChannelSubscription,
+        team_id: &str,
+        my_user_id: &str,
+        msg: &SlackMessage,
+        source: SlackIngestSource,
+        outcome: &mut PollOutcome,
+    ) -> anyhow::Result<(SlackRecordOutcome, Option<Email>)> {
+        let key = SlackMessageKey::new(team_id, &sub.channel_id, &msg.ts)?;
+        let email = message_to_email(msg, sub, my_user_id);
+        let now = self.now_ms();
+        let recorded =
+            self.store
+                .record_slack_message(&key, msg.thread_ts.as_deref(), &email, source, now)?;
+        match recorded {
+            SlackRecordOutcome::Deleted => return Ok((recorded, None)),
+            SlackRecordOutcome::Stored => {
+                if sub.mode == SubscriptionMode::Priority {
+                    // #1290 — the reply goes to this conversation and thread.
+                    record_reply_target(&self.store, &email, msg, sub, team_id);
+                }
+            }
+            SlackRecordOutcome::Duplicate { .. } => {}
+        }
+        // An edit this sighting carries (`edited.ts`) applies once, on
+        // whichever path sees it first.
+        if let Some(edited) = &msg.edited {
+            match self
+                .store
+                .apply_slack_edit(&key, &edited.ts, &msg.text, now)
+            {
+                Ok(o) => debug!(message_id = %email.message_id, outcome = ?o, "slack edit"),
+                Err(e) => warn!(message_id = %email.message_id, "slack edit not applied: {e}"),
+            }
+        }
+        let fresh = recorded == SlackRecordOutcome::Stored;
         match sub.mode {
-            SubscriptionMode::Priority => self.handle_priority(email, outcome).await,
+            SubscriptionMode::Priority => {
+                // One triage decision: the claim succeeds for exactly one
+                // path (or again only after a daemon died mid-triage).
+                if self
+                    .store
+                    .claim_slack_triage(&email.message_id, now, TRIAGE_STALE_AFTER_MS)?
+                {
+                    return Ok((recorded, Some(email)));
+                }
+            }
             SubscriptionMode::Digest => {
-                outcome.digest_stored += 1;
-                Ok(())
+                if fresh {
+                    outcome.digest_stored += 1;
+                }
             }
             SubscriptionMode::StoreOnly => {
-                outcome.store_only_stored += 1;
-                self.store
-                    .mark_email_processed(&email.message_id, TriageResult::DigestOnly)?;
-                Ok(())
+                if !self.store.is_email_complete(&email.message_id)? {
+                    outcome.store_only_stored += 1;
+                    self.store
+                        .mark_email_processed(&email.message_id, TriageResult::DigestOnly)?;
+                }
             }
         }
+        Ok((recorded, None))
+    }
+
+    /// #1296 — triage a stored priority message whose claim the caller
+    /// holds. A failure before any decision was recorded (the reasoner could
+    /// not be reached) gives the claim back so the next sighting can try
+    /// again; once an action row exists the claim stands, so a failure later
+    /// on (a card that could not be posted) never produces a second draft.
+    pub(crate) async fn triage_claimed(
+        &self,
+        email: Email,
+        outcome: &mut PollOutcome,
+    ) -> anyhow::Result<()> {
+        let message_id = email.message_id.clone();
+        let result = self.handle_priority(email, outcome).await;
+        if result.is_err() {
+            let decided = self
+                .store
+                .with_conn(|c| {
+                    c.prepare("SELECT 1 FROM actions WHERE messageId = ?1")?
+                        .exists([&message_id])
+                })
+                .unwrap_or(true);
+            if !decided && !self.store.is_email_complete(&message_id).unwrap_or(true) {
+                if let Err(e) = self.store.release_slack_triage(&message_id) {
+                    warn!(message_id = %message_id, "could not release the triage claim: {e}");
+                }
+            }
+        }
+        result
     }
 
     async fn handle_priority(
@@ -842,6 +987,29 @@ pub(crate) fn message_to_email(
     }
 }
 
+/// #1290 — remember where a reply to this message goes (conversation and
+/// thread), so an approved reply lands where the owner saw it. Best effort:
+/// without a row the reply goes to the conversation top level, as before.
+pub(crate) fn record_reply_target(
+    store: &Store,
+    email: &Email,
+    msg: &SlackMessage,
+    sub: &ChannelSubscription,
+    team_id: &str,
+) {
+    let target = crate::contact::ingested_reply_target(
+        &email.message_id,
+        team_id,
+        &sub.channel_id,
+        &sub.display_name,
+        &msg.ts,
+        msg.thread_ts.as_deref(),
+    );
+    if let Err(e) = store.record_slack_send_target(&target) {
+        warn!(message_id = %email.message_id, "could not record the reply target: {e}");
+    }
+}
+
 /// Parse a Slack user id out of the `from` field shape
 /// `"<display> <slack:<user_id>>"`.
 fn extract_slack_id(from: &str) -> Option<String> {
@@ -942,7 +1110,25 @@ mod tests {
             text: text.into(),
             thread_ts: None,
             bot_id: None,
+            edited: None,
         }
+    }
+
+    /// #1290 — an ingested priority message records where its reply goes:
+    /// the thread it is in, or a thread under it in a channel.
+    #[test]
+    fn a_priority_message_records_where_its_reply_goes() {
+        let (store, _f) = tmp_store();
+        let sub = sub_with_mode(SubscriptionMode::Priority);
+        let mut m = sample_msg("100.000002", "in a thread");
+        m.thread_ts = Some("100.000001".into());
+        let e = message_to_email(&m, &sub, "me");
+        record_reply_target(&store, &e, &m, &sub, "T1");
+        let t = store.slack_send_target(&e.message_id).unwrap().unwrap();
+        assert_eq!(t.channel_id, "C1");
+        assert_eq!(t.team_id, "T1");
+        assert_eq!(t.thread_ts.as_deref(), Some("100.000001"));
+        assert_eq!(t.label.as_deref(), Some("#general"));
     }
 
     #[test]
@@ -1158,6 +1344,31 @@ mod tests {
             },
             None,
         )
+    }
+
+    /// #1287 — serve's graceful shutdown waited out this loop's post-poll
+    /// jitter (up to an hour) because the sleep ignored the shutdown token.
+    #[tokio::test]
+    async fn shutdown_interrupts_the_post_poll_jitter() {
+        let (store, _f) = tmp_store();
+        let r = Arc::new(ScriptedReasoner::new(Vec::<&str>::new()));
+        let b: Arc<dyn ApprovalBroker> = Arc::new(CountingBroker::default());
+        let ch = Arc::new(build_channel(store, r, b));
+        let shutdown = CancellationToken::new();
+        let task = {
+            let ch = Arc::clone(&ch);
+            let sd = shutdown.clone();
+            tokio::spawn(async move { ch.run(sd).await })
+        };
+        // The first tick polls at once (no subscriptions), then the loop
+        // sleeps its jitter.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("run returns promptly on shutdown")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

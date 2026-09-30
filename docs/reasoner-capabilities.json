@@ -90,6 +90,15 @@
         "mcp__model__switch_model"
       ]
     },
+    "discord-voice-mcp": {
+      "scope": "Owner-authorized turn in one active Discord voice binding; ephemeral grant permits speech, receipt lookup, status, and interrupt only in that conversation",
+      "operations": [
+        "mcp__voice__speak",
+        "mcp__voice__speech_status",
+        "mcp__voice__voice_status",
+        "mcp__voice__voice_interrupt"
+      ]
+    },
     "computer-task-mcp": {
       "scope": "Owner-authorized conversation only: goal-driven browser tasks through a scoped service; existing Chrome, independent Astra worker, no generic CDP access",
       "operations": [
@@ -541,6 +550,21 @@
       "provider_conformance": "verified"
     },
     {
+      "callsite": "crates/augmentagent-cli/src/voice_tool.rs::configure",
+      "permission_profile": "discord-voice-mcp",
+      "output_contract": "Preserve the wrapped Discord query output contract; audio and text mirrors have separate receipts",
+      "model_tier": "preserved",
+      "tier_rationale": "Adds only ephemeral, conversation-bound MCP tools to the owner query turn and retains the selected native model. Both installed CLIs discovered and called the tools against a synthetic local endpoint; audible Discord output is a separate live gate.",
+      "conformance": [
+        "discord_voice_session_tests::active_voice_binding_injects_tool_only_into_its_owner_conversation_turn",
+        "voice_tool_contract::tool_grant_binds_speech_to_one_active_conversation_and_rejects_spoofing",
+        "voice_bridge::tests::final_output_delivered_by_tool_is_not_played_again",
+        "codex_tools::tests::voice_mcp_capability_is_forwarded_only_to_the_bound_stdio_server",
+        "reasoner::failover_error_tests::claude_voice_mcp_grant_is_in_private_config_file_not_process_args"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
       "callsite": "crates/augmentagent-cli/src/computer_tool.rs::configure",
       "permission_profile": "computer-task-mcp",
       "output_contract": "Preserve the wrapped preset output contract",
@@ -550,6 +574,16 @@
         "computer_tool::tests::computer_tools_require_trusted_owner_and_bind_identity_outside_model_arguments"
       ],
       "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-heartbeat/src/runner.rs::heartbeat_opts",
+      "permission_profile": "wiki-read",
+      "output_contract": "One JSON decision object: {\"notify\": false} or {\"notify\": true, \"message\": ...}; anything else is recorded as an error and never delivered",
+      "model_tier": "fast",
+      "tier_rationale": "Pins Haiku: runs every interval all day, and most runs end silent, so per-run cost dominates.",
+      "conformance": [
+        "runner::tests::heartbeat_opts_are_read_only_fast_and_scoped_to_the_wiki"
+      ]
     }
   ]
 }

@@ -41,18 +41,20 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 /// Default socket path resolution. Honors `AUGMENTAGENT_BROWSER_SOCK`,
-/// then `${XDG_RUNTIME_DIR}/augmentagent/browser.sock`, finally
-/// `/run/user/<uid>/augmentagent/browser.sock` on Linux and
-/// `~/Library/Caches/augmentagent/browser.sock` elsewhere (#1079: macOS has neither
-/// `XDG_RUNTIME_DIR` nor `/run/user`; `sidecars/browser/sidecar.py` applies
-/// the same rule).
+/// then uses `/tmp/augmentagent-<uid>/browser.sock` on macOS. Linux uses
+/// `${XDG_RUNTIME_DIR}/augmentagent/browser.sock` or falls back to
+/// `/run/user/<uid>/augmentagent/browser.sock`. The browser worker mirrors
+/// this rule.
 pub fn default_socket_path() -> PathBuf {
     if let Ok(p) = std::env::var("AUGMENTAGENT_BROWSER_SOCK") {
         return PathBuf::from(p);
     }
+    if cfg!(target_os = "macos") {
+        return PathBuf::from(format!("/tmp/augmentagent-{}/browser.sock", fallback_uid()));
+    }
     let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
         if cfg!(target_os = "linux") {
-            format!("/run/user/{}", unsafe { libc_getuid() })
+            format!("/run/user/{}", fallback_uid())
         } else {
             // Per-user and the same for launchd agents and terminals, unlike
             // `$TMPDIR`; `/tmp` only when HOME is unset.
@@ -64,13 +66,8 @@ pub fn default_socket_path() -> PathBuf {
     PathBuf::from(runtime).join("augmentagent").join("browser.sock")
 }
 
-#[allow(non_snake_case)]
-unsafe fn libc_getuid() -> u32 {
-    // Avoid pulling in libc just for getuid(); fall back to env or 1000.
-    std::env::var("UID")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1000)
+fn fallback_uid() -> u32 {
+    unsafe { libc::getuid() }
 }
 
 /// Errors returned by [`BrowserClient`]. The `Sidecar` variant carries the
@@ -534,10 +531,16 @@ mod tests {
     }
 
     #[test]
-    fn default_socket_path_uses_runtime() {
+    fn default_socket_path_matches_platform() {
         std::env::set_var("XDG_RUNTIME_DIR", "/tmp/xdgtest");
         std::env::remove_var("AUGMENTAGENT_BROWSER_SOCK");
         let p = default_socket_path();
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            p,
+            std::path::PathBuf::from(format!("/tmp/augmentagent-{}/browser.sock", fallback_uid()))
+        );
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(p, std::path::PathBuf::from("/tmp/xdgtest/augmentagent/browser.sock"));
     }
 }

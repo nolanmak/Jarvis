@@ -14,11 +14,15 @@
 //!   * `per_channel_validate` — one finding per configured channel, sourced
 //!                              from `status::collect` (read-only).
 //!
-//! `--fix` is intentionally NOT implemented here — it lands as a follow-up
-//! issue. Doctor stays strictly read-only.
+//! `--deep` also compares granted with required Slack bot scopes from the
+//! stored install record (`slack_app.scopes`, #1299; reads the record).
 //!
-//! Linux-only by design — uses `secret-tool` (libsecret) and probes the
-//! systemd-user dashboard unit indirectly through `status`.
+//! `--fix` is intentionally NOT implemented here — it lands as a follow-up
+//! issue. Ordinary and `--deep` checks stay read-only. `--keychain-probe` is
+//! the explicit exception: it writes, reads and deletes one synthetic item.
+//!
+//! Linux uses `secret-tool`; macOS checks Keychain configuration separately
+//! from an explicitly requested credential-access probe.
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -111,7 +115,12 @@ impl Finding {
 }
 
 /// Entry point. `json = None` auto-detects (JSON when stdout piped).
-pub async fn run(store: Arc<Store>, json: Option<bool>, deep: bool) -> Result<i32> {
+pub async fn run(
+    store: Arc<Store>,
+    json: Option<bool>,
+    deep: bool,
+    keychain_probe: bool,
+) -> Result<i32> {
     let mut findings: Vec<Finding> = Vec::new();
 
     // --- Compose the status aggregator. Doctor doesn't duplicate status's
@@ -136,6 +145,14 @@ pub async fn run(store: Arc<Store>, json: Option<bool>, deep: bool) -> Result<i3
     findings.push(check_sqlite_migrated().await);
     // 3. keyring_reachable — secret-tool present + libsecret reachable
     findings.push(check_keyring_reachable().await);
+    if keychain_probe {
+        findings.push(if cfg!(target_os = "macos") {
+            check_keychain_probe_with(std::path::Path::new("security"), Duration::from_secs(30))
+                .await
+        } else {
+            Finding::error("keychain_access", "--keychain-probe requires macOS", None)
+        });
+    }
     if cfg!(target_os = "macos") {
         findings.push(check_launchd_agents());
     }
@@ -191,12 +208,39 @@ pub async fn run(store: Arc<Store>, json: Option<bool>, deep: bool) -> Result<i3
     findings.push(check_build_vm());
     // 17. build scratch — admission-limit validity and capacity (#1092)
     findings.push(check_build_scratch());
+    // 18. durable surface delivery — dead letters / unreconciled sends (#1285)
+    if let Some(doc) = &status_doc {
+        findings.push(check_surface_delivery(&doc.delivery));
+        // 19. interactive surfaces — live listener health, apart from the
+        // Composio ingestion `channels.slack` reports (#1287)
+        findings.extend(check_interactive_surfaces(&doc.interactive));
+        // 20. #1299 — Slack credentials present vs proven usable by the
+        // daemon, and configuration issues (Discord broker off, plaintext
+        // credential store) with their recovery.
+        if let Some(slack) = doc.interactive.get("slack") {
+            findings.push(check_slack_credentials(slack, cfg!(target_os = "macos")));
+        }
+        findings.extend(check_config_issues(&doc.config_issues));
+    }
+    // 21. #1299 / #1325 — the credential backend this process uses.
+    findings.push(check_credential_backend(
+        &augmentagent_auth::describe_default_store(),
+    ));
 
     // --- Deep checks (off by default).
     if deep {
         findings.push(check_composio_api().await);
         findings.push(check_cerebras_models().await);
         findings.extend(check_per_channel_validate(&status_doc));
+        // #1299 — granted vs required Slack scopes from the install record.
+        // Reads the stored record (the Keychain on macOS), so `--deep` only.
+        if status_doc
+            .as_ref()
+            .and_then(|d| d.interactive.get("slack"))
+            .is_some_and(|s| s.app_installed == Some(true))
+        {
+            findings.extend(slack_scope_findings(load_slack_install_summaries()));
+        }
     }
 
     // Tally severities.
@@ -357,42 +401,138 @@ async fn check_keyring_reachable() -> Finding {
     }
 }
 
-/// #1079 — macOS: the `keyring` crate uses the login Keychain. `security
-/// default-keychain` answers whether one is configured for this session.
+/// `security default-keychain` only proves configuration, not credential read.
 async fn check_keychain_reachable() -> Finding {
-    let res = timeout(
-        SUBPROCESS_TIMEOUT,
-        Command::new("security").arg("default-keychain").output(),
-    )
-    .await;
+    check_keychain_configuration_with(std::path::Path::new("security"), SUBPROCESS_TIMEOUT).await
+}
+
+async fn check_keychain_configuration_with(bin: &std::path::Path, limit: Duration) -> Finding {
+    let mut command = Command::new(bin);
+    command.arg("default-keychain").kill_on_drop(true);
+    let res = timeout(limit, command.output()).await;
     match res {
-        Ok(Ok(out)) if out.status.success() => Finding::ok(
+        Ok(Ok(out)) if out.status.success() => Finding::warn(
             "keyring_reachable",
-            format!(
-                "login Keychain reachable ({})",
-                String::from_utf8_lossy(&out.stdout)
-                    .trim()
-                    .trim_matches('"')
-            ),
+            "default Keychain configured; credential access unverified".to_string(),
+            Some("augmentagent doctor --keychain-probe"),
         ),
-        Ok(Ok(out)) => Finding::error(
+        Ok(Ok(_out)) => Finding::error(
             "keyring_reachable",
-            format!(
-                "no default Keychain: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-            Some("security default-keychain -s login.keychain-db"),
+            "default Keychain unavailable or access denied".to_string(),
+            Some("check the login Keychain in Keychain Access, then rerun doctor"),
         ),
         Ok(Err(e)) => Finding::error(
             "keyring_reachable",
-            format!("`security` could not run: {e}"),
-            None,
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "macOS security command not found".to_string()
+            } else {
+                "could not run macOS security command".to_string()
+            },
+            Some("verify Xcode command-line tools and /usr/bin/security"),
         ),
         Err(_) => Finding::warn(
             "keyring_reachable",
-            "security timed out after 2s".to_string(),
+            "security default-keychain timed out; credential access unverified".to_string(),
             None,
         ),
+    }
+}
+
+/// Run a bounded native Keychain operation without echoing the command's
+/// output. The disposable item is not a production credential.
+async fn keychain_step(
+    bin: &std::path::Path,
+    args: &[&str],
+    limit: Duration,
+) -> std::result::Result<std::process::Output, &'static str> {
+    let mut command = Command::new(bin);
+    command.args(args).kill_on_drop(true);
+    match timeout(limit, command.output()).await {
+        Ok(Ok(out)) if out.status.success() => Ok(out),
+        Ok(Ok(out)) => {
+            let diagnostic = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
+            if diagnostic.contains("could not be found") || diagnostic.contains("item not found") {
+                Err("missing")
+            } else {
+                Err("denied or locked")
+            }
+        }
+        Ok(Err(_)) => Err("security command could not start"),
+        Err(_) => Err("timed out"),
+    }
+}
+
+async fn check_keychain_probe_with(bin: &std::path::Path, limit: Duration) -> Finding {
+    let service = format!("augmentagent/doctor-probe-{}", uuid::Uuid::new_v4());
+    let value = uuid::Uuid::new_v4().to_string();
+    let account = "synthetic";
+    let add = keychain_step(
+        bin,
+        &[
+            "add-generic-password",
+            "-a",
+            account,
+            "-s",
+            &service,
+            "-w",
+            &value,
+        ],
+        limit,
+    )
+    .await;
+    let read = if add.is_ok() {
+        Some(
+            keychain_step(
+                bin,
+                &["find-generic-password", "-a", account, "-s", &service, "-w"],
+                limit,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    // Attempt cleanup even if add reported a failure: a killed process may
+    // have written the item before the command timed out.
+    let cleanup = keychain_step(
+        bin,
+        &["delete-generic-password", "-a", account, "-s", &service],
+        limit,
+    )
+    .await;
+    if cleanup.is_err() && add.is_ok() {
+        let recovery = format!("security delete-generic-password -a synthetic -s {service}");
+        return Finding::error(
+            "keychain_access",
+            "synthetic Keychain item cleanup could not be verified",
+            Some(&recovery),
+        );
+    }
+    if let Err(reason) = add {
+        return Finding::error(
+            "keychain_access",
+            format!("Keychain credential write {reason}"),
+            Some("unlock login Keychain and check Jarvis access in Keychain Access"),
+        );
+    }
+    match read {
+        Some(Ok(output)) if String::from_utf8_lossy(&output.stdout).trim_end() == value => {
+            Finding::ok(
+                "keychain_access",
+                "synthetic Keychain credential write/read/delete verified",
+            )
+        }
+        Some(Ok(_)) => Finding::error(
+            "keychain_access",
+            "synthetic Keychain credential read returned a different value",
+            None,
+        ),
+        Some(Err(reason)) => Finding::error(
+            "keychain_access",
+            format!("Keychain credential read {reason}"),
+            Some("unlock login Keychain and check Jarvis access in Keychain Access"),
+        ),
+        None => unreachable!("a successful add always attempts a read"),
     }
 }
 
@@ -1701,6 +1841,251 @@ fn check_per_channel_validate(status_doc: &Option<status::StatusDoc>) -> Vec<Fin
     out
 }
 
+/// #1285 — durable delivery needs the owner when a surface has dead letters
+/// or sends whose provider outcome is unknown. A backlog alone is normal.
+fn check_surface_delivery(
+    delivery: &std::collections::BTreeMap<String, status::DeliveryStatus>,
+) -> Finding {
+    let mut problems = Vec::new();
+    for (name, d) in delivery {
+        let mut parts = Vec::new();
+        if d.outbound_reconcile > 0 {
+            parts.push(format!(
+                "{} send(s) awaiting reconcile",
+                d.outbound_reconcile
+            ));
+        }
+        let dead = d.inbound_dead_letter + d.outbound_dead_letter;
+        if dead > 0 {
+            parts.push(format!("{dead} dead letter(s)"));
+        }
+        if !parts.is_empty() {
+            problems.push(format!("{name}: {}", parts.join(", ")));
+        }
+    }
+    if problems.is_empty() {
+        Finding::ok(
+            "surface_delivery",
+            "no dead letters or unreconciled sends".to_string(),
+        )
+    } else {
+        Finding::warn(
+            "surface_delivery",
+            problems.join("; "),
+            Some("augmentagent status --json"),
+        )
+    }
+}
+
+/// #1287 — one finding per interactive surface from its live listener
+/// report. Healthy only when connected; `not_configured` and `disabled` are
+/// informational; a misconfiguration is an error because the operator
+/// asked for something that cannot start.
+fn check_interactive_surfaces(
+    interactive: &std::collections::BTreeMap<String, status::InteractiveStatus>,
+) -> Vec<Finding> {
+    interactive
+        .iter()
+        .map(|(name, i)| {
+            let check = format!("interactive.{name}");
+            let mut message = i.state.clone();
+            if let Some(detail) = &i.detail {
+                message.push_str(&format!(": {detail}"));
+            }
+            match i.state.as_str() {
+                _ if i.healthy => Finding::ok(
+                    &check,
+                    format!(
+                        "connected; last event {}, last send {}{}",
+                        i.last_event_unix.map_or("never".into(), |t| t.to_string()),
+                        i.last_send_unix.map_or("never".into(), |t| t.to_string()),
+                        if i.dry_run { " (dry-run)" } else { "" }
+                    ),
+                ),
+                "not_configured" | "disabled" => Finding::ok(&check, message),
+                "misconfigured" => Finding::error(&check, message, i.recovery.as_deref()),
+                _ => Finding::warn(&check, message, i.recovery.as_deref()),
+            }
+        })
+        .collect()
+}
+
+/// #1299 / #1325 — which credential backend this process uses. Plaintext
+/// files are an error outside tests, and so is a backend that forgets
+/// credentials when the process exits (keyring's mock on an OS without a
+/// supported store, or Linux without HOME for the owner-only file store).
+fn check_credential_backend(d: &augmentagent_auth::BackendDescription) -> Finding {
+    const NAME: &str = "credential_backend";
+    if d.insecure {
+        return Finding::error(
+            NAME,
+            format!(
+                "{} is set: credentials are plaintext files ({}), for tests and local QA only",
+                augmentagent_auth::INSECURE_FILE_STORE_ENV,
+                d.backend
+            ),
+            Some(status::INSECURE_STORE_RECOVERY),
+        );
+    }
+    if !d.persistent {
+        return Finding::error(
+            NAME,
+            format!(
+                "{}: {}",
+                d.backend,
+                d.note
+                    .as_deref()
+                    .unwrap_or("credentials do not persist (#1325)")
+            ),
+            Some(
+                "credentials stored here (including `augmentagent slack app install`) do not \
+                 survive the command that stored them. On Linux run the CLI and the daemon with \
+                 HOME set (or an absolute XDG_STATE_HOME) so the owner-only file store under the \
+                 state directory is used, then re-run `augmentagent slack app install`; on other \
+                 systems use macOS or Linux (#1325)",
+            ),
+        );
+    }
+    Finding::ok(NAME, format!("{} (persistent)", d.backend))
+}
+
+/// #1299 — one finding per configuration issue from `status`, with its
+/// recovery; a single ok finding when there are none.
+fn check_config_issues(issues: &[status::ConfigIssue]) -> Vec<Finding> {
+    if issues.is_empty() {
+        return vec![Finding::ok(
+            "config_issues",
+            "no configuration issues found".to_string(),
+        )];
+    }
+    issues
+        .iter()
+        .map(|i| {
+            let name = format!("config.{}", i.id);
+            let message = format!("{} (reported by {})", i.detail, i.source);
+            if i.severity == "error" {
+                Finding::error(&name, message, i.recovery.as_deref())
+            } else {
+                Finding::warn(&name, message, i.recovery.as_deref())
+            }
+        })
+        .collect()
+}
+
+/// #1299 — Slack app credentials: present here vs proven usable by the
+/// running daemon (#1246/#1272 semantics: never claim usable without proof;
+/// only the daemon's fresh `connected` report is proof).
+fn check_slack_credentials(i: &status::InteractiveStatus, macos: bool) -> Finding {
+    const NAME: &str = "interactive.slack.credentials";
+    match i.credentials.as_str() {
+        "usable" => Finding::ok(
+            NAME,
+            "usable: the running daemon read the stored tokens and Slack accepted them".to_string(),
+        ),
+        "present" => {
+            let fix = if macos {
+                "augmentagent doctor --keychain-probe, then augmentagent service --unit daemon \
+                 restart (the daemon needs your login session to read the Keychain)"
+            } else {
+                "augmentagent service --unit daemon restart, then augmentagent status"
+            };
+            Finding::warn(
+                NAME,
+                "stored, but not yet proven readable by the running daemon (it has not \
+                 connected with them)"
+                    .to_string(),
+                Some(fix),
+            )
+        }
+        "unreadable" => Finding::warn(
+            NAME,
+            "this process cannot read the credential store, so whether the Slack app is \
+             installed is unknown"
+                .to_string(),
+            Some(status::UNREADABLE_RECOVERY),
+        ),
+        _ if i.owner_bound => Finding::warn(
+            NAME,
+            "an owner is bound but no Slack app credentials are visible to this process"
+                .to_string(),
+            Some("augmentagent slack app install --stdin"),
+        ),
+        _ => Finding::ok(NAME, "no Slack app installed".to_string()),
+    }
+}
+
+/// #1299 — granted vs required bot scopes from the stored install records
+/// (`--deep`: reads the records, which on macOS reads the Keychain).
+fn slack_scope_findings(
+    installs: std::result::Result<
+        Vec<augmentagent_channel_slack::app::SlackAppSummary>,
+        augmentagent_channel_slack::app::SlackAppError,
+    >,
+) -> Vec<Finding> {
+    const NAME: &str = "slack_app.scopes";
+    let installs = match installs {
+        Ok(v) => v,
+        Err(e) => {
+            return vec![Finding::error(
+                NAME,
+                format!("could not read the stored Slack install: {e}"),
+                Some(&e.recovery()),
+            )]
+        }
+    };
+    let required = augmentagent_channel_slack::app::REQUIRED_BOT_SCOPES.len();
+    installs
+        .into_iter()
+        .map(|s| match (&s.scopes, &s.missing_scopes) {
+            (Some(granted), Some(missing)) if missing.is_empty() => Finding::ok(
+                NAME,
+                format!(
+                    "{}: all {required} required scopes granted ({} total)",
+                    s.team_id,
+                    granted.len()
+                ),
+            ),
+            (_, Some(missing)) => Finding::error(
+                NAME,
+                format!(
+                    "{}: missing required scopes: {}",
+                    s.team_id,
+                    missing.join(", ")
+                ),
+                Some(&format!(
+                    "Add {} under OAuth & Permissions > Bot Token Scopes at api.slack.com/apps \
+                     (or recreate the app from `augmentagent slack app manifest`), reinstall the \
+                     app to the workspace, store the new bot token with `augmentagent slack app \
+                     rotate --stdin`, then restart the daemon",
+                    missing.join(", ")
+                )),
+            ),
+            _ => Finding::warn(
+                NAME,
+                format!(
+                    "{}: granted scopes unknown (not recorded at install)",
+                    s.team_id
+                ),
+                Some("augmentagent slack app verify"),
+            ),
+        })
+        .collect()
+}
+
+fn load_slack_install_summaries() -> std::result::Result<
+    Vec<augmentagent_channel_slack::app::SlackAppSummary>,
+    augmentagent_channel_slack::app::SlackAppError,
+> {
+    let apps = augmentagent_channel_slack::app::SlackAppStore::default_store();
+    let mut out = Vec::new();
+    for team in apps.teams()? {
+        if let Some(c) = apps.load(&team)? {
+            out.push(c.summary());
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Human-readable table output.
 // ---------------------------------------------------------------------------
@@ -1744,6 +2129,192 @@ fn print_table(findings: &[Finding], ok: usize, warn: usize, error: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write a fake `security` script without this test process holding a
+    /// write descriptor on it: tests on other threads fork, a child forked
+    /// while `std::fs::write` has the file open keeps the descriptor until it
+    /// execs, and exec of a file open for writing fails on Linux with ETXTBSY
+    /// (the probe then reports "security command could not start"). A short
+    /// `sh` child writes the bytes instead (same fix as converter_bounds.rs).
+    #[cfg(unix)]
+    fn write_stub(path: &std::path::Path, script: impl AsRef<str>) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let mut writer = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("cat > \"$1\"")
+            .arg("sh")
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sh to write the stub");
+        writer
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_ref().as_bytes())
+            .unwrap();
+        assert!(writer.wait().unwrap().success());
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn macos_keychain_configuration_does_not_claim_credential_access() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let security = dir.path().join("security");
+        write_stub(
+            &security,
+            "#!/bin/sh\nprintf 'synthetic-canary-secret\\n'\nexit 0\n",
+        );
+        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let finding = check_keychain_configuration_with(&security, Duration::from_secs(2)).await;
+        assert_eq!(finding.severity, Severity::Warn);
+        assert!(finding.message.contains("unverified"));
+        assert!(!finding.message.contains("synthetic-canary-secret"));
+        assert!(!finding
+            .to_json()
+            .to_string()
+            .contains("synthetic-canary-secret"));
+
+        write_stub(
+            &security,
+            "#!/bin/sh\necho synthetic-canary-secret >&2\nexit 1\n",
+        );
+        let denied = check_keychain_configuration_with(&security, Duration::from_secs(2)).await;
+        assert_eq!(denied.severity, Severity::Error);
+        assert!(!denied.message.contains("synthetic-canary-secret"));
+
+        write_stub(&security, "#!/bin/sh\nsleep 1\n");
+        let timed_out =
+            check_keychain_configuration_with(&security, Duration::from_millis(20)).await;
+        assert_eq!(timed_out.severity, Severity::Warn);
+        assert!(timed_out.message.contains("timed out"));
+
+        let missing_binary = check_keychain_configuration_with(
+            std::path::Path::new("/nonexistent-synthetic-security"),
+            Duration::from_millis(100),
+        )
+        .await;
+        assert_eq!(missing_binary.severity, Severity::Error);
+        assert!(missing_binary.message.contains("not found"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn macos_keychain_probe_reads_and_deletes_disposable_credential() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let security = dir.path().join("security");
+        let item = dir.path().join("item");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  add-generic-password) printf '%s' \"$7\" > '{item}' ;;
+              \n  find-generic-password) cat '{item}' ;;
+              \n  delete-generic-password) rm '{item}' ;;
+              \n esac\necho synthetic-canary-secret >&2\n",
+            item = item.display(),
+        );
+        write_stub(&security, script);
+        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let finding = check_keychain_probe_with(&security, Duration::from_secs(2)).await;
+        assert_eq!(finding.severity, Severity::Ok, "{}", finding.message);
+        assert!(!item.exists());
+        assert!(!finding.message.contains("synthetic-canary-secret"));
+        assert!(!finding
+            .to_json()
+            .to_string()
+            .contains("synthetic-canary-secret"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn macos_keychain_probe_reports_denied_read_and_cleans_up() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let security = dir.path().join("security");
+        let item = dir.path().join("item");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  add-generic-password) printf '%s' \"$7\" > '{item}' ;;
+              \n  find-generic-password) echo synthetic-canary-secret >&2; exit 1 ;;
+              \n  delete-generic-password) rm '{item}' ;;
+              \n esac\n",
+            item = item.display(),
+        );
+        write_stub(&security, script);
+        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let finding = check_keychain_probe_with(&security, Duration::from_secs(2)).await;
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(finding.message.contains("read"), "{}", finding.message);
+        assert!(!item.exists());
+        assert!(!finding.message.contains("synthetic-canary-secret"));
+        assert!(!finding
+            .to_json()
+            .to_string()
+            .contains("synthetic-canary-secret"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn macos_keychain_probe_surfaces_unverified_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let security = dir.path().join("security");
+        let item = dir.path().join("item");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  add-generic-password) printf '%s' \"$7\" > '{item}' ;;
+              \n  find-generic-password) cat '{item}' ;;
+              \n  delete-generic-password) exit 1 ;;
+              \n esac\n",
+            item = item.display(),
+        );
+        write_stub(&security, script);
+        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let finding = check_keychain_probe_with(&security, Duration::from_secs(2)).await;
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(finding.message.contains("cleanup"));
+        assert!(finding
+            .suggested_cmd
+            .as_deref()
+            .unwrap()
+            .contains("delete-generic-password"));
+        assert!(item.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn macos_keychain_probe_distinguishes_missing_and_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let security = dir.path().join("security");
+        let item = dir.path().join("item");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  add-generic-password) printf '%s' \"$7\" > '{item}' ;;
+              \n  find-generic-password) echo 'The specified item could not be found in the keychain.' >&2; exit 1 ;;
+              \n  delete-generic-password) rm '{item}' ;;
+              \n esac\n",
+            item = item.display(),
+        );
+        write_stub(&security, script);
+        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let missing = check_keychain_probe_with(&security, Duration::from_secs(2)).await;
+        assert_eq!(missing.severity, Severity::Error);
+        assert!(missing.message.contains("missing"));
+        assert!(!item.exists());
+
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  add-generic-password) printf '%s' \"$7\" > '{item}' ;;
+              \n  find-generic-password) sleep 1 ;;
+              \n  delete-generic-password) rm '{item}' ;;
+              \n esac\n",
+            item = item.display(),
+        );
+        write_stub(&security, script);
+        let timed_out = check_keychain_probe_with(&security, Duration::from_millis(50)).await;
+        assert_eq!(timed_out.severity, Severity::Error);
+        assert!(timed_out.message.contains("timed out"));
+        assert!(!item.exists());
+    }
     use std::collections::BTreeMap;
 
     #[test]
@@ -2391,6 +2962,16 @@ mod tests {
             },
             channels,
             queue: status::QueueStatus { pending: 0 },
+            delivery: BTreeMap::new(),
+            interactive: BTreeMap::new(),
+            credentials: status::CredentialsStatus {
+                backend: "macos-keychain".into(),
+                persistent: true,
+                insecure_file_store: false,
+                note: None,
+            },
+            daemon_report: None,
+            config_issues: Vec::new(),
             summary: "ok".to_string(),
         };
         let v = check_per_channel_validate(&Some(doc));
@@ -2410,5 +2991,299 @@ mod tests {
             slack.suggested_cmd.as_deref(),
             Some("augmentagent channel slack arm")
         );
+    }
+
+    #[test]
+    fn interactive_surface_is_reported_apart_from_composio_and_never_ok_when_down() {
+        use crate::status::InteractiveStatus;
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(
+            "slack".to_string(),
+            InteractiveStatus {
+                state: "connected".into(),
+                healthy: true,
+                last_event_unix: Some(1_700_000_000),
+                ..Default::default()
+            },
+        );
+        let f = check_interactive_surfaces(&m);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].name, "interactive.slack");
+        assert_eq!(f[0].severity, Severity::Ok);
+
+        m.get_mut("slack").unwrap().state = "reconnecting".into();
+        m.get_mut("slack").unwrap().healthy = false;
+        m.get_mut("slack").unwrap().detail = Some("socket closed".into());
+        m.get_mut("slack").unwrap().recovery = Some("check the network".into());
+        let f = check_interactive_surfaces(&m);
+        assert_eq!(f[0].severity, Severity::Warn);
+        assert!(f[0].message.contains("reconnecting"));
+        assert!(f[0].message.contains("socket closed"));
+        assert_eq!(f[0].suggested_cmd.as_deref(), Some("check the network"));
+
+        m.get_mut("slack").unwrap().state = "misconfigured".into();
+        assert_eq!(check_interactive_surfaces(&m)[0].severity, Severity::Error);
+
+        for quiet in ["not_configured", "disabled"] {
+            m.get_mut("slack").unwrap().state = quiet.into();
+            assert_eq!(
+                check_interactive_surfaces(&m)[0].severity,
+                Severity::Ok,
+                "{quiet}"
+            );
+        }
+    }
+
+    #[test]
+    fn surface_delivery_warns_on_dead_letters_and_unreconciled_sends() {
+        let mut delivery = BTreeMap::new();
+        delivery.insert("discord".to_string(), status::DeliveryStatus::default());
+        assert_eq!(
+            check_surface_delivery(&delivery).severity,
+            Severity::Ok,
+            "idle surfaces are healthy"
+        );
+        delivery.insert(
+            "slack".to_string(),
+            status::DeliveryStatus {
+                outbound_backlog: 4,
+                outbound_reconcile: 1,
+                ..Default::default()
+            },
+        );
+        delivery.insert(
+            "whatsapp".to_string(),
+            status::DeliveryStatus {
+                inbound_dead_letter: 1,
+                outbound_dead_letter: 2,
+                ..Default::default()
+            },
+        );
+        let finding = check_surface_delivery(&delivery);
+        assert_eq!(finding.name, "surface_delivery");
+        assert_eq!(finding.severity, Severity::Warn);
+        assert_eq!(
+            finding.message,
+            "slack: 1 send(s) awaiting reconcile; whatsapp: 3 dead letter(s)"
+        );
+        // A plain backlog is normal work in progress, not a warning.
+        delivery.remove("whatsapp");
+        delivery.get_mut("slack").unwrap().outbound_reconcile = 0;
+        assert_eq!(check_surface_delivery(&delivery).severity, Severity::Ok);
+    }
+
+    // --- #1299 -------------------------------------------------------------
+
+    fn backend(
+        backend: &'static str,
+        persistent: bool,
+        insecure: bool,
+    ) -> augmentagent_auth::BackendDescription {
+        augmentagent_auth::BackendDescription {
+            backend,
+            persistent,
+            insecure,
+            note: (!persistent).then(|| "not persistent (#1325)".to_string()),
+        }
+    }
+
+    #[test]
+    fn credential_backend_is_named_and_insecure_or_volatile_stores_are_flagged() {
+        let ok = check_credential_backend(&backend("macos-keychain", true, false));
+        assert_eq!(ok.name, "credential_backend");
+        assert_eq!(ok.severity, Severity::Ok);
+        assert!(ok.message.contains("macos-keychain"));
+
+        let insecure = check_credential_backend(&backend("insecure-file", true, true));
+        assert_eq!(insecure.severity, Severity::Error);
+        assert!(insecure
+            .message
+            .contains("AUGMENTAGENT_INSECURE_CREDENTIAL_DIR"));
+        assert!(insecure
+            .suggested_cmd
+            .as_deref()
+            .unwrap()
+            .contains("unset AUGMENTAGENT_INSECURE_CREDENTIAL_DIR"));
+
+        // #1325 — Linux's owner-only file store is persistent and fine.
+        let linux = check_credential_backend(&backend("private-file", true, false));
+        assert_eq!(linux.severity, Severity::Ok);
+        assert!(linux.message.contains("private-file"));
+
+        // A store that forgets credentials when the process exits (keyring's
+        // mock on an unsupported OS, or Linux without HOME) is an error with
+        // a recovery, never a silent success.
+        for volatile in ["keyring-mock", "unavailable"] {
+            let f = check_credential_backend(&backend(volatile, false, false));
+            assert_eq!(f.severity, Severity::Error, "{volatile}");
+            assert!(f.message.contains(volatile));
+            assert!(f.message.contains("#1325"));
+            let fix = f.suggested_cmd.as_deref().unwrap();
+            assert!(fix.contains("HOME"), "{fix}");
+            assert!(fix.contains("slack app install"), "{fix}");
+        }
+    }
+
+    #[test]
+    fn every_config_issue_becomes_a_finding_with_its_recovery() {
+        let issues = vec![
+            status::ConfigIssue {
+                id: "discord.approval_broker".into(),
+                source: "cli",
+                severity: "warn".into(),
+                detail: "DISCORD_BOT_TOKEN is set but DISCORD_CHANNEL_ID is not".into(),
+                recovery: Some(status::DISCORD_BROKER_RECOVERY.into()),
+            },
+            status::ConfigIssue {
+                id: "daemon.insecure_file_store".into(),
+                source: "daemon",
+                severity: "error".into(),
+                detail: "plaintext".into(),
+                recovery: Some(status::INSECURE_STORE_RECOVERY.into()),
+            },
+        ];
+        let f = check_config_issues(&issues);
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[0].name, "config.discord.approval_broker");
+        assert_eq!(f[0].severity, Severity::Warn);
+        assert!(f[0]
+            .suggested_cmd
+            .as_deref()
+            .unwrap()
+            .contains("DISCORD_CHANNEL_ID"));
+        assert_eq!(f[1].name, "config.daemon.insecure_file_store");
+        assert_eq!(f[1].severity, Severity::Error);
+        let none = check_config_issues(&[]);
+        assert_eq!(none.len(), 1);
+        assert_eq!(none[0].severity, Severity::Ok);
+    }
+
+    fn slack_status(credentials: &str, app: bool, owner: bool) -> status::InteractiveStatus {
+        status::InteractiveStatus {
+            state: if credentials == "usable" {
+                "connected"
+            } else {
+                "disconnected"
+            }
+            .into(),
+            healthy: credentials == "usable",
+            app_installed: Some(app),
+            owner_bound: owner,
+            credentials: credentials.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn slack_credentials_are_never_ok_as_usable_without_the_daemons_proof() {
+        let usable = check_slack_credentials(&slack_status("usable", true, true), true);
+        assert_eq!(usable.name, "interactive.slack.credentials");
+        assert_eq!(usable.severity, Severity::Ok);
+        assert!(usable.message.contains("usable"));
+
+        let mac = check_slack_credentials(&slack_status("present", true, true), true);
+        assert_eq!(mac.severity, Severity::Warn);
+        assert!(mac.message.contains("not yet proven"));
+        assert!(mac
+            .suggested_cmd
+            .as_deref()
+            .unwrap()
+            .contains("augmentagent doctor --keychain-probe"));
+        let linux = check_slack_credentials(&slack_status("present", true, true), false);
+        assert!(linux
+            .suggested_cmd
+            .as_deref()
+            .unwrap()
+            .contains("service --unit daemon restart"));
+
+        let missing = check_slack_credentials(&slack_status("missing", false, false), true);
+        assert_eq!(
+            missing.severity,
+            Severity::Ok,
+            "nothing installed is not a fault"
+        );
+        assert!(missing.message.contains("no Slack app"));
+        let orphan = check_slack_credentials(&slack_status("missing", false, true), true);
+        assert_eq!(
+            orphan.severity,
+            Severity::Warn,
+            "an owner without an install"
+        );
+        assert!(orphan
+            .suggested_cmd
+            .as_deref()
+            .unwrap()
+            .contains("slack app install --stdin"));
+    }
+
+    #[test]
+    fn an_unreadable_credential_store_is_never_reported_as_nothing_installed() {
+        let mut s = slack_status("unreadable", false, false);
+        s.app_installed = None;
+        let f = check_slack_credentials(&s, true);
+        assert_eq!(f.severity, Severity::Warn);
+        assert!(f.message.contains("cannot read"), "{}", f.message);
+        assert!(f
+            .suggested_cmd
+            .as_deref()
+            .unwrap()
+            .contains("augmentagent doctor --keychain-probe"));
+    }
+
+    fn summary(scopes: Option<Vec<&str>>) -> augmentagent_channel_slack::app::SlackAppSummary {
+        let scopes: Option<Vec<String>> =
+            scopes.map(|v| v.into_iter().map(str::to_string).collect());
+        augmentagent_channel_slack::app::SlackAppSummary {
+            team_id: "T00000001".into(),
+            team_name: None,
+            team_url: None,
+            bot_user_id: "U0000000B".into(),
+            bot_user_name: None,
+            bot_id: None,
+            app_id: None,
+            missing_scopes: scopes
+                .as_deref()
+                .map(augmentagent_channel_slack::app::missing_scopes),
+            scopes,
+            installed_at: 1,
+            verified_at: None,
+            rotated_at: None,
+        }
+    }
+
+    #[test]
+    fn slack_scopes_compare_the_stored_grant_with_the_required_set() {
+        use augmentagent_channel_slack::app::REQUIRED_BOT_SCOPES;
+        let all = summary(Some(REQUIRED_BOT_SCOPES.to_vec()));
+        let f = slack_scope_findings(Ok(vec![all]));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].name, "slack_app.scopes");
+        assert_eq!(f[0].severity, Severity::Ok);
+        assert!(f[0].message.contains("T00000001"));
+
+        let few = summary(Some(vec!["chat:write"]));
+        let f = slack_scope_findings(Ok(vec![few]));
+        assert_eq!(f[0].severity, Severity::Error);
+        assert!(f[0].message.contains("im:history"), "{}", f[0].message);
+        assert!(f[0]
+            .suggested_cmd
+            .as_deref()
+            .unwrap()
+            .contains("slack app rotate --stdin"));
+
+        let unknown = slack_scope_findings(Ok(vec![summary(None)]));
+        assert_eq!(unknown[0].severity, Severity::Warn);
+        assert!(unknown[0]
+            .suggested_cmd
+            .as_deref()
+            .unwrap()
+            .contains("slack app verify"));
+
+        assert!(slack_scope_findings(Ok(Vec::new())).is_empty());
+        let err = slack_scope_findings(Err(augmentagent_channel_slack::app::SlackAppError::Store(
+            "denied".into(),
+        )));
+        assert_eq!(err[0].severity, Severity::Error);
+        assert!(err[0].suggested_cmd.is_some());
     }
 }

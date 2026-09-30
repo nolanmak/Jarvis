@@ -240,6 +240,32 @@ class TestSync(unittest.TestCase):
         result = sync(self.db_path, self.out, self.state)
         self.assertEqual(result["messages"], 0)
 
+    def _index(self):
+        return json.loads((self.out / "conversations" / "index.json").read_text())
+
+    def test_index_includes_chat_guid_from_database(self):
+        self.con.execute(
+            "INSERT INTO chat VALUES (3, 'any;+;chat123', 'chat123', 'Crew', 'iMessage')"
+        )
+        self.con.execute("INSERT INTO chat_handle_join VALUES (3, 1)")
+        self.con.execute("INSERT INTO chat_handle_join VALUES (3, 2)")
+        add_message(self.con, 1, 3, "hi crew", ns(1782475200), 0)
+        sync(self.db_path, self.out, self.state)
+        self.assertEqual(self._index()["chat123"]["chat_guid"], "any;+;chat123")
+
+    def test_existing_index_entries_gain_chat_guid_without_new_messages(self):
+        add_message(self.con, 1, 1, "hello", ns(1782475200), 0)
+        sync(self.db_path, self.out, self.state)
+        index = self._index()
+        for entry in index.values():
+            entry.pop("chat_guid", None)
+        (self.out / "conversations" / "index.json").write_text(json.dumps(index))
+        sync(self.db_path, self.out, self.state)
+        self.assertEqual(
+            self._index()["+15551234567"]["chat_guid"],
+            "iMessage;-;+15551234567",  # the fixture's legacy-form guid, copied verbatim
+        )
+
     def test_group_chat_gets_own_dir_and_display_name(self):
         add_message(self.con, 1, 2, "who's driving?", ns(1782475200), 0, handle_id=2)
         sync(self.db_path, self.out, self.state)

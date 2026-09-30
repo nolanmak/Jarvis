@@ -12,3 +12,6 @@ repository.workspace = true
 keyring = { version = "3", features = ["apple-native", "crypto-rust"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
