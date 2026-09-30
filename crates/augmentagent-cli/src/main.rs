@@ -2548,14 +2548,11 @@ const DRAIN_BUDGET: Duration = Duration::from_secs(20);
 /// it bounds the stop, which is what `TimeoutStopSec` measures — per-task budgets would
 /// multiply into a wait systemd would SIGKILL.
 async fn drain_daemon_tasks(tasks: Vec<tokio::task::JoinHandle<Result<()>>>, budget: Duration) -> Result<()> {
-    let drained = tokio::time::timeout(budget, async {
-        for handle in tasks { handle.await??; }
-        Ok(())
-    }).await;
-    drained.unwrap_or_else(|_| {
-        warn!("shutdown drain timed out; the next start's orphan pass will clear any marker left");
-        Ok(())
-    })
+    tokio::time::timeout(budget, async { for handle in tasks { handle.await??; } Ok(()) }).await
+        .unwrap_or_else(|_| {
+            warn!("shutdown drain timed out; the next start's orphan pass will clear any marker left");
+            Ok(())
+        })
 }
 
 #[tokio::main]
@@ -21259,8 +21256,7 @@ mod identity_merge_tests {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_wedged_runner_cannot_hold_the_stop_open_past_the_budget() {
     use std::sync::atomic::{AtomicBool, Ordering};
-    let shutdown = CancellationToken::new();
-    let retired = Arc::new(AtomicBool::new(false));
+    let (retired, shutdown) = (Arc::new(AtomicBool::new(false)), CancellationToken::new());
     let (flag, sd) = (Arc::clone(&retired), shutdown.clone());
     let started = tokio::time::Instant::now();
     shutdown.cancel();

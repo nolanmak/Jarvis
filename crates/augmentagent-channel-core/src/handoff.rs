@@ -7,8 +7,9 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-/// The liveness probes [`clear_orphaned_markers`] reads (#1071).
-pub use crate::process_tree::LivenessEnv;
+/// The liveness probes [`clear_orphaned_markers`] reads, and the containment guarantee
+/// they are gated on (#1071).
+pub use crate::process_tree::{daemon_kill_mode, LivenessEnv, DAEMON_UNIT};
 
 pub(crate) fn system_root() -> Option<PathBuf> {
     crate::state_dir::state_dir().map(|dir| dir.join("reasoner-handoffs"))
@@ -497,13 +498,12 @@ pub fn sweep_finished(root: &Path, grace: Duration, dry_run: bool) -> anyhow::Re
 
 /// The request directory name `request_path` writes: a hex SHA-256 digest.
 fn is_request_name(name: &OsStr) -> bool {
-    name.to_str().is_some_and(|name| name.len() == 64
-        && name.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
+    name.to_str().is_some_and(|name| name.len() == 64 && name.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
 }
 
-/// What one orphan pass saw (#1071). `kept_legacy` (pre-#1071, recording no writer to judge)
-/// is counted apart because no pass can ever clear one: `doctor` reports that backlog, which
-/// unlike the others never drains itself.
+/// What one orphan pass saw (#1071). `kept_legacy` (pre-#1071, recording no writer to judge) is
+/// counted apart because no pass can ever clear one: `doctor` reports that backlog, which unlike
+/// the others never drains itself.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct OrphanReport { pub cleared: u64, pub kept_live: u64, pub kept_legacy: u64, pub kept_unproven: u64 }
 
@@ -533,10 +533,8 @@ pub fn clear_orphaned_markers(root: &Path, env: &LivenessEnv, dry_run: bool) -> 
             Ok(Liveness::Legacy) => report.kept_legacy += 1,
             Ok(Liveness::Unproven) => report.kept_unproven += 1,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                tracing::warn!(request = %name.to_string_lossy(), "orphan pass left a request: {error}");
-                report.kept_unproven += 1;
-            }
+            Err(error) => { report.kept_unproven += 1;
+                tracing::warn!(request = %name.to_string_lossy(), "orphan pass left a request: {error}") }
         }
     }
     Ok(report)
@@ -1345,9 +1343,8 @@ for line in sys.stdin:
 
     /// #1071, the reported case through the path the daemon runs: a `systemctl restart` killed
     /// the previous instance mid-call and left a marker; starting the successor's sweep loop —
-    /// nothing else — must retire it. A live call's marker and a pre-#1071 one stay.
-    /// Deliberately *not* a reboot: the markers name this same boot, so only the realistic
-    /// restart cgroup reading can decide them.
+    /// nothing else — must retire it. A live call's marker and a pre-#1071 one stay. Deliberately
+    /// *not* a reboot: the markers name this boot, so only the restart cgroup reading decides them.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_restart_retires_the_marker_the_previous_instance_orphaned() {
         let (_temp, root) = private_root();
@@ -1383,13 +1380,12 @@ for line in sys.stdin:
         tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
         assert!(live.with_extension("active").exists() && legacy.with_extension("active").exists());
         assert_eq!(std::fs::read_to_string(&orphan).unwrap(), kept, "the journal must be left for recovery");
-        // The cleared request rejoins the sweep from a fresh grace period (removing the
-        // marker moved the mtime), then becomes removable like any other.
+        // The cleared request rejoins the sweep from a fresh grace period (removing the marker
+        // moved the mtime), then becomes removable like any other.
         assert_eq!(sweep_finished(&root, GRACE, true).unwrap().kept_recent, 1);
         age(&orphan, TWO_DAYS);
         let swept = sweep_finished(&root, GRACE, false).unwrap();
-        assert!(gone(&orphan), "a cleared orphan must become eligible for the sweep");
-        assert_eq!((swept.removed, swept.kept_active), (1, 2));
+        assert!(gone(&orphan) && (swept.removed, swept.kept_active) == (1, 2), "{swept:?}");
     }
 
     #[test]
