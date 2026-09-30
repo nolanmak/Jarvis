@@ -418,24 +418,46 @@ mod tests {
         dir
     }
 
+    /// A python3 that signals readiness by creating `argv[1]`, then sleeps.
+    const READY_THEN_SLEEP: &str =
+        "import pathlib, sys, time; pathlib.Path(sys.argv[1]).write_text('ready'); time.sleep(60)";
+
+    /// Wait until the sweep's own matcher reports exactly `expected` (sorted)
+    /// for `dir`. This is the property [`sweep_with`] consumes, so polling it
+    /// removes every timing assumption about how far a child has got.
+    fn await_vm_processes(dir: &Path, expected: &[u32]) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut pids: Vec<u32> = ProcFs.vm_processes_using(dir).into_iter().map(|(pid, _)| pid).collect();
+            pids.sort_unstable();
+            if pids == expected { return; }
+            assert!(std::time::Instant::now() < deadline,
+                "vm_processes_using({}) settled on {pids:?}, expected {expected:?}", dir.display());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// A real child process, killed and reaped when dropped.
     struct Child(std::process::Child);
 
     impl Child {
-        fn spawn(program: &str, args: &[&str]) -> Self {
-            let child = std::process::Command::new(program).args(args)
+        /// Spawn `program`, then wait for the child itself to create `ready`.
+        /// `/proc/<pid>/exe` is the wrong signal for what the sweep reads: it
+        /// resolves once `execve` has swapped the image in, while the sweep
+        /// matches on `/proc/<pid>/cmdline` and on the interpreter having
+        /// actually reached its own code. A file the child writes proves both.
+        fn spawn(program: &str, args: &[&str], ready: &Path) -> Self {
+            // Wrapped before the wait so a readiness timeout still kills and reaps.
+            let child = Self(std::process::Command::new(program).args(args)
                 .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null()).spawn().unwrap();
-            let pid = child.id();
-            // Wait until exec has replaced the forked test binary.
+                .stderr(std::process::Stdio::null()).spawn().unwrap());
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while std::fs::read_link(format!("/proc/{pid}/exe")).ok()
-                .and_then(|exe| exe.file_name().map(|n| n.to_string_lossy().into_owned()))
-                .is_none_or(|name| !name.starts_with(program)) {
-                assert!(std::time::Instant::now() < deadline, "{program} did not start");
+            while !ready.exists() {
+                assert!(std::time::Instant::now() < deadline,
+                    "{program} never signalled readiness at {}", ready.display());
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Self(child)
+            child
         }
         fn pid(&self) -> u32 { self.0.id() }
         fn killed_by_sigkill(&mut self) -> bool {
@@ -632,10 +654,25 @@ mod tests {
     fn real_sweep_kills_only_vm_processes_of_a_stale_session() {
         let temp = tempfile::tempdir().unwrap();
         let stale = session(temp.path(), "jarvis-vm-session-stale", Some(serde_json::json!({"pid": u32::MAX, "start_time": "1"})));
-        let vm_arg = format!("{}/tmp/jarvis-build-vm-synthetic/cleanup-complete", stale.display());
-        let mut vm_like = Child::spawn("python3", &["-c", "import time; time.sleep(60)", &vm_arg]);
-        let mut shell = Child::spawn("bash", &["-c", &format!("sleep 60; : {}/", stale.display())]);
-        let mut mention = Child::spawn("python3", &["-c", &format!("import time; time.sleep(60) # {}/", stale.display())]);
+        // The non-matching children signal readiness outside any session
+        // directory: a sibling of the session dirs is ignored by the sweep, and
+        // a path under `stale` would make them genuine matches.
+        let ready = temp.path().join("ready");
+        std::fs::create_dir(&ready).unwrap();
+        // The VM-like child's readiness path *is* its in-session argument, so
+        // its existence proves the argv the sweep matches on is installed.
+        let vm_arg = stale.join("tmp/jarvis-build-vm-synthetic/cleanup-complete");
+        std::fs::create_dir_all(vm_arg.parent().unwrap()).unwrap();
+        let mut vm_like = Child::spawn("python3",
+            &["-c", READY_THEN_SLEEP, &vm_arg.to_string_lossy()], &vm_arg);
+        // `sleep 60` is not the last command, so bash does not exec away its argv.
+        let mut shell = Child::spawn("bash",
+            &["-c", &format!("touch {}; sleep 60; : {}/", ready.join("shell").display(), stale.display())],
+            &ready.join("shell"));
+        let mut mention = Child::spawn("python3",
+            &["-c", &format!("{READY_THEN_SLEEP} # {}/", stale.display()), &ready.join("mention").to_string_lossy()],
+            &ready.join("mention"));
+        await_vm_processes(&stale, &[vm_like.pid()]);
         let report = sweep_with(temp.path(), &ProcFs, SystemTime::now());
         assert_eq!((report.removed, report.killed), (1, 1), "{report:?}");
         assert!(vm_like.killed_by_sigkill(), "the stale session's VM process must be killed");
@@ -649,11 +686,17 @@ mod tests {
     fn real_sweep_keeps_a_live_session_and_its_processes() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("jarvis-vm-session-live");
-        let arg = format!("{}/tmp/jarvis-build-vm-synthetic/cleanup-complete", dir.display());
-        let mut owner = Child::spawn("python3", &["-c", "import time; time.sleep(60)"]);
+        let ready = temp.path().join("ready");
+        std::fs::create_dir(&ready).unwrap();
+        let mut owner = Child::spawn("python3",
+            &["-c", READY_THEN_SLEEP, &ready.join("owner").to_string_lossy()], &ready.join("owner"));
         let start = ProcFs.start_time(owner.pid()).unwrap();
         session(temp.path(), "jarvis-vm-session-live", Some(serde_json::json!({"pid": owner.pid(), "start_time": start})));
-        let mut vm_like = Child::spawn("python3", &["-c", "import time; time.sleep(60)", &arg]);
+        let arg = dir.join("tmp/jarvis-build-vm-synthetic/cleanup-complete");
+        std::fs::create_dir_all(arg.parent().unwrap()).unwrap();
+        let mut vm_like = Child::spawn("python3",
+            &["-c", READY_THEN_SLEEP, &arg.to_string_lossy()], &arg);
+        await_vm_processes(&dir, &[vm_like.pid()]);
         let report = sweep_with(temp.path(), &ProcFs, SystemTime::now());
         assert_eq!(report, SweepReport { removed: 0, kept_live: 1, killed: 0 });
         assert!(dir.join("tmp/jarvis-vm-build-synthetic/initrd.gz").exists());
@@ -662,7 +705,10 @@ mod tests {
 
     #[test]
     fn kill_if_same_refuses_a_mismatched_start_time() {
-        let mut child = Child::spawn("python3", &["-c", "import time; time.sleep(60)"]);
+        let temp = tempfile::tempdir().unwrap();
+        let ready = temp.path().join("ready");
+        let mut child = Child::spawn("python3",
+            &["-c", READY_THEN_SLEEP, &ready.to_string_lossy()], &ready);
         assert!(!ProcFs.kill_if_same(child.pid(), "0"), "a reused pid (other start time) is never signalled");
         assert!(child.alive());
         let start = ProcFs.start_time(child.pid()).unwrap();
