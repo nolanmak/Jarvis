@@ -2537,6 +2537,24 @@ enum RatelimitOp {
     Caps,
 }
 
+/// #1071 — how long a stop waits for cancelled runners to unwind. Kept well under
+/// systemd's `TimeoutStopSec` so the drain always ends before SIGKILL does.
+const DRAIN_BUDGET: Duration = Duration::from_secs(20);
+
+/// Join the daemon's tasks after cancellation, bounded (#1071). Letting a cancelled runner
+/// return drops its `ProcessGroup`, which retires that call's marker; a runner wedged in a
+/// call that never returns must not hold the stop open, so the budget expires and the next
+/// start's orphan pass clears what was left. One budget covers the whole join deliberately:
+/// it bounds the stop, which is what `TimeoutStopSec` measures — per-task budgets would
+/// multiply into a wait systemd would SIGKILL.
+async fn drain_daemon_tasks(tasks: Vec<tokio::task::JoinHandle<Result<()>>>, budget: Duration) -> Result<()> {
+    tokio::time::timeout(budget, async { for handle in tasks { handle.await??; } Ok(()) }).await
+        .unwrap_or_else(|_| {
+            warn!("shutdown drain timed out; the next start's orphan pass will clear any marker left");
+            Ok(())
+        })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
@@ -3087,6 +3105,15 @@ async fn main() -> Result<()> {
                     s2.cancel();
                 }
             });
+            // #1071 — a stop or restart sends SIGTERM. Without this the process dies at
+            // once and every in-flight call leaves a lifecycle marker.
+            let s3 = shutdown.clone();
+            tokio::spawn(async move {
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(mut term) => { term.recv().await; info!("SIGTERM received"); s3.cancel(); }
+                    Err(e) => warn!("SIGTERM handler unavailable; a stop may orphan markers: {e:#}"),
+                }
+            });
             // Collect the enabled channels' runners + optional digest scheduler.
             let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
 
@@ -3101,6 +3128,8 @@ async fn main() -> Result<()> {
                 // #1036 — also reap Codex VM build sessions left by a killed
                 // bridge (and any VM still running for them), hourly.
                 Some(std::sync::Arc::new(augmentagent_channel_core::build_scratch::sweep_and_log)),
+                // #1071 — its start also clears markers orphaned by a dead instance.
+                augmentagent_channel_core::handoff::LivenessEnv::probe(),
             )));
 
 
@@ -3709,10 +3738,7 @@ async fn main() -> Result<()> {
                     }
                 });
             }
-            for handle in tasks {
-                handle.await??;
-            }
-            Ok(())
+            drain_daemon_tasks(tasks, DRAIN_BUDGET).await
         }
         Cmd::Transcripts { ref op } => match op {
             TranscriptsOp::Sync {
@@ -21220,6 +21246,29 @@ mod identity_merge_tests {
             other => panic!("expected AlreadyResolved, got {other:?}"),
         }
     }
+}
+
+/// #1071, the reported shape: one runner returns once cancelled (its `ProcessGroup` drops,
+/// retiring that marker), one is wedged in a provider call that never returns. An unbounded
+/// join waits on the wedged one forever, so the budget must expire and leave the rest to the
+/// next start's orphan pass.
+#[cfg(test)]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_wedged_runner_cannot_hold_the_stop_open_past_the_budget() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (retired, shutdown) = (Arc::new(AtomicBool::new(false)), CancellationToken::new());
+    let (flag, sd) = (Arc::clone(&retired), shutdown.clone());
+    let started = tokio::time::Instant::now();
+    shutdown.cancel();
+    drain_daemon_tasks(vec![
+        tokio::spawn(async move { sd.cancelled().await; flag.store(true, Ordering::SeqCst); Ok(()) }),
+        tokio::spawn(async { std::future::pending().await })], DRAIN_BUDGET).await.unwrap();
+    assert!(retired.load(Ordering::SeqCst), "the drain must let a cancelled runner unwind");
+    assert!(started.elapsed() >= DRAIN_BUDGET && DRAIN_BUDGET <= Duration::from_secs(30),
+        "the drain must end within a budget systemd's TimeoutStopSec outlives");
+    // A failing runner still surfaces its error, as it did before the bound.
+    let failed = vec![tokio::spawn(async { Err(anyhow::anyhow!("synthetic runner failure")) })];
+    assert!(drain_daemon_tasks(failed, DRAIN_BUDGET).await.is_err());
 }
 
 /// Test builders shared by sibling modules (`imessage_send`).

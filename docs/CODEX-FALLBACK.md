@@ -945,17 +945,39 @@ What it never touches, and for how long:
 - **Uncertain journals** (a `started` row, or any status it does not recognise)
   stay until the recovery command above records a decision. The next passes
   then treat them like any other finished journal.
-- **Journals with an `operations.active` marker are retained indefinitely.**
-  A marker means a provider is running or its descendants' cleanup has not
-  been verified. The recovery command refuses while a marker exists and never
-  clears one, and the sweep never clears one either. The only path that clears
-  a marker today is the resume gate, when the same turn is dispatched again and
-  its cleanup receipt still verifies. The daemon has no SIGTERM handler, so a
-  service stop or restart during a call leaves a marker behind. Most such
-  turns are never dispatched again (calls without a turn id get a fresh
-  request), and the receipt lives in a temporary directory that may be gone.
-  Those journals stay on disk until a marker-clearing mechanism exists,
-  tracked in #1071.
+- **Journals with an `operations.active` marker are retained while the marker
+  exists.** A marker means a provider is running or its descendants' cleanup has not been
+  verified. The recovery command refuses while a marker exists, and the sweep never clears
+  one. A single function unlinks a marker, judging the proof against the marker on disk, so no
+  caller removes one on its own authority. It accepts two: a supervisor's `all-descendants-reaped`
+  receipt (offered by a `ProcessGroup` as it drops, and by the resume gate when the same turn is
+  dispatched again and that receipt still verifies), or — with no receipt left to read — that the
+  writing process cannot still be running. The latter is the orphan pass (#1071), run once as the
+  sweep loop starts, before any channel can dispatch: a
+  `boot_id` differing from `/proc/sys/kernel/random/boot_id` means nothing the marker names
+  survived the reboot; failing that, on the same boot, the recorded writer must be gone (pid
+  **and** its `/proc` start time, so a reused pid never counts) **and** its cgroup v2 directory
+  must hold no process that could have outlived the call. The kernel removes such a directory
+  only once it is empty, so a vanished one — or one re-created at another inode — is its own
+  proof. A surviving one is read by **ancestry**, since an in-place restart can leave the
+  successor in that same unit cgroup at the same inode: every member's `/proc` parent chain
+  (walked bounded, so a cycle cannot hang the pass) must reach this process — start times
+  cannot serve, a live writer's child spawned after us being younger yet not ours. Anything we
+  cannot claim keeps the marker: a foreign process, a listed pid `/proc` will not show (no
+  proven exit), or a leak reparented away from us. Membership only *means* no survivor if a
+  stop cannot have moved one out of that cgroup, so that reading is **gated** on the unit's
+  `KillMode=control-group` (systemd's default: a stop kills every process in the unit cgroup),
+  read read-only before membership is. With any other value — or the mode unreadable, on a host
+  without systemd — the cgroup is no containment boundary, so only the reboot proof applies and
+  every same-boot marker is kept; `doctor` reports the same value and warns on it. Every other
+  doubtful reading keeps the marker too — an unreadable or malformed marker, an unreadable boot
+  id, a zero or unreadable cgroup, and every pre-#1071 marker (no writer identity, so no proof
+  can apply; `doctor` counts that backlog apart, as it never drains itself). Clearing removes only
+  the marker: the journal keeps its `started` row, so the request becomes idle to the sweep but
+  stays *unfinished* and still needs the recovery command above. The daemon also handles SIGTERM,
+  so a stop cancels the runners and joins them for at most 20s, letting each in-flight call drop
+  its `ProcessGroup`; keep `TimeoutStopSec` above that. A runner wedged in a call that never
+  returns is left to the orphan pass.
 
 Do not delete handoff state by hand.
 
