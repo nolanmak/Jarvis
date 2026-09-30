@@ -2541,18 +2541,32 @@ enum RatelimitOp {
 /// systemd's `TimeoutStopSec` so the drain always ends before SIGKILL does.
 const DRAIN_BUDGET: Duration = Duration::from_secs(20);
 
-/// Join the daemon's tasks after cancellation, bounded (#1071). Letting a cancelled runner
-/// return drops its `ProcessGroup`, which retires that call's marker; a runner wedged in a
-/// call that never returns must not hold the stop open, so the budget expires and the next
-/// start's orphan pass clears what was left. One budget covers the whole join deliberately:
-/// it bounds the stop, which is what `TimeoutStopSec` measures — per-task budgets would
-/// multiply into a wait systemd would SIGKILL.
-async fn drain_daemon_tasks(tasks: Vec<tokio::task::JoinHandle<Result<()>>>, budget: Duration) -> Result<()> {
-    tokio::time::timeout(budget, async { for handle in tasks { handle.await??; } Ok(()) }).await
-        .unwrap_or_else(|_| {
-            warn!("shutdown drain timed out; the next start's orphan pass will clear any marker left");
-            Ok(())
-        })
+/// Join the daemon's tasks, bounding only the stop (#1071). Until `shutdown` fires the join is
+/// unbounded — the runners are the daemon's lifetime, and a runner error still ends it. Once
+/// it fires, letting a cancelled runner return drops its `ProcessGroup`, which retires that
+/// call's marker; a runner wedged in a call that never returns must not hold the stop open, so
+/// the budget expires and the next start's orphan pass clears what was left. One budget covers
+/// the whole drain deliberately: it bounds the stop, which is what `TimeoutStopSec` measures —
+/// per-task budgets would multiply into a wait systemd would SIGKILL.
+async fn drain_daemon_tasks(
+    tasks: Vec<tokio::task::JoinHandle<Result<()>>>,
+    shutdown: CancellationToken,
+    budget: Duration,
+) -> Result<()> {
+    let mut join = std::pin::pin!(async move {
+        for handle in tasks {
+            handle.await??;
+        }
+        Ok(())
+    });
+    tokio::select! {
+        result = &mut join => return result,
+        _ = shutdown.cancelled() => {}
+    }
+    tokio::time::timeout(budget, join).await.unwrap_or_else(|_| {
+        warn!("shutdown drain timed out; the next start's orphan pass will clear any marker left");
+        Ok(())
+    })
 }
 
 #[tokio::main]
@@ -3738,7 +3752,7 @@ async fn main() -> Result<()> {
                     }
                 });
             }
-            drain_daemon_tasks(tasks, DRAIN_BUDGET).await
+            drain_daemon_tasks(tasks, shutdown, DRAIN_BUDGET).await
         }
         Cmd::Transcripts { ref op } => match op {
             TranscriptsOp::Sync {
@@ -21262,13 +21276,35 @@ async fn a_wedged_runner_cannot_hold_the_stop_open_past_the_budget() {
     shutdown.cancel();
     drain_daemon_tasks(vec![
         tokio::spawn(async move { sd.cancelled().await; flag.store(true, Ordering::SeqCst); Ok(()) }),
-        tokio::spawn(async { std::future::pending().await })], DRAIN_BUDGET).await.unwrap();
+        tokio::spawn(async { std::future::pending().await })], shutdown.clone(), DRAIN_BUDGET).await.unwrap();
     assert!(retired.load(Ordering::SeqCst), "the drain must let a cancelled runner unwind");
     assert!(started.elapsed() >= DRAIN_BUDGET && DRAIN_BUDGET <= Duration::from_secs(30),
         "the drain must end within a budget systemd's TimeoutStopSec outlives");
     // A failing runner still surfaces its error, as it did before the bound.
     let failed = vec![tokio::spawn(async { Err(anyhow::anyhow!("synthetic runner failure")) })];
-    assert!(drain_daemon_tasks(failed, DRAIN_BUDGET).await.is_err());
+    assert!(drain_daemon_tasks(failed, CancellationToken::new(), DRAIN_BUDGET).await.is_err());
+}
+
+/// The 2026-09-30 outage: the budget bounded the daemon's whole lifetime, so `serve` returned
+/// Ok 20s after every start and systemd (`Restart=on-failure`) left it down. Without a stop
+/// the join must outlive the budget; the budget starts only when shutdown fires.
+#[cfg(test)]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn the_drain_budget_does_not_bound_a_running_daemon() {
+    let shutdown = CancellationToken::new();
+    let sd = shutdown.clone();
+    let drain = tokio::spawn(drain_daemon_tasks(
+        vec![tokio::spawn(async move { sd.cancelled().await; Ok(()) }),
+             tokio::spawn(async { std::future::pending().await })],
+        shutdown.clone(),
+        DRAIN_BUDGET,
+    ));
+    tokio::time::sleep(DRAIN_BUDGET * 10).await;
+    assert!(!drain.is_finished(), "a running daemon must not exit when the drain budget elapses");
+    let stop = tokio::time::Instant::now();
+    shutdown.cancel();
+    drain.await.unwrap().unwrap();
+    assert!(stop.elapsed() >= DRAIN_BUDGET, "the wedged runner still gets the full drain budget");
 }
 
 /// Test builders shared by sibling modules (`imessage_send`).
