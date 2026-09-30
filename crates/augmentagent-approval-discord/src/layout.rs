@@ -350,16 +350,11 @@ pub fn approval_edit_message(
 /// guarantees a redrawn card and a freshly posted one render identically.
 ///
 /// #1366 — `email.body` reaches Discord from exactly three builders, all in
-/// this file, and each converts: here (posted cards via [`approval_message`]
-/// and #1188 in-place edits via [`approval_edit_message`]/`broker::redraw_cards`),
-/// [`flag_notice_message`], and [`revise_failure_notice`]. `post_digest`'s
-/// default (`lib.rs`) forwards its summary into `post_flag_notice`'s reason
-/// slot, so it lands on the second. `scheduled_notice_message` renders no body.
-/// Attachments and thread context are NOT additional body-bearing paths:
-/// `Email.attachments` is never read in this crate, the only `[attachment: …]`
-/// renderer (`event_handler::append_envelope_markers`) formats a caller-supplied
-/// filename, and `fetch_conversation_context` feeds the reasoner, not Discord.
-/// `every_rendered_field_of_an_html_card_is_plain_text` pins the whole card.
+/// this file, and each converts through [`plain`]: here (posted cards and #1188
+/// in-place edits, which share this builder), [`flag_notice_message`] — where
+/// `post_digest`'s summary also lands — and [`revise_failure_notice`].
+/// `scheduled_notice_message` renders no body, `Email.attachments` is never read
+/// in this crate, and `fetch_conversation_context` feeds the reasoner.
 fn approval_embed_and_rows(
     action_id: &str,
     email: &Email,
@@ -938,12 +933,10 @@ fn truncate_within(s: &str, max: usize) -> String {
 /// indexed copies keep the original. Markup is detected by shape
 /// ([`contains_markup`]) rather than a tag list, since a body the sniffer
 /// misses is posted verbatim. A body that is *all* markup (tracking pixel,
-/// image-only newsletter) converts to nothing, and the card says so instead of
-/// falling back to the tags.
-///
-/// Preferring a `text/plain` alternative upstream instead is not available:
-/// Composio flattens the message into one body string, so by the time our code
-/// sees it the HTML alternative *is* the body
+/// image-only newsletter) converts to nothing, and the card says so rather than
+/// fall back to the tags. Preferring a `text/plain` alternative upstream is not
+/// available: Composio flattens the message into one body string, so the HTML
+/// alternative *is* the body
 /// (`composio_flattens_html_into_the_only_body_field` pins that).
 fn plain(body: &str) -> Cow<'_, str> {
     if !contains_markup(body) {
@@ -1009,10 +1002,8 @@ mod tests {
         assert!(t.is_char_boundary(t.len()));
     }
 
-    // #1366: HTML-only mail renders as prose, not as its own markup.
-
-    /// Apple-Mail-shaped HTML-only body: preamble, attribute-laden `<div>` per
-    /// line, `&nbsp;` separators, quoted reply in a `<blockquote>`.
+    /// #1366 — Apple-Mail-shaped HTML-only body: preamble, attribute-laden
+    /// `<div>` per line, `&nbsp;` separators, quoted reply in a `<blockquote>`.
     const APPLE_MAIL_HTML: &str = r#"<html><head><style type="text/css">body{font-family:Helvetica}</style></head>
         <body style="word-wrap:break-word">
         <div class="apple-mail-dark-mode" style="color:#1d1d1f">Hi there &mdash; the rollout slipped to Tuesday.</div>
@@ -1027,8 +1018,8 @@ mod tests {
     /// The reported case, end to end — asserted against the WHOLE serialized
     /// card, not just the description, so the attachment and envelope blocks an
     /// HTML mail also carries fall under the same scan. The #1188 in-place edit
-    /// (`redraw_cards`) shares `approval_embed_and_rows`, and is checked here so
-    /// a future split of the two builders cannot reopen the leak.
+    /// shares `approval_embed_and_rows`, and is checked here so a future split
+    /// of the two builders cannot reopen the leak.
     #[test]
     fn every_rendered_field_of_an_html_card_is_plain_text() {
         let mut e = email();
@@ -1050,28 +1041,23 @@ mod tests {
     }
 
     #[test]
-    fn flag_notice_strips_markup_from_the_reason() {
-        // `post_digest` and the engagement path forward a whole body here.
-        let content = json(&flag_notice_message(&email(), APPLE_MAIL_HTML));
-        assert!(content.contains("rollout slipped to Tuesday"), "{content}");
-        for leak in ["<div", "class=", "style=", "&nbsp;"] {
-            assert!(!content.contains(leak), "markup {leak} leaked: {content}");
+    fn the_other_body_bearing_surfaces_strip_too() {
+        // `post_digest` and the engagement path forward a whole body as a reason.
+        let notice = json(&flag_notice_message(&email(), APPLE_MAIL_HTML));
+        assert!(notice.contains("rollout slipped to Tuesday"), "{notice}");
+        for leak in MARKUP_LEAKS {
+            assert!(!notice.contains(leak), "markup {leak} leaked: {notice}");
         }
-    }
-
-    #[test]
-    fn plain_text_body_is_untouched() {
         // No sniffer false positives: prose renders byte-identically to pre-#1366.
-        let body = "Hi there,\n\nMove to Tuesday? a < b either way.\n\nThanks";
-        assert_eq!(format_body(body, "Sure."), format!("{body}{SEPARATOR}Sure."));
-    }
-
-    #[test]
-    fn all_markup_body_says_so_instead_of_posting_the_tags() {
-        let body = r#"<html><body><img src="https://t.example.com/p.gif" width="1"></body></html>"#;
-        let out = format_body(body, "noted");
-        assert!(out.starts_with(NO_TEXT_BODY), "{out}");
-        assert!(!out.contains("<img"), "markup leaked: {out}");
+        let prose = "Hi there,\n\nMove to Tuesday? a < b either way.\n\nThanks";
+        assert_eq!(
+            format_body(prose, "Sure."),
+            format!("{prose}{SEPARATOR}Sure.")
+        );
+        // An all-markup body (tracking pixel) says so rather than post the tags.
+        let pixel = r#"<html><body><img src="https://t.example.com/p.gif"></body></html>"#;
+        let out = format_body(pixel, "noted");
+        assert!(out.starts_with(NO_TEXT_BODY) && !out.contains("<img"), "{out}");
     }
 
     #[test]

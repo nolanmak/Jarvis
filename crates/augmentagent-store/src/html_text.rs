@@ -4,17 +4,13 @@
 //! strips markup with the converter the index already runs on real mail rather
 //! than a third hand-rolled stripper. Only render boundaries convert; persisted
 //! and indexed copies keep the original. [`html_to_text`] is byte-identical to
-//! the pre-#1366 FTS output; [`html_to_text_for_display`] adds reader extras.
+//! the pre-#1366 FTS output, [`html_to_text_for_display`] adds reader extras.
 
 /// Cheap sniff for "this body is HTML, not prose". A fixed tag list, so the
 /// index's verdict on a body does not move; render boundaries use
-/// [`contains_markup`].
+/// [`contains_markup`] instead.
 pub fn looks_like_html(s: &str) -> bool {
-    let head: String = s
-        .chars()
-        .take(4000)
-        .collect::<String>()
-        .to_ascii_lowercase();
+    let head = s.chars().take(4000).collect::<String>().to_ascii_lowercase();
     [
         "<html", "<body", "<div", "<table", "<p>", "<p ", "<br", "<span", "</a>",
     ]
@@ -43,11 +39,11 @@ pub fn contains_markup(s: &str) -> bool {
     })
 }
 
+/// `Index` is the pre-#1366 `fts::html_to_text` output, exactly; `Display` adds
+/// link targets and paragraph breaks.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    /// Full-text index: the pre-#1366 `fts::html_to_text` output, exactly.
     Index,
-    /// Human-readable surface: link targets kept, paragraph breaks kept.
     Display,
 }
 
@@ -164,8 +160,8 @@ fn convert(html: &str, mode: Mode) -> String {
 /// Offset from the `<` at `open` to the `>` that closes that tag, skipping any
 /// `>` inside a quoted attribute value so `<div title="1 > 0">` is one tag and
 /// not a tag plus the literal text `0">`. `None` if never terminated. A quote
-/// only opens a value right after `=`, so a stray apostrophe cannot swallow the
-/// rest of the mail.
+/// only opens a value right after `=`, so a stray apostrophe in prose cannot
+/// swallow the rest of the mail.
 fn tag_end(bytes: &[u8], open: usize) -> Option<usize> {
     let mut j = open + 1;
     let mut after_eq = false;
@@ -193,8 +189,7 @@ fn tag_end(bytes: &[u8], open: usize) -> Option<usize> {
 /// nothing a reader needs.
 fn href_of(lower: &str, raw: &str) -> Option<String> {
     let at = lower.find("href")?;
-    let rest = raw[at + 4..].trim_start();
-    let rest = rest.strip_prefix('=')?.trim_start();
+    let rest = raw[at + 4..].trim_start().strip_prefix('=')?.trim_start();
     let value = match rest.chars().next()? {
         q @ ('"' | '\'') => rest[1..].split(q).next()?,
         _ => rest.split_whitespace().next()?,
@@ -260,26 +255,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn anchor_keeps_its_target() {
+    fn display_mode_keeps_link_targets_and_paragraph_structure() {
+        let d = html_to_text_for_display;
         let linked = r#"<p><a href="https://example.com/x">click</a></p>"#;
-        assert_eq!(
-            html_to_text_for_display(linked).trim(),
-            "click (https://example.com/x)"
-        );
+        assert_eq!(d(linked).trim(), "click (https://example.com/x)");
         // Self-describing anchors and targets a reader can't use stay bare.
         let same = r#"<p><a href="https://example.com">https://example.com</a></p>"#;
-        assert_eq!(html_to_text_for_display(same).trim(), "https://example.com");
-        assert_eq!(
-            html_to_text_for_display(r#"<p><a href="mailto:peer@example.com">peer</a></p>"#).trim(),
-            "peer"
-        );
-    }
-
-    #[test]
-    fn nested_blockquotes_collapse_to_one_paragraph_break() {
-        let html = "<blockquote><div><blockquote><div><div>quoted</div></div>\
-                    </blockquote></div></blockquote><p>reply</p>";
-        assert_eq!(html_to_text_for_display(html), "quoted\n\nreply\n");
+        assert_eq!(d(same).trim(), "https://example.com");
+        assert_eq!(d(r#"<a href="mailto:p@example.com">peer</a>"#).trim(), "peer");
+        // Runs of empty lines — one per nested wrapper — become one break.
+        let nested = "<blockquote><div><blockquote><div><div>quoted</div></div>\
+                      </blockquote></div></blockquote><p>reply</p>";
+        assert_eq!(d(nested), "quoted\n\nreply\n");
     }
 
     /// #1366 split one converter into two modes. Index mode must still produce
@@ -287,20 +274,19 @@ mod tests {
     /// bodies disagree with newly indexed ones.
     #[test]
     fn index_mode_output_is_unchanged_by_the_display_additions() {
-        assert_eq!(
-            html_to_text(r#"<p><a href="https://example.com/x">click</a></p>"#),
-            "click\n"
-        );
-        assert_eq!(html_to_text("<p>first</p><p>second</p>"), "first\nsecond\n");
-        let raw = "<p>a&mdash;b &hellip; &rsquo;</p>";
-        assert_eq!(html_to_text(raw), "a&mdash;b &hellip; &rsquo;\n");
+        let x = html_to_text;
+        assert_eq!(x(r#"<p><a href="https://example.com/x">c</a></p>"#), "c\n");
+        assert_eq!(x("<p>first</p><p>second</p>"), "first\nsecond\n");
+        assert_eq!(x("<p>a&mdash;b &hellip;</p>"), "a&mdash;b &hellip;\n");
+        // Entities the pre-split converter did decode still decode.
+        assert_eq!(x("<p>a&nbsp;&amp;b</p>"), "a &b\n");
         // Prose up to a bare `<` is kept for a reader; the index drops the tail,
         // since a truncated one changes which documents match.
-        assert_eq!(html_to_text("<p>x</p>y < z and more"), "x\ny\n");
-        let disp = html_to_text_for_display("<p>x</p>y < z and more");
-        assert_eq!(disp, "x\ny < z and more\n");
-        // Entities the pre-split converter did decode still decode.
-        assert_eq!(html_to_text("<p>a&nbsp;&amp;b</p>"), "a &b\n");
+        assert_eq!(x("<p>x</p>y < z and more"), "x\ny\n");
+        assert_eq!(
+            html_to_text_for_display("<p>x</p>y < z and more"),
+            "x\ny < z and more\n"
+        );
     }
 
     #[test]

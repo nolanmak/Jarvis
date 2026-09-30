@@ -14,11 +14,9 @@ use augmentagent_store::rusqlite::{params, Connection};
 use serde::Serialize;
 
 // #1366 — the converter moved to `augmentagent-store` so the Discord renderer
-// shares this stripping instead of growing a third stripper. The index still
-// calls `html_to_text`, byte-identical to the copy that lived here; the
-// reader-facing extras (link targets, spacing, typographic entities) live only
-// in `html_to_text_for_display`, which no indexing path calls.
-// `prepare_html_output_is_stable` pins the unchanged behaviour.
+// shares it instead of growing a third stripper. `html_to_text` is
+// byte-identical to the copy that lived here; the reader-facing extras live in
+// `html_to_text_for_display`, which no indexing path calls.
 pub use augmentagent_store::html_text::html_to_text;
 use augmentagent_store::html_text::looks_like_html;
 
@@ -207,10 +205,9 @@ mod tests {
     use augmentagent_store::{Email, Store};
     use std::time::Duration;
 
-    /// #1366 moved this converter to `augmentagent-store` and added a second,
-    /// reader-facing mode. A body already in the FTS table must keep matching
-    /// the same queries as one indexed after the move, so the prepared text is
-    /// pinned byte for byte.
+    /// #1366 moved this converter and added a reader-facing mode. A body
+    /// already in the FTS table must keep matching the same queries as one
+    /// indexed after the move, so the prepared text is pinned byte for byte.
     #[test]
     fn prepare_html_output_is_stable() {
         let html = r#"<html><head><style>p{color:red}</style></head><body>
