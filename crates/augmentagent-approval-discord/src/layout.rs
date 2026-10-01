@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use augmentagent_store::html_text::{contains_markup, html_to_text_for_display};
 use augmentagent_store::Email;
 use serenity::all::{
-    ActionRowComponent, ButtonStyle, CreateActionRow, CreateButton, CreateEmbed, CreateEmbedFooter,
+    ActionRowComponent, ButtonStyle, CreateActionRow, CreateAllowedMentions, CreateButton, CreateEmbed, CreateEmbedFooter,
     CreateInputText, CreateModal, CreateMessage, CreateSelectMenu, CreateSelectMenuKind,
     CreateSelectMenuOption, EditMessage, InputTextStyle,
 };
@@ -268,12 +268,15 @@ fn label_for(kind: &str) -> &'static str {
 pub fn flag_notice_message(email: &Email, reason: &str) -> CreateMessage {
     let subject = truncate(&email.subject, 256);
     let from = truncate(&email.from, 200);
-    // #1366 — several callers pass a whole email body through the reason slot.
+    // #1366 — several callers pass a whole email body through the reason slot. The empty allow-list below is part
+    // of the same fix: this `reason` lands in message *content*, where Discord resolves `@everyone`/`<@id>`, and
+    // entity decoding lets a sender spell those `&#64;everyone`. Card bodies go in an embed description, which
+    // Discord never resolves.
     let reason = truncate(&plain(reason), 500);
     let content = format!(
         "🚩 **Important** — from `{from}`\n**{subject}**\n_reason: {reason}_"
     );
-    CreateMessage::new().content(content)
+    CreateMessage::new().content(content).allowed_mentions(CreateAllowedMentions::new())
 }
 
 /// #1190 — durable in-channel notice posted when a Revise/QuickRefine redraft
@@ -299,7 +302,7 @@ pub fn revise_failure_notice(email: Option<&Email>, reason: &str) -> CreateMessa
         "⚠️ **Revise produced no new draft** — the approval card above{subject_clause} \
          is unchanged.\n_reason: {reason}_\nRetry **Revise** or **Skip** the draft."
     );
-    CreateMessage::new().content(content)
+    CreateMessage::new().content(content).allowed_mentions(CreateAllowedMentions::new())
 }
 
 /// #1190 — header prepended (via `.content(...)`) to the reposted approval card
@@ -349,10 +352,9 @@ pub fn approval_edit_message(
 /// wrapper. Keeping the two entry points on this one builder is what
 /// guarantees a redrawn card and a freshly posted one render identically.
 ///
-/// #1366 — `email.body` reaches Discord from exactly three builders, all in this file,
-/// each converting through [`plain`]: here (posted cards and the #1188 in-place edits
-/// that share this builder), [`flag_notice_message`] — where `post_digest`'s summary also
-/// lands — and [`revise_failure_notice`]. `scheduled_notice_message` renders no body;
+/// #1366 — `email.body` reaches Discord from exactly three builders, all here, each going through [`plain`]: this
+/// one (posted cards and the #1188 in-place edits that share it), [`flag_notice_message`] — where `post_digest`'s
+/// summary also lands — and [`revise_failure_notice`]. `scheduled_notice_message` renders no body;
 /// `fetch_conversation_context` feeds the reasoner, not a card.
 fn approval_embed_and_rows(
     action_id: &str,
@@ -754,10 +756,9 @@ fn format_body(email_body: &str, draft: &str) -> String {
         markers.len() + 1 // the newline rejoining prose and markers
     };
     let rest = budget.saturating_sub(reserved);
-    // #1366: strip BEFORE the budget split, so truncation spends the card on
-    // prose rather than a `<head>` preamble. The draft is left as written: it is
-    // agent-authored plain text whose `<!--aa:needs-input-->` fence and
-    // `[to:]`/`[cc:]` markers a converter would eat.
+    // #1366: strip BEFORE the budget split, so truncation spends the card on prose rather than a `<head>`
+    // preamble. The draft is left as written — agent-authored plain text whose `<!--aa:needs-input-->` fence
+    // and `[to:]` markers a converter would eat.
     let email_part = truncate_within(&plain(email_body), rest / 2);
     let mut draft_part = truncate_within(&prose, rest - email_part.len());
     if !markers.is_empty() {
@@ -926,14 +927,12 @@ fn truncate_within(s: &str, max: usize) -> String {
     }
 }
 
-/// #1366 — readable text for a Discord surface. An HTML-only body (Apple Mail and
-/// friends) otherwise posts its own markup: `<div>` wrappers, `style=` attributes and
-/// `&nbsp;` instead of prose. Render-only — stored, wiki and indexed copies keep the
-/// original. Markup is detected by shape ([`contains_markup`]), not a tag list, since a
-/// missed body is posted verbatim. An all-markup body (tracking pixel) converts to
-/// nothing, and the card says so rather than fall back to the tags. Preferring a
-/// `text/plain` alternative upstream is not an option: Composio flattens the message
-/// into one body string (`composio_flattens_html_into_the_only_body_field` pins that).
+/// #1366 — readable text for a Discord surface, which an HTML-only body (Apple Mail and friends) otherwise fills
+/// with its own `<div>` wrappers, `style=` attributes and `&nbsp;`. Render-only: stored, wiki and indexed copies
+/// keep the original. Markup is detected by shape ([`contains_markup`]), not a tag list, since a missed body is
+/// posted verbatim; an all-markup body (tracking pixel) converts to nothing and the card says so. Preferring
+/// `text/plain` upstream cannot work — Composio flattens the message into one body string
+/// (`composio_flattens_html_into_the_only_body_field`).
 fn plain(body: &str) -> Cow<'_, str> {
     if !contains_markup(body) {
         return Cow::Borrowed(body);
@@ -997,58 +996,63 @@ mod tests {
         assert!(t.is_char_boundary(t.len()));
     }
 
-    /// #1366 — Apple-Mail-shaped HTML-only body: preamble, attribute-laden `<div>` per
-    /// line, `&nbsp;` separators, quoted reply in a `<blockquote>`.
+    /// #1366 — Apple-Mail-shaped HTML-only body: `<head>` preamble, attribute-laden `<div>` per line, `&nbsp;`
+    /// spacer, quoted reply in a `<blockquote>`, and one malformed `style=` whose quote never closes (real mail,
+    /// and the shape that defeats a quote-aware scan that bails instead of degrading).
     const APPLE_MAIL_HTML: &str = r#"<html><head><style type="text/css">body{font-family:Helvetica}</style></head>
         <body style="word-wrap:break-word">
         <div class="apple-mail-dark-mode" style="color:#1d1d1f">Hi there &mdash; the rollout slipped to Tuesday.</div>
         <div class="apple-mail-dark-mode" style="color:#1d1d1f">&nbsp;</div>
         <div style="color:#1d1d1f">Docs &amp; r&eacute;sum&eacute; &rarr; <a href="https://docs.example.com/rollout">the usual place</a>.</div>
-        <blockquote type="cite"><div>On Sep 29, 2026, at 09:12, peer@example.com wrote:</div>
+        <blockquote type="cite"><div style="margin:0>On Sep 29, 2026, at 09:12, peer@example.com wrote:</div>
           <div><div>Are we still shipping Monday?</div></div></blockquote></body></html>"#;
 
     #[rustfmt::skip]
     const MARKUP_LEAKS: [&str; 8] =
         ["<div", "<html", "class=", "style=", "&nbsp;", "&amp;", "&eacute;", "&rarr;"];
 
-    /// The reported case, end to end — asserted against the WHOLE serialized card, not
-    /// just the description, so the attachment and envelope blocks fall under the same
-    /// scan. The #1188 in-place edit shares `approval_embed_and_rows` and is checked
-    /// too, so a future split of the builders cannot reopen the leak.
+    /// The reported case, end to end, across every body-bearing Discord surface: the posted card, the #1188
+    /// in-place edit (same builder, so a future split cannot reopen the leak) and the 🚩 notice `post_digest`
+    /// forwards a whole body through. Asserted on the WHOLE serialized payload, envelope blocks included.
     #[test]
-    fn every_rendered_field_of_an_html_card_is_plain_text() {
+    fn every_rendered_surface_of_an_html_body_is_plain_text() {
         let mut e = email();
         e.body = APPLE_MAIL_HTML.to_string();
         e.attachments = vec!["application/pdf rollout.pdf".into()];
         let draft = "Tuesday works.\n[to: peer@example.com]\n[attachment: rollout.pdf]";
-        let posted = json(&approval_message("act-h1", &e, draft, 0));
         let edited = serde_json::to_string(&approval_edit_message("act-h1", &e, draft, 0)).unwrap();
-        // Prose, the quoted reply, decoded entities and the link target survive.
-        let kept = ["slipped to Tuesday", "still shipping Monday?", "résumé →", "docs.example.com"];
-        for card in [&posted, &edited] {
-            for k in kept {
-                assert!(card.contains(k), "{k} missing: {card}");
-            }
+        let surfaces = [
+            json(&approval_message("act-h1", &e, draft, 0)),
+            edited,
+            json(&flag_notice_message(&email(), APPLE_MAIL_HTML)),
+        ];
+        for card in &surfaces {
+            // Prose, decoded entities and (on the cards) the quoted reply and link target.
+            assert!(card.contains("slipped to Tuesday") && card.contains("résumé →"), "{card}");
             for leak in MARKUP_LEAKS {
                 assert!(!card.contains(leak), "markup {leak} leaked: {card}");
             }
         }
-    }
-
-    #[test]
-    fn the_other_body_bearing_surfaces_strip_too() {
-        // `post_digest` and the engagement path forward a whole body as a reason.
-        let notice = json(&flag_notice_message(&email(), APPLE_MAIL_HTML));
-        assert!(notice.contains("slipped to Tuesday"), "{notice}");
-        for leak in MARKUP_LEAKS {
-            assert!(!notice.contains(leak), "markup {leak} leaked: {notice}");
-        }
+        assert!(surfaces[0].contains("still shipping Monday?") && surfaces[0].contains("docs.example.com"));
         // No sniffer false positives: prose renders byte-identically to pre-#1366.
         let prose = "Hi there,\n\nMove to Tuesday? a < b either way.\n\nThanks";
         assert_eq!(format_body(prose, "Sure."), format!("{prose}{SEPARATOR}Sure."));
         // An all-markup body (tracking pixel) says so rather than post the tags.
         let pixel = r#"<html><body><img src="https://t.example.com/p.gif"></body></html>"#;
         assert!(format_body(pixel, "noted").starts_with(NO_TEXT_BODY));
+    }
+
+    /// #1366 — decoding entities in a `reason` lets a sender write `&#64;everyone`, which lands in Discord
+    /// message *content*. Both content-bearing notices must ship an empty allow-list so the text cannot ping.
+    #[test]
+    fn content_notices_cannot_be_made_to_ping() {
+        let bait = "<div>&#64;everyone &lt;@1&gt; &lt;@&amp;2&gt; see this</div>";
+        for notice in [flag_notice_message(&email(), bait), revise_failure_notice(None, bait)] {
+            let card = json(&notice);
+            assert!(card.contains("@everyone"), "decoded text expected: {card}");
+            let empty = r#""allowed_mentions":{"parse":[],"users":[],"roles":[]}"#;
+            assert!(card.contains(empty), "mentions not disabled: {card}");
+        }
     }
 
     #[test]

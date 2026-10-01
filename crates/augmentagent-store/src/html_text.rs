@@ -1,7 +1,6 @@
-//! HTML → visible-text conversion shared by every consumer of stored mail. Lifted out
-//! of `augmentagent-messages::fts` by #1366 so the Discord renderer strips markup with
-//! the converter the index already runs on real mail, not a third hand-rolled stripper.
-//! Only render boundaries convert; persisted and indexed copies keep the original.
+//! HTML → visible-text conversion shared by every consumer of stored mail. Lifted out of
+//! `augmentagent-messages::fts` by #1366 so the Discord renderer strips markup with the converter the index
+//! already runs on real mail, not a third hand-rolled stripper. Only render boundaries convert.
 
 /// Cheap sniff for "this body is HTML, not prose". A fixed tag list, so the index's
 /// verdict does not move; render boundaries use [`contains_markup`] instead.
@@ -12,11 +11,9 @@ pub fn looks_like_html(s: &str) -> bool {
         .any(|t| head.contains(t))
 }
 
-/// True if `s` holds anything tag-shaped — `<name…>` or `</name…>`, anywhere. Render
-/// boundaries must not leak markup, so they cannot use a fixed tag list:
-/// `<article>Update</article>` is ordinary HTML mail [`looks_like_html`] misses, and a
-/// missed body is posted verbatim. A `<` with no tag name after it — `a < b` — is
-/// arithmetic in prose, so it does not count.
+/// True if `s` holds anything tag-shaped — `<name…>` or `</name…>`, anywhere. Render boundaries must not leak
+/// markup, so they cannot use a fixed tag list: `<article>Update</article>` is ordinary HTML mail
+/// [`looks_like_html`] misses, and a missed body is posted verbatim. A bare `<` — `a < b` — is prose arithmetic.
 pub fn contains_markup(s: &str) -> bool {
     let bytes = s.as_bytes();
     s.bytes().enumerate().any(|(i, b)| {
@@ -44,9 +41,8 @@ pub fn html_to_text(html: &str) -> String {
     convert(html, Mode::Index)
 }
 
-/// As [`html_to_text`], plus what a reader needs and an index does not: `<a href>`
-/// targets in ` (url)` form, every HTML 4 named entity, paragraphs as at most one
-/// blank line, an unterminated tag's tail kept as prose.
+/// As [`html_to_text`], plus what a reader needs and an index does not: `<a href>` targets in ` (url)` form, every
+/// HTML 4 named entity, paragraphs as at most one blank line, an unterminated tag's tail kept as prose.
 pub fn html_to_text_for_display(html: &str) -> String {
     convert(html, Mode::Display)
 }
@@ -62,20 +58,17 @@ fn convert(html: &str, mode: Mode) -> String {
     while i < bytes.len() {
         if bytes[i] == b'<' {
             let Some(rel) = tag_end(bytes, i, mode) else {
-                // A bare `<` with no `>` after it is text, not a tag. A reader wants
-                // the remainder; the index dropped it pre-#1366 and keeps doing so,
-                // since a truncated tail changes which documents match.
+                // A bare `<` with no `>` after it is text, not a tag. A reader wants the
+                // remainder; the index dropped it pre-#1366 and keeps doing so, since a
+                // truncated tail changes which documents match.
                 if mode == Mode::Display {
                     out.push_str(&html[i..]);
                 }
                 break;
             };
             let tag = &lower[i + 1..i + rel];
-            let name: String = tag
-                .trim_start_matches('/')
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric())
-                .collect();
+            let name: String =
+                tag.trim_start_matches('/').chars().take_while(char::is_ascii_alphanumeric).collect();
             let closing = tag.starts_with('/');
             i += rel + 1;
             if !closing && matches!(name.as_str(), "script" | "style" | "head" | "title") {
@@ -132,13 +125,11 @@ fn convert(html: &str, mode: Mode) -> String {
     result
 }
 
-/// Offset from the `<` at `open` to the `>` closing that tag, `None` if never
-/// terminated. `Display` skips a `>` inside a quoted attribute value, so
-/// `<div title="1 > 0">` is one tag and not a tag plus the literal text `0">`; a quote
-/// only opens a value right after `=`, so a stray apostrophe in prose cannot swallow
-/// the rest of the mail. `Index` stops at the first `>` regardless, as pre-#1366: the
-/// FTS table holds documents tokenized that way, and reading quotes here would stop a
-/// query matching them until a full reindex. The leak is render-side only.
+/// Offset from the `<` at `open` to the `>` closing that tag, `None` if never terminated. `Display` skips a `>`
+/// inside a quoted attribute value, so `<div title="1 > 0">` is one tag and not a tag plus the literal text `0">`;
+/// a quote only opens a value right after `=`, so a stray apostrophe in prose cannot swallow the rest of the mail.
+/// `Index` stops at the first `>` regardless, as pre-#1366: the FTS table holds documents tokenized that way, and
+/// reading quotes here would stop a query matching them until a full reindex.
 fn tag_end(bytes: &[u8], open: usize, mode: Mode) -> Option<usize> {
     if mode == Mode::Index {
         return bytes[open..].iter().position(|b| *b == b'>');
@@ -151,8 +142,17 @@ fn tag_end(bytes: &[u8], open: usize, mode: Mode) -> Option<usize> {
             return Some(j - open);
         }
         if after_eq && (b == b'"' || b == b'\'') {
-            j += bytes[j + 1..].iter().position(|c| *c == b)? + 1;
-            after_eq = false;
+            match bytes[j + 1..].iter().position(|c| *c == b) {
+                Some(k) => {
+                    j += k + 1;
+                    after_eq = false;
+                }
+                // `<div style="color:red>` — a quote that never closes is malformed
+                // mail, not a quoted `>`. Dropping quote-awareness from here on lets
+                // the next `>` end the tag, so the markup is still stripped; giving up
+                // would keep the whole remainder, tags included, as prose.
+                None => return bytes[j..].iter().position(|c| *c == b'>').map(|p| j + p - open),
+            }
         } else if b == b'=' {
             after_eq = true;
         } else if !b.is_ascii_whitespace() {
@@ -178,37 +178,32 @@ fn href_of(lower: &str, raw: &str) -> Option<String> {
     keep.then(|| value.to_string())
 }
 
-/// HTML 4's contiguous name blocks — Latin-1, then upper- and lower-case Greek — each
-/// introduced by `@<hex>`, the codepoint of the name that follows it. Position within a
-/// block *is* the character, so no second column can drift out of step with the first;
-/// `.` fills the unassigned slot at `U+03A2`.
-const RUNS: &str = "@A0 nbsp iexcl cent pound curren yen brvbar sect uml copy ordf laquo not shy \
-    reg macr deg plusmn sup2 sup3 acute micro para middot cedil sup1 ordm raquo frac14 frac12 \
-    frac34 iquest Agrave Aacute Acirc Atilde Auml Aring AElig Ccedil Egrave Eacute Ecirc Euml \
-    Igrave Iacute Icirc Iuml ETH Ntilde Ograve Oacute Ocirc Otilde Ouml times Oslash Ugrave \
-    Uacute Ucirc Uuml Yacute THORN szlig agrave aacute acirc atilde auml aring aelig ccedil \
-    egrave eacute ecirc euml igrave iacute icirc iuml eth ntilde ograve oacute ocirc otilde ouml \
-    divide oslash ugrave uacute ucirc uuml yacute thorn yuml \
-    @391 Alpha Beta Gamma Delta Epsilon Zeta Eta Theta Iota Kappa Lambda Mu Nu Xi Omicron Pi Rho \
-    . Sigma Tau Upsilon Phi Chi Psi Omega \
-    @3B1 alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho \
-    sigmaf sigma tau upsilon phi chi psi omega";
+/// HTML 4's contiguous name blocks — Latin-1, then upper- and lower-case Greek — each introduced by `@<hex>`, the
+/// codepoint of the name that follows it. Position within a block *is* the character, so no second column can
+/// drift out of step with the first; `.` fills the unassigned slot at `U+03A2`.
+const RUNS: &str = "@A0 nbsp iexcl cent pound curren yen brvbar sect uml copy ordf laquo not shy reg macr deg plusmn \
+    sup2 sup3 acute micro para middot cedil sup1 ordm raquo frac14 frac12 frac34 iquest Agrave Aacute Acirc Atilde \
+    Auml Aring AElig Ccedil Egrave Eacute Ecirc Euml Igrave Iacute Icirc Iuml ETH Ntilde Ograve Oacute Ocirc Otilde \
+    Ouml times Oslash Ugrave Uacute Ucirc Uuml Yacute THORN szlig agrave aacute acirc atilde auml aring aelig ccedil \
+    egrave eacute ecirc euml igrave iacute icirc iuml eth ntilde ograve oacute ocirc otilde ouml divide oslash ugrave \
+    uacute ucirc uuml yacute thorn yuml \
+    @391 Alpha Beta Gamma Delta Epsilon Zeta Eta Theta Iota Kappa Lambda Mu Nu Xi Omicron Pi Rho . Sigma Tau \
+    Upsilon Phi Chi Psi Omega \
+    @3B1 alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigmaf sigma tau \
+    upsilon phi chi psi omega";
 
-/// HTML 4's remaining named characters as `name=char`: smart punctuation, currency,
-/// letterlike symbols, arrows, operators, card suits. Scattered across Unicode, so spelled
-/// out rather than run-encoded. The whole standard set — not a hand-picked few — is the
-/// point: any omission renders as `&name;` source on the card, the leak #1366 is about.
-/// `ensp`/`emsp`/`thinsp` are absent — a space cannot be a value here — and map to a
-/// plain one below, which `convert` collapses with its neighbours anyway.
-const PAIRS: &str = "OElig=Œ oelig=œ Scaron=Š scaron=š Yuml=Ÿ fnof=ƒ circ=ˆ tilde=˜ thetasym=ϑ \
-    upsih=ϒ piv=ϖ ndash=– mdash=— lsquo=‘ rsquo=’ sbquo=‚ ldquo=“ rdquo=” bdquo=„ dagger=† \
-    Dagger=‡ bull=• hellip=… permil=‰ prime=′ Prime=″ lsaquo=‹ rsaquo=› oline=‾ frasl=⁄ euro=€ \
-    image=ℑ weierp=℘ real=ℜ trade=™ alefsym=ℵ larr=← uarr=↑ rarr=→ darr=↓ harr=↔ crarr=↵ lArr=⇐ \
-    uArr=⇑ rArr=⇒ dArr=⇓ hArr=⇔ forall=∀ part=∂ exist=∃ empty=∅ nabla=∇ isin=∈ notin=∉ ni=∋ \
-    prod=∏ sum=∑ minus=− lowast=∗ radic=√ prop=∝ infin=∞ ang=∠ and=∧ or=∨ cap=∩ cup=∪ int=∫ \
-    there4=∴ sim=∼ cong=≅ asymp=≈ ne=≠ equiv=≡ le=≤ ge=≥ sub=⊂ sup=⊃ nsub=⊄ sube=⊆ supe=⊇ \
-    oplus=⊕ otimes=⊗ perp=⊥ sdot=⋅ lceil=⌈ rceil=⌉ lfloor=⌊ rfloor=⌋ lang=〈 rang=〉 loz=◊ \
-    spades=♠ clubs=♣ hearts=♥ diams=♦ zwnj=\u{200c} zwj=\u{200d} lrm=\u{200e} rlm=\u{200f}";
+/// HTML 4's remaining named characters as `name=char` — punctuation, currency, symbols, arrows, operators, suits —
+/// scattered across Unicode, so spelled out rather than run-encoded. The whole standard set, not a hand-picked few:
+/// any omission renders as `&name;` source on the card, the leak #1366 is about. `ensp`/`emsp`/`thinsp` are absent
+/// (a space cannot be a value here) and map to a plain one below.
+const PAIRS: &str = "OElig=Œ oelig=œ Scaron=Š scaron=š Yuml=Ÿ fnof=ƒ circ=ˆ tilde=˜ thetasym=ϑ upsih=ϒ piv=ϖ ndash=– \
+    mdash=— lsquo=‘ rsquo=’ sbquo=‚ ldquo=“ rdquo=” bdquo=„ dagger=† Dagger=‡ bull=• hellip=… permil=‰ prime=′ \
+    Prime=″ lsaquo=‹ rsaquo=› oline=‾ frasl=⁄ euro=€ image=ℑ weierp=℘ real=ℜ trade=™ alefsym=ℵ larr=← uarr=↑ \
+    rarr=→ darr=↓ harr=↔ crarr=↵ lArr=⇐ uArr=⇑ rArr=⇒ dArr=⇓ hArr=⇔ forall=∀ part=∂ exist=∃ empty=∅ nabla=∇ \
+    isin=∈ notin=∉ ni=∋ prod=∏ sum=∑ minus=− lowast=∗ radic=√ prop=∝ infin=∞ ang=∠ and=∧ or=∨ cap=∩ cup=∪ \
+    int=∫ there4=∴ sim=∼ cong=≅ asymp=≈ ne=≠ equiv=≡ le=≤ ge=≥ sub=⊂ sup=⊃ nsub=⊄ sube=⊆ supe=⊇ oplus=⊕ \
+    otimes=⊗ perp=⊥ sdot=⋅ lceil=⌈ rceil=⌉ lfloor=⌊ rfloor=⌋ lang=〈 rang=〉 loz=◊ spades=♠ clubs=♣ hearts=♥ \
+    diams=♦ zwnj=\u{200c} zwj=\u{200d} lrm=\u{200e} rlm=\u{200f}";
 
 fn named(ent: &str) -> Option<char> {
     if !ent.bytes().all(|b| b.is_ascii_alphanumeric()) {
@@ -272,11 +267,11 @@ fn decode_entities(s: &str, mode: Mode) -> String {
 mod tests {
     use super::*;
 
-    /// #1366 split one converter into two modes. Index mode must still produce exactly
-    /// what `fts::html_to_text` did, or indexed bodies disagree with new ones: entities
-    /// past the core five stay literal, a `>` in a quoted attribute still ends the tag,
-    /// and prose after a bare `<` is still dropped.
+    /// #1366 split one converter into two modes. Index mode must still produce exactly what `fts::html_to_text`
+    /// did, or indexed bodies disagree with new ones: entities past the core five stay literal, a `>` in a quoted
+    /// attribute still ends the tag, prose after a bare `<` is still dropped.
     #[test]
+    #[rustfmt::skip]
     fn index_mode_output_is_unchanged_by_the_display_additions() {
         let x = html_to_text;
         assert_eq!(x(r#"<p><a href="https://example.com/x">c</a></p>"#), "c\n");
@@ -292,41 +287,40 @@ mod tests {
         // The reported leak: HTML mail built from tags `looks_like_html` omits.
         assert!(contains_markup("<article>Update</article>"));
         assert!(!looks_like_html("<article>Update</article>"));
-        // Prose with arithmetic is not markup: `<` must be followed by a name
-        // *and* a terminator, so no comparison or unterminated fragment counts.
+        // Prose arithmetic is not markup: `<` needs a name *and* a terminator after it.
         for prose in ["a < b and 5 < 6, right?", "a < b > c", "plain text", "<article"] {
             assert!(!contains_markup(prose), "{prose}");
         }
     }
 
-    /// Everything display mode owes a reader and an index does not — link targets,
-    /// paragraph breaks, an unterminated tag's tail, a `>` inside a quoted attribute value
-    /// (the first-`>` scan leaked the literal `0">Update` onto the card), and every HTML 4
-    /// named entity: a hand-picked subset is what made `<div>Next &rarr; review</div>`
-    /// render its own markup, so each block of the standard set is spot-checked.
+    /// Everything display mode owes a reader and an index does not — link targets, paragraph breaks, an
+    /// unterminated tag's tail, a `>` inside a quoted attribute (the first-`>` scan leaked the literal
+    /// `0">Update` onto the card) and every HTML 4 named entity, since a hand-picked subset is what made
+    /// `<div>Next &rarr; review</div>` render its own markup.
     #[test]
+    #[rustfmt::skip]
     fn display_mode_renders_what_a_reader_needs() {
-        #[rustfmt::skip]
         let cases = [
             (r#"<p><a href="https://example.com/x">click</a></p>"#, "click (https://example.com/x)"),
             // Self-describing anchors and targets a reader can't use stay bare.
             (r#"<a href="https://example.com">https://example.com</a>"#, "https://example.com"),
             (r#"<a href="mailto:p@example.com">peer</a>"#, "peer"),
             (r#"<a title="x > y" href="https://example.com/p">go</a>"#, "go (https://example.com/p)"),
-            (r#"<div title="1 > 0">Update</div>"#, "Update"),
-            (r#"<div data-x='a>b' title="c>d">Update</div>"#, "Update"),
+            (r#"<div data-x='a>b' title="1 > 0">Update</div>"#, "Update"),
+            // Malformed mail — an attribute quote that never closes — must still strip:
+            // quote-awareness is abandoned at that point, not the whole remainder.
+            (r#"<div style="color:red>Update</div>"#, "Update"),
+            (r#"<p>a</p><div title='x>b</div><p>c</p>"#, "a\n\nb\n\nc"),
             // Nested wrappers collapse to one break; an unterminated tag's tail is prose.
             ("<blockquote><div><blockquote><div>q</div></blockquote></div></blockquote><p>r</p>", "q\n\nr"),
             ("<p>x</p>y < z and more", "x\ny < z and more"),
-            ("<div>Next &rarr; review</div>", "Next → review"),
-            ("<div>R&eacute;sum&eacute; &copy; 2026</div>", "Résumé © 2026"),
-            ("<p>&Uuml;ber cr&egrave;me &mdash; &euro;12 &bull; 20&deg;C &frac12;</p>", "Über crème — €12 • 20°C ½"),
-            ("<p>&larr;&uarr;&darr;&harr;&rArr;&crarr;&sum;&radic;&ne;&sdot;&lang;x&rang;</p>", "←↑↓↔⇒↵∑√≠⋅〈x〉"),
-            ("<p>&Omega;&alpha;&pi;&sigmaf;&Delta;&spades;&loz;&OElig;&prime;&trade;</p>", "ΩαπςΔ♠◊Œ′™"),
-            // A fixed-width space collapses; an unknown name stays literal rather than
-            // silently losing the text around it.
-            ("<p>a&ensp;&emsp;b</p>", "a b"),
-            ("<p>&notareal; x</p>", "&notareal; x"),
+            // Each block of the standard entity set, a collapsing fixed-width space, and an
+            // unknown name left literal rather than silently losing the text around it.
+            ("<p>Next &rarr; R&eacute;sum&eacute; &copy; &Uuml;ber cr&egrave;me &mdash; &euro;12 &bull; 20&deg;C &frac12;</p>",
+             "Next → Résumé © Über crème — €12 • 20°C ½"),
+            ("<p>&larr;&uarr;&darr;&harr;&rArr;&crarr;&sum;&radic;&ne;&sdot;&lang;x&rang;&Omega;&alpha;&pi;&sigmaf;&Delta;&spades;&loz;&OElig;&prime;&trade;</p>",
+             "←↑↓↔⇒↵∑√≠⋅〈x〉ΩαπςΔ♠◊Œ′™"),
+            ("<p>a&ensp;&emsp;b &notareal; x</p>", "a b &notareal; x"),
         ];
         for (html, want) in cases {
             assert_eq!(html_to_text_for_display(html).trim(), want, "{html}");
