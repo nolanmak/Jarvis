@@ -220,12 +220,21 @@ impl Invitation {
 /// LinkedIn-sourced rows from Gmail rows in sqlite.
 pub const ACCOUNT_PREFIX: &str = "linkedin:";
 
-/// True iff the email row came from this channel.
+/// True iff the email row belongs to this channel — by the `platform` column
+/// or by the legacy entity prefix.
+///
+/// Both halves are load-bearing (#1375). Ingested rows set both. An
+/// operator-composed card (`linkedin dm --post`) has no ingested message to
+/// take the owner's member urn from, so it sets only `platform` — a
+/// prefix-only predicate sent all four approval verbs down the Gmail arm,
+/// where Revise died on "no accountEntityId on email; cannot revise". Rows
+/// written before the `platform` column existed set only the prefix.
 pub fn is_linkedin_email(email: &Email) -> bool {
-    email
-        .account_entity_id
-        .as_deref()
-        .is_some_and(|a| a.starts_with(ACCOUNT_PREFIX))
+    email.platform == crate::inbound::PLATFORM
+        || email
+            .account_entity_id
+            .as_deref()
+            .is_some_and(|a| a.starts_with(ACCOUNT_PREFIX))
 }
 
 #[cfg(test)]
@@ -294,6 +303,49 @@ mod tests {
             email.account_entity_id.as_deref(),
             Some("linkedin:urn:li:fsd_profile:ME")
         );
+        assert!(is_linkedin_email(&email));
+    }
+
+    /// #1375 — `linkedin dm --post` / `linkedin comment --post` compose a
+    /// card with no account entity id (there is no ingested message to take
+    /// the owner's urn from), so an entity-prefix-only predicate missed them
+    /// and every approval verb fell through to the Gmail arm.
+    #[test]
+    fn is_linkedin_email_accepts_a_composed_card_with_no_entity_id() {
+        let email = Email {
+            attachments: Vec::new(),
+            to: String::new(),
+            cc: String::new(),
+            message_id: "compose:linkedin:dm:urn:li:msg_conversation:abc".into(),
+            thread_id: Some("urn:li:msg_conversation:abc".into()),
+            from: "them".into(),
+            subject: "[LinkedIn DM from them]".into(),
+            body: String::new(),
+            date: String::new(),
+            account_entity_id: None,
+            platform: "linkedin".into(),
+            kind: "dm".into(),
+        };
+        assert!(is_linkedin_email(&email));
+    }
+
+    /// Legacy rows predate the `platform` column and carry only the prefix.
+    #[test]
+    fn is_linkedin_email_accepts_a_prefix_only_row() {
+        let email = Email {
+            attachments: Vec::new(),
+            to: String::new(),
+            cc: String::new(),
+            message_id: "urn:li:messagingMessage:xyz".into(),
+            thread_id: Some("urn:li:msg_conversation:abc".into()),
+            from: "Ada Vance <linkedin:urn:li:fsd_profile:PEER>".into(),
+            subject: "s".into(),
+            body: "b".into(),
+            date: "d".into(),
+            account_entity_id: Some("linkedin:urn:li:fsd_profile:ME".into()),
+            platform: "gmail".into(),
+            kind: "dm".into(),
+        };
         assert!(is_linkedin_email(&email));
     }
 

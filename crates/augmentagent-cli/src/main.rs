@@ -6628,6 +6628,36 @@ mod external_message_ccat_tests {
     }
 }
 
+/// The exact `emails` row every `--post` card is built from. Factored out of
+/// `post_social_approval_card` so the dispatch tests can persist the real row
+/// shape (#1375) instead of a hand-written copy of it.
+#[allow(clippy::too_many_arguments)]
+fn social_card_row(
+    platform: &str,
+    kind: &str,
+    message_id: &str,
+    thread_id: &str,
+    account_entity_id: Option<&str>,
+    counterparty: &str,
+    subject: &str,
+    context_body: &str,
+) -> augmentagent_store::Email {
+    augmentagent_store::Email {
+        attachments: Vec::new(),
+        message_id: message_id.to_string(),
+        to: String::new(),
+        cc: String::new(),
+        thread_id: Some(thread_id.to_string()),
+        from: counterparty.to_string(),
+        subject: subject.to_string(),
+        body: context_body.to_string(),
+        date: String::new(),
+        account_entity_id: account_entity_id.map(str::to_string),
+        platform: platform.to_string(),
+        kind: kind.to_string(),
+    }
+}
+
 /// Raise a Discord approval card for an operator-initiated social draft
 /// (#571 / #572).
 ///
@@ -6659,8 +6689,6 @@ async fn post_social_approval_card(
     context_body: &str,
     draft_body: &str,
 ) -> Result<String> {
-    use augmentagent_store::Email as StoreEmail;
-
     anyhow::ensure!(
         !draft_body.trim().is_empty(),
         "refusing to card an empty draft body"
@@ -6689,20 +6717,16 @@ async fn post_social_approval_card(
         anyhow::bail!("CCat blocked external-message draft");
     }
 
-    let inbound = StoreEmail {
-        attachments: Vec::new(),
-        message_id: message_id.to_string(),
-        to: String::new(),
-        cc: String::new(),
-        thread_id: Some(thread_id.to_string()),
-        from: counterparty.to_string(),
-        subject: subject.to_string(),
-        body: context_body.to_string(),
-        date: String::new(),
-        account_entity_id: account_entity_id.map(str::to_string),
-        platform: platform.to_string(),
-        kind: kind.to_string(),
-    };
+    let inbound = social_card_row(
+        platform,
+        kind,
+        message_id,
+        thread_id,
+        account_entity_id,
+        counterparty,
+        subject,
+        context_body,
+    );
     store
         .upsert_email(&inbound)
         .context("upsert inbound row for action linkage")?;
@@ -20978,6 +21002,215 @@ mod linkedin_approve_dispatch_tests {
         let urn = "urn:li:invitation:7280000000000000000";
         assert!(urn.starts_with("urn:li:invitation:"));
         assert!(!urn.starts_with("urn:li:conversation:"));
+    }
+}
+
+#[cfg(test)]
+mod linkedin_composed_card_dispatch_tests {
+    //! #1375: `linkedin dm --post` and `linkedin comment --post` card rows
+    //! carry `account_entity_id = None`, but the LinkedIn discriminator only
+    //! looked at the `linkedin:` entity prefix. Every approval verb therefore
+    //! fell past the LinkedIn arm into the Gmail one — Revise reported "no
+    //! accountEntityId on email; cannot revise", Approve "no draftId on
+    //! action; cannot send", and Skip ran a Gmail-shaped resolve.
+    //!
+    //! These drive the PRODUCTION verbs (`run_approve` / `run_skip` /
+    //! `run_revise` / `run_schedule`) against rows persisted through
+    //! `social_card_row` — the same constructor the four
+    //! `post_social_approval_card` call sites use — so an arm-order
+    //! divergence fails here rather than on a live card.
+
+    use super::*;
+    use augmentagent_store::ActionStatus;
+
+    /// An approver whose platform clients are all `None` and whose reasoner
+    /// chain is empty. Every platform arm then fails with its own
+    /// "not configured" / "redraft call failed" message, which is exactly the
+    /// signal these tests need: a distinct, arm-specific error proving which
+    /// branch ran, with no network.
+    fn approver(store: Arc<Store>, latch_dir: &tempfile::TempDir) -> ReplyApprover {
+        let mut approver = crate::test_support::approver_with_store(store);
+        approver.reasoner = Arc::new(FallbackReasoner::for_tests(
+            Vec::new(),
+            augmentagent_channel_core::CooldownLatch::at(latch_dir.path().join("cooldowns.json")),
+        ));
+        approver
+    }
+
+    /// The four `--post` card shapes, built by the production row constructor
+    /// with the literal arguments of their call sites.
+    fn carded_rows() -> Vec<(&'static str, augmentagent_store::Email)> {
+        let row = |platform, kind, message_id, thread_id, entity| {
+            social_card_row(platform, kind, message_id, thread_id, entity, "Ada Vance", "s", "ctx")
+        };
+        vec![
+            // run_socialapi_dm — `--account-id` is optional, so entity is None.
+            ("socialapi dm", row(
+                augmentagent_channel_socialapi::PLATFORM,
+                augmentagent_channel_core::trigger::kind::DM,
+                "compose:socialapi:dm:conv_1", "conv_1", None,
+            )),
+            ("socialapi comment", row(
+                augmentagent_channel_socialapi::PLATFORM,
+                augmentagent_channel_core::trigger::kind::OWN_POST_COMMENT,
+                "comment_1", "post_1", None,
+            )),
+            // run_linkedin_dm — the verbatim shape from the #1375 report.
+            ("linkedin dm", row(
+                "linkedin",
+                augmentagent_channel_core::trigger::kind::DM,
+                "compose:linkedin:dm:urn:li:msg_conversation:abc",
+                "urn:li:msg_conversation:abc", None,
+            )),
+            ("linkedin comment", row(
+                "linkedin", "post_engagement",
+                "urn:li:activity:7280000000000000000",
+                "urn:li:activity:7280000000000000000", None,
+            )),
+        ]
+    }
+
+    /// Persist a carded row + its pending action, as `post_social_approval_card`
+    /// does, and return the action id.
+    fn seed(store: &Store, email: &augmentagent_store::Email) -> String {
+        store.upsert_email(email).unwrap();
+        store
+            .log_action(
+                &email.message_id,
+                email.thread_id.as_deref(),
+                &email.from,
+                &email.subject,
+                Some(&email.body),
+                Some("a draft"),
+                ActionStatus::Pending,
+            )
+            .unwrap()
+    }
+
+    /// Error strings only the Gmail fall-through can produce. No carded social
+    /// row may ever surface one.
+    const GMAIL_FALLTHROUGH_ERRORS: [&str; 3] = [
+        "no accountEntityId on email; cannot revise",
+        "no accountEntityId on email; cannot send",
+        "no draftId on action; cannot send",
+    ];
+
+    fn assert_not_gmail_fallthrough(label: &str, verb: &str, out: &ApprovalActionOutcome) {
+        if let ApprovalActionOutcome::Failed { message } = out {
+            for banned in GMAIL_FALLTHROUGH_ERRORS {
+                assert_ne!(message, banned, "{label}: {verb} reached the Gmail fall-through");
+            }
+        }
+    }
+
+    /// The reported bug verbatim: Revise on a `linkedin dm --post` card. It
+    /// must reach `revise_linkedin` (which here fails only on the redraft
+    /// call, there being no reasoner), never the Gmail entity-id guard.
+    #[tokio::test]
+    async fn revise_on_a_composed_linkedin_dm_card_reaches_the_linkedin_arm() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(Store::open(tmp.path().join("data.db")).unwrap());
+        let approver = approver(Arc::clone(&store), &tmp);
+        let (_, email) = carded_rows().into_iter().find(|(l, _)| *l == "linkedin dm").unwrap();
+        let id = seed(&store, &email);
+
+        match approver.run_revise(&id, "make it warmer").await {
+            ApprovalActionOutcome::Failed { message } => assert!(
+                message.starts_with("redraft call failed:"),
+                "expected the linkedin redraft path, got {message:?}"
+            ),
+            other => panic!("expected the linkedin redraft path, got {other:?}"),
+        }
+    }
+
+    /// Every verb, every carded shape: the real dispatch ladders must claim
+    /// the row before the Gmail arm.
+    #[tokio::test]
+    async fn no_verb_lets_a_carded_social_row_reach_the_gmail_arm() {
+        let at_ms =
+            chrono::Utc::now().timestamp_millis() + augmentagent_channel_core::MIN_LEAD_MS * 2;
+        for (label, email) in carded_rows() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = Arc::new(Store::open(tmp.path().join("data.db")).unwrap());
+            let approver = approver(Arc::clone(&store), &tmp);
+
+            let id = seed(&store, &email);
+            let out = approver.run_approve(&id).await;
+            assert_not_gmail_fallthrough(label, "approve", &out);
+            assert!(
+                matches!(&out, ApprovalActionOutcome::Failed { message }
+                    if message.contains("is not configured")),
+                "{label}: approve must reach the unconfigured platform client, got {out:?}"
+            );
+
+            let out = approver.run_revise(&id, "tighten it").await;
+            assert_not_gmail_fallthrough(label, "revise", &out);
+            assert!(
+                matches!(&out, ApprovalActionOutcome::Failed { message }
+                    if message.starts_with("redraft call failed:")),
+                "{label}: revise must reach the platform redraft path, got {out:?}"
+            );
+
+            // Schedule is a deferred Gmail send_draft: these rows must be
+            // refused before arming, not failed hours later at fire time.
+            match approver.run_schedule(&id, at_ms).await {
+                ApprovalActionOutcome::Failed { message } => assert!(
+                    message.starts_with("scheduling is only supported"),
+                    "{label}: {message:?}"
+                ),
+                other => panic!("{label}: schedule must be refused, got {other:?}"),
+            }
+
+            // Skip's outcome is `Skipped` on both arms; the tell is that the
+            // platform arms resolve via `update_action_status` (no
+            // `status_source`) while the Gmail arm goes through
+            // `try_resolve_action`, which stamps the deciding surface.
+            assert!(matches!(
+                approver.run_skip(&id).await,
+                ApprovalActionOutcome::Skipped
+            ));
+            assert_eq!(
+                store.action_status_source(&id).unwrap(),
+                None,
+                "{label}: skip took the Gmail CAS path"
+            );
+        }
+    }
+
+    /// The predicate widened in #1375 must not capture Gmail rows, and an
+    /// ingested prefix-only LinkedIn row must still route to LinkedIn.
+    #[tokio::test]
+    async fn gmail_rows_still_take_the_gmail_arm_and_prefix_only_rows_take_linkedin() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(Store::open(tmp.path().join("data.db")).unwrap());
+        let approver = approver(Arc::clone(&store), &tmp);
+
+        let gmail = social_card_row(
+            "gmail", "dm", "m-gmail", "t-gmail", None, "someone@example.org", "s", "ctx",
+        );
+        let id = seed(&store, &gmail);
+        match approver.run_revise(&id, "tighten it").await {
+            ApprovalActionOutcome::Failed { message } => assert_eq!(
+                message, "no accountEntityId on email; cannot revise",
+                "an entity-less GMAIL row keeps its original error"
+            ),
+            other => panic!("expected the Gmail guard, got {other:?}"),
+        }
+
+        // `Dm::into_email` writes platform "linkedin" today, but a row stored
+        // before that column existed carries only the entity prefix.
+        let legacy = social_card_row(
+            "gmail", "dm", "urn:li:messagingMessage:xyz", "urn:li:msg_conversation:abc",
+            Some("linkedin:urn:li:fsd_profile:ME"), "Ada Vance", "s", "ctx",
+        );
+        let id = seed(&store, &legacy);
+        match approver.run_approve(&id).await {
+            ApprovalActionOutcome::Failed { message } => assert!(
+                message.contains("LinkedIn is not configured"),
+                "prefix-only row must still reach approve_linkedin, got {message:?}"
+            ),
+            other => panic!("expected the linkedin arm, got {other:?}"),
+        }
     }
 }
 

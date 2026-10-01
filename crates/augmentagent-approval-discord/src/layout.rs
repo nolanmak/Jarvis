@@ -1327,6 +1327,13 @@ mod tests {
         e.account_entity_id = Some("linkedin:urn123".into());
         let v = json(&approval_message("act-s6", &e, "d", 0));
         assert!(!v.contains("schedule_pick"), "linkedin-entity card gated");
+        // #1375 — an operator-composed LinkedIn card has no entity id at all;
+        // the platform column is the only tell, and it must gate too.
+        let mut e = email();
+        e.platform = "linkedin".into();
+        e.account_entity_id = None;
+        let v = json(&approval_message("act-s6", &e, "d", 0));
+        assert!(!v.contains("schedule_pick"), "linkedin-platform card gated");
     }
 
     #[test]
