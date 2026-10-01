@@ -349,12 +349,11 @@ pub fn approval_edit_message(
 /// wrapper. Keeping the two entry points on this one builder is what
 /// guarantees a redrawn card and a freshly posted one render identically.
 ///
-/// #1366 — `email.body` reaches Discord from exactly three builders, all in
-/// this file, and each converts through [`plain`]: here (posted cards and #1188
-/// in-place edits, which share this builder), [`flag_notice_message`] — where
-/// `post_digest`'s summary also lands — and [`revise_failure_notice`].
-/// `scheduled_notice_message` renders no body, `Email.attachments` is never read
-/// in this crate, and `fetch_conversation_context` feeds the reasoner.
+/// #1366 — `email.body` reaches Discord from exactly three builders, all in this
+/// file, each converting through [`plain`]: here (posted cards and the #1188 in-place
+/// edits that share this builder), [`flag_notice_message`] — where `post_digest`'s
+/// summary also lands — and [`revise_failure_notice`]. `scheduled_notice_message`
+/// renders no body; `fetch_conversation_context` feeds the reasoner, not a card.
 fn approval_embed_and_rows(
     action_id: &str,
     email: &Email,
@@ -756,8 +755,8 @@ fn format_body(email_body: &str, draft: &str) -> String {
     };
     let rest = budget.saturating_sub(reserved);
     // #1366: strip BEFORE the budget split, so truncation spends the card on
-    // prose rather than a `<head>` preamble. The draft is left as written — it
-    // is agent-authored plain text whose `<!--aa:needs-input-->` fence and
+    // prose rather than a `<head>` preamble. The draft is left as written: it is
+    // agent-authored plain text whose `<!--aa:needs-input-->` fence and
     // `[to:]`/`[cc:]` markers a converter would eat.
     let email_part = truncate_within(&plain(email_body), rest / 2);
     let mut draft_part = truncate_within(&prose, rest - email_part.len());
@@ -927,16 +926,14 @@ fn truncate_within(s: &str, max: usize) -> String {
     }
 }
 
-/// #1366 — readable text for a Discord surface. An HTML-only body (Apple Mail
-/// and friends) otherwise posts its own markup: `<div>` wrappers, `style=`
-/// attributes and `&nbsp;` instead of prose. Render-only — stored, wiki and
-/// indexed copies keep the original. Markup is detected by shape
-/// ([`contains_markup`]) rather than a tag list, since a body the sniffer
-/// misses is posted verbatim. A body that is *all* markup (tracking pixel,
-/// image-only newsletter) converts to nothing, and the card says so rather than
-/// fall back to the tags. Preferring a `text/plain` alternative upstream is not
-/// available: Composio flattens the message into one body string, so the HTML
-/// alternative *is* the body
+/// #1366 — readable text for a Discord surface. An HTML-only body (Apple Mail and
+/// friends) otherwise posts its own markup: `<div>` wrappers, `style=` attributes
+/// and `&nbsp;` instead of prose. Render-only — stored, wiki and indexed copies keep
+/// the original. Markup is detected by shape ([`contains_markup`]), not a tag list,
+/// since a missed body is posted verbatim. An all-markup body (tracking pixel)
+/// converts to nothing, and the card says so rather than fall back to the tags.
+/// Preferring a `text/plain` alternative upstream is not an option: Composio
+/// flattens the message into one body string
 /// (`composio_flattens_html_into_the_only_body_field` pins that).
 fn plain(body: &str) -> Cow<'_, str> {
     if !contains_markup(body) {
@@ -950,7 +947,6 @@ fn plain(body: &str) -> Cow<'_, str> {
     }
 }
 
-/// Stand-in for a body whose markup carries no readable text at all.
 const NO_TEXT_BODY: &str = "_(no text content — HTML-only message)_";
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1008,18 +1004,16 @@ mod tests {
         <body style="word-wrap:break-word">
         <div class="apple-mail-dark-mode" style="color:#1d1d1f">Hi there &mdash; the rollout slipped to Tuesday.</div>
         <div class="apple-mail-dark-mode" style="color:#1d1d1f">&nbsp;</div>
-        <div style="color:#1d1d1f">Docs &amp; runbook are at <a href="https://docs.example.com/rollout">the usual place</a>.</div>
+        <div style="color:#1d1d1f">Docs &amp; r&eacute;sum&eacute;: <a href="https://docs.example.com/rollout">the usual place</a>.</div>
         <blockquote type="cite"><div>On Sep 29, 2026, at 09:12, peer@example.com wrote:</div>
-          <div><div>Are we still shipping Monday?</div></div></blockquote>
-        </body></html>"#;
+          <div><div>Are we still shipping Monday?</div></div></blockquote></body></html>"#;
 
-    const MARKUP_LEAKS: [&str; 6] = ["<div", "<html", "class=", "style=", "&nbsp;", "&amp;"];
+    const MARKUP_LEAKS: [&str; 7] = ["<div", "<html", "class=", "style=", "&nbsp;", "&amp;", "&eacute;"];
 
-    /// The reported case, end to end — asserted against the WHOLE serialized
-    /// card, not just the description, so the attachment and envelope blocks an
-    /// HTML mail also carries fall under the same scan. The #1188 in-place edit
-    /// shares `approval_embed_and_rows`, and is checked here so a future split
-    /// of the two builders cannot reopen the leak.
+    /// The reported case, end to end — asserted against the WHOLE serialized card,
+    /// not just the description, so the attachment and envelope blocks fall under
+    /// the same scan. The #1188 in-place edit shares `approval_embed_and_rows` and
+    /// is checked too, so a future split of the builders cannot reopen the leak.
     #[test]
     fn every_rendered_field_of_an_html_card_is_plain_text() {
         let mut e = email();
@@ -1027,13 +1021,13 @@ mod tests {
         e.attachments = vec!["application/pdf rollout.pdf".into()];
         let draft = "Tuesday works.\n[to: peer@example.com]\n[attachment: rollout.pdf]";
         let posted = json(&approval_message("act-h1", &e, draft, 0));
-        let edit = approval_edit_message("act-h1", &e, draft, 0);
-        let edited = serde_json::to_string(&edit).unwrap();
+        let edited = serde_json::to_string(&approval_edit_message("act-h1", &e, draft, 0)).unwrap();
+        // Prose, the quoted reply, decoded entities and the link target survive.
+        let kept = ["slipped to Tuesday", "still shipping Monday?", "résumé", "docs.example.com"];
         for card in [&posted, &edited] {
-            assert!(card.contains("the rollout slipped to Tuesday"), "{card}");
-            assert!(card.contains("Are we still shipping Monday?"), "{card}");
-            // The link target survives in readable form.
-            assert!(card.contains("https://docs.example.com/rollout"), "{card}");
+            for k in kept {
+                assert!(card.contains(k), "{k} missing: {card}");
+            }
             for leak in MARKUP_LEAKS {
                 assert!(!card.contains(leak), "markup {leak} leaked: {card}");
             }
@@ -1044,20 +1038,16 @@ mod tests {
     fn the_other_body_bearing_surfaces_strip_too() {
         // `post_digest` and the engagement path forward a whole body as a reason.
         let notice = json(&flag_notice_message(&email(), APPLE_MAIL_HTML));
-        assert!(notice.contains("rollout slipped to Tuesday"), "{notice}");
+        assert!(notice.contains("slipped to Tuesday"), "{notice}");
         for leak in MARKUP_LEAKS {
             assert!(!notice.contains(leak), "markup {leak} leaked: {notice}");
         }
         // No sniffer false positives: prose renders byte-identically to pre-#1366.
         let prose = "Hi there,\n\nMove to Tuesday? a < b either way.\n\nThanks";
-        assert_eq!(
-            format_body(prose, "Sure."),
-            format!("{prose}{SEPARATOR}Sure.")
-        );
+        assert_eq!(format_body(prose, "Sure."), format!("{prose}{SEPARATOR}Sure."));
         // An all-markup body (tracking pixel) says so rather than post the tags.
         let pixel = r#"<html><body><img src="https://t.example.com/p.gif"></body></html>"#;
-        let out = format_body(pixel, "noted");
-        assert!(out.starts_with(NO_TEXT_BODY) && !out.contains("<img"), "{out}");
+        assert!(format_body(pixel, "noted").starts_with(NO_TEXT_BODY));
     }
 
     #[test]

@@ -8,7 +8,6 @@
 pub mod approval_cards;
 pub mod daemon_report;
 pub mod delivery;
-// #1366 — shared HTML → visible-text conversion for render boundaries.
 pub mod html_text;
 pub mod imessage;
 pub mod models;
