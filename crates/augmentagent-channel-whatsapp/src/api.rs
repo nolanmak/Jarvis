@@ -55,9 +55,9 @@ use crate::types::{WaContact, WaEvent, WaMessage};
 const PROTOCOL_VERSION: u32 = 1;
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Default UDS path. `${XDG_RUNTIME_DIR}/augmentagent/wa.sock`, falling back to
-/// `/run/user/<uid>/...` then `/tmp/augmentagent-<uid>/...` so headless
-/// hosts use a private, account-specific directory.
+/// Default UDS path. Linux uses `${XDG_RUNTIME_DIR}/augmentagent/wa.sock`,
+/// then `/run/user/<uid>/...` or a private `/tmp/augmentagent-<uid>/...`.
+/// macOS uses the short private `/tmp/augmentagent-<uid>/wa.sock` path.
 /// Overridable via `AUGMENTAGENT_WA_SOCK` (parity with the browser sidecar's
 /// `AUGMENTAGENT_BROWSER_SOCK`).
 pub fn default_socket_path() -> PathBuf {
@@ -66,21 +66,32 @@ pub fn default_socket_path() -> PathBuf {
             return PathBuf::from(custom);
         }
     }
-    if cfg!(target_os = "macos") {
-        return PathBuf::from(format!("/tmp/augmentagent-{}/wa.sock", users_uid()));
+    #[cfg(target_os = "macos")]
+    {
+        // Darwin's Unix socket path limit is short. Keep this path stable
+        // across terminal and launchd environments, even with a long HOME.
+        macos_socket_path(users_uid())
     }
-    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
-        if !runtime.is_empty() {
-            return PathBuf::from(runtime).join("augmentagent").join("wa.sock");
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+            if !runtime.is_empty() {
+                return PathBuf::from(runtime).join("augmentagent").join("wa.sock");
+            }
+        }
+        let uid = users_uid();
+        let runtime = PathBuf::from(format!("/run/user/{uid}"));
+        if runtime.is_dir() {
+            runtime.join("augmentagent").join("wa.sock")
+        } else {
+            PathBuf::from(format!("/tmp/augmentagent-{uid}")).join("wa.sock")
         }
     }
-    let uid = users_uid();
-    let runtime = PathBuf::from(format!("/run/user/{uid}"));
-    if runtime.is_dir() {
-        runtime.join("augmentagent").join("wa.sock")
-    } else {
-        PathBuf::from(format!("/tmp/augmentagent-{uid}")).join("wa.sock")
-    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_socket_path(uid: u32) -> PathBuf {
+    PathBuf::from(format!("/tmp/augmentagent-{uid}/wa.sock"))
 }
 
 fn users_uid() -> u32 {
@@ -141,6 +152,14 @@ struct RpcError {
     kind: String,
     #[serde(default)]
     message: String,
+}
+
+/// One message read from the sidecar's persistent inbound journal.
+/// A caller must commit the message locally before acknowledging `seq`.
+#[derive(Debug)]
+pub struct ReplayedWaEvent {
+    pub seq: u64,
+    pub event: WaEvent,
 }
 
 type Pending = Arc<StdMutex<HashMap<String, oneshot::Sender<Result<RpcResponse, WaError>>>>>;
@@ -375,6 +394,70 @@ impl WaClient {
     pub async fn status(&self) -> Result<Value, WaError> {
         self.call("status", serde_json::json!({})).await
     }
+
+    /// Start or resume QR pairing on the sidecar's single linked-device store.
+    pub async fn start_pairing(&self) -> Result<(), WaError> {
+        self.call("start_pairing", serde_json::json!({})).await?;
+        Ok(())
+    }
+
+    /// Remove exactly the linked device the operator selected. The sidecar
+    /// rejects a stale or different device JID before contacting WhatsApp.
+    pub async fn logout(&self, expected_device_jid: &str) -> Result<(), WaError> {
+        if expected_device_jid.trim().is_empty() {
+            return Err(WaError::Config("expected device JID is required".into()));
+        }
+        self.call(
+            "logout",
+            serde_json::json!({ "expected_device_jid": expected_device_jid }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Read unacknowledged journal events in sidecar sequence order.
+    pub async fn replay_events(
+        &self,
+        after: u64,
+        limit: u32,
+    ) -> Result<Vec<ReplayedWaEvent>, WaError> {
+        if limit == 0 || limit > 1000 {
+            return Err(WaError::Config("replay limit must be 1–1000".into()));
+        }
+        let result = self
+            .call("replay_events", serde_json::json!({"after": after, "limit": limit}))
+            .await?;
+        let frames = result
+            .get("events")
+            .and_then(Value::as_array)
+            .ok_or_else(|| WaError::Protocol("replay_events omitted events array".into()))?;
+        frames
+            .iter()
+            .map(|frame| {
+                let seq = frame
+                    .get("seq")
+                    .and_then(Value::as_u64)
+                    .filter(|seq| *seq > 0)
+                    .ok_or_else(|| {
+                        WaError::Protocol("replayed event omitted positive sequence".into())
+                    })?;
+                let event = serde_json::from_value::<WaEvent>(frame.clone())?;
+                if !matches!(event, WaEvent::ReceivedMessage { .. }) {
+                    return Err(WaError::Protocol("replay contained a non-message event".into()));
+                }
+                Ok(ReplayedWaEvent { seq, event })
+            })
+            .collect()
+    }
+
+    /// Advance exactly one sequence after the daemon's durable commit.
+    pub async fn ack_event(&self, seq: u64) -> Result<(), WaError> {
+        if seq == 0 {
+            return Err(WaError::Config("ack sequence must be positive".into()));
+        }
+        self.call("ack_events", serde_json::json!({"through": seq})).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -440,6 +523,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mid, "3EB0SENT");
+    }
+
+    #[tokio::test]
+    async fn pairing_and_logout_use_explicit_sidecar_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sock(&dir, "wa.sock");
+        mock_sidecar(path.clone(), |req| {
+            let id = req["request_id"].as_str().unwrap();
+            assert!(matches!(req["op"].as_str(), Some("start_pairing" | "logout")));
+            if req["op"] == "logout" {
+                assert_eq!(req["params"]["expected_device_jid"], "15551234567:2@s.whatsapp.net");
+            }
+            vec![serde_json::json!({"version": PROTOCOL_VERSION, "request_id": id, "ok": true, "result": {}}).to_string()]
+        }).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (tx, _rx) = mpsc::channel(8);
+        let client = WaClient::connect(&path, tx).await.unwrap();
+        client.start_pairing().await.unwrap();
+        client.logout("15551234567:2@s.whatsapp.net").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_event_is_typed_and_ack_uses_its_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sock(&dir, "wa.sock");
+        mock_sidecar(path.clone(), |req| {
+            let id = req["request_id"].as_str().unwrap();
+            let result = match req["op"].as_str().unwrap() {
+                "replay_events" => {
+                    assert_eq!(req["params"]["after"], 0);
+                    serde_json::json!({"events": [{"version": 1, "seq": 7, "event": "received-message", "id": "m7", "chat": "1@s.whatsapp.net", "sender": "1@s.whatsapp.net", "text": "hello", "timestamp": 1700000000}]})
+                }
+                "ack_events" => {
+                    assert_eq!(req["params"]["through"], 7);
+                    serde_json::json!({"acked_through": 7})
+                }
+                other => panic!("unexpected op: {other}"),
+            };
+            vec![serde_json::json!({"version": 1, "request_id": id, "ok": true, "result": result}).to_string()]
+        }).await;
+        let (tx, _rx) = mpsc::channel(8);
+        let client = WaClient::connect(&path, tx).await.unwrap();
+        let replayed = client.replay_events(0, 10).await.unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].seq, 7);
+        assert!(matches!(replayed[0].event, WaEvent::ReceivedMessage { .. }));
+        client.ack_event(replayed[0].seq).await.unwrap();
     }
 
     #[tokio::test]
@@ -668,6 +798,14 @@ mod tests {
         std::env::set_var("AUGMENTAGENT_WA_SOCK", "/tmp/custom-wa.sock");
         assert_eq!(default_socket_path(), PathBuf::from("/tmp/custom-wa.sock"));
         std::env::remove_var("AUGMENTAGENT_WA_SOCK");
+    }
+
+    #[test]
+    fn macos_socket_path_is_short_and_independent_of_home() {
+        assert_eq!(
+            macos_socket_path(501),
+            PathBuf::from("/tmp/augmentagent-501/wa.sock")
+        );
     }
 
     #[test]

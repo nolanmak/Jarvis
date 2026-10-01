@@ -76,7 +76,10 @@ async fn compiled_go_process_matches_rust_wire_contract() {
         );
         return;
     };
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("wa-contract-")
+        .tempdir_in("/tmp")
+        .unwrap();
     let socket = temp.path().join("wa.sock");
     let _child = Sidecar(
         Command::new(binary)
@@ -108,6 +111,14 @@ async fn compiled_go_process_matches_rust_wire_contract() {
     assert_eq!(status["paired"], false);
     assert_eq!(status["connected"], false);
     assert!(matches!(concurrent_send, Err(WaError::Sidecar { kind, .. }) if kind == "NotPaired"));
+    assert!(matches!(
+        client.start_pairing().await.unwrap_err(),
+        WaError::Sidecar { kind, .. } if kind == "NotConnected"
+    ));
+    assert!(matches!(
+        client.logout("15551234567:2@s.whatsapp.net").await.unwrap_err(),
+        WaError::Sidecar { kind, .. } if kind == "NotPaired"
+    ));
     assert!(
         matches!(client.list_chats(10).await.unwrap_err(), WaError::Sidecar { kind, .. } if kind == "NotPaired")
     );
