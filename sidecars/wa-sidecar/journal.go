@@ -22,6 +22,7 @@ type eventJournal struct {
 }
 
 type journalRow struct {
+	Account string
 	Seq     int64
 	Payload json.RawMessage
 }
@@ -43,6 +44,16 @@ func openEventJournal(path string) (*eventJournal, error) {
             chat TEXT NOT NULL,
             message_id TEXT NOT NULL,
             payload BLOB NOT NULL,
+            UNIQUE(account, chat, message_id)
+        );
+        CREATE TABLE IF NOT EXISTS outbound_messages (
+            account TEXT NOT NULL,
+            request_key TEXT NOT NULL,
+            chat TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('pending', 'sent')),
+            PRIMARY KEY(account, request_key),
             UNIQUE(account, chat, message_id)
         );
         CREATE TABLE IF NOT EXISTS inbound_cursor (
@@ -113,7 +124,7 @@ func (j *eventJournal) readAfter(after int64, limit int) ([]journalRow, error) {
 	if after < 0 || limit <= 0 || limit > 1000 {
 		return nil, errors.New("invalid WhatsApp event replay cursor or limit")
 	}
-	rows, err := j.db.Query(`SELECT seq, payload FROM inbound_events WHERE seq > ? ORDER BY seq LIMIT ?`, after, limit)
+	rows, err := j.db.Query(`SELECT seq, account, payload FROM inbound_events WHERE seq > ? ORDER BY seq LIMIT ?`, after, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -121,7 +132,7 @@ func (j *eventJournal) readAfter(after int64, limit int) ([]journalRow, error) {
 	result := make([]journalRow, 0)
 	for rows.Next() {
 		var row journalRow
-		if err := rows.Scan(&row.Seq, &row.Payload); err != nil {
+		if err := rows.Scan(&row.Seq, &row.Account, &row.Payload); err != nil {
 			return nil, err
 		}
 		result = append(result, row)

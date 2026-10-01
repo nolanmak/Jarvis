@@ -670,3 +670,156 @@ fn subscription_requires_the_sidecars_actual_paired_device() {
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn serve_processes_owner_self_chat_immediately_and_ignores_echoes_and_strangers() {
+    use std::{process::Stdio, sync::mpsc, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("agent.db");
+    let socket = dir.path().join("wa.sock");
+    let store = Store::open(&db).unwrap();
+    store
+        .upsert_whatsapp_device(
+            "15551234567",
+            "15551234567:2@s.whatsapp.net",
+            "15551234567@s.whatsapp.net",
+        )
+        .unwrap();
+    store
+        .set_whatsapp_owner_config(&augmentagent_store::WhatsappOwnerConfig {
+            phone: "15551234567".into(),
+            owner_jid: "15551234567@s.whatsapp.net".into(),
+            control_chat_jid: "15551234567@s.whatsapp.net".into(),
+            mode: "self_chat".into(),
+        })
+        .unwrap();
+    store
+        .allow_whatsapp_outbound("15551234567@s.whatsapp.net")
+        .unwrap();
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (sent, received) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(c) => break c,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "daemon did not connect"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        };
+        // Darwin inherits O_NONBLOCK from the listener; Linux does not.
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        let reader = BufReader::new(stream.try_clone().unwrap());
+        let mut replayed = false;
+        let mut statuses = 0;
+        for line in reader.lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(_) => break,
+            };
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let result = match request["op"].as_str().unwrap() {
+                "status" => {
+                    statuses += 1;
+                    serde_json::json!({"paired":true,"connected":statuses > 2,"device_jid":"15551234567:2@s.whatsapp.net"})
+                }
+                "replay_events" if !replayed => {
+                    replayed = true;
+                    let events:Vec<_>=(1..=3).map(|seq|serde_json::json!({"version":1,"event":"received-message",
+                        "seq":seq,"id":format!("m{seq}"),"chat":"15551234567@s.whatsapp.net",
+                        "sender":if seq==1{"15550000000@s.whatsapp.net"}else{"15551234567:9@s.whatsapp.net"},
+                        "text":"help","timestamp":1,"from_me":true,"origin_verified":true,
+                        "agent_generated":seq==2,"account_jid":"15551234567:2@s.whatsapp.net"})).collect();
+                    serde_json::json!({"events":events})
+                }
+                "replay_events" => serde_json::json!({"events":[]}),
+                "ack_events" => serde_json::json!({"acked_through":request["params"]["through"]}),
+                "send_text" => {
+                    sent.send(request["params"].clone()).unwrap();
+                    serde_json::json!({"message_id":"agent-reply"})
+                }
+                other => panic!("unexpected op {other}"),
+            };
+            if writeln!(stream,"{}",serde_json::json!({"version":1,"request_id":request["request_id"],"ok":true,"result":result})).is_err(){break;}
+        }
+    });
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let stderr = std::fs::File::create(dir.path().join("daemon.log")).unwrap();
+    let mut daemon = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_augmentagent"))
+            .current_dir(dir.path())
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", dir.path().join("home"))
+            .env("XDG_STATE_HOME", dir.path().join("state"))
+            .env(
+                "AUGMENTAGENT_INSECURE_CREDENTIAL_DIR",
+                dir.path().join("credentials"),
+            )
+            .env("AUGMENTAGENT_WA_SOCK", &socket)
+            .env("AUGMENTAGENT_WHATSAPP_CONTROL_ENABLED", "1")
+            .env("AUGMENTAGENT_SLACK_INTERACTIVE", "0")
+            .env("AUGMENTAGENT_GH_DISABLE", "1")
+            .env("AUGMENTAGENT_REASONER_CHAIN", "claude")
+            .env("CLAUDE_CLI", "/nonexistent/claude")
+            .arg("--db")
+            .arg(&db)
+            .arg("--wiki-dir")
+            .arg(dir.path().join("wiki"))
+            .args(["serve", "--no-email", "true", "--dry-run", "false"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(stderr)
+            .spawn()
+            .unwrap(),
+    );
+    let reply = received
+        .recv_timeout(Duration::from_secs(15))
+        .unwrap_or_else(|e| {
+            panic!(
+                "no immediate reply: {e}: {}",
+                std::fs::read_to_string(dir.path().join("daemon.log")).unwrap()
+            )
+        });
+    assert_eq!(reply["chat_jid"], "15551234567@s.whatsapp.net");
+    assert_eq!(
+        reply["idempotency_key"],
+        "reply:15551234567@s.whatsapp.net:m3:0"
+    );
+    assert!(reply["text"].as_str().unwrap().contains("Send a question"));
+    assert!(
+        received.recv_timeout(Duration::from_millis(1500)).is_err(),
+        "echo or stranger got a reply"
+    );
+    assert!(store
+        .pending_whatsapp_control("15551234567", "15551234567@s.whatsapp.net")
+        .unwrap()
+        .is_empty());
+    unsafe {
+        libc::kill(daemon.0.id() as i32, libc::SIGTERM);
+    }
+    for _ in 0..50 {
+        if daemon.0.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    drop(daemon);
+    server.join().unwrap();
+}

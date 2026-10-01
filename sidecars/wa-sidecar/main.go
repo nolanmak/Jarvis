@@ -42,6 +42,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -232,6 +233,7 @@ func (s *sidecar) emitEvent(ev map[string]interface{}) {
 		if s.client != nil && s.client.Store.ID != nil {
 			account = s.client.Store.ID.String()
 		}
+		ev["account_jid"] = account
 		chat, _ := ev["chat"].(string)
 		messageID, _ := ev["id"].(string)
 		payload, err := json.Marshal(ev)
@@ -285,9 +287,29 @@ func (s *sidecar) fail(conn net.Conn, reqID, kind, msg string) {
 // NDJSON event frames the Rust channel/control surface consume.
 // ---------------------------------------------------------------------------
 
+// whatsmeow authenticates alternate addresses. Normalize private LIDs to the
+// paired phone identity only when it supplied a personal alternate address.
+func messageIdentity(source types.MessageSource) (types.JID, types.JID) {
+	chat, sender := source.Chat.ToNonAD(), source.Sender.ToNonAD()
+	if sender.Server == types.HiddenUserServer && source.SenderAlt.Server == types.DefaultUserServer {
+		sender = source.SenderAlt.ToNonAD()
+	}
+	if chat.Server == types.HiddenUserServer && !source.IsGroup {
+		if source.IsFromMe && source.RecipientAlt.Server == types.DefaultUserServer {
+			chat = source.RecipientAlt.ToNonAD()
+		} else if source.IsFromMe && source.Chat.ToNonAD() == source.Sender.ToNonAD() && sender.Server == types.DefaultUserServer {
+			chat = sender
+		} else if !source.IsFromMe && sender.Server == types.DefaultUserServer {
+			chat = sender
+		}
+	}
+	return chat, sender
+}
+
 func (s *sidecar) handleWAEvent(rawEvt interface{}) {
 	switch evt := rawEvt.(type) {
 	case *events.Message:
+		chat, sender := messageIdentity(evt.Info.MessageSource)
 		text := extractText(evt)
 		contextInfo := messageContext(evt.Message)
 		var quotedID string
@@ -304,15 +326,29 @@ func (s *sidecar) handleWAEvent(rawEvt interface{}) {
 		if isRevoke {
 			quotedID = protocol.GetKey().GetID()
 		}
+		agentGenerated, originVerified := false, false
+		if s.journal != nil && s.client != nil && s.client.Store.ID != nil {
+			account := s.client.Store.ID.ToNonAD().String()
+			var err error
+			agentGenerated, err = s.journal.isAgentMessage(account, chat.String(), evt.Info.ID)
+			originVerified = err == nil
+			if agentGenerated && evt.Info.IsFromMe {
+				if err := s.journal.confirmSend(account, chat.String(), evt.Info.ID); err != nil {
+					originVerified = false
+				}
+			}
+		}
 		s.emitEvent(map[string]interface{}{
 			"event":             "received-message",
 			"id":                evt.Info.ID,
-			"chat":              evt.Info.Chat.String(),
-			"sender":            evt.Info.Sender.String(),
+			"chat":              chat.String(),
+			"sender":            sender.String(),
 			"push_name":         evt.Info.PushName,
 			"text":              text,
 			"timestamp":         evt.Info.Timestamp.Unix(),
 			"from_me":           evt.Info.IsFromMe,
+			"agent_generated":   agentGenerated,
+			"origin_verified":   originVerified,
 			"quoted_message_id": quotedID,
 			"mentioned_jids":    mentions,
 			"media":             mediaDescriptor(evt.Message),
@@ -325,6 +361,12 @@ func (s *sidecar) handleWAEvent(rawEvt interface{}) {
 		ids := make([]string, len(evt.MessageIDs))
 		for i, id := range evt.MessageIDs {
 			ids[i] = string(id)
+			if s.journal != nil && s.client != nil && s.client.Store.ID != nil &&
+				(evt.Type == types.ReceiptTypeDelivered || evt.Type == types.ReceiptTypeRead || evt.Type == types.ReceiptTypePlayed) {
+				if err := s.journal.confirmSend(s.client.Store.ID.ToNonAD().String(), evt.Chat.ToNonAD().String(), id); err != nil {
+					s.journalFailures.Add(1)
+				}
+			}
 		}
 		s.emitEvent(map[string]interface{}{
 			"event":        "receipt",
@@ -465,6 +507,8 @@ func (s *sidecar) dispatch(conn net.Conn, req rpcRequest) {
 		s.opFetchHistory(conn, req)
 	case "send_text":
 		s.opSendText(conn, req)
+	case "delivery_status":
+		s.opDeliveryStatus(conn, req)
 	case "replay_events":
 		s.opReplayEvents(conn, req)
 	case "ack_events":
@@ -614,6 +658,7 @@ func (s *sidecar) opReplayEvents(conn net.Conn, req rpcRequest) {
 			return
 		}
 		event["seq"] = row.Seq
+		event["account_jid"] = row.Account
 		events = append(events, event)
 	}
 	s.ok(conn, req.RequestID, map[string]interface{}{"events": events})
@@ -695,10 +740,31 @@ func (s *sidecar) opFetchHistory(conn net.Conn, req rpcRequest) {
 	s.fail(conn, req.RequestID, "Unavailable", "chat history is not stored by this sidecar")
 }
 
+func (s *sidecar) opDeliveryStatus(conn net.Conn, req rpcRequest) {
+	var p struct {
+		Key string `json:"idempotency_key"`
+	}
+	if json.Unmarshal(req.Params, &p) != nil || p.Key == "" || len(p.Key) > 256 {
+		s.fail(conn, req.RequestID, "BadRequest", "idempotency_key required")
+		return
+	}
+	if s.journal == nil || s.client == nil || s.client.Store.ID == nil {
+		s.fail(conn, req.RequestID, "NotPaired", "paired device and journal required")
+		return
+	}
+	row, err := s.journal.deliveryStatus(s.client.Store.ID.ToNonAD().String(), p.Key)
+	if err != nil {
+		s.fail(conn, req.RequestID, "Unavailable", "delivery record unavailable")
+		return
+	}
+	s.ok(conn, req.RequestID, map[string]interface{}{"message_id": row.ID, "state": row.State})
+}
+
 func (s *sidecar) opSendText(conn net.Conn, req rpcRequest) {
 	var p struct {
-		ChatJID string `json:"chat_jid"`
-		Text    string `json:"text"`
+		ChatJID        string `json:"chat_jid"`
+		Text           string `json:"text"`
+		IdempotencyKey string `json:"idempotency_key"`
 	}
 	if err := json.Unmarshal(req.Params, &p); err != nil || p.ChatJID == "" || p.Text == "" {
 		s.fail(conn, req.RequestID, "BadRequest", "chat_jid and text required")
@@ -717,15 +783,27 @@ func (s *sidecar) opSendText(conn net.Conn, req rpcRequest) {
 		s.fail(conn, req.RequestID, "BadRequest", "bad jid: "+err.Error())
 		return
 	}
-	msg := &waE2E.Message{Conversation: &p.Text}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	resp, err := s.client.SendMessage(ctx, jid, msg)
-	if err != nil {
-		s.fail(conn, req.RequestID, "SendFailed", err.Error())
+	if s.journal == nil || p.IdempotencyKey == "" {
+		s.fail(conn, req.RequestID, "BadRequest", "durable journal and idempotency_key required")
 		return
 	}
-	s.ok(conn, req.RequestID, map[string]interface{}{"message_id": resp.ID})
+	account := s.client.Store.ID.ToNonAD().String()
+	id, err := s.journal.sendOnce(account, p.IdempotencyKey, jid.ToNonAD().String(), p.Text,
+		s.client.GenerateMessageID(), func(id string) error {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_, err := s.client.SendMessage(ctx, jid, &waE2E.Message{Conversation: &p.Text}, whatsmeow.SendRequestExtra{ID: id})
+			return err
+		})
+	if err != nil {
+		kind := "DeliveryUncertain"
+		if errors.Is(err, errSendKeyConflict) {
+			kind = "IdempotencyConflict"
+		}
+		s.fail(conn, req.RequestID, kind, "outgoing message not retried; inspect durable delivery status")
+		return
+	}
+	s.ok(conn, req.RequestID, map[string]interface{}{"message_id": id})
 }
 
 // ---------------------------------------------------------------------------

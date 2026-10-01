@@ -102,6 +102,15 @@ pub struct WaMessage {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct WaMessageMetadata {
+    /// Linked device that durably received this event; prevents cross-account replay.
+    #[serde(default)]
+    pub account_jid: String,
+    /// True only when the sidecar's durable outbox owns this message ID.
+    #[serde(default)]
+    pub agent_generated: bool,
+    /// A missing/failed origin lookup must never enable self-chat input.
+    #[serde(default)]
+    pub origin_verified: bool,
     /// Message being quoted, or the target of a revoke event.
     #[serde(default)]
     pub quoted_message_id: String,

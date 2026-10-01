@@ -67,3 +67,20 @@ Still open: native command confinement/build VM, Intel qualification, full
 workspace qualification, reboot/sleep/soak, and real Slack/WhatsApp account
 acceptance. Slack huddle support remains unproven. These results do not certify
 full platform or channel parity.
+
+### Interactive channel follow-up
+
+On the same Mac, `cargo test -p augmentagent-channel-whatsapp -p
+augmentagent-channel-slack` passed 547 tests across 41 suites (one ignored).
+The Slack serve CLI suite passed seven tests; the final WhatsApp CLI suite
+passed 15, including a daemon with only WhatsApp configured, delayed sidecar
+connection, owner help, and rejection of stranger and own-agent messages.
+The store's two WhatsApp restart/deduplication tests passed on both hosts.
+
+A further development acceptance probe used a simulated local WhatsApp socket
+with the **real Codex provider**: the first owner message read a synthetic wiki
+marker, the second recalled it without a tool call. Both replies were
+`MACOS_SESSION_READY`; the store retained one healthy native Codex session.
+The Go WhatsApp network connection and real account were not exercised by this
+probe. Its local artifact directory on the Mac is
+`/tmp/jarvis-wa-native-8a6njrhu` (disposable synthetic state).

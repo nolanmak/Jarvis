@@ -378,19 +378,27 @@ impl WaClient {
 
     /// `send_text` — outbound text to a chat. Returns the server message id.
     pub async fn send_text(&self, chat_jid: &str, text: &str) -> Result<String, WaError> {
+        self.send_text_once(chat_jid, text, &uuid::Uuid::new_v4().to_string()).await
+    }
+
+    /// Retry using the same key; an ambiguous earlier attempt never sends again.
+    pub async fn send_text_once(&self, chat_jid: &str, text: &str, key: &str) -> Result<String, WaError> {
         let v = self
             .call(
                 "send_text",
-                serde_json::json!({ "chat_jid": chat_jid, "text": text }),
+                serde_json::json!({ "chat_jid": chat_jid, "text": text, "idempotency_key": key }),
             )
             .await?;
-        Ok(v.get("message_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string())
+        v.get("message_id").and_then(Value::as_str)
+            .filter(|id| !id.is_empty()).map(str::to_string)
+            .ok_or_else(|| WaError::Protocol("send response lacks message ID".into()))
     }
 
     /// `status` — sidecar self-report (paired? connected? which device JID?).
+    pub async fn delivery_status(&self, key: &str) -> Result<Value, WaError> {
+        self.call("delivery_status", serde_json::json!({"idempotency_key": key})).await
+    }
+
     pub async fn status(&self) -> Result<Value, WaError> {
         self.call("status", serde_json::json!({})).await
     }

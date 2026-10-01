@@ -12,7 +12,7 @@ use augmentagent_channel_whatsapp::{WaEvent, WhatsappAuth};
 use augmentagent_store::{Store, SubscriptionMode, WhatsappOwnerConfig};
 use tokio::sync::mpsc;
 
-struct OwnedSidecar(Child);
+pub(crate) struct OwnedSidecar(Child);
 
 impl Drop for OwnedSidecar {
     fn drop(&mut self) {
@@ -24,6 +24,11 @@ impl Drop for OwnedSidecar {
         unsafe {
             libc::kill(self.0.id() as i32, libc::SIGTERM);
         }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while matches!(self.0.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if matches!(self.0.try_wait(), Ok(None)) { let _ = self.0.kill(); }
         let _ = self.0.wait();
     }
 }
@@ -61,7 +66,7 @@ fn sidecar_binary() -> PathBuf {
     }
 }
 
-async fn pairing_client(
+pub(crate) async fn pairing_client(
     timeout: Duration,
 ) -> Result<(WaClient, mpsc::Receiver<WaEvent>, Option<OwnedSidecar>)> {
     let path = default_socket_path();
@@ -291,6 +296,10 @@ pub async fn run(op: WhatsappOp, store: Arc<Store>) -> Result<()> {
                 }
                 Err(error) => return Err(error),
             };
+            let health = store.surface_listener_health(&augmentagent_store::SurfacePlatform::new("whatsapp")?)?;
+            let now = chrono::Utc::now().timestamp_millis();
+            let listening = health.as_ref().is_some_and(|h| h.state == "connected" && !h.dry_run
+                && (0..15_000).contains(&(now - h.heartbeat_at_ms)));
             let status = serde_json::json!({
                 "sidecar_running": sidecar_running,
                 "paired": live["paired"].as_bool().unwrap_or(false),
@@ -302,13 +311,17 @@ pub async fn run(op: WhatsappOp, store: Arc<Store>) -> Result<()> {
                 "control_chat_jid": owner.as_ref().map(|config| config.control_chat_jid.as_str()),
                 "account_mode": owner.as_ref().map(|config| config.mode.as_str()),
                 "enabled": control_enabled(),
-                "actively_listening": false,
+                "actively_listening": listening,
+                "listener_state": health.as_ref().map(|h| h.state.as_str()),
             });
             if json {
                 println!("{}", status);
             } else {
                 println!("WhatsApp: {status}");
             }
+        }
+        WhatsappOp::DeliveryStatus { idempotency_key } => {
+            println!("{}", client().await?.delivery_status(&idempotency_key).await?);
         }
         WhatsappOp::Devices { json } => {
             let devices = store.list_active_whatsapp_devices()?;

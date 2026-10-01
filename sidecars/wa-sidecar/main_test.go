@@ -480,3 +480,31 @@ func TestPrivateDirectoryRejectsSymlinkAndTightensPermissions(t *testing.T) {
 		t.Fatal("a symlinked state/socket directory must be rejected")
 	}
 }
+
+func TestPrivateIdentityUsesAuthenticatedPhoneAlternate(t *testing.T) {
+	source := types.MessageSource{Chat: types.NewJID("lid-owner", types.HiddenUserServer),
+		Sender: types.NewJID("lid-owner", types.HiddenUserServer), SenderAlt: types.NewJID("15550000000", types.DefaultUserServer)}
+	chat, sender := messageIdentity(source)
+	if chat.String() != "15550000000@s.whatsapp.net" || sender != chat {
+		t.Fatalf("incoming mapping: %v %v", chat, sender)
+	}
+	source.IsFromMe = true
+	source.RecipientAlt = source.SenderAlt
+	chat, sender = messageIdentity(source)
+	if chat != sender || chat.Server != types.DefaultUserServer {
+		t.Fatalf("self chat mapping: %v %v", chat, sender)
+	}
+	source.SenderAlt = types.JID{}
+	source.RecipientAlt = types.JID{}
+	chat, sender = messageIdentity(source)
+	if chat.Server != types.HiddenUserServer || sender.Server != types.HiddenUserServer {
+		t.Fatal("missing alternate must stay unverified")
+	}
+	source.Chat = types.NewJID("group", types.GroupServer)
+	source.IsGroup = true
+	source.RecipientAlt = types.NewJID("owner", types.DefaultUserServer)
+	chat, _ = messageIdentity(source)
+	if chat.Server != types.GroupServer {
+		t.Fatal("group became owner DM")
+	}
+}

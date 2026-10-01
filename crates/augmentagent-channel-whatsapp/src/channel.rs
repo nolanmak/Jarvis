@@ -889,7 +889,7 @@ fn now_millis() -> i64 {
 /// Transfer the sidecar's unacknowledged messages to the daemon store.
 /// Acknowledgement follows the SQLite commit, so a crash between the two
 /// replays a duplicate that the store key safely ignores.
-async fn replay_to_store(client: &WaClient, store: &Store, phone: &str) -> anyhow::Result<usize> {
+pub async fn replay_to_store(client: &WaClient, store: &Store, phone: &str) -> anyhow::Result<usize> {
     let mut after = 0;
     let mut committed = 0;
     loop {

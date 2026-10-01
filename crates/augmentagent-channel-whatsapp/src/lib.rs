@@ -21,6 +21,8 @@ pub mod api;
 pub mod auth;
 pub mod channel;
 pub mod control;
+pub mod owner;
+pub mod interactive;
 pub mod types;
 
 pub use api::{default_socket_path, WaClient, WaError};

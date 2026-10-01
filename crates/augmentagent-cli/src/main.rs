@@ -72,6 +72,7 @@ use async_trait::async_trait;
 
 mod whatsapp_history;
 mod whatsapp_cmd;
+mod whatsapp_serve;
 mod messages_cmd;
 mod embeddings_cmd;
 mod triage_prefilter_cmd;
@@ -1079,6 +1080,8 @@ enum WhatsappOp {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         json: bool,
     },
+    /// Inspect an outbound send without retrying it.
+    DeliveryStatus { idempotency_key: String },
     Devices {
         #[arg(long, action = clap::ArgAction::SetTrue)]
         json: bool,
@@ -3441,6 +3444,16 @@ async fn main() -> Result<()> {
                     dry_run,
                     shutdown.clone(),
                 ));
+            }
+            if let Some(root) = &cli.wiki_dir {
+                let devices = store.list_active_whatsapp_devices()?;
+                let phone = devices.first().map(|d| d.phone.clone()).unwrap_or_default();
+                tasks.push(whatsapp_serve::spawn(Arc::new(
+                    augmentagent_channel_whatsapp::interactive::WhatsappInteractive {
+                        store: Arc::clone(&store), phone, wiki_root: root.clone(),
+                        agent: Arc::new(wiki_querier(build_reasoner(), root.clone(),
+                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")), Arc::clone(&store), false)),
+                    }), dry_run, shutdown.clone()));
             }
             if let Some(gh) = github_ch {
                 let sd = shutdown.clone();

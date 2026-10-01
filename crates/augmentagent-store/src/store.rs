@@ -1417,6 +1417,12 @@ impl Store {
             [],
         )?;
 
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS whatsapp_control_turns (
+                phone TEXT NOT NULL, chat_jid TEXT NOT NULL, message_id TEXT NOT NULL,
+                reply TEXT, PRIMARY KEY(phone, chat_jid, message_id))", [],
+        )?;
+
         // #104 — user-defined scheduled tasks (`/loop`). Channel-agnostic:
         // `channel` is the surface the loop was created from (`discord` today)
         // and `channel_ref` is the originating channel/DM id the scheduler
@@ -5319,6 +5325,36 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// None = not claimed; Some(None) = interrupted/in flight; Some(Some(reply)) = durable answer.
+    pub fn whatsapp_control_reply(&self, phone: &str, chat: &str, id: &str) -> StoreResult<Option<Option<String>>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        Ok(guard.query_row("SELECT reply FROM whatsapp_control_turns WHERE phone=?1 AND chat_jid=?2 AND message_id=?3",
+            params![phone, chat, id], |row| row.get(0)).optional()?)
+    }
+
+    pub fn claim_whatsapp_control_turn(&self, phone: &str, chat: &str, id: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        Ok(guard.execute("INSERT OR IGNORE INTO whatsapp_control_turns(phone, chat_jid, message_id) VALUES(?1,?2,?3)",
+            params![phone, chat, id])? == 1)
+    }
+
+    pub fn finish_whatsapp_control_turn(&self, phone: &str, chat: &str, id: &str, reply: &str) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute("UPDATE whatsapp_control_turns SET reply=?4 WHERE phone=?1 AND chat_jid=?2 AND message_id=?3 AND reply IS NULL",
+            params![phone, chat, id, reply])?;
+        Ok(())
+    }
+
+    pub fn pending_whatsapp_control(&self, phone: &str, chat: &str) -> StoreResult<Vec<WhatsappInboundEvent>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare("SELECT phone,chat_jid,message_id,seq,payload_json FROM whatsapp_inbound_events
+            WHERE phone=?1 AND chat_jid=?2 AND processed=0 ORDER BY seq LIMIT 100")?;
+        let rows = stmt.query_map(params![phone,chat], |row| Ok(WhatsappInboundEvent {
+            phone:row.get(0)?,chat_jid:row.get(1)?,message_id:row.get(2)?,seq:row.get(3)?,payload_json:row.get(4)?,
+        }))?;
+        Ok(rows.collect::<Result<Vec<_>,_>>()?)
     }
 
     pub fn mark_whatsapp_inbound_processed(
