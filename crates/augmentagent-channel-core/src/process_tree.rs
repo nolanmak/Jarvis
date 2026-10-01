@@ -214,6 +214,7 @@ pub(crate) enum Liveness { Dead, Live, Legacy, Unproven }
 
 const MARKER_VERSION: u64 = 2;
 
+#[cfg(not(target_os = "macos"))]
 fn read_trimmed(path: &str) -> Option<String> {
     let value = std::fs::read_to_string(path).ok()?.trim().to_owned();
     (!value.is_empty()).then_some(value)
@@ -227,7 +228,37 @@ fn stat_field<T: std::str::FromStr>(pid: libc::pid_t, field: usize) -> Option<T>
 }
 
 /// Field 22: when the process started, to tell a reused pid from the one recorded.
+#[cfg(not(target_os = "macos"))]
 fn process_start(pid: libc::pid_t) -> Option<u64> { stat_field(pid, 22) }
+
+#[cfg(target_os = "macos")]
+fn darwin_info<const N: usize>(pid: libc::pid_t, flavor: i32) -> Option<[u8; N]> {
+    unsafe extern "C" {
+        fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut libc::c_void, size: i32) -> i32;
+    }
+    let mut bytes = [0; N];
+    let count = unsafe { proc_pidinfo(pid, flavor, 0, bytes.as_mut_ptr().cast(), N as i32) };
+    (count == N as i32).then_some(bytes)
+}
+
+/// Kernel unique process identity survives exec and changes on PID reuse.
+#[cfg(target_os = "macos")]
+fn process_start(pid: libc::pid_t) -> Option<u64> {
+    let bytes = darwin_info::<56>(pid, 17)?;
+    Some(u64::from_ne_bytes(bytes[16..24].try_into().ok()?))
+}
+
+fn boot_id() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "kern.bootsessionuuid"]).output().ok()?;
+        output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            .filter(|value| !value.is_empty())
+    }
+    #[cfg(not(target_os = "macos"))]
+    { read_trimmed("/proc/sys/kernel/random/boot_id") }
+}
 
 /// The cgroup a call ran in, as it stands now. `Gone` covers a vanished directory and
 /// one re-created at another inode: either way the recorded one was destroyed. `Ours`
@@ -239,10 +270,19 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// This process's own cgroup v2 path and inode, which together identify it.
 fn own_cgroup() -> Option<(String, u64)> {
+    #[cfg(target_os = "macos")]
+    {
+        let bytes = darwin_info::<40>(unsafe { libc::getpid() }, 20)?;
+        let id = u64::from_ne_bytes(bytes[..8].try_into().ok()?);
+        return Some((format!("/darwin/coalition/{id}"), id));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
     let line = read_trimmed("/proc/self/cgroup")?;
     let path = line.rsplit_once("::")?.1.to_owned();
     let inode = std::fs::metadata(format!("{CGROUP_ROOT}{path}")).ok()?.ino();
     Some((path, inode))
+    }
 }
 
 /// Does the cgroup a call ran in still hold a process that could have survived from it? The
@@ -306,7 +346,7 @@ pub struct LivenessEnv { boot_id: Option<String>, start_of: StartProbe, cgroup_o
 impl LivenessEnv {
     /// Production: `/proc` and the cgroup v2 hierarchy, read-only.
     pub fn probe() -> Self {
-        LivenessEnv { boot_id: read_trimmed("/proc/sys/kernel/random/boot_id"),
+        LivenessEnv { boot_id: boot_id(),
             start_of: Box::new(process_start), cgroup_of: Box::new(cgroup_state),
             contained: daemon_kill_mode(DAEMON_UNIT).as_deref() == Some("control-group") }
     }
@@ -409,7 +449,7 @@ fn begin_request(journal: Option<&std::path::Path>, receipt: &std::path::Path) -
     let (cgroup, cgroup_inode) = own_cgroup().unzip();
     file.write_all(serde_json::json!({
         "version": MARKER_VERSION, "receipt": receipt, "writer_pid": writer,
-        "boot_id": read_trimmed("/proc/sys/kernel/random/boot_id"), "writer_start": process_start(writer),
+        "boot_id": boot_id(), "writer_start": process_start(writer),
         "writer_cgroup": cgroup, "writer_cgroup_inode": cgroup_inode,
     }).to_string().as_bytes())?;
     file.sync_all()?;
@@ -475,6 +515,9 @@ mod tests {
     use serde_json::{json, Value};
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, BufReader};
+
+    // Python's setsid works on both hosts; macOS ships no `setsid` executable.
+    const DETACHED_TOOL: &str = "import os,sys,time\nif os.fork()==0:\n os.setsid()\n print('ready',flush=True)\n time.sleep(.5)\n open(sys.argv[1],'w').write('escaped')\n os._exit(0)\ntime.sleep(30)\n";
 
     #[test]
     fn restart_uses_a_verified_receipt_but_never_age_or_partial_state() {
@@ -628,6 +671,7 @@ mod tests {
             ("a cycle must terminate, and prove nothing", "900\n", Cgroup::Populated)]
         { assert_eq!(seen(procs), wanted, "{case}"); }
         // And against the real hierarchy: a foreign inode means the recorded one is gone.
+        #[cfg(target_os = "linux")]
         if let Some((path, inode)) = own_cgroup() {
             assert!(matches!(cgroup_state(&path, inode), Cgroup::Populated | Cgroup::Ours));
             assert_eq!(cgroup_state(&path, inode.wrapping_add(1)), Cgroup::Gone);
@@ -676,7 +720,7 @@ mod tests {
         let mut controller = Command::new("python3");
         controller.args(["-I", "-c", "import subprocess,sys,time; subprocess.Popen(sys.argv[1:]); time.sleep(30)",
             "python3", "-I"]).arg(&helper).arg(&receipt)
-            .args(["sh", "-c", "setsid sh -c 'printf \"ready\\n\"; sleep 0.5; printf escaped > \"$1\"' sh \"$1\" & wait", "sh"])
+            .args(["python3", "-I", "-c", DETACHED_TOOL])
             .arg(&unexpected).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         let mut controller = controller.spawn().unwrap();
         let mut output = BufReader::new(controller.stdout.take().unwrap()).lines();
@@ -718,8 +762,8 @@ mod tests {
     async fn successful_provider_exit_also_reaps_detached_background_work() {
         let directory = tempfile::tempdir().unwrap();
         let marker = directory.path().join("unexpected-after-success");
-        let mut command = Command::new("sh");
-        command.args(["-c", "setsid sh -c 'sleep 0.3; printf escaped > \"$1\"' sh \"$1\" & printf 'result\\n'", "sh"])
+        let mut command = Command::new("python3");
+        command.args(["-I", "-c", "import os,sys,time\nif os.fork()==0:\n os.setsid()\n time.sleep(.3)\n open(sys.argv[1],'w').write('escaped')\n os._exit(0)\nprint('result',flush=True)\n"])
             .arg(&marker);
         let clean = Arc::new(AtomicBool::new(true));
         let (child, group) = spawn_supervised(&command, false, clean.clone(), None).unwrap();
@@ -758,8 +802,8 @@ mod tests {
     async fn cancellation_stops_a_tool_that_detached_into_its_own_session() {
         let directory = tempfile::tempdir().unwrap();
         let marker = directory.path().join("unexpected-detached-effect");
-        let mut command = Command::new("sh");
-        command.args(["-c", "setsid sh -c 'printf \"ready\\n\"; sleep 0.3; printf escaped > \"$1\"' sh \"$1\" & wait", "sh"])
+        let mut command = Command::new("python3");
+        command.args(["-I", "-c", DETACHED_TOOL])
             .arg(&marker).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
         let (mut child, group) = spawn(&mut command).unwrap();
         let mut output = BufReader::new(child.stdout.take().unwrap()).lines();

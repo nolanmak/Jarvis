@@ -170,7 +170,7 @@ bot.
 - Linux with gnome-keyring (Secret Service) unlocked, and `python3`, `node`,
   `secret-tool` (libsecret-tools), and `jq` (wiki mode) on `PATH`; **or**
   macOS with the Xcode command-line tools (`xcode-select --install`) and
-  Homebrew `node`, `deno`, and `jq` — secrets go to the login Keychain. For an
+  Homebrew `node@24`, `deno`, `jq`, `bash`, and `coreutils` — secrets go to the login Keychain. For an
   always-on Mac mini, stop it sleeping: `sudo pmset -c sleep 0`.
 - Rust via rustup (the pinned toolchain in `rust-toolchain.toml` installs
   itself), a C toolchain with `perl`/`make` (OpenSSL and SQLite build from
@@ -294,7 +294,10 @@ the bot's Message Content intent, and more Claude calls per email — finish
 the [Quickstart](#quickstart) first.
 
 On macOS, run the installers from a shell where the required tools are on
-`PATH`. The daemon installer checks Node, Deno, jq, and only the CLI providers
+`PATH`. Include `/opt/homebrew/opt/coreutils/libexec/gnubin` (Apple Silicon)
+or `/usr/local/opt/coreutils/libexec/gnubin` (Intel) for GNU `readlink` and
+`timeout`; the launchd installer also includes these directories. The daemon
+installer checks Node, Deno, jq, Python, timeout, and only the CLI providers
 selected by `AUGMENTAGENT_REASONER_CHAIN` (from the environment or `.env`).
 The dashboard installer checks Node; the updater checks Cargo, Node, npm, and
 Git. Their resolved directories are written into the launchd environment, so

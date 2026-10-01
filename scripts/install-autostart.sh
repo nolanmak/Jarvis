@@ -32,6 +32,12 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LABEL="com.nolanmak.augmentagent"
 DRY_RUN="${AUGMENTAGENT_AUTOSTART_DRY_RUN:-false}"
+# Slack/WhatsApp-only installations do not require Composio Gmail credentials.
+NO_EMAIL="${AUGMENTAGENT_AUTOSTART_NO_EMAIL:-false}"
+case "$NO_EMAIL" in
+  true|false) ;;
+  *) printf 'AUGMENTAGENT_AUTOSTART_NO_EMAIL must be true or false\n' >&2; exit 1 ;;
+esac
 case "$DRY_RUN" in
   true|false) ;;
   *) printf 'AUGMENTAGENT_AUTOSTART_DRY_RUN must be true or false (got: %s)\n' "$DRY_RUN" >&2; exit 1 ;;
@@ -55,7 +61,7 @@ install_macos() {
   # Include the usual suspects so `claude`, `cargo`, `node`, Homebrew, etc. are found.
   local REASONER_TOOLS LAUNCH_PATH
   REASONER_TOOLS="$(launchd_reasoner_tools "$REPO_ROOT")"
-  LAUNCH_PATH="$(launchd_service_path node deno jq $REASONER_TOOLS)"
+  LAUNCH_PATH="$(launchd_service_path node deno jq python3 timeout $REASONER_TOOLS)"
 
   local REPO_ROOT_XML HOME_XML LOG_DIR_XML LAUNCH_PATH_XML
   REPO_ROOT_XML="$(launchd_xml_escape "$REPO_ROOT")"
@@ -84,6 +90,8 @@ install_macos() {
         <string>serve</string>
         <string>--dry-run</string>
         <string>$DRY_RUN</string>
+        <string>--no-email</string>
+        <string>$NO_EMAIL</string>
     </array>
 
     <key>EnvironmentVariables</key>
@@ -158,7 +166,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=$REPO_ROOT
-ExecStart=$REPO_ROOT/scripts/run-rs.sh --wiki-dir ./wiki serve --dry-run $DRY_RUN
+ExecStart=$REPO_ROOT/scripts/run-rs.sh --wiki-dir ./wiki serve --dry-run $DRY_RUN --no-email $NO_EMAIL
 Environment=PATH=$SERVICE_PATH
 Environment=RUST_LOG=info
 # Deft channel still inert until a token is stored via 'augmentagent deft login'
