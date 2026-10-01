@@ -8,10 +8,10 @@
 //! Journal text is sensitive — nothing in here may log its input.
 //!
 //! #1366 unified the *email* converters (FTS + the Discord renderer) in
-//! `augmentagent-store::html_text`; this one stays separate on purpose. It converts
-//! for wiki *ingest*, never for a Discord card, so it is not on that leak's path,
-//! and its output is deliberately journal-shaped: `<li>` becomes a `- ` bullet and
-//! `<img>` becomes `[image]` — markers an email card must not carry.
+//! `augmentagent-store::html_text`; this one stays separate on purpose. It converts for
+//! wiki *ingest*, never for a Discord card, so it is not on that leak's path, and its
+//! output is deliberately journal-shaped: `<li>` becomes a `- ` bullet and `<img>`
+//! becomes `[image]` — markers an email card must not carry.
 
 /// Tags whose end (or self-closing occurrence) implies a line break.
 /// `li` is handled separately: its *opening* emits the bullet+break.

@@ -349,11 +349,11 @@ pub fn approval_edit_message(
 /// wrapper. Keeping the two entry points on this one builder is what
 /// guarantees a redrawn card and a freshly posted one render identically.
 ///
-/// #1366 — `email.body` reaches Discord from exactly three builders, all in this
-/// file, each converting through [`plain`]: here (posted cards and the #1188 in-place
-/// edits that share this builder), [`flag_notice_message`] — where `post_digest`'s
-/// summary also lands — and [`revise_failure_notice`]. `scheduled_notice_message`
-/// renders no body; `fetch_conversation_context` feeds the reasoner, not a card.
+/// #1366 — `email.body` reaches Discord from exactly three builders, all in this file,
+/// each converting through [`plain`]: here (posted cards and the #1188 in-place edits
+/// that share this builder), [`flag_notice_message`] — where `post_digest`'s summary also
+/// lands — and [`revise_failure_notice`]. `scheduled_notice_message` renders no body;
+/// `fetch_conversation_context` feeds the reasoner, not a card.
 fn approval_embed_and_rows(
     action_id: &str,
     email: &Email,
@@ -927,14 +927,13 @@ fn truncate_within(s: &str, max: usize) -> String {
 }
 
 /// #1366 — readable text for a Discord surface. An HTML-only body (Apple Mail and
-/// friends) otherwise posts its own markup: `<div>` wrappers, `style=` attributes
-/// and `&nbsp;` instead of prose. Render-only — stored, wiki and indexed copies keep
-/// the original. Markup is detected by shape ([`contains_markup`]), not a tag list,
-/// since a missed body is posted verbatim. An all-markup body (tracking pixel)
-/// converts to nothing, and the card says so rather than fall back to the tags.
-/// Preferring a `text/plain` alternative upstream is not an option: Composio
-/// flattens the message into one body string
-/// (`composio_flattens_html_into_the_only_body_field` pins that).
+/// friends) otherwise posts its own markup: `<div>` wrappers, `style=` attributes and
+/// `&nbsp;` instead of prose. Render-only — stored, wiki and indexed copies keep the
+/// original. Markup is detected by shape ([`contains_markup`]), not a tag list, since a
+/// missed body is posted verbatim. An all-markup body (tracking pixel) converts to
+/// nothing, and the card says so rather than fall back to the tags. Preferring a
+/// `text/plain` alternative upstream is not an option: Composio flattens the message
+/// into one body string (`composio_flattens_html_into_the_only_body_field` pins that).
 fn plain(body: &str) -> Cow<'_, str> {
     if !contains_markup(body) {
         return Cow::Borrowed(body);
@@ -998,22 +997,24 @@ mod tests {
         assert!(t.is_char_boundary(t.len()));
     }
 
-    /// #1366 — Apple-Mail-shaped HTML-only body: preamble, attribute-laden
-    /// `<div>` per line, `&nbsp;` separators, quoted reply in a `<blockquote>`.
+    /// #1366 — Apple-Mail-shaped HTML-only body: preamble, attribute-laden `<div>` per
+    /// line, `&nbsp;` separators, quoted reply in a `<blockquote>`.
     const APPLE_MAIL_HTML: &str = r#"<html><head><style type="text/css">body{font-family:Helvetica}</style></head>
         <body style="word-wrap:break-word">
         <div class="apple-mail-dark-mode" style="color:#1d1d1f">Hi there &mdash; the rollout slipped to Tuesday.</div>
         <div class="apple-mail-dark-mode" style="color:#1d1d1f">&nbsp;</div>
-        <div style="color:#1d1d1f">Docs &amp; r&eacute;sum&eacute;: <a href="https://docs.example.com/rollout">the usual place</a>.</div>
+        <div style="color:#1d1d1f">Docs &amp; r&eacute;sum&eacute; &rarr; <a href="https://docs.example.com/rollout">the usual place</a>.</div>
         <blockquote type="cite"><div>On Sep 29, 2026, at 09:12, peer@example.com wrote:</div>
           <div><div>Are we still shipping Monday?</div></div></blockquote></body></html>"#;
 
-    const MARKUP_LEAKS: [&str; 7] = ["<div", "<html", "class=", "style=", "&nbsp;", "&amp;", "&eacute;"];
+    #[rustfmt::skip]
+    const MARKUP_LEAKS: [&str; 8] =
+        ["<div", "<html", "class=", "style=", "&nbsp;", "&amp;", "&eacute;", "&rarr;"];
 
-    /// The reported case, end to end — asserted against the WHOLE serialized card,
-    /// not just the description, so the attachment and envelope blocks fall under
-    /// the same scan. The #1188 in-place edit shares `approval_embed_and_rows` and
-    /// is checked too, so a future split of the builders cannot reopen the leak.
+    /// The reported case, end to end — asserted against the WHOLE serialized card, not
+    /// just the description, so the attachment and envelope blocks fall under the same
+    /// scan. The #1188 in-place edit shares `approval_embed_and_rows` and is checked
+    /// too, so a future split of the builders cannot reopen the leak.
     #[test]
     fn every_rendered_field_of_an_html_card_is_plain_text() {
         let mut e = email();
@@ -1023,7 +1024,7 @@ mod tests {
         let posted = json(&approval_message("act-h1", &e, draft, 0));
         let edited = serde_json::to_string(&approval_edit_message("act-h1", &e, draft, 0)).unwrap();
         // Prose, the quoted reply, decoded entities and the link target survive.
-        let kept = ["slipped to Tuesday", "still shipping Monday?", "résumé", "docs.example.com"];
+        let kept = ["slipped to Tuesday", "still shipping Monday?", "résumé →", "docs.example.com"];
         for card in [&posted, &edited] {
             for k in kept {
                 assert!(card.contains(k), "{k} missing: {card}");
