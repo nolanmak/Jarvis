@@ -10,6 +10,14 @@ on:
       - 'crates/augmentagent-store/**'
       - 'docs/discord-voice/**'
       - 'systemd/augmentagent-discord-voice.service'
+      - 'scripts/tests/voice_package_platform_test.py'
+      - 'scripts/tests/voice_launchd_test.py'
+      - 'scripts/install-sidecar.py'
+      - 'scripts/start-sidecar.py'
+      - 'scripts/uninstall-sidecar.sh'
+      - 'scripts/build-whisper.sh'
+      - 'scripts/tests/whisper_setup_test.py'
+      - 'docs/MACOS-VOICE.md'
       - '.github/workflows/discord-voice.yml'
   push:
     branches: [main]
@@ -21,6 +29,14 @@ on:
       - 'crates/augmentagent-store/**'
       - 'docs/discord-voice/**'
       - 'systemd/augmentagent-discord-voice.service'
+      - 'scripts/tests/voice_package_platform_test.py'
+      - 'scripts/tests/voice_launchd_test.py'
+      - 'scripts/install-sidecar.py'
+      - 'scripts/start-sidecar.py'
+      - 'scripts/uninstall-sidecar.sh'
+      - 'scripts/build-whisper.sh'
+      - 'scripts/tests/whisper_setup_test.py'
+      - 'docs/MACOS-VOICE.md'
       - '.github/workflows/discord-voice.yml'
 
 permissions:
@@ -28,19 +44,35 @@ permissions:
 
 jobs:
   sidecar:
-    runs-on: ubuntu-latest
+    name: sidecar (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
     timeout-minutes: 20
     defaults:
       run:
         working-directory: sidecars/discord-voice
     steps:
       - uses: actions/checkout@v4
+      - name: Record native target
+        run: uname -srm
+        working-directory: .
+      - name: Check required package portability
+        run: python3 -m unittest scripts.tests.voice_package_platform_test -v
+        working-directory: .
+      - name: macOS voice service contracts
+        run: python3 -m unittest scripts.tests.voice_launchd_test scripts.tests.whisper_setup_test -v
+        working-directory: .
       - uses: actions/setup-node@v4
         with:
           node-version: '24.17.0'
           cache: npm
           cache-dependency-path: sidecars/discord-voice/package-lock.json
-      - run: npm ci
+      - run: bash setup.sh
+      - name: Check native codec binding
+        run: ./node_modules/node/bin/node -e "require('@snazzah/davey')"
       - run: npm run typecheck
       - run: npm test
       - run: npm audit --omit=optional --audit-level=high
@@ -48,7 +80,12 @@ jobs:
       # remain explicit opt-in verification, never synthetic CI success.
 
   rust:
-    runs-on: ubuntu-latest
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -58,5 +95,72 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: discord-voice
-      - run: cargo test -p augmentagent-approval-discord -p augmentagent-channel-core -p augmentagent-store --locked
-      - run: cargo test -p augmentagent-cli --bin augmentagent --locked -- --test-threads=1
+      - name: Linux voice and channel regression suites
+        if: runner.os == 'Linux'
+        run: cargo test -p augmentagent-approval-discord -p augmentagent-channel-core -p augmentagent-channel-voice -p augmentagent-store --locked
+      - name: macOS voice and persistence regression suites
+        if: runner.os == 'macOS'
+        run: |
+          cargo test -p augmentagent-approval-discord -p augmentagent-channel-voice -p augmentagent-store --locked
+          cargo test -p augmentagent-channel-core --lib voice_bridge::tests --locked
+          cargo test -p augmentagent-channel-core --test conversation_scheduler --locked
+          cargo test -p augmentagent-channel-core --test voice_tool_contract --locked
+      - name: Linux CLI regression suite
+        if: runner.os == 'Linux'
+        run: cargo test -p augmentagent-cli --bin augmentagent --locked -- --test-threads=1
+      - name: macOS voice CLI regression suite
+        if: runner.os == 'macOS'
+        run: |
+          cargo test -p augmentagent-cli --bin augmentagent discord_voice_session_tests --locked -- --test-threads=1
+          cargo test -p augmentagent-cli --bin augmentagent resolve_discord_voice_socket --locked -- --test-threads=1
+
+  whisper-native:
+    name: whisper-native (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record native target
+        run: |
+          uname -srm
+          if [ "$(uname -s)" = Darwin ]; then sw_vers; fi
+      - name: Build pinned whisper.cpp from source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v1.9.4 https://github.com/ggml-org/whisper.cpp.git "$RUNNER_TEMP/whisper-src"
+          test "$(git -C "$RUNNER_TEMP/whisper-src" rev-parse HEAD)" = 927cfce34f31707e17f2bff35c349632fb9e2c3a
+          cmake -S "$RUNNER_TEMP/whisper-src" -B "$RUNNER_TEMP/whisper-src/build" -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+          cmake --build "$RUNNER_TEMP/whisper-src/build" --config Release --parallel 2
+          "$RUNNER_TEMP/whisper-src/build/bin/whisper-cli" -h >/dev/null
+      - name: Transcribe a fixed synthetic audio sequence
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 \
+            'https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-tiny.en.bin' \
+            --output "$RUNNER_TEMP/ggml-tiny.en.bin"
+          test "$(shasum -a 256 "$RUNNER_TEMP/ggml-tiny.en.bin" | awk '{print $1}')" = 921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import wave
+          root = Path('sidecars/discord-voice/test/fixtures/commands')
+          clips = [root / 'yes/004ae714_nohash_0.wav', root / 'no/012c8314_nohash_0.wav'] * 4
+          with wave.open(str(clips[0]), 'rb') as source:
+              params = source.getparams()
+          with wave.open(str(Path(os.environ['RUNNER_TEMP']) / 'voice-sequence.wav'), 'wb') as target:
+              target.setparams(params)
+              for clip in clips:
+                  with wave.open(str(clip), 'rb') as source:
+                      assert source.getparams()[:3] == params[:3]
+                      target.writeframes(source.readframes(source.getnframes()))
+          PY
+          "$RUNNER_TEMP/whisper-src/build/bin/whisper-cli" \
+            -m "$RUNNER_TEMP/ggml-tiny.en.bin" -f "$RUNNER_TEMP/voice-sequence.wav" \
+            -otxt -of "$RUNNER_TEMP/voice-sequence" -nt
+          test -s "$RUNNER_TEMP/voice-sequence.txt"

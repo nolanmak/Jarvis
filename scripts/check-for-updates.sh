@@ -137,12 +137,13 @@ apply_update() {
   # registered job. The setup scripts use pinned dependency locks. A failed
   # build or restart withholds the stamp so the next updater tick can retry.
   local sidecar need label unit installed
-  for sidecar in browser renderer fetch wa-sidecar; do
+  for sidecar in browser renderer fetch wa-sidecar discord-voice; do
     case "$sidecar" in
       browser) need="${NEEDS_BROWSER_REBUILD:-0}" ;;
       renderer) need="${NEEDS_RENDERER_REBUILD:-0}" ;;
       fetch) need="${NEEDS_FETCH_REBUILD:-0}" ;;
       wa-sidecar) need="${NEEDS_WA_SIDECAR_REBUILD:-0}" ;;
+      discord-voice) need="${NEEDS_DISCORD_VOICE_REBUILD:-0}" ;;
     esac
     [ "$need" -eq 1 ] || continue
     if [ "$sidecar" = browser ]; then
@@ -160,7 +161,12 @@ apply_update() {
     fi
     [ "$installed" = true ] || continue
     log "rebuilding installed $sidecar sidecar"
-    if ! (cd "$REPO_ROOT/sidecars/$sidecar" && bash setup.sh >> "$LOG" 2>&1); then
+    if [ "$sidecar" = discord-voice ]; then
+      (cd "$REPO_ROOT/sidecars/discord-voice" && bash setup.sh >> "$LOG" 2>&1) || {
+        log "discord-voice setup failed; withholding build stamp"
+        return 1
+      }
+    elif ! (cd "$REPO_ROOT/sidecars/$sidecar" && bash setup.sh >> "$LOG" 2>&1); then
       log "$sidecar setup failed; withholding build stamp"
       return 1
     fi
@@ -198,6 +204,15 @@ apply_update() {
         else
           log "daemon not registered under launchd ($LABEL) — run install-autostart.sh manually"
           RESTART_FAILURES=$((RESTART_FAILURES + 1))
+        fi
+      fi
+      if [ "$NEEDS_REBUILD" -eq 1 ] &&
+          [ -f "$HOME/Library/LaunchAgents/com.nolanmak.augmentagent.telegram-capture.plist" ]; then
+        if launchctl print "gui/$(id -u)/com.nolanmak.augmentagent.telegram-capture" 2>/dev/null | grep -q 'state = running'; then
+          restart_agent com.nolanmak.augmentagent.telegram-capture \
+            || RESTART_FAILURES=$((RESTART_FAILURES + 1))
+        else
+          log "Telegram capture is installed but idle; no running listener to restart"
         fi
       fi
       if [ "$NEEDS_DASHBOARD_REBUILD" -eq 1 ]; then
@@ -310,6 +325,7 @@ if [ "$LOCAL" = "$REMOTE" ]; then
   NEEDS_RENDERER_REBUILD=1
   NEEDS_FETCH_REBUILD=1
   NEEDS_WA_SIDECAR_REBUILD=1
+  NEEDS_DISCORD_VOICE_REBUILD=1
   NEEDS_BROWSER_REBUILD=1
   NEEDS_BROWSER_REINSTALL=1
   apply_update "$LOCAL"
@@ -386,6 +402,7 @@ NEEDS_COMPUTER_REBUILD=0
 NEEDS_RENDERER_REBUILD=0
 NEEDS_FETCH_REBUILD=0
 NEEDS_WA_SIDECAR_REBUILD=0
+NEEDS_DISCORD_VOICE_REBUILD=0
 NEEDS_BROWSER_REBUILD=0
 NEEDS_BROWSER_REINSTALL=0
 if printf '%s\n' "$CHANGED_FILES" | grep -qE '^(sidecars/browser/|scripts/start-sidecar\.py$|crates/augmentagent-browser-client/src/lib\.rs$|crates/augmentagent-cli/src/installers\.rs$)'; then
@@ -402,6 +419,9 @@ if printf '%s\n' "$CHANGED_FILES" | grep -qE '^(sidecars/fetch/|scripts/start-si
 fi
 if printf '%s\n' "$CHANGED_FILES" | grep -q '^sidecars/wa-sidecar/'; then
   NEEDS_WA_SIDECAR_REBUILD=1
+fi
+if printf '%s\n' "$CHANGED_FILES" | grep -qE '^(sidecars/discord-voice/|scripts/start-sidecar\.py$)'; then
+  NEEDS_DISCORD_VOICE_REBUILD=1
 fi
 if printf '%s\n' "$CHANGED_FILES" | grep -qE '^(sidecars/computer-use/|systemd/augmentagent-computer-use.service$)'; then
   NEEDS_COMPUTER_REBUILD=1
