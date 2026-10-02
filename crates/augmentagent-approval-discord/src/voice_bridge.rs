@@ -162,6 +162,9 @@ impl VoiceBridge {
         };
         let channel = ChannelId::new(binding.text_channel_id.parse()?);
         let mirror = format!("🔊 **Agent** (`{turn_id}/{utterance_id}`): {text}");
+        // Raw chunking: a spoken-utterance mirror is a transcript of what was
+        // said, not a deliverable to copy, and the `🔊 **Agent**` prefix would
+        // be stranded in its own message by a fence-aware split (#1373).
         for chunk in crate::event_handler::chunk_for_discord(&mirror) {
             channel
                 .send_message(&handler.http, CreateMessage::new().content(chunk))
@@ -648,6 +651,8 @@ impl VoiceBridge {
         let mirror = format!("🎙️ **You:** {transcript}");
         let mirror_http = Arc::clone(&handler.http);
         let mirror_task = tokio::spawn(async move {
+            // Raw chunking: see the `speak` mirror above — this is the user's
+            // own transcript, prefixed, not a deliverable (#1373).
             for chunk in crate::event_handler::chunk_for_discord(&mirror) {
                 if let Err(error) = channel
                     .send_message(&mirror_http, CreateMessage::new().content(chunk))
@@ -689,7 +694,7 @@ impl VoiceBridge {
                 // Preserve visible transcript-before-reply order without
                 // making Discord REST latency delay native work or audio.
                 let _ = mirror_task.await;
-                for chunk in crate::event_handler::chunk_for_discord(&answer) {
+                for chunk in crate::event_handler::messages_for_discord(&answer) {
                     if let Err(error) = channel
                         .send_message(&handler.http, CreateMessage::new().content(chunk))
                         .await

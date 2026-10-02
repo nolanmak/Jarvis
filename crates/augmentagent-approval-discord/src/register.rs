@@ -148,7 +148,9 @@ pub fn is_owner_override_receipt(line: &str) -> bool {
     parse_receipt(line).is_some() && line.to_ascii_lowercase().contains("(you asked)")
 }
 
-fn is_fence(line: &str) -> bool {
+/// True when `line` opens or closes a markdown code fence. A ``` that only
+/// appears mid-line does not count, so prose mentioning backticks is safe.
+pub(crate) fn is_fence(line: &str) -> bool {
     line.trim_start().starts_with("```")
 }
 

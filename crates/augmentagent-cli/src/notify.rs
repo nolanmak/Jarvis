@@ -995,6 +995,9 @@ impl NotificationSink for DiscordChannelSink {
 
     async fn deliver(&self, n: &ResolvedNotice, _now_ms: i64) -> anyhow::Result<Delivered> {
         use serenity::all::CreateMessage;
+        // Raw chunking: a notice is a single alert, not a drafted deliverable,
+        // and splitting one into extra messages would only widen the
+        // partial-delivery surface for no copy benefit (#1373).
         for chunk in augmentagent_approval_discord::chunk_for_discord(&n.body) {
             self.channel
                 .send_message(&*self.http, CreateMessage::new().content(chunk))

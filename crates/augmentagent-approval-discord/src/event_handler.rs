@@ -480,7 +480,7 @@ impl EventHandler for Handler {
                     &http,
                     channel_id,
                     msg_id,
-                    chunk_for_discord(&reply),
+                    messages_for_discord(&reply),
                     Vec::new(),
                     "journal command reply",
                 )
@@ -505,7 +505,7 @@ impl EventHandler for Handler {
             let msg_id = msg.id;
             tokio::spawn(async move {
                 let reply = crate::process_loops::handle(&text, allowlist_active).await;
-                for chunk in chunk_for_discord(&reply) {
+                for chunk in messages_for_discord(&reply) {
                     let builder = CreateMessage::new()
                         .content(chunk)
                         .reference_message(MessageReference::from((channel_id, msg_id)));
@@ -551,7 +551,7 @@ impl EventHandler for Handler {
                 &ctx.http,
                 msg.channel_id,
                 msg.id,
-                chunk_for_discord(&reply),
+                messages_for_discord(&reply),
                 Vec::new(),
                 "loop command reply",
             )
@@ -649,7 +649,7 @@ impl EventHandler for Handler {
                         &http,
                         channel_id,
                         msg_id,
-                        chunk_for_discord(&answer),
+                        messages_for_discord(&answer),
                         attachments,
                         "wiki answer chunk",
                     )
@@ -2621,6 +2621,123 @@ pub fn chunk_for_discord(full: &str) -> Vec<String> {
     chunks
 }
 
+/// #1373 — split an outbound reply into Discord messages at fenced-block
+/// boundaries, then chunk each piece as before.
+///
+/// A drafted deliverable arrives as a fenced block sitting under a
+/// `register:` receipt line, with `⚠️` notes appended after it. Delivered as
+/// one message, Discord's per-message copy hands back the receipt and notes
+/// along with the draft, so the owner has to trim by hand. Isolating every
+/// fence in its own message makes the clean copy structural instead of
+/// depending on the model formatting its reply correctly.
+///
+/// The guarantee is that some posted message holds the draft and nothing
+/// else — not that a reply always becomes two or more messages. A reply that
+/// is only a fence already meets it unsplit.
+///
+/// Replies with no fence are passed straight through to
+/// [`chunk_for_discord`], so ordinary text delivers byte-identically.
+///
+/// Every outbound poster that can carry a drafted deliverable calls this; the
+/// remaining raw [`chunk_for_discord`] callers are enumerated and justified by
+/// `raw_chunk_for_discord_has_only_the_known_non_draft_callers`, which fails
+/// if a new one appears.
+pub fn messages_for_discord(full: &str) -> Vec<String> {
+    if !full.lines().any(crate::register::is_fence) {
+        return chunk_for_discord(full);
+    }
+    let mut out = Vec::new();
+    let mut prose = String::new();
+    // Markdown fences don't nest: the next fence line always closes the open
+    // one, so this toggles rather than recursing.
+    let mut open: Option<(String, String)> = None;
+    for line in full.lines() {
+        let fencing = crate::register::is_fence(line);
+        if let Some((opener, body)) = open.as_mut() {
+            if fencing {
+                push_fence_messages(opener, body, line, &mut out);
+                open = None;
+            } else {
+                body.push_str(line);
+                body.push('\n');
+            }
+        } else if fencing {
+            flush_prose_messages(&mut prose, &mut out);
+            open = Some((line.to_string(), String::new()));
+        } else {
+            prose.push_str(line);
+            prose.push('\n');
+        }
+    }
+    if let Some((opener, body)) = open.take() {
+        // Unterminated opener: synthesize the closer so no message ever ships
+        // an odd number of fence lines.
+        push_fence_messages(&opener, &body, "```", &mut out);
+    }
+    flush_prose_messages(&mut prose, &mut out);
+    out
+}
+
+fn flush_prose_messages(prose: &mut String, out: &mut Vec<String>) {
+    let segment = prose.trim().to_string();
+    prose.clear();
+    if segment.is_empty() {
+        return;
+    }
+    out.extend(chunk_for_discord(&segment));
+}
+
+/// Smallest body a repeated opener may leave room for. Below this, the
+/// opener is too long to carry and a bare fence is used instead.
+const MIN_FENCE_BODY_BUDGET: usize = 64;
+
+/// Emit one fence as its own message, re-wrapping each piece in a fence of
+/// its own (keeping the original opener's language tag where it fits) when
+/// the contents don't fit a single message. Every message this pushes carries
+/// an even number of fence lines.
+fn push_fence_messages(opener: &str, body: &str, closer: &str, out: &mut Vec<String>) {
+    let whole = format!("{opener}\n{body}{closer}");
+    if whole.len() <= DISCORD_MSG_LIMIT {
+        out.push(whole);
+        return;
+    }
+    // Every piece below repeats the opener and closer, so a pathological pair
+    // (a model emitting a multi-hundred-char language tag) would leave no room
+    // for the body. Re-wrap the pieces in a bare fence instead of handing the
+    // text to the plain chunker: the chunker splits on length alone and would
+    // strand an opener and its closer in different messages, breaking both
+    // Discord's rendering and the one-click copy this exists for. The dropped
+    // language tag is only syntax highlighting.
+    let (opener, closer) = match DISCORD_MSG_LIMIT
+        .checked_sub(opener.len() + closer.len() + 2)
+        .filter(|budget| *budget >= MIN_FENCE_BODY_BUDGET)
+    {
+        Some(_) => (opener, closer),
+        None => ("```", "```"),
+    };
+    let budget = DISCORD_MSG_LIMIT - (opener.len() + closer.len() + 2);
+    let mut piece = String::new();
+    for line in body.lines() {
+        if !piece.is_empty() && piece.len() + line.len() + 1 > budget {
+            out.push(format!("{opener}\n{piece}{closer}"));
+            piece.clear();
+        }
+        if line.len() + 1 > budget {
+            // A single line longer than the budget has no line boundary to
+            // split on; fall back to the char-boundary-safe splitter.
+            for part in hard_split(line, budget - 1) {
+                out.push(format!("{opener}\n{part}\n{closer}"));
+            }
+            continue;
+        }
+        piece.push_str(line);
+        piece.push('\n');
+    }
+    if !piece.is_empty() {
+        out.push(format!("{opener}\n{piece}{closer}"));
+    }
+}
+
 fn hard_split(s: &str, max: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut buf = String::with_capacity(max);
@@ -3263,6 +3380,207 @@ mod tests {
                 message: "too soon".into()
             }
         ));
+    }
+
+    fn fence_line_count(msg: &str) -> usize {
+        msg.lines().filter(|l| crate::register::is_fence(l)).count()
+    }
+
+    #[test]
+    fn draft_fence_is_posted_as_its_own_message() {
+        let answer = "Here's the post draft.\n\
+             register: friendly (matches thread)\n\
+             ```\n\
+             Shipping day. Three months of work, one button.\n\
+             Thanks to everyone who kicked the tires.\n\
+             ```\n\
+             \u{26a0}\u{fe0f} draft tone reads warmer than the receipt claims";
+        let msgs = messages_for_discord(answer);
+        assert!(msgs.len() >= 2, "expected a split, got {msgs:?}");
+
+        // The issue's ask: one message whose copy is the draft and nothing
+        // else. Discord's per-message copy strips the wrapping fence, so the
+        // copied text is exactly this message's fence body.
+        let fence_msg = msgs
+            .iter()
+            .find(|m| fence_line_count(m) > 0)
+            .expect("a message carrying the fence");
+        assert_eq!(
+            fence_msg,
+            "```\nShipping day. Three months of work, one button.\n\
+             Thanks to everyone who kicked the tires.\n```"
+        );
+
+        let others: String = msgs
+            .iter()
+            .filter(|m| fence_line_count(m) == 0)
+            .cloned()
+            .collect();
+        assert!(others.contains("register: friendly (matches thread)"));
+        assert!(others.contains("Here's the post draft."));
+        assert!(others.contains("warmer than the receipt claims"));
+    }
+
+    #[test]
+    fn fenced_draft_over_the_limit_stays_balanced_in_every_piece() {
+        let body: String = (0..120)
+            .map(|i| format!("line {i} {}\n\n", "y".repeat(30)))
+            .collect();
+        let answer = format!("lead-in\n```text\n{body}```");
+        let msgs = messages_for_discord(&answer);
+        let mut rejoined = String::new();
+        for m in &msgs {
+            assert_eq!(fence_line_count(m) % 2, 0, "unbalanced message: {m:?}");
+            assert!(
+                m.len() <= DISCORD_MSG_LIMIT,
+                "message too long: {}",
+                m.len()
+            );
+            if let Some(inner) = m.strip_prefix("```text\n").and_then(|r| r.strip_suffix("```")) {
+                rejoined.push_str(inner);
+            }
+        }
+        assert_eq!(rejoined, body);
+    }
+
+    #[test]
+    fn answer_without_a_fence_is_chunked_exactly_as_before() {
+        let para = "a".repeat(1000);
+        for input in [
+            "hi there".to_string(),
+            format!("{para}\n\n{para}\n\n{para}"),
+            "x".repeat(5000),
+        ] {
+            assert_eq!(messages_for_discord(&input), chunk_for_discord(&input));
+        }
+    }
+
+    #[test]
+    fn inline_backticks_in_prose_do_not_open_a_fence() {
+        let answer = "wrap it in ``` to fence\n```\ndraft\n```";
+        let msgs = messages_for_discord(answer);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0], "wrap it in ``` to fence");
+        assert_eq!(msgs[1], "```\ndraft\n```");
+    }
+
+    #[test]
+    fn two_fences_each_get_their_own_message() {
+        let answer = "option A\n```\nfirst draft\n```\noption B\n```\nsecond draft\n```";
+        let msgs = messages_for_discord(answer);
+        assert_eq!(
+            msgs,
+            vec![
+                "option A".to_string(),
+                "```\nfirst draft\n```".to_string(),
+                "option B".to_string(),
+                "```\nsecond draft\n```".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unterminated_fence_is_closed() {
+        let msgs = messages_for_discord("here you go\n```\ndraft text");
+        assert_eq!(msgs, vec!["here you go".to_string(), "```\ndraft text\n```".to_string()]);
+        for m in &msgs {
+            assert_eq!(fence_line_count(m) % 2, 0);
+        }
+    }
+
+    // The invariant this function owes the owner is "some posted message
+    // contains the draft and nothing else", not "the reply always becomes two
+    // or more messages". A fence-only reply already satisfies it with one
+    // message: copying that message yields exactly the draft. Splitting it
+    // anyway could only add an empty companion message.
+    #[test]
+    fn reply_that_is_only_a_fence_is_one_message_that_copies_to_the_draft_alone() {
+        let msgs = messages_for_discord("```\ndraft text\n```");
+        assert_eq!(msgs, vec!["```\ndraft text\n```".to_string()]);
+    }
+
+    /// Criterion 2 of #1373 is "every poster that can carry a drafted
+    /// deliverable splits on fences". That is a property of the whole
+    /// workspace, not of this file, so assert it here rather than leaving it
+    /// to a reviewer to re-inventory by hand on each change. A new
+    /// `chunk_for_discord` caller fails this test and has to either switch to
+    /// `messages_for_discord` or justify itself by joining `EXEMPT`.
+    #[test]
+    fn raw_chunk_for_discord_has_only_the_known_non_draft_callers() {
+        // Spoken-utterance mirrors: transcripts of speech, not deliverables,
+        // and their `🔊`/`🎙️` prefix would be stranded in its own message.
+        // Notices: single alerts; extra messages would only widen the
+        // partial-delivery surface.
+        const EXEMPT: [&str; 3] = [
+            "augmentagent-approval-discord/src/event_handler.rs",
+            "augmentagent-approval-discord/src/voice_bridge.rs",
+            "augmentagent-cli/src/notify.rs",
+        ];
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let mut offenders = Vec::new();
+        let mut stack = vec![crates.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|name| name != "target") {
+                        stack.push(path);
+                    }
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let relative = path.strip_prefix(crates).unwrap().to_string_lossy().into_owned();
+                if EXEMPT.contains(&relative.as_str()) {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                for (n, line) in source.lines().enumerate() {
+                    // Outside the exempt files the only occurrences with a
+                    // paren are calls: the definition and the `pub use`
+                    // re-export both live in this crate's exempt files, and
+                    // prose/doc references to the name carry no paren.
+                    if line.contains("chunk_for_discord(") {
+                        offenders.push(format!("{relative}:{}: {}", n + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "post drafted deliverables via messages_for_discord (#1373): {offenders:#?}"
+        );
+    }
+
+    #[test]
+    fn pathologically_long_fence_opener_stays_balanced_and_within_the_limit() {
+        let opener = format!("```{}", "lang".repeat(600));
+        let body: String = (0..200).map(|i| format!("draft line {i}\n")).collect();
+        let msgs = messages_for_discord(&format!("lead-in\n{opener}\n{body}```"));
+        assert!(msgs.len() > 2, "expected the body to split: {}", msgs.len());
+        let mut rejoined = String::new();
+        for m in &msgs {
+            assert_eq!(fence_line_count(m) % 2, 0, "unbalanced message: {m:?}");
+            assert!(
+                m.len() <= DISCORD_MSG_LIMIT,
+                "message too long: {}",
+                m.len()
+            );
+            if let Some(inner) = m.strip_prefix("```\n").and_then(|r| r.strip_suffix("```")) {
+                rejoined.push_str(inner);
+            }
+        }
+        // The unusable language tag is dropped, but every piece is still a
+        // self-contained fence and the draft survives intact.
+        assert_eq!(rejoined, body);
+    }
+
+    #[test]
+    fn empty_fence_does_not_produce_an_empty_message() {
+        for m in messages_for_discord("note\n```\n```") {
+            assert!(!m.trim().is_empty());
+        }
     }
 
     #[test]

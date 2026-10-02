@@ -8271,7 +8271,9 @@ async fn run_wiki_ask(cli: &Cli, question: String, post: bool) -> Result<()> {
 
         let (text, attachments) = prepare_answer_delivery(&answer, Some(&wiki_root)).await;
         let n_files = attachments.len();
-        let chunks = augmentagent_approval_discord::chunk_for_discord(&text);
+        // #1373 — same answer shape as the daemon's query path, so it must
+        // split on fences identically or the two posters disagree.
+        let chunks = augmentagent_approval_discord::messages_for_discord(&text);
         let total = chunks.len();
         for (idx, chunk) in chunks.into_iter().enumerate() {
             let mut builder = CreateMessage::new().content(chunk);
@@ -11834,7 +11836,7 @@ impl LoopPoster for DiscordLoopPoster {
             .parse()
             .with_context(|| format!("loop channel_ref not a u64: {channel_ref}"))?;
         let channel = ChannelId::new(cid);
-        for chunk in augmentagent_approval_discord::chunk_for_discord(body) {
+        for chunk in augmentagent_approval_discord::messages_for_discord(body) {
             channel
                 .send_message(&*self.http, CreateMessage::new().content(chunk))
                 .await
@@ -11858,7 +11860,10 @@ impl LoopPoster for DiscordLoopPoster {
             .parse()
             .with_context(|| format!("loop channel_ref not a u64: {channel_ref}"))?;
         let channel = ChannelId::new(cid);
-        let chunks = augmentagent_approval_discord::chunk_for_discord(body);
+        // #1373 — fence-aware split. A nag body's fenced draft gets its own
+        // message; the buttons still ride the last message, which after a
+        // split is the trailing prose rather than the draft.
+        let chunks = augmentagent_approval_discord::messages_for_discord(body);
         let last = chunks.len().saturating_sub(1);
         for (i, chunk) in chunks.into_iter().enumerate() {
             let mut msg = CreateMessage::new().content(chunk);
