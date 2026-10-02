@@ -2633,17 +2633,20 @@ pub fn chunk_for_discord(full: &str) -> Vec<String> {
 ///
 /// The guarantee is that some posted message holds the draft and nothing
 /// else — not that a reply always becomes two or more messages. A reply that
-/// is only a fence already meets it unsplit.
+/// is only a fence already meets it unsplit; forcing a second message there
+/// could only add an empty one, so #1373's "always two messages" wording is
+/// read as the copy guarantee it exists to describe.
 ///
 /// Replies with no fence are passed straight through to
 /// [`chunk_for_discord`], so ordinary text delivers byte-identically.
 ///
-/// Every outbound poster that can carry a drafted deliverable calls this; the
-/// remaining raw [`chunk_for_discord`] callers are enumerated and justified by
-/// `raw_chunk_for_discord_has_only_the_known_non_draft_callers`, which fails
-/// if a new one appears.
+/// Every outbound poster that can carry a drafted deliverable calls this;
+/// `raw_chunk_for_discord_has_only_the_known_non_draft_callers` fails on any
+/// raw [`chunk_for_discord`] call site that lacks a `raw-chunk-ok` rationale.
 pub fn messages_for_discord(full: &str) -> Vec<String> {
     if !full.lines().any(crate::register::is_fence) {
+        // raw-chunk-ok: no fence means no draft to isolate; delegate so
+        // fence-free replies deliver byte-identically to before.
         return chunk_for_discord(full);
     }
     let mut out = Vec::new();
@@ -2684,6 +2687,7 @@ fn flush_prose_messages(prose: &mut String, out: &mut Vec<String>) {
     if segment.is_empty() {
         return;
     }
+    // raw-chunk-ok: prose outside every fence, draft text already removed.
     out.extend(chunk_for_discord(&segment));
 }
 
@@ -2702,10 +2706,10 @@ const MIN_FENCE_BODY_BUDGET: usize = 64;
 /// makes: no arrangement of messages can hold a 3000-character draft in one
 /// copyable message. What the split still buys at that size is that the
 /// pieces contain draft text *only* — the receipt line and `⚠️` notes are
-/// never mixed in — so the pieces concatenate to the draft with nothing to
-/// trim. Delivering an over-limit draft as a single copyable unit needs a
-/// file attachment rather than message text (see `attachments.rs`); that is
-/// a separate delivery path and out of scope here.
+/// never mixed in — so the pieces concatenate back to the draft byte for
+/// byte, with nothing to trim. Delivering an over-limit draft as a single
+/// copyable unit needs a file attachment rather than message text (see
+/// `attachments.rs`); that is a separate delivery path and out of scope here.
 fn push_fence_messages(opener: &str, body: &str, closer: &str, out: &mut Vec<String>) {
     let pushed_before = out.len();
     let whole = format!("{opener}\n{body}{closer}");
@@ -2736,10 +2740,17 @@ fn push_fence_messages(opener: &str, body: &str, closer: &str, out: &mut Vec<Str
         }
         if line.len() + 1 > budget {
             // A single line longer than the budget has no line boundary to
-            // split on; fall back to the char-boundary-safe splitter.
-            for part in hard_split(line, budget - 1) {
-                out.push(format!("{opener}\n{part}\n{closer}"));
-            }
+            // split on, so the char-boundary-safe splitter cuts it mid-line.
+            // A closing fence has to sit on its own line, so fencing a
+            // mid-line fragment would append a newline the draft never had
+            // and the owner would paste a broken URL or token. The fragments
+            // before the last one therefore ship unfenced — a bare message
+            // copies back verbatim — and only the final fragment is fenced,
+            // where the newline its closer contributes is the line's own.
+            let mut parts = hard_split(line, budget - 1);
+            let tail = parts.pop().unwrap_or_default();
+            out.extend(parts);
+            out.push(format!("{opener}\n{tail}\n{closer}"));
             continue;
         }
         piece.push_str(line);
@@ -3473,6 +3484,32 @@ mod tests {
         assert_eq!(rejoined, body);
     }
 
+    /// A draft that is one uninterrupted over-budget line — a long URL or a
+    /// generated token — has no line boundary to cut on, so the pieces are
+    /// cut mid-line. Joining them back must reproduce the draft exactly: an
+    /// invented newline at each cut would corrupt the text the owner pastes.
+    #[test]
+    fn over_budget_single_line_draft_rejoins_without_invented_newlines() {
+        let body = format!("https://example.com/d/{}", "a".repeat(3000));
+        let msgs = messages_for_discord(&format!("register: terse\n```\n{body}\n```\nnote"));
+        assert!(msgs.len() > 3, "expected the line to split: {}", msgs.len());
+        assert_eq!(msgs.first().unwrap(), "register: terse");
+        assert_eq!(msgs.last().unwrap(), "note");
+        let rejoined: String = msgs[1..msgs.len() - 1]
+            .iter()
+            .map(|m| {
+                m.strip_prefix("```\n")
+                    .and_then(|r| r.strip_suffix("\n```"))
+                    .unwrap_or(m)
+            })
+            .collect();
+        assert_eq!(rejoined, body);
+        for m in &msgs {
+            assert!(m.len() <= DISCORD_MSG_LIMIT);
+            assert_eq!(fence_line_count(m) % 2, 0, "unbalanced message: {m:?}");
+        }
+    }
+
     /// The shape from #1373 as reported: a receipt line, the fenced draft,
     /// and a trailing `⚠️` note, all in one reply. Copying the posted message
     /// used to hand back the receipt and the note along with the draft. One
@@ -3555,18 +3592,15 @@ mod tests {
     /// workspace, not of this file, so assert it here rather than leaving it
     /// to a reviewer to re-inventory by hand on each change. A new
     /// `chunk_for_discord` caller fails this test and has to either switch to
-    /// `messages_for_discord` or justify itself by joining `EXEMPT`.
+    /// `messages_for_discord` or carry a `raw-chunk-ok` rationale comment
+    /// within the few lines above it. The exemption is per call site rather
+    /// than per file so that the live delivery code in this very file is
+    /// audited too.
     #[test]
     fn raw_chunk_for_discord_has_only_the_known_non_draft_callers() {
-        // Spoken-utterance mirrors: transcripts of speech, not deliverables,
-        // and their `🔊`/`🎙️` prefix would be stranded in its own message.
-        // Notices: single alerts; extra messages would only widen the
-        // partial-delivery surface.
-        const EXEMPT: [&str; 3] = [
-            "augmentagent-approval-discord/src/event_handler.rs",
-            "augmentagent-approval-discord/src/voice_bridge.rs",
-            "augmentagent-cli/src/notify.rs",
-        ];
+        const MARKER: &str = "raw-chunk-ok";
+        /// How far above a call site the rationale comment may sit.
+        const LOOKBACK: usize = 10;
         let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let mut offenders = Vec::new();
         let mut stack = vec![crates.to_path_buf()];
@@ -3582,17 +3616,24 @@ mod tests {
                 if path.extension().is_none_or(|ext| ext != "rs") {
                     continue;
                 }
-                let relative = path.strip_prefix(crates).unwrap().to_string_lossy().into_owned();
-                if EXEMPT.contains(&relative.as_str()) {
-                    continue;
-                }
                 let source = std::fs::read_to_string(&path).unwrap();
-                for (n, line) in source.lines().enumerate() {
-                    // Outside the exempt files the only occurrences with a
-                    // paren are calls: the definition and the `pub use`
-                    // re-export both live in this crate's exempt files, and
-                    // prose/doc references to the name carry no paren.
-                    if line.contains("chunk_for_discord(") {
+                // Unit tests exercise the raw chunker directly by design, so
+                // audit production code only.
+                let lines: Vec<&str> = source
+                    .lines()
+                    .take_while(|line| line.trim_start() != "mod tests {")
+                    .collect();
+                let relative = path.strip_prefix(crates).unwrap().to_string_lossy().into_owned();
+                for (n, line) in lines.iter().enumerate() {
+                    // Only occurrences with a paren are calls or the
+                    // definition; prose and doc references carry no paren.
+                    if !line.contains("chunk_for_discord(") || line.contains("pub fn ") {
+                        continue;
+                    }
+                    let justified = lines[n.saturating_sub(LOOKBACK)..=n]
+                        .iter()
+                        .any(|above| above.contains(MARKER));
+                    if !justified {
                         offenders.push(format!("{relative}:{}: {}", n + 1, line.trim()));
                     }
                 }
@@ -3600,7 +3641,8 @@ mod tests {
         }
         assert!(
             offenders.is_empty(),
-            "post drafted deliverables via messages_for_discord (#1373): {offenders:#?}"
+            "post drafted deliverables via messages_for_discord, or mark the \
+             call site `raw-chunk-ok` with a rationale (#1373): {offenders:#?}"
         );
     }
 
