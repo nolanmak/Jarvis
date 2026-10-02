@@ -2631,11 +2631,11 @@ pub fn chunk_for_discord(full: &str) -> Vec<String> {
 /// fence in its own message makes the clean copy structural instead of
 /// depending on the model formatting its reply correctly.
 ///
-/// The guarantee is that some posted message holds the draft and nothing
-/// else — not that a reply always becomes two or more messages. A reply that
-/// is only a fence already meets it unsplit; forcing a second message there
-/// could only add an empty one, so #1373's "always two messages" wording is
-/// read as the copy guarantee it exists to describe.
+/// A fenced reply always lands as two or more messages. When the reply is
+/// nothing but the fence there is no surrounding prose to be the second one,
+/// so [`DRAFT_LEAD_IN`] is posted ahead of it: the draft message still holds
+/// the draft and nothing else, and the owner sees the same "the next message
+/// is the thing to copy" shape as for a reply that did carry a receipt.
 ///
 /// Replies with no fence are passed straight through to
 /// [`chunk_for_discord`], so ordinary text delivers byte-identically.
@@ -2678,8 +2678,20 @@ pub fn messages_for_discord(full: &str) -> Vec<String> {
         push_fence_messages(&opener, &body, "```", &mut out);
     }
     flush_prose_messages(&mut prose, &mut out);
+    if out.len() == 1 {
+        // The whole reply was one fence, so nothing above or below it became a
+        // message of its own. Prepend the lead-in rather than returning a lone
+        // message: #1373 asks for a fenced reply to arrive as the draft plus at
+        // least one companion message, so the owner never has to judge whether
+        // the message they are copying also carries prose.
+        out.insert(0, DRAFT_LEAD_IN.to_string());
+    }
     out
 }
+
+/// Companion message for a reply that is nothing but a fenced draft, so the
+/// draft still arrives as a message of its own (#1373).
+const DRAFT_LEAD_IN: &str = "Draft below — copy the next message.";
 
 fn flush_prose_messages(prose: &mut String, out: &mut Vec<String>) {
     let segment = prose.trim().to_string();
@@ -3524,6 +3536,7 @@ mod tests {
              \u{26a0}\u{fe0f} guessed the meeting is the one on Friday";
         let draft = "```\nHi Dana \u{2014} thanks for the nudge. Friday works on my end;\nI'll send an agenda Thursday.\n```";
         let msgs = messages_for_discord(reply);
+        assert!(msgs.len() >= 2, "expected a split, got {msgs:?}");
         assert!(msgs.iter().any(|m| m == draft), "got {msgs:?}");
         // The receipt and the note are delivered, just not inside the draft.
         let rest = msgs.join("\n");
@@ -3576,15 +3589,33 @@ mod tests {
         }
     }
 
-    // The invariant this function owes the owner is "some posted message
-    // contains the draft and nothing else", not "the reply always becomes two
-    // or more messages". A fence-only reply already satisfies it with one
-    // message: copying that message yields exactly the draft. Splitting it
-    // anyway could only add an empty companion message.
+    /// A reply that is nothing but a fence has no surrounding prose to be the
+    /// companion message, so the lead-in becomes it: criterion 1's "two or
+    /// more messages" holds for every fenced reply, not just the ones that
+    /// happen to carry a receipt, and the draft message is still the draft
+    /// alone.
     #[test]
-    fn reply_that_is_only_a_fence_is_one_message_that_copies_to_the_draft_alone() {
+    fn reply_that_is_only_a_fence_gets_a_lead_in_so_the_draft_stands_alone() {
         let msgs = messages_for_discord("```\ndraft text\n```");
-        assert_eq!(msgs, vec!["```\ndraft text\n```".to_string()]);
+        assert_eq!(msgs, vec![DRAFT_LEAD_IN, "```\ndraft text\n```"]);
+    }
+
+    /// Criterion 1 is unconditional: a reply carrying a fence is two or more
+    /// messages, whatever surrounds the fence. The fence-only and empty-body
+    /// shapes are the ones that previously collapsed to one.
+    #[test]
+    fn every_fenced_reply_becomes_at_least_two_messages() {
+        for reply in [
+            "```\ndraft text\n```",
+            "```\n```",
+            "```text\nonly a tagged fence\n```",
+            "register: terse\n```\ndraft\n```",
+            "```\ndraft\n```\n\u{26a0}\u{fe0f} note",
+        ] {
+            let msgs = messages_for_discord(reply);
+            assert!(msgs.len() >= 2, "{reply:?} gave {msgs:?}");
+            assert!(!msgs.iter().any(|m| m.trim().is_empty()), "{msgs:?}");
+        }
     }
 
     /// Criterion 2 of #1373 is "every poster that can carry a drafted
