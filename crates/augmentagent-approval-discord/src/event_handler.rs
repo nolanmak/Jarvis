@@ -2695,7 +2695,19 @@ const MIN_FENCE_BODY_BUDGET: usize = 64;
 /// its own (keeping the original opener's language tag where it fits) when
 /// the contents don't fit a single message. Every message this pushes carries
 /// an even number of fence lines.
+///
+/// A fence whose contents exceed [`DISCORD_MSG_LIMIT`] necessarily spans
+/// several messages, so copying it back takes one click per piece. That is
+/// Discord's 2000-character per-message ceiling, not a choice this split
+/// makes: no arrangement of messages can hold a 3000-character draft in one
+/// copyable message. What the split still buys at that size is that the
+/// pieces contain draft text *only* — the receipt line and `⚠️` notes are
+/// never mixed in — so the pieces concatenate to the draft with nothing to
+/// trim. Delivering an over-limit draft as a single copyable unit needs a
+/// file attachment rather than message text (see `attachments.rs`); that is
+/// a separate delivery path and out of scope here.
 fn push_fence_messages(opener: &str, body: &str, closer: &str, out: &mut Vec<String>) {
+    let pushed_before = out.len();
     let whole = format!("{opener}\n{body}{closer}");
     if whole.len() <= DISCORD_MSG_LIMIT {
         out.push(whole);
@@ -2735,6 +2747,14 @@ fn push_fence_messages(opener: &str, body: &str, closer: &str, out: &mut Vec<Str
     }
     if !piece.is_empty() {
         out.push(format!("{opener}\n{piece}{closer}"));
+        return;
+    }
+    if out.len() == pushed_before {
+        // An over-limit opener (a pathological language tag) with an empty
+        // body leaves no piece to carry it, and every branch above is driven
+        // by body lines. Emit the balanced bare fence rather than returning
+        // nothing: dropping it silently would delete a fenced deliverable.
+        out.push("```\n```".to_string());
     }
 }
 
@@ -3421,12 +3441,18 @@ mod tests {
         assert!(others.contains("warmer than the receipt claims"));
     }
 
+    /// A draft longer than Discord's per-message ceiling cannot be one
+    /// copyable message at any granularity, so the guarantee degrades to: the
+    /// fenced pieces carry draft text and nothing else, and concatenating
+    /// them reproduces the draft byte-for-byte with nothing to hand-trim.
+    /// The receipt line and `⚠️` notes stay out of every fenced piece.
     #[test]
-    fn fenced_draft_over_the_limit_stays_balanced_in_every_piece() {
+    fn fenced_draft_over_the_limit_splits_into_draft_only_pieces() {
         let body: String = (0..120)
             .map(|i| format!("line {i} {}\n\n", "y".repeat(30)))
             .collect();
-        let answer = format!("lead-in\n```text\n{body}```");
+        let answer =
+            format!("lead-in\nregister: friendly\n```text\n{body}```\n\u{26a0}\u{fe0f} a note");
         let msgs = messages_for_discord(&answer);
         let mut rejoined = String::new();
         for m in &msgs {
@@ -3438,9 +3464,34 @@ mod tests {
             );
             if let Some(inner) = m.strip_prefix("```text\n").and_then(|r| r.strip_suffix("```")) {
                 rejoined.push_str(inner);
+                // No fenced piece carries the receipt or the note, so each
+                // one copies to draft text alone.
+                assert!(!inner.contains("register:"), "receipt leaked: {inner:?}");
+                assert!(!inner.contains('\u{26a0}'), "note leaked: {inner:?}");
             }
         }
         assert_eq!(rejoined, body);
+    }
+
+    /// The shape from #1373 as reported: a receipt line, the fenced draft,
+    /// and a trailing `⚠️` note, all in one reply. Copying the posted message
+    /// used to hand back the receipt and the note along with the draft. One
+    /// message must now copy to the draft and nothing else.
+    #[test]
+    fn reported_receipt_draft_and_note_reply_yields_a_draft_only_message() {
+        let reply = "register: friendly (matches thread)\n\
+             ```\n\
+             Hi Dana \u{2014} thanks for the nudge. Friday works on my end;\n\
+             I'll send an agenda Thursday.\n\
+             ```\n\
+             \u{26a0}\u{fe0f} guessed the meeting is the one on Friday";
+        let draft = "```\nHi Dana \u{2014} thanks for the nudge. Friday works on my end;\nI'll send an agenda Thursday.\n```";
+        let msgs = messages_for_discord(reply);
+        assert!(msgs.iter().any(|m| m == draft), "got {msgs:?}");
+        // The receipt and the note are delivered, just not inside the draft.
+        let rest = msgs.join("\n");
+        assert!(rest.contains("register: friendly (matches thread)"));
+        assert!(rest.contains("guessed the meeting is the one on Friday"));
     }
 
     #[test]
@@ -3576,10 +3627,29 @@ mod tests {
         assert_eq!(rejoined, body);
     }
 
+    // Criterion 1 for an empty fence: the fence is still delivered as its own
+    // standalone message, separate from the prose, rather than collapsing to
+    // just `note`. Asserted exactly, because a weaker "no empty message"
+    // check passes even if the fence is dropped entirely.
     #[test]
-    fn empty_fence_does_not_produce_an_empty_message() {
-        for m in messages_for_discord("note\n```\n```") {
-            assert!(!m.trim().is_empty());
+    fn empty_fence_is_still_its_own_message_beside_the_prose() {
+        assert_eq!(
+            messages_for_discord("note\n```\n```"),
+            vec!["note".to_string(), "```\n```".to_string()],
+        );
+    }
+
+    /// An over-limit opener with an empty body hits none of the body-driven
+    /// emit paths, so the fence used to vanish from the output entirely —
+    /// a silently dropped deliverable.
+    #[test]
+    fn over_limit_opener_with_an_empty_body_still_emits_a_balanced_fence() {
+        let opener = format!("```{}", "lang".repeat(600));
+        let msgs = messages_for_discord(&format!("note\n{opener}\n```"));
+        assert_eq!(msgs, vec!["note".to_string(), "```\n```".to_string()]);
+        for m in &msgs {
+            assert!(m.len() <= DISCORD_MSG_LIMIT);
+            assert_eq!(fence_line_count(m) % 2, 0);
         }
     }
 
