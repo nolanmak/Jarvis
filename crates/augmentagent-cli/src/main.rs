@@ -6658,6 +6658,46 @@ fn social_card_row(
     }
 }
 
+/// #1376 — refuse to raise a card the Approve button could never fulfil.
+///
+/// Approve dispatches through the same platform client the pollers use, so a
+/// `--post` run on a box with no LinkedIn cookies / no SocialAPI.ai key
+/// produces a card whose every button errors: the operator is left copying
+/// the draft into the platform by hand, which is the friction the card exists
+/// to remove. Checking send-readiness before any row is written turns that
+/// into a non-zero exit naming the setup step instead.
+///
+/// Fail-closed on anything else: a card is only worth raising when this
+/// function can vouch for the Approve dispatch behind it, and a platform it
+/// has never heard of is exactly the case it cannot. Adding a fifth `--post`
+/// shape therefore means adding its readiness check here, which is the same
+/// review step that keeps its Approve arm above the Gmail guard.
+fn social_send_preflight(store: &Store, platform: &str) -> Result<()> {
+    match platform {
+        augmentagent_channel_linkedin::inbound::PLATFORM => {
+            let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            anyhow::ensure!(
+                load_linkedin_client(&repo_root).is_some(),
+                "LinkedIn is not configured (no cookies); run `linkedin login` \
+                 before --post, or drop --post for a draft only"
+            );
+        }
+        augmentagent_channel_socialapi::PLATFORM => {
+            anyhow::ensure!(
+                load_socialapi_client(store).is_some(),
+                "SocialAPI.ai is not configured (no SOCIALAPI_API_KEY); run \
+                 `setup oauth --provider socialapi` before --post, or drop \
+                 --post for a draft only"
+            );
+        }
+        other => anyhow::bail!(
+            "{other} has no --post send path; the Approve button on such a \
+             card could not dispatch"
+        ),
+    }
+    Ok(())
+}
+
 /// Raise a Discord approval card for an operator-initiated social draft
 /// (#571 / #572).
 ///
@@ -6697,6 +6737,10 @@ async fn post_social_approval_card(
         !thread_id.trim().is_empty(),
         "a send target is required: Approve routes on the email's thread id"
     );
+    // Before any row is written: a refused --post must leave no `emails` row
+    // and no `pending` action behind, or the nudge scheduler later promotes
+    // the orphan into a surprise card for a draft that still cannot send.
+    social_send_preflight(store, platform)?;
 
     let token = std::env::var("DISCORD_BOT_TOKEN")
         .context("DISCORD_BOT_TOKEN required for --post (set it in the daemon's .env)")?;
@@ -13144,6 +13188,15 @@ impl ReplyApprover {
         if is_linkedin_email(&action.email) {
             return self.approve_linkedin(action_id, action).await;
         }
+        // #1376 — Gmail-only from here down, and the arms above are the whole
+        // fix: `log_action` writes no `draftId`, so EVERY `--post` card row
+        // reaches this guard with `None` and reported "no draftId on action;
+        // cannot send". Each social arm above dispatches on `platform`/`kind`
+        // alone, so none of them can fall here. The ladder order is the
+        // invariant — a social platform added below this guard instead of
+        // above it reproduces #1376 exactly, which is why
+        // `approve_on_a_carded_social_row_never_needs_a_gmail_draft_id`
+        // asserts the `None` precondition rather than assuming it.
         let Some(draft_id) = action.draft_id.as_deref() else {
             return ApprovalActionOutcome::Failed {
                 message: "no draftId on action; cannot send".into(),
@@ -21103,6 +21156,54 @@ mod linkedin_composed_card_dispatch_tests {
         }
     }
 
+    /// #1376 verbatim: Approve on a `linkedin dm --post` card reported
+    /// "no draftId on action; cannot send".
+    ///
+    /// The precondition is asserted, not assumed: `log_action` has no
+    /// `draftId` column in its INSERT, so EVERY carded social row loads with
+    /// `draft_id = None`. The Gmail arm's first guard is exactly that field,
+    /// which is why a mis-ordered ladder produces the reported message rather
+    /// than something platform-shaped. Approve must therefore route on
+    /// `platform`/`kind` alone and never read a Gmail draft id or an account
+    /// entity id — proven here by driving the production `run_approve` over
+    /// every production card shape and requiring a platform-client refusal.
+    #[tokio::test]
+    async fn approve_on_a_carded_social_row_never_needs_a_gmail_draft_id() {
+        for (label, email) in carded_rows() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = Arc::new(Store::open(tmp.path().join("data.db")).unwrap());
+            let approver = approver(Arc::clone(&store), &tmp);
+            let id = seed(&store, &email);
+
+            let loaded = store.get_action_with_email(&id).unwrap().unwrap();
+            assert_eq!(
+                loaded.draft_id, None,
+                "{label}: the #1376 precondition is gone; this test no longer reproduces it"
+            );
+            assert_eq!(
+                loaded.email.account_entity_id, None,
+                "{label}: carded rows carry no account entity id"
+            );
+
+            // The expected refusal names the platform client, so it can only
+            // come from approve_linkedin / approve_socialapi — the Gmail arm
+            // cannot reach a client at all without the two ids asserted away
+            // above.
+            let out = approver.run_approve(&id).await;
+            assert_not_gmail_fallthrough(label, "approve", &out);
+            assert!(
+                matches!(&out, ApprovalActionOutcome::Failed { message }
+                    if message.contains("is not configured")),
+                "{label}: approve must dispatch to the platform client, got {out:?}"
+            );
+            assert_eq!(
+                store.action_status_source(&id).unwrap(),
+                None,
+                "{label}: approve took the Gmail claim path"
+            );
+        }
+    }
+
     /// The reported bug verbatim: Revise on a `linkedin dm --post` card. It
     /// must reach `revise_linkedin` (which here fails only on the redraft
     /// call, there being no reasoner), never the Gmail entity-id guard.
@@ -21211,6 +21312,213 @@ mod linkedin_composed_card_dispatch_tests {
             ),
             other => panic!("expected the linkedin arm, got {other:?}"),
         }
+    }
+
+    /// Serializes the #1376 credential-env mutations so parallel tests don't
+    /// read each other's writes, in the style of `auto_expire_sweep_tests`.
+    static CRED_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const CRED_KEYS: [&str; 4] = [
+        augmentagent_auth::INSECURE_FILE_STORE_ENV,
+        "AUGMENTAGENT_LINKEDIN_AUTH",
+        augmentagent_channel_socialapi::ENV_VAR,
+        "DISCORD_BOT_TOKEN",
+    ];
+
+    struct NoCredentials {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        _dir: tempfile::TempDir,
+        prior: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl Drop for NoCredentials {
+        fn drop(&mut self) {
+            for (key, value) in &self.prior {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    /// Force "no credentials anywhere" for the life of the returned guard: an
+    /// empty plaintext credential dir in place of the platform vault, no
+    /// `SOCIALAPI_API_KEY`, a LinkedIn auth path that does not exist, and no
+    /// Discord token — so a card that got past the preflight fails on the
+    /// token lookup rather than reaching the network. Every write is restored
+    /// on drop, including an operator's real ambient key.
+    fn without_credentials() -> NoCredentials {
+        let guard = CRED_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = CRED_KEYS
+            .iter()
+            .map(|k| (*k, std::env::var_os(k)))
+            .collect();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var(augmentagent_auth::INSECURE_FILE_STORE_ENV, dir.path());
+        std::env::set_var(
+            "AUGMENTAGENT_LINKEDIN_AUTH",
+            dir.path().join("absent-linkedin-auth.json"),
+        );
+        std::env::remove_var(augmentagent_channel_socialapi::ENV_VAR);
+        std::env::remove_var("DISCORD_BOT_TOKEN");
+        NoCredentials { _guard: guard, _dir: dir, prior }
+    }
+
+    /// Run a `--post` through the production command entry point for the
+    /// `carded_rows()` shape with this label, plus the credential the
+    /// refusal must name. Keyed by the same labels so a fifth card shape
+    /// added to `carded_rows()` and not here fails the enumeration test.
+    async fn post_via_command(label: &str, store: Arc<Store>) -> Option<(Result<()>, &'static str)> {
+        let body = Some("a draft".to_string());
+        Some(match label {
+            "socialapi dm" => (
+                run_socialapi_dm(
+                    store, "conv_1".into(), None, None, None, body, None, None, true, false,
+                )
+                .await,
+                "SOCIALAPI_API_KEY",
+            ),
+            "socialapi comment" => (
+                run_socialapi_comment(
+                    store, "post_1".into(), "comment_1".into(), None, None, None, body, None,
+                    None, true, false,
+                )
+                .await,
+                "SOCIALAPI_API_KEY",
+            ),
+            "linkedin dm" => (
+                run_linkedin_dm(
+                    store, "urn:li:msg_conversation:abc".into(), None, body, None, None, true,
+                    false,
+                )
+                .await,
+                "linkedin login",
+            ),
+            "linkedin comment" => (
+                run_linkedin_comment(
+                    store, "urn:li:activity:7280000000000000000".into(), None, body, None, None,
+                    true, false,
+                )
+                .await,
+                "linkedin login",
+            ),
+            _ => return None,
+        })
+    }
+
+    fn row_counts(store: &Store) -> (i64, i64) {
+        store
+            .with_conn(|c| {
+                Ok((
+                    c.query_row("SELECT COUNT(*) FROM emails", [], |r| r.get(0))?,
+                    c.query_row("SELECT COUNT(*) FROM actions", [], |r| r.get(0))?,
+                ))
+            })
+            .unwrap()
+    }
+
+    /// The reported bug's closing clause: `linkedin dm --post` with no
+    /// cookies used to card anyway, leaving a row whose Approve could only
+    /// report "not configured". It must refuse instead, and write nothing.
+    #[tokio::test]
+    async fn a_composed_linkedin_dm_post_is_refused_when_linkedin_is_unconfigured() {
+        let _env = without_credentials();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(Store::open(tmp.path().join("data.db")).unwrap());
+
+        let err = run_linkedin_dm(
+            Arc::clone(&store),
+            "urn:li:msg_conversation:abc".into(),
+            None,
+            Some("a draft".into()),
+            None,
+            None,
+            true,
+            false,
+        )
+        .await
+        .expect_err("--post must refuse without cookies");
+        assert!(
+            err.to_string().contains("linkedin login"),
+            "the refusal must name the setup step, got {err:?}"
+        );
+        assert_eq!(row_counts(&store), (0, 0), "a refused --post must write nothing");
+    }
+
+    /// Enumeration: every carded shape is preflighted. A shape added to
+    /// `carded_rows()` without a `post_via_command` entry fails here.
+    #[tokio::test]
+    async fn every_carded_shape_is_preflighted_before_any_row_is_written() {
+        let _env = without_credentials();
+        for (label, _) in carded_rows() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = Arc::new(Store::open(tmp.path().join("data.db")).unwrap());
+            let (result, credential) = post_via_command(label, Arc::clone(&store))
+                .await
+                .unwrap_or_else(|| panic!("{label}: no --post entry point; is it preflighted?"));
+
+            let err = result.expect_err(&format!("{label}: --post must refuse"));
+            assert!(
+                err.to_string().contains(credential),
+                "{label}: refusal must name {credential}, got {err:?}"
+            );
+            assert_eq!(row_counts(&store), (0, 0), "{label}: refused --post wrote rows");
+        }
+    }
+
+    /// Fail-closed: a platform the preflight cannot vouch for must be refused
+    /// before any row is written, even with a Discord token available —
+    /// otherwise carding succeeds and Approve has nowhere to dispatch.
+    #[tokio::test]
+    async fn an_unknown_platform_is_refused_before_any_row_is_written() {
+        let _env = without_credentials();
+        std::env::set_var("DISCORD_BOT_TOKEN", "token-for-tests");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path().join("data.db")).unwrap();
+
+        let err = post_social_approval_card(
+            &store,
+            "some-future-platform",
+            augmentagent_channel_core::trigger::kind::DM,
+            "compose:some-future-platform:dm:conv_1",
+            "conv_1",
+            None,
+            "Ada Vance",
+            "s",
+            "ctx",
+            "a draft",
+        )
+        .await
+        .expect_err("an unvouched platform must not be carded");
+        assert!(
+            err.to_string().contains("no --post send path"),
+            "the refusal must name the missing send path, got {err:?}"
+        );
+        assert_eq!(row_counts(&store), (0, 0), "a refused card wrote rows");
+    }
+
+    /// `--post false` is a pure draft to stdout: it must keep working with no
+    /// credentials at all, and still write nothing.
+    #[tokio::test]
+    async fn a_draft_only_run_does_not_preflight() {
+        let _env = without_credentials();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(Store::open(tmp.path().join("data.db")).unwrap());
+
+        run_linkedin_dm(
+            Arc::clone(&store),
+            "urn:li:msg_conversation:abc".into(),
+            None,
+            Some("a draft".into()),
+            None,
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect("a draft-only run needs no credentials");
+        assert_eq!(row_counts(&store), (0, 0));
     }
 }
 
