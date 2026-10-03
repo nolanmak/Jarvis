@@ -2651,20 +2651,27 @@ pub fn messages_for_discord(full: &str) -> Vec<String> {
     }
     let mut out = Vec::new();
     let mut prose = String::new();
-    // Markdown fences don't nest: the next fence line always closes the open
-    // one, so this toggles rather than recursing.
+    // Markdown fences don't nest, so this toggles rather than recursing. The
+    // two directions are not symmetric, though: any ``` run opens a fence,
+    // but only a run with no info string after it closes one. A ```python
+    // line inside an open fence is draft content — treating it as a closer
+    // would split the draft and emit a tagged line as a bogus closer (#1373).
     let mut open: Option<(String, String)> = None;
     for line in full.lines() {
-        let fencing = crate::register::is_fence(line);
         if let Some((opener, body)) = open.as_mut() {
-            if fencing {
+            if crate::register::is_fence_closer(line) {
                 push_fence_messages(opener, body, line, &mut out);
                 open = None;
             } else {
+                // Fence contents are copied through verbatim, receipt-looking
+                // and `⚠️`-prefixed lines included. Inside a fence they are
+                // draft text the owner asked to send, not decoration this
+                // split may delete: silently dropping a line from a draft is
+                // worse than copying one the owner then edits out.
                 body.push_str(line);
                 body.push('\n');
             }
-        } else if fencing {
+        } else if crate::register::is_fence(line) {
             flush_prose_messages(&mut prose, &mut out);
             open = Some((line.to_string(), String::new()));
         } else {
@@ -2759,6 +2766,12 @@ fn push_fence_messages(opener: &str, body: &str, closer: &str, out: &mut Vec<Str
             // before the last one therefore ship unfenced — a bare message
             // copies back verbatim — and only the final fragment is fenced,
             // where the newline its closer contributes is the line's own.
+            //
+            // That closer-borne newline is also why `continue` loses nothing
+            // when another body line follows: the separator this arm owes the
+            // next line has already been emitted as part of the fenced tail,
+            // so rejoining the pieces reproduces the body exactly. Guarded by
+            // `over_budget_line_keeps_the_newline_before_the_next_line`.
             let mut parts = hard_split(line, budget - 1);
             let tail = parts.pop().unwrap_or_default();
             out.extend(parts);
@@ -3710,6 +3723,59 @@ mod tests {
             messages_for_discord("note\n```\n```"),
             vec!["note".to_string(), "```\n```".to_string()],
         );
+    }
+
+    /// A draft that itself contains a tagged code fence. Per CommonMark only
+    /// an info-string-free ``` run closes a block, so the inner ```python line
+    /// is draft content: splitting there would emit it as a bogus closer and
+    /// push the trailing note into a synthesized fence, so neither message
+    /// copies back to the draft.
+    #[test]
+    fn tagged_fence_inside_a_draft_is_content_not_a_closer() {
+        let msgs = messages_for_discord(
+            "register: terse\n```\ndraft\n```python\ncode\n```\n\u{26a0}\u{fe0f} note",
+        );
+        assert_eq!(
+            msgs,
+            vec![
+                "register: terse".to_string(),
+                "```\ndraft\n```python\ncode\n```".to_string(),
+                "\u{26a0}\u{fe0f} note".to_string(),
+            ],
+        );
+    }
+
+    /// A tagged opener still opens a fence when none is open, so a draft the
+    /// model tagged for highlighting is isolated like any other.
+    #[test]
+    fn tagged_opener_still_opens_a_fence() {
+        assert_eq!(
+            messages_for_discord("register: terse\n```python\ncode\n```\nnote"),
+            vec![
+                "register: terse".to_string(),
+                "```python\ncode\n```".to_string(),
+                "note".to_string(),
+            ],
+        );
+    }
+
+    /// An over-budget line is cut mid-line and its fragments ship unfenced,
+    /// but the line's own trailing newline still rides the fenced tail, so a
+    /// following body line is not glued onto it.
+    #[test]
+    fn over_budget_line_keeps_the_newline_before_the_next_line() {
+        let long = "z".repeat(4000);
+        let msgs = messages_for_discord(&format!("```\n{long}\nshort tail line\n```"));
+        let rejoined: String = msgs
+            .iter()
+            .map(|m| {
+                m.strip_prefix("```\n")
+                    .and_then(|r| r.strip_suffix("```"))
+                    .unwrap_or(m)
+            })
+            .filter(|piece| *piece != DRAFT_LEAD_IN)
+            .collect();
+        assert_eq!(rejoined, format!("{long}\nshort tail line\n"));
     }
 
     /// An over-limit opener with an empty body hits none of the body-driven

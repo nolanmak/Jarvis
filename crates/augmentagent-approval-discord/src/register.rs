@@ -154,6 +154,14 @@ pub(crate) fn is_fence(line: &str) -> bool {
     line.trim_start().starts_with("```")
 }
 
+/// True when `line` can *close* an open fence: markdown closers carry no info
+/// string, so ```` ``` ```` closes but ```` ```python ```` is an opener and,
+/// inside an already-open fence, ordinary content (#1373).
+pub(crate) fn is_fence_closer(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.len() >= 3 && trimmed.chars().all(|c| c == '`')
+}
+
 /// Paragraph break inside a draft: a blank line, or a bare `>` in a
 /// blockquoted one.
 fn is_break(line: &str) -> bool {
