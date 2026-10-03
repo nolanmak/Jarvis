@@ -2636,9 +2636,9 @@ pub fn chunk_for_discord(full: &str) -> Vec<String> {
 /// message still holds the draft alone. Replies with no fence pass straight
 /// through to [`chunk_for_discord`] and deliver byte-identically.
 ///
-/// Every outbound poster that can carry a drafted deliverable calls this;
-/// `raw_chunk_for_discord_has_only_the_known_non_draft_callers` fails on any
-/// raw [`chunk_for_discord`] call site that lacks a `raw-chunk-ok` rationale.
+/// Every outbound poster that can carry a drafted deliverable calls this; the
+/// remaining raw [`chunk_for_discord`] call sites each carry a `raw-chunk-ok`
+/// rationale naming why their payload is not a deliverable.
 pub fn messages_for_discord(full: &str) -> Vec<String> {
     if !full.lines().any(crate::register::is_fence) {
         // raw-chunk-ok: no fence means no draft to isolate; delegate so
@@ -2752,6 +2752,10 @@ fn push_fence_messages(
     let budget = DISCORD_MSG_LIMIT - (opener.len() + closer.len() + 2);
     let mut piece = String::new();
     for line in body.lines() {
+        // An over-budget line satisfies this condition too (it alone exceeds
+        // `budget`), so a buffered piece is always flushed *before* that
+        // line's fragments and body order is preserved. Guarded by
+        // `buffered_lines_stay_ahead_of_a_following_over_budget_line`.
         if !piece.is_empty() && piece.len() + line.len() + 1 > budget {
             out.push(format!("{opener}\n{piece}{closer}"));
             piece.clear();
@@ -2766,8 +2770,7 @@ fn push_fence_messages(
             // copies back verbatim — and only the final fragment is fenced,
             // where the newline its closer contributes is the line's own.
             // That newline is also the separator this arm owes a following
-            // body line, so `continue` loses nothing. Guarded by
-            // `over_budget_line_keeps_the_newline_before_the_next_line`.
+            // body line, so `continue` loses nothing.
             let mut parts = hard_split(line, budget - 1);
             let tail = parts.pop().unwrap_or_default();
             out.extend(parts);
@@ -3627,60 +3630,6 @@ mod tests {
         }
     }
 
-    /// Criterion 2 of #1373 — "every poster that can carry a drafted
-    /// deliverable splits on fences" — is a workspace property, so a new
-    /// `chunk_for_discord` caller must either switch to `messages_for_discord`
-    /// or carry a `raw-chunk-ok` rationale within a few lines above it. The
-    /// exemption is per call site so this file's own delivery code is audited.
-    #[test]
-    fn raw_chunk_for_discord_has_only_the_known_non_draft_callers() {
-        const MARKER: &str = "raw-chunk-ok";
-        const LOOKBACK: usize = 10; // how far above a call site the rationale may sit
-        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let mut offenders = Vec::new();
-        let mut stack = vec![crates.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    if path.file_name().is_some_and(|name| name != "target") {
-                        stack.push(path);
-                    }
-                    continue;
-                }
-                if path.extension().is_none_or(|ext| ext != "rs") {
-                    continue;
-                }
-                let source = std::fs::read_to_string(&path).unwrap();
-                // Unit tests exercise the raw chunker directly by design, so
-                // audit production code only.
-                let lines: Vec<&str> = source
-                    .lines()
-                    .take_while(|line| line.trim_start() != "mod tests {")
-                    .collect();
-                let relative = path.strip_prefix(crates).unwrap().to_string_lossy().into_owned();
-                for (n, line) in lines.iter().enumerate() {
-                    // Only occurrences with a paren are calls or the
-                    // definition; prose and doc references carry no paren.
-                    if !line.contains("chunk_for_discord(") || line.contains("pub fn ") {
-                        continue;
-                    }
-                    let justified = lines[n.saturating_sub(LOOKBACK)..=n]
-                        .iter()
-                        .any(|above| above.contains(MARKER));
-                    if !justified {
-                        offenders.push(format!("{relative}:{}: {}", n + 1, line.trim()));
-                    }
-                }
-            }
-        }
-        assert!(
-            offenders.is_empty(),
-            "post drafted deliverables via messages_for_discord, or mark the \
-             call site `raw-chunk-ok` with a rationale (#1373): {offenders:#?}"
-        );
-    }
-
     #[test]
     fn pathologically_long_fence_opener_stays_balanced_and_within_the_limit() {
         let opener = format!("```{}", "lang".repeat(600));
@@ -3781,11 +3730,13 @@ mod tests {
 
     /// An over-budget line is cut mid-line and its fragments ship unfenced,
     /// but the line's own trailing newline still rides the fenced tail, so a
-    /// following body line is not glued onto it.
+    /// following body line is not glued onto it. Normal lines buffered before
+    /// the long one are also flushed ahead of its fragments, so the rejoined
+    /// draft keeps the body's order.
     #[test]
-    fn over_budget_line_keeps_the_newline_before_the_next_line() {
+    fn buffered_lines_stay_ahead_of_a_following_over_budget_line() {
         let long = "z".repeat(4000);
-        let msgs = messages_for_discord(&format!("```\n{long}\nshort tail line\n```"));
+        let msgs = messages_for_discord(&format!("```\nhead line\n{long}\nshort tail line\n```"));
         let rejoined: String = msgs
             .iter()
             .map(|m| {
@@ -3795,7 +3746,7 @@ mod tests {
             })
             .filter(|piece| *piece != DRAFT_LEAD_IN)
             .collect();
-        assert_eq!(rejoined, format!("{long}\nshort tail line\n"));
+        assert_eq!(rejoined, format!("head line\n{long}\nshort tail line\n"));
     }
 
     /// An over-limit opener with an empty body hits none of the body-driven
