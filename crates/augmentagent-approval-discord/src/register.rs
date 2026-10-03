@@ -154,12 +154,22 @@ pub(crate) fn is_fence(line: &str) -> bool {
     line.trim_start().starts_with("```")
 }
 
-/// True when `line` can *close* an open fence: markdown closers carry no info
-/// string, so ```` ``` ```` closes but ```` ```python ```` is an opener and,
-/// inside an already-open fence, ordinary content (#1373).
-pub(crate) fn is_fence_closer(line: &str) -> bool {
+/// Length of `line`'s leading backtick run, or 0 when it is not a fence line.
+/// A fence may open with more than three backticks precisely so its contents
+/// can hold a shorter run of their own (#1373).
+pub(crate) fn fence_run_len(line: &str) -> usize {
+    let run = line.trim_start().chars().take_while(|c| *c == '`').count();
+    if run >= 3 { run } else { 0 }
+}
+
+/// True when `line` can *close* a fence opened with a run of `opener_run`
+/// backticks: markdown closers carry no info string and are at least as long
+/// as the opener, so ```` ``` ```` closes a three-backtick fence but is
+/// ordinary content inside a four-backtick one, and ```` ```python ```` is an
+/// opener rather than a closer either way (#1373).
+pub(crate) fn is_fence_closer(line: &str, opener_run: usize) -> bool {
     let trimmed = line.trim();
-    trimmed.len() >= 3 && trimmed.chars().all(|c| c == '`')
+    trimmed.len() >= opener_run.max(3) && trimmed.chars().all(|c| c == '`')
 }
 
 /// Paragraph break inside a draft: a blank line, or a bare `>` in a

@@ -2631,14 +2631,10 @@ pub fn chunk_for_discord(full: &str) -> Vec<String> {
 /// fence in its own message makes the clean copy structural instead of
 /// depending on the model formatting its reply correctly.
 ///
-/// A fenced reply always lands as two or more messages. When the reply is
-/// nothing but the fence there is no surrounding prose to be the second one,
-/// so [`DRAFT_LEAD_IN`] is posted ahead of it: the draft message still holds
-/// the draft and nothing else, and the owner sees the same "the next message
-/// is the thing to copy" shape as for a reply that did carry a receipt.
-///
-/// Replies with no fence are passed straight through to
-/// [`chunk_for_discord`], so ordinary text delivers byte-identically.
+/// A fenced reply always lands as two or more messages; when the reply is
+/// nothing but the fence, [`DRAFT_LEAD_IN`] becomes the companion so the draft
+/// message still holds the draft alone. Replies with no fence pass straight
+/// through to [`chunk_for_discord`] and deliver byte-identically.
 ///
 /// Every outbound poster that can carry a drafted deliverable calls this;
 /// `raw_chunk_for_discord_has_only_the_known_non_draft_callers` fails on any
@@ -2653,44 +2649,43 @@ pub fn messages_for_discord(full: &str) -> Vec<String> {
     let mut prose = String::new();
     // Markdown fences don't nest, so this toggles rather than recursing. The
     // two directions are not symmetric, though: any ``` run opens a fence,
-    // but only a run with no info string after it closes one. A ```python
-    // line inside an open fence is draft content — treating it as a closer
-    // would split the draft and emit a tagged line as a bogus closer (#1373).
-    let mut open: Option<(String, String)> = None;
+    // but a closer needs no info string *and* at least as many backticks as
+    // the opener. A ```python line, or a ``` line inside a ```` fence, is
+    // draft content — treating either as a closer would split the draft and
+    // emit a content line as a bogus closer (#1373).
+    let mut open: Option<(String, usize, String)> = None;
     for line in full.lines() {
-        if let Some((opener, body)) = open.as_mut() {
-            if crate::register::is_fence_closer(line) {
-                push_fence_messages(opener, body, line, &mut out);
+        if let Some((opener, opener_run, body)) = open.as_mut() {
+            if crate::register::is_fence_closer(line, *opener_run) {
+                push_fence_messages(opener, *opener_run, body, line, &mut out);
                 open = None;
             } else {
-                // Fence contents are copied through verbatim, receipt-looking
-                // and `⚠️`-prefixed lines included. Inside a fence they are
-                // draft text the owner asked to send, not decoration this
-                // split may delete: silently dropping a line from a draft is
+                // Copied through verbatim, receipt-looking and `⚠️`-prefixed
+                // lines included: inside a fence they are draft text the owner
+                // asked to send, and silently dropping a line from a draft is
                 // worse than copying one the owner then edits out.
                 body.push_str(line);
                 body.push('\n');
             }
-        } else if crate::register::is_fence(line) {
+        } else if crate::register::fence_run_len(line) > 0 {
             flush_prose_messages(&mut prose, &mut out);
-            open = Some((line.to_string(), String::new()));
+            open = Some((line.to_string(), crate::register::fence_run_len(line), String::new()));
         } else {
             prose.push_str(line);
             prose.push('\n');
         }
     }
-    if let Some((opener, body)) = open.take() {
-        // Unterminated opener: synthesize the closer so no message ever ships
-        // an odd number of fence lines.
-        push_fence_messages(&opener, &body, "```", &mut out);
+    if let Some((opener, opener_run, body)) = open.take() {
+        // Unterminated opener: synthesize a closer as long as the opener so no
+        // message ever ships an unbalanced fence.
+        let closer = "`".repeat(opener_run);
+        push_fence_messages(&opener, opener_run, &body, &closer, &mut out);
     }
     flush_prose_messages(&mut prose, &mut out);
     if out.len() == 1 {
-        // The whole reply was one fence, so nothing above or below it became a
-        // message of its own. Prepend the lead-in rather than returning a lone
-        // message: #1373 asks for a fenced reply to arrive as the draft plus at
-        // least one companion message, so the owner never has to judge whether
-        // the message they are copying also carries prose.
+        // The whole reply was one fence. #1373 asks for a fenced reply to
+        // arrive as the draft plus a companion, so the owner never has to
+        // judge whether the message they copy also carries prose.
         out.insert(0, DRAFT_LEAD_IN.to_string());
     }
     out
@@ -2720,35 +2715,39 @@ const MIN_FENCE_BODY_BUDGET: usize = 64;
 /// an even number of fence lines.
 ///
 /// A fence whose contents exceed [`DISCORD_MSG_LIMIT`] necessarily spans
-/// several messages, so copying it back takes one click per piece. That is
-/// Discord's 2000-character per-message ceiling, not a choice this split
-/// makes: no arrangement of messages can hold a 3000-character draft in one
-/// copyable message. What the split still buys at that size is that the
-/// pieces contain draft text *only* — the receipt line and `⚠️` notes are
-/// never mixed in — so the pieces concatenate back to the draft byte for
-/// byte, with nothing to trim. Delivering an over-limit draft as a single
-/// copyable unit needs a file attachment rather than message text (see
-/// `attachments.rs`); that is a separate delivery path and out of scope here.
-fn push_fence_messages(opener: &str, body: &str, closer: &str, out: &mut Vec<String>) {
+/// several messages, so copying it back takes one click per piece — that is
+/// Discord's per-message ceiling, not a choice this split makes. What the
+/// split still buys at that size is pieces holding draft text *only*, so they
+/// concatenate back to the draft byte for byte with nothing to trim.
+fn push_fence_messages(
+    opener: &str,
+    opener_run: usize,
+    body: &str,
+    closer: &str,
+    out: &mut Vec<String>,
+) {
     let pushed_before = out.len();
     let whole = format!("{opener}\n{body}{closer}");
     if whole.len() <= DISCORD_MSG_LIMIT {
         out.push(whole);
         return;
     }
+    // Any bare fence substituted below keeps the opener's run length: the body
+    // of a ```` fence may hold ``` lines of its own, and wrapping it in a
+    // three-backtick fence would let that content close the fence early.
+    let bare = "`".repeat(opener_run);
     // Every piece below repeats the opener and closer, so a pathological pair
     // (a model emitting a multi-hundred-char language tag) would leave no room
     // for the body. Re-wrap the pieces in a bare fence instead of handing the
-    // text to the plain chunker: the chunker splits on length alone and would
-    // strand an opener and its closer in different messages, breaking both
-    // Discord's rendering and the one-click copy this exists for. The dropped
-    // language tag is only syntax highlighting.
+    // text to the plain chunker, which splits on length alone and would strand
+    // an opener and its closer in different messages, breaking both Discord's
+    // rendering and the one-click copy. The dropped tag is only highlighting.
     let (opener, closer) = match DISCORD_MSG_LIMIT
         .checked_sub(opener.len() + closer.len() + 2)
         .filter(|budget| *budget >= MIN_FENCE_BODY_BUDGET)
     {
         Some(_) => (opener, closer),
-        None => ("```", "```"),
+        None => (bare.as_str(), bare.as_str()),
     };
     let budget = DISCORD_MSG_LIMIT - (opener.len() + closer.len() + 2);
     let mut piece = String::new();
@@ -2766,11 +2765,8 @@ fn push_fence_messages(opener: &str, body: &str, closer: &str, out: &mut Vec<Str
             // before the last one therefore ship unfenced — a bare message
             // copies back verbatim — and only the final fragment is fenced,
             // where the newline its closer contributes is the line's own.
-            //
-            // That closer-borne newline is also why `continue` loses nothing
-            // when another body line follows: the separator this arm owes the
-            // next line has already been emitted as part of the fenced tail,
-            // so rejoining the pieces reproduces the body exactly. Guarded by
+            // That newline is also the separator this arm owes a following
+            // body line, so `continue` loses nothing. Guarded by
             // `over_budget_line_keeps_the_newline_before_the_next_line`.
             let mut parts = hard_split(line, budget - 1);
             let tail = parts.pop().unwrap_or_default();
@@ -2790,7 +2786,7 @@ fn push_fence_messages(opener: &str, body: &str, closer: &str, out: &mut Vec<Str
         // body leaves no piece to carry it, and every branch above is driven
         // by body lines. Emit the balanced bare fence rather than returning
         // nothing: dropping it silently would delete a fenced deliverable.
-        out.push("```\n```".to_string());
+        out.push(format!("{bare}\n{bare}"));
     }
 }
 
@@ -3631,20 +3627,15 @@ mod tests {
         }
     }
 
-    /// Criterion 2 of #1373 is "every poster that can carry a drafted
-    /// deliverable splits on fences". That is a property of the whole
-    /// workspace, not of this file, so assert it here rather than leaving it
-    /// to a reviewer to re-inventory by hand on each change. A new
-    /// `chunk_for_discord` caller fails this test and has to either switch to
-    /// `messages_for_discord` or carry a `raw-chunk-ok` rationale comment
-    /// within the few lines above it. The exemption is per call site rather
-    /// than per file so that the live delivery code in this very file is
-    /// audited too.
+    /// Criterion 2 of #1373 — "every poster that can carry a drafted
+    /// deliverable splits on fences" — is a workspace property, so a new
+    /// `chunk_for_discord` caller must either switch to `messages_for_discord`
+    /// or carry a `raw-chunk-ok` rationale within a few lines above it. The
+    /// exemption is per call site so this file's own delivery code is audited.
     #[test]
     fn raw_chunk_for_discord_has_only_the_known_non_draft_callers() {
         const MARKER: &str = "raw-chunk-ok";
-        /// How far above a call site the rationale comment may sit.
-        const LOOKBACK: usize = 10;
+        const LOOKBACK: usize = 10; // how far above a call site the rationale may sit
         let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let mut offenders = Vec::new();
         let mut stack = vec![crates.to_path_buf()];
@@ -3699,11 +3690,7 @@ mod tests {
         let mut rejoined = String::new();
         for m in &msgs {
             assert_eq!(fence_line_count(m) % 2, 0, "unbalanced message: {m:?}");
-            assert!(
-                m.len() <= DISCORD_MSG_LIMIT,
-                "message too long: {}",
-                m.len()
-            );
+            assert!(m.len() <= DISCORD_MSG_LIMIT, "message too long: {}", m.len());
             if let Some(inner) = m.strip_prefix("```\n").and_then(|r| r.strip_suffix("```")) {
                 rejoined.push_str(inner);
             }
@@ -3713,10 +3700,9 @@ mod tests {
         assert_eq!(rejoined, body);
     }
 
-    // Criterion 1 for an empty fence: the fence is still delivered as its own
-    // standalone message, separate from the prose, rather than collapsing to
-    // just `note`. Asserted exactly, because a weaker "no empty message"
-    // check passes even if the fence is dropped entirely.
+    // Criterion 1 for an empty fence: still its own message beside the prose
+    // rather than collapsing to just `note`. Asserted exactly, because a
+    // weaker "no empty message" check passes even if the fence is dropped.
     #[test]
     fn empty_fence_is_still_its_own_message_beside_the_prose() {
         assert_eq!(
@@ -3725,11 +3711,9 @@ mod tests {
         );
     }
 
-    /// A draft that itself contains a tagged code fence. Per CommonMark only
-    /// an info-string-free ``` run closes a block, so the inner ```python line
-    /// is draft content: splitting there would emit it as a bogus closer and
-    /// push the trailing note into a synthesized fence, so neither message
-    /// copies back to the draft.
+    /// Per CommonMark only an info-string-free ``` run closes a block, so an
+    /// inner ```python line is draft content: splitting there would emit it as
+    /// a bogus closer and leave neither message copying back to the draft.
     #[test]
     fn tagged_fence_inside_a_draft_is_content_not_a_closer() {
         let msgs = messages_for_discord(
@@ -3743,6 +3727,42 @@ mod tests {
                 "\u{26a0}\u{fe0f} note".to_string(),
             ],
         );
+    }
+
+    /// A draft that itself contains a triple-backtick code block is fenced
+    /// with four backticks. The shorter run inside it is content: closing on
+    /// it would end the draft message early, leaving the rest of the draft
+    /// and the trailing note in Markdown-unbalanced messages.
+    #[test]
+    fn shorter_backtick_run_inside_a_longer_fence_is_content_not_a_closer() {
+        let msgs = messages_for_discord(
+            "register: terse\n````\ndraft\n```\ncode\n```\nmore draft\n````\n\u{26a0}\u{fe0f} note",
+        );
+        assert_eq!(
+            msgs,
+            vec![
+                "register: terse".to_string(),
+                "````\ndraft\n```\ncode\n```\nmore draft\n````".to_string(),
+                "\u{26a0}\u{fe0f} note".to_string(),
+            ],
+        );
+        for m in &msgs {
+            assert_eq!(fence_line_count(m) % 2, 0);
+        }
+    }
+
+    /// An over-limit four-backtick fence re-wraps each piece in a four-backtick
+    /// fence too: a three-backtick wrapper would be closed early by the
+    /// triple-backtick runs the body carries.
+    #[test]
+    fn oversized_longer_fence_rewraps_at_the_openers_run_length() {
+        let body = "```\nz\n```\n".repeat(400);
+        let msgs = messages_for_discord(&format!("note\n````\n{body}````"));
+        assert!(msgs.len() > 2);
+        for m in msgs.iter().skip(1) {
+            assert!(m.len() <= DISCORD_MSG_LIMIT);
+            assert!(m.starts_with("````\n") && m.ends_with("````"), "unbalanced piece: {m}");
+        }
     }
 
     /// A tagged opener still opens a fence when none is open, so a draft the

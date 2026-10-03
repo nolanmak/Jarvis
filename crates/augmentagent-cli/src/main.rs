@@ -11860,9 +11860,11 @@ impl LoopPoster for DiscordLoopPoster {
             .parse()
             .with_context(|| format!("loop channel_ref not a u64: {channel_ref}"))?;
         let channel = ChannelId::new(cid);
-        // #1373 — fence-aware split. A nag body's fenced draft gets its own
-        // message; the buttons still ride the last message, which after a
-        // split is the trailing prose rather than the draft.
+        // #1373 — fence-aware split, so a nag body's fenced draft gets its own
+        // message. The buttons still ride the last message per #1135, which for
+        // a body ending in its fence is the draft message itself; that is fine
+        // because buttons are components rather than content, so Discord's copy
+        // on that message still yields the draft text alone.
         let chunks = augmentagent_approval_discord::messages_for_discord(body);
         let last = chunks.len().saturating_sub(1);
         for (i, chunk) in chunks.into_iter().enumerate() {
