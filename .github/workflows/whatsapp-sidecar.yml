@@ -5,6 +5,8 @@ on:
     paths:
       - 'sidecars/wa-sidecar/**'
       - 'crates/augmentagent-channel-whatsapp/**'
+      - 'crates/augmentagent-cli/src/whatsapp_cmd.rs'
+      - 'crates/augmentagent-cli/tests/whatsapp_cli.rs'
       - 'docs/fixtures/whatsapp/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -15,12 +17,11 @@ permissions:
 
 jobs:
   wire-contract:
-    name: wire-contract (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     env:
       CARGO_BUILD_JOBS: 2
@@ -48,9 +49,17 @@ jobs:
       - name: Build exact sidecar used by Rust contract tests
         working-directory: sidecars/wa-sidecar
         run: |
-          go build -mod=readonly -trimpath -o "$RUNNER_TEMP/wa-sidecar" .
-          echo "AUGMENTAGENT_WA_SIDECAR_TEST_BIN=$RUNNER_TEMP/wa-sidecar" >> "$GITHUB_ENV"
+          ./setup.sh
+          echo "AUGMENTAGENT_WA_SIDECAR_TEST_BIN=$PWD/wa-sidecar" >> "$GITHUB_ENV"
       - name: Rust channel and real Go-process contract tests
         run: cargo test -p augmentagent-channel-whatsapp
+      - name: WhatsApp account CLI behavior tests
+        # The existing embeddings dependency (ort-sys 2.0.0-rc.13) has no
+        # x86_64-apple-darwin prebuilt runtime. Track the Intel CLI host
+        # blocker in #1319; Go and Rust channel tests still run.
+        if: matrix.os != 'macos-15-intel'
+        run: cargo test -p augmentagent-cli --test whatsapp_cli
+      - name: Durable inbound store tests
+        run: cargo test -p augmentagent-store --test whatsapp_inbound
       - name: Rust channel lint
         run: cargo clippy --no-deps -p augmentagent-channel-whatsapp --all-targets -- -D warnings

@@ -66,6 +66,7 @@ class LaunchdInstallerTests(unittest.TestCase):
             "node": "exit 0\n",
             "deno": "exit 0\n",
             "jq": "exit 0\n",
+            "timeout": "exit 0\n",
             "codex": "exit 0\n",
             "claude": "exit 0\n",
             "cargo": "exit 0\n",
@@ -88,6 +89,12 @@ class LaunchdInstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return plistlib.loads((self.home / "Library/LaunchAgents" / f"{LABELS[name]}.plist").read_bytes())
 
+    def test_chat_only_daemon_does_not_require_email(self):
+        self.env['AUGMENTAGENT_AUTOSTART_NO_EMAIL'] = 'true'
+        data = self.install('autostart')
+        args = data['ProgramArguments']
+        self.assertEqual(args[args.index('--no-email') + 1], 'true')
+
     def test_all_installers_preserve_special_paths(self):
         for name in INSTALLERS:
             with self.subTest(installer=name):
@@ -98,7 +105,7 @@ class LaunchdInstallerTests(unittest.TestCase):
                 if "EnvironmentVariables" in data:
                     self.assertIn(str(self.bin), data["EnvironmentVariables"]["PATH"])
                 if name == "autostart":
-                    self.assertEqual(data["ProgramArguments"][-1], "true")
+                    self.assertEqual(data["ProgramArguments"][data["ProgramArguments"].index("--dry-run") + 1], "true")
 
     def test_missing_selected_provider_preserves_installed_job(self):
         old = self.install("autostart")
@@ -117,7 +124,7 @@ class LaunchdInstallerTests(unittest.TestCase):
         (self.repo / ".env").write_text("AUGMENTAGENT_REASONER_CHAIN='codex,cerebras'\n")
         (self.bin / "claude").unlink()
         data = self.install("autostart")
-        self.assertEqual(data["ProgramArguments"][-1], "true")
+        self.assertEqual(data["ProgramArguments"][data["ProgramArguments"].index("--dry-run") + 1], "true")
         self.assertIn(str(self.bin), data["EnvironmentVariables"]["PATH"])
 
     def test_failed_bootstrap_restores_previous_plist(self):
@@ -130,7 +137,8 @@ class LaunchdInstallerTests(unittest.TestCase):
                                 cwd=self.repo, env=self.env, text=True, capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(path.read_bytes(), before)
-        self.assertEqual(plistlib.loads(path.read_bytes())["ProgramArguments"][-1], "true")
+        args = plistlib.loads(path.read_bytes())["ProgramArguments"]
+        self.assertEqual(args[args.index("--dry-run") + 1], "true")
         self.assertTrue((self.root / "launchctl.loaded").exists())
         calls = (self.root / "launchctl.log").read_text()
         self.assertEqual(calls.count("bootstrap gui/"), 3)

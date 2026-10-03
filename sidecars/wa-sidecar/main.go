@@ -23,7 +23,8 @@
 //	   "push_name":"...","text":"...","timestamp":1700000000,"from_me":false}
 //	  {"version":1,"event":"receipt","chat":"...","message_ids":["..."],...}
 //
-// Ops: status, list_chats, fetch_history, send_text.
+// Ops: status, start_pairing, logout, list_chats, fetch_history, send_text,
+// replay_events, ack_events.
 //
 // Lifecycle: on first run with no stored session the sidecar emits `qr`
 // events and retains the latest one for the pairing CLI (#1228). It never
@@ -32,13 +33,16 @@
 //
 // Concurrency: the daemon and CLI may connect at the same time. Responses
 // return only to their requesting connection; lifecycle events reach both.
-// Durable replay across disconnected clients is tracked in #1229.
+// Received messages are journaled before live fan-out. The daemon must replay
+// and acknowledge them after its own durable commit; consumer wiring and the
+// outbound delivery ledger are tracked in #1229.
 package main
 
 import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -46,6 +50,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -67,16 +72,27 @@ func socketPath() string {
 		return p
 	}
 	if runtime.GOOS == "darwin" {
-		return filepath.Join(fmt.Sprintf("/tmp/augmentagent-%d", os.Getuid()), "wa.sock")
+		return socketPathFor("darwin", os.Getuid(), "", false)
 	}
-	runtime := os.Getenv("XDG_RUNTIME_DIR")
-	if runtime == "" {
-		runtime = fmt.Sprintf("/run/user/%d", os.Getuid())
-		if info, err := os.Stat(runtime); err != nil || !info.IsDir() {
-			return filepath.Join(fmt.Sprintf("/tmp/augmentagent-%d", os.Getuid()), "wa.sock")
-		}
+	xdgRuntime := os.Getenv("XDG_RUNTIME_DIR")
+	linuxRuntime := fmt.Sprintf("/run/user/%d", os.Getuid())
+	info, err := os.Stat(linuxRuntime)
+	return socketPathFor(runtime.GOOS, os.Getuid(), xdgRuntime, err == nil && info.IsDir())
+}
+
+func socketPathFor(goos string, uid int, xdgRuntime string, linuxRuntimeExists bool) string {
+	// Darwin's Unix-socket path limit is shorter than Linux's. A short,
+	// per-user private directory also works when HOME contains spaces/Unicode.
+	if goos == "darwin" {
+		return filepath.Join(fmt.Sprintf("/tmp/augmentagent-%d", uid), "wa.sock")
 	}
-	return filepath.Join(runtime, "augmentagent", "wa.sock")
+	if xdgRuntime != "" {
+		return filepath.Join(xdgRuntime, "augmentagent", "wa.sock")
+	}
+	if linuxRuntimeExists {
+		return filepath.Join(fmt.Sprintf("/run/user/%d", uid), "augmentagent", "wa.sock")
+	}
+	return filepath.Join(fmt.Sprintf("/tmp/augmentagent-%d", uid), "wa.sock")
 }
 
 // The WhatsApp session and socket must be inaccessible to other local users.
@@ -142,7 +158,11 @@ type rpcResponse struct {
 // ---------------------------------------------------------------------------
 
 type sidecar struct {
-	client *whatsmeow.Client
+	client          *whatsmeow.Client
+	journal         *eventJournal
+	journalFailures atomic.Uint64
+	pairMu          sync.Mutex
+	pairing         bool
 	// writeMu protects clients/lastQR and serializes writes to each socket.
 	writeMu sync.Mutex
 	clients map[net.Conn]struct{}
@@ -208,6 +228,31 @@ func (s *sidecar) unregisterConn(conn net.Conn) {
 
 func (s *sidecar) emitEvent(ev map[string]interface{}) {
 	ev["version"] = 1
+	if ev["event"] == "received-message" && s.journal != nil {
+		account := ""
+		if s.client != nil && s.client.Store.ID != nil {
+			account = s.client.Store.ID.String()
+		}
+		ev["account_jid"] = account
+		chat, _ := ev["chat"].(string)
+		messageID, _ := ev["id"].(string)
+		payload, err := json.Marshal(ev)
+		if err != nil {
+			s.journalFailures.Add(1)
+			s.logger.Errorf("marshal inbound WhatsApp event: %v", err)
+			return
+		}
+		seq, fresh, err := s.journal.appendMessage(account, chat, messageID, payload)
+		if err != nil {
+			s.journalFailures.Add(1)
+			s.logger.Errorf("persist inbound WhatsApp event before delivery: %v", err)
+			return
+		}
+		if !fresh {
+			return
+		}
+		ev["seq"] = seq
+	}
 	frame := s.marshalFrame(ev)
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -242,9 +287,29 @@ func (s *sidecar) fail(conn net.Conn, reqID, kind, msg string) {
 // NDJSON event frames the Rust channel/control surface consume.
 // ---------------------------------------------------------------------------
 
+// whatsmeow authenticates alternate addresses. Normalize private LIDs to the
+// paired phone identity only when it supplied a personal alternate address.
+func messageIdentity(source types.MessageSource) (types.JID, types.JID) {
+	chat, sender := source.Chat.ToNonAD(), source.Sender.ToNonAD()
+	if sender.Server == types.HiddenUserServer && source.SenderAlt.Server == types.DefaultUserServer {
+		sender = source.SenderAlt.ToNonAD()
+	}
+	if chat.Server == types.HiddenUserServer && !source.IsGroup {
+		if source.IsFromMe && source.RecipientAlt.Server == types.DefaultUserServer {
+			chat = source.RecipientAlt.ToNonAD()
+		} else if source.IsFromMe && source.Chat.ToNonAD() == source.Sender.ToNonAD() && sender.Server == types.DefaultUserServer {
+			chat = sender
+		} else if !source.IsFromMe && sender.Server == types.DefaultUserServer {
+			chat = sender
+		}
+	}
+	return chat, sender
+}
+
 func (s *sidecar) handleWAEvent(rawEvt interface{}) {
 	switch evt := rawEvt.(type) {
 	case *events.Message:
+		chat, sender := messageIdentity(evt.Info.MessageSource)
 		text := extractText(evt)
 		contextInfo := messageContext(evt.Message)
 		var quotedID string
@@ -261,15 +326,29 @@ func (s *sidecar) handleWAEvent(rawEvt interface{}) {
 		if isRevoke {
 			quotedID = protocol.GetKey().GetID()
 		}
+		agentGenerated, originVerified := false, false
+		if s.journal != nil && s.client != nil && s.client.Store.ID != nil {
+			account := s.client.Store.ID.ToNonAD().String()
+			var err error
+			agentGenerated, err = s.journal.isAgentMessage(account, chat.String(), evt.Info.ID)
+			originVerified = err == nil
+			if agentGenerated && evt.Info.IsFromMe {
+				if err := s.journal.confirmSend(account, chat.String(), evt.Info.ID); err != nil {
+					originVerified = false
+				}
+			}
+		}
 		s.emitEvent(map[string]interface{}{
 			"event":             "received-message",
 			"id":                evt.Info.ID,
-			"chat":              evt.Info.Chat.String(),
-			"sender":            evt.Info.Sender.String(),
+			"chat":              chat.String(),
+			"sender":            sender.String(),
 			"push_name":         evt.Info.PushName,
 			"text":              text,
 			"timestamp":         evt.Info.Timestamp.Unix(),
 			"from_me":           evt.Info.IsFromMe,
+			"agent_generated":   agentGenerated,
+			"origin_verified":   originVerified,
 			"quoted_message_id": quotedID,
 			"mentioned_jids":    mentions,
 			"media":             mediaDescriptor(evt.Message),
@@ -282,6 +361,12 @@ func (s *sidecar) handleWAEvent(rawEvt interface{}) {
 		ids := make([]string, len(evt.MessageIDs))
 		for i, id := range evt.MessageIDs {
 			ids[i] = string(id)
+			if s.journal != nil && s.client != nil && s.client.Store.ID != nil &&
+				(evt.Type == types.ReceiptTypeDelivered || evt.Type == types.ReceiptTypeRead || evt.Type == types.ReceiptTypePlayed) {
+				if err := s.journal.confirmSend(s.client.Store.ID.ToNonAD().String(), evt.Chat.ToNonAD().String(), id); err != nil {
+					s.journalFailures.Add(1)
+				}
+			}
 		}
 		s.emitEvent(map[string]interface{}{
 			"event":        "receipt",
@@ -412,22 +497,116 @@ func (s *sidecar) dispatch(conn net.Conn, req rpcRequest) {
 	switch req.Op {
 	case "status":
 		s.opStatus(conn, req)
+	case "start_pairing":
+		s.opStartPairing(conn, req)
+	case "logout":
+		s.opLogout(conn, req)
 	case "list_chats":
 		s.opListChats(conn, req)
 	case "fetch_history":
 		s.opFetchHistory(conn, req)
 	case "send_text":
 		s.opSendText(conn, req)
+	case "delivery_status":
+		s.opDeliveryStatus(conn, req)
+	case "replay_events":
+		s.opReplayEvents(conn, req)
+	case "ack_events":
+		s.opAckEvents(conn, req)
 	default:
 		s.fail(conn, req.RequestID, "BadRequest", "unknown op: "+req.Op)
 	}
 }
 
-func (s *sidecar) opStatus(conn net.Conn, req rpcRequest) {
+func (s *sidecar) startPairing() error {
 	if s.client == nil {
-		s.ok(conn, req.RequestID, map[string]interface{}{
-			"paired": false, "connected": false, "device_jid": "",
-		})
+		return fmt.Errorf("whatsapp client is unavailable")
+	}
+	s.pairMu.Lock()
+	defer s.pairMu.Unlock()
+	if s.client.Store.ID != nil || s.pairing {
+		return nil
+	}
+	qrChan, err := s.client.GetQRChannel(context.Background())
+	if err != nil {
+		return err
+	}
+	if err := s.client.Connect(); err != nil {
+		return err
+	}
+	s.pairing = true
+	go func() {
+		defer func() {
+			s.pairMu.Lock()
+			s.pairing = false
+			s.pairMu.Unlock()
+		}()
+		for evt := range qrChan {
+			if evt.Event == "code" {
+				// Never print the QR or session material into service logs.
+				s.emitEvent(map[string]interface{}{"event": "qr", "code": evt.Code})
+			} else if s.logger != nil {
+				s.logger.Infof("pair flow: %s", evt.Event)
+			}
+		}
+	}()
+	return nil
+}
+
+func (s *sidecar) opStartPairing(conn net.Conn, req rpcRequest) {
+	if s.client == nil {
+		s.fail(conn, req.RequestID, "NotConnected", "whatsapp client is unavailable")
+		return
+	}
+	if err := s.startPairing(); err != nil {
+		s.fail(conn, req.RequestID, "NotConnected", "start pairing: "+err.Error())
+		return
+	}
+	s.ok(conn, req.RequestID, map[string]interface{}{"paired": s.client.Store.ID != nil})
+}
+
+func (s *sidecar) opLogout(conn net.Conn, req rpcRequest) {
+	var params struct {
+		ExpectedDeviceJID string `json:"expected_device_jid"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil || params.ExpectedDeviceJID == "" {
+		s.fail(conn, req.RequestID, "BadRequest", "expected_device_jid required")
+		return
+	}
+	if s.client == nil || s.client.Store.ID == nil {
+		s.fail(conn, req.RequestID, "NotPaired", "no linked device")
+		return
+	}
+	if actual := s.client.Store.ID.String(); actual != params.ExpectedDeviceJID {
+		s.fail(conn, req.RequestID, "BadRequest", "linked device does not match expected_device_jid")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.client.Logout(ctx); err != nil {
+		s.fail(conn, req.RequestID, "LogoutFailed", err.Error())
+		return
+	}
+	s.emitEvent(map[string]interface{}{"event": "logged-out", "reason": "user_initiated"})
+	s.ok(conn, req.RequestID, map[string]interface{}{"unlinked_device_jid": params.ExpectedDeviceJID})
+}
+
+func (s *sidecar) opStatus(conn net.Conn, req rpcRequest) {
+	journalStatus := map[string]interface{}{}
+	if s.journal != nil {
+		journalStatus["event_journal_failures"] = s.journalFailures.Load()
+		if acked, err := s.journal.acked(); err == nil {
+			journalStatus["events_acked_through"] = acked
+		}
+		if pending, err := s.journal.pendingCount(); err == nil {
+			journalStatus["events_pending"] = pending
+		}
+	}
+	if s.client == nil {
+		journalStatus["paired"] = false
+		journalStatus["connected"] = false
+		journalStatus["device_jid"] = ""
+		s.ok(conn, req.RequestID, journalStatus)
 		return
 	}
 	paired := s.client.Store.ID != nil
@@ -436,11 +615,72 @@ func (s *sidecar) opStatus(conn net.Conn, req rpcRequest) {
 	if s.client.Store.ID != nil {
 		deviceJID = s.client.Store.ID.String()
 	}
-	s.ok(conn, req.RequestID, map[string]interface{}{
-		"paired":     paired,
-		"connected":  connected,
-		"device_jid": deviceJID,
-	})
+	journalStatus["paired"] = paired
+	journalStatus["connected"] = connected
+	journalStatus["device_jid"] = deviceJID
+	s.ok(conn, req.RequestID, journalStatus)
+}
+
+func (s *sidecar) opReplayEvents(conn net.Conn, req rpcRequest) {
+	if s.journal == nil {
+		s.fail(conn, req.RequestID, "Unavailable", "event journal is not configured")
+		return
+	}
+	var p struct {
+		After int64 `json:"after"`
+		Limit int   `json:"limit"`
+	}
+	if err := json.Unmarshal(req.Params, &p); err != nil {
+		s.fail(conn, req.RequestID, "BadRequest", "invalid replay parameters")
+		return
+	}
+	if p.Limit == 0 {
+		p.Limit = 100
+	}
+	acked, err := s.journal.acked()
+	if err != nil {
+		s.fail(conn, req.RequestID, "Internal", "read event cursor failed")
+		return
+	}
+	if p.After < acked {
+		p.After = acked
+	}
+	rows, err := s.journal.readAfter(p.After, p.Limit)
+	if err != nil {
+		s.fail(conn, req.RequestID, "BadRequest", err.Error())
+		return
+	}
+	events := make([]map[string]interface{}, 0, len(rows))
+	for _, row := range rows {
+		var event map[string]interface{}
+		if err := json.Unmarshal(row.Payload, &event); err != nil {
+			s.fail(conn, req.RequestID, "Internal", "stored event is corrupt")
+			return
+		}
+		event["seq"] = row.Seq
+		event["account_jid"] = row.Account
+		events = append(events, event)
+	}
+	s.ok(conn, req.RequestID, map[string]interface{}{"events": events})
+}
+
+func (s *sidecar) opAckEvents(conn net.Conn, req rpcRequest) {
+	if s.journal == nil {
+		s.fail(conn, req.RequestID, "Unavailable", "event journal is not configured")
+		return
+	}
+	var p struct {
+		Through int64 `json:"through"`
+	}
+	if err := json.Unmarshal(req.Params, &p); err != nil {
+		s.fail(conn, req.RequestID, "BadRequest", "invalid ack parameters")
+		return
+	}
+	if err := s.journal.ackThrough(p.Through); err != nil {
+		s.fail(conn, req.RequestID, "BadRequest", err.Error())
+		return
+	}
+	s.ok(conn, req.RequestID, map[string]interface{}{"acked_through": p.Through})
 }
 
 func (s *sidecar) opListChats(conn net.Conn, req rpcRequest) {
@@ -500,10 +740,31 @@ func (s *sidecar) opFetchHistory(conn net.Conn, req rpcRequest) {
 	s.fail(conn, req.RequestID, "Unavailable", "chat history is not stored by this sidecar")
 }
 
+func (s *sidecar) opDeliveryStatus(conn net.Conn, req rpcRequest) {
+	var p struct {
+		Key string `json:"idempotency_key"`
+	}
+	if json.Unmarshal(req.Params, &p) != nil || p.Key == "" || len(p.Key) > 256 {
+		s.fail(conn, req.RequestID, "BadRequest", "idempotency_key required")
+		return
+	}
+	if s.journal == nil || s.client == nil || s.client.Store.ID == nil {
+		s.fail(conn, req.RequestID, "NotPaired", "paired device and journal required")
+		return
+	}
+	row, err := s.journal.deliveryStatus(s.client.Store.ID.ToNonAD().String(), p.Key)
+	if err != nil {
+		s.fail(conn, req.RequestID, "Unavailable", "delivery record unavailable")
+		return
+	}
+	s.ok(conn, req.RequestID, map[string]interface{}{"message_id": row.ID, "state": row.State})
+}
+
 func (s *sidecar) opSendText(conn net.Conn, req rpcRequest) {
 	var p struct {
-		ChatJID string `json:"chat_jid"`
-		Text    string `json:"text"`
+		ChatJID        string `json:"chat_jid"`
+		Text           string `json:"text"`
+		IdempotencyKey string `json:"idempotency_key"`
 	}
 	if err := json.Unmarshal(req.Params, &p); err != nil || p.ChatJID == "" || p.Text == "" {
 		s.fail(conn, req.RequestID, "BadRequest", "chat_jid and text required")
@@ -522,15 +783,27 @@ func (s *sidecar) opSendText(conn net.Conn, req rpcRequest) {
 		s.fail(conn, req.RequestID, "BadRequest", "bad jid: "+err.Error())
 		return
 	}
-	msg := &waE2E.Message{Conversation: &p.Text}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	resp, err := s.client.SendMessage(ctx, jid, msg)
-	if err != nil {
-		s.fail(conn, req.RequestID, "SendFailed", err.Error())
+	if s.journal == nil || p.IdempotencyKey == "" {
+		s.fail(conn, req.RequestID, "BadRequest", "durable journal and idempotency_key required")
 		return
 	}
-	s.ok(conn, req.RequestID, map[string]interface{}{"message_id": resp.ID})
+	account := s.client.Store.ID.ToNonAD().String()
+	id, err := s.journal.sendOnce(account, p.IdempotencyKey, jid.ToNonAD().String(), p.Text,
+		s.client.GenerateMessageID(), func(id string) error {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_, err := s.client.SendMessage(ctx, jid, &waE2E.Message{Conversation: &p.Text}, whatsmeow.SendRequestExtra{ID: id})
+			return err
+		})
+	if err != nil {
+		kind := "DeliveryUncertain"
+		if errors.Is(err, errSendKeyConflict) {
+			kind = "IdempotencyConflict"
+		}
+		s.fail(conn, req.RequestID, kind, "outgoing message not retried; inspect durable delivery status")
+		return
+	}
+	s.ok(conn, req.RequestID, map[string]interface{}{"message_id": id})
 }
 
 // ---------------------------------------------------------------------------
@@ -586,34 +859,21 @@ func main() {
 	}
 
 	client := whatsmeow.NewClient(deviceStore, logger)
-	s := &sidecar{client: client, logger: logger}
+	journal, err := openEventJournal(storePath() + ".events")
+	if err != nil {
+		logger.Errorf("open durable WhatsApp event journal: %v", err)
+		os.Exit(1)
+	}
+	defer journal.Close()
+	s := &sidecar{client: client, journal: journal, logger: logger}
 	client.AddEventHandler(s.handleWAEvent)
 
 	// Pairing vs. reconnect.
 	if client.Store.ID == nil {
-		qrChan, err := client.GetQRChannel(context.Background())
-		if err != nil {
-			logger.Errorf("start QR pairing: %v", err)
+		if err := s.startPairing(); err != nil {
+			logger.Errorf("start pairing: %v", err)
 			os.Exit(1)
 		}
-		if err := client.Connect(); err != nil {
-			logger.Errorf("connect (pairing): %v", err)
-			os.Exit(1)
-		}
-		go func() {
-			for evt := range qrChan {
-				if evt.Event == "code" {
-					// Keep the latest code for a CLI that connects after pairing began.
-					// Never print QR/session material into service logs.
-					s.emitEvent(map[string]interface{}{
-						"event": "qr",
-						"code":  evt.Code,
-					})
-				} else {
-					logger.Infof("pair flow: %s", evt.Event)
-				}
-			}
-		}()
 	} else {
 		if err := client.Connect(); err != nil {
 			logger.Errorf("connect (reconnect): %v", err)

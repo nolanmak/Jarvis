@@ -464,7 +464,7 @@ mod tests {
         opts.env.push(("AUGMENTAGENT_BUILD_SCRATCH_HEADROOM_GIB".into(), "1".into()));
         opts.handoff_path = Some(temp.path().join("private-handoff.json"));
         let launch = BridgeLaunch::prepare(&opts, &launch_dir).unwrap();
-        assert!(launch.native_cwd.starts_with(&launch_dir));
+        assert!(launch.native_cwd.starts_with(launch_dir.canonicalize().unwrap()));
         assert_ne!(launch.native_cwd, wiki);
         let args = launch.config_overrides.join("\n");
         assert!(args.contains("features.shell_tool=false"));
@@ -494,8 +494,8 @@ mod tests {
         for helper in ["codex-build-vm.py", "build-dependency-proxy.py", "provider-supervisor.py"] {
             assert_eq!(std::fs::metadata(launch_dir.join(helper)).unwrap().permissions().mode() & 0o777, 0o600);
         }
-        assert_eq!(policy["write_roots"], serde_json::json!([wiki]));
-        assert!(policy["read_roots"].as_array().unwrap().contains(&serde_json::json!(transcripts)));
+        assert_eq!(policy["write_roots"], serde_json::json!([wiki.canonicalize().unwrap()]));
+        assert!(policy["read_roots"].as_array().unwrap().contains(&serde_json::json!(transcripts.canonicalize().unwrap())));
         assert_eq!(std::fs::metadata(launch.policy_path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 

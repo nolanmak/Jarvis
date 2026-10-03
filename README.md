@@ -27,6 +27,9 @@ personal wiki, and social/posting integrations.
 - **WhatsApp history.** Export WhatsApp Desktop conversations into searchable
   history and incremental wiki capture, with local or SSH setup and support for
   existing private Git feeds. See [WhatsApp history setup](docs/WHATSAPP-HISTORY.md).
+- **Live WhatsApp setup.** Link a phone with a QR scan and configure the owner
+  chat; the interactive daemon integration is still in progress. See
+  [live WhatsApp setup](docs/WHATSAPP-LIVE.md).
 - **Apple Notes.** A bundled Mac exporter turns your notes into a private,
   git-versioned Markdown bundle (edits show as diffs, secrets are scrubbed
   before anything is written) that the agent ingests. See
@@ -34,8 +37,8 @@ personal wiki, and social/posting integrations.
 - **SocialAPI.ai backend.** An official unified REST integration for
   cross-posting and reading/replying to comments + DMs across connected
   social accounts. See [SocialAPI.ai integration](#socialapiai-integration).
-- **Approval surfaces.** Discord is the primary control surface; a WhatsApp
-  control surface and a PWA + Web Push surface are also available.
+- **Approval surfaces.** Discord is the primary control surface; a PWA + Web
+  Push surface is also available. WhatsApp control is under development.
 - **Proactive CRM.** A scheduled engine surfaces stale contacts, unmet
   commitments, and upcoming events as nudges, backed by a markdown
   person-wiki with an identity index (email/phone/handles → person).
@@ -167,7 +170,7 @@ bot.
 - Linux with gnome-keyring (Secret Service) unlocked, and `python3`, `node`,
   `secret-tool` (libsecret-tools), and `jq` (wiki mode) on `PATH`; **or**
   macOS with the Xcode command-line tools (`xcode-select --install`) and
-  Homebrew `node`, `deno`, and `jq` — secrets go to the login Keychain. For an
+  Homebrew `node@24`, `deno`, `jq`, `bash`, and `coreutils` — secrets go to the login Keychain. For an
   always-on Mac mini, stop it sleeping: `sudo pmset -c sleep 0`.
 - Rust via rustup (the pinned toolchain in `rust-toolchain.toml` installs
   itself), a C toolchain with `perl`/`make` (OpenSSL and SQLite build from
@@ -291,7 +294,10 @@ the bot's Message Content intent, and more Claude calls per email — finish
 the [Quickstart](#quickstart) first.
 
 On macOS, run the installers from a shell where the required tools are on
-`PATH`. The daemon installer checks Node, Deno, jq, and only the CLI providers
+`PATH`. Include `/opt/homebrew/opt/coreutils/libexec/gnubin` (Apple Silicon)
+or `/usr/local/opt/coreutils/libexec/gnubin` (Intel) for GNU `readlink` and
+`timeout`; the launchd installer also includes these directories. The daemon
+installer checks Node, Deno, jq, Python, timeout, and only the CLI providers
 selected by `AUGMENTAGENT_REASONER_CHAIN` (from the environment or `.env`).
 The dashboard installer checks Node; the updater checks Cargo, Node, npm, and
 Git. Their resolved directories are written into the launchd environment, so
