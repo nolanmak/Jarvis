@@ -92,6 +92,7 @@ fn fixture() -> Fixture {
         search_path: Some(tools.path().as_os_str().to_owned()),
         fallback_dirs: vec![],
         timeout: Duration::from_secs(5),
+        ..ConvertOptions::default()
     };
     Fixture {
         _state: state,

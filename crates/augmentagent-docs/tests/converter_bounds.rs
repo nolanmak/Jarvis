@@ -60,6 +60,10 @@ fn opts(path: Option<OsString>, fallback: Vec<PathBuf>, timeout: Duration) -> Co
     ConvertOptions {
         search_path: path,
         fallback_dirs: fallback,
+        // These tests are about the converter lookup; the DOCX fallback
+        // (#1385) is disabled so a missing pandoc stays a missing pandoc.
+        fallback_search_path: None,
+        fallback_tool_dirs: vec![],
         timeout,
     }
 }
@@ -80,7 +84,15 @@ async fn missing_converter_is_a_clear_error_not_a_hang() {
         .to_string();
     assert!(started.elapsed() < Duration::from_secs(2));
     assert!(err.contains("pdftotext is not installed"), "{err}");
-    assert!(err.contains("poppler"), "install hint missing: {err}");
+    // Pinned verbatim: the DOCX fallback (#1385) reworded pandoc's hint for
+    // operators, and the PDF hint must not drift along with it.
+    assert!(
+        err.ends_with(
+            "; install poppler (`brew install poppler` on macOS, \
+             `apt install poppler-utils` on Linux)"
+        ),
+        "pdf install hint changed: {err}"
+    );
     let err = convert_doc_to_text_with(DocKind::Docx, &input(work.path()), &o)
         .await
         .unwrap_err()

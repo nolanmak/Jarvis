@@ -164,6 +164,7 @@ pub async fn run(
             "claude_cli_in_path",
             &std::env::var("CLAUDE_CLI").unwrap_or_else(|_| "claude".to_string()),
             Some("install the Claude CLI: see https://docs.claude.com/claude-code/install"),
+            true,
         )
         .await,
     );
@@ -173,6 +174,7 @@ pub async fn run(
             "python3_in_path",
             "python3",
             Some(&crate::platform::package_install_hint("python3", "python")),
+            true,
         )
         .await,
     );
@@ -182,6 +184,31 @@ pub async fn run(
             "node_in_path",
             "node",
             Some("install node (e.g. nvm install --lts)"),
+            true,
+        )
+        .await,
+    );
+    // 7b. Stage-1 document converters (#1385). Warnings, not errors: a host
+    // that never sees attachments is healthy, and DOCX now has a python3
+    // fallback. Surfacing them here beats discovering the gap mid-request.
+    findings.push(
+        check_which(
+            "pandoc_in_path",
+            "pandoc",
+            Some(&crate::platform::package_install_hint("pandoc", "pandoc")),
+            false,
+        )
+        .await,
+    );
+    findings.push(
+        check_which(
+            "pdftotext_in_path",
+            "pdftotext",
+            Some(&crate::platform::package_install_hint(
+                "poppler-utils",
+                "poppler",
+            )),
+            false,
         )
         .await,
     );
@@ -628,7 +655,14 @@ async fn probe_dashboard_direct(port: u16) -> bool {
     false
 }
 
-async fn check_which(name: &str, binary: &str, suggested: Option<&str>) -> Finding {
+/// `required: false` reports a missing binary as a warning — the capability it
+/// backs is optional or has a fallback.
+async fn check_which(name: &str, binary: &str, suggested: Option<&str>, required: bool) -> Finding {
+    let missing = if required {
+        Finding::error
+    } else {
+        Finding::warn
+    };
     let res = timeout(
         SUBPROCESS_TIMEOUT,
         Command::new("which").arg(binary).output(),
@@ -639,8 +673,8 @@ async fn check_which(name: &str, binary: &str, suggested: Option<&str>) -> Findi
             let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
             Finding::ok(name, format!("{binary} -> {path}"))
         }
-        Ok(Ok(_)) => Finding::error(name, format!("{binary} not on $PATH"), suggested),
-        Ok(Err(e)) => Finding::error(name, format!("which {binary} failed: {e}"), suggested),
+        Ok(Ok(_)) => missing(name, format!("{binary} not on $PATH"), suggested),
+        Ok(Err(e)) => missing(name, format!("which {binary} failed: {e}"), suggested),
         Err(_) => Finding::warn(
             name,
             format!("which {binary} timed out after 2s"),
