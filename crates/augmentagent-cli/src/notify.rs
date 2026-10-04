@@ -253,7 +253,7 @@ pub static PRODUCERS: &[Producer] = &[
     p("twitter_flags", "crates/augmentagent-channel-twitter/src/channel.rs", ".post_flag_notice(", 1, BROKER, "Twitter flags"),
     p("whatsapp_flags", "crates/augmentagent-channel-whatsapp/src/channel.rs", ".post_flag_notice(", 1, BROKER, "WhatsApp flags"),
     p("imessage_outbox_failures", "crates/augmentagent-cli/src/imessage_send.rs", ".post_flag_notice(", 1, BROKER, "iMessage send failures"),
-    p("cli_broker_digests", CLI, ".post_digest(", 3, BROKER, "contacts sync, signature backfill and pending-review digests"),
+    p("cli_broker_digests", CLI, ".post_digest(", 4, BROKER, "contacts sync, signature backfill, pending-review and contact auto-merge digests"),
     p("cli_broker_notices", CLI, ".post_flag_notice(", 2, BROKER, "compose fan-out / family cards"),
     act(p("pr_awaiting_approval", "crates/augmentagent-cli/src/self_improve.rs", ".post_flag_notice(", 1, BROKER, "agent-coding PR awaiting approval")),
     p("heartbeat", "crates/augmentagent-heartbeat/src/runner.rs", ".post_flag_notice(", 2, BROKER, "heartbeat check-ins"),

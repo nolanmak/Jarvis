@@ -4252,8 +4252,9 @@ async fn main() -> Result<()> {
             PersonOp::ProposeMerges => {
                 let wiki = cli.wiki_dir.as_deref().context("--wiki-dir is required")?;
                 let (broker, _) = build_broker(&cli, Arc::clone(&store), false).await?;
-                let n = propose_high_confidence_merges(wiki, &store, broker.as_ref()).await?;
-                println!("{n} merge card(s) raised");
+                let auto = auto_merge_contacts_enabled();
+                let scan = run_merge_scan(wiki, &store, broker.as_ref(), auto).await?;
+                println!("{} merge card(s) raised, {} auto-merged", scan.raised, scan.merged.len());
                 Ok(())
             }
         },
@@ -15659,25 +15660,129 @@ fn high_confidence_merge_candidates(wiki_dir: &Path) -> Result<Vec<(String, Stri
 /// #927 — a first pass over a 1,300-page wiki must not bury the channel.
 const MAX_MERGE_CARDS_PER_SCAN: usize = 5;
 
+/// What one merge scan did: cards raised for the owner, and (auto mode only)
+/// the merges it applied itself, as `Stub → Target` lines.
+#[derive(Debug, Default)]
+struct MergeScan {
+    raised: usize,
+    merged: Vec<String>,
+}
+
+/// `AUGMENTAGENT_AUTO_MERGE_CONTACTS=true` — apply high-confidence merges
+/// without a card. Off by default: the card flow (#927) stays the baseline.
+fn auto_merge_contacts_enabled() -> bool {
+    std::env::var("AUGMENTAGENT_AUTO_MERGE_CONTACTS")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// A survivor named after a bare phone number (`15555550100`) would swallow
+/// the stub's better name, so that direction still goes to a human as a card.
+fn auto_merge_eligible(into: &str) -> bool {
+    !into.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+/// The digest lists at most this many merges; the rest are counted.
+const MAX_AUTO_MERGE_DIGEST_LINES: usize = 25;
+
 /// #927 — the unattended path, run after every iMessage poll (and by `person
 /// propose-merges`): suggest, then raise a card each. One bad pair must not
-/// swallow the scan.
+/// swallow the scan. With `auto`, eligible pairs are merged on the spot and
+/// summarised in ONE digest instead of a card each.
+async fn run_merge_scan(
+    wiki_dir: &Path,
+    store: &Store,
+    broker: &dyn ApprovalBroker,
+    auto: bool,
+) -> Result<MergeScan> {
+    let mut scan = MergeScan::default();
+    for (stub, canonical) in high_confidence_merge_candidates(wiki_dir)? {
+        if auto && auto_merge_eligible(&canonical) {
+            match auto_apply_identity_merge(wiki_dir, store, &stub, &canonical) {
+                Ok(Some(r)) => scan.merged.push(format!("{} → {}", r.stub_title, r.target_title)),
+                Ok(None) => {}
+                Err(e) => warn!(stub, canonical, "identity auto-merge failed: {e:#}"),
+            }
+            continue;
+        }
+        if scan.raised >= MAX_MERGE_CARDS_PER_SCAN {
+            continue;
+        }
+        match propose_identity_merge(wiki_dir, store, broker, &stub, &canonical).await {
+            Ok(posted) => scan.raised += usize::from(posted),
+            Err(e) => warn!(stub, canonical, "identity-merge proposal failed: {e:#}"),
+        }
+    }
+    if !scan.merged.is_empty() {
+        let mut body: Vec<String> = scan
+            .merged
+            .iter()
+            .take(MAX_AUTO_MERGE_DIGEST_LINES)
+            .map(|l| format!("• {l}"))
+            .collect();
+        if scan.merged.len() > MAX_AUTO_MERGE_DIGEST_LINES {
+            body.push(format!("…and {} more", scan.merged.len() - MAX_AUTO_MERGE_DIGEST_LINES));
+        }
+        body.push("Undo: revert the merge commit in the wiki repo.".into());
+        let title = format!("Contacts auto-merged ({})", scan.merged.len());
+        if let Err(e) = broker.post_digest(&title, &body.join("\n")).await {
+            warn!("post identity auto-merge digest: {e}");
+        }
+    }
+    Ok(scan)
+}
+
+/// The card path alone — what the daemon did before auto mode existed.
+#[cfg(test)]
 async fn propose_high_confidence_merges(
     wiki_dir: &Path,
     store: &Store,
     broker: &dyn ApprovalBroker,
 ) -> Result<usize> {
-    let mut raised = 0;
-    for (stub, canonical) in high_confidence_merge_candidates(wiki_dir)? {
-        if raised >= MAX_MERGE_CARDS_PER_SCAN {
-            break;
+    Ok(run_merge_scan(wiki_dir, store, broker, false).await?.raised)
+}
+
+/// Auto mode: merge one pair without asking, leaving the same `merge:` row a
+/// card would have (settled `sent`, source `auto`) so it is never re-raised.
+/// A pair the owner already decided is left alone; a card still pending is
+/// claimed exactly as an Approve click would, so a later click is a no-op.
+/// `None` when there was nothing to do.
+fn auto_apply_identity_merge(
+    wiki_dir: &Path,
+    store: &Store,
+    from: &str,
+    into: &str,
+) -> Result<Option<PersonMergeReport>> {
+    let message_id = format!("merge:{from}->{into}");
+    let prior = store.latest_action_for_message(&message_id)?;
+    let action_id = match prior {
+        Some((_, status, _)) if matches!(status.as_str(), "sent" | "rejected") => return Ok(None),
+        Some((id, status, _)) if status == "pending" => id,
+        _ => {
+            let report = execute_person_merge(Some(wiki_dir), store, from, into, false)?;
+            let (inbound, payload, draft) = build_identity_merge_card(&report);
+            record_identity_merge_proposal(store, &inbound, &payload, &draft)?
         }
-        match propose_identity_merge(wiki_dir, store, broker, &stub, &canonical).await {
-            Ok(posted) => raised += usize::from(posted),
-            Err(e) => warn!(stub, canonical, "identity-merge proposal failed: {e:#}"),
+    };
+    if !store.claim_action_for_send(&action_id, ActionStatus::Pending, "auto")? {
+        return Ok(None);
+    }
+    match execute_person_merge(Some(wiki_dir), store, from, into, true) {
+        Ok(report) => {
+            let summary = format!(
+                "auto-merged {} into {} (phone rows repointed: {})",
+                report.from, report.into, report.phone_rows_repointed,
+            );
+            store.update_action_status(&action_id, ActionStatus::Sent, Some(&summary), None)?;
+            info!(action_id, from, into, "identity auto-merged");
+            Ok(Some(report))
+        }
+        Err(e) => {
+            let msg = format!("auto-merge: {e:#}");
+            let _ = store.update_action_status(&action_id, ActionStatus::Error, None, Some(&msg));
+            Err(e)
         }
     }
-    Ok(raised)
 }
 
 /// #927 — raise one suggested merge as a card; `false` when the pair is already
@@ -15965,7 +16070,8 @@ async fn imessage_poll_loop(
         }
         // #927 — the stubs this sync leaves ARE what the merge scan proposes.
         if let Some(root) = &wiki_root {
-            if let Err(e) = propose_high_confidence_merges(root, &store, broker.as_ref()).await {
+            let auto = auto_merge_contacts_enabled();
+            if let Err(e) = run_merge_scan(root, &store, broker.as_ref(), auto).await {
                 warn!("identity-merge scan failed: {e:#}");
             }
         }
@@ -21538,6 +21644,7 @@ mod identity_merge_tests {
     #[derive(Default)]
     struct RecordingBroker {
         posts: std::sync::Mutex<Vec<(String, String)>>,
+        digests: std::sync::Mutex<Vec<(String, String)>>,
         dead: bool,
     }
 
@@ -21553,6 +21660,11 @@ mod identity_merge_tests {
         }
 
         async fn post_flag_notice(&self, _e: &Email, _r: &str) -> Result<(), ApprovalError> {
+            Ok(())
+        }
+
+        async fn post_digest(&self, title: &str, body: &str) -> Result<(), ApprovalError> {
+            self.digests.lock().unwrap().push((title.to_string(), body.to_string()));
             Ok(())
         }
     }
@@ -21692,6 +21804,54 @@ mod identity_merge_tests {
         let row = store.lookup_person_by_phone(PHONE).unwrap().unwrap();
         assert_eq!(row.person_slug, TARGET, "future syncs hit the survivor");
         assert!(matches!(click(), ApprovalActionOutcome::AlreadyResolved { .. }));
+    }
+
+    /// Auto mode merges the pair with no card, says so in ONE digest, leaves a
+    /// settled row (so the next scan is a no-op), and claims a card that was
+    /// already up so a late Approve click cannot run it twice.
+    #[tokio::test]
+    async fn auto_mode_merges_without_a_card_and_posts_one_digest() {
+        let (store, _t, wiki) = seeded_env();
+        let stub = wiki.join("people").join(format!("{STUB}.md"));
+        let discord = RecordingBroker::default();
+        // A card raised before auto mode was switched on.
+        assert_eq!(run_merge_scan(&wiki, &store, &discord, false).await.unwrap().raised, 1);
+        let (card_id, _) = discord.posts.lock().unwrap().remove(0);
+
+        let scan = run_merge_scan(&wiki, &store, &discord, true).await.unwrap();
+        assert_eq!((scan.raised, scan.merged.len()), (0, 1));
+        assert!(discord.posts.lock().unwrap().is_empty(), "no card in auto mode");
+        assert!(!stub.exists(), "the merge ran");
+        let digests = discord.digests.lock().unwrap().clone();
+        assert_eq!(digests.len(), 1);
+        assert_eq!(digests[0].0, "Contacts auto-merged (1)");
+        assert!(digests[0].1.contains("• Landlord Philly → Centra Associates"), "{digests:?}");
+        let row = store.get_action_with_email(&card_id).unwrap().unwrap();
+        assert_eq!(row.action.status, "sent", "the pending card was claimed");
+        let late_click = ReplyApprover::approve_identity_merge(&store, Some(&wiki), &card_id, row);
+        assert!(matches!(late_click, ApprovalActionOutcome::AlreadyResolved { .. }));
+
+        let again = run_merge_scan(&wiki, &store, &discord, true).await.unwrap();
+        assert_eq!((again.raised, again.merged.len()), (0, 0));
+        assert_eq!(discord.digests.lock().unwrap().len(), 1, "no empty digest");
+    }
+
+    /// A pair the owner rejected stays rejected, and a survivor named after a
+    /// bare phone number still goes to a human as a card.
+    #[tokio::test]
+    async fn auto_mode_respects_a_rejection_and_cards_phone_named_targets() {
+        let (store, _t, wiki) = seeded_env();
+        let discord = RecordingBroker::default();
+        run_merge_scan(&wiki, &store, &discord, false).await.unwrap();
+        let (card_id, _) = discord.posts.lock().unwrap().remove(0);
+        store.update_action_status(&card_id, ActionStatus::Rejected, None, None).unwrap();
+        let scan = run_merge_scan(&wiki, &store, &discord, true).await.unwrap();
+        assert_eq!((scan.raised, scan.merged.len()), (0, 0));
+        assert!(wiki.join("people").join(format!("{STUB}.md")).exists());
+
+        assert!(auto_merge_eligible("centra-associates"));
+        assert!(!auto_merge_eligible("15555550100"));
+        assert!(!auto_merge_eligible("1-555-555-0100"));
     }
 
     /// #968 — Discord hands `email.body` half of the embed's ~3.8K description,
