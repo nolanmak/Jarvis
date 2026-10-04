@@ -19,7 +19,9 @@
 //! them (the #994 failure) vouches for nothing. A receipt marked `(you
 //! asked)` records an owner override — a dictated register or an exact
 //! template with deliberate per-line casing — and is not second-guessed
-//! ([`is_owner_override_receipt`], #1107).
+//! ([`is_owner_override_receipt`], #1107). A period that may be an
+//! abbreviation (`vol. 2`, `Dr. Smith`) is not read as a sentence boundary
+//! at all, so the word behind it is evidence for neither register (#1371).
 //!
 //! Call sites: Discord replies via `attachments::prepare_answer_delivery`
 //! and `/loop` results in `loops.rs`; email bodies via `gmail compose|
@@ -205,6 +207,52 @@ fn draft_paragraphs<'a>(lines: &[&'a str], receipt_idx: Option<usize>) -> (Vec<V
     (paragraphs, i)
 }
 
+/// Words whose trailing period is usually an abbreviation rather than a
+/// terminator (#1371). Lowercase, no trailing dot, alphabetically sorted;
+/// every entry has a plausible mid-sentence use.
+const ABBREVIATIONS: &[&str] = &[
+    "al", "approx", "ave", "ca", "cf", "co", "corp", "dept", "dr", "eg", "est", "etc", "fig",
+    "hrs", "ie", "inc", "jr", "ltd", "max", "min", "mr", "mrs", "ms", "mx", "no", "nos", "pp",
+    "prof", "rd", "sr", "st", "vs", "vol",
+];
+
+/// Whether the word just read ends the sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Boundary {
+    /// The sentence continues.
+    No,
+    /// A real terminator: the next word starts a sentence.
+    Sure,
+    /// A period that is probably an abbreviation (#1371). The next word is
+    /// evidence for neither register — guessing either way would turn this
+    /// false positive into a false negative in the other direction.
+    Unsure,
+}
+
+/// The single place the checker decides whether a word ends a sentence.
+/// Nothing else in this crate classifies a terminator: the only other
+/// `ends_with(['.', '!', '?'])`-shaped tests in the workspace punctuate
+/// flattened voice text and score signature lines, neither of which feeds
+/// register evidence, so they are deliberately left alone (#1371).
+fn boundary_after(word: &str, opaque: bool) -> Boundary {
+    if opaque {
+        return Boundary::No;
+    }
+    let trimmed = word.trim_end_matches(['"', '\'', ')', '*', '_']);
+    match trimmed.chars().last() {
+        Some('!') | Some('?') => return Boundary::Sure,
+        Some('.') => {}
+        _ => return Boundary::No,
+    }
+    let stem = trimmed.trim_end_matches('.').to_lowercase();
+    let initial = stem.chars().count() == 1 && stem.chars().all(char::is_alphabetic);
+    if initial || ABBREVIATIONS.contains(&stem.as_str()) {
+        Boundary::Unsure
+    } else {
+        Boundary::Sure
+    }
+}
+
 /// Casing at each sentence start of the paragraph: its first word, and every
 /// word after a `.`/`!`/`?`. A sentence runs ACROSS a soft wrap, so a line
 /// break is not a boundary. Only sentence-shaped paragraphs (three
@@ -212,6 +260,11 @@ fn draft_paragraphs<'a>(lines: &[&'a str], receipt_idx: Option<usize>) -> (Vec<V
 /// way — a list marker demotes the item's first word, and URL/handle/
 /// abbreviation/brand-shaped words (`github.com/x`, `@sam`, `e.g.`,
 /// `iPhone`) are skipped: their casing says nothing about register.
+///
+/// #1371: a period the checker cannot classify — after `vol.`, `Dr.`, an
+/// initial — is [`Boundary::Unsure`] and the word behind it counts toward
+/// neither tally, and nothing but a word with a letter in it can open a
+/// sentence, so `vol. 2 is …` no longer reads `is` as a lowercase opener.
 fn sentence_starts(paragraph: &[&str]) -> (usize, usize) {
     let (mut upper, mut lower) = (0, 0);
     // Evidence is judged per PARAGRAPH, not per line, and a sentence runs
@@ -235,13 +288,17 @@ fn sentence_starts(paragraph: &[&str]) -> (usize, usize) {
     {
         return (0, 0);
     }
-    let mut at_start = true;
+    let mut at_start = Boundary::Sure;
     for line in paragraph {
-        let words: Vec<&str> = line.split_whitespace().collect();
-        for (n, word) in words.iter().enumerate() {
+        for word in line.split_whitespace() {
             let Some(first) = word.chars().find(|c| c.is_alphabetic()) else {
-                // `-`, `1.`, `•` open a list item; a blockquote `>` does not.
-                at_start &= n > 0 || *word == ">";
+                // `-`, `1.`, `•` open a list item and demote it; a blockquote
+                // `>` is not part of the prose and leaves the state alone.
+                // Nothing wordless opens a sentence, so a digit or a symbol
+                // ends the boundary rather than carrying it across (#1371).
+                if word != ">" {
+                    at_start = Boundary::No;
+                }
                 continue;
             };
             // Trimming the edges leaves only interior dots, so `e.g.` and
@@ -250,17 +307,14 @@ fn sentence_starts(paragraph: &[&str]) -> (usize, usize) {
                 .trim_matches(|c: char| !c.is_alphanumeric())
                 .contains(['/', '@', '.'])
                 || (first.is_lowercase() && word.chars().skip(1).any(char::is_uppercase));
-            if at_start && !opaque {
+            if at_start == Boundary::Sure && !opaque {
                 if first.is_uppercase() {
                     upper += 1;
                 } else {
                     lower += 1;
                 }
             }
-            at_start = word
-                .trim_end_matches(['"', '\'', ')', '*', '_'])
-                .ends_with(['.', '!', '?'])
-                && !opaque;
+            at_start = boundary_after(word, opaque);
         }
     }
     (upper, lower)
@@ -514,6 +568,79 @@ mod tests {
             "the receipt form is:\n```\nregister: standard (she capitalizes), mirroring\n```\nhey there, no thread on file for her.",
         ] {
             assert!(audit_register_receipts(reply).is_empty(), "{reply}");
+        }
+    }
+
+    /// #1371 verbatim: the period in `vol.` is an abbreviation, not a
+    /// terminator, so the digit after it does not open a sentence and the
+    /// correctly-cased draft must draw no note.
+    #[test]
+    fn issue_1371_abbreviation_period_is_not_a_sentence_boundary() {
+        let notes = audit_register_receipts(
+            "register: standard (she capitalizes), mirroring\n\
+             ```\nExample Event rooftop vol. 2 is in the books.\n```",
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// #1371: an abbreviation period draws no note under EITHER register, and
+    /// through either entry point — `audit_draft_against_sample` shares the
+    /// splitter, so `Dr. Smith` must stop manufacturing a spurious capital
+    /// for a lowercase recipient.
+    #[test]
+    fn issue_1371_abbreviations_are_evidence_for_neither_register() {
+        // Standard: the word after the abbreviation is lowercase and must not
+        // be read as a lowercase sentence start.
+        for draft in [
+            "Example Event rooftop vol. 2 is in the books.",
+            "We expect approx. 40 people at the rooftop one.",
+            "Dr. Smith is in the room already.",
+            "Bring something small, e.g. the rooftop one.",
+            "J. Smith replied about the venue.",
+            "Example Event rooftop vol.\n2 is in the books.",
+            "He said \"ok.\" Then we left.",
+            "Bring snacks, drinks, etc. ...",
+        ] {
+            let notes = audit_register_receipts(&format!(
+                "register: standard (she capitalizes), mirroring\n```\n{draft}\n```"
+            ));
+            assert!(notes.is_empty(), "{draft:?}: {notes:?}");
+        }
+
+        // Lowercase: the word after the abbreviation is capitalized (a proper
+        // noun) and must not be read as a capitalized sentence start either.
+        for draft in [
+            "saw dr. Smith about it, all good",
+            "going to the vol. 2 thing at Example Venue tonight",
+            "ask approx. 40 of them, e.g. Casey and the rooftop crew",
+            "heard from j. Smith about the venue",
+            "we are going to the vol.\n2 thing tonight",
+        ] {
+            let notes = audit_register_receipts(&format!(
+                "register: lowercase (he types all-lowercase), mirroring\n```\n{draft}\n```"
+            ));
+            assert!(notes.is_empty(), "{draft:?}: {notes:?}");
+        }
+
+        // The recipient-sample path shares the splitter: her all-lowercase
+        // message is lowercase, and `Dr.` in the draft is not a capital.
+        let inbound = "hey jo, are we still on for thursday? let me know";
+        assert!(audit_draft_against_sample(inbound, "saw dr. Smith about it. all good").is_none());
+        assert!(audit_draft_against_sample(inbound, "saw the doctor. All good").is_some());
+    }
+
+    /// #1371: one abbreviation must not blind the rest of the paragraph —
+    /// a real terminator later in the same paragraph is still reported.
+    #[test]
+    fn issue_1371_an_abbreviation_does_not_suppress_a_later_real_boundary() {
+        for draft in [
+            "Hello Casey, the proposal is ready. it went out this morning.",
+            "Example Event rooftop vol. 2 is in the books. it was great.",
+        ] {
+            let notes = audit_register_receipts(&format!(
+                "register: standard (she capitalizes), mirroring\n```\n{draft}\n```"
+            ));
+            assert_eq!(notes.len(), 1, "{draft:?}: {notes:?}");
         }
     }
 
