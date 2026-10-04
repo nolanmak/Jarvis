@@ -214,6 +214,7 @@ impl Harness {
                 // Generous: a fresh script's first run can be slow on a
                 // loaded macOS host (the fake finishes in milliseconds).
                 timeout: Duration::from_secs(30),
+                ..ConvertOptions::default()
             },
             limits: ClipLimits::default(),
             replies: SpokenReplyOptions::new(self.replies_root()),
