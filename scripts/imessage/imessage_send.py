@@ -205,7 +205,10 @@ class Sender:
             # Report a fixed diagnostic, without sending local paths or database text.
             self.agent.heartbeat("Messages database unreadable: grant Full Disk Access to the scheduled Python")
             raise
-        self.agent.heartbeat()
+        try:
+            self.agent.heartbeat()
+        except AgentError:
+            print("heartbeat failed; continuing delivery reconciliation", flush=True)
         try:
             with self.lock():
                 self._reconcile_journal()

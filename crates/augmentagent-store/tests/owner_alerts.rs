@@ -234,3 +234,24 @@ fn concurrent_schedulers_enqueue_and_claim_only_one_owner_text() {
     assert_eq!(claimed, 1);
     assert_eq!(store.list_imessage_outbox(10).unwrap().len(), 1);
 }
+
+#[test]
+fn health_and_delivery_failure_caps_are_independent_and_persistent() {
+    let dir=tempfile::tempdir().unwrap();let path=dir.path().join("test.db");let store=Store::open(&path).unwrap();
+    assert!(store.claim_owner_text_health_notice(1_000,600_000).unwrap());
+    assert!(store.claim_owner_text_failure_notice(1_000,600_000).unwrap());
+    drop(store);let store=Store::open(path).unwrap();
+    assert!(!store.claim_owner_text_failure_notice(1_001,600_000).unwrap());
+    assert!(store.claim_owner_text_health_notice(601_000,600_000).unwrap());
+    assert!(store.claim_owner_text_failure_notice(601_000,600_000).unwrap());
+}
+#[test]
+fn reported_unknown_outcome_has_a_completion_timestamp() {
+    let dir=tempfile::tempdir().unwrap();let store=Store::open(dir.path().join("test.db")).unwrap();
+    store.configure_owner_alert_texts(Some("+15555550100"),true).unwrap();
+    store.insert_owner_alert(&alert("a",Urgency::Critical),1000).unwrap();store.enqueue_owner_alert_texts(1000).unwrap();
+    let item=store.claim_owner_alert_text(1100).unwrap().unwrap();
+    store.complete_imessage_outbox(item.id,&augmentagent_store::ImessageSendOutcome::Unknown{reason:"no receipt".into()}).unwrap();
+    let completed:Option<i64>=store.with_conn(|c|c.query_row("SELECT completed_at_ms FROM imessage_outbox WHERE id=?1",[item.id],|r|r.get(0))).unwrap();
+    assert!(completed.is_some());
+}

@@ -499,9 +499,9 @@ pub(crate) async fn notify_outbox_failures(
             if let Some(alert) = store.owner_alert_for_outbox(row.id)? {
                 let status = store.owner_alert_text_status(&alert.id)?.unwrap_or_default();
                 if status != "cancelled" {
-                    // One notice per evaluation, with the same persistent ten-minute cap
-                    // as health failures. Unposted failures remain eligible next time.
-                    if !store.claim_owner_text_health_notice(now, 600_000)? { continue; }
+                    // Separate ten-minute cap: health notices cannot starve
+                    // alert-specific outcomes. Unposted failures remain eligible.
+                    if !store.claim_owner_text_failure_notice(now, 600_000)? { continue; }
                     broker.post_digest("Owner alert text not confirmed", &format!(
                         "Alert {}: {}. {}. Discord reminders remain active. {}",
                         alert.id,status,row.error_detail.as_deref().unwrap_or("check sender health"),alert.source_url

@@ -128,7 +128,10 @@ pub(crate) fn migrate(c: &Connection) -> StoreResult<()> {
         CREATE TABLE IF NOT EXISTS owner_text_sender_health (
             singleton INTEGER PRIMARY KEY CHECK(singleton=1), heartbeat_at_ms INTEGER,
             error TEXT, notified_at_ms INTEGER);
-        INSERT OR IGNORE INTO owner_text_sender_health(singleton) VALUES(1);",
+        INSERT OR IGNORE INTO owner_text_sender_health(singleton) VALUES(1);
+        CREATE TABLE IF NOT EXISTS owner_text_failure_notice_limit (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),notified_at_ms INTEGER);
+        INSERT OR IGNORE INTO owner_text_failure_notice_limit(singleton) VALUES(1);",
     )?;
     Ok(())
 }
@@ -216,6 +219,13 @@ impl Store {
                 params![now, interval_ms],
             )
         })? == 1)
+    }
+
+    /// Failure notices have their own cap so persistent health degradation
+    /// cannot starve delivery outcomes indefinitely.
+    pub fn claim_owner_text_failure_notice(&self, now: i64, interval_ms: i64) -> StoreResult<bool> {
+        Ok(self.with_conn(|c|c.execute("UPDATE owner_text_failure_notice_limit SET notified_at_ms=?1
+            WHERE singleton=1 AND (notified_at_ms IS NULL OR notified_at_ms<=?1-?2)",params![now,interval_ms]))?==1)
     }
 
     /// Separate owner opt-in, independent of approved-contact allowlists.

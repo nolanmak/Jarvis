@@ -248,8 +248,8 @@ impl Store {
         let now = now_millis();
         let n = self.with_conn(|c| match outcome {
             ImessageSendOutcome::Unknown { reason } => c.execute(
-                "UPDATE imessage_outbox SET status='unknown',error_detail=?2
-                 WHERE id=?1 AND status='claimed'", params![id,reason],
+                "UPDATE imessage_outbox SET status='unknown',error_detail=?2,completed_at_ms=?3
+                 WHERE id=?1 AND status='claimed'", params![id,reason,now],
             ),
             ImessageSendOutcome::Sent { message_guid } => c.execute(
                 "UPDATE imessage_outbox \

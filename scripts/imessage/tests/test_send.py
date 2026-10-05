@@ -107,6 +107,15 @@ class SenderTests(unittest.TestCase):
         self.assertEqual(agent.completed[0]["status"], "failed")
         self.assertIn("expired before dispatch", agent.completed[0]["reason"])
 
+    def test_heartbeat_failure_does_not_block_delivery(self):
+        agent = FakeAgent([item()])
+        def broken_heartbeat(error=None):
+            raise snd.AgentError("temporary heartbeat failure")
+        agent.heartbeat = broken_heartbeat
+        runner = FakeRunner(effect=lambda: insert(self.con, 2, 1, "see you at 8", sent=1, error=0))
+        self.assertEqual(self.sender(agent, runner).run_once(), 1)
+        self.assertEqual(agent.completed[0]["status"], "sent")
+
     def test_idle_scheduler_reports_health_and_permissions_failure(self):
         agent = FakeAgent()
         self.sender(agent, FakeRunner()).run_once()
