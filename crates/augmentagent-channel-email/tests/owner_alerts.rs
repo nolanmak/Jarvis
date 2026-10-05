@@ -198,3 +198,71 @@ fn changed_sender_priority_reopens_prior_assessment() {
         1
     );
 }
+
+struct FailsOnce(std::sync::atomic::AtomicBool);
+#[async_trait::async_trait]
+impl augmentagent_channel_core::Reasoner for FailsOnce {
+    async fn call(
+        &self,
+        opts: &augmentagent_channel_core::reasoner::ReasonerOpts,
+        prompt: &str,
+    ) -> anyhow::Result<String> {
+        if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Ok("malformed assessment".into());
+        }
+        augmentagent_channel_core::Reasoner::call(&PreparationReasoner, opts, prompt).await
+    }
+}
+#[tokio::test]
+async fn one_bad_assessment_does_not_starve_other_emails_and_remains_retryable() {
+    use augmentagent_channel_email::owner_alerts::backfill_tick;
+    use augmentagent_store::{Store, TriageResult};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("test.db")).unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    for n in 0..2 {
+        let mut mail=email("Please review the project brief before our Monday meeting and tell me your recommendation.");
+        mail.message_id = format!("mail{n}");
+        store.upsert_email_backfill(&mail, now - n - 1).unwrap();
+        store
+            .mark_email_processed(&mail.message_id, TriageResult::Flag)
+            .unwrap();
+    }
+    let meeting = MeetingContext {
+        id: "meeting1".into(),
+        account_id: "account1".into(),
+        summary: "Project review".into(),
+        start_ms: now + 7_200_000,
+        participants: vec!["colleague@example.test".into()],
+        url: None,
+    };
+    store
+        .cache_owner_alert_meeting(
+            "meeting1",
+            "account1",
+            meeting.start_ms,
+            &serde_json::to_string(&meeting).unwrap(),
+            now,
+        )
+        .unwrap();
+    let reasoner = FailsOnce(true.into());
+    assert_eq!(
+        backfill_tick(&store, &reasoner, None, now).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .owner_alert_backfill_candidates(now, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        backfill_tick(&store, &reasoner, None, now).await.unwrap(),
+        1
+    );
+    assert!(store
+        .owner_alert_backfill_candidates(now, 10)
+        .unwrap()
+        .is_empty());
+}

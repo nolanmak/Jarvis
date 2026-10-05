@@ -41,18 +41,27 @@ pub async fn backfill_tick<R: augmentagent_channel_core::Reasoner + ?Sized>(
     let opts = augmentagent_channel_core::reasoner::triage_opts(wiki_root.clone());
     let mut assessed = 0;
     for email in store.owner_alert_backfill_candidates(now, 10)? {
-        let hint = wiki_root
-            .as_ref()
-            .map(|root| {
-                let layout = augmentagent_wiki::WikiLayout::new(root.clone());
-                augmentagent_wiki::WikiReader::new(&layout).triage_hint(&email)
-            })
-            .unwrap_or_default();
-        let mut prompt = augmentagent_channel_core::prompt::triage_user_message(&email, "", &hint);
-        prompt.push_str(&prompt_context(store, &email, now)?);
-        let raw = reasoner.call(&opts, &prompt).await?;
-        persist_assessment(store, &email, &raw, chrono::Utc::now().timestamp_millis())?;
-        assessed += 1;
+        let result: anyhow::Result<()> = async {
+            let hint = wiki_root
+                .as_ref()
+                .map(|root| {
+                    let layout = augmentagent_wiki::WikiLayout::new(root.clone());
+                    augmentagent_wiki::WikiReader::new(&layout).triage_hint(&email)
+                })
+                .unwrap_or_default();
+            let mut prompt =
+                augmentagent_channel_core::prompt::triage_user_message(&email, "", &hint);
+            prompt.push_str(&prompt_context(store, &email, now)?);
+            let raw = reasoner.call(&opts, &prompt).await?;
+            persist_assessment(store, &email, &raw, chrono::Utc::now().timestamp_millis())?;
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => assessed += 1,
+            Err(error) => tracing::warn!(message_id=%email.message_id,
+                "owner alert assessment failed; remains eligible for retry: {error:#}"),
+        }
     }
     Ok(assessed)
 }
