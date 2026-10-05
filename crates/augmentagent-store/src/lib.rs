@@ -46,7 +46,8 @@ pub use models::{
     TelegramBot, ToneExample, ToneProfile, TriageResult, UserLoop, WhatsappDevice,
 };
 pub use store::{
-    ActionCodeModeFields, ActionWithEmail, DiscordConversation, JournalSyncCursor,
+    ActionCodeModeFields, ActionWithEmail, DiscordConversation, InterruptedDiscordTurn,
+    JournalSyncCursor,
     NativeConversation, PendingActionRow, PendingNudge, RetryableReply, RevisionRecord, Store,
     StoreError, StoreResult, SurfaceTurnResolution, SurfaceTurnState, SurfaceTurnStatus,
     NUDGE_INTERVAL_MS,

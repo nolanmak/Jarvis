@@ -94,6 +94,15 @@ impl SurfaceTurnResolution {
     }
 }
 
+/// #1396 — a Discord turn the previous daemon process died on, closed by
+/// [`Store::interrupt_pending_discord_turns`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterruptedDiscordTurn {
+    pub guild_id: String,
+    pub channel_id: String,
+    pub turn_id: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SurfaceTurnState {
     pub status: SurfaceTurnStatus,
@@ -417,9 +426,15 @@ impl Store {
         }
         let mut guard = self.conn.lock().expect("store mutex poisoned");
         let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // #1396 — a turn the startup pass closed as interrupted stays
+        // consumed but no longer blocks the channel.
         let unfinished: Option<String> = tx.query_row(
-            "SELECT turn_id FROM discord_native_turns \
-             WHERE guild_id = ?1 AND channel_id = ?2 AND status != 'complete' LIMIT 1",
+            "SELECT t.turn_id FROM discord_native_turns t \
+             WHERE t.guild_id = ?1 AND t.channel_id = ?2 AND t.status != 'complete' \
+             AND NOT EXISTS (SELECT 1 FROM surface_turn_resolutions r \
+                 WHERE r.platform = 'discord' AND r.account_id = t.guild_id \
+                 AND r.conversation_id = t.channel_id AND r.thread_id = '' \
+                 AND r.turn_id = t.turn_id) LIMIT 1",
             params![guild_id, channel_id],
             |row| row.get(0),
         ).optional()?;
@@ -440,6 +455,49 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// #1396 — close every Discord turn still `pending` as interrupted and
+    /// return them, so the owner can be told. Only the daemon may call this,
+    /// once, before it accepts Discord messages: at that point a pending
+    /// claim can only belong to a process that died mid-turn. The turn is
+    /// never re-run (its tools may have acted) but no longer blocks its
+    /// channel. Turns a live process finished as `uncertain` are left alone.
+    pub fn interrupt_pending_discord_turns(&self) -> StoreResult<Vec<InterruptedDiscordTurn>> {
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let turns: Vec<InterruptedDiscordTurn> = {
+            let mut stmt = tx.prepare(
+                "SELECT guild_id, channel_id, turn_id FROM discord_native_turns \
+                 WHERE status = 'pending' ORDER BY created_at_ms, turn_id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(InterruptedDiscordTurn {
+                    guild_id: row.get(0)?,
+                    channel_id: row.get(1)?,
+                    turn_id: row.get(2)?,
+                })
+            })?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let now = now_millis();
+        for turn in &turns {
+            tx.execute(
+                "UPDATE discord_native_turns SET status = 'uncertain', finished_at_ms = ?4 \
+                 WHERE guild_id = ?1 AND channel_id = ?2 AND turn_id = ?3 AND status = 'pending'",
+                params![turn.guild_id, turn.channel_id, turn.turn_id, now],
+            )?;
+            tx.execute(
+                "INSERT INTO surface_turn_resolutions \
+                 (platform, account_id, conversation_id, thread_id, turn_id, resolution, resolved_at_ms) \
+                 VALUES ('discord', ?1, ?2, '', ?3, ?4, ?5) \
+                 ON CONFLICT(platform, account_id, conversation_id, thread_id, turn_id) DO NOTHING",
+                params![turn.guild_id, turn.channel_id, turn.turn_id,
+                    SurfaceTurnResolution::Interrupted.as_str(), now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(turns)
     }
 
     /// Only the native runner that claimed a pending turn can resolve it.

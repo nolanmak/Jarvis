@@ -49,6 +49,10 @@ pub struct DiscordConfig {
     /// Bridge into the cli's ShadowNote journaling flow (#428). `None`
     /// leaves `!journal` answering with a not-configured notice.
     pub journal_ops: Option<Arc<dyn JournalOps>>,
+    /// #1396 — turns the previous daemon process died on, already closed in
+    /// the store (`Store::interrupt_pending_discord_turns`). The owner is told
+    /// about each once the gateway is ready. One-shot commands pass none.
+    pub interrupted_turns: Vec<augmentagent_store::InterruptedDiscordTurn>,
     /// Private Unix socket for the Discord voice sidecar. Voice remains off
     /// when this is unset.
     pub voice_socket_path: Option<std::path::PathBuf>,
@@ -75,6 +79,9 @@ pub(crate) struct BrokerState {
     /// Populated once, from the first `Ready` event. Used to distinguish the
     /// bot's own messages from the user's when building conversation context.
     pub(crate) bot_user_id: std::sync::OnceLock<UserId>,
+    /// #1396 — interrupted turns the owner has not been told about yet;
+    /// drained by the first `Ready`.
+    pub(crate) interrupted_turns: std::sync::Mutex<Vec<augmentagent_store::InterruptedDiscordTurn>>,
 }
 
 impl BrokerState {
@@ -107,6 +114,7 @@ impl BrokerState {
             voice_bridge,
             voice_enabled,
             bot_user_id: std::sync::OnceLock::new(),
+            interrupted_turns: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -166,6 +174,9 @@ impl DiscordApprovalBroker {
             voice_bridge,
             config.voice_socket_path.is_some(),
         ));
+
+        *state.interrupted_turns.lock().expect("interrupted turns poisoned") =
+            config.interrupted_turns.clone();
 
         if state.allowed_user_id.is_none() {
             warn!(

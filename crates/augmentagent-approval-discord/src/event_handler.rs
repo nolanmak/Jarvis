@@ -297,6 +297,29 @@ impl Handler {
     }
 }
 
+/// #1396 — posted for a turn a daemon restart interrupted. It is not re-run,
+/// because its tools may already have acted.
+pub const INTERRUPTED_TURN_NOTICE: &str = "Jarvis restarted while working on this, so it stopped \
+     part-way and was not run again (it may already have done some of the work). Send it again \
+     if you still need it.";
+
+/// Where to post the notice for an interrupted turn: its channel, and the
+/// message to reply to when the turn is a text turn (`<channel>:<message>`).
+/// Any other turn ID (speech) gets a channel-level notice. `None` only when
+/// the channel itself is not a Discord ID.
+pub fn interrupted_turn_target(
+    turn: &augmentagent_store::InterruptedDiscordTurn,
+) -> Option<(ChannelId, Option<MessageId>)> {
+    let channel = turn.channel_id.parse::<u64>().ok().filter(|id| *id != 0)?;
+    let message = turn
+        .turn_id
+        .strip_prefix(&format!("{}:", turn.channel_id))
+        .and_then(|rest| rest.parse::<u64>().ok())
+        .filter(|id| *id != 0)
+        .map(MessageId::new);
+    Some((ChannelId::new(channel), message))
+}
+
 #[serenity::async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
@@ -325,6 +348,31 @@ impl EventHandler for Handler {
                     }
                 });
             }
+        }
+
+        // #1396 — tell the owner about turns the previous process died on.
+        // They are already closed in the store; drained so a re-identify
+        // does not repeat the notice.
+        let interrupted = std::mem::take(
+            &mut *self.state.interrupted_turns.lock().expect("interrupted turns poisoned"),
+        );
+        if !interrupted.is_empty() {
+            let http = Arc::clone(&ctx.http);
+            tokio::spawn(async move {
+                for turn in interrupted {
+                    let Some((channel, message)) = interrupted_turn_target(&turn) else {
+                        warn!(turn_id = %turn.turn_id, "interrupted Discord turn has no channel to notify");
+                        continue;
+                    };
+                    let mut builder = CreateMessage::new().content(INTERRUPTED_TURN_NOTICE);
+                    if let Some(message) = message {
+                        builder = builder.reference_message(MessageReference::from((channel, message)));
+                    }
+                    if let Err(error) = channel.send_message(&*http, builder).await {
+                        warn!(turn_id = %turn.turn_id, "could not post interrupted-turn notice: {error}");
+                    }
+                }
+            });
         }
 
         // One-shot scrollback sweep: delete approval cards whose actions are
@@ -2652,6 +2700,35 @@ fn hard_split(s: &str, max: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #1396 — where the owner is told about a turn a restart interrupted.
+    fn interrupted(channel: &str, turn_id: &str) -> augmentagent_store::InterruptedDiscordTurn {
+        augmentagent_store::InterruptedDiscordTurn {
+            guild_id: "1".into(),
+            channel_id: channel.into(),
+            turn_id: turn_id.into(),
+        }
+    }
+
+    #[test]
+    fn interrupted_text_turn_is_answered_on_its_own_message() {
+        assert_eq!(
+            interrupted_turn_target(&interrupted("42", "42:77")),
+            Some((ChannelId::new(42), Some(MessageId::new(77))))
+        );
+    }
+
+    #[test]
+    fn interrupted_turn_of_any_other_shape_still_gets_a_channel_notice() {
+        for turn_id in ["42:voice-start-77", "speech-9", "43:77", "42:0", ""] {
+            assert_eq!(
+                interrupted_turn_target(&interrupted("42", turn_id)),
+                Some((ChannelId::new(42), None)),
+                "{turn_id}"
+            );
+        }
+        assert_eq!(interrupted_turn_target(&interrupted("not-a-channel", "x")), None);
+    }
     use augmentagent_docs::doc_command_for;
 
     #[test]
