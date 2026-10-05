@@ -33,6 +33,7 @@ pub const GCAL_FIELD_ALLOWLIST: &[&str] = &[
     "attendees",
     "organizer",
     "conference_data",
+    "html_link",
 ];
 
 /// Raw Calendar event parsed from Composio's `GOOGLECALENDAR_EVENTS_LIST` /
@@ -43,6 +44,9 @@ pub const GCAL_FIELD_ALLOWLIST: &[&str] = &[
 #[serde(default)]
 pub struct CalendarEvent {
     pub id: String,
+    /// Authenticated Calendar event link, never a conference join URL.
+    #[serde(rename = "htmlLink")]
+    pub html_link: Option<String>,
     #[serde(rename = "iCalUID")]
     pub ical_uid: Option<String>,
     #[serde(rename = "recurringEventId")]

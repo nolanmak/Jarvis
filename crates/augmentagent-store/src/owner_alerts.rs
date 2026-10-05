@@ -136,7 +136,7 @@ pub(crate) fn migrate(c: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
-fn row(r: &Row<'_>) -> rusqlite::Result<OwnerAlert> {
+pub(crate) fn row(r: &Row<'_>) -> rusqlite::Result<OwnerAlert> {
     let urgency: String = r.get("urgency")?;
     let state: String = r.get("state")?;
     Ok(OwnerAlert {

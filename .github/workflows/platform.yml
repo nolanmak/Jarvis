@@ -53,6 +53,12 @@ jobs:
           cargo test -p augmentagent-cli --test imessage_outbox_cli
           cargo test -p augmentagent-cli --bin augmentagent imessage_send
           cargo test -p augmentagent-channel-imessage
+      - name: Discord actionable alerts and preparation reminders
+        run: |
+          cargo test -p augmentagent-store --test alert_schedule
+          cargo test -p augmentagent-channel-email --lib --test owner_alerts
+          cargo test -p augmentagent-channel-calendar
+          cargo test -p augmentagent-approval-discord --lib owner_alerts
       - name: Process walker + sidecar clients
         run: cargo test -p augmentagent-loops -p augmentagent-browser-client -p augmentagent-renderer-client
       # #1226 / #1282 — the transport-neutral surface contracts and the Slack

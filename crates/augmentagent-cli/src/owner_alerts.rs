@@ -6,6 +6,25 @@ use augmentagent_store::{
 
 #[derive(clap::Subcommand, Debug)]
 pub(crate) enum Op {
+    /// Override priority for an exact sender; routine mutes proactive escalation.
+    Priority {
+        sender: String,
+        #[arg(long,value_parser=["routine","high","critical"])]
+        urgency: String,
+    },
+    /// Persist the reminder schedule across restarts.
+    Policy {
+        #[arg(long, default_value_t = 600)]
+        followup_seconds: u32,
+        #[arg(long, default_value_t = 3600)]
+        prepare_first_seconds: u32,
+        #[arg(long, default_value_t = 900)]
+        prepare_last_seconds: u32,
+        #[arg(long, default_value_t = 6)]
+        max_notices: u32,
+    },
+    /// Run one Discord alert evaluation, useful for end-to-end acceptance.
+    Dispatch,
     /// Explicitly opt the verified owner destination into proactive texts.
     Configure {
         #[arg(long)]
@@ -57,9 +76,46 @@ pub(crate) enum Op {
     },
 }
 
-pub(crate) fn run(store: &Store, op: &Op) -> anyhow::Result<()> {
+pub(crate) async fn run(store: &std::sync::Arc<Store>, op: &Op) -> anyhow::Result<()> {
     let now = chrono::Utc::now().timestamp_millis();
     match op {
+        Op::Priority { sender, urgency } => {
+            let priority = match urgency.as_str() {
+                "critical" => Urgency::Critical,
+                "high" => Urgency::High,
+                _ => Urgency::Routine,
+            };
+            store.set_owner_alert_priority(sender, priority)?;
+            println!("Sender priority saved");
+        }
+        Op::Policy {
+            followup_seconds,
+            prepare_first_seconds,
+            prepare_last_seconds,
+            max_notices,
+        } => {
+            store.configure_owner_alert_schedule(
+                i64::from(*followup_seconds) * 1000,
+                i64::from(*prepare_first_seconds) * 1000,
+                i64::from(*prepare_last_seconds) * 1000,
+                i64::from(*max_notices),
+            )?;
+            println!("Reminder policy saved");
+        }
+        Op::Dispatch => {
+            let token = std::env::var("DISCORD_BOT_TOKEN")?;
+            let channel = std::env::var("DISCORD_CHANNEL_ID")?.parse::<u64>()?;
+            let owner = std::env::var("DISCORD_ALLOWED_USER_ID")?.parse::<u64>()?;
+            let broker = augmentagent_approval_discord::DiscordApprovalBroker::post_only(
+                &token,
+                channel,
+                owner,
+                std::sync::Arc::clone(store),
+            );
+            let count =
+                augmentagent_approval_discord::owner_alerts::tick(store, &broker, now).await?;
+            println!("{}", serde_json::json!({"posted":count}));
+        }
         Op::Configure {
             destination,
             enabled,

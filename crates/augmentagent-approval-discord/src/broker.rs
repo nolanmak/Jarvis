@@ -127,12 +127,18 @@ impl BrokerState {
 pub struct DiscordApprovalBroker {
     http: Arc<serenity::http::Http>,
     channel_id: ChannelId,
+    owner_id: Option<UserId>,
     /// #1289 — read when another surface decided an action, to redraw the
     /// Discord card from the action's current state. `None`: no redraw.
     store: Option<Arc<Store>>,
 }
 
 impl DiscordApprovalBroker {
+    /// HTTP-only operator dispatch; the running daemon handles controls.
+    pub fn post_only(token:&str,channel_id:u64,owner_id:u64,store:Arc<Store>)->Self {
+        Self {http:Arc::new(serenity::http::Http::new(token)),channel_id:ChannelId::new(channel_id),
+            owner_id:Some(UserId::new(owner_id)),store:Some(store)}
+    }
     /// Start the serenity client in a background task. Blocks the current task
     /// until the gateway is `Ready`, after which `post_approval` calls may be
     /// issued.
@@ -214,6 +220,7 @@ impl DiscordApprovalBroker {
         Ok(Self {
             http,
             channel_id: approval_channel,
+            owner_id: config.allowed_user_id.map(UserId::new),
             store: config.store.clone(),
         })
     }
@@ -221,6 +228,17 @@ impl DiscordApprovalBroker {
 
 #[async_trait]
 impl ApprovalBroker for DiscordApprovalBroker {
+    async fn post_owner_alert(&self, notice:&augmentagent_store::alert_schedule::AlertNotice)
+        -> Result<String,ApprovalError> {
+        let owner=self.owner_id.ok_or_else(||ApprovalError::Discord("DISCORD_ALLOWED_USER_ID is required for owner alerts".into()))?;
+        let channel=self.channel_id.to_channel(&*self.http).await.map_err(|e|ApprovalError::Discord(e.to_string()))?;
+        let guild=match channel {serenity::all::Channel::Guild(c)=>c.guild_id.to_string(),_=>"@me".into()};
+        let status=self.store.as_ref().and_then(|s|s.owner_alert_text_status(&notice.alert.id).ok().flatten());
+        let message=crate::owner_alerts::message(notice,owner,chrono::Utc::now().timestamp_millis(),status.as_deref());
+        let posted=self.channel_id.send_message(&*self.http,message).await
+            .map_err(|e|ApprovalError::Discord(e.to_string()))?;
+        Ok(format!("https://discord.com/channels/{}/{}/{}",guild,self.channel_id,posted.id))
+    }
     async fn post_approval(
         &self,
         action_id: &str,
