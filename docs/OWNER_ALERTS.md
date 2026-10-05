@@ -96,12 +96,13 @@ first seen at 13:49:45.921 and 13:50:37.200 UTC and marked processed at
 and a next nudge six hours later. A corresponding next-day meeting began at
 15:00 UTC, and the existing calendar alert record showed it had been detected.
 
-These records establish successful ingestion/triage and a successful broker
-return (the dispatch path records the nudge after broker success). They do not
-establish which notification surface accepted the card or whether a phone showed
-it: no matching persisted surface-card receipt was available. The specific miss
-cannot honestly be attributed solely to Discord delivery. The six-hour serial
-approval mechanism also had no preparation deadline. Regression fixtures use a
-synthetic colleague/project brief and test previous-day detection, reminders,
-classification, owner overrides, controls, failure, restart and cancellation;
-private message content and identifiers are not included.
+A read-only Discord history check matched both action IDs to approval cards,
+posted at 13:50:37.128 and 13:51:19.473 UTC, respectively. Neither card contained
+an actual owner mention. This establishes ingestion, triage, and Discord channel
+delivery, but not phone visibility. The existing serial approval mechanism had a
+six-hour reminder interval and no preparation deadline. The evidence points to a
+visibility/escalation gap; it does not establish the phone's notification settings
+or exact reason it stayed unnoticed. Regression fixtures use a synthetic
+colleague/project brief and test previous-day detection, reminders, classification,
+owner overrides, controls, failure, restart and cancellation. Private message
+content and identifiers are not included.
