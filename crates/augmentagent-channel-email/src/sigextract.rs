@@ -1273,6 +1273,8 @@ mod tests {
     /// with the fast-tier model instead of inheriting the owner's interactive
     /// model (#448). The stub runs no model, so extraction quality is not
     /// exercised; the canned JSON only proves the answer parsed.
+    // The real provider supervisor requires Linux PR_SET_CHILD_SUBREAPER.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn extract_spawn_pins_the_fast_model() {
         use crate::argv_stub::{flag, summarize, ArgvStub};

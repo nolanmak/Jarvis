@@ -2103,6 +2103,8 @@ mod tests {
     /// `--model` with the quality-tier model, and no spawn in the poll may
     /// omit `--model` (which would inherit the owner's interactive model,
     /// #448). The stub runs no model, so draft quality is not exercised.
+    // The real provider supervisor requires Linux PR_SET_CHILD_SUBREAPER.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn reply_poll_pins_the_model_on_every_claude_spawn() {
         use crate::argv_stub::{flag, summarize, ArgvStub};

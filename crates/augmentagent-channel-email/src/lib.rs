@@ -14,7 +14,7 @@ pub mod scheduled;
 pub mod sigextract;
 pub mod tone;
 mod channel;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod argv_stub;
 
 pub use channel::{
