@@ -42,7 +42,7 @@ pub fn parse(raw: &str) -> Result<Decision, ParseError> {
     Ok(decision)
 }
 
-fn extract_json_blob(s: &str) -> Option<String> {
+pub fn extract_json_blob(s: &str) -> Option<String> {
     // Prefer fenced blocks first.
     if let Some(fenced) = extract_fenced(s) {
         if find_object(&fenced).is_some() {

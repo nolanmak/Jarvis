@@ -522,6 +522,7 @@ dependencies = [
  "augmentagent-wiki",
  "chrono",
  "md-5",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",

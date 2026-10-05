@@ -242,7 +242,7 @@ impl CalendarApi for ComposioCalendarClient {
                 "singleEvents": true,
                 "orderBy": "startTime",
                 "maxResults": PAGE_SIZE,
-                "showDeleted": false,
+                "showDeleted": true,
             });
             if let Some(tok) = &page_token {
                 args["pageToken"] = serde_json::Value::String(tok.clone());

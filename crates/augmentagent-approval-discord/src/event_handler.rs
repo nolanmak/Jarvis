@@ -703,6 +703,19 @@ impl EventHandler for Handler {
                 }
             }
             Interaction::Component(comp) => {
+                if comp.data.custom_id.starts_with("oa:") {
+                    if !is_authorized(self.state.allowed_user_id, comp.user.id) {
+                        ack_ephemeral(&ctx,&comp,"Only the configured owner can change this alert.").await;
+                        return;
+                    }
+                    let response=match self.state.store.as_ref() {
+                        Some(store)=>crate::owner_alerts::control(store,&comp.data.custom_id,chrono::Utc::now().timestamp_millis())
+                            .unwrap_or_else(|e|format!("Alert unchanged: {e}")),
+                        None=>"Alert store unavailable".into(),
+                    };
+                    ack_ephemeral(&ctx,&comp,&response).await;
+                    return;
+                }
                 let Some(cid) = CustomId::parse(&comp.data.custom_id) else {
                     debug!("unrecognized custom_id: {}", comp.data.custom_id);
                     return;

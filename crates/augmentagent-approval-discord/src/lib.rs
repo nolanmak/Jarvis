@@ -19,6 +19,7 @@ mod journal_cmd;
 mod layout;
 mod loops;
 mod nudge;
+pub mod owner_alerts;
 // #1292 — the shared owner-command registry (Discord triggers, Slack mapping).
 pub mod owner_commands;
 mod process_loops;
@@ -144,6 +145,10 @@ pub enum ApprovalError {
 /// Discord API round-trip finishes, not when the user clicks a button.
 #[async_trait]
 pub trait ApprovalBroker: Send + Sync {
+    async fn post_owner_alert(&self, _notice: &augmentagent_store::alert_schedule::AlertNotice)
+        -> Result<String,ApprovalError> {
+        Err(ApprovalError::Discord("owner alerts are not supported by this broker".into()))
+    }
     async fn post_approval(
         &self,
         action_id: &str,

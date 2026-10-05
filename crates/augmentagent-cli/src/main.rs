@@ -3648,6 +3648,22 @@ async fn main() -> Result<()> {
             // next tick. Skipped under dry-run (NoopBroker) — bumping
             // counters with no visible card is pointless.
             if !dry_run {
+                let assessment_store=Arc::clone(&store);
+                let assessment_reasoner=build_reasoner();
+                let assessment_wiki=cli.wiki_dir.clone();
+                let assessment_shutdown=shutdown.clone();
+                tasks.push(tokio::spawn(async move {
+                    augmentagent_channel_email::owner_alerts::run_backfill(assessment_store,assessment_reasoner,
+                        assessment_wiki,assessment_shutdown).await;
+                    Ok(())
+                }));
+                let alert_store=Arc::clone(&store);
+                let alert_broker=Arc::clone(&broker);
+                let alert_shutdown=shutdown.clone();
+                tasks.push(tokio::spawn(async move {
+                    augmentagent_approval_discord::owner_alerts::run(alert_store,alert_broker,alert_shutdown).await;
+                    Ok(())
+                }));
                 let nudge = Arc::new(augmentagent_approval_discord::NudgeScheduler::new(
                     Arc::clone(&store),
                     Arc::clone(&broker),
@@ -4332,7 +4348,7 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Imessage { ref op } => match op {
-            ImessageOp::Alerts { op } => owner_alerts::run(&store, op),
+            ImessageOp::Alerts { op } => owner_alerts::run(&store, op).await,
             ImessageOp::Sync { apply } => {
                 run_imessage_sync(&cli, store, *apply)?;
                 Ok(())
