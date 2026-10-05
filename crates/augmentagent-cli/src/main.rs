@@ -1543,6 +1543,19 @@ enum MeetupOp {
 
 #[derive(Subcommand)]
 enum GdriveOp {
+    /// Upload a local file (up to 5 MB) as a new Drive file.
+    Upload {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        account: String,
+        #[arg(long)]
+        folder_id: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        mime_type: Option<String>,
+    },
     /// Search live Drive files/folders. Query uses Google Drive v3 syntax.
     Search {
         #[arg(long, default_value = "trashed = false")]
@@ -4608,6 +4621,8 @@ async fn main() -> Result<()> {
         },
         Cmd::Gdrive { ref op } => match op {
             GdriveOp::Accounts { json } => run_gdrive_accounts(store, *json),
+            GdriveOp::Upload { file, account, folder_id, name, mime_type } =>
+                gdrive_query::upload(&store, account, file, folder_id.as_deref(), name.as_deref(), mime_type.as_deref()).await,
             GdriveOp::Search { query, account, limit, page_token } =>
                 gdrive_query::search(&store, account.as_deref(), query, *limit, page_token.as_deref()).await,
             GdriveOp::Get { file_id, account } =>

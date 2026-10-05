@@ -117,3 +117,22 @@ truncation; `--max-chars` can raise the output limit up to 200000.
 
 API contracts: https://docs.composio.dev/toolkits/googledrive and
 https://docs.composio.dev/docs/tools-direct/executing-tools.
+
+## Permissions and uploads
+
+On Google's consent screen, select the Drive access permission; granting only
+sign-in/email leaves the connection ACTIVE but Drive calls fail with HTTP 403
+`ACCESS_TOKEN_SCOPE_INSUFFICIENT`. Inspect granted `state.val.scope`, not just
+`requested_scopes`. Full `https://www.googleapis.com/auth/drive` permits reading
+and writing subject to file-level permissions. Reconnect only accounts missing
+the required grant, using `--email` to verify the same identity.
+
+The agent can upload owner-requested files with:
+
+```sh
+augmentagent gdrive upload --account owner@example.com --file ./wiki/deliverables/report.pdf
+```
+
+Optional `--folder-id`, `--name`, and `--mime-type` select the destination and
+metadata. Uploads create new files up to 5 MB and do not modify sharing. Agent
+sessions restrict uploads to non-hidden files under WIKI_ROOT.

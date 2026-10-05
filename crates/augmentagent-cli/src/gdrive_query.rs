@@ -1,4 +1,4 @@
-//! Read-only live Drive tools for the interactive agent.
+//! Live Drive search, reading, and explicitly requested uploads.
 use anyhow::{bail, Context, Result};
 use augmentagent_channel_gdrive::composio::{find_string_field, ComposioClient};
 use augmentagent_store::{DriveAccount, Store};
@@ -94,7 +94,7 @@ fn export_mime(mime: &str) -> Result<Option<&'static str>> {
     }
 }
 
-// Composio's documented download result is a temporary S3 artifact, never an
+// Composio's download result is a temporary storage artifact, never an
 // arbitrary URL from the document. No credentials are sent to the artifact host.
 fn artifact_url(value: &Value) -> Result<reqwest::Url> {
     let raw = value
@@ -105,7 +105,10 @@ fn artifact_url(value: &Value) -> Result<reqwest::Url> {
     let url = reqwest::Url::parse(raw)?;
     let host = url.host_str().unwrap_or_default();
     if url.scheme() != "https"
-        || !host.ends_with(".amazonaws.com")
+        || !(host.ends_with(".amazonaws.com")
+            || host.ends_with(".r2.cloudflarestorage.com")
+            || host.ends_with(".composio.dev")
+            || host.ends_with(".blob.core.windows.net"))
         || url.port().is_some_and(|p| p != 443)
     {
         bail!("Unexpected Drive artifact host");
@@ -187,5 +190,90 @@ mod tests {
             &json!({"data":{"downloaded_file_content":{"s3url":"http://127.0.0.1/secrets"}}})
         )
         .is_err());
+    }
+}
+
+fn upload_path(
+    path: &std::path::Path,
+    wiki_root: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf> {
+    let resolved = path.canonicalize().context("resolve upload file")?;
+    if let Some(root) = wiki_root {
+        let root = root.canonicalize()?;
+        let relative = resolved
+            .strip_prefix(&root)
+            .context("Agent uploads must be inside WIKI_ROOT")?;
+        if relative
+            .components()
+            .any(|p| p.as_os_str().to_string_lossy().starts_with('.'))
+        {
+            bail!("Agent uploads cannot include hidden files or directories");
+        }
+    }
+    let meta = resolved.metadata()?;
+    if !meta.is_file() || meta.len() > 5_000_000 {
+        bail!("Upload must be a regular file of at most 5 MB");
+    }
+    Ok(resolved)
+}
+
+pub async fn upload(
+    store: &Store,
+    account: &str,
+    file: &std::path::Path,
+    folder: Option<&str>,
+    name: Option<&str>,
+    mime: Option<&str>,
+) -> Result<()> {
+    let (client, account) = setup(store, Some(account))?;
+    let root = std::env::var_os("WIKI_ROOT").map(std::path::PathBuf::from);
+    let file = upload_path(file, root.as_deref())?;
+    let name = name
+        .or_else(|| file.file_name().and_then(|s| s.to_str()))
+        .context("File name is required")?;
+    if name.trim().is_empty() {
+        bail!("File name cannot be empty");
+    }
+    let mime = mime.unwrap_or_else(|| augmentagent_channel_email::gmail::guess_mimetype(name));
+    let bytes = std::fs::read(&file)?;
+    let result = client
+        .upload_file(
+            &account.entity_id,
+            &account.connection_id,
+            name,
+            mime,
+            bytes,
+            folder,
+        )
+        .await?;
+    println!(
+        "{}",
+        serde_json::to_string(&json!({"account":account.email,"result":result}))?
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+    #[test]
+    fn agent_uploads_are_scoped_and_cannot_follow_symlinks_outside_wiki() {
+        let wiki = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let file = wiki.path().join("report.txt");
+        std::fs::write(&file, "report").unwrap();
+        assert!(upload_path(&file, Some(wiki.path())).is_ok());
+        let secret = outside.path().join("secret");
+        std::fs::write(&secret, "private").unwrap();
+        assert!(upload_path(&secret, Some(wiki.path())).is_err());
+        let hidden = wiki.path().join(".env");
+        std::fs::write(&hidden, "private").unwrap();
+        assert!(upload_path(&hidden, Some(wiki.path())).is_err());
+        #[cfg(unix)]
+        {
+            let link = wiki.path().join("linked.txt");
+            std::os::unix::fs::symlink(&secret, &link).unwrap();
+            assert!(upload_path(&link, Some(wiki.path())).is_err());
+        }
     }
 }

@@ -44,7 +44,13 @@ export async function finishConnection(client, store, pending) {
     version: drive ? '20261001_00' : '20260915_00',
     arguments: drive ? { fields: 'user(emailAddress)' } : { user_id: 'me' },
   });
-  if (profile.successful !== true) throw new Error('Could not verify the Google account profile');
+  if (profile.successful !== true) {
+    const detail = String(profile.error || 'profile request failed');
+    if (/insufficient.*(scope|permission)/i.test(detail)) {
+      throw new Error('Google Drive permission was not granted. Reconnect and select the Drive access checkbox.');
+    }
+    throw new Error('Could not verify the Google account profile');
+  }
   const data = profile.data?.response_data || profile.data;
   const email = drive ? data?.user?.emailAddress : data?.emailAddress;
   if (typeof email !== 'string' || !email.includes('@')) throw new Error('Google profile returned no email address');

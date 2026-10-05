@@ -554,6 +554,7 @@ dependencies = [
  "async-trait",
  "augmentagent-approval-discord",
  "augmentagent-store",
+ "md-5",
  "mockito",
  "reqwest",
  "rusqlite",

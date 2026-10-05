@@ -2070,6 +2070,8 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             "Bash(augmentagent gdrive read)".into(),
             format!("Bash({} gdrive read *)", bin.display()),
             "Bash(augmentagent gdrive read *)".into(),
+            format!("Bash({} gdrive upload *)", bin.display()),
+            "Bash(augmentagent gdrive upload *)".into(),
             bash_loop_abs,
             bash_loop_bare,
             bash_loops_abs,
@@ -3368,11 +3370,11 @@ mod tests {
     }
 
     #[test]
-    fn ask_opts_drive_tools_are_read_only_and_available() {
+    fn ask_opts_drive_tools_are_narrowly_scoped_and_available() {
         let repo = tempfile::tempdir().unwrap();
         let wiki = tempfile::tempdir().unwrap();
         let opts = ask_opts(wiki.path().into(), repo.path().into());
-        for verb in ["accounts", "search", "get", "read"] {
+        for verb in ["accounts", "search", "get", "read", "upload"] {
             assert!(opts.allowed_tools.contains(&format!("Bash(augmentagent gdrive {verb} *)")));
             assert!(opts.allowed_tools.contains(&format!("Bash({} gdrive {verb} *)",
                 repo.path().join("target/release/augmentagent").display())));

@@ -39,6 +39,86 @@ impl ComposioClient {
         self
     }
 
+    /// Stage an explicitly selected local file, then create a new Drive file.
+    /// Creation is sent once: retrying an ambiguous POST can duplicate files.
+    pub async fn upload_file(
+        &self,
+        entity_id: &str,
+        connection_id: &str,
+        name: &str,
+        mimetype: &str,
+        bytes: Vec<u8>,
+        folder: Option<&str>,
+    ) -> Result<serde_json::Value, ComposioError> {
+        use md5::{Digest, Md5};
+        use serde_json::{json, Value};
+        if bytes.len() > 5_000_000 {
+            return Err(ComposioError::Decode("Drive upload limit is 5 MB".into()));
+        }
+        let staged: Value = self
+            .http
+            .post(format!("{}/api/v3/files/upload/request", self.base_url))
+            .header("x-api-key", &self.api_key)
+            .json(
+                &json!({"toolkit_slug":"googledrive", "tool_slug":"GOOGLEDRIVE_UPLOAD_FILE",
+                "tool_input_field":"file_to_upload", "filename":name, "mimetype":mimetype,
+                "md5":format!("{:x}", Md5::digest(&bytes))}),
+            )
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let key = staged
+            .get("key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ComposioError::Decode("Upload staging returned no key".into()))?;
+        if let Some(raw) = staged.get("new_presigned_url").and_then(Value::as_str) {
+            let url = reqwest::Url::parse(raw)
+                .map_err(|_| ComposioError::Decode("Invalid staging URL".into()))?;
+            let host = url.host_str().unwrap_or_default();
+            if url.scheme() != "https"
+                || !(host.ends_with(".amazonaws.com")
+                    || host.ends_with(".r2.cloudflarestorage.com")
+                    || host.ends_with(".composio.dev")
+                    || host.ends_with(".blob.core.windows.net"))
+            {
+                return Err(ComposioError::Decode(
+                    "Unexpected upload staging host".into(),
+                ));
+            }
+            let http = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?;
+            let mut request = http.put(url).header("content-type", mimetype).body(bytes);
+            if staged
+                .pointer("/metadata/storage_backend")
+                .and_then(Value::as_str)
+                == Some("azure_blob_storage")
+            {
+                request = request.header("x-ms-blob-type", "BlockBlob");
+            }
+            let response = request.send().await?.error_for_status()?;
+            if !response.status().is_success() {
+                return Err(ComposioError::Decode(
+                    "Upload staging redirected unexpectedly".into(),
+                ));
+            }
+        }
+        let mut args = json!({"file_to_upload":{"name":name,"mimetype":mimetype,"s3key":key}});
+        if let Some(folder) = folder {
+            args["folder_to_upload_to"] = folder.into();
+        }
+        self.execute_on_account(
+            "GOOGLEDRIVE_UPLOAD_FILE",
+            entity_id,
+            Some(connection_id),
+            args,
+        )
+        .await
+    }
+
     /// `POST {base}/api/v3/tools/execute/{action}` with `{user_id, arguments}`
     /// and an `x-api-key` header. 3 attempts; retries 429/5xx/transient with
     /// exponential backoff and a per-request timeout.
@@ -71,7 +151,12 @@ impl ComposioClient {
             body["connected_account_id"] = id.into();
         }
 
-        const MAX_ATTEMPTS: u32 = 3;
+        // Reads are retryable; a failed upload response may hide a completed creation.
+        let max_attempts = if action == "GOOGLEDRIVE_UPLOAD_FILE" {
+            1
+        } else {
+            3
+        };
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
@@ -105,7 +190,7 @@ impl ComposioClient {
                     let err = ComposioError::Composio {
                         message: format!("{action} → {status}: {text}"),
                     };
-                    if retryable && attempt < MAX_ATTEMPTS {
+                    if retryable && attempt < max_attempts {
                         tracing::warn!(
                             action, status = %status, attempt,
                             "composio retryable failure; backing off"
@@ -115,7 +200,7 @@ impl ComposioClient {
                     }
                     return Err(err);
                 }
-                Err(e) if attempt < MAX_ATTEMPTS && is_transient_reqwest(&e) => {
+                Err(e) if attempt < max_attempts && is_transient_reqwest(&e) => {
                     tracing::warn!(action, attempt, "composio transport error; retrying: {e}");
                     backoff(attempt).await;
                     continue;
@@ -268,5 +353,65 @@ mod execution_tests {
             .unwrap_err();
         assert!(err.to_string().contains("Account expired"));
         mock.assert_async().await;
+    }
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn staged_upload_selects_account_folder_and_does_not_retry_creation() {
+        let mut server = mockito::Server::new_async().await;
+        let stage = server
+            .mock("POST", "/api/v3/files/upload/request")
+            .match_header("x-api-key", "test-key")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "toolkit_slug":"googledrive","tool_slug":"GOOGLEDRIVE_UPLOAD_FILE",
+                "tool_input_field":"file_to_upload","filename":"report.txt","mimetype":"text/plain"
+            })))
+            .with_status(200)
+            .with_body(r#"{"key":"staged/existing-file"}"#)
+            .create_async()
+            .await;
+        let upload = server.mock("POST", "/api/v3/tools/execute/GOOGLEDRIVE_UPLOAD_FILE")
+            .match_body(mockito::Matcher::Json(json!({
+                "user_id":"user1","connected_account_id":"ca1","version":"20261001_00",
+                "arguments":{"file_to_upload":{"name":"report.txt","mimetype":"text/plain","s3key":"staged/existing-file"},"folder_to_upload_to":"folder1"}
+            })))
+            .with_status(500).with_body("ambiguous creation failure").expect(1).create_async().await;
+        let client = ComposioClient::new("test-key".into()).with_base_url(server.url());
+        assert!(client
+            .upload_file(
+                "user1",
+                "ca1",
+                "report.txt",
+                "text/plain",
+                b"hello".to_vec(),
+                Some("folder1")
+            )
+            .await
+            .is_err());
+        stage.assert_async().await;
+        upload.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn rejects_oversize_before_network() {
+        let client =
+            ComposioClient::new("test-key".into()).with_base_url("http://127.0.0.1:1".into());
+        let err = client
+            .upload_file(
+                "u",
+                "ca",
+                "big",
+                "application/octet-stream",
+                vec![0; 5_000_001],
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("5 MB"));
     }
 }
