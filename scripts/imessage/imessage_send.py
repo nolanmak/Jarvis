@@ -120,6 +120,12 @@ class AgentCli:
             raise AgentError(f"unsupported outbox protocol version {data.get('version')!r}")
         return data.get("item")
 
+    def heartbeat(self, error=None):
+        args = ["outbox", "heartbeat"]
+        if error:
+            args += ["--error", error]
+        self._run(args)
+
     def complete(self, item_id, status, error_code=None, reason=None, message_guid=None):
         args = ["outbox", "complete", str(int(item_id)), "--status", status]
         if error_code is not None:
@@ -193,7 +199,16 @@ class Sender:
     def run_once(self):
         """Reconcile any interrupted item, then send up to `max_items`.
         Returns how many new items were sent (0 when another sender runs)."""
-        self._connect().close()
+        try:
+            self._connect().close()
+        except ChatDbUnreadable:
+            # Report a fixed diagnostic, without sending local paths or database text.
+            self.agent.heartbeat("Messages database unreadable: grant Full Disk Access to the scheduled Python")
+            raise
+        try:
+            self.agent.heartbeat()
+        except AgentError:
+            print("heartbeat failed; continuing delivery reconciliation", flush=True)
         try:
             with self.lock():
                 self._reconcile_journal()
@@ -215,8 +230,8 @@ class Sender:
         outcome = entry.get("outcome")
         if outcome is None:
             outcome = self._verify(entry, entry["watermark"], deadline_s=0)
-            if outcome["status"] != "sent":
-                outcome = _outcome("failed", outcome["error_code"],
+            if outcome["status"] == "unknown":
+                outcome = _outcome("unknown", outcome["error_code"],
                                    "sender was interrupted and chat.db shows no sent message")
         self._report(entry, outcome)
 
@@ -236,19 +251,28 @@ class Sender:
         if kind not in SCRIPTS or not entry["target"] or not body.strip():
             self._report(entry, _outcome("failed", reason="invalid outbox item"))
             return
+        # Owner alerts have a short dispatch lease. This bounds the interval
+        # between the Linux lifecycle check and invoking Messages, assuming
+        # synchronized host clocks. Expired work is never requeued.
+        if item.get("send_by_ms") is not None and time.time() * 1000 >= item["send_by_ms"]:
+            self._report(entry, _outcome("failed", reason="owner alert expired before dispatch"))
+            return
         self._write_journal(entry)
         cmd = [OSASCRIPT, "-e", SCRIPTS[kind], body, entry["target"]]
         try:
             done = self.runner(cmd, capture_output=True, text=True, timeout=self.send_timeout_s)
         except subprocess.TimeoutExpired:
             outcome = self._verify(entry, entry["watermark"], deadline_s=0)
-            if outcome["status"] != "sent":
-                outcome = _outcome("failed", reason=f"osascript timed out after {self.send_timeout_s}s")
+            if outcome["status"] == "unknown":
+                outcome = _outcome("unknown", reason=f"osascript timed out after {self.send_timeout_s}s")
             self._report(entry, outcome)
             return
         if done.returncode != 0:
             err = (done.stderr or "").replace(entry["target"], "<target>").strip()[:200]
-            self._report(entry, _outcome("failed", reason=f"osascript exit {done.returncode}: {err}"))
+            outcome = self._verify(entry, entry["watermark"], deadline_s=0)
+            if outcome["status"] == "unknown":
+                outcome = _outcome("unknown", reason=f"osascript exit {done.returncode}: {err}")
+            self._report(entry, outcome)
             return
         self._report(entry, self._verify(entry, entry["watermark"], self.deadline_s))
 
@@ -282,10 +306,10 @@ class Sender:
                     return _outcome("sent", message_guid=guid)
             if waited >= deadline_s:
                 if in_chat:
-                    return _outcome("failed", reason=f"message not sent within {deadline_s}s")
+                    return _outcome("unknown", reason=f"message not sent within {deadline_s}s")
                 if unjoined:
-                    return _outcome("failed", reason="message row never joined the target chat")
-                return _outcome("failed",
+                    return _outcome("unknown", reason="message row never joined the target chat")
+                return _outcome("unknown",
                                 reason=f"no matching message in chat.db within {deadline_s}s")
             self.sleep(self.poll_s)
             waited += self.poll_s

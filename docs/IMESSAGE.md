@@ -316,7 +316,90 @@ the card, then the send interval once you approve.
 - No attachments, tapbacks, edits or unsend. BlueBubbles and Messages'
   private API are not used; System Integrity Protection stays enabled.
 
-## Tests
+## Proactive owner alerts (#1393)
+
+Owner alerts share the existing outbox and Mac sender, but have a separate,
+default-off policy. They never create an inbound message or approve a reply.
+Only the explicitly configured owner handle can receive these alerts; contact
+reply approvals and allowlists retain their existing behavior. Keep the global
+`AUGMENTAGENT_IMESSAGE_SEND_ENABLED=1` switch enabled as well.
+
+First verify the destination with the owner and a synthetic test. A self-chat
+row does not prove that the owner's iPhone shows a notification. Then enable:
+
+```sh
+augmentagent imessage alerts configure --destination +15555550100 --enabled
+```
+
+Use the real, verified number in place of the synthetic example. Disable with
+`augmentagent imessage alerts configure` (no `--enabled`); claims check this
+persisted policy on every dispatch, without a daemon restart. Changing the
+destination never redirects already queued texts to the new number.
+
+The durable alert contract contains a stable source-derived ID, source link,
+sender, required action, urgency, reason, known deadline and IANA timezone,
+optional meeting ID, usefulness expiry, escalation time, and acknowledgment/
+resolution state. Duplicate ingestion preserves acknowledgment. Critical alerts
+are eligible immediately; high alerts wait until their escalation time and only
+text while unacknowledged. Routine items never text. Unknown deadlines are
+displayed as unknown, with an explicit usefulness timeout. Discord classification
+and controls use this same store contract (#1392).
+
+Synthetic end-to-end example (use a fresh ID for each intentional test):
+
+```sh
+augmentagent imessage alerts create owner-alert-test-1 \
+  --sender 'Synthetic acceptance test' \
+  --action 'Confirm this notification appeared on your iPhone' \
+  --reason 'Verify unattended escalation delivery' \
+  --source-url https://github.com/nolanmak/Jarvis/issues/1393 \
+  --urgency critical --timezone America/New_York --useful-seconds 300
+augmentagent imessage alerts status owner-alert-test-1
+augmentagent imessage outbox health
+```
+
+Do not run `send.py` manually for unattended acceptance. Leave the 15-second
+launchd job to claim the row. Record creation and confirmed-send times, verify
+the elapsed time is under 60 seconds while healthy, and separately ask the owner
+to confirm phone receipt and notification visibility. Check again after reloading
+the sender job; login and awake operation remain prerequisites. Test high urgency
+with `--urgency high --escalation-seconds 60`, then repeat with acknowledgment
+before that threshold. `alerts acknowledge ID` means seen; `alerts resolve ID`
+means completed. Neither authorizes any reply. `alerts snooze ID --seconds 600`
+rejects crossing the deadline unless `--override-deadline` is explicit.
+
+Acknowledgment/resolution cancels queued texts at reconciliation or the final
+atomic claim. A text already handed to the Mac cannot be recalled. Owner claims
+carry a five-second dispatch lease, checked before calling Messages; keep both hosts'
+clocks synchronized. Once AppleScript has started, Messages may finish delivery
+after an acknowledgment, deadline, or process timeout. A timeout is **unknown**,
+not proof of failure. Unknown work is never automatically resent. A repeated
+identical completion report is accepted so an SSH response lost after commit
+does not trap the sender's crash journal.
+
+Alert text status distinguishes queued, claimed, sent, failed, expired, cancelled,
+and unknown. Expiry follows the alert's usefulness/deadline rather than the
+generic approved-reply one-hour timeout. Reconnecting the Mac does not resurrect
+expired, acknowledged, or already attempted alerts. Countdown text is refreshed
+at claim time. `sent` still means `chat.db` evidence, not phone receipt or task
+acknowledgment; Discord reminders remain independent of transport success.
+
+The updated sender reports a heartbeat even with an empty queue, and reports a
+fixed Full Disk Access diagnostic when it cannot read Messages. No heartbeat for
+two minutes is unhealthy; the daemon's one-minute reconciliation tick surfaces
+that in Discord (worst case three minutes after the last heartbeat). Failure
+notices are capped at one per ten minutes. Health includes the last confirmed
+send time. If degraded, inspect `launchctl print`, the sender log, Mac power/sleep,
+Messages login, the scheduled Python's Full Disk Access and Automation grants,
+and batch SSH from the Mac to Linux over Tailscale. A healthy heartbeat alone
+does not prove Automation permission or a successful send.
+
+Deploy the Linux CLI before the updated Python sender, since the latter requires
+`outbox heartbeat` and reports `unknown` outcomes. Keep the Mac's journal and
+state directory during updates. Never delete a crash journal or requeue an unknown
+send as a recovery shortcut; reconcile against `chat.db` first.
+
+## Regression tests
 
 ```sh
 python3 -m unittest discover -s scripts/imessage/tests -v
