@@ -11,7 +11,7 @@ use crate::surface::{SurfaceConversationRef, SurfaceTurnRef};
 
 use crate::models::{
     Account, ActionRecord, ActionStatus, AgentPrRun, AgentRepo, ChannelSubscription,
-    ConnectionRequestRow, DriveAccount, Email, FriendWatch, LearnedPattern,
+    ConnectionRequestRow, DriveAccount, Email, FriendWatch, GmailRateRefusal, LearnedPattern,
     LinkedInConnectionSync, OwnPost, PhoneIdentity, RateAuditRow, RateHalt,
     RateWarmup, ScheduledPost, ScheduledPostStatus, SlackWorkspace, SocialapiAccount,
     SocialapiWebhookEvent, SubscriptionMode, TelegramBot,
@@ -1519,6 +1519,31 @@ impl Store {
                  logId TEXT,\
                  observedAtMs INTEGER NOT NULL\
              );",
+        )?;
+
+        // #1384 — append-only ledger of provider rate-limit refusals. Unlike
+        // `gmail_fetch_cooldowns` (one latched row per entity, MAX() upsert)
+        // this keeps every observation so frequency and shape are measurable.
+        // Growth is bounded by how rarely the provider refuses, so a retention
+        // sweep is deferred until it is needed.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS gmail_rate_refusals (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                 observedAtMs INTEGER NOT NULL,\
+                 entityId TEXT NOT NULL,\
+                 mailbox TEXT,\
+                 action TEXT NOT NULL,\
+                 class TEXT NOT NULL,\
+                 origin TEXT NOT NULL,\
+                 retryAfterMs INTEGER,\
+                 retryAfterRaw TEXT,\
+                 providerMessage TEXT NOT NULL,\
+                 headersJson TEXT,\
+                 logId TEXT,\
+                 attempt INTEGER NOT NULL\
+             );\
+             CREATE INDEX IF NOT EXISTS idx_gmail_rate_refusals_observed \
+                 ON gmail_rate_refusals(observedAtMs);",
         )?;
 
         // #81 — Proactive CRM signals + per-scan run cursor.
@@ -3224,6 +3249,74 @@ impl Store {
             params![entity_id],
         )?;
         Ok(())
+    }
+
+    /// #1384 — append one refusal observation. Callers must not fail a Gmail
+    /// call when this errors; the ledger is diagnostics, not control flow.
+    pub fn record_gmail_rate_refusal(&self, r: &GmailRateRefusal) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        // The mailbox is snapshotted here rather than joined at read time: the
+        // Gmail client only knows the entity id, and an account that is later
+        // disconnected would otherwise lose the address its refusals belong to.
+        guard.execute(
+            "INSERT INTO gmail_rate_refusals \
+                (observedAtMs, entityId, mailbox, action, class, origin, retryAfterMs, \
+                 retryAfterRaw, providerMessage, headersJson, logId, attempt) \
+             VALUES (?1, ?2, \
+                 COALESCE(?3, (SELECT NULLIF(TRIM(email), '') FROM gmail_accounts \
+                               WHERE entityId = ?2 ORDER BY active DESC LIMIT 1)), \
+                 ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                r.observed_at_ms,
+                r.entity_id,
+                r.mailbox,
+                r.action,
+                r.class,
+                r.origin,
+                r.retry_after_ms,
+                r.retry_after_raw,
+                r.provider_message,
+                r.headers_json,
+                r.log_id,
+                r.attempt,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Refusals observed in `[from_ms, to_ms]`, oldest first. Grouping happens
+    /// in the reporting layer so the shape stays easy to test.
+    pub fn gmail_rate_refusals_between(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> StoreResult<Vec<GmailRateRefusal>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT observedAtMs, entityId, mailbox, action, class, origin, retryAfterMs, \
+                    retryAfterRaw, providerMessage, headersJson, logId, attempt \
+             FROM gmail_rate_refusals \
+             WHERE observedAtMs BETWEEN ?1 AND ?2 ORDER BY observedAtMs",
+        )?;
+        let rows = stmt
+            .query_map(params![from_ms, to_ms], |row| {
+                Ok(GmailRateRefusal {
+                    observed_at_ms: row.get(0)?,
+                    entity_id: row.get(1)?,
+                    mailbox: row.get(2)?,
+                    action: row.get(3)?,
+                    class: row.get(4)?,
+                    origin: row.get(5)?,
+                    retry_after_ms: row.get(6)?,
+                    retry_after_raw: row.get(7)?,
+                    provider_message: row.get(8)?,
+                    headers_json: row.get(9)?,
+                    log_id: row.get(10)?,
+                    attempt: row.get(11)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn get_active_gmail_accounts(&self) -> StoreResult<Vec<Account>> {
@@ -8797,6 +8890,50 @@ mod tests {
             None,
             "expired cooldowns must stop blocking requests"
         );
+    }
+
+    /// Round-trip plus the two things the read path depends on: rows outside
+    /// the window are excluded, and the mailbox is snapshotted at write time
+    /// so disconnecting the account later does not erase whose refusal it was.
+    #[test]
+    fn gmail_rate_refusals_round_trip_and_keep_their_mailbox_after_a_disconnect() {
+        let (store, _file) = fresh_store();
+        let sql = |q: &str| store.conn.lock().unwrap().execute(q, []).unwrap();
+        sql("INSERT INTO gmail_accounts (id, connectionId, email, entityId, active, createdAt) \
+             VALUES ('g1', 'c1', 'owner@example.com', 'acct-a', 1, 0)");
+
+        let row = |observed_at_ms, class: &str, retry: Option<(i64, &str)>| GmailRateRefusal {
+            observed_at_ms,
+            entity_id: "acct-a".into(),
+            mailbox: None,
+            action: "GMAIL_FETCH_EMAILS".into(),
+            class: class.into(),
+            origin: "interactive".into(),
+            retry_after_ms: retry.map(|(ms, _)| ms),
+            // Kept even when it did not parse into a boundary above.
+            retry_after_raw: Some(retry.map_or("Mon, 32 Foo 2026", |(_, raw)| raw).into()),
+            provider_message: "rate limit".into(),
+            headers_json: Some(r#"{"retry-after":"30"}"#.into()),
+            log_id: Some("log-1".into()),
+            attempt: 1,
+        };
+        for r in [
+            row(1_000, "http_429", Some((31_000, "30"))),
+            row(2_000, "envelope", None),
+            row(9_000, "http_429", Some((39_000, "30"))),
+        ] {
+            store.record_gmail_rate_refusal(&r).unwrap();
+        }
+        sql("UPDATE gmail_accounts SET active = 0 WHERE id = 'g1'");
+
+        let found = store.gmail_rate_refusals_between(1_000, 2_000).unwrap();
+        assert_eq!(found.len(), 2, "out-of-window rows must be excluded");
+        assert_eq!((&*found[0].class, &*found[0].origin), ("http_429", "interactive"));
+        assert_eq!(found[0].mailbox.as_deref(), Some("owner@example.com"));
+        assert_eq!(found[0].retry_after_ms, Some(31_000));
+        assert_eq!(found[0].headers_json.as_deref(), Some(r#"{"retry-after":"30"}"#));
+        assert_eq!((&*found[1].class, found[1].retry_after_ms), ("envelope", None));
+        assert_eq!(found[1].retry_after_raw.as_deref(), Some("Mon, 32 Foo 2026"));
     }
 
     #[test]

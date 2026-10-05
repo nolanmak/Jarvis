@@ -67,7 +67,7 @@ use augmentagent_channel_linkedin::connections::{
 use augmentagent_channel_contacts::{
     CardDavSource, ContactsSource, ContactsSyncer, GooglePeopleSource,
 };
-use augmentagent_store::{ActionStatus, Store, TriageResult};
+use augmentagent_store::{ActionStatus, GmailRateRefusal, Store, TriageResult};
 use async_trait::async_trait;
 
 mod whatsapp_history;
@@ -1947,6 +1947,20 @@ enum GmailOp {
         #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         json: bool,
     },
+    /// Report provider rate-limit refusals over a window (#1384), grouped by
+    /// mailbox, action and call origin, with the observed retry-after spread
+    /// and the platform-budget (429) vs provider user-rate (envelope) split.
+    /// Counts refusals, not commands: each refused retry attempt is a row.
+    RateReport {
+        /// Window start, YYYY-MM-DD (default: 7 days ago).
+        #[arg(long)]
+        since: Option<String>,
+        /// Window end, YYYY-MM-DD inclusive (default: today).
+        #[arg(long)]
+        until: Option<String>,
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        json: bool,
+    },
     /// List active Gmail accounts (so the chat agent can pick `--account`).
     Accounts {
         #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
@@ -3815,6 +3829,9 @@ async fn main() -> Result<()> {
             GmailOp::Search { query, limit, full, account } => {
                 run_gmail_search(store, query.clone(), *limit, *full, account.clone()).await
             }
+            GmailOp::RateReport { since, until, json } => {
+                run_gmail_rate_report(store, since.clone(), until.clone(), *json)
+            }
             GmailOp::Accounts { json } => run_gmail_accounts(store, *json).await,
             GmailOp::ListAttachments { account, message_id, json } => {
                 gmail_attach::run_gmail_list_attachments(
@@ -5136,7 +5153,9 @@ async fn run_gmail_search(
     account_filter: Option<String>,
 ) -> Result<()> {
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
-    let gmail = ComposioClient::new(api_key).with_rate_limit_store(Arc::clone(&store));
+    let gmail = ComposioClient::new(api_key)
+        .with_rate_limit_store(Arc::clone(&store))
+        .with_call_origin("interactive");
     let mut accounts = store.get_active_gmail_accounts()?;
     if accounts.is_empty() {
         println!("(no active gmail accounts)");
@@ -5630,6 +5649,136 @@ fn unescape_body(s: &str) -> String {
         }
     }
     out
+}
+
+/// One group of refusals (by mailbox, or by action) with the retry-after
+/// spread the issue asks for (#1384).
+#[derive(serde::Serialize)]
+struct RefusalGroup {
+    key: String,
+    count: usize,
+    platform: usize,
+    provider: usize,
+    retry_after_min_ms: Option<i64>,
+    retry_after_median_ms: Option<i64>,
+    retry_after_max_ms: Option<i64>,
+}
+
+fn group_refusals<'a>(
+    rows: &'a [GmailRateRefusal],
+    key_of: impl Fn(&'a GmailRateRefusal) -> String,
+) -> Vec<RefusalGroup> {
+    use std::collections::BTreeMap;
+    let mut by_key: BTreeMap<String, Vec<&GmailRateRefusal>> = BTreeMap::new();
+    for row in rows {
+        by_key.entry(key_of(row)).or_default().push(row);
+    }
+    let mut groups: Vec<_> = by_key
+        .into_iter()
+        .map(|(key, rows)| {
+            // The wait the provider asked for, relative to when it refused.
+            let mut waits: Vec<i64> = rows
+                .iter()
+                .filter_map(|r| r.retry_after_ms.map(|ms| ms - r.observed_at_ms))
+                .collect();
+            waits.sort_unstable();
+            RefusalGroup {
+                key,
+                count: rows.len(),
+                platform: rows.iter().filter(|r| r.class == "http_429").count(),
+                provider: rows.iter().filter(|r| r.class == "envelope").count(),
+                retry_after_min_ms: waits.first().copied(),
+                retry_after_median_ms: waits.get(waits.len() / 2).copied(),
+                retry_after_max_ms: waits.last().copied(),
+            }
+        })
+        .collect();
+    groups.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.key.cmp(&b.key)));
+    groups
+}
+
+fn render_refusal_groups(title: &str, groups: &[RefusalGroup]) {
+    let wait = |ms: Option<i64>| match ms {
+        Some(ms) if ms >= 3_600_000 => format!("{:.1}h", ms as f64 / 3_600_000.0),
+        Some(ms) if ms >= 60_000 => format!("{:.1}m", ms as f64 / 60_000.0),
+        Some(ms) => format!("{}s", ms / 1_000),
+        None => "-".into(),
+    };
+    println!("\n{title}  (count  platform/provider  retry-after min/median/max)");
+    for g in groups {
+        let (min, med, max) =
+            (wait(g.retry_after_min_ms), wait(g.retry_after_median_ms), wait(g.retry_after_max_ms));
+        println!(
+            "  {:<40} {:>5}  {}/{}  {min}/{med}/{max}",
+            g.key, g.count, g.platform, g.provider,
+        );
+    }
+}
+
+fn day_bound_ms(raw: &Option<String>, flag: &str, default_ms: i64, end_of_day: bool) -> Result<i64> {
+    let Some(raw) = raw else { return Ok(default_ms) };
+    let day = chrono::NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d")
+        .with_context(|| format!("{flag} must be YYYY-MM-DD"))?;
+    // The query bound is inclusive, so the last millisecond of the named day
+    // has to be inside it — `23:59:59.000` would drop a refusal observed in
+    // that final second.
+    let (h, m, s, milli) = if end_of_day { (23, 59, 59, 999) } else { (0, 0, 0, 0) };
+    Ok(day.and_hms_milli_opt(h, m, s, milli).unwrap().and_utc().timestamp_millis())
+}
+
+fn run_gmail_rate_report(
+    store: Arc<Store>,
+    since: Option<String>,
+    until: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let now = chrono::Utc::now();
+    let week_ago = (now - chrono::Duration::days(7)).timestamp_millis();
+    let from_ms = day_bound_ms(&since, "--since", week_ago, false)?;
+    let to_ms = day_bound_ms(&until, "--until", now.timestamp_millis(), true)?;
+    let rows = store.gmail_rate_refusals_between(from_ms, to_ms)?;
+
+    // The mailbox is the one snapshotted when the provider refused, so a
+    // since-disconnected account still reports under its own address.
+    let by_account =
+        group_refusals(&rows, |r| r.mailbox.clone().unwrap_or_else(|| r.entity_id.clone()));
+    let by_action = group_refusals(&rows, |r| r.action.clone());
+    let by_origin = group_refusals(&rows, |r| r.origin.clone());
+    let platform = rows.iter().filter(|r| r.class == "http_429").count();
+    let provider = rows.iter().filter(|r| r.class == "envelope").count();
+
+    let window = |ms: i64| {
+        chrono::DateTime::from_timestamp_millis(ms)
+            .map_or_else(|| ms.to_string(), |d| d.format("%Y-%m-%d").to_string())
+    };
+    let (from, to) = (window(from_ms), window(to_ms));
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "since": from,
+                "until": to,
+                "total": rows.len(),
+                "platform_429": platform,
+                "provider_user_rate": provider,
+                "by_account": by_account,
+                "by_action": by_action,
+                "by_origin": by_origin,
+            }))?
+        );
+    } else if rows.is_empty() {
+        println!("(no rate-limit refusals between {from} and {to})");
+    } else {
+        println!(
+            "{} rate-limit refusals {from} → {to}: {platform} platform-budget (HTTP 429), \
+             {provider} provider user-rate",
+            rows.len(),
+        );
+        render_refusal_groups("by mailbox", &by_account);
+        render_refusal_groups("by action", &by_action);
+        render_refusal_groups("by origin", &by_origin);
+    }
+    Ok(())
 }
 
 async fn run_gmail_accounts(store: Arc<Store>, json: bool) -> Result<()> {
@@ -7604,7 +7753,11 @@ async fn run_outbound_observer(
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n >= 30)
         .unwrap_or(300);
-    let gmail = Arc::new(ComposioClient::new(api_key).with_rate_limit_store(Arc::clone(&store)));
+    let gmail = Arc::new(
+        ComposioClient::new(api_key)
+            .with_rate_limit_store(Arc::clone(&store))
+            .with_call_origin("background"),
+    );
     let observer = OutboundObserver::new(store, gmail, 200);
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
     info!(interval_secs, "outbound observer started");
@@ -14674,7 +14827,11 @@ fn build_channel(
     interval_secs: u64,
 ) -> Result<GmailChannel<ComposioClient, FallbackReasoner>> {
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
-    let gmail = Arc::new(ComposioClient::new(api_key).with_rate_limit_store(Arc::clone(&store)));
+    let gmail = Arc::new(
+        ComposioClient::new(api_key)
+            .with_rate_limit_store(Arc::clone(&store))
+            .with_call_origin("background"),
+    );
     let reasoner = build_reasoner();
 
     // Resolve wiki enable/disable and schema path.
@@ -19431,7 +19588,9 @@ async fn run_tone_backfill(
 
     let api_key = std::env::var("COMPOSIO_API_KEY")
         .context("COMPOSIO_API_KEY env var required for tone backfill")?;
-    let gmail = ComposioClient::new(api_key).with_rate_limit_store(Arc::clone(&store));
+    let gmail = ComposioClient::new(api_key)
+        .with_rate_limit_store(Arc::clone(&store))
+        .with_call_origin("interactive");
 
     let accounts = match account {
         Some(a) => vec![a],
@@ -21846,6 +22005,63 @@ async fn the_drain_budget_does_not_bound_a_running_daemon() {
     shutdown.cancel();
     drain.await.unwrap().unwrap();
     assert!(stop.elapsed() >= DRAIN_BUDGET, "the wedged runner still gets the full drain budget");
+}
+
+/// #1384 — the report must separate the two refusal classes on the stored
+/// `class` field and count per mailbox and per action, so the owner can see
+/// whether throttling concentrates in one account or one call.
+#[cfg(test)]
+#[test]
+fn the_rate_report_groups_refusals_by_class_account_action_and_origin() {
+    let row = |entity_id: &str, action: &str, class: &str, wait_ms: i64| GmailRateRefusal {
+        observed_at_ms: 1_000,
+        entity_id: entity_id.into(),
+        // A disconnected mailbox still reports under its snapshotted address.
+        mailbox: (entity_id == "acct-a").then(|| "owner@example.com".to_string()),
+        action: action.into(),
+        class: class.into(),
+        origin: if class == "envelope" { "interactive".into() } else { "background".into() },
+        retry_after_ms: Some(1_000 + wait_ms),
+        retry_after_raw: None,
+        provider_message: "rate limit".into(),
+        headers_json: None,
+        log_id: None,
+        attempt: 1,
+    };
+    let rows = vec![
+        row("acct-a", "GMAIL_FETCH_EMAILS", "http_429", 30_000),
+        row("acct-a", "GMAIL_FETCH_EMAILS", "envelope", 7_200_000),
+        row("acct-a", "GMAIL_SEARCH_EMAILS", "http_429", 60_000),
+        row("acct-b", "GMAIL_FETCH_EMAILS", "http_429", 45_000),
+    ];
+
+    let by_account =
+        group_refusals(&rows, |r| r.mailbox.clone().unwrap_or_else(|| r.entity_id.clone()));
+    assert_eq!(by_account[0].key, "owner@example.com", "the worst mailbox sorts first");
+    assert_eq!((by_account[0].count, by_account[0].platform, by_account[0].provider), (3, 2, 1));
+    // A short platform window and a multi-hour provider block stay distinguishable.
+    let (min, max) = (by_account[0].retry_after_min_ms, by_account[0].retry_after_max_ms);
+    assert_eq!((min, max), (Some(30_000), Some(7_200_000)));
+    assert_eq!((&*by_account[1].key, by_account[1].provider), ("acct-b", 0));
+
+    let by_action = group_refusals(&rows, |r| r.action.clone());
+    assert_eq!((&*by_action[0].key, by_action[0].count), ("GMAIL_FETCH_EMAILS", 3));
+    assert_eq!((&*by_action[1].key, by_action[1].count), ("GMAIL_SEARCH_EMAILS", 1));
+
+    // Interactive-vs-background degradation has to be readable too.
+    let by_origin = group_refusals(&rows, |r| r.origin.clone());
+    assert_eq!((&*by_origin[0].key, by_origin[0].count), ("background", 3));
+    assert_eq!((&*by_origin[1].key, by_origin[1].count), ("interactive", 1));
+}
+
+/// A refusal in the last millisecond of `--until`'s day is inside the window:
+/// the SQL bound is inclusive, so the bound itself must be `23:59:59.999`.
+#[cfg(test)]
+#[test]
+fn the_until_bound_covers_the_whole_final_day() {
+    let to_ms = day_bound_ms(&Some("2026-10-05".into()), "--until", 0, true).unwrap();
+    let late = chrono::DateTime::parse_from_rfc3339("2026-10-05T23:59:59.500Z").unwrap();
+    assert_eq!(to_ms, late.timestamp_millis() + 499, "23:59:59.500Z must be inside --until");
 }
 
 /// Test builders shared by sibling modules (`imessage_send`).

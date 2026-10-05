@@ -105,7 +105,9 @@ async fn write_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 fn composio_client(store: &Arc<Store>) -> Result<ComposioClient> {
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
-    Ok(ComposioClient::new(api_key).with_rate_limit_store(Arc::clone(store)))
+    Ok(ComposioClient::new(api_key)
+        .with_rate_limit_store(Arc::clone(store))
+        .with_call_origin("interactive"))
 }
 
 pub async fn run_gmail_list_attachments(
