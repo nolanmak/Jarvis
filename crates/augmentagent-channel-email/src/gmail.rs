@@ -12,7 +12,7 @@ use chrono::DateTime;
 use serde::Deserialize;
 use thiserror::Error;
 
-use augmentagent_store::Email;
+use augmentagent_store::{Email, GmailRateRefusal};
 
 use crate::outbound::parse_rfc2822_or_ms;
 
@@ -176,6 +176,7 @@ pub struct ComposioClient {
     base_url: String,
     api_key: String,
     rate_limit_store: Option<Arc<augmentagent_store::Store>>,
+    call_origin: &'static str,
 }
 
 impl ComposioClient {
@@ -185,6 +186,7 @@ impl ComposioClient {
             base_url: "https://backend.composio.dev".into(),
             api_key,
             rate_limit_store: None,
+            call_origin: "unknown",
         }
     }
 
@@ -196,6 +198,14 @@ impl ComposioClient {
     /// Shares one persisted cooldown across the daemon and separate CLI calls.
     pub fn with_rate_limit_store(mut self, store: Arc<augmentagent_store::Store>) -> Self {
         self.rate_limit_store = Some(store);
+        self
+    }
+
+    /// #1384 — tags ledgered rate-limit refusals with where the call came
+    /// from: `"interactive"` for an owner command, `"background"` for the
+    /// poller/observers. Unset builders stay `"unknown"`.
+    pub fn with_call_origin(mut self, origin: &'static str) -> Self {
+        self.call_origin = origin;
         self
     }
 
@@ -233,10 +243,28 @@ impl ComposioClient {
                         let v = resp.json::<serde_json::Value>().await?;
                         let checked = check_envelope(action, v);
                         match &checked {
-                            Err(GmailError::RateLimited { retry_after_ms, log_id, .. })
-                                if action == "GMAIL_FETCH_EMAILS" => {
+                            Err(err @ GmailError::RateLimited { retry_after_ms, retry_after, log_id }) => {
+                                // Ledgered for every action, not just fetch, so a
+                                // future rate-limited search/send is not dropped.
+                                self.ledger(GmailRateRefusal {
+                                    observed_at_ms: wallclock_ms(),
+                                    entity_id: entity_id.to_string(),
+                                    // Resolved from the registry by the store.
+                                    mailbox: None,
+                                    action: action.to_string(),
+                                    class: "envelope".into(),
+                                    origin: self.call_origin.to_string(),
+                                    retry_after_ms: Some(*retry_after_ms),
+                                    retry_after_raw: Some(retry_after.clone()),
+                                    provider_message: err.to_string(),
+                                    headers_json: None,
+                                    log_id: Some(log_id.clone()),
+                                    attempt: attempt as i64,
+                                });
+                                if action == "GMAIL_FETCH_EMAILS" {
                                     self.record_cooldown(entity_id, *retry_after_ms, Some(log_id))?;
                                 }
+                            }
                             Ok(_) if action == "GMAIL_FETCH_EMAILS" => {
                                 self.clear_cooldown(entity_id)?;
                             }
@@ -246,10 +274,33 @@ impl ComposioClient {
                     }
                     // Retry 5xx and 429; surface 4xx (other than 429) immediately.
                     let retryable = status.as_u16() == 429 || status.is_server_error();
+                    // #1384 — snapshot the rate-limit headers while the response
+                    // is still live: `resp.text()` below consumes it, and these
+                    // headers are the only non-wording evidence that separates a
+                    // platform-budget 429 from an upstream per-user refusal.
+                    let headers = (status.as_u16() == 429)
+                        .then(|| snapshot_rate_limit_headers(resp.headers()));
                     let text = resp.text().await.unwrap_or_default();
                     let err = GmailError::Composio {
                         message: format!("{action} → {status}: {text}"),
                     };
+                    if let Some((headers_json, retry)) = headers {
+                        // Every observed 429 is a real refusal, retried or not.
+                        self.ledger(GmailRateRefusal {
+                            observed_at_ms: wallclock_ms(),
+                            entity_id: entity_id.to_string(),
+                            mailbox: None,
+                            action: action.to_string(),
+                            class: "http_429".into(),
+                            origin: self.call_origin.to_string(),
+                            retry_after_ms: retry.as_ref().and_then(|(ms, _)| *ms),
+                            retry_after_raw: retry.map(|(_, raw)| raw),
+                            provider_message: err.to_string(),
+                            headers_json,
+                            log_id: None,
+                            attempt: attempt as i64,
+                        });
+                    }
                     if retryable && attempt < MAX_ATTEMPTS {
                         tracing::warn!(
                             action, status = %status, attempt, "composio retryable failure; backing off"
@@ -277,9 +328,25 @@ impl ComposioClient {
             .gmail_fetch_cooldown_until(entity_id, wallclock_ms())
             .map_err(|e| GmailError::Composio { message: format!("read Gmail cooldown: {e}") })?;
         if let Some(retry_after_ms) = retry_after_ms {
+            // #1384 — deliberately NOT ledgered: this is our own refusal
+            // replaying a boundary already recorded when the provider set it,
+            // so counting it would inflate "how often the provider refuses us"
+            // by every call we make during one cooldown window.
             return Err(rate_limited_error(retry_after_ms, "cached"));
         }
         Ok(())
+    }
+
+    /// Diagnostics only: a failed ledger write must never change the outcome
+    /// or the error of the Gmail call that produced it (#1384).
+    fn ledger(&self, row: GmailRateRefusal) {
+        let Some(store) = &self.rate_limit_store else {
+            return;
+        };
+        if let Err(e) = store.record_gmail_rate_refusal(&row) {
+            let (action, class) = (&row.action, &row.class);
+            tracing::warn!(%action, %class, "could not record Gmail rate-limit refusal: {e}");
+        }
     }
 
     fn record_cooldown(&self, entity_id: &str, retry_after_ms: i64, log_id: Option<&str>) -> Result<(), GmailError> {
@@ -1403,8 +1470,13 @@ mod tests {
     /// A mock that replies with the SAME `body`/`status` to EVERY request it
     /// receives (each on a fresh `Connection: close` socket), so a paginated
     /// caller that keeps requesting sees the same page repeated — the Composio
-    /// "stuck cursor" shape behind #331.
-    async fn spawn_repeating_http(status: u16, body: &'static str) -> SocketAddr {
+    /// "stuck cursor" shape behind #331. `extra_headers` are appended verbatim
+    /// (each must end in CRLF), which #1384 uses to send rate-limit headers.
+    async fn spawn_repeating_http(
+        status: u16,
+        body: &'static str,
+        extra_headers: &'static str,
+    ) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1416,7 +1488,7 @@ mod tests {
                     let mut buf = [0u8; 4096];
                     let _ = socket.read(&mut buf).await;
                     let resp = format!(
-                        "HTTP/1.1 {status} OK\r\nContent-Length: {len}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 {status} OK\r\nContent-Length: {len}\r\nContent-Type: application/json\r\n{extra_headers}Connection: close\r\n\r\n{body}",
                         len = body.len(),
                         body = body
                     );
@@ -1522,7 +1594,7 @@ mod tests {
     #[tokio::test]
     async fn get_attachment_file_surfaces_an_unsuccessful_envelope() {
         let resp = r#"{"successful":false,"error":"Requested entity was not found.","log_id":"lg1"}"#;
-        let addr = spawn_repeating_http(200, resp).await;
+        let addr = spawn_repeating_http(200, resp, "").await;
         let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
         let err = client
             .get_attachment_file("entity-x", "m1", "A1", "r.pdf")
@@ -1645,7 +1717,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_with_query_dedups_repeated_message_and_parses_timestamp() {
         let body = r#"{"data":{"messages":[{"id":"MSG1","from":"me@example.com","subject":"Invoice #35","messageTimestamp":"2026-01-17T21:11:09Z","messageText":"hi"}],"nextPageToken":"STUCK_CURSOR"}}"#;
-        let addr = spawn_repeating_http(200, body).await;
+        let addr = spawn_repeating_http(200, body, "").await;
         let base = format!("http://{addr}");
         let client = ComposioClient::new("ak_fake".into()).with_base_url(base);
 
@@ -1677,7 +1749,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_with_query_accepts_numeric_internal_date() {
         let body = r#"{"data":{"messages":[{"id":"MSG9","from":"sender@example.com","subject":"Re: ping","internalDate":1737147069000,"messageText":"hi"}]}}"#;
-        let addr = spawn_repeating_http(200, body).await;
+        let addr = spawn_repeating_http(200, body, "").await;
         let base = format!("http://{addr}");
         let client = ComposioClient::new("ak_fake".into()).with_base_url(base);
 
@@ -1719,6 +1791,83 @@ mod tests {
             store.gmail_fetch_cooldown_until("entity-limited", 0).unwrap(),
             Some(4_070_908_800_000),
             "the provider retry timestamp must be persisted for every caller"
+        );
+    }
+
+    // ---- #1384: every provider rate-limit refusal lands in the ledger ----
+
+    #[tokio::test]
+    async fn platform_429_ledgers_header_derived_retry_after_and_allowance() {
+        use std::sync::Arc;
+        // Every request is refused, so each of the client's retries sees a 429.
+        let addr = spawn_repeating_http(
+            429,
+            r#"{"error":"rate limit exceeded"}"#,
+            // Standard spellings alongside the vendor ones: both must survive.
+            "Retry-After: 30\r\nRateLimit-Remaining: 0\r\nRateLimit-Reset: 30\r\nX-RateLimit-Limit: 60\r\n",
+        )
+        .await;
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(augmentagent_store::Store::open(db.path()).unwrap());
+        let client = ComposioClient::new("ak_fake".into())
+            .with_base_url(format!("http://{addr}"))
+            .with_rate_limit_store(Arc::clone(&store))
+            .with_call_origin("interactive");
+
+        let before = wallclock_ms();
+        client
+            .fetch_with_query("entity-429", "anything", 1)
+            .await
+            .expect_err("a 429 must surface as an error");
+
+        let rows = store.gmail_rate_refusals_between(0, i64::MAX).unwrap();
+        let row = rows.first().expect("the platform refusal must be recorded");
+        assert_eq!(
+            (&*row.class, &*row.origin, &*row.action),
+            ("http_429", "interactive", "GMAIL_FETCH_EMAILS")
+        );
+        assert_eq!(row.retry_after_raw.as_deref(), Some("30"));
+        let ms = row.retry_after_ms.expect("Retry-After must be read from the live headers");
+        assert!((ms - (before + 30_000)).abs() < 5_000, "retry-after boundary off: {ms}");
+        let headers = row.headers_json.as_deref().expect("headers must be captured");
+        for key in ["retry-after", "ratelimit-remaining", "ratelimit-reset", "x-ratelimit-limit"] {
+            assert!(headers.contains(key), "missing {key} in {headers}");
+        }
+        // Each retried attempt sees its own refusal, so each is its own row.
+        assert_eq!(
+            rows.iter().map(|r| r.attempt).collect::<Vec<_>>(),
+            (1..=rows.len() as i64).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn user_rate_envelope_ledgers_the_provider_class_and_excludes_cached_replays() {
+        use std::sync::Arc;
+        let body = r#"{"successful":false,"error":"User-rate limit exceeded. Retry after 2099-01-01T00:00:00Z","log_id":"log_1384"}"#;
+        let addr = spawn_one_shot_http(200, body).await;
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(augmentagent_store::Store::open(db.path()).unwrap());
+        let client = ComposioClient::new("ak_fake".into())
+            .with_base_url(format!("http://{addr}"))
+            .with_rate_limit_store(Arc::clone(&store))
+            .with_call_origin("background");
+
+        client.fetch_unread("entity-envelope", 1).await.expect_err("the envelope must error");
+
+        let rows = store.gmail_rate_refusals_between(0, i64::MAX).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((&*rows[0].class, &*rows[0].origin), ("envelope", "background"));
+        assert_eq!(rows[0].log_id.as_deref(), Some("log_1384"));
+        assert_eq!(rows[0].retry_after_ms, Some(4_070_908_800_000));
+        assert_eq!(rows[0].headers_json, None);
+
+        // The cached-cooldown short-circuit is our own refusal replaying a
+        // boundary already counted, so it must not add a row.
+        client.fetch_unread("entity-envelope", 1).await.expect_err("the cooldown still rejects");
+        assert_eq!(
+            store.gmail_rate_refusals_between(0, i64::MAX).unwrap().len(),
+            1,
+            "a cached cooldown replay must not inflate the refusal count"
         );
     }
 
@@ -1888,7 +2037,7 @@ mod tests {
     async fn resolve_thread_id_rejects_unknown_id() {
         // Served for BOTH the messages.get and threads.get attempts.
         let body = r#"{"successful":false,"error":"Requested entity was not found.","data":{}}"#;
-        let addr = spawn_repeating_http(200, body).await;
+        let addr = spawn_repeating_http(200, body, "").await;
         let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
 
         let err = client
@@ -1910,7 +2059,7 @@ mod tests {
     async fn update_draft_recreates_and_returns_new_id() {
         // Same body serves both the create (draft id lookup) and the delete.
         let body = r#"{"successful":true,"data":{"id":"NEWDRAFT"}}"#;
-        let addr = spawn_repeating_http(200, body).await;
+        let addr = spawn_repeating_http(200, body, "").await;
         let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
 
         let new_id = client
@@ -2041,7 +2190,7 @@ mod tests {
             {"id":"D1","message":{"id":"M1","threadId":"T9"}},
             {"id":"D2","message":{"id":"M2","threadId":"M2"}}
         ]}}"#;
-        let addr = spawn_repeating_http(200, body).await;
+        let addr = spawn_repeating_http(200, body, "").await;
         let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
 
         let threaded = client
@@ -2118,6 +2267,35 @@ fn parse_rate_limit_retry_after(error: &str) -> Option<(i64, String)> {
         .trim_matches(|c: char| matches!(c, '.' | ',' | ';' | ')' | ']'));
     let retry_after_ms = DateTime::parse_from_rfc3339(retry_after).ok()?.timestamp_millis();
     Some((retry_after_ms, retry_after.to_string()))
+}
+
+/// Collect the rate-limit headers from a 429 response, plus the parsed
+/// `Retry-After` boundary (#1384). Returns the headers as a JSON object, or
+/// `None` when the provider sent none, and `(Option<absolute ms>, raw token)`
+/// for `Retry-After` — the raw text is kept even when it would not parse.
+fn snapshot_rate_limit_headers(
+    h: &reqwest::header::HeaderMap,
+) -> (Option<String>, Option<(Option<i64>, String)>) {
+    let mut map = serde_json::Map::new();
+    for (name, value) in h.iter() {
+        let name = name.as_str().to_ascii_lowercase();
+        // RFC 9238 `RateLimit-*`, plus the `X-` and hyphenated vendor spellings.
+        let core = name.strip_prefix("x-").unwrap_or(&name).replacen("rate-", "rate", 1);
+        let relevant = name == "retry-after" || core.starts_with("ratelimit");
+        if let (true, Ok(v)) = (relevant, value.to_str()) {
+            map.insert(name, serde_json::Value::String(v.to_string()));
+        }
+    }
+    let retry = map.get("retry-after").and_then(serde_json::Value::as_str).map(|raw| {
+        let raw = raw.trim();
+        // Either delta-seconds or an HTTP-date, per RFC 9110.
+        let ms = raw.parse::<i64>().ok().map(|secs| wallclock_ms() + secs * 1_000).or_else(|| {
+            DateTime::parse_from_rfc2822(raw).ok().map(|dt| dt.timestamp_millis())
+        });
+        (ms, raw.to_string())
+    });
+    let headers_json = (!map.is_empty()).then(|| serde_json::Value::Object(map).to_string());
+    (headers_json, retry)
 }
 
 fn rate_limited_error(retry_after_ms: i64, log_id: &str) -> GmailError {

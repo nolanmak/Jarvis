@@ -137,6 +137,31 @@ pub struct ActionRecord {
     pub updated_at: String,
 }
 
+/// #1384 — one append-only row per provider rate-limit refusal of a Gmail
+/// action, so "how often, which mailbox, which action" is answerable without
+/// scraping a log tail. `class` is the structural discriminator: `http_429`
+/// is a platform-budget refusal from the Composio API, `envelope` is the
+/// upstream per-user refusal Composio reports inside an HTTP 200 body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GmailRateRefusal {
+    pub observed_at_ms: i64,
+    pub entity_id: String,
+    /// The mailbox as known when the refusal happened, so a later disconnect
+    /// cannot erase which account was throttled. `None` if no address yet.
+    pub mailbox: Option<String>,
+    pub action: String,
+    pub class: String,
+    pub origin: String,
+    /// Absolute wallclock boundary, when one is derivable.
+    pub retry_after_ms: Option<i64>,
+    /// The raw header or message token, kept even when it would not parse.
+    pub retry_after_raw: Option<String>,
+    pub provider_message: String,
+    pub headers_json: Option<String>,
+    pub log_id: Option<String>,
+    pub attempt: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     pub id: String,
