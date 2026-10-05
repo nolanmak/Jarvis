@@ -56,6 +56,10 @@ class FakeAgent:
         self.items = list(items)
         self.completed = []
         self.claims = 0
+        self.heartbeats = []
+
+    def heartbeat(self, error=None):
+        self.heartbeats.append(error)
 
     def claim(self):
         self.claims += 1
@@ -93,6 +97,26 @@ def item(body="see you at 8", target=PHONE, kind="handle", item_id=5):
 
 
 class SenderTests(unittest.TestCase):
+    def test_expired_dispatch_lease_never_calls_messages(self):
+        expired = item()
+        expired["send_by_ms"] = 1
+        agent = FakeAgent([expired])
+        runner = FakeRunner()
+        self.sender(agent, runner).run_once()
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(agent.completed[0]["status"], "failed")
+        self.assertIn("expired before dispatch", agent.completed[0]["reason"])
+
+    def test_idle_scheduler_reports_health_and_permissions_failure(self):
+        agent = FakeAgent()
+        self.sender(agent, FakeRunner()).run_once()
+        self.assertEqual(agent.heartbeats, [None])
+        sender = self.sender(agent, FakeRunner())
+        sender.db = str(self.root / "missing.db")
+        with self.assertRaises(snd.ChatDbUnreadable):
+            sender.run_once()
+        self.assertIn("Full Disk Access", agent.heartbeats[-1])
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -152,28 +176,28 @@ class SenderTests(unittest.TestCase):
         agent = FakeAgent([item()])
         runner = FakeRunner(effect=lambda: insert(self.con, 2, 2, "see you at 8"))
         self.sender(agent, runner).run_once()
-        self.assertEqual(agent.completed[0]["status"], "failed")
+        self.assertEqual(agent.completed[0]["status"], "unknown")
 
     def test_no_row_before_deadline_fails_once_without_retry(self):
         agent = FakeAgent([item()])
         runner = FakeRunner()
         self.sender(agent, runner).run_once()
         self.assertEqual(len(runner.calls), 1)
-        self.assertEqual(agent.completed[0]["status"], "failed")
+        self.assertEqual(agent.completed[0]["status"], "unknown")
         self.assertIn("no matching message", agent.completed[0]["reason"])
 
     def test_unsent_row_at_deadline_fails(self):
         agent = FakeAgent([item()])
         runner = FakeRunner(effect=lambda: insert(self.con, 2, 1, "see you at 8", sent=0))
         self.sender(agent, runner).run_once()
-        self.assertEqual(agent.completed[0]["status"], "failed")
+        self.assertEqual(agent.completed[0]["status"], "unknown")
         self.assertIn("not sent", agent.completed[0]["reason"])
 
     def test_osascript_failure_is_reported_with_applescript_error(self):
         agent = FakeAgent([item()])
         runner = FakeRunner(returncode=1, stderr="execution error: nope (-1728)")
         self.sender(agent, runner).run_once()
-        self.assertEqual(agent.completed[0]["status"], "failed")
+        self.assertEqual(agent.completed[0]["status"], "unknown")
         self.assertIn("-1728", agent.completed[0]["reason"])
 
     def test_interrupted_dispatch_is_reconciled_from_chat_db_without_resending(self):
@@ -198,7 +222,7 @@ class SenderTests(unittest.TestCase):
         runner = FakeRunner(effect=lambda: insert(self.con, 2, 1, "see you at 8"))
         self.sender(agent, runner).run_once()
         self.assertEqual(agent.completed[0]["id"], 5)
-        self.assertEqual(agent.completed[0]["status"], "failed")
+        self.assertEqual(agent.completed[0]["status"], "unknown")
         self.assertEqual(len(runner.calls), 1)  # only item 6 was sent
 
     def test_report_failure_keeps_journal_and_reports_next_run(self):
@@ -257,7 +281,7 @@ class SenderTests(unittest.TestCase):
         self.sender(agent, runner).run_once()
         self.assertGreaterEqual(runner.calls[0][1]["timeout"], 90)
         self.assertEqual(len(runner.calls), 1)
-        self.assertEqual(agent.completed[0]["status"], "failed")
+        self.assertEqual(agent.completed[0]["status"], "unknown")
         self.assertIn("timed out", agent.completed[0]["reason"])
 
     def test_group_target_uses_chat_id_form_and_guid_match(self):

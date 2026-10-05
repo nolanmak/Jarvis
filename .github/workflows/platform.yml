@@ -47,6 +47,12 @@ jobs:
       # main can sit broken for a day. This is the PR gate, so it belongs here.
       - name: Whole workspace compiles
         run: cargo build --workspace --locked
+      - name: Owner alerts and iMessage delivery
+        run: |
+          cargo test -p augmentagent-store --test owner_alerts --test imessage_outbox
+          cargo test -p augmentagent-cli --test imessage_outbox_cli
+          cargo test -p augmentagent-cli --bin augmentagent imessage_send
+          cargo test -p augmentagent-channel-imessage
       - name: Process walker + sidecar clients
         run: cargo test -p augmentagent-loops -p augmentagent-browser-client -p augmentagent-renderer-client
       # #1226 / #1282 — the transport-neutral surface contracts and the Slack

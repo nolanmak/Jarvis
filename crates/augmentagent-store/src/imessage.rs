@@ -104,6 +104,7 @@ pub struct ImessageOutboxItem {
 /// What the sender observed in `chat.db`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImessageSendOutcome {
+    Unknown { reason: String },
     Sent {
         message_guid: Option<String>,
     },
@@ -148,10 +149,10 @@ pub(crate) fn migrate(conn: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
-const COLUMNS: &str = "id, action_id, target, target_kind, service, body, status, \
+pub(crate) const COLUMNS: &str = "id, action_id, target, target_kind, service, body, status, \
      created_at_ms, claimed_at_ms, completed_at_ms, error_code, error_detail, message_guid";
 
-fn row_to_item(r: &Row<'_>) -> rusqlite::Result<ImessageOutboxItem> {
+pub(crate) fn row_to_item(r: &Row<'_>) -> rusqlite::Result<ImessageOutboxItem> {
     let kind: String = r.get(3)?;
     let status: String = r.get(6)?;
     Ok(ImessageOutboxItem {
@@ -225,6 +226,7 @@ impl Store {
         let sql = format!(
             "UPDATE imessage_outbox SET status = 'claimed', claimed_at_ms = ?1 \
               WHERE id = (SELECT id FROM imessage_outbox WHERE status = 'queued' \
+                          AND NOT EXISTS (SELECT 1 FROM owner_alert_texts WHERE outbox_id=imessage_outbox.id) \
                           ORDER BY id LIMIT 1) \
                 AND status = 'queued' \
              RETURNING {COLUMNS}"
@@ -245,6 +247,10 @@ impl Store {
     ) -> StoreResult<bool> {
         let now = now_millis();
         let n = self.with_conn(|c| match outcome {
+            ImessageSendOutcome::Unknown { reason } => c.execute(
+                "UPDATE imessage_outbox SET status='unknown',error_detail=?2
+                 WHERE id=?1 AND status='claimed'", params![id,reason],
+            ),
             ImessageSendOutcome::Sent { message_guid } => c.execute(
                 "UPDATE imessage_outbox \
                     SET status = 'sent', completed_at_ms = ?2, message_guid = ?3 \
@@ -292,6 +298,7 @@ impl Store {
                 SET status = 'failed', completed_at_ms = ?2, \
                     error_detail = 'expired before the Mac sender picked it up' \
               WHERE status = 'queued' AND created_at_ms < ?1 \
+                AND NOT EXISTS (SELECT 1 FROM owner_alert_texts WHERE outbox_id=imessage_outbox.id) \
              RETURNING {COLUMNS}"
         );
         let now = now_millis();

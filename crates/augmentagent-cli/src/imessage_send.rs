@@ -173,6 +173,11 @@ fn env_secs(name: &str, default: i64) -> i64 {
 
 #[derive(clap::Subcommand, Debug, Clone)]
 pub(crate) enum OutboxOp {
+    /// Scheduler liveness and local permission diagnostics; never claims a send.
+    Heartbeat {
+        #[arg(long)] error: Option<String>,
+    },
+    Health,
     /// Hand the oldest queued reply to the calling sender. Prints one JSON
     /// line: `{"version":1,"item":null}` or the item to send.
     Claim {
@@ -183,7 +188,7 @@ pub(crate) enum OutboxOp {
     /// Report what the sender observed in chat.db for a claimed item.
     Complete {
         id: i64,
-        #[arg(long, value_parser = ["sent", "failed"])]
+        #[arg(long, value_parser = ["sent", "failed", "unknown"])]
         status: String,
         /// `message.error` from chat.db.
         #[arg(long)]
@@ -204,6 +209,9 @@ pub(crate) enum OutboxOp {
 /// Fail expired queued rows and stale claims, and flip their actions to
 /// `error`. Returns the rows that changed so the daemon can notify.
 pub(crate) fn reconcile_outbox(store: &Store) -> anyhow::Result<Vec<ImessageOutboxItem>> {
+    let now = chrono::Utc::now().timestamp_millis();
+    store.enqueue_owner_alert_texts(now)?;
+    store.reconcile_owner_alert_texts(now)?;
     let claim_timeout_ms = env_secs(ENV_CLAIM_TIMEOUT_SECS, DEFAULT_CLAIM_TIMEOUT_SECS) * 1000;
     let max_age_ms = env_secs(ENV_OUTBOX_MAX_AGE_SECS, DEFAULT_OUTBOX_MAX_AGE_SECS) * 1000;
     let mut changed = store.expire_imessage_outbox_claims(claim_timeout_ms)?;
@@ -218,15 +226,17 @@ pub(crate) fn reconcile_outbox(store: &Store) -> anyhow::Result<Vec<ImessageOutb
     Ok(changed)
 }
 
-fn claim_json(item: Option<&ImessageOutboxItem>) -> String {
+fn claim_json(item: Option<&ImessageOutboxItem>, send_by_ms: Option<i64>) -> String {
     let item = item.map(|i| {
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "id": i.id,
             "target": i.target,
             "target_kind": i.target_kind.as_str(),
             "service": i.service,
             "body": i.body,
-        })
+        });
+        if let Some(deadline) = send_by_ms { value["send_by_ms"] = deadline.into(); }
+        value
     });
     // Fixed key order: the contract is one exact line (#1304 AC-1).
     format!(
@@ -244,7 +254,17 @@ pub(crate) fn complete(
     let Some(before) = store.get_imessage_outbox(id)? else {
         anyhow::bail!("no outbox item {id}");
     };
-    if !store.complete_imessage_outbox(id, outcome)? {
+    // The report may have committed before SSH dropped its response. Accept
+    // that exact report again so the Mac can retire its durable journal.
+    let repeated = match outcome {
+        ImessageSendOutcome::Sent { message_guid } => before.status == ImessageOutboxStatus::Sent
+            && before.message_guid == *message_guid,
+        ImessageSendOutcome::Failed { error_code, reason } => before.status == ImessageOutboxStatus::Failed
+            && before.error_code == *error_code && before.error_detail.as_deref() == Some(reason.as_str()),
+        ImessageSendOutcome::Unknown { reason } => before.status == ImessageOutboxStatus::Unknown
+            && before.error_detail.as_deref() == Some(reason.as_str()),
+    };
+    if !repeated && !store.complete_imessage_outbox(id, outcome)? {
         anyhow::bail!(
             "outbox item {id} is {}, not claimed; nothing changed",
             before.status.as_str()
@@ -252,6 +272,9 @@ pub(crate) fn complete(
     }
     let action = store.get_action_with_email(&before.action_id)?;
     match outcome {
+        ImessageSendOutcome::Unknown { reason } => {
+            store.finish_send_error(&before.action_id, &format!("{UNKNOWN_OUTCOME} {reason}"), None, "imessage")?;
+        }
         ImessageSendOutcome::Sent { message_guid } => {
             // A late report for a claim that had already been marked unknown
             // moves the action from that error to sent: it did go out.
@@ -287,14 +310,35 @@ pub(crate) fn complete(
 
 pub(crate) fn run_outbox(store: &Store, op: &OutboxOp) -> anyhow::Result<()> {
     match op {
+        OutboxOp::Heartbeat { error } => {
+            store.record_owner_text_heartbeat(chrono::Utc::now().timestamp_millis(),error.as_deref())?;
+            println!("{{\"version\":1,\"ok\":true}}");
+            Ok(())
+        }
+        OutboxOp::Health => {
+            let health = store.owner_text_health(chrono::Utc::now().timestamp_millis(),120_000)?;
+            println!("{}",serde_json::json!({"enabled":health.enabled,"healthy":health.healthy,
+                "detail":health.detail,"heartbeat_at_ms":health.heartbeat_at_ms,"last_success_at_ms":health.last_success_at_ms}));
+            Ok(())
+        }
         OutboxOp::Claim { .. } => {
             reconcile_outbox(store)?;
+            let now = chrono::Utc::now().timestamp_millis();
+            store.enqueue_owner_alert_texts(now)?;
             let item = if augmentagent_channel_imessage::send_enabled() {
-                store.claim_imessage_outbox()?
+                match store.claim_owner_alert_text(now)? {
+                    Some(item) => Some(item),
+                    None => store.claim_imessage_outbox()?,
+                }
             } else {
                 None
             };
-            println!("{}", claim_json(item.as_ref()));
+            let send_by_ms = match item.as_ref() {
+                Some(item) => store.owner_alert_for_outbox(item.id)?.map(|a|
+                    (now + 5_000).min(a.expires_at_ms).min(a.due_at_ms.unwrap_or(i64::MAX))),
+                None => None,
+            };
+            println!("{}", claim_json(item.as_ref(), send_by_ms));
             Ok(())
         }
         OutboxOp::Complete {
@@ -307,6 +351,10 @@ pub(crate) fn run_outbox(store: &Store, op: &OutboxOp) -> anyhow::Result<()> {
             let outcome = if status == "sent" {
                 ImessageSendOutcome::Sent {
                     message_guid: message_guid.clone(),
+                }
+            } else if status == "unknown" {
+                ImessageSendOutcome::Unknown {
+                    reason: reason.clone().unwrap_or_else(|| "sender could not verify delivery".into()),
                 }
             } else {
                 ImessageSendOutcome::Failed {
@@ -437,8 +485,30 @@ pub(crate) async fn notify_outbox_failures(
     broker: &dyn augmentagent_approval_discord::ApprovalBroker,
 ) -> anyhow::Result<usize> {
     let mut posted = 0;
+    let now = chrono::Utc::now().timestamp_millis();
+    let health = store.owner_text_health(now, 120_000)?;
+    if health.enabled && !health.healthy && store.claim_owner_text_health_notice(now, 600_000)? {
+        broker.post_digest("Owner text delivery degraded", &format!(
+            "{}. Discord alert reminders remain active. Last confirmed send: {}.",
+            health.detail, health.last_success_at_ms.map(|t| t.to_string()).unwrap_or_else(|| "none".into())
+        )).await?;
+        posted += 1;
+    }
     for row in store.unnotified_imessage_outbox_failures()? {
         let Some(action) = store.get_action_with_email(&row.action_id)? else {
+            if let Some(alert) = store.owner_alert_for_outbox(row.id)? {
+                let status = store.owner_alert_text_status(&alert.id)?.unwrap_or_default();
+                if status != "cancelled" {
+                    // One notice per evaluation, with the same persistent ten-minute cap
+                    // as health failures. Unposted failures remain eligible next time.
+                    if !store.claim_owner_text_health_notice(now, 600_000)? { continue; }
+                    broker.post_digest("Owner alert text not confirmed", &format!(
+                        "Alert {}: {}. {}. Discord reminders remain active. {}",
+                        alert.id,status,row.error_detail.as_deref().unwrap_or("check sender health"),alert.source_url
+                    )).await?;
+                    posted += 1;
+                }
+            }
             store.mark_imessage_outbox_notified(row.id)?;
             continue;
         };
@@ -754,6 +824,44 @@ mod tests {
             self.0.lock().unwrap().push(reason.to_string());
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn owner_sender_outage_posts_rate_limited_notice() {
+        let f = fixture(true);
+        f.store.configure_owner_alert_texts(Some(PHONE), true).unwrap();
+        let broker = Notices::default();
+        assert_eq!(notify_outbox_failures(&f.store, &broker).await.unwrap(), 1);
+        assert_eq!(notify_outbox_failures(&f.store, &broker).await.unwrap(), 0);
+        let posted = broker.0.lock().unwrap();
+        assert!(posted[0].contains("Tailscale"));
+        assert!(posted[0].contains("Discord alert reminders remain active"));
+    }
+
+    #[tokio::test]
+    async fn failed_owner_text_has_notice_without_fabricated_email_action() {
+        use augmentagent_store::owner_alerts::{NewOwnerAlert, Urgency};
+        let f = fixture(true);
+        let now = chrono::Utc::now().timestamp_millis();
+        f.store.configure_owner_alert_texts(Some(PHONE), true).unwrap();
+        f.store.record_owner_text_heartbeat(now, None).unwrap();
+        f.store.insert_owner_alert(&NewOwnerAlert {
+            id: "notice-test", source_url: "https://example.test/alert", sender: "Test Sender",
+            action: "Prepare brief", reason: "Meeting soon", urgency: Urgency::Critical,
+            due_at_ms: None, timezone: "UTC", meeting_id: None,
+            expires_at_ms: now+60_000, text_after_ms: now,
+        },now).unwrap();
+        f.store.enqueue_owner_alert_texts(now).unwrap();
+        let item = f.store.claim_owner_alert_text(now).unwrap().unwrap();
+        complete(&f.store,item.id,&ImessageSendOutcome::Unknown { reason: "ambiguous outcome".into() }).unwrap();
+        let broker = Notices::default();
+        assert_eq!(notify_outbox_failures(&f.store,&broker).await.unwrap(),1);
+        assert_eq!(notify_outbox_failures(&f.store,&broker).await.unwrap(),0);
+        let posted = broker.0.lock().unwrap();
+        assert!(posted[0].contains("notice-test: unknown"));
+        assert!(posted[0].contains("Discord reminders remain active"));
+        assert_eq!(f.store.owner_alert("notice-test").unwrap().unwrap().state,
+            augmentagent_store::owner_alerts::AlertState::Open);
     }
 
     #[tokio::test]

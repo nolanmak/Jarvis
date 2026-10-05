@@ -76,6 +76,7 @@ mod embeddings_cmd;
 mod triage_prefilter_cmd;
 mod apple_notes;
 mod imessage_send;
+mod owner_alerts;
 mod autopr_eval;
 mod autopr_health;
 mod channel_router;
@@ -1259,6 +1260,11 @@ enum PersonOp {
 
 #[derive(Subcommand)]
 enum ImessageOp {
+    /// Proactive owner alerts, separate from approved replies to contacts.
+    Alerts {
+        #[command(subcommand)]
+        op: owner_alerts::Op,
+    },
     /// Backfill conversation history into person pages (#885). Dry-run
     /// JSON report by default; pass `--apply` to write fill-blanks pages,
     /// stamp `updated:` with last-message dates, and index phones.
@@ -4326,6 +4332,7 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Imessage { ref op } => match op {
+            ImessageOp::Alerts { op } => owner_alerts::run(&store, op),
             ImessageOp::Sync { apply } => {
                 run_imessage_sync(&cli, store, *apply)?;
                 Ok(())

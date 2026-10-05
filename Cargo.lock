@@ -1219,6 +1219,8 @@ dependencies = [
 name = "augmentagent-store"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "chrono-tz",
  "once_cell",
  "regex",
  "rusqlite",
