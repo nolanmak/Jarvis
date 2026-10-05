@@ -65,6 +65,21 @@ def process_start_time(pid):
     Paired with the pid it identifies one process: pids are reused, start
     times of a reused pid differ.
     """
+    import sys
+    if sys.platform == 'darwin':
+        import ctypes
+        import errno
+        import struct
+        lib = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
+        lib.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                                    ctypes.c_void_p, ctypes.c_int]
+        buffer = ctypes.create_string_buffer(56)
+        count = lib.proc_pidinfo(pid, 17, 0, buffer, 56)
+        if count == 56:
+            return str(struct.unpack_from('=Q', buffer.raw, 16)[0])
+        if ctypes.get_errno() == errno.ESRCH:
+            return None
+        raise OSError('macOS process identity unavailable')
     try:
         stat_line = Path(f'/proc/{pid}/stat').read_text()
     except OSError:
@@ -319,8 +334,21 @@ class SearchBudget:
 GREP_MATCHER = r'''
 import ctypes, json, os, re, resource, sys
 resource.setrlimit(resource.RLIMIT_CPU, (3, 3))
-resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
-if ctypes.CDLL(None).prctl(1, 9, 0, 0, 0) != 0 or os.getppid() != int(sys.argv[1]):
+if sys.platform == 'darwin':
+    # dyld reserves a large shared-cache address range on macOS. Bound
+    # additional address space rather than setting a limit below that mapping.
+    import struct
+    libproc = ctypes.CDLL('/usr/lib/libproc.dylib')
+    info = ctypes.create_string_buffer(96)  # proc_taskinfo
+    if libproc.proc_pidinfo(os.getpid(), 4, 0, info, len(info)) != len(info):
+        sys.exit(3)
+    limit = struct.unpack_from('=Q', info.raw)[0] + (1 << 30)
+    resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+else:
+    resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
+    if ctypes.CDLL(None).prctl(1, 9, 0, 0, 0) != 0:
+        sys.exit(3)
+if os.getppid() != int(sys.argv[1]):
     sys.exit(3)
 source = sys.stdin.buffer
 header = json.loads(source.readline())
@@ -349,6 +377,15 @@ while len(matches) < limit:
     index += 1
 sys.stdout.write(json.dumps({'matches': matches}))
 '''
+
+
+def anonymous_search_file(name):
+    """Private unlinked scratch descriptors on macOS; memfd on Linux."""
+    if hasattr(os, 'memfd_create'):
+        return os.memfd_create(name, os.MFD_CLOEXEC)
+    import tempfile
+    with tempfile.TemporaryFile(prefix=name + '-') as stream:
+        return os.dup(stream.fileno())
 
 
 FILE_TOOLS = {'Read', 'Write', 'Edit', 'Glob', 'Grep', 'LS'}
@@ -1384,8 +1421,8 @@ class Policy:
             candidates = [(str(candidate), candidate.name, None, None)]
         else:
             candidates = self._walk(path, budget=budget)
-        source = os.memfd_create('jarvis-grep-input', os.MFD_CLOEXEC)
-        output = os.memfd_create('jarvis-grep-output', os.MFD_CLOEXEC)
+        source = anonymous_search_file('jarvis-grep-input')
+        output = anonymous_search_file('jarvis-grep-output')
         process = None
         try:
             def emit(data):
@@ -2546,16 +2583,33 @@ def serve(config_path):
     # PR_SET_PDEATHSIG follows the spawning *thread*, which may retire while
     # a multithreaded Codex process remains healthy. A pidfd follows the whole
     # process and cannot be confused by PID reuse.
-    parent_fd = os.pidfd_open(parent)
-    if os.getppid() != parent:
-        os.close(parent_fd)
-        raise Denied('cannot bind bridge lifetime to parent')
-    def watch_parent():
-        watcher = select.poll()
-        watcher.register(parent_fd, select.POLLIN)
-        events = watcher.poll()
-        if any(flags & (select.POLLIN | select.POLLHUP) for _, flags in events):
-            os.kill(os.getpid(), signal.SIGTERM)
+    if sys.platform == 'darwin':
+        # EVFILT_PROC follows this kernel process instance, including when the
+        # spawning thread exits. Register before rechecking the parent identity.
+        parent_identity = process_start_time(parent)
+        parent_watch = select.kqueue()
+        parent_watch.control([select.kevent(parent, filter=select.KQ_FILTER_PROC,
+            flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+            fflags=select.KQ_NOTE_EXIT)], 0, 0)
+        if os.getppid() != parent or process_start_time(parent) != parent_identity:
+            parent_watch.close()
+            raise Denied('cannot bind bridge lifetime to parent')
+        def watch_parent():
+            if parent_watch.control(None, 1, None):
+                os.kill(os.getpid(), signal.SIGTERM)
+        close_parent_watch = parent_watch.close
+    else:
+        parent_fd = os.pidfd_open(parent)
+        if os.getppid() != parent:
+            os.close(parent_fd)
+            raise Denied('cannot bind bridge lifetime to parent')
+        def watch_parent():
+            watcher = select.poll()
+            watcher.register(parent_fd, select.POLLIN)
+            events = watcher.poll()
+            if any(flags & (select.POLLIN | select.POLLHUP) for _, flags in events):
+                os.kill(os.getpid(), signal.SIGTERM)
+        close_parent_watch = lambda: os.close(parent_fd)
     threading.Thread(target=watch_parent, daemon=True).start()
     policy = Policy(config)
     startup_failure = None
@@ -2575,7 +2629,7 @@ def serve(config_path):
                 print(response, flush=True)
     finally:
         server.close()
-        os.close(parent_fd)
+        close_parent_watch()
 
 
 if __name__ == '__main__':

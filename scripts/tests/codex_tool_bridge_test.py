@@ -2063,10 +2063,17 @@ sys.stdin.readline()
         parent = subprocess.Popen([sys.executable, '-c', program, str(SPEC.origin), str(self.config), self.PATHOLOGICAL],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         pidfd = None
+        kernel_watch = None
         pid = None
         try:
             pid = int(parent.stdout.readline())
-            pidfd = os.pidfd_open(pid)
+            if sys.platform == 'darwin':
+                kernel_watch = select.kqueue()
+                kernel_watch.control([select.kevent(pid, filter=select.KQ_FILTER_PROC,
+                    flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                    fflags=select.KQ_NOTE_EXIT)], 0, 0)
+            else:
+                pidfd = os.pidfd_open(pid)
             time.sleep(0.2)
             children = None
             try:
@@ -2075,9 +2082,13 @@ sys.stdin.readline()
             except FileNotFoundError:
                 pass  # kernel without CONFIG_PROC_CHILDREN
             parent.communicate('exit\n', timeout=5)
-            watcher = select.poll()
-            watcher.register(pidfd, select.POLLIN)
-            self.assertTrue(watcher.poll(1000), 'bridge kept running a match after its parent died')
+            if kernel_watch is not None:
+                self.assertTrue(kernel_watch.control(None, 1, 1),
+                                'bridge kept running a match after its parent died')
+            else:
+                watcher = select.poll()
+                watcher.register(pidfd, select.POLLIN)
+                self.assertTrue(watcher.poll(1000), 'bridge kept running a match after its parent died')
             if children is not None:
                 self.assertTrue(children, 'no matcher process was observed during the search')
             deadline = time.monotonic() + 2
@@ -2093,6 +2104,8 @@ sys.stdin.readline()
                 else:
                     self.fail('matcher process outlived the bridge')
         finally:
+            if kernel_watch is not None:
+                kernel_watch.close()
             if pidfd is not None:
                 import signal
                 try:

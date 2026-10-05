@@ -66,14 +66,7 @@ fi
 # that laundering: if the requested name OR the resolved name hits the reserved
 # list, the write is denied. Relative candidates are already wiki-relative;
 # absolute ones are made relative only when they land under the wiki root.
-REQUESTED_REL=""
-if [[ "$CANDIDATE" = /* ]]; then
-  if [[ "$CANDIDATE" == "$WIKI_ROOT_ABS"/* ]]; then
-    REQUESTED_REL="${CANDIDATE#"$WIKI_ROOT_ABS"/}"
-  fi
-else
-  REQUESTED_REL="$CANDIDATE"
-fi
+REQUESTED_REL=$(aa_requested_wiki_relative "$CANDIDATE" "$WIKI_ROOT_ABS")
 
 # #1078 — every write must land inside the wiki. The ingest CLI used to
 # inherit the daemon's cwd (the repo checkout, which holds the repo's own

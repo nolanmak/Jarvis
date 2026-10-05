@@ -48,6 +48,7 @@ pub use store::{
     NativeConversation, PendingActionRow, PendingNudge, RetryableReply, RevisionRecord, Store,
     StoreError, StoreResult, SurfaceTurnResolution, SurfaceTurnState, SurfaceTurnStatus,
     NUDGE_INTERVAL_MS,
+    WhatsappInboundEvent, WhatsappOwnerConfig,
 };
 
 /// Re-exported so extension crates (`augmentagent-proactive`, …) can write

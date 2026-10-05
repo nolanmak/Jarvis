@@ -32,7 +32,7 @@ pub fn stage(root: &Path, filename: &str, bytes: &[u8]) -> Result<PathBuf> {
         .open(&path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    directory.keep();
+    let _ = directory.keep();
     Ok(path)
 }
 #[cfg(test)]
@@ -48,7 +48,7 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(first.file_name().unwrap(), "Example report.pdf");
         assert_eq!(std::fs::read(&first).unwrap(), bytes);
-        assert!(first.canonicalize().unwrap().starts_with(root.path()));
+        assert!(first.canonicalize().unwrap().starts_with(root.path().canonicalize().unwrap()));
         assert_eq!(
             std::fs::metadata(first).unwrap().permissions().mode() & 0o777,
             0o600

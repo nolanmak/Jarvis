@@ -15,7 +15,7 @@
       "blockers": [
         {
           "issue": 1252,
-          "reason": "The CLI provider supervisor (scripts/provider-supervisor.py) relies on Linux prctl and exits 125 on macOS, so no claude or codex turn, digest, audit or review notice can run on a Mac until descendant cleanup is ported."
+          "reason": "Native launchd coalition cleanup and a real Codex wiki Read passed on Nolan’s Apple Silicon Mac (docs/MACOS-PARITY.md). Reboot/sleep/soak and real Slack workspace acceptance remain unverified."
         }
       ]
     },
@@ -25,7 +25,7 @@
       "blockers": [
         {
           "issue": 1252,
-          "reason": "The CLI provider supervisor (scripts/provider-supervisor.py) relies on Linux prctl and exits 125 on macOS, so no claude or codex turn, digest, audit or review notice can run on a Mac until descendant cleanup is ported."
+          "reason": "The native launchd supervisor has been exercised on Apple Silicon only; Intel provider lifecycle and real Slack workspace acceptance remain unverified."
         }
       ]
     }

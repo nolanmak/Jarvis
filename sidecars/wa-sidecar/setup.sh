@@ -22,4 +22,4 @@ go build -mod=readonly -trimpath -o wa-sidecar .
 
 echo
 echo "wa-sidecar built at: $(pwd)/wa-sidecar"
-echo "next: complete the WhatsApp CLI/lifecycle work in Jarvis #1228 before pairing"
+echo "next: run 'augmentagent whatsapp login --phone <number> --self-chat' or use --owner-jid for a dedicated account"

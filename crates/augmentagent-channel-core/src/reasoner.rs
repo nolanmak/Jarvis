@@ -3400,7 +3400,7 @@ mod tests {
         assert!(opts
             .env
             .iter()
-            .any(|(k, v)| k == "WIKI_ROOT" && v == wiki.path().to_str().unwrap()));
+            .any(|(k, v)| k == "WIKI_ROOT" && v == wiki.path().canonicalize().unwrap().to_str().unwrap()));
         assert!(opts.system_prompt.contains("augmentagent doc render-pdf"));
         assert!(opts
             .system_prompt

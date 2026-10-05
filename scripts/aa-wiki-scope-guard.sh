@@ -112,14 +112,7 @@ fi
 # past a resolved-path-only check. Comparing the pre-resolution name too closes
 # that laundering. Relative candidates are already wiki-relative; absolute ones
 # are made relative only when they land under the wiki root.
-REQUESTED_REL=""
-if [[ "$CANDIDATE" = /* ]]; then
-  if [[ "$CANDIDATE" == "$WIKI_ROOT_ABS"/* ]]; then
-    REQUESTED_REL="${CANDIDATE#"$WIKI_ROOT_ABS"/}"
-  fi
-else
-  REQUESTED_REL="$CANDIDATE"
-fi
+REQUESTED_REL=$(aa_requested_wiki_relative "$CANDIDATE" "$WIKI_ROOT_ABS")
 
 # #1078 — deny model writes to instruction/config files Claude Code or Codex
 # auto-load from a working directory (CLAUDE.md, CLAUDE.local.md, .claude,
@@ -176,6 +169,11 @@ fi
 # wiki. The regex pins the canonical filename shape (digits-only ids,
 # alphanumeric extension) so a literal name like `aa-txt-..` cannot
 # slip past as a `/tmp/aa-txt-*` glob would.
+# Darwin canonicalizes /tmp to /private/tmp. Normalize that system alias only
+# for the fixed temporary attachment carve-outs, after wiki scoping above.
+if [[ "$ABS" == /private/tmp/* && "$(readlink -f /tmp)" == /private/tmp ]]; then
+  ABS="/tmp/${ABS#/private/tmp/}"
+fi
 if [[ "$TOOL" == "Read" && "$ABS" =~ ^/tmp/aa-(txt|img|doc)-[0-9]+-[0-9]+\.[a-zA-Z0-9]+$ ]]; then
   exit 0
 fi

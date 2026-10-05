@@ -211,12 +211,22 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
         let inbox = Arc::clone(&self.inbox);
         let store = Arc::clone(&self.store);
         let phone = self.config.phone.clone();
+        let client = self.client.clone();
         tokio::spawn(async move {
+            let mut replay_tick = tokio::time::interval(Duration::from_secs(5));
+            replay_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => {
                         debug!("whatsapp event pump: shutdown");
                         return;
+                    }
+                    _ = replay_tick.tick(), if client.is_some() && !phone.is_empty() => {
+                        if let Some(client) = &client {
+                            if let Err(error) = replay_to_store(client, &store, &phone).await {
+                                warn!("whatsapp durable replay will retry: {error:#}");
+                            }
+                        }
                     }
                     ev = events.recv() => {
                         let Some(ev) = ev else {
@@ -225,7 +235,15 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                         };
                         match ev {
                             WaEvent::ReceivedMessage { message } => {
-                                inbox.lock().await.push(message);
+                                if let Some(client) = &client {
+                                    if let Err(error) = replay_to_store(client, &store, &phone).await {
+                                        warn!("whatsapp live event replay will retry: {error:#}");
+                                    }
+                                } else {
+                                    // Unit-test channels without a sidecar
+                                    // still use their in-memory fixture inbox.
+                                    inbox.lock().await.push(message);
+                                }
                             }
                             WaEvent::Receipt { chat, message_ids, receipt_type, .. } => {
                                 debug!(?chat, ?message_ids, %receipt_type, "whatsapp delivery receipt");
@@ -276,10 +294,20 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
     /// Drain the buffered inbox and run each new message through the pipeline.
     pub async fn poll_once(&self) -> anyhow::Result<PollOutcome> {
         let mut outcome = PollOutcome::default();
-        let drained: Vec<WaMessage> = {
+        let mut drained: Vec<(WaMessage, Option<(String, String)>)> = Vec::new();
+        if !self.config.phone.is_empty() {
+            for event in self.store.list_pending_whatsapp_inbound(&self.config.phone, 1000)? {
+                drained.push((
+                    serde_json::from_str::<WaMessage>(&event.payload_json)?,
+                    Some((event.chat_jid, event.message_id)),
+                ));
+            }
+        }
+        let buffered: Vec<WaMessage> = {
             let mut guard = self.inbox.lock().await;
             std::mem::take(&mut *guard)
         };
+        drained.extend(buffered.into_iter().map(|message| (message, None)));
         outcome.events_drained = drained.len();
         if !control_enabled() {
             debug!(
@@ -288,9 +316,17 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
             );
         }
 
-        for msg in drained {
+        for (msg, persisted_key) in drained {
             match self.handle_message(msg, &mut outcome).await {
-                Ok(()) => {}
+                Ok(()) => {
+                    if let Some((chat_jid, message_id)) = persisted_key {
+                        self.store.mark_whatsapp_inbound_processed(
+                            &self.config.phone,
+                            &chat_jid,
+                            &message_id,
+                        )?;
+                    }
+                }
                 Err(e) => {
                     outcome.errors += 1;
                     error!("whatsapp handle_message failed: {e:#}");
@@ -850,6 +886,37 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
+/// Transfer the sidecar's unacknowledged messages to the daemon store.
+/// Acknowledgement follows the SQLite commit, so a crash between the two
+/// replays a duplicate that the store key safely ignores.
+pub async fn replay_to_store(client: &WaClient, store: &Store, phone: &str) -> anyhow::Result<usize> {
+    let mut after = 0;
+    let mut committed = 0;
+    loop {
+        let batch = client.replay_events(after, 100).await?;
+        if batch.is_empty() {
+            return Ok(committed);
+        }
+        for replayed in batch {
+            let seq = i64::try_from(replayed.seq)?;
+            let WaEvent::ReceivedMessage { message } = replayed.event else {
+                anyhow::bail!("sidecar replay contained a non-message event");
+            };
+            let payload = serde_json::to_string(&message)?;
+            store.record_whatsapp_inbound_event(
+                phone,
+                &message.chat.bare(),
+                &message.id,
+                seq,
+                &payload,
+            )?;
+            client.ack_event(replayed.seq).await?;
+            after = replayed.seq;
+            committed += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1002,6 +1069,144 @@ mod tests {
         assert_eq!(out.messages_dispatched, 0);
         // Reasoner untouched.
         assert!(r.responses.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn persisted_inbound_is_processed_once_after_channel_restart() {
+        let (store, _f) = tmp_store();
+        let message = msg("persisted-1", "hello");
+        store
+            .record_whatsapp_inbound_event(
+                "15559998888",
+                &message.chat.bare(),
+                &message.id,
+                1,
+                &serde_json::to_string(&message).unwrap(),
+            )
+            .unwrap();
+        let first = channel(
+            Arc::clone(&store),
+            Arc::new(ScriptedReasoner::new([])),
+            Arc::new(CountingBroker::default()),
+        );
+        let out = first.poll_once().await.unwrap();
+        assert_eq!(out.events_drained, 1);
+        assert_eq!(out.not_allowlisted_dropped, 1);
+        assert!(store
+            .list_pending_whatsapp_inbound("15559998888", 10)
+            .unwrap()
+            .is_empty());
+        let restarted = channel(
+            Arc::clone(&store),
+            Arc::new(ScriptedReasoner::new([])),
+            Arc::new(CountingBroker::default()),
+        );
+        assert_eq!(restarted.poll_once().await.unwrap().events_drained, 0);
+    }
+
+    #[tokio::test]
+    async fn replay_commits_locally_before_acknowledging_sidecar() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let (store, _f) = tmp_store();
+        let dir = tempfile::Builder::new().prefix("wa-inbox-").tempdir_in("/tmp").unwrap();
+        let socket = dir.path().join("wa.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let observed_store = Arc::clone(&store);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut requests = BufReader::new(read).lines();
+            let mut replayed = false;
+            let mut observed_ack = false;
+            while let Some(line) = requests.next_line().await.unwrap() {
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let result = match request["op"].as_str().unwrap() {
+                    "replay_events" if !replayed => {
+                        replayed = true;
+                        serde_json::json!({"events": [{"version":1,"seq":1,"event":"received-message","id":"m1","chat":"15551234567@s.whatsapp.net","sender":"15551234567@s.whatsapp.net","text":"hello","timestamp":1776630000}]})
+                    }
+                    "replay_events" => serde_json::json!({"events": []}),
+                    "ack_events" => {
+                        assert_eq!(request["params"]["through"], 1);
+                        assert_eq!(observed_store.list_pending_whatsapp_inbound("15559998888", 10).unwrap().len(), 1);
+                        observed_ack = true;
+                        serde_json::json!({"acked_through":1})
+                    }
+                    other => panic!("unexpected sidecar op: {other}"),
+                };
+                let response = serde_json::json!({"version":1,"request_id":request["request_id"],"ok":true,"result":result});
+                write.write_all(response.to_string().as_bytes()).await.unwrap();
+                write.write_all(b"\n").await.unwrap();
+                if observed_ack && request["op"] == "replay_events" {
+                    break;
+                }
+            }
+            observed_ack
+        });
+        let (events, _receiver) = tokio::sync::mpsc::channel(8);
+        let client = WaClient::connect(&socket, events).await.unwrap();
+        assert_eq!(replay_to_store(&client, &store, "15559998888").await.unwrap(), 1);
+        assert!(server.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn event_pump_replays_sidecar_journal_into_store() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let (store, _f) = tmp_store();
+        let dir = tempfile::Builder::new().prefix("wa-inbox-").tempdir_in("/tmp").unwrap();
+        let socket = dir.path().join("wa.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut requests = BufReader::new(read).lines();
+            let mut first = true;
+            while let Some(line) = requests.next_line().await.unwrap() {
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let result = match request["op"].as_str().unwrap() {
+                    "replay_events" if first => {
+                        first = false;
+                        serde_json::json!({"events":[{"version":1,"seq":1,"event":"received-message","id":"m1","chat":"15551234567@s.whatsapp.net","sender":"15551234567@s.whatsapp.net","text":"hello","timestamp":1776630000}]})
+                    }
+                    "replay_events" => serde_json::json!({"events":[]}),
+                    "ack_events" => serde_json::json!({"acked_through":1}),
+                    other => panic!("unexpected op: {other}"),
+                };
+                let response = serde_json::json!({"version":1,"request_id":request["request_id"],"ok":true,"result":result});
+                write.write_all(response.to_string().as_bytes()).await.unwrap();
+                write.write_all(b"\n").await.unwrap();
+            }
+        });
+        let (events, receiver) = tokio::sync::mpsc::channel(8);
+        let client = WaClient::connect(&socket, events).await.unwrap();
+        let mut channel = channel(
+            Arc::clone(&store),
+            Arc::new(ScriptedReasoner::new([])),
+            Arc::new(CountingBroker::default()),
+        );
+        channel.client = Some(client);
+        let stop = CancellationToken::new();
+        channel.spawn_event_pump(receiver, stop.clone());
+        let committed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !store
+                    .list_pending_whatsapp_inbound("15559998888", 10)
+                    .unwrap()
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        stop.cancel();
+        assert!(committed.is_ok(), "event pump did not replay the durable sidecar event");
+        assert!(channel.inbox.lock().await.is_empty());
     }
 
     #[tokio::test]

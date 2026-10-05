@@ -30,3 +30,25 @@ aa_path_has_protected_injection_name() {
   done
   return 1
 }
+
+# Preserve the requested suffix while accepting OS aliases of the wiki root
+# (for example /var -> /private/var on macOS). Resolve ancestors only: resolving
+# the final component would hide an instruction-named symlink.
+aa_requested_wiki_relative() {
+  local candidate="$1" wiki_root="$2" prefix="" rest component resolved
+  if [[ "$candidate" != /* ]]; then
+    printf '%s' "$candidate"
+    return
+  fi
+  rest="${candidate#/}"
+  while [[ "$rest" == */* ]]; do
+    component="${rest%%/*}"
+    rest="${rest#*/}"
+    prefix="$prefix/$component"
+    resolved=$(readlink -m -- "$prefix" 2>/dev/null) || return
+    if [[ "$resolved" == "$wiki_root" ]]; then
+      printf '%s' "$rest"
+      return
+    fi
+  done
+}

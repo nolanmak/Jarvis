@@ -13,10 +13,10 @@ launchd_candidate() {
 # Include directories where the selected tools were found during setup. A
 # graphical login does not inherit the interactive shell's PATH.
 launchd_service_path() {
-  local path="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+  local path="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/opt/coreutils/libexec/gnubin:/usr/local/opt/coreutils/libexec/gnubin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
   local tool found directory
   for tool in "$@"; do
-    found="$(command -v "$tool" 2>/dev/null || true)"
+    found="$(command -v "$tool" 2>/dev/null || PATH="$path:$PATH" command -v "$tool" 2>/dev/null || true)"
     if [ -z "$found" ] || [ ! -x "$found" ]; then
       printf 'required launchd tool %s is missing; install it and rerun this installer\n' "$tool" >&2
       return 1

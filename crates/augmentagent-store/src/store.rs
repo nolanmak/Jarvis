@@ -100,6 +100,26 @@ pub struct SurfaceTurnState {
     pub resolution: Option<SurfaceTurnResolution>,
 }
 
+/// Explicit owner/control identity for one linked WhatsApp device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhatsappOwnerConfig {
+    pub phone: String,
+    pub owner_jid: String,
+    pub control_chat_jid: String,
+    /// `self_chat` or `dedicated`.
+    pub mode: String,
+}
+
+/// A sidecar event committed locally before its sidecar sequence is acked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhatsappInboundEvent {
+    pub phone: String,
+    pub chat_jid: String,
+    pub message_id: String,
+    pub seq: i64,
+    pub payload_json: String,
+}
+
 /// #900 — an interrupted ShadowNote sync pass, persisted after every page so
 /// a restart resumes pagination instead of replaying the whole batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1355,6 +1375,16 @@ impl Store {
             [],
         )?;
         conn.execute(
+            "CREATE TABLE IF NOT EXISTS whatsapp_owner_config (\
+                 phone TEXT PRIMARY KEY REFERENCES whatsapp_devices(phone) ON DELETE CASCADE,\
+                 owner_jid TEXT NOT NULL,\
+                 control_chat_jid TEXT NOT NULL,\
+                 mode TEXT NOT NULL CHECK(mode IN ('self_chat', 'dedicated')),\
+                 updated_at_ms INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+        conn.execute(
             "CREATE TABLE IF NOT EXISTS whatsapp_outbound_allowlist (\
                  chat_jid       TEXT PRIMARY KEY,\
                  enabled_at_ms  INTEGER NOT NULL\
@@ -1367,6 +1397,30 @@ impl Store {
                  enabled_at_ms  INTEGER NOT NULL\
              )",
             [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS whatsapp_inbound_events (\
+                 phone TEXT NOT NULL,\
+                 chat_jid TEXT NOT NULL,\
+                 message_id TEXT NOT NULL,\
+                 seq INTEGER NOT NULL CHECK(seq > 0),\
+                 payload_json TEXT NOT NULL,\
+                 processed INTEGER NOT NULL DEFAULT 0,\
+                 received_at_ms INTEGER NOT NULL,\
+                 PRIMARY KEY(phone, chat_jid, message_id)\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_whatsapp_inbound_pending \
+                ON whatsapp_inbound_events(phone, processed, seq)",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS whatsapp_control_turns (
+                phone TEXT NOT NULL, chat_jid TEXT NOT NULL, message_id TEXT NOT NULL,
+                reply TEXT, PRIMARY KEY(phone, chat_jid, message_id))", [],
         )?;
 
         // #104 — user-defined scheduled tasks (`/loop`). Channel-agnostic:
@@ -5314,6 +5368,102 @@ impl Store {
 
     // --- whatsapp_devices + allowlists (#74 / #102) ---
 
+    /// Commit one received message before acknowledging the sidecar event.
+    /// Replays of the same account/chat/message identity are idempotent.
+    pub fn record_whatsapp_inbound_event(
+        &self,
+        phone: &str,
+        chat_jid: &str,
+        message_id: &str,
+        seq: i64,
+        payload_json: &str,
+    ) -> StoreResult<bool> {
+        if phone.trim().is_empty() || chat_jid.trim().is_empty() || message_id.trim().is_empty() || seq <= 0 {
+            return Err(StoreError::InvalidInput("WhatsApp inbound event identity is required".into()));
+        }
+        if serde_json::from_str::<serde_json::Value>(payload_json).is_err() {
+            return Err(StoreError::InvalidInput("WhatsApp inbound payload is not JSON".into()));
+        }
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        Ok(guard.execute(
+            "INSERT INTO whatsapp_inbound_events \
+             (phone, chat_jid, message_id, seq, payload_json, received_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(phone, chat_jid, message_id) DO NOTHING",
+            params![phone, chat_jid, message_id, seq, payload_json, now_millis()],
+        )? == 1)
+    }
+
+    pub fn list_pending_whatsapp_inbound(
+        &self,
+        phone: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<WhatsappInboundEvent>> {
+        if phone.trim().is_empty() || limit == 0 || limit > 1000 {
+            return Err(StoreError::InvalidInput("invalid WhatsApp inbound query".into()));
+        }
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT phone, chat_jid, message_id, seq, payload_json \
+             FROM whatsapp_inbound_events WHERE phone = ?1 AND processed = 0 \
+             ORDER BY seq LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![phone, limit as i64], |row| {
+            Ok(WhatsappInboundEvent {
+                phone: row.get(0)?,
+                chat_jid: row.get(1)?,
+                message_id: row.get(2)?,
+                seq: row.get(3)?,
+                payload_json: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// None = not claimed; Some(None) = interrupted/in flight; Some(Some(reply)) = durable answer.
+    pub fn whatsapp_control_reply(&self, phone: &str, chat: &str, id: &str) -> StoreResult<Option<Option<String>>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        Ok(guard.query_row("SELECT reply FROM whatsapp_control_turns WHERE phone=?1 AND chat_jid=?2 AND message_id=?3",
+            params![phone, chat, id], |row| row.get(0)).optional()?)
+    }
+
+    pub fn claim_whatsapp_control_turn(&self, phone: &str, chat: &str, id: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        Ok(guard.execute("INSERT OR IGNORE INTO whatsapp_control_turns(phone, chat_jid, message_id) VALUES(?1,?2,?3)",
+            params![phone, chat, id])? == 1)
+    }
+
+    pub fn finish_whatsapp_control_turn(&self, phone: &str, chat: &str, id: &str, reply: &str) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute("UPDATE whatsapp_control_turns SET reply=?4 WHERE phone=?1 AND chat_jid=?2 AND message_id=?3 AND reply IS NULL",
+            params![phone, chat, id, reply])?;
+        Ok(())
+    }
+
+    pub fn pending_whatsapp_control(&self, phone: &str, chat: &str) -> StoreResult<Vec<WhatsappInboundEvent>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare("SELECT phone,chat_jid,message_id,seq,payload_json FROM whatsapp_inbound_events
+            WHERE phone=?1 AND chat_jid=?2 AND processed=0 ORDER BY seq LIMIT 100")?;
+        let rows = stmt.query_map(params![phone,chat], |row| Ok(WhatsappInboundEvent {
+            phone:row.get(0)?,chat_jid:row.get(1)?,message_id:row.get(2)?,seq:row.get(3)?,payload_json:row.get(4)?,
+        }))?;
+        Ok(rows.collect::<Result<Vec<_>,_>>()?)
+    }
+
+    pub fn mark_whatsapp_inbound_processed(
+        &self,
+        phone: &str,
+        chat_jid: &str,
+        message_id: &str,
+    ) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        Ok(guard.execute(
+            "UPDATE whatsapp_inbound_events SET processed = 1 \
+             WHERE phone = ?1 AND chat_jid = ?2 AND message_id = ?3 AND processed = 0",
+            params![phone, chat_jid, message_id],
+        )? == 1)
+    }
+
     /// Insert a fresh `whatsapp_devices` row, or — if a row with this `phone`
     /// already exists — refresh its JIDs / status and re-activate it.
     /// `paired_at_ms` is preserved on update so the original pairing time
@@ -5393,6 +5543,43 @@ impl Store {
         Ok(row)
     }
 
+    pub fn set_whatsapp_owner_config(&self, config: &WhatsappOwnerConfig) -> StoreResult<()> {
+        let expected_self = format!("{}@s.whatsapp.net", config.phone);
+        if config.phone.is_empty()
+            || !config.phone.bytes().all(|b| b.is_ascii_digit())
+            || config.owner_jid != config.control_chat_jid
+            || !config.owner_jid.ends_with("@s.whatsapp.net")
+            || config.owner_jid.matches('@').count() != 1
+            || config.owner_jid.starts_with('@')
+            || !config.owner_jid.split('@').next().unwrap_or("").bytes().all(|b| b.is_ascii_digit())
+            || !matches!(config.mode.as_str(), "self_chat" | "dedicated")
+            || (config.mode == "self_chat") != (config.owner_jid == expected_self)
+        {
+            return Err(StoreError::InvalidInput("invalid WhatsApp owner/control identity".into()));
+        }
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO whatsapp_owner_config (phone, owner_jid, control_chat_jid, mode, updated_at_ms)\
+             VALUES (?1, ?2, ?3, ?4, ?5)\
+             ON CONFLICT(phone) DO UPDATE SET owner_jid=excluded.owner_jid,\
+                 control_chat_jid=excluded.control_chat_jid, mode=excluded.mode,\
+                 updated_at_ms=excluded.updated_at_ms",
+            params![config.phone, config.owner_jid, config.control_chat_jid, config.mode, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    pub fn whatsapp_owner_config(&self, phone: &str) -> StoreResult<Option<WhatsappOwnerConfig>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        Ok(guard.query_row(
+            "SELECT phone, owner_jid, control_chat_jid, mode FROM whatsapp_owner_config WHERE phone = ?1",
+            params![phone],
+            |row| Ok(WhatsappOwnerConfig {
+                phone: row.get(0)?, owner_jid: row.get(1)?, control_chat_jid: row.get(2)?, mode: row.get(3)?,
+            }),
+        ).optional()?)
+    }
+
     /// Mark a device logged-out (sidecar emitted `logged-out`). Keeps the row
     /// for audit; the channel skips logged-out devices at send time.
     pub fn mark_whatsapp_device_logged_out(&self, phone: &str) -> StoreResult<()> {
@@ -5418,17 +5605,23 @@ impl Store {
     /// Hard delete + deactivate subscriptions for one device (unlink).
     pub fn delete_whatsapp_device(&self, phone: &str) -> StoreResult<()> {
         let now = now_millis();
-        let guard = self.conn.lock().expect("store mutex poisoned");
-        guard.execute(
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             "UPDATE channel_subscriptions \
                 SET active = 0, updated_at_ms = ?2 \
               WHERE platform = 'whatsapp' AND account_id = ?1",
             params![phone, now],
         )?;
-        guard.execute(
+        tx.execute(
+            "DELETE FROM whatsapp_inbound_events WHERE phone = ?1",
+            params![phone],
+        )?;
+        tx.execute(
             "DELETE FROM whatsapp_devices WHERE phone = ?1",
             params![phone],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
