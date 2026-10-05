@@ -1,12 +1,8 @@
 //! Self-contained Composio v3 REST client.
 //!
-//! INTENTIONAL ~150-line duplication of
-//! `crates/augmentagent-channel-email/src/gmail.rs::ComposioClient`
-//! (`new`/`with_base_url`/`execute` + backoff + `find_string_field`). A later
-//! PR can extract a shared `augmentagent-composio` crate; doing it now would
-//! require editing the email crate, which is forbidden under the production
-//! zero-regression constraint (the prod email path must stay byte-identical).
-//! Keep this in sync if the email client's retry policy changes.
+//! Independent from Gmail's client. Drive execution pins a verified toolkit
+//! version, supports explicit connected-account selection, and propagates
+//! Composio tool failures even when transport status is HTTP 200.
 
 use thiserror::Error;
 
@@ -29,7 +25,10 @@ pub struct ComposioClient {
 impl ComposioClient {
     pub fn new(api_key: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .expect("HTTP client"),
             base_url: "https://backend.composio.dev".into(),
             api_key,
         }
@@ -42,18 +41,35 @@ impl ComposioClient {
 
     /// `POST {base}/api/v3/tools/execute/{action}` with `{user_id, arguments}`
     /// and an `x-api-key` header. 3 attempts; retries 429/5xx/transient with
-    /// exponential backoff. Identical policy to the email crate's client.
+    /// exponential backoff and a per-request timeout.
     pub async fn execute(
         &self,
         action: &str,
         entity_id: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value, ComposioError> {
+        self.execute_on_account(action, entity_id, None, arguments)
+            .await
+    }
+
+    /// Pin the schema and select the exact connection for interactive queries.
+    pub async fn execute_on_account(
+        &self,
+        action: &str,
+        entity_id: &str,
+        connection_id: Option<&str>,
+        arguments: serde_json::Value,
+    ) -> Result<serde_json::Value, ComposioError> {
         let url = format!("{}/api/v3/tools/execute/{}", self.base_url, action);
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "user_id": entity_id,
             "arguments": arguments,
+            "version": "20261001_00",
         });
+
+        if let Some(id) = connection_id {
+            body["connected_account_id"] = id.into();
+        }
 
         const MAX_ATTEMPTS: u32 = 3;
         let mut attempt: u32 = 0;
@@ -71,7 +87,18 @@ impl ComposioClient {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_success() {
-                        return resp.json::<serde_json::Value>().await.map_err(Into::into);
+                        let value = resp.json::<serde_json::Value>().await?;
+                        if value.get("successful").and_then(serde_json::Value::as_bool)
+                            == Some(false)
+                        {
+                            return Err(ComposioError::Composio {
+                                message: format!(
+                                    "{action} failed: {}",
+                                    value.get("error").unwrap_or(&serde_json::Value::Null)
+                                ),
+                            });
+                        }
+                        return Ok(value);
                     }
                     let retryable = status.as_u16() == 429 || status.is_server_error();
                     let text = resp.text().await.unwrap_or_default();
@@ -190,5 +217,56 @@ mod tests {
     fn find_array_walks_nesting() {
         let v = json!({"data": {"changes": [{"fileId": "a"}, {"fileId": "b"}]}});
         assert_eq!(find_array(&v, &["changes"]).map(|a| a.len()), Some(2));
+    }
+}
+
+#[cfg(test)]
+mod execution_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn pins_version_and_connection_and_preserves_pagination() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server.mock("POST", "/api/v3/tools/execute/GOOGLEDRIVE_FIND_FILE")
+            .match_header("x-api-key", "test-key")
+            .match_body(mockito::Matcher::Json(json!({
+                "user_id":"u1", "connected_account_id":"ca_1", "version":"20261001_00",
+                "arguments":{"q":"trashed = false","pageToken":"next"}
+            })))
+            .with_status(200).with_body(r#"{"successful":true,"data":{"files":[],"nextPageToken":"page3","incompleteSearch":true}}"#)
+            .create_async().await;
+        let client = ComposioClient::new("test-key".into()).with_base_url(server.url());
+        let result = client
+            .execute_on_account(
+                "GOOGLEDRIVE_FIND_FILE",
+                "u1",
+                Some("ca_1"),
+                json!({"q":"trashed = false","pageToken":"next"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["data"]["nextPageToken"], "page3");
+        assert_eq!(result["data"]["incompleteSearch"], true);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn treats_http_200_tool_failure_as_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/v3/tools/execute/GOOGLEDRIVE_FIND_FILE")
+            .with_status(200)
+            .with_body(r#"{"successful":false,"error":"Account expired"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let client = ComposioClient::new("test-key".into()).with_base_url(server.url());
+        let err = client
+            .execute("GOOGLEDRIVE_FIND_FILE", "u1", json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Account expired"));
+        mock.assert_async().await;
     }
 }

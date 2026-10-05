@@ -1080,7 +1080,7 @@ router.get("/api/oauth/calendar/status", async (_req, res) => {
 });
 
 // --- Composio OAuth for Google Drive (multi-tenant) ---
-// Byte-for-byte mirror of the Gmail flow with toolkit "googledrive". Writes to
+// Uses the Gmail connection pattern with toolkit "googledrive". Writes to
 // the `drive_accounts` table in whatever db this dashboard is pointed at
 // (run with AUGMENTAGENT_DB=<tenant db> to connect a tenant's Drive).
 
@@ -1100,13 +1100,11 @@ router.get("/oauth/googledrive/start", async (_req, res) => {
       auth_config_id: authConfigId,
       callback_url: callbackUrl,
     });
-    if (!linkResponse.redirect_url) {
-      throw new Error("No redirect URL returned from Composio");
+    if (!linkResponse.redirect_url || !linkResponse.connected_account_id) {
+      throw new Error("Composio returned an incomplete Drive connection link");
     }
-    if (linkResponse.connected_account_id) {
-      setConfig("gdrive_pending_connection_id", linkResponse.connected_account_id);
-      setConfig("gdrive_pending_entity_id", entityId);
-    }
+    setConfig("gdrive_pending_connection_id", linkResponse.connected_account_id);
+    setConfig("gdrive_pending_entity_id", entityId);
     console.log(`[oauth] Google Drive OAuth initiated for entity ${entityId}`);
     res.redirect(linkResponse.redirect_url);
   } catch (err) {
@@ -1145,27 +1143,31 @@ router.get("/oauth/googledrive/callback", async (req, res) => {
         retries--;
         if (retries > 0) await new Promise((r) => setTimeout(r, 2000));
       }
-      addDriveAccount(connectionId, entityId, email || undefined, email || `Connection (${status})`);
+      if (status !== "ACTIVE") {
+        res.redirect("/settings?googledrive=error");
+        return;
+      }
+      // Bind this connection to the pending user; never import project-wide accounts.
+      const verified = await client.connectedAccounts.retrieve(connectionId);
+      if (verified.status !== "ACTIVE" || verified.user_id !== entityId || verified.toolkit?.slug !== "googledrive") {
+        throw new Error("Drive connection does not match the pending user and toolkit");
+      }
+      const profile = await client.tools.execute("GOOGLEDRIVE_GET_ABOUT", {
+        connected_account_id: connectionId,
+        user_id: entityId,
+        version: "20261001_00",
+        arguments: { fields: "user(emailAddress,displayName)" },
+      });
+      if (profile.successful === false) throw new Error("Could not verify Drive account identity");
+      const profileData = profile.data as any;
+      email = profileData?.user?.emailAddress || profileData?.response_data?.user?.emailAddress || email;
+      addDriveAccount(connectionId, entityId, email || undefined, email || "Google Drive");
       console.log(`[oauth] Drive account stored: ${connectionId}, status=${status}, email=${email}`);
       deleteConfig("gdrive_pending_connection_id");
       deleteConfig("gdrive_pending_entity_id");
-    } else if (client) {
-      try {
-        const connections = await client.connectedAccounts.list({
-          toolkit_slugs: ["googledrive"],
-        });
-        const existing = new Set(getDriveAccounts().map((a) => a.connection_id));
-        for (const conn of connections.items) {
-          if (conn.status === "ACTIVE" && !existing.has(conn.id)) {
-            const email = (conn as any).member_email || (conn as any).email || null;
-            const userId =
-              (conn as any).user_id || (conn as any).entity_id || `discovered-${Date.now()}`;
-            addDriveAccount(conn.id, userId, email || undefined, email || "Discovered account");
-          }
-        }
-      } catch (err) {
-        console.error("[oauth] gdrive discovery failed:", err instanceof Error ? err.message : err);
-      }
+    } else {
+      res.redirect("/settings?googledrive=error");
+      return;
     }
     res.redirect("/settings?googledrive=connected");
   } catch (err) {

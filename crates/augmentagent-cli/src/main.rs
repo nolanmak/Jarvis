@@ -84,6 +84,7 @@ mod doc_cmd;
 mod doctor;
 mod env_cfg;
 mod gmail_attach;
+mod gdrive_query;
 mod repo_docs;
 mod finance;
 mod handoff_prune;
@@ -1542,6 +1543,33 @@ enum MeetupOp {
 
 #[derive(Subcommand)]
 enum GdriveOp {
+    /// Search live Drive files/folders. Query uses Google Drive v3 syntax.
+    Search {
+        #[arg(long, default_value = "trashed = false")]
+        query: String,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=100))]
+        limit: u32,
+        #[arg(long)]
+        page_token: Option<String>,
+    },
+    /// Get live metadata for a Drive file id.
+    Get {
+        #[arg(long)]
+        file_id: String,
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Read text/JSON files or export Docs/Slides as text and Sheets as CSV.
+    Read {
+        #[arg(long)]
+        file_id: String,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long, default_value_t = 30000, value_parser = clap::value_parser!(u32).range(1..=200000))]
+        max_chars: u32,
+    },
     /// List connected Drive accounts (entity → email) in this db.
     Accounts {
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
@@ -4580,6 +4608,12 @@ async fn main() -> Result<()> {
         },
         Cmd::Gdrive { ref op } => match op {
             GdriveOp::Accounts { json } => run_gdrive_accounts(store, *json),
+            GdriveOp::Search { query, account, limit, page_token } =>
+                gdrive_query::search(&store, account.as_deref(), query, *limit, page_token.as_deref()).await,
+            GdriveOp::Get { file_id, account } =>
+                gdrive_query::get(&store, account.as_deref(), file_id).await,
+            GdriveOp::Read { file_id, account, max_chars } =>
+                gdrive_query::read(&store, account.as_deref(), file_id, *max_chars).await,
             GdriveOp::PollOnce { dry_run } => {
                 let (broker, _) = build_broker(&cli, Arc::clone(&store), *dry_run).await?;
                 let ch = build_gdrive_channel(store, broker, *dry_run)?;
