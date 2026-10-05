@@ -16,7 +16,13 @@ email linking the task to that meeting. An inferred preparation cutoff is labele
 an unknown deadline stays unknown. Calendar descriptions and locations are not
 included in the context. Prior processed reply/flag emails from the last 14 days
 are reconsidered in batches of ten each minute, prioritizing participant matches
-to meetings in the next day. Changed calendar evidence reopens assessment.
+to meetings in the next day. Changed future calendar evidence reopens assessment
+only for matching participants in the same account. Valid triage without an alert
+is assessed once. Failed assessments retry after one and then five minutes, with
+three total attempts; persistent failure records prevent starvation and repeated
+model calls across restarts. New relevant meeting evidence or a changed sender
+priority starts a fresh retry cycle. `--no-email true` disables this backfill;
+existing Discord alert schedules remain active.
 
 ## Configure
 

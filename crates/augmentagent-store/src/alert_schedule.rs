@@ -6,6 +6,15 @@ use crate::{
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
+// Correlated with email alias e and the evaluation time parameter ?1. Only
+// evidence that can appear in the assessor's seven-day context reopens work.
+const RELEVANT_MEETING_EVIDENCE: &str = "(SELECT MAX(m.updated_at_ms)
+    FROM owner_alert_meetings m,json_each(m.payload,'$.participants') p
+    WHERE m.account_id=e.accountEntityId AND m.cancelled=0
+    AND m.start_ms>?1 AND m.start_ms<=?1+604800000
+    AND (lower(trim(e.fromEmail))=lower(p.value)
+        OR instr(lower(e.fromEmail),'<'||lower(p.value)||'>')>0))";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlertDetails {
     pub message_id: String,
@@ -48,6 +57,9 @@ pub(crate) fn migrate(c: &Connection) -> StoreResult<()> {
         payload TEXT NOT NULL, updated_at_ms INTEGER NOT NULL, cancelled INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS owner_alert_assessments (
         message_id TEXT PRIMARY KEY, assessed_at_ms INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS owner_alert_assessment_failures (
+        message_id TEXT PRIMARY KEY, attempts INTEGER NOT NULL,
+        last_failed_at_ms INTEGER NOT NULL, next_attempt_ms INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS owner_alert_priorities (
         sender TEXT PRIMARY KEY, urgency TEXT NOT NULL CHECK(urgency IN ('routine','high','critical')));
         CREATE TABLE IF NOT EXISTS owner_alert_audit (
@@ -159,6 +171,12 @@ impl Store {
                 OR instr(lower(fromEmail),'<'||lower(?1)||'>')>0)",
                 [sender],
             )?;
+            tx.execute(
+                "DELETE FROM owner_alert_assessment_failures WHERE message_id IN
+                (SELECT messageId FROM emails WHERE lower(trim(fromEmail))=lower(?1)
+                OR instr(lower(fromEmail),'<'||lower(?1)||'>')>0)",
+                [sender],
+            )?;
             tx.commit()
         })?;
         Ok(())
@@ -216,11 +234,45 @@ impl Store {
 
     pub fn mark_owner_alert_assessed(&self, message_id: &str, now: i64) -> StoreResult<()> {
         self.with_conn(|c| {
-            c.execute(
+            let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
+            tx.execute(
                 "INSERT INTO owner_alert_assessments(message_id,assessed_at_ms) VALUES(?1,?2)
-            ON CONFLICT(message_id) DO UPDATE SET assessed_at_ms=excluded.assessed_at_ms",
+                ON CONFLICT(message_id) DO UPDATE SET assessed_at_ms=excluded.assessed_at_ms",
                 params![message_id, now],
-            )
+            )?;
+            tx.execute(
+                "DELETE FROM owner_alert_assessment_failures WHERE message_id=?1",
+                [message_id],
+            )?;
+            tx.commit()
+        })?;
+        Ok(())
+    }
+
+    /// Three attempts per evidence generation, with one- and five-minute delays.
+    /// Failure metadata survives restarts without storing private model output.
+    pub fn record_owner_alert_assessment_failure(
+        &self,
+        message_id: &str,
+        now: i64,
+    ) -> StoreResult<()> {
+        self.with_conn(|c| {
+            let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
+            let evidence: Option<i64> = tx.query_row(
+                &format!("SELECT {RELEVANT_MEETING_EVIDENCE} FROM emails e WHERE e.messageId=?2"),
+                params![now, message_id],
+                |r| r.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO owner_alert_assessment_failures
+                (message_id,attempts,last_failed_at_ms,next_attempt_ms) VALUES(?1,1,?2,?2+60000)
+                ON CONFLICT(message_id) DO UPDATE SET
+                attempts=CASE WHEN ?3>last_failed_at_ms THEN 1 ELSE MIN(attempts+1,3) END,
+                next_attempt_ms=?2+CASE WHEN ?3>last_failed_at_ms THEN 60000 ELSE 300000 END,
+                last_failed_at_ms=?2",
+                params![message_id, now, evidence],
+            )?;
+            tx.commit()
         })?;
         Ok(())
     }
@@ -233,17 +285,21 @@ impl Store {
         limit: i64,
     ) -> StoreResult<Vec<crate::Email>> {
         self.with_conn(|c|{
-            let mut q=c.prepare("SELECT e.* FROM emails e LEFT JOIN owner_alert_assessments x ON x.message_id=e.messageId
+            let mut q=c.prepare(&format!("SELECT e.* FROM emails e
+                LEFT JOIN owner_alert_assessments x ON x.message_id=e.messageId
+                LEFT JOIN owner_alert_assessment_failures f ON f.message_id=e.messageId
                 WHERE e.platform='gmail' AND e.firstSeenAt>=?1-1209600000
                 AND (e.triageResult IN ('reply','flag') OR EXISTS(SELECT 1 FROM owner_alert_priorities p
-                    WHERE instr(lower(e.fromEmail),p.sender)>0 AND p.urgency!='routine'))
-                AND (x.message_id IS NULL OR EXISTS(SELECT 1 FROM owner_alert_meetings m
-                    WHERE m.account_id=e.accountEntityId AND m.updated_at_ms>x.assessed_at_ms))
+                    WHERE (lower(trim(e.fromEmail))=p.sender OR instr(lower(e.fromEmail),'<'||p.sender||'>')>0)
+                    AND p.urgency!='routine'))
+                AND (x.message_id IS NULL OR {RELEVANT_MEETING_EVIDENCE}>x.assessed_at_ms)
+                AND (f.message_id IS NULL OR (f.attempts<3 AND f.next_attempt_ms<=?1)
+                    OR {RELEVANT_MEETING_EVIDENCE}>f.last_failed_at_ms)
                 AND NOT EXISTS(SELECT 1 FROM owner_alerts a WHERE a.id='gmail:'||e.messageId AND a.state='resolved')
                 ORDER BY EXISTS(SELECT 1 FROM owner_alert_meetings m,json_each(m.payload,'$.participants') p
                     WHERE m.account_id=e.accountEntityId AND m.cancelled=0 AND m.start_ms>?1 AND m.start_ms<=?1+86400000
                     AND (lower(trim(e.fromEmail))=lower(p.value) OR instr(lower(e.fromEmail),'<'||lower(p.value)||'>')>0)) DESC,
-                    e.firstSeenAt DESC LIMIT ?2")?;
+                    e.firstSeenAt DESC LIMIT ?2"))?;
             let rows=q.query_map(params![now,limit],|r|Ok(crate::Email{
                 message_id:r.get("messageId")?,thread_id:r.get("threadId")?,from:r.get("fromEmail")?,subject:r.get("subject")?,
                 body:r.get::<_,Option<String>>("body")?.unwrap_or_default(),date:r.get::<_,Option<String>>("receivedAt")?.unwrap_or_default(),
@@ -310,12 +366,16 @@ impl Store {
             let tx=Transaction::new_unchecked(c,TransactionBehavior::Immediate)?;
             // Reuse verified external-reply evidence (#1275), scoped to the
             // account and only for tasks whose required action is a reply.
+            // Compare with receipt time: the owner may reply before polling
+            // ingests the email. Retain millisecond precision and fall back
+            // to firstSeenAt when the source timestamp cannot be parsed.
             tx.execute("UPDATE owner_alerts SET state='resolved',updated_at_ms=?1
                 WHERE state!='resolved' AND id IN (SELECT d.alert_id FROM owner_alert_details d
                 JOIN emails e ON e.messageId=json_extract(d.payload,'$.message_id')
                 JOIN outbound_thread_log o ON o.thread_id=json_extract(d.payload,'$.thread_id')
                 AND o.entity_id=json_extract(d.payload,'$.account_id')
-                WHERE json_extract(d.payload,'$.reply_resolves')=1 AND o.sent_at_ms>e.firstSeenAt)",[now])?;
+                WHERE json_extract(d.payload,'$.reply_resolves')=1
+                AND o.sent_at_ms>COALESCE(CAST(round(unixepoch(e.receivedAt,'subsec')*1000) AS INTEGER),e.firstSeenAt))",[now])?;
             let (followup,first,last,max):(i64,i64,i64,i64)=tx.query_row("SELECT followup_ms,prepare_first_ms,prepare_last_ms,max_notices
                 FROM owner_alert_schedule_policy WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
             tx.execute("INSERT OR IGNORE INTO owner_alert_schedule(alert_id) SELECT id FROM owner_alerts WHERE urgency!='routine'",[])?;

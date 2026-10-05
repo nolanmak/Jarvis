@@ -3648,15 +3648,17 @@ async fn main() -> Result<()> {
             // next tick. Skipped under dry-run (NoopBroker) — bumping
             // counters with no visible card is pointless.
             if !dry_run {
-                let assessment_store=Arc::clone(&store);
-                let assessment_reasoner=build_reasoner();
-                let assessment_wiki=cli.wiki_dir.clone();
-                let assessment_shutdown=shutdown.clone();
-                tasks.push(tokio::spawn(async move {
-                    augmentagent_channel_email::owner_alerts::run_backfill(assessment_store,assessment_reasoner,
-                        assessment_wiki,assessment_shutdown).await;
-                    Ok(())
-                }));
+                if !no_email {
+                    let assessment_store=Arc::clone(&store);
+                    let assessment_reasoner=build_reasoner();
+                    let assessment_wiki=cli.wiki_dir.clone();
+                    let assessment_shutdown=shutdown.clone();
+                    tasks.push(tokio::spawn(async move {
+                        augmentagent_channel_email::owner_alerts::run_backfill(assessment_store,assessment_reasoner,
+                            assessment_wiki,assessment_shutdown).await;
+                        Ok(())
+                    }));
+                }
                 let alert_store=Arc::clone(&store);
                 let alert_broker=Arc::clone(&broker);
                 let alert_shutdown=shutdown.clone();

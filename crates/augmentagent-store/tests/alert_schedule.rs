@@ -328,3 +328,53 @@ fn repeat_cap_and_failed_retry_coalesce_even_when_another_threshold_passes() {
         .unwrap()
         .is_none());
 }
+
+#[test]
+fn reply_after_receipt_but_before_ingestion_resolves_a_reply_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("test.db")).unwrap();
+    let received = 1_791_120_000_250;
+    let first_seen = received + 60_000;
+    seed(&store, first_seen, None);
+    let mail = augmentagent_store::Email {
+        message_id: "email1".into(),
+        thread_id: Some("thread1".into()),
+        from: "colleague@example.test".into(),
+        subject: "Request".into(),
+        body: "Please send your answer".into(),
+        date: chrono::DateTime::from_timestamp_millis(received)
+            .unwrap()
+            .to_rfc3339(),
+        to: String::new(),
+        cc: String::new(),
+        attachments: vec![],
+        account_entity_id: Some("test".into()),
+        platform: "gmail".into(),
+        kind: "dm".into(),
+    };
+    store.upsert_email_backfill(&mail, first_seen).unwrap();
+    store.with_conn(|c|c.execute("UPDATE owner_alert_details SET payload=json_set(payload,'$.reply_resolves',json('true'))",[])).unwrap();
+    store
+        .record_outbound_thread_event("test", "before-receipt", Some("thread1"), received - 100)
+        .unwrap();
+    let initial = store.claim_owner_alert_notice(first_seen).unwrap().unwrap();
+    store
+        .complete_owner_alert_notice(
+            initial.id,
+            Some("https://discord.com/channels/1/2/3"),
+            None,
+            first_seen,
+        )
+        .unwrap();
+    store
+        .record_outbound_thread_event("test", "after-receipt", Some("thread1"), received + 100)
+        .unwrap();
+    assert!(store
+        .claim_owner_alert_notice(first_seen + 1)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store.owner_alert("prep").unwrap().unwrap().state,
+        AlertState::Resolved
+    );
+}

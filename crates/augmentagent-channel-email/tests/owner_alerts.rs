@@ -255,14 +255,220 @@ async fn one_bad_assessment_does_not_starve_other_emails_and_remains_retryable()
             .owner_alert_backfill_candidates(now, 10)
             .unwrap()
             .len(),
-        1
+        0
     );
     assert_eq!(
-        backfill_tick(&store, &reasoner, None, now).await.unwrap(),
+        backfill_tick(&store, &reasoner, None, now + 60_000)
+            .await
+            .unwrap(),
         1
     );
     assert!(store
         .owner_alert_backfill_candidates(now, 10)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn valid_legacy_triage_is_assessed_but_invalid_json_objects_are_not() {
+    use augmentagent_channel_email::owner_alerts::persist_assessment;
+    use augmentagent_store::{Store, TriageResult};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("test.db")).unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    let mail = email("Please review the brief when you can.");
+    store.upsert_email_backfill(&mail, now - 1).unwrap();
+    store
+        .mark_email_processed(&mail.message_id, TriageResult::Flag)
+        .unwrap();
+    assert!(persist_assessment(&store, &mail, r#"{"garbage":true}"#, now).is_err());
+    persist_assessment(
+        &store,
+        &mail,
+        r#"{"decision":"flag","reason":"review"}"#,
+        now,
+    )
+    .unwrap();
+    assert!(store
+        .owner_alert_backfill_candidates(now, 10)
+        .unwrap()
+        .is_empty());
+}
+
+struct AlwaysMalformed;
+#[async_trait::async_trait]
+impl augmentagent_channel_core::Reasoner for AlwaysMalformed {
+    async fn call(
+        &self,
+        _: &augmentagent_channel_core::reasoner::ReasonerOpts,
+        _: &str,
+    ) -> anyhow::Result<String> {
+        Ok("malformed assessment".into())
+    }
+}
+
+#[tokio::test]
+async fn repeated_failures_back_off_survive_restart_and_do_not_starve_older_mail() {
+    use augmentagent_channel_email::owner_alerts::backfill_tick;
+    use augmentagent_store::{Store, TriageResult};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    let store = Store::open(&path).unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    for n in 0..11 {
+        let mut mail = email("Please review the brief when you can.");
+        mail.message_id = format!("mail{n}");
+        store.upsert_email_backfill(&mail, now - n - 1).unwrap();
+        store
+            .mark_email_processed(&mail.message_id, TriageResult::Flag)
+            .unwrap();
+    }
+    backfill_tick(&store, &AlwaysMalformed, None, now)
+        .await
+        .unwrap();
+    let next = store.owner_alert_backfill_candidates(now + 1, 10).unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].message_id, "mail10");
+    backfill_tick(&store, &AlwaysMalformed, None, now + 1)
+        .await
+        .unwrap();
+    backfill_tick(&store, &AlwaysMalformed, None, now + 60_001)
+        .await
+        .unwrap();
+    backfill_tick(&store, &AlwaysMalformed, None, now + 60_002)
+        .await
+        .unwrap();
+    backfill_tick(&store, &AlwaysMalformed, None, now + 360_002)
+        .await
+        .unwrap();
+    backfill_tick(&store, &AlwaysMalformed, None, now + 360_003)
+        .await
+        .unwrap();
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    assert!(store
+        .owner_alert_backfill_candidates(now + 3_600_000, 20)
+        .unwrap()
+        .is_empty());
+    let meeting = MeetingContext {
+        id: "meeting1".into(),
+        account_id: "account1".into(),
+        summary: "Review".into(),
+        start_ms: now + 7_200_000,
+        participants: vec!["colleague@example.test".into()],
+        url: None,
+    };
+    store
+        .cache_owner_alert_meeting(
+            "meeting1",
+            "account1",
+            meeting.start_ms,
+            &serde_json::to_string(&meeting).unwrap(),
+            now + 3_600_001,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .owner_alert_backfill_candidates(now + 3_600_001, 20)
+            .unwrap()
+            .len(),
+        11
+    );
+    backfill_tick(&store, &AlwaysMalformed, None, now + 3_600_001)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .owner_alert_backfill_candidates(now + 3_660_001, 20)
+            .unwrap()
+            .len(),
+        11,
+        "new evidence starts a fresh bounded retry cycle"
+    );
+    store
+        .set_owner_alert_priority("colleague@example.test", Urgency::High)
+        .unwrap();
+    assert_eq!(
+        store
+            .owner_alert_backfill_candidates(now + 3_600_002, 20)
+            .unwrap()
+            .len(),
+        11
+    );
+}
+
+#[test]
+fn only_relevant_future_calendar_changes_reopen_assessment() {
+    use augmentagent_store::{Store, TriageResult};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("test.db")).unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    let mail = email("Please review the brief when you can.");
+    store.upsert_email_backfill(&mail, now - 1).unwrap();
+    store
+        .mark_email_processed(&mail.message_id, TriageResult::Flag)
+        .unwrap();
+    store
+        .mark_owner_alert_assessed(&mail.message_id, now)
+        .unwrap();
+    let mut meeting = MeetingContext {
+        id: "meeting1".into(),
+        account_id: "account1".into(),
+        summary: "Review".into(),
+        start_ms: now + 7_200_000,
+        participants: vec!["unrelated@example.test".into()],
+        url: None,
+    };
+    store
+        .cache_owner_alert_meeting(
+            "meeting1",
+            "account1",
+            meeting.start_ms,
+            &serde_json::to_string(&meeting).unwrap(),
+            now + 1,
+        )
+        .unwrap();
+    assert!(store
+        .owner_alert_backfill_candidates(now + 2, 10)
+        .unwrap()
+        .is_empty());
+    meeting.participants = vec!["colleague@example.test".into()];
+    meeting.start_ms = now - 1000;
+    store
+        .cache_owner_alert_meeting(
+            "meeting1",
+            "account1",
+            meeting.start_ms,
+            &serde_json::to_string(&meeting).unwrap(),
+            now + 3,
+        )
+        .unwrap();
+    assert!(store
+        .owner_alert_backfill_candidates(now + 4, 10)
+        .unwrap()
+        .is_empty());
+    meeting.start_ms = now + 7_200_000;
+    store
+        .cache_owner_alert_meeting(
+            "meeting1",
+            "account1",
+            meeting.start_ms,
+            &serde_json::to_string(&meeting).unwrap(),
+            now + 5,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .owner_alert_backfill_candidates(now + 6, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    store
+        .cancel_owner_alert_meeting("meeting1", now + 7)
+        .unwrap();
+    assert!(store
+        .owner_alert_backfill_candidates(now + 8, 10)
         .unwrap()
         .is_empty());
 }

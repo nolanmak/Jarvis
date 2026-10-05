@@ -53,14 +53,17 @@ pub async fn backfill_tick<R: augmentagent_channel_core::Reasoner + ?Sized>(
                 augmentagent_channel_core::prompt::triage_user_message(&email, "", &hint);
             prompt.push_str(&prompt_context(store, &email, now)?);
             let raw = reasoner.call(&opts, &prompt).await?;
-            persist_assessment(store, &email, &raw, chrono::Utc::now().timestamp_millis())?;
+            persist_assessment(store, &email, &raw, now)?;
             Ok(())
         }
         .await;
         match result {
             Ok(()) => assessed += 1,
-            Err(error) => tracing::warn!(message_id=%email.message_id,
-                "owner alert assessment failed; remains eligible for retry: {error:#}"),
+            Err(error) => {
+                store.record_owner_alert_assessment_failure(&email.message_id, now)?;
+                tracing::warn!(message_id=%email.message_id,
+                    "owner alert assessment failed; bounded retry recorded: {error:#}");
+            }
         }
     }
     Ok(assessed)
@@ -98,10 +101,15 @@ pub fn persist_assessment(
         .ok_or_else(|| anyhow::anyhow!("missing triage JSON"))?;
     let value: serde_json::Value = serde_json::from_str(&blob)?;
     let Some(value) = value.get("alert").filter(|v| !v.is_null()) else {
-        // Older/mocked triage output without this field is not proof of assessment.
-        if value.get("alert").is_some() {
-            store.mark_owner_alert_assessed(&email.message_id, now)?;
-        }
+        anyhow::ensure!(
+            value.get("alert").is_some()
+                || matches!(
+                    value.get("decision").and_then(|v| v.as_str()),
+                    Some("reply" | "flag" | "skip")
+                ),
+            "missing alert assessment or valid triage decision"
+        );
+        store.mark_owner_alert_assessed(&email.message_id, now)?;
         return Ok(None);
     };
     let a: Assessment = serde_json::from_value(value.clone())?;
