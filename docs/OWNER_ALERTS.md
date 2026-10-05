@@ -14,7 +14,8 @@ sender priority. A subject saying “URGENT” alone is insufficient. Calendar l
 require the same connected account, sender participation, and evidence in the
 email linking the task to that meeting. An inferred preparation cutoff is labeled;
 an unknown deadline stays unknown. Calendar descriptions and locations are not
-included in the context. Prior processed reply/flag emails from the last 14 days
+included in the context. Private/confidential events are excluded, and a visibility
+change removes cached context and stops linked reminders. Prior processed reply/flag emails from the last 14 days
 are reconsidered in batches of ten each minute, prioritizing participant matches
 to meetings in the next day. Changed future calendar evidence reopens assessment
 only for matching participants in the same account. Valid triage without an alert

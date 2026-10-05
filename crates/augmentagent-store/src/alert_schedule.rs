@@ -221,6 +221,15 @@ impl Store {
         self.update_owner_alert_meeting(id, None, now)
     }
 
+    /// Revoke model context and reminders when a meeting becomes private.
+    pub fn forget_owner_alert_meeting(&self, id: &str, now: i64) -> StoreResult<()> {
+        // First exclude from retrieval and stop linked reminders. Retain no
+        // cached summary or participants after the visibility change.
+        self.cancel_owner_alert_meeting(id, now)?;
+        self.with_conn(|c| c.execute("DELETE FROM owner_alert_meetings WHERE id=?1", [id]))?;
+        Ok(())
+    }
+
     pub fn owner_alert_meetings(&self, account: &str, now: i64) -> StoreResult<Vec<String>> {
         self.with_conn(|c| {
             let mut q = c.prepare(
