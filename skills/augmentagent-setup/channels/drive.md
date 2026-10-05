@@ -42,8 +42,21 @@ wants Drive on.
 4. After consent, re-run `augmentagent status --json` and check
    `channels.gdrive.configured` and `channels.gdrive.accounts`.
 
-This channel has no `augmentagent gdrive login` subcommand. The dashboard
-URL is the only entry point today.
+For CLI-managed sign-in, run:
+
+```sh
+node scripts/connect-google.mjs start --toolkit googledrive --email owner@example.com
+# Or generate separate links for several accounts:
+node scripts/connect-google.mjs start --toolkit googledrive --count 4
+node scripts/connect-google.mjs finish
+node scripts/connect-google.mjs status
+```
+
+Open each printed link and consent with the intended Google account, then run
+`finish`. The CLI verifies the ACTIVE connection and provider email before
+saving it. `--email` rejects accidental sign-in to a different address. Each
+attempt has separate persisted state; no dashboard callback is required.
+The same CLI supports `--toolkit gmail` for a new mailbox.
 
 ## Validate
 
