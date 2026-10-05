@@ -42,6 +42,7 @@ pub use broker::{DiscordApprovalBroker, DiscordConfig};
 // #501 — `append_envelope_markers` is shared with the CLI's Back-to-queue
 // repost so it renders the same To/cc/bcc decoration as the Revise repost.
 pub use event_handler::{append_envelope_markers, chunk_for_discord, edit_card_for_action};
+pub use event_handler::{interrupted_turn_target, INTERRUPTED_TURN_NOTICE};
 pub use journal_cmd::{parse_journal_command, JournalCmd, JOURNAL_NOT_CONFIGURED, JOURNAL_USAGE};
 // #35 Phase 5: the email channel appends the needs-input marker to the
 // persisted draft via this; the card decodes it on render. `NeedsInput` is

@@ -2950,6 +2950,12 @@ async fn main() -> Result<()> {
                 _ => None,
             };
             let mut broker_error = None;
+            // A dry run starts no Discord bot, so it must not touch the claims.
+            let interrupted_discord_turns = if dry_run {
+                Vec::new()
+            } else {
+                interrupt_dead_discord_turns(&store)
+            };
             let (broker, approver) = match build_approval_surfaces(
                 &cli,
                 Arc::clone(&store),
@@ -2957,6 +2963,7 @@ async fn main() -> Result<()> {
                 routing,
                 slack_approvals.clone(),
                 card_surfaces.clone(),
+                interrupted_discord_turns,
             )
             .await
             {
@@ -14627,6 +14634,9 @@ async fn build_broker(
         },
         None,
         augmentagent_approval_discord::CardSurfaces::new(),
+        // A one-shot command may run beside the daemon, whose pending turn
+        // is then live: only `serve` closes interrupted turns (#1396).
+        Vec::new(),
     )
     .await
 }
@@ -14644,6 +14654,7 @@ async fn build_approval_surfaces(
     routing: approval_routing::Routing,
     slack: Option<Arc<augmentagent_channel_slack::approvals::SlackApprovals>>,
     surfaces: augmentagent_approval_discord::CardSurfaces,
+    interrupted_discord_turns: Vec<augmentagent_store::InterruptedDiscordTurn>,
 ) -> Result<(Arc<dyn ApprovalBroker>, Option<Arc<ReplyApprover>>)> {
     if dry_run {
         return Ok((Arc::new(NoopBroker), None));
@@ -14731,8 +14742,16 @@ async fn build_approval_surfaces(
             )),
             None => Arc::clone(&approver) as Arc<dyn ApprovalActionHandler>,
         };
-        match start_discord_broker(cli, store_for_broker, token, handler, &reasoner, &repo_root)
-            .await
+        match start_discord_broker(
+            cli,
+            store_for_broker,
+            token,
+            handler,
+            &reasoner,
+            &repo_root,
+            interrupted_discord_turns,
+        )
+        .await
         {
             Ok(discord) => {
                 let discord = Arc::new(discord);
@@ -14774,6 +14793,27 @@ async fn build_approval_surfaces(
     Ok((broker, Some(approver)))
 }
 
+/// #1396 — `serve` start, before the Discord gateway connects: a Discord turn
+/// still `pending` was claimed by a daemon process that died mid-turn (a
+/// message landing in the shutdown drain, a crash). Close each as
+/// interrupted so it stops refusing every later message in its channel; the
+/// broker tells the owner. A store failure leaves the turns as they were.
+fn interrupt_dead_discord_turns(store: &Store) -> Vec<augmentagent_store::InterruptedDiscordTurn> {
+    match store.interrupt_pending_discord_turns() {
+        Ok(turns) => {
+            for turn in &turns {
+                warn!(turn_id = %turn.turn_id, guild = %turn.guild_id, channel = %turn.channel_id,
+                    "Discord native turn interrupted by a restart: closed, not re-run");
+            }
+            turns
+        }
+        Err(error) => {
+            tracing::error!("could not close interrupted Discord turns: {error}");
+            Vec::new()
+        }
+    }
+}
+
 /// #1299 — why the Discord approval broker did not start while Slack
 /// approvals carried on (that error is logged, not returned), so serve can
 /// record it in the daemon start report.
@@ -14787,6 +14827,7 @@ async fn start_discord_broker(
     handler: Arc<dyn ApprovalActionHandler>,
     reasoner: &Arc<FallbackReasoner>,
     repo_root: &Path,
+    interrupted_turns: Vec<augmentagent_store::InterruptedDiscordTurn>,
 ) -> Result<DiscordApprovalBroker> {
     let channel_id: u64 = std::env::var("DISCORD_CHANNEL_ID")
         .context("DISCORD_CHANNEL_ID env var required")?
@@ -14837,6 +14878,7 @@ async fn start_discord_broker(
         wiki_root: cli.wiki_dir.clone(),
         journal_ops,
         voice_socket_path,
+        interrupted_turns,
     })
     .await
     .context("start discord broker")
