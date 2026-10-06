@@ -800,6 +800,48 @@ impl ClaudeCliReasoner {
         // user-facing error instead of the raw multi-line stderr blob.
         match self.call_once_timed(opts, user_message, capture).await {
             Ok(text) => Ok(text),
+            // #1404 — the gateway refused a routed request before any tool
+            // ran: the same request is safe to submit once on the native CLI
+            // login, which does not share the gateway's failure.
+            Err(CallError::ApiError { message, tools_ran }) => {
+                let routed = crate::model_router::current()
+                    .ok()
+                    .flatten()
+                    .filter(|router| router.enabled());
+                let Some(mut direct) = routed.filter(|_| !tools_ran) else {
+                    return Err(api_unavailable(&message));
+                };
+                warn!("routed claude call failed at the gateway ({}); retrying once on the direct CLI",
+                    message.lines().next().unwrap_or_default());
+                direct.mode = "direct".into();
+                let retried = crate::model_router::SNAPSHOT
+                    .scope(Some(direct), self.call_once_timed(opts, user_message, capture))
+                    .await;
+                match retried {
+                    Ok(text) => Ok(text),
+                    Err(CallError::ApiError { message, .. }) => Err(api_unavailable(&message)),
+                    Err(CallError::RateLimited { message }) => Err(rate_limited_error("claude", message)),
+                    Err(CallError::Timeout { secs }) => Err(anyhow::Error::new(ReasonerError::Timeout {
+                        provider: "claude".into(),
+                        secs,
+                    })),
+                    Err(CallError::GateTimeout { waited_secs }) => {
+                        Err(anyhow::Error::new(ReasonerError::GateTimeout {
+                            provider: "claude".into(),
+                            waited_secs,
+                        }))
+                    }
+                    Err(CallError::EmptyOutput) => {
+                        Err(crate::turn_failure::TurnFailure::empty_output("claude").into())
+                    }
+                    Err(CallError::ConfigCorrupted { stderr }) => {
+                        Err(anyhow::Error::new(ReasonerError::Local {
+                            message: sanitize_claude_error(&stderr),
+                        }))
+                    }
+                    Err(CallError::Other(e)) => Err(classify_other("claude", e)),
+                }
+            }
             // #448 — do NOT retry. Retrying a quota refusal is exactly the
             // amplification that kept the daemon pinned against the limit.
             // Log it once, loudly and honestly, and surface a typed error the
@@ -869,6 +911,9 @@ impl ClaudeCliReasoner {
                             return Err(
                                 crate::turn_failure::TurnFailure::empty_output("claude").into()
                             );
+                        }
+                        Err(CallError::ApiError { message, .. }) => {
+                            return Err(api_unavailable(&message));
                         }
                         Err(CallError::Other(e)) => return Err(classify_other("claude", e)),
                     }
@@ -983,6 +1028,11 @@ enum CallError {
     /// provider-side (#655 review): surfaced untyped so it neither latches
     /// the provider nor triggers failover.
     EmptyOutput,
+    /// #1404 — the CLI exited non-zero with its own `API Error: …` line as
+    /// the result: the gateway or provider refused the request. Never an
+    /// answer. `tools_ran` says whether the turn had already acted, which
+    /// decides whether it may be submitted again.
+    ApiError { message: String, tools_ran: bool },
     /// Any other failure: spawn errors, IO errors, non-config exit failures.
     Other(anyhow::Error),
 }
@@ -1254,6 +1304,7 @@ impl ClaudeCliReasoner {
         // (#446).
         let mut text_blocks: Vec<String> = Vec::new();
         let mut result_text: Option<String> = None;
+        let mut tools_ran = false;
         // #1001 — the CLI reports exact usage on its terminal `result` event.
         // It costs nothing to read and is the only measurement of what this
         // daemon actually spends, so capture it as the stream goes by.
@@ -1277,6 +1328,7 @@ impl ClaudeCliReasoner {
             if let Some(u) = crate::token_usage::parse_usage(&line) {
                 observed_usage = Some(u);
             }
+            tools_ran = tools_ran || line_has_tool_use(&line);
             if audit_active {
                 audit_stream_line(
                     &line,
@@ -1336,6 +1388,19 @@ impl ClaudeCliReasoner {
                 let _ = err.read_to_string(&mut stderr_buf).await;
             }
             warn!("claude exited {status:?}: {stderr_buf}");
+            if is_cli_api_error(&final_text) {
+                // The request was refused, so the session itself is intact:
+                // release it rather than letting the dropped lease mark the
+                // conversation uncertain. Tools that already ran are the
+                // caller's concern (`tools_ran`).
+                if let Some(lease) = native_lease {
+                    let _ = lease.finish();
+                }
+                return Err(CallError::ApiError {
+                    message: final_text.trim().to_string(),
+                    tools_ran,
+                });
+            }
             if final_text.is_empty() {
                 // #141 — Detect the "~/.claude.json corrupted" pattern and
                 // surface a typed error so the outer wrapper can attempt
@@ -1428,6 +1493,34 @@ pub(crate) fn audit_stream_line(
             }
         }
     }
+}
+
+/// #1404 — the `claude` CLI reports a refused or failed API request as a
+/// result whose text starts with `API Error:`. Only that leading form
+/// counts: an answer that merely quotes the phrase is still an answer.
+fn is_cli_api_error(text: &str) -> bool {
+    text.trim_start().starts_with("API Error:")
+}
+
+/// Whether a stream-json line is an assistant message that calls a tool.
+fn line_has_tool_use(line: &str) -> bool {
+    if !line.contains("\"tool_use\"") {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
+        value["type"] == "assistant"
+            && value["message"]["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_use"))
+    })
+}
+
+/// The typed, failover-eligible form of a CLI `API Error:` result.
+fn api_unavailable(message: &str) -> anyhow::Error {
+    anyhow::Error::new(ReasonerError::Unavailable {
+        provider: "claude".into(),
+        message: message.lines().next().unwrap_or_default().chars().take(300).collect(),
+    })
 }
 
 /// Recognises the stderr pattern emitted by the `claude` CLI when it cannot
@@ -4727,6 +4820,123 @@ echo '{{"type":"result","result":"ok","is_error":false}}'
         assert!(args.contains("--allowedTools") && args.contains("--permission-mode"));
         assert!(!args.contains("router-secret"));
         assert_eq!(std::fs::read_to_string(auth).unwrap(), "http://127.0.0.1:20128\nrouter-secret");
+    }
+
+    // ---- #1400: a gateway API error is a provider failure, not an answer ----
+
+    /// A stub that fails like the gateway did (non-zero exit, the CLI's
+    /// `API Error:` text as its result) whenever it is routed, and answers
+    /// when it runs on the native login. `prelude` runs before either.
+    fn gateway_down_cli(dir: &tempfile::TempDir, log: &std::path::Path, prelude: &str) -> String {
+        stub_cli(dir, "fake-claude-gateway-down", &format!(r#"
+cat >/dev/null
+printf 'base=%s retries=%s args=%s\n' "$ANTHROPIC_BASE_URL" "$CLAUDE_CODE_MAX_RETRIES" "$*" >>{log}
+session=''
+previous=''
+for argument in "$@"; do
+  case "$previous" in --session-id|--resume) session="$argument";; esac
+  previous="$argument"
+done
+echo "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$session\"}}"
+{prelude}
+if [ "$ANTHROPIC_BASE_URL" = 'http://127.0.0.1:20128' ]; then
+  echo "{{\"type\":\"result\",\"session_id\":\"$session\",\"is_error\":true,\"result\":\"API Error: 503 [claude/claude-opus-5] [400]: upstream rejected the request\"}}"
+  exit 1
+fi
+echo "{{\"type\":\"result\",\"session_id\":\"$session\",\"result\":\"direct ok\"}}"
+"#, log = log.display()))
+    }
+
+    fn routed() -> Option<crate::model_router::RouterConfig> {
+        Some(crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn routed_gateway_api_error_is_retried_once_on_the_direct_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("calls");
+        let bin = gateway_down_cli(&dir, &log, "");
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        let answer = crate::model_router::SNAPSHOT
+            .scope(routed(), reasoner.call(&dummy_opts(), "test"))
+            .await
+            .unwrap();
+        assert_eq!(answer, "direct ok");
+        let calls = std::fs::read_to_string(&log).unwrap();
+        let calls: Vec<&str> = calls.lines().collect();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        // The routed attempt gives up quickly instead of sitting in the
+        // CLI's own retry loop; the direct one uses the preset's own model.
+        assert!(calls[0].contains("base=http://127.0.0.1:20128 retries=2 "), "{}", calls[0]);
+        assert!(calls[0].contains("cc/claude-opus-4-6"), "{}", calls[0]);
+        assert!(!calls[1].contains("base=http://127.0.0.1:20128"), "{}", calls[1]);
+        assert!(!calls[1].contains("cc/"), "{}", calls[1]);
+    }
+
+    #[tokio::test]
+    async fn direct_api_error_is_provider_unavailable_never_an_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("calls");
+        let bin = stub_cli(&dir, "fake-claude-api-error", &format!(r#"
+cat >/dev/null
+echo call >>{log}
+echo '{{"type":"result","is_error":true,"result":"API Error: 529 Overloaded"}}'
+exit 1
+"#, log = log.display()));
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        let err = crate::model_router::SNAPSHOT
+            .scope(None, reasoner.call(&dummy_opts(), "test"))
+            .await
+            .unwrap_err();
+        let typed = ReasonerError::find_in(&err).expect("typed for the fallback chain");
+        assert!(matches!(typed, ReasonerError::Unavailable { .. }), "{typed:?}");
+        assert!(typed.is_provider_side());
+        assert!(err.to_string().contains("API Error: 529"), "{err}");
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn routed_api_error_after_tools_ran_is_not_rerun_on_the_direct_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("calls");
+        let bin = gateway_down_cli(&dir, &log, r#"echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_1","name":"Bash","input":{"command":"send"}}]}}'"#);
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        let err = crate::model_router::SNAPSHOT
+            .scope(routed(), reasoner.call(&dummy_opts(), "test"))
+            .await
+            .unwrap_err();
+        assert!(matches!(ReasonerError::find_in(&err), Some(ReasonerError::Unavailable { .. })), "{err:?}");
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1,
+            "a turn whose tools already acted must not be submitted twice");
+    }
+
+    #[tokio::test]
+    async fn direct_retry_resumes_the_native_session_and_leaves_it_certain() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("calls");
+        let bin = gateway_down_cli(&dir, &log, "");
+        let session = crate::native_session::NativeSession::new(
+            crate::providers::ProviderKind::Claude).unwrap();
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        let answer = crate::native_session::CURRENT.scope(Arc::clone(&session),
+            crate::model_router::SNAPSHOT.scope(routed(), reasoner.call(&dummy_opts(), "test")))
+            .await
+            .unwrap();
+        assert_eq!(answer, "direct ok");
+        assert!(!session.is_uncertain(), "a rejected request must not wedge the conversation");
+        let id = session.id().unwrap();
+        let calls = std::fs::read_to_string(&log).unwrap();
+        let calls: Vec<&str> = calls.lines().collect();
+        assert!(calls[0].contains(&format!("--session-id {id}")), "{}", calls[0]);
+        assert!(calls[1].contains(&format!("--resume {id}")), "{}", calls[1]);
+    }
+
+    #[test]
+    fn only_the_clis_own_api_error_result_counts_as_one() {
+        assert!(is_cli_api_error("API Error: 503 [claude/claude-opus-5] [400]: {\"type\":\"error\"}"));
+        assert!(is_cli_api_error("  API Error: Connection refused (ECONNREFUSED)\n"));
+        assert!(!is_cli_api_error("The log shows `API Error: 503` twice."));
+        assert!(!is_cli_api_error("ok"));
     }
 
     #[tokio::test]
