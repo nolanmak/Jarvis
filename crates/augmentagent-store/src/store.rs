@@ -698,7 +698,12 @@ impl Store {
     /// call dropped; zero rows means there is nothing left.
     pub fn compact_action_bodies(&self, older_than_ms: i64, batch: usize) -> StoreResult<BodyCompaction> {
         let mut guard = self.conn.lock().expect("store mutex poisoned");
-        let tx = guard.transaction()?;
+        // IMMEDIATE, not the default deferred: the batch reads then writes,
+        // and a read transaction cannot be upgraded once another connection
+        // (the dashboard, a CLI run) has committed — SQLite fails that at
+        // once with "database is locked" instead of waiting. Taking the
+        // write lock up front waits out the other writer instead.
+        let tx = guard.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let picked: Vec<(String, i64)> = {
             let mut stmt = tx.prepare(&format!(
                 "SELECT a.id, length(a.originalBody) {COMPACTABLE_BODY_FROM} LIMIT ?2"
