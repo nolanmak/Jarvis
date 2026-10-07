@@ -23,6 +23,7 @@ make_case() {
   git clone -q "$TMP/origin.git" "$TMP/work" 2>/dev/null
   mkdir -p "$TMP/work/scripts/lib" "$TMP/work/crates"
   cp "$REPO_ROOT/scripts/check-for-updates.sh" "$TMP/work/scripts/"
+  printf 'import os, sys; sys.exit(int(os.environ.get("PDF_INSTALL_FAIL", "0")))\n' > "$TMP/work/scripts/pdf-runtime.py"
   cp "$REPO_ROOT/scripts/lib/service-restart.sh" "$TMP/work/scripts/lib/"
   echo base > "$TMP/work/crates/x.rs"
   git -C "$TMP/work" add -A

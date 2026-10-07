@@ -25,6 +25,7 @@ make_case() {
   mkdir -p "$TMP/repo/scripts/lib" "$TMP/repo/target/release" "$TMP/bin" "$TMP/home"
   cp "$REPO_ROOT/scripts/install-autostart.sh" "$REPO_ROOT/scripts/install-tenant.sh" "$TMP/repo/scripts/"
   cp "$REPO_ROOT/scripts/lib/launchd-install.sh" "$TMP/repo/scripts/lib/"
+  printf '# PDF installation is tested separately.\n' > "$TMP/repo/scripts/pdf-runtime.py"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/repo/scripts/run-rs.sh"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/repo/target/release/augmentagent"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/bin/systemctl"

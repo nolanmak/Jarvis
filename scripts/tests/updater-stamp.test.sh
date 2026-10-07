@@ -22,6 +22,7 @@ make_case() {
   git clone -q "$TMP/origin.git" "$TMP/work" 2>/dev/null
   mkdir -p "$TMP/work/scripts/lib" "$TMP/work/crates"
   cp "$REPO_ROOT/scripts/check-for-updates.sh" "$TMP/work/scripts/"
+  printf 'import os, sys; sys.exit(int(os.environ.get("PDF_INSTALL_FAIL", "0")))\n' > "$TMP/work/scripts/pdf-runtime.py"
   cp "$REPO_ROOT/scripts/lib/service-restart.sh" "$TMP/work/scripts/lib/"
   echo base > "$TMP/work/crates/x.rs"
   git -C "$TMP/work" add -A
@@ -85,6 +86,21 @@ run_updater() {
 }
 
 echo "check-for-updates.sh stamp policy:"
+
+# A renderer install failure must stop deployment before restart/stamping.
+make_case
+export PDF_INSTALL_FAIL=1
+run_updater 1; rc=$?
+unset PDF_INSTALL_FAIL
+[ "$rc" -ne 0 ] && ok "PDF provisioning failure stops deployment" \
+                || bad "PDF provisioning failure stops deployment"
+[ ! -s "$STAMP_FILE" ] && ok "PDF failure withholds build stamp" \
+                       || bad "PDF failure withholds build stamp"
+[ ! -f "$TMP/mainpid" ] && ok "PDF failure does not restart daemon" \
+                       || bad "PDF failure does not restart daemon"
+grep -q "PDF RUNTIME INSTALL FAILED" "$TMP/state/augmentagent/update.log" \
+  && ok "PDF failure is actionable in update log" || bad "PDF failure is actionable in update log"
+rm -rf "$TMP"
 
 # --- the 2026-08-27 failure: restart runs but the process never bounces ---
 make_case

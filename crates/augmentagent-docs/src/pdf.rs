@@ -12,6 +12,18 @@ pub const MAX_PDF_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_MARKDOWN_BYTES: usize = 1024 * 1024;
 const WORKER: &str = include_str!("../python/render_pdf.py");
 
+fn renderer_python() -> Result<PathBuf> {
+    if let Some(python) = std::env::var_os("AUGMENTAGENT_PDF_PYTHON") {
+        return Ok(python.into());
+    }
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .context("set HOME or XDG_DATA_HOME for the PDF runtime")?;
+    Ok(data.join("augmentagent/pdf-runtime/bin/python3"))
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct PdfReceipt {
     pub path: PathBuf,
@@ -99,11 +111,11 @@ pub async fn render_pdf(root: &Path, input: &Path, output: Option<&Path>) -> Res
         bail!("cannot render an empty document");
     }
 
-    let mut child = tokio::process::Command::new("python3")
-        .args(["-E", "-P", "-c", WORKER])
+    let mut child = tokio::process::Command::new(renderer_python()?)
+        .args(["-I", "-c", WORKER])
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .kill_on_drop(true).spawn()
-        .context("start PDF renderer: install python3, python3-reportlab, python3-markdown and fonts-liberation")?;
+        .context("start PDF renderer: run python3 scripts/pdf-runtime.py to provision the pinned runtime")?;
     let mut stdin = child.stdin.take().context("PDF renderer stdin")?;
     let stdout = child.stdout.take().context("PDF renderer stdout")?;
     let stderr = child.stderr.take().context("PDF renderer stderr")?;
@@ -128,7 +140,7 @@ pub async fn render_pdf(root: &Path, input: &Path, output: Option<&Path>) -> Res
     .await
     .context("PDF rendering timed out after 30 seconds")??;
     if !status.success() {
-        bail!("PDF renderer failed: {}. Required packages: python3-reportlab, python3-markdown, fonts-liberation", String::from_utf8_lossy(&errors).trim());
+        bail!("PDF renderer failed: {}. Repair with python3 scripts/pdf-runtime.py; fonts-liberation must be installed", String::from_utf8_lossy(&errors).trim());
     }
     if !pdf.starts_with(b"%PDF-") || !pdf.ends_with(b"%%EOF\n") {
         bail!("PDF renderer did not return a complete PDF");

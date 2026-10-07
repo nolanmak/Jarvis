@@ -82,6 +82,10 @@ apply_update() {
       return 1
     fi
     log "rebuilding rust (changed files touched crates/ or Cargo)"
+    if ! python3 "$REPO_ROOT/scripts/pdf-runtime.py" >> "$LOG" 2>&1; then
+      log "PDF RUNTIME INSTALL FAILED — not restarting; build stamp withheld"
+      return 1
+    fi
     # Build BOTH production binaries. `augmentagent-mcp-memory` is a separate
     # package that the daemon spawns as a stdio MCP server — ask_opts points
     # at `target/release/augmentagent-mcp-memory` (see reasoner.rs). It was
@@ -419,7 +423,7 @@ fi
 # Missing one means the PR merges but the daemon keeps the stale embedded copy.
 # scripts/tests/updater-rebuild-trigger.test.sh fails when a new include target
 # outside crates/ is added without being classified here.
-RUST_REBUILD_PATHS='^(crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|schema/|\.env\.example$|docs/slack-app-manifest\.json$|scripts/(codex-tool-bridge|codex-command-sandbox|codex-build-vm|build-dependency-proxy|provider-supervisor)\.py$)'
+RUST_REBUILD_PATHS='^(crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|schema/|\.env\.example$|docs/slack-app-manifest\.json$|scripts/(codex-tool-bridge|codex-command-sandbox|codex-build-vm|build-dependency-proxy|provider-supervisor|pdf-runtime)\.py$|scripts/run-rs\.sh$)'
 if printf '%s\n' "$CHANGED_FILES" | grep -qE "$RUST_REBUILD_PATHS"; then
   NEEDS_REBUILD=1
 fi
