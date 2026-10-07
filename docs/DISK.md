@@ -45,6 +45,28 @@ And two refusals:
 Top-level binaries in a profile dir, which is where the deployed daemon
 lives, are never candidates.
 
+## Temp-dir leftovers
+
+A test process that is killed (a timeout, Ctrl-C, an OOM) never runs its
+destructors, so its `tempfile` entries stay in the system temp dir: SQLite
+files with `-wal`/`-shm` sidecars and whole `.tmpXXXXXX` dirs. A clean test run
+leaves nothing, so this cannot be fixed in the tests. `disk prune` sweeps:
+
+- sidecars whose database is already gone, after a day;
+- a database with its sidecars, after a day, when no running process has it
+  open;
+- a `.tmpXXXXXX` dir, after a week, when no running process has a file open in
+  it or sits inside it.
+
+Only names the `tempfile` crate generates, owned by the current user, are ever
+considered. Where open files cannot be listed (no `/proc`), only the first
+rule applies.
+
+The gate keeps its own temp files inside the gate cache (#877) and sweeps them
+before every run. The renderer sidecar removes its webpack bundle dir on
+shutdown and, at start, the bundle dirs of renderers that are no longer
+running.
+
 ## Which dirs
 
 - the checkout's `target/` (profile dirs reached through a symlink are pruned
