@@ -314,6 +314,24 @@ trim_gate_cache_if_idle >/dev/null 2>&1
 [ -d "$GATE_CACHE_DIR/debug" ] && bad "backstop: an old binary falls back to the wipe" "still present" \
   || ok "backstop: an old binary falls back to the wipe"
 GATE_PRUNE_BIN=/nonexistent
+
+# #1407 — a cache under its cap on a volume under the gate's free-space floor
+# must still be trimmed, or every gate refuses and nothing ever frees space.
+GATE_CACHE_MAX_MB=100000
+mkdir -p "$GATE_CACHE_DIR/debug"; dd if=/dev/zero of="$GATE_CACHE_DIR/debug/blob" bs=1M count=3 status=none
+_gate_free_mb() { echo 20000; }
+trim_gate_cache_if_idle >/dev/null 2>&1
+check "floor: plenty of free space leaves an under-cap cache alone" "$?" "1"
+_gate_free_mb() { echo 100; }
+FLOOR_LOG=$(trim_gate_cache_if_idle 2>&1); rc=$?
+check "floor: trims an under-cap cache when the volume is under the floor" "$rc" "0"
+[ -d "$GATE_CACHE_DIR/debug" ] && bad "floor: frees the space" "debug/ still present" || ok "floor: frees the space"
+AUGMENTAGENT_GATE_MIN_FREE_GB=0
+mkdir -p "$GATE_CACHE_DIR/debug"; dd if=/dev/zero of="$GATE_CACHE_DIR/debug/blob" bs=1M count=3 status=none
+trim_gate_cache_if_idle >/dev/null 2>&1
+check "floor: a zero floor disables the tightening" "$?" "1"
+unset AUGMENTAGENT_GATE_MIN_FREE_GB
+_gate_free_mb() { df -Pm "$GATE_CACHE_DIR" 2>/dev/null | awk 'NR==2 {print $4}'; }
 rm -rf "$CACHE_DIR"
 unset AUGMENTAGENT_GATE_TARGET_DIR AUGMENTAGENT_GATE_CACHE_MAX_MB AUGMENTAGENT_SELFIMPROVE_LOCK
 

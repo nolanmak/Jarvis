@@ -401,9 +401,12 @@ pub fn scan_profile(profile: &Path, now: SystemTime) -> (Vec<Candidate>, bool) {
         .chain(read_dir_paths(&profile.join("build")));
     for path in artifacts {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        // Cargo names a few outputs without a unit hash (a cdylib's
+        // `libfoo.so`). Nothing says who needs those, so they stay.
+        let Some(hash) = unit_hash(name) else { continue };
         // A unit's record speaks for all its files; an artifact with no
         // record left is already orphaned and judged on its own age.
-        let idle = match unit_hash(name).and_then(|h| needed.get(h)) {
+        let idle = match needed.get(hash) {
             Some(days) => *days,
             None => {
                 let own = if path.is_dir() { last_touch_shallow(&path) } else { last_touch(&path) };
@@ -1327,6 +1330,9 @@ mod tests {
         }
         write(&p.join("augmentagent"), 4096);
         age(&p.join("augmentagent"), 90.0);
+        // An output cargo names without a unit hash.
+        write(&p.join("deps/libplugin.so"), 4096);
+        age(&p.join("deps/libplugin.so"), 90.0);
         p
     }
 
@@ -1416,6 +1422,7 @@ mod tests {
         assert!(profile.join(format!("deps/libpkg-{APP}.rlib")).exists());
         assert!(profile.join("incremental/new-sess").exists());
         assert!(profile.join("augmentagent").exists());
+        assert!(profile.join("deps/libplugin.so").exists(), "no unit hash, no verdict, no removal");
     }
 
     #[test]

@@ -325,6 +325,15 @@ GATE_PRUNE_BIN="${AUGMENTAGENT_GATE_PRUNE_BIN:-${REPO_ROOT:-.}/target/release/au
 GATE_CACHE_STALE_DAYS="${AUGMENTAGENT_GATE_CACHE_STALE_DAYS:-3}"
 
 _gate_cache_mb() { du -sm "$GATE_CACHE_DIR" 2>/dev/null | cut -f1; }
+# Free MB on the cache's filesystem; overridable (tests).
+_gate_free_mb() { df -Pm "$GATE_CACHE_DIR" 2>/dev/null | awk 'NR==2 {print $4}'; }
+# The gate's own free-space floor (#1407), in MB. A non-integer setting falls
+# back to the default here; the gate itself reads the exact value.
+_gate_min_free_mb() {
+  local gb="${AUGMENTAGENT_GATE_MIN_FREE_GB:-15}"
+  case "$gb" in ''|*[!0-9]*) gb=15 ;; esac
+  printf '%s\n' $((gb * 1024))
+}
 
 # Trim the gate cache when it is over the cap and every lane is idle.
 # 0 = trimmed, 1 = left alone (under cap, or a lane is mid-build).
@@ -340,23 +349,34 @@ _gate_cache_mb() { du -sm "$GATE_CACHE_DIR" 2>/dev/null | cut -f1; }
 # session or an rlib while we unlink it, so no tier is safe under a live lane.
 trim_gate_cache_if_idle() {
   [ -d "$GATE_CACHE_DIR/debug" ] || return 1
-  local sz after
+  local sz after cap free floor
   sz=$(_gate_cache_mb)
-  [ "${sz:-0}" -gt "$GATE_CACHE_MAX_MB" ] || return 1
+  cap=$GATE_CACHE_MAX_MB
+  # The gate refuses to start under its free-space floor. A cache that is
+  # under its cap on a volume that is under the floor would then never be
+  # trimmed and the loop would hold forever, so the floor tightens the cap by
+  # exactly the shortfall.
+  free=$(_gate_free_mb); floor=$(_gate_min_free_mb)
+  if [ -n "$free" ] && [ "$free" -lt "$floor" ]; then
+    local tight=$(( ${sz:-0} - (floor - free) ))
+    [ "$tight" -lt 0 ] && tight=0
+    [ "$tight" -lt "$cap" ] && cap=$tight
+  fi
+  [ "${sz:-0}" -gt "$cap" ] || return 1
   if any_lane_building; then
     _sr_log "gate cache ${sz}MB over cap but a lane is building; trimming later"
     return 1
   fi
   if [ -x "$GATE_PRUNE_BIN" ] && "$GATE_PRUNE_BIN" disk prune --root "$GATE_CACHE_DIR" \
-       --cap-mb "$GATE_CACHE_MAX_MB" --stale-days "$GATE_CACHE_STALE_DAYS" >/dev/null 2>&1; then
+       --cap-mb "$cap" --stale-days "$GATE_CACHE_STALE_DAYS" >/dev/null 2>&1; then
     after=$(_gate_cache_mb)
-    if [ "${after:-0}" -le "$GATE_CACHE_MAX_MB" ]; then
-      _sr_log "gate cache ${sz}MB over ${GATE_CACHE_MAX_MB}MB cap and lanes idle; trimmed cold entries to ${after}MB"
+    if [ "${after:-0}" -le "$cap" ]; then
+      _sr_log "gate cache ${sz}MB over ${cap}MB cap and lanes idle; trimmed cold entries to ${after}MB"
       return 0
     fi
     sz=$after
   fi
-  _sr_log "gate cache ${sz}MB over ${GATE_CACHE_MAX_MB}MB cap and lanes idle; dropping debug/ (next gate cold-rebuilds once)"
+  _sr_log "gate cache ${sz}MB over ${cap}MB cap and lanes idle; dropping debug/ (next gate cold-rebuilds once)"
   rm -rf "$GATE_CACHE_DIR/debug"
   return 0
 }
