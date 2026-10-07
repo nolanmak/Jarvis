@@ -245,6 +245,7 @@ rm -rf "$DEFER_DIR"
 unset AUGMENTAGENT_SELFIMPROVE_LOCK AUGMENTAGENT_RESTART_DEFER_STAMP
 
 echo "trim_gate_cache_if_idle (#891):"
+GATE_PRUNE_BIN=/nonexistent  # hermetic: never the checkout's real binary
 CACHE_DIR=$(mktemp -d)
 export AUGMENTAGENT_GATE_TARGET_DIR="$CACHE_DIR/gate"
 export AUGMENTAGENT_GATE_CACHE_MAX_MB=1
@@ -275,6 +276,44 @@ check "trims when over cap and every lane is idle" "$?" "0"
 mkdir -p "$GATE_CACHE_DIR/debug"; GATE_CACHE_MAX_MB=100000
 trim_gate_cache_if_idle >/dev/null 2>&1
 check "leaves a cache under the cap alone" "$?" "1"
+
+# #1407 — tiered: a pruner that gets under the cap spares debug/.
+GATE_CACHE_MAX_MB=2
+mkdir -p "$GATE_CACHE_DIR/debug/incremental" "$GATE_CACHE_DIR/debug/deps"
+dd if=/dev/zero of="$GATE_CACHE_DIR/debug/incremental/cold" bs=1M count=3 status=none
+: > "$GATE_CACHE_DIR/debug/deps/libwarm.rlib"
+GATE_PRUNE_BIN="$CACHE_DIR/pruner"
+cat > "$GATE_PRUNE_BIN" <<'STUB'
+#!/usr/bin/env bash
+# Stands in for `augmentagent disk prune --root <dir> --cap-mb <n> --stale-days <d>`.
+printf '%s\n' "$*" > "$(dirname "$0")/pruner.args"
+[ -e "$(dirname "$0")/pruner.fail" ] && exit 2
+[ -e "$(dirname "$0")/pruner.noop" ] && exit 0
+rm -rf "$4/debug/incremental"
+STUB
+chmod +x "$GATE_PRUNE_BIN"
+TRIM_LOG=$(trim_gate_cache_if_idle 2>&1); rc=$?
+check "tiered: reports a trim" "$rc" "0"
+check "tiered: asks the pruner for this dir, cap and stale window" \
+  "$(cat "$CACHE_DIR/pruner.args")" "disk prune --root $GATE_CACHE_DIR --cap-mb 2 --stale-days 3"
+[ -e "$GATE_CACHE_DIR/debug/deps/libwarm.rlib" ] && ok "tiered: warm artifacts survive (no cold rebuild)" \
+  || bad "tiered: warm artifacts survive (no cold rebuild)" "debug/ was wiped"
+case "$TRIM_LOG" in *"trimmed cold entries"*) ok "tiered: logs the cheap trim" ;; *) bad "tiered: logs the cheap trim" "$TRIM_LOG" ;; esac
+
+# A pruner that runs but cannot get under the cap -> the wipe is the backstop.
+dd if=/dev/zero of="$GATE_CACHE_DIR/debug/deps/big" bs=1M count=3 status=none
+touch "$CACHE_DIR/pruner.noop"
+trim_gate_cache_if_idle >/dev/null 2>&1
+check "backstop: still trims when the pruner could not fit the cap" "$?" "0"
+[ -d "$GATE_CACHE_DIR/debug" ] && bad "backstop: drops debug/" "still present" || ok "backstop: drops debug/"
+
+# A binary that predates `disk prune` (clap exits 2) -> same backstop.
+rm -f "$CACHE_DIR/pruner.noop"; touch "$CACHE_DIR/pruner.fail"
+mkdir -p "$GATE_CACHE_DIR/debug"; dd if=/dev/zero of="$GATE_CACHE_DIR/debug/blob" bs=1M count=3 status=none
+trim_gate_cache_if_idle >/dev/null 2>&1
+[ -d "$GATE_CACHE_DIR/debug" ] && bad "backstop: an old binary falls back to the wipe" "still present" \
+  || ok "backstop: an old binary falls back to the wipe"
+GATE_PRUNE_BIN=/nonexistent
 rm -rf "$CACHE_DIR"
 unset AUGMENTAGENT_GATE_TARGET_DIR AUGMENTAGENT_GATE_CACHE_MAX_MB AUGMENTAGENT_SELFIMPROVE_LOCK
 

@@ -61,6 +61,10 @@ pub struct Finding {
 /// than the tick interval, so one pause covers the gap it causes.
 const PROVIDER_HOLD_FRESH_MINS: i64 = 90;
 
+/// #1409 — a previous disk reading older than this is no baseline for the
+/// growth rule (the timer runs every 2 h; three missed runs is a gap).
+const DISK_DROP_WINDOW_HOURS: f64 = 6.0;
+
 /// Everything the rules judge. Absent evidence is `None`, which never fires a
 /// rule: a missing log is a reason to stay quiet, not to cry wolf.
 #[derive(Debug, Clone, Default)]
@@ -83,6 +87,11 @@ pub struct HealthInputs {
     pub deploy_lag_mins: Option<i64>,
     pub free_gb_root: Option<f64>,
     pub free_gb_gate: Option<f64>,
+    /// #1409 — every OTHER filesystem that holds build output or state
+    /// (a symlinked `target/debug`, the temp dir, …), one entry per mount.
+    pub free_gb_elsewhere: Vec<(String, f64)>,
+    /// #1409 — filesystems that lost space fast since the previous check.
+    pub disk_drops: Vec<crate::disk::FsDrop>,
     /// When the cached red-`main` verdict was written, if `main` is currently
     /// recorded red.
     pub red_main_since: Option<DateTime<Utc>>,
@@ -123,6 +132,8 @@ pub struct Thresholds {
     pub reasoner_silent_mins: i64,
     pub loop_silent_mins: i64,
     pub free_gb_floor: f64,
+    /// GB a filesystem may lose between two checks before it is a finding.
+    pub disk_drop_gb: f64,
     pub no_merge_days: i64,
     pub deploy_lag_mins: i64,
     pub red_main_hours: i64,
@@ -139,6 +150,8 @@ impl Default for Thresholds {
             loop_silent_mins: 95,
             // A workspace test build needs well over this.
             free_gb_floor: 15.0,
+            // One heavy day of builds is 30-40 GB; a check runs every 2 h.
+            disk_drop_gb: 20.0,
             no_merge_days: 3,
             // The updater ticks every 5 min and a full rebuild is minutes;
             // an hour behind means it is not deploying, not merely slow.
@@ -241,7 +254,10 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         }
     }
 
-    for (label, free) in [("/", i.free_gb_root), ("the gate target", i.free_gb_gate)] {
+    let disks = [("/", i.free_gb_root), ("the gate target", i.free_gb_gate)]
+        .into_iter()
+        .chain(i.free_gb_elsewhere.iter().map(|(l, gb)| (l.as_str(), Some(*gb))));
+    for (label, free) in disks {
         if let Some(gb) = free {
             if gb < t.free_gb_floor {
                 out.push(Finding {
@@ -257,6 +273,24 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
                         .into(),
                 });
             }
+        }
+    }
+
+    // #1409 — a runaway writer, caught before the floor: a build cache that
+    // adds tens of GB between two checks fills the volume within the day.
+    for d in &i.disk_drops {
+        if d.lost_gb >= t.disk_drop_gb {
+            out.push(Finding {
+                severity: Severity::Warn,
+                code: "disk-shrinking",
+                detail: format!(
+                    "{} lost {:.0} GB in {:.1} h ({:.1} GB left)",
+                    d.label, d.lost_gb, d.hours, d.free_gb
+                ),
+                fix: "`augmentagent disk prune --dry-run` shows what is cold; \
+                      `augmentagent disk status` shows what lives on each filesystem."
+                    .into(),
+            });
         }
     }
 
@@ -762,6 +796,23 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
         });
 
     let deploy = deploy_state(repo_root, &dir);
+    // #1409 — everything beyond `/` and the gate cache, de-duplicated by
+    // mount, plus how fast each is shrinking since the last check.
+    let filesystems = crate::disk::read_filesystems(repo_root);
+    let already = [Path::new("/"), gate_dir.as_path()].map(crate::disk::device_id);
+    let free_gb_elsewhere = filesystems
+        .iter()
+        .filter(|r| !already.contains(&Some(r.dev)))
+        .map(|r| (r.label(), r.free_gb))
+        .collect();
+    let disk_drops = crate::disk::fs_drops(
+        &crate::disk::load_readings(),
+        &filesystems,
+        now,
+        0.0,
+        DISK_DROP_WINDOW_HOURS,
+    );
+    crate::disk::save_readings(&filesystems, now);
     HealthInputs {
         now_or_epoch: Some(now),
         daemon_active: daemon_active(),
@@ -774,6 +825,8 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
         deployed_is_current: deploy.0,
         deploy_lag_mins: deploy.1,
         free_gb_root: free_gb(Path::new("/")),
+        free_gb_elsewhere,
+        disk_drops,
         free_gb_gate: gate_dir
             .exists()
             .then(|| free_gb(&gate_dir))
@@ -912,6 +965,8 @@ mod tests {
             deploy_lag_mins: Some(0),
             free_gb_root: Some(70.0),
             free_gb_gate: Some(53.0),
+            free_gb_elsewhere: vec![("the debug target".into(), 51.0)],
+            disk_drops: Vec::new(),
             red_main_since: None,
             repeated_refusals: vec![],
             open_prs: None,
@@ -972,6 +1027,38 @@ mod tests {
             ..healthy()
         };
         assert_eq!(codes(&analyze(&g, &Thresholds::default())), vec!["disk-low"]);
+    }
+
+    /// 2026-10-06 (#1409): `target/debug` had been symlinked onto a third
+    /// volume, which filled to 73% with nothing watching it.
+    #[test]
+    fn catches_a_low_filesystem_that_is_neither_root_nor_the_gate() {
+        let i = HealthInputs {
+            free_gb_elsewhere: vec![("the debug target".into(), 3.0), ("the temp dir".into(), 80.0)],
+            ..healthy()
+        };
+        let f = analyze(&i, &Thresholds::default());
+        assert_eq!(codes(&f), vec!["disk-low"]);
+        assert!(f[0].detail.starts_with("the debug target has 3.0 GB free"), "{:?}", f[0]);
+    }
+
+    /// #1409: 41 GB written to the gate cache in a day is visible two hours
+    /// in, long before the floor.
+    #[test]
+    fn warns_when_a_filesystem_is_shrinking_fast() {
+        let drop = |lost: f64| crate::disk::FsDrop {
+            label: "the gate target".into(),
+            lost_gb: lost,
+            hours: 2.0,
+            free_gb: 50.0,
+        };
+        let i = HealthInputs { disk_drops: vec![drop(28.0)], ..healthy() };
+        let f = analyze(&i, &Thresholds::default());
+        assert_eq!(codes(&f), vec!["disk-shrinking"]);
+        assert_eq!(f[0].severity, Severity::Warn);
+        assert!(f[0].detail.contains("lost 28 GB in 2.0 h"), "{:?}", f[0]);
+        let quiet = HealthInputs { disk_drops: vec![drop(6.0)], ..healthy() };
+        assert!(analyze(&quiet, &Thresholds::default()).is_empty(), "ordinary growth is silent");
     }
 
     /// 2026-09-07: a red verdict held behind a gave-up issue, forever.

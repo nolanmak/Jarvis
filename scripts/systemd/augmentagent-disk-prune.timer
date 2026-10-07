@@ -1,0 +1,12 @@
+[Unit]
+Description=Prune cold build output daily
+
+[Timer]
+# Wall-clock, so a suspended laptop catches up instead of drifting.
+OnCalendar=*-*-* 04:37:00
+# Catch a miss after a reboot or a long sleep.
+Persistent=true
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

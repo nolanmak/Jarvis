@@ -1,0 +1,19 @@
+# User unit (%h = your home). Install with its .timer into ~/.config/systemd/user/.
+[Unit]
+Description=AugmentAgent — prune cold build output (one pass)
+Documentation=https://github.com/nolanmak/Jarvis/issues/1406
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/AugmentAgent
+EnvironmentFile=-%h/AugmentAgent/.env
+# Skips any target dir a running build is using, so it never needs to be
+# scheduled around the auto-PR loop.
+ExecStart=%h/AugmentAgent/target/release/augmentagent disk prune
+# Housekeeping must not compete with a build for the disk or the CPU.
+Nice=19
+IOSchedulingClass=idle
+# append: does not create parent dirs; StateDirectory does (as in siblings).
+StateDirectory=augmentagent
+StandardOutput=append:%h/.local/state/augmentagent/disk-prune.log
+StandardError=append:%h/.local/state/augmentagent/disk-prune.log

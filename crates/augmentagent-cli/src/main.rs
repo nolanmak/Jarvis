@@ -82,6 +82,7 @@ mod autopr_health;
 mod channel_router;
 mod code_mode;
 mod doc_cmd;
+mod disk;
 mod doctor;
 mod env_cfg;
 mod gmail_attach;
@@ -623,6 +624,13 @@ enum Cmd {
         #[command(subcommand)]
         op: AutoprOp,
     },
+    /// Disk hygiene for build output (#1406). Cargo never deletes an
+    /// artifact; this bounds every target dir the project writes without
+    /// touching anything a warm build still uses.
+    Disk {
+        #[command(subcommand)]
+        op: DiskOp,
+    },
     Doctor {
         /// Force JSON (`--json`) or human table. Default: auto — JSON when
         /// stdout is piped, table on a tty.
@@ -805,6 +813,42 @@ enum Cmd {
     // === end setup+maintenance subcommands ===
 }
 
+
+#[derive(Subcommand, Debug)]
+enum DiskOp {
+    /// Remove cold build output: `incremental/` sessions idle 2 days,
+    /// artifacts whose cargo unit has not been used for 7 (14 where the
+    /// filesystem records no access times), and the whole `target/` of a
+    /// worktree whose branch is merged or gone. Skips any target dir a
+    /// running build is using. Tunable via `AUGMENTAGENT_PRUNE_*`; extra
+    /// dirs via `AUGMENTAGENT_PRUNE_TARGET_DIRS` (colon-separated).
+    Prune {
+        /// Report what would go and how many bytes; remove nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Machine-readable output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Prune exactly this target dir (repeatable) instead of
+        /// discovering the repo's own.
+        #[arg(long)]
+        root: Vec<std::path::PathBuf>,
+        /// With `--root`: trim down to this size in tiers (incremental,
+        /// then stale artifacts, then a full drop) instead of by age.
+        #[arg(long, requires = "root")]
+        cap_mb: Option<u64>,
+        /// Idle days an artifact needs before a `--cap-mb` trim takes it.
+        #[arg(long, requires = "cap_mb")]
+        stale_days: Option<f64>,
+    },
+    /// Free space on every filesystem that holds build output or state
+    /// (#1409), one line per mount, with what lives there.
+    Status {
+        /// Machine-readable output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
 #[derive(Subcommand)]
 enum AutoprOp {
     /// Put `agent-gave-up` issues back in the pool by recorded reason code
@@ -2658,6 +2702,26 @@ async fn main() -> Result<()> {
     if let Cmd::Newsletter { ref op } = cli.cmd {
         return newsletter::run(op).await;
     }
+    // Build-output housekeeping needs no database either.
+    if let Cmd::Disk { ref op } = cli.cmd {
+        let repo_root = std::env::current_dir().context("current_dir")?;
+        return match op {
+            DiskOp::Prune { dry_run, json, root, cap_mb, stale_days } => disk::run_prune(
+                &repo_root,
+                &disk::Options {
+                    dry_run: *dry_run,
+                    json: *json,
+                    roots: root.clone(),
+                    cap_mb: *cap_mb,
+                    stale_days: *stale_days,
+                },
+                &mut std::io::stdout().lock(),
+            ),
+            DiskOp::Status { json } => {
+                disk::run_status(&repo_root, *json, &mut std::io::stdout().lock())
+            }
+        };
+    }
     // Journal housekeeping needs no database.
     if let Cmd::HandoffPrune {
         dry_run,
@@ -3897,6 +3961,7 @@ async fn main() -> Result<()> {
         } => research::run_research(store, since_hours, post_discord, dry_run, max_issues).await,
         Cmd::RepoDocs { .. } => unreachable!("handled before database initialization"),
         Cmd::HandoffPrune { .. } => unreachable!("handled before database initialization"),
+        Cmd::Disk { .. } => unreachable!("handled before database initialization"),
         Cmd::Gmail { ref op } => match op {
             GmailOp::Search { query, limit, full, account } => {
                 run_gmail_search(store, query.clone(), *limit, *full, account.clone()).await
