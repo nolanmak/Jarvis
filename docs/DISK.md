@@ -120,6 +120,32 @@ Backups made by hand before this existed (`deploy-backups/`,
 `deploy prune --strays` lists the ones older than 7 days, and `--strays --yes`
 removes them, always keeping the newest in each place.
 
+## The database
+
+`actions.originalBody` repeated `emails.body` for every action that never
+produces a reply, which is most of them: about 40% of the file on a mail-heavy
+instance. The daemon drops that duplicate hourly, in small batches:
+
+- only for actions in a terminal no-reply status (`skipped`,
+  `permanent_error`) older than `AUGMENTAGENT_ACTION_BODY_RETENTION_DAYS`;
+- only when the email row holds byte-for-byte the same text.
+
+No row and no decision is removed. Readers (the store's
+`get_action_with_email`, the dashboard) fall back to the email's body, so they
+show what they always showed.
+
+Dropping text frees pages inside the file; the file shrinks only on a
+`VACUUM`, which rewrites the whole database and is therefore never automatic:
+
+```sh
+augmentagent db compact --dry-run     # what would be dropped
+augmentagent db compact --vacuum      # drop it and shrink the file; run when quiet
+```
+
+`doctor`'s `db_size` check reports the file size, the largest tables and how
+much is reclaimable. Deploy snapshots are compact regardless: `VACUUM INTO`
+never copies free pages.
+
 ## Settings
 
 | Variable | Default | Meaning |
@@ -130,6 +156,7 @@ removes them, always keeping the newest in each place.
 | `AUGMENTAGENT_GATE_MIN_FREE_GB` | 15 | Free-space floor for a gate; `0` disables |
 | `AUGMENTAGENT_GATE_CACHE_MAX_MB` | 20000 | Gate cache cap |
 | `AUGMENTAGENT_GATE_CACHE_STALE_DAYS` | 3 | Idle days before a cap trim may take an artifact |
+| `AUGMENTAGENT_ACTION_BODY_RETENTION_DAYS` | 30 | Days a terminal action keeps its own copy of the body; `0` disables compaction |
 | `AUGMENTAGENT_DEPLOY_KEEP` | 2 | Deploy snapshots and rollback binaries kept regardless of age |
 | `AUGMENTAGENT_DEPLOY_SNAPSHOT_DIR` | data dir | Where deploy snapshots are written |
 
