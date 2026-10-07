@@ -2,13 +2,18 @@
 
 Cargo never deletes an artifact, so every target dir this project builds into
 grows until the filesystem is full. Epic #1406 gives each unbounded writer an
-owner and a cap. This page covers the build-output half.
+owner and a cap: build output, temp files, deploy snapshots, the database and
+the logs.
 
 ## What runs
 
 | What | When | Does |
 |---|---|---|
 | `augmentagent disk prune` | daily (`augmentagent-disk-prune.timer`) | Removes cold build output from every target dir the repo owns |
+| `augmentagent log-rotate` | daily, same timer | Rotates and compresses the state dir's logs and sinks |
+| `augmentagent ops-archive sync` | daily, same timer | Pushes rotated logs to a private repo, if one is configured |
+| `augmentagent deploy prune` | daily, and after every verified update | Keeps the newest deploy snapshots and rollback binaries |
+| action-body compaction | hourly, inside the daemon | Drops action bodies that only repeat the stored email |
 | gate cache trim | every updater tick, lanes idle | Brings the gate cache back under `AUGMENTAGENT_GATE_CACHE_MAX_MB` in tiers |
 | gate free-space floor | before every gate | Refuses to start below `AUGMENTAGENT_GATE_MIN_FREE_GB` |
 | `autopr-health` | every 2 h | Alerts on any watched filesystem under the floor, or shrinking fast |
@@ -167,6 +172,43 @@ Readers that look back across a rotation still work: `token-usage` reads the
 kept rotations too, and `autopr-health` takes the tail of the newest rotation
 when the live log is shorter than its window.
 
+## Archive or prune
+
+The rule: **archive only what is small, text and cannot be regenerated; prune
+everything else.**
+
+| Data | Decision | Why |
+|---|---|---|
+| Cargo target dirs, gate cache, worktree builds | Prune | Rebuildable from source |
+| Temp files, render bundles | Prune | Leftovers of dead processes |
+| Old rollback binaries and deploy snapshots | Prune, keep the last N | Rebuildable from the commit |
+| Reasoner handoff journals | Prune (the daemon's hourly sweep) | Short-lived by design |
+| CLI session transcripts | Prune (the CLI's own 30-day cleanup) | Large, low reuse |
+| Rotated daemon logs | Archive | The only record of past incidents; about 20x smaller compressed |
+| `tool-audit.log`, `token-usage.jsonl` | Archive | Audit trail and cost history |
+| The live database | Neither | Too big for git: needs a real backup target |
+
+The archive is opt-in. Without it, rotation simply deletes after local
+retention.
+
+```sh
+scripts/ops-archive-bootstrap.sh            # creates a PRIVATE repo, once
+# then add to .env:  AUGMENTAGENT_OPS_ARCHIVE_REMOTE=<owner>/<repo>
+augmentagent ops-archive sync --dry-run
+```
+
+`ops-archive sync` runs with the daily timer and:
+
+- takes only closed, compressed rotations from the state dir. A live file, the
+  database or `.env` is never a candidate, and an allowlist over the staged
+  paths aborts the commit if anything else is there;
+- refuses to push unless GitHub reports the remote as `PRIVATE`. The logs hold
+  message content;
+- skips and reports any file containing one of the daemon's own secret values
+  or a known credential prefix;
+- after a successful push, deletes local rotations past
+  `AUGMENTAGENT_LOG_KEEP_MONTHS`.
+
 ## Settings
 
 | Variable | Default | Meaning |
@@ -180,6 +222,8 @@ when the live log is shorter than its window.
 | `AUGMENTAGENT_ACTION_BODY_RETENTION_DAYS` | 30 | Days a terminal action keeps its own copy of the body; `0` disables compaction |
 | `AUGMENTAGENT_LOG_ROTATE_MB` | 50 | Size at which a log is rotated regardless of age |
 | `AUGMENTAGENT_LOG_KEEP_MONTHS` | 3 | Months a rotated log is kept locally |
+| `AUGMENTAGENT_OPS_ARCHIVE_REMOTE` | unset | `owner/repo` of the private ops archive; unset = off |
+| `AUGMENTAGENT_OPS_ARCHIVE_DIR` | data dir | Local clone of the ops archive |
 | `AUGMENTAGENT_DEPLOY_KEEP` | 2 | Deploy snapshots and rollback binaries kept regardless of age |
 | `AUGMENTAGENT_DEPLOY_SNAPSHOT_DIR` | data dir | Where deploy snapshots are written |
 
