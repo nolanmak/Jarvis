@@ -176,6 +176,28 @@ fn registry_covers_every_producer_in_the_code() {
     );
 }
 
+/// #1416 — the interrupted-turn notice added in #1396 posted from
+/// `event_handler.rs` without the registry totals being bumped, so both
+/// completeness tests failed on main. The registry must cover every
+/// `event_handler.rs` posting site, as a `Reply`.
+#[test]
+fn the_discord_event_handler_reply_sites_are_all_registered() {
+    const FILE: &str = "crates/augmentagent-approval-discord/src/event_handler.rs";
+    let found = scan_producer_sites(&workspace_root());
+    for marker in ["send_message(&", "CreateMessage::new("] {
+        let scanned = found
+            .get(&(FILE.to_string(), marker))
+            .copied()
+            .unwrap_or_default();
+        let registered: usize = PRODUCERS
+            .iter()
+            .filter(|p| p.file == FILE && p.marker == marker && p.route == Route::Reply)
+            .map(|p| p.sites)
+            .sum();
+        assert_eq!(registered, scanned, "`{marker}` sites in {FILE}");
+    }
+}
+
 #[test]
 fn a_producer_missing_from_the_registry_fails_the_check() {
     let found = scan_producer_sites(&workspace_root());
