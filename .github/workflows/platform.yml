@@ -305,6 +305,7 @@ jobs:
             echo "::endgroup::"
           done
           bash scripts/tests/updater-rebuild-trigger.test.sh
+          bash scripts/tests/updater-sync-scripts.test.sh
       - name: Launchd installer contract tests
         run: python3 -m unittest scripts.tests.launchd_installers_test scripts.tests.scheduled_sync_installers_test -v
       - uses: actions/setup-node@v4
