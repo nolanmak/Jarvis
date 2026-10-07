@@ -562,6 +562,15 @@ fn gate_env() -> Vec<(String, String)> {
     env.retain(|(k, _)| k != "TMPDIR");
     env.push(("TMPDIR".into(), format!("{}/tmp", gate_target_dir())));
 
+    // #1407 — the gate never reads debuginfo, and it is most of what a test
+    // build writes: one day of runs put 30 GB in `deps/`. Without it the
+    // build is also faster. Forced, not defaulted: a parent env that wants
+    // debuginfo for its own builds must not re-inflate the shared cache.
+    for key in ["CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG"] {
+        env.retain(|(k, _)| k != key);
+        env.push((key.into(), "0".into()));
+    }
+
     // #780 — gate-run tests must NEVER file real GitHub issues. Channel
     // tests that build the production channel reach GhCliIssueRunner; the
     // per-crate test guards are the first line, this is the backstop.
@@ -577,6 +586,16 @@ fn gate_target_dir() -> String {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
         format!("{home}/.cache/augmentagent-gate-target")
     })
+}
+
+/// #1407 — refuse a gate that would start on a nearly full disk. The text is
+/// classified `Infra` by [`infra_failure_reason`], so the run is neither
+/// charged to the builder nor cached as a red `main`.
+fn gate_disk_guard() -> Result<()> {
+    match crate::disk::gate_floor_refusal(Path::new(&gate_target_dir())) {
+        Some(why) => bail!("{why}"),
+        None => Ok(()),
+    }
 }
 
 /// True if an env-var name looks like a provider secret (case-insensitive
@@ -3664,6 +3683,7 @@ fn changed_crates(paths: &str) -> Option<Vec<String>> {
 /// three-round run. The FULL gate still runs exactly once before anything is
 /// pushed or merged; this trims the redundancy, not the bar.
 async fn verification_gate_targeted(worktree: &Path, crates: &[String]) -> Result<()> {
+    gate_disk_guard()?;
     let env = gate_env();
     let pkgs: String = crates
         .iter()
@@ -3707,6 +3727,7 @@ async fn gate_for_round(worktree: &Path, changed_paths: &str) -> Result<()> {
 }
 
 async fn verification_gate(worktree: &Path) -> Result<()> {
+    gate_disk_guard()?;
     // #300 — Strip provider secrets from the gate's child env. `cargo
     // build`/`npm run build` execute `build.rs`/proc-macros/`npm
     // postinstall`, which the issue body could influence; none need
@@ -4029,6 +4050,7 @@ async fn baseline_failures(
     if pkgs.is_empty() || tests.is_empty() {
         bail!("baseline: no package or test names to target");
     }
+    gate_disk_guard()?;
     let lane = lane_from_env().worktree_name();
     let worktree = repo_root
         .join(".self-improve-worktrees")
@@ -4149,6 +4171,17 @@ async fn main_is_red(repo_root: &Path) -> Option<RedMain> {
             Ok(Ok(())) => cache.record_full(&sha, &[], None, now),
             Ok(Err(gate_err)) => {
                 let text = format!("{gate_err:#}");
+                // #1407 (#960 item 1) — a gate that died on the box (full
+                // disk, OOM, network) says nothing about `main`. Recording
+                // it would hold the loop on a red verdict nothing re-checks.
+                if let Some(why) = baseline_infra_reason(&text) {
+                    warn!(
+                        sha = short,
+                        "full gate on origin/main failed on infra ({why}); verdict not recorded, \
+                         next tick re-runs it"
+                    );
+                    return None;
+                }
                 let failing = failing_tests(&text);
                 warn!(
                     sha = short,
@@ -4181,9 +4214,17 @@ async fn main_is_red(repo_root: &Path) -> Option<RedMain> {
     })
 }
 
+/// `Some(reason)` when a red full-gate result is the harness's fault and must
+/// not be cached as `main`'s verdict.
+fn baseline_infra_reason(gate_text: &str) -> Option<&'static str> {
+    infra_failure_reason(gate_text)
+}
+
 /// Run [`verification_gate`] on a clean detached checkout of `origin/main`.
 /// Outer `Err` = could not even try; inner `Err` = the gate is red.
 async fn full_gate_on_main(repo_root: &Path) -> Result<Result<()>> {
+    // Outer `Err`: with no room to build, the gate was not run at all.
+    gate_disk_guard()?;
     let lane = lane_from_env().worktree_name();
     let worktree = repo_root
         .join(".self-improve-worktrees")
@@ -9545,6 +9586,8 @@ impl AttemptRecord {
 fn infra_failure_reason(text: &str) -> Option<&'static str> {
     const SIGNS: &[(&str, &str)] = &[
         ("no space left on device", "disk full"),
+        // #1407 — the pre-gate free-space floor (`disk::LOW_DISK_REFUSAL`).
+        ("gate refused: low disk", "disk low"),
         ("out of memory", "out of memory"),
         ("memory allocation of", "out of memory"),
         ("signal: 9", "killed (SIGKILL)"),
@@ -10892,6 +10935,53 @@ for tool, arguments in [
             tmp.1
         );
         assert!(!tmp.1.trim_end_matches('/').eq("/tmp"));
+    }
+
+    #[test]
+    fn gate_env_builds_without_debuginfo() {
+        // #1407 — debuginfo is most of the gate cache and the gate never
+        // reads it.
+        let env = gate_env();
+        for key in ["CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG"] {
+            let vals: Vec<_> = env.iter().filter(|(k, _)| k == key).collect();
+            assert_eq!(vals.len(), 1, "{key} set exactly once");
+            assert_eq!(vals[0].1, "0", "{key}");
+        }
+    }
+
+    #[test]
+    fn a_low_disk_refusal_is_infra_and_never_a_red_main() {
+        // #1407 — the floor's own message must classify as the box's fault
+        // on both paths: the per-attempt outcome and the baseline verdict.
+        let why = crate::disk::floor_refusal(1 << 30, 15.0).expect("1 GB is under the floor");
+        let (kind, detail) = gate_outcome(&why);
+        assert_eq!(kind, FailureKind::Infra, "{detail}");
+        assert_eq!(baseline_infra_reason(&why), Some("disk low"));
+        assert_eq!(
+            baseline_infra_reason("error: No space left on device (os error 28)"),
+            Some("disk full")
+        );
+        assert_eq!(baseline_infra_reason("test result: FAILED. 3 passed; 1 failed"), None);
+    }
+
+    #[test]
+    fn every_gate_entry_point_checks_free_disk_first() {
+        // Structural: a gate that starts on a full disk fails mid-build with
+        // a misleading error. Each entry point must consult the guard.
+        let src = include_str!("self_improve.rs");
+        for sig in [
+            "async fn verification_gate_targeted(",
+            "async fn verification_gate(",
+            "async fn baseline_failures(",
+            "async fn full_gate_on_main(",
+        ] {
+            let at = src.find(sig).unwrap_or_else(|| panic!("{sig} not found"));
+            let body = &src[at..at + 900];
+            assert!(body.contains("gate_disk_guard()?"), "{sig} skips the disk guard");
+        }
+        // And the baseline must not cache an infra failure as red.
+        let at = src.find("async fn main_is_red(").expect("main_is_red");
+        assert!(src[at..at + 2000].contains("baseline_infra_reason(&text)"));
     }
 
     #[test]

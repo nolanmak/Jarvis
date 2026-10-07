@@ -235,6 +235,7 @@ pub async fn run(
     findings.push(check_build_vm());
     // 17. build scratch — admission-limit validity and capacity (#1092)
     findings.push(check_build_scratch());
+    findings.push(check_disk_filesystems());
     // 18. durable surface delivery — dead letters / unreconciled sends (#1285)
     if let Some(doc) = &status_doc {
         findings.push(check_surface_delivery(&doc.delivery));
@@ -1550,6 +1551,35 @@ fn build_vm_finding(
     Finding::ok(NAME, "ok: VM runtime configured, qemu and kernel present, /dev/kvm read-write via group or owner")
 }
 
+/// #1409 — free space on every filesystem that holds build output or state.
+/// Pure over the readings, so the wording and the floor are testable.
+fn disk_filesystems_finding(readings: &[crate::disk::FsReading], floor_gb: f64) -> Finding {
+    const NAME: &str = "disk_filesystems";
+    if readings.is_empty() {
+        return Finding::warn(NAME, "no filesystem could be read", None);
+    }
+    let table = readings
+        .iter()
+        .map(|r| format!("{:.1} GB free: {}", r.free_gb, r.label()))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let low: Vec<String> = readings.iter().filter(|r| r.free_gb < floor_gb).map(|r| r.label()).collect();
+    if low.is_empty() {
+        Finding::ok(NAME, table)
+    } else {
+        Finding::warn(
+            NAME,
+            format!("under the {floor_gb:.0} GB a gate needs on {}. {table}", low.join(", ")),
+            Some("augmentagent disk prune --dry-run"),
+        )
+    }
+}
+
+fn check_disk_filesystems() -> Finding {
+    let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    disk_filesystems_finding(&crate::disk::read_filesystems(&root), crate::disk::gate_min_free_gb())
+}
+
 /// What doctor observed about the build scratch volume (#1092).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ScratchUsage {
@@ -2745,6 +2775,21 @@ mod tests {
             .as_deref()
             .unwrap()
             .starts_with("sudo usermod -aG kvm synthetic-user"));
+    }
+
+    #[test]
+    fn disk_filesystems_finding_lists_every_mount_and_flags_the_low_one() {
+        let fs = |label: &str, dev: u64, free: f64| crate::disk::FsReading {
+            labels: vec![label.into()],
+            dev,
+            free_gb: free,
+        };
+        let ok = disk_filesystems_finding(&[fs("/", 1, 26.0), fs("the debug target", 2, 51.0)], 15.0);
+        assert_eq!(ok.severity, Severity::Ok, "{}", ok.message);
+        assert!(ok.message.contains("51.0 GB free: the debug target"), "{}", ok.message);
+        let low = disk_filesystems_finding(&[fs("/", 1, 26.0), fs("the debug target", 2, 4.0)], 15.0);
+        assert_eq!(low.severity, Severity::Warn, "{}", low.message);
+        assert!(low.message.starts_with("under the 15 GB a gate needs on the debug target"), "{}", low.message);
     }
 
     #[test]
