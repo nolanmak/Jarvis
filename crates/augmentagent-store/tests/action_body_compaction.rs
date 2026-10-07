@@ -119,3 +119,25 @@ fn a_row_that_never_had_a_body_and_can_still_act_does_not_gain_one() {
     let row = store.get_action_with_email("p").unwrap().unwrap();
     assert_eq!(row.action.original_body, None);
 }
+
+#[test]
+fn a_batch_waits_out_another_writer_instead_of_failing_locked() {
+    // Live failure: the daemon committed between a batch's read and its
+    // write, and the deferred transaction died with "database is locked".
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    let store = Store::open(&path).unwrap();
+    seed(&store, "a", "skipped", 40, Some("body"), Some("body"));
+
+    let other = rusqlite::Connection::open(&path).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE; UPDATE actions SET subject = 'touched' WHERE id = 'a';").unwrap();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        other.execute_batch("COMMIT;").unwrap();
+    });
+
+    let done = store.compact_action_bodies(NOW - 30 * DAY_MS, 100).expect("waits, then compacts");
+    writer.join().unwrap();
+    assert_eq!(done.rows, 1);
+    assert_eq!(raw_body(&store, "a"), None);
+}
