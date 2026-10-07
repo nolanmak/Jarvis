@@ -10,6 +10,8 @@ EnvironmentFile=-%h/AugmentAgent/.env
 # Skips any target dir a running build is using, so it never needs to be
 # scheduled around the auto-PR loop.
 ExecStart=%h/AugmentAgent/target/release/augmentagent disk prune
+# #1410 — the same pass expires old deploy snapshots and rollback binaries.
+ExecStart=%h/AugmentAgent/target/release/augmentagent deploy prune
 # Housekeeping must not compete with a build for the disk or the CPU.
 Nice=19
 IOSchedulingClass=idle

@@ -82,6 +82,7 @@ mod autopr_health;
 mod channel_router;
 mod code_mode;
 mod doc_cmd;
+mod deploy_snapshot;
 mod disk;
 mod doctor;
 mod env_cfg;
@@ -624,6 +625,12 @@ enum Cmd {
         #[command(subcommand)]
         op: AutoprOp,
     },
+    /// Pre-deploy snapshots and their retention (#1410): the one supported
+    /// way to back up the database and binary before a manual deploy.
+    Deploy {
+        #[command(subcommand)]
+        op: DeployOp,
+    },
     /// Disk hygiene for build output (#1406). Cargo never deletes an
     /// artifact; this bounds every target dir the project writes without
     /// touching anything a warm build still uses.
@@ -813,6 +820,48 @@ enum Cmd {
     // === end setup+maintenance subcommands ===
 }
 
+
+#[derive(Subcommand, Debug)]
+enum DeployOp {
+    /// Snapshot the database (consistent while the daemon runs, compressed)
+    /// and the release binary into one dated dir. Prints the dir.
+    Snapshot {
+        /// Short name for the snapshot, e.g. the PR number.
+        #[arg(long, default_value = "manual")]
+        label: String,
+    },
+    /// Snapshots, newest first.
+    List,
+    /// Keep the newest `AUGMENTAGENT_DEPLOY_KEEP` snapshots (default 2) and
+    /// anything younger than 48 h; the same for `augmentagent.*` rollback
+    /// binaries beside the release build. The newest is never removed.
+    Prune {
+        /// Report what would go; remove nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Also list backups made by hand before this command existed
+        /// (older than 7 days, newest kept).
+        #[arg(long, default_value_t = false)]
+        strays: bool,
+        /// Actually remove the listed hand-made backups.
+        #[arg(long, default_value_t = false, requires = "strays")]
+        yes: bool,
+        /// Machine-readable output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Decompress a snapshot's database to a path. Stop the daemon first.
+    RestoreDb {
+        /// Snapshot name, as `deploy list` prints it.
+        name: String,
+        /// Where to write the database.
+        #[arg(long)]
+        to: std::path::PathBuf,
+        /// Replace an existing file.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+}
 
 #[derive(Subcommand, Debug)]
 enum DiskOp {
@@ -2702,6 +2751,57 @@ async fn main() -> Result<()> {
     if let Cmd::Newsletter { ref op } = cli.cmd {
         return newsletter::run(op).await;
     }
+    // Snapshots read the database file directly; they must not open (and
+    // migrate) it through the store.
+    if let Cmd::Deploy { ref op } = cli.cmd {
+        let root = deploy_snapshot::snapshot_root()
+            .context("no AUGMENTAGENT_DEPLOY_SNAPSHOT_DIR and no HOME to locate the snapshot dir")?;
+        let repo_root = std::env::current_dir().context("current_dir")?;
+        let release = repo_root.join("target/release");
+        let mut out = std::io::stdout().lock();
+        return match op {
+            DeployOp::Snapshot { label } => {
+                let db = cli
+                    .db
+                    .clone()
+                    .or_else(|| std::env::var("AUGMENTAGENT_DB").ok().map(PathBuf::from))
+                    .unwrap_or_else(|| PathBuf::from("data.db"));
+                let sha = std::process::Command::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+                let dir = deploy_snapshot::snapshot(
+                    &db,
+                    Some(&release.join("augmentagent")),
+                    &root,
+                    label,
+                    sha.as_deref(),
+                    chrono::Utc::now(),
+                )?;
+                use std::io::Write as _;
+                writeln!(out, "{}", dir.display())?;
+                Ok(())
+            }
+            DeployOp::List => deploy_snapshot::run_list(&root, &mut out),
+            DeployOp::Prune { dry_run, strays, yes, json } => deploy_snapshot::run_prune(
+                &root,
+                Some(&release),
+                &deploy_snapshot::PruneOptions {
+                    dry_run: *dry_run,
+                    strays: *strays,
+                    yes: *yes,
+                    keep: deploy_snapshot::keep_from_env(),
+                },
+                *json,
+                &mut out,
+            ),
+            DeployOp::RestoreDb { name, to, force } => {
+                deploy_snapshot::restore_db(&root.join(name), to, *force)
+            }
+        };
+    }
     // Build-output housekeeping needs no database either.
     if let Cmd::Disk { ref op } = cli.cmd {
         let repo_root = std::env::current_dir().context("current_dir")?;
@@ -3962,6 +4062,7 @@ async fn main() -> Result<()> {
         Cmd::RepoDocs { .. } => unreachable!("handled before database initialization"),
         Cmd::HandoffPrune { .. } => unreachable!("handled before database initialization"),
         Cmd::Disk { .. } => unreachable!("handled before database initialization"),
+        Cmd::Deploy { .. } => unreachable!("handled before database initialization"),
         Cmd::Gmail { ref op } => match op {
             GmailOp::Search { query, limit, full, account } => {
                 run_gmail_search(store, query.clone(), *limit, *full, account.clone()).await

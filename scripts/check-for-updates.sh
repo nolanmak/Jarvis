@@ -278,6 +278,12 @@ will retry via the build-stamp mismatch path."
   fi
   printf '%s\n' "$TARGET" > "$STAMP"
   log "update complete: now at $TARGET (build stamp written)"
+  # #1410 — a verified deploy is the moment older rollback material stops
+  # mattering: keep the newest snapshots and rollback binaries, drop the rest.
+  # Housekeeping only; it can never fail the update.
+  if [ -x "$REPO_ROOT/target/release/augmentagent" ]; then
+    "$REPO_ROOT/target/release/augmentagent" deploy prune >> "$LOG" 2>&1 || true
+  fi
 }
 
 log "checking for updates"

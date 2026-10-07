@@ -65,6 +65,13 @@ esac
 exit 0
 STUB
   chmod +x "$TMP/bin/cargo" "$TMP/bin/systemctl"
+  # The built daemon: records what the updater asks it to do.
+  mkdir -p "$TMP/work/target/release"
+  cat > "$TMP/work/target/release/augmentagent" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$SYSTEMCTL_STUB_DIR/daemon-calls"
+STUB
+  chmod +x "$TMP/work/target/release/augmentagent"
   # Exercise the Linux (systemd) branch on any host (#1079: CI runs macOS too).
   printf '#!/usr/bin/env bash\necho Linux\n' > "$TMP/bin/uname" && chmod +x "$TMP/bin/uname"
   SYSTEMCTL_STUB_DIR="$TMP"; export SYSTEMCTL_STUB_DIR
@@ -92,6 +99,9 @@ else
 fi
 grep -q "NOT writing the build stamp" "$TMP/state/augmentagent/update.log" \
   && ok "says why in the log" || bad "says why in the log" "no explanation logged"
+grep -qx "deploy prune" "$TMP/daemon-calls" 2>/dev/null \
+  && bad "keeps rollback material after an unverified restart (#1410)" "deploy prune ran" \
+  || ok "keeps rollback material after an unverified restart (#1410)"
 
 # The retry path: with the stamp absent, the next tick must try again rather
 # than reporting `up to date`. This is the property the old code destroyed.
@@ -102,6 +112,9 @@ else
   bad "a later tick recovers and writes the stamp once the restart works" \
     "stamp still absent; retry exit $retry_rc; $(tail -n 8 "$TMP/state/augmentagent/update.log")"
 fi
+grep -qx "deploy prune" "$TMP/daemon-calls" 2>/dev/null \
+  && ok "prunes old rollback material once the deploy is verified (#1410)" \
+  || bad "prunes old rollback material once the deploy is verified (#1410)" "deploy prune never ran"
 rm -rf "$TMP"
 
 # --- healthy deploy is unchanged ---

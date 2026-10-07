@@ -90,6 +90,10 @@ quick-xml = "0.38"
 # fake `Signaler` that returns ESRCH; the real walker + kill live in the
 # `augmentagent-loops` shared crate so the Discord channel can call them.
 libc = "0.2"
+# #1410 — deploy snapshots store the database gzip-compressed.
+flate2 = "1"
+# …and are taken with `VACUUM INTO` on the raw file, outside the store.
+rusqlite = { workspace = true }
 
 # #14 — snapshot test for the `augmentagent status --json` schema. `insta`
 # is the idiomatic Rust snapshot crate; `tempfile` gives the test an isolated
