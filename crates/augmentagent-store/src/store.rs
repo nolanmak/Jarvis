@@ -150,6 +150,23 @@ fn lost_migration_race(e: &StoreError) -> bool {
         .is_some_and(|m| m.contains("duplicate column name") || m.contains("already exists"))
 }
 
+/// #1412 — what a body-compaction pass found or dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BodyCompaction {
+    pub rows: u64,
+    pub bytes: u64,
+}
+
+/// The rows [`Store::compact_action_bodies`] may touch; `?1` is the cutoff.
+/// `e.body = a.originalBody` is the whole safety argument: only an exact
+/// duplicate is ever dropped, so the reader fallback returns the same text.
+const COMPACTABLE_BODY_FROM: &str = "FROM actions a \
+     JOIN emails e ON e.messageId = a.messageId \
+    WHERE a.status IN ('skipped', 'permanent_error') \
+      AND a.originalBody IS NOT NULL \
+      AND a.createdAt < ?1 \
+      AND e.body = a.originalBody";
+
 pub struct Store {
     conn: Mutex<Connection>,
     path: std::path::PathBuf,
@@ -651,6 +668,54 @@ impl Store {
     /// constructor.
     pub fn db_path(&self) -> &Path {
         &self.path
+    }
+
+    /// #1412 — rows whose `originalBody` [`compact_action_bodies`] would
+    /// drop, and how many bytes that is.
+    ///
+    /// [`compact_action_bodies`]: Self::compact_action_bodies
+    pub fn action_body_compaction_candidates(&self, older_than_ms: i64) -> StoreResult<BodyCompaction> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let (rows, bytes): (i64, i64) = guard.query_row(
+            &format!("SELECT count(*), COALESCE(sum(length(a.originalBody)), 0) {COMPACTABLE_BODY_FROM}"),
+            params![older_than_ms],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(BodyCompaction { rows: rows as u64, bytes: bytes as u64 })
+    }
+
+    /// #1412 — drop `actions.originalBody` where it only repeats the email.
+    ///
+    /// A row qualifies when all of these hold: it is in a terminal status
+    /// that never produces a reply, it was created before `older_than_ms`,
+    /// and `emails.body` for the same message is byte-for-byte the same
+    /// text. Readers fall back to `emails.body`, so what they see does not
+    /// change. No row is removed and no status is touched: triage decisions
+    /// are evaluation data (#448).
+    ///
+    /// At most `batch` rows per call, in one short transaction, so the
+    /// daemon's own writes are never held up for long. Returns what this
+    /// call dropped; zero rows means there is nothing left.
+    pub fn compact_action_bodies(&self, older_than_ms: i64, batch: usize) -> StoreResult<BodyCompaction> {
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction()?;
+        let picked: Vec<(String, i64)> = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT a.id, length(a.originalBody) {COMPACTABLE_BODY_FROM} LIMIT ?2"
+            ))?;
+            let rows = stmt.query_map(params![older_than_ms, batch as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut done = BodyCompaction::default();
+        {
+            let mut clear = tx.prepare("UPDATE actions SET originalBody = NULL WHERE id = ?1")?;
+            for (id, len) in &picked {
+                done.rows += clear.execute(params![id])? as u64;
+                done.bytes += *len as u64;
+            }
+        }
+        tx.commit()?;
+        Ok(done)
     }
 
     /// Run a closure with the locked connection. Used by extension traits in
@@ -4464,9 +4529,13 @@ impl Store {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let row: Option<ActionWithEmail> = guard
             .query_row(
+                // #1412 — a compacted row's body lives only in `emails`.
                 "SELECT \
                    a.id, a.messageId, a.threadId, a.fromEmail, a.subject, \
-                   a.originalBody, a.draftBody, a.status, a.errorMessage, \
+                   CASE WHEN a.originalBody IS NULL \
+                             AND a.status IN ('skipped', 'permanent_error') \
+                        THEN e.body ELSE a.originalBody END, \
+                   a.draftBody, a.status, a.errorMessage, \
                    a.createdAt, a.updatedAt, COALESCE(a.retryCount, 0), a.draftId, \
                    e.body, e.receivedAt, e.accountEntityId, e.platform, e.kind \
                  FROM actions a \

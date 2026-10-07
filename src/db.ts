@@ -375,6 +375,23 @@ export function updateActionRecipient(id: string, recipientEmail: string): boole
   return res.changes > 0;
 }
 
+// #1412 — the Rust daemon drops `actions.originalBody` from old terminal
+// actions when it only repeats `emails.body`. Same rule as the store's
+// `get_action_with_email`: for those statuses, a missing body reads from the
+// email, so the preview shows what it always showed.
+const COMPACTED_BODY_SQL =
+  "CASE WHEN a.originalBody IS NULL AND a.status IN ('skipped', 'permanent_error') THEN e.body END";
+
+type CompactableAction = ActionRecord & { compactedBody?: string | null };
+
+function withBody(row: CompactableAction): ActionRecord {
+  const { compactedBody, ...action } = row;
+  if (action.originalBody == null && compactedBody != null) {
+    action.originalBody = compactedBody;
+  }
+  return action;
+}
+
 export function getActions(opts: {
   limit?: number;
   offset?: number;
@@ -387,7 +404,7 @@ export function getActions(opts: {
   // a messageId that lives in emails, so the JOIN is effectively 1:1 but kept LEFT
   // to be defensive against any orphan rows.
   const baseSelect =
-    "SELECT a.*, e.platform AS platform, e.kind AS kind FROM actions a LEFT JOIN emails e ON a.messageId = e.messageId";
+    `SELECT a.*, e.platform AS platform, e.kind AS kind, ${COMPACTED_BODY_SQL} AS compactedBody FROM actions a LEFT JOIN emails e ON a.messageId = e.messageId`;
 
   const where: string[] = [];
   const params: unknown[] = [];
@@ -401,15 +418,19 @@ export function getActions(opts: {
   }
   const whereClause = where.length ? ` WHERE ${where.join(" AND ")}` : "";
 
-  return getDb()
+  const rows = getDb()
     .prepare(`${baseSelect}${whereClause} ORDER BY a.createdAt DESC LIMIT ? OFFSET ?`)
-    .all(...params, limit, offset) as ActionRecord[];
+    .all(...params, limit, offset) as CompactableAction[];
+  return rows.map(withBody);
 }
 
 export function getActionById(id: string): ActionRecord | undefined {
-  return getDb()
-    .prepare("SELECT * FROM actions WHERE id = ?")
-    .get(id) as ActionRecord | undefined;
+  const row = getDb()
+    .prepare(
+      `SELECT a.*, ${COMPACTED_BODY_SQL} AS compactedBody FROM actions a LEFT JOIN emails e ON a.messageId = e.messageId WHERE a.id = ?`
+    )
+    .get(id) as CompactableAction | undefined;
+  return row ? withBody(row) : undefined;
 }
 
 export function getActionCount(status?: ActionStatus, platform?: string): number {

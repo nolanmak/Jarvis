@@ -236,6 +236,7 @@ pub async fn run(
     // 17. build scratch — admission-limit validity and capacity (#1092)
     findings.push(check_build_scratch());
     findings.push(check_disk_filesystems());
+    findings.push(check_db_size());
     // 18. durable surface delivery — dead letters / unreconciled sends (#1285)
     if let Some(doc) = &status_doc {
         findings.push(check_surface_delivery(&doc.delivery));
@@ -1580,6 +1581,71 @@ fn check_disk_filesystems() -> Finding {
     disk_filesystems_finding(&crate::disk::read_filesystems(&root), crate::disk::gate_min_free_gb())
 }
 
+/// #1412 — how big the database is, what dominates it, and how much of it is
+/// action bodies that only repeat the stored email. Pure over the numbers.
+fn db_size_finding(total: u64, free: u64, dup_rows: u64, dup_bytes: u64, top: &[(String, u64)]) -> Finding {
+    const NAME: &str = "db_size";
+    let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+    let mut msg = format!("{:.0} MB ({:.0} MB free pages)", mb(total), mb(free));
+    if !top.is_empty() {
+        let tables: Vec<String> = top.iter().map(|(n, b)| format!("{n} {:.0} MB", mb(*b))).collect();
+        msg.push_str(&format!("; largest: {}", tables.join(", ")));
+    }
+    // Under a tenth of the file is not worth a line of anyone's attention;
+    // the daemon's hourly pass clears it anyway.
+    if dup_bytes * 10 >= total.max(1) {
+        return Finding::warn(
+            NAME,
+            format!("{msg}; {dup_rows} old terminal actions repeat their email's body ({:.0} MB)", mb(dup_bytes)),
+            Some("augmentagent db compact --dry-run"),
+        );
+    }
+    if free * 4 >= total.max(1) {
+        return Finding::warn(
+            NAME,
+            format!("{msg}; a quarter of the file is free pages"),
+            Some("augmentagent db compact --vacuum   # when the daemon is quiet"),
+        );
+    }
+    Finding::ok(NAME, msg)
+}
+
+fn check_db_size() -> Finding {
+    let db_path = std::env::var("AUGMENTAGENT_DB").unwrap_or_else(|_| "data.db".to_string());
+    let conn = match rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(c) => c,
+        Err(e) => return Finding::warn("db_size", format!("could not open {db_path}: {e}"), None),
+    };
+    let pragma = |name: &str| conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get::<_, i64>(0)).unwrap_or(0) as u64;
+    let page = pragma("page_size");
+    let (total, free) = (pragma("page_count") * page, pragma("freelist_count") * page);
+    let cutoff = crate::db_compact::retention_days()
+        .map(|d| crate::db_compact::cutoff_ms(chrono::Utc::now().timestamp_millis(), d));
+    // Same predicate as `Store::compact_action_bodies`; a database that
+    // predates either table simply has nothing to report.
+    let (dup_rows, dup_bytes) = cutoff
+        .and_then(|cutoff| {
+            conn.query_row(
+                "SELECT count(*), COALESCE(sum(length(a.originalBody)), 0) FROM actions a \
+                   JOIN emails e ON e.messageId = a.messageId \
+                  WHERE a.status IN ('skipped', 'permanent_error') AND a.originalBody IS NOT NULL \
+                    AND a.createdAt < ?1 AND e.body = a.originalBody",
+                [cutoff],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+            )
+            .ok()
+        })
+        .unwrap_or((0, 0));
+    // `dbstat` is a compile-time option of SQLite; without it, no breakdown.
+    let top: Vec<(String, u64)> = conn
+        .prepare("SELECT name, sum(pgsize) FROM dbstat GROUP BY name ORDER BY 2 DESC LIMIT 3")
+        .and_then(|mut st| {
+            st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?.collect()
+        })
+        .unwrap_or_default();
+    db_size_finding(total, free, dup_rows, dup_bytes, &top)
+}
+
 /// What doctor observed about the build scratch volume (#1092).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ScratchUsage {
@@ -2775,6 +2841,22 @@ mod tests {
             .as_deref()
             .unwrap()
             .starts_with("sudo usermod -aG kvm synthetic-user"));
+    }
+
+    #[test]
+    fn db_size_finding_flags_duplicated_bodies_then_free_pages() {
+        const MB: u64 = 1024 * 1024;
+        let top = [("actions".to_string(), 1800 * MB), ("emails".to_string(), 1300 * MB)];
+        let dup = db_size_finding(4000 * MB, 0, 33_895, 1478 * MB, &top);
+        assert_eq!(dup.severity, Severity::Warn, "{}", dup.message);
+        assert!(dup.message.contains("4000 MB"), "{}", dup.message);
+        assert!(dup.message.contains("largest: actions 1800 MB, emails 1300 MB"), "{}", dup.message);
+        assert!(dup.message.contains("33895 old terminal actions repeat their email's body (1478 MB)"), "{}", dup.message);
+        let free = db_size_finding(4000 * MB, 1500 * MB, 0, 0, &[]);
+        assert_eq!(free.severity, Severity::Warn);
+        assert!(free.message.contains("a quarter of the file is free pages"), "{}", free.message);
+        let fine = db_size_finding(2500 * MB, 10 * MB, 12, MB, &[]);
+        assert_eq!(fine.severity, Severity::Ok, "{}", fine.message);
     }
 
     #[test]

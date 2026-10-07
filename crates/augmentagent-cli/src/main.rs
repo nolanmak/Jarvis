@@ -82,6 +82,7 @@ mod autopr_health;
 mod channel_router;
 mod code_mode;
 mod doc_cmd;
+mod db_compact;
 mod deploy_snapshot;
 mod disk;
 mod doctor;
@@ -625,6 +626,11 @@ enum Cmd {
         #[command(subcommand)]
         op: AutoprOp,
     },
+    /// Database housekeeping (#1412).
+    Db {
+        #[command(subcommand)]
+        op: DbOp,
+    },
     /// Pre-deploy snapshots and their retention (#1410): the one supported
     /// way to back up the database and binary before a manual deploy.
     Deploy {
@@ -820,6 +826,25 @@ enum Cmd {
     // === end setup+maintenance subcommands ===
 }
 
+
+#[derive(Subcommand, Debug)]
+enum DbOp {
+    /// Drop `actions.originalBody` where it only repeats `emails.body`:
+    /// terminal no-reply actions older than
+    /// `AUGMENTAGENT_ACTION_BODY_RETENTION_DAYS` (default 30) whose email
+    /// row holds the identical text. No row or decision is removed, and
+    /// readers fall back to the email's body. The daemon does this hourly;
+    /// this is the on-demand pass.
+    Compact {
+        /// Report what would be dropped; change nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Also `VACUUM`, which is what actually shrinks the file. It
+        /// rewrites the whole database: run it when the daemon is quiet.
+        #[arg(long, default_value_t = false)]
+        vacuum: bool,
+    },
+}
 
 #[derive(Subcommand, Debug)]
 enum DeployOp {
@@ -3363,6 +3388,10 @@ async fn main() -> Result<()> {
             // Collect the enabled channels' runners + optional digest scheduler.
             let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
 
+            // #1412 — drop action bodies that only repeat the stored email,
+            // shortly after start and hourly, in small batches.
+            tasks.push(tokio::spawn(db_compact::run_loop(Arc::clone(&store), shutdown.clone())));
+
             // #1035 — reasoner handoff journals: remove finished ones idle past
             // the grace period, at start and hourly, on the blocking pool.
             // Never in-flight or uncertain ones; failures only log.
@@ -5091,6 +5120,9 @@ async fn main() -> Result<()> {
         Cmd::Loops { op } => loops::run(op).await,
         Cmd::Service { op, ref unit, json } => service::run_service(op, unit, json).await,
         Cmd::Setup { ref op } => setup::run_setup(op).await,
+        Cmd::Db { op: DbOp::Compact { dry_run, vacuum } } => {
+            db_compact::run_cli(&store, &db_path, dry_run, vacuum, &mut std::io::stdout().lock())
+        }
         Cmd::Status {
             json,
             channel,
