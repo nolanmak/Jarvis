@@ -443,7 +443,7 @@ apply_update "$REMOTE"
 if [ -n "$CHANGED_SYNC_SCRIPTS" ]; then
   SYNC_SCRIPT_LIST=$(printf '%s' "$CHANGED_SYNC_SCRIPTS" | tr '\n' ' ')
   log "data sync script changed in this pull; live for the next scheduled run: $SYNC_SCRIPT_LIST"
-  notify "data sync script updated: $SYNC_SCRIPT_LIST — live on the next scheduled run"
+  notify_owner "data sync script updated: $SYNC_SCRIPT_LIST — live on the next scheduled run"
 fi
 
 # --- Auto-register optional scheduled jobs once ----------------------------

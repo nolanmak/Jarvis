@@ -99,6 +99,39 @@ expect_silent() {
   rm -rf "$TMP"
 }
 
+# The reporting path must survive `set -euo pipefail`. A call to a function that
+# does not exist returns 127 and aborts the script mid-run, silently skipping
+# everything after it — including the auto-register block. Asserting on the log
+# alone misses this, because the log line is written BEFORE the notify call.
+expect_completes() {
+  make_case scripts/apple-notes/sync.py
+  ( cd "$TMP/work" \
+    && env -u DISCORD_WEBHOOK_URL PATH="$TMP/bin:$PATH" STUB_DIR="$TMP" \
+       XDG_STATE_HOME="$TMP/state" HOME="$TMP" AUGMENTAGENT_RESTART_FORCE=1 \
+       ./scripts/check-for-updates.sh >/dev/null 2>&1 )
+  local status=$?
+  if [ "$status" -eq 0 ]; then
+    ok "finishes the run cleanly after reporting a sync-script change"
+  else
+    bad "finishes the run cleanly after reporting a sync-script change" \
+        "exit $status; a call to an undefined function returns 127 and aborts under set -e"
+  fi
+  rm -rf "$TMP"
+}
+
+# Every function the reporting path calls must actually be defined in the script.
+expect_functions_defined() {
+  local missing=""
+  for fn in log notify_owner; do
+    grep -qE "^${fn}\(\)" "$REPO_ROOT/scripts/check-for-updates.sh" || missing="$missing $fn"
+  done
+  if [ -z "$missing" ]; then
+    ok "the reporting path's helper functions are defined"
+  else
+    bad "the reporting path's helper functions are defined" "undefined:$missing"
+  fi
+}
+
 echo "check-for-updates.sh data-sync-script reporting:"
 
 # Every script the cron jobs execute, directly or by import.
@@ -112,6 +145,9 @@ expect_reported scripts/imessage/imessage_sync.py
 expect_silent crates/augmentagent-channel-core/src/lib.rs
 expect_silent docs/IMESSAGE.md
 expect_silent src/dashboard.ts
+
+expect_completes
+expect_functions_defined
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
