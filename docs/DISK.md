@@ -95,6 +95,31 @@ A gate that would start with less than `AUGMENTAGENT_GATE_MIN_FREE_GB` free is
 refused as an infra failure: it is not charged to the builder, and a refusal
 during the baseline check is never recorded as a red `main`.
 
+## Deploy snapshots
+
+`augmentagent deploy snapshot --label <name>` is the supported way to back up
+before a manual deploy. It writes one dated dir under
+`~/.local/share/augmentagent/deploy-snapshots/` (override:
+`AUGMENTAGENT_DEPLOY_SNAPSHOT_DIR`) holding:
+
+- `data.db.gz` — taken with `VACUUM INTO`, so it is consistent while the
+  daemon runs, then compressed (about 3.5x smaller on a mail database);
+- `augmentagent` — the release binary;
+- `manifest.json` — time, label, commit, sizes.
+
+`deploy list` shows them. `deploy restore-db <name> --to <path>` writes the
+database back; stop the daemon first, and pass `--force` to replace a file.
+
+`deploy prune` keeps the newest `AUGMENTAGENT_DEPLOY_KEEP` (default 2) and
+anything younger than 48 hours, and applies the same rule to the
+`augmentagent.*` rollback binaries beside the release build. The newest is
+never removed. It runs after every verified update and with the daily timer.
+
+Backups made by hand before this existed (`deploy-backups/`,
+`deploy-artifacts/`, the state dir's `rollbacks/`) are left alone unless asked:
+`deploy prune --strays` lists the ones older than 7 days, and `--strays --yes`
+removes them, always keeping the newest in each place.
+
 ## Settings
 
 | Variable | Default | Meaning |
@@ -105,6 +130,8 @@ during the baseline check is never recorded as a red `main`.
 | `AUGMENTAGENT_GATE_MIN_FREE_GB` | 15 | Free-space floor for a gate; `0` disables |
 | `AUGMENTAGENT_GATE_CACHE_MAX_MB` | 20000 | Gate cache cap |
 | `AUGMENTAGENT_GATE_CACHE_STALE_DAYS` | 3 | Idle days before a cap trim may take an artifact |
+| `AUGMENTAGENT_DEPLOY_KEEP` | 2 | Deploy snapshots and rollback binaries kept regardless of age |
+| `AUGMENTAGENT_DEPLOY_SNAPSHOT_DIR` | data dir | Where deploy snapshots are written |
 
 ## Install the timer
 

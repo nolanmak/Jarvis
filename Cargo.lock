@@ -1019,6 +1019,7 @@ dependencies = [
  "cron",
  "dashmap 6.1.0",
  "dotenvy",
+ "flate2",
  "futures",
  "insta",
  "libc",
