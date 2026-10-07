@@ -94,6 +94,7 @@ mod finance;
 mod handoff_prune;
 mod heartbeat_cmd;
 mod installers;
+mod log_rotate;
 mod logs;
 mod newsletter;
 mod notify;
@@ -625,6 +626,21 @@ enum Cmd {
     Autopr {
         #[command(subcommand)]
         op: AutoprOp,
+    },
+    /// Rotate and compress the state dir's logs and append-only sinks
+    /// (#1413): anything at `AUGMENTAGENT_LOG_ROTATE_MB` (default 50) or
+    /// not rotated since last month. Rotated files are kept for
+    /// `AUGMENTAGENT_LOG_KEEP_MONTHS` (default 3).
+    LogRotate {
+        /// Report what would happen; change nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Machine-readable output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Rotate this dir instead of the state dir.
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
     },
     /// Database housekeeping (#1412).
     Db {
@@ -2776,6 +2792,14 @@ async fn main() -> Result<()> {
     if let Cmd::Newsletter { ref op } = cli.cmd {
         return newsletter::run(op).await;
     }
+    // Log rotation needs no database.
+    if let Cmd::LogRotate { dry_run, json, ref dir } = cli.cmd {
+        let dir = dir
+            .clone()
+            .or_else(augmentagent_channel_core::state_dir::state_dir)
+            .context("no --dir and no HOME to locate the state dir")?;
+        return log_rotate::run_cli(&dir, dry_run, json, false, &mut std::io::stdout().lock());
+    }
     // Snapshots read the database file directly; they must not open (and
     // migrate) it through the store.
     if let Cmd::Deploy { ref op } = cli.cmd {
@@ -4092,6 +4116,7 @@ async fn main() -> Result<()> {
         Cmd::HandoffPrune { .. } => unreachable!("handled before database initialization"),
         Cmd::Disk { .. } => unreachable!("handled before database initialization"),
         Cmd::Deploy { .. } => unreachable!("handled before database initialization"),
+        Cmd::LogRotate { .. } => unreachable!("handled before database initialization"),
         Cmd::Gmail { ref op } => match op {
             GmailOp::Search { query, limit, full, account } => {
                 run_gmail_search(store, query.clone(), *limit, *full, account.clone()).await
@@ -5042,7 +5067,8 @@ async fn main() -> Result<()> {
         Cmd::TokenUsage { days, json } => {
             use augmentagent_channel_core::token_usage as tu;
             let path = tu::default_usage_log_path();
-            let raw = std::fs::read_to_string(&path).unwrap_or_default();
+            // #1413 — a report window can straddle a rotation.
+            let raw = log_rotate::read_with_rotated(&path);
             let mut rolled = tu::rollup(&raw);
             if rolled.len() > days as usize {
                 rolled.drain(..rolled.len() - days as usize);

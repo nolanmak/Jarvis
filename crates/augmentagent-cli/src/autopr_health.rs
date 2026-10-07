@@ -480,20 +480,6 @@ pub fn report(findings: &[Finding]) -> Option<String> {
 // Collection
 // ---------------------------------------------------------------------------
 
-/// The last `max` bytes of a file — the daemon log is hundreds of MB and only
-/// its tail is ever relevant.
-fn tail_bytes(path: &Path, max: u64) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    if len > max {
-        f.seek(SeekFrom::Start(len - max)).ok()?;
-    }
-    let mut buf = Vec::new();
-    f.take(max).read_to_end(&mut buf).ok()?;
-    Some(String::from_utf8_lossy(&buf).into_owned())
-}
-
 /// Drop ANSI SGR sequences. The daemon writes coloured tracing output, so a
 /// raw log line carries escapes in the middle of the text — they broke both
 /// timestamp parsing and the refusal grouping until this existed.
@@ -786,7 +772,10 @@ fn last_merge(repo_root: &Path) -> Option<DateTime<Utc>> {
 pub fn collect(repo_root: &Path) -> HealthInputs {
     let now = Utc::now();
     let dir = state_dir();
-    let log = tail_bytes(&dir.join("stderr.log"), 4 * 1024 * 1024).unwrap_or_default();
+    // #1413 — right after a rotation the live log is nearly empty; the tail
+    // of the rotated one keeps the last hours in view.
+    let log = crate::log_rotate::tail_with_rotated(&dir.join("stderr.log"), 4 * 1024 * 1024)
+        .unwrap_or_default();
     let gate_dir = std::env::var("AUGMENTAGENT_GATE_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {

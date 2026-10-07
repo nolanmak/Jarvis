@@ -146,6 +146,27 @@ augmentagent db compact --vacuum      # drop it and shrink the file; run when qu
 much is reclaimable. Deploy snapshots are compact regardless: `VACUUM INTO`
 never copies free pages.
 
+## Logs
+
+Every unit appends to a log in the state dir and the in-process sinks
+(`tool-audit.log`, `token-usage.jsonl`) append forever. `augmentagent
+log-rotate` runs with the daily timer:
+
+- a file is rotated once it reaches `AUGMENTAGENT_LOG_ROTATE_MB`, or once a
+  calendar month has passed since it was last rotated (or created);
+- rotated files are gzip-compressed as `<name>.<YYYYMMDD>.gz` and kept for
+  `AUGMENTAGENT_LOG_KEEP_MONTHS`, then deleted.
+
+A file nobody holds open is renamed, which is atomic and loses nothing; the
+next writer creates a fresh file. That covers the timer units and the sinks.
+A file a process holds open (the daemon's own stdout and stderr) is copied
+and then truncated in place, and a line written in the instant between the
+two can be lost. A held `.jsonl` is skipped rather than risk half a record.
+
+Readers that look back across a rotation still work: `token-usage` reads the
+kept rotations too, and `autopr-health` takes the tail of the newest rotation
+when the live log is shorter than its window.
+
 ## Settings
 
 | Variable | Default | Meaning |
@@ -157,6 +178,8 @@ never copies free pages.
 | `AUGMENTAGENT_GATE_CACHE_MAX_MB` | 20000 | Gate cache cap |
 | `AUGMENTAGENT_GATE_CACHE_STALE_DAYS` | 3 | Idle days before a cap trim may take an artifact |
 | `AUGMENTAGENT_ACTION_BODY_RETENTION_DAYS` | 30 | Days a terminal action keeps its own copy of the body; `0` disables compaction |
+| `AUGMENTAGENT_LOG_ROTATE_MB` | 50 | Size at which a log is rotated regardless of age |
+| `AUGMENTAGENT_LOG_KEEP_MONTHS` | 3 | Months a rotated log is kept locally |
 | `AUGMENTAGENT_DEPLOY_KEEP` | 2 | Deploy snapshots and rollback binaries kept regardless of age |
 | `AUGMENTAGENT_DEPLOY_SNAPSHOT_DIR` | data dir | Where deploy snapshots are written |
 
