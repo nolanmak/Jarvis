@@ -12,6 +12,10 @@ EnvironmentFile=-%h/AugmentAgent/.env
 ExecStart=%h/AugmentAgent/target/release/augmentagent disk prune
 # #1413 — rotate and compress the state dir's logs and sinks.
 ExecStart=%h/AugmentAgent/target/release/augmentagent log-rotate
+# #1414 — push rotated logs to the private ops archive. A no-op unless
+# AUGMENTAGENT_OPS_ARCHIVE_REMOTE is set. `-`: a failed push (offline) must not
+# stop the housekeeping that follows.
+ExecStart=-%h/AugmentAgent/target/release/augmentagent ops-archive sync
 # #1410 — the same pass expires old deploy snapshots and rollback binaries.
 ExecStart=%h/AugmentAgent/target/release/augmentagent deploy prune
 # Housekeeping must not compete with a build for the disk or the CPU.

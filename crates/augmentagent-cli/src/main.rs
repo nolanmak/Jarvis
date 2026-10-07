@@ -96,6 +96,7 @@ mod heartbeat_cmd;
 mod installers;
 mod log_rotate;
 mod logs;
+mod ops_archive;
 mod newsletter;
 mod notify;
 mod loop_cmd;
@@ -642,6 +643,13 @@ enum Cmd {
         #[arg(long)]
         dir: Option<std::path::PathBuf>,
     },
+    /// Private archive of rotated logs and audit sinks (#1414). Off unless
+    /// `AUGMENTAGENT_OPS_ARCHIVE_REMOTE` names a GitHub repo, which must be
+    /// PRIVATE.
+    OpsArchive {
+        #[command(subcommand)]
+        op: OpsArchiveOp,
+    },
     /// Database housekeeping (#1412).
     Db {
         #[command(subcommand)]
@@ -842,6 +850,21 @@ enum Cmd {
     // === end setup+maintenance subcommands ===
 }
 
+
+#[derive(Subcommand, Debug)]
+enum OpsArchiveOp {
+    /// Commit every rotated log not yet archived and push. Refuses a remote
+    /// that is not PRIVATE; skips a file that holds a secret; deletes local
+    /// rotations past `AUGMENTAGENT_LOG_KEEP_MONTHS` once the push succeeds.
+    Sync {
+        /// Report what would be archived; copy and push nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Machine-readable output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
 
 #[derive(Subcommand, Debug)]
 enum DbOp {
@@ -2798,7 +2821,12 @@ async fn main() -> Result<()> {
             .clone()
             .or_else(augmentagent_channel_core::state_dir::state_dir)
             .context("no --dir and no HOME to locate the state dir")?;
-        return log_rotate::run_cli(&dir, dry_run, json, false, &mut std::io::stdout().lock());
+        // With the archive on, it takes expired rotations before they go.
+        let archive_on = ops_archive::remote_from_env().is_some();
+        return log_rotate::run_cli(&dir, dry_run, json, archive_on, &mut std::io::stdout().lock());
+    }
+    if let Cmd::OpsArchive { op: OpsArchiveOp::Sync { dry_run, json } } = cli.cmd {
+        return ops_archive::run_cli(dry_run, json, &mut std::io::stdout().lock());
     }
     // Snapshots read the database file directly; they must not open (and
     // migrate) it through the store.
@@ -4117,6 +4145,7 @@ async fn main() -> Result<()> {
         Cmd::Disk { .. } => unreachable!("handled before database initialization"),
         Cmd::Deploy { .. } => unreachable!("handled before database initialization"),
         Cmd::LogRotate { .. } => unreachable!("handled before database initialization"),
+        Cmd::OpsArchive { .. } => unreachable!("handled before database initialization"),
         Cmd::Gmail { ref op } => match op {
             GmailOp::Search { query, limit, full, account } => {
                 run_gmail_search(store, query.clone(), *limit, *full, account.clone()).await

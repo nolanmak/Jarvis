@@ -600,7 +600,7 @@ fn gate_disk_guard() -> Result<()> {
 
 /// True if an env-var name looks like a provider secret (case-insensitive
 /// substring match against [`GATE_SECRET_ENV_SUBSTRINGS`]).
-fn env_name_is_secret(name: &str) -> bool {
+pub(crate) fn env_name_is_secret(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     GATE_SECRET_ENV_SUBSTRINGS
         .iter()
