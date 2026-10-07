@@ -1,5 +1,5 @@
 [Unit]
-Description=Prune cold build output daily
+Description=Daily AugmentAgent housekeeping (build output, temp files, logs, deploy snapshots)
 
 [Timer]
 # Wall-clock, so a suspended laptop catches up instead of drifting.
