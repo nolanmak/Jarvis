@@ -813,6 +813,162 @@ pub fn run_status(repo_root: &Path, json: bool, out: &mut dyn Write) -> Result<(
 }
 
 // ---------------------------------------------------------------------------
+// Temp-dir leftovers (#1411).
+// ---------------------------------------------------------------------------
+//
+// A test process that is killed (a timeout, Ctrl-C, an OOM) never runs its
+// destructors, so its `tempfile` entries stay behind: `.tmpXXXXXX` SQLite
+// files with their `-wal`/`-shm` sidecars, and whole `.tmpXXXXXX` dirs. A
+// clean run leaves nothing, which is why no change to the tests fixes this.
+// The OS ages the temp dir out on its own schedule (30 days is a common
+// default); several GB accumulate in between.
+
+/// One entry directly in the temp dir.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TmpEntry {
+    pub name: String,
+    pub is_dir: bool,
+    /// Owned by the current user.
+    pub owned: bool,
+    /// Days since the newest write to it (for a dir: to it or a direct child).
+    pub idle_days: f64,
+    pub bytes: u64,
+}
+
+/// A database's sidecars are swept with it after this long without a write.
+pub const TMP_SQLITE_DAYS: f64 = 1.0;
+/// A leftover temp dir needs longer: a live process may keep one by path.
+pub const TMP_DIR_DAYS: f64 = 7.0;
+
+/// `.tmp` + six alphanumerics: the `tempfile` crate's default name.
+pub fn is_tempfile_name(name: &str) -> bool {
+    name.strip_prefix(".tmp")
+        .is_some_and(|rest| rest.len() == 6 && rest.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+/// Names in `entries` that are leftovers of a dead process.
+///
+/// `in_use(name)` says whether any running process holds the entry open (or
+/// sits inside it); `None` means that cannot be told on this platform, and
+/// then only sidecars whose database is already gone are taken.
+pub fn temp_orphans(entries: &[TmpEntry], in_use: Option<&dyn Fn(&str) -> bool>) -> Vec<String> {
+    let by_name: HashMap<&str, &TmpEntry> = entries.iter().map(|e| (e.name.as_str(), e)).collect();
+    let free = |name: &str| in_use.is_some_and(|f| !f(name));
+    let mut out: Vec<String> = Vec::new();
+    for e in entries.iter().filter(|e| e.owned) {
+        let sidecar_of = e
+            .name
+            .strip_suffix("-wal")
+            .or_else(|| e.name.strip_suffix("-shm"))
+            .filter(|main| is_tempfile_name(main));
+        if let Some(main) = sidecar_of {
+            if e.is_dir || e.idle_days < TMP_SQLITE_DAYS {
+                continue;
+            }
+            match by_name.get(main) {
+                // The database was deleted and its sidecars were not: nothing
+                // can open them again.
+                None => out.push(e.name.clone()),
+                // The database is still there. It goes, with its sidecars,
+                // only when it is as old and provably closed everywhere.
+                Some(db) if db.owned && db.idle_days >= TMP_SQLITE_DAYS && free(main) => {
+                    out.push(e.name.clone());
+                    out.push(main.to_string());
+                }
+                Some(_) => {}
+            }
+        } else if e.is_dir
+            && is_tempfile_name(&e.name)
+            && e.idle_days >= TMP_DIR_DAYS
+            && free(&e.name)
+        {
+            out.push(e.name.clone());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn read_tmp_entries(dir: &Path, now: SystemTime) -> Vec<TmpEntry> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    read_dir_paths(dir)
+        .into_iter()
+        .filter_map(|path| {
+            let name = path.file_name()?.to_str()?.to_string();
+            // Only names this sweep could ever act on are worth a stat.
+            let base = name.strip_suffix("-wal").or_else(|| name.strip_suffix("-shm")).unwrap_or(&name);
+            if !is_tempfile_name(base) {
+                return None;
+            }
+            let meta = std::fs::symlink_metadata(&path).ok()?;
+            if meta.file_type().is_symlink() {
+                return None;
+            }
+            let is_dir = meta.is_dir();
+            let touch = if is_dir { last_touch_shallow(&path) } else { last_touch(&path) }?;
+            Some(TmpEntry {
+                is_dir,
+                owned: meta.uid() == uid,
+                idle_days: idle_days(now, touch),
+                bytes: if is_dir { disk_bytes(&path) } else { meta.blocks().saturating_mul(512) },
+                name,
+            })
+        })
+        .collect()
+}
+
+/// Every path under `dir` some running process has open or sits in.
+/// `None` without a readable `/proc`.
+fn open_paths_under(dir: &Path) -> Option<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        if !entry.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let proc_dir = entry.path();
+        let links = read_dir_paths(&proc_dir.join("fd"))
+            .into_iter()
+            .chain([proc_dir.join("cwd")])
+            .filter_map(|l| std::fs::read_link(l).ok());
+        out.extend(links.filter(|t| t.starts_with(dir)));
+    }
+    Some(out)
+}
+
+/// Sweep dead processes' `tempfile` leftovers out of `dir`.
+pub fn sweep_temp_dir(dir: &Path, dry_run: bool, now: SystemTime) -> RootReport {
+    let entries = read_tmp_entries(dir, now);
+    let open = open_paths_under(dir);
+    let in_use = |name: &str| {
+        let path = dir.join(name);
+        open.as_ref().is_some_and(|paths| paths.iter().any(|p| p.starts_with(&path)))
+    };
+    let probe: Option<&dyn Fn(&str) -> bool> = if open.is_some() { Some(&in_use) } else { None };
+    let orphans = temp_orphans(&entries, probe);
+    let sizes: HashMap<&str, u64> = entries.iter().map(|e| (e.name.as_str(), e.bytes)).collect();
+    let mut report = RootReport {
+        label: "temp dir".into(),
+        path: dir.display().to_string(),
+        outcome: String::new(),
+        removed: 0,
+        freed_bytes: 0,
+        full_drop: false,
+    };
+    for name in &orphans {
+        if dry_run || remove(&dir.join(name)) {
+            report.removed += 1;
+            report.freed_bytes += sizes.get(name.as_str()).copied().unwrap_or(0);
+        }
+    }
+    let verb = if dry_run { "would remove" } else { "removed" };
+    report.outcome = format!("{verb} {} leftovers of dead processes", report.removed);
+    report
+}
+
+// ---------------------------------------------------------------------------
 // Run.
 // ---------------------------------------------------------------------------
 
@@ -1007,6 +1163,11 @@ pub fn run_prune(repo_root: &Path, opts: &Options, out: &mut dyn Write) -> Resul
         reports.push(prune_root(root, busy, opts, &policy, now));
     }
 
+    // #1411 — only on a discovering run: `--root` names target dirs.
+    if opts.roots.is_empty() {
+        reports.push(sweep_temp_dir(&std::env::temp_dir(), opts.dry_run, now));
+    }
+
     if opts.json {
         writeln!(out, "{}", serde_json::to_string_pretty(&reports)?)?;
     } else {
@@ -1022,7 +1183,7 @@ pub fn run_prune(repo_root: &Path, opts: &Options, out: &mut dyn Write) -> Resul
         }
         let total: u64 = reports.iter().map(|r| r.freed_bytes).sum();
         let verb = if opts.dry_run { "would free" } else { "freed" };
-        writeln!(out, "{verb} {} across {} target dirs", fmt_gb(total), reports.len())?;
+        writeln!(out, "{verb} {} across {} dirs", fmt_gb(total), reports.len())?;
     }
     Ok(())
 }
@@ -1275,6 +1436,92 @@ mod tests {
         for label in ["/", "the temp dir", "the gate target", "the release target"] {
             assert!(watched.iter().any(|(l, _)| l == label), "{label} not watched");
         }
+    }
+
+    fn tmp(name: &str, is_dir: bool, idle: f64) -> TmpEntry {
+        TmpEntry { name: name.into(), is_dir, owned: true, idle_days: idle, bytes: 1 }
+    }
+
+    #[test]
+    fn tempfile_names_are_recognised_exactly() {
+        assert!(is_tempfile_name(".tmpDanFto"));
+        assert!(!is_tempfile_name(".tmpDanFt"), "five characters");
+        assert!(!is_tempfile_name(".tmpDanFto-wal"), "a sidecar is not the database");
+        assert!(!is_tempfile_name("tmpDanFto"));
+        assert!(!is_tempfile_name(".tmp.dotnet"));
+    }
+
+    #[test]
+    fn sidecars_of_a_deleted_database_go_after_a_day() {
+        let entries = [
+            tmp(".tmpAAAAAA-wal", false, 3.0),
+            tmp(".tmpAAAAAA-shm", false, 3.0),
+            tmp(".tmpBBBBBB-wal", false, 0.2), // a test running right now
+            tmp("data.db-wal", false, 30.0),   // not a tempfile name: never ours
+        ];
+        // Taken even where open files cannot be listed: with the database
+        // gone, nothing can open them again.
+        assert_eq!(temp_orphans(&entries, None), [".tmpAAAAAA-shm", ".tmpAAAAAA-wal"]);
+    }
+
+    #[test]
+    fn a_surviving_database_goes_only_when_old_and_closed_everywhere() {
+        let entries = [
+            tmp(".tmpAAAAAA", false, 3.0),
+            tmp(".tmpAAAAAA-wal", false, 3.0),
+            tmp(".tmpBBBBBB", false, 3.0),
+            tmp(".tmpBBBBBB-wal", false, 3.0),
+            tmp(".tmpCCCCCC", false, 9.0), // no sidecars: not provably SQLite, left to the OS
+        ];
+        let open_b = |name: &str| name == ".tmpBBBBBB";
+        assert_eq!(temp_orphans(&entries, Some(&open_b)), [".tmpAAAAAA", ".tmpAAAAAA-wal"]);
+        assert!(temp_orphans(&entries, None).is_empty(), "cannot prove it is closed: keep it");
+    }
+
+    #[test]
+    fn a_leftover_temp_dir_needs_a_week_and_no_process_inside() {
+        let entries = [
+            tmp(".tmpOLDDIR", true, 9.0),
+            tmp(".tmpNEWDIR", true, 2.0),
+            tmp(".tmpINUSE1", true, 9.0),
+            TmpEntry { owned: false, ..tmp(".tmpOTHERS", true, 9.0) },
+            tmp("systemd-private-x", true, 90.0),
+        ];
+        let in_use = |name: &str| name == ".tmpINUSE1";
+        assert_eq!(temp_orphans(&entries, Some(&in_use)), [".tmpOLDDIR"]);
+        assert!(temp_orphans(&entries, None).is_empty());
+    }
+
+    #[test]
+    fn the_sweep_removes_orphans_from_a_real_dir_and_nothing_else() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let d = tmp_dir.path();
+        for (name, days) in [
+            (".tmpAAAAAA-wal", 3.0),
+            (".tmpAAAAAA-shm", 3.0),
+            (".tmpBBBBBB-wal", 0.0),
+            ("keep.txt", 90.0),
+        ] {
+            write(&d.join(name), 4096);
+            age(&d.join(name), days);
+        }
+        let held = d.join(".tmpHELD00");
+        write(&held, 4096);
+        write(&d.join(".tmpHELD00-wal"), 4096);
+        age(&held, 3.0);
+        age(&d.join(".tmpHELD00-wal"), 3.0);
+        let _fd = std::fs::File::open(&held).unwrap();
+
+        let dry = sweep_temp_dir(d, true, SystemTime::now());
+        assert_eq!(dry.removed, 2, "{dry:?}");
+        assert!(d.join(".tmpAAAAAA-wal").exists());
+
+        let real = sweep_temp_dir(d, false, SystemTime::now());
+        assert_eq!(real.removed, 2);
+        assert!(!d.join(".tmpAAAAAA-wal").exists() && !d.join(".tmpAAAAAA-shm").exists());
+        assert!(d.join(".tmpBBBBBB-wal").exists(), "written today");
+        assert!(d.join("keep.txt").exists());
+        assert!(held.exists() && d.join(".tmpHELD00-wal").exists(), "this process has it open");
     }
 
     // ---- filesystem-backed: a synthetic profile dir, never a real build ----
