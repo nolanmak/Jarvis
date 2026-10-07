@@ -268,8 +268,10 @@ pub static PRODUCERS: &[Producer] = &[
     act(p("loop_output_slack", "crates/augmentagent-channel-slack/src/commands/loops.rs", "impl LoopPoster for", 2, LOOP, "loop results and reminders on Slack")),
     act(p("loop_output_discord", CLI, "impl LoopPoster for", 1, LOOP, "loop results and reminders on Discord")),
     // -- Replies, interaction responses and Discord-only posts ---------------
-    p("discord_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "send_message(&", 8, REPLY, "query answers, command replies, redraft notices"),
-    p("discord_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "CreateMessage::new(", 6, REPLY, "query answers, command replies"),
+    // #1396's interrupted-turn notice stays `REPLY`: it posts in the owner
+    // channel the dead turn came from, referencing the owner's own message.
+    p("discord_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "send_message(&", 9, REPLY, "query answers, command replies, redraft and interrupted-turn notices"),
+    p("discord_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "CreateMessage::new(", 7, REPLY, "query answers, command replies, interrupted-turn notices"),
     p("voice_bridge", "crates/augmentagent-approval-discord/src/voice_bridge.rs", "send_message(&", 6, REPLY, "Discord voice transcripts in the voice channel"),
     p("voice_bridge", "crates/augmentagent-approval-discord/src/voice_bridge.rs", "CreateMessage::new(", 7, REPLY, "Discord voice transcripts in the voice channel"),
     p("cli_discord_posts", CLI, "send_message(&", 7, Route::DiscordOnly("explicit `--post` Discord commands (compose/propose cards, wiki ask --post) and Discord loop output"), "one-shot Discord posts"),
