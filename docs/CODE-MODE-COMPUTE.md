@@ -111,6 +111,11 @@ files named `audit-<executionId>-prepare.stdout` and `.stderr`. Their bytes and
 SHA-256 are verified when the CLI copies the audit. Raw installer logs do not
 appear in the public compute result. A reuse hit has `preparation: null` and
 zero registry requests.
+Each execution record also contains a canonical `policy` snapshot and its
+`policyFingerprint`, covering host budgets, request limits and the embedded
+compute/gateway helper hashes. `phases` records contiguous monotonic admission,
+preparation, execution and export intervals for the work that actually occurred.
+Compare these with the unchanged task deadline when diagnosing budget exhaustion.
 
 Production artifacts belong to the originating account/task and expire after
 24 hours if unclaimed. Startup recovery and the 30-second sweep remove expired

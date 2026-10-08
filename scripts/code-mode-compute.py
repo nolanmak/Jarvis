@@ -552,6 +552,18 @@ class ComputeTask:
         self.call_timeout = call_timeout
         self.clock = clock
         self.deadline = bound_host_deadline(clock() + task_timeout, host_deadline)
+        implementation = {}
+        for name in ('code-mode-compute.py', 'code-mode-compute-guest.py',
+                     'code-mode-compute-prepare.py', 'build-dependency-proxy.py',
+                     'codex-build-vm.py', 'codex-tool-bridge.py', 'provider-supervisor.py'):
+            implementation[name] = hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+        self.policy = {'version': 1, 'enabled': enabled, 'callTimeoutSecs': call_timeout,
+                       'taskTimeoutSecs': task_timeout, 'implementation': implementation,
+                       'maxSourceBytes': MAX_SOURCE, 'maxDirectPackages': MAX_PACKAGES,
+                       'maxFiles': MAX_FILES, 'maxInputBytes': MAX_INPUT_BYTES,
+                       'maxOutputBytes': MAX_OUTPUT_BYTES, 'maxOutputFileBytes': MAX_FILE_BYTES}
+        self.policy_fingerprint = hashlib.sha256(json.dumps(self.policy, sort_keys=True,
+                                                           separators=(',', ':')).encode()).hexdigest()
         self.environments = {}
         self.records = []
         self.task_id = uuid.uuid4().hex
@@ -592,8 +604,16 @@ class ComputeTask:
             deny('resource_limit', 'Compute audit metadata limit exceeded.')
         self._private_write('audit.json', data, replace=True)
 
+    def _end_phase(self, ended):
+        started = self.active['phaseStartedMonotonic']
+        self.active['phases'].append({'phase': self.active['phase'], 'startedMonotonic': started,
+                                      'endedMonotonic': ended, 'elapsedSecs': ended - started})
+
     def _phase(self, name):
+        now = self.clock()
+        self._end_phase(now)
         self.active['phase'] = name
+        self.active['phaseStartedMonotonic'] = now
         self._audit()
 
     def _logs(self, execution_id, executed):
@@ -649,7 +669,8 @@ class ComputeTask:
         logs = {}
         preparation = None
         preparation_started = None
-        self.active = {'executionId': execution_id, 'phase': 'admission', 'startedMonotonic': started}
+        self.active = {'executionId': execution_id, 'phase': 'admission', 'startedMonotonic': started,
+                       'phaseStartedMonotonic': started, 'phases': []}
         self._audit()
         try:
             if not self.enabled:
@@ -658,7 +679,7 @@ class ComputeTask:
                 deny('timeout', 'Compute deadline expired before admission.')
             selected = self.artifacts.resolve_inputs(request['inputs'])
             fingerprint = self.backend.fingerprint
-            key = json.dumps([request['dependencies'], fingerprint, 1], separators=(',', ':'))
+            key = json.dumps([request['dependencies'], fingerprint, self.policy_fingerprint], separators=(',', ':'))
             with self.backend.admit(deadline):
                 environment = self.environments.get(key)
                 if environment is None:
@@ -722,12 +743,16 @@ class ComputeTask:
             result['error'] = {'code': code, 'message': 'Compute execution interrupted.', 'retryable': False}
             raise
         finally:
+            ended = self.clock()
+            self._end_phase(ended)
             self.records.append({'executionId': execution_id, 'taskId': self.task_id,
                                  'startedMonotonic': started, 'deadlineMonotonic': deadline,
                                  'taskDeadlineMonotonic': self.deadline,
                                  'runner': result['runner'], 'runtimeFingerprint': fingerprint,
+                                 'policy': self.policy, 'policyFingerprint': self.policy_fingerprint,
+                                 'phases': self.active['phases'],
                                  'dependencyLock': result['dependencyLock'], 'environmentReused': result['environmentReused'],
-                                 'downloads': downloads, 'elapsedSecs': self.clock() - started,
+                                 'downloads': downloads, 'elapsedSecs': ended - started,
                                  'cleanupVerified': cleanup, 'error': result['error'],
                                  'logs': logs, 'preparation': preparation, 'artifacts': result['artifacts']})
             self.active = None

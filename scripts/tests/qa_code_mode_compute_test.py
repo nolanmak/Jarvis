@@ -35,6 +35,39 @@ class EvidenceContractTests(unittest.TestCase):
 
 
 class HarnessExecutionTests(unittest.TestCase):
+    def test_policy_timing_audit_rejects_inconsistent_metadata(self):
+        import copy
+        import hashlib
+        import json
+        import tempfile
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        policy = {'enabled': True, 'callTimeoutSecs': 90, 'taskTimeoutSecs': 180,
+                  'implementation': {name: qa.digest(qa.REPO / 'scripts' / name) for name in
+                    ('code-mode-compute.py', 'code-mode-compute-guest.py', 'code-mode-compute-prepare.py', 'build-dependency-proxy.py',
+                     'codex-build-vm.py', 'codex-tool-bridge.py', 'provider-supervisor.py')}}
+        fingerprint = hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        rows = []
+        for names in [('admission', 'prepare'), ('admission', 'prepare', 'execute', 'export'), ('admission', 'execute', 'export')]:
+            rows.append({'policy': policy, 'policyFingerprint': fingerprint, 'startedMonotonic': 0,
+                         'deadlineMonotonic': 90, 'taskDeadlineMonotonic': 180, 'elapsedSecs': len(names),
+                         'phases': [{'phase': name, 'startedMonotonic': i, 'endedMonotonic': i+1, 'elapsedSecs': 1}
+                                    for i, name in enumerate(names)]})
+        with tempfile.TemporaryDirectory() as tmp, patch.object(qa, 'preparation_audit', lambda *_: None):
+            report = Path(tmp) / 'report.json'
+            h = SimpleNamespace(results={'fixture': {'report': str(report)}})
+            report.write_text(json.dumps({'records': rows}))
+            qa.policy_timings_audit(h, 'fixture')
+            for mutation in ('fingerprint', 'gap', 'elapsed', 'deadline'):
+                bad = copy.deepcopy(rows)
+                if mutation == 'fingerprint': bad[0]['policyFingerprint'] = '0' * 64
+                if mutation == 'gap': bad[0]['phases'][1]['startedMonotonic'] += 1
+                if mutation == 'elapsed': bad[1]['elapsedSecs'] += 1
+                if mutation == 'deadline': bad[2]['taskDeadlineMonotonic'] += 1
+                report.write_text(json.dumps({'records': bad}))
+                with self.subTest(mutation=mutation), self.assertRaises(AssertionError):
+                    qa.policy_timings_audit(h, 'fixture')
+
     def test_preparation_audit_is_registered_for_real_cli_acceptance(self):
         self.assertIn('preparation_audit', qa.CASES)
 

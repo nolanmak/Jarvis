@@ -306,6 +306,41 @@ def xlsx(h, name):
     h.cli(name, (FIXTURES / 'sum-xlsx.ts').read_text(), files={'sheet': (FIXTURES / 'numbers.xlsx').read_bytes()}, verify=verify)
 
 
+def policy_timings_audit(h, name):
+    preparation_audit(h, name)
+    value = json.loads(Path(h.results[name]['report']).read_text())
+    rows = value['records']
+    fingerprints = set()
+    expected_phases = [['admission', 'prepare'], ['admission', 'prepare', 'execute', 'export'],
+                       ['admission', 'execute', 'export']]
+    for row, names in zip(rows, expected_phases):
+        policy = row['policy']
+        fingerprint = hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        checked(fingerprint == row['policyFingerprint'], 'policy fingerprint does not match policy metadata')
+        fingerprints.add(fingerprint)
+        checked(policy['enabled'] is True and policy['callTimeoutSecs'] == 90 and policy['taskTimeoutSecs'] == 180,
+                'policy does not record enforced host settings')
+        expected = {filename: digest(REPO / 'scripts' / filename) for filename in
+                    ('code-mode-compute.py', 'code-mode-compute-guest.py', 'code-mode-compute-prepare.py', 'build-dependency-proxy.py',
+                     'codex-build-vm.py', 'codex-tool-bridge.py', 'provider-supervisor.py')}
+        checked(policy['implementation'] == expected, 'binary helper policy differs from the QA source tree')
+        checked([phase['phase'] for phase in row['phases']] == names, 'phase sequence does not match observed work')
+        previous = row['startedMonotonic']
+        for phase in row['phases']:
+            checked(phase['startedMonotonic'] == previous and phase['endedMonotonic'] >= previous,
+                    'phase timings contain a gap or moved backward')
+            checked(abs(phase['elapsedSecs'] - (phase['endedMonotonic'] - previous)) < .000001,
+                    'phase elapsed time differs from monotonic timestamps')
+            previous = phase['endedMonotonic']
+        checked(abs(previous - row['startedMonotonic'] - row['elapsedSecs']) < .000001,
+                'phase totals do not cover the call')
+        checked(row['deadlineMonotonic'] <= row['taskDeadlineMonotonic']
+                and row['deadlineMonotonic'] - row['startedMonotonic'] <= 90,
+                'call deadline exceeded host policy')
+    checked(len(fingerprints) == 1, 'policy changed across task calls')
+    checked(len({row['taskDeadlineMonotonic'] for row in rows}) == 1, 'task deadline reset across calls')
+
+
 def preparation_audit(h, name):
     checked(h.args.public_packages, 'preparation audit requires --public-packages')
     requests = [{'runtime': 'python', 'dependencies': [dependency], 'code': code}
@@ -722,7 +757,7 @@ def suite(argv, public=False):
 
 
 CASES = {
-    'native_wheel': native_wheel, 'preparation_audit': preparation_audit,
+    'native_wheel': native_wheel, 'preparation_audit': preparation_audit, 'policy_timings_audit': policy_timings_audit,
     'arithmetic': arithmetic, 'chaining': chaining, 'private_audit': private_audit, 'xlsx': xlsx,
     'selected_readonly': selected_readonly, 'network': network,
     'byte_boundaries': byte_boundaries, 'concurrent_admission': concurrent_admission,

@@ -487,6 +487,48 @@ class TaskLifecycleContractTests(unittest.TestCase):
             self.assertEqual(len(task.records), 25)
             self.assertEqual(len(backend.executions), 25)
 
+    def test_policy_fingerprint_and_phase_timings_follow_host_policy_and_clock(self):
+        import hashlib
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            now = [10.0]
+            backend, task = self.setup_task(Path(tmp), clock=lambda: now[0], task_timeout=60)
+            prepare, execute, publish = backend.prepare, backend.execute, task.artifacts.publish
+            def timed_prepare(*args):
+                now[0] += 2
+                return prepare(*args)
+            def timed_execute(*args):
+                now[0] += 3
+                return execute(*args)
+            def timed_publish(*args, **kwargs):
+                now[0] += 4
+                return publish(*args, **kwargs)
+            backend.prepare, backend.execute, task.artifacts.publish = timed_prepare, timed_execute, timed_publish
+            self.assertTrue(task.execute(request(dependencies=['example'], outputs=['result.json']))['ok'])
+            record = task.records[-1]
+            self.assertIn('policyFingerprint', record, 'audit cannot identify the enforced policy')
+            policy = record['policy']
+            expected = hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            self.assertEqual(record['policyFingerprint'], expected)
+            self.assertEqual(policy['taskTimeoutSecs'], 60)
+            self.assertEqual(policy['callTimeoutSecs'], 600)
+            self.assertEqual([(phase['phase'], phase['elapsedSecs']) for phase in record['phases']],
+                             [('admission', 0), ('prepare', 2), ('execute', 3), ('export', 4)])
+            self.assertEqual(record['elapsedSecs'], 9)
+            previous = record['startedMonotonic']
+            for phase in record['phases']:
+                self.assertEqual(phase['startedMonotonic'], previous)
+                previous = phase['endedMonotonic']
+            self.assertEqual(previous - record['startedMonotonic'], record['elapsedSecs'])
+            first = record['policyFingerprint']
+            self.assertTrue(task.execute(request(dependencies=['example'], outputs=['result.json']))['ok'])
+            self.assertEqual(task.records[-1]['policyFingerprint'], first)
+            self.assertNotIn('prepare', [phase['phase'] for phase in task.records[-1]['phases']])
+        with tempfile.TemporaryDirectory() as tmp:
+            _, other = self.setup_task(Path(tmp), task_timeout=61)
+            other.execute(request(outputs=['result.json']))
+            self.assertNotEqual(other.records[-1]['policyFingerprint'], first)
+
     def test_preparation_audit_preserves_private_diagnostics_on_success_and_failure(self):
         import json
         for failed in (False, True):
