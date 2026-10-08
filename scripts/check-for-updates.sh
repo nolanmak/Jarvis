@@ -419,11 +419,12 @@ fi
 # Rust rebuild: crates/ and Cargo files, plus every file outside crates/ that
 # production code compiles in with include_str!/include_bytes! — agent prompts
 # under schema/, the embedded .env.example key list, and the Codex tool bridge,
-# command sandbox, build VM runner, dependency gateway and provider supervisor.
+# command sandbox, build VM runner, dependency gateway, provider supervisor,
+# Python compute helpers and the embedded Deno Code Mode runner.
 # Missing one means the PR merges but the daemon keeps the stale embedded copy.
 # scripts/tests/updater-rebuild-trigger.test.sh fails when a new include target
 # outside crates/ is added without being classified here.
-RUST_REBUILD_PATHS='^(crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|schema/|\.env\.example$|docs/slack-app-manifest\.json$|scripts/(codex-tool-bridge|codex-command-sandbox|codex-build-vm|build-dependency-proxy|provider-supervisor|pdf-runtime)\.py$|scripts/run-rs\.sh$)'
+RUST_REBUILD_PATHS='^(crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|schema/|\.env\.example$|docs/slack-app-manifest\.json$|scripts/(codex-tool-bridge|codex-command-sandbox|codex-build-vm|build-dependency-proxy|provider-supervisor|pdf-runtime|code-mode-compute(-guest|-prepare)?)\.py$|scripts/run-rs\.sh$|sidecars/code-mode-runner/runner\.ts$)'
 if printf '%s\n' "$CHANGED_FILES" | grep -qE "$RUST_REBUILD_PATHS"; then
   NEEDS_REBUILD=1
 fi
