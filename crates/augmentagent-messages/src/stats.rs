@@ -125,6 +125,14 @@ pub struct StatsResponse {
     pub timezone: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ambiguous: Option<Vec<people::PersonMatch>>,
+    /// Newest message each bundle-backed platform in scope actually holds
+    /// (#1429) — the same field `search_messages` returns, so the two paths
+    /// cannot report different freshness for one platform.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub archive_newest_entry: std::collections::BTreeMap<String, Option<String>>,
+    /// Platforms whose archive ends before `since_ms`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stale_platforms: Vec<String>,
 }
 
 fn timezone() -> String {
@@ -205,6 +213,8 @@ pub fn stats(c: &Connection, req: &StatsRequest) -> anyhow::Result<StatsResponse
             ));
         }
     }
+    let archive_newest_entry = crate::archive::newest_entries(c, &req.platforms)?;
+    let stale_platforms = crate::archive::stale_platforms(&archive_newest_entry, req.since_ms);
     if let Some(candidates) = ambiguous {
         return Ok(StatsResponse {
             rows: Vec::new(),
@@ -212,6 +222,8 @@ pub fn stats(c: &Connection, req: &StatsRequest) -> anyhow::Result<StatsResponse
             filters_applied: req.clone(),
             timezone: timezone(),
             ambiguous: Some(candidates),
+            archive_newest_entry,
+            stale_platforms,
         });
     }
     let where_clause = if filters.is_empty() {
@@ -332,6 +344,8 @@ pub fn stats(c: &Connection, req: &StatsRequest) -> anyhow::Result<StatsResponse
         filters_applied: req.clone(),
         timezone: timezone(),
         ambiguous: None,
+        archive_newest_entry,
+        stale_platforms,
     })
 }
 
@@ -514,6 +528,40 @@ mod tests {
         );
         let keys: Vec<&str> = kinds.rows.iter().map(|r| r.key.as_str()).collect();
         assert!(keys.contains(&"dm") && keys.contains(&"channel"));
+    }
+
+    #[test]
+    fn stats_exposes_the_same_archive_cursor_and_staleness_flag_as_search() {
+        let (_d, _w, s) = fixture();
+        s.set_archive_newest_entry("whatsapp", Some("2026-09-29T21:10:00-04:00"))
+            .unwrap();
+        let since = |iso: &str| {
+            chrono::DateTime::parse_from_rfc3339(iso)
+                .unwrap()
+                .timestamp_millis()
+        };
+        let req = |since_ms: Option<i64>| StatsRequest {
+            group_by: GroupBy::Conversation,
+            platforms: vec!["whatsapp".into()],
+            since_ms,
+            ..Default::default()
+        };
+        let stale = run(&s, req(Some(since("2026-10-01T00:00:00Z"))));
+        assert!(stale.rows.is_empty());
+        assert_eq!(
+            stale
+                .archive_newest_entry
+                .get("whatsapp")
+                .cloned()
+                .flatten(),
+            Some("2026-09-29T21:10:00-04:00".to_string())
+        );
+        assert_eq!(stale.stale_platforms, ["whatsapp"]);
+
+        let in_range = run(&s, req(Some(since("2026-09-01T00:00:00Z"))));
+        assert!(in_range.stale_platforms.is_empty());
+        assert!(in_range.archive_newest_entry.contains_key("whatsapp"));
+        assert!(run(&s, req(None)).stale_platforms.is_empty());
     }
 
     #[test]

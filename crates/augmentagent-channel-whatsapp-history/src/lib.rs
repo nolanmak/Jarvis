@@ -126,6 +126,13 @@ pub fn poll_once(root: &Path, store: &Store) -> Result<Report> {
         );",
         )
     })?;
+    store.set_archive_newest_entry(
+        "whatsapp",
+        augmentagent_channel_imessage::newest_entry_of(
+            index.values().filter_map(|c| c.newest_entry.as_deref()),
+        )
+        .as_deref(),
+    )?;
     let mut report = Report::default();
     for (key, conv) in index {
         if key != conv.identifier || conv.service != "WhatsApp" {

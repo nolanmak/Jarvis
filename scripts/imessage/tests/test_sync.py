@@ -405,6 +405,43 @@ class TestSync(unittest.TestCase):
         state = json.loads(self.state.read_text())
         self.assertEqual(state["last_rowid"], 1)
 
+    def test_newest_entry_tracks_the_last_appended_message(self):
+        add_message(self.con, 1, 1, "first", ns(1782475200), 0)
+        sync(self.db_path, self.out, self.state)
+        self.assertEqual(
+            self._index()["+15551234567"]["newest_entry"],
+            apple_time_to_iso(ns(1782475200)),
+        )
+        add_message(self.con, 2, 1, "second", ns(1782475300), 1)
+        sync(self.db_path, self.out, self.state)
+        newest = apple_time_to_iso(ns(1782475300))
+        self.assertEqual(self._index()["+15551234567"]["newest_entry"], newest)
+        # A run that appends nothing never regresses the cursor.
+        sync(self.db_path, self.out, self.state)
+        self.assertEqual(self._index()["+15551234567"]["newest_entry"], newest)
+
+    def test_newest_entry_is_not_the_synced_at_value(self):
+        add_message(self.con, 1, 1, "first", ns(1782475200), 0)
+        sync(self.db_path, self.out, self.state)
+        self.assertNotEqual(
+            self._index()["+15551234567"]["newest_entry"],
+            json.loads(self.state.read_text())["synced_at"],
+        )
+
+    def test_unknown_time_never_becomes_the_cursor(self):
+        add_message(self.con, 1, 1, "dated", ns(1782475200), 0)
+        sync(self.db_path, self.out, self.state)
+        known = self._index()["+15551234567"]["newest_entry"]
+        add_message(self.con, 2, 1, "undated", 0, 0)
+        sync(self.db_path, self.out, self.state)
+        self.assertIn("unknown-time", self.read_md("+15551234567"))
+        self.assertEqual(self._index()["+15551234567"]["newest_entry"], known)
+
+    def test_newest_entry_absent_until_a_message_with_a_timestamp(self):
+        add_message(self.con, 1, 1, "undated", 0, 0)
+        sync(self.db_path, self.out, self.state)
+        self.assertIsNone(self._index()["+15551234567"].get("newest_entry"))
+
     def test_index_json_written(self):
         add_message(self.con, 1, 2, "yo", ns(1782475200), 0, handle_id=2)
         sync(self.db_path, self.out, self.state)

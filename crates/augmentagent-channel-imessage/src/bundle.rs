@@ -41,6 +41,11 @@ pub struct Conversation {
     /// way to address a group chat.
     #[serde(default)]
     pub chat_guid: Option<String>,
+    /// Timestamp of the newest entry the exporter has written for this
+    /// conversation (#1429). Absent in bundles written before the field
+    /// existed, so recall reports "unknown freshness" rather than failing.
+    #[serde(default)]
+    pub newest_entry: Option<String>,
 }
 
 impl Conversation {
@@ -83,6 +88,17 @@ impl Bundle {
         let map: BTreeMap<String, Conversation> =
             serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
         Ok(map.into_values().collect())
+    }
+
+    /// Newest message timestamp present anywhere in the bundle, verbatim
+    /// (#1429). `None` when the bundle is empty or predates `newest_entry`:
+    /// the archive's freshness is then simply unknown, which is not an error.
+    pub fn newest_entry(&self) -> Result<Option<String>> {
+        Ok(newest_entry_of(
+            self.conversations()?
+                .iter()
+                .filter_map(|c| c.newest_entry.as_deref()),
+        ))
     }
 
     /// All entries of one conversation, oldest first.
@@ -180,6 +196,22 @@ pub fn synthetic_imessage_email(conv: &Conversation, idx: usize, entry: &Message
     }
 }
 
+/// The latest of a set of bundle timestamps, returned verbatim (#1429).
+/// Candidates are ordered as parsed instants — lexicographic order is wrong
+/// across differing UTC offsets — and unparseable ones (`unknown-time`) are
+/// ignored rather than allowed to become the cursor.
+pub fn newest_entry_of<'a>(candidates: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    candidates
+        .into_iter()
+        .filter_map(|raw| {
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .ok()
+                .map(|ts| (ts, raw))
+        })
+        .max_by_key(|(ts, _)| *ts)
+        .map(|(_, raw)| raw.to_string())
+}
+
 /// `2026-08-26T14:32:05-04:00` → `2026-08-26`. Timestamps are written by the
 /// bundle producer; a malformed one yields `None` rather than a bogus date.
 pub fn entry_date(timestamp: &str) -> Option<&str> {
@@ -257,6 +289,7 @@ mod tests {
             participants: vec!["+1".into(), "+2".into()],
             service: "iMessage".into(),
             chat_guid: None,
+            newest_entry: None,
         };
         assert!(group.is_group());
     }
@@ -270,6 +303,7 @@ mod tests {
             participants: vec!["+14155550123".into()],
             service: "iMessage".into(),
             chat_guid: None,
+            newest_entry: None,
         };
         let entries = parse_entries(SAMPLE_MD);
         let email = synthetic_imessage_email(&conv, 1, &entries[1]);
@@ -279,6 +313,56 @@ mod tests {
         assert_eq!(email.platform, "imessage");
         assert_eq!(email.kind, "dm");
         assert_eq!(email.date, "2026-08-26T14:33:10-04:00");
+    }
+
+    /// Write a `conversations/index.json` verbatim and open the bundle.
+    fn bundle_with_index(dir: &TempDir, index_json: &str) -> Bundle {
+        let conv_root = dir.path().join("conversations");
+        std::fs::create_dir_all(&conv_root).unwrap();
+        std::fs::write(conv_root.join("index.json"), index_json).unwrap();
+        Bundle::open(dir.path())
+    }
+
+    #[test]
+    fn index_without_newest_entry_parses_and_reports_no_cursor() {
+        let dir = TempDir::new().unwrap();
+        let bundle = bundle_with_index(
+            &dir,
+            r#"{"+14155550123": {"identifier": "+14155550123", "dir": "John_Smith",
+                "title": "John Smith", "participants": ["+14155550123"],
+                "service": "iMessage", "path": "conversations/John_Smith/messages.md"}}"#,
+        );
+        assert_eq!(bundle.newest_entry().unwrap(), None);
+    }
+
+    #[test]
+    fn newest_entry_compares_instants_across_offsets_and_returns_the_source_string() {
+        let dir = TempDir::new().unwrap();
+        // The UTC-equivalent order is Sep 29 21:10-04:00 (01:10Z Sep 30) >
+        // Sep 30 00:30+02:00 (22:30Z Sep 29) > Sep 29 18:00-07:00 (01:00Z
+        // Sep 30)… so a lexicographic max would wrongly pick "2026-09-30".
+        let bundle = bundle_with_index(
+            &dir,
+            r#"{
+              "a": {"identifier": "a", "dir": "A", "title": "A",
+                    "newest_entry": "2026-09-29T21:10:00-04:00"},
+              "b": {"identifier": "b", "dir": "B", "title": "B",
+                    "newest_entry": "2026-09-30T00:30:00+02:00"},
+              "c": {"identifier": "c", "dir": "C", "title": "C",
+                    "newest_entry": "unknown-time"}
+            }"#,
+        );
+        assert_eq!(
+            bundle.newest_entry().unwrap().as_deref(),
+            Some("2026-09-29T21:10:00-04:00")
+        );
+    }
+
+    #[test]
+    fn empty_bundle_reports_no_cursor() {
+        let dir = TempDir::new().unwrap();
+        let bundle = bundle_with_index(&dir, "{}");
+        assert_eq!(bundle.newest_entry().unwrap(), None);
     }
 
     #[test]
