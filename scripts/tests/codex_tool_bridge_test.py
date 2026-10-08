@@ -28,6 +28,17 @@ requires_poppler = capabilities.requirement(POPPLER_UNAVAILABLE)
 
 class ToolPolicyTests(unittest.TestCase):
     def setUp(self):
+        # Every policy owns session resources, including when an assertion or
+        # command fails. Do not rely on GC or leave sparse image reservations
+        # behind between real VM regression cases.
+        from unittest.mock import patch
+        original = bridge.Policy.__init__
+        def tracked(policy, *args, **kwargs):
+            original(policy, *args, **kwargs)
+            self.addCleanup(policy.close)
+        tracker = patch.object(bridge.Policy, '__init__', tracked)
+        tracker.start()
+        self.addCleanup(tracker.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / 'workspace'
@@ -495,8 +506,15 @@ else:
         (self.root/'src').mkdir()
         (self.root/'Cargo.toml').write_text('[package]\nname="synthetic-build"\nversion="0.1.0"\nedition="2021"\n')
         (self.root/'src/lib.rs').write_text('#[test] fn synthetic_passes() { assert_eq!(2 + 2, 4); }\n')
+        import os
+        # The harness gives this test an isolated HOME. Supply only the
+        # operator's already-provisioned Rust caches to this trusted fixture;
+        # production Policy must not inherit these ambient settings implicitly.
+        runtime = {key: os.environ.get(key, str(Path.home() / fallback))
+                   for key, fallback in [('CARGO_HOME', '.cargo'), ('RUSTUP_HOME', '.rustup')]}
         policy=bridge.Policy({'build_runner':'host','cwd':str(self.root),'read_roots':[str(self.root)],
-            'write_roots':[str(self.root)],'allowed_tools':['Read','Write','Edit','Bash(cargo *)']})
+            'write_roots':[str(self.root)],'allowed_tools':['Read','Write','Edit','Bash(cargo *)'],
+            'environment': runtime})
         outcome=policy.run_command('cargo test --offline',timeout=60)
         self.assertEqual(outcome['exit_code'],0,outcome)
         self.assertIn('1 passed',outcome['stdout'])

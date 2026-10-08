@@ -811,6 +811,7 @@ CASES = {
     'request_contracts': suite([sys.executable, '-m', 'unittest', 'scripts.tests.code_mode_compute_test.RequestContractTests', '-v']),
     'artifact_contracts': suite([sys.executable, '-m', 'unittest', 'scripts.tests.code_mode_compute_test.ArtifactCapabilityTests', '-v']),
     'gateway_contracts': suite([sys.executable, '-m', 'unittest', 'scripts.tests.build_dependency_proxy_test', '-v']),
+    'bridge_regression': suite([sys.executable, '-m', 'unittest', 'scripts.tests.codex_tool_bridge_test', '-v'], public=True),
     'build_vm_regression': suite([sys.executable, '-m', 'unittest', 'scripts.tests.codex_build_vm_test', 'scripts.tests.codex_tool_bridge_test.BuildScratchTests', '-v'], public=True),
     'deno_regression': lambda h, n: h.suite(n, [h.deno, 'test', '--no-lock', '--allow-run=deno', '--allow-read=.', 'sidecars/code-mode-runner/runner_test.ts']),
 }

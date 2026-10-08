@@ -68,6 +68,16 @@ class HarnessExecutionTests(unittest.TestCase):
                 with self.subTest(mutation=mutation), self.assertRaises(AssertionError):
                     qa.policy_timings_audit(h, 'fixture')
 
+    def test_bridge_regression_requires_full_suite_and_public_prerequisites(self):
+        self.assertIn('bridge_regression', qa.CASES)
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        h = SimpleNamespace(suite=Mock())
+        qa.CASES['bridge_regression'](h, 'bridge_regression')
+        args, options = h.suite.call_args
+        self.assertIn('scripts.tests.codex_tool_bridge_test', args[1])
+        self.assertTrue(options['public'])
+
     def test_preparation_audit_is_registered_for_real_cli_acceptance(self):
         self.assertIn('preparation_audit', qa.CASES)
 
