@@ -134,3 +134,173 @@ async fn orchestration_cannot_import_host_or_remote_modules() {
         }
     }
 }
+
+fn service_config(
+    root: &std::path::Path,
+    enabled: bool,
+) -> augmentagent_channel_core::code_mode::compute::ServiceConfig {
+    use augmentagent_channel_core::code_mode::compute::{ComputePolicy, ServiceConfig};
+    let artifacts = root.join("artifacts");
+    std::fs::create_dir(&artifacts).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&artifacts, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    ServiceConfig {
+        policy: ComputePolicy {
+            enabled,
+            call_timeout: Duration::from_secs(30),
+            task_timeout: Duration::from_secs(60),
+        },
+        runtime: root.join("missing-runtime.json"),
+        scratch_root: root.join("scratch"),
+        pip_runtime: None,
+        artifact_root: artifacts,
+        input_files: BTreeMap::new(),
+    }
+}
+
+#[tokio::test]
+async fn disabled_service_returns_structured_denial_and_verified_close() {
+    use augmentagent_channel_core::code_mode::compute::ComputeService;
+    let root = tempfile::tempdir().unwrap();
+    let service = ComputeService::start(service_config(root.path(), false))
+        .await
+        .expect("private helper starts even without a VM when disabled");
+    let result = service
+        .execute(json!({"runtime":"python","dependencies":[],"code":"print(1)"}))
+        .await
+        .unwrap();
+    assert_eq!(result["error"]["code"], "compute_disabled");
+    assert_eq!(result["runner"], "none");
+    let finished = service.finish().await.unwrap();
+    assert_eq!(finished["cleanupVerified"], true);
+}
+
+#[tokio::test]
+async fn service_imports_selected_files_as_opaque_ids() {
+    use augmentagent_channel_core::code_mode::compute::ComputeService;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("selected.csv");
+    std::fs::write(&source, "a,b\n1,2\n").unwrap();
+    let mut config = service_config(root.path(), false);
+    config
+        .input_files
+        .insert("sheet.csv".into(), source.clone());
+    let service = ComputeService::start(config).await.unwrap();
+    let ids = service.inputs();
+    assert_eq!(ids.len(), 1);
+    assert_eq!(ids["sheet.csv"].len(), 32);
+    assert_ne!(ids["sheet.csv"], source.to_string_lossy());
+    service.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn real_dispatcher_preserves_denial_and_redacts_compute_trace() {
+    use augmentagent_channel_core::code_mode::{
+        compute::{ComputeDispatcher, ComputeService},
+        manifest::manifest_compute,
+        Dispatcher,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let service = ComputeService::start(service_config(root.path(), false))
+        .await
+        .unwrap();
+    let dispatcher = ComputeDispatcher::new(service.clone());
+    let outcome = run_program_with_options(
+        "async function main() { return await tools.compute.run({runtime:'python',dependencies:[],code:'SOURCE_CANARY'}); } main();",
+        &manifest_compute(), &dispatcher, &service.run_options().unwrap()).await.unwrap();
+    assert_eq!(outcome.final_value["error"]["code"], "compute_disabled");
+    assert!(!serde_json::to_string(&outcome.trace)
+        .unwrap()
+        .contains("SOURCE_CANARY"));
+    assert_eq!(outcome.trace.len(), 1);
+    assert!(dispatcher.call("draft", json!([])).await.is_err());
+    assert!(dispatcher
+        .call("compute.run", json!([{}, {}]))
+        .await
+        .is_err());
+    service.finish().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires JARVIS_TEST_VM_CONFIG and an isolated JARVIS_TEST_COMPUTE_SCRATCH; run explicitly in VM acceptance QA"]
+async fn real_deno_rust_vm_artifact_round_trip() {
+    use augmentagent_channel_core::code_mode::{
+        compute::{ComputeDispatcher, ComputeService},
+        manifest::manifest_compute,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut config = service_config(root.path(), true);
+    config.runtime = std::env::var_os("JARVIS_TEST_VM_CONFIG")
+        .expect("VM config required")
+        .into();
+    config.scratch_root = std::env::var_os("JARVIS_TEST_COMPUTE_SCRATCH")
+        .expect("isolated scratch required")
+        .into();
+    let source = root.path().join("selected.txt");
+    std::fs::write(&source, "10\n20\n30\n").unwrap();
+    config.input_files.insert("numbers".into(), source);
+    let service = ComputeService::start(config).await.unwrap();
+    let dispatcher = ComputeDispatcher::new(service.clone());
+    let program = r#"async function main() {
+        const first = await tools.compute.run({runtime:'python',dependencies:[],
+            inputs:[{artifactId:computeInputs.numbers,name:'numbers.txt'}], outputs:['total.json'],
+            code:"import json\nnumbers=[int(x) for x in open('/inputs/numbers.txt')]\nopen('/outputs/total.json','w').write(json.dumps({'count':len(numbers),'total':sum(numbers)}))"});
+        if (!first.ok) throw new Error(JSON.stringify(first.error));
+        const second = await tools.compute.run({runtime:'python',dependencies:[],
+            inputs:[{artifactId:first.artifacts[0].id,name:'total.json'}],
+            code:"print(open('/inputs/total.json').read())"});
+        if (!second.ok) throw new Error(JSON.stringify(second.error));
+        return {runner:second.runner, value:JSON.parse(second.stdout)};
+    } main();"#;
+    let outcome = run_program_with_options(
+        program,
+        &manifest_compute(),
+        &dispatcher,
+        &service.run_options().unwrap(),
+    )
+    .await;
+    let finished = service.finish().await.expect("verified VM cleanup");
+    assert_eq!(finished["cleanupVerified"], true);
+    let outcome = outcome.unwrap();
+    assert_eq!(
+        outcome.final_value,
+        json!({"runner":"vm","value":{"count":3,"total":60}})
+    );
+    assert_eq!(outcome.trace.len(), 2);
+}
+
+#[tokio::test]
+#[ignore = "requires real isolated VM configuration; run explicitly in VM lifecycle QA"]
+async fn dropped_compute_future_cancels_vm_and_verifies_cleanup() {
+    use augmentagent_channel_core::code_mode::compute::ComputeService;
+    let root = tempfile::tempdir().unwrap();
+    let mut config = service_config(root.path(), true);
+    config.runtime = std::env::var_os("JARVIS_TEST_VM_CONFIG")
+        .expect("VM config required")
+        .into();
+    config.scratch_root = std::env::var_os("JARVIS_TEST_COMPUTE_SCRATCH")
+        .expect("isolated scratch required")
+        .into();
+    let service = ComputeService::start(config).await.unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        service.execute(json!({
+            "runtime":"python", "dependencies":[], "code":"import time\ntime.sleep(25)"
+        })),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "workload should still be executing when canceled"
+    );
+    let receipt = tokio::time::timeout(Duration::from_secs(5), service.finish())
+        .await
+        .expect("cleanup must finish within five seconds")
+        .expect("verified cleanup");
+    assert_eq!(receipt["cancelled"], true);
+    assert_eq!(receipt["cleanupVerified"], true);
+    assert!(service.execute(json!({})).await.is_err());
+}

@@ -1,4 +1,8 @@
 //! Host-owned policy for dependency-enabled Code Mode computation.
+mod dispatch;
+pub mod service;
+pub use dispatch::ComputeDispatcher;
+pub use service::{ComputeService, ServiceConfig};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

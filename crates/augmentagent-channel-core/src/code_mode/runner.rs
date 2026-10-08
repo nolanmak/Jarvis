@@ -51,7 +51,6 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::time::timeout;
 
 use super::dispatch::Dispatcher;
 use super::manifest::ToolManifest;
