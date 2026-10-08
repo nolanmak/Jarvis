@@ -70,9 +70,11 @@ The test uses a unique `[TEST #1436]` title and a five-minute meeting one day
 in the future. Invitation/cancellation mail is left intact. It does not write
 the live daemon's SQLite database or restart/deploy the daemon.
 
-**This is live approver/provider QA, not a live Discord click.** The issue's
-final end-to-end gate additionally requires the built version to handle a real
-CLI proposal and owner click through Discord. Record that version's commit,
-action/event IDs, acknowledgment and independent calendar/inbox results. Use
-only owned accounts and clean up the recorded test IDs. A disappearing card,
-HTTP 200, or mocked transport test alone does not satisfy that gate.
+**This is live CLI approver/provider QA, not a live Discord click.** Per the
+owner's acceptance direction, the automated CLI test is the live acceptance
+gate; it does not require the owner to operate Discord. Record the tested
+commit, saved event receipt, independent calendar/inbox results, and cleanup.
+The Discord delivery contract is covered separately by the production-handler
+HTTP integration tests above. Do not describe those as a real gateway click.
+A disappearing card, HTTP 200, or mocked provider test alone does not satisfy
+the live gate.
