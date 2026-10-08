@@ -84,6 +84,7 @@ async fn live_calendar_self_invite_and_cleanup() -> Result<()> {
     let ApprovalActionOutcome::CalendarCreated {
         event_id,
         html_link,
+        ..
     } = outcome
     else {
         anyhow::bail!("real approval did not confirm creation: {outcome:?}; inspect the test title before retrying");
@@ -95,6 +96,10 @@ async fn live_calendar_self_invite_and_cleanup() -> Result<()> {
     let verify: Result<()> = async {
         std::fs::write(&report, serde_json::to_vec_pretty(&evidence)?)?;
         anyhow::ensure!(store.get_action_with_email(&action)?.unwrap().action.status == "sent");
+        let recovered = approver.approve(&action).await;
+        anyhow::ensure!(matches!(recovered,
+            ApprovalActionOutcome::CalendarCreated { event_id: ref saved_id, already_existed: true, .. }
+                if saved_id == &event_id), "repeat approval lost the receipt: {recovered:?}");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         loop {
             let mut complete = true;

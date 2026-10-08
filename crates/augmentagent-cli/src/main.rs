@@ -13519,7 +13519,7 @@ impl ApprovalActionHandler for ReplyApprover {
         if matches!(
             outcome,
             ApprovalActionOutcome::Approved
-                | ApprovalActionOutcome::CalendarCreated { .. }
+                | ApprovalActionOutcome::CalendarCreated { already_existed: false, .. }
                 | ApprovalActionOutcome::Scheduled { .. }
         ) {
             self.trigger_next_nudge().await;
@@ -13645,6 +13645,13 @@ impl ReplyApprover {
         // retryable and never sends a delivered message twice.
         if action.email.platform == "slack" && action.action.status == "error" {
             return self.approve_slack(action_id, action).await;
+        }
+        // A card is retained when Discord fails to deliver the first receipt.
+        // Recover that receipt on a repeated click without creating/nudging again.
+        if action.email.platform == "gcal" && action.email.kind == "create_event"
+            && action.action.status == "sent"
+        {
+            return Self::recover_calendar_receipt(&action);
         }
         if action.action.status != "pending" {
             return ApprovalActionOutcome::AlreadyResolved {
@@ -13830,6 +13837,27 @@ impl ReplyApprover {
         ApprovalActionOutcome::Approved
     }
 
+    fn recover_calendar_receipt(action: &augmentagent_store::ActionWithEmail) -> ApprovalActionOutcome {
+        // #1436 appends these two terminal lines only after confirmed creation.
+        // Use the last suffix so proposal text cannot shadow the saved receipt.
+        let receipt = action.action.draft_body.as_deref()
+            .and_then(|body| body.rsplit_once("\ncreated: "))
+            .and_then(|(_, suffix)| suffix.split_once("\nevent ID: "))
+            .filter(|(_, id)| !id.is_empty() && !id.chars().any(char::is_whitespace));
+        let Some((link, event_id)) = receipt else {
+            // Historical false-success rows have no ID. Never create on a sent
+            // row or rewrite history based on the old empty-link placeholder.
+            return ApprovalActionOutcome::Failed {
+                message: "This calendar action is marked sent, but no event ID was saved; check the calendar before retrying".into(),
+            };
+        };
+        ApprovalActionOutcome::CalendarCreated {
+            event_id: event_id.into(),
+            html_link: (!link.trim().is_empty() && link != event_id).then(|| link.to_string()),
+            already_existed: true,
+        }
+    }
+
     /// #398 — Approve on a calendar-event card: parse the machine payload
     /// (EventDraft JSON) from the emails row and execute the create. The
     /// event exists — and invites go out — only after this succeeds.
@@ -13890,6 +13918,7 @@ impl ReplyApprover {
                 ApprovalActionOutcome::CalendarCreated {
                     event_id,
                     html_link: created.html_link,
+                    already_existed: false,
                 }
             }
             Err(CalendarError::Forbidden { message }) => {

@@ -72,6 +72,7 @@ async fn calendar_success_posts_receipt_then_deletes_card() {
         ApprovalActionOutcome::CalendarCreated {
             event_id: "evt-1436".into(),
             html_link: None,
+            already_existed: false,
         },
         "Calendar event created. Event ID: evt-1436.",
         200,
@@ -86,10 +87,24 @@ async fn undelivered_success_receipt_keeps_the_card() {
         ApprovalActionOutcome::CalendarCreated {
             event_id: "evt-1436".into(),
             html_link: None,
+            already_existed: false,
         },
         "Calendar event created. Event ID: evt-1436.",
         403,
         0,
     )
     .await;
+}
+
+#[tokio::test]
+async fn recovered_calendar_receipt_is_delivered_before_retiring_card() {
+    deliver(
+        ApprovalActionOutcome::CalendarCreated {
+            event_id: "evt-1436".into(),
+            html_link: Some("https://calendar.google.com/event?eid=test".into()),
+            already_existed: true,
+        },
+        "Calendar event already created: https://calendar.google.com/event?eid=test (event ID: evt-1436).",
+        200, 1,
+    ).await;
 }

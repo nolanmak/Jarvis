@@ -1,8 +1,8 @@
 //! Google Calendar client over Composio HTTP.
 //!
 //! Mirrors `crates/augmentagent-channel-email/src/gmail.rs::ComposioClient`:
-//! one method per Composio action we use, identical retry+backoff loop, the
-//! same `x-api-key` header. The `CalendarApi` trait is the seam tests inject
+//! one method per Composio action we use and the same `x-api-key` header.
+//! Reads retry with bounded backoff; creates are never automatically replayed. The `CalendarApi` trait is the seam tests inject
 //! a fake into.
 //!
 //! Phase 1 surfaces only `list_events` (the `GOOGLECALENDAR_EVENTS_LIST`

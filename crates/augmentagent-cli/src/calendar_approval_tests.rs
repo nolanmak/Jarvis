@@ -109,10 +109,65 @@ async fn calendar_success_receipt_contains_handle_and_is_persisted() {
         assert_eq!(row.action.status, "sent");
         assert!(row.action.error_message.is_none());
         assert!(row.action.draft_body.unwrap().contains("event_1436"));
-        assert!(matches!(
-            approver.approve(&id).await,
-            ApprovalActionOutcome::AlreadyResolved { .. }
-        ));
+        let recovered = approver.approve(&id).await;
+        let text = augmentagent_approval_discord::outcome::describe(&recovered);
+        assert!(
+            text.contains(link.unwrap_or("event_1436")),
+            "repeat Approve lost receipt: {text}"
+        );
+        assert_eq!(
+            store
+                .get_action_with_email(&id)
+                .unwrap()
+                .unwrap()
+                .action
+                .status,
+            "sent"
+        );
         m.assert_async().await;
     }
+}
+
+#[tokio::test]
+async fn legacy_sent_calendar_without_receipt_requires_verification_and_never_recreates() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(dir.path().join("qa.db")).unwrap());
+    let id = proposal(&store);
+    store
+        .update_action_status(
+            &id,
+            ActionStatus::Sent,
+            Some("Create calendar event\ncreated: (no link returned)"),
+            None,
+        )
+        .unwrap();
+    let mut server = mockito::Server::new_async().await;
+    let m = server
+        .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_CREATE_EVENT")
+        .expect(0)
+        .create_async()
+        .await;
+    let mut approver = test_support::approver_with_store(store.clone());
+    approver.calendar =
+        Arc::new(ComposioCalendarClient::new("test".into()).with_base_url(server.url()));
+    let outcome = approver.approve(&id).await;
+    assert!(
+        matches!(outcome, ApprovalActionOutcome::Failed { .. }),
+        "{outcome:?}"
+    );
+    let text = augmentagent_approval_discord::outcome::describe(&outcome);
+    assert!(
+        text.contains("check the calendar before retrying"),
+        "{text}"
+    );
+    assert_eq!(
+        store
+            .get_action_with_email(&id)
+            .unwrap()
+            .unwrap()
+            .action
+            .status,
+        "sent"
+    );
+    m.assert_async().await;
 }

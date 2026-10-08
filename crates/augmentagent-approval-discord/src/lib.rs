@@ -105,7 +105,12 @@ pub enum ApprovalActionOutcome {
     /// Approve succeeded — email sent, action marked Sent.
     Approved,
     /// Calendar creation confirmed by the provider; carry a verifiable receipt.
-    CalendarCreated { event_id: String, html_link: Option<String> },
+    CalendarCreated {
+        event_id: String,
+        html_link: Option<String>,
+        /// A repeated Approve recovered the saved receipt; no new write/nudge.
+        already_existed: bool,
+    },
     /// Skip succeeded — draft deleted, action marked Rejected.
     Skipped,
     /// Revise succeeded — a new draft was created and should be re-posted as

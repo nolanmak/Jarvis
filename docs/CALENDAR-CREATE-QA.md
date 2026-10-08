@@ -6,6 +6,9 @@ creation only when the provider returns a nonempty event ID. Composio tool
 failures inside HTTP 200 responses are errors for create, list and get.
 
 The approval acknowledgment includes the confirmed event ID and optional link.
+If receipt delivery fails, repeating Approve recovers the stored receipt without
+creating another event or advancing the nudge queue. Historical sent rows with
+no saved event ID require calendar verification rather than an automatic retry.
 A failed creation leaves an error on the action and displays its reason in
 Discord. A missing handle, malformed response, transport failure or upstream
 5xx is **unconfirmed**: check the calendar before proposing another event.
