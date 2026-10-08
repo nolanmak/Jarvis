@@ -464,12 +464,20 @@ impl EventHandler for Handler {
             images,
             text_files,
             docs,
-            rejected,
+            mut rejected,
         } = partition_attachments(&msg.attachments);
+        let compute_enabled = self.state.allowed_user_id.is_some() && msg.guild_id.is_none()
+            && matches!(std::env::var("AUGMENTAGENT_COMPUTE_ENABLED").as_deref(), Ok("true" | "1"));
+        let compute_files: Vec<_> = if compute_enabled {
+            msg.attachments.iter().filter(|a| crate::compute_inputs::eligible(
+                &a.filename, a.content_type.as_deref(), u64::from(a.size))).cloned().collect()
+        } else { Vec::new() };
+        rejected.retain(|rejection| !compute_files.iter().any(|a| a.filename == rejection.filename));
         if user_text.is_empty()
             && images.is_empty()
             && text_files.is_empty()
             && docs.is_empty()
+            && compute_files.is_empty()
         {
             // Rejected-only path: tell the user what was dropped, don't ping
             // the reasoner. Otherwise the message is truly empty — return.
@@ -641,7 +649,18 @@ impl EventHandler for Handler {
             let extracted_docs = extract_doc_attachments(&docs, msg_id.get()).await;
             downloaded_txts.extend(extracted_docs);
 
-            let current = build_prompt(&user_text, &downloaded_imgs, &downloaded_txts);
+            let mut current = build_prompt(&user_text, &downloaded_imgs, &downloaded_txts);
+            let compute_inputs = match crate::compute_inputs::download(&compute_files).await {
+                Ok(inputs) => inputs,
+                Err(_) => {
+                    current.push_str("\nRaw compute attachments could not be imported. Do not claim to have computed results from unavailable inputs.");
+                    None
+                }
+            };
+            let selected = compute_inputs.as_ref().map(|inputs| inputs.files.clone()).unwrap_or_default();
+            if !selected.is_empty() {
+                current.push_str(&format!("\nRaw files selected for computeInputs (alias to original attachment name): {}", serde_json::to_string(&compute_inputs.as_ref().expect("nonempty selection").labels).unwrap_or_default()));
+            }
 
             // #125: Liveness signal. Discord's typing indicator auto-expires
             // after ~10s, so we kick one off immediately and re-broadcast on a
@@ -663,7 +682,7 @@ impl EventHandler for Handler {
             let result = run_with_typing(
                 &http,
                 channel_id,
-                handler.answer_turn(&audit_ctx, &history, &current),
+                crate::compute_inputs::SELECTED.scope(selected, handler.answer_turn(&audit_ctx, &history, &current)),
             ).await;
             info!(%channel_id, %msg_id, success = result.is_ok(), "discord query completed");
 

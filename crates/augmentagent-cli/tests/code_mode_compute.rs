@@ -179,3 +179,57 @@ fn forged_host_rpc_denial_cannot_be_hidden_by_successful_program_return() {
     assert_eq!(result.status.code(), Some(1));
     assert_eq!(report(root.path())["ok"], false);
 }
+
+#[test]
+fn mcp_facade_is_bounded_to_programs_and_refuses_missing_turn_grants() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join(".env"),
+        "AUGMENTAGENT_COMPUTE_TOOL_GRANT=fixture-from-dotenv\n",
+    )
+    .unwrap();
+    let mut process = Command::new(env!("CARGO_BIN_EXE_augmentagent"))
+        .current_dir(root.path())
+        .env_clear()
+        .arg("compute-tool")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = process.stdin.take().unwrap();
+    writeln!(
+        input,
+        "{}",
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})
+    )
+    .unwrap();
+    writeln!(input, "{}", json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run","arguments":{"program":"1"}}})).unwrap();
+    drop(input);
+    let output = process.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let frames: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(frames.len(), 2);
+    let tools = frames[0]["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["name"], "run");
+    assert_eq!(
+        tools[0]["inputSchema"]["properties"]
+            .as_object()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(frames[1]["result"]["isError"], true);
+    assert!(!root.path().join("data.db").exists());
+}

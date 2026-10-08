@@ -340,6 +340,7 @@ impl CodexCliReasoner {
         }
         cmd.env("CODEX_HOME", codex_home());
         for (key, value) in &bridge.voice_env { cmd.env(key, value); }
+        for (key, value) in &bridge.compute_env { cmd.env(key, value); }
         if let Some(key) = crate::secret_loader::load_provider_key("CODEX_API_KEY") {
             cmd.env("CODEX_API_KEY", key);
         }
