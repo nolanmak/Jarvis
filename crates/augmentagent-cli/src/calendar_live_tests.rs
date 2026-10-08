@@ -43,6 +43,8 @@ async fn live_calendar_self_invite_and_cleanup() -> Result<()> {
         "configure organizer followed by exactly two owned attendee accounts"
     );
     let report = PathBuf::from(std::env::var("JARVIS_CALENDAR_QA_REPORT")?);
+    // Check report storage before sending an invitation.
+    std::fs::write(&report, b"{\"cleanup\":\"no event created yet\"}")?;
     let dir = tempfile::tempdir()?;
     let store = Arc::new(Store::open(dir.path().join("qa.db"))?);
     let summary = format!("[TEST #1436] Rust approval QA {}", uuid::Uuid::new_v4());
@@ -84,8 +86,9 @@ async fn live_calendar_self_invite_and_cleanup() -> Result<()> {
     // Write the cleanup capability before any assertion/readback can fail.
     let mut evidence = json!({"summary":summary,"event_id":event_id,"html_link":html_link,
         "expected_start":start.to_rfc3339(),"expected_end":end.to_rfc3339(),"cleanup":"pending"});
-    std::fs::write(&report, serde_json::to_vec_pretty(&evidence)?)?;
+    let verification_started = tokio::time::Instant::now();
     let verify: Result<()> = async {
+        std::fs::write(&report, serde_json::to_vec_pretty(&evidence)?)?;
         anyhow::ensure!(store.get_action_with_email(&action)?.unwrap().action.status == "sent");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         loop {
@@ -122,15 +125,17 @@ async fn live_calendar_self_invite_and_cleanup() -> Result<()> {
                 observations.push(observation);
             }
             evidence["observations"] = json!(observations);
-            if complete { return Ok(()); }
             anyhow::ensure!(tokio::time::Instant::now() < deadline, "calendar/inbox propagation exceeded 120 seconds");
+            if complete { return Ok(()); }
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     }.await;
-    // Always attempt cleanup, including when verification fails.
+    evidence["verification_ms"] = json!(verification_started.elapsed().as_millis());
+    // Always attempt cleanup, including when verification or receipt storage fails.
+    let cleanup_started = tokio::time::Instant::now();
     let cleanup: Result<()> = async {
+        let deadline = cleanup_started + Duration::from_secs(120);
         execute(&key, &accounts[0].entity_id, "GOOGLECALENDAR_DELETE_EVENT", json!({"calendar_id":"primary","event_id":event_id})).await?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         loop {
             let mut complete = true;
             for account in &accounts {
@@ -141,11 +146,12 @@ async fn live_calendar_self_invite_and_cleanup() -> Result<()> {
                 complete &= !listed["data"]["items"].as_array().context("missing event list")?
                     .iter().any(|e| e["id"] == event_id && e["status"] != "cancelled");
             }
-            if complete { return Ok(()); }
             anyhow::ensure!(tokio::time::Instant::now() < deadline, "cleanup propagation exceeded 120 seconds");
+            if complete { return Ok(()); }
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     }.await;
+    evidence["cleanup_ms"] = json!(cleanup_started.elapsed().as_millis());
     evidence["verification"] = json!(verify.as_ref().map(|_| "passed").map_err(|e| e.to_string()));
     evidence["cleanup"] = json!(cleanup
         .as_ref()
