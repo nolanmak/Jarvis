@@ -19,6 +19,13 @@ def require(condition, message):
         raise ValueError(message)
 
 
+def completed_command(command):
+    return (isinstance(command, dict) and command.get('executed') is True
+            and isinstance(command.get('argv'), list) and bool(command['argv'])
+            and type(command.get('exitCode')) is int and command['exitCode'] >= 0
+            and command.get('failure', 'missing') is None)
+
+
 def validate(report, head):
     require(isinstance(report, dict), 'receipt must be an object')
     require(report.get('schemaVersion') == 1 and report.get('issue') == 1434, 'unsupported receipt schema')
@@ -44,10 +51,12 @@ def validate(report, head):
         case = cases.get(name, {})
         command = case.get('command', {})
         require(case.get('status') == 'passed', f'required case incomplete: {name}')
-        require(command.get('executed') is True and isinstance(command.get('argv'), list)
-                and bool(command['argv']) and type(command.get('exitCode')) is int
-                and command['exitCode'] >= 0 and command.get('failure', 'missing') is None,
-                f'command evidence missing or failed: {name}')
+        require(completed_command(command), f'command evidence missing or failed: {name}')
+        if name in qa.MULTI_COMMAND_CASES:
+            commands = case.get('commands')
+            require(isinstance(commands, list) and len(commands) == qa.MULTI_COMMAND_CASES[name]
+                    and all(completed_command(entry) for entry in commands),
+                    f'multi-command evidence missing or failed: {name}')
     require(all(case.get('status') == 'passed' for case in cases.values()), 'report contains a failed or skipped case')
     expected = qa.coverage_report(qa.REQUIREMENTS, cases)
     require(report.get('acceptance') == expected and all(row['complete'] for row in expected.values()),

@@ -12,6 +12,8 @@ SPEC.loader.exec_module(receipt)
 def fixture(head='a' * 40):
     cases = {name: {'status': 'passed', 'command': {'executed': True, 'argv': ['synthetic-fixture'],
               'exitCode': 0, 'failure': None}} for name in receipt.qa.GROUPS['all']}
+    for name, count in [('fresh_task', 2), ('byte_boundaries', 6)]:
+        cases[name]['commands'] = [copy.deepcopy(cases[name]['command']) for _ in range(count)]
     return {'schemaVersion': 1, 'issue': 1434, 'mode': 'all', 'requireVm': True,
             'publicPackages': True, 'ok': True, 'acceptanceComplete': True,
             'git': {'head': head, 'dirty': False}, 'binaryUnchangedDuringQa': True,
@@ -48,6 +50,18 @@ class ReceiptTests(unittest.TestCase):
             if mutation == 'failed-command': case['command']['failure'] = 'timed out'
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                 receipt.validate(report, 'a' * 40)
+
+    def test_multi_command_cases_require_every_completed_command(self):
+        for name in ('fresh_task', 'byte_boundaries'):
+            for mutation in ('missing', 'short', 'not-executed', 'failure'):
+                report = fixture()
+                case = report['cases'][name]
+                if mutation == 'missing': del case['commands']
+                if mutation == 'short': case['commands'].pop(0)
+                if mutation == 'not-executed': case['commands'][0]['executed'] = False
+                if mutation == 'failure': case['commands'][0]['failure'] = 'timed out'
+                with self.subTest(name=name, mutation=mutation), self.assertRaises(ValueError):
+                    receipt.validate(report, 'a' * 40)
 
     def test_acceptance_map_must_match_current_contract(self):
         report = fixture()

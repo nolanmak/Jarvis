@@ -50,6 +50,7 @@ GROUPS = {
     'lifecycle': {name for ac in ('AC04', 'AC09', 'AC10', 'AC11', 'AC12', 'AC16', 'AC17') for name in REQUIREMENTS[ac]},
 }
 GROUPS['all'] = {name for cases in REQUIREMENTS.values() for name in cases} | {'arithmetic'}
+MULTI_COMMAND_CASES = {'fresh_task': 2, 'byte_boundaries': 6}
 
 
 def coverage_report(requirements, results):
@@ -361,6 +362,78 @@ def fresh_task(h, name):
                        'reports': [child.results[child_name]['report'] for child_name in names]}
 
 
+def byte_boundaries(h, name):
+    child = Harness(h.args, h.deno)
+    commands, reports = [], []
+    def run(suffix, source, **options):
+        child_name = name + '-' + suffix
+        child.cli(child_name, source, **options)
+        receipt = child.results[child_name]
+        checked(receipt['command'].get('executed') is True and receipt['command'].get('failure') is None,
+                'byte boundary has no completed CLI evidence')
+        commands.append(receipt['command'])
+        reports.append(receipt['report'])
+        h.results[name] = {'status': 'failed', 'command': commands[-1], 'commands': commands, 'reports': reports}
+
+    # One call reaches all file-count and byte maxima without exceeding the
+    # task's 128 MiB input/output capability store. Empty files count too.
+    files = {f'input{i}': b'' for i in range(32)}
+    files['input0'] = b'\0' * (64 * 1024 * 1024)
+    outputs = [f'output{i}' for i in range(32)]
+    code = """from pathlib import Path
+assert len(list(Path('/inputs').iterdir()))==32
+assert sum(p.stat().st_size for p in Path('/inputs').iterdir())==64*1024*1024
+with open('/inputs/input0','rb') as f:
+    assert f.read(1)==b'\\0'
+    f.seek(-1,2)
+    assert f.read()==b'\\0'
+for i in range(32):
+    with open('/outputs/output'+str(i),'wb') as f:
+        if i<2:
+            for _ in range(32):f.write(bytes(1024*1024))
+print('60')
+"""
+    request = {'runtime': 'python', 'dependencies': [], 'code': code, 'outputs': outputs}
+    source = f"async function main(){{const r={json.dumps(request)};r.inputs=Object.entries(computeInputs).map(([name,artifactId])=>({{name,artifactId}}));return await tools.compute.run(r);}}main();"
+    expected_hash = hashlib.sha256(bytes(32 * 1024 * 1024)).hexdigest()
+    def verify_limits(value, root):
+        final_value(value, root)
+        entries = {entry['name']: entry for entry in value['artifacts']}
+        checked(set(entries) == set(outputs), 'exact-limit export count differs')
+        checked(sum(entry['bytes'] for entry in entries.values()) == 64 * 1024 * 1024, 'exact-limit export bytes differ')
+        for index in range(32):
+            entry = entries[f'output{index}']
+            expected_size = 32 * 1024 * 1024 if index < 2 else 0
+            checked(entry['bytes'] == expected_size, 'exact-limit file size differs')
+            checked(digest(root / 'artifacts' / entry['name']) == entry['sha256'] ==
+                    (expected_hash if index < 2 else hashlib.sha256(b'').hexdigest()), 'exact-limit export digest differs')
+    run('at-limits', source, files=files, verify=verify_limits)
+    del files
+
+    # Import less than 64 MiB, then select one capability twice under distinct
+    # valid names. The requested aggregate is exactly 64 MiB + 1, so the host
+    # must refuse it before booting a guest, independently of import validation.
+    source = """async function main(){return await tools.compute.run({runtime:'python',dependencies:[],
+code:'raise AssertionError("over-limit input executed")',inputs:[
+{artifactId:computeInputs.large,name:'one'},{artifactId:computeInputs.large,name:'two'},
+{artifactId:computeInputs.extra,name:'extra'}]});}main();"""
+    run('input-plus-one', source, files={'large': bytes(32 * 1024 * 1024), 'extra': b'x'},
+        expect_exit=1, expected_error='resource_limit', runner='none')
+    for suffix, sizes in [('file-plus-one', [32 * 1024 * 1024 + 1]),
+                          ('total-plus-one', [32 * 1024 * 1024, 32 * 1024 * 1024, 1])]:
+        code = f"from pathlib import Path\nfor i,size in enumerate({sizes!r}):\n with open('/outputs/f'+str(i),'wb') as f:\n  for _ in range(size//1048576):f.write(bytes(1048576))\n  f.write(bytes(size%1048576))"
+        run(suffix, program(code, outputs=[f'f{i}' for i in range(len(sizes))]),
+            expect_exit=1, expected_error='resource_limit')
+    for field in ('inputs', 'outputs'):
+        items = [f'f{i}' if field == 'outputs' else {'artifactId': 'unresolved', 'name': f'f{i}'} for i in range(33)]
+        request = {'runtime': 'python', 'dependencies': [], 'code': 'pass', field: items}
+        source = f"async function main(){{try{{await tools.compute.run({json.dumps(request)});return false;}}catch(e){{return String(e).includes('bad_args');}}}}main();"
+        run(field + '-count-plus-one', source, expect_exit=1, runner=None,
+            verify=lambda value, _: checked(value['final'] is True and not value['records'] and not value['artifacts'],
+                                           'over-count request executed or lost its typed refusal'))
+    checked(len(commands) == MULTI_COMMAND_CASES[name], 'byte boundary evidence is incomplete')
+
+
 def selected_readonly(h, name):
     code = """from pathlib import Path
 p=Path('/inputs/selected.txt')
@@ -541,6 +614,7 @@ def suite(argv, public=False):
 CASES = {
     'arithmetic': arithmetic, 'chaining': chaining, 'private_audit': private_audit, 'xlsx': xlsx,
     'selected_readonly': selected_readonly, 'network': network,
+    'byte_boundaries': byte_boundaries,
     'fresh_task': fresh_task, 'changed_constraints': changed_constraints, 'failed_preparation': failed_preparation,
     'host_canaries': host_canaries, 'host_package_integrity': package_integrity,
     'detached_descendants': detached_descendants,

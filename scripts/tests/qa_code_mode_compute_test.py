@@ -85,6 +85,24 @@ class HarnessExecutionTests(unittest.TestCase):
             with self.subTest(index=index, field=field), self.assertRaises(AssertionError):
                 qa.changed_constraints(h, 'fixture')
 
+    def test_byte_boundaries_cannot_pass_without_all_cli_commands(self):
+        self.assertIn('byte_boundaries', qa.CASES)
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        class Probe:
+            args = SimpleNamespace()
+            deno = '/deno'
+            def __init__(self):
+                self.results = {}
+        parent = Probe()
+        class MissingEvidence:
+            def __init__(self, *_):
+                self.results = {}
+            def cli(self, *_args, **_kwargs):
+                pass
+        with patch.object(qa, 'Harness', MissingEvidence), self.assertRaises((AssertionError, KeyError)):
+            qa.byte_boundaries(parent, 'fixture')
+
     def test_missing_prerequisite_writes_failed_report_for_all_criteria(self):
         import contextlib
         import io
