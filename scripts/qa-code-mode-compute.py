@@ -50,7 +50,7 @@ GROUPS = {
     'lifecycle': {name for ac in ('AC04', 'AC09', 'AC10', 'AC11', 'AC12', 'AC16', 'AC17') for name in REQUIREMENTS[ac]},
 }
 GROUPS['all'] = {name for cases in REQUIREMENTS.values() for name in cases} | {'arithmetic'}
-MULTI_COMMAND_CASES = {'fresh_task': 2, 'byte_boundaries': 6}
+MULTI_COMMAND_CASES = {'fresh_task': 2, 'byte_boundaries': 6, 'concurrent_admission': 2}
 
 
 def coverage_report(requirements, results):
@@ -362,6 +362,50 @@ def fresh_task(h, name):
                        'reports': [child.results[child_name]['report'] for child_name in names]}
 
 
+def concurrent_admission(h, name):
+    from concurrent.futures import ThreadPoolExecutor
+    first, second = Harness(h.args, h.deno), Harness(h.args, h.deno)
+    first_name, second_name = name + '-owner', name + '-contender'
+    def running_vm(scratch):
+        for entry in Path('/proc').iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                if (entry / 'exe').resolve().name.startswith('qemu-system-'):
+                    if str(scratch).encode() in (entry / 'cmdline').read_bytes():
+                        return entry.name
+            except (OSError, RuntimeError):
+                pass
+        return None
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        active = pool.submit(first.cli, first_name, program('import time;time.sleep(10);print(60)', timeoutSecs=15),
+                             maximum=20, verify=final_value)
+        deadline = time.monotonic() + 10
+        owner_pid, shared = None, None
+        while owner_pid is None:
+            if active.done():
+                active.result()
+                raise AssertionError('owner CLI finished before contention could be exercised')
+            checked(time.monotonic() < deadline, 'first CLI never launched a real VM')
+            if first_name in first.results:
+                shared = first.results[first_name]['scratch']
+                owner_pid = running_vm(shared)
+            if owner_pid is None:
+                time.sleep(.02)
+        def verify_contender(value, _):
+            checked(value['final']['error']['retryable'] is True, 'contention must be retryable')
+            checked(len(value['records']) == 1 and value['records'][0]['runner'] == 'none', 'contender launched a VM')
+            checked(not active.done() and running_vm(shared) == owner_pid, 'contention interrupted the active VM or queued behind it')
+        second.cli(second_name, program('raise AssertionError("contender must not execute")'),
+                   overrides={'AUGMENTAGENT_BUILD_SCRATCH_DIR': shared}, maximum=5,
+                   expect_exit=1, expected_error='resource_limit', runner='none', verify=verify_contender)
+        active.result()
+    commands = [first.results[first_name]['command'], second.results[second_name]['command']]
+    checked(commands[1]['elapsedSecs'] < 5, 'contention was queued beyond its bound')
+    h.results[name] = {'status': 'failed', 'command': commands[-1], 'commands': commands,
+                       'reports': [first.results[first_name]['report'], second.results[second_name]['report']]}
+
+
 def byte_boundaries(h, name):
     child = Harness(h.args, h.deno)
     commands, reports = [], []
@@ -614,7 +658,7 @@ def suite(argv, public=False):
 CASES = {
     'arithmetic': arithmetic, 'chaining': chaining, 'private_audit': private_audit, 'xlsx': xlsx,
     'selected_readonly': selected_readonly, 'network': network,
-    'byte_boundaries': byte_boundaries,
+    'byte_boundaries': byte_boundaries, 'concurrent_admission': concurrent_admission,
     'fresh_task': fresh_task, 'changed_constraints': changed_constraints, 'failed_preparation': failed_preparation,
     'host_canaries': host_canaries, 'host_package_integrity': package_integrity,
     'detached_descendants': detached_descendants,

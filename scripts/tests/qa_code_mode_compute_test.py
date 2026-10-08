@@ -85,6 +85,10 @@ class HarnessExecutionTests(unittest.TestCase):
             with self.subTest(index=index, field=field), self.assertRaises(AssertionError):
                 qa.changed_constraints(h, 'fixture')
 
+    def test_concurrent_admission_requires_both_real_cli_commands(self):
+        self.assertIn('concurrent_admission', qa.CASES)
+        self.assertEqual(qa.MULTI_COMMAND_CASES['concurrent_admission'], 2)
+
     def test_byte_boundaries_cannot_pass_without_all_cli_commands(self):
         self.assertIn('byte_boundaries', qa.CASES)
         from types import SimpleNamespace

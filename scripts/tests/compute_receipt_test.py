@@ -12,7 +12,7 @@ SPEC.loader.exec_module(receipt)
 def fixture(head='a' * 40):
     cases = {name: {'status': 'passed', 'command': {'executed': True, 'argv': ['synthetic-fixture'],
               'exitCode': 0, 'failure': None}} for name in receipt.qa.GROUPS['all']}
-    for name, count in [('fresh_task', 2), ('byte_boundaries', 6)]:
+    for name, count in receipt.qa.MULTI_COMMAND_CASES.items():
         cases[name]['commands'] = [copy.deepcopy(cases[name]['command']) for _ in range(count)]
     return {'schemaVersion': 1, 'issue': 1434, 'mode': 'all', 'requireVm': True,
             'publicPackages': True, 'ok': True, 'acceptanceComplete': True,
@@ -52,7 +52,7 @@ class ReceiptTests(unittest.TestCase):
                 receipt.validate(report, 'a' * 40)
 
     def test_multi_command_cases_require_every_completed_command(self):
-        for name in ('fresh_task', 'byte_boundaries'):
+        for name in receipt.qa.MULTI_COMMAND_CASES:
             for mutation in ('missing', 'short', 'not-executed', 'failure'):
                 report = fixture()
                 case = report['cases'][name]
