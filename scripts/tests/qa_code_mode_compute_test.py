@@ -35,6 +35,56 @@ class EvidenceContractTests(unittest.TestCase):
 
 
 class HarnessExecutionTests(unittest.TestCase):
+    def test_dependency_lifecycle_cases_require_real_cli_evidence(self):
+        for name in ('fresh_task', 'changed_constraints', 'failed_preparation'):
+            with self.subTest(name=name):
+                self.assertIn(name, qa.CASES)
+
+    def test_failed_preparation_check_rejects_cached_failure_and_execution(self):
+        from types import SimpleNamespace
+        import copy
+        class FakeHarness:
+            args = SimpleNamespace(public_packages=True)
+            def cli(self, name, source, **kwargs):
+                kwargs['verify'](self.value, None)
+        h = FakeHarness()
+        failure = {'ok': False, 'runner': 'vm', 'error': {'code': 'dependency_unavailable'},
+                   'artifacts': [], 'dependencyLock': [], 'environmentReused': False, 'stdout': ''}
+        success = {'ok': True, 'runner': 'vm', 'stdout': '60', 'environmentReused': False}
+        records = [{'runner': 'vm', 'cleanupVerified': True, 'environmentReused': False,
+                    'dependencyLock': [], 'error': failure['error']} for _ in range(2)]
+        records.append({'runner': 'vm', 'cleanupVerified': True, 'error': None})
+        good = {'final': [failure, copy.deepcopy(failure), success], 'records': records, 'artifacts': []}
+        h.value = good
+        qa.failed_preparation(h, 'fixture')
+        for field, value in [('environmentReused', True), ('stdout', 'EXECUTION_MUST_NOT_RUN'),
+                             ('dependencyLock', [{'name': 'unexpected'}]), ('ok', True)]:
+            h.value = copy.deepcopy(good)
+            h.value['final'][1][field] = value
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                qa.failed_preparation(h, 'fixture')
+
+    def test_changed_constraints_check_rejects_reuse_and_hidden_network(self):
+        from types import SimpleNamespace
+        import copy
+        class FakeHarness:
+            args = SimpleNamespace(public_packages=True)
+            def cli(self, name, source, **kwargs):
+                kwargs['verify'](self.value, None)
+        h = FakeHarness()
+        records = [{'environmentReused': reused, 'downloads': {'requests': requests, 'bytes': requests * 100},
+                    'dependencyLock': [{'name': 'fixture', 'sha256': 'a' * 64}], 'cleanupVerified': True}
+                   for reused, requests in [(False, 1), (False, 1), (True, 0)]]
+        good = {'final': [{'ok': True, 'runner': 'vm', 'stdout': '60'} for _ in records], 'records': records}
+        h.value = good
+        qa.changed_constraints(h, 'fixture')
+        for index, field, value in [(1, 'environmentReused', True), (1, 'downloads', {'requests': 0, 'bytes': 0}),
+                                     (2, 'downloads', {'requests': 1, 'bytes': 100}), (2, 'dependencyLock', [])]:
+            h.value = copy.deepcopy(good)
+            h.value['records'][index][field] = value
+            with self.subTest(index=index, field=field), self.assertRaises(AssertionError):
+                qa.changed_constraints(h, 'fixture')
+
     def test_missing_prerequisite_writes_failed_report_for_all_criteria(self):
         import contextlib
         import io

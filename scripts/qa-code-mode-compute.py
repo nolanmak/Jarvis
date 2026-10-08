@@ -305,6 +305,62 @@ def xlsx(h, name):
     h.cli(name, (FIXTURES / 'sum-xlsx.ts').read_text(), files={'sheet': (FIXTURES / 'numbers.xlsx').read_bytes()}, verify=verify)
 
 
+def failed_preparation(h, name):
+    checked(h.args.public_packages, 'failed preparation requires --public-packages')
+    unavailable = {'runtime': 'python', 'dependencies': ['openpyxl==9999999.0.0'],
+                   'code': "print('EXECUTION_MUST_NOT_RUN')"}
+    healthy = {'runtime': 'python', 'dependencies': [], 'code': 'print(60)'}
+    source = f"async function main(){{const results=[];for(let i=0;i<2;i++)results.push(await tools.compute.run({json.dumps(unavailable)}));results.push(await tools.compute.run({json.dumps(healthy)}));return results;}}main();"
+    def verify(value, _):
+        checked(len(value['final']) == len(value['records']) == 3, 'expected two preparation failures and recovery')
+        for result, record in zip(value['final'][:2], value['records'][:2]):
+            checked(result['ok'] is False and result['error']['code'] == 'dependency_unavailable', 'unavailable version did not fail preparation')
+            checked(result['runner'] == record['runner'] == 'vm' and record['cleanupVerified'], 'failed preparation VM was not cleaned up')
+            checked(not result['environmentReused'] and not record['environmentReused'], 'failed environment was reused')
+            checked(not result['dependencyLock'] and not record['dependencyLock'] and not result['artifacts'], 'failed preparation published state')
+            checked(not result['stdout'], 'workload executed after failed preparation')
+        healthy_result = value['final'][2]
+        checked(healthy_result['ok'] and healthy_result['runner'] == 'vm' and healthy_result['stdout'].strip() == '60', 'failed preparation poisoned later execution')
+        checked(not value['artifacts'] and all(row['cleanupVerified'] for row in value['records']), 'failed preparation left artifacts or unverified cleanup')
+    # CLI records any failed call even when the program handles the result and
+    # successfully recovers, so the overall report must retain exit status 1.
+    h.cli(name, source, expect_exit=1, verify=verify)
+
+
+def changed_constraints(h, name):
+    checked(h.args.public_packages, 'changed constraints requires --public-packages')
+    requirements = ['openpyxl==3.1.5', 'openpyxl>=3.1.5,<3.1.6', 'openpyxl>=3.1.5,<3.1.6']
+    requests = [{'runtime': 'python', 'dependencies': [requirement],
+                 'code': "import openpyxl;assert openpyxl.__version__=='3.1.5';print(60)"} for requirement in requirements]
+    source = f"async function main(){{const results=[];for(const request of {json.dumps(requests)})results.push(await tools.compute.run(request));return results;}}main();"
+    def verify(value, _):
+        checked(len(value['final']) == len(value['records']) == 3, 'expected three dependency calls')
+        checked(all(result['ok'] and result['runner'] == 'vm' and result['stdout'].strip() == '60' for result in value['final']), 'dependency call failed')
+        checked([row['environmentReused'] for row in value['records']] == [False, False, True], 'changed constraints reused the old environment')
+        for row in value['records'][:2]:
+            checked(row['downloads']['requests'] > 0 and row['downloads']['bytes'] > 0, 'changed constraints did not prepare independently')
+        checked(value['records'][2]['downloads'] == {'requests': 0, 'bytes': 0}, 'identical constraints did not reuse offline')
+        locks = [row['dependencyLock'] for row in value['records']]
+        checked(bool(locks[0]) and locks[0] == locks[1] == locks[2], 'equivalent pinned constraints changed the resolved lock')
+        checked(all(row['cleanupVerified'] for row in value['records']), 'VM cleanup unverified')
+    h.cli(name, source, verify=verify)
+
+
+def fresh_task(h, name):
+    checked(h.args.public_packages, 'fresh task requires --public-packages')
+    # Separate CLI processes own separate task leases. Each xlsx probe checks
+    # a cold public download followed by zero-request reuse inside that task.
+    child = Harness(h.args, h.deno)
+    names = [name + '-first', name + '-second']
+    for child_name in names:
+        xlsx(child, child_name)
+    reports = [json.loads((h.args.output_dir / child_name / 'cli-report.json').read_text()) for child_name in names]
+    checked(reports[0]['records'][0]['taskId'] != reports[1]['records'][0]['taskId'], 'fresh CLI reused a task identity')
+    commands = [child.results[child_name]['command'] for child_name in names]
+    h.results[name] = {'status': 'failed', 'command': commands[-1], 'commands': commands,
+                       'reports': [child.results[child_name]['report'] for child_name in names]}
+
+
 def selected_readonly(h, name):
     code = """from pathlib import Path
 p=Path('/inputs/selected.txt')
@@ -475,6 +531,7 @@ def suite(argv, public=False):
 CASES = {
     'arithmetic': arithmetic, 'chaining': chaining, 'private_audit': private_audit, 'xlsx': xlsx,
     'selected_readonly': selected_readonly, 'network': network,
+    'fresh_task': fresh_task, 'changed_constraints': changed_constraints, 'failed_preparation': failed_preparation,
     'host_canaries': host_canaries, 'host_package_integrity': package_integrity,
     'full_log_transfer': full_log_transfer, 'workload_rpc': workload_rpc, 'execution_gateway_absent': gateway_absent,
     'traversal': lambda h, n: schema_denial(h, n, {'runtime':'python','dependencies':[],'code':'pass','outputs':['../outside']}, 'bad_args'),
