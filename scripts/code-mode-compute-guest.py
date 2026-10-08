@@ -155,7 +155,18 @@ def main():
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         resource.setrlimit(resource.RLIMIT_NPROC, (128, 128))
         resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
-        resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_FILE, MAX_FILE))
+        # The 32 MiB file ceiling belongs to workload exports. A compressed
+        # wheel below the broker limit can legitimately contain a larger native
+        # library (for example NumPy's BLAS library). Preparation writes only
+        # to bounded guest filesystems, so cap its files at the provisioned
+        # cache filesystem capacity instead of applying the export ceiling.
+        file_limit = MAX_FILE
+        if job['prepare']:
+            cache_info = os.statvfs('/cache')
+            file_limit = cache_info.f_blocks * cache_info.f_frsize
+            if file_limit <= 0:
+                raise OSError('invalid preparation filesystem capacity')
+        resource.setrlimit(resource.RLIMIT_FSIZE, (file_limit, file_limit))
         memory = job['memory_mb'] * 1024 * 1024
         resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
 

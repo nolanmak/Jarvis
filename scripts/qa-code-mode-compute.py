@@ -25,7 +25,7 @@ FIXTURES = REPO / 'scripts/tests/fixtures/code-mode-compute'
 LOG_LIMIT = 16 * 1024 * 1024
 REQUIREMENTS = {
     'AC01': ['disabled', 'owner_contracts', 'missing_runtime', 'host_optout', 'unsupported_platform'],
-    'AC02': ['xlsx', 'host_package_integrity'],
+    'AC02': ['xlsx', 'host_package_integrity', 'native_wheel'],
     'AC03': ['xlsx'],
     'AC04': ['fresh_task', 'changed_constraints', 'failed_preparation'],
     'AC05': ['request_contracts', 'gateway_contracts', 'source_only', 'transitive_url', 'altered_wheel'],
@@ -304,6 +304,35 @@ def xlsx(h, name):
         checked({entry['name'] for entry in cold['dependencyLock']} == {'openpyxl', 'et-xmlfile'}, 'transitive lock incomplete')
         checked(all(re.fullmatch('[0-9a-f]{64}', entry['sha256']) for entry in cold['dependencyLock']), 'invalid wheel digest')
     h.cli(name, (FIXTURES / 'sum-xlsx.ts').read_text(), files={'sheet': (FIXTURES / 'numbers.xlsx').read_bytes()}, verify=verify)
+
+
+def native_wheel(h, name):
+    checked(h.args.public_packages, 'native wheel import requires --public-packages')
+    code = """import os,errno
+os.environ['OPENBLAS_NUM_THREADS']='1'
+from pathlib import Path
+import numpy as np
+import numpy.core._multiarray_umath as native
+assert np.__version__=='1.26.4'
+assert Path(native.__file__).suffix=='.so'
+try:
+    with open(native.__file__,'ab') as f:f.write(b'forbidden')
+    raise AssertionError('native dependency is writable')
+except OSError as error:
+    assert error.errno in (errno.EROFS,errno.EACCES,errno.EPERM)
+assert int(np.array([10,20,30],dtype=np.int64).sum())==60
+print('60')
+"""
+    def verify(value, root):
+        final_value(value, root)
+        checked(len(value['records']) == 1, 'expected one native dependency call')
+        row = value['records'][0]
+        checked(row['cleanupVerified'] and not row['environmentReused'], 'native wheel did not prepare in a fresh VM task')
+        checked(row['downloads']['requests'] > 0 and row['downloads']['bytes'] > 0, 'native wheel was not downloaded')
+        lock = row['dependencyLock']
+        checked(len(lock) == 1 and lock[0]['name'] == 'numpy' and lock[0]['version'] == '1.26.4'
+                and re.fullmatch('[0-9a-f]{64}', lock[0]['sha256']), 'native wheel lock differs')
+    h.cli(name, program(code, dependencies=['numpy==1.26.4']), verify=verify)
 
 
 def failed_preparation(h, name):
@@ -656,6 +685,7 @@ def suite(argv, public=False):
 
 
 CASES = {
+    'native_wheel': native_wheel,
     'arithmetic': arithmetic, 'chaining': chaining, 'private_audit': private_audit, 'xlsx': xlsx,
     'selected_readonly': selected_readonly, 'network': network,
     'byte_boundaries': byte_boundaries, 'concurrent_admission': concurrent_admission,

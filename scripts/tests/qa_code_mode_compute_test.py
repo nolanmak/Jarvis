@@ -35,6 +35,16 @@ class EvidenceContractTests(unittest.TestCase):
 
 
 class HarnessExecutionTests(unittest.TestCase):
+    def test_native_wheel_is_required_and_drives_the_cli(self):
+        self.assertIn('native_wheel', qa.REQUIREMENTS['AC02'])
+        self.assertIn('native_wheel', qa.CASES)
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        h = SimpleNamespace(args=SimpleNamespace(public_packages=False), cli=Mock())
+        with self.assertRaises(AssertionError):
+            qa.native_wheel(h, 'native_wheel')
+        h.cli.assert_not_called()
+
     def test_dependency_lifecycle_cases_require_real_cli_evidence(self):
         for name in ('fresh_task', 'changed_constraints', 'failed_preparation'):
             with self.subTest(name=name):

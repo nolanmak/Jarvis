@@ -89,7 +89,10 @@ reusable; a new task starts cold. Environments are removed when the task ends.
 
 Guest tmpfs caps are 128 MiB for `/tmp`, 256 MiB for `/work`, 64 MiB for
 `/outputs`, and 16 MiB for worker HOME. Guest-writable storage uses bounded
-filesystems and the existing shared build scratch accounting. Retained task storage has a 2 GiB aggregate admission ceiling
+filesystems and the existing shared build scratch accounting. During dependency
+preparation, an extracted wheel file may exceed the 32 MiB export ceiling; its
+file-size ceiling is the bounded cache filesystem capacity. This allows native
+libraries while keeping execution exports at 32 MiB per file. Retained task storage has a 2 GiB aggregate admission ceiling
 and reserves 640 MiB per active task. Capacity refusals do not authorize bypassing
 the VM or increasing limits from model arguments.
 
