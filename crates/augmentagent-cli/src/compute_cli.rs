@@ -155,8 +155,8 @@ pub async fn run(args: &ComputeRunArgs) -> i32 {
     if report["ok"] == true {
         let exported = serde_json::from_value::<Vec<Artifact>>(report["artifacts"].clone())
             .map_err(anyhow::Error::from)
-            .and_then(|entries| artifacts::export_pending(
-                &prepared.config.artifact_root, &prepared.destination, &entries));
+            .and_then(|entries| artifacts::export_pending_checked(
+                &prepared.config.artifact_root, &prepared.destination, &entries, &|| shutdown.check()));
         match exported {
             Ok(pending) => pending_exports = Some(pending),
             Err(_) => {
@@ -168,7 +168,7 @@ pub async fn run(args: &ComputeRunArgs) -> i32 {
     }
     let retain_audit = report["cleanup"]["cleanupVerified"] == true;
     let audit = if retain_audit {
-        let exported = (|| -> Result<tempfile::TempDir> {
+        let exported = (|| -> Result<(tempfile::TempDir, Directory)> {
             let (temporary, directory) =
                 prepared.report_parent.private_tempdir("compute-audit-")?;
             if report["startupFailure"] == true {
@@ -184,13 +184,13 @@ pub async fn run(args: &ComputeRunArgs) -> i32 {
             if let Some(lease) = prepared.storage.take() {
                 lease.discard()?;
             }
-            Ok(temporary)
+            Ok((temporary, directory))
         })();
         match exported {
-            Ok(temporary) => {
+            Ok((temporary, directory)) => {
                 report["auditDirectory"] =
                     json!(temporary.path().file_name().unwrap().to_str().unwrap());
-                Some(temporary)
+                Some((temporary, directory))
             }
             Err(_) => {
                 report["ok"] = json!(false);
@@ -202,6 +202,22 @@ pub async fn run(args: &ComputeRunArgs) -> i32 {
     } else {
         None
     };
+    // The signal listener runs independently while synchronous file copies
+    // and cleanup execute. Check again at the final publication boundary.
+    tokio::task::yield_now().await;
+    if shutdown.cancelled() && report["cleanup"]["cleanupVerified"] == true {
+        report["ok"] = json!(false);
+        report["error"] = json!({"code":"cancelled","message":"Compute task cancelled."});
+        report["cleanup"]["cancelled"] = json!(true);
+        if let Some((_, directory)) = &audit {
+            let recorded = directory.write_report("audit-cli.json", &json!({"schemaVersion":1,
+                    "phase":"finalization","cancelled":true,"cleanupVerified":true}));
+            if recorded.is_err() {
+                report["error"] = json!({"code":"cleanup_unverified","message":"Cancellation audit could not be retained."});
+                report["cleanup"]["cleanupVerified"] = json!(false);
+            }
+        }
+    }
     let success = report["ok"] == true;
     if !success {
         drop(pending_exports.take());
@@ -215,7 +231,7 @@ pub async fn run(args: &ComputeRunArgs) -> i32 {
         return 1;
     }
     if let Some(pending) = pending_exports { pending.commit(); }
-    if let Some(audit) = audit {
+    if let Some((audit, _directory)) = audit {
         let _ = audit.keep();
     }
     println!("{}", json!({"ok":success,"report":args.report}));
@@ -312,26 +328,40 @@ async fn execute(prepared: &Prepared, shutdown: &mut ShutdownSignals) -> Value {
 }
 
 struct ShutdownSignals {
-    #[cfg(unix)]
-    term: tokio::signal::unix::Signal,
-    #[cfg(unix)]
-    interrupt: tokio::signal::unix::Signal,
+    token: tokio_util::sync::CancellationToken,
+    listener: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ShutdownSignals {
+    fn drop(&mut self) { self.listener.abort(); }
 }
 
 impl ShutdownSignals {
     fn register() -> std::io::Result<Self> {
-        Ok(Self {
+        #[cfg(unix)]
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        #[cfg(unix)]
+        let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        let token = tokio_util::sync::CancellationToken::new();
+        let observed = token.clone();
+        let listener = tokio::spawn(async move {
             #[cfg(unix)]
-            term: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
-            #[cfg(unix)]
-            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
-        })
+            tokio::select! { _ = term.recv() => {}, _ = interrupt.recv() => {} }
+            #[cfg(not(unix))]
+            { let _ = tokio::signal::ctrl_c().await; }
+            observed.cancel();
+        });
+        Ok(Self { token, listener })
     }
 
-    async fn recv(&mut self) {
-        #[cfg(unix)]
-        tokio::select! { _ = self.term.recv() => {}, _ = self.interrupt.recv() => {} }
-        #[cfg(not(unix))]
-        { let _ = tokio::signal::ctrl_c().await; }
+    fn cancelled(&self) -> bool { self.token.is_cancelled() }
+
+    fn check(&self) -> Result<()> {
+        if self.cancelled() {
+            return Err(augmentagent_channel_core::code_mode::compute::RequestError::Cancelled.into());
+        }
+        Ok(())
     }
+
+    async fn recv(&mut self) { self.token.cancelled().await; }
 }

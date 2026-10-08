@@ -201,6 +201,14 @@ pub fn export(root: &Path, destination: &Directory, entries: &[Artifact]) -> Res
 /// report. Dropping this batch removes only the destination files it created.
 #[cfg(unix)]
 pub fn export_pending(root: &Path, destination: &Directory, entries: &[Artifact]) -> Result<ExportTransaction> {
+    export_pending_checked(root, destination, entries, &|| Ok(()))
+}
+
+/// Host cancellation/deadline checks run between bounded chunks and before
+/// publication. An interrupted batch retains the same rollback guarantees.
+#[cfg(unix)]
+pub fn export_pending_checked(root: &Path, destination: &Directory, entries: &[Artifact], check: &dyn Fn() -> Result<()>) -> Result<ExportTransaction> {
+    check()?;
     let source = Directory::open(root, false)?;
     let mut names = BTreeSet::new();
     let mut total = 0u64;
@@ -221,7 +229,7 @@ pub fn export_pending(root: &Path, destination: &Directory, entries: &[Artifact]
             "artifact export size limit"
         );
     }
-    copy_verified(&source, destination, entries, false)
+    copy_verified(&source, destination, entries, false, check)
 }
 
 /// Copy only completed private audit records and their digest-bound log files.
@@ -276,7 +284,7 @@ pub fn export_audit(root: &Path, destination: &Directory) -> Result<()> {
             });
         }
     }
-    let pending = copy_verified(&source, destination, &entries, true)?;
+    let pending = copy_verified(&source, destination, &entries, true, &|| Ok(()))?;
     destination.write_report("audit.json", &audit)?;
     pending.commit();
     Ok(())
@@ -318,11 +326,13 @@ fn copy_verified(
     destination: &Directory,
     entries: &[Artifact],
     private: bool,
+    check: &dyn Fn() -> Result<()>,
 ) -> Result<ExportTransaction> {
     let mut pending = ExportTransaction {
         destination: Directory(destination.0.try_clone()?), created: Vec::new(), committed: false,
     };
         for entry in entries {
+            check()?;
             let mut input = source.open_file(&entry.id, false)?;
             let before = input.metadata()?;
             anyhow::ensure!(
@@ -336,7 +346,14 @@ fn copy_verified(
                 );
             }
             let mut bytes = Vec::new();
-            (&mut input).take(entry.bytes + 1).read_to_end(&mut bytes)?;
+            let mut limited = (&mut input).take(entry.bytes + 1);
+            let mut chunk = [0u8; 64 * 1024];
+            loop {
+                check()?;
+                let count = limited.read(&mut chunk)?;
+                if count == 0 { break; }
+                bytes.extend_from_slice(&chunk[..count]);
+            }
             let after = input.metadata()?;
             anyhow::ensure!(
                 bytes.len() as u64 == entry.bytes
@@ -346,13 +363,20 @@ fn copy_verified(
                     && format!("{:x}", Sha256::digest(&bytes)) == entry.sha256,
                 "artifact integrity verification failed"
             );
+            check()?;
             let output = destination.open_file(&entry.name, true)?;
             pending.created.push((entry.name.clone(), output));
             let output = &mut pending.created.last_mut().unwrap().1;
-            output.write_all(&bytes)?;
+            for chunk in bytes.chunks(64 * 1024) {
+                check()?;
+                output.write_all(chunk)?;
+            }
+            check()?;
             output.sync_all()?;
         }
+        check()?;
         destination.0.sync_all()?;
+        check()?;
         Ok(pending)
 }
 
@@ -448,6 +472,26 @@ mod tests {
         std::fs::write(root.join(&entry.id), bytes).unwrap();
         entry
     }
+    #[test]
+    fn cancellation_between_export_chunks_removes_partial_output() {
+        let root = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let destination = Directory::open(out.path(), false).unwrap();
+        let entry = fixture(root.path(), "result.bin", &vec![42; 256 * 1024]);
+        let observed = std::cell::Cell::new(0);
+        let result = export_pending_checked(root.path(), &destination, &[entry], &|| {
+            let bytes = std::fs::metadata(out.path().join("result.bin")).map(|m| m.len()).unwrap_or(0);
+            if bytes > 0 {
+                observed.set(bytes);
+                anyhow::bail!("cancelled fixture");
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(observed.get(), 64 * 1024, "cancellation was not checked after one bounded chunk");
+        assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+    }
+
     #[test]
     fn pending_export_rolls_back_until_committed_and_preserves_replacements() {
         let root = tempfile::tempdir().unwrap();

@@ -675,6 +675,16 @@ fn killed_cli_cannot_leave_spinning_orchestration_process() {
 #[test]
 #[ignore = "requires real VM; races final report with a no-clobber sentinel"]
 fn real_cli_report_failure_rolls_back_exported_outputs() {
+    cli_export_failure(false);
+}
+
+#[test]
+#[ignore = "requires real VM; cancels while a verified output batch is copied"]
+fn real_cli_export_cancellation_rolls_back_outputs() {
+    cli_export_failure(true);
+}
+
+fn cli_export_failure(cancel: bool) {
     use augmentagent_channel_core::build_scratch::{ProcFs, ProcessTable};
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
@@ -683,7 +693,12 @@ fn real_cli_report_failure_rolls_back_exported_outputs() {
     let scratch = root.path().join("scratch");
     std::fs::create_dir(&scratch).unwrap();
     std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700)).unwrap();
-    std::fs::write(root.path().join("program.ts"), "async function main(){return await tools.compute.run({runtime:'python',dependencies:[],code:\"import time;time.sleep(1);open('/outputs/result.json','w').write('{}')\",outputs:['result.json']});}main();").unwrap();
+    let code = if cancel {
+        "from pathlib import Path; data=b'x'*(32*1024*1024); Path('/outputs/result.json').write_bytes(data); Path('/outputs/second.bin').write_bytes(data)"
+    } else { "import time;time.sleep(1);open('/outputs/result.json','w').write('{}')" };
+    let outputs = if cancel { vec!["result.json", "second.bin"] } else { vec!["result.json"] };
+    std::fs::write(root.path().join("program.ts"), format!("async function main(){{return await tools.compute.run({});}}main();",
+        json!({"runtime":"python","dependencies":[],"code":code,"outputs":outputs}))).unwrap();
     struct Owned(std::process::Child);
     impl Drop for Owned { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
     let mut cli = Owned(Command::new(env!("CARGO_BIN_EXE_augmentagent"))
@@ -694,7 +709,7 @@ fn real_cli_report_failure_rolls_back_exported_outputs() {
         .env("AUGMENTAGENT_BUILD_SCRATCH_DIR",&scratch)
         .args(["code-mode","compute-run","--program","program.ts","--output-dir","out","--report","report.json"])
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(if cancel { 60 } else { 15 });
     loop {
         assert!(cli.0.try_wait().unwrap().is_none());
         if ProcFs.vm_processes_using(&scratch).iter().any(|(pid,_)| {
@@ -703,13 +718,35 @@ fn real_cli_report_failure_rolls_back_exported_outputs() {
         assert!(Instant::now() < deadline,"VM did not start");
         std::thread::sleep(Duration::from_millis(10));
     }
-    std::fs::write(root.path().join("report.json"),b"no-clobber sentinel").unwrap();
+    if cancel {
+        while !root.path().join("out/result.json").exists() {
+            assert!(cli.0.try_wait().unwrap().is_none(), "CLI exited before export began");
+            assert!(Instant::now() < deadline, "export did not begin");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(unsafe { libc::kill(cli.0.id() as i32, libc::SIGTERM) }, 0);
+    } else {
+        std::fs::write(root.path().join("report.json"),b"no-clobber sentinel").unwrap();
+    }
+    let cancelled_at = Instant::now();
     let status = loop {
         if let Some(status) = cli.0.try_wait().unwrap() { break status; }
         assert!(Instant::now() < deadline,"CLI did not finish");
         std::thread::sleep(Duration::from_millis(10));
     };
     assert_eq!(status.code(),Some(1));
-    assert_eq!(std::fs::read(root.path().join("report.json")).unwrap(),b"no-clobber sentinel");
+    if cancel {
+        assert!(cancelled_at.elapsed() < Duration::from_secs(5), "export cancellation exceeded allowance");
+        let result = report(root.path());
+        assert_eq!(result["error"]["code"], "cancelled");
+        assert_eq!(result["artifacts"], json!([]));
+        assert_eq!(result["cleanup"]["cleanupVerified"], true);
+        let audit_path = root.path().join(result["auditDirectory"].as_str().unwrap()).join("audit-cli.json");
+        let audit: Value = serde_json::from_slice(&std::fs::read(audit_path).unwrap()).unwrap();
+        assert_eq!(audit["cancelled"], true);
+        assert_eq!(audit["phase"], "finalization");
+    } else {
+        assert_eq!(std::fs::read(root.path().join("report.json")).unwrap(),b"no-clobber sentinel");
+    }
     assert_eq!(std::fs::read_dir(root.path().join("out")).unwrap().count(),0,"failed CLI published success artifacts");
 }

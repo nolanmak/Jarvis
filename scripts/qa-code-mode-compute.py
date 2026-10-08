@@ -503,6 +503,7 @@ CASES = {
     'owner_repair': suite(cargo('augmentagent-cli', binary=True, filter_name='compute_tool::tests::real_owner_query', ignored=True), public=True),
     'cli_signals': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_signals', ignored=True)),
     'export_transaction': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_report_failure', ignored=True)),
+    'cancel_export': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_export_cancellation', ignored=True)),
     'cli_startup_signals': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_startup_signals', ignored=True)),
     'cli_stalled_startup': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_stalled_startup', ignored=True)),
     'owner_crash': suite(cargo('augmentagent-channel-core', test='code_mode_compute', filter_name='killed_owner_recovery', ignored=True)),
