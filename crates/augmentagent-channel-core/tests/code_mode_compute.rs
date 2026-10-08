@@ -560,3 +560,118 @@ async fn killed_owner_recovery_removes_vm_and_task_lease() {
         "task artifacts survived recovery"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires real VM configuration; verifies deadline result and subsequent task call"]
+async fn real_call_timeout_returns_typed_result_and_preserves_remaining_task_budget() {
+    use augmentagent_channel_core::code_mode::compute::ComputeService;
+    let root = tempfile::tempdir().unwrap();
+    let mut config = service_config(root.path(), true);
+    config.runtime = std::env::var_os("JARVIS_TEST_VM_CONFIG")
+        .expect("VM config required")
+        .into();
+    config.scratch_root = std::env::var_os("JARVIS_TEST_COMPUTE_SCRATCH")
+        .expect("isolated scratch required")
+        .into();
+    let service = ComputeService::start(config).await.unwrap();
+    let before = service.run_options().unwrap().timeout;
+    let started = std::time::Instant::now();
+    let failed = service.execute(json!({"runtime":"python","dependencies":[],"code":"import time;time.sleep(20)","timeoutSecs":2})).await;
+    assert!(
+        failed.is_ok(),
+        "deadline must return a ComputeResult, not a transport error: {failed:?}"
+    );
+    let failed = failed.unwrap();
+    assert_eq!(failed["error"]["code"], "timeout");
+    assert_eq!(failed["runner"], "vm");
+    assert_eq!(failed["artifacts"], json!([]));
+    assert!(started.elapsed() < Duration::from_secs(7));
+    assert!(service.run_options().unwrap().timeout < before - Duration::from_secs(1));
+    let next = service
+        .execute(json!({"runtime":"python","dependencies":[],"code":"print(60)"}))
+        .await
+        .unwrap();
+    assert_eq!(next["ok"], true, "{next:?}");
+    assert_eq!(next["stdout"], "60\n");
+    // A queued call spends its own budget while waiting for the helper. It
+    // must not get a new second when the preceding call finally releases it.
+    let occupied = service.clone();
+    let first = tokio::spawn(async move {
+        occupied.execute(json!({"runtime":"python","dependencies":[],"code":"import time;time.sleep(20)","timeoutSecs":2})).await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let queued = service.execute(json!({"runtime":"python","dependencies":[],"code":"print('must not run')","timeoutSecs":1})).await.unwrap();
+    assert_eq!(queued["error"]["code"], "timeout");
+    assert_eq!(
+        queued["runner"], "none",
+        "expired queued call started a guest"
+    );
+    assert_eq!(first.await.unwrap().unwrap()["error"]["code"], "timeout");
+    let receipt = service.finish().await.unwrap();
+    assert_eq!(receipt["cleanupVerified"], true);
+    assert_eq!(receipt["records"][0]["error"]["code"], "timeout");
+    assert_eq!(receipt["records"][0]["cleanupVerified"], true);
+}
+
+#[tokio::test]
+async fn stalled_helper_cannot_get_a_second_cleanup_allowance() {
+    use augmentagent_channel_core::code_mode::compute::ComputeService;
+    let root = tempfile::tempdir().unwrap();
+    let mut config = service_config(root.path(), false);
+    config.policy.call_timeout = Duration::from_secs(1);
+    let artifact_root = config.artifact_root.clone();
+    let service = ComputeService::start(config).await.unwrap();
+    let audit: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(artifact_root.join("audit.json")).unwrap()).unwrap();
+    let pid = audit["ownerPid"].as_i64().unwrap() as libc::pid_t;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    struct Resume(OwnedFd);
+    impl Resume {
+        fn signal(&self, signal: libc::c_int) -> libc::c_long {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.0.as_raw_fd(),
+                    signal,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            }
+        }
+    }
+    impl Drop for Resume {
+        fn drop(&mut self) {
+            self.signal(libc::SIGCONT);
+        }
+    }
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    assert!(fd >= 0);
+    let resume = Resume(unsafe { OwnedFd::from_raw_fd(fd as i32) });
+    assert_eq!(resume.signal(libc::SIGSTOP), 0);
+    let started = std::time::Instant::now();
+    let result = service
+        .execute(json!({"runtime":"python","dependencies":[],"code":"pass"}))
+        .await;
+    assert!(result.is_err());
+    assert!(started.elapsed() < Duration::from_millis(6500));
+    let cleanup_started = std::time::Instant::now();
+    assert!(
+        service.finish().await.is_err(),
+        "a killed/stalled helper cannot prove cleanup"
+    );
+    assert!(
+        cleanup_started.elapsed() < Duration::from_millis(500),
+        "cleanup restarted an already spent allowance"
+    );
+    let mut poll = libc::pollfd {
+        fd: resume.0.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert_eq!(
+        unsafe { libc::poll(&mut poll, 1, 500) },
+        1,
+        "stopped helper survived the hard deadline"
+    );
+    assert_ne!(poll.revents & libc::POLLIN, 0);
+}

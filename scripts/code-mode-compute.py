@@ -8,6 +8,7 @@ import base64
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -39,6 +40,14 @@ class ComputeError(ValueError):
 
 def deny(code='bad_args', message='Invalid compute request.', **details):
     raise ComputeError(code, message, **details)
+
+
+def bound_host_deadline(local, host):
+    if host is None:
+        return local
+    if type(host) not in (int, float) or not math.isfinite(host) or host <= 0:
+        deny('bad_args', 'Invalid host deadline.')
+    return min(local, host)
 
 
 def filename(value):
@@ -416,7 +425,7 @@ class ArtifactStore:
             os.unlink(identifier, dir_fd=self.descriptor)
             raise
 
-    def publish(self, files):
+    def publish(self, files, *, deadline=None, clock=time.monotonic):
         if not isinstance(files, dict) or len(files) > MAX_FILES:
             deny('output_denied', 'Invalid output file set.')
         total = 0
@@ -430,8 +439,12 @@ class ArtifactStore:
             deny('resource_limit', 'Task artifact storage is full.')
         published = []
         try:
+            if deadline is not None and clock() >= deadline:
+                deny('timeout', 'Compute deadline expired before export.')
             for name, data in files.items():
                 published.append(self._store(data, name))
+                if deadline is not None and clock() >= deadline:
+                    deny('timeout', 'Compute deadline expired during export.')
             return published
         except BaseException:
             for entry in published:
@@ -498,7 +511,7 @@ def validate_lock(value):
 
 class ComputeTask:
     """Host-owned task identity, monotonic deadline and immutable resolution map."""
-    def __init__(self, backend, artifacts, *, enabled, call_timeout=600, task_timeout=1800, clock=time.monotonic):
+    def __init__(self, backend, artifacts, *, enabled, call_timeout=600, task_timeout=1800, clock=time.monotonic, host_deadline=None):
         validate_request({'runtime': 'python', 'dependencies': [], 'code': ''}, call_timeout)
         if type(enabled) is not bool or type(task_timeout) is not int or not 1 <= task_timeout <= 3600:
             deny('sandbox_unavailable', 'Invalid compute task policy.')
@@ -507,7 +520,7 @@ class ComputeTask:
         self.enabled = enabled
         self.call_timeout = call_timeout
         self.clock = clock
-        self.deadline = clock() + task_timeout
+        self.deadline = bound_host_deadline(clock() + task_timeout, host_deadline)
         self.environments = {}
         self.records = []
         self.task_id = uuid.uuid4().hex
@@ -580,7 +593,7 @@ class ComputeTask:
         self._audit(**receipt)
         return receipt
 
-    def execute(self, value):
+    def execute(self, value, *, host_deadline=None):
         # Schema failures are distinguishable from execution results, and occur
         # before artifacts, admission, resolution or VM startup.
         request = validate_request(value, self.call_timeout)
@@ -589,6 +602,7 @@ class ComputeTask:
         self.calls += 1
         execution_id = uuid.uuid4().hex
         started = self.clock()
+        deadline = bound_host_deadline(min(self.deadline, started + request['timeoutSecs']), host_deadline)
         result = {'ok': False, 'runner': 'none', 'executionId': execution_id, 'exitCode': None,
                   'stdout': '', 'stderr': '', 'error': None, 'dependencyLock': [],
                   'environmentReused': False, 'artifacts': []}
@@ -601,10 +615,9 @@ class ComputeTask:
         try:
             if not self.enabled:
                 deny('compute_disabled', 'Compute is disabled for this context.')
-            if self.clock() >= self.deadline:
-                deny('timeout', 'Compute task deadline expired.')
+            if self.clock() >= deadline:
+                deny('timeout', 'Compute deadline expired before admission.')
             selected = self.artifacts.resolve_inputs(request['inputs'])
-            deadline = min(self.deadline, started + request['timeoutSecs'])
             fingerprint = self.backend.fingerprint
             key = json.dumps([request['dependencies'], fingerprint, 1], separators=(',', ':'))
             with self.backend.admit():
@@ -647,7 +660,7 @@ class ComputeTask:
                 if self.clock() >= deadline:
                     deny('timeout', 'Compute call deadline expired before export.')
                 self._phase('export')
-                result['artifacts'] = self.artifacts.publish(executed['files'])
+                result['artifacts'] = self.artifacts.publish(executed['files'], deadline=deadline, clock=self.clock)
                 result['ok'] = True
         except ComputeError as error:
             if error.runner == 'vm':
@@ -663,6 +676,8 @@ class ComputeTask:
             raise
         finally:
             self.records.append({'executionId': execution_id, 'taskId': self.task_id,
+                                 'startedMonotonic': started, 'deadlineMonotonic': deadline,
+                                 'taskDeadlineMonotonic': self.deadline,
                                  'runner': result['runner'], 'runtimeFingerprint': fingerprint,
                                  'dependencyLock': result['dependencyLock'], 'environmentReused': result['environmentReused'],
                                  'downloads': downloads, 'elapsedSecs': self.clock() - started,
@@ -798,14 +813,14 @@ def serve(policy_path):
         deny('sandbox_unavailable', 'Compute helper lost its owner.')
     policy = vm_module().private_json(Path(policy_path))
     required = {'runtime', 'scratch', 'artifactRoot', 'enabled', 'callTimeoutSecs', 'taskTimeoutSecs', 'inputFiles'}
-    if not required <= set(policy) or set(policy) - required - {'pip', 'scratchLimits'}:
+    if not required <= set(policy) or set(policy) - required - {'pip', 'scratchLimits', 'taskDeadlineMonotonic'}:
         deny('sandbox_unavailable', 'Invalid compute host policy.')
     if not isinstance(policy['inputFiles'], dict) or len(policy['inputFiles']) > MAX_FILES:
         deny('bad_args', 'Invalid input file mapping.')
     backend = VMBackend(policy['runtime'], policy['scratch'], policy.get('pip'), policy.get('scratchLimits'))
     artifacts = ArtifactStore(policy['artifactRoot'])
     task = ComputeTask(backend, artifacts, enabled=policy['enabled'], call_timeout=policy['callTimeoutSecs'],
-                       task_timeout=policy['taskTimeoutSecs'])
+                       task_timeout=policy['taskTimeoutSecs'], host_deadline=policy.get('taskDeadlineMonotonic'))
     aliases = {}
     try:
         # Recovery must know the helper identity before any input snapshot exists.
@@ -828,8 +843,8 @@ def serve(policy_path):
                 frame = json.loads(line)
                 if not isinstance(frame, dict):
                     deny()
-                if set(frame) == {'execute'}:
-                    respond({'result': task.execute(frame['execute'])})
+                if set(frame) in ({'execute'}, {'execute', 'deadlineMonotonic'}):
+                    respond({'result': task.execute(frame['execute'], host_deadline=frame.get('deadlineMonotonic'))})
                 elif frame == {'close': True}:
                     backend.close()
                     respond(task.finish())

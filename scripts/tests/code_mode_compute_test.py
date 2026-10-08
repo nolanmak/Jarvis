@@ -27,7 +27,7 @@ class RequestContractTests(unittest.TestCase):
 
     def test_unknown_fields_and_wrong_types_have_no_authority(self):
         for value in (None, [], True, request(runtime='node'), request(code=1),
-                      request(registry='https://attacker.invalid'), request(sessionId='other'),
+                      request(registry='https://attacker.invalid'), request(sessionId='other'), request(deadlineMonotonic=1),
                       request(dependencies='pandas'), request(inputs={}), request(outputs='out'),
                       {'code': 'pass'}, request(code='\0')):
             with self.subTest(value=value):
@@ -396,6 +396,59 @@ class TaskLifecycleContractTests(unittest.TestCase):
         backend = self.Backend()
         artifacts = compute.ArtifactStore(root)
         return backend, compute.ComputeTask(backend, artifacts, enabled=True, **options)
+
+    def test_expiry_during_export_rolls_back_artifacts_before_returning(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            now = [10.0]
+            backend, task = self.setup_task(Path(tmp), clock=lambda: now[0])
+            store = task.artifacts._store
+            def expire_after_write(data, name):
+                entry = store(data, name)
+                now[0] = 13.0
+                return entry
+            with patch.object(task.artifacts, '_store', side_effect=expire_after_write):
+                result = task.execute(request(outputs=['result.json']), host_deadline=12.0)
+            self.assertFalse(result['ok'], result)
+            self.assertEqual(result['error']['code'], 'timeout')
+            self.assertEqual(result['artifacts'], [])
+            self.assertEqual(task.artifacts.entries, {})
+            self.assertFalse(any(len(path.name) == 32 for path in Path(tmp).iterdir()), 'expired export left a capability file')
+
+    def test_invalid_private_deadlines_fail_before_backend_access(self):
+        for deadline in (True, '12', float('nan'), float('inf'), 0, -1):
+            with self.subTest(deadline=deadline), tempfile.TemporaryDirectory() as tmp:
+                backend, task = self.setup_task(Path(tmp))
+                with self.assertRaises(compute.ComputeError) as failure:
+                    task.execute(request(), host_deadline=deadline)
+                self.assertEqual(failure.exception.code, 'bad_args')
+                self.assertEqual(backend.executions, [])
+                self.assertEqual(backend.prepares, [])
+                self.assertEqual(list(Path(tmp).iterdir()), [])
+
+    def test_host_deadline_cannot_reset_or_extend_task_or_call_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            now = [10.0]
+            backend, task = self.setup_task(Path(tmp), call_timeout=3, task_timeout=30,
+                                           host_deadline=35.0, clock=lambda: now[0])
+            self.assertEqual(task.deadline, 35.0)
+            result = task.execute(request(dependencies=['example'], outputs=['result.json']), host_deadline=12.0)
+            self.assertTrue(result['ok'], result)
+            self.assertEqual(backend.prepares[0][1], 12.0)
+            self.assertEqual(backend.executions[0][-1], 12.0)
+            self.assertEqual(task.records[0].get('deadlineMonotonic'), 12.0)
+            self.assertEqual(task.records[0].get('taskDeadlineMonotonic'), 35.0)
+            now[0] = 20.0
+            self.assertTrue(task.execute(request(outputs=['result.json']), host_deadline=1000.0)['ok'])
+            self.assertEqual(backend.executions[-1][-1], 23.0)
+            now[0] = 34.0
+            self.assertTrue(task.execute(request(outputs=['result.json']), host_deadline=1000.0)['ok'])
+            self.assertEqual(backend.executions[-1][-1], 35.0)
+            count = len(backend.executions)
+            expired = task.execute(request(), host_deadline=33.0)
+            self.assertEqual(expired['error']['code'], 'timeout')
+            self.assertEqual(expired['runner'], 'none')
+            self.assertEqual(len(backend.executions), count)
 
     def test_exhausted_shared_storage_has_typed_resource_limit(self):
         from unittest.mock import patch

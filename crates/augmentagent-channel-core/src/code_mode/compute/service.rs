@@ -104,6 +104,29 @@ impl ServiceConfig {
     }
 }
 
+// Python time.monotonic and Linux CLOCK_MONOTONIC use the same kernel clock.
+// Transfer absolute deadlines, so startup, mutex waits and IPC cannot reset a
+// budget. The model request never contains or controls this envelope field.
+fn monotonic_deadline(remaining: Duration) -> Result<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        anyhow::ensure!(
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } == 0,
+            "sandbox_unavailable: cannot read compute monotonic clock"
+        );
+        Ok(now.tv_sec as f64 + now.tv_nsec as f64 / 1_000_000_000.0 + remaining.as_secs_f64())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = remaining;
+        anyhow::bail!("sandbox_unavailable: compute requires Linux KVM")
+    }
+}
+
 struct Helper {
     child: Option<Child>,
     stdin: ChildStdin,
@@ -137,6 +160,14 @@ impl ProcessOwner {
         }
     }
     fn terminate(&self) {
+        self.signal(libc::SIGTERM);
+    }
+    fn kill(&self) {
+        self.signal(libc::SIGKILL);
+    }
+    fn signal(&self, signal: libc::c_int) {
+        #[cfg(not(target_os = "linux"))]
+        let _ = signal;
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
@@ -144,7 +175,7 @@ impl ProcessOwner {
                 libc::syscall(
                     libc::SYS_pidfd_send_signal,
                     self.descriptor.as_raw_fd(),
-                    libc::SIGTERM,
+                    signal,
                     std::ptr::null::<libc::siginfo_t>(),
                     0,
                 );
@@ -174,6 +205,7 @@ pub struct ComputeService {
     helper: Mutex<Helper>,
     owner: ProcessOwner,
     cancelled: AtomicBool,
+    cleanup_deadline: std::sync::Mutex<Option<tokio::time::Instant>>,
     _helpers: tempfile::TempDir,
 }
 
@@ -258,7 +290,8 @@ impl ComputeService {
         let mut policy = json!({"runtime":config.runtime, "scratch":config.scratch_root,
             "artifactRoot":config.artifact_root, "enabled":config.policy.enabled,
             "callTimeoutSecs":config.policy.call_timeout.as_secs(), "taskTimeoutSecs":config.policy.task_timeout.as_secs(),
-            "inputFiles":config.input_files});
+            "inputFiles":config.input_files,
+            "taskDeadlineMonotonic":monotonic_deadline(budget.remaining().map_err(anyhow::Error::msg)?)?});
         if let Some(limits) = config.scratch_limits {
             policy["scratchLimits"] = serde_json::to_value(limits)?;
         }
@@ -330,6 +363,7 @@ impl ComputeService {
             }),
             owner,
             cancelled,
+            cleanup_deadline: std::sync::Mutex::new(None),
             _helpers: helpers,
         }))
     }
@@ -365,7 +399,12 @@ impl ComputeService {
                     RequestError::BadArgs
                 }
             })?;
-        let mut bytes = serde_json::to_vec(&json!({"execute":request}))?;
+        // The helper stops user work at the shared deadline. Keep the response
+        // reader alive for its fixed cleanup allowance, instead of dropping a
+        // partial frame at the instant the helper starts terminating the VM.
+        let watchdog = tokio::time::Instant::now() + duration + Duration::from_secs(5);
+        let mut bytes = serde_json::to_vec(&json!({"execute":request,
+            "deadlineMonotonic":monotonic_deadline(duration)?}))?;
         if bytes.len() >= FRAME_LIMIT as usize {
             return Err(RequestError::BadArgs.into());
         }
@@ -384,9 +423,21 @@ impl ComputeService {
             helper.stdin.flush().await?;
             read_frame(&mut helper.stdout).await
         };
-        let response = tokio::time::timeout(duration, operation)
-            .await
-            .map_err(|_| RequestError::Timeout)??;
+        let response = match tokio::time::timeout_at(watchdog, operation).await {
+            Ok(response) => response?,
+            Err(_) => {
+                // The entire work + cleanup allowance has elapsed. Terminate
+                // this exact helper (even if stopped), and never give finish()
+                // a fresh five seconds. Its descendants retain their existing
+                // parent-death supervision; absent receipts fail closed.
+                *self
+                    .cleanup_deadline
+                    .lock()
+                    .expect("compute cleanup deadline") = Some(watchdog);
+                self.owner.kill();
+                return Err(RequestError::Timeout.into());
+            }
+        };
         guard.armed = false;
         if response.get("error").is_some() {
             let fault = match response["error"]["code"].as_str() {
@@ -418,7 +469,11 @@ impl ComputeService {
         // One shared allowance covers the close handshake and process exit.
         // Taking the child only after waiting preserves ownership if this
         // future itself is dropped while cleanup is in progress.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = self
+            .cleanup_deadline
+            .lock()
+            .expect("compute cleanup deadline")
+            .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(5));
         let operation = async {
             let receipt = if cancelled {
                 self.owner.terminate();
