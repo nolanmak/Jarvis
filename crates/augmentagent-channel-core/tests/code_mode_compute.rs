@@ -515,7 +515,15 @@ async fn killed_owner_recovery_removes_vm_and_task_lease() {
                 std::fs::read_to_string(log.path()).unwrap()
             );
             let processes = ProcFs.vm_processes_using(root.path());
-            if !processes.is_empty() {
+            if processes.iter().any(|(pid, _)| {
+                std::fs::read_link(format!("/proc/{pid}/exe"))
+                    .ok()
+                    .and_then(|path| {
+                        path.file_name()
+                            .map(|name| name.to_string_lossy().starts_with("qemu-system-"))
+                    })
+                    .unwrap_or(false)
+            }) {
                 break processes;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -523,25 +531,67 @@ async fn killed_owner_recovery_removes_vm_and_task_lease() {
     })
     .await
     .expect("real VM must start");
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let process_descriptors: Vec<_> = processes
+        .iter()
+        .map(|(pid, identity)| {
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, *pid, 0) };
+            assert!(fd >= 0, "cannot pin crash fixture process {pid}");
+            let file = unsafe { std::fs::File::from_raw_fd(fd as i32) };
+            assert_eq!(ProcFs.start_time(*pid).as_deref(), Some(identity.as_str()));
+            (*pid, file)
+        })
+        .collect();
     let storage = root.path().join("compute-artifacts");
     let before = retention::sweep_at(&storage, retention::now().unwrap()).unwrap();
     assert_eq!(before.live, 1, "active owner must survive startup recovery");
+    let helper_files: Vec<_> = std::fs::read_dir(&storage)
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_dir())
+        .flat_map(|path| std::fs::read_dir(path).unwrap())
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("compute-helper-")
+        })
+        .collect();
+    assert_eq!(
+        helper_files.len(),
+        1,
+        "crashed helper must be owned by its recovery lease"
+    );
     owner.0.kill().unwrap();
     owner.0.wait().unwrap();
     let started = std::time::Instant::now();
     let recovered = retention::sweep_at(&storage, retention::now().unwrap()).unwrap();
     assert_eq!(recovered.removed, 1);
+    assert!(
+        helper_files.iter().all(|path| !path.exists()),
+        "orphaned helper files survived lease recovery"
+    );
     assert!(started.elapsed() < Duration::from_secs(5));
     assert!(
         sentinel.0.try_wait().unwrap().is_none(),
         "unrelated process was killed"
     );
-    for (pid, identity) in processes {
-        assert_ne!(
-            ProcFs.start_time(pid).as_deref(),
-            Some(identity.as_str()),
-            "owned VM or supervisor survived recovery"
+    for (pid, descriptor) in process_descriptors {
+        // An orphan helper may be an exited zombie until init reaps it. PIDFD
+        // readiness proves termination without confusing that state with work.
+        let remaining = Duration::from_secs(5).saturating_sub(started.elapsed());
+        let mut poll = libc::pollfd {
+            fd: descriptor.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut poll, 1, remaining.as_millis() as i32) },
+            1,
+            "owned process {pid} survived recovery"
         );
+        assert_ne!(poll.revents & libc::POLLIN, 0);
     }
     assert!(
         std::fs::read_dir(root.path()).unwrap().all(|entry| !entry
@@ -674,4 +724,54 @@ async fn stalled_helper_cannot_get_a_second_cleanup_allowance() {
         "stopped helper survived the hard deadline"
     );
     assert_ne!(poll.revents & libc::POLLIN, 0);
+}
+
+#[tokio::test]
+async fn helper_files_live_in_managed_storage_and_cleanup_pins_the_original_directory() {
+    use augmentagent_channel_core::code_mode::compute::ComputeService;
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let config = service_config(root.path(), false);
+    let artifacts = config.artifact_root.clone();
+    let service = ComputeService::start(config).await.unwrap();
+    let directories: Vec<_> = std::fs::read_dir(&artifacts)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .collect();
+    assert_eq!(
+        directories.len(),
+        1,
+        "helper files escaped managed task storage"
+    );
+    let helper = &directories[0];
+    assert_eq!(
+        std::fs::metadata(helper).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert!(helper.join("code-mode-compute.py").is_file());
+    assert_eq!(
+        std::fs::metadata(helper.join("policy.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let name = helper.file_name().unwrap();
+    let moved = root.path().join("moved-artifacts");
+    std::fs::rename(&artifacts, &moved).unwrap();
+    std::fs::create_dir(&artifacts).unwrap();
+    let replacement = artifacts.join(name);
+    std::fs::create_dir(&replacement).unwrap();
+    std::fs::write(replacement.join("sentinel"), "unrelated directory").unwrap();
+    assert_eq!(service.finish().await.unwrap()["cleanupVerified"], true);
+    assert!(
+        !moved.join(name).exists(),
+        "finished task retained executable helper files"
+    );
+    assert_eq!(
+        std::fs::read_to_string(replacement.join("sentinel")).unwrap(),
+        "unrelated directory"
+    );
 }

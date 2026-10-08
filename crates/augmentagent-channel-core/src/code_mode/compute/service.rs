@@ -132,6 +132,9 @@ struct Helper {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     finished: Option<Value>,
+    helpers: Option<tempfile::TempDir>,
+    // TempDir uses this descriptor's /proc/self/fd path. Drop it last.
+    _helper_parent: super::artifacts::Directory,
 }
 
 /// Signals the exact helper process even if the numeric PID is later reused.
@@ -206,7 +209,6 @@ pub struct ComputeService {
     owner: ProcessOwner,
     cancelled: AtomicBool,
     cleanup_deadline: std::sync::Mutex<Option<tokio::time::Instant>>,
-    _helpers: tempfile::TempDir,
 }
 
 fn private_file(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -220,6 +222,37 @@ fn private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     options.open(path)?.write_all(bytes)?;
     Ok(())
+}
+
+fn managed_helpers(
+    root: &Path,
+) -> Result<(
+    super::artifacts::Directory,
+    tempfile::TempDir,
+    std::path::PathBuf,
+)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let parent = super::artifacts::Directory::open(root, false)?;
+        let metadata = parent.0.metadata()?;
+        anyhow::ensure!(
+            metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.permissions().mode() & 0o777 == 0o700,
+            "sandbox_unavailable: helper storage must be owner-private"
+        );
+        let (helpers, _directory) = parent.private_tempdir("compute-helper-")?;
+        // Child processes cannot use the Rust parent's /proc/self/fd alias.
+        // Resolve the newly-created private directory for their executable path;
+        // retain the pinned parent for cleanup even if the task root is renamed.
+        let path = std::fs::canonicalize(helpers.path())?;
+        Ok((parent, helpers, path))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        anyhow::bail!("sandbox_unavailable: compute requires Linux KVM")
+    }
 }
 
 async fn read_frame(reader: &mut BufReader<ChildStdout>) -> Result<Value> {
@@ -247,14 +280,7 @@ impl ComputeService {
             "invalid compute host policy"
         );
         let budget = TaskBudget::new(config.policy.clone());
-        let helpers = tempfile::Builder::new()
-            .prefix("jarvis-compute-helper-")
-            .tempdir()?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(helpers.path(), std::fs::Permissions::from_mode(0o700))?;
-        }
+        let (helper_parent, helpers, helper_path) = managed_helpers(&config.artifact_root)?;
         for (name, data) in [
             (
                 "code-mode-compute.py",
@@ -305,9 +331,9 @@ impl ComputeService {
         let mut command = Command::new("/usr/bin/python3");
         command
             .args(["-I"])
-            .arg(helpers.path().join("code-mode-compute.py"))
+            .arg(helper_path.join("code-mode-compute.py"))
             .arg("--serve")
-            .arg(helpers.path().join("policy.json"))
+            .arg(helper_path.join("policy.json"))
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("LANG", "C.UTF-8")
@@ -360,11 +386,12 @@ impl ComputeService {
                 stdin,
                 stdout,
                 finished: None,
+                helpers: Some(helpers),
+                _helper_parent: helper_parent,
             }),
             owner,
             cancelled,
             cleanup_deadline: std::sync::Mutex::new(None),
-            _helpers: helpers,
         }))
     }
 
@@ -517,6 +544,11 @@ impl ComputeService {
             receipt["cleanupVerified"] == true,
             "cleanup_unverified: compute helper lacks cleanup receipt"
         );
+        if let Some(helpers) = helper.helpers.take() {
+            helpers
+                .close()
+                .context("cleanup_unverified: cannot remove compute helper files")?;
+        }
         helper.finished = Some(receipt.clone());
         Ok(receipt)
     }

@@ -278,6 +278,7 @@ fn real_cli_signals_clean_managed_inputs_and_vm_work() {
         build_scratch::{ProcFs, ProcessTable},
         code_mode::compute::retention,
     };
+    use std::os::fd::{AsRawFd, FromRawFd};
     use std::{
         os::unix::fs::PermissionsExt,
         process::Stdio,
@@ -337,7 +338,15 @@ fn real_cli_signals_clean_managed_inputs_and_vm_work() {
                 "CLI exited before launching VM"
             );
             let processes = ProcFs.vm_processes_using(&scratch);
-            if !processes.is_empty() {
+            if processes.iter().any(|(pid, _)| {
+                std::fs::read_link(format!("/proc/{pid}/exe"))
+                    .ok()
+                    .and_then(|path| {
+                        path.file_name()
+                            .map(|name| name.to_string_lossy().starts_with("qemu-system-"))
+                    })
+                    .unwrap_or(false)
+            }) {
                 break processes;
             }
             assert!(
@@ -346,6 +355,16 @@ fn real_cli_signals_clean_managed_inputs_and_vm_work() {
             );
             std::thread::sleep(Duration::from_millis(20));
         };
+        let process_descriptors: Vec<_> = processes
+            .iter()
+            .map(|(pid, identity)| {
+                let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, *pid, 0) };
+                assert!(fd >= 0, "cannot pin signal fixture process {pid}");
+                let file = unsafe { std::fs::File::from_raw_fd(fd as i32) };
+                assert_eq!(ProcFs.start_time(*pid).as_deref(), Some(identity.as_str()));
+                (*pid, file)
+            })
+            .collect();
         let storage = scratch.join("compute-artifacts");
         assert!(
             storage.is_dir(),
@@ -384,8 +403,19 @@ fn real_cli_signals_clean_managed_inputs_and_vm_work() {
             );
         }
         assert!(stopped.elapsed() < Duration::from_secs(5));
-        for (pid, start) in processes {
-            assert_ne!(ProcFs.start_time(pid).as_deref(), Some(start.as_str()));
+        for (pid, descriptor) in process_descriptors {
+            let remaining = Duration::from_secs(5).saturating_sub(stopped.elapsed());
+            let mut poll = libc::pollfd {
+                fd: descriptor.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(
+                unsafe { libc::poll(&mut poll, 1, remaining.as_millis() as i32) },
+                1,
+                "owned process {pid} survived CLI cleanup"
+            );
+            assert_ne!(poll.revents & libc::POLLIN, 0);
         }
         assert!(std::fs::read_dir(&scratch).unwrap().all(|entry| !entry
             .unwrap()
