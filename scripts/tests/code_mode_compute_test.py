@@ -235,6 +235,53 @@ print('isolated')
             self.assertEqual(result['stdout'].strip(), 'isolated')
 
 
+class GuestExportValidationTests(unittest.TestCase):
+    def guest(self):
+        spec = importlib.util.spec_from_file_location('guest_export', Path(__file__).parents[1] / 'code-mode-compute-guest.py')
+        guest = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(guest)
+        return guest
+
+    def test_metadata_changes_after_first_stat_are_refused(self):
+        from unittest.mock import patch
+        import time
+        guest = self.guest()
+        for mode in ('hardlink', 'restored_mtime', 'replacement'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                path = root / 'bad'; path.write_bytes(b'original')
+                identity = path.stat()
+                original_open, original_stat = os.open, os.fstat
+                injected = [False]
+                def redirect(name, *args, **kwargs):
+                    return original_open(root if name == '/outputs' else name, *args, **kwargs)
+                def race(fd):
+                    info = original_stat(fd)
+                    if not injected[0] and (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino):
+                        injected[0] = True
+                        if mode == 'hardlink': os.link(path, root / 'alias')
+                        elif mode == 'restored_mtime':
+                            time.sleep(.01)
+                            path.write_bytes(b'tampered')
+                            os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+                        else:
+                            path.rename(root / 'old'); path.write_bytes(b'tampered')
+                    return info
+                with patch.object(os, 'open', redirect), patch.object(os, 'fstat', race):
+                    with self.assertRaisesRegex(ValueError, 'output_denied'):
+                        guest.export_files(['bad'])
+                self.assertTrue(injected[0])
+
+    def test_actual_character_device_is_refused_without_reading(self):
+        from unittest.mock import patch
+        guest = self.guest()
+        original_open = os.open
+        def redirect(name, *args, **kwargs):
+            return original_open('/dev' if name == '/outputs' else name, *args, **kwargs)
+        with patch.object(os, 'open', redirect), self.assertRaisesRegex(ValueError, 'output_denied'):
+            guest.export_files(['null'])
+
+
 class WorkloadExitTests(unittest.TestCase):
     def test_resource_exceptions_are_distinct_from_ordinary_failures(self):
         import subprocess

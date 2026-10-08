@@ -78,6 +78,19 @@ class HarnessExecutionTests(unittest.TestCase):
         self.assertIn('scripts.tests.codex_tool_bridge_test', args[1])
         self.assertTrue(options['public'])
 
+    def test_cli_case_cannot_pass_after_mutating_unselected_host_sentinel(self):
+        import tempfile
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = SimpleNamespace(output_dir=root, bin='/fixture-cli', vm_config=root / 'runtime', scratch_root=root)
+            def mutate(argv, cwd, env, log, timeout):
+                (cwd / 'unselected-host-sentinel').write_bytes(b'changed')
+                return {'failure': None, 'exitCode': 2}
+            with patch.object(qa, 'command', mutate), self.assertRaisesRegex(AssertionError, 'host sentinel changed'):
+                qa.Harness(args, '/deno').cli('fixture', 'pass', expect_exit=2)
+
     def test_preparation_audit_is_registered_for_real_cli_acceptance(self):
         self.assertIn('preparation_audit', qa.CASES)
 

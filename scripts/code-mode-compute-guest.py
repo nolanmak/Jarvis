@@ -77,7 +77,14 @@ def export_files(names):
                     raise ValueError('resource_limit')
                 data = stream.read(MAX_FILE + 1)
                 after = os.fstat(stream.fileno())
-                if (after.st_size != info.st_size or after.st_mtime_ns != info.st_mtime_ns
+                current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                # mtime can be restored by a writer. Recheck ctime, link count
+                # and the named entry as well as the pinned descriptor, so
+                # content rewrites, hard links and replacements fail closed.
+                fields = ('st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_size',
+                          'st_mtime_ns', 'st_ctime_ns')
+                if (any(getattr(info, field) != getattr(after, field)
+                        or getattr(info, field) != getattr(current, field) for field in fields)
                         or len(data) != info.st_size):
                     raise ValueError('output_denied')
                 total += len(data)

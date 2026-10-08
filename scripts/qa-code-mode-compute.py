@@ -153,6 +153,18 @@ def base_environment(root, args, deno):
     return env
 
 
+def host_sentinel_intact(path, original, expected):
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(descriptor, 'rb') as stream:
+            current = os.fstat(stream.fileno())
+            return (current.st_dev == original.st_dev and current.st_ino == original.st_ino
+                    and current.st_mode == original.st_mode and current.st_size == len(expected)
+                    and stream.read(len(expected) + 1) == expected)
+    except OSError:
+        return False
+
+
 def program(code, outputs=(), selected=False, **fields):
     request = {'runtime': 'python', 'dependencies': [], 'code': code, 'outputs': list(outputs), **fields}
     binding = "request.inputs=[{artifactId:computeInputs.selected,name:'selected.txt'}];" if selected else ''
@@ -167,6 +179,11 @@ class Harness:
     def cli(self, name, source, *, files=None, overrides=None, expect_exit=0, expected_error=None, verify=None, maximum=185, runner='vm'):
         root = self.args.output_dir / name
         root.mkdir(mode=0o700)
+        sentinel = root / 'unselected-host-sentinel'
+        sentinel_bytes = b'SYNTHETIC_UNSELECTED_HOST_SENTINEL'
+        sentinel.write_bytes(sentinel_bytes)
+        sentinel.chmod(0o600)
+        sentinel_info = sentinel.stat()
         inputs = {}
         for alias, data in (files or {}).items():
             path = root / f'input-{alias}'
@@ -208,6 +225,9 @@ class Harness:
             if verify:
                 verify(value, root)
         finally:
+            intact = host_sentinel_intact(sentinel, sentinel_info, sentinel_bytes)
+            self.results[name]['hostSentinelUnchanged'] = intact
+            checked(intact, 'unselected host sentinel changed')
             sessions = list(scratch.glob('jarvis-vm-session-*'))
             leases = list((scratch / 'compute-artifacts').glob('task-*'))
             checked(not sessions and not leases, 'task scratch remains; preserved for diagnosis')
@@ -736,6 +756,32 @@ def package_integrity(h, name):
     h.results[name]['hostPackages'] = {'roots': roots, 'entries': len(before), 'sha256': hashlib.sha256(json.dumps(before, sort_keys=True).encode()).hexdigest()}
 
 
+def device_export(h, name):
+    request = {'runtime': 'python', 'dependencies': [], 'code': (FIXTURES / 'device-export.py').read_text(), 'outputs': ['bad']}
+    source = f"async function main(){{const request={json.dumps(request)};request.inputs=[{{artifactId:computeInputs.validator,name:'validator.py'}}];return await tools.compute.run(request);}}main();"
+    def verify(value, _):
+        checked(value['records'][0]['policy']['implementation']['code-mode-compute-guest.py'] == digest(REPO / 'scripts/code-mode-compute-guest.py'),
+                'selected validator differs from compiled guest implementation')
+    h.cli(name, source, files={'validator': (REPO / 'scripts/code-mode-compute-guest.py').read_bytes()},
+          expect_exit=1, expected_error='output_denied', verify=verify)
+
+
+def racing_output(h, name):
+    fixture = (FIXTURES / 'racing-export.py').read_text()
+    requests = [{'runtime': 'python', 'dependencies': [], 'code': f'RACE_MODE={mode!r}\n' + fixture,
+                 'outputs': ['bad']} for mode in ('hardlink', 'restored_mtime', 'replacement')]
+    source = f"async function main(){{const results=[];for(const request of {json.dumps(requests)}){{request.inputs=[{{artifactId:computeInputs.validator,name:'validator.py'}}];results.push(await tools.compute.run(request));}}return results;}}main();"
+    def verify(value, root):
+        checked(len(value['final']) == len(value['records']) == 3, 'not all export races executed')
+        checked(all(result['ok'] is False and result['runner'] == 'vm' and result['error']['code'] == 'output_denied'
+                    and not result['artifacts'] for result in value['final']), 'export race was accepted or failed before its intended refusal')
+        checked(not value['artifacts'] and not list((root / 'artifacts').iterdir()), 'racing output was published')
+        checked(all(row['cleanupVerified'] for row in value['records']), 'racing guest cleanup unverified')
+        checked(all(row['policy']['implementation']['code-mode-compute-guest.py'] == digest(REPO / 'scripts/code-mode-compute-guest.py')
+                    for row in value['records']), 'selected validator differs from the compiled guest implementation')
+    h.cli(name, source, files={'validator': (REPO / 'scripts/code-mode-compute-guest.py').read_bytes()}, expect_exit=1, verify=verify)
+
+
 def export_denial(code):
     return lambda h, name: h.cli(name, program(code, outputs=['bad']), expect_exit=1, expected_error='output_denied')
 
@@ -779,6 +825,7 @@ CASES = {
     'timeout': lambda h, n: h.cli(n, program('import time\ntime.sleep(20)', timeoutSecs=2), overrides={'AUGMENTAGENT_COMPUTE_TIMEOUT_SECS': '2'}, expect_exit=1, expected_error='timeout', maximum=7),
     'invalid_config': lambda h, n: h.cli(n, 'throw Error("must not execute")', overrides={'AUGMENTAGENT_COMPUTE_TIMEOUT_SECS': '0'}, expect_exit=2),
     'log_limit': lambda h, n: h.cli(n, program("import os\nos.write(1,b'x'*(9*1024*1024))"), expect_exit=1, expected_error='resource_limit'),
+    'racing_output': racing_output, 'device': device_export,
     'symlink': export_denial("import os\nos.symlink('/etc/passwd','/outputs/bad')"),
     'hardlink': export_denial("import os\nopen('/outputs/original','w').write('fixture')\nos.link('/outputs/original','/outputs/bad')"),
     'fifo': export_denial("import os\nos.mkfifo('/outputs/bad')"),
