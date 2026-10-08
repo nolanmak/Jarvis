@@ -799,16 +799,13 @@ impl EventHandler for Handler {
                                     message: "no action handler configured".into(),
                                 },
                             };
-                            followup_with_recovery(&ctx_clone, &comp_clone, &outcome, &action_id)
-                                .await;
-                            if should_delete_source(&outcome) {
-                                delete_source_message(
-                                    &ctx_clone,
-                                    comp_clone.channel_id,
-                                    comp_clone.message.id,
-                                    &action_id,
-                                )
-                                .await;
+                            if let Err(e) = deliver_approval_outcome(
+                                &ctx_clone.http,
+                                &comp_clone,
+                                &outcome,
+                                &action_id,
+                            ).await {
+                                warn!(%action_id, "failed to deliver approval outcome: {e}");
                             }
                         });
                     }
@@ -1635,17 +1632,44 @@ async fn followup_with_recovery(
     outcome: &ApprovalActionOutcome,
     action_id: &str,
 ) {
+    if let Err(e) = comp
+        .create_followup(&ctx.http, approval_followup(outcome, action_id))
+        .await
+    {
+        warn!("failed to send followup: {e}");
+    }
+}
+
+fn approval_followup(
+    outcome: &ApprovalActionOutcome,
+    action_id: &str,
+) -> CreateInteractionResponseFollowup {
     let mut fu = CreateInteractionResponseFollowup::new()
         .content(describe(outcome))
-        .ephemeral(true);
+        .ephemeral(true)
+        .allowed_mentions(serenity::all::CreateAllowedMentions::new());
     if let ApprovalActionOutcome::AlreadyResolved { status, detail } = outcome {
         if offers_recompose(status, detail.as_deref()) {
             fu = fu.components(vec![recompose_button_row(action_id)]);
         }
     }
-    if let Err(e) = comp.create_followup(&ctx.http, fu).await {
-        warn!("failed to send followup: {e}");
+    fu
+}
+
+/// The real Approve button's HTTP tail, also exercised with Serenity against
+/// a local Discord API. A failed acknowledgment must not silently consume a card.
+async fn deliver_approval_outcome(
+    http: &Http,
+    comp: &serenity::all::ComponentInteraction,
+    outcome: &ApprovalActionOutcome,
+    action_id: &str,
+) -> Result<(), serenity::Error> {
+    comp.create_followup(http, approval_followup(outcome, action_id))
+        .await?;
+    if should_delete_source(outcome) {
+        comp.channel_id.delete_message(http, comp.message.id).await?;
     }
+    Ok(())
 }
 
 /// Non-deferred immediate ephemeral ack — used only for the authorization
@@ -1831,6 +1855,7 @@ fn should_delete_source(outcome: &ApprovalActionOutcome) -> bool {
     matches!(
         outcome,
         ApprovalActionOutcome::Approved
+            | ApprovalActionOutcome::CalendarCreated { .. }
             | ApprovalActionOutcome::Skipped
             | ApprovalActionOutcome::Revised { .. }
             | ApprovalActionOutcome::AlreadyResolved { .. }
@@ -3940,3 +3965,7 @@ mod tests {
         assert_eq!(p.rejected[0].filename, "archive.zip");
     }
 }
+
+#[cfg(test)]
+#[path = "approval_delivery_tests.rs"]
+mod approval_delivery_tests;

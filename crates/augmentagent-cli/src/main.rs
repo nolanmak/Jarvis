@@ -14,6 +14,10 @@ mod discord_voice_session_tests;
 #[cfg(test)]
 mod surface_conformance_tests;
 #[cfg(test)]
+mod calendar_approval_tests;
+#[cfg(test)]
+mod calendar_live_tests;
+#[cfg(test)]
 mod slack_approval_tests;
 #[cfg(test)]
 mod slack_schedule_tests;
@@ -13514,7 +13518,9 @@ impl ApprovalActionHandler for ReplyApprover {
         // — the card leaves the queue either way, so advance the carousel.
         if matches!(
             outcome,
-            ApprovalActionOutcome::Approved | ApprovalActionOutcome::Scheduled { .. }
+            ApprovalActionOutcome::Approved
+                | ApprovalActionOutcome::CalendarCreated { .. }
+                | ApprovalActionOutcome::Scheduled { .. }
         ) {
             self.trigger_next_nudge().await;
         }
@@ -13854,20 +13860,24 @@ impl ReplyApprover {
         };
         match self.calendar.create_event(entity_id, "primary", &draft).await {
             Ok(created) => {
-                let link = created
-                    .html_link
-                    .clone()
-                    .unwrap_or_else(|| "(no link returned)".into());
+                // The concrete calendar client returns success only with a
+                // nonempty ID. Keep that receipt in both storage and the ack.
+                let event_id = created.id.clone().expect("validated calendar event ID");
+                let link = created.html_link.clone().unwrap_or_else(|| event_id.clone());
                 let final_body = format!(
-                    "{}\ncreated: {link}",
+                    "{}\ncreated: {link}\nevent ID: {event_id}",
                     action.action.draft_body.clone().unwrap_or_default()
                 );
-                let _ = self.store.update_action_status(
+                if let Err(e) = self.store.update_action_status(
                     action_id,
                     ActionStatus::Sent,
                     Some(&final_body),
                     None,
-                );
+                ) {
+                    return ApprovalActionOutcome::Failed {
+                        message: format!("calendar event {event_id} was created, but recording its receipt failed: {e}; check the calendar before retrying"),
+                    };
+                }
                 let _ = self
                     .store
                     .mark_email_processed(&action.email.message_id, TriageResult::Reply);
@@ -13877,7 +13887,10 @@ impl ReplyApprover {
                     link,
                     "gcal event created"
                 );
-                ApprovalActionOutcome::Approved
+                ApprovalActionOutcome::CalendarCreated {
+                    event_id,
+                    html_link: created.html_link,
+                }
             }
             Err(CalendarError::Forbidden { message }) => {
                 let msg = format!(

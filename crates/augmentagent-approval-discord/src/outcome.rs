@@ -36,6 +36,12 @@ pub fn describe(outcome: &ApprovalActionOutcome) -> String {
             resolved_message(status, detail.as_deref())
         }
         ApprovalActionOutcome::Approved => "Approved — sending.".into(),
+        ApprovalActionOutcome::CalendarCreated { event_id, html_link } => {
+            match html_link.as_deref().filter(|link| !link.trim().is_empty()) {
+                Some(link) => format!("Calendar event created: {link} (event ID: {event_id})."),
+                None => format!("Calendar event created. Event ID: {event_id}."),
+            }
+        }
         ApprovalActionOutcome::Skipped => "Skipped — draft discarded.".into(),
         ApprovalActionOutcome::Revised { .. } => "Revising — new draft posted below.".into(),
         ApprovalActionOutcome::Scheduled { local, .. } => {
