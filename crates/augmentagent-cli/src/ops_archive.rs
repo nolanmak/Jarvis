@@ -77,12 +77,27 @@ pub fn repo_dir_from_env() -> Option<PathBuf> {
 }
 
 /// This process's own secret values: every env var whose name looks like a
-/// credential and whose value is long enough to be one.
+/// credential and whose value could be one.
 pub fn secrets_from_env(is_secret_name: &dyn Fn(&str) -> bool) -> Vec<String> {
     std::env::vars()
-        .filter(|(k, v)| is_secret_name(k) && v.len() >= MIN_SECRET_LEN)
+        .filter(|(k, v)| is_secret_name(k) && could_be_credential(v))
         .map(|(_, v)| v)
         .collect()
+}
+
+/// A name like `DISCORD_CHANNEL_ID` or `CLAUDE_CONFIG_DIR` matches the
+/// secret-name list, but its value is an identifier or a location, and those
+/// are all over an ordinary log. Treating them as secrets skipped the main
+/// daemon log on the first live run. A credential is long, opaque text.
+pub fn could_be_credential(value: &str) -> bool {
+    let v = value.trim();
+    v.len() >= MIN_SECRET_LEN
+        && !v.bytes().all(|b| b.is_ascii_digit())
+        && !v.starts_with('/')
+        && !v.starts_with("~/")
+        && !v.starts_with("http://")
+        && !v.starts_with("https://")
+        && !v.contains(char::is_whitespace)
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +361,21 @@ mod tests {
         ] {
             assert!(!is_allowed_path(bad), "{bad} must be refused");
         }
+    }
+
+    #[test]
+    fn identifiers_paths_and_urls_are_not_credentials() {
+        // First live run: the daemon log was skipped because it contained the
+        // Discord channel id, whose variable name contains DISCORD.
+        assert!(!could_be_credential("1234567890123456789"), "a numeric id");
+        assert!(!could_be_credential("/home/user/.config/app/creds.json"), "a path");
+        assert!(!could_be_credential("~/.config/app/creds.json"));
+        assert!(!could_be_credential("https://example.test/api/v1"), "an endpoint");
+        assert!(!could_be_credential("claude,codex,gemini fallback chain"), "prose");
+        assert!(!could_be_credential("short"));
+        // Built at runtime: no credential-shaped literal in the source.
+        assert!(could_be_credential(&"aB3x".repeat(6)), "long opaque text");
+        assert!(could_be_credential(&format!("{}.{}", "Ab1".repeat(5), "cD2".repeat(4))));
     }
 
     #[test]
