@@ -302,6 +302,7 @@ async fn run_program_inner(
         // Only async-signal-safe syscalls are used between fork and exec.
         unsafe {
             command.pre_exec(move || {
+                super::process::isolate_descriptors()?;
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }

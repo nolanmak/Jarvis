@@ -792,3 +792,86 @@ fn real_cli_task_deadline_cancels_active_compute() {
     assert!(std::fs::read_dir(&scratch).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().starts_with("jarvis-vm-session-")));
     assert!(std::fs::read_dir(root.path().join("out")).unwrap().next().is_none());
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "requires real VM; injects a synthetic inherited descriptor into CLI"]
+fn real_cli_unrelated_fds_are_absent_from_children_and_guest() {
+    use std::{os::{fd::AsRawFd, unix::{fs::{MetadataExt, PermissionsExt}, process::CommandExt}},
+              process::Stdio, time::{Duration, Instant}};
+    struct Owner(std::process::Child);
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_some() { return; }
+            unsafe { libc::kill(self.0.id() as i32, libc::SIGTERM); }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if self.0.try_wait().ok().flatten().is_some() { return; }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let scratch = root.path().join("scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let canary = root.path().join("private-fd-canary");
+    std::fs::write(&canary, b"SYNTHETIC_UNSELECTED_DESCRIPTOR_CANARY").unwrap();
+    let file = std::fs::File::open(&canary).unwrap();
+    let identity = file.metadata().unwrap();
+    let code = "import os\nfor fd in range(3,1024):\n try:os.fstat(fd)\n except OSError:continue\n raise AssertionError('unexpected inherited guest descriptor')\nprint(60)";
+    let request = json!({"runtime":"python","dependencies":[],"code":code});
+    std::fs::write(root.path().join("program.ts"), format!(
+        "async function main(){{await new Promise(r=>setTimeout(r,1000));return await tools.compute.run({request});}}main();")).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_augmentagent"));
+    command.current_dir(root.path()).env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", root.path()).env("AUGMENTAGENT_COMPUTE_ENABLED", "true")
+        .env("AUGMENTAGENT_BUILD_SCRATCH_DIR", &scratch)
+        .env("AUGMENTAGENT_BUILD_VM_CONFIG", std::env::var_os("JARVIS_TEST_VM_CONFIG").expect("VM required"))
+        .args(["code-mode", "compute-run", "--program", "program.ts", "--output-dir", "out", "--report", "report.json"])
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let descriptor = file.as_raw_fd();
+    unsafe { command.pre_exec(move || {
+        if libc::dup2(descriptor, 200) == -1 { return Err(std::io::Error::last_os_error()); }
+        Ok(())
+    }); }
+    let mut owner = Owner(command.spawn().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = std::collections::BTreeSet::new();
+    while seen.len() < 2 {
+        assert!(owner.0.try_wait().unwrap().is_none(), "CLI exited before child inspection");
+        for thread in std::fs::read_dir(format!("/proc/{}/task", owner.0.id())).unwrap() {
+            let children = std::fs::read_to_string(thread.unwrap().path().join("children")).unwrap_or_default();
+            for pid in children.split_whitespace().filter_map(|p| p.parse::<u32>().ok()) {
+                let Ok(executable) = std::fs::read_link(format!("/proc/{pid}/exe")) else { continue; };
+                let name = executable.file_name().unwrap().to_string_lossy();
+                let kind = if name == "deno" { "deno" } else if name.starts_with("python3") { "helper" } else { continue; };
+                let descriptors = std::fs::read_dir(format!("/proc/{pid}/fd")).unwrap();
+                for entry in descriptors.flatten() {
+                    if let Ok(metadata) = std::fs::metadata(entry.path()) {
+                        assert!(!(metadata.dev() == identity.dev() && metadata.ino() == identity.ino()),
+                                "{kind} inherited the unrelated canary descriptor");
+                    }
+                }
+                seen.insert(kind);
+            }
+        }
+        assert!(Instant::now() < deadline, "did not inspect both Deno and compute helper");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let status = loop {
+        if let Some(status) = owner.0.try_wait().unwrap() { break status; }
+        assert!(Instant::now() < deadline, "CLI did not finish its descriptor probe");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success(), "guest descriptor isolation failed");
+    let result = report(root.path());
+    assert_eq!(result["final"]["runner"], "vm");
+    assert_eq!(result["final"]["stdout"].as_str().unwrap().trim(), "60");
+    assert_eq!(result["cleanup"]["cleanupVerified"], true);
+    assert!(!result.to_string().contains("SYNTHETIC_UNSELECTED_DESCRIPTOR_CANARY"));
+    assert!(std::fs::read_dir(&scratch).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with("jarvis-vm-session-")));
+}

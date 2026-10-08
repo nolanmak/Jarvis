@@ -358,6 +358,10 @@ impl ComputeService {
             .stderr(std::process::Stdio::null());
         #[cfg(unix)]
         command.process_group(0);
+        #[cfg(target_os = "linux")]
+        unsafe {
+            command.pre_exec(|| crate::code_mode::process::isolate_descriptors());
+        }
         let mut child = command
             .spawn()
             .context("sandbox_unavailable: cannot start compute helper")?;

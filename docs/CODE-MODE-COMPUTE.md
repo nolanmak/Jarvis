@@ -20,6 +20,10 @@ manifest must pass the existing runtime checks. Compute additionally requires
 parser, `openssl`, and `mke2fs`. Deno must support the pinned runner's import
 restrictions; CI and acceptance development use Deno 2.7.14. The daemon account
 must have persistent read/write access to `/dev/kvm`.
+The host must also permit Linux `close_range` with `CLOSE_RANGE_CLOEXEC`.
+Before Deno or the compute helper executes, descriptors above stderr are marked
+close-on-exec; a failure to enforce this prevents that child from starting.
+Only the explicitly configured standard streams cross this process boundary.
 
 Configure these host-owned paths:
 
