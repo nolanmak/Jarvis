@@ -312,7 +312,7 @@ async function run(): Promise<void> {
     Deno.exit(1);
   }
 
-  let header: { program?: unknown; manifest?: unknown };
+  let header: { program?: unknown; manifest?: unknown; timeoutMs?: unknown; computeInputs?: unknown };
   try {
     header = JSON.parse(first);
   } catch (e) {
@@ -342,6 +342,28 @@ async function run(): Promise<void> {
     });
     Deno.exit(1);
   }
+
+  // Only the host constructs this frame. Model code cannot extend its own
+  // budget; Rust independently supervises the same monotonic deadline.
+  const timeoutMs = Object.hasOwn(header, "timeoutMs") ? header.timeoutMs : TIMEOUT_MS;
+  if (typeof timeoutMs !== "number" || !Number.isSafeInteger(timeoutMs) ||
+      timeoutMs < 1 || timeoutMs > 3_600_000) {
+    await writeLine({ error: { message: "header.timeoutMs must be an integer in 1..3600000", stack: "" } });
+    Deno.exit(1);
+  }
+  const inputs = Object.hasOwn(header, "computeInputs") ? header.computeInputs : {};
+  if (inputs === null || typeof inputs !== "object" || Array.isArray(inputs) ||
+      Object.keys(inputs).length > 32 ||
+      !Object.entries(inputs).every(([name, id]) =>
+        /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name) &&
+        typeof id === "string" && id.length > 0 && id.length <= 128)) {
+    await writeLine({ error: { message: "header.computeInputs must map input names to opaque IDs", stack: "" } });
+    Deno.exit(1);
+  }
+  Object.defineProperty(globalThis, "computeInputs", {
+    value: Object.freeze(Object.assign(Object.create(null), inputs)),
+    writable: false, configurable: false,
+  });
 
   // Install the tools Proxy on globalThis.
   const tree = buildTree(manifest as string[]);
@@ -387,8 +409,8 @@ async function run(): Promise<void> {
   const timeoutPromise = new Promise<never>((_resolve, reject) => {
     timeoutHandle = setTimeout(() => {
       timedOut = true;
-      reject(new Error(`timeout: program exceeded ${TIMEOUT_MS}ms wall clock`));
-    }, TIMEOUT_MS);
+      reject(new Error(`timeout: program exceeded ${timeoutMs}ms wall clock`));
+    }, timeoutMs);
   });
 
   try {

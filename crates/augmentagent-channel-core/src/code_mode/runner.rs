@@ -37,7 +37,7 @@
 //! `sidecars/code-mode-runner/runner.ts`'s `TIMEOUT_MS`). We additionally
 //! enforce the same budget on the Rust side as defence-in-depth — if the
 //! child process is still alive after [`RUST_WALL_CLOCK_MS`] from when we
-//! finished writing the header, we kill it and return
+//! began delivering the header, we kill it and return
 //! [`RunnerError::Timeout`]. This guards against a malfunctioning
 //! sandbox that fails to enforce its own timeout (e.g. a JIT bug) or
 //! against the spawn step itself hanging on a stuck child.
@@ -57,11 +57,9 @@ use super::dispatch::Dispatcher;
 use super::manifest::ToolManifest;
 use super::trace::ToolCallRecord;
 
-/// Defence-in-depth wall clock for the *whole* program (header write →
-/// `{"final"}` or `{"error"}` frame). Generous over the sandbox's own
-/// 60s so the in-sandbox timeout frame can be observed before we kill
-/// the child.
-pub const RUST_WALL_CLOCK_MS: u64 = 65_000;
+/// Default host wall clock for the whole program, including header delivery
+/// and process exit. The host deadline also stops a blocked JS event loop.
+pub const RUST_WALL_CLOCK_MS: u64 = 60_000;
 
 /// Outcome of a successful program run.
 ///
@@ -180,6 +178,25 @@ pub enum RunnerError {
     UnexpectedExit(String),
 }
 
+/// Host-selected program policy. Never deserialize this from model arguments.
+#[derive(Debug, Clone)]
+pub struct RunOptions {
+    pub timeout: Duration,
+    pub compute_inputs: std::collections::BTreeMap<String, String>,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self { timeout: Duration::from_secs(60), compute_inputs: Default::default() }
+    }
+}
+
+pub async fn run_program_with_options(
+    source: &str, manifest: &ToolManifest, dispatcher: &dyn Dispatcher, options: &RunOptions,
+) -> Result<CodeModeOutcome, RunnerError> {
+    run_program_inner(source, manifest, dispatcher, options).await
+}
+
 /// Run `source` inside the Deno sandbox with the given `manifest` as the
 /// allowlist; dispatch every `tools.*` call to `dispatcher`.
 ///
@@ -195,6 +212,20 @@ pub async fn run_program(
     manifest: &ToolManifest,
     dispatcher: &dyn Dispatcher,
 ) -> Result<CodeModeOutcome, RunnerError> {
+    run_program_inner(source, manifest, dispatcher, &RunOptions::default()).await
+}
+
+async fn run_program_inner(
+    source: &str,
+    manifest: &ToolManifest,
+    dispatcher: &dyn Dispatcher,
+    options: &RunOptions,
+) -> Result<CodeModeOutcome, RunnerError> {
+    let millis = options.timeout.as_millis();
+    if !(1..=3_600_000).contains(&millis) || options.timeout.subsec_nanos() % 1_000_000 != 0 {
+        return Err(RunnerError::Protocol("invalid host program timeout".into()));
+    }
+    let started = tokio::time::Instant::now();
     let resolution = resolve_deno_bin();
     let sidecar = resolve_sidecar_path();
 
@@ -207,9 +238,9 @@ pub async fn run_program(
 
     let mut child = Command::new(&resolution.path)
         .arg("run")
-        // No --allow-* flags: default-deny on every capability. See
-        // sidecars/code-mode-runner/README.md — `--allow-none` is NOT a
-        // real Deno flag.
+        // Configuration and import resolution are independent of ordinary
+        // capability permissions. Do not inherit a task's deno.json or npm.
+        .args(["--no-config", "--no-npm", "--no-remote", "--deny-import", "--no-prompt"])
         .arg(&sidecar)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -247,16 +278,21 @@ pub async fn run_program(
     let header = HeaderFrame {
         program: source,
         manifest: manifest.to_runner_manifest(),
+        timeout_ms: millis as u64,
+        compute_inputs: &options.compute_inputs,
     };
     let mut header_line = serde_json::to_vec(&header)
         .map_err(|e| RunnerError::Protocol(format!("header encode: {e}")))?;
     header_line.push(b'\n');
-    stdin.write_all(&header_line).await?;
-    stdin.flush().await?;
-
-    // Drive the RPC loop with a Rust-side wall clock as defence-in-depth.
-    let loop_fut = rpc_loop(stdout, &mut stdin, dispatcher);
-    let outcome = match timeout(Duration::from_millis(RUST_WALL_CLOCK_MS), loop_fut).await {
+    // Header delivery is inside the watchdog too: a child that stops reading
+    // must not hang the host before the RPC loop even begins.
+    let loop_fut = async {
+        stdin.write_all(&header_line).await?;
+        stdin.flush().await?;
+        rpc_loop(stdout, &mut stdin, dispatcher, manifest).await
+    };
+    let wall = options.timeout;
+    let outcome = match tokio::time::timeout_at(started + wall, loop_fut).await {
         Ok(result) => result,
         Err(_) => {
             // Wall clock fired. Kill the child explicitly (kill_on_drop
@@ -266,7 +302,7 @@ pub async fn run_program(
             let _ = child.wait().await;
             stderr_task.abort();
             return Err(RunnerError::Timeout {
-                ms: RUST_WALL_CLOCK_MS,
+                ms: wall.as_millis() as u64,
             });
         }
     };
@@ -275,7 +311,24 @@ pub async fn run_program(
     // coming, then reap the process. We don't care about the exit code
     // beyond logging — the protocol layer already told us success / failure.
     drop(stdin);
-    let _ = child.wait().await;
+    let exit = tokio::time::timeout_at(started + wall, child.wait()).await;
+    match exit {
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            stderr_task.abort();
+            return Err(RunnerError::Timeout { ms: wall.as_millis() as u64 });
+        }
+        Ok(Err(error)) => {
+            stderr_task.abort();
+            return Err(error.into());
+        }
+        Ok(Ok(status)) if !status.success() && outcome.is_ok() => {
+            stderr_task.abort();
+            return Err(RunnerError::UnexpectedExit("sandbox exited unsuccessfully after final frame".into()));
+        }
+        _ => (),
+    }
     // Stop draining stderr (the child is gone).
     let _ = stderr_task.await;
 
@@ -286,6 +339,10 @@ pub async fn run_program(
 struct HeaderFrame<'a> {
     program: &'a str,
     manifest: Vec<String>,
+    #[serde(rename = "timeoutMs")]
+    timeout_ms: u64,
+    #[serde(rename = "computeInputs")]
+    compute_inputs: &'a std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -321,7 +378,10 @@ async fn rpc_loop(
     stdout: tokio::process::ChildStdout,
     stdin: &mut tokio::process::ChildStdin,
     dispatcher: &dyn Dispatcher,
+    manifest: &ToolManifest,
 ) -> Result<CodeModeOutcome, RunnerError> {
+    let allowed = manifest.to_runner_manifest();
+    let mut calls = 0;
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
 
@@ -342,8 +402,14 @@ async fn rpc_loop(
             .map_err(|e| RunnerError::Protocol(format!("decode {trimmed:?}: {e}")))?;
         match frame {
             SandboxFrame::Call { id, call, args } => {
-                let args_for_dispatch = args.clone();
-                let result = dispatcher.call(&call, args_for_dispatch).await;
+                calls += 1;
+                let result = if !allowed.contains(&call) {
+                    Err(super::dispatch::DispatchError::UnknownTool(call.clone()))
+                } else if calls > 25 {
+                    Err(super::dispatch::DispatchError::PermitDenied("tool call budget exceeded".into()))
+                } else {
+                    dispatcher.call(&call, args).await
+                };
                 let response_line = match result {
                     Ok(value) => serde_json::json!({ "id": id, "result": value }),
                     Err(err) => serde_json::json!({ "id": id, "error": err.wire_message() }),

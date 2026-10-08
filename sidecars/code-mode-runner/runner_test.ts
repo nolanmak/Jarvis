@@ -9,7 +9,7 @@
 // `--allow-read` (so Deno can load `runner.ts` from disk).
 
 // deno-lint-ignore-file no-import-prefix
-// The runner itself forbids imports (deno.json has empty `imports`). This
+// The runner explicitly disables remote/npm imports. This
 // test file is loaded only by `deno test`, never by the production runner,
 // so we pull std/assert inline via a JSR specifier.
 import { assert, assertEquals, assertStringIncludes } from "jsr:@std/assert@1";
@@ -35,7 +35,7 @@ async function driveRunner(opts: {
   status: Deno.CommandStatus;
 }> {
   const cmd = new Deno.Command(Deno.execPath(), {
-    args: ["run", RUNNER],
+    args: ["run", "--no-config", "--no-npm", "--no-remote", "--deny-import", "--no-prompt", RUNNER],
     stdin: "piped",
     stdout: "piped",
     stderr: "piped",
@@ -349,7 +349,7 @@ Deno.test({
     };
     // We spawn manually so we can write both lines in a single chunk.
     const cmd = new Deno.Command(Deno.execPath(), {
-      args: ["run", RUNNER],
+      args: ["run", "--no-config", "--no-npm", "--no-remote", "--deny-import", "--no-prompt", RUNNER],
       stdin: "piped",
       stdout: "piped",
       stderr: "piped",
@@ -567,7 +567,7 @@ Deno.test("#989: console.log goes to stderr, never corrupts stdout frames", asyn
     await main();
   `;
   const cmd = new Deno.Command(Deno.execPath(), {
-    args: ["run", RUNNER],
+    args: ["run", "--no-config", "--no-npm", "--no-remote", "--deny-import", "--no-prompt", RUNNER],
     stdin: "piped",
     stdout: "piped",
     stderr: "piped",
