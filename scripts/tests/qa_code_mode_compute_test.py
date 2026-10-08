@@ -35,6 +35,24 @@ class EvidenceContractTests(unittest.TestCase):
 
 
 class HarnessExecutionTests(unittest.TestCase):
+    def test_install_cancellation_requires_real_cli_and_public_packages(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        self.assertIn('cancel_install', qa.CASES)
+        harness = SimpleNamespace(suite=Mock())
+        qa.CASES['cancel_install'](harness, 'cancel_install')
+        self.assertIn('real_cli_install_cancellation', harness.suite.call_args.args[1])
+        self.assertIn('--ignored', harness.suite.call_args.args[1])
+        self.assertTrue(harness.suite.call_args.kwargs['public'])
+
+    def test_unsupported_platform_requires_service_startup_guard_suite(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        self.assertIn('unsupported_platform', qa.CASES)
+        harness = SimpleNamespace(suite=Mock())
+        qa.CASES['unsupported_platform'](harness, 'unsupported_platform')
+        self.assertIn('unsupported_platform_rejected_before_initialization', harness.suite.call_args.args[1])
+
     def test_cancelled_logs_requires_cli_cancellation_after_observed_output(self):
         from types import SimpleNamespace
         from unittest.mock import Mock

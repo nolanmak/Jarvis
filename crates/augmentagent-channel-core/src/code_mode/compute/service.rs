@@ -286,8 +286,19 @@ impl ComputeService {
         config: ServiceConfig,
         cancellation: impl std::future::Future<Output = ()>,
     ) -> Result<Arc<Self>> {
+        Self::start_on_platform(config, cancellation, cfg!(target_os = "linux")).await
+    }
+
+    // Private injection point for the unsupported-host test. Production always
+    // supplies the compiler's target; neither configuration nor task arguments
+    // can change this capability or select a host fallback.
+    async fn start_on_platform(
+        config: ServiceConfig,
+        cancellation: impl std::future::Future<Output = ()>,
+        linux: bool,
+    ) -> Result<Arc<Self>> {
         anyhow::ensure!(
-            cfg!(target_os = "linux"),
+            linux,
             "sandbox_unavailable: compute requires Linux KVM"
         );
         anyhow::ensure!(
@@ -624,5 +635,33 @@ impl Drop for ComputeService {
         // Do not SIGKILL here: the helper's SIGTERM handler owns VM shutdown
         // and scratch removal. Its supervisor also handles parent death.
         self.owner.terminate();
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unsupported_platform_rejected_before_initialization() {
+        let root = tempfile::tempdir().unwrap();
+        let sentinel = root.path().join("sentinel");
+        std::fs::write(&sentinel, b"unchanged").unwrap();
+        let config = ServiceConfig {
+            policy: ComputePolicy { enabled: true, call_timeout: Duration::from_secs(600),
+                task_timeout: Duration::from_secs(1800) },
+            runtime: root.path().join("missing-runtime"),
+            scratch_root: root.path().join("must-not-create-scratch"),
+            artifact_root: root.path().join("must-not-create-artifacts"),
+            pip_runtime: None,
+            input_files: BTreeMap::new(),
+            scratch_limits: None,
+        };
+        let error = ComputeService::start_on_platform(config, std::future::pending(), false)
+            .await.err().expect("unsupported platform must be refused");
+        assert_eq!(error.to_string(), "sandbox_unavailable: compute requires Linux KVM");
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"unchanged");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1,
+            "unsupported-platform startup created runtime files");
     }
 }

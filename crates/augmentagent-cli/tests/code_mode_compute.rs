@@ -301,13 +301,20 @@ fn real_cli_cancelled_logs_preserve_partial_binary_output() {
     cli_signal_cleanup(SignalStage::LoggedExecution);
 }
 
-enum SignalStage { Running, Startup { stalled: bool }, Download, LoggedExecution }
+#[test]
+#[ignore = "requires KVM, pinned pip and public NumPy wheel; pauses preparation after pip announces installation"]
+fn real_cli_install_cancellation_reaps_preparation_vm() {
+    cli_signal_cleanup(SignalStage::Install);
+}
+
+enum SignalStage { Running, Startup { stalled: bool }, Download, Install, LoggedExecution }
 
 fn cli_signal_cleanup(stage: SignalStage) {
     let startup = matches!(stage, SignalStage::Startup { .. });
     let stalled = matches!(stage, SignalStage::Startup { stalled: true } | SignalStage::Download);
     let download = matches!(stage, SignalStage::Download);
     let logged = matches!(stage, SignalStage::LoggedExecution);
+    let install = matches!(stage, SignalStage::Install);
     use augmentagent_channel_core::{
         build_scratch::{ProcFs, ProcessTable},
         code_mode::compute::retention,
@@ -325,7 +332,10 @@ fn cli_signal_cleanup(stage: SignalStage) {
             let _ = self.0.wait();
         }
     }
-    for signal in if startup || download || logged { [libc::SIGTERM, libc::SIGINT] } else { [libc::SIGTERM, libc::SIGKILL] } {
+    for signal in if startup || download || install || logged { [libc::SIGTERM, libc::SIGINT] } else { [libc::SIGTERM, libc::SIGKILL] } {
+        let mut sentinel = Owned(Command::new("/usr/bin/sleep").arg("120")
+            .env_clear().stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .spawn().unwrap());
         let root = tempfile::Builder::new()
             .prefix("compute-cli-signal-qa-")
             .tempdir_in(
@@ -339,7 +349,7 @@ fn cli_signal_cleanup(stage: SignalStage) {
         let source = root.path().join("selected.txt");
         std::fs::write(&source, b"selected-input-canary").unwrap();
         std::fs::write(root.path().join("program.ts"), "async function main(){return await tools.compute.run({runtime:'python',dependencies:[],inputs:[{artifactId:computeInputs.selected,name:'selected.txt'}],code:'import time\\ntime.sleep(60)'});} main();").unwrap();
-        if download {
+        if download || install {
             std::fs::write(root.path().join("program.ts"), "async function main(){return await tools.compute.run({runtime:'python',dependencies:['numpy==1.26.4'],code:'raise AssertionError(\"must not execute\")'});}main();").unwrap();
         }
         if logged {
@@ -361,7 +371,7 @@ time.sleep(60)"#});
                     std::env::var_os("JARVIS_TEST_VM_CONFIG").expect("VM required"),
                 )
                 .env("AUGMENTAGENT_BUILD_SCRATCH_DIR", &scratch)
-                .envs(if download {
+                .envs(if download || install {
                     vec![("AUGMENTAGENT_COMPUTE_PIP_RUNTIME", std::env::var_os("JARVIS_TEST_COMPUTE_PIP").expect("pinned pip required"))]
                 } else { vec![] })
                 .args([
@@ -379,7 +389,8 @@ time.sleep(60)"#});
                 .unwrap(),
         );
         let started = Instant::now();
-        let mut fetch_pid = None;
+        let mut stalled_pid = None;
+        let mut installation_log = None;
         let processes = loop {
             assert!(
                 cli.0.try_wait().unwrap().is_none(),
@@ -387,7 +398,7 @@ time.sleep(60)"#});
             );
             let processes = ProcFs.vm_processes_using(&scratch);
             if download {
-                fetch_pid = processes.iter().find_map(|(pid, _)| {
+                stalled_pid = processes.iter().find_map(|(pid, _)| {
                     let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
                     let args: Vec<_> = bytes.split(|byte| *byte == 0).filter(|part| !part.is_empty())
                         .map(|part| String::from_utf8_lossy(part).into_owned()).collect();
@@ -396,16 +407,38 @@ time.sleep(60)"#});
                     let route = value["route"].as_str()?;
                     (route.starts_with("/pypi-files/") && route.ends_with(".whl")).then_some(*pid)
                 });
-                if fetch_pid.is_some() { break processes; }
-            } else if logged {
+                if stalled_pid.is_some() { break processes; }
+            } else if logged || install {
                 let ready = std::fs::read_dir(&scratch).unwrap().filter_map(Result::ok)
                     .filter(|entry| entry.file_name().to_string_lossy().starts_with("jarvis-vm-session-compute-"))
                     .filter_map(|entry| std::fs::read_dir(entry.path().join("tmp")).ok())
                     .flatten().filter_map(Result::ok)
                     .filter(|entry| entry.file_name().to_string_lossy().starts_with("compute-execution-"))
-                    .any(|entry| std::fs::read(entry.path().join("partial.stdout")).ok().as_deref() == Some(b"partial-out\xff")
-                        && std::fs::read(entry.path().join("partial.stderr")).ok().as_deref() == Some(b"partial-err\xfe"));
-                if ready { break processes; }
+                    .any(|entry| {
+                        if install {
+                            let path = entry.path().join("partial.stdout");
+                            let output = std::fs::read_to_string(&path).unwrap_or_default();
+                            if output.contains("Installing collected packages: numpy") && !output.contains("Successfully installed") {
+                                installation_log = Some(path);
+                                return true;
+                            }
+                            false
+                        } else {
+                            std::fs::read(entry.path().join("partial.stdout")).ok().as_deref() == Some(b"partial-out\xff")
+                                && std::fs::read(entry.path().join("partial.stderr")).ok().as_deref() == Some(b"partial-err\xfe")
+                        }
+                    });
+                if ready {
+                    if install {
+                        stalled_pid = processes.iter().find_map(|(pid, _)| {
+                            std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+                                .filter(|path| path.file_name().unwrap().to_string_lossy().starts_with("qemu-system-"))
+                                .map(|_| *pid)
+                        });
+                        assert!(stalled_pid.is_some(), "installation log without live preparation VM");
+                    }
+                    break processes;
+                }
             } else if (startup && !processes.is_empty()) || processes.iter().any(|(pid, _)| {
                 std::fs::read_link(format!("/proc/{pid}/exe"))
                     .ok()
@@ -418,10 +451,10 @@ time.sleep(60)"#});
                 break processes;
             }
             assert!(
-                started.elapsed() < Duration::from_secs(if download { 45 } else { 15 }),
+                started.elapsed() < Duration::from_secs(if download || install { 45 } else { 15 }),
                 "required VM or wheel-fetch stage did not start"
             );
-            std::thread::sleep(Duration::from_millis(if startup || download { 1 } else { 20 }));
+            std::thread::sleep(Duration::from_millis(if startup || download || install { 1 } else { 20 }));
         };
         let process_descriptors: Vec<_> = processes
             .iter()
@@ -463,17 +496,25 @@ time.sleep(60)"#});
                 .count();
             assert_eq!(managed, 1, "live Deno files must belong to the crash-recovery lease");
         }
-        if download {
-            let (_, descriptor) = process_descriptors.iter().find(|(pid, _)| Some(*pid) == fetch_pid).unwrap();
+        if download || install {
+            let (_, descriptor) = process_descriptors.iter().find(|(pid, _)| Some(*pid) == stalled_pid).unwrap();
             assert_eq!(unsafe { libc::syscall(libc::SYS_pidfd_send_signal,
                 descriptor.as_raw_fd(), libc::SIGSTOP, std::ptr::null::<libc::siginfo_t>(), 0) }, 0);
             let stop_requested = Instant::now();
             loop {
-                let state = std::fs::read_to_string(format!("/proc/{}/stat", fetch_pid.unwrap())).unwrap();
+                let state = std::fs::read_to_string(format!("/proc/{}/stat", stalled_pid.unwrap())).unwrap();
                 if state.rsplit_once(')').unwrap().1.split_whitespace().next() == Some("T") { break; }
-                assert!(stop_requested.elapsed() < Duration::from_secs(1), "fetch did not stop");
+                assert!(stop_requested.elapsed() < Duration::from_secs(1), "selected preparation process did not stop");
                 std::thread::sleep(Duration::from_millis(1));
             }
+        }
+        if install {
+            // Give the host time to drain already-sent frames from the now
+            // stopped VM. Do not call a completed preparation an install cancel.
+            std::thread::sleep(Duration::from_millis(150));
+            let output = std::fs::read_to_string(installation_log.as_ref().unwrap()).unwrap();
+            assert!(output.contains("Installing collected packages: numpy"));
+            assert!(!output.contains("Successfully installed"), "installer completed before cancellation probe");
         }
         if startup {
             // Pin and stop the helper before its ready frame. This also keeps
@@ -510,7 +551,7 @@ time.sleep(60)"#});
             let result = report(root.path());
             assert_eq!(result["error"]["code"], "cancelled");
             assert_eq!(result["cleanup"]["cleanupVerified"], true);
-            if download {
+            if download || install {
                 let rows = result["records"].as_array().unwrap();
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0]["error"]["code"], "cancelled");
@@ -519,6 +560,14 @@ time.sleep(60)"#});
                 let phases = rows[0]["phases"].as_array().unwrap();
                 assert!(phases.iter().any(|phase| phase["phase"] == "prepare"));
                 assert!(!phases.iter().any(|phase| phase["phase"] == "execute"));
+                if install {
+                    assert_eq!(rows[0]["preparation"]["error"], "cancelled");
+                    assert_eq!(rows[0]["preparation"]["cleanupVerified"], true);
+                    let audit = root.path().join(result["auditDirectory"].as_str().unwrap());
+                    let output = std::fs::read_to_string(audit.join(rows[0]["preparation"]["logs"]["stdout"]["file"].as_str().unwrap())).unwrap();
+                    assert!(output.contains("Installing collected packages: numpy"));
+                    assert!(!output.contains("Successfully installed"));
+                }
             }
             if logged {
                 let rows = result["records"].as_array().unwrap();
@@ -554,6 +603,7 @@ time.sleep(60)"#});
             );
         }
         assert!(stopped.elapsed() < Duration::from_secs(5));
+        assert!(sentinel.0.try_wait().unwrap().is_none(), "cleanup killed an unrelated process");
         for (pid, descriptor) in &process_descriptors {
             let remaining = Duration::from_secs(5).saturating_sub(stopped.elapsed());
             let mut poll = libc::pollfd {

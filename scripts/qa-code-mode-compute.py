@@ -839,6 +839,8 @@ CASES = {
     'secret_fds': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_unrelated_fds', ignored=True)),
     'cli_signals': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_signals', ignored=True)),
     'cancel_download': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_download_cancellation', ignored=True), public=True),
+    'cancel_install': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_install_cancellation', ignored=True), public=True),
+    'unsupported_platform': suite(cargo('augmentagent-channel-core', library=True, filter_name='unsupported_platform_rejected_before_initialization')),
     'cancelled_logs': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_cancelled_logs', ignored=True)),
     'partial_log_contracts': suite([sys.executable, '-m', 'unittest', 'scripts.tests.code_mode_compute_test.GuestLogTransferTests',
         'scripts.tests.code_mode_compute_test.ComputeVMTests.test_cancelled_vm_keeps_partial_binary_logs_in_private_audit',
