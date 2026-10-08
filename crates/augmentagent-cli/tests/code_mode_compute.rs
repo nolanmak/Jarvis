@@ -750,3 +750,36 @@ fn cli_export_failure(cancel: bool) {
     }
     assert_eq!(std::fs::read_dir(root.path().join("out")).unwrap().count(),0,"failed CLI published success artifacts");
 }
+
+#[test]
+#[ignore = "requires real VM; expires enclosing task while a compute call is active"]
+fn real_cli_task_deadline_cancels_active_compute() {
+    use augmentagent_channel_core::build_scratch::{ProcFs, ProcessTable};
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+    let root = tempfile::Builder::new().prefix("compute-task-timeout-qa-")
+        .tempdir_in(std::env::var_os("JARVIS_TEST_COMPUTE_SCRATCH").unwrap()).unwrap();
+    let scratch = root.path().join("scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = std::env::var("JARVIS_TEST_VM_CONFIG").unwrap();
+    let started = Instant::now();
+    let output = invoke(root.path(), "async function main(){return await tools.compute.run({runtime:'python',dependencies:[],code:'import time;time.sleep(20)'});}main();", &[
+        ("AUGMENTAGENT_COMPUTE_ENABLED", "true"),
+        ("AUGMENTAGENT_CODE_MODE_COMPUTE_TIMEOUT_SECS", "5"),
+        ("AUGMENTAGENT_COMPUTE_TIMEOUT_SECS", "60"),
+        ("AUGMENTAGENT_BUILD_VM_CONFIG", &runtime),
+        ("AUGMENTAGENT_BUILD_SCRATCH_DIR", scratch.to_str().unwrap()),
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(started.elapsed() < Duration::from_secs(10), "task exceeded deadline plus cleanup allowance");
+    let result = report(root.path());
+    assert_eq!(result["error"]["code"], "timeout", "{result}");
+    assert_eq!(result["cleanup"]["cleanupVerified"], true, "{result}");
+    assert_eq!(result["artifacts"], json!([]));
+    assert_eq!(result["records"].as_array().unwrap().len(), 1);
+    assert_eq!(result["records"][0]["runner"], "vm", "{result}");
+    assert!(ProcFs.vm_processes_using(&scratch).is_empty());
+    assert!(std::fs::read_dir(&scratch).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().starts_with("jarvis-vm-session-")));
+    assert!(std::fs::read_dir(root.path().join("out")).unwrap().next().is_none());
+}

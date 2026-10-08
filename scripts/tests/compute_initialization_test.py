@@ -17,6 +17,51 @@ SUPERVISOR = Path(__file__).parents[1] / 'provider-supervisor.py'
 
 
 class InitializationTests(unittest.TestCase):
+    def test_vm_shutdown_finishes_when_cancellation_interrupts_wait(self):
+        import io
+        class Interrupted(BaseException):
+            pass
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt = Path(tmp) / 'receipt'
+            class Process:
+                stdin = io.BytesIO()
+                stdout = io.BytesIO()
+                done = False
+                waits = 0
+                def poll(self): return 0 if self.done else None
+                def terminate(self): pass
+                def kill(self): raise AssertionError('cooperative shutdown should finish')
+                def wait(self, timeout):
+                    assert 0 < timeout <= 5
+                    self.waits += 1
+                    if self.waits == 1:
+                        raise Interrupted()
+                    receipt.write_text('all-descendants-reaped\n')
+                    self.done = True
+                    return 0
+            process = Process()
+            with self.assertRaises(Interrupted) as error:
+                compute.cleanup_vm_phase(process, receipt)
+            self.assertEqual(error.exception.runner, 'vm')
+            self.assertTrue(process.done)
+            self.assertEqual(process.waits, 2)
+            self.assertTrue(process.stdin.closed and process.stdout.closed)
+
+    def test_unresponsive_vm_shutdown_never_waits_without_timeout(self):
+        from unittest.mock import Mock
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = subprocess.TimeoutExpired('owned fixture', 5)
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(compute.ComputeError) as error:
+                compute.cleanup_vm_phase(process, Path(tmp) / 'missing')
+        self.assertEqual(error.exception.code, 'cleanup_unverified')
+        process.kill.assert_called_once()
+        self.assertEqual(process.wait.call_count, 2)
+        for call in process.wait.call_args_list:
+            self.assertGreater(call.kwargs['timeout'], 0)
+            self.assertLessEqual(call.kwargs['timeout'], 5)
+
     def phase(self, *args):
         self.assertTrue(hasattr(compute, 'run_host_phase'), 'initialization needs supervised deadline enforcement')
         return compute.run_host_phase(*args)

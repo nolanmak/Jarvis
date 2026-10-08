@@ -140,6 +140,42 @@ def run_execution(runtime_path, private, request, timeout=600, *, cache=None, en
                      environment_id=environment_id, input_data=input_data)
 
 
+def cleanup_vm_phase(process, receipt):
+    """Finish one bounded shutdown even if cancellation interrupts timeout cleanup."""
+    deadline = time.monotonic() + 5
+    interrupted = None
+    if process.poll() is None:
+        process.terminate()
+        grace = deadline - .5
+        while process.poll() is None:
+            try:
+                process.wait(timeout=max(.001, grace - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                break
+            except BaseException as error:
+                if isinstance(error, Exception):
+                    deny('cleanup_unverified', 'Compute shutdown could not be observed.', runner='vm')
+                # The signal handler disables subsequent cancellation signals.
+                # Preserve this cancellation, but first finish the shutdown it
+                # interrupted instead of abandoning the supervisor and receipt.
+                interrupted = error
+            if time.monotonic() >= grace:
+                break
+        if process.poll() is None:
+            process.kill()
+            try:
+                process.wait(timeout=max(.001, deadline - time.monotonic()))
+            except BaseException:
+                deny('cleanup_unverified', 'Compute supervisor failed to stop.', runner='vm')
+    process.stdin.close()
+    process.stdout.close()
+    if process.poll() is None or not receipt.is_file() or receipt.read_text() != 'all-descendants-reaped\n':
+        deny('cleanup_unverified', 'Compute descendant cleanup was not verified.', runner='vm')
+    if interrupted is not None:
+        interrupted.runner = 'vm'
+        raise interrupted
+
+
 def run_phase(runtime_path, private, request, timeout, *, cache=None, environment_id=None,
               input_data=None, pip_runtime=None):
     """Run a dependency-free workload through the compute VM profile.
@@ -294,18 +330,11 @@ poweroff -f
             error.runner = 'vm'
             raise
         finally:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
-                    deny('cleanup_unverified', 'Compute supervisor failed to stop.')
-            process.stdin.close()
-            process.stdout.close()
-            if not cleanup.is_file() or cleanup.read_text() != 'all-descendants-reaped\n':
-                deny('cleanup_unverified', 'Compute descendant cleanup was not verified.', runner='vm')
+            try:
+                cleanup_vm_phase(process, cleanup)
+            except BaseException as error:
+                error.runner = 'vm'
+                raise
         prefix = b'JARVIS_COMPUTE_RESULT:'
         records = [line[len(prefix):] for line in captured.splitlines() if line.startswith(prefix)]
         if len(records) != 1:
