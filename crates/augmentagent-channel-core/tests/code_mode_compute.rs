@@ -436,6 +436,21 @@ async fn orchestration_log_overflow_cancels_active_vm_rpc() {
 #[tokio::test]
 #[ignore = "requires provisioned KVM and private build-volume scratch; kills only its fixture owner"]
 async fn killed_owner_recovery_removes_vm_and_task_lease() {
+    crash_recovery(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires provisioned KVM; kills only its fixture compute helper"]
+async fn killed_helper_recovery_removes_vm_and_task_lease() {
+    crash_recovery(true).await;
+}
+
+async fn crash_recovery(kill_helper: bool) {
+    let fixture_name = if kill_helper {
+        "killed_helper_recovery_removes_vm_and_task_lease"
+    } else {
+        "killed_owner_recovery_removes_vm_and_task_lease"
+    };
     use augmentagent_channel_core::{
         build_scratch::{BuildScratchLimits, ProcFs, ProcessTable},
         code_mode::compute::{retention, ComputeService},
@@ -465,6 +480,12 @@ async fn killed_owner_recovery_removes_vm_and_task_lease() {
                 json!({"runtime":"python","dependencies":[],"code":"import time\ntime.sleep(60)"}),
             )
             .await;
+        if kill_helper {
+            assert!(_result.is_err(), "killed helper must not return compute success");
+            drop(service);
+            drop(lease);
+            return;
+        }
         drop(lease);
         panic!("fixture owner must be killed while its VM is running");
     }
@@ -486,7 +507,7 @@ async fn killed_owner_recovery_removes_vm_and_task_lease() {
     let mut owner = OwnedChild(
         Command::new(std::env::current_exe().unwrap())
             .args([
-                "killed_owner_recovery_removes_vm_and_task_lease",
+                fixture_name,
                 "--exact",
                 "--ignored",
                 "--test-threads=1",
@@ -563,9 +584,31 @@ async fn killed_owner_recovery_removes_vm_and_task_lease() {
         1,
         "crashed helper must be owned by its recovery lease"
     );
-    owner.0.kill().unwrap();
-    owner.0.wait().unwrap();
     let started = std::time::Instant::now();
+    if kill_helper {
+        let audit: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(helper_files[0].parent().unwrap().join("audit.json")).unwrap()
+        ).unwrap();
+        let helper_pid = audit["ownerPid"].as_u64().unwrap() as u32;
+        let (_, descriptor) = process_descriptors.iter().find(|(pid, _)| *pid == helper_pid)
+            .expect("helper must be pinned before crash injection");
+        assert_eq!(unsafe { libc::syscall(libc::SYS_pidfd_send_signal,
+            descriptor.as_raw_fd(), libc::SIGKILL, std::ptr::null::<libc::siginfo_t>(), 0) }, 0);
+        let status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(status) = owner.0.try_wait().unwrap() { break status; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("owner did not observe helper failure within cleanup allowance");
+        assert!(status.success(), "helper failure fixture failed: {}", std::fs::read_to_string(log.path()).unwrap());
+        let scratch = augmentagent_channel_core::build_scratch::sweep_compute_with(
+            root.path(), &ProcFs, std::time::SystemTime::now());
+        assert_eq!(scratch.cleanup_unverified, 0);
+        assert!(scratch.removed > 0, "SIGKILL fixture must exercise orphan scratch recovery");
+    } else {
+        owner.0.kill().unwrap();
+        owner.0.wait().unwrap();
+    }
     let recovered = retention::sweep_at(&storage, retention::now().unwrap()).unwrap();
     assert_eq!(recovered.removed, 1);
     assert!(
