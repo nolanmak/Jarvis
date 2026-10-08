@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use augmentagent_channel_core::code_mode::{
     compute::{
         artifacts::{self, Artifact, Directory},
-        ComputeDispatcher, ComputeService, ServiceConfig,
+        retention, ComputeDispatcher, ComputeService, ServiceConfig,
     },
     manifest::manifest_compute,
     runner::run_program_with_options,
@@ -26,8 +26,8 @@ pub struct ComputeRunArgs {
 }
 
 struct Prepared {
-    // Drop task storage before its descriptor-pinned parent.
-    _task: tempfile::TempDir,
+    storage: Option<retention::Lease>,
+    _disabled: Option<tempfile::TempDir>,
     program: String,
     destination: Directory,
     report_parent: Directory,
@@ -81,34 +81,61 @@ fn prepare(args: &ComputeRunArgs) -> Result<Prepared> {
     );
     let destination = Directory::open(&args.output_dir, true)?;
     destination.require_empty()?;
-    let task = tempfile::Builder::new()
-        .prefix("compute-audit-")
-        .tempdir_in(report_parent.path())?;
-    #[cfg(unix)]
-    {
+    let mut config = ServiceConfig::from_env(PathBuf::new(), input_files)?;
+    let (storage, disabled) = if config.policy.enabled {
+        let lease = retention::Lease::reserve(
+            &config.scratch_root.join("compute-artifacts"),
+            "cli",
+            retention::now()?,
+            config.scratch_limits.context("missing scratch limits")?,
+        )?;
+        config.artifact_root = lease.path.clone();
+        (Some(lease), None)
+    } else {
+        // Disabled computation cannot import selected data. Keep only bounded,
+        // non-sensitive refusal metadata; no provisioned VM storage is needed.
+        config.input_files.clear();
+        let temporary = tempfile::Builder::new()
+            .prefix("compute-disabled-")
+            .tempdir()?;
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(task.path(), std::fs::Permissions::from_mode(0o700))?;
-    }
-    // The helper has its own descriptor table, so give it the ordinary path.
-    let task_path = report
-        .parent()
-        .unwrap()
-        .join(task.path().file_name().unwrap());
-    let config = ServiceConfig::from_env(task_path, input_files)?;
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700))?;
+        config.artifact_root = temporary.path().to_owned();
+        (None, Some(temporary))
+    };
     Ok(Prepared {
         program,
         destination,
         report_parent,
         report_name,
         config,
-        _task: task,
+        storage,
+        _disabled: disabled,
     })
 }
 
 /// Return the documented exit code after all task-owned processes are closed.
 pub async fn run(args: &ComputeRunArgs) -> i32 {
-    let prepared = match prepare(args) {
+    let mut prepared = match prepare(args) {
         Ok(prepared) => prepared,
+        Err(error) if error.downcast_ref::<retention::AdmissionDenied>().is_some() => {
+            let written = (|| -> Result<()> {
+                let path = std::path::absolute(&args.report)?;
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("invalid report name")?;
+                let parent =
+                    Directory::open(path.parent().context("report parent missing")?, false)?;
+                parent.write_report(name, &json!({"schemaVersion":1,"ok":false,"final":null,"records":[],"artifacts":[],
+                    "error":{"code":"resource_limit","message":"Compute storage capacity or admission limit exceeded."},
+                    "cleanup":{"cleanupVerified":true}}))
+            })();
+            if written.is_err() {
+                eprintln!("compute-run admission report could not be written");
+            }
+            return 1;
+        }
         Err(error) => {
             eprintln!("compute-run configuration: {error}");
             return 2;
@@ -116,28 +143,32 @@ pub async fn run(args: &ComputeRunArgs) -> i32 {
     };
     let mut report = execute(&prepared).await;
     let retain_audit = report["cleanup"]["cleanupVerified"] == true;
-    if retain_audit {
-        // Generated files have already been exported. Keep only private audit
-        // files, never raw input snapshots or duplicate output capabilities.
-        let cleanup = (|| -> Result<()> {
-            for entry in std::fs::read_dir(prepared._task.path())? {
-                let entry = entry?;
-                let name = entry.file_name();
-                if name.to_str().is_some_and(|name| {
-                    name.len() == 32 && name.bytes().all(|b| b.is_ascii_hexdigit())
-                }) {
-                    std::fs::remove_file(entry.path())?;
-                }
+    let audit = if retain_audit {
+        let exported = (|| -> Result<tempfile::TempDir> {
+            let (temporary, directory) =
+                prepared.report_parent.private_tempdir("compute-audit-")?;
+            artifacts::export_audit(&prepared.config.artifact_root, &directory)?;
+            if let Some(lease) = prepared.storage.take() {
+                lease.discard()?;
             }
-            Ok(())
+            Ok(temporary)
         })();
-        if cleanup.is_err() {
-            eprintln!("compute-run audit cleanup failed");
-            return 1;
+        match exported {
+            Ok(temporary) => {
+                report["auditDirectory"] =
+                    json!(temporary.path().file_name().unwrap().to_str().unwrap());
+                Some(temporary)
+            }
+            Err(_) => {
+                report["ok"] = json!(false);
+                report["error"] = json!({"code":"cleanup_unverified","message":"Compute audit export or storage cleanup failed."});
+                report["cleanup"]["cleanupVerified"] = json!(false);
+                None
+            }
         }
-        report["auditDirectory"] =
-            json!(prepared._task.path().file_name().unwrap().to_str().unwrap());
-    }
+    } else {
+        None
+    };
     let success = report["ok"] == true;
     if let Err(error) = prepared
         .report_parent
@@ -146,8 +177,8 @@ pub async fn run(args: &ComputeRunArgs) -> i32 {
         eprintln!("compute-run report: {error}");
         return 1;
     }
-    if retain_audit {
-        let _ = prepared._task.keep();
+    if let Some(audit) = audit {
+        let _ = audit.keep();
     }
     println!("{}", json!({"ok":success,"report":args.report}));
     if success {
@@ -178,9 +209,11 @@ async fn execute(prepared: &Prepared) -> Value {
     };
     let manifest = manifest_compute();
     let future = run_program_with_options(&prepared.program, &manifest, &dispatcher, &options);
+    let mut cancelled = false;
     let outcome = tokio::select! {
         outcome = future => outcome,
         _ = shutdown_signal() => {
+            cancelled = true;
             service.cancel();
             Err(augmentagent_channel_core::code_mode::RunnerError::Protocol("Compute task cancelled.".into()))
         }
@@ -192,7 +225,7 @@ async fn execute(prepared: &Prepared) -> Value {
         || dispatcher.has_failed()
     {
         Some(
-            json!({"code":outcome.as_ref().err().map(|error| error.public_code()).unwrap_or("execution_failed"),"message":"Program or compute call failed."}),
+            json!({"code":if cancelled { "cancelled" } else { outcome.as_ref().err().map(|error| error.public_code()).unwrap_or("execution_failed") },"message":"Program or compute call failed."}),
         )
     } else {
         None

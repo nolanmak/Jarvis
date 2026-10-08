@@ -262,7 +262,8 @@ async fn run_program_inner(
         "spawning code-mode sandbox"
     );
 
-    let mut child = Command::new(&resolution.path)
+    let mut command = Command::new(&resolution.path);
+    command
         .arg("run")
         // Configuration and import resolution are independent of ordinary
         // capability permissions. Do not inherit a task's deno.json or npm.
@@ -277,7 +278,25 @@ async fn run_program_inner(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    #[cfg(target_os = "linux")]
+    {
+        let owner = unsafe { libc::getpid() };
+        // kill_on_drop cannot run when the daemon/CLI receives SIGKILL.
+        // Only async-signal-safe syscalls are used between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != owner {
+                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+                }
+                Ok(())
+            });
+        }
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| map_spawn_error(e, &resolution))?;
 

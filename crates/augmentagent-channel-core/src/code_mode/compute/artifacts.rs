@@ -146,6 +146,35 @@ impl Directory {
     }
 
     #[cfg(unix)]
+    pub fn private_tempdir(&self, prefix: &str) -> Result<(tempfile::TempDir, Directory)> {
+        use std::os::unix::fs::PermissionsExt;
+        anyhow::ensure!(filename(prefix), "invalid private directory prefix");
+        let temporary = tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(self.path())?;
+        let name = std::ffi::CString::new(
+            temporary
+                .path()
+                .file_name()
+                .context("private directory name missing")?
+                .as_encoded_bytes(),
+        )?;
+        let fd = unsafe {
+            libc::openat(
+                self.0.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        anyhow::ensure!(fd >= 0, "private directory could not be pinned");
+        let directory = Directory(unsafe { File::from_raw_fd(fd) });
+        directory
+            .0
+            .set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        Ok((temporary, directory))
+    }
+
+    #[cfg(unix)]
     pub fn write_report(&self, name: &str, report: &serde_json::Value) -> Result<()> {
         anyhow::ensure!(filename(name), "invalid report filename");
         let mut staged = tempfile::NamedTempFile::new_in(self.path())?;
@@ -184,6 +213,72 @@ pub fn export(root: &Path, destination: &Directory, entries: &[Artifact]) -> Res
             "artifact export size limit"
         );
     }
+    copy_verified(&source, destination, entries, false)
+}
+
+/// Copy only completed private audit records and their digest-bound log files.
+/// Raw input/output capabilities are intentionally absent from this allowlist.
+#[cfg(unix)]
+pub fn export_audit(root: &Path, destination: &Directory) -> Result<()> {
+    let source = Directory::open(root, false)?;
+    let audit = source.read_private_json("audit.json")?;
+    anyhow::ensure!(
+        audit["schemaVersion"] == 1 && audit["closed"] == true && audit["cleanupVerified"] == true,
+        "private audit is not a completed task"
+    );
+    let records = audit["records"]
+        .as_array()
+        .context("invalid audit records")?;
+    anyhow::ensure!(records.len() <= 25, "audit record limit exceeded");
+    let mut entries = Vec::new();
+    let mut names = BTreeSet::new();
+    let mut total = 0u64;
+    for record in records {
+        let id = record["executionId"]
+            .as_str()
+            .context("invalid execution ID")?;
+        anyhow::ensure!(
+            id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid execution ID"
+        );
+        for stream in ["stdout", "stderr"] {
+            let log = &record["logs"][stream];
+            if log.is_null() {
+                continue;
+            }
+            let expected = format!("audit-{id}.{stream}");
+            anyhow::ensure!(
+                log["file"].as_str() == Some(expected.as_str()) && names.insert(expected.clone()),
+                "invalid audit log filename"
+            );
+            let bytes = log["bytes"].as_u64().context("invalid audit log length")?;
+            total = total.checked_add(bytes).context("audit size overflow")?;
+            anyhow::ensure!(
+                bytes <= 8 * 1024 * 1024 && total <= 25 * 8 * 1024 * 1024,
+                "audit log size limit exceeded"
+            );
+            entries.push(Artifact {
+                id: expected.clone(),
+                name: expected,
+                bytes,
+                sha256: log["sha256"]
+                    .as_str()
+                    .context("missing audit log digest")?
+                    .into(),
+            });
+        }
+    }
+    copy_verified(&source, destination, &entries, true)?;
+    destination.write_report("audit.json", &audit)
+}
+
+#[cfg(unix)]
+fn copy_verified(
+    source: &Directory,
+    destination: &Directory,
+    entries: &[Artifact],
+    private: bool,
+) -> Result<()> {
     let mut created: Vec<&str> = Vec::new();
     let result = (|| {
         for entry in entries {
@@ -193,6 +288,12 @@ pub fn export(root: &Path, destination: &Directory, entries: &[Artifact]) -> Res
                 before.is_file() && before.nlink() == 1 && before.len() == entry.bytes,
                 "invalid artifact storage"
             );
+            if private {
+                anyhow::ensure!(
+                    before.uid() == unsafe { libc::getuid() } && before.mode() & 0o777 == 0o600,
+                    "audit log is not private"
+                );
+            }
             let mut bytes = Vec::new();
             (&mut input).take(entry.bytes + 1).read_to_end(&mut bytes)?;
             let after = input.metadata()?;
@@ -226,6 +327,49 @@ pub fn export(root: &Path, destination: &Directory, entries: &[Artifact]) -> Res
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[test]
+    fn private_audit_export_copies_only_verified_logs_and_rejects_forged_names() {
+        let root = tempfile::tempdir().unwrap();
+        let source = Directory::open(root.path(), false).unwrap();
+        let id = "a".repeat(32);
+        let log_name = format!("audit-{id}.stdout");
+        source
+            .open_file(&log_name, true)
+            .unwrap()
+            .write_all(b"private log")
+            .unwrap();
+        source
+            .open_file(&"b".repeat(32), true)
+            .unwrap()
+            .write_all(b"unselected snapshot canary")
+            .unwrap();
+        let audit = serde_json::json!({"schemaVersion":1,"closed":true,"cleanupVerified":true,"records":[{
+            "executionId":id,"logs":{"stdout":{"file":log_name,"bytes":11,"sha256":format!("{:x}",Sha256::digest(b"private log"))}}
+        }]});
+        source.write_report("audit.json", &audit).unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let destination = Directory::open(target.path(), false).unwrap();
+        export_audit(root.path(), &destination).unwrap();
+        assert_eq!(
+            std::fs::read(target.path().join(&log_name)).unwrap(),
+            b"private log"
+        );
+        assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 2);
+        let mut forged = audit.clone();
+        forged["records"][0]["logs"]["stdout"]["file"] = serde_json::json!("../outside");
+        std::fs::remove_file(root.path().join("audit.json")).unwrap();
+        source.write_report("audit.json", &forged).unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let destination = Directory::open(target.path(), false).unwrap();
+        assert!(export_audit(root.path(), &destination).is_err());
+        assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
+        std::fs::remove_file(root.path().join("audit.json")).unwrap();
+        source.write_report("audit.json", &audit).unwrap();
+        std::fs::write(root.path().join(log_name), b"altered log").unwrap();
+        assert!(export_audit(root.path(), &destination).is_err());
+        assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
+    }
+
     #[test]
     fn private_audit_read_rejects_links_modes_and_oversized_records() {
         use std::os::unix::fs::{symlink, PermissionsExt};

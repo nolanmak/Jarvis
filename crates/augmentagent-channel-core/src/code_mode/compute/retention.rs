@@ -13,6 +13,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[derive(Debug, thiserror::Error)]
+#[error("resource_limit: Compute storage capacity or admission limit exceeded.")]
+pub struct AdmissionDenied;
+
 pub const TTL_SECS: u64 = 86400;
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 // 128 MiB capabilities + up to 25 calls' preparation/execution logs + journal.
@@ -46,7 +50,7 @@ impl<'a> Lock<'a> {
     fn acquire(file: &'a File) -> Result<Self> {
         anyhow::ensure!(
             unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-            "resource_limit: compute storage is busy"
+            AdmissionDenied
         );
         Ok(Self(file))
     }
@@ -72,10 +76,7 @@ fn tasks(root: &Directory) -> Result<Vec<String>> {
                 names.push(name.to_owned());
             }
         }
-        anyhow::ensure!(
-            names.len() <= MAX_TASKS,
-            "resource_limit: too many retained compute tasks"
-        );
+        anyhow::ensure!(names.len() <= MAX_TASKS, AdmissionDenied);
     }
     Ok(names)
 }
@@ -227,10 +228,7 @@ fn charge(task: &Directory) -> Result<u64> {
             .checked_add(info.len().max(info.blocks() * 512))
             .context("compute storage overflow")?;
         count += 1;
-        anyhow::ensure!(
-            count <= 2048 && bytes <= TASK_RESERVATION,
-            "resource_limit: retained task exceeds reservation"
-        );
+        anyhow::ensure!(count <= 2048 && bytes <= TASK_RESERVATION, AdmissionDenied);
     }
     Ok(bytes.max(MIN_CHARGE))
 }
@@ -307,7 +305,7 @@ impl Lease {
         sweep_locked(&root, at)?;
         anyhow::ensure!(
             usage(&root)? + TASK_RESERVATION <= STORE_LIMIT,
-            "resource_limit: retained compute storage is full"
+            AdmissionDenied
         );
         let retained = usage(&root)?;
         let (mut allocated, mut outstanding) = (0u64, 0u64);
@@ -340,7 +338,7 @@ impl Lease {
                 .saturating_add(retained)
                 .saturating_add(TASK_RESERVATION)
                 <= limits.budget_bytes,
-            "resource_limit: compute retention exceeds shared scratch budget"
+            AdmissionDenied
         );
         let mut vfs = std::mem::MaybeUninit::<libc::statvfs>::uninit();
         anyhow::ensure!(
@@ -355,7 +353,7 @@ impl Lease {
                     .saturating_add(outstanding)
                     .saturating_add(retained)
                     .saturating_add(TASK_RESERVATION),
-            "resource_limit: insufficient compute storage capacity"
+            AdmissionDenied
         );
         // Crash before mkdir may over-reserve; it cannot undercount growth.
         publish_usage(&root, TASK_RESERVATION)?;

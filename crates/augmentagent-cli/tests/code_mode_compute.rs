@@ -270,3 +270,319 @@ fn orchestration_limits_keep_typed_report_codes() {
     assert_eq!(report(root.path())["error"]["code"], "resource_limit");
     assert_eq!(report(root.path())["cleanup"]["cleanupVerified"], true);
 }
+
+#[test]
+#[ignore = "requires provisioned KVM and private build-volume scratch; real CLI signal/recovery QA"]
+fn real_cli_signals_clean_managed_inputs_and_vm_work() {
+    use augmentagent_channel_core::{
+        build_scratch::{ProcFs, ProcessTable},
+        code_mode::compute::retention,
+    };
+    use std::{
+        os::unix::fs::PermissionsExt,
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+    struct Owned(std::process::Child);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    for signal in [libc::SIGTERM, libc::SIGKILL] {
+        let root = tempfile::Builder::new()
+            .prefix("compute-cli-signal-qa-")
+            .tempdir_in(
+                std::env::var_os("JARVIS_TEST_COMPUTE_SCRATCH").expect("build scratch required"),
+            )
+            .unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let source = root.path().join("selected.txt");
+        std::fs::write(&source, b"selected-input-canary").unwrap();
+        std::fs::write(root.path().join("program.ts"), "async function main(){return await tools.compute.run({runtime:'python',dependencies:[],inputs:[{artifactId:computeInputs.selected,name:'selected.txt'}],code:'import time\\ntime.sleep(60)'});} main();").unwrap();
+        let mut cli = Owned(
+            Command::new(env!("CARGO_BIN_EXE_augmentagent"))
+                .current_dir(root.path())
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", root.path())
+                .env("AUGMENTAGENT_COMPUTE_ENABLED", "true")
+                .env(
+                    "AUGMENTAGENT_BUILD_VM_CONFIG",
+                    std::env::var_os("JARVIS_TEST_VM_CONFIG").expect("VM required"),
+                )
+                .env("AUGMENTAGENT_BUILD_SCRATCH_DIR", &scratch)
+                .args([
+                    "code-mode",
+                    "compute-run",
+                    "--program",
+                    "program.ts",
+                    "--inputs",
+                ])
+                .arg(json!({"selected":source}).to_string())
+                .args(["--output-dir", "out", "--report", "report.json"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let started = Instant::now();
+        let processes = loop {
+            assert!(
+                cli.0.try_wait().unwrap().is_none(),
+                "CLI exited before launching VM"
+            );
+            let processes = ProcFs.vm_processes_using(&scratch);
+            if !processes.is_empty() {
+                break processes;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "VM did not start"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let storage = scratch.join("compute-artifacts");
+        assert!(
+            storage.is_dir(),
+            "active CLI inputs need a managed recovery lease"
+        );
+        assert_eq!(
+            retention::sweep_at(&storage, retention::now().unwrap())
+                .unwrap()
+                .live,
+            1
+        );
+        let stopped = Instant::now();
+        assert_eq!(unsafe { libc::kill(cli.0.id() as i32, signal) }, 0);
+        let status = loop {
+            if let Some(status) = cli.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                stopped.elapsed() < Duration::from_secs(5),
+                "CLI signal cleanup exceeded five seconds"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if signal == libc::SIGTERM {
+            assert_eq!(status.code(), Some(1));
+            let result = report(root.path());
+            assert_eq!(result["error"]["code"], "cancelled");
+            assert_eq!(result["cleanup"]["cleanupVerified"], true);
+        } else {
+            assert!(!root.path().join("report.json").exists());
+            assert_eq!(
+                retention::sweep_at(&storage, retention::now().unwrap())
+                    .unwrap()
+                    .removed,
+                1
+            );
+        }
+        assert!(stopped.elapsed() < Duration::from_secs(5));
+        for (pid, start) in processes {
+            assert_ne!(ProcFs.start_time(pid).as_deref(), Some(start.as_str()));
+        }
+        assert!(std::fs::read_dir(&scratch).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("jarvis-vm-session-")));
+        assert!(std::fs::read_dir(&storage).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("task-")));
+        assert_eq!(std::fs::read(&source).unwrap(), b"selected-input-canary");
+        assert!(std::fs::read_dir(root.path().join("out"))
+            .unwrap()
+            .next()
+            .is_none());
+    }
+}
+
+#[test]
+fn storage_admission_refusal_is_a_reported_policy_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let scratch = root.path().join("scratch");
+    let retained = scratch.join("compute-artifacts");
+    std::fs::create_dir_all(&retained).unwrap();
+    for path in [&scratch, &retained] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    for digit in ['1', '2', '3'] {
+        let task = retained.join(format!("task-{}", digit.to_string().repeat(32)));
+        std::fs::create_dir(&task).unwrap();
+        std::fs::set_permissions(&task, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory =
+            augmentagent_channel_core::code_mode::compute::artifacts::Directory::open(&task, false)
+                .unwrap();
+        directory
+            .write_report(
+                "retention.json",
+                &json!({"schemaVersion":1,"expiresAt":u64::MAX}),
+            )
+            .unwrap();
+        std::fs::File::create(task.join("synthetic-sparse-artifact"))
+            .unwrap()
+            .set_len(512 * 1024 * 1024)
+            .unwrap();
+    }
+    let result = invoke(
+        root.path(),
+        "throw new Error('must not execute');",
+        &[
+            ("AUGMENTAGENT_COMPUTE_ENABLED", "true"),
+            ("AUGMENTAGENT_BUILD_SCRATCH_DIR", scratch.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(
+        result.status.code(),
+        Some(1),
+        "storage exhaustion is a policy failure, not invalid CLI arguments"
+    );
+    let result = report(root.path());
+    assert_eq!(result["error"]["code"], "resource_limit");
+    assert_eq!(result["cleanup"]["cleanupVerified"], true);
+    assert_eq!(result["records"], json!([]));
+    assert!(std::fs::read_dir(&scratch).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with("jarvis-vm-session-")));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn killed_cli_cannot_leave_spinning_orchestration_process() {
+    use std::{
+        os::fd::{AsRawFd, FromRawFd},
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+    struct Owner(std::process::Child);
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    struct Pinned(std::fs::File);
+    impl Drop for Pinned {
+        fn drop(&mut self) {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.0.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            }
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("spin.ts"),
+        "async function main(){while(true){}} main();",
+    )
+    .unwrap();
+    let mut owner = Owner(
+        Command::new(env!("CARGO_BIN_EXE_augmentagent"))
+            .current_dir(root.path())
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", root.path())
+            .env("AUGMENTAGENT_COMPUTE_ENABLED", "false")
+            .args([
+                "code-mode",
+                "compute-run",
+                "--program",
+                "spin.ts",
+                "--output-dir",
+                "out",
+                "--report",
+                "report.json",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let started = Instant::now();
+    let (pid, pinned) = loop {
+        assert!(
+            owner.0.try_wait().unwrap().is_none(),
+            "CLI exited before orchestration started"
+        );
+        let mut found = None;
+        for thread in std::fs::read_dir(format!("/proc/{}/task", owner.0.id())).unwrap() {
+            let children = std::fs::read_to_string(thread.unwrap().path().join("children"))
+                .unwrap_or_default();
+            for pid in children
+                .split_whitespace()
+                .filter_map(|pid| pid.parse::<u32>().ok())
+            {
+                let executable = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+                if executable
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .is_some_and(|name| name == "deno")
+                {
+                    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+                    assert!(fd >= 0);
+                    found = Some((
+                        pid,
+                        Pinned(unsafe { std::fs::File::from_raw_fd(fd as i32) }),
+                    ));
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        if let Some(found) = found {
+            break found;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "Deno did not start"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    loop {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let fields: Vec<_> = stat
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .collect();
+        if fields[11].parse::<u64>().unwrap() >= 20 {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "fixture did not enter its busy loop"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    owner.0.kill().unwrap();
+    owner.0.wait().unwrap();
+    let mut exited = libc::pollfd {
+        fd: pinned.0.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let status = unsafe { libc::poll(&mut exited, 1, 1000) };
+    assert!(
+        status > 0 && exited.revents & libc::POLLIN != 0,
+        "orchestration survived owner SIGKILL and kept using host CPU"
+    );
+}
