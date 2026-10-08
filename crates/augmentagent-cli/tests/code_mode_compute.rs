@@ -274,6 +274,16 @@ fn orchestration_limits_keep_typed_report_codes() {
 #[test]
 #[ignore = "requires provisioned KVM and private build-volume scratch; real CLI signal/recovery QA"]
 fn real_cli_signals_clean_managed_inputs_and_vm_work() {
+    cli_signal_cleanup(false);
+}
+
+#[test]
+#[ignore = "requires provisioned private scratch; signals the CLI before helper readiness"]
+fn real_cli_startup_signals_are_reported_and_cleaned() {
+    cli_signal_cleanup(true);
+}
+
+fn cli_signal_cleanup(startup: bool) {
     use augmentagent_channel_core::{
         build_scratch::{ProcFs, ProcessTable},
         code_mode::compute::retention,
@@ -291,7 +301,7 @@ fn real_cli_signals_clean_managed_inputs_and_vm_work() {
             let _ = self.0.wait();
         }
     }
-    for signal in [libc::SIGTERM, libc::SIGKILL] {
+    for signal in if startup { [libc::SIGTERM, libc::SIGINT] } else { [libc::SIGTERM, libc::SIGKILL] } {
         let root = tempfile::Builder::new()
             .prefix("compute-cli-signal-qa-")
             .tempdir_in(
@@ -338,7 +348,7 @@ fn real_cli_signals_clean_managed_inputs_and_vm_work() {
                 "CLI exited before launching VM"
             );
             let processes = ProcFs.vm_processes_using(&scratch);
-            if processes.iter().any(|(pid, _)| {
+            if (startup && !processes.is_empty()) || processes.iter().any(|(pid, _)| {
                 std::fs::read_link(format!("/proc/{pid}/exe"))
                     .ok()
                     .and_then(|path| {
@@ -353,7 +363,7 @@ fn real_cli_signals_clean_managed_inputs_and_vm_work() {
                 started.elapsed() < Duration::from_secs(15),
                 "VM did not start"
             );
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(if startup { 1 } else { 20 }));
         };
         let process_descriptors: Vec<_> = processes
             .iter()
@@ -376,8 +386,26 @@ fn real_cli_signals_clean_managed_inputs_and_vm_work() {
                 .live,
             1
         );
+        if startup {
+            // Pin and stop the helper before its ready frame. This also keeps
+            // the CLI from registering its old, late signal listener by racing
+            // through initialization while the test prepares its assertions.
+            for (_, descriptor) in &process_descriptors {
+                assert_eq!(unsafe { libc::syscall(libc::SYS_pidfd_send_signal,
+                    descriptor.as_raw_fd(), libc::SIGSTOP, std::ptr::null::<libc::siginfo_t>(), 0) }, 0);
+            }
+        }
         let stopped = Instant::now();
         assert_eq!(unsafe { libc::kill(cli.0.id() as i32, signal) }, 0);
+        if startup {
+            std::thread::sleep(Duration::from_millis(50));
+            // Resume even the failing pre-fix CLI's orphan so parent-death
+            // cleanup can finish; never strand a stopped fixture helper.
+            for (_, descriptor) in &process_descriptors {
+                unsafe { libc::syscall(libc::SYS_pidfd_send_signal,
+                    descriptor.as_raw_fd(), libc::SIGCONT, std::ptr::null::<libc::siginfo_t>(), 0); }
+            }
+        }
         let status = loop {
             if let Some(status) = cli.0.try_wait().unwrap() {
                 break status;
@@ -388,11 +416,14 @@ fn real_cli_signals_clean_managed_inputs_and_vm_work() {
             );
             std::thread::sleep(Duration::from_millis(10));
         };
-        if signal == libc::SIGTERM {
+        if signal != libc::SIGKILL {
             assert_eq!(status.code(), Some(1));
             let result = report(root.path());
             assert_eq!(result["error"]["code"], "cancelled");
             assert_eq!(result["cleanup"]["cleanupVerified"], true);
+            if startup {
+                assert_eq!(result["records"], json!([]), "queued startup cancellation launched computation");
+            }
         } else {
             assert!(!root.path().join("report.json").exists());
             assert_eq!(

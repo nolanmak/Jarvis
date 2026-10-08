@@ -116,6 +116,15 @@ fn prepare(args: &ComputeRunArgs) -> Result<Prepared> {
 
 /// Return the documented exit code after all task-owned processes are closed.
 pub async fn run(args: &ComputeRunArgs) -> i32 {
+    // Register synchronously before preparing storage or spawning a helper.
+    // Signals arriving during initialization remain queued for execute().
+    let mut shutdown = match ShutdownSignals::register() {
+        Ok(shutdown) => shutdown,
+        Err(error) => {
+            eprintln!("compute-run signal registration: {error}");
+            return 1;
+        }
+    };
     let mut prepared = match prepare(args) {
         Ok(prepared) => prepared,
         Err(error) if error.downcast_ref::<retention::AdmissionDenied>().is_some() => {
@@ -141,7 +150,7 @@ pub async fn run(args: &ComputeRunArgs) -> i32 {
             return 2;
         }
     };
-    let mut report = execute(&prepared).await;
+    let mut report = execute(&prepared, &mut shutdown).await;
     let retain_audit = report["cleanup"]["cleanupVerified"] == true;
     let audit = if retain_audit {
         let exported = (|| -> Result<tempfile::TempDir> {
@@ -188,7 +197,7 @@ pub async fn run(args: &ComputeRunArgs) -> i32 {
     }
 }
 
-async fn execute(prepared: &Prepared) -> Value {
+async fn execute(prepared: &Prepared, shutdown: &mut ShutdownSignals) -> Value {
     let service = match ComputeService::start(prepared.config.clone()).await {
         Ok(service) => service,
         Err(_) => {
@@ -211,12 +220,13 @@ async fn execute(prepared: &Prepared) -> Value {
     let future = run_program_with_options(&prepared.program, &manifest, &dispatcher, &options);
     let mut cancelled = false;
     let outcome = tokio::select! {
-        outcome = future => outcome,
-        _ = shutdown_signal() => {
+        biased;
+        _ = shutdown.recv() => {
             cancelled = true;
             service.cancel();
             Err(augmentagent_channel_core::code_mode::RunnerError::Protocol("Compute task cancelled.".into()))
         }
+        outcome = future => outcome,
     };
     let cleanup = service.finish().await;
     let mut error = if outcome
@@ -271,15 +281,27 @@ async fn execute(prepared: &Prepared) -> Value {
         "cleanup":{"cleanupVerified":receipt["cleanupVerified"],"cancelled":receipt["cancelled"]}})
 }
 
-async fn shutdown_signal() {
+struct ShutdownSignals {
     #[cfg(unix)]
-    {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("SIGTERM registration");
-        tokio::select! { _ = term.recv() => {}, _ = tokio::signal::ctrl_c() => {} }
+    term: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignals {
+    fn register() -> std::io::Result<Self> {
+        Ok(Self {
+            #[cfg(unix)]
+            term: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+            #[cfg(unix)]
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+        })
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        tokio::select! { _ = self.term.recv() => {}, _ = self.interrupt.recv() => {} }
+        #[cfg(not(unix))]
+        { let _ = tokio::signal::ctrl_c().await; }
     }
 }
