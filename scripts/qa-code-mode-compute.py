@@ -25,7 +25,7 @@ FIXTURES = REPO / 'scripts/tests/fixtures/code-mode-compute'
 LOG_LIMIT = 16 * 1024 * 1024
 REQUIREMENTS = {
     'AC01': ['disabled', 'owner_contracts', 'missing_runtime', 'host_optout', 'unsupported_platform'],
-    'AC02': ['xlsx', 'host_package_integrity', 'native_wheel'],
+    'AC02': ['xlsx', 'host_package_integrity', 'native_wheel', 'runtime_package_isolation'],
     'AC03': ['xlsx'],
     'AC04': ['fresh_task', 'changed_constraints', 'failed_preparation'],
     'AC05': ['request_contracts', 'gateway_contracts', 'source_only', 'transitive_url', 'altered_wheel', 'valid_fixture_wheel'],
@@ -407,6 +407,7 @@ import numpy as np
 import numpy.core._multiarray_umath as native
 assert np.__version__=='1.26.4'
 assert Path(native.__file__).suffix=='.so'
+assert native.__file__.startswith('/cache/envs/'), native.__file__
 try:
     with open(native.__file__,'ab') as f:f.write(b'forbidden')
     raise AssertionError('native dependency is writable')
@@ -873,6 +874,7 @@ CASES = {
     'source_only': suite([sys.executable, '-m', 'unittest', 'scripts.tests.compute_package_fixture_test.PackageFixtureVMTests.test_source_only_is_unavailable_without_downloading_source', '-v']),
     'transitive_url': suite([sys.executable, '-m', 'unittest', 'scripts.tests.compute_package_fixture_test.PackageFixtureVMTests.test_transitive_url_is_policy_denied_without_requesting_url', '-v']),
     'altered_wheel': suite([sys.executable, '-m', 'unittest', 'scripts.tests.compute_package_fixture_test.PackageFixtureVMTests.test_altered_wheel_has_integrity_failure_before_install_or_execution', '-v']),
+    'runtime_package_isolation': suite([sys.executable, '-m', 'unittest', 'scripts.tests.compute_package_fixture_test.PackageFixtureVMTests.test_locked_packages_override_runtime_packages_and_are_absent_without_dependencies', '-v']),
     'valid_fixture_wheel': suite([sys.executable, '-m', 'unittest', 'scripts.tests.compute_package_fixture_test.PackageFixtureVMTests.test_valid_fixture_installs_and_executes_offline', '-v']),
     'bridge_regression': suite([sys.executable, '-m', 'unittest', 'scripts.tests.codex_tool_bridge_test', '-v'], public=True),
     'build_vm_regression': suite([sys.executable, '-m', 'unittest', 'scripts.tests.codex_build_vm_test', 'scripts.tests.codex_tool_bridge_test.BuildScratchTests', '-v'], public=True),

@@ -54,7 +54,7 @@ def prepare():
     staging = root / 'tmp'; staging.mkdir()
     # Isolated pip ignores configuration; TMPDIR remains a normal OS setting.
     os.environ['TMPDIR'] = str(staging)
-    command = ['/usr/bin/python3', '-I', '-B', '/prepare.py', '--pip']
+    command = ['/usr/bin/python3', '-I', '-S', '-B', '/prepare.py', '--pip']
     common = ['--only-binary=:all:', '--no-cache-dir', '--retries', '0', '--timeout', '15',
               '--cert', '/etc/jarvis-registry-ca.pem']
     downloaded = subprocess.run([*command, 'download', *common, '--dest', str(wheels),

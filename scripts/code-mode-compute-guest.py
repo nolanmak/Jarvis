@@ -195,7 +195,9 @@ def main():
         program = '/execute.py'
     Path('/worker.py').write_text(WORKER_BOOTSTRAP)
     os.chmod('/worker.py', 0o444)
-    process = subprocess.Popen(['/usr/bin/python3', '-I', '-B', '/worker.py', program], cwd='/work', env=environment,
+    # Disable ambient site packages and startup hooks; only the locked site
+    # directory is explicitly loaded by execute.py. Preparation uses pinned pip.
+    process = subprocess.Popen(['/usr/bin/python3', '-I', '-S', '-B', '/worker.py', program], cwd='/work', env=environment,
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         start_new_session=True, preexec_fn=worker)
     if registry is not None:

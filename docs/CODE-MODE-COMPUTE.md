@@ -48,7 +48,9 @@ The placeholder is not a usable digest. The wheel must be at most 8 MiB and pass
 the private-file checks; do not use a symlink. Keep the wheel and manifest readable
 only by the runtime owner. This supplies the installer to the guest; do not run
 `pip install` into the daemon environment. Dependency-free calls do not require
-this manifest. A missing or invalid runtime fails closed; setting
+this manifest. Guest workers disable automatic Python site initialization: only
+the selected locked environment is added to the import path. Ambient runtime
+packages and their startup hooks are not loaded automatically. A missing or invalid runtime fails closed; setting
 `AUGMENTAGENT_BUILD_VM=host` does not enable a compute host fallback.
 
 ## Enablement and budgets

@@ -24,17 +24,19 @@ def request(**changes):
     return {'runtime': 'python', 'dependencies': [], 'code': 'print(60)', **changes}
 
 
-def wheel(requirement=None):
+def wheel(requirement=None, name='jarvis-probe', version='1.0'):
     buffer = io.BytesIO()
+    module = name.replace('-', '_')
+    info = module + '-' + version + '.dist-info/'
     with zipfile.ZipFile(buffer, 'w') as archive:
-        metadata = 'Metadata-Version: 2.1\nName: jarvis-probe\nVersion: 1.0\n'
+        metadata = f'Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n'
         if requirement:
             metadata += 'Requires-Dist: ' + requirement + '\n'
-        archive.writestr('jarvis_probe-1.0.dist-info/METADATA', metadata)
-        archive.writestr('jarvis_probe-1.0.dist-info/WHEEL',
+        archive.writestr(info + 'METADATA', metadata)
+        archive.writestr(info + 'WHEEL',
                          'Wheel-Version: 1.0\nGenerator: harmless-fixture\nRoot-Is-Purelib: true\nTag: py3-none-any\n')
-        archive.writestr('jarvis_probe-1.0.dist-info/RECORD', '')
-        archive.writestr('jarvis_probe.py', 'VALUE = 60\n')
+        archive.writestr(info + 'RECORD', '')
+        archive.writestr(module + '.py', 'VALUE = 60\n')
     return buffer.getvalue()
 
 
@@ -43,19 +45,21 @@ class FixtureTransport:
         self.mode = mode
         self.calls = []
         self.original_run = subprocess.run
-        self.filename = 'jarvis_probe-1.0-py3-none-any.whl'
+        self.name = 'packaging' if mode == 'shadow' else 'jarvis-probe'
+        self.version = '1434.0' if mode == 'shadow' else '1.0'
+        self.filename = self.name.replace('-', '_') + '-' + self.version + '-py3-none-any.whl'
         origin = 'files.pythonhosted.org' if mode == 'registry_url' else 'attacker.invalid'
         self.body = wheel('other @ https://' + origin + '/packages/other-1.0-py3-none-any.whl'
-                          if mode in ('transitive_url', 'registry_url') else None)
+                          if mode in ('transitive_url', 'registry_url') else None, self.name, self.version)
 
     def run(self, argv, *args, **kwargs):
         if len(argv) < 6 or Path(argv[2]).name != 'build-dependency-proxy.py' or argv[3] != '--fetch':
             return self.original_run(argv, *args, **kwargs)
         route = json.loads(Path(argv[4]).read_text())['route']
         self.calls.append(route)
-        if route == '/pypi/simple/jarvis-probe/':
+        if route == '/pypi/simple/' + self.name + '/':
             filename = 'jarvis-probe-1.0.tar.gz' if self.mode == 'source_only' else self.filename
-            body = json.dumps({'meta': {'api-version': '1.0'}, 'name': 'jarvis-probe', 'files': [{
+            body = json.dumps({'meta': {'api-version': '1.0'}, 'name': self.name, 'files': [{
                 'filename': filename, 'url': 'https://files.pythonhosted.org/packages/' + filename,
                 'hashes': {'sha256': hashlib.sha256(self.body).hexdigest()}}]}).encode()
         elif route == '/pypi-files/packages/' + self.filename:
@@ -69,6 +73,30 @@ class FixtureTransport:
 @unittest.skipUnless(os.environ.get('JARVIS_TEST_VM_CONFIG') and os.environ.get('JARVIS_TEST_COMPUTE_PIP'),
                      'requires KVM and pinned pip; no public network is used')
 class PackageFixtureVMTests(unittest.TestCase):
+    def test_locked_packages_override_runtime_packages_and_are_absent_without_dependencies(self):
+        self.assertIsNotNone(importlib.util.find_spec('packaging'), 'host parser is a required runtime prerequisite')
+        transport = FixtureTransport('shadow')
+        with tempfile.TemporaryDirectory() as tmp:
+            backend = compute.VMBackend(os.environ['JARVIS_TEST_VM_CONFIG'],
+                os.environ['JARVIS_TEST_COMPUTE_SCRATCH'],
+                json.loads(Path(os.environ['JARVIS_TEST_COMPUTE_PIP']).read_text()))
+            try:
+                task = compute.ComputeTask(backend, compute.ArtifactStore(Path(tmp)), enabled=True)
+                with patch.object(subprocess, 'run', transport.run):
+                    result = task.execute(request(dependencies=['packaging==1434.0'], code=
+                        "import packaging\nassert packaging.__file__.startswith('/cache/envs/'), packaging.__file__\nprint(packaging.VALUE)", timeoutSecs=30))
+                    self.assertTrue(result['ok'], result)
+                    self.assertEqual(result['stdout'].strip(), '60')
+                    self.assertEqual(result['dependencyLock'], [{'name': 'packaging', 'version': '1434.0',
+                        'sha256': hashlib.sha256(transport.body).hexdigest()}])
+                    empty = task.execute(request(code="import importlib.util\nassert importlib.util.find_spec('packaging') is None\nprint(60)", timeoutSecs=15))
+                    self.assertTrue(empty['ok'], empty)
+                    self.assertEqual(empty['dependencyLock'], [])
+                    self.assertEqual(empty['stdout'].strip(), '60')
+                    self.assertEqual(len(transport.calls), 2)
+            finally:
+                backend.close()
+
     def check_refusal(self, mode, expected):
         transport = FixtureTransport(mode)
         scratch = Path(os.environ['JARVIS_TEST_COMPUTE_SCRATCH'])

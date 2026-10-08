@@ -48,7 +48,7 @@ async function main() {
 
     def test_default_header_still_executes_typescript(self):
         frames = self.run_program(program='async function main(): Promise<number> { return 42; } main();')
-        self.assertEqual(frames[-1], {'final': 42})
+        self.assertEqual(frames[-1], {'final': 42, 'localRefusal': False})
 
 
 if __name__ == '__main__':
