@@ -39,3 +39,4 @@ uuid = { workspace = true }
 tempfile = "3"
 
 [dev-dependencies]
+mockito = "1"

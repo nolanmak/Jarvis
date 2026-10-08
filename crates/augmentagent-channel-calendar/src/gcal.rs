@@ -1,8 +1,8 @@
 //! Google Calendar client over Composio HTTP.
 //!
 //! Mirrors `crates/augmentagent-channel-email/src/gmail.rs::ComposioClient`:
-//! one method per Composio action we use, identical retry+backoff loop, the
-//! same `x-api-key` header. The `CalendarApi` trait is the seam tests inject
+//! one method per Composio action we use and the same `x-api-key` header.
+//! Reads retry with bounded backoff; creates are never automatically replayed. The `CalendarApi` trait is the seam tests inject
 //! a fake into.
 //!
 //! Phase 1 surfaces only `list_events` (the `GOOGLECALENDAR_EVENTS_LIST`
@@ -27,7 +27,7 @@ pub struct EventDraft {
     /// RFC3339 with offset, e.g. `2026-07-10T15:00:00-04:00`.
     pub start_datetime: String,
     pub duration_minutes: i64,
-    /// Attendee emails; invites go out on create (`send_updates=all`).
+    /// Attendee emails; invites go out on create (`send_updates=true`).
     #[serde(default)]
     pub attendees: Vec<String>,
     #[serde(default)]
@@ -60,6 +60,11 @@ pub enum CalendarError {
     Forbidden { message: String },
     #[error("decode: {0}")]
     Decode(String),
+    #[error("invalid calendar input: {0}")]
+    Invalid(String),
+    /// A create might have reached Google. Never retry it automatically.
+    #[error("calendar creation is unconfirmed: {0}; check the calendar before retrying")]
+    Unconfirmed(String),
 }
 
 #[async_trait]
@@ -87,7 +92,7 @@ pub trait CalendarApi: Send + Sync {
     ) -> Result<CalendarEvent, CalendarError>;
 
     /// #398 — create an event with attendees (`GOOGLECALENDAR_CREATE_EVENT`,
-    /// `send_updates=all` so invites go out). Requires the `calendar.events`
+    /// `send_updates=true` so invites go out). Requires the `calendar.events`
     /// scope on the Google connection — a 403 surfaces as
     /// [`CalendarError::Forbidden`]. Only ever called from the daemon's
     /// Approve handler; there is no unattended write path.
@@ -108,7 +113,10 @@ pub struct ComposioCalendarClient {
 impl ComposioCalendarClient {
     pub fn new(api_key: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("calendar HTTP client"),
             base_url: "https://backend.composio.dev".into(),
             api_key,
         }
@@ -131,7 +139,10 @@ impl ComposioCalendarClient {
             "arguments": arguments,
         });
 
-        const MAX_ATTEMPTS: u32 = 3;
+        // Reads may retry; creates have no idempotency key. A lost response or
+        // upstream 5xx must not create a second event/invitation (#1436).
+        let creating = action == "GOOGLECALENDAR_CREATE_EVENT";
+        let max_attempts = if creating { 1 } else { 3 };
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
@@ -147,19 +158,33 @@ impl ComposioCalendarClient {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_success() {
-                        return resp.json::<serde_json::Value>().await.map_err(Into::into);
+                        let value = resp.json::<serde_json::Value>().await.map_err(|e| {
+                            if creating {
+                                CalendarError::Unconfirmed(format!(
+                                    "{action}: invalid or incomplete response ({e})"
+                                ))
+                            } else {
+                                CalendarError::Http(e)
+                            }
+                        })?;
+                        return check_envelope(action, value);
                     }
-                    let text = resp.text().await.unwrap_or_default();
+                    let text = bounded(&resp.text().await.unwrap_or_default(), 900);
                     if status.as_u16() == 403 {
                         return Err(CalendarError::Forbidden {
                             message: format!("{action} → 403: {text}"),
                         });
                     }
+                    if creating && status.is_server_error() {
+                        return Err(CalendarError::Unconfirmed(format!(
+                            "{action} → {status}: {text}"
+                        )));
+                    }
                     let retryable = status.as_u16() == 429 || status.is_server_error();
                     let err = CalendarError::Composio {
                         message: format!("{action} → {status}: {text}"),
                     };
-                    if retryable && attempt < MAX_ATTEMPTS {
+                    if retryable && attempt < max_attempts {
                         warn!(
                             action, status = %status, attempt,
                             "composio calendar retryable failure; backing off"
@@ -169,18 +194,74 @@ impl ComposioCalendarClient {
                     }
                     return Err(err);
                 }
-                Err(e) if attempt < MAX_ATTEMPTS && is_transient_reqwest(&e) => {
+                Err(e) if attempt < max_attempts && is_transient_reqwest(&e) => {
                     warn!(
-                        action, attempt,
-                        "composio calendar transport error; retrying: {e}"
+                        action,
+                        attempt, "composio calendar transport error; retrying: {e}"
                     );
                     backoff(attempt).await;
                     continue;
+                }
+                Err(e) if creating => {
+                    return Err(CalendarError::Unconfirmed(format!("{action}: {e}")));
                 }
                 Err(e) => return Err(CalendarError::Http(e)),
             }
         }
     }
+}
+
+fn bounded(value: &str, max_chars: usize) -> String {
+    let mut chars = value.trim().chars();
+    let mut result: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        result.push('…');
+    }
+    result
+}
+
+/// Composio uses HTTP 200 for tool failures too. Reject those before any
+/// result-shape fallback, including read paths that otherwise look empty.
+fn check_envelope(action: &str, v: serde_json::Value) -> Result<serde_json::Value, CalendarError> {
+    let error = [v.get("error"), v.pointer("/data/error")]
+        .into_iter()
+        .flatten()
+        .find(|e| !e.is_null() && e.as_str().is_none_or(|s| !s.trim().is_empty()));
+    let status = v
+        .pointer("/data/status_code")
+        .or_else(|| v.get("status_code"))
+        .and_then(serde_json::Value::as_u64);
+    if v.get("successful").and_then(serde_json::Value::as_bool) == Some(false)
+        || error.is_some()
+        || status.is_some_and(|s| s >= 400)
+    {
+        let detail = error.or_else(|| v.pointer("/data/message"));
+        let detail = match detail {
+            Some(serde_json::Value::String(s)) => bounded(s, 900),
+            Some(value) => bounded(&value.to_string(), 900),
+            None => "provider reported failure without an error message".into(),
+        };
+        let log_id = bounded(
+            v.get("log_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-"),
+            128,
+        );
+        let message = format!("{action} reported failure: {detail} (composio log_id {log_id})");
+        return Err(if status == Some(403) {
+            CalendarError::Forbidden { message }
+        } else {
+            CalendarError::Composio { message }
+        });
+    }
+    if v.get("successful").is_some_and(|flag| !flag.is_boolean()) {
+        return Err(if action == "GOOGLECALENDAR_CREATE_EVENT" {
+            CalendarError::Unconfirmed("provider returned an invalid successful flag".into())
+        } else {
+            CalendarError::Decode("provider returned an invalid successful flag".into())
+        });
+    }
+    Ok(v)
 }
 
 fn is_transient_reqwest(e: &reqwest::Error) -> bool {
@@ -287,11 +368,7 @@ impl CalendarApi for ComposioCalendarClient {
         if let Ok(GetResp { data }) = serde_json::from_value::<GetResp>(v.clone()) {
             return Ok(data);
         }
-        if let Some(inner) = v
-            .get("data")
-            .and_then(|d| d.get("response_data"))
-            .cloned()
-        {
+        if let Some(inner) = v.get("data").and_then(|d| d.get("response_data")).cloned() {
             if let Ok(ev) = serde_json::from_value::<CalendarEvent>(inner) {
                 return Ok(ev);
             }
@@ -310,22 +387,30 @@ impl CalendarApi for ComposioCalendarClient {
     ) -> Result<CreatedEvent, CalendarError> {
         // Param names per Composio's GOOGLECALENDAR_CREATE_EVENT schema
         // (snake_case, unlike EVENTS_LIST's Google-native camelCase).
+        // The Composio tool expects a naive datetime plus an IANA zone.
+        // Passing an RFC3339 offset unchanged loses the offset upstream.
+        let start = DateTime::parse_from_rfc3339(&draft.start_datetime)
+            .map_err(|e| {
+                CalendarError::Invalid(format!(
+                    "start_datetime must be RFC3339 with an offset: {e}"
+                ))
+            })?
+            .with_timezone(&Utc);
         let mins = draft.duration_minutes.max(1);
         let mut args = serde_json::json!({
             "calendar_id": calendar_id,
             "summary": draft.summary,
-            "start_datetime": draft.start_datetime,
+            "start_datetime": start.format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
+            "timezone": "UTC",
             "event_duration_hour": mins / 60,
             "event_duration_minutes": mins % 60,
             "attendees": draft.attendees,
-            "send_updates": "all",
+            "send_updates": true,
         });
         if let Some(desc) = &draft.description {
             args["description"] = serde_json::Value::String(desc.clone());
         }
-        if draft.create_meeting_room {
-            args["create_meeting_room"] = serde_json::Value::Bool(true);
-        }
+        args["create_meeting_room"] = serde_json::Value::Bool(draft.create_meeting_room);
 
         let v = self
             .execute("GOOGLECALENDAR_CREATE_EVENT", entity_id, args)
@@ -339,18 +424,26 @@ impl CalendarApi for ComposioCalendarClient {
         ];
         for cand in candidates.into_iter().flatten() {
             if let Ok(created) = serde_json::from_value::<CreatedEvent>(cand.clone()) {
-                if created.id.is_some() || created.html_link.is_some() {
+                if created
+                    .id
+                    .as_deref()
+                    .is_some_and(|id| !id.trim().is_empty())
+                {
                     return Ok(created);
                 }
             }
         }
-        // Created but couldn't pick out the handle — succeed with an empty
-        // handle rather than erroring after a real write.
-        warn!(
-            "events.create: response shape carried no id/htmlLink: {}",
-            serde_json::to_string(&v).unwrap_or_default()
+        // No proof of creation. Do not manufacture success or retry a write
+        // which may have happened; do not dump private event data into logs.
+        let log_id = bounded(
+            v.get("log_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-"),
+            128,
         );
-        Ok(CreatedEvent::default())
+        Err(CalendarError::Unconfirmed(format!(
+            "GOOGLECALENDAR_CREATE_EVENT returned no nonempty event ID (composio log_id {log_id})"
+        )))
     }
 }
 
@@ -364,9 +457,7 @@ fn fallback_list_resp(v: &serde_json::Value) -> ListResp {
     ];
     for cand in candidates {
         if let Some(items_v) = cand.get("items").or_else(|| cand.get("events")) {
-            if let Ok(items) =
-                serde_json::from_value::<Vec<CalendarEvent>>(items_v.clone())
-            {
+            if let Ok(items) = serde_json::from_value::<Vec<CalendarEvent>>(items_v.clone()) {
                 let token = cand
                     .get("nextPageToken")
                     .or_else(|| cand.get("next_page_token"))
@@ -419,8 +510,7 @@ mod tests {
             .with_body(body)
             .create_async()
             .await;
-        let client =
-            ComposioCalendarClient::new("k".into()).with_base_url(server.url());
+        let client = ComposioCalendarClient::new("k".into()).with_base_url(server.url());
         let events = client
             .list_events(
                 "ent",
@@ -467,8 +557,7 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
-        let client =
-            ComposioCalendarClient::new("k".into()).with_base_url(server.url());
+        let client = ComposioCalendarClient::new("k".into()).with_base_url(server.url());
         let events = client
             .list_events(
                 "ent",
@@ -492,11 +581,13 @@ mod tests {
                     "arguments": {
                         "calendar_id": "primary",
                         "summary": "Coffee chat",
-                        "start_datetime": "2026-07-10T15:00:00-04:00",
+                        "start_datetime": "2026-07-10T19:00:00",
+                        "timezone": "UTC",
                         "event_duration_hour": 0,
                         "event_duration_minutes": 30,
                         "attendees": ["sarah@acme.example.com"],
-                        "send_updates": "all",
+                        "send_updates": true,
+                        "create_meeting_room": false,
                     }
                 })),
             ]))
@@ -507,8 +598,7 @@ mod tests {
             )
             .create_async()
             .await;
-        let client =
-            ComposioCalendarClient::new("k".into()).with_base_url(server.url());
+        let client = ComposioCalendarClient::new("k".into()).with_base_url(server.url());
         let draft = EventDraft {
             summary: "Coffee chat".into(),
             start_datetime: "2026-07-10T15:00:00-04:00".into(),
@@ -519,7 +609,11 @@ mod tests {
         };
         let created = client.create_event("ent", "primary", &draft).await.unwrap();
         assert_eq!(created.id.as_deref(), Some("new-evt-1"));
-        assert!(created.html_link.as_deref().unwrap().contains("calendar.google.com"));
+        assert!(created
+            .html_link
+            .as_deref()
+            .unwrap()
+            .contains("calendar.google.com"));
     }
 
     #[tokio::test]
@@ -531,8 +625,7 @@ mod tests {
             .with_body("insufficient_scope: calendar.events")
             .create_async()
             .await;
-        let client =
-            ComposioCalendarClient::new("k".into()).with_base_url(server.url());
+        let client = ComposioCalendarClient::new("k".into()).with_base_url(server.url());
         let draft = EventDraft {
             summary: "x".into(),
             start_datetime: "2026-07-10T15:00:00-04:00".into(),
@@ -541,7 +634,10 @@ mod tests {
             description: None,
             create_meeting_room: false,
         };
-        let err = client.create_event("ent", "primary", &draft).await.unwrap_err();
+        let err = client
+            .create_event("ent", "primary", &draft)
+            .await
+            .unwrap_err();
         assert!(matches!(err, CalendarError::Forbidden { .. }));
     }
 
@@ -554,8 +650,7 @@ mod tests {
             .with_body("insufficient_scope")
             .create_async()
             .await;
-        let client =
-            ComposioCalendarClient::new("k".into()).with_base_url(server.url());
+        let client = ComposioCalendarClient::new("k".into()).with_base_url(server.url());
         let err = client
             .list_events(
                 "ent",
@@ -568,3 +663,7 @@ mod tests {
         assert!(matches!(err, CalendarError::Forbidden { .. }));
     }
 }
+
+#[cfg(test)]
+#[path = "gcal_regression_tests.rs"]
+mod regression_tests;
