@@ -541,7 +541,8 @@ def main(argv=None):
     checked(not args.output_dir.exists() or not any(args.output_dir.iterdir()), 'QA output directory must be new or empty')
     args.output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     args.output_dir.chmod(0o700)
-    report = {'schemaVersion': 1, 'issue': 1434, 'mode': args.cases, 'ok': False, 'acceptanceComplete': False, 'cases': {}}
+    report = {'schemaVersion': 1, 'issue': 1434, 'mode': args.cases, 'requireVm': args.require_vm,
+              'publicPackages': args.public_packages, 'ok': False, 'acceptanceComplete': False, 'cases': {}}
     try:
         checked(args.bin.is_file() and os.access(args.bin, os.X_OK), 'compiled CLI binary is missing or not executable')
         checked(args.vm_config.is_file(), 'VM runtime manifest is missing')

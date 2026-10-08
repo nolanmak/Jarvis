@@ -97,9 +97,12 @@ fi
 # A single match means "verification required".
 MATCHED=""
 BRIDGE_MATCHED=""
+COMPUTE_MATCHED=""
 while IFS= read -r f; do
   [[ -z "$f" ]] && continue
   case "$f" in
+    scripts/code-mode-compute*.py|scripts/qa-code-mode-compute.py|scripts/verify-code-mode-receipt.py|sidecars/code-mode-runner/runner.ts|sidecars/code-mode-runner/runner_test.ts|crates/augmentagent-channel-core/src/code_mode/*|crates/augmentagent-cli/src/compute_*.rs|crates/augmentagent-channel-core/tests/code_mode_compute.rs|crates/augmentagent-cli/tests/code_mode_compute.rs|scripts/tests/code_mode_compute_test.py|scripts/tests/compute_initialization_test.py|scripts/tests/fixtures/code-mode-compute/*)
+      MATCHED+="$f"$'\n'; COMPUTE_MATCHED+="$f"$'\n' ;;
     # Original (#216) match set: agent prompts, skills, reasoner config.
     schema/*.md)                                        MATCHED+="$f"$'\n' ;;
     skills/*/SKILL.md|skills/*/*.md|skills/*.md)        MATCHED+="$f"$'\n' ;;
@@ -147,6 +150,17 @@ fi
 # gate.
 HEAD_SHA=$(git -C "$REPO_ROOT" rev-parse HEAD)
 RECEIPT="$REPO_ROOT/.claude/agent-test-receipts/${HEAD_SHA}.txt"
+
+if [[ -n "$COMPUTE_MATCHED" ]]; then
+  COMPUTE_RECEIPT="$REPO_ROOT/.claude/agent-test-receipts/${HEAD_SHA}.compute.json"
+  GATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if ! python3 "$GATE_DIR/verify-code-mode-receipt.py" "$COMPUTE_RECEIPT" --head "$HEAD_SHA" >/dev/null 2>&1; then
+    REASON="Compute changes require complete final-HEAD acceptance evidence. Run scripts/qa-code-mode-compute.py with explicit --bin, --vm-config, --scratch-root and --output-dir plus --require-vm --public-packages --cases all. Preserve its unchanged report.json as $COMPUTE_RECEIPT and the human-readable receipt as $RECEIPT. Missing cases, skips, dirty source, changed binaries and stale commits do not pass. Changed compute files:
+$COMPUTE_MATCHED"
+    jq -n --arg r "$REASON" '{decision:"block",reason:$r,hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$r}}'
+    exit 0
+  fi
+fi
 
 if [[ -f "$RECEIPT" && -s "$RECEIPT" ]]; then
   exit 0
@@ -222,7 +236,7 @@ ${BRIDGE_SECTION}  schema/wiki-ask.md OR crates/augmentagent-channel-core/src/re
   skills/<name>/SKILL.md:
       Invoke the skill in a fresh claude session and confirm the behaviour.
 
-Then write the receipt (this satisfies the gate — content is for human review, not parsed):
+Then write the text receipt (content is for human review; compute changes also require the validated JSON receipt):
 
   mkdir -p .claude/agent-test-receipts
   cat > .claude/agent-test-receipts/${HEAD_SHA}.txt <<RECEIPT
@@ -233,7 +247,7 @@ Then write the receipt (this satisfies the gate — content is for human review,
 
 Re-run \`gh pr create\`. The receipt path is keyed by HEAD sha, so any rebase or amend voids the receipt — re-verify after any rewrite.
 
-If you genuinely cannot live-exercise a change (e.g. a refactor with no observable behaviour delta), say so in the receipt — write "command: n/a refactor", "observed: cargo test green + no behaviour delta possible", "verifies: <files>". The hook does not parse the receipt; it only checks that the file exists and is non-empty. But document HONESTLY — a future agent reading the audit trail will catch lies.
+If you genuinely cannot live-exercise a change (e.g. a refactor with no observable behaviour delta), say so in the receipt — write "command: n/a refactor", "observed: cargo test green + no behaviour delta possible", "verifies: <files>". The hook does not parse this text receipt; it checks that the file exists and is non-empty. Compute changes additionally require complete final-HEAD JSON acceptance evidence; a refactor note does not waive that requirement. But document HONESTLY — a future agent reading the audit trail will catch lies.
 EOF
 )
 

@@ -30,7 +30,8 @@ daemon state. The Codex fallback contract they verify is in
 3. Fails if an enforcement or compute suite is missing:
    `codex_tool_bridge_test`, `codex_command_sandbox_test`, `codex_build_vm_test`,
    `build_dependency_proxy_test`, `code_mode_compute_test`,
-   `compute_initialization_test`, `qa_code_mode_compute_test` or `compute_ci_test`.
+   `compute_initialization_test`, `qa_code_mode_compute_test`, `compute_ci_test` or
+   `compute_receipt_test`.
 4. From `scripts/`, runs `python3 -m unittest discover -s tests -p '*_test.py' -v`.
 5. Runs `bash scripts/tests/agent-pr-verify-gate.test.sh`.
 
@@ -215,6 +216,26 @@ logs and latches there. The synthetic-`HOME` pin test above is the reliable
 check.
 
 ## Receipts
+
+Compute runtime, helper, runner and acceptance-fixture changes require both
+`.claude/agent-test-receipts/<HEAD>.txt` and
+`.claude/agent-test-receipts/<HEAD>.compute.json` before `gh pr create`.
+Copy the **unchanged** `report.json` from a successful
+`qa-code-mode-compute.py --require-vm --public-packages --cases all` run to the
+JSON receipt path after final verification. Keep the human-readable commands,
+counts and observations in the text receipt. Do not commit either private
+receipt or its logs.
+
+`scripts/verify-code-mode-receipt.py <receipt> --head <HEAD>` checks the report
+schema, exact commit, clean source, unchanged binary, runtime fingerprints,
+version evidence, all required command records and the complete AC01–AC18
+map against the current harness. Missing or skipped cases, a partial mode,
+a stale commit, missing VM/public-package requirements, or a forged green
+summary with incomplete case evidence fail. Rebase/amend requires a fresh
+run. A generic text receipt or a refactor note cannot bypass this compute gate.
+These checks detect incomplete evidence; they do not cryptographically attest
+that a manually edited report is authentic. Preserve original harness output.
+
 
 `scripts/agent-pr-verify-gate.sh` blocks `gh pr create` until
 `.claude/agent-test-receipts/<HEAD-sha>.txt` exists when a PR changes one of

@@ -38,7 +38,7 @@ jobs:
           for suite in codex_tool_bridge_test codex_command_sandbox_test \
                        codex_build_vm_test build_dependency_proxy_test \
                        code_mode_compute_test compute_initialization_test \
-                       qa_code_mode_compute_test compute_ci_test; do
+                       qa_code_mode_compute_test compute_ci_test compute_receipt_test; do
             test -f "scripts/tests/$suite.py" || { echo "missing suite: $suite" >&2; exit 1; }
           done
       - name: Run Python suites
