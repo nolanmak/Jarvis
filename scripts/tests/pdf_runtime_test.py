@@ -1,4 +1,6 @@
 """Exercise the production installer, health check and startup without global deps."""
+import hashlib
+import io
 import os
 from pathlib import Path
 import shutil
@@ -6,8 +8,17 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.request
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
+# The real installer test already needs PyPI for renderer dependencies. Supply
+# its installer in the fixture too: isolated HOME must not rely on user pip.
+# Pin and verify the official wheel before loading any of its code.
+PIP_URL = ('https://files.pythonhosted.org/packages/44/3c/'
+           'd717024885424591d5376220b5e836c2d5293ce2011523c9de23ff7bf068/'
+           'pip-25.3-py3-none-any.whl')
+PIP_SHA256 = '9655943313a94722b7774661c21049070f6bbb0a1516bf02f7c8d5d9201514cd'
 
 
 class PdfRuntimeTests(unittest.TestCase):
@@ -23,6 +34,15 @@ class PdfRuntimeTests(unittest.TestCase):
                 shutil.copy(ROOT / 'crates/augmentagent-docs/python' / name, worker_dir)
             env = {**os.environ, 'XDG_DATA_HOME': str(root / 'data')}
             env.pop('AUGMENTAGENT_PDF_PYTHON', None)
+            with urllib.request.urlopen(PIP_URL, timeout=30) as response:
+                wheel = response.read(4 * 1024 * 1024 + 1)
+            self.assertLessEqual(len(wheel), 4 * 1024 * 1024)
+            self.assertEqual(hashlib.sha256(wheel).hexdigest(), PIP_SHA256)
+            bootstrap = root / 'pip-bootstrap'
+            with zipfile.ZipFile(io.BytesIO(wheel)) as archive:
+                archive.extractall(bootstrap)
+            env['PYTHONPATH'] = str(bootstrap)
+            env['PYTHONNOUSERSITE'] = '1'
             active = root / 'data/augmentagent/pdf-runtime'
 
             def run(*args, success=True, extra_env=None):
