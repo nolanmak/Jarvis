@@ -75,6 +75,7 @@ type Pending = {
 const pending = new Map<number, Pending>();
 let nextId = 1;
 let callCount = 0;
+let localRefusal = false;
 // Buffer for responses the reader sees BEFORE rpc() has registered the
 // matching pending entry. Pre-existing tests already cover the same-chunk
 // race when execution was synchronous (`eval`); switching to async module
@@ -181,6 +182,7 @@ function startReaderLoop(): void {
 
 async function rpc(name: string, args: unknown[]): Promise<unknown> {
   if (callCount >= CALL_BUDGET) {
+    localRefusal = true;
     // Don't even emit the call — fail synchronously inside the program.
     const err = new Error(
       `call_budget_exceeded: tool call limit of ${CALL_BUDGET} reached`,
@@ -284,6 +286,7 @@ function makeProxy(node: Node, path: string[]): unknown {
       }
       const child = node[prop as string];
       if (!child || typeof child !== "object") {
+        localRefusal = true;
         throw new Error(
           `tool_not_in_manifest: ${[...path, prop as string].join(".")}`,
         );
@@ -292,6 +295,7 @@ function makeProxy(node: Node, path: string[]): unknown {
     },
     apply(_t, _this, args) {
       if (!leafName) {
+        localRefusal = true;
         throw new Error(
           `not_callable: tools.${path.join(".")} is a namespace, not a tool`,
         );
@@ -441,7 +445,7 @@ async function run(): Promise<void> {
     Deno.exit(1);
   }
 
-  await writeLine({ final: result ?? null });
+  await writeLine({ final: result ?? null, localRefusal });
   Deno.exit(0);
 }
 

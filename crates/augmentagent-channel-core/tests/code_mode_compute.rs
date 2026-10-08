@@ -156,6 +156,7 @@ fn service_config(
         runtime: root.join("missing-runtime.json"),
         scratch_root: root.join("scratch"),
         pip_runtime: None,
+        scratch_limits: None,
         artifact_root: artifacts,
         input_files: BTreeMap::new(),
     }
@@ -303,4 +304,15 @@ async fn dropped_compute_future_cancels_vm_and_verifies_cleanup() {
     assert_eq!(receipt["cancelled"], true);
     assert_eq!(receipt["cleanupVerified"], true);
     assert!(service.execute(json!({})).await.is_err());
+}
+
+#[tokio::test]
+async fn locally_rejected_call_budget_remains_observable_after_catch() {
+    use augmentagent_channel_core::code_mode::manifest::manifest_compute;
+    let outcome = run_program_with_options(
+        "async function main(){for(let i=0;i<26;i++){try{await tools.compute.run({});}catch(_){}}return 'done';}main();",
+        &manifest_compute(), &StubDispatcher::always_null(&["compute.run"]), &RunOptions::default()).await.unwrap();
+    assert_eq!(outcome.final_value, json!("done"));
+    assert_eq!(outcome.trace.len(), 25);
+    assert!(outcome.dispatch_failures > 0, "local budget refusal was lost when the program caught it");
 }

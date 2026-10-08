@@ -25,6 +25,66 @@ pub struct ServiceConfig {
     pub pip_runtime: Option<Value>,
     pub artifact_root: PathBuf,
     pub input_files: BTreeMap<String, PathBuf>,
+    pub scratch_limits: Option<crate::build_scratch::BuildScratchLimits>,
+}
+
+impl ServiceConfig {
+    /// Resolve operator settings in the host, before giving any control to the
+    /// generated program. The build runner's host opt-out never applies here.
+    pub fn from_env(
+        artifact_root: PathBuf,
+        input_files: BTreeMap<String, PathBuf>,
+    ) -> Result<Self> {
+        let policy = ComputePolicy::from_env().map_err(anyhow::Error::msg)?;
+        let runtime = match std::env::var_os(crate::codex_tools::BUILD_VM_CONFIG_ENV) {
+            Some(path) => {
+                anyhow::ensure!(!path.is_empty(), "empty compute VM configuration path");
+                PathBuf::from(path)
+            }
+            None => PathBuf::from(
+                std::env::var_os("HOME")
+                    .context("HOME required to locate compute VM configuration")?,
+            )
+            .join(crate::codex_tools::BUILD_VM_DEFAULT_CONFIG),
+        };
+        let runtime = std::path::absolute(runtime)?;
+        let pip_path = std::env::var_os("AUGMENTAGENT_COMPUTE_PIP_RUNTIME").map(PathBuf::from);
+        let pip_runtime = match pip_path {
+            Some(path) => {
+                use std::io::Read;
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+                }
+                let mut file = options
+                    .open(path)
+                    .context("guest pip runtime manifest unavailable")?;
+                anyhow::ensure!(
+                    file.metadata()?.is_file(),
+                    "guest pip runtime manifest must be a regular file"
+                );
+                let mut bytes = Vec::new();
+                (&mut file).take(16385).read_to_end(&mut bytes)?;
+                anyhow::ensure!(bytes.len() <= 16384, "guest pip runtime manifest too large");
+                Some(serde_json::from_slice(&bytes).context("invalid guest pip runtime manifest")?)
+            }
+            None => None,
+        };
+        let limits = crate::build_scratch::BuildScratchLimits::from_env();
+        limits.validate().map_err(anyhow::Error::msg)?;
+        Ok(Self {
+            policy,
+            runtime,
+            scratch_root: std::path::absolute(crate::build_scratch::scratch_dir())?,
+            pip_runtime,
+            artifact_root,
+            input_files,
+            scratch_limits: Some(limits),
+        })
+    }
 }
 
 struct Helper {
@@ -141,6 +201,10 @@ impl ComputeService {
         let helpers = tempfile::Builder::new()
             .prefix("jarvis-compute-helper-")
             .tempdir()?;
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(helpers.path(), std::fs::Permissions::from_mode(0o700))?;
+        }
         for (name, data) in [
             (
                 "code-mode-compute.py",
@@ -177,6 +241,9 @@ impl ComputeService {
             "artifactRoot":config.artifact_root, "enabled":config.policy.enabled,
             "callTimeoutSecs":config.policy.call_timeout.as_secs(), "taskTimeoutSecs":config.policy.task_timeout.as_secs(),
             "inputFiles":config.input_files});
+        if let Some(limits) = config.scratch_limits {
+            policy["scratchLimits"] = serde_json::to_value(limits)?;
+        }
         if let Some(pip) = &config.pip_runtime {
             policy["pip"] = pip.clone();
         }

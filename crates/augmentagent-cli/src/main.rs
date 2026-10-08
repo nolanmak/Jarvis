@@ -81,6 +81,7 @@ mod autopr_eval;
 mod autopr_health;
 mod channel_router;
 mod code_mode;
+mod compute_cli;
 mod doc_cmd;
 mod db_compact;
 mod deploy_snapshot;
@@ -2789,6 +2790,11 @@ async fn drain_daemon_tasks(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    // Compute QA is explicitly isolated from live configuration and storage.
+    if let Cmd::CodeMode { op: code_mode::CodeModeOp::ComputeRun(ref args) } = cli.cmd {
+        std::process::exit(compute_cli::run(args).await);
+    }
     let _ = dotenvy::dotenv();
     // Send tracing to stderr so JSON-mode subcommands (consumed by the
     // dashboard via shell-out) don't get their stdout polluted with log
@@ -2802,7 +2808,6 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let cli = Cli::parse();
     if let Cmd::ModelTool { channel, ref readiness } = cli.cmd {
         return model_tool::serve(channel, readiness);
     }

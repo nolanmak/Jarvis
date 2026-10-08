@@ -13,9 +13,8 @@
 //!
 //! 1. `AUGMENTAGENT_CODE_MODE_SIDECAR` env var (absolute path to
 //!    `runner.ts`) wins.
-//! 2. Otherwise walk up from `CARGO_MANIFEST_DIR` (or `cwd` when not
-//!    built via cargo) looking for `sidecars/code-mode-runner/runner.ts`.
-//! 3. Fall back to `./sidecars/code-mode-runner/runner.ts`.
+//! 2. Otherwise materialize the compiled-in sidecar into a private temporary
+//!    file, retained until the runner exits. Task directories never select code.
 //!
 //! The Deno binary location resolves in the following order:
 //!
@@ -74,6 +73,8 @@ pub struct CodeModeOutcome {
     /// One entry per `tools.*` call in the order they happened. Pulled
     /// from the dispatcher's internal buffer after the program finished.
     pub trace: Vec<ToolCallRecord>,
+    /// Host refusals remain observable even when the program catches errors.
+    pub dispatch_failures: usize,
 }
 
 /// Where [`resolve_deno_bin`] sourced the returned path from. Carried
@@ -226,12 +227,12 @@ async fn run_program_inner(
     }
     let started = tokio::time::Instant::now();
     let resolution = resolve_deno_bin();
-    let sidecar = resolve_sidecar_path();
+    let sidecar = resolve_sidecar()?;
 
     tracing::debug!(
         deno = %resolution.path.display(),
         deno_source = %resolution.source,
-        sidecar = %sidecar.display(),
+        sidecar = %sidecar.path.display(),
         "spawning code-mode sandbox"
     );
 
@@ -240,7 +241,7 @@ async fn run_program_inner(
         // Configuration and import resolution are independent of ordinary
         // capability permissions. Do not inherit a task's deno.json or npm.
         .args(["--no-config", "--no-npm", "--no-remote", "--deny-import", "--no-prompt"])
-        .arg(&sidecar)
+        .arg(&sidecar.path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -358,6 +359,8 @@ enum SandboxFrame {
     Final {
         #[serde(rename = "final")]
         value: Value,
+        #[serde(default, rename = "localRefusal")]
+        local_refusal: bool,
     },
     /// `{ "error": { ... } }` — terminal failure.
     Error { error: ErrorPayload },
@@ -381,6 +384,7 @@ async fn rpc_loop(
 ) -> Result<CodeModeOutcome, RunnerError> {
     let allowed = manifest.to_runner_manifest();
     let mut calls = 0;
+    let mut dispatch_failures = 0;
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
 
@@ -409,6 +413,7 @@ async fn rpc_loop(
                 } else {
                     dispatcher.call(&call, args).await
                 };
+                if result.is_err() { dispatch_failures += 1; }
                 let response_line = match result {
                     Ok(value) => serde_json::json!({ "id": id, "result": value }),
                     Err(err) => serde_json::json!({ "id": id, "error": err.wire_message() }),
@@ -419,10 +424,11 @@ async fn rpc_loop(
                 stdin.write_all(&buf).await?;
                 stdin.flush().await?;
             }
-            SandboxFrame::Final { value } => {
+            SandboxFrame::Final { value, local_refusal } => {
                 return Ok(CodeModeOutcome {
                     final_value: value,
                     trace: dispatcher.drain_trace(),
+                    dispatch_failures: dispatch_failures + usize::from(local_refusal),
                 });
             }
             SandboxFrame::Error { error } => {
@@ -635,37 +641,27 @@ pub async fn check_deno_available() -> Result<DenoResolution, RunnerError> {
     Ok(resolution)
 }
 
-fn resolve_sidecar_path() -> PathBuf {
-    if let Ok(p) = std::env::var("AUGMENTAGENT_CODE_MODE_SIDECAR") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    // Walk up from this crate's manifest dir looking for the sidecar.
-    // CARGO_MANIFEST_DIR is set at compile time when this crate is built
-    // by cargo; falls back to CWD otherwise.
-    let start: PathBuf = std::env::var_os("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."));
-    if let Some(p) = walk_up_for_sidecar(&start) {
-        return p;
-    }
-    PathBuf::from("./sidecars/code-mode-runner/runner.ts")
+struct Sidecar {
+    path: PathBuf,
+    _file: Option<tempfile::NamedTempFile>,
 }
 
-fn walk_up_for_sidecar(start: &Path) -> Option<PathBuf> {
-    let mut cur = start.to_path_buf();
-    for _ in 0..8 {
-        let candidate = cur.join("sidecars/code-mode-runner/runner.ts");
-        if candidate.exists() {
-            return Some(candidate);
+fn resolve_sidecar() -> Result<Sidecar, RunnerError> {
+    materialize_sidecar(std::env::var_os("AUGMENTAGENT_CODE_MODE_SIDECAR"))
+}
+
+fn materialize_sidecar(override_path: Option<std::ffi::OsString>) -> Result<Sidecar, RunnerError> {
+    if let Some(path) = override_path.filter(|path| !path.is_empty()) {
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(RunnerError::Protocol("sidecar override must be an absolute operator path".into()));
         }
-        if !cur.pop() {
-            break;
-        }
+        return Ok(Sidecar { path, _file:None });
     }
-    None
+    use std::io::Write;
+    let mut file = tempfile::Builder::new().prefix("jarvis-code-mode-").suffix(".ts").tempfile()?;
+    file.write_all(include_bytes!("../../../../sidecars/code-mode-runner/runner.ts"))?;
+    Ok(Sidecar { path:file.path().to_owned(), _file:Some(file) })
 }
 
 #[cfg(test)]
@@ -831,18 +827,21 @@ mod tests {
 
     #[test]
     fn resolve_sidecar_env_overrides() {
-        std::env::set_var("AUGMENTAGENT_CODE_MODE_SIDECAR", "/custom/runner.ts");
-        assert_eq!(resolve_sidecar_path(), PathBuf::from("/custom/runner.ts"));
-        std::env::remove_var("AUGMENTAGENT_CODE_MODE_SIDECAR");
+        let sidecar = materialize_sidecar(Some("/custom/runner.ts".into())).unwrap();
+        assert_eq!(sidecar.path, PathBuf::from("/custom/runner.ts"));
+        assert!(materialize_sidecar(Some("relative/runner.ts".into())).is_err());
     }
 
     #[test]
-    fn walk_up_finds_workspace_sidecar() {
-        // CARGO_MANIFEST_DIR at compile time points into the crate dir, so
-        // the walk-up should land on the real workspace sidecar.
-        let p = walk_up_for_sidecar(Path::new(env!("CARGO_MANIFEST_DIR")));
-        assert!(p.is_some(), "expected to find sidecar from crate dir");
-        let p = p.unwrap();
-        assert!(p.ends_with("sidecars/code-mode-runner/runner.ts"));
+    fn embedded_sidecar_is_private_and_removed_after_use() {
+        let sidecar = materialize_sidecar(None).unwrap();
+        let path = sidecar.path.clone();
+        assert_eq!(std::fs::read(&path).unwrap(), include_bytes!("../../../../sidecars/code-mode-runner/runner.ts"));
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        drop(sidecar);
+        assert!(!path.exists());
     }
 }
