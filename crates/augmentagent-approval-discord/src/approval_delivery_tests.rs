@@ -68,28 +68,32 @@ async fn failure_posts_reason_without_deleting_card() {
 
 #[tokio::test]
 async fn calendar_success_posts_receipt_then_deletes_card() {
-    deliver(
-        ApprovalActionOutcome::CalendarCreated {
-            event_id: "evt-1436".into(),
-            html_link: None,
-            already_existed: false,
-        },
-        "Calendar event created. Event ID: evt-1436.",
-        200,
-        1,
-    )
-    .await;
+    for (link, expected) in [
+        (None, "Calendar event created on owner+work@example.test (primary calendar). Event ID: evt-1436."),
+        (Some("https://calendar.google.com/event?eid=test&authuser=owner%2Bwork%40example.test"), "Calendar event created on owner+work@example.test (primary calendar): https://calendar.google.com/event?eid=test&authuser=owner%2Bwork%40example.test (event ID: evt-1436)."),
+    ] {
+        deliver(
+            ApprovalActionOutcome::CalendarCreated {
+                organizer_account: "owner+work@example.test".into(),
+                event_id: "evt-1436".into(),
+                html_link: link.map(str::to_string),
+                already_existed: false,
+            },
+            expected, 200, 1,
+        ).await;
+    }
 }
 
 #[tokio::test]
 async fn undelivered_success_receipt_keeps_the_card() {
     deliver(
         ApprovalActionOutcome::CalendarCreated {
+            organizer_account: "owner+work@example.test".into(),
             event_id: "evt-1436".into(),
             html_link: None,
             already_existed: false,
         },
-        "Calendar event created. Event ID: evt-1436.",
+        "Calendar event created on owner+work@example.test (primary calendar). Event ID: evt-1436.",
         403,
         0,
     )
@@ -100,11 +104,12 @@ async fn undelivered_success_receipt_keeps_the_card() {
 async fn recovered_calendar_receipt_is_delivered_before_retiring_card() {
     deliver(
         ApprovalActionOutcome::CalendarCreated {
+            organizer_account: "owner+work@example.test".into(),
             event_id: "evt-1436".into(),
-            html_link: Some("https://calendar.google.com/event?eid=test".into()),
+            html_link: Some("https://calendar.google.com/event?eid=test&authuser=owner%2Bwork%40example.test".into()),
             already_existed: true,
         },
-        "Calendar event already created: https://calendar.google.com/event?eid=test (event ID: evt-1436).",
+        "Calendar event already created on owner+work@example.test (primary calendar): https://calendar.google.com/event?eid=test&authuser=owner%2Bwork%40example.test (event ID: evt-1436).",
         200, 1,
     ).await;
 }

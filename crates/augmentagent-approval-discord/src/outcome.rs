@@ -36,11 +36,16 @@ pub fn describe(outcome: &ApprovalActionOutcome) -> String {
             resolved_message(status, detail.as_deref())
         }
         ApprovalActionOutcome::Approved => "Approved — sending.".into(),
-        ApprovalActionOutcome::CalendarCreated { event_id, html_link, already_existed } => {
+        ApprovalActionOutcome::CalendarCreated { organizer_account, event_id, html_link, already_existed } => {
             let verb = if *already_existed { "already created" } else { "created" };
+            let destination = if organizer_account.trim().is_empty() {
+                "on the primary calendar (organizing account unavailable)".to_string()
+            } else {
+                format!("on {organizer_account} (primary calendar)")
+            };
             match html_link.as_deref().filter(|link| !link.trim().is_empty()) {
-                Some(link) => format!("Calendar event {verb}: {link} (event ID: {event_id})."),
-                None => format!("Calendar event {verb}. Event ID: {event_id}."),
+                Some(link) => format!("Calendar event {verb} {destination}: {link} (event ID: {event_id})."),
+                None => format!("Calendar event {verb} {destination}. Event ID: {event_id}."),
             }
         }
         ApprovalActionOutcome::Skipped => "Skipped — draft discarded.".into(),
