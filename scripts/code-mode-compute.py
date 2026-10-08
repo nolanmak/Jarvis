@@ -259,7 +259,8 @@ poweroff -f
         if cache is not None and not prepare:
             index = command.index('-drive') + 1
             command[index] += ',readonly=on'
-        environment = {'PATH': os.defpath, 'LD_LIBRARY_PATH': config['library_dir'], 'QEMU_MODULE_DIR': config['module_dir']}
+        environment = {'PATH': os.defpath, 'LD_LIBRARY_PATH': config['library_dir'], 'QEMU_MODULE_DIR': config['module_dir'],
+                       'JARVIS_SUPERVISOR_PARENT_PID': str(os.getpid())}
         cleanup = root / 'cleanup-complete'
         supervisor = Path(__file__).with_name('provider-supervisor.py')
         # Keep the unused input pipe open until shutdown: /dev/null sends EOF
@@ -620,7 +621,7 @@ class ComputeTask:
             selected = self.artifacts.resolve_inputs(request['inputs'])
             fingerprint = self.backend.fingerprint
             key = json.dumps([request['dependencies'], fingerprint, 1], separators=(',', ':'))
-            with self.backend.admit():
+            with self.backend.admit(deadline):
                 environment = self.environments.get(key)
                 if environment is None:
                     if request['dependencies']:
@@ -688,6 +689,53 @@ class ComputeTask:
         return result
 
 
+def run_host_phase(argv, private, deadline):
+    """Run a trusted initialization command under the descendant supervisor.
+
+    argv is built by host code, never by a compute request. The same deadline
+    covers process startup and execution; only cleanup receives five seconds.
+    """
+    if time.monotonic() >= deadline:
+        deny('timeout', 'Compute initialization deadline expired.')
+    with tempfile.TemporaryDirectory(prefix='compute-initialize-', dir=private) as temporary:
+        receipt = Path(temporary) / 'cleanup-complete'
+        supervisor = Path(__file__).with_name('provider-supervisor.py')
+        environment = {'PATH': os.defpath, 'JARVIS_SUPERVISOR_PARENT_PID': str(os.getpid())}
+        if time.monotonic() >= deadline:
+            deny('timeout', 'Compute initialization deadline expired.')
+        try:
+            process = subprocess.Popen([sys.executable, '-I', str(supervisor), str(receipt), *argv],
+                env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            deny('sandbox_unavailable', 'Compute initialization could not start.')
+        expired = False
+        try:
+            try:
+                status = process.wait(timeout=max(.001, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                expired = True
+        finally:
+            if process.poll() is None:
+                cleanup_deadline = time.monotonic() + 5
+                process.terminate()
+                try:
+                    process.wait(timeout=4.5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    try:
+                        process.wait(timeout=max(.001, cleanup_deadline - time.monotonic()))
+                    except subprocess.TimeoutExpired:
+                        pass
+                    deny('cleanup_unverified', 'Compute initialization could not stop.')
+            if not receipt.is_file() or receipt.read_text() != 'all-descendants-reaped\n':
+                deny('cleanup_unverified', 'Compute initialization cleanup could not be verified.')
+        if expired or time.monotonic() >= deadline:
+            deny('timeout', 'Compute initialization deadline expired.')
+        if status:
+            deny('sandbox_unavailable', 'Compute initialization failed.')
+
+
 class VMBackend:
     """Operator-configured transport; task arguments cannot select host paths."""
     def __init__(self, runtime_path, scratch_root, pip_runtime=None, scratch_limits=None):
@@ -717,7 +765,7 @@ class VMBackend:
             digest.update(self.pip_runtime['sha256'].encode())
         return digest.hexdigest()
 
-    def admit(self):
+    def admit(self, deadline=None):
         from contextlib import contextmanager
         import fcntl
 
@@ -725,6 +773,8 @@ class VMBackend:
         def admission():
             root = lock = None
             try:
+                if deadline is not None and time.monotonic() >= deadline:
+                    deny('timeout', 'Compute admission deadline expired.')
                 root = self.scratch._open_root()
                 lock = os.open('.compute.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
                                0o600, dir_fd=root)
@@ -742,10 +792,9 @@ class VMBackend:
                     # reservation covers host-side inputs, logs, broker staging
                     # and exports as well as guest-writable data.
                     blocks = (self.scratch.cache_bytes - 2 * 1024**3) // 4096
-                    subprocess.run(['/usr/sbin/mke2fs', '-q', '-F', '-t', 'ext4', '-b', '4096', '-m', '0',
+                    run_host_phase(['/usr/sbin/mke2fs', '-q', '-F', '-t', 'ext4', '-b', '4096', '-m', '0',
                                     '-E', 'lazy_itable_init=1,nodiscard', str(self.scratch.cache), str(blocks)],
-                                   env={'PATH': os.defpath}, stdin=subprocess.DEVNULL,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=True)
+                                   self.scratch.tmp, deadline if deadline is not None else time.monotonic() + 30)
                     self._formatted = True
                 yield
             except self.bridge.Readiness as error:

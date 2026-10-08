@@ -376,7 +376,7 @@ class TaskLifecycleContractTests(unittest.TestCase):
         fingerprint = 'trusted-runtime-fixture'
         def __init__(self):
             self.prepares = []; self.executions = []; self.preparation_failure = False
-        def admit(self):
+        def admit(self, deadline=None):
             from contextlib import nullcontext
             return nullcontext()
         def prepare(self, requirements, deadline):

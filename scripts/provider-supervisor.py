@@ -20,6 +20,9 @@ def supervise(receipt, argv):
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     parent = os.getppid()
+    expected_parent = os.environ.get('JARVIS_SUPERVISOR_PARENT_PID')
+    if expected_parent is not None and parent != int(expected_parent):
+        raise RuntimeError('provider supervision lost its originating parent')
     # Orphaned grandchildren are reparented here, not to init, so detached
     # sessions remain enumerable and reapable by this invocation alone.
     if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
