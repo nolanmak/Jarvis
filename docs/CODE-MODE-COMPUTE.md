@@ -65,6 +65,13 @@ task budget. Preparation, registry activity, VM startup, execution and export
 consume the original monotonic deadline. Cleanup has at most five additional
 seconds. Ordinary non-compute Code Mode keeps its 60-second default.
 
+Cancellation starts that cleanup allowance once; dropping a call, cancelling
+again or awaiting cleanup later cannot reset it. Cleanup escalates from SIGTERM
+to a PID-bound kill for an unresponsive helper, reserving time for the VM
+supervisor to stop descendants. An abandoned startup helper can be killed
+immediately because no workload request has been sent. Missing terminal cleanup
+receipts still produce `cleanup_unverified` and no success artifacts.
+
 The requested dependency list accepts names and version comparisons, for example
 `openpyxl==3.1.5` or `pandas>=2,<3`. Extras, direct URLs, paths, Git references,
 private registries, editable installs, flags and direct environment markers are

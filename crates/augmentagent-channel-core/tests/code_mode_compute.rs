@@ -708,6 +708,55 @@ async fn real_call_timeout_returns_typed_result_and_preserves_remaining_task_bud
 
 #[tokio::test]
 async fn stalled_helper_cannot_get_a_second_cleanup_allowance() {
+    stalled_helper_cleanup(false).await;
+}
+
+#[tokio::test]
+async fn dropped_future_stalled_helper_cannot_survive_cleanup() {
+    stalled_helper_cleanup(true).await;
+}
+
+#[tokio::test]
+async fn dropped_startup_stalled_helper_is_killed_before_any_workload() {
+    use augmentagent_channel_core::{build_scratch::{ProcFs, ProcessTable}, code_mode::compute::ComputeService};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    struct KillOnDrop(OwnedFd);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            unsafe { libc::syscall(libc::SYS_pidfd_send_signal, self.0.as_raw_fd(),
+                libc::SIGKILL, std::ptr::null::<libc::siginfo_t>(), 0); }
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut config = service_config(root.path(), false);
+    let source = root.path().join("selected-input");
+    std::fs::File::create(&source).unwrap().set_len(64 * 1024 * 1024).unwrap();
+    config.input_files.insert("selected".into(), source);
+    let artifacts = config.artifact_root.clone();
+    let startup = tokio::spawn(ComputeService::start(config));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let (pid, identity) = loop {
+        assert!(!startup.is_finished(), "missed pre-readiness startup stage");
+        if let Some(process) = ProcFs.vm_processes_using(&artifacts).into_iter().next() { break process; }
+        assert!(tokio::time::Instant::now() < deadline, "startup helper was not observed");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    };
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    assert!(descriptor >= 0);
+    let pinned = KillOnDrop(unsafe { OwnedFd::from_raw_fd(descriptor as i32) });
+    assert_eq!(ProcFs.start_time(pid).as_deref(), Some(identity.as_str()));
+    assert_eq!(unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pinned.0.as_raw_fd(),
+        libc::SIGSTOP, std::ptr::null::<libc::siginfo_t>(), 0) }, 0);
+    startup.abort();
+    assert!(startup.await.err().expect("startup was not aborted").is_cancelled());
+    let mut poll = libc::pollfd { fd: pinned.0.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    assert_eq!(unsafe { libc::poll(&mut poll, 1, 500) }, 1,
+        "abandoned startup left its stopped helper alive");
+    assert!(std::fs::read_dir(artifacts).unwrap().all(|entry|
+        !entry.unwrap().file_name().to_string_lossy().starts_with("compute-helper-")));
+}
+
+async fn stalled_helper_cleanup(drop_call: bool) {
     use augmentagent_channel_core::code_mode::compute::ComputeService;
     let root = tempfile::tempdir().unwrap();
     let mut config = service_config(root.path(), false);
@@ -742,10 +791,18 @@ async fn stalled_helper_cannot_get_a_second_cleanup_allowance() {
     let resume = Resume(unsafe { OwnedFd::from_raw_fd(fd as i32) });
     assert_eq!(resume.signal(libc::SIGSTOP), 0);
     let started = std::time::Instant::now();
-    let result = service
-        .execute(json!({"runtime":"python","dependencies":[],"code":"pass"}))
-        .await;
-    assert!(result.is_err());
+    let mut dropped_at = None;
+    let call = service.execute(json!({"runtime":"python","dependencies":[],"code":"pass"}));
+    if drop_call {
+        assert!(tokio::time::timeout(Duration::from_millis(100), call).await.is_err(),
+            "stopped helper unexpectedly answered before future drop");
+        dropped_at = Some(std::time::Instant::now());
+        // A late finish or repeated cancellation must not restart cleanup.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        service.cancel();
+    } else {
+        assert!(call.await.is_err());
+    }
     assert!(started.elapsed() < Duration::from_millis(6500));
     let cleanup_started = std::time::Instant::now();
     assert!(
@@ -767,6 +824,9 @@ async fn stalled_helper_cannot_get_a_second_cleanup_allowance() {
         "stopped helper survived the hard deadline"
     );
     assert_ne!(poll.revents & libc::POLLIN, 0);
+    if let Some(dropped_at) = dropped_at {
+        assert!(dropped_at.elapsed() < Duration::from_secs(5), "future-drop cleanup exceeded its original allowance");
+    }
 }
 
 #[tokio::test]

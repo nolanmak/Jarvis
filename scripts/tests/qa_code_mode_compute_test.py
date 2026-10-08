@@ -35,6 +35,15 @@ class EvidenceContractTests(unittest.TestCase):
 
 
 class HarnessExecutionTests(unittest.TestCase):
+    def test_future_drop_requires_real_vm_cancellation_suite(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        self.assertIn('future_drop', qa.CASES)
+        harness = SimpleNamespace(suite=Mock())
+        qa.CASES['future_drop'](harness, 'future_drop')
+        self.assertIn('dropped_compute_future', harness.suite.call_args.args[1])
+        self.assertIn('--ignored', harness.suite.call_args.args[1])
+
     def test_install_cancellation_requires_real_cli_and_public_packages(self):
         from types import SimpleNamespace
         from unittest.mock import Mock

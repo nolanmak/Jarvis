@@ -199,13 +199,22 @@ impl ProcessOwner {
 struct CallGuard<'a> {
     owner: &'a ProcessOwner,
     cancelled: &'a AtomicBool,
+    cleanup_deadline: Option<&'a std::sync::Mutex<Option<tokio::time::Instant>>>,
     armed: bool,
 }
 impl Drop for CallGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
             self.cancelled.store(true, Ordering::SeqCst);
-            self.owner.terminate();
+            if let Some(deadline) = self.cleanup_deadline {
+                deadline.lock().expect("compute cleanup deadline")
+                    .get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(5));
+                self.owner.terminate();
+            } else {
+                // An abandoned startup has not sent any workload request.
+                // Kill this exact helper even if it was stopped before ready.
+                self.owner.kill();
+            }
         }
     }
 }
@@ -396,6 +405,7 @@ impl ComputeService {
         let mut guard = CallGuard {
             owner: &owner,
             cancelled: &cancelled,
+            cleanup_deadline: None,
             armed: true,
         };
         let remaining = budget.remaining().unwrap_or(Duration::ZERO);
@@ -485,6 +495,8 @@ impl ComputeService {
     }
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+        self.cleanup_deadline.lock().expect("compute cleanup deadline")
+            .get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(5));
         self.owner.terminate();
     }
 
@@ -515,6 +527,7 @@ impl ComputeService {
         let mut guard = CallGuard {
             owner: &self.owner,
             cancelled: &self.cancelled,
+            cleanup_deadline: Some(&self.cleanup_deadline),
             armed: true,
         };
         let operation = async {
@@ -587,7 +600,19 @@ impl ComputeService {
                 read_frame(&mut helper.stdout).await?
             };
             if let Some(child) = helper.child.as_mut() {
-                let status = child.wait().await?;
+                let status = if cancelled {
+                    // Leave two seconds of the same allowance for the VM
+                    // supervisor's parent-death cleanup after escalation.
+                    match tokio::time::timeout_at(deadline - Duration::from_secs(2), child.wait()).await {
+                        Ok(status) => status?,
+                        Err(_) => {
+                            self.owner.kill();
+                            child.wait().await?
+                        }
+                    }
+                } else {
+                    child.wait().await?
+                };
                 anyhow::ensure!(
                     status.success() || (cancelled && status.code() == Some(130)),
                     "cleanup_unverified: compute helper exited unsuccessfully"
