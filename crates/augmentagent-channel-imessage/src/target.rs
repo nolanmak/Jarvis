@@ -113,6 +113,7 @@ mod tests {
             participants: participants.iter().map(|s| s.to_string()).collect(),
             service: service.into(),
             chat_guid: None,
+            newest_entry: None,
         }
     }
 

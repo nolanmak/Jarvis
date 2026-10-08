@@ -92,6 +92,24 @@ def apple_time_to_iso(raw):
     return dt.astimezone().isoformat(timespec="seconds")
 
 
+def newer_iso(current, candidate):
+    """The later of two ISO-8601 timestamps, compared as instants so differing
+    UTC offsets order correctly. Unparseable values ('unknown-time') never win,
+    so an incremental run cannot regress a conversation's freshness cursor."""
+    def instant(value):
+        try:
+            return datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            return None
+
+    a, b = instant(current), instant(candidate)
+    if b is None:
+        return current
+    if a is None:
+        return candidate
+    return candidate if b > a else current
+
+
 def decode_attributed_body(blob):
     """Best-effort extraction of message text from the typedstream blob
     modern macOS uses when message.text is NULL. Returns None whenever the
@@ -522,6 +540,11 @@ def sync(db_path, out_dir, state_path, contacts=None, s3=None):
         entry = f"\n{HEADER_PREFIX}{when}] {sender}\n" + "\n".join(parts) + "\n"
         with md_path.open("a") as f:
             f.write(entry)
+        # #1429 — recall reads this to tell "no match" from "the archive
+        # stopped here"; it must come from a message, never from synced_at.
+        cursor = newer_iso(index[ident].get("newest_entry"), when)
+        if cursor is not None:
+            index[ident]["newest_entry"] = cursor
         written += 1
         touched.add(ident)
 

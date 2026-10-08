@@ -326,7 +326,18 @@ pub fn poll_once(bundle: &Bundle, store: &Store) -> Result<(PollStats, Vec<PollD
     let mut stats = PollStats::default();
     let mut deltas = Vec::new();
 
-    for conv in bundle.conversations()? {
+    let conversations = bundle.conversations()?;
+    store.set_archive_newest_entry(
+        "imessage",
+        crate::bundle::newest_entry_of(
+            conversations
+                .iter()
+                .filter_map(|c| c.newest_entry.as_deref()),
+        )
+        .as_deref(),
+    )?;
+
+    for conv in conversations {
         let seen = store.get_imessage_entries_seen(&conv.identifier)? as usize;
         let entries = match bundle.entries(&conv) {
             Ok(e) => e,
@@ -775,6 +786,39 @@ mod tests {
         assert!(deltas2.is_empty());
     }
 
+    /// #1429 — every bundle reader leaves a freshness cursor behind, `None`
+    /// for a bundle written before the field existed.
+    #[test]
+    fn poll_records_the_archive_freshness_cursor() {
+        let (dir, _layout, store) = fresh_env();
+        let bundle = fixture_bundle(
+            dir.path(),
+            &[("+14155550123", "John_Smith", "John Smith", DM_MD)],
+        );
+        poll_once(&bundle, &store).unwrap();
+        assert_eq!(
+            store.archive_newest_entries().unwrap().get("imessage"),
+            Some(&None)
+        );
+
+        let path = dir.path().join("conversations").join("index.json");
+        let mut index: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        index["+14155550123"]["newest_entry"] = serde_json::json!("2026-08-26T11:00:00-04:00");
+        std::fs::write(&path, index.to_string()).unwrap();
+        poll_once(&bundle, &store).unwrap();
+        assert_eq!(
+            store
+                .archive_newest_entries()
+                .unwrap()
+                .get("imessage")
+                .cloned()
+                .flatten()
+                .as_deref(),
+            Some("2026-08-26T11:00:00-04:00")
+        );
+    }
+
     #[test]
     fn batched_delta_email_joins_entries_and_caps_size() {
         let conv = Conversation {
@@ -784,6 +828,7 @@ mod tests {
             participants: vec!["+14155550123".into()],
             service: "iMessage".into(),
             chat_guid: None,
+            newest_entry: None,
         };
         let entry = |i: usize, body: &str| {
             (

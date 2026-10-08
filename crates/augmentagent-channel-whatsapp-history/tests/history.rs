@@ -65,6 +65,39 @@ fn backfill_is_searchable_historical_and_repeat_safe() {
     assert_eq!(capture.platform, "whatsapp");
 }
 
+/// #1429 — the poll records how far the archive actually reaches, so a recall
+/// query past that date can say "stale since" instead of "no results".
+#[test]
+fn poll_records_the_archive_freshness_cursor() {
+    let tmp = tempfile::tempdir().unwrap();
+    bundle(tmp.path());
+    let store = Store::open(tmp.path().join("data.db")).unwrap();
+
+    // A bundle written before the field existed: freshness unknown, not an error.
+    poll_once(tmp.path(), &store).unwrap();
+    assert_eq!(
+        store.archive_newest_entries().unwrap().get("whatsapp"),
+        Some(&None)
+    );
+
+    let path = tmp.path().join("conversations/index.json");
+    let mut index: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    index["15550000001@s.whatsapp.net"]["newest_entry"] = json!("2026-09-29T21:10:00-04:00");
+    fs::write(&path, index.to_string()).unwrap();
+    poll_once(tmp.path(), &store).unwrap();
+    assert_eq!(
+        store
+            .archive_newest_entries()
+            .unwrap()
+            .get("whatsapp")
+            .cloned()
+            .flatten()
+            .as_deref(),
+        Some("2026-09-29T21:10:00-04:00")
+    );
+}
+
 #[test]
 fn invalid_paths_and_missing_conversations_do_not_block_good_ones() {
     let tmp = tempfile::tempdir().unwrap();
@@ -98,6 +131,7 @@ from test_sync import make_fixture_db, add_message, cd
 from whatsapp_sync import sync
 con = make_fixture_db(dest/'source.sqlite')
 add_message(con, 1, 2, 'cabin compatibility test', cd(1787745600), 0, group_member=7)
+add_message(con, 2, 2, 'no timestamp here', None, 0, group_member=7)
 sync(dest/'source.sqlite', dest, dest/'.sync_state.json')
 con.close()
 "#;
@@ -114,6 +148,25 @@ con.close()
     let email = capture_email(&report.deltas[0]);
     assert_eq!(email.kind, "group");
     assert!(email.body.contains("+14155550999"));
+    // #1429 — the exporter's freshness cursor is the newest *message*
+    // timestamp, never `synced_at`, and an undated message cannot claim it.
+    let newest = store
+        .archive_newest_entries()
+        .unwrap()
+        .get("whatsapp")
+        .cloned()
+        .flatten()
+        .expect("exporter wrote newest_entry");
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(&newest)
+            .unwrap()
+            .timestamp_millis(),
+        1_787_745_600_000
+    );
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(tmp.path().join(".sync_state.json")).unwrap())
+            .unwrap();
+    assert_ne!(state["synced_at"].as_str(), Some(newest.as_str()));
 }
 
 #[test]

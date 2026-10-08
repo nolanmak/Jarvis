@@ -9,6 +9,7 @@
 //!
 //! Nothing in this crate calls a model. Extraction is deterministic code.
 
+pub mod archive;
 pub mod eval;
 pub mod extract;
 pub mod fts;

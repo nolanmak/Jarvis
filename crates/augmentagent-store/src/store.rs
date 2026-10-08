@@ -2021,6 +2021,19 @@ impl Store {
             [],
         )?;
 
+        // #1429 — per-platform archive freshness cursor. One row per
+        // bundle-backed platform; stores the newest *message* timestamp the
+        // bundle holds (not when the exporter last ran), so recall can say
+        // "the archive ends here" instead of returning a bare zero.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS platform_archive_state (\
+                 platform      TEXT PRIMARY KEY,\
+                 newest_entry  TEXT,\
+                 updated_at_ms INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+
         // #80 — voice-capture Telegram long-poll cursor. Single-row table
         // keyed by a logical capture-bot id; stores the last acked update_id
         // so a daemon restart never re-ingests an already-transcribed memo.
@@ -3693,6 +3706,45 @@ impl Store {
             params![conversation, entries_seen, now_millis()],
         )?;
         Ok(())
+    }
+
+    /// Record how fresh a bundle-backed platform's archive is (#1429):
+    /// the newest message timestamp present, verbatim. `None` when the
+    /// bundle carries no parseable timestamp — the row still lands, so
+    /// "ingest ran, freshness unknown" stays distinguishable from
+    /// "this platform has no archive".
+    pub fn set_archive_newest_entry(
+        &self,
+        platform: &str,
+        newest_entry: Option<&str>,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO platform_archive_state (platform, newest_entry, updated_at_ms) \
+                 VALUES (?1, ?2, ?3) \
+             ON CONFLICT(platform) DO UPDATE SET \
+                 newest_entry = excluded.newest_entry, updated_at_ms = excluded.updated_at_ms",
+            params![platform, newest_entry, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// Archive freshness cursors, keyed by platform. A platform with no
+    /// bundle reader is absent rather than reported stale.
+    pub fn archive_newest_entries(
+        &self,
+    ) -> StoreResult<std::collections::BTreeMap<String, Option<String>>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare("SELECT platform, newest_entry FROM platform_archive_state")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        let mut out = std::collections::BTreeMap::new();
+        for row in rows {
+            let (platform, newest) = row?;
+            out.insert(platform, newest);
+        }
+        Ok(out)
     }
 
     // ---------------------------------------------------------------
@@ -8871,6 +8923,36 @@ mod tests {
         let e = sample_email("m1");
         assert!(s.upsert_email(&e).unwrap());
         assert!(!s.upsert_email(&e).unwrap());
+    }
+
+    #[test]
+    fn archive_newest_entry_roundtrip_keeps_platforms_without_a_reader_absent() {
+        let (store, _d) = fresh_store();
+        assert!(store.archive_newest_entries().unwrap().is_empty());
+        store
+            .set_archive_newest_entry("whatsapp", Some("2026-09-29T21:10:00-04:00"))
+            .unwrap();
+        store.set_archive_newest_entry("imessage", None).unwrap();
+        let map = store.archive_newest_entries().unwrap();
+        assert_eq!(
+            map.get("whatsapp").cloned().flatten().as_deref(),
+            Some("2026-09-29T21:10:00-04:00")
+        );
+        assert_eq!(map.get("imessage"), Some(&None));
+        assert!(!map.contains_key("discord"));
+        store
+            .set_archive_newest_entry("whatsapp", Some("2026-10-02T08:00:00-04:00"))
+            .unwrap();
+        assert_eq!(
+            store
+                .archive_newest_entries()
+                .unwrap()
+                .get("whatsapp")
+                .cloned()
+                .flatten()
+                .as_deref(),
+            Some("2026-10-02T08:00:00-04:00")
+        );
     }
 
     #[test]
