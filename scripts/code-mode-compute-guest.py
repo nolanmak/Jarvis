@@ -16,6 +16,8 @@ import selectors
 import signal
 import stat
 import subprocess
+import sys
+import time
 
 MAX_CAPTURE = 8 * 1024 * 1024
 MAX_FILE = 32 * 1024 * 1024
@@ -65,6 +67,30 @@ def export_files(names):
     return result
 
 
+def seal_environment(root):
+    """Make prior environments inaccessible to later preparation workers."""
+    for base, directories, files in os.walk(root, followlinks=False):
+        for name in [*directories, *files]:
+            path = Path(base) / name
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                raise ValueError('invalid installed file')
+            if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
+                raise ValueError('linked installed file')
+            os.chown(path, 0, 0, follow_symlinks=False)
+            path.chmod(0o555 if stat.S_ISDIR(info.st_mode) or info.st_mode & 0o111 else 0o444)
+    os.chown(root, 0, 0); root.chmod(0o555)
+    descriptor = os.open(root / 'lock.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor) as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024 or info.st_nlink != 1:
+            raise ValueError('invalid dependency lock')
+        value = json.load(stream)
+    if not isinstance(value, list) or not 1 <= len(value) <= 256:
+        raise ValueError('invalid resolved package count')
+    return value
+
+
 def main():
     job = json.loads(Path('/job.json').read_text())
     uid, gid = job['uid'], job['gid']
@@ -92,9 +118,27 @@ def main():
         memory = job['memory_mb'] * 1024 * 1024
         resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
 
-    process = subprocess.Popen(['/usr/bin/python3', '-I', '/program.py'], cwd='/work', env=environment,
+    registry = None
+    program = '/program.py'
+    if job['prepare']:
+        cache = Path('/cache')
+        os.chown(cache, 0, 0); cache.chmod(0o755)
+        envs = cache / 'envs'; envs.mkdir(exist_ok=True); envs.chmod(0o755)
+        target = envs / job['environmentId']
+        target.mkdir(mode=0o700)
+        os.chown(target, uid, gid)
+        registry = make_proxy('/root/control', python=True)
+        program = '/prepare.py'
+    elif job.get('environmentId'):
+        site_path = '/cache/envs/' + job['environmentId'] + '/site'
+        Path('/execute.py').write_text('import site,runpy\nsite.addsitedir(' + repr(site_path) + ')\nrunpy.run_path("/program.py",run_name="__main__")\n')
+        os.chmod('/execute.py', 0o444)
+        program = '/execute.py'
+    process = subprocess.Popen(['/usr/bin/python3', '-I', '-B', program], cwd='/work', env=environment,
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         start_new_session=True, preexec_fn=worker)
+    if registry is not None:
+        threading.Thread(target=registry.serve_forever, daemon=True).start()
     logs = {'stdout': bytearray(), 'stderr': bytearray()}
     total = 0
     error = None
@@ -122,6 +166,15 @@ def main():
     files = {}
     if error is None and status:
         error = 'resource_limit' if status in (-signal.SIGKILL, -signal.SIGXFSZ) else 'execution_failed'
+    locked = []
+    if job['prepare'] and error is not None:
+        error = ('dependency_policy_denied' if b'JARVIS_DEPENDENCY_POLICY' in logs['stderr']
+                 else 'resource_limit' if error == 'resource_limit' else 'dependency_unavailable')
+    if job['prepare'] and error is None:
+        try:
+            locked = seal_environment(Path('/cache/envs') / job['environmentId'])
+        except (OSError, ValueError):
+            error = 'dependency_integrity'
     if error is None:
         try:
             files = export_files(job['outputs'])
@@ -131,7 +184,7 @@ def main():
             error = 'output_denied'
     result = {'ok': error is None, 'exitCode': status, 'error': error,
               'stdout': logs['stdout'].decode(errors='replace'),
-              'stderr': logs['stderr'].decode(errors='replace'), 'files': files if error is None else {}}
+              'stderr': logs['stderr'].decode(errors='replace'), 'files': files if error is None else {}, 'dependencyLock': locked}
     print('\nJARVIS_COMPUTE_RESULT:' + json.dumps(result, separators=(',', ':')), flush=True)
 
 

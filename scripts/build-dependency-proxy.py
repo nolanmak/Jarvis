@@ -273,6 +273,14 @@ if __name__ == '__main__':
     if len(sys.argv) != 4 or sys.argv[1] != '--fetch':
         raise SystemExit(2)
     try:
+        # A killed compute/build owner must not leave a credential-free but
+        # still network-active fetch child behind during cancellation.
+        import ctypes
+        import signal
+        parent = os.getppid()
+        libc = ctypes.CDLL(None)
+        if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0 or os.getppid() != parent:
+            raise RuntimeError('package fetch lost its owner')
         status, content_type, body = fetch(read_request(Path(sys.argv[2])))
         atomic(Path(sys.argv[3]), body)
         print(json.dumps({'status': status, 'content_type': content_type}))
