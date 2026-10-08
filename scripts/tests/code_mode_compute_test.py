@@ -94,6 +94,48 @@ import tempfile
 
 @unittest.skipUnless(os.environ.get('JARVIS_TEST_VM_CONFIG'), 'requires provisioned KVM runtime')
 class ComputeVMTests(unittest.TestCase):
+    def test_full_binary_log_transfer_does_not_consume_execution_budget(self):
+        import hashlib
+        import random
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            backend = compute.VMBackend(os.environ['JARVIS_TEST_VM_CONFIG'],
+                os.environ.get('JARVIS_TEST_COMPUTE_SCRATCH', '/mnt/build/codex-vm'))
+            self.addCleanup(backend.close)
+            task = compute.ComputeTask(backend, compute.ArtifactStore(Path(tmp)), enabled=True)
+            started = time.monotonic()
+            result = task.execute(request(code="import os,random;os.write(1,random.Random(1434).randbytes(8*1024*1024))", timeoutSecs=20))
+            self.assertTrue(result['ok'], result)
+            self.assertLess(time.monotonic() - started, 20)
+            log = task.records[-1]['logs']['stdout']
+            expected = random.Random(1434).randbytes(8*1024*1024)
+            self.assertEqual(log['bytes'], len(expected))
+            self.assertEqual(log['sha256'], hashlib.sha256(expected).hexdigest())
+            self.assertEqual((Path(tmp) / log['file']).read_bytes(), expected)
+            self.assertLessEqual(len(result['stdout'].encode()), 65536)
+            self.assertTrue(task.records[-1]['cleanupVerified'])
+
+    def test_vm_resource_exhaustion_has_typed_failure_and_no_exports(self):
+        cases = {
+            'memory': 'bytearray(16*1024**3)',
+            'file': "f=open('/outputs/bad','wb');f.write(b'x'*(32*1024*1024+1));f.write(b'x');f.close()",
+            'disk': "from pathlib import Path\nfor i in range(20):Path('/work/chunk-'+str(i)).write_bytes(b'x'*(20*1024*1024))",
+            'processes': "import os,time\nfor i in range(192):\n if os.fork()==0:\n  os.close(1);os.close(2);time.sleep(30);os._exit(0)",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            backend = compute.VMBackend(os.environ['JARVIS_TEST_VM_CONFIG'],
+                os.environ.get('JARVIS_TEST_COMPUTE_SCRATCH', '/mnt/build/codex-vm'))
+            self.addCleanup(backend.close)
+            task = compute.ComputeTask(backend, compute.ArtifactStore(Path(tmp)), enabled=True)
+            for name, code in cases.items():
+                with self.subTest(resource=name):
+                    result = task.execute(request(code=code, outputs=['bad'], timeoutSecs=30))
+                    self.assertFalse(result['ok'], result)
+                    self.assertEqual(result['error']['code'], 'resource_limit', result)
+                    self.assertEqual(result['runner'], 'vm', result)
+                    self.assertEqual(result['artifacts'], [])
+                    self.assertTrue(task.records[-1]['cleanupVerified'])
+
     def test_vm_preserves_binary_logs_privately_and_bounds_public_output(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -176,6 +218,31 @@ print('isolated')
                                            request(code=code), timeout=30)
             self.assertTrue(result['ok'], result)
             self.assertEqual(result['stdout'].strip(), 'isolated')
+
+
+class WorkloadExitTests(unittest.TestCase):
+    def test_resource_exceptions_are_distinct_from_ordinary_failures(self):
+        import subprocess
+        import sys
+        guest_spec = importlib.util.spec_from_file_location('compute_guest', Path(__file__).parents[1] / 'code-mode-compute-guest.py')
+        guest = importlib.util.module_from_spec(guest_spec)
+        guest_spec.loader.exec_module(guest)
+        self.assertTrue(hasattr(guest, 'WORKER_BOOTSTRAP'), 'worker needs a typed resource-exhaustion exit protocol')
+        with tempfile.TemporaryDirectory() as tmp:
+            wrapper = Path(tmp) / 'worker.py'
+            wrapper.write_text(guest.WORKER_BOOTSTRAP)
+            program = Path(tmp) / 'program.py'
+            cases = [('raise MemoryError()', 125)]
+            cases += [(f'import errno;raise OSError(errno.{name}, "fixture")', 125)
+                      for name in ('ENOSPC', 'EDQUOT', 'EFBIG', 'ENOMEM', 'EAGAIN')]
+            cases += [('raise PermissionError("fixture")', 1), ('raise RuntimeError("fixture")', 1),
+                      ('raise SystemExit(7)', 7), ('print("done")', 0)]
+            for source, expected in cases:
+                with self.subTest(source=source):
+                    program.write_text(source)
+                    result = subprocess.run([sys.executable, '-I', '-B', wrapper, program],
+                                            capture_output=True, timeout=5)
+                    self.assertEqual(result.returncode, expected, result.stderr)
 
 
 class ArtifactCapabilityTests(unittest.TestCase):

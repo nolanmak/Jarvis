@@ -2,7 +2,7 @@
 """Trusted VM supervisor. Never import task packages in this root process.
 
 Launched with -I -S. User code runs in a separate unprivileged interpreter.
-Only this supervisor can write the terminal serial result. The workload's
+Only this supervisor can write the virtio result channel. The workload's
 stdout/stderr are bounded pipes, not the QEMU serial device.
 """
 import base64
@@ -22,6 +22,27 @@ import time
 MAX_CAPTURE = 8 * 1024 * 1024
 MAX_FILE = 32 * 1024 * 1024
 MAX_EXPORT = 64 * 1024 * 1024
+
+
+# Runs after dropping privileges and setting resource limits. The exit code is
+# only an error classification, never an authorization or cleanup signal. User
+# code can choose this exit code just as it can kill itself with SIGXFSZ.
+RESOURCE_EXIT = 125
+WORKER_BOOTSTRAP = """import errno,os,runpy,sys,traceback
+program = sys.argv[1]
+sys.argv = [program]
+try:
+    runpy.run_path(program, run_name='__main__')
+except (MemoryError, OSError) as error:
+    if isinstance(error, MemoryError) or error.errno in (errno.ENOSPC, errno.EDQUOT, errno.EFBIG, errno.ENOMEM, errno.EAGAIN):
+        try:
+            traceback.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            os._exit(125)
+    raise
+"""
 
 
 def reap_workload(uid):
@@ -91,7 +112,27 @@ def seal_environment(root):
     return value
 
 
+def result_channel():
+    # devtmpfs creates the port for the trusted supervisor. Make ownership and
+    # access explicit before starting any workload. Popen closes this fd in the
+    # unprivileged interpreter, including during package preparation.
+    for port in Path('/sys/class/virtio-ports').iterdir():
+        if (port / 'name').read_text().strip() == 'org.jarvis.compute.result':
+            descriptor = os.open('/dev/' + port.name, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                info = os.fstat(descriptor)
+                if not stat.S_ISCHR(info.st_mode) or info.st_uid != 0:
+                    raise RuntimeError('untrusted result channel')
+                os.fchmod(descriptor, 0o600)
+                return os.fdopen(descriptor, 'wb')
+            except BaseException:
+                os.close(descriptor)
+                raise
+    raise RuntimeError('runtime requires the virtio console driver')
+
+
 def main():
+    channel = result_channel()
     job = json.loads(Path('/job.json').read_text())
     uid, gid = job['uid'], job['gid']
     libc = ctypes.CDLL(None)
@@ -134,7 +175,9 @@ def main():
         Path('/execute.py').write_text('import site,runpy\nsite.addsitedir(' + repr(site_path) + ')\nrunpy.run_path("/program.py",run_name="__main__")\n')
         os.chmod('/execute.py', 0o444)
         program = '/execute.py'
-    process = subprocess.Popen(['/usr/bin/python3', '-I', '-B', program], cwd='/work', env=environment,
+    Path('/worker.py').write_text(WORKER_BOOTSTRAP)
+    os.chmod('/worker.py', 0o444)
+    process = subprocess.Popen(['/usr/bin/python3', '-I', '-B', '/worker.py', program], cwd='/work', env=environment,
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         start_new_session=True, preexec_fn=worker)
     if registry is not None:
@@ -165,7 +208,7 @@ def main():
         reap_workload(uid)
     files = {}
     if error is None and status:
-        error = 'resource_limit' if status in (-signal.SIGKILL, -signal.SIGXFSZ) else 'execution_failed'
+        error = 'resource_limit' if status in (RESOURCE_EXIT, -signal.SIGKILL, -signal.SIGXFSZ) else 'execution_failed'
     locked = []
     if job['prepare'] and error is not None:
         error = ('dependency_policy_denied' if b'JARVIS_DEPENDENCY_POLICY' in logs['stderr']
@@ -185,7 +228,8 @@ def main():
     result = {'ok': error is None, 'exitCode': status, 'error': error,
               'privateLogs': {name: base64.b64encode(data).decode() for name, data in logs.items()},
               'files': files if error is None else {}, 'dependencyLock': locked}
-    print('\nJARVIS_COMPUTE_RESULT:' + json.dumps(result, separators=(',', ':')), flush=True)
+    with channel:
+        channel.write(('\nJARVIS_COMPUTE_RESULT:' + json.dumps(result, separators=(',', ':')) + '\n').encode())
 
 
 if __name__ == '__main__':

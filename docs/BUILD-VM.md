@@ -204,6 +204,17 @@ its matching uncompressed modules in dependency order, and a static BusyBox.
 The module list depends on which drivers the kernel includes; virtio PCI must be
 available before loading 9p. The daemon user needs read-write access to `/dev/kvm`
 through the `kvm` group, not only a login-seat ACL (see above).
+The Code Mode compute profile additionally requires the guest's `virtio_console`
+driver, either built into the kernel or included in `modules` with its matching
+dependencies. Compute transfers bounded logs and requested artifacts through a
+root-owned virtio serial port connected to the host's bounded subprocess pipe.
+The unprivileged workload cannot open this port, and receives no writable host
+share for exports. Results are accepted only after guest shutdown and verified
+descendant cleanup. The legacy build profile keeps its existing console transport.
+A runtime without the required driver cannot execute compute; it never falls back
+to host Python. A UART console is not a substitute for this result channel: full
+8 MiB logs must transfer within the configured execution deadline.
+
 On Debian/Ubuntu, distribution packages and their shared-library dependencies
 can be extracted into a private directory using `dpkg-deb -x`; system installation
 is not required. Keep package versions and hashes in a private provisioning record.

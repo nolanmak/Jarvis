@@ -136,7 +136,7 @@ def run_phase(runtime_path, private, request, timeout, *, cache=None, environmen
     """Run a dependency-free workload through the compute VM profile.
 
     No writable host directory is shared with the guest. Artifacts cross only
-    the bounded serial protocol and are accepted after verified shutdown.
+    the bounded virtio protocol and are accepted after verified shutdown.
     The task service supplies the private scratch directory and validated policy.
     """
     prepare = pip_runtime is not None
@@ -240,14 +240,24 @@ poweroff -f
         image = root / 'initrd.gz'
         image.write_bytes(vm.initrd(entries))
         command = vm.qemu_command(config, image, shares, cache)
+        # The UART console is far too slow for bounded multi-MiB logs/exports.
+        # A root-only virtio port feeds the same bounded host pipe; no writable
+        # host share, file, socket listener, or workload RPC channel is added.
+        command[command.index('-serial') + 1] = 'null'
+        command.extend(['-device', 'virtio-serial-pci',
+                        '-chardev', 'stdio,id=compute-result,signal=off',
+                        '-device', 'virtserialport,chardev=compute-result,name=org.jarvis.compute.result'])
         if cache is not None and not prepare:
             index = command.index('-drive') + 1
             command[index] += ',readonly=on'
         environment = {'PATH': os.defpath, 'LD_LIBRARY_PATH': config['library_dir'], 'QEMU_MODULE_DIR': config['module_dir']}
         cleanup = root / 'cleanup-complete'
         supervisor = Path(__file__).with_name('provider-supervisor.py')
+        # Keep the unused input pipe open until shutdown: /dev/null sends EOF
+        # immediately and makes QEMU disconnect its bidirectional virtio port.
+        # No host command or data is ever written to this pipe.
         process = subprocess.Popen([sys.executable, '-I', str(supervisor), str(cleanup), *command],
-            env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             start_new_session=True)
         captured = bytearray()
         try:
@@ -282,6 +292,7 @@ poweroff -f
                     process.kill()
                     process.wait()
                     deny('cleanup_unverified', 'Compute supervisor failed to stop.')
+            process.stdin.close()
             process.stdout.close()
             if not cleanup.is_file() or cleanup.read_text() != 'all-descendants-reaped\n':
                 deny('cleanup_unverified', 'Compute descendant cleanup was not verified.', runner='vm')

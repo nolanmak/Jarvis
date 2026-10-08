@@ -107,6 +107,7 @@ async function* stdinLines(): AsyncGenerator<string> {
     }
     const n = await Deno.stdin.read(chunk);
     if (n === null) {
+      stdinBuf += decoder.decode();
       // EOF: emit any trailing partial line.
       if (stdinBuf.length > 0) {
         const last = stdinBuf;
@@ -115,7 +116,7 @@ async function* stdinLines(): AsyncGenerator<string> {
       }
       return;
     }
-    stdinBuf += decoder.decode(chunk.subarray(0, n));
+    stdinBuf += decoder.decode(chunk.subarray(0, n), { stream: true });
   }
 }
 
@@ -130,12 +131,13 @@ async function readFirstLine(): Promise<string> {
     }
     const n = await Deno.stdin.read(chunk);
     if (n === null) {
+      stdinBuf += decoder.decode();
       // EOF without newline — yield whatever we have.
       const last = stdinBuf;
       stdinBuf = "";
       return last;
     }
-    stdinBuf += decoder.decode(chunk.subarray(0, n));
+    stdinBuf += decoder.decode(chunk.subarray(0, n), { stream: true });
   }
 }
 
