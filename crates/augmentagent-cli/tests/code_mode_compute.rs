@@ -233,3 +233,12 @@ fn mcp_facade_is_bounded_to_programs_and_refuses_missing_turn_grants() {
     assert_eq!(frames[1]["result"]["isError"], true);
     assert!(!root.path().join("data.db").exists());
 }
+
+#[test]
+fn orchestration_limits_keep_typed_report_codes() {
+    let root = tempfile::tempdir().unwrap();
+    let result=invoke(root.path(), "async function main(){const b=new Uint8Array(9*1024*1024);let n=0;while(n<b.length)n+=Deno.stderr.writeSync(b.subarray(n));return 1;}main();", &[]);
+    assert_eq!(result.status.code(), Some(1));
+    assert_eq!(report(root.path())["error"]["code"], "resource_limit");
+    assert_eq!(report(root.path())["cleanup"]["cleanupVerified"], true);
+}

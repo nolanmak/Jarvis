@@ -3,7 +3,7 @@ pub mod artifacts;
 mod dispatch;
 pub mod service;
 pub use dispatch::ComputeDispatcher;
-pub use service::{ComputeService, ServiceConfig};
+pub use service::{ComputeService, RequestError, ServiceConfig};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

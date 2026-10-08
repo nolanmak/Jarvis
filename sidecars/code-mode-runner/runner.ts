@@ -33,9 +33,13 @@ const CALL_BUDGET = 25;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-function writeLine(obj: unknown): Promise<void> {
-  const line = JSON.stringify(obj) + "\n";
-  return Deno.stdout.write(encoder.encode(line)).then(() => {});
+async function writeLine(obj: unknown): Promise<void> {
+  let bytes = encoder.encode(JSON.stringify(obj) + "\n");
+  while (bytes.length > 0) {
+    const count = await Deno.stdout.write(bytes);
+    if (count === 0) throw new Error("Protocol output closed");
+    bytes = bytes.subarray(count);
+  }
 }
 
 // Stdout is the protocol channel, so program-side `console.*` output (which

@@ -154,8 +154,14 @@ async fn execute(prepared: &Prepared) -> Value {
         }
     };
     let cleanup = service.finish().await;
-    let mut error = if outcome.as_ref().map_or(true, |value| value.dispatch_failures > 0) || dispatcher.has_failed() {
-        Some(json!({"code":"execution_failed","message":"Program or compute call failed."}))
+    let mut error = if outcome
+        .as_ref()
+        .map_or(true, |value| value.dispatch_failures > 0)
+        || dispatcher.has_failed()
+    {
+        Some(
+            json!({"code":outcome.as_ref().err().map(|error| error.public_code()).unwrap_or("execution_failed"),"message":"Program or compute call failed."}),
+        )
     } else {
         None
     };

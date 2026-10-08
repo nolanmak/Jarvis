@@ -259,8 +259,8 @@ async fn handle_connection(
                     json!({"version":1,"ok":!dispatcher.has_failed() && value.dispatch_failures == 0,"final":value.final_value,
                     "trace":value.trace})
                 }
-                Err(_) => {
-                    json!({"version":1,"ok":false,"error":{"code":"execution_failed","message":"Compute orchestration failed. Repair the program within the remaining task budget."}})
+                Err(error) => {
+                    json!({"version":1,"ok":false,"error":{"code":error.public_code(),"message":"Compute orchestration failed. Repair the program within the remaining task budget."}})
                 }
             }
         }

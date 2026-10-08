@@ -48,7 +48,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use super::dispatch::Dispatcher;
@@ -118,6 +118,8 @@ pub struct DenoResolution {
 /// Errors `run_program` can return.
 #[derive(Debug, Error)]
 pub enum RunnerError {
+    #[error("resource_limit: {0}")]
+    ResourceLimit(&'static str),
     /// Failed to spawn `deno` — non-ENOENT cause (permission denied,
     /// EMFILE, etc.). ENOENT is surfaced as [`RunnerError::DenoNotFound`]
     /// with a richer diagnostic.
@@ -178,6 +180,24 @@ pub enum RunnerError {
     UnexpectedExit(String),
 }
 
+impl RunnerError {
+    /// Stable failure category for reports; never serialize program messages.
+    pub fn public_code(&self) -> &'static str {
+        match self {
+            Self::Timeout { .. } => "timeout",
+            Self::ResourceLimit(_) => "resource_limit",
+            Self::DenoNotFound { .. } | Self::Spawn(_) => "sandbox_unavailable",
+            Self::RuntimeError {
+                kind: Some(kind), ..
+            } if kind == "timeout" => "timeout",
+            Self::RuntimeError {
+                kind: Some(kind), ..
+            } if kind == "call_budget_exceeded" => "resource_limit",
+            _ => "execution_failed",
+        }
+    }
+}
+
 /// Host-selected program policy. Never deserialize this from model arguments.
 #[derive(Debug, Clone)]
 pub struct RunOptions {
@@ -187,12 +207,18 @@ pub struct RunOptions {
 
 impl Default for RunOptions {
     fn default() -> Self {
-        Self { timeout: Duration::from_secs(60), compute_inputs: Default::default() }
+        Self {
+            timeout: Duration::from_secs(60),
+            compute_inputs: Default::default(),
+        }
     }
 }
 
 pub async fn run_program_with_options(
-    source: &str, manifest: &ToolManifest, dispatcher: &dyn Dispatcher, options: &RunOptions,
+    source: &str,
+    manifest: &ToolManifest,
+    dispatcher: &dyn Dispatcher,
+    options: &RunOptions,
 ) -> Result<CodeModeOutcome, RunnerError> {
     run_program_inner(source, manifest, dispatcher, options).await
 }
@@ -240,7 +266,13 @@ async fn run_program_inner(
         .arg("run")
         // Configuration and import resolution are independent of ordinary
         // capability permissions. Do not inherit a task's deno.json or npm.
-        .args(["--no-config", "--no-npm", "--no-remote", "--deny-import", "--no-prompt"])
+        .args([
+            "--no-config",
+            "--no-npm",
+            "--no-remote",
+            "--deny-import",
+            "--no-prompt",
+        ])
         .arg(&sidecar.path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -263,15 +295,6 @@ async fn run_program_inner(
         .take()
         .ok_or_else(|| RunnerError::Protocol("missing child stderr".into()))?;
 
-    // Drain stderr in the background so a chatty `deno run` warning can't
-    // wedge the pipe. We log it at debug level (it's almost always boilerplate
-    // about "Warning: ..."), but keep the join handle so the future is owned.
-    // Since #989 the sidecar also routes the program's `console.*` output
-    // here with synchronous writes, so this must be running before the
-    // header goes out and for the whole RPC loop — a full pipe would block
-    // the sidecar mid-program.
-    let stderr_task = tokio::spawn(drain_stderr(stderr));
-
     // First NDJSON frame: header. Serialise the manifest the runner.ts
     // schema expects (flat array of dotted names — see
     // sidecars/code-mode-runner/README.md).
@@ -286,13 +309,21 @@ async fn run_program_inner(
     header_line.push(b'\n');
     // Header delivery is inside the watchdog too: a child that stops reading
     // must not hang the host before the RPC loop even begins.
-    let loop_fut = async {
+    let loop_fut = async move {
         stdin.write_all(&header_line).await?;
         stdin.flush().await?;
-        rpc_loop(stdout, &mut stdin, dispatcher, manifest).await
+        let result = rpc_loop(stdout, &mut stdin, dispatcher, manifest).await;
+        drop(stdin);
+        result
+    };
+    // Both streams are owned by this future. A log overflow cancels an active
+    // RPC immediately, and dropping the caller cannot detach a drain task.
+    let drive = async {
+        let (outcome, ()) = tokio::try_join!(loop_fut, drain_stderr(stderr))?;
+        Ok(outcome)
     };
     let wall = options.timeout;
-    let outcome = match tokio::time::timeout_at(started + wall, loop_fut).await {
+    let outcome = match tokio::time::timeout_at(started + wall, drive).await {
         Ok(result) => result,
         Err(_) => {
             // Wall clock fired. Kill the child explicitly (kill_on_drop
@@ -300,7 +331,6 @@ async fn run_program_inner(
             // the error).
             let _ = child.start_kill();
             let _ = child.wait().await;
-            stderr_task.abort();
             return Err(RunnerError::Timeout {
                 ms: wall.as_millis() as u64,
             });
@@ -310,27 +340,28 @@ async fn run_program_inner(
     // Close our stdin so the sandbox knows there are no more responses
     // coming, then reap the process. We don't care about the exit code
     // beyond logging — the protocol layer already told us success / failure.
-    drop(stdin);
+    if outcome.is_err() {
+        let _ = child.start_kill();
+    }
     let exit = tokio::time::timeout_at(started + wall, child.wait()).await;
     match exit {
         Err(_) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            stderr_task.abort();
-            return Err(RunnerError::Timeout { ms: wall.as_millis() as u64 });
+            return Err(RunnerError::Timeout {
+                ms: wall.as_millis() as u64,
+            });
         }
         Ok(Err(error)) => {
-            stderr_task.abort();
             return Err(error.into());
         }
         Ok(Ok(status)) if !status.success() && outcome.is_ok() => {
-            stderr_task.abort();
-            return Err(RunnerError::UnexpectedExit("sandbox exited unsuccessfully after final frame".into()));
+            return Err(RunnerError::UnexpectedExit(
+                "sandbox exited unsuccessfully after final frame".into(),
+            ));
         }
         _ => (),
     }
-    // Stop draining stderr (the child is gone).
-    let _ = stderr_task.await;
 
     outcome
 }
@@ -386,34 +417,49 @@ async fn rpc_loop(
     let mut calls = 0;
     let mut dispatch_failures = 0;
     let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
+    let mut line = Vec::new();
 
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).await?;
+        let n = (&mut reader)
+            .take(2 * 1024 * 1024 + 1)
+            .read_until(b'\n', &mut line)
+            .await?;
+        if n > 2 * 1024 * 1024 {
+            return Err(RunnerError::ResourceLimit("sandbox frame exceeds 2 MiB"));
+        }
         if n == 0 {
             // EOF before terminal frame.
             return Err(RunnerError::UnexpectedExit(
                 "sandbox stdout closed with no {final} or {error} frame".into(),
             ));
         }
+        if line.last() != Some(&b'\n') {
+            return Err(RunnerError::Protocol("incomplete sandbox frame".into()));
+        }
+        let line = std::str::from_utf8(&line)
+            .map_err(|_| RunnerError::Protocol("sandbox frame is not UTF-8".into()))?;
         let trimmed = line.trim_end_matches(['\n', '\r']);
         if trimmed.is_empty() {
             continue;
         }
         let frame: SandboxFrame = serde_json::from_str(trimmed)
-            .map_err(|e| RunnerError::Protocol(format!("decode {trimmed:?}: {e}")))?;
+            .map_err(|_| RunnerError::Protocol("invalid sandbox frame".into()))?;
         match frame {
             SandboxFrame::Call { id, call, args } => {
                 calls += 1;
                 let result = if !allowed.contains(&call) {
                     Err(super::dispatch::DispatchError::UnknownTool(call.clone()))
                 } else if calls > 25 {
-                    Err(super::dispatch::DispatchError::PermitDenied("tool call budget exceeded".into()))
+                    Err(super::dispatch::DispatchError::PermitDenied(
+                        "tool call budget exceeded".into(),
+                    ))
                 } else {
                     dispatcher.call(&call, args).await
                 };
-                if result.is_err() { dispatch_failures += 1; }
+                if result.is_err() {
+                    dispatch_failures += 1;
+                }
                 let response_line = match result {
                     Ok(value) => serde_json::json!({ "id": id, "result": value }),
                     Err(err) => serde_json::json!({ "id": id, "error": err.wire_message() }),
@@ -424,7 +470,10 @@ async fn rpc_loop(
                 stdin.write_all(&buf).await?;
                 stdin.flush().await?;
             }
-            SandboxFrame::Final { value, local_refusal } => {
+            SandboxFrame::Final {
+                value,
+                local_refusal,
+            } => {
                 return Ok(CodeModeOutcome {
                     final_value: value,
                     trace: dispatcher.drain_trace(),
@@ -442,23 +491,21 @@ async fn rpc_loop(
     }
 }
 
-async fn drain_stderr(stderr: tokio::process::ChildStderr) {
-    let mut reader = BufReader::new(stderr);
-    let mut line = String::new();
+async fn drain_stderr(mut stderr: tokio::process::ChildStderr) -> Result<(), RunnerError> {
+    // Program console output is untrusted, including newline-free streams.
+    // Do not copy its contents into public diagnostics or unbounded buffers.
+    let mut buffer = [0u8; 8192];
+    let mut total = 0usize;
     loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => {
-                let trimmed = line.trim_end_matches(['\n', '\r']);
-                if !trimmed.is_empty() {
-                    tracing::debug!(target: "code_mode_runner", "sandbox stderr: {trimmed}");
-                }
-            }
-            Err(e) => {
-                tracing::debug!("sandbox stderr read error: {e}");
-                break;
-            }
+        let count = stderr.read(&mut buffer).await?;
+        if count == 0 {
+            return Ok(());
+        }
+        total += count;
+        if total > 8 * 1024 * 1024 {
+            return Err(RunnerError::ResourceLimit(
+                "orchestration logs exceed 8 MiB",
+            ));
         }
     }
 }
@@ -654,14 +701,24 @@ fn materialize_sidecar(override_path: Option<std::ffi::OsString>) -> Result<Side
     if let Some(path) = override_path.filter(|path| !path.is_empty()) {
         let path = PathBuf::from(path);
         if !path.is_absolute() {
-            return Err(RunnerError::Protocol("sidecar override must be an absolute operator path".into()));
+            return Err(RunnerError::Protocol(
+                "sidecar override must be an absolute operator path".into(),
+            ));
         }
-        return Ok(Sidecar { path, _file:None });
+        return Ok(Sidecar { path, _file: None });
     }
     use std::io::Write;
-    let mut file = tempfile::Builder::new().prefix("jarvis-code-mode-").suffix(".ts").tempfile()?;
-    file.write_all(include_bytes!("../../../../sidecars/code-mode-runner/runner.ts"))?;
-    Ok(Sidecar { path:file.path().to_owned(), _file:Some(file) })
+    let mut file = tempfile::Builder::new()
+        .prefix("jarvis-code-mode-")
+        .suffix(".ts")
+        .tempfile()?;
+    file.write_all(include_bytes!(
+        "../../../../sidecars/code-mode-runner/runner.ts"
+    ))?;
+    Ok(Sidecar {
+        path: file.path().to_owned(),
+        _file: Some(file),
+    })
 }
 
 #[cfg(test)]
@@ -836,10 +893,17 @@ mod tests {
     fn embedded_sidecar_is_private_and_removed_after_use() {
         let sidecar = materialize_sidecar(None).unwrap();
         let path = sidecar.path.clone();
-        assert_eq!(std::fs::read(&path).unwrap(), include_bytes!("../../../../sidecars/code-mode-runner/runner.ts"));
-        #[cfg(unix)] {
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            include_bytes!("../../../../sidecars/code-mode-runner/runner.ts")
+        );
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
         drop(sidecar);
         assert!(!path.exists());

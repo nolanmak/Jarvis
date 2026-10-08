@@ -79,7 +79,10 @@ impl Dispatcher for ComputeDispatcher {
                     .map(|_| "Compute transport failed.".into()),
                 timestamp_ms: now_ms(),
             });
-        result.map_err(|_| {
+        result.map_err(|error| {
+            if let Some(fault) = error.downcast_ref::<super::RequestError>() {
+                return DispatchError::Compute(*fault);
+            }
             DispatchError::Internal(
                 "Compute transport failed; inspect private task diagnostics.".into(),
             )

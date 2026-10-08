@@ -314,5 +314,105 @@ async fn locally_rejected_call_budget_remains_observable_after_catch() {
         &manifest_compute(), &StubDispatcher::always_null(&["compute.run"]), &RunOptions::default()).await.unwrap();
     assert_eq!(outcome.final_value, json!("done"));
     assert_eq!(outcome.trace.len(), 25);
-    assert!(outcome.dispatch_failures > 0, "local budget refusal was lost when the program caught it");
+    assert!(
+        outcome.dispatch_failures > 0,
+        "local budget refusal was lost when the program caught it"
+    );
+}
+
+#[tokio::test]
+async fn malformed_protocol_does_not_echo_program_data() {
+    let result = run_program_with_options(
+        "async function main(){Deno.stdout.writeSync(new TextEncoder().encode('PROTOCOL_CANARY\\n'));return 1;}main();",
+        &ToolManifest::default(), &StubDispatcher::always_null(&[]), &RunOptions::default()).await.unwrap_err();
+    assert!(!result.to_string().contains("PROTOCOL_CANARY"));
+}
+
+#[tokio::test]
+async fn oversized_protocol_frame_is_refused_before_final_success() {
+    let result = run_program_with_options(
+        "async function main(){const bytes=new TextEncoder().encode(JSON.stringify({final:'x'.repeat(3*1024*1024)})+'\\n');let n=0;while(n<bytes.length)n+=Deno.stdout.writeSync(bytes.subarray(n));return 1;}main();",
+        &ToolManifest::default(), &StubDispatcher::always_null(&[]), &RunOptions {timeout:Duration::from_secs(3),..Default::default()}).await;
+    assert!(result.is_err(), "oversized frame accepted");
+    assert!(result.unwrap_err().to_string().contains("resource_limit"));
+}
+
+#[tokio::test]
+async fn stderr_flood_is_bounded_and_aborts_program_promptly() {
+    let started = std::time::Instant::now();
+    let result = run_program_with_options(
+        "async function main(){const bytes=new Uint8Array(9*1024*1024);let n=0;while(n<bytes.length)n+=Deno.stderr.writeSync(bytes.subarray(n));return 1;}main();",
+        &ToolManifest::default(), &StubDispatcher::always_null(&[]), &RunOptions {timeout:Duration::from_secs(5),..Default::default()}).await;
+    assert!(result.is_err(), "stderr byte limit ignored");
+    assert!(result.unwrap_err().to_string().contains("resource_limit"));
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[tokio::test]
+async fn invalid_compute_requests_keep_typed_errors_and_allow_repair() {
+    use augmentagent_channel_core::code_mode::{
+        compute::{ComputeDispatcher, ComputeService},
+        Dispatcher,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let service = ComputeService::start(service_config(root.path(), false))
+        .await
+        .unwrap();
+    let dispatcher = ComputeDispatcher::new(service.clone());
+    for request in [
+        json!({"runtime":"python","dependencies":[],"code":"SOURCE_CANARY","unexpected":1}),
+        json!({"runtime":"python","dependencies":[],"code":"","timeoutSecs":0}),
+    ] {
+        let error = dispatcher
+            .call("compute.run", json!([request]))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("bad_args:"), "{error}");
+        assert!(!error.contains("SOURCE_CANARY"));
+    }
+    let error=dispatcher.call("compute.run",json!([{"runtime":"python","dependencies":["example @ https://example.invalid/package.whl"],"code":""}])).await.unwrap_err();
+    assert!(error.to_string().starts_with("dependency_policy_denied:"));
+    let result = dispatcher
+        .call(
+            "compute.run",
+            json!([{"runtime":"python","dependencies":[],"code":"print(1)"}]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["error"]["code"], "compute_disabled");
+    assert_eq!(service.finish().await.unwrap()["cleanupVerified"], true);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated real VM configuration; cancellation during an active RPC"]
+async fn orchestration_log_overflow_cancels_active_vm_rpc() {
+    use augmentagent_channel_core::code_mode::{
+        compute::{ComputeDispatcher, ComputeService},
+        manifest::manifest_compute,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut config = service_config(root.path(), true);
+    config.runtime = std::env::var_os("JARVIS_TEST_VM_CONFIG")
+        .expect("VM required")
+        .into();
+    config.scratch_root = std::env::var_os("JARVIS_TEST_COMPUTE_SCRATCH")
+        .expect("scratch required")
+        .into();
+    let service = ComputeService::start(config).await.unwrap();
+    let dispatcher = ComputeDispatcher::new(service.clone());
+    let result=run_program_with_options(r#"async function main(){
+        const running=tools.compute.run({runtime:'python',dependencies:[],code:'import time\ntime.sleep(25)'});
+        await new Promise(r=>setTimeout(r,2000));
+        const bytes=new Uint8Array(9*1024*1024);let n=0;
+        while(n<bytes.length)n+=Deno.stderr.writeSync(bytes.subarray(n));
+        return await running;
+    }main();"#, &manifest_compute(), &dispatcher,&service.run_options().unwrap()).await;
+    assert!(result.unwrap_err().to_string().contains("resource_limit"));
+    let receipt = tokio::time::timeout(Duration::from_secs(5), service.finish())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt["cleanupVerified"], true);
+    assert_eq!(receipt["cancelled"], true);
 }

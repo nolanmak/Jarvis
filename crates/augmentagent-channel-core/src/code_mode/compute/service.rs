@@ -17,6 +17,21 @@ use tokio::sync::Mutex;
 
 const FRAME_LIMIT: u64 = 2 * 1024 * 1024;
 
+/// Safe, stable wire errors. Never include request source or helper internals.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+pub enum RequestError {
+    #[error("bad_args: Invalid compute request; check fields, bounds, and filenames.")]
+    BadArgs,
+    #[error("dependency_policy_denied: Use public Python package constraints without extras, markers or direct URLs.")]
+    DependencyPolicy,
+    #[error("sandbox_unavailable: Compute runtime is unavailable.")]
+    SandboxUnavailable,
+    #[error("timeout: Compute deadline expired.")]
+    Timeout,
+    #[error("cancelled: Compute task is closed.")]
+    Cancelled,
+}
+
 #[derive(Debug, Clone)]
 pub struct ServiceConfig {
     pub policy: ComputePolicy,
@@ -201,7 +216,8 @@ impl ComputeService {
         let helpers = tempfile::Builder::new()
             .prefix("jarvis-compute-helper-")
             .tempdir()?;
-        #[cfg(unix)] {
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(helpers.path(), std::fs::Permissions::from_mode(0o700))?;
         }
@@ -334,14 +350,24 @@ impl ComputeService {
     }
 
     pub async fn execute(&self, request: Value) -> Result<Value> {
-        anyhow::ensure!(
-            !self.cancelled.load(Ordering::SeqCst),
-            "cancelled: compute task is closed"
-        );
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err(RequestError::Cancelled.into());
+        }
         let duration = self
             .budget
             .call_budget(request.get("timeoutSecs").and_then(Value::as_u64))
-            .map_err(anyhow::Error::msg)?;
+            .map_err(|code| {
+                if code == "timeout" {
+                    RequestError::Timeout
+                } else {
+                    RequestError::BadArgs
+                }
+            })?;
+        let mut bytes = serde_json::to_vec(&json!({"execute":request}))?;
+        if bytes.len() >= FRAME_LIMIT as usize {
+            return Err(RequestError::BadArgs.into());
+        }
+        bytes.push(b'\n');
         let mut guard = CallGuard {
             owner: &self.owner,
             cancelled: &self.cancelled,
@@ -349,31 +375,27 @@ impl ComputeService {
         };
         let operation = async {
             let mut helper = self.helper.lock().await;
-            anyhow::ensure!(helper.finished.is_none(), "compute task is already closed");
-            let mut bytes = serde_json::to_vec(&json!({"execute":request}))?;
-            anyhow::ensure!(
-                bytes.len() < FRAME_LIMIT as usize,
-                "bad_args: compute request is too large"
-            );
-            bytes.push(b'\n');
+            if helper.finished.is_some() {
+                return Err(RequestError::Cancelled.into());
+            }
             helper.stdin.write_all(&bytes).await?;
             helper.stdin.flush().await?;
             read_frame(&mut helper.stdout).await
         };
         let response = tokio::time::timeout(duration, operation)
             .await
-            .context("timeout: compute call expired")??;
+            .map_err(|_| RequestError::Timeout)??;
         guard.armed = false;
         if response.get("error").is_some() {
-            anyhow::bail!(
-                "{}: {}",
-                response["error"]["code"]
-                    .as_str()
-                    .unwrap_or("execution_failed"),
-                response["error"]["message"]
-                    .as_str()
-                    .unwrap_or("Compute request failed.")
-            );
+            let fault = match response["error"]["code"].as_str() {
+                Some("bad_args") => RequestError::BadArgs,
+                Some("dependency_policy_denied") => RequestError::DependencyPolicy,
+                Some("sandbox_unavailable") => RequestError::SandboxUnavailable,
+                Some("timeout") => RequestError::Timeout,
+                Some("cancelled") => RequestError::Cancelled,
+                _ => anyhow::bail!("compute helper rejected the request"),
+            };
+            return Err(fault.into());
         }
         let result = response
             .get("result")
