@@ -108,6 +108,8 @@ pub enum ApprovalActionOutcome {
     Approved,
     /// Calendar creation confirmed by the provider; carry a verifiable receipt.
     CalendarCreated {
+        /// Selected account; calendar creation currently targets its primary calendar.
+        organizer_account: String,
         event_id: String,
         html_link: Option<String>,
         /// A repeated Approve recovered the saved receipt; no new write/nudge.

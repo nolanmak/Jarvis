@@ -22,7 +22,12 @@ Summary/error fields are bounded and use the existing credential redactor.
 
 History also projects the current action status and available Gmail receipt,
 so a scheduled decision can be distinguished from the later send. Calendar
-receipts contain the event ID and optional URL. Old action rows are not migrated
+receipts contain the event ID and optional URL. Calendar success confirmations
+name the selected account and its primary calendar. The URL carries an encoded
+`authuser` hint for that account, including when recovering a legacy bare saved
+receipt. This hint does not grant access or replace Google sign-in. Invalid or
+missing links fall back to the account/calendar and event ID; they do not turn a
+confirmed creation into a failure. Recovery never creates another event. Old action rows are not migrated
 into invented approval decisions; a legacy Calendar `sent` row without an event
 ID remains unverified under the Calendar recovery rules.
 

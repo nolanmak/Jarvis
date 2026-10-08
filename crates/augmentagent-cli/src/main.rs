@@ -13892,6 +13892,30 @@ impl ReplyApprover {
         ApprovalActionOutcome::Approved
     }
 
+    /// Keep the provider's event destination but select the approved account.
+    /// This is a browser account hint, not an access grant or a creation request.
+    fn calendar_account_link(link: Option<&str>, account: &str) -> Option<String> {
+        let mut url = reqwest::Url::parse(link?).ok()?;
+        if account.trim().is_empty()
+            || url.scheme() != "https"
+            || !matches!(url.host_str(), Some("www.google.com" | "calendar.google.com"))
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return None;
+        }
+        let pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(key, _)| key != "authuser")
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        url.query_pairs_mut()
+            .clear()
+            .extend_pairs(pairs)
+            .append_pair("authuser", account);
+        Some(url.into())
+    }
+
     fn recover_calendar_receipt(action: &augmentagent_store::ActionWithEmail) -> ApprovalActionOutcome {
         // #1436 appends these two terminal lines only after confirmed creation.
         // Use the last suffix so proposal text cannot shadow the saved receipt.
@@ -13908,7 +13932,8 @@ impl ReplyApprover {
         };
         ApprovalActionOutcome::CalendarCreated {
             event_id: event_id.into(),
-            html_link: (!link.trim().is_empty() && link != event_id).then(|| link.to_string()),
+            html_link: Self::calendar_account_link(Some(link), &action.email.from),
+            organizer_account: action.email.from.clone(),
             already_existed: true,
         }
     }
@@ -13946,7 +13971,9 @@ impl ReplyApprover {
                 // The concrete calendar client returns success only with a
                 // nonempty ID. Keep that receipt in both storage and the ack.
                 let event_id = created.id.clone().expect("validated calendar event ID");
-                let link = created.html_link.clone().unwrap_or_else(|| event_id.clone());
+                let html_link =
+                    Self::calendar_account_link(created.html_link.as_deref(), &action.email.from);
+                let link = html_link.clone().unwrap_or_else(|| event_id.clone());
                 let final_body = format!(
                     "{}\ncreated: {link}\nevent ID: {event_id}",
                     action.action.draft_body.clone().unwrap_or_default()
@@ -13972,7 +13999,8 @@ impl ReplyApprover {
                 );
                 ApprovalActionOutcome::CalendarCreated {
                     event_id,
-                    html_link: created.html_link,
+                    html_link,
+                    organizer_account: action.email.from.clone(),
                     already_existed: false,
                 }
             }
