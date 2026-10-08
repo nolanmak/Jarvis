@@ -260,7 +260,11 @@ impl SlackTurnHandler for SlackConversationHarness {
                         Some(&turn.cancel),
                         |prompt| {
                             let ctx = &ctx;
-                            async move { self.agent.answer(ctx, &prompt).await }
+                            async move {
+                                augmentagent_approval_discord::interaction::owner_history(
+                                    session.conversation_id().starts_with('D'),
+                                    self.agent.answer(ctx, &prompt)).await
+                            }
                         },
                     ),
                 ),

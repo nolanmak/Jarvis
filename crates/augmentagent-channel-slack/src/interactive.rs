@@ -1469,7 +1469,12 @@ async fn run_turn(
                 return;
             }
         } else if files.is_empty() && !is_cancel_command(&text) {
-            if let Some(reply) = approvals.handle_command(&text).await {
+            let decision=augmentagent_approval_discord::interaction::DecisionContext {
+                surface:"slack".into(),actor:input.owner.sender_id().into(),
+                conversation:input.conversation.as_ref().map(|c|format!("{}:{}",account.account_id(),c.conversation_id())).unwrap_or_default(),
+                interaction_id:claimed.event_id.clone(),revision:None,
+            };
+            if let Some(reply) = augmentagent_approval_discord::interaction::deciding(decision,approvals.handle_command(&text)).await {
                 match &session {
                     Some(conversation) => {
                         let turn = answer_turn_id(&claimed.event_id);

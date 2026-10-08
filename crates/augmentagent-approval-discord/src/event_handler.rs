@@ -776,8 +776,12 @@ impl EventHandler for Handler {
                         return;
                     }
                     let response=match self.state.store.as_ref() {
-                        Some(store)=>crate::owner_alerts::control(store,&comp.data.custom_id,chrono::Utc::now().timestamp_millis())
-                            .unwrap_or_else(|e|format!("Alert unchanged: {e}")),
+                        Some(store)=>crate::interaction::local_decision(store,
+                            &crate::interaction::DecisionContext { surface:"discord".into(),actor:comp.user.id.to_string(),conversation:comp.channel_id.to_string(),interaction_id:comp.id.to_string(),revision:None },
+                            comp.data.custom_id.rsplit(':').next().unwrap_or(&comp.data.custom_id),
+                            comp.data.custom_id.split(':').nth(1).unwrap_or("unknown"),"owner_alert","Owner alert control",
+                            || crate::owner_alerts::control(store,&comp.data.custom_id,chrono::Utc::now().timestamp_millis()))
+                            .unwrap_or_else(|e|format!("Alert outcome unconfirmed: {e}; check its state before repeating")),
                         None=>"Alert store unavailable".into(),
                     };
                     ack_ephemeral(&ctx,&comp,&response).await;
@@ -808,16 +812,12 @@ impl EventHandler for Handler {
                             return;
                         }
                         let handler = self.state.action_handler.clone();
+                        let allowed = self.state.allowed_user_id;
                         let action_id = cid.action_id.clone();
                         let ctx_clone = ctx.clone();
                         let comp_clone = comp.clone();
                         tokio::spawn(async move {
-                            let outcome = match handler {
-                                Some(h) => h.approve(&action_id).await,
-                                None => ApprovalActionOutcome::Failed {
-                                    message: "no action handler configured".into(),
-                                },
-                            };
+                            let outcome = dispatch_component_approval(&comp_clone, allowed, handler).await;
                             if let Err(e) = deliver_approval_outcome(
                                 &ctx_clone.http,
                                 &comp_clone,
@@ -833,7 +833,11 @@ impl EventHandler for Handler {
                             warn!("failed to defer Skip: {e}");
                             return;
                         }
-                        let handler = self.state.action_handler.clone();
+                        let handler = crate::interaction::contextual(self.state.action_handler.clone(), crate::interaction::DecisionContext {
+                            surface: "discord".into(), actor: comp.user.id.to_string(),
+                            conversation: comp.channel_id.to_string(), interaction_id: comp.id.to_string(),
+                            revision: cid.revision.clone(),
+                        });
                         let action_id = cid.action_id.clone();
                         let ctx_clone = ctx.clone();
                         let comp_clone = comp.clone();
@@ -923,7 +927,11 @@ impl EventHandler for Handler {
                             warn!("failed to defer QuickRefine: {e}");
                             return;
                         }
-                        let handler = self.state.action_handler.clone();
+                        let handler = crate::interaction::contextual(self.state.action_handler.clone(), crate::interaction::DecisionContext {
+                            surface: "discord".into(), actor: comp.user.id.to_string(),
+                            conversation: comp.channel_id.to_string(), interaction_id: comp.id.to_string(),
+                            revision: cid.revision.clone(),
+                        });
                         let action_id = cid.action_id.clone();
                         let approval_channel = self.state.approval_channel_id;
                         let store_for_capture = self.state.store.clone();
@@ -1126,7 +1134,11 @@ impl EventHandler for Handler {
                             warn!("failed to defer SchedulePick: {e}");
                             return;
                         }
-                        let handler = self.state.action_handler.clone();
+                        let handler = crate::interaction::contextual(self.state.action_handler.clone(), crate::interaction::DecisionContext {
+                            surface: "discord".into(), actor: comp.user.id.to_string(),
+                            conversation: comp.channel_id.to_string(), interaction_id: comp.id.to_string(),
+                            revision: cid.revision.clone(),
+                        });
                         let action_id = cid.action_id.clone();
                         let ctx_clone = ctx.clone();
                         let comp_clone = comp.clone();
@@ -1163,7 +1175,11 @@ impl EventHandler for Handler {
                             return;
                         }
                         let verb = cid.verb;
-                        let handler = self.state.action_handler.clone();
+                        let handler = crate::interaction::contextual(self.state.action_handler.clone(), crate::interaction::DecisionContext {
+                            surface: "discord".into(), actor: comp.user.id.to_string(),
+                            conversation: comp.channel_id.to_string(), interaction_id: comp.id.to_string(),
+                            revision: cid.revision.clone(),
+                        });
                         let action_id = cid.action_id.clone();
                         let ctx_clone = ctx.clone();
                         let comp_clone = comp.clone();
@@ -1210,7 +1226,11 @@ impl EventHandler for Handler {
                             warn!("failed to defer Recompose: {e}");
                             return;
                         }
-                        let handler = self.state.action_handler.clone();
+                        let handler = crate::interaction::contextual(self.state.action_handler.clone(), crate::interaction::DecisionContext {
+                            surface: "discord".into(), actor: comp.user.id.to_string(),
+                            conversation: comp.channel_id.to_string(), interaction_id: comp.id.to_string(),
+                            revision: cid.revision.clone(),
+                        });
                         let action_id = cid.action_id.clone();
                         let ctx_clone = ctx.clone();
                         let comp_clone = comp.clone();
@@ -1239,7 +1259,16 @@ impl EventHandler for Handler {
                         let dismissed = matches!(cid.verb, Verb::LoopDismiss);
                         let rows = match self.state.store.as_ref() {
                             Some(store) => {
-                                store.acknowledge_nag_cycle(loop_id, cycle_ms).unwrap_or(0)
+                                match crate::interaction::local_decision(store,
+                                    &crate::interaction::DecisionContext { surface:"discord".into(),actor:comp.user.id.to_string(),conversation:comp.channel_id.to_string(),interaction_id:comp.id.to_string(),revision:None },
+                                    &cid.action_id,cid.verb.as_str(),"loop_reminder","Reminder cycle control",
+                                    || Ok(store.acknowledge_nag_cycle(loop_id,cycle_ms)?)) {
+                                    Ok(rows) => rows,
+                                    Err(_) => {
+                                        ack_ephemeral(&ctx,&comp,"Reminder outcome could not be recorded. Check its state before repeating.").await;
+                                        return;
+                                    }
+                                }
                             }
                             None => 0,
                         };
@@ -1323,7 +1352,11 @@ impl EventHandler for Handler {
                 // Parse failure is an ephemeral followup and the card stays.
                 if matches!(cid.verb, Verb::ScheduleModal) {
                     let input = extract_feedback(&modal.data.components).unwrap_or_default();
-                    let handler = self.state.action_handler.clone();
+                    let handler = crate::interaction::contextual(self.state.action_handler.clone(), crate::interaction::DecisionContext {
+                            surface: "discord".into(), actor: modal.user.id.to_string(),
+                            conversation: modal.channel_id.to_string(), interaction_id: modal.id.to_string(),
+                            revision: cid.revision.clone(),
+                        });
                     let action_id = cid.action_id.clone();
                     let ctx_clone = ctx.clone();
                     let modal_clone = modal.clone();
@@ -1405,7 +1438,11 @@ impl EventHandler for Handler {
                     }
                     _ => extract_feedback(&modal.data.components).unwrap_or_default(),
                 };
-                let handler = self.state.action_handler.clone();
+                let handler = crate::interaction::contextual(self.state.action_handler.clone(), crate::interaction::DecisionContext {
+                            surface: "discord".into(), actor: modal.user.id.to_string(),
+                            conversation: modal.channel_id.to_string(), interaction_id: modal.id.to_string(),
+                            revision: cid.revision.clone(),
+                        });
                 let action_id = cid.action_id.clone();
                 let approval_channel = self.state.approval_channel_id;
                 let store_for_capture = self.state.store.clone();
@@ -1673,6 +1710,29 @@ fn approval_followup(
         }
     }
     fu
+}
+
+/// Shared with the local Serenity interaction repro. Authorization and metadata
+/// capture occur before the approver, independently of receipt delivery.
+async fn dispatch_component_approval(
+    comp: &serenity::all::ComponentInteraction,
+    allowed: Option<UserId>,
+    handler: Option<Arc<dyn crate::ApprovalActionHandler>>,
+) -> ApprovalActionOutcome {
+    if !is_authorized(allowed,comp.user.id) {
+        return ApprovalActionOutcome::Failed {message:"Not authorized to approve this action".into()};
+    }
+    let Some(cid)=CustomId::parse(&comp.data.custom_id).filter(|c|c.verb==Verb::Approve) else {
+        return ApprovalActionOutcome::Failed {message:"Invalid approval control".into()};
+    };
+    let handler=crate::interaction::contextual(handler,crate::interaction::DecisionContext {
+        surface:"discord".into(),actor:comp.user.id.to_string(),conversation:comp.channel_id.to_string(),
+        interaction_id:comp.id.to_string(),revision:cid.revision,
+    });
+    match handler {
+        Some(handler)=>handler.approve(&cid.action_id).await,
+        None=>ApprovalActionOutcome::Failed {message:"no action handler configured".into()},
+    }
 }
 
 /// The real Approve button's HTTP tail, also exercised with Serenity against

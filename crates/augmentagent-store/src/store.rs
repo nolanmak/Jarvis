@@ -999,6 +999,7 @@ impl Store {
         crate::surface_health::migrate(conn)?;
         // #1289 — approval-card pointers per surface.
         crate::approval_cards::migrate(conn)?;
+        crate::approval_history::migrate(conn)?;
         // #1299 — the daemon's own start report (credential backend, notices).
         crate::daemon_report::migrate(conn)?;
         // #1297 — per-conversation reply mode (`voice on|off` on Slack).

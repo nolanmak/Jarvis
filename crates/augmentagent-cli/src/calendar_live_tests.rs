@@ -96,6 +96,10 @@ async fn live_calendar_self_invite_and_cleanup() -> Result<()> {
     let verify: Result<()> = async {
         std::fs::write(&report, serde_json::to_vec_pretty(&evidence)?)?;
         anyhow::ensure!(store.get_action_with_email(&action)?.unwrap().action.status == "sent");
+        let history=store.approval_history(None,20,Some(&action))?;
+        anyhow::ensure!(history.len()==1 && history[0].verb=="approve" && history[0].outcome=="completed", "live approval missing decision/outcome");
+        anyhow::ensure!(crate::approval_context::context(&store)?.contains(&event_id), "next-turn context missing real event receipt");
+        evidence["approval_history_verified"]=json!(true);
         let recovered = approver.approve(&action).await;
         anyhow::ensure!(matches!(recovered,
             ApprovalActionOutcome::CalendarCreated { event_id: ref saved_id, already_existed: true, .. }

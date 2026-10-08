@@ -1,0 +1,16 @@
+name: Approval history
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  decisions-and-context:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p augmentagent-store --test approval_history --locked
+      - run: cargo test -p augmentagent-approval-discord --lib --locked
+      - run: cargo test -p augmentagent-cli --bin augmentagent approval_context::tests --locked
+      - run: cargo test -p augmentagent-cli --bin augmentagent calendar_approval_tests --locked
