@@ -35,6 +35,19 @@ class EvidenceContractTests(unittest.TestCase):
 
 
 class HarnessExecutionTests(unittest.TestCase):
+    def test_adversarial_registry_cases_require_real_vm_fixture_suites(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        for name, method in [('source_only', 'test_source_only'), ('transitive_url', 'test_transitive_url'),
+                             ('altered_wheel', 'test_altered_wheel')]:
+            with self.subTest(name=name):
+                self.assertIn(name, qa.CASES)
+                harness = SimpleNamespace(suite=Mock())
+                qa.CASES[name](harness, name)
+                argv = harness.suite.call_args.args[1]
+                self.assertTrue(any('compute_package_fixture_test.PackageFixtureVMTests.' + method in arg for arg in argv))
+                self.assertFalse(harness.suite.call_args.kwargs.get('public', False))
+
     def test_policy_timing_audit_rejects_inconsistent_metadata(self):
         import copy
         import hashlib

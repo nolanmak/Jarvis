@@ -345,6 +345,10 @@ poweroff -f
         result = json.loads(records[0])
         if not isinstance(result, dict) or type(result.get('ok')) is not bool:
             deny('sandbox_unavailable', 'Invalid compute guest result.')
+        if broker is not None and broker.integrity_failed:
+            # Preserve the host-verified failure even if pip only reports HTTP
+            # 502, or resolves another candidate after the corrupted download.
+            result.update(ok=False, error='dependency_integrity', files={}, dependencyLock=[])
         encoded_logs = result.pop('privateLogs', None)
         if not isinstance(encoded_logs, dict) or set(encoded_logs) != {'stdout', 'stderr'}:
             deny('sandbox_unavailable', 'Invalid compute log transfer.')

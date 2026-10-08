@@ -28,7 +28,7 @@ REQUIREMENTS = {
     'AC02': ['xlsx', 'host_package_integrity', 'native_wheel'],
     'AC03': ['xlsx'],
     'AC04': ['fresh_task', 'changed_constraints', 'failed_preparation'],
-    'AC05': ['request_contracts', 'gateway_contracts', 'source_only', 'transitive_url', 'altered_wheel'],
+    'AC05': ['request_contracts', 'gateway_contracts', 'source_only', 'transitive_url', 'altered_wheel', 'valid_fixture_wheel'],
     'AC06': ['selected_readonly', 'host_canaries', 'secret_fds'],
     'AC07': ['network', 'execution_gateway_absent', 'xlsx'],
     'AC08': ['orchestration_boundary', 'workload_rpc'],
@@ -256,8 +256,8 @@ class Harness:
         env.update(CARGO_TARGET_DIR=target, CARGO_BUILD_JOBS='2',
                    JARVIS_TEST_VM_CONFIG=str(self.args.vm_config), JARVIS_TEST_COMPUTE_SCRATCH=str(self.args.scratch_root),
                    JARVIS_TEST_BUILD_SCRATCH=str(self.args.scratch_root), REQUIRE_ENFORCEABLE_SANDBOX='1')
+        env['JARVIS_TEST_COMPUTE_PIP'] = env.get('AUGMENTAGENT_COMPUTE_PIP_RUNTIME', '')
         if public:
-            env['JARVIS_TEST_COMPUTE_PIP'] = env.get('AUGMENTAGENT_COMPUTE_PIP_RUNTIME', '')
             env['JARVIS_TEST_PACKAGE_NETWORK'] = '1'
         receipt = command(argv, REPO, env, root / 'command.log', 1200)
         self.results[name] = {'status': 'failed', 'command': receipt}
@@ -859,6 +859,13 @@ CASES = {
     'request_contracts': suite([sys.executable, '-m', 'unittest', 'scripts.tests.code_mode_compute_test.RequestContractTests', '-v']),
     'artifact_contracts': suite([sys.executable, '-m', 'unittest', 'scripts.tests.code_mode_compute_test.ArtifactCapabilityTests', '-v']),
     'gateway_contracts': suite([sys.executable, '-m', 'unittest', 'scripts.tests.build_dependency_proxy_test', '-v']),
+    # The production CLI deliberately has no fixture-registry setting. These
+    # associated suites inject only the external fetch transport and exercise
+    # real KVM preparation, the production broker, pinned pip and task service.
+    'source_only': suite([sys.executable, '-m', 'unittest', 'scripts.tests.compute_package_fixture_test.PackageFixtureVMTests.test_source_only_is_unavailable_without_downloading_source', '-v']),
+    'transitive_url': suite([sys.executable, '-m', 'unittest', 'scripts.tests.compute_package_fixture_test.PackageFixtureVMTests.test_transitive_url_is_policy_denied_without_requesting_url', '-v']),
+    'altered_wheel': suite([sys.executable, '-m', 'unittest', 'scripts.tests.compute_package_fixture_test.PackageFixtureVMTests.test_altered_wheel_has_integrity_failure_before_install_or_execution', '-v']),
+    'valid_fixture_wheel': suite([sys.executable, '-m', 'unittest', 'scripts.tests.compute_package_fixture_test.PackageFixtureVMTests.test_valid_fixture_installs_and_executes_offline', '-v']),
     'bridge_regression': suite([sys.executable, '-m', 'unittest', 'scripts.tests.codex_tool_bridge_test', '-v'], public=True),
     'build_vm_regression': suite([sys.executable, '-m', 'unittest', 'scripts.tests.codex_build_vm_test', 'scripts.tests.codex_tool_bridge_test.BuildScratchTests', '-v'], public=True),
     'deno_regression': lambda h, n: h.suite(n, [h.deno, 'test', '--no-lock', '--allow-run=deno', '--allow-read=.', 'sidecars/code-mode-runner/runner_test.ts']),

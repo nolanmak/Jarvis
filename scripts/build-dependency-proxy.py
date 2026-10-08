@@ -155,6 +155,7 @@ class Broker:
         self.control = Path(control)
         self.requests = 0
         self.bytes = 0
+        self.integrity_failed = False
 
     def poll(self, remaining):
         deadline = time.monotonic() + max(0, remaining)
@@ -198,6 +199,7 @@ class Broker:
                         atomic(body, filtered)
                         metadata['content_type'] = 'application/vnd.pypi.simple.v1+json'
                     elif hashlib.sha256(received).hexdigest() != self.wheels[route]:
+                        self.integrity_failed = True
                         raise ValueError('wheel integrity mismatch')
                 if self.bytes > MAX_TOTAL:
                     raise ValueError('dependency retrieval budget exceeded')

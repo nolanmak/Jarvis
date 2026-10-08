@@ -188,6 +188,14 @@ copy the successful report unchanged to the HEAD-specific receipt location in
 [TESTING.md](TESTING.md). Rebuild and regenerate evidence after a rebase or code
 change. A deployment is a separate operator action.
 
+The adversarial package cases use an associated real-VM test suite with a
+synthetic fetch transport. They run the production broker and pinned guest pip
+against harmless generated wheels, without contacting a registry. There is no
+fixture-registry option in the production CLI. These cases check source-only
+refusal, URL dependencies (including URLs on approved origins), altered wheel
+hashes, and a successful control install. The public-package CLI cases separately
+verify Deno dispatch, actual approved registry downloads, and offline reuse.
+
 ## Errors and rollback
 
 | Error | Operator interpretation |

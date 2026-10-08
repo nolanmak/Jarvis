@@ -112,6 +112,7 @@ class DependencyProxyTests(unittest.TestCase):
                     broker.poll(1)
                 result = json.loads((root / ('e' * 32 + '.response')).read_text())
                 self.assertEqual(result['status'], 200 if correct else 502)
+                self.assertEqual(broker.integrity_failed, not correct)
                 if not correct:
                     self.assertNotIn(b'CORRUPT', (root / ('e' * 32 + '.body')).read_bytes())
 

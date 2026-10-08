@@ -18,6 +18,8 @@ def pip_main(arguments):
     from pip._internal.cli.main import main
     from pip._internal.network.session import PipSession
     from pip._internal.exceptions import InstallationError
+    from pip._internal.req import constructors
+    from pip._vendor.packaging.requirements import Requirement
     from urllib.parse import urlsplit
     original = PipSession.request
 
@@ -30,6 +32,18 @@ def pip_main(arguments):
         return original(self, method, url, *args, **kwargs)
 
     PipSession.request = guarded
+    original_requirement = constructors.install_req_from_req_string
+
+    def registry_requirement(value, *args, **kwargs):
+        # Reject every direct URL in dependency metadata before pip creates a
+        # link candidate (including URLs at otherwise approved registries).
+        # The operator-pinned pip is loaded before its resolver imports this
+        # constructor; the real-VM fixture verifies that integration.
+        if Requirement(value).url:
+            raise InstallationError('JARVIS_DEPENDENCY_POLICY: transitive URL requirement')
+        return original_requirement(value, *args, **kwargs)
+
+    constructors.install_req_from_req_string = registry_requirement
     raise SystemExit(main(['--isolated', '--disable-pip-version-check', '--no-input', *arguments]))
 
 
