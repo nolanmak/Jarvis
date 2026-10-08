@@ -469,6 +469,16 @@ print('60')
     h.cli(name, program(code), verify=final_value)
 
 
+def detached_descendants(h, name):
+    def verify(value, root):
+        final_value(value, root)
+        checked((root / 'artifacts/result.json').read_bytes() == b'{"total":60}',
+                'detached child changed the exported result')
+        checked(value['records'][0]['cleanupVerified'], 'descendant cleanup unverified')
+    h.cli(name, program((FIXTURES / 'detached-descendant.py').read_text(),
+                       outputs=['result.json'], timeoutSecs=5), maximum=10, verify=verify)
+
+
 def schema_denial(h, name, request, code):
     source = f"async function main(){{try{{await tools.compute.run({json.dumps(request)});return false;}}catch(e){{return String(e).includes({json.dumps(code)});}}}}main();"
     # Schema refusals have no execution records; check the typed RPC error and
@@ -533,6 +543,7 @@ CASES = {
     'selected_readonly': selected_readonly, 'network': network,
     'fresh_task': fresh_task, 'changed_constraints': changed_constraints, 'failed_preparation': failed_preparation,
     'host_canaries': host_canaries, 'host_package_integrity': package_integrity,
+    'detached_descendants': detached_descendants,
     'full_log_transfer': full_log_transfer, 'workload_rpc': workload_rpc, 'execution_gateway_absent': gateway_absent,
     'traversal': lambda h, n: schema_denial(h, n, {'runtime':'python','dependencies':[],'code':'pass','outputs':['../outside']}, 'bad_args'),
     'memory_limit': lambda h, n: h.cli(n, program('bytearray(16*1024**3)'), expect_exit=1, expected_error='resource_limit'),

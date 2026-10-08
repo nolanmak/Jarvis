@@ -189,7 +189,16 @@ def main():
         with selectors.DefaultSelector() as selector:
             selector.register(process.stdout, selectors.EVENT_READ, 'stdout')
             selector.register(process.stderr, selectors.EVENT_READ, 'stderr')
+            descendants_reaped = False
             while selector.get_map() and error is None:
+                # EOF is not proof the main workload is alive: detached
+                # descendants can retain its pipe writers indefinitely. Reap
+                # them as soon as the main process exits, then drain buffered
+                # output. Popen.poll reaps the main child first so its exit
+                # status remains available after the subreaper waits below.
+                if not descendants_reaped and process.poll() is not None:
+                    reap_workload(uid)
+                    descendants_reaped = True
                 for key, _ in selector.select(0.1):
                     data = os.read(key.fileobj.fileno(), 65536)
                     if not data:

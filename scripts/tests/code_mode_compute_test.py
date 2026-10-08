@@ -94,6 +94,21 @@ import tempfile
 
 @unittest.skipUnless(os.environ.get('JARVIS_TEST_VM_CONFIG'), 'requires provisioned KVM runtime')
 class ComputeVMTests(unittest.TestCase):
+    def test_detached_descendant_cannot_hold_logs_open_after_workload_exits(self):
+        import time
+        code = (Path(__file__).parent / 'fixtures/code-mode-compute/detached-descendant.py').read_text()
+        with tempfile.TemporaryDirectory() as tmp:
+            started = time.monotonic()
+            result = compute.run_execution(os.environ['JARVIS_TEST_VM_CONFIG'], Path(tmp),
+                request(code=code, outputs=['result.json']), timeout=5)
+            self.assertTrue(result['ok'], result)
+            self.assertEqual(result['runner'], 'vm')
+            self.assertEqual(result['stdout'].strip(), '60')
+            self.assertEqual(result['files']['result.json'], b'{"total":60}')
+            self.assertTrue(result['cleanupVerified'])
+            self.assertLess(time.monotonic() - started, 5)
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
     def test_full_binary_log_transfer_does_not_consume_execution_budget(self):
         import hashlib
         import random
