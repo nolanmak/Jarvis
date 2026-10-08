@@ -81,6 +81,8 @@ mod autopr_eval;
 mod autopr_health;
 mod channel_router;
 mod code_mode;
+mod compute_cli;
+mod compute_tool;
 mod doc_cmd;
 mod db_compact;
 mod deploy_snapshot;
@@ -694,6 +696,9 @@ enum Cmd {
     /// Internal conversation-bound MCP server for Discord speech.
     #[command(hide = true)]
     VoiceTool,
+    /// Internal owner-DM-bound computation MCP facade.
+    #[command(hide = true)]
+    ComputeTool,
     /// #655/#667 — one live round-trip through the provider fallback chain.
     /// Builds the production reasoner (AUGMENTAGENT_REASONER_CHAIN +
     /// eligibility checks), sends a trivial text-only prompt, and prints the
@@ -2789,6 +2794,12 @@ async fn drain_daemon_tasks(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    // Compute QA is explicitly isolated from live configuration and storage.
+    if let Cmd::CodeMode { op: code_mode::CodeModeOp::ComputeRun(ref args) } = cli.cmd {
+        std::process::exit(compute_cli::run(args).await);
+    }
+    if let Cmd::ComputeTool = cli.cmd { return compute_tool::serve(); }
     let _ = dotenvy::dotenv();
     // Send tracing to stderr so JSON-mode subcommands (consumed by the
     // dashboard via shell-out) don't get their stdout polluted with log
@@ -2802,7 +2813,6 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let cli = Cli::parse();
     if let Cmd::ModelTool { channel, ref readiness } = cli.cmd {
         return model_tool::serve(channel, readiness);
     }
@@ -3443,6 +3453,10 @@ async fn main() -> Result<()> {
             // #1412 — drop action bodies that only repeat the stored email,
             // shortly after start and hourly, in small batches.
             tasks.push(tokio::spawn(db_compact::run_loop(Arc::clone(&store), shutdown.clone())));
+
+            // #1434 — task leases recover at startup and at most 30 seconds
+            // apart; retained compute artifacts expire after 24 hours.
+            tasks.push(tokio::spawn(augmentagent_channel_core::code_mode::compute::retention::run_sweep_loop(shutdown.clone())));
 
             // #1035 — reasoner handoff journals: remove finished ones idle past
             // the grace period, at start and hourly, on the blocking pool.
@@ -5160,6 +5174,7 @@ async fn main() -> Result<()> {
         Cmd::Env { ref op, json } => env_cfg::run_env(op, json),
         Cmd::ModelTool { channel, ref readiness } => model_tool::serve(channel, readiness),
         Cmd::VoiceTool => voice_tool::serve(),
+        Cmd::ComputeTool => compute_tool::serve(),
         Cmd::ReasonerSelftest { ref prompt, ref profile, tool_probe } =>
             run_reasoner_selftest(prompt, profile.as_deref(), tool_probe).await,
         Cmd::Install { component } => installers::run_install(component).await,
@@ -10668,6 +10683,13 @@ impl QueryHandler for WikiQuerier {
         enable_newsletter_tools(&mut opts, ctx);
         computer_tool::configure(&mut opts, ctx, &self.repo_root);
         model_tool::configure(&mut opts, ctx, &self.reasoner, &self.repo_root.join("target/release/augmentagent"));
+        let compute_turn = match compute_tool::attach(&mut opts, ctx, &std::env::current_exe()?).await {
+            Ok(turn) => turn,
+            Err(_) => {
+                warn!("owner compute unavailable: host policy or runtime setup failed");
+                None
+            }
+        };
         let voice_grant = self.voice_tools.get().and_then(|service| {
             let guild = ctx.guild_id?;
             let channel = ctx.channel_id?;
@@ -10737,6 +10759,9 @@ impl QueryHandler for WikiQuerier {
         if answer.is_ok() &&
             voice_grant.as_ref().is_some_and(|(_, grant)| grant.final_spoken()) {
             self.final_spoken_turns.insert(ctx.session_id.clone(), ());
+        }
+        if let Some(turn) = compute_turn {
+            turn.finish().await.context("compute task cleanup could not be verified")?;
         }
         sweep_imessage_attachments(&opts.env);
         answer

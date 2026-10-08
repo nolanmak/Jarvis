@@ -283,3 +283,13 @@ mod tests {
         );
     }
 }
+
+/// Compute-only orchestration surface. Runtime paths and authorization are
+/// deliberately absent: those are host-owned capabilities.
+pub fn manifest_compute() -> ToolManifest {
+    ToolManifest { tools: vec![ToolDef::new(
+        "compute.run",
+        r#"(request: { runtime: "python"; dependencies: string[]; code: string; inputs?: { artifactId: string; name: string }[]; outputs?: string[]; timeoutSecs?: number }) => Promise<{ ok: boolean; runner: "vm" | "none"; executionId: string; exitCode: number | null; stdout: string; stderr: string; error: { code: string; message: string; retryable: boolean } | null; dependencyLock: { name: string; version: string; sha256: string }[]; environmentReused: boolean; artifacts: { id: string; name: string; bytes: number; sha256: string }[] }>"#,
+        "Execute Python in an isolated VM with public PyPI wheels. Inputs are opaque task artifact IDs. Write requested flat output filenames under /outputs. Environments may be reused only within this task. Inspect ok before using results.",
+    )] }
+}

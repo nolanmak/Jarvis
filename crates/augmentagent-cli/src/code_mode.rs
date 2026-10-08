@@ -39,6 +39,8 @@ use tracing::info;
 /// `augmentagent code-mode <op>` subcommands.
 #[derive(Subcommand, Debug)]
 pub enum CodeModeOp {
+    /// Run a provider-free TypeScript compute task with real VM dispatch.
+    ComputeRun(crate::compute_cli::ComputeRunArgs),
     /// Run the code-mode draft pipeline against a fixture message end-to-end.
     ///
     /// Loads the email by id, runs a fixture Code-Mode program through the
@@ -55,6 +57,7 @@ pub enum CodeModeOp {
 /// Entry point dispatched from `main.rs`'s `Cmd::CodeMode` arm.
 pub async fn run(store: Arc<Store>, op: CodeModeOp) -> Result<()> {
     match op {
+        CodeModeOp::ComputeRun(_) => anyhow::bail!("compute-run must execute before database initialization"),
         CodeModeOp::DryRun { message_id } => dry_run(store, &message_id).await,
     }
 }

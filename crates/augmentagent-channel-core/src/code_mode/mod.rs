@@ -20,9 +20,12 @@
 //! between "model text → fenced TS program" and "program → sandbox →
 //! action row."
 
+pub mod compute;
 pub mod dispatch;
 pub mod failure;
 pub mod manifest;
+#[cfg(target_os = "linux")]
+mod process;
 pub mod runner;
 pub mod trace;
 

@@ -1,7 +1,7 @@
 # AugmentAgent code-mode runner sidecar
 
 Deno-based sandbox that runs LLM-generated TypeScript programs for AugmentAgent
-Code Mode. The Rust daemon spawns `deno run runner.ts` (no `--allow-*` flags),
+Code Mode. The Rust daemon spawns Deno with explicit import restrictions and no capability grants,
 pipes the program in over stdin, and dispatches `tools.*` RPC calls back to the
 backing Rust implementations.
 
@@ -14,7 +14,7 @@ Part of the Code Mode for AugmentAgent epic.
 sidecars/code-mode-runner/
   runner.ts        # the sandbox runner (entry point)
   runner_test.ts   # acceptance tests (deno test)
-  deno.json        # Deno config: imports locked empty, strict TS
+  deno.json        # development/type-check configuration; production uses --no-config
   README.md        # this file
 ```
 
@@ -40,26 +40,30 @@ and refuse to boot if the binary is missing or too old.
 
 ## How the sandbox is locked down
 
-The runner is invoked with **no `--allow-*` flags**, which in Deno 2 means
-default-deny on every capability:
+The production runner is invoked with:
 
-- No network (`fetch`, `Deno.connect`, `WebSocket`).
-- No filesystem (`Deno.readFile`, `Deno.writeFile`, dynamic `import` from disk).
-- No environment access (`Deno.env`).
-- No subprocesses (`Deno.Command`).
-- No FFI, no `--unstable` APIs.
+```sh
+deno run --no-config --no-npm --no-remote --deny-import --no-prompt runner.ts
+```
 
-Note: the original issue spec refers to `--allow-none`. That is **not** a real
-Deno flag — passing it errors out (`unexpected argument '--allow-none' found`).
-The semantic equivalent is simply omitting all `--allow-*` flags. The runner
-is therefore launched as `deno run runner.ts`.
+No filesystem, network, environment, subprocess, or FFI permissions are granted.
+The generated TypeScript program loads from an in-memory `data:` URL. Remote
+and npm resolution are explicitly disabled, and configuration is not discovered
+from a task's working directory. An empty import map and `lock: false` are not
+security boundaries; module loading has rules distinct from ordinary Deno
+capability checks. The host also checks each RPC against its own tool manifest
+and 25-call limit because generated code can write raw protocol frames.
 
-`deno.json` additionally locks down:
+The default program deadline is 60 seconds. A trusted caller can pass a
+`RunOptions` budget of 1–3,600,000 milliseconds; the Deno header and Rust watchdog
+use that budget. Rust includes header delivery and child exit in its deadline,
+so a forged final frame or a blocked JavaScript event loop cannot remove the
+limit. Compute task policy further bounds this by the operator's cumulative task
+budget; model arguments cannot change runner policy.
 
-- `"imports": {}` — empty import map; the program text cannot resolve any
-  bare specifier or remote URL.
-- `"nodeModulesDir": "none"` — no npm shim.
-- `"lock": false` — no remote dependency caching at runtime.
+Optional host header fields are `timeoutMs` and `computeInputs` (a map of input
+aliases to task-owned artifact IDs). The input map is frozen and cannot be
+replaced by generated code. It grants no filesystem access itself.
 
 ## Wire protocol
 

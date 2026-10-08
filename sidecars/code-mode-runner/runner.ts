@@ -33,9 +33,13 @@ const CALL_BUDGET = 25;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-function writeLine(obj: unknown): Promise<void> {
-  const line = JSON.stringify(obj) + "\n";
-  return Deno.stdout.write(encoder.encode(line)).then(() => {});
+async function writeLine(obj: unknown): Promise<void> {
+  let bytes = encoder.encode(JSON.stringify(obj) + "\n");
+  while (bytes.length > 0) {
+    const count = await Deno.stdout.write(bytes);
+    if (count === 0) throw new Error("Protocol output closed");
+    bytes = bytes.subarray(count);
+  }
 }
 
 // Stdout is the protocol channel, so program-side `console.*` output (which
@@ -75,6 +79,7 @@ type Pending = {
 const pending = new Map<number, Pending>();
 let nextId = 1;
 let callCount = 0;
+let localRefusal = false;
 // Buffer for responses the reader sees BEFORE rpc() has registered the
 // matching pending entry. Pre-existing tests already cover the same-chunk
 // race when execution was synchronous (`eval`); switching to async module
@@ -102,6 +107,7 @@ async function* stdinLines(): AsyncGenerator<string> {
     }
     const n = await Deno.stdin.read(chunk);
     if (n === null) {
+      stdinBuf += decoder.decode();
       // EOF: emit any trailing partial line.
       if (stdinBuf.length > 0) {
         const last = stdinBuf;
@@ -110,7 +116,7 @@ async function* stdinLines(): AsyncGenerator<string> {
       }
       return;
     }
-    stdinBuf += decoder.decode(chunk.subarray(0, n));
+    stdinBuf += decoder.decode(chunk.subarray(0, n), { stream: true });
   }
 }
 
@@ -125,12 +131,13 @@ async function readFirstLine(): Promise<string> {
     }
     const n = await Deno.stdin.read(chunk);
     if (n === null) {
+      stdinBuf += decoder.decode();
       // EOF without newline — yield whatever we have.
       const last = stdinBuf;
       stdinBuf = "";
       return last;
     }
-    stdinBuf += decoder.decode(chunk.subarray(0, n));
+    stdinBuf += decoder.decode(chunk.subarray(0, n), { stream: true });
   }
 }
 
@@ -181,6 +188,7 @@ function startReaderLoop(): void {
 
 async function rpc(name: string, args: unknown[]): Promise<unknown> {
   if (callCount >= CALL_BUDGET) {
+    localRefusal = true;
     // Don't even emit the call — fail synchronously inside the program.
     const err = new Error(
       `call_budget_exceeded: tool call limit of ${CALL_BUDGET} reached`,
@@ -284,6 +292,7 @@ function makeProxy(node: Node, path: string[]): unknown {
       }
       const child = node[prop as string];
       if (!child || typeof child !== "object") {
+        localRefusal = true;
         throw new Error(
           `tool_not_in_manifest: ${[...path, prop as string].join(".")}`,
         );
@@ -292,6 +301,7 @@ function makeProxy(node: Node, path: string[]): unknown {
     },
     apply(_t, _this, args) {
       if (!leafName) {
+        localRefusal = true;
         throw new Error(
           `not_callable: tools.${path.join(".")} is a namespace, not a tool`,
         );
@@ -312,7 +322,7 @@ async function run(): Promise<void> {
     Deno.exit(1);
   }
 
-  let header: { program?: unknown; manifest?: unknown };
+  let header: { program?: unknown; manifest?: unknown; timeoutMs?: unknown; computeInputs?: unknown };
   try {
     header = JSON.parse(first);
   } catch (e) {
@@ -342,6 +352,28 @@ async function run(): Promise<void> {
     });
     Deno.exit(1);
   }
+
+  // Only the host constructs this frame. Model code cannot extend its own
+  // budget; Rust independently supervises the same monotonic deadline.
+  const timeoutMs = Object.hasOwn(header, "timeoutMs") ? header.timeoutMs : TIMEOUT_MS;
+  if (typeof timeoutMs !== "number" || !Number.isSafeInteger(timeoutMs) ||
+      timeoutMs < 1 || timeoutMs > 3_600_000) {
+    await writeLine({ error: { message: "header.timeoutMs must be an integer in 1..3600000", stack: "" } });
+    Deno.exit(1);
+  }
+  const inputs = Object.hasOwn(header, "computeInputs") ? header.computeInputs : {};
+  if (inputs === null || typeof inputs !== "object" || Array.isArray(inputs) ||
+      Object.keys(inputs).length > 32 ||
+      !Object.entries(inputs).every(([name, id]) =>
+        /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name) &&
+        typeof id === "string" && id.length > 0 && id.length <= 128)) {
+    await writeLine({ error: { message: "header.computeInputs must map input names to opaque IDs", stack: "" } });
+    Deno.exit(1);
+  }
+  Object.defineProperty(globalThis, "computeInputs", {
+    value: Object.freeze(Object.assign(Object.create(null), inputs)),
+    writable: false, configurable: false,
+  });
 
   // Install the tools Proxy on globalThis.
   const tree = buildTree(manifest as string[]);
@@ -387,8 +419,8 @@ async function run(): Promise<void> {
   const timeoutPromise = new Promise<never>((_resolve, reject) => {
     timeoutHandle = setTimeout(() => {
       timedOut = true;
-      reject(new Error(`timeout: program exceeded ${TIMEOUT_MS}ms wall clock`));
-    }, TIMEOUT_MS);
+      reject(new Error(`timeout: program exceeded ${timeoutMs}ms wall clock`));
+    }, timeoutMs);
   });
 
   try {
@@ -419,7 +451,7 @@ async function run(): Promise<void> {
     Deno.exit(1);
   }
 
-  await writeLine({ final: result ?? null });
+  await writeLine({ final: result ?? null, localRefusal });
   Deno.exit(0);
 }
 

@@ -28,6 +28,17 @@ requires_poppler = capabilities.requirement(POPPLER_UNAVAILABLE)
 
 class ToolPolicyTests(unittest.TestCase):
     def setUp(self):
+        # Every policy owns session resources, including when an assertion or
+        # command fails. Do not rely on GC or leave sparse image reservations
+        # behind between real VM regression cases.
+        from unittest.mock import patch
+        original = bridge.Policy.__init__
+        def tracked(policy, *args, **kwargs):
+            original(policy, *args, **kwargs)
+            self.addCleanup(policy.close)
+        tracker = patch.object(bridge.Policy, '__init__', tracked)
+        tracker.start()
+        self.addCleanup(tracker.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / 'workspace'
@@ -495,8 +506,15 @@ else:
         (self.root/'src').mkdir()
         (self.root/'Cargo.toml').write_text('[package]\nname="synthetic-build"\nversion="0.1.0"\nedition="2021"\n')
         (self.root/'src/lib.rs').write_text('#[test] fn synthetic_passes() { assert_eq!(2 + 2, 4); }\n')
+        import os
+        # The harness gives this test an isolated HOME. Supply only the
+        # operator's already-provisioned Rust caches to this trusted fixture;
+        # production Policy must not inherit these ambient settings implicitly.
+        runtime = {key: os.environ.get(key, str(Path.home() / fallback))
+                   for key, fallback in [('CARGO_HOME', '.cargo'), ('RUSTUP_HOME', '.rustup')]}
         policy=bridge.Policy({'build_runner':'host','cwd':str(self.root),'read_roots':[str(self.root)],
-            'write_roots':[str(self.root)],'allowed_tools':['Read','Write','Edit','Bash(cargo *)']})
+            'write_roots':[str(self.root)],'allowed_tools':['Read','Write','Edit','Bash(cargo *)'],
+            'environment': runtime})
         outcome=policy.run_command('cargo test --offline',timeout=60)
         self.assertEqual(outcome['exit_code'],0,outcome)
         self.assertIn('1 passed',outcome['stdout'])
@@ -2572,6 +2590,31 @@ class BuildScratchTests(unittest.TestCase):
             fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)  # released afterwards
         finally:
             os.close(other)
+
+    def test_retained_compute_reservations_share_build_capacity_and_fail_closed(self):
+        import os
+        policy = self.policy()
+        storage = self.scratch / 'compute-artifacts'
+        storage.mkdir(mode=0o700)
+        ledger = storage / 'usage.json'
+        reserved = 640 * 1024**2
+        ledger.write_text(json.dumps({'schemaVersion': 1, 'reservedBytes': reserved}))
+        ledger.chmod(0o600)
+        root_fd = policy._scratch._open_root()
+        self.addCleanup(os.close, root_fd)
+        cap = policy._scratch.cache_bytes
+        policy._scratch.budget_bytes = cap + reserved - 1
+        with self.assertRaises(bridge.Readiness, msg='artifact reservations must count against the build budget'):
+            policy._scratch._require_space(root_fd)
+        policy._scratch.budget_bytes = cap + reserved
+        policy._scratch.statvfs = self.fake_statvfs(policy._scratch.headroom_bytes + cap + reserved - 4096)
+        with self.assertRaises(bridge.Readiness, msg='future artifact growth must reserve free disk capacity'):
+            policy._scratch._require_space(root_fd)
+        policy._scratch.statvfs = self.fake_statvfs(policy._scratch.headroom_bytes + cap + reserved)
+        policy._scratch._require_space(root_fd)
+        ledger.write_text('{invalid')
+        with self.assertRaises(bridge.Readiness, msg='invalid accounting cannot silently become zero'):
+            policy._scratch._require_space(root_fd)
 
     def test_concurrent_sessions_share_one_budget_and_reserve_unallocated_growth(self):
         import os

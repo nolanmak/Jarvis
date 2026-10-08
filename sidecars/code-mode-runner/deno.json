@@ -4,7 +4,11 @@
   "imports": {},
   "compilerOptions": {
     "strict": true,
-    "lib": ["deno.ns", "deno.window", "esnext"],
+    "lib": [
+      "deno.ns",
+      "deno.window",
+      "esnext"
+    ],
     "noImplicitAny": true
   },
   "fmt": {
@@ -19,5 +23,5 @@
     "test": "deno test --allow-run --allow-read=. --no-prompt runner_test.ts"
   },
   "_minDenoVersion": "2.7.0",
-  "_note": "Imports are locked empty. The runner forbids any `import`/`fetch`/`Deno.*` access by being run without any `--allow-*` flags (Deno's default: all permissions denied)."
+  "_note": "Development configuration only. Production uses --no-config, --no-npm, --no-remote, --deny-import and --no-prompt with no capability grants."
 }
