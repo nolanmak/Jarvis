@@ -402,6 +402,15 @@ fn cli_signal_cleanup(startup: bool, stalled: bool) {
                 .live,
             1
         );
+        if !startup {
+            let managed = std::fs::read_dir(&storage).unwrap().filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with("task-"))
+                .flat_map(|e| std::fs::read_dir(e.path()).unwrap())
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with("compute-orchestration-"))
+                .count();
+            assert_eq!(managed, 1, "live Deno files must belong to the crash-recovery lease");
+        }
         if startup {
             // Pin and stop the helper before its ready frame. This also keeps
             // the CLI from registering its old, late signal listener by racing

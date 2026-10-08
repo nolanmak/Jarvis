@@ -203,6 +203,8 @@ impl RunnerError {
 pub struct RunOptions {
     pub timeout: Duration,
     pub compute_inputs: std::collections::BTreeMap<String, String>,
+    /// Private host-owned task storage for recoverable orchestration files.
+    pub orchestration_root: Option<PathBuf>,
 }
 
 impl Default for RunOptions {
@@ -210,6 +212,7 @@ impl Default for RunOptions {
         Self {
             timeout: Duration::from_secs(60),
             compute_inputs: Default::default(),
+            orchestration_root: None,
         }
     }
 }
@@ -253,7 +256,8 @@ async fn run_program_inner(
     }
     let started = tokio::time::Instant::now();
     let resolution = resolve_deno_bin();
-    let sidecar = resolve_sidecar()?;
+    let runtime_storage = options.orchestration_root.as_deref().map(RunStorage::new).transpose()?;
+    let sidecar = resolve_sidecar(runtime_storage.as_ref().map(|storage| storage.path.as_path()))?;
 
     tracing::debug!(
         deno = %resolution.path.display(),
@@ -263,12 +267,24 @@ async fn run_program_inner(
     );
 
     let mut command = Command::new(&resolution.path);
+    if let Some(storage) = &runtime_storage {
+        command.env_clear().env("PATH", std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
+            .env("DENO_NO_UPDATE_CHECK", "1")
+            .env("HOME", storage.path.join("home"))
+            .env("DENO_DIR", storage.path.join("cache"))
+            .env("TMPDIR", storage.path.join("tmp"))
+            .env("XDG_CACHE_HOME", storage.path.join("cache"))
+            .env("XDG_CONFIG_HOME", storage.path.join("config"))
+            .env("XDG_DATA_HOME", storage.path.join("data"));
+    }
     command
         .arg("run")
         // Configuration and import resolution are independent of ordinary
         // capability permissions. Do not inherit a task's deno.json or npm.
         .args([
             "--no-config",
+            "--no-lock",
+            "--no-code-cache",
             "--no-npm",
             "--no-remote",
             "--deny-import",
@@ -707,16 +723,53 @@ pub async fn check_deno_available() -> Result<DenoResolution, RunnerError> {
     Ok(resolution)
 }
 
+struct RunStorage {
+    _temporary: tempfile::TempDir,
+    path: PathBuf,
+    // Keep the parent descriptor alive until descriptor-relative TempDir cleanup.
+    _parent: super::compute::artifacts::Directory,
+}
+
+impl RunStorage {
+    #[cfg(not(unix))]
+    fn new(_root: &std::path::Path) -> Result<Self, RunnerError> {
+        Err(RunnerError::Protocol("private compute storage requires Unix".into()))
+    }
+
+    #[cfg(unix)]
+    fn new(root: &std::path::Path) -> Result<Self, RunnerError> {
+        let create = || -> anyhow::Result<Self> {
+            use std::os::unix::fs::MetadataExt;
+            let parent = super::compute::artifacts::Directory::open(root, false)?;
+            let metadata = std::fs::metadata(parent.path())?;
+            anyhow::ensure!(metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o777 == 0o700,
+                "orchestration storage must be owner-private");
+            let (temporary, _) = parent.private_tempdir("compute-orchestration-")?;
+            let path = std::fs::canonicalize(temporary.path())?;
+            for name in ["home", "cache", "tmp", "config", "data"] {
+                std::fs::create_dir(path.join(name))?;
+            }
+            Ok(Self { _temporary: temporary, path, _parent: parent })
+        };
+        create().map_err(|_| RunnerError::Protocol("private orchestration storage unavailable".into()))
+    }
+}
+
 struct Sidecar {
     path: PathBuf,
     _file: Option<tempfile::NamedTempFile>,
 }
 
-fn resolve_sidecar() -> Result<Sidecar, RunnerError> {
-    materialize_sidecar(std::env::var_os("AUGMENTAGENT_CODE_MODE_SIDECAR"))
+fn resolve_sidecar(root: Option<&std::path::Path>) -> Result<Sidecar, RunnerError> {
+    materialize_sidecar_in(std::env::var_os("AUGMENTAGENT_CODE_MODE_SIDECAR"), root)
 }
 
+#[cfg(test)]
 fn materialize_sidecar(override_path: Option<std::ffi::OsString>) -> Result<Sidecar, RunnerError> {
+    materialize_sidecar_in(override_path, None)
+}
+
+fn materialize_sidecar_in(override_path: Option<std::ffi::OsString>, root: Option<&std::path::Path>) -> Result<Sidecar, RunnerError> {
     if let Some(path) = override_path.filter(|path| !path.is_empty()) {
         let path = PathBuf::from(path);
         if !path.is_absolute() {
@@ -727,10 +780,12 @@ fn materialize_sidecar(override_path: Option<std::ffi::OsString>) -> Result<Side
         return Ok(Sidecar { path, _file: None });
     }
     use std::io::Write;
-    let mut file = tempfile::Builder::new()
-        .prefix("jarvis-code-mode-")
-        .suffix(".ts")
-        .tempfile()?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("jarvis-code-mode-").suffix(".ts");
+    let mut file = match root {
+        Some(root) => builder.tempfile_in(root)?,
+        None => builder.tempfile()?,
+    };
     file.write_all(include_bytes!(
         "../../../../sidecars/code-mode-runner/runner.ts"
     ))?;

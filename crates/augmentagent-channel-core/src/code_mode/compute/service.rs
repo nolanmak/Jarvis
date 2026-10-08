@@ -465,6 +465,7 @@ impl ComputeService {
         Ok(RunOptions {
             timeout: self.budget.remaining().map_err(anyhow::Error::msg)?,
             compute_inputs: self.inputs(),
+            orchestration_root: Some(self.config.artifact_root.clone()),
         })
     }
     pub fn cancel(&self) {

@@ -818,3 +818,41 @@ async fn helper_files_live_in_managed_storage_and_cleanup_pins_the_original_dire
         "unrelated directory"
     );
 }
+
+#[tokio::test]
+async fn compute_orchestration_files_are_owned_by_task_storage() {
+    use augmentagent_channel_core::code_mode::compute::ComputeService;
+    let root = tempfile::tempdir().unwrap();
+    let config = service_config(root.path(), false);
+    let artifacts = config.artifact_root.clone();
+    let service = ComputeService::start(config).await.unwrap();
+    let options = service.run_options().unwrap();
+    let running = tokio::spawn(async move {
+        run_program_with_options("async function main(){await new Promise(r=>setTimeout(r,1500));return 60;}main();",
+            &ToolManifest::default(), &StubDispatcher::always_null(&[]), &options).await
+    });
+    let managed = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(path) = std::fs::read_dir(&artifacts).unwrap().filter_map(|e| e.ok())
+                .map(|e| e.path()).find(|p| p.file_name().unwrap().to_string_lossy().starts_with("compute-orchestration-")) {
+                break path;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await;
+    let managed = match managed {
+        Ok(path) => path,
+        Err(_) => panic!("Deno runtime files must live in recoverable task storage: {:?}", running.await.unwrap()),
+    };
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(&managed).unwrap().permissions().mode() & 0o777, 0o700);
+    assert!(managed.join("cache").is_dir());
+    assert!(managed.join("home").is_dir());
+    let sidecars: Vec<_> = std::fs::read_dir(&managed).unwrap().filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ts")).collect();
+    assert_eq!(sidecars.len(), 1);
+    assert_eq!(sidecars[0].metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(running.await.unwrap().unwrap().final_value, json!(60));
+    assert!(!managed.exists(), "completed orchestration left runtime files behind");
+    assert_eq!(service.finish().await.unwrap()["cleanupVerified"], true);
+}
