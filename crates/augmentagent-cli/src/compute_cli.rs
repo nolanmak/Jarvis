@@ -26,12 +26,13 @@ pub struct ComputeRunArgs {
 }
 
 struct Prepared {
+    // Drop task storage before its descriptor-pinned parent.
+    _task: tempfile::TempDir,
     program: String,
     destination: Directory,
     report_parent: Directory,
     report_name: String,
     config: ServiceConfig,
-    _task: tempfile::TempDir,
 }
 
 fn prepare(args: &ComputeRunArgs) -> Result<Prepared> {
@@ -65,15 +66,6 @@ fn prepare(args: &ComputeRunArgs) -> Result<Prepared> {
         .into_iter()
         .map(|(name, path)| Ok((name, std::path::absolute(path)?)))
         .collect::<Result<BTreeMap<_, _>>>()?;
-    let task = tempfile::Builder::new()
-        .prefix("jarvis-compute-cli-")
-        .tempdir()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(task.path(), std::fs::Permissions::from_mode(0o700))?;
-    }
-    let config = ServiceConfig::from_env(task.path().to_owned(), input_files)?;
     let report = std::path::absolute(&args.report)?;
     let report_name = report
         .file_name()
@@ -89,6 +81,20 @@ fn prepare(args: &ComputeRunArgs) -> Result<Prepared> {
     );
     let destination = Directory::open(&args.output_dir, true)?;
     destination.require_empty()?;
+    let task = tempfile::Builder::new()
+        .prefix("compute-audit-")
+        .tempdir_in(report_parent.path())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(task.path(), std::fs::Permissions::from_mode(0o700))?;
+    }
+    // The helper has its own descriptor table, so give it the ordinary path.
+    let task_path = report
+        .parent()
+        .unwrap()
+        .join(task.path().file_name().unwrap());
+    let config = ServiceConfig::from_env(task_path, input_files)?;
     Ok(Prepared {
         program,
         destination,
@@ -108,7 +114,30 @@ pub async fn run(args: &ComputeRunArgs) -> i32 {
             return 2;
         }
     };
-    let report = execute(&prepared).await;
+    let mut report = execute(&prepared).await;
+    let retain_audit = report["cleanup"]["cleanupVerified"] == true;
+    if retain_audit {
+        // Generated files have already been exported. Keep only private audit
+        // files, never raw input snapshots or duplicate output capabilities.
+        let cleanup = (|| -> Result<()> {
+            for entry in std::fs::read_dir(prepared._task.path())? {
+                let entry = entry?;
+                let name = entry.file_name();
+                if name.to_str().is_some_and(|name| {
+                    name.len() == 32 && name.bytes().all(|b| b.is_ascii_hexdigit())
+                }) {
+                    std::fs::remove_file(entry.path())?;
+                }
+            }
+            Ok(())
+        })();
+        if cleanup.is_err() {
+            eprintln!("compute-run audit cleanup failed");
+            return 1;
+        }
+        report["auditDirectory"] =
+            json!(prepared._task.path().file_name().unwrap().to_str().unwrap());
+    }
     let success = report["ok"] == true;
     if let Err(error) = prepared
         .report_parent
@@ -116,6 +145,9 @@ pub async fn run(args: &ComputeRunArgs) -> i32 {
     {
         eprintln!("compute-run report: {error}");
         return 1;
+    }
+    if retain_audit {
+        let _ = prepared._task.keep();
     }
     println!("{}", json!({"ok":success,"report":args.report}));
     if success {

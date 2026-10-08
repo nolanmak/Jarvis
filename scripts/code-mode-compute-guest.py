@@ -183,8 +183,8 @@ def main():
         except OSError:
             error = 'output_denied'
     result = {'ok': error is None, 'exitCode': status, 'error': error,
-              'stdout': logs['stdout'].decode(errors='replace'),
-              'stderr': logs['stderr'].decode(errors='replace'), 'files': files if error is None else {}, 'dependencyLock': locked}
+              'privateLogs': {name: base64.b64encode(data).decode() for name, data in logs.items()},
+              'files': files if error is None else {}, 'dependencyLock': locked}
     print('\nJARVIS_COMPUTE_RESULT:' + json.dumps(result, separators=(',', ':')), flush=True)
 
 

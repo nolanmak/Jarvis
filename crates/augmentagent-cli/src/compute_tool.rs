@@ -115,16 +115,12 @@ impl ComputeTurn {
         self.worker.abort();
         let _ = (&mut self.worker).await;
         let receipt = self.service.finish().await?;
-        // Keep only tasks with generated artifacts for the retention worker.
-        // Inputs and all files remain in an owner-private directory.
-        let generated = receipt["records"].as_array().is_some_and(|records| {
-            records.iter().any(|record| {
-                record["artifacts"]
-                    .as_array()
-                    .is_some_and(|files| !files.is_empty())
-            })
-        });
-        if generated {
+        // Failed calls also need private audit evidence; raw selected inputs
+        // are removed below and are never retained as evidence.
+        let audited = receipt["records"]
+            .as_array()
+            .is_some_and(|records| !records.is_empty());
+        if audited {
             if let Some(directory) = self.artifacts.take() {
                 let root =
                     augmentagent_channel_core::code_mode::compute::artifacts::Directory::open(
@@ -607,11 +603,6 @@ mod tests {
             .map(|entry| entry.unwrap().path())
             .collect();
         assert_eq!(tasks.len(), 1);
-        assert_eq!(
-            std::fs::read_dir(&tasks[0]).unwrap().count(),
-            2,
-            "retain only generated output and its receipt, not raw input snapshots"
-        );
         let retained: Value =
             serde_json::from_slice(&std::fs::read(tasks[0].join("retention.json")).unwrap())
                 .unwrap();
@@ -624,6 +615,29 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0]["taskId"], records[1]["taskId"]);
         let artifact = &records[1]["artifacts"][0];
+        let capabilities: Vec<_> = std::fs::read_dir(&tasks[0])
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| {
+                name.to_str().is_some_and(|name| {
+                    name.len() == 32 && name.bytes().all(|b| b.is_ascii_hexdigit())
+                })
+            })
+            .collect();
+        assert_eq!(
+            capabilities,
+            vec![std::ffi::OsString::from(artifact["id"].as_str().unwrap())],
+            "never retain raw selected inputs"
+        );
+        assert!(tasks[0].join("audit.json").is_file());
+        for record in records {
+            for stream in ["stdout", "stderr"] {
+                assert!(tasks[0]
+                    .join(record["logs"][stream]["file"].as_str().unwrap())
+                    .is_file());
+            }
+        }
+
         let exported: Value = serde_json::from_slice(
             &std::fs::read(tasks[0].join(artifact["id"].as_str().unwrap())).unwrap(),
         )

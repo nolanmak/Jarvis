@@ -56,6 +56,15 @@ fn disabled_compute_reports_failure_without_opening_database_or_dotenv() {
     assert_eq!(report["ok"], false);
     assert_eq!(report["records"][0]["error"]["code"], "compute_disabled");
     assert_eq!(report["cleanup"]["cleanupVerified"], true);
+    let audit_dir = report["auditDirectory"]
+        .as_str()
+        .expect("CLI keeps private audit evidence after task cleanup");
+    let audit: Value = serde_json::from_slice(
+        &std::fs::read(root.path().join(audit_dir).join("audit.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(audit["records"], report["records"]);
+    assert_eq!(audit["cleanupVerified"], true);
     assert!(!root.path().join("data.db").exists());
 }
 #[test]
@@ -156,6 +165,25 @@ fn real_cli_downloads_reuses_and_exports_spreadsheet_summary() {
     assert!(report["records"][0]["downloads"]["bytes"].as_u64().unwrap() > 0);
     assert_eq!(report["records"][1]["downloads"]["bytes"], 0);
     assert_eq!(report["records"][1]["environmentReused"], true);
+    let audit_root = root.path().join(report["auditDirectory"].as_str().unwrap());
+    assert!(audit_root.join("audit.json").is_file());
+    for record in report["records"].as_array().unwrap() {
+        for stream in ["stdout", "stderr"] {
+            let metadata = &record["logs"][stream];
+            let bytes = std::fs::read(audit_root.join(metadata["file"].as_str().unwrap())).unwrap();
+            assert_eq!(bytes.len() as u64, metadata["bytes"].as_u64().unwrap());
+        }
+    }
+    assert!(
+        std::fs::read_dir(&audit_root).unwrap().all(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_str()
+            .unwrap()
+            .starts_with("audit")),
+        "raw inputs must not survive in the audit directory"
+    );
+
     let summary: Value =
         serde_json::from_slice(&std::fs::read(root.path().join("out/summary.json")).unwrap())
             .unwrap();

@@ -22,6 +22,8 @@ const FRAME_LIMIT: u64 = 2 * 1024 * 1024;
 pub enum RequestError {
     #[error("bad_args: Invalid compute request; check fields, bounds, and filenames.")]
     BadArgs,
+    #[error("resource_limit: Compute task resource limit exceeded.")]
+    ResourceLimit,
     #[error("dependency_policy_denied: Use public Python package constraints without extras, markers or direct URLs.")]
     DependencyPolicy,
     #[error("sandbox_unavailable: Compute runtime is unavailable.")]
@@ -389,6 +391,7 @@ impl ComputeService {
         if response.get("error").is_some() {
             let fault = match response["error"]["code"].as_str() {
                 Some("bad_args") => RequestError::BadArgs,
+                Some("resource_limit") => RequestError::ResourceLimit,
                 Some("dependency_policy_denied") => RequestError::DependencyPolicy,
                 Some("sandbox_unavailable") => RequestError::SandboxUnavailable,
                 Some("timeout") => RequestError::Timeout,
@@ -419,7 +422,7 @@ impl ComputeService {
         let operation = async {
             let receipt = if cancelled {
                 self.owner.terminate();
-                json!({"closed":true,"cleanupVerified":true,"cancelled":true,"records":[]})
+                Value::Null
             } else {
                 helper.stdin.write_all(b"{\"close\":true}\n").await?;
                 helper.stdin.flush().await?;
@@ -432,6 +435,19 @@ impl ComputeService {
                     "cleanup_unverified: compute helper exited unsuccessfully"
                 );
             }
+            let receipt = if cancelled {
+                // The execute future may have consumed part of a stdout frame.
+                // Read the durable terminal receipt only after verified exit.
+                let root = super::artifacts::Directory::open(&self.config.artifact_root, false)?;
+                let receipt = root.read_private_json("audit.json")?;
+                anyhow::ensure!(
+                    receipt["closed"] == true && receipt["cancelled"] == true,
+                    "cleanup_unverified: missing cancellation receipt"
+                );
+                receipt
+            } else {
+                receipt
+            };
             Ok::<Value, anyhow::Error>(receipt)
         };
         let receipt = match tokio::time::timeout_at(deadline, operation).await {

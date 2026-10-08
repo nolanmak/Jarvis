@@ -94,6 +94,21 @@ import tempfile
 
 @unittest.skipUnless(os.environ.get('JARVIS_TEST_VM_CONFIG'), 'requires provisioned KVM runtime')
 class ComputeVMTests(unittest.TestCase):
+    def test_vm_preserves_binary_logs_privately_and_bounds_public_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            backend = compute.VMBackend(os.environ['JARVIS_TEST_VM_CONFIG'],
+                os.environ.get('JARVIS_TEST_COMPUTE_SCRATCH', '/mnt/build/codex-vm'))
+            self.addCleanup(backend.close)
+            task = compute.ComputeTask(backend, compute.ArtifactStore(root), enabled=True)
+            result = task.execute(request(code="import os\nos.write(1, b'\\xff' * 70000)\nos.write(2, b'private-log-canary')"))
+            self.assertTrue(result['ok'], result)
+            self.assertLessEqual(len(result['stdout'].encode()), 65536)
+            record = task.records[0]
+            self.assertEqual((root / record['logs']['stdout']['file']).read_bytes(), b'\xff' * 70000)
+            self.assertTrue(record['logs']['stdout']['responseTruncated'])
+            self.assertEqual((root / record['logs']['stderr']['file']).read_bytes(), b'private-log-canary')
+
     def test_dependency_free_execution_exports_after_vm_shutdown(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = compute.run_execution(os.environ['JARVIS_TEST_VM_CONFIG'], Path(tmp),
@@ -314,6 +329,70 @@ class TaskLifecycleContractTests(unittest.TestCase):
         backend = self.Backend()
         artifacts = compute.ArtifactStore(root)
         return backend, compute.ComputeTask(backend, artifacts, enabled=True, **options)
+
+    def test_call_limit_also_bounds_retained_audit_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            backend, task = self.setup_task(Path(tmp))
+            for _ in range(25):
+                self.assertTrue(task.execute(request(outputs=['result.json']))['ok'])
+            with self.assertRaises(compute.ComputeError) as failure:
+                task.execute(request(outputs=['result.json']))
+            self.assertEqual(failure.exception.code, 'resource_limit')
+            self.assertEqual(len(task.records), 25)
+            self.assertEqual(len(backend.executions), 25)
+
+    def test_private_audit_preserves_full_logs_without_source_in_metadata(self):
+        import json
+        import stat
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            backend, task = self.setup_task(root)
+            original = backend.execute
+            def execute(*args):
+                result = original(*args)
+                result['stdout'] = 'x' * 70000
+                result['stderr'] = 'private-log-canary'
+                return result
+            backend.execute = execute
+            result = task.execute(request(code='# source-only-canary', outputs=['result.json']))
+            self.assertTrue(result['ok'])
+            self.assertEqual(len(result['stdout']), 65536)
+            audit = root / 'audit.json'
+            self.assertTrue(audit.exists(), 'execution metadata must survive helper exit')
+            metadata = json.loads(audit.read_text())
+            self.assertNotIn('source-only-canary', audit.read_text())
+            self.assertNotIn('private-log-canary', audit.read_text())
+            record = metadata['records'][0]
+            self.assertEqual(record['logs']['stdout']['bytes'], 70000)
+            self.assertTrue(record['logs']['stdout']['responseTruncated'])
+            for name, expected in [('stdout', b'x' * 70000), ('stderr', b'private-log-canary')]:
+                path = root / record['logs'][name]['file']
+                self.assertEqual(path.read_bytes(), expected)
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(audit.stat().st_mode), 0o600)
+
+    def test_interrupted_execution_is_recorded_and_cleanup_stays_unverified(self):
+        import json
+        class Interrupted(BaseException):
+            pass
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            backend, task = self.setup_task(root)
+            def execute(*args):
+                audit = root / 'audit.json'
+                self.assertTrue(audit.exists(), 'write active lease before running the guest')
+                self.assertEqual(json.loads(audit.read_text())['active']['phase'], 'execute')
+                raise Interrupted()
+            backend.execute = execute
+            with self.assertRaises(Interrupted):
+                task.execute(request())
+            self.assertEqual(len(task.records), 1, 'cancellation lost its execution record')
+            record = task.records[0]
+            self.assertEqual(record['error']['code'], 'cancelled')
+            self.assertFalse(record['cleanupVerified'])
+            audit = json.loads((root / 'audit.json').read_text())
+            self.assertIsNone(audit['active'])
+            self.assertEqual(audit['records'], task.records)
 
     def test_identical_constraints_reuse_lock_and_changed_constraints_prepare_again(self):
         with tempfile.TemporaryDirectory() as tmp:

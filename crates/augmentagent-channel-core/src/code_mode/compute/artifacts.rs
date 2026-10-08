@@ -118,6 +118,34 @@ impl Directory {
         Ok(())
     }
     #[cfg(unix)]
+    pub fn read_private_json(&self, name: &str) -> Result<serde_json::Value> {
+        let mut file = self.open_file(name, false)?;
+        let before = file.metadata()?;
+        anyhow::ensure!(
+            before.is_file()
+                && before.nlink() == 1
+                && before.uid() == unsafe { libc::getuid() }
+                && before.mode() & 0o777 == 0o600
+                && before.len() <= 2 * 1024 * 1024,
+            "invalid private compute record"
+        );
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(2 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        let after = file.metadata()?;
+        anyhow::ensure!(
+            bytes.len() as u64 == before.len()
+                && after.len() == before.len()
+                && after.nlink() == 1
+                && before.mtime() == after.mtime()
+                && before.mtime_nsec() == after.mtime_nsec(),
+            "private compute record changed while reading"
+        );
+        serde_json::from_slice(&bytes).context("invalid private compute JSON")
+    }
+
+    #[cfg(unix)]
     pub fn write_report(&self, name: &str, report: &serde_json::Value) -> Result<()> {
         anyhow::ensure!(filename(name), "invalid report filename");
         let mut staged = tempfile::NamedTempFile::new_in(self.path())?;
@@ -198,6 +226,42 @@ pub fn export(root: &Path, destination: &Directory, entries: &[Artifact]) -> Res
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[test]
+    fn private_audit_read_rejects_links_modes_and_oversized_records() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let directory = Directory::open(root.path(), false).unwrap();
+        directory
+            .write_report("audit.json", &serde_json::json!({"closed":true}))
+            .unwrap();
+        assert_eq!(
+            directory.read_private_json("audit.json").unwrap()["closed"],
+            true
+        );
+        symlink(
+            root.path().join("audit.json"),
+            root.path().join("link.json"),
+        )
+        .unwrap();
+        assert!(directory.read_private_json("link.json").is_err());
+        std::fs::hard_link(
+            root.path().join("audit.json"),
+            root.path().join("hard.json"),
+        )
+        .unwrap();
+        assert!(directory.read_private_json("audit.json").is_err());
+        std::fs::remove_file(root.path().join("hard.json")).unwrap();
+        std::fs::set_permissions(
+            root.path().join("audit.json"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(directory.read_private_json("audit.json").is_err());
+        let file = directory.open_file("huge.json", true).unwrap();
+        file.set_len(2 * 1024 * 1024 + 1).unwrap();
+        assert!(directory.read_private_json("huge.json").is_err());
+    }
+
     fn fixture(root: &Path, name: &str, bytes: &[u8]) -> Artifact {
         let entry = Artifact {
             id: "a".repeat(32),

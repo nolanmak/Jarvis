@@ -270,7 +270,7 @@ poweroff -f
             status = process.wait(timeout=max(0.001, deadline - time.monotonic()))
             if status or not cleanup.is_file() or cleanup.read_text() != 'all-descendants-reaped\n':
                 deny('cleanup_unverified', 'Compute cleanup could not be verified.')
-        except ComputeError as error:
+        except BaseException as error:
             error.runner = 'vm'
             raise
         finally:
@@ -294,6 +294,15 @@ poweroff -f
         result = json.loads(records[0])
         if not isinstance(result, dict) or type(result.get('ok')) is not bool:
             deny('sandbox_unavailable', 'Invalid compute guest result.')
+        encoded_logs = result.pop('privateLogs', None)
+        if not isinstance(encoded_logs, dict) or set(encoded_logs) != {'stdout', 'stderr'}:
+            deny('sandbox_unavailable', 'Invalid compute log transfer.')
+        raw_logs = {name: base64.b64decode(data, validate=True) for name, data in encoded_logs.items()}
+        if sum(map(len, raw_logs.values())) > 8 * 1024 * 1024:
+            deny('resource_limit', 'Compute logs exceed their transfer limit.')
+        result['_logs'] = raw_logs
+        for name, data in raw_logs.items():
+            result[name] = data.decode(errors='replace')
         files, total = {}, 0
         if result['ok']:
             if set(result.get('files', {})) != set(request['outputs']):
@@ -492,11 +501,81 @@ class ComputeTask:
         self.records = []
         self.task_id = uuid.uuid4().hex
         self.calls = 0
+        self.active = None
+
+    def _private_write(self, name, data, *, replace=False):
+        # Never follow an entry supplied by another process. Atomic replacement
+        # ensures crash recovery sees either complete journal snapshot.
+        temporary = 'audit-tmp-' + uuid.uuid4().hex
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                     0o600, dir_fd=self.artifacts.descriptor)
+        try:
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if replace:
+                os.replace(temporary, name, src_dir_fd=self.artifacts.descriptor,
+                           dst_dir_fd=self.artifacts.descriptor)
+            else:
+                os.link(temporary, name, src_dir_fd=self.artifacts.descriptor,
+                        dst_dir_fd=self.artifacts.descriptor, follow_symlinks=False)
+                os.unlink(temporary, dir_fd=self.artifacts.descriptor)
+            os.fsync(self.artifacts.descriptor)
+        finally:
+            try:
+                os.unlink(temporary, dir_fd=self.artifacts.descriptor)
+            except FileNotFoundError:
+                pass
+
+    def _audit(self, **terminal):
+        snapshot = {'schemaVersion': 1, 'taskId': self.task_id, 'ownerPid': os.getpid(),
+                    'ownerStartTime': Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19],
+                    'active': self.active, 'records': self.records, **terminal}
+        data = json.dumps(snapshot, separators=(',', ':')).encode()
+        if len(data) > 2 * 1024 * 1024:
+            deny('resource_limit', 'Compute audit metadata limit exceeded.')
+        self._private_write('audit.json', data, replace=True)
+
+    def _phase(self, name):
+        self.active['phase'] = name
+        self._audit()
+
+    def _logs(self, execution_id, executed):
+        metadata = {}
+        total = 0
+        for name in ('stdout', 'stderr'):
+            raw = executed.get('_logs', {}).get(name)
+            if raw is None:
+                raw = executed.get(name, '').encode()
+            total += len(raw)
+            if total > 8 * 1024 * 1024:
+                deny('resource_limit', 'Compute private logs exceed their limit.')
+            filename = 'audit-' + execution_id + '.' + name
+            self._private_write(filename, raw)
+            metadata[name] = {'file': filename, 'bytes': len(raw),
+                              'sha256': hashlib.sha256(raw).hexdigest(),
+                              'responseTruncated': len(raw.decode(errors='replace').encode()) > 65536}
+        return metadata
+
+    def finish(self, *, cancelled=False):
+        # The caller must first verify backend.close(); cancellation alone is
+        # never evidence of successful descendant cleanup.
+        for record in self.records:
+            if record['error'] and record['error']['code'] == 'cancelled':
+                record['cleanupVerified'] = True
+        receipt = {'closed': True, 'cleanupVerified': True, 'cancelled': cancelled,
+                   'records': self.records}
+        self._audit(**receipt)
+        return receipt
 
     def execute(self, value):
         # Schema failures are distinguishable from execution results, and occur
         # before artifacts, admission, resolution or VM startup.
         request = validate_request(value, self.call_timeout)
+        if self.calls >= 25:
+            deny('resource_limit', 'Compute task call limit exceeded.')
+        self.calls += 1
         execution_id = uuid.uuid4().hex
         started = self.clock()
         result = {'ok': False, 'runner': 'none', 'executionId': execution_id, 'exitCode': None,
@@ -505,14 +584,14 @@ class ComputeTask:
         downloads = {'requests': 0, 'bytes': 0}
         fingerprint = None
         cleanup = True
+        logs = {}
+        self.active = {'executionId': execution_id, 'phase': 'admission', 'startedMonotonic': started}
+        self._audit()
         try:
             if not self.enabled:
                 deny('compute_disabled', 'Compute is disabled for this context.')
             if self.clock() >= self.deadline:
                 deny('timeout', 'Compute task deadline expired.')
-            self.calls += 1
-            if self.calls > 25:
-                deny('resource_limit', 'Compute task call limit exceeded.')
             selected = self.artifacts.resolve_inputs(request['inputs'])
             deadline = min(self.deadline, started + request['timeoutSecs'])
             fingerprint = self.backend.fingerprint
@@ -521,6 +600,7 @@ class ComputeTask:
                 environment = self.environments.get(key)
                 if environment is None:
                     if request['dependencies']:
+                        self._phase('prepare')
                         environment = self.backend.prepare(request['dependencies'], deadline)
                         validate_lock(environment['dependencyLock'])
                         if not environment['dependencyLock']:
@@ -535,12 +615,14 @@ class ComputeTask:
                 result['dependencyLock'] = environment['dependencyLock']
                 if self.clock() >= deadline:
                     deny('timeout', 'Compute call deadline expired.')
+                self._phase('execute')
                 executed = self.backend.execute(request, selected, environment['environmentId'], deadline)
                 result['runner'] = executed.get('runner', 'none')
                 cleanup = executed.get('cleanupVerified') is True
                 if not cleanup:
                     deny('cleanup_unverified', 'Compute cleanup could not be verified.')
                 result['exitCode'] = executed.get('exitCode')
+                logs = self._logs(execution_id, executed)
                 for name in ('stdout', 'stderr'):
                     result[name] = executed.get(name, '').encode()[:65536].decode(errors='ignore')
                 if not executed['ok']:
@@ -553,6 +635,7 @@ class ComputeTask:
                     deny('output_denied', 'Compute output set does not match the request.')
                 if self.clock() >= deadline:
                     deny('timeout', 'Compute call deadline expired before export.')
+                self._phase('export')
                 result['artifacts'] = self.artifacts.publish(executed['files'])
                 result['ok'] = True
         except ComputeError as error:
@@ -560,12 +643,22 @@ class ComputeTask:
                 result['runner'] = 'vm'
             cleanup = error.code != 'cleanup_unverified'
             result['error'] = {'code': error.code, 'message': str(error), 'retryable': error.retryable}
-        self.records.append({'executionId': execution_id, 'taskId': self.task_id,
-                             'runner': result['runner'], 'runtimeFingerprint': fingerprint,
-                             'dependencyLock': result['dependencyLock'], 'environmentReused': result['environmentReused'],
-                             'downloads': downloads, 'elapsedSecs': self.clock() - started,
-                             'cleanupVerified': cleanup, 'error': result['error'],
-                             'artifacts': result['artifacts']})
+        except BaseException as error:
+            if getattr(error, 'runner', None) == 'vm':
+                result['runner'] = 'vm'
+            cleanup = False
+            code = 'cancelled' if not isinstance(error, Exception) else 'execution_failed'
+            result['error'] = {'code': code, 'message': 'Compute execution interrupted.', 'retryable': False}
+            raise
+        finally:
+            self.records.append({'executionId': execution_id, 'taskId': self.task_id,
+                                 'runner': result['runner'], 'runtimeFingerprint': fingerprint,
+                                 'dependencyLock': result['dependencyLock'], 'environmentReused': result['environmentReused'],
+                                 'downloads': downloads, 'elapsedSecs': self.clock() - started,
+                                 'cleanupVerified': cleanup, 'error': result['error'],
+                                 'logs': logs, 'artifacts': result['artifacts']})
+            self.active = None
+            self._audit()
         return result
 
 
@@ -724,7 +817,7 @@ def serve(policy_path):
                     respond({'result': task.execute(frame['execute'])})
                 elif frame == {'close': True}:
                     backend.close()
-                    respond({'closed': True, 'cleanupVerified': True, 'records': task.records})
+                    respond(task.finish())
                     break
                 elif frame == {'report': True}:
                     respond({'records': task.records})
@@ -735,6 +828,8 @@ def serve(policy_path):
             except ComputeError as error:
                 respond({'error': {'code': error.code, 'message': str(error)}})
     except Cancelled:
+        backend.close()
+        respond(task.finish(cancelled=True))
         return 130
     finally:
         backend.close()

@@ -303,6 +303,18 @@ async fn dropped_compute_future_cancels_vm_and_verifies_cleanup() {
         .expect("verified cleanup");
     assert_eq!(receipt["cancelled"], true);
     assert_eq!(receipt["cleanupVerified"], true);
+    assert_eq!(
+        receipt["records"].as_array().unwrap().len(),
+        1,
+        "cancelled call must retain its audit record"
+    );
+    assert_eq!(receipt["records"][0]["error"]["code"], "cancelled");
+    assert_eq!(receipt["records"][0]["runner"], "vm");
+    let audit: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(service.artifact_root().join("audit.json")).unwrap())
+            .unwrap();
+    assert_eq!(audit["records"], receipt["records"]);
+    assert_eq!(audit["cleanupVerified"], true);
     assert!(service.execute(json!({})).await.is_err());
 }
 
