@@ -190,6 +190,10 @@ async fn service_imports_selected_files_as_opaque_ids() {
         .input_files
         .insert("sheet.csv".into(), source.clone());
     let service = ComputeService::start(config).await.unwrap();
+    assert!(
+        service.artifact_root().join("audit.json").is_file(),
+        "startup must register the helper before exposing selected inputs"
+    );
     let ids = service.inputs();
     assert_eq!(ids.len(), 1);
     assert_eq!(ids["sheet.csv"].len(), 32);
@@ -427,4 +431,132 @@ async fn orchestration_log_overflow_cancels_active_vm_rpc() {
         .unwrap();
     assert_eq!(receipt["cleanupVerified"], true);
     assert_eq!(receipt["cancelled"], true);
+}
+
+#[tokio::test]
+#[ignore = "requires provisioned KVM and private build-volume scratch; kills only its fixture owner"]
+async fn killed_owner_recovery_removes_vm_and_task_lease() {
+    use augmentagent_channel_core::{
+        build_scratch::{BuildScratchLimits, ProcFs, ProcessTable},
+        code_mode::compute::{retention, ComputeService},
+    };
+    use std::{
+        os::unix::fs::PermissionsExt,
+        process::{Child, Command, Stdio},
+    };
+    if let Some(root) = std::env::var_os("JARVIS_COMPUTE_CRASH_ROOT") {
+        let root = std::path::PathBuf::from(root);
+        let mut config = service_config(&root, true);
+        config.runtime = std::env::var_os("JARVIS_TEST_VM_CONFIG")
+            .expect("VM required")
+            .into();
+        config.scratch_root = root.clone();
+        let lease = retention::Lease::reserve(
+            &root.join("compute-artifacts"),
+            "crash-fixture",
+            retention::now().unwrap(),
+            BuildScratchLimits::from_env(),
+        )
+        .unwrap();
+        config.artifact_root = lease.path.clone();
+        let service = ComputeService::start(config).await.unwrap();
+        let _result = service
+            .execute(
+                json!({"runtime":"python","dependencies":[],"code":"import time\ntime.sleep(60)"}),
+            )
+            .await;
+        drop(lease);
+        panic!("fixture owner must be killed while its VM is running");
+    }
+    struct OwnedChild(Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let root = tempfile::Builder::new()
+        .prefix("compute-crash-qa-")
+        .tempdir_in(
+            std::env::var_os("JARVIS_TEST_COMPUTE_SCRATCH").expect("build-volume scratch required"),
+        )
+        .unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let mut owner = OwnedChild(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "killed_owner_recovery_removes_vm_and_task_lease",
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.path())
+            .env("XDG_STATE_HOME", root.path().join("state"))
+            .env("JARVIS_COMPUTE_CRASH_ROOT", root.path())
+            .env(
+                "JARVIS_TEST_VM_CONFIG",
+                std::env::var_os("JARVIS_TEST_VM_CONFIG").expect("VM required"),
+            )
+            .stdout(Stdio::from(log.reopen().unwrap()))
+            .stderr(Stdio::from(log.reopen().unwrap()))
+            .spawn()
+            .unwrap(),
+    );
+    let mut sentinel = OwnedChild(Command::new("sleep").arg("60").spawn().unwrap());
+    let processes = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            assert!(
+                owner.0.try_wait().unwrap().is_none(),
+                "fixture exited before VM start: {}",
+                std::fs::read_to_string(log.path()).unwrap()
+            );
+            let processes = ProcFs.vm_processes_using(root.path());
+            if !processes.is_empty() {
+                break processes;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("real VM must start");
+    let storage = root.path().join("compute-artifacts");
+    let before = retention::sweep_at(&storage, retention::now().unwrap()).unwrap();
+    assert_eq!(before.live, 1, "active owner must survive startup recovery");
+    owner.0.kill().unwrap();
+    owner.0.wait().unwrap();
+    let started = std::time::Instant::now();
+    let recovered = retention::sweep_at(&storage, retention::now().unwrap()).unwrap();
+    assert_eq!(recovered.removed, 1);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(
+        sentinel.0.try_wait().unwrap().is_none(),
+        "unrelated process was killed"
+    );
+    for (pid, identity) in processes {
+        assert_ne!(
+            ProcFs.start_time(pid).as_deref(),
+            Some(identity.as_str()),
+            "owned VM or supervisor survived recovery"
+        );
+    }
+    assert!(
+        std::fs::read_dir(root.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("jarvis-vm-session-")),
+        "VM scratch survived recovery"
+    );
+    assert!(
+        std::fs::read_dir(&storage).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("task-")),
+        "task artifacts survived recovery"
+    );
 }

@@ -33,7 +33,7 @@ pub fn filename(name: &str) -> bool {
 
 /// An open inode prevents parent or destination replacement from redirecting
 /// writes. Every component is opened without following symbolic links.
-pub struct Directory(File);
+pub struct Directory(pub(super) File);
 impl Directory {
     pub fn open(path: &Path, create: bool) -> Result<Self> {
         #[cfg(not(unix))]
@@ -87,7 +87,7 @@ impl Directory {
     }
 
     #[cfg(unix)]
-    fn open_file(&self, name: &str, create: bool) -> Result<File> {
+    pub(super) fn open_file(&self, name: &str, create: bool) -> Result<File> {
         anyhow::ensure!(filename(name), "invalid artifact filename");
         let name = std::ffi::CString::new(name)?;
         let flags = libc::O_CLOEXEC

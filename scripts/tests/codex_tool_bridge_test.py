@@ -2573,6 +2573,31 @@ class BuildScratchTests(unittest.TestCase):
         finally:
             os.close(other)
 
+    def test_retained_compute_reservations_share_build_capacity_and_fail_closed(self):
+        import os
+        policy = self.policy()
+        storage = self.scratch / 'compute-artifacts'
+        storage.mkdir(mode=0o700)
+        ledger = storage / 'usage.json'
+        reserved = 640 * 1024**2
+        ledger.write_text(json.dumps({'schemaVersion': 1, 'reservedBytes': reserved}))
+        ledger.chmod(0o600)
+        root_fd = policy._scratch._open_root()
+        self.addCleanup(os.close, root_fd)
+        cap = policy._scratch.cache_bytes
+        policy._scratch.budget_bytes = cap + reserved - 1
+        with self.assertRaises(bridge.Readiness, msg='artifact reservations must count against the build budget'):
+            policy._scratch._require_space(root_fd)
+        policy._scratch.budget_bytes = cap + reserved
+        policy._scratch.statvfs = self.fake_statvfs(policy._scratch.headroom_bytes + cap + reserved - 4096)
+        with self.assertRaises(bridge.Readiness, msg='future artifact growth must reserve free disk capacity'):
+            policy._scratch._require_space(root_fd)
+        policy._scratch.statvfs = self.fake_statvfs(policy._scratch.headroom_bytes + cap + reserved)
+        policy._scratch._require_space(root_fd)
+        ledger.write_text('{invalid')
+        with self.assertRaises(bridge.Readiness, msg='invalid accounting cannot silently become zero'):
+            policy._scratch._require_space(root_fd)
+
     def test_concurrent_sessions_share_one_budget_and_reserve_unallocated_growth(self):
         import os
         cap = 64 * 1024**2

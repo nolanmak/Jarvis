@@ -330,6 +330,17 @@ class TaskLifecycleContractTests(unittest.TestCase):
         artifacts = compute.ArtifactStore(root)
         return backend, compute.ComputeTask(backend, artifacts, enabled=True, **options)
 
+    def test_exhausted_shared_storage_has_typed_resource_limit(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            backend = compute.VMBackend('/missing-runtime', Path(tmp))
+            self.addCleanup(backend.close)
+            with patch.object(backend.scratch, 'open', side_effect=backend.bridge.Readiness('build_scratch_space', tmp)):
+                with self.assertRaises(compute.ComputeError) as failure:
+                    with backend.admit():
+                        self.fail('exhausted admission must not start work')
+            self.assertEqual(failure.exception.code, 'resource_limit')
+
     def test_call_limit_also_bounds_retained_audit_records(self):
         with tempfile.TemporaryDirectory() as tmp:
             backend, task = self.setup_task(Path(tmp))

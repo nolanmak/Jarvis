@@ -47,6 +47,7 @@ class Readiness(Denied):
     }
 
     def __init__(self, category, path=None, detail=''):
+        self.category = category
         # Only operator-provisioned paths and sizes are substituted, never secrets.
         message = self.MESSAGES[category].format(path=path if path is not None else '(not configured)', detail=detail)
         super().__init__('JARVIS_READINESS:' + category + ' ' + message)
@@ -152,6 +153,42 @@ class BuildScratch:
             raise Readiness('build_scratch_unavailable', self.root)
         return descriptor
 
+    def _compute_reservation(self, root_fd):
+        """Read the private ledger published before Rust creates task leases."""
+        import fcntl
+        try:
+            storage = os.open('compute-artifacts', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                              dir_fd=root_fd)
+        except FileNotFoundError:
+            return 0
+        except OSError:
+            raise Readiness('build_scratch_unavailable', self.root) from None
+        try:
+            info = os.fstat(storage)
+            if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                raise ValueError('invalid compute storage')
+            fcntl.flock(storage, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            try:
+                descriptor = os.open('usage.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=storage)
+            except FileNotFoundError:
+                if any(name.startswith('task-') for name in os.listdir(storage)):
+                    raise ValueError('missing compute accounting')
+                return 0
+            with os.fdopen(descriptor, 'rb') as stream:
+                info = os.fstat(stream.fileno())
+                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid()
+                        or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > 1024):
+                    raise ValueError('invalid compute accounting')
+                value = json.loads(stream.read(1025))
+            reserved = value.get('reservedBytes')
+            if value.get('schemaVersion') != 1 or type(reserved) is not int or not 0 <= reserved <= 2 * 1024**3:
+                raise ValueError('invalid compute reservation')
+            return reserved
+        except (OSError, ValueError, TypeError, AttributeError):
+            raise Readiness('build_scratch_unavailable', self.root) from None
+        finally:
+            os.close(storage)
+
     def _require_space(self, root_fd):
         # #1092: fail closed before touching the volume when the operator limits
         # are out of range; no session or image is created.
@@ -170,18 +207,19 @@ class BuildScratch:
                 used = info.st_blocks * 512
                 allocated += used
                 outstanding += max(info.st_size - used, 0)
+        retained = self._compute_reservation(root_fd)
         vfs = self.statvfs(root_fd)
         free = vfs.f_bavail * vfs.f_frsize
-        if allocated + self.cache_bytes > self.budget_bytes:
+        if allocated + retained + self.cache_bytes > self.budget_bytes:
             raise Readiness('build_scratch_space', self.root,
-                f'build caches hold {allocated / gib:.1f} GiB; a new {self.cache_bytes / gib:.0f} GiB cache '
+                f'build caches hold {allocated / gib:.1f} GiB and compute reserves {retained / gib:.1f} GiB; a new {self.cache_bytes / gib:.0f} GiB cache '
                 f'would exceed the {self.budget_bytes / gib:.0f} GiB budget')
-        needed = self.headroom_bytes + outstanding + self.cache_bytes
+        needed = self.headroom_bytes + outstanding + retained + self.cache_bytes
         if free < needed:
             raise Readiness('build_scratch_space', self.root,
                 f'{free / gib:.1f} GiB free; needs {needed / gib:.1f} GiB: {self.headroom_bytes / gib:.0f} GiB '
                 f'headroom, {outstanding / gib:.1f} GiB other sessions may still grow, '
-                f'{self.cache_bytes / gib:.0f} GiB for this cache')
+                f'{retained / gib:.1f} GiB reserved for compute, {self.cache_bytes / gib:.0f} GiB for this cache')
 
     def open(self):
         import secrets

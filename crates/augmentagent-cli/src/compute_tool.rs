@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use augmentagent_approval_discord::AuditCtx;
 use augmentagent_channel_core::{
     code_mode::{
-        compute::{ComputeDispatcher, ComputePolicy, ComputeService, ServiceConfig},
+        compute::{retention, ComputeDispatcher, ComputePolicy, ComputeService, ServiceConfig},
         manifest::manifest_compute,
         runner::run_program_with_options,
     },
@@ -42,8 +42,7 @@ pub struct ComputeTurn {
     grant: String,
     worker: tokio::task::JoinHandle<()>,
     _control: tempfile::TempDir,
-    artifacts: Option<tempfile::TempDir>,
-    _retention_root: Option<augmentagent_channel_core::code_mode::compute::artifacts::Directory>,
+    artifacts: Option<retention::Lease>,
 }
 
 fn make_private(path: &Path) -> Result<()> {
@@ -90,7 +89,6 @@ impl ComputeTurn {
             worker,
             _control: control,
             artifacts: None,
-            _retention_root: None,
         })
     }
 
@@ -115,58 +113,41 @@ impl ComputeTurn {
         self.worker.abort();
         let _ = (&mut self.worker).await;
         let receipt = self.service.finish().await?;
-        // Failed calls also need private audit evidence; raw selected inputs
-        // are removed below and are never retained as evidence.
-        let audited = receipt["records"]
-            .as_array()
-            .is_some_and(|records| !records.is_empty());
-        if audited {
-            if let Some(directory) = self.artifacts.take() {
-                let root =
-                    augmentagent_channel_core::code_mode::compute::artifacts::Directory::open(
-                        self.service.artifact_root(),
-                        false,
-                    )?;
-                let kept: std::collections::BTreeSet<&str> = receipt["records"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .flat_map(|record| record["artifacts"].as_array().into_iter().flatten())
-                    .filter_map(|artifact| artifact["id"].as_str())
-                    .collect();
-                for entry in std::fs::read_dir(root.path())? {
-                    let entry = entry?;
-                    let name = entry.file_name();
-                    let Some(name) = name.to_str() else {
-                        continue;
-                    };
-                    if name.len() == 32
-                        && name.bytes().all(|byte| byte.is_ascii_hexdigit())
-                        && !kept.contains(name)
-                    {
-                        // unlink removes the selected entry itself; the pinned
-                        // directory prevents a parent swap redirecting cleanup.
-                        std::fs::remove_file(root.path().join(name))?;
-                    }
-                }
-                let expires = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)?
-                    .as_secs()
-                    + 86400;
-                root.write_report(
-                    "retention.json",
-                    &json!({"schemaVersion":1,"expiresAt":expires,"receipt":receipt}),
-                )?;
-                let _ = directory.keep();
-            }
+        if let Some(lease) = self.artifacts.take() {
+            finish_retention(lease, &receipt)?;
         }
         Ok(receipt)
     }
 }
+fn finish_retention(lease: retention::Lease, receipt: &Value) -> Result<()> {
+    if receipt["records"]
+        .as_array()
+        .is_some_and(|records| !records.is_empty())
+    {
+        lease.retain(receipt, retention::now()?)
+    } else {
+        anyhow::ensure!(
+            receipt["cleanupVerified"] == true,
+            "compute cleanup not verified"
+        );
+        lease.discard()
+    }
+}
+
 impl Drop for ComputeTurn {
     fn drop(&mut self) {
         self.worker.abort();
         self.service.cancel();
+        if let Some(lease) = self.artifacts.take() {
+            let service = self.service.clone();
+            // Keep the lease until cancellation and input removal complete.
+            // Runtime/process death releases it for startup recovery instead.
+            tokio::spawn(async move {
+                if let Ok(receipt) = service.finish().await {
+                    let _ = finish_retention(lease, &receipt);
+                }
+            });
+        }
     }
 }
 
@@ -184,32 +165,26 @@ pub async fn attach(
     if !authorized(ctx, &policy) {
         return Ok(None);
     }
-    let state = augmentagent_channel_core::state_dir::state_dir()
-        .context("compute state directory unavailable")?;
-    std::fs::create_dir_all(&state)?;
-    let retained = state.join("compute-artifacts");
-    let root =
-        augmentagent_channel_core::code_mode::compute::artifacts::Directory::open(&retained, true)?;
-    make_private(&retained)?;
-    // The descriptor path pins the parent for creation; use the ordinary task
-    // path in the helper, which independently checks every component.
-    let temporary = tempfile::Builder::new()
-        .prefix("task-")
-        .tempdir_in(root.path())?;
-    let task_path = retained.join(
-        temporary
-            .path()
-            .file_name()
-            .context("task directory missing")?,
-    );
-    make_private(&task_path)?;
-    let config = ServiceConfig::from_env(
-        task_path,
+    let mut config = ServiceConfig::from_env(
+        PathBuf::new(),
         augmentagent_approval_discord::compute_inputs::selected(),
     )?;
+    let retained = config.scratch_root.join("compute-artifacts");
+    let account = format!(
+        "discord-dm:{}",
+        ctx.channel_id.context("missing authorized channel")?.get()
+    );
+    let lease = retention::Lease::reserve(
+        &retained,
+        &account,
+        retention::now()?,
+        config
+            .scratch_limits
+            .context("missing scratch admission limits")?,
+    )?;
+    config.artifact_root = lease.path.clone();
     let mut turn = ComputeTurn::start(config).await?;
-    turn.artifacts = Some(temporary);
-    turn._retention_root = Some(root);
+    turn.artifacts = Some(lease);
     turn.configure(opts, bin)?;
     Ok(Some(turn))
 }
@@ -407,6 +382,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropped_turn_finishes_cleanup_before_releasing_artifact_lease() {
+        let root = tempfile::tempdir().unwrap();
+        make_private(root.path()).unwrap();
+        let mut config = test_config(root.path());
+        let lease = retention::Lease::reserve(
+            &root.path().join("store"),
+            "fixture-account",
+            10,
+            augmentagent_channel_core::build_scratch::BuildScratchLimits {
+                headroom_bytes: 0,
+                cache_bytes: 12 * 1024 * 1024 * 1024,
+                budget_bytes: 24 * 1024 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let task_path = lease.path.clone();
+        let input = root.path().join("selected.txt");
+        std::fs::write(&input, b"synthetic-input-canary").unwrap();
+        config.input_files.insert("selected".into(), input);
+        config.artifact_root = task_path.clone();
+        let mut turn = ComputeTurn::start(config).await.unwrap();
+        turn.artifacts = Some(lease);
+        let result = turn
+            .service
+            .execute(json!({"runtime":"python","dependencies":[],"code":"pass"}))
+            .await
+            .unwrap();
+        assert_eq!(result["error"]["code"], "compute_disabled");
+        drop(turn);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if task_path.join("retention.json").exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dropped turn must finish cleanup within five seconds");
+        let retained: Value =
+            serde_json::from_slice(&std::fs::read(task_path.join("retention.json")).unwrap())
+                .unwrap();
+        assert_eq!(retained["receipt"]["cleanupVerified"], true);
+        assert_eq!(retained["receipt"]["cancelled"], true);
+        assert!(
+            std::fs::read_dir(&task_path)
+                .unwrap()
+                .all(|entry| entry.unwrap().file_name().len() != 32),
+            "raw selected input must not survive cancellation"
+        );
+        assert_eq!(
+            retention::sweep_at(
+                &root.path().join("store"),
+                retained["expiresAt"].as_u64().unwrap()
+            )
+            .unwrap()
+            .removed,
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn capability_denial_and_program_repair_share_original_task_budget() {
         let root = tempfile::tempdir().unwrap();
         let turn = ComputeTurn::start(test_config(root.path())).await.unwrap();
@@ -483,6 +520,13 @@ mod tests {
         use augmentagent_channel_core::{providers::ProviderKind, FallbackReasoner, Reasoner};
         if std::env::var_os("JARVIS_COMPUTE_OWNER_FIXTURE_ROOT").is_none() {
             let root = tempfile::tempdir().unwrap();
+            let scratch = tempfile::Builder::new()
+                .prefix("compute-owner-qa-")
+                .tempdir_in(
+                    std::env::var_os("JARVIS_TEST_COMPUTE_SCRATCH").expect("scratch required"),
+                )
+                .unwrap();
+            make_private(scratch.path()).unwrap();
             let result = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["compute_tool::tests::real_owner_query_repairs_computation_in_the_same_environment", "--exact", "--ignored", "--test-threads=1", "--nocapture"])
                 .env_clear().env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -490,7 +534,7 @@ mod tests {
                 .env("JARVIS_COMPUTE_OWNER_FIXTURE_ROOT", root.path())
                 .env("AUGMENTAGENT_COMPUTE_ENABLED", "true")
                 .env("AUGMENTAGENT_BUILD_VM_CONFIG", std::env::var_os("JARVIS_TEST_VM_CONFIG").expect("VM config required"))
-                .env("AUGMENTAGENT_BUILD_SCRATCH_DIR", std::env::var_os("JARVIS_TEST_COMPUTE_SCRATCH").expect("scratch required"))
+                .env("AUGMENTAGENT_BUILD_SCRATCH_DIR", scratch.path())
                 .env("AUGMENTAGENT_COMPUTE_PIP_RUNTIME", std::env::var_os("JARVIS_TEST_COMPUTE_PIP").expect("pinned installer required"))
                 .output().unwrap();
             assert!(
@@ -598,9 +642,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(answer, "The spreadsheet contains 3 rows totaling 60.");
-        let tasks: Vec<_> = std::fs::read_dir(root.join("state/augmentagent/compute-artifacts"))
+        let retained_root =
+            augmentagent_channel_core::build_scratch::scratch_dir().join("compute-artifacts");
+        let tasks: Vec<_> = std::fs::read_dir(&retained_root)
             .unwrap()
             .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_dir())
             .collect();
         assert_eq!(tasks.len(), 1);
         let retained: Value =
@@ -643,5 +690,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(exported, json!({"count":3,"total":60}));
+        assert_eq!(retained["account"], "discord-dm:123");
+        let expires = retained["expiresAt"].as_u64().unwrap();
+        assert_eq!(
+            retention::sweep_at(&retained_root, expires - 1)
+                .unwrap()
+                .retained,
+            1
+        );
+        assert_eq!(
+            retention::sweep_at(&retained_root, expires)
+                .unwrap()
+                .removed,
+            1
+        );
+        assert!(!tasks[0].exists());
     }
 }

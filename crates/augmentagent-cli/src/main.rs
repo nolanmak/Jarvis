@@ -3454,6 +3454,10 @@ async fn main() -> Result<()> {
             // shortly after start and hourly, in small batches.
             tasks.push(tokio::spawn(db_compact::run_loop(Arc::clone(&store), shutdown.clone())));
 
+            // #1434 — task leases recover at startup and at most 30 seconds
+            // apart; retained compute artifacts expire after 24 hours.
+            tasks.push(tokio::spawn(augmentagent_channel_core::code_mode::compute::retention::run_sweep_loop(shutdown.clone())));
+
             // #1035 — reasoner handoff journals: remove finished ones idle past
             // the grace period, at start and hourly, on the blocking pool.
             // Never in-flight or uncertain ones; failures only log.

@@ -722,8 +722,10 @@ class VMBackend:
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=True)
                     self._formatted = True
                 yield
-            except self.bridge.Readiness:
-                deny('sandbox_unavailable', 'Compute scratch is unavailable or lacks capacity.')
+            except self.bridge.Readiness as error:
+                if error.category == 'build_scratch_space':
+                    deny('resource_limit', 'Compute scratch capacity is exhausted.')
+                deny('sandbox_unavailable', 'Compute scratch is unavailable.')
             finally:
                 if lock is not None:
                     os.close(lock)
@@ -795,6 +797,8 @@ def serve(policy_path):
                        task_timeout=policy['taskTimeoutSecs'])
     aliases = {}
     try:
+        # Recovery must know the helper identity before any input snapshot exists.
+        task._audit()
         total = 0
         for name, path in policy['inputFiles'].items():
             entry = artifacts.import_file(path, name)
