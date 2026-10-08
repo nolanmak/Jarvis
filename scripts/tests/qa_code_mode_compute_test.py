@@ -35,6 +35,17 @@ class EvidenceContractTests(unittest.TestCase):
 
 
 class HarnessExecutionTests(unittest.TestCase):
+    def test_download_cancellation_requires_actual_cli_stage_and_public_prerequisite(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        self.assertIn('cancel_download', qa.CASES)
+        harness = SimpleNamespace(suite=Mock())
+        qa.CASES['cancel_download'](harness, 'cancel_download')
+        argv = harness.suite.call_args.args[1]
+        self.assertIn('real_cli_download_cancellation', argv)
+        self.assertIn('--ignored', argv)
+        self.assertTrue(harness.suite.call_args.kwargs['public'])
+
     def test_adversarial_registry_cases_require_real_vm_fixture_suites(self):
         from types import SimpleNamespace
         from unittest.mock import Mock

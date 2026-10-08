@@ -274,22 +274,28 @@ fn orchestration_limits_keep_typed_report_codes() {
 #[test]
 #[ignore = "requires provisioned KVM and private build-volume scratch; real CLI signal/recovery QA"]
 fn real_cli_signals_clean_managed_inputs_and_vm_work() {
-    cli_signal_cleanup(false, false);
+    cli_signal_cleanup(false, false, false);
 }
 
 #[test]
 #[ignore = "requires provisioned private scratch; signals the CLI before helper readiness"]
 fn real_cli_startup_signals_are_reported_and_cleaned() {
-    cli_signal_cleanup(true, false);
+    cli_signal_cleanup(true, false, false);
 }
 
 #[test]
 #[ignore = "requires private scratch; holds compute helper stopped throughout cancellation"]
 fn real_cli_stalled_startup_cancellation_reaps_helper() {
-    cli_signal_cleanup(true, true);
+    cli_signal_cleanup(true, true, false);
 }
 
-fn cli_signal_cleanup(startup: bool, stalled: bool) {
+#[test]
+#[ignore = "requires KVM, pinned pip and public NumPy wheel; stops an active wheel fetch"]
+fn real_cli_download_cancellation_reaps_stalled_fetch() {
+    cli_signal_cleanup(false, true, true);
+}
+
+fn cli_signal_cleanup(startup: bool, stalled: bool, download: bool) {
     use augmentagent_channel_core::{
         build_scratch::{ProcFs, ProcessTable},
         code_mode::compute::retention,
@@ -307,7 +313,7 @@ fn cli_signal_cleanup(startup: bool, stalled: bool) {
             let _ = self.0.wait();
         }
     }
-    for signal in if startup { [libc::SIGTERM, libc::SIGINT] } else { [libc::SIGTERM, libc::SIGKILL] } {
+    for signal in if startup || download { [libc::SIGTERM, libc::SIGINT] } else { [libc::SIGTERM, libc::SIGKILL] } {
         let root = tempfile::Builder::new()
             .prefix("compute-cli-signal-qa-")
             .tempdir_in(
@@ -321,6 +327,9 @@ fn cli_signal_cleanup(startup: bool, stalled: bool) {
         let source = root.path().join("selected.txt");
         std::fs::write(&source, b"selected-input-canary").unwrap();
         std::fs::write(root.path().join("program.ts"), "async function main(){return await tools.compute.run({runtime:'python',dependencies:[],inputs:[{artifactId:computeInputs.selected,name:'selected.txt'}],code:'import time\\ntime.sleep(60)'});} main();").unwrap();
+        if download {
+            std::fs::write(root.path().join("program.ts"), "async function main(){return await tools.compute.run({runtime:'python',dependencies:['numpy==1.26.4'],code:'raise AssertionError(\"must not execute\")'});}main();").unwrap();
+        }
         let mut cli = Owned(
             Command::new(env!("CARGO_BIN_EXE_augmentagent"))
                 .current_dir(root.path())
@@ -333,6 +342,9 @@ fn cli_signal_cleanup(startup: bool, stalled: bool) {
                     std::env::var_os("JARVIS_TEST_VM_CONFIG").expect("VM required"),
                 )
                 .env("AUGMENTAGENT_BUILD_SCRATCH_DIR", &scratch)
+                .envs(if download {
+                    vec![("AUGMENTAGENT_COMPUTE_PIP_RUNTIME", std::env::var_os("JARVIS_TEST_COMPUTE_PIP").expect("pinned pip required"))]
+                } else { vec![] })
                 .args([
                     "code-mode",
                     "compute-run",
@@ -348,13 +360,25 @@ fn cli_signal_cleanup(startup: bool, stalled: bool) {
                 .unwrap(),
         );
         let started = Instant::now();
+        let mut fetch_pid = None;
         let processes = loop {
             assert!(
                 cli.0.try_wait().unwrap().is_none(),
                 "CLI exited before launching VM"
             );
             let processes = ProcFs.vm_processes_using(&scratch);
-            if (startup && !processes.is_empty()) || processes.iter().any(|(pid, _)| {
+            if download {
+                fetch_pid = processes.iter().find_map(|(pid, _)| {
+                    let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+                    let args: Vec<_> = bytes.split(|byte| *byte == 0).filter(|part| !part.is_empty())
+                        .map(|part| String::from_utf8_lossy(part).into_owned()).collect();
+                    let fetch = args.iter().position(|arg| arg == "--fetch")?;
+                    let value: Value = serde_json::from_slice(&std::fs::read(args.get(fetch + 1)?).ok()?).ok()?;
+                    let route = value["route"].as_str()?;
+                    (route.starts_with("/pypi-files/") && route.ends_with(".whl")).then_some(*pid)
+                });
+                if fetch_pid.is_some() { break processes; }
+            } else if (startup && !processes.is_empty()) || processes.iter().any(|(pid, _)| {
                 std::fs::read_link(format!("/proc/{pid}/exe"))
                     .ok()
                     .and_then(|path| {
@@ -366,10 +390,10 @@ fn cli_signal_cleanup(startup: bool, stalled: bool) {
                 break processes;
             }
             assert!(
-                started.elapsed() < Duration::from_secs(15),
-                "VM did not start"
+                started.elapsed() < Duration::from_secs(if download { 45 } else { 15 }),
+                "required VM or wheel-fetch stage did not start"
             );
-            std::thread::sleep(Duration::from_millis(if startup { 1 } else { 20 }));
+            std::thread::sleep(Duration::from_millis(if startup || download { 1 } else { 20 }));
         };
         let process_descriptors: Vec<_> = processes
             .iter()
@@ -411,6 +435,18 @@ fn cli_signal_cleanup(startup: bool, stalled: bool) {
                 .count();
             assert_eq!(managed, 1, "live Deno files must belong to the crash-recovery lease");
         }
+        if download {
+            let (_, descriptor) = process_descriptors.iter().find(|(pid, _)| Some(*pid) == fetch_pid).unwrap();
+            assert_eq!(unsafe { libc::syscall(libc::SYS_pidfd_send_signal,
+                descriptor.as_raw_fd(), libc::SIGSTOP, std::ptr::null::<libc::siginfo_t>(), 0) }, 0);
+            let stop_requested = Instant::now();
+            loop {
+                let state = std::fs::read_to_string(format!("/proc/{}/stat", fetch_pid.unwrap())).unwrap();
+                if state.rsplit_once(')').unwrap().1.split_whitespace().next() == Some("T") { break; }
+                assert!(stop_requested.elapsed() < Duration::from_secs(1), "fetch did not stop");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
         if startup {
             // Pin and stop the helper before its ready frame. This also keeps
             // the CLI from registering its old, late signal listener by racing
@@ -446,6 +482,16 @@ fn cli_signal_cleanup(startup: bool, stalled: bool) {
             let result = report(root.path());
             assert_eq!(result["error"]["code"], "cancelled");
             assert_eq!(result["cleanup"]["cleanupVerified"], true);
+            if download {
+                let rows = result["records"].as_array().unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0]["error"]["code"], "cancelled");
+                assert_eq!(rows[0]["dependencyLock"], json!([]));
+                assert_eq!(rows[0]["artifacts"], json!([]));
+                let phases = rows[0]["phases"].as_array().unwrap();
+                assert!(phases.iter().any(|phase| phase["phase"] == "prepare"));
+                assert!(!phases.iter().any(|phase| phase["phase"] == "execute"));
+            }
             if startup {
                 assert_eq!(result["records"], json!([]), "queued startup cancellation launched computation");
                 if stalled {

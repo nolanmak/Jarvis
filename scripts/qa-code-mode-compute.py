@@ -838,6 +838,7 @@ CASES = {
     'owner_repair': suite(cargo('augmentagent-cli', binary=True, filter_name='compute_tool::tests::real_owner_query', ignored=True), public=True),
     'secret_fds': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_unrelated_fds', ignored=True)),
     'cli_signals': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_signals', ignored=True)),
+    'cancel_download': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_download_cancellation', ignored=True), public=True),
     'export_transaction': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_report_failure', ignored=True)),
     'cancel_export': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_export_cancellation', ignored=True)),
     'cli_startup_signals': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_startup_signals', ignored=True)),
