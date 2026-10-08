@@ -204,6 +204,9 @@ its matching uncompressed modules in dependency order, and a static BusyBox.
 The module list depends on which drivers the kernel includes; virtio PCI must be
 available before loading 9p. The daemon user needs read-write access to `/dev/kvm`
 through the `kvm` group, not only a login-seat ACL (see above).
+For Code Mode enablement, pinned guest pip provisioning, limits, CLI QA and
+rollback, see [CODE-MODE-COMPUTE.md](CODE-MODE-COMPUTE.md).
+
 The Code Mode compute profile additionally requires the guest's `virtio_console`
 driver, either built into the kernel or included in `modules` with its matching
 dependencies. Compute transfers bounded logs and requested artifacts through a
