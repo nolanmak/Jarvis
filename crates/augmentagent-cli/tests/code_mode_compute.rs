@@ -274,16 +274,22 @@ fn orchestration_limits_keep_typed_report_codes() {
 #[test]
 #[ignore = "requires provisioned KVM and private build-volume scratch; real CLI signal/recovery QA"]
 fn real_cli_signals_clean_managed_inputs_and_vm_work() {
-    cli_signal_cleanup(false);
+    cli_signal_cleanup(false, false);
 }
 
 #[test]
 #[ignore = "requires provisioned private scratch; signals the CLI before helper readiness"]
 fn real_cli_startup_signals_are_reported_and_cleaned() {
-    cli_signal_cleanup(true);
+    cli_signal_cleanup(true, false);
 }
 
-fn cli_signal_cleanup(startup: bool) {
+#[test]
+#[ignore = "requires private scratch; holds compute helper stopped throughout cancellation"]
+fn real_cli_stalled_startup_cancellation_reaps_helper() {
+    cli_signal_cleanup(true, true);
+}
+
+fn cli_signal_cleanup(startup: bool, stalled: bool) {
     use augmentagent_channel_core::{
         build_scratch::{ProcFs, ProcessTable},
         code_mode::compute::retention,
@@ -375,6 +381,16 @@ fn cli_signal_cleanup(startup: bool) {
                 (*pid, file)
             })
             .collect();
+        struct ResumeOnDrop<'a>(&'a [(u32, std::fs::File)]);
+        impl Drop for ResumeOnDrop<'_> {
+            fn drop(&mut self) {
+                for (_, fd) in self.0 {
+                    unsafe { libc::syscall(libc::SYS_pidfd_send_signal, fd.as_raw_fd(),
+                        libc::SIGCONT, std::ptr::null::<libc::siginfo_t>(), 0); }
+                }
+            }
+        }
+        let _resume_on_failure = ResumeOnDrop(&process_descriptors);
         let storage = scratch.join("compute-artifacts");
         assert!(
             storage.is_dir(),
@@ -397,7 +413,7 @@ fn cli_signal_cleanup(startup: bool) {
         }
         let stopped = Instant::now();
         assert_eq!(unsafe { libc::kill(cli.0.id() as i32, signal) }, 0);
-        if startup {
+        if startup && !stalled {
             std::thread::sleep(Duration::from_millis(50));
             // Resume even the failing pre-fix CLI's orphan so parent-death
             // cleanup can finish; never strand a stopped fixture helper.
@@ -423,6 +439,14 @@ fn cli_signal_cleanup(startup: bool) {
             assert_eq!(result["cleanup"]["cleanupVerified"], true);
             if startup {
                 assert_eq!(result["records"], json!([]), "queued startup cancellation launched computation");
+                if stalled {
+                    let audit_path = root.path().join(result["auditDirectory"].as_str().unwrap()).join("audit.json");
+                    let audit: Value = serde_json::from_slice(&std::fs::read(&audit_path).unwrap()).unwrap();
+                    assert_eq!(audit["phase"], "initialization");
+                    assert_eq!(audit["cancelled"], true);
+                    assert_eq!(audit["cleanupVerified"], true);
+                    assert_eq!(std::fs::metadata(audit_path).unwrap().permissions().mode() & 0o777, 0o600);
+                }
             }
         } else {
             assert!(!root.path().join("report.json").exists());
@@ -434,7 +458,7 @@ fn cli_signal_cleanup(startup: bool) {
             );
         }
         assert!(stopped.elapsed() < Duration::from_secs(5));
-        for (pid, descriptor) in process_descriptors {
+        for (pid, descriptor) in &process_descriptors {
             let remaining = Duration::from_secs(5).saturating_sub(stopped.elapsed());
             let mut poll = libc::pollfd {
                 fd: descriptor.as_raw_fd(),

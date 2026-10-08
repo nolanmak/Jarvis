@@ -34,6 +34,15 @@ pub enum RequestError {
     Cancelled,
 }
 
+/// Initialization failed before any workload request could be sent. Cleanup
+/// is verified by reaping the helper, including a stopped/unresponsive helper.
+#[derive(Debug, thiserror::Error)]
+#[error("{code}: Compute initialization failed.")]
+pub struct StartupFailure {
+    pub code: &'static str,
+    pub cleanup_verified: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ServiceConfig {
     pub policy: ComputePolicy,
@@ -270,6 +279,13 @@ async fn read_frame(reader: &mut BufReader<ChildStdout>) -> Result<Value> {
 
 impl ComputeService {
     pub async fn start(config: ServiceConfig) -> Result<Arc<Self>> {
+        Self::start_cancellable(config, std::future::pending()).await
+    }
+
+    pub async fn start_cancellable(
+        config: ServiceConfig,
+        cancellation: impl std::future::Future<Output = ()>,
+    ) -> Result<Arc<Self>> {
         anyhow::ensure!(
             cfg!(target_os = "linux"),
             "sandbox_unavailable: compute requires Linux KVM"
@@ -367,14 +383,58 @@ impl ComputeService {
             cancelled: &cancelled,
             armed: true,
         };
-        let ready = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut stdout))
-            .await
-            .context("sandbox_unavailable: compute helper startup timed out")??;
-        anyhow::ensure!(
-            ready["ready"] == true,
-            "sandbox_unavailable: compute helper rejected its policy"
-        );
-        let inputs: BTreeMap<String, String> = serde_json::from_value(ready["inputs"].clone())?;
+        let remaining = budget.remaining().unwrap_or(Duration::ZERO);
+        let initialize = async {
+            let ready = read_frame(&mut stdout).await?;
+            anyhow::ensure!(ready["ready"] == true,
+                "sandbox_unavailable: compute helper rejected its policy");
+            serde_json::from_value::<BTreeMap<String, String>>(ready["inputs"].clone())
+                .context("invalid compute input capabilities")
+        };
+        let initialized = tokio::select! {
+            biased;
+            _ = cancellation => Err(RequestError::Cancelled.into()),
+            result = tokio::time::timeout(remaining.min(Duration::from_secs(5)), initialize) => {
+                match result {
+                    Ok(result) => result,
+                    Err(_) => Err(RequestError::Timeout.into()),
+                }
+            }
+        };
+        let inputs = match initialized {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                let code = match error.downcast_ref::<RequestError>() {
+                    Some(RequestError::Cancelled) => "cancelled",
+                    Some(RequestError::Timeout) => "timeout",
+                    _ => "sandbox_unavailable",
+                };
+                // No workload has been sent, so initialization owns only this
+                // helper and its input snapshots. Escalate early enough to
+                // verify even a SIGSTOPped helper within one cleanup allowance.
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                owner.terminate();
+                let exited = match tokio::time::timeout(Duration::from_millis(100), child.wait()).await {
+                    Ok(result) => result.is_ok(),
+                    Err(_) => {
+                        owner.kill();
+                        matches!(tokio::time::timeout_at(deadline, child.wait()).await, Ok(Ok(_)))
+                    }
+                };
+                guard.armed = false;
+                drop(guard);
+                let cleanup_verified = if exited {
+                    helpers.close().is_ok()
+                } else {
+                    let _ = helpers.keep(); // Preserve unverified storage for recovery.
+                    false
+                };
+                return Err(StartupFailure {
+                    code: if cleanup_verified { code } else { "cleanup_unverified" },
+                    cleanup_verified,
+                }.into());
+            }
+        };
         guard.armed = false;
         drop(guard);
         Ok(Arc::new(Self {

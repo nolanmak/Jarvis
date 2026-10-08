@@ -156,7 +156,16 @@ pub async fn run(args: &ComputeRunArgs) -> i32 {
         let exported = (|| -> Result<tempfile::TempDir> {
             let (temporary, directory) =
                 prepared.report_parent.private_tempdir("compute-audit-")?;
-            artifacts::export_audit(&prepared.config.artifact_root, &directory)?;
+            if report["startupFailure"] == true {
+                // The helper may have been stopped before creating its journal.
+                // Record the host's verified pre-workload cancellation privately.
+                directory.write_report("audit.json", &json!({"schemaVersion":1,
+                    "phase":"initialization", "error":report["error"],
+                    "cleanupVerified":true,"closed":true,
+                    "cancelled":report["cleanup"]["cancelled"],"records":[]}))?;
+            } else {
+                artifacts::export_audit(&prepared.config.artifact_root, &directory)?;
+            }
             if let Some(lease) = prepared.storage.take() {
                 lease.discard()?;
             }
@@ -198,12 +207,16 @@ pub async fn run(args: &ComputeRunArgs) -> i32 {
 }
 
 async fn execute(prepared: &Prepared, shutdown: &mut ShutdownSignals) -> Value {
-    let service = match ComputeService::start(prepared.config.clone()).await {
+    let service = match ComputeService::start_cancellable(prepared.config.clone(), shutdown.recv()).await {
         Ok(service) => service,
-        Err(_) => {
+        Err(error) => {
+            let failure = error.downcast_ref::<augmentagent_channel_core::code_mode::compute::service::StartupFailure>();
+            let code = failure.map_or("sandbox_unavailable", |failure| failure.code);
+            let verified = failure.is_some_and(|failure| failure.cleanup_verified);
             return json!({"schemaVersion":1,"ok":false,"final":null,"records":[],"artifacts":[],
-            "error":{"code":"sandbox_unavailable","message":"Compute service could not start."},
-            "cleanup":{"cleanupVerified":false}})
+            "startupFailure":true,
+            "error":{"code":code,"message":"Compute service initialization did not complete."},
+            "cleanup":{"cleanupVerified":verified,"cancelled":code == "cancelled"}})
         }
     };
     let dispatcher = ComputeDispatcher::new(service.clone());
