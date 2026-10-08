@@ -306,6 +306,43 @@ def xlsx(h, name):
     h.cli(name, (FIXTURES / 'sum-xlsx.ts').read_text(), files={'sheet': (FIXTURES / 'numbers.xlsx').read_bytes()}, verify=verify)
 
 
+def preparation_audit(h, name):
+    checked(h.args.public_packages, 'preparation audit requires --public-packages')
+    requests = [{'runtime': 'python', 'dependencies': [dependency], 'code': code}
+                for dependency, code in [('openpyxl==9999999.0.0', "print('MUST_NOT_EXECUTE')"),
+                                         ('openpyxl==3.1.5', 'import openpyxl;print(60)'),
+                                         ('openpyxl==3.1.5', 'import openpyxl;print(60)')]]
+    source = f"async function main(){{const results=[];for(const request of {json.dumps(requests)})results.push(await tools.compute.run(request));return results;}}main();"
+    def verify(value, root):
+        rows = value['records']
+        checked(len(rows) == len(value['final']) == 3, 'preparation audit did not exercise failure/success/reuse')
+        checked(value['final'][0]['error']['code'] == 'dependency_unavailable' and not value['final'][0]['stdout']
+                and not value['final'][0]['stderr'], 'failed preparation leaked logs into public streams or executed code')
+        checked(all(result['ok'] and result['stdout'].strip() == '60' for result in value['final'][1:]), 'valid dependency execution failed')
+        audit = root / value['auditDirectory']
+        checked(audit.stat().st_mode & 0o777 == 0o700, 'preparation audit directory is not private')
+        for index, row in enumerate(rows[:2]):
+            prepared = row.get('preparation')
+            checked(prepared and prepared['runner'] == 'vm' and prepared['cleanupVerified'], 'preparation VM metadata missing')
+            checked(prepared['downloads'] == row['downloads'] and row['downloads']['requests'] > 0
+                    and row['downloads']['bytes'] > 0, 'preparation download evidence was lost')
+            checked(0 < prepared['elapsedSecs'] <= row['elapsedSecs'], 'invalid preparation elapsed time')
+            checked(prepared['error'] == ('dependency_unavailable' if index == 0 else None), 'preparation outcome lost')
+            logs = prepared['logs']
+            checked(0 < sum(log['bytes'] for log in logs.values()) <= 8 * 1024 * 1024, 'preparation logs absent or unbounded')
+            for stream in ('stdout', 'stderr'):
+                entry = logs[stream]
+                checked(entry['file'] == f"audit-{row['executionId']}-prepare.{stream}", 'unexpected preparation log path')
+                path = audit / entry['file']
+                checked(path.stat().st_mode & 0o777 == 0o600 and path.stat().st_size == entry['bytes']
+                        and digest(path) == entry['sha256'], 'private preparation log copy failed verification')
+        checked(rows[2]['environmentReused'] and rows[2]['preparation'] is None
+                and rows[2]['downloads'] == {'requests': 0, 'bytes': 0}, 'reuse fabricated another preparation')
+        checked(rows[1]['dependencyLock'] == rows[2]['dependencyLock'], 'reuse changed lock')
+        checked(json.loads((audit / 'audit.json').read_text())['records'] == rows, 'retained audit differs')
+    h.cli(name, source, expect_exit=1, verify=verify)
+
+
 def native_wheel(h, name):
     checked(h.args.public_packages, 'native wheel import requires --public-packages')
     code = """import os,errno
@@ -685,7 +722,7 @@ def suite(argv, public=False):
 
 
 CASES = {
-    'native_wheel': native_wheel,
+    'native_wheel': native_wheel, 'preparation_audit': preparation_audit,
     'arithmetic': arithmetic, 'chaining': chaining, 'private_audit': private_audit, 'xlsx': xlsx,
     'selected_readonly': selected_readonly, 'network': network,
     'byte_boundaries': byte_boundaries, 'concurrent_admission': concurrent_admission,

@@ -257,31 +257,35 @@ pub fn export_audit(root: &Path, destination: &Directory) -> Result<()> {
             id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()),
             "invalid execution ID"
         );
-        for stream in ["stdout", "stderr"] {
-            let log = &record["logs"][stream];
-            if log.is_null() {
-                continue;
+        for (phase, suffix) in [(record, ""), (&record["preparation"], "-prepare")] {
+            let mut phase_bytes = 0u64;
+            for stream in ["stdout", "stderr"] {
+                let log = &phase["logs"][stream];
+                if log.is_null() {
+                    continue;
+                }
+                let expected = format!("audit-{id}{suffix}.{stream}");
+                anyhow::ensure!(
+                    log["file"].as_str() == Some(expected.as_str()) && names.insert(expected.clone()),
+                    "invalid audit log filename"
+                );
+                let bytes = log["bytes"].as_u64().context("invalid audit log length")?;
+                total = total.checked_add(bytes).context("audit size overflow")?;
+                phase_bytes = phase_bytes.checked_add(bytes).context("audit size overflow")?;
+                anyhow::ensure!(
+                    phase_bytes <= 8 * 1024 * 1024 && total <= 25 * 2 * 8 * 1024 * 1024,
+                    "audit log size limit exceeded"
+                );
+                entries.push(Artifact {
+                    id: expected.clone(),
+                    name: expected,
+                    bytes,
+                    sha256: log["sha256"]
+                        .as_str()
+                        .context("missing audit log digest")?
+                        .into(),
+                });
             }
-            let expected = format!("audit-{id}.{stream}");
-            anyhow::ensure!(
-                log["file"].as_str() == Some(expected.as_str()) && names.insert(expected.clone()),
-                "invalid audit log filename"
-            );
-            let bytes = log["bytes"].as_u64().context("invalid audit log length")?;
-            total = total.checked_add(bytes).context("audit size overflow")?;
-            anyhow::ensure!(
-                bytes <= 8 * 1024 * 1024 && total <= 25 * 8 * 1024 * 1024,
-                "audit log size limit exceeded"
-            );
-            entries.push(Artifact {
-                id: expected.clone(),
-                name: expected,
-                bytes,
-                sha256: log["sha256"]
-                    .as_str()
-                    .context("missing audit log digest")?
-                    .into(),
-            });
         }
     }
     let pending = copy_verified(&source, destination, &entries, true, &|| Ok(()))?;
@@ -399,8 +403,11 @@ mod tests {
             .unwrap()
             .write_all(b"unselected snapshot canary")
             .unwrap();
+        let preparation_name = format!("audit-{id}-prepare.stderr");
+        source.open_file(&preparation_name, true).unwrap().write_all(b"private installer log").unwrap();
         let audit = serde_json::json!({"schemaVersion":1,"closed":true,"cleanupVerified":true,"records":[{
-            "executionId":id,"logs":{"stdout":{"file":log_name,"bytes":11,"sha256":format!("{:x}",Sha256::digest(b"private log"))}}
+            "executionId":id,"logs":{"stdout":{"file":log_name,"bytes":11,"sha256":format!("{:x}",Sha256::digest(b"private log"))}},
+            "preparation":{"logs":{"stderr":{"file":preparation_name,"bytes":21,"sha256":format!("{:x}",Sha256::digest(b"private installer log"))}}}
         }]});
         source.write_report("audit.json", &audit).unwrap();
         let target = tempfile::tempdir().unwrap();
@@ -410,7 +417,8 @@ mod tests {
             std::fs::read(target.path().join(&log_name)).unwrap(),
             b"private log"
         );
-        assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 2);
+        assert_eq!(std::fs::read(target.path().join(&preparation_name)).unwrap(), b"private installer log");
+        assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 3);
         let mut forged = audit.clone();
         forged["records"][0]["logs"]["stdout"]["file"] = serde_json::json!("../outside");
         std::fs::remove_file(root.path().join("audit.json")).unwrap();
@@ -418,6 +426,22 @@ mod tests {
         let target = tempfile::tempdir().unwrap();
         let destination = Directory::open(target.path(), false).unwrap();
         assert!(export_audit(root.path(), &destination).is_err());
+        assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
+        for phase in ["logs", "preparation"] {
+            let mut forged = audit.clone();
+            let logs = if phase == "logs" { &mut forged["records"][0]["logs"] }
+                       else { &mut forged["records"][0]["preparation"]["logs"] };
+            logs["stderr"] = serde_json::json!({"file":"../outside","bytes":1,"sha256":"a".repeat(64)});
+            std::fs::remove_file(root.path().join("audit.json")).unwrap();
+            source.write_report("audit.json", &forged).unwrap();
+            assert!(export_audit(root.path(), &destination).is_err());
+            assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
+        }
+        let mut oversized = audit.clone();
+        oversized["records"][0]["preparation"]["logs"]["stderr"]["bytes"] = serde_json::json!(8 * 1024 * 1024 + 1);
+        std::fs::remove_file(root.path().join("audit.json")).unwrap();
+        source.write_report("audit.json", &oversized).unwrap();
+        assert!(export_audit(root.path(), &destination).unwrap_err().to_string().contains("audit log size limit"));
         assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
         std::fs::remove_file(root.path().join("audit.json")).unwrap();
         source.write_report("audit.json", &audit).unwrap();

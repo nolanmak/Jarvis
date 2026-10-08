@@ -31,10 +31,11 @@ FILENAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', re.ASCII)
 
 class ComputeError(ValueError):
     """Fixed diagnostics: never embed model source, secrets or package URLs."""
-    def __init__(self, code, message, *, runner='none', retryable=False):
+    def __init__(self, code, message, *, runner='none', retryable=False, preparation=None):
         self.code = code
         self.runner = runner
         self.retryable = retryable
+        self.preparation = preparation
         super().__init__(message)
 
 
@@ -612,6 +613,12 @@ class ComputeTask:
                               'responseTruncated': len(raw.decode(errors='replace').encode()) > 65536}
         return metadata
 
+    def _preparation_record(self, execution_id, outcome, started):
+        return {'runner': outcome['runner'], 'cleanupVerified': outcome['cleanupVerified'],
+                'downloads': dict(outcome['downloads']), 'error': outcome.get('error'),
+                'elapsedSecs': self.clock() - started,
+                'logs': self._logs(execution_id + '-prepare', outcome)}
+
     def finish(self, *, cancelled=False):
         # The caller must first verify backend.close(); cancellation alone is
         # never evidence of successful descendant cleanup.
@@ -640,6 +647,8 @@ class ComputeTask:
         fingerprint = None
         cleanup = True
         logs = {}
+        preparation = None
+        preparation_started = None
         self.active = {'executionId': execution_id, 'phase': 'admission', 'startedMonotonic': started}
         self._audit()
         try:
@@ -655,7 +664,12 @@ class ComputeTask:
                 if environment is None:
                     if request['dependencies']:
                         self._phase('prepare')
+                        preparation_started = self.clock()
                         environment = self.backend.prepare(request['dependencies'], deadline)
+                        prepared = environment.pop('preparation', None)
+                        if prepared is not None:
+                            preparation = self._preparation_record(execution_id, prepared, preparation_started)
+                            downloads = prepared['downloads']
                         validate_lock(environment['dependencyLock'])
                         if not environment['dependencyLock']:
                             deny('dependency_integrity', 'Preparation returned an empty lock.')
@@ -696,6 +710,9 @@ class ComputeTask:
             if error.runner == 'vm':
                 result['runner'] = 'vm'
             cleanup = error.code != 'cleanup_unverified'
+            if error.preparation is not None:
+                preparation = self._preparation_record(execution_id, error.preparation, preparation_started)
+                downloads = error.preparation['downloads']
             result['error'] = {'code': error.code, 'message': str(error), 'retryable': error.retryable}
         except BaseException as error:
             if getattr(error, 'runner', None) == 'vm':
@@ -712,7 +729,7 @@ class ComputeTask:
                                  'dependencyLock': result['dependencyLock'], 'environmentReused': result['environmentReused'],
                                  'downloads': downloads, 'elapsedSecs': self.clock() - started,
                                  'cleanupVerified': cleanup, 'error': result['error'],
-                                 'logs': logs, 'artifacts': result['artifacts']})
+                                 'logs': logs, 'preparation': preparation, 'artifacts': result['artifacts']})
             self.active = None
             self._audit()
         return result
@@ -847,9 +864,10 @@ class VMBackend:
         result = run_preparation(self.runtime_path, self.scratch.tmp, self.scratch.cache,
                                  self.pip_runtime, requirements, environment_id, remaining)
         if not result['ok']:
-            deny(result['error'], 'Dependency preparation failed; inspect the private execution record.', runner='vm')
+            deny(result['error'], 'Dependency preparation failed; inspect the private execution record.',
+                 runner='vm', preparation=result)
         return {'environmentId': environment_id, 'dependencyLock': validate_lock(result['dependencyLock']),
-                'downloads': result['downloads']}
+                'downloads': result['downloads'], 'preparation': result}
 
     def execute(self, request, selected, environment_id, deadline):
         remaining = deadline - time.monotonic()

@@ -35,6 +35,9 @@ class EvidenceContractTests(unittest.TestCase):
 
 
 class HarnessExecutionTests(unittest.TestCase):
+    def test_preparation_audit_is_registered_for_real_cli_acceptance(self):
+        self.assertIn('preparation_audit', qa.CASES)
+
     def test_native_wheel_is_required_and_drives_the_cli(self):
         self.assertIn('native_wheel', qa.REQUIREMENTS['AC02'])
         self.assertIn('native_wheel', qa.CASES)

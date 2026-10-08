@@ -487,6 +487,49 @@ class TaskLifecycleContractTests(unittest.TestCase):
             self.assertEqual(len(task.records), 25)
             self.assertEqual(len(backend.executions), 25)
 
+    def test_preparation_audit_preserves_private_diagnostics_on_success_and_failure(self):
+        import json
+        for failed in (False, True):
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                backend, task = self.setup_task(root)
+                prepare = backend.prepare
+                outcome = {'runner': 'vm', 'cleanupVerified': True,
+                           'downloads': {'requests': 3, 'bytes': 123},
+                           'error': 'dependency_unavailable' if failed else None,
+                           '_logs': {'stdout': b'private installer output', 'stderr': b'private preparation canary'}}
+                def with_diagnostics(*args):
+                    if failed:
+                        error = compute.ComputeError('dependency_unavailable', 'fixed diagnostic', runner='vm')
+                        error.preparation = outcome
+                        raise error
+                    result = prepare(*args)
+                    result['downloads'] = outcome['downloads']
+                    result['preparation'] = outcome
+                    return result
+                backend.prepare = with_diagnostics
+                result = task.execute(request(dependencies=['example'], outputs=['result.json']))
+                self.assertEqual(result['ok'], not failed)
+                record = task.records[-1]
+                metadata = record.get('preparation')
+                self.assertIsNotNone(metadata, 'completed preparation diagnostics were discarded')
+                self.assertEqual(record['downloads'], outcome['downloads'])
+                self.assertEqual(metadata['downloads'], outcome['downloads'])
+                self.assertTrue(metadata['cleanupVerified'])
+                self.assertGreaterEqual(metadata['elapsedSecs'], 0)
+                self.assertEqual(metadata['error'], outcome['error'])
+                self.assertNotIn('private preparation canary', json.dumps(result))
+                self.assertNotIn('private preparation canary', (root / 'audit.json').read_text())
+                for stream, raw in outcome['_logs'].items():
+                    path = root / metadata['logs'][stream]['file']
+                    self.assertEqual(path.read_bytes(), raw)
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                if not failed:
+                    self.assertTrue(task.execute(request(dependencies=['example'], outputs=['result.json']))['environmentReused'])
+                    self.assertIsNone(task.records[-1]['preparation'])
+                    self.assertEqual(task.records[-1]['downloads'], {'requests': 0, 'bytes': 0})
+                    self.assertTrue(all('preparation' not in environment for environment in task.environments.values()))
+
     def test_private_audit_preserves_full_logs_without_source_in_metadata(self):
         import json
         import stat

@@ -105,6 +105,12 @@ Only requested ordinary files can be exported. Export validation rejects links,
 special files, traversal and size violations. Results are accepted after verified
 guest shutdown. A failed call publishes no artifacts. Full bounded logs and audit
 records remain private; treat them as sensitive task data.
+Completed preparation phases, including failed installs, have a `preparation`
+audit entry with download counts, elapsed time, cleanup status and private log
+files named `audit-<executionId>-prepare.stdout` and `.stderr`. Their bytes and
+SHA-256 are verified when the CLI copies the audit. Raw installer logs do not
+appear in the public compute result. A reuse hit has `preparation: null` and
+zero registry requests.
 
 Production artifacts belong to the originating account/task and expire after
 24 hours if unclaimed. Startup recovery and the 30-second sweep remove expired
