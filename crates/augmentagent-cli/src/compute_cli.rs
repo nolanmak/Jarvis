@@ -151,6 +151,21 @@ pub async fn run(args: &ComputeRunArgs) -> i32 {
         }
     };
     let mut report = execute(&prepared, &mut shutdown).await;
+    let mut pending_exports = None;
+    if report["ok"] == true {
+        let exported = serde_json::from_value::<Vec<Artifact>>(report["artifacts"].clone())
+            .map_err(anyhow::Error::from)
+            .and_then(|entries| artifacts::export_pending(
+                &prepared.config.artifact_root, &prepared.destination, &entries));
+        match exported {
+            Ok(pending) => pending_exports = Some(pending),
+            Err(_) => {
+                report["ok"] = json!(false);
+                report["artifacts"] = json!([]);
+                report["error"] = json!({"code":"output_denied","message":"Artifact export failed verification or destination checks."});
+            }
+        }
+    }
     let retain_audit = report["cleanup"]["cleanupVerified"] == true;
     let audit = if retain_audit {
         let exported = (|| -> Result<tempfile::TempDir> {
@@ -188,6 +203,10 @@ pub async fn run(args: &ComputeRunArgs) -> i32 {
         None
     };
     let success = report["ok"] == true;
+    if !success {
+        drop(pending_exports.take());
+        report["artifacts"] = json!([]);
+    }
     if let Err(error) = prepared
         .report_parent
         .write_report(&prepared.report_name, &report)
@@ -195,6 +214,7 @@ pub async fn run(args: &ComputeRunArgs) -> i32 {
         eprintln!("compute-run report: {error}");
         return 1;
     }
+    if let Some(pending) = pending_exports { pending.commit(); }
     if let Some(audit) = audit {
         let _ = audit.keep();
     }
@@ -277,10 +297,7 @@ async fn execute(prepared: &Prepared, shutdown: &mut ShutdownSignals) -> Value {
         });
     let mut exported = Vec::new();
     if error.is_none() {
-        match parsed.and_then(|entries| {
-            artifacts::export(service.artifact_root(), &prepared.destination, &entries)?;
-            Ok(entries)
-        }) {
+        match parsed {
             Ok(entries) => exported = entries,
             Err(_) => {
                 error = Some(

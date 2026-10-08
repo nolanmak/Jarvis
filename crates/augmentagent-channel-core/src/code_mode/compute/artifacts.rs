@@ -193,6 +193,14 @@ impl Directory {
 /// this call created; never overwrite anything at the selected destination.
 #[cfg(unix)]
 pub fn export(root: &Path, destination: &Directory, entries: &[Artifact]) -> Result<()> {
+    export_pending(root, destination, entries)?.commit();
+    Ok(())
+}
+
+/// Keep rollback ownership until the enclosing CLI operation has published its
+/// report. Dropping this batch removes only the destination files it created.
+#[cfg(unix)]
+pub fn export_pending(root: &Path, destination: &Directory, entries: &[Artifact]) -> Result<ExportTransaction> {
     let source = Directory::open(root, false)?;
     let mut names = BTreeSet::new();
     let mut total = 0u64;
@@ -268,8 +276,40 @@ pub fn export_audit(root: &Path, destination: &Directory) -> Result<()> {
             });
         }
     }
-    copy_verified(&source, destination, &entries, true)?;
-    destination.write_report("audit.json", &audit)
+    let pending = copy_verified(&source, destination, &entries, true)?;
+    destination.write_report("audit.json", &audit)?;
+    pending.commit();
+    Ok(())
+}
+
+#[cfg(unix)]
+pub struct ExportTransaction {
+    destination: Directory,
+    created: Vec<(String, File)>,
+    committed: bool,
+}
+
+#[cfg(unix)]
+impl ExportTransaction {
+    pub fn commit(mut self) { self.committed = true; }
+}
+
+#[cfg(unix)]
+impl Drop for ExportTransaction {
+    fn drop(&mut self) {
+        if self.committed { return; }
+        for (name, file) in &self.created {
+            // The retained descriptor prevents inode reuse. A concurrently
+            // replaced name belongs to somebody else and must survive rollback.
+            let Ok(original) = file.metadata() else { continue };
+            let Ok(current) = std::fs::symlink_metadata(self.destination.path().join(name)) else { continue };
+            if original.dev() != current.dev() || original.ino() != current.ino() { continue; }
+            if let Ok(name) = std::ffi::CString::new(name.as_str()) {
+                unsafe { libc::unlinkat(self.destination.0.as_raw_fd(), name.as_ptr(), 0); }
+            }
+        }
+        let _ = self.destination.0.sync_all();
+    }
 }
 
 #[cfg(unix)]
@@ -278,9 +318,10 @@ fn copy_verified(
     destination: &Directory,
     entries: &[Artifact],
     private: bool,
-) -> Result<()> {
-    let mut created: Vec<&str> = Vec::new();
-    let result = (|| {
+) -> Result<ExportTransaction> {
+    let mut pending = ExportTransaction {
+        destination: Directory(destination.0.try_clone()?), created: Vec::new(), committed: false,
+    };
         for entry in entries {
             let mut input = source.open_file(&entry.id, false)?;
             let before = input.metadata()?;
@@ -305,23 +346,14 @@ fn copy_verified(
                     && format!("{:x}", Sha256::digest(&bytes)) == entry.sha256,
                 "artifact integrity verification failed"
             );
-            let mut output = destination.open_file(&entry.name, true)?;
-            created.push(&entry.name);
+            let output = destination.open_file(&entry.name, true)?;
+            pending.created.push((entry.name.clone(), output));
+            let output = &mut pending.created.last_mut().unwrap().1;
             output.write_all(&bytes)?;
             output.sync_all()?;
         }
         destination.0.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        for name in created {
-            let name = std::ffi::CString::new(name)?;
-            unsafe {
-                libc::unlinkat(destination.0.as_raw_fd(), name.as_ptr(), 0);
-            }
-        }
-    }
-    result
+        Ok(pending)
 }
 
 #[cfg(all(test, unix))]
@@ -416,6 +448,36 @@ mod tests {
         std::fs::write(root.join(&entry.id), bytes).unwrap();
         entry
     }
+    #[test]
+    fn pending_export_rolls_back_until_committed_and_preserves_replacements() {
+        let root = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let target = out.path().join("selected");
+        std::fs::create_dir(&target).unwrap();
+        let destination = Directory::open(&target, false).unwrap();
+        let entry = fixture(root.path(), "result.json", b"{}");
+        let pending = export_pending(root.path(), &destination, &[entry.clone()]).unwrap();
+        assert!(target.join("result.json").exists());
+        drop(pending);
+        assert!(!target.join("result.json").exists());
+        let pending = export_pending(root.path(), &destination, &[entry.clone()]).unwrap();
+        std::fs::remove_file(target.join("result.json")).unwrap();
+        std::fs::write(target.join("result.json"), b"replacement sentinel").unwrap();
+        drop(pending);
+        assert_eq!(std::fs::read(target.join("result.json")).unwrap(), b"replacement sentinel");
+        std::fs::remove_file(target.join("result.json")).unwrap();
+        let pending = export_pending(root.path(), &destination, &[entry.clone()]).unwrap();
+        let moved = out.path().join("moved");
+        std::fs::rename(&target, &moved).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("result.json"), b"new directory sentinel").unwrap();
+        drop(pending);
+        assert!(!moved.join("result.json").exists());
+        assert_eq!(std::fs::read(target.join("result.json")).unwrap(), b"new directory sentinel");
+        export_pending(root.path(), &destination, &[entry]).unwrap().commit();
+        assert_eq!(std::fs::read(moved.join("result.json")).unwrap(), b"{}");
+    }
+
     #[test]
     fn exports_verified_bytes_and_refuses_clobber() {
         let root = tempfile::tempdir().unwrap();

@@ -671,3 +671,45 @@ fn killed_cli_cannot_leave_spinning_orchestration_process() {
         "orchestration survived owner SIGKILL and kept using host CPU"
     );
 }
+
+#[test]
+#[ignore = "requires real VM; races final report with a no-clobber sentinel"]
+fn real_cli_report_failure_rolls_back_exported_outputs() {
+    use augmentagent_channel_core::build_scratch::{ProcFs, ProcessTable};
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+    let root = tempfile::Builder::new().prefix("compute-export-qa-")
+        .tempdir_in(std::env::var_os("JARVIS_TEST_COMPUTE_SCRATCH").unwrap()).unwrap();
+    let scratch = root.path().join("scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(root.path().join("program.ts"), "async function main(){return await tools.compute.run({runtime:'python',dependencies:[],code:\"import time;time.sleep(1);open('/outputs/result.json','w').write('{}')\",outputs:['result.json']});}main();").unwrap();
+    struct Owned(std::process::Child);
+    impl Drop for Owned { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+    let mut cli = Owned(Command::new(env!("CARGO_BIN_EXE_augmentagent"))
+        .current_dir(root.path()).env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default()).env("HOME",root.path())
+        .env("AUGMENTAGENT_COMPUTE_ENABLED","true")
+        .env("AUGMENTAGENT_BUILD_VM_CONFIG",std::env::var_os("JARVIS_TEST_VM_CONFIG").unwrap())
+        .env("AUGMENTAGENT_BUILD_SCRATCH_DIR",&scratch)
+        .args(["code-mode","compute-run","--program","program.ts","--output-dir","out","--report","report.json"])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(cli.0.try_wait().unwrap().is_none());
+        if ProcFs.vm_processes_using(&scratch).iter().any(|(pid,_)| {
+            std::fs::read_link(format!("/proc/{pid}/exe")).ok().is_some_and(|p| p.file_name().unwrap().to_string_lossy().starts_with("qemu-system-"))
+        }) { break; }
+        assert!(Instant::now() < deadline,"VM did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::write(root.path().join("report.json"),b"no-clobber sentinel").unwrap();
+    let status = loop {
+        if let Some(status) = cli.0.try_wait().unwrap() { break status; }
+        assert!(Instant::now() < deadline,"CLI did not finish");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(status.code(),Some(1));
+    assert_eq!(std::fs::read(root.path().join("report.json")).unwrap(),b"no-clobber sentinel");
+    assert_eq!(std::fs::read_dir(root.path().join("out")).unwrap().count(),0,"failed CLI published success artifacts");
+}

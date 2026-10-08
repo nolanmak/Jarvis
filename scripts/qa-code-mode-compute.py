@@ -40,7 +40,7 @@ REQUIREMENTS = {
     'AC14': ['symlink', 'hardlink', 'fifo', 'unix_socket', 'traversal', 'device', 'racing_output', 'output_limit'],
     'AC15': ['request_contracts', 'chaining', 'foreign_handle', 'artifact_contracts', 'byte_boundaries'],
     'AC16': ['owner_repair'],
-    'AC17': ['full_log_transfer', 'private_audit', 'retention_contracts', 'preparation_audit', 'cancelled_logs', 'policy_timings_audit'],
+    'AC17': ['export_transaction', 'full_log_transfer', 'private_audit', 'retention_contracts', 'preparation_audit', 'cancelled_logs', 'policy_timings_audit'],
     'AC18': ['disabled', 'legacy_runner', 'deno_regression', 'bridge_regression', 'build_vm_regression', 'dry_run'],
 }
 # Selection never changes the all-mode acceptance contract above.
@@ -502,6 +502,7 @@ CASES = {
     'owner_contracts': suite(cargo('augmentagent-cli', binary=True, filter_name='compute_tool::tests', skips=('real_owner_query',))),
     'owner_repair': suite(cargo('augmentagent-cli', binary=True, filter_name='compute_tool::tests::real_owner_query', ignored=True), public=True),
     'cli_signals': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_signals', ignored=True)),
+    'export_transaction': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_report_failure', ignored=True)),
     'cli_startup_signals': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_startup_signals', ignored=True)),
     'cli_stalled_startup': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_stalled_startup', ignored=True)),
     'owner_crash': suite(cargo('augmentagent-channel-core', test='code_mode_compute', filter_name='killed_owner_recovery', ignored=True)),
