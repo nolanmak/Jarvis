@@ -31,6 +31,9 @@ pub const DEFAULT_BUILD_TIMEOUT_SECS: u64 = 600;
 pub const MAX_BUILD_TIMEOUT_SECS: u64 = 900;
 /// Session directory prefix, shared with the bridge.
 pub const SESSION_PREFIX: &str = "jarvis-vm-session-";
+/// Compute stays in the shared quota namespace but has faster crash recovery.
+pub const COMPUTE_SESSION_PREFIX: &str = "jarvis-vm-session-compute-";
+const COMPUTE_OWNERLESS_GRACE: Duration = Duration::from_secs(30);
 /// Build-cache image filename, shared with the bridge.
 pub const IMAGE_NAME: &str = "build-cache.img";
 /// A session without a readable owner record younger than this may still be
@@ -224,17 +227,28 @@ pub struct SweepReport {
     pub kept_live: usize,
     /// VM processes (qemu, its python3 supervisor) of stale sessions, killed.
     pub killed: usize,
+    /// Scratch preserved because owned process termination was not verified.
+    pub cleanup_unverified: usize,
 }
 
 /// What the sweep needs from the process table (injected in tests).
 pub trait ProcessTable {
     /// Kernel start time of `pid` (field 22 of `/proc/<pid>/stat`), if running.
     fn start_time(&self, pid: u32) -> Option<String>;
+    /// Whether the recorded process can still run. An exited, unreaped owner
+    /// can retain a /proc start time; identity alone is not liveness.
+    fn is_live(&self, pid: u32, start_time: &str) -> bool {
+        self.start_time(pid).as_deref() == Some(start_time)
+    }
     /// This user's VM processes for the session `dir`, with their start times
     /// (see [`is_session_vm_process`]).
     fn vm_processes_using(&self, dir: &Path) -> Vec<(u32, String)>;
     /// SIGKILL `pid` only if it is still the process that had `start_time`.
     fn kill_if_same(&self, pid: u32, start_time: &str) -> bool;
+    /// Stop the recorded process and verify termination before removing files.
+    fn kill_and_wait_if_same(&self, pid: u32, start_time: &str, _timeout: Duration) -> bool {
+        self.kill_if_same(pid, start_time)
+    }
 }
 
 /// Whether a process belongs to a session's VM: its executable is qemu or
@@ -242,7 +256,9 @@ pub trait ProcessTable {
 /// is a qemu option naming a file inside it (`path=` / `file=`). A process
 /// that only mentions the path, such as a shell running `du`, never matches.
 pub fn is_session_vm_process(exe_name: &str, args: &[String], dir: &Path) -> bool {
-    if !(exe_name.starts_with("qemu-system-") || exe_name.starts_with("python3")) {
+    let formatter = exe_name == "mke2fs" && dir.file_name().and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(COMPUTE_SESSION_PREFIX));
+    if !(exe_name.starts_with("qemu-system-") || exe_name.starts_with("python3") || formatter) {
         return false;
     }
     let prefix = format!("{}/", dir.display());
@@ -262,6 +278,21 @@ impl ProcessTable for ProcFs {
     fn start_time(&self, pid: u32) -> Option<String> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         stat.rsplit_once(')')?.1.split_whitespace().nth(19).map(str::to_string)
+    }
+
+    fn is_live(&self, pid: u32, start_time: &str) -> bool {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        if self.start_time(pid).as_deref() != Some(start_time) { return false; }
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if fd < 0 {
+            // An observation failure must not authorize deleting live storage.
+            return self.start_time(pid).as_deref() == Some(start_time);
+        }
+        let descriptor = unsafe { std::fs::File::from_raw_fd(fd as i32) };
+        if self.start_time(pid).as_deref() != Some(start_time) { return false; }
+        let mut poll = libc::pollfd { fd: descriptor.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        let result = unsafe { libc::poll(&mut poll, 1, 0) };
+        !(result > 0 && poll.revents & libc::POLLIN != 0)
     }
 
     fn vm_processes_using(&self, dir: &Path) -> Vec<(u32, String)> {
@@ -284,6 +315,19 @@ impl ProcessTable for ProcFs {
             if !is_session_vm_process(&exe_name, &args, dir) { return None; }
             (self.start_time(pid)? == start).then_some((pid, start))
         }).collect()
+    }
+
+    fn kill_and_wait_if_same(&self, pid: u32, start_time: &str, timeout: Duration) -> bool {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if raw < 0 { return !self.is_live(pid, start_time); }
+        let descriptor = unsafe { std::fs::File::from_raw_fd(raw as i32) };
+        if self.start_time(pid).as_deref() != Some(start_time) { return true; }
+        unsafe { libc::syscall(libc::SYS_pidfd_send_signal, descriptor.as_raw_fd(), libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(), 0); }
+        let mut poll = libc::pollfd { fd: descriptor.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        let result = unsafe { libc::poll(&mut poll, 1, timeout.as_millis().min(i32::MAX as u128) as i32) };
+        result > 0 && poll.revents & libc::POLLIN != 0
     }
 
     fn kill_if_same(&self, pid: u32, start_time: &str) -> bool {
@@ -315,18 +359,32 @@ impl ProcessTable for ProcFs {
 }
 
 fn owner_is_live(dir: &Path, procs: &dyn ProcessTable, now: SystemTime) -> bool {
-    let owner = std::fs::read(dir.join("owner.json")).ok()
+    use std::os::fd::AsRawFd;
+    let read_owner = || std::fs::read(dir.join("owner.json")).ok()
         .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok());
-    let Some(owner) = owner else {
+    let mut owner = read_owner();
+    let _startup_guard;
+    if owner.is_none() {
+        let grace = if dir.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with(COMPUTE_SESSION_PREFIX)) {
+            COMPUTE_OWNERLESS_GRACE
+        } else { OWNERLESS_GRACE };
         let young = std::fs::symlink_metadata(dir).and_then(|m| m.modified()).ok()
             .and_then(|modified| now.duration_since(modified).ok())
-            .is_none_or(|age| age < OWNERLESS_GRACE);
-        return young;
-    };
+            .is_none_or(|age| age < grace);
+        if young { return true; }
+        // The allocator holds this lock from before mkdir through owner.json.
+        // Even an unusually slow live initializer must survive recovery.
+        let Some(parent) = dir.parent() else { return true };
+        let Ok(guard) = std::fs::File::open(parent) else { return true };
+        if unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 { return true; }
+        _startup_guard = guard;
+        owner = read_owner(); // The initializer may have finished before locking.
+    }
+    let Some(owner) = owner else { return false };
     let pid = owner.get("pid").and_then(|v| v.as_u64()).and_then(|v| u32::try_from(v).ok());
     let start = owner.get("start_time").and_then(|v| v.as_str());
     match (pid, start) {
-        (Some(pid), Some(start)) => procs.start_time(pid).as_deref() == Some(start),
+        (Some(pid), Some(start)) => procs.is_live(pid, start),
         _ => false,
     }
 }
@@ -337,8 +395,18 @@ fn owner_is_live(dir: &Path, procs: &dyn ProcessTable, now: SystemTime) -> bool 
 /// The qemu and its supervisor each lead their own process group (both are
 /// started with a new session) and both match, so each is killed directly.
 pub fn sweep_with(root: &Path, procs: &dyn ProcessTable, now: SystemTime) -> SweepReport {
+    sweep_matching(root, procs, now, SESSION_PREFIX)
+}
+
+/// Frequent compute recovery must not shorten the legacy build sweep policy.
+pub fn sweep_compute_with(root: &Path, procs: &dyn ProcessTable, now: SystemTime) -> SweepReport {
+    sweep_matching(root, procs, now, COMPUTE_SESSION_PREFIX)
+}
+
+fn sweep_matching(root: &Path, procs: &dyn ProcessTable, now: SystemTime, prefix: &str) -> SweepReport {
     use std::os::unix::fs::MetadataExt;
     let mut report = SweepReport::default();
+    let cleanup_deadline = std::time::Instant::now() + Duration::from_secs(5);
     // Liveness comes from /proc; without it every owner would look dead.
     if !cfg!(target_os = "linux") { return report; }
     let Ok(entries) = std::fs::read_dir(root) else { return report };
@@ -346,7 +414,7 @@ pub fn sweep_with(root: &Path, procs: &dyn ProcessTable, now: SystemTime) -> Swe
     let uid = unsafe { libc::getuid() };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        if !name.to_str().is_some_and(|n| n.starts_with(SESSION_PREFIX)) { continue; }
+        if !name.to_str().is_some_and(|n| n.starts_with(prefix)) { continue; }
         let Ok(meta) = std::fs::symlink_metadata(entry.path()) else { continue };
         if !meta.is_dir() || meta.uid() != uid { continue; }
         let dir = entry.path();
@@ -354,10 +422,23 @@ pub fn sweep_with(root: &Path, procs: &dyn ProcessTable, now: SystemTime) -> Swe
             report.kept_live += 1;
             continue;
         }
-        for (pid, start) in procs.vm_processes_using(&dir) {
-            if procs.kill_if_same(pid, &start) {
-                report.killed += 1;
+        let compute = name.to_str().is_some_and(|name| name.starts_with(COMPUTE_SESSION_PREFIX));
+        let mut verified = true;
+        loop {
+            for (pid, start) in procs.vm_processes_using(&dir) {
+                if compute {
+                    if procs.kill_and_wait_if_same(pid, &start, cleanup_deadline.saturating_duration_since(std::time::Instant::now())) {
+                        report.killed += 1;
+                    } else { verified = false; break; }
+                } else if procs.kill_if_same(pid, &start) { report.killed += 1; }
             }
+            if !compute || !verified || !procs.vm_processes_using(&dir).iter().any(|(pid, start)| procs.is_live(*pid, start)) { break; }
+            if std::time::Instant::now() >= cleanup_deadline { verified = false; break; }
+        }
+        if !verified {
+            report.cleanup_unverified += 1;
+            tracing::warn!(dir = %dir.display(), "compute scratch preserved: process termination unverified");
+            continue;
         }
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => report.removed += 1,
@@ -416,6 +497,30 @@ mod tests {
             std::fs::write(dir.join("owner.json"), owner.to_string()).unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn exited_unreaped_owner_does_not_keep_scratch_live() {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let root = tempfile::tempdir().unwrap();
+        let mut child = Child(std::process::Command::new("sleep").arg("60").spawn().unwrap());
+        let pid = child.0.id();
+        let start = ProcFs.start_time(pid).unwrap();
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        assert!(raw >= 0);
+        let descriptor = unsafe { std::fs::File::from_raw_fd(raw as i32) };
+        let stale = session(root.path(), "jarvis-vm-session-zombie", Some(serde_json::json!({"pid":pid,"start_time":start})));
+        let live = session(root.path(), "jarvis-vm-session-live", Some(serde_json::json!({"pid":std::process::id(),"start_time":ProcFs.start_time(std::process::id()).unwrap()})));
+        child.0.kill().unwrap();
+        let mut poll = libc::pollfd { fd: descriptor.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 1000) }, 1);
+        // Deliberately do not reap: an orphan can retain its /proc start time.
+        assert_eq!(ProcFs.start_time(pid).as_deref(), Some(start.as_str()));
+        let report = sweep_with(root.path(), &ProcFs, SystemTime::now());
+        assert_eq!(report.removed, 1, "exited owner was mistaken for a live task");
+        assert_eq!(report.kept_live, 1);
+        assert!(!stale.exists());
+        assert!(live.exists());
     }
 
     /// A python3 that signals readiness by creating `argv[1]`, then sleeps.
@@ -607,11 +712,75 @@ mod tests {
             ..Default::default()
         };
         let report = sweep_with(root, &procs, SystemTime::now());
-        assert_eq!(report, SweepReport { removed: 2, kept_live: 1, killed: 1 });
+        assert_eq!(report, SweepReport { removed: 2, kept_live: 1, killed: 1, ..Default::default() });
         assert!(!stale.exists() && !reused.exists());
         assert!(live.join("tmp/jarvis-vm-build-synthetic/initrd.gz").exists());
         assert_eq!(*procs.killed.borrow(), vec![5001], "only the stale session's VM is killed");
         assert!(unrelated.exists() && outside.exists() && linked.is_symlink(), "only session dirs are touched");
+    }
+
+    #[test]
+    fn compute_recovery_preserves_storage_when_termination_is_unverified() {
+        struct Unstoppable;
+        impl ProcessTable for Unstoppable {
+            fn start_time(&self, pid: u32) -> Option<String> {
+                (pid == 5001).then(|| "51".into())
+            }
+            fn vm_processes_using(&self, _dir: &Path) -> Vec<(u32, String)> {
+                vec![(5001, "51".into())]
+            }
+            fn kill_if_same(&self, _pid: u32, _start: &str) -> bool { false }
+            fn kill_and_wait_if_same(&self, _pid: u32, _start: &str, timeout: Duration) -> bool {
+                assert!(timeout <= Duration::from_secs(5));
+                false
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let orphan = session(root.path(), "jarvis-vm-session-compute-stuck",
+            Some(serde_json::json!({"pid":42,"start_time":"gone"})));
+        let report = sweep_compute_with(root.path(), &Unstoppable, SystemTime::now());
+        assert_eq!(report.cleanup_unverified, 1);
+        assert_eq!(report.removed, 0);
+        assert!(orphan.join("owner.json").exists());
+    }
+
+    #[test]
+    fn formatter_recovery_is_scoped_to_compute_image_arguments() {
+        let compute = Path::new("/scratch/jarvis-vm-session-compute-x");
+        let legacy = Path::new("/scratch/jarvis-vm-session-legacy-x");
+        assert!(is_session_vm_process("mke2fs", &[compute.join("build-cache.img").display().to_string()], compute));
+        assert!(!is_session_vm_process("mke2fs", &[legacy.join("build-cache.img").display().to_string()], legacy));
+        assert!(!is_session_vm_process("mke2fs", &["/scratch/other/build-cache.img".into()], compute));
+        assert!(!is_session_vm_process("mke2fs", &["/scratch/jarvis-vm-session-compute-xy/build-cache.img".into()], compute));
+    }
+
+    #[test]
+    fn compute_recovery_keeps_locked_initialization_and_legacy_sessions() {
+        use std::os::fd::AsRawFd;
+        let root = tempfile::tempdir().unwrap();
+        let partial = session(root.path(), "jarvis-vm-session-compute-partial", None);
+        let legacy = session(root.path(), "jarvis-vm-session-legacy", Some(serde_json::json!({"pid":42,"start_time":"gone"})));
+        let guard = std::fs::File::open(root.path()).unwrap();
+        assert_eq!(unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        let later = SystemTime::now() + Duration::from_secs(31);
+        assert_eq!(sweep_compute_with(root.path(), &FakeProcs::default(), later).kept_live, 1);
+        assert!(partial.exists());
+        drop(guard);
+        assert_eq!(sweep_compute_with(root.path(), &FakeProcs::default(), later).removed, 1);
+        assert!(legacy.exists(), "frequent compute recovery touched a legacy build");
+    }
+
+    #[test]
+    fn incomplete_compute_session_has_bounded_startup_grace() {
+        let root = tempfile::tempdir().unwrap();
+        let compute = session(root.path(), "jarvis-vm-session-compute-partial", None);
+        let legacy = session(root.path(), "jarvis-vm-session-legacy-partial", None);
+        let procs = FakeProcs::default();
+        assert_eq!(sweep_with(root.path(), &procs, SystemTime::now()).kept_live, 2);
+        let report = sweep_with(root.path(), &procs, SystemTime::now() + Duration::from_secs(31));
+        assert_eq!(report.removed, 1, "partial compute initialization exceeds its recovery bound");
+        assert!(!compute.exists());
+        assert!(legacy.exists(), "legacy initialization grace changed");
     }
 
     #[test]
@@ -681,6 +850,24 @@ mod tests {
         assert!(!stale.exists());
     }
 
+    #[test]
+    fn compute_recovery_verifies_real_process_exit_and_preserves_reused_pid() {
+        let root = tempfile::tempdir().unwrap();
+        let stale = session(root.path(), "jarvis-vm-session-compute-real",
+            Some(serde_json::json!({"pid":u32::MAX,"start_time":"gone"})));
+        let ready = stale.join("ready");
+        let mut child = Child::spawn("python3", &["-c", READY_THEN_SLEEP, &ready.to_string_lossy()], &ready);
+        await_vm_processes(&stale, &[child.pid()]);
+        assert!(ProcFs.kill_and_wait_if_same(child.pid(), "mismatched-start", Duration::ZERO));
+        assert!(child.alive(), "mismatched PID identity was signalled");
+        let start = ProcFs.start_time(child.pid()).unwrap();
+        let report = sweep_compute_with(root.path(), &ProcFs, SystemTime::now());
+        assert_eq!(report, SweepReport { removed: 1, killed: 1, ..Default::default() });
+        assert!(!ProcFs.is_live(child.pid(), &start), "storage removed before process termination");
+        assert!(child.killed_by_sigkill());
+        assert!(!stale.exists());
+    }
+
     /// M2: a live session (owner = a real running process) survives a real sweep.
     #[test]
     fn real_sweep_keeps_a_live_session_and_its_processes() {
@@ -698,7 +885,7 @@ mod tests {
             &["-c", READY_THEN_SLEEP, &arg.to_string_lossy()], &arg);
         await_vm_processes(&dir, &[vm_like.pid()]);
         let report = sweep_with(temp.path(), &ProcFs, SystemTime::now());
-        assert_eq!(report, SweepReport { removed: 0, kept_live: 1, killed: 0 });
+        assert_eq!(report, SweepReport { removed: 0, kept_live: 1, killed: 0, ..Default::default() });
         assert!(dir.join("tmp/jarvis-vm-build-synthetic/initrd.gz").exists());
         assert!(owner.alive() && vm_like.alive());
     }

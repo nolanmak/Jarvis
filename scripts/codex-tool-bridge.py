@@ -89,6 +89,7 @@ class BuildScratch:
     daemon's own build caches.
     """
     SESSION_PREFIX = 'jarvis-vm-session-'
+    COMPUTE_SESSION_PREFIX = 'jarvis-vm-session-compute-'
     IMAGE_NAME = 'build-cache.img'
     # One checkout's debug target for a couple of workspace crates is ~9-10 GiB
     # (the burn-down target holding channel-core and cli test builds is 9.4 GiB),
@@ -104,9 +105,12 @@ class BuildScratch:
     # Below this after a failed build, the volume (not the build) is the cause.
     FULL_BYTES = 1024**3
 
-    def __init__(self, root, refused=False, limits=None):
+    def __init__(self, root, refused=False, limits=None, *, compute=False):
         self.root = Path(root) if root else None
         self.refused = refused
+        if type(compute) is not bool:
+            raise ValueError("invalid scratch profile")
+        self.compute_profile = compute
         self.cache_bytes = self.CACHE_BYTES
         self.headroom_bytes = self.HEADROOM_BYTES
         self.budget_bytes = self.BUDGET_BYTES
@@ -236,7 +240,8 @@ class BuildScratch:
             # when root_fd closes.
             fcntl.flock(root_fd, fcntl.LOCK_EX)
             self._require_space(root_fd)
-            name = self.SESSION_PREFIX + secrets.token_hex(8)
+            prefix = self.COMPUTE_SESSION_PREFIX if self.compute_profile else self.SESSION_PREFIX
+            name = prefix + secrets.token_hex(8)
             os.mkdir(name, 0o700, dir_fd=root_fd)
             session = self.root / name
             try:
@@ -255,15 +260,17 @@ class BuildScratch:
                         os.close(image)
                 finally:
                     os.close(session_fd)
-                mke2fs = shutil.which('mke2fs', path='/usr/sbin:/sbin:/usr/bin:/bin')
-                if not mke2fs:
-                    raise Denied('build cache filesystem tool (mke2fs) is not installed')
-                # Sparse and lazily initialised: disk use grows with the build.
-                subprocess.run([mke2fs, '-q', '-F', '-t', 'ext4', '-m', '0',
-                                '-E', f'root_owner={os.getuid()}:{os.getgid()},lazy_itable_init=1,nodiscard',
-                                str(session / self.IMAGE_NAME)], env={'PATH': '/usr/sbin:/sbin:/usr/bin:/bin'},
-                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               timeout=60, check=True)
+                # Compute owns its deadline-bound supervised formatter.
+                if not self.compute_profile:
+                    mke2fs = shutil.which('mke2fs', path='/usr/sbin:/sbin:/usr/bin:/bin')
+                    if not mke2fs:
+                        raise Denied('build cache filesystem tool (mke2fs) is not installed')
+                    # Sparse and lazily initialised: disk use grows with the build.
+                    subprocess.run([mke2fs, '-q', '-F', '-t', 'ext4', '-m', '0',
+                                    '-E', f'root_owner={os.getuid()}:{os.getgid()},lazy_itable_init=1,nodiscard',
+                                    str(session / self.IMAGE_NAME)], env={'PATH': '/usr/sbin:/sbin:/usr/bin:/bin'},
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   timeout=60, check=True)
             except (OSError, subprocess.SubprocessError, Denied):
                 shutil.rmtree(session, ignore_errors=True)
                 raise Readiness('build_scratch_unavailable', self.root) from None

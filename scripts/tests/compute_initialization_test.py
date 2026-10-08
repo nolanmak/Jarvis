@@ -51,6 +51,19 @@ time.sleep(30)
                 self.assertFalse(Path(f'/proc/{pid}').exists(), f'initialization left descendant {pid}')
             self.assertFalse(list(root.glob('compute-initialize-*')))
 
+    def test_compute_allocator_does_not_run_the_unsupervised_legacy_formatter(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            backend = compute.VMBackend('/unused-runtime', Path(tmp))
+            self.addCleanup(backend.close)
+            backend.scratch.statvfs = lambda _: SimpleNamespace(f_bavail=500*1024**3, f_frsize=1)
+            with patch.object(compute.subprocess, 'run') as legacy_formatter:
+                path = backend.scratch.open()
+            legacy_formatter.assert_not_called()
+            self.assertTrue(path.name.startswith('jarvis-vm-session-compute-'))
+            self.assertEqual(backend.scratch.cache.stat().st_size, backend.scratch.cache_bytes)
+
     def test_unverifiable_shutdown_never_uses_an_unbounded_wait(self):
         from unittest.mock import Mock, patch
         with tempfile.TemporaryDirectory() as tmp:

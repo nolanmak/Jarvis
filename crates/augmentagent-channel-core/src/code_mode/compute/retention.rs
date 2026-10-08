@@ -423,7 +423,10 @@ impl Lease {
 
 /// Maintenance runs even after feature rollback, so old artifacts still expire.
 pub async fn run_sweep_loop(shutdown: tokio_util::sync::CancellationToken) -> Result<()> {
-    let root = crate::build_scratch::scratch_dir().join("compute-artifacts");
+    run_sweep_loop_at(crate::build_scratch::scratch_dir(), shutdown).await
+}
+
+async fn run_sweep_loop_at(root: PathBuf, shutdown: tokio_util::sync::CancellationToken) -> Result<()> {
     let mut interval = tokio::time::interval(SWEEP_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -431,7 +434,14 @@ pub async fn run_sweep_loop(shutdown: tokio_util::sync::CancellationToken) -> Re
             _ = shutdown.cancelled() => return Ok(()),
             _ = interval.tick() => {
                 let root = root.clone();
-                let result = tokio::task::spawn_blocking(move || sweep_at(&root, now()?)).await;
+                let result = tokio::task::spawn_blocking(move || {
+                    let scratch = crate::build_scratch::sweep_compute_with(&root, &ProcFs, SystemTime::now());
+                    if scratch.removed > 0 || scratch.cleanup_unverified > 0 {
+                        tracing::info!(removed=scratch.removed, cleanup_unverified=scratch.cleanup_unverified,
+                            "compute scratch recovery completed");
+                    }
+                    sweep_at(&root.join("compute-artifacts"), now()?)
+                }).await;
                 match result {
                     Ok(Ok(report)) if report.removed > 0 => tracing::info!(removed=report.removed, "expired or orphan compute artifacts removed"),
                     Ok(Ok(_)) => {},
@@ -447,6 +457,31 @@ mod tests {
     use super::*;
     use crate::code_mode::compute::artifacts::Directory;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn periodic_worker_recovers_compute_scratch_at_startup_and_next_tick() {
+        fn orphan(root: &Path, name: &str) -> PathBuf {
+            let path = root.join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("owner.json"), json!({"pid":u32::MAX,"start_time":"absent"}).to_string()).unwrap();
+            path
+        }
+        let root = tempfile::tempdir().unwrap();
+        let first = orphan(root.path(), "jarvis-vm-session-compute-startup");
+        let legacy = orphan(root.path(), "jarvis-vm-session-legacy");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let worker = tokio::spawn(run_sweep_loop_at(root.path().to_owned(), shutdown.clone()));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while first.exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
+        }).await.expect("startup recovery did not run");
+        let second = orphan(root.path(), "jarvis-vm-session-compute-next-tick");
+        tokio::time::timeout(Duration::from_secs(35), async {
+            while second.exists() { tokio::time::sleep(Duration::from_millis(20)).await; }
+        }).await.expect("compute orphan missed its periodic sweep");
+        assert!(legacy.exists());
+        shutdown.cancel();
+        worker.await.unwrap().unwrap();
+    }
     use std::os::unix::fs::{symlink, PermissionsExt};
     fn fixture(root: &Path, id: char, expires: u64) -> std::path::PathBuf {
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();

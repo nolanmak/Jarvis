@@ -744,7 +744,7 @@ class VMBackend:
         spec = importlib.util.spec_from_file_location('compute_bridge', Path(__file__).with_name('codex-tool-bridge.py'))
         bridge = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(bridge)
-        self.scratch = bridge.BuildScratch(str(scratch_root), limits=scratch_limits)
+        self.scratch = bridge.BuildScratch(str(scratch_root), limits=scratch_limits, compute=True)
         self.bridge = bridge
         self._formatted = False
 
