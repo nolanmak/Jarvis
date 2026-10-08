@@ -11,7 +11,7 @@ external receipt.
 limit is capped at 100. This is local owner data, like the existing approval
 queue: do not expose it in an unauthenticated dashboard endpoint.
 
-The owner query channel in Discord, owner Slack DMs, and the designated
+Authorized owner DMs and the query channel/its threads in Discord, owner Slack DMs, and the designated
 non-group WhatsApp control chat receive bounded recent history on every model
 call, including resumed native sessions. Global history is deliberately not
 injected into other/shared conversations. Records identify the action and

@@ -396,7 +396,13 @@ mod tests {
                 native_session::{Launch, CURRENT},
                 providers::ProviderKind,
             };
-            let session = CURRENT.try_with(std::sync::Arc::clone)?;
+            let Ok(session) = CURRENT.try_with(std::sync::Arc::clone) else {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(("legacy".into(), prompt.into()));
+                return Ok("recorded".into());
+            };
             let mut lease = session.begin(ProviderKind::Claude)?;
             let id = match lease.launch() {
                 Launch::Create {
@@ -469,12 +475,24 @@ mod tests {
         q.answer_turn(&ctx, "", "unrelated shared channel")
             .await
             .unwrap();
+        ctx.session_id = "dm:1".into();
+        ctx.guild_id = None;
+        augmentagent_approval_discord::interaction::owner_history(
+            true,
+            q.answer_turn(&ctx, "", "authorized owner DM"),
+        )
+        .await
+        .unwrap();
         let rows = calls.lock().unwrap();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].0, rows[1].0);
         assert!(!rows[0].1.contains(&id));
         assert!(rows[1].1.contains(&id));
         assert!(rows[1].1.contains("failed"));
         assert!(!rows[2].1.contains(&id), "private action leaked");
+        assert!(
+            rows[3].1.contains(&id),
+            "admitted owner DM lost approval context"
+        );
     }
 }

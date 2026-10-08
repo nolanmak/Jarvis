@@ -682,7 +682,9 @@ impl EventHandler for Handler {
             let result = run_with_typing(
                 &http,
                 channel_id,
-                crate::compute_inputs::SELECTED.scope(selected, handler.answer_turn(&audit_ctx, &history, &current)),
+                crate::interaction::owner_history(
+                    allowed_user_id.is_some() && (is_dm || in_query_channel),
+                    crate::compute_inputs::SELECTED.scope(selected, handler.answer_turn(&audit_ctx, &history, &current))),
             ).await;
             info!(%channel_id, %msg_id, success = result.is_ok(), "discord query completed");
 
