@@ -3480,5 +3480,105 @@
     "test_plan": "Install the equivalent of augmentagent-xvfb.service in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
     "status": "unverified",
     "evidence": null
+  },
+  {
+    "id": "cli:db",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Database compaction and optional vacuum.",
+    "macos_target": "Same CLI behavior and safety guards on macOS; native evidence has not been recorded.",
+    "prerequisites": [
+      "Rust CLI",
+      "Disposable test data; no live deployment or archive writes"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1412",
+    "test_plan": "Use a synthetic database; compare dry-run counts, retained rows and vacuum results. Run on both Linux and macOS.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:deploy",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Pre-deploy snapshots, restore and retention.",
+    "macos_target": "Same CLI behavior and safety guards on macOS; native evidence has not been recorded.",
+    "prerequisites": [
+      "Rust CLI",
+      "Disposable test data; no live deployment or archive writes"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1410",
+    "test_plan": "Use disposable database/binary snapshots; verify restoration, retention and overwrite guards. Run on both Linux and macOS.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:disk",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Bounded build-output pruning.",
+    "macos_target": "Same CLI behavior and safety guards on macOS; native evidence has not been recorded.",
+    "prerequisites": [
+      "Rust CLI",
+      "Disposable test data; no live deployment or archive writes"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1406",
+    "test_plan": "Use synthetic target directories; verify dry-run, age/size limits and active-build protection. Run on both Linux and macOS.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:log-rotate",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Rotation and compression of state logs.",
+    "macos_target": "Same CLI behavior and safety guards on macOS; native evidence has not been recorded.",
+    "prerequisites": [
+      "Rust CLI",
+      "Disposable test data; no live deployment or archive writes"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1413",
+    "test_plan": "Use synthetic logs; verify dry-run, compression and retention boundaries. Run on both Linux and macOS.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:ops-archive",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Opt-in private archive of rotated logs.",
+    "macos_target": "Same CLI behavior and safety guards on macOS; native evidence has not been recorded.",
+    "prerequisites": [
+      "Rust CLI",
+      "Disposable test data; no live deployment or archive writes"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1414",
+    "test_plan": "Use an injected transport and synthetic logs; verify disabled behavior, private-repository requirement and retry safety. Run on both Linux and macOS.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-disk-prune.service",
+    "source": "scripts/systemd/augmentagent-disk-prune.service",
+    "linux_baseline": "Daily systemd user housekeeping: disk pruning, log rotation, optional archive sync and snapshot retention.",
+    "macos_target": "Equivalent launchd scheduling and housekeeping lifecycle; systemd unit itself is Linux-only.",
+    "prerequisites": [
+      "User service manager",
+      "Rust CLI",
+      "Synthetic housekeeping directories"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1406",
+    "test_plan": "Verify 04:37 daily schedule and catch-up behavior, synthetic cleanup, active-build protection and service install/uninstall on each platform.",
+    "status": "gap",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-disk-prune.timer",
+    "source": "scripts/systemd/augmentagent-disk-prune.timer",
+    "linux_baseline": "Daily systemd user housekeeping: disk pruning, log rotation, optional archive sync and snapshot retention.",
+    "macos_target": "Equivalent launchd scheduling and housekeeping lifecycle; systemd unit itself is Linux-only.",
+    "prerequisites": [
+      "User service manager",
+      "Rust CLI",
+      "Synthetic housekeeping directories"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1406",
+    "test_plan": "Verify 04:37 daily schedule and catch-up behavior, synthetic cleanup, active-build protection and service install/uninstall on each platform.",
+    "status": "gap",
+    "evidence": null
   }
 ]
