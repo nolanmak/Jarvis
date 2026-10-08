@@ -47,7 +47,12 @@ async fn live_calendar_self_invite_and_cleanup() -> Result<()> {
     std::fs::write(&report, b"{\"cleanup\":\"no event created yet\"}")?;
     let dir = tempfile::tempdir()?;
     let store = Arc::new(Store::open(dir.path().join("qa.db"))?);
-    let summary = format!("[TEST #1436] Rust approval QA {}", uuid::Uuid::new_v4());
+    // Google truncates long event titles in invitation subjects. Keep the
+    // unique marker short enough that the inbox oracle can match it exactly.
+    let summary = format!(
+        "[TEST #1436] {}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
     let start = chrono::Utc::now() + chrono::Duration::days(1);
     let start = chrono::DateTime::from_timestamp(start.timestamp(), 0).unwrap();
     let end = start + chrono::Duration::minutes(5);
