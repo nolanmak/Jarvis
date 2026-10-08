@@ -518,6 +518,7 @@ CASES = {
     'cleanup_allowance': suite(cargo('augmentagent-channel-core', test='code_mode_compute', filter_name='stalled_helper')),
     'call_timeout_recovery': suite(cargo('augmentagent-channel-core', test='code_mode_compute', filter_name='real_call_timeout', ignored=True)),
     'task_deadline': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_task_deadline', ignored=True)),
+    'repair_deadline': suite(cargo('augmentagent-cli', binary=True, filter_name='repair_deadline_exhaustion')),
     'request_contracts': suite([sys.executable, '-m', 'unittest', 'scripts.tests.code_mode_compute_test.RequestContractTests', '-v']),
     'artifact_contracts': suite([sys.executable, '-m', 'unittest', 'scripts.tests.code_mode_compute_test.ArtifactCapabilityTests', '-v']),
     'gateway_contracts': suite([sys.executable, '-m', 'unittest', 'scripts.tests.build_dependency_proxy_test', '-v']),

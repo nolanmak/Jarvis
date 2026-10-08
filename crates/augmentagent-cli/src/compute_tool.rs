@@ -63,15 +63,27 @@ impl ComputeTurn {
         let task_grant = grant.clone();
         let worker = tokio::spawn(async move {
             loop {
-                let Ok(options) = task_service.run_options() else {
-                    task_service.cancel();
-                    break;
+                let accepted = match task_service.run_options() {
+                    Ok(options) => {
+                        match tokio::time::timeout(options.timeout, listener.accept()).await {
+                            Ok(accepted) => accepted,
+                            Err(_) => {
+                                task_service.cancel();
+                                let _ = task_service.finish().await;
+                                continue;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Release computation at expiry, but keep this owner's
+                        // control endpoint until the turn is dropped so a repair
+                        // receives a typed refusal instead of a transport error.
+                        task_service.cancel();
+                        let _ = task_service.finish().await;
+                        listener.accept().await
+                    }
                 };
-                let accepted = tokio::time::timeout(options.timeout, listener.accept()).await;
-                let Ok(Ok((stream, _))) = accepted else {
-                    task_service.cancel();
-                    break;
-                };
+                let Ok((stream, _)) = accepted else { break };
                 // Socket permissions and the per-turn grant are independent.
                 if !stream
                     .peer_cred()
@@ -215,23 +227,32 @@ async fn handle_connection(
                 && request.grant == grant
                 && request.program.len() <= 256 * 1024 =>
         {
-            let dispatcher = ComputeDispatcher::new(service.clone());
-            let options = service.run_options()?;
-            let manifest = manifest_compute();
-            let future =
-                run_program_with_options(&request.program, &manifest, &dispatcher, &options);
-            let mut extra = [0u8; 1];
-            let outcome = tokio::select! {
-                result = future => result,
-                _ = read.read(&mut extra) => { service.cancel(); return Ok(()); }
-            };
-            match outcome {
-                Ok(value) => {
-                    json!({"version":1,"ok":!dispatcher.has_failed() && value.dispatch_failures == 0,"final":value.final_value,
+            match service.run_options() {
+                Err(_) => json!({"version":1,"ok":false,"error":{"code":"timeout",
+                    "message":"Compute task deadline expired; repair cannot start new work."}}),
+                Ok(options) => {
+                    let dispatcher = ComputeDispatcher::new(service.clone());
+                    let manifest = manifest_compute();
+                    let future = run_program_with_options(
+                        &request.program,
+                        &manifest,
+                        &dispatcher,
+                        &options,
+                    );
+                    let mut extra = [0u8; 1];
+                    let outcome = tokio::select! {
+                        result = future => result,
+                        _ = read.read(&mut extra) => { service.cancel(); return Ok(()); }
+                    };
+                    match outcome {
+                        Ok(value) => {
+                            json!({"version":1,"ok":!dispatcher.has_failed() && value.dispatch_failures == 0,"final":value.final_value,
                     "trace":value.trace})
-                }
-                Err(error) => {
-                    json!({"version":1,"ok":false,"error":{"code":error.public_code(),"message":"Compute orchestration failed. Repair the program within the remaining task budget."}})
+                        }
+                        Err(error) => {
+                            json!({"version":1,"ok":false,"error":{"code":error.public_code(),"message":"Compute orchestration failed. Repair the program within the remaining task budget."}})
+                        }
+                    }
                 }
             }
         }
@@ -463,6 +484,48 @@ mod tests {
         assert_eq!(repaired["final"], 60);
         assert!(turn.service.run_options().unwrap().timeout < before);
         assert_eq!(turn.finish().await.unwrap()["cleanupVerified"], true);
+    }
+
+    #[tokio::test]
+    async fn repair_deadline_exhaustion_returns_typed_refusal_without_dispatch() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = test_config(root.path());
+        config.policy.task_timeout = Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        let turn = ComputeTurn::start(config).await.unwrap();
+        let first = control(&turn, &turn.grant,
+            "async function main(){await new Promise(r=>setTimeout(r,700));throw Error('repair needed');}main();").await;
+        assert_eq!(first["ok"], false);
+        let remaining = turn.service.run_options().unwrap().timeout;
+        assert!(remaining < Duration::from_millis(1400));
+        let repair = control(&turn, &turn.grant,
+            "async function main(){await new Promise(r=>setTimeout(r,3000));return 'deadline reset';}main();").await;
+        assert_eq!(repair["error"]["code"], "timeout");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "repair reset the original two-second task deadline"
+        );
+        let denied = control(&turn, &turn.grant,
+            "async function main(){return await tools.compute.run({runtime:'python',dependencies:[],code:'raise Exception()'});}main();").await;
+        assert_eq!(denied["error"]["code"], "timeout");
+        let wrong_grant = control(&turn, "another-task", "42").await;
+        assert_eq!(wrong_grant["error"]["code"], "permission_denied");
+        let audit: Value = serde_json::from_slice(
+            &std::fs::read(turn.service.artifact_root().join("audit.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            audit["closed"], true,
+            "expiry must close computation before retaining the refusal endpoint"
+        );
+        assert_eq!(audit["cleanupVerified"], true);
+        let receipt = turn.finish().await.unwrap();
+        assert_eq!(receipt["cleanupVerified"], true);
+        assert_eq!(
+            receipt["records"],
+            json!([]),
+            "expired repair dispatched computation"
+        );
     }
 
     #[tokio::test]
