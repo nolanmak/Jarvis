@@ -194,12 +194,16 @@ impl WhatsappControlSurface {
                     .ok();
                     return Ok(true);
                 };
-                let outcome = match &cmd {
+                let decision = augmentagent_approval_discord::interaction::DecisionContext {
+                    surface:"whatsapp".into(),actor:msg.sender.bare(),conversation:chat_jid.clone(),
+                    interaction_id:msg.stable_id(),revision:None,
+                };
+                let outcome = augmentagent_approval_discord::interaction::deciding(decision, async { match &cmd {
                     ControlCommand::Approve => handler.approve(&action_id).await,
                     ControlCommand::Decline => handler.skip(&action_id).await,
                     ControlCommand::Revise(fb) => handler.revise(&action_id, fb).await,
                     ControlCommand::Query(_) => unreachable!(),
-                };
+                }}).await;
                 self.ack_outcome(&chat_jid, &action_id, outcome).await;
                 Ok(true)
             }
@@ -225,7 +229,7 @@ impl WhatsappControlSurface {
                     // WhatsApp sender must not inherit that authority.
                     owner_authorized: false,
                 };
-                match qh.answer(&audit_ctx, &q).await {
+                match augmentagent_approval_discord::interaction::owner_history(!chat_jid.ends_with("@g.us"), qh.answer(&audit_ctx, &q)).await {
                     Ok(answer) => {
                         for chunk in chunk_for_whatsapp(&answer) {
                             if let Err(e) = self.send_to_control(&chunk).await {

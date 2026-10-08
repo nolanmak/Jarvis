@@ -107,6 +107,7 @@ impl Verb {
 pub struct CustomId {
     pub action_id: String,
     pub verb: Verb,
+    pub revision: Option<String>,
 }
 
 impl CustomId {
@@ -114,24 +115,31 @@ impl CustomId {
         Self {
             action_id: action_id.into(),
             verb,
+            revision: None,
         }
     }
 
+    pub fn with_revision(mut self, draft:&str) -> Self { self.revision=Some(crate::interaction::draft_revision(draft)); self }
+
     pub fn parse(raw: &str) -> Option<Self> {
-        let mut parts = raw.splitn(3, ':');
+        let mut parts = raw.split(':');
         let prefix = parts.next()?;
         if prefix != "aa" {
             return None;
         }
         let action_id = parts.next()?.to_string();
         let verb = Verb::parse(parts.next()?)?;
-        Some(Self { action_id, verb })
+        let revision=parts.next().map(str::to_string);
+        if parts.next().is_some() || revision.as_ref().is_some_and(|r|r.len()!=16 || !r.bytes().all(|b|b.is_ascii_hexdigit())) { return None; }
+        Some(Self { action_id, verb, revision })
     }
 }
 
 impl fmt::Display for CustomId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "aa:{}:{}", self.action_id, self.verb.as_str())
+        write!(f, "aa:{}:{}", self.action_id, self.verb.as_str())?;
+        if let Some(revision)=&self.revision { write!(f, ":{revision}")?; }
+        Ok(())
     }
 }
 

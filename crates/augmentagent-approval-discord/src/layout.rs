@@ -389,7 +389,7 @@ fn approval_embed_and_rows(
     // so Approve (which runs the merge) and Skip are the only verbs offered.
     if email.kind == "identity_merge" {
         let row = CreateActionRow::Buttons(vec![
-            CreateButton::new(CustomId::new(action_id, Verb::Approve).to_string())
+            CreateButton::new(CustomId::new(action_id, Verb::Approve).with_revision(draft).to_string())
                 .label("Approve & Merge")
                 .style(ButtonStyle::Success),
             CreateButton::new(CustomId::new(action_id, Verb::Skip).to_string())
@@ -400,7 +400,7 @@ fn approval_embed_and_rows(
     }
 
     let button_row = CreateActionRow::Buttons(vec![
-        CreateButton::new(CustomId::new(action_id, Verb::Approve).to_string())
+        CreateButton::new(CustomId::new(action_id, Verb::Approve).with_revision(draft).to_string())
             .label("Approve & Send")
             .style(ButtonStyle::Success),
         CreateButton::new(CustomId::new(action_id, Verb::Revise).to_string())
@@ -867,7 +867,7 @@ fn render_marker_line(name: &str, values: &str, hidden: usize) -> String {
 /// and lifts consecutive [`is_envelope_marker_line`] lines, stopping at the
 /// first line that is not one — so a `[to: …]` sitting inside the body stays
 /// body. No trailing markers ⇒ `(draft, "")`, the byte-identical path.
-fn split_trailing_envelope_markers(draft: &str) -> (String, String) {
+pub(crate) fn split_trailing_envelope_markers(draft: &str) -> (String, String) {
     let mut end = draft.trim_end().len();
     let scanned_from = end;
     while end > 0 {

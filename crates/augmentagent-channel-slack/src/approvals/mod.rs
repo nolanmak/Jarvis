@@ -832,6 +832,14 @@ impl SlackApprovals {
     /// by `owner::admit`). Returns `false` when it is not an approval
     /// interaction.
     pub async fn handle_interaction(&self, interaction: &Interaction) -> bool {
+        let ctx = augmentagent_approval_discord::interaction::DecisionContext {
+            surface: "slack".into(), actor: interaction.user_id.clone().unwrap_or_default(),
+            conversation: format!("{}:{}", self.config.workspace.team_id(), interaction.channel_id.as_deref().unwrap_or(&self.config.channel)),
+            interaction_id: interaction.trigger_id.clone().unwrap_or_else(|| card::draft_digest(&interaction.raw.to_string())), revision: None,
+        };
+        augmentagent_approval_discord::interaction::deciding(ctx, self.handle_interaction_inner(interaction)).await
+    }
+    async fn handle_interaction_inner(&self, interaction: &Interaction) -> bool {
         if !self.handles(interaction) {
             return false;
         }

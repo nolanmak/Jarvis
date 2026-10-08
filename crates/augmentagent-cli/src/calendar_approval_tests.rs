@@ -2,7 +2,7 @@
 use super::*;
 use augmentagent_channel_calendar::ComposioCalendarClient;
 
-fn proposal(store: &Store) -> String {
+pub(super) fn proposal(store: &Store) -> String {
     let email = augmentagent_store::Email {
         message_id: "gcal-create:test-1436".into(),
         thread_id: None,

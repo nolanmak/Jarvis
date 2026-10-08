@@ -1,5 +1,6 @@
 //! `augmentagent` binary.
 
+mod approval_context;
 #[cfg(test)]
 mod provider_migration_tests;
 mod model_tool;
@@ -1147,6 +1148,12 @@ enum DraftsOp {
 
 #[derive(Subcommand)]
 enum ApprovalsOp {
+    /// Read-only decision and execution history. Cursor pagination, newest first.
+    History {
+        #[arg(long)] before: Option<i64>,
+        #[arg(long, default_value_t=20)] limit: usize,
+        #[arg(long)] action: Option<String>,
+    },
     /// List the oldest pending drafts (action id, sender, subject, age).
     /// Read-only; safe to run anytime.
     List {
@@ -5032,6 +5039,10 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Approvals { op } => match op {
+            ApprovalsOp::History { before, limit, action } => {
+                println!("{}",serde_json::to_string_pretty(&store.approval_history(before,limit,action.as_deref())?)?);
+                Ok(())
+            },
             ApprovalsOp::List { limit } => run_approvals_list(store, limit),
             ApprovalsOp::ApproveAll { yes } => run_approvals_approve_all(store, yes),
             ApprovalsOp::DiscardOlder { days, yes } => {
@@ -10678,7 +10689,26 @@ impl QueryHandler for WikiQuerier {
         ctx: &augmentagent_approval_discord::AuditCtx,
         question: &str,
     ) -> anyhow::Result<String> {
+        let discord_history = ctx.owner_authorized && ctx.channel_id.is_some_and(|channel| {
+            std::env::var("DISCORD_QUERY_CHANNEL_ID").or_else(|_|std::env::var("DISCORD_CHANNEL_ID"))
+                .ok().and_then(|v|v.parse::<u64>().ok()) == Some(channel.get())
+        });
+        let history_allowed = discord_history || augmentagent_approval_discord::interaction::history_allowed();
+        let question = approval_context::inject(self.conversation_store.as_deref(), history_allowed, question)?;
+        let question = question.as_str();
         let mut opts = ask_opts(self.wiki_root.clone(), self.repo_root.clone());
+        if history_allowed {
+            if let Some(store)=self.conversation_store.as_ref() {
+                let db=store.db_path();
+                let db=if db.is_absolute() {db.to_path_buf()} else {std::env::current_dir()?.join(db)};
+                opts.env.push(("AUGMENTAGENT_DB".into(),db.display().to_string()));
+            }
+            let bin=self.repo_root.join("target/release/augmentagent");
+            for prefix in ["augmentagent".to_string(),bin.display().to_string()] {
+                opts.allowed_tools.push(format!("Bash({prefix} approvals history*)"));
+            }
+        }
+
         // #1288 — per-turn environment from the surface running this turn
         // (Slack's inbound file directory, which the scope guard and the
         // Codex bridge grant read-only). Empty for Discord turns.
@@ -13538,7 +13568,7 @@ impl ReplyApprover {
 #[async_trait]
 impl ApprovalActionHandler for ReplyApprover {
     async fn approve(&self, action_id: &str) -> ApprovalActionOutcome {
-        let outcome = self.run_approve(action_id).await;
+        let outcome = self.audited(action_id, "approve", self.run_approve(action_id)).await;
         // Scheduled: Approve on a --send-at proposal armed the timer (#502)
         // — the card leaves the queue either way, so advance the carousel.
         if matches!(
@@ -13553,7 +13583,7 @@ impl ApprovalActionHandler for ReplyApprover {
     }
 
     async fn skip(&self, action_id: &str) -> ApprovalActionOutcome {
-        let outcome = self.run_skip(action_id).await;
+        let outcome = self.audited(action_id, "skip", self.run_skip(action_id)).await;
         if matches!(outcome, ApprovalActionOutcome::Skipped) {
             self.trigger_next_nudge().await;
         }
@@ -13564,7 +13594,7 @@ impl ApprovalActionHandler for ReplyApprover {
         // Revise does NOT advance the queue — the card stays active until the
         // user finally approves or skips. The instant-new-draft response is
         // handled by the broker's event handler from the Revised outcome.
-        self.run_revise(action_id, feedback).await
+        self.audited(action_id, "revise", self.run_revise(action_id, feedback)).await
     }
 
     async fn is_resolved(&self, action_id: &str) -> bool {
@@ -13575,7 +13605,7 @@ impl ApprovalActionHandler for ReplyApprover {
     }
 
     async fn schedule(&self, action_id: &str, at_ms: i64) -> ApprovalActionOutcome {
-        let outcome = self.run_schedule(action_id, at_ms).await;
+        let outcome = self.audited(action_id, "schedule", self.run_schedule(action_id, at_ms)).await;
         if matches!(outcome, ApprovalActionOutcome::Scheduled { .. }) {
             // The scheduled card left the queue — surface the next one, the
             // same instant-advance approve/skip get.
@@ -13586,25 +13616,25 @@ impl ApprovalActionHandler for ReplyApprover {
 
     async fn send_now(&self, action_id: &str) -> ApprovalActionOutcome {
         // No nudge trigger: the row left the carousel at schedule time.
-        self.run_send_now(action_id).await
+        self.audited(action_id, "send_now", self.run_send_now(action_id)).await
     }
 
     async fn reschedule(&self, action_id: &str, at_ms: i64) -> ApprovalActionOutcome {
-        self.run_reschedule(action_id, at_ms).await
+        self.audited(action_id, "reschedule", self.run_reschedule(action_id, at_ms)).await
     }
 
     async fn cancel_schedule(&self, action_id: &str) -> ApprovalActionOutcome {
-        self.run_cancel_schedule(action_id).await
+        self.audited(action_id, "cancel_schedule", self.run_cancel_schedule(action_id)).await
     }
 
     async fn back_to_queue(&self, action_id: &str) -> ApprovalActionOutcome {
         // No nudge trigger: the repost + record_nudge inside makes this row
         // the active card again.
-        self.run_back_to_queue(action_id).await
+        self.audited(action_id, "back_to_queue", self.run_back_to_queue(action_id)).await
     }
 
     async fn recompose(&self, action_id: &str) -> ApprovalActionOutcome {
-        self.run_recompose(action_id).await
+        self.audited(action_id, "recompose", self.run_recompose(action_id)).await
     }
 
     async fn is_schedule_live(&self, action_id: &str) -> bool {

@@ -108,3 +108,36 @@ async fn recovered_calendar_receipt_is_delivered_before_retiring_card() {
         200, 1,
     ).await;
 }
+
+struct RecordedApproval(std::sync::Arc<augmentagent_store::Store>);
+#[async_trait::async_trait]
+impl crate::ApprovalActionHandler for RecordedApproval {
+    async fn approve(&self,id:&str)->ApprovalActionOutcome {
+        let ctx=crate::interaction::current().expect("transport metadata must reach handler");
+        assert_eq!(ctx.actor,"777");assert_eq!(ctx.interaction_id,"111");
+        assert_eq!(ctx.conversation,"222");assert!(ctx.revision.is_some());
+        let seq=self.0.begin_approval(id,&ctx,"approve",ctx.revision.as_deref().unwrap(),"gcal:create_event","Meeting").unwrap().unwrap();
+        self.0.finish_approval(seq,"failed","provider rejected request").unwrap();
+        ApprovalActionOutcome::Failed{message:"provider rejected request".into()}
+    }
+    async fn skip(&self,_:&str)->ApprovalActionOutcome {panic!("wrong verb")}
+    async fn revise(&self,_:&str,_:&str)->ApprovalActionOutcome {panic!("wrong verb")}
+    async fn is_resolved(&self,_:&str)->bool {false}
+}
+
+#[tokio::test]
+async fn serenity_click_records_actor_and_decision_even_when_receipt_delivery_fails() {
+    let d=tempfile::tempdir().unwrap();let store=std::sync::Arc::new(augmentagent_store::Store::open(d.path().join("db")).unwrap());
+    let handler=std::sync::Arc::new(RecordedApproval(store.clone())) as std::sync::Arc<dyn crate::ApprovalActionHandler>;
+    let mut click=component();click.user.id=UserId::new(777);
+    click.data.custom_id=CustomId::new("action-1446",Verb::Approve).with_revision("draft").to_string();
+    // Unauthorized serialized interaction cannot reach the effect or audit store.
+    let denied=dispatch_component_approval(&click,Some(UserId::new(888)),Some(handler.clone())).await;
+    assert!(matches!(denied,ApprovalActionOutcome::Failed{..}));
+    assert!(store.approval_history(None,20,None).unwrap().is_empty());
+    let outcome=tokio::spawn(async move {dispatch_component_approval(&click,Some(UserId::new(777)),Some(handler)).await}).await.unwrap();
+    // Exercise actual Serenity followup serialization and failure handling.
+    deliver(outcome,"Failed: provider rejected request",403,0).await;
+    let rows=store.approval_history(None,20,None).unwrap();assert_eq!(rows.len(),1);
+    assert_eq!(rows[0].verb,"approve");assert_eq!(rows[0].outcome,"failed");
+}

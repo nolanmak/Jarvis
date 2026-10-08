@@ -11,6 +11,7 @@
 pub mod attachments;
 pub mod compute_inputs;
 pub mod conversation;
+pub mod interaction;
 pub mod voice_bridge;
 pub mod voice_tool;
 mod broker;
