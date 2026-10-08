@@ -85,6 +85,49 @@ class RequestContractTests(unittest.TestCase):
         self.assertEqual(value, request(dependencies=['OpenPyXL']))
 
 
+class GuestLogTransferTests(unittest.TestCase):
+    def test_live_logs_are_private_bounded_files_and_close_with_transfer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with compute.GuestTransfer(root) as parser:
+                parser.feed(self.frame(data=b'visible\xff'))
+                self.assertEqual((root / 'partial.stdout').read_bytes(), b'visible\xff')
+                for name in ('stdout', 'stderr'):
+                    self.assertEqual((root / ('partial.' + name)).stat().st_mode & 0o777, 0o600)
+            self.assertTrue(all(stream.closed for stream in parser.files.values()))
+
+    def frame(self, name='stdout', offset=0, data=b'hello\xff'):
+        import base64
+        import json
+        return b'JARVIS_COMPUTE_LOG:' + json.dumps({'stream': name, 'offset': offset,
+            'data': base64.b64encode(data).decode()}).encode() + b'\n'
+
+    def test_fragmented_binary_frames_cannot_become_control_messages(self):
+        parser = compute.GuestTransfer()
+        payload = b'\xff\nJARVIS_COMPUTE_RESULT:{"ok":true}\n'
+        wire = self.frame(data=payload) + b'JARVIS_COMPUTE_RESULT:{"ok":false}\n'
+        for byte in wire:
+            parser.feed(bytes([byte]))
+        self.assertEqual(bytes(parser.logs['stdout']), payload)
+        self.assertEqual(bytes(parser.result), b'JARVIS_COMPUTE_RESULT:{"ok":false}\n')
+
+    def test_invalid_stream_offset_encoding_and_oversized_frames_fail_closed(self):
+        for wire in (self.frame(name='tool'), self.frame(offset=1), self.frame(data=b'x' * 65537),
+                     b'JARVIS_COMPUTE_LOG:{"stream":"stdout","offset":0,"data":"!"}\n',
+                     b'JARVIS_COMPUTE_LOG:' + b'x' * 100000):
+            with self.subTest(wire=wire[:60]), self.assertRaises(compute.ComputeError):
+                compute.GuestTransfer().feed(wire)
+
+    def test_combined_partial_log_limit_is_eight_mib(self):
+        parser = compute.GuestTransfer()
+        chunk = b'x' * 65536
+        for index in range(128):
+            parser.feed(self.frame(offset=index * len(chunk), data=chunk))
+        with self.assertRaises(compute.ComputeError) as error:
+            parser.feed(self.frame(name='stderr', data=b'x'))
+        self.assertEqual(error.exception.code, 'resource_limit')
+        self.assertEqual(sum(map(len, parser.logs.values())), 8 * 1024 * 1024)
+
 
 
 # Explicit opt-in: unit tests do not pretend to prove the VM boundary.
@@ -94,6 +137,62 @@ import tempfile
 
 @unittest.skipUnless(os.environ.get('JARVIS_TEST_VM_CONFIG'), 'requires provisioned KVM runtime')
 class ComputeVMTests(unittest.TestCase):
+    def test_timed_out_vm_keeps_partial_logs_and_timeout_cause(self):
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            backend = compute.VMBackend(os.environ['JARVIS_TEST_VM_CONFIG'],
+                os.environ['JARVIS_TEST_COMPUTE_SCRATCH'])
+            try:
+                task = compute.ComputeTask(backend, compute.ArtifactStore(root), enabled=True)
+                started = time.monotonic()
+                result = task.execute(request(code="import os,time\nos.write(1,b'timeout-partial')\ntime.sleep(60)", timeoutSecs=5))
+                self.assertLess(time.monotonic() - started, 10)
+                self.assertFalse(result['ok'])
+                self.assertEqual(result['error']['code'], 'timeout')
+                self.assertEqual(result['runner'], 'vm')
+                self.assertEqual(result['artifacts'], [])
+                record = task.records[-1]
+                self.assertTrue(record['cleanupVerified'])
+                self.assertEqual((root / record['logs']['stdout']['file']).read_bytes(), b'timeout-partial')
+            finally:
+                backend.close()
+
+    def test_cancelled_vm_keeps_partial_binary_logs_in_private_audit(self):
+        import signal
+        import time
+        class Interrupted(BaseException):
+            pass
+        def interrupt(*_):
+            raise Interrupted()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            backend = compute.VMBackend(os.environ['JARVIS_TEST_VM_CONFIG'],
+                os.environ['JARVIS_TEST_COMPUTE_SCRATCH'])
+            task = compute.ComputeTask(backend, compute.ArtifactStore(root), enabled=True)
+            previous = signal.signal(signal.SIGALRM, interrupt)
+            started = time.monotonic()
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 5)
+                with self.assertRaises(Interrupted):
+                    task.execute(request(code="import os,time\nos.write(1,b'partial-out\\xff')\nos.write(2,b'partial-err\\xfe')\ntime.sleep(60)"))
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous)
+                backend.close()
+            self.assertLess(time.monotonic() - started, 10)
+            record = task.records[-1]
+            self.assertEqual(record['error']['code'], 'cancelled')
+            self.assertEqual(record['runner'], 'vm')
+            self.assertEqual(record['artifacts'], [])
+            for name, expected in [('stdout', b'partial-out\xff'), ('stderr', b'partial-err\xfe')]:
+                self.assertIn(name, record['logs'], 'cancellation discarded partial logs')
+                path = root / record['logs'][name]['file']
+                self.assertEqual(path.read_bytes(), expected)
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            task.finish(cancelled=True)
+            self.assertTrue(record['cleanupVerified'])
+
     def test_detached_descendant_cannot_hold_logs_open_after_workload_exits(self):
         import time
         code = (Path(__file__).parent / 'fixtures/code-mode-compute/detached-descendant.py').read_text()

@@ -201,6 +201,23 @@ def main():
     if registry is not None:
         threading.Thread(target=registry.serve_forever, daemon=True).start()
     logs = {'stdout': bytearray(), 'stderr': bytearray()}
+    sent = {'stdout': 0, 'stderr': 0}
+    last_flush = 0
+
+    def flush_logs(force=False):
+        nonlocal last_flush
+        now = time.monotonic()
+        if not force and now - last_flush < .1 and all(len(logs[name]) - sent[name] < 65536 for name in logs):
+            return
+        for name in logs:
+            while sent[name] < len(logs[name]):
+                chunk = logs[name][sent[name]:sent[name] + 65536]
+                frame = {'stream': name, 'offset': sent[name], 'data': base64.b64encode(chunk).decode()}
+                channel.write(b'JARVIS_COMPUTE_LOG:' + json.dumps(frame, separators=(',', ':')).encode() + b'\n')
+                channel.flush()
+                sent[name] += len(chunk)
+        last_flush = now
+
     total = 0
     error = None
     try:
@@ -209,6 +226,7 @@ def main():
             selector.register(process.stderr, selectors.EVENT_READ, 'stderr')
             descendants_reaped = False
             while selector.get_map() and error is None:
+                flush_logs()
                 # EOF is not proof the main workload is alive: detached
                 # descendants can retain its pipe writers indefinitely. Reap
                 # them as soon as the main process exits, then drain buffered
@@ -233,6 +251,7 @@ def main():
         status = process.wait()
     finally:
         reap_workload(uid)
+    flush_logs(force=True)
     files = {}
     if error is None and status:
         error = 'resource_limit' if status in (RESOURCE_EXIT, -signal.SIGKILL, -signal.SIGXFSZ) else 'execution_failed'

@@ -35,6 +35,15 @@ class EvidenceContractTests(unittest.TestCase):
 
 
 class HarnessExecutionTests(unittest.TestCase):
+    def test_cancelled_logs_requires_cli_cancellation_after_observed_output(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        self.assertIn('cancelled_logs', qa.CASES)
+        harness = SimpleNamespace(suite=Mock())
+        qa.CASES['cancelled_logs'](harness, 'cancelled_logs')
+        self.assertIn('real_cli_cancelled_logs', harness.suite.call_args.args[1])
+        self.assertIn('--ignored', harness.suite.call_args.args[1])
+
     def test_download_cancellation_requires_actual_cli_stage_and_public_prerequisite(self):
         from types import SimpleNamespace
         from unittest.mock import Mock

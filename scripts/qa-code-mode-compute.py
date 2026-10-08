@@ -40,7 +40,7 @@ REQUIREMENTS = {
     'AC14': ['symlink', 'hardlink', 'fifo', 'unix_socket', 'traversal', 'device', 'racing_output', 'output_limit'],
     'AC15': ['request_contracts', 'chaining', 'foreign_handle', 'artifact_contracts', 'byte_boundaries'],
     'AC16': ['owner_repair'],
-    'AC17': ['export_transaction', 'full_log_transfer', 'private_audit', 'retention_contracts', 'preparation_audit', 'cancelled_logs', 'policy_timings_audit'],
+    'AC17': ['export_transaction', 'full_log_transfer', 'private_audit', 'retention_contracts', 'preparation_audit', 'cancelled_logs', 'partial_log_contracts', 'policy_timings_audit'],
     'AC18': ['disabled', 'legacy_runner', 'deno_regression', 'bridge_regression', 'build_vm_regression', 'dry_run'],
 }
 # Selection never changes the all-mode acceptance contract above.
@@ -839,6 +839,10 @@ CASES = {
     'secret_fds': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_unrelated_fds', ignored=True)),
     'cli_signals': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_signals', ignored=True)),
     'cancel_download': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_download_cancellation', ignored=True), public=True),
+    'cancelled_logs': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_cancelled_logs', ignored=True)),
+    'partial_log_contracts': suite([sys.executable, '-m', 'unittest', 'scripts.tests.code_mode_compute_test.GuestLogTransferTests',
+        'scripts.tests.code_mode_compute_test.ComputeVMTests.test_cancelled_vm_keeps_partial_binary_logs_in_private_audit',
+        'scripts.tests.code_mode_compute_test.ComputeVMTests.test_timed_out_vm_keeps_partial_logs_and_timeout_cause', '-v']),
     'export_transaction': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_report_failure', ignored=True)),
     'cancel_export': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_export_cancellation', ignored=True)),
     'cli_startup_signals': suite(cargo('augmentagent-cli', test='code_mode_compute', filter_name='real_cli_startup_signals', ignored=True)),

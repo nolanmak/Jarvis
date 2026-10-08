@@ -274,28 +274,40 @@ fn orchestration_limits_keep_typed_report_codes() {
 #[test]
 #[ignore = "requires provisioned KVM and private build-volume scratch; real CLI signal/recovery QA"]
 fn real_cli_signals_clean_managed_inputs_and_vm_work() {
-    cli_signal_cleanup(false, false, false);
+    cli_signal_cleanup(SignalStage::Running);
 }
 
 #[test]
 #[ignore = "requires provisioned private scratch; signals the CLI before helper readiness"]
 fn real_cli_startup_signals_are_reported_and_cleaned() {
-    cli_signal_cleanup(true, false, false);
+    cli_signal_cleanup(SignalStage::Startup { stalled: false });
 }
 
 #[test]
 #[ignore = "requires private scratch; holds compute helper stopped throughout cancellation"]
 fn real_cli_stalled_startup_cancellation_reaps_helper() {
-    cli_signal_cleanup(true, true, false);
+    cli_signal_cleanup(SignalStage::Startup { stalled: true });
 }
 
 #[test]
 #[ignore = "requires KVM, pinned pip and public NumPy wheel; stops an active wheel fetch"]
 fn real_cli_download_cancellation_reaps_stalled_fetch() {
-    cli_signal_cleanup(false, true, true);
+    cli_signal_cleanup(SignalStage::Download);
 }
 
-fn cli_signal_cleanup(startup: bool, stalled: bool, download: bool) {
+#[test]
+#[ignore = "requires KVM and private scratch; cancels after actual binary logs reach the host"]
+fn real_cli_cancelled_logs_preserve_partial_binary_output() {
+    cli_signal_cleanup(SignalStage::LoggedExecution);
+}
+
+enum SignalStage { Running, Startup { stalled: bool }, Download, LoggedExecution }
+
+fn cli_signal_cleanup(stage: SignalStage) {
+    let startup = matches!(stage, SignalStage::Startup { .. });
+    let stalled = matches!(stage, SignalStage::Startup { stalled: true } | SignalStage::Download);
+    let download = matches!(stage, SignalStage::Download);
+    let logged = matches!(stage, SignalStage::LoggedExecution);
     use augmentagent_channel_core::{
         build_scratch::{ProcFs, ProcessTable},
         code_mode::compute::retention,
@@ -313,7 +325,7 @@ fn cli_signal_cleanup(startup: bool, stalled: bool, download: bool) {
             let _ = self.0.wait();
         }
     }
-    for signal in if startup || download { [libc::SIGTERM, libc::SIGINT] } else { [libc::SIGTERM, libc::SIGKILL] } {
+    for signal in if startup || download || logged { [libc::SIGTERM, libc::SIGINT] } else { [libc::SIGTERM, libc::SIGKILL] } {
         let root = tempfile::Builder::new()
             .prefix("compute-cli-signal-qa-")
             .tempdir_in(
@@ -329,6 +341,13 @@ fn cli_signal_cleanup(startup: bool, stalled: bool, download: bool) {
         std::fs::write(root.path().join("program.ts"), "async function main(){return await tools.compute.run({runtime:'python',dependencies:[],inputs:[{artifactId:computeInputs.selected,name:'selected.txt'}],code:'import time\\ntime.sleep(60)'});} main();").unwrap();
         if download {
             std::fs::write(root.path().join("program.ts"), "async function main(){return await tools.compute.run({runtime:'python',dependencies:['numpy==1.26.4'],code:'raise AssertionError(\"must not execute\")'});}main();").unwrap();
+        }
+        if logged {
+            let request = json!({"runtime":"python", "dependencies":[], "code":r#"import os,time
+os.write(1,b'partial-out\xff')
+os.write(2,b'partial-err\xfe')
+time.sleep(60)"#});
+            std::fs::write(root.path().join("program.ts"), format!("async function main(){{return await tools.compute.run({request});}}main();")).unwrap();
         }
         let mut cli = Owned(
             Command::new(env!("CARGO_BIN_EXE_augmentagent"))
@@ -378,6 +397,15 @@ fn cli_signal_cleanup(startup: bool, stalled: bool, download: bool) {
                     (route.starts_with("/pypi-files/") && route.ends_with(".whl")).then_some(*pid)
                 });
                 if fetch_pid.is_some() { break processes; }
+            } else if logged {
+                let ready = std::fs::read_dir(&scratch).unwrap().filter_map(Result::ok)
+                    .filter(|entry| entry.file_name().to_string_lossy().starts_with("jarvis-vm-session-compute-"))
+                    .filter_map(|entry| std::fs::read_dir(entry.path().join("tmp")).ok())
+                    .flatten().filter_map(Result::ok)
+                    .filter(|entry| entry.file_name().to_string_lossy().starts_with("compute-execution-"))
+                    .any(|entry| std::fs::read(entry.path().join("partial.stdout")).ok().as_deref() == Some(b"partial-out\xff")
+                        && std::fs::read(entry.path().join("partial.stderr")).ok().as_deref() == Some(b"partial-err\xfe"));
+                if ready { break processes; }
             } else if (startup && !processes.is_empty()) || processes.iter().any(|(pid, _)| {
                 std::fs::read_link(format!("/proc/{pid}/exe"))
                     .ok()
@@ -491,6 +519,19 @@ fn cli_signal_cleanup(startup: bool, stalled: bool, download: bool) {
                 let phases = rows[0]["phases"].as_array().unwrap();
                 assert!(phases.iter().any(|phase| phase["phase"] == "prepare"));
                 assert!(!phases.iter().any(|phase| phase["phase"] == "execute"));
+            }
+            if logged {
+                let rows = result["records"].as_array().unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0]["error"]["code"], "cancelled");
+                assert_eq!(rows[0]["runner"], "vm");
+                assert_eq!(rows[0]["artifacts"], json!([]));
+                let audit = root.path().join(result["auditDirectory"].as_str().unwrap());
+                for (name, expected) in [("stdout", b"partial-out\xff"), ("stderr", b"partial-err\xfe")] {
+                    let path = audit.join(rows[0]["logs"][name]["file"].as_str().unwrap());
+                    assert_eq!(std::fs::read(&path).unwrap(), expected);
+                    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+                }
             }
             if startup {
                 assert_eq!(result["records"], json!([]), "queued startup cancellation launched computation");

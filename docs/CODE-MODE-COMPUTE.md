@@ -196,6 +196,13 @@ refusal, URL dependencies (including URLs on approved origins), altered wheel
 hashes, and a successful control install. The public-package CLI cases separately
 verify Deno dispatch, actual approved registry downloads, and offline reuse.
 
+The trusted guest supervisor streams bounded stdout/stderr frames to private
+host scratch while a phase runs. Cancellation and deadline records preserve
+the bytes already received, including binary output, in the private audit.
+Logs emitted but not yet received when the VM stops may be absent. Normal
+completion verifies the streamed bytes against the final guest receipt.
+Streaming does not grant workload stdout access to the tool dispatcher.
+
 ## Errors and rollback
 
 | Error | Operator interpretation |

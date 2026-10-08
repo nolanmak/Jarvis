@@ -43,6 +43,84 @@ def deny(code='bad_args', message='Invalid compute request.', **details):
     raise ComputeError(code, message, **details)
 
 
+class GuestTransfer:
+    """Decode only trusted supervisor frames, never workload stdout as RPC."""
+    RESULT = b'JARVIS_COMPUTE_RESULT:'
+    LOG = b'JARVIS_COMPUTE_LOG:'
+
+    def __init__(self, log_directory=None):
+        self.logs = {'stdout': bytearray(), 'stderr': bytearray()}
+        self.pending = bytearray()
+        self.result = bytearray()
+        self.terminal = False
+        self.received = 0
+        self.files = {}
+        try:
+            if log_directory is not None:
+                for name in self.logs:
+                    descriptor = os.open(Path(log_directory) / ('partial.' + name),
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+                    self.files[name] = os.fdopen(descriptor, 'wb')
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        for stream in self.files.values():
+            stream.close()
+
+    def feed(self, data):
+        self.received += len(data)
+        # At most 64 MiB exports, 8 MiB logs (streamed and repeated in the
+        # final receipt), base64 expansion, and bounded framing overhead.
+        if self.received > 128 * 1024 * 1024:
+            deny('resource_limit', 'Compute result exceeded its transfer limit.')
+        if self.terminal:
+            self.result.extend(data)
+            return
+        self.pending.extend(data)
+        while self.pending:
+            if self.pending[:1] == b'\n':
+                del self.pending[:1]
+                continue
+            if self.RESULT.startswith(self.pending):
+                return
+            if self.pending.startswith(self.RESULT):
+                self.terminal = True
+                self.result.extend(self.pending)
+                self.pending.clear()
+                return
+            end = self.pending.find(b'\n')
+            if end < 0:
+                if len(self.pending) > 96 * 1024:
+                    deny('resource_limit', 'Compute log frame exceeds its limit.')
+                return
+            if end > 96 * 1024 or not self.pending.startswith(self.LOG):
+                deny('sandbox_unavailable', 'Invalid compute log frame.')
+            try:
+                frame = json.loads(self.pending[len(self.LOG):end])
+                if (not isinstance(frame, dict) or set(frame) != {'stream', 'offset', 'data'}
+                        or frame['stream'] not in self.logs or type(frame['offset']) is not int
+                        or frame['offset'] != len(self.logs[frame['stream']])):
+                    raise ValueError()
+                chunk = base64.b64decode(frame['data'], validate=True)
+                if not 0 < len(chunk) <= 65536:
+                    raise ValueError()
+            except (ValueError, TypeError, KeyError):
+                deny('sandbox_unavailable', 'Invalid compute log frame.')
+            if sum(map(len, self.logs.values())) + len(chunk) > 8 * 1024 * 1024:
+                deny('resource_limit', 'Compute logs exceed their transfer limit.')
+            self.logs[frame['stream']].extend(chunk)
+            if frame['stream'] in self.files:
+                stream = self.files[frame['stream']]
+                stream.write(chunk)
+                stream.flush()
+            del self.pending[:end + 1]
+
+
 def bound_host_deadline(local, host):
     if host is None:
         return local
@@ -303,76 +381,88 @@ poweroff -f
         # Keep the unused input pipe open until shutdown: /dev/null sends EOF
         # immediately and makes QEMU disconnect its bidirectional virtio port.
         # No host command or data is ever written to this pipe.
-        process = subprocess.Popen([sys.executable, '-I', str(supervisor), str(cleanup), *command],
-            env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            start_new_session=True)
-        captured = bytearray()
-        try:
-            with selectors.DefaultSelector() as selector:
-                selector.register(process.stdout, selectors.EVENT_READ)
-                while selector.get_map():
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        deny('timeout', 'Compute execution deadline expired.')
-                    if broker is not None:
-                        broker.poll(remaining)
-                    for key, _ in selector.select(min(max(0, deadline-time.monotonic()), 0.05)):
-                        data = os.read(key.fileobj.fileno(), 65536)
-                        if not data:
-                            selector.unregister(key.fileobj)
-                            break
-                        captured.extend(data)
-                        if len(captured) > 100 * 1024 * 1024:
-                            deny('resource_limit', 'Compute result exceeded its transfer limit.')
-            status = process.wait(timeout=max(0.001, deadline - time.monotonic()))
-            if status or not cleanup.is_file() or cleanup.read_text() != 'all-descendants-reaped\n':
-                deny('cleanup_unverified', 'Compute cleanup could not be verified.')
-        except BaseException as error:
-            error.runner = 'vm'
-            raise
-        finally:
+        with GuestTransfer(root) as transfer:
+            process = subprocess.Popen([sys.executable, '-I', str(supervisor), str(cleanup), *command],
+                env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                start_new_session=True)
+            failure = None
+            cleanup_verified = False
             try:
-                cleanup_vm_phase(process, cleanup)
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stdout, selectors.EVENT_READ)
+                    while selector.get_map():
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            deny('timeout', 'Compute execution deadline expired.')
+                        if broker is not None:
+                            broker.poll(remaining)
+                        for key, _ in selector.select(min(max(0, deadline-time.monotonic()), 0.05)):
+                            data = os.read(key.fileobj.fileno(), 65536)
+                            if not data:
+                                selector.unregister(key.fileobj)
+                                break
+                            transfer.feed(data)
+                status = process.wait(timeout=max(0.001, deadline - time.monotonic()))
+                if status or not cleanup.is_file() or cleanup.read_text() != 'all-descendants-reaped\n':
+                    deny('cleanup_unverified', 'Compute cleanup could not be verified.')
             except BaseException as error:
+                failure = error
                 error.runner = 'vm'
                 raise
-        prefix = b'JARVIS_COMPUTE_RESULT:'
-        records = [line[len(prefix):] for line in captured.splitlines() if line.startswith(prefix)]
-        if len(records) != 1:
-            with tempfile.NamedTemporaryFile(prefix='compute-boot-', suffix='.log', dir=private, delete=False) as stream:
-                stream.write(captured[-65536:])
-            deny('sandbox_unavailable', 'Compute guest did not return a result.')
-        result = json.loads(records[0])
-        if not isinstance(result, dict) or type(result.get('ok')) is not bool:
-            deny('sandbox_unavailable', 'Invalid compute guest result.')
-        if broker is not None and broker.integrity_failed:
-            # Preserve the host-verified failure even if pip only reports HTTP
-            # 502, or resolves another candidate after the corrupted download.
-            result.update(ok=False, error='dependency_integrity', files={}, dependencyLock=[])
-        encoded_logs = result.pop('privateLogs', None)
-        if not isinstance(encoded_logs, dict) or set(encoded_logs) != {'stdout', 'stderr'}:
-            deny('sandbox_unavailable', 'Invalid compute log transfer.')
-        raw_logs = {name: base64.b64decode(data, validate=True) for name, data in encoded_logs.items()}
-        if sum(map(len, raw_logs.values())) > 8 * 1024 * 1024:
-            deny('resource_limit', 'Compute logs exceed their transfer limit.')
-        result['_logs'] = raw_logs
-        for name, data in raw_logs.items():
-            result[name] = data.decode(errors='replace')
-        files, total = {}, 0
-        if result['ok']:
-            if set(result.get('files', {})) != set(request['outputs']):
-                deny('output_denied', 'Compute output set does not match the request.')
-            for name, entry in result['files'].items():
-                data = base64.b64decode(entry['data'], validate=True)
-                total += len(data)
-                if len(data) > MAX_FILE_BYTES or total > MAX_OUTPUT_BYTES:
-                    deny('resource_limit', 'Compute exports exceed their byte limit.')
-                if len(data) != entry['bytes'] or hashlib.sha256(data).hexdigest() != entry['sha256']:
-                    deny('output_denied', 'Compute export integrity check failed.')
-                files[name] = data
-        result.update(runner='vm', cleanupVerified=True, files=files,
-                      downloads={'requests': broker.requests if broker else 0, 'bytes': broker.bytes if broker else 0})
-        return result
+            finally:
+                try:
+                    cleanup_vm_phase(process, cleanup)
+                    cleanup_verified = True
+                except BaseException as error:
+                    failure = error
+                    error.runner = 'vm'
+                    raise
+                finally:
+                    if failure is not None:
+                        failure.partial = {'runner': 'vm', 'cleanupVerified': cleanup_verified,
+                            'error': getattr(failure, 'code', 'cancelled' if not isinstance(failure, Exception) else 'execution_failed'),
+                            '_logs': {name: bytes(data) for name, data in transfer.logs.items()},
+                            'downloads': {'requests': broker.requests if broker else 0, 'bytes': broker.bytes if broker else 0}}
+            captured = transfer.result
+            prefix = b'JARVIS_COMPUTE_RESULT:'
+            records = [line[len(prefix):] for line in captured.splitlines() if line.startswith(prefix)]
+            if len(records) != 1:
+                with tempfile.NamedTemporaryFile(prefix='compute-boot-', suffix='.log', dir=private, delete=False) as stream:
+                    stream.write(captured[-65536:])
+                deny('sandbox_unavailable', 'Compute guest did not return a result.')
+            result = json.loads(records[0])
+            if not isinstance(result, dict) or type(result.get('ok')) is not bool:
+                deny('sandbox_unavailable', 'Invalid compute guest result.')
+            if broker is not None and broker.integrity_failed:
+                # Preserve the host-verified failure even if pip only reports HTTP
+                # 502, or resolves another candidate after the corrupted download.
+                result.update(ok=False, error='dependency_integrity', files={}, dependencyLock=[])
+            encoded_logs = result.pop('privateLogs', None)
+            if not isinstance(encoded_logs, dict) or set(encoded_logs) != {'stdout', 'stderr'}:
+                deny('sandbox_unavailable', 'Invalid compute log transfer.')
+            raw_logs = {name: base64.b64decode(data, validate=True) for name, data in encoded_logs.items()}
+            if sum(map(len, raw_logs.values())) > 8 * 1024 * 1024:
+                deny('resource_limit', 'Compute logs exceed their transfer limit.')
+            if raw_logs != {name: bytes(data) for name, data in transfer.logs.items()}:
+                deny('sandbox_unavailable', 'Compute log receipt does not match its stream.')
+            result['_logs'] = raw_logs
+            for name, data in raw_logs.items():
+                result[name] = data.decode(errors='replace')
+            files, total = {}, 0
+            if result['ok']:
+                if set(result.get('files', {})) != set(request['outputs']):
+                    deny('output_denied', 'Compute output set does not match the request.')
+                for name, entry in result['files'].items():
+                    data = base64.b64decode(entry['data'], validate=True)
+                    total += len(data)
+                    if len(data) > MAX_FILE_BYTES or total > MAX_OUTPUT_BYTES:
+                        deny('resource_limit', 'Compute exports exceed their byte limit.')
+                    if len(data) != entry['bytes'] or hashlib.sha256(data).hexdigest() != entry['sha256']:
+                        deny('output_denied', 'Compute export integrity check failed.')
+                    files[name] = data
+            result.update(runner='vm', cleanupVerified=True, files=files,
+                          downloads={'requests': broker.requests if broker else 0, 'bytes': broker.bytes if broker else 0})
+            return result
 
 
 def open_absolute(path, *, directory=False):
@@ -738,6 +828,12 @@ class ComputeTask:
             if error.preparation is not None:
                 preparation = self._preparation_record(execution_id, error.preparation, preparation_started)
                 downloads = error.preparation['downloads']
+            elif getattr(error, 'partial', None) is not None:
+                if self.active['phase'] == 'prepare':
+                    preparation = self._preparation_record(execution_id, error.partial, preparation_started)
+                else:
+                    logs = self._logs(execution_id, error.partial)
+                downloads = error.partial['downloads']
             result['error'] = {'code': error.code, 'message': str(error), 'retryable': error.retryable}
         except BaseException as error:
             if getattr(error, 'runner', None) == 'vm':
@@ -745,6 +841,12 @@ class ComputeTask:
             cleanup = False
             code = 'cancelled' if not isinstance(error, Exception) else 'execution_failed'
             result['error'] = {'code': code, 'message': 'Compute execution interrupted.', 'retryable': False}
+            if getattr(error, 'partial', None) is not None:
+                if self.active['phase'] == 'prepare':
+                    preparation = self._preparation_record(execution_id, error.partial, preparation_started)
+                else:
+                    logs = self._logs(execution_id, error.partial)
+                downloads = error.partial['downloads']
             raise
         finally:
             ended = self.clock()
