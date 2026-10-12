@@ -115,6 +115,8 @@ pub enum ApprovalActionOutcome {
         /// A repeated Approve recovered the saved receipt; no new write/nudge.
         already_existed: bool,
     },
+    /// A signed PDF was published, or its immutable receipt recovered.
+    DocumentSigned { receipt: String, already_existed: bool, output: Option<(std::path::PathBuf, String)> },
     /// Skip succeeded — draft deleted, action marked Rejected.
     Skipped,
     /// Revise succeeded — a new draft was created and should be re-posted as

@@ -14,6 +14,7 @@ repository.workspace = true
 # live in core without a cycle.
 
 [dependencies]
+sha2 = "0.10.9"
 # Keyring-first `MISTRAL_API_KEY` lookup (#128 pattern), env fallback.
 augmentagent-auth = { path = "../augmentagent-auth" }
 

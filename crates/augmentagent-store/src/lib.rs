@@ -7,6 +7,7 @@
 // #1289 — durable approval-card pointers per surface.
 pub mod approval_cards;
 pub mod approval_history;
+pub mod document_signatures;
 pub mod alert_schedule;
 pub mod daemon_report;
 pub mod delivery;

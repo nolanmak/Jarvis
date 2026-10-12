@@ -387,10 +387,10 @@ fn approval_embed_and_rows(
 
     // #927 — a merge card carries evidence, not a draft: nothing to redraft,
     // so Approve (which runs the merge) and Skip are the only verbs offered.
-    if email.kind == "identity_merge" {
+    if email.kind == "identity_merge" || email.platform == "document-signing" {
         let row = CreateActionRow::Buttons(vec![
             CreateButton::new(CustomId::new(action_id, Verb::Approve).with_revision(draft).to_string())
-                .label("Approve & Merge")
+                .label(if email.platform == "document-signing" { "Approve & Sign" } else { "Approve & Merge" })
                 .style(ButtonStyle::Success),
             CreateButton::new(CustomId::new(action_id, Verb::Skip).to_string())
                 .label("Skip")

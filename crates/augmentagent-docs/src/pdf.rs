@@ -12,7 +12,7 @@ pub const MAX_PDF_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_MARKDOWN_BYTES: usize = 1024 * 1024;
 const WORKER: &str = include_str!("../python/render_pdf.py");
 
-fn renderer_python() -> Result<PathBuf> {
+pub(crate) fn renderer_python() -> Result<PathBuf> {
     if let Some(python) = std::env::var_os("AUGMENTAGENT_PDF_PYTHON") {
         return Ok(python.into());
     }
@@ -31,7 +31,7 @@ pub struct PdfReceipt {
     pub attach: String,
 }
 
-async fn bounded_read(reader: impl AsyncRead + Unpin, limit: usize) -> Result<Vec<u8>> {
+pub(crate) async fn bounded_read(reader: impl AsyncRead + Unpin, limit: usize) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     reader
         .take(limit as u64 + 1)
@@ -145,6 +145,7 @@ pub async fn render_pdf(root: &Path, input: &Path, output: Option<&Path>) -> Res
     if !pdf.starts_with(b"%PDF-") || !pdf.ends_with(b"%%EOF\n") {
         bail!("PDF renderer did not return a complete PDF");
     }
+    crate::signing::register_generated(&pdf)?;
     // Publish only a complete, size-checked PDF. Never clobber an existing
     // file (including a symlink), even if it appeared while rendering.
     let mut temporary = tempfile::NamedTempFile::new_in(&parent)?;

@@ -146,3 +146,29 @@ async fn serenity_click_records_actor_and_decision_even_when_receipt_delivery_fa
     let rows=store.approval_history(None,20,None).unwrap();assert_eq!(rows.len(),1);
     assert_eq!(rows[0].verb,"approve");assert_eq!(rows[0].outcome,"failed");
 }
+
+#[tokio::test]
+async fn signing_receipt_delivered_before_card_retirement() {
+    for status in [200,403] {
+        deliver(ApprovalActionOutcome::DocumentSigned { receipt:"ATTACH: signed.pdf\nSHA-256: fixture".into(),already_existed:false, output: None },
+            "Document signed. ATTACH: signed.pdf\nSHA-256: fixture",status,if status==200 {1}else{0}).await;
+    }
+}
+
+#[tokio::test]
+async fn signed_pdf_is_attached_and_a_changed_file_keeps_the_card() {
+    let dir=tempfile::tempdir().unwrap(); let file=dir.path().join("signed.pdf");
+    let pdf=b"%PDF-1.4\nsynthetic signed document\n%%EOF\n"; std::fs::write(&file,pdf).unwrap();
+    let outcome=ApprovalActionOutcome::DocumentSigned { receipt:"Ready".into(),already_existed:false,output:Some((file.clone(),augmentagent_docs::signing::digest(pdf))) };
+    let mut server=Server::new_async().await;
+    let followup=server.mock("POST",Matcher::Regex("/webhooks/333/fixture-token".into()))
+        .match_body(Matcher::Regex("(?s)filename=\"signed-document.pdf\".*synthetic signed document".into()))
+        .with_status(200).with_header("content-type","application/json")
+        .with_body(serde_json::to_string(&Message::default()).unwrap()).expect(1).create_async().await;
+    let delete=server.mock("DELETE",Matcher::Regex("/channels/222/messages/444".into())).with_status(204).expect(1).create_async().await;
+    let http=serenity::http::HttpBuilder::new("test-token").application_id(serenity::all::ApplicationId::new(333)).proxy(server.url()).ratelimiter_disabled(true).build();
+    deliver_approval_outcome(&http,&component(),&outcome,"signature-test").await.unwrap();
+    std::fs::write(file,b"changed").unwrap();
+    assert!(deliver_approval_outcome(&http,&component(),&outcome,"signature-test").await.is_err());
+    followup.assert_async().await; delete.assert_async().await;
+}

@@ -232,5 +232,12 @@ ln -s ../people/dana.md "$WIKI/sub/CLAUDE.md"
 expect_block "Write a symlink named CLAUDE.md resolving to a benign page is blocked (requested path)" \
   Write file_path "$WIKI/sub/CLAUDE.md"
 
+# Signing assets remain outside the model-readable wiki, even through a symlink.
+mkdir -p "$TMP/signatures"
+touch "$TMP/signatures/default.png"
+expect_block "private signature asset cannot be read" Read file_path "$TMP/signatures/default.png"
+ln -s "$TMP/signatures" "$WIKI/signature-escape"
+expect_block "signature symlink escape cannot be read" Read file_path "$WIKI/signature-escape/default.png"
+
 printf '\n%d ok, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
