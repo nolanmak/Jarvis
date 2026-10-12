@@ -571,8 +571,6 @@ impl ComposioClient {
         tool_slug: &str,
         path: &std::path::Path,
     ) -> Result<Attachment, GmailError> {
-        use md5::{Digest, Md5};
-
         let bytes = std::fs::read(path).map_err(|e| {
             GmailError::Decode(format!("read attachment {}: {e}", path.display()))
         })?;
@@ -581,6 +579,18 @@ impl ComposioClient {
             .and_then(|s| s.to_str())
             .unwrap_or("attachment")
             .to_string();
+        self.upload_attachment_bytes(tool_slug, &name, bytes).await
+    }
+
+    /// Upload the exact snapshot used by the caller's attachment review details.
+    pub async fn upload_attachment_bytes(
+        &self,
+        tool_slug: &str,
+        name: &str,
+        bytes: Vec<u8>,
+    ) -> Result<Attachment, GmailError> {
+        use md5::{Digest, Md5};
+        let name = name.to_string();
         let mimetype = guess_mimetype(&name).to_string();
         let md5_hex = format!("{:x}", Md5::digest(&bytes));
 
