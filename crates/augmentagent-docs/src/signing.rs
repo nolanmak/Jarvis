@@ -102,10 +102,21 @@ pub fn register_at(state: &Path, pdf: &[u8]) -> Result<()> {
     let dir = state.join("generated");
     private_dir(&dir)?;
     let path = dir.join(digest(pdf));
-    if !path.exists() {
-        publish(&path, b"generated-pdf-v1\n")?;
+    // Multiple renders can produce the same bytes. Publish atomically, accepting
+    // only another completed regular marker as the idempotent winner.
+    let mut marker = tempfile::NamedTempFile::new_in(&dir)?;
+    marker.write_all(b"generated-pdf-v1\n")?;
+    marker.as_file().sync_all()?;
+    match marker.persist_noclobber(&path) {
+        Ok(_) => Ok(()),
+        Err(error)
+            if error.error.kind() == std::io::ErrorKind::AlreadyExists
+                && path.symlink_metadata().is_ok_and(|m| m.is_file()) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error).context("register generated PDF"),
     }
-    Ok(())
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Placement {
