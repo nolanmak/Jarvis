@@ -94,3 +94,21 @@ installer, tests missing-dependency detection and repair, and exercises the CLI
 against the managed runtime from a separate wiki directory. OS removal of
 `python3-markdown` no longer affects the renderer. Host Python and Liberation
 fonts remain system prerequisites; the preflight detects their loss.
+
+## Owner signature image (#1444)
+
+The operator installs a supplied PNG once with `augmentagent doc signature-install /path/to/signature.png --name default`.
+The image lives under the OS state directory's `augmentagent/signatures`, outside wiki/git, with a private directory and file permissions.
+Names are immutable: use another name to rotate an asset. The query agent may list names with `doc signatures`; installation and image reads are not allowed agent tools.
+
+Render the document with `doc render-pdf` first. New exports are registered by SHA-256 outside the wiki. Older/unregistered PDFs must be regenerated from the reviewed source.
+`doc sign draft.pdf --out draft-signed.pdf --signature default --page 1 --x 72 --y 72 --width 144 --date 2026-10-12`
+posts an unsigned PDF and an **Approve & Sign** card. Positions are PDF points measured from bottom-left; pages are one-based. Supply coordinates from the document layout and leave space for the image's original aspect ratio. The optional ISO date is printed below it.
+
+Approval is bound to both document and asset hashes. Changing either requires a new proposal. Signing never overwrites files and never sends email. Sending requires its own approval. The Discord confirmation attaches the completed PDF directly. The next owner query also receives its ATTACH marker and SHA-256 through approval history. Attachment delivery checks the saved hash and retains the card if the file is missing or changed.
+
+The immutable `document_signatures` table stores the approval ID, full proposal (paths, hashes, placement), output hash and completion timestamp. Approval history records the actor/decision separately. Repeated approvals recover a verified output receipt; concurrent approvals share the durable action fence. If publication succeeded but receipt persistence failed, the outcome is unconfirmed and cannot replay automatically. Inspect the output before recovery.
+
+The first release accepts generated, text-readable, unencrypted PDFs of up to 100 pages/8 MiB and PNG assets up to 1 MiB/4096 pixels per side. Rotated/offset pages, interactive forms and the issue's affidavit/sworn-statement/perjury/government-filing keyword cases require manual handling. This applies a signature image; it does not implement counterparty signing, cryptographic sealing or certificate validation.
+
+Tests use synthetic signatures. Run the Python renderer/signing suite, `cargo test -p augmentagent-docs --test signing`, `cargo test -p augmentagent-cli --bin augmentagent document_signing::tests`, and the Discord approval-delivery tests. Provision the updated pinned runtime with `python3 scripts/pdf-runtime.py`.

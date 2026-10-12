@@ -1,6 +1,7 @@
 //! `augmentagent` binary.
 
 mod approval_context;
+mod document_signing;
 #[cfg(test)]
 mod provider_migration_tests;
 mod model_tool;
@@ -2066,6 +2067,24 @@ enum DiscordOp {
 
 #[derive(Subcommand)]
 enum DocOp {
+    /// Propose a signature on a generated PDF. Only approval publishes the signed output.
+    Sign {
+        file: PathBuf,
+        #[arg(long)] out: PathBuf,
+        #[arg(long, default_value = "default")] signature: String,
+        #[arg(long)] page: u32,
+        /// PDF points from bottom-left.
+        #[arg(long)] x: f64,
+        #[arg(long)] y: f64,
+        #[arg(long, default_value = "144")] width: f64,
+        /// Optional ISO date printed below the signature.
+        #[arg(long)] date: Option<String>,
+    },
+    /// Operator-only: install a PNG under a logical signature name. Never overwrites a name.
+    SignatureInstall { file: PathBuf, #[arg(long, default_value = "default")] name: String },
+    /// List logical signature names, without paths or image data.
+    Signatures,
+
     /// Render Markdown to a real PDF under WIKI_ROOT, ready for Discord attachment.
     RenderPdf {
         /// Wiki-relative Markdown or text file (absolute paths must also be inside WIKI_ROOT).
@@ -2671,7 +2690,7 @@ enum WikiOp {
     ///
     /// - Conversation and memory recall through the memory MCP server (search and read only, no memory writes).
     ///
-    /// - Bash limited to an allowlist: `augmentagent gmail` (every subcommand, including send), `finance` status/transactions/summary, `calendar` list-events/create-event, `loop`, `loops`, `meetup events`, `socialapi` and `linkedin` dm/comment, `linkedin recent-dms`, `repo-docs`, `doc render-pdf`, `imessage fetch-attachment`, and `aa-gh issue` create/list/view/comment.
+    /// - Bash limited to an allowlist: `augmentagent gmail` (every subcommand, including send), `finance` status/transactions/summary, `calendar` list-events/create-event, `loop`, `loops`, `meetup events`, `socialapi` and `linkedin` dm/comment, `linkedin recent-dms`, `repo-docs`, `doc render-pdf/sign/signatures`, `imessage fetch-attachment`, and `aa-gh issue` create/list/view/comment.
     ///
     /// Some of these act outside the wiki: sending email, filing or commenting on GitHub issues, and changing or stopping loops. Calendar events and social DMs and comments are raised as Discord approval cards and happen only when approved.
     Ask {
@@ -4282,6 +4301,17 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Doc { ref op } => match op {
+            DocOp::SignatureInstall { ref file, ref name } => {
+                let hash = augmentagent_docs::signing::install(&augmentagent_docs::signing::state_root()?, name, file)?;
+                println!("Installed signature {name}; SHA-256 {hash}"); Ok(())
+            }
+            DocOp::Signatures => {
+                println!("{}", serde_json::to_string(&augmentagent_docs::signing::list(&augmentagent_docs::signing::state_root()?)?)?); Ok(())
+            }
+            DocOp::Sign { ref file, ref out, ref signature, page, x, y, width, ref date } => {
+                document_signing::propose(store.clone(), file, out, signature,
+                    augmentagent_docs::signing::Placement { page: *page, x: *x, y: *y, width: *width, date: date.clone() }).await
+            }
             DocOp::RenderPdf { .. } => unreachable!("PDF rendering dispatched before store initialization"),
             DocOp::Extract { file, out, kind, no_ocr, json } => {
                 doc_cmd::run_doc_extract(file.clone(), out.clone(), kind.clone(), *no_ocr, *json)
@@ -13575,6 +13605,7 @@ impl ApprovalActionHandler for ReplyApprover {
             outcome,
             ApprovalActionOutcome::Approved
                 | ApprovalActionOutcome::CalendarCreated { already_existed: false, .. }
+                | ApprovalActionOutcome::DocumentSigned { already_existed: false, .. }
                 | ApprovalActionOutcome::Scheduled { .. }
         ) {
             self.trigger_next_nudge().await;
@@ -13700,6 +13731,9 @@ impl ReplyApprover {
         // retryable and never sends a delivered message twice.
         if action.email.platform == "slack" && action.action.status == "error" {
             return self.approve_slack(action_id, action).await;
+        }
+        if action.email.platform == "document-signing" {
+            return self.approve_document_signature(action_id, action).await;
         }
         // A card is retained when Discord fails to deliver the first receipt.
         // Recover that receipt on a repeated click without creating/nudging again.

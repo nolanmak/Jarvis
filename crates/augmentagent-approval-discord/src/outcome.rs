@@ -48,6 +48,7 @@ pub fn describe(outcome: &ApprovalActionOutcome) -> String {
                 None => format!("Calendar event {verb} {destination}. Event ID: {event_id}."),
             }
         }
+        ApprovalActionOutcome::DocumentSigned { receipt, .. } => format!("Document signed. {receipt}"),
         ApprovalActionOutcome::Skipped => "Skipped — draft discarded.".into(),
         ApprovalActionOutcome::Revised { .. } => "Revising — new draft posted below.".into(),
         ApprovalActionOutcome::Scheduled { local, .. } => {

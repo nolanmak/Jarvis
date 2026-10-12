@@ -1745,8 +1745,13 @@ async fn deliver_approval_outcome(
     outcome: &ApprovalActionOutcome,
     action_id: &str,
 ) -> Result<(), serenity::Error> {
-    comp.create_followup(http, approval_followup(outcome, action_id))
-        .await?;
+    let mut followup = approval_followup(outcome, action_id);
+    if let ApprovalActionOutcome::DocumentSigned { output: Some((path, hash)), .. } = outcome {
+        let bytes = augmentagent_docs::signing::verified_output(path, hash)
+            .map_err(|_| serenity::Error::Other("Signed PDF is missing or changed; approval card retained"))?;
+        followup = followup.add_file(serenity::all::CreateAttachment::bytes(bytes, "signed-document.pdf"));
+    }
+    comp.create_followup(http, followup).await?;
     if should_delete_source(outcome) {
         comp.channel_id.delete_message(http, comp.message.id).await?;
     }
@@ -1937,6 +1942,7 @@ fn should_delete_source(outcome: &ApprovalActionOutcome) -> bool {
         outcome,
         ApprovalActionOutcome::Approved
             | ApprovalActionOutcome::CalendarCreated { .. }
+            | ApprovalActionOutcome::DocumentSigned { .. }
             | ApprovalActionOutcome::Skipped
             | ApprovalActionOutcome::Revised { .. }
             | ApprovalActionOutcome::AlreadyResolved { .. }

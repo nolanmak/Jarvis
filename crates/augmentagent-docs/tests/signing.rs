@@ -1,0 +1,82 @@
+use augmentagent_docs::{
+    pdf,
+    signing::{self, Placement},
+};
+fn place() -> Placement {
+    Placement {
+        page: 1,
+        x: 72.,
+        y: 72.,
+        width: 144.,
+        date: Some("2026-10-12".into()),
+    }
+}
+#[tokio::test]
+async fn signature_is_revision_bound_and_published_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("wiki");
+    let state = dir.path().join("private");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(
+        root.join("contract.md"),
+        "# Contract\n\nServices agreement.\n",
+    )
+    .unwrap();
+    pdf::render_pdf(&root, std::path::Path::new("contract.md"), None)
+        .await
+        .unwrap();
+    let original = std::fs::read(root.join("contract.pdf")).unwrap();
+    signing::register_at(&state, &original).unwrap();
+    let png = dir.path().join("test.png");
+    std::fs::write(&png, include_bytes!("fixtures/signature-test.png")).unwrap();
+    signing::install(&state, "default", &png).unwrap();
+    assert!(signing::install(&state, "../escape", &png).is_err());
+    let p = signing::propose(
+        &root,
+        &state,
+        "contract.pdf".as_ref(),
+        "signed.pdf".as_ref(),
+        "default",
+        place(),
+    )
+    .await
+    .unwrap();
+    assert!(!root.join("signed.pdf").exists());
+    std::fs::write(root.join("contract.pdf"), b"changed").unwrap();
+    assert!(signing::execute(&root, &state, &p)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("changed"));
+    std::fs::write(root.join("contract.pdf"), &original).unwrap();
+    let asset = std::fs::read(state.join("default.png")).unwrap();
+    std::fs::write(state.join("default.png"), b"changed").unwrap();
+    assert!(signing::execute(&root, &state, &p).await.is_err());
+    std::fs::write(state.join("default.png"), asset).unwrap();
+    let receipt = signing::execute(&root, &state, &p).await.unwrap();
+    signing::verify_receipt(&root, &receipt).unwrap();
+    assert_eq!(std::fs::read(root.join("contract.pdf")).unwrap(), original);
+    assert!(signing::execute(&root, &state, &p).await.is_err());
+    assert!(signing::propose(
+        &root,
+        &state,
+        "contract.pdf".as_ref(),
+        "../escape.pdf".as_ref(),
+        "default",
+        place()
+    )
+    .await
+    .is_err());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(state.join("default.png"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+}
