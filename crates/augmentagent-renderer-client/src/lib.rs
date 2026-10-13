@@ -361,8 +361,15 @@ mod tests {
         assert!(!e2.is_bundle_failed());
     }
 
+    // `std::env::set_var` is process-global, so these two tests cannot run
+    // concurrently: one clears AUGMENTAGENT_RENDERER_SOCK while the other sets
+    // it, and `cargo test` runs them on parallel threads in one binary.
+    // Whichever interleaving loses, fails — reddening PRs that touch no Rust.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn default_socket_path_matches_platform() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("XDG_RUNTIME_DIR", "/tmp/xdgtest-renderer");
         std::env::remove_var("AUGMENTAGENT_RENDERER_SOCK");
         let p = default_socket_path();
@@ -377,6 +384,7 @@ mod tests {
 
     #[test]
     fn explicit_socket_env_overrides() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("AUGMENTAGENT_RENDERER_SOCK", "/tmp/custom.sock");
         let p = default_socket_path();
         assert_eq!(p, std::path::PathBuf::from("/tmp/custom.sock"));
