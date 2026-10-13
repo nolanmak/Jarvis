@@ -232,6 +232,7 @@ pub static PRODUCERS: &[Producer] = &[
     // -- Approval surfaces (#1289) -------------------------------------------
     act(p("approval_broker", "crates/augmentagent-approval-discord/src/broker.rs", "send_message(&", 4, BROKER, "Discord approval broker: cards, flag notices, digests")),
     act(p("owner_alert_discord", "crates/augmentagent-approval-discord/src/broker.rs", "send_message(&", 1, BROKER, "critical owner alerts with acknowledgment controls")),
+    act(p("signing_approval", "crates/augmentagent-cli/src/document_signing.rs", "send_message(&", 1, BROKER, "`sign`: the document signing approval card with the unsigned review PDF")),
     act(p("owner_alert_scheduler", "crates/augmentagent-approval-discord/src/owner_alerts.rs", ".post_owner_alert(", 1, BROKER, "persistent owner alert escalation")),
     act(p("owner_alert_route", "crates/augmentagent-approval-discord/src/sync.rs", ".post_owner_alert(", 1, BROKER, "Discord-only route for owner alert controls")),
     p("owner_alert_layout", "crates/augmentagent-approval-discord/src/owner_alerts.rs", "CreateMessage::new(", 1, TRANSPORT, "owner alert presentation"),
