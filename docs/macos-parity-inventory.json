@@ -3580,5 +3580,32 @@
     "test_plan": "Verify 04:37 daily schedule and catch-up behavior, synthetic cleanup, active-build protection and service install/uninstall on each platform.",
     "status": "gap",
     "evidence": null
+  },
+  {
+    "id": "installer:install-sync-watchdog.sh",
+    "source": "scripts/install-sync-watchdog.sh",
+    "macos_target": "Mac install-sync-watchdog.sh manages only the source-app watchdog LaunchAgent idempotently, relaunching Notes/WhatsApp/Messages when their local store stops being written.",
+    "linux_baseline": "No Linux equivalent: the exporters' source apps are macOS-only, so there is no store for a Linux host to watch.",
+    "prerequisites": [
+      "signed-in launchd user session",
+      "the source apps installed and signed in"
+    ],
+    "status": "in_progress",
+    "evidence": null,
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1463",
+    "test_plan": "Run sync_source_watchdog_test in a disposable home, then verify on a real Mac that a cold store relaunches its app and a fresh one does not."
+  },
+  {
+    "id": "installer:uninstall-sync-watchdog.sh",
+    "source": "scripts/uninstall-sync-watchdog.sh",
+    "macos_target": "Mac uninstall-sync-watchdog.sh removes the watchdog LaunchAgent and leaves every source database and exported bundle untouched.",
+    "linux_baseline": "No Linux equivalent: nothing to uninstall where the watchdog never installs.",
+    "prerequisites": [
+      "signed-in launchd user session"
+    ],
+    "status": "in_progress",
+    "evidence": null,
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1463",
+    "test_plan": "Covered by sync_source_watchdog_test's uninstall case; confirm on a real Mac that the job is gone and the stores remain."
   }
 ]

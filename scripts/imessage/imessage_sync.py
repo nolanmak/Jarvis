@@ -26,6 +26,27 @@ _NORMAL_ASSOC_TYPES = (0, None)
 
 HEADER_PREFIX = "### ["
 
+# A source app that stops running freezes its database, and an exporter with
+# nothing to export looks identical to a healthy one. Report the age so a cold
+# source is visible in the job's own log instead of being silent for weeks.
+SOURCE_STALE_AFTER_S = 6 * 3600
+
+
+def source_staleness(db_path, now=None, threshold=SOURCE_STALE_AFTER_S):
+    """Seconds since `db_path` was written when that exceeds `threshold`.
+
+    None when the source is fresh or unreadable — the caller reports staleness,
+    it does not diagnose a missing file.
+    """
+    import os
+    import time
+    try:
+        age = (now if now is not None else time.time()) - os.path.getmtime(db_path)
+    except OSError:
+        return None
+    return age if age > threshold else None
+
+
 # Link previews (rich URL cards) arrive as attachments but hold no media worth
 # storing: uploading them cost more than half of every queue drain.
 SKIP_ATTACHMENT_SUFFIXES = (".pluginpayloadattachment",)
