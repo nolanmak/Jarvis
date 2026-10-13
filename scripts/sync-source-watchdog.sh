@@ -28,11 +28,16 @@ MESSAGES_DB="${WATCHDOG_MESSAGES_DB:-$HOME/Library/Messages/chat.db}"
 stamp() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 say()   { printf '%s [watchdog] %s\n' "$(stamp)" "$*"; }
 
-# Seconds since <file> was last written, or empty when it does not exist.
+# Seconds since <file> was last written, or non-zero when it cannot be read.
+# `stat -f %m` is BSD/macOS; `stat -c %Y` is GNU coreutils. The watchdog only
+# ACTS on macOS, but the freshness logic is exercised by CI on Linux, so both
+# have to work or the tests pass vacuously against a never-cold store.
 age_of() {
   [ -f "$1" ] || return 1
   local mtime now
-  mtime=$(stat -f %m "$1" 2>/dev/null) || return 1
+  mtime=$(stat -f %m "$1" 2>/dev/null) \
+    || mtime=$(stat -c %Y "$1" 2>/dev/null) \
+    || return 1
   now=$(date +%s)
   printf '%s' "$(( now - mtime ))"
 }

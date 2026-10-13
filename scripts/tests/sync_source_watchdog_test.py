@@ -98,6 +98,16 @@ class SyncSourceWatchdogTest(unittest.TestCase):
         return log.read_text() if log.exists() else ""
 
     # --- the contract ----------------------------------------------------
+    def test_mtime_is_read_on_bsd_and_gnu_stat(self):
+        # `stat -f %m` is BSD-only; on GNU coreutils -f means --file-system and
+        # the mtime read fails, so nothing is ever judged cold. CI runs Linux,
+        # so the freshness logic has to work with either stat.
+        self.age(self.notes_db, 7 * 86400)
+        result = self.run_watchdog()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("cold", result.stdout + result.stderr,
+                      "freshness could not be computed with this platform's stat")
+
     def test_cold_database_relaunches_its_app(self):
         self.age(self.notes_db, 7 * 86400)
         result = self.run_watchdog()
