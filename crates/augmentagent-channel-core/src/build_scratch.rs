@@ -499,6 +499,69 @@ mod tests {
         dir
     }
 
+    /// A session's age decides its grace, so pin the mtime instead of betting a
+    /// fixed offset from `SystemTime::now()` against runner speed. Call after
+    /// `session`, whose `create_dir_all` bumps the mtime it sets.
+    ///
+    /// Only an ownerless session reaches that age comparison: `owner_is_live`
+    /// consults the mtime solely inside its `owner.is_none()` branch. So the
+    /// sweeps that need a pinned `now` are exactly those over a
+    /// `session(.., None)` directory.
+    ///
+    /// The full inventory of this module's `session(.., None)` callers, which
+    /// is therefore the complete set of mtime-sensitive sweeps, is the three
+    /// tests that pin here:
+    ///   - `compute_recovery_keeps_locked_initialization_and_legacy_sessions`
+    ///   - `incomplete_compute_session_has_bounded_startup_grace`
+    ///   - `sweep_waits_out_a_session_that_is_still_being_created`
+    ///
+    /// Every other sweep caller left on `SystemTime::now()` is accounted for
+    /// and cannot reach the mtime branch:
+    ///   - `sweep_reaps_stale_sessions_and_their_vms_but_keeps_live_ones`,
+    ///     `compute_recovery_preserves_storage_when_termination_is_unverified`,
+    ///     `real_sweep_kills_only_vm_processes_of_a_stale_session`,
+    ///     `compute_recovery_verifies_real_process_exit_and_preserves_reused_pid`,
+    ///     `real_sweep_keeps_a_live_session_and_its_processes` -- every session
+    ///     they build carries a `Some(owner)` payload, so `owner.is_none()` is
+    ///     false and the age is never computed.
+    ///   - `live_sweep_reaps_a_killed_bridge_session_and_its_vm` -- `#[ignore]`d
+    ///     owner-run receipt against a real scratch root it does not populate.
+    ///   - `sweep_build_scratch` (production, not a test) -- its `now` is the
+    ///     real clock against real session mtimes, which is the intended
+    ///     behaviour this pinning exists to test, not to change.
+    fn pin_mtime(dir: &Path, at: SystemTime) {
+        let dir_file = std::fs::File::open(dir).unwrap();
+        dir_file.set_times(std::fs::FileTimes::new().set_modified(at))
+            .unwrap_or_else(|error| panic!("could not pin the mtime of {}: {error}", dir.display()));
+    }
+
+    /// An mtime far enough in the past that every grace window has elapsed.
+    fn pinned_base() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+    }
+
+    /// Sweep until a session past its grace is actually removed.
+    ///
+    /// Recovery fails open while the session root is locked, and a sibling
+    /// test's `fork` inherits every descriptor this process holds on that root
+    /// until the child `exec`s. So a sweep racing that window legitimately
+    /// reports the session live. Only that one report is tolerated, which keeps
+    /// the removal guarantee asserted without letting the window decide it.
+    ///
+    /// The window closes when the child `exec`s, so it is milliseconds wide;
+    /// the bound matches the 5s this module already allows its other waits, to
+    /// keep a genuine recovery regression a fast failure rather than a stall.
+    fn sweep_until_removed(sweep: impl Fn() -> SweepReport, live: SweepReport) -> SweepReport {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let report = sweep();
+            if report != live { return report; }
+            assert!(std::time::Instant::now() < deadline,
+                "recovery never stopped reporting the session live");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn exited_unreaped_owner_does_not_keep_scratch_live() {
         use std::os::fd::{AsRawFd, FromRawFd};
@@ -754,19 +817,37 @@ mod tests {
         assert!(!is_session_vm_process("mke2fs", &["/scratch/jarvis-vm-session-compute-xy/build-cache.img".into()], compute));
     }
 
+    /// #1467: this test was flaky. Reproduced on Linux with
+    /// `cargo test -p augmentagent-channel-core --lib build_scratch --
+    /// --test-threads=16`, which failed 9 of 10 runs on the removal assertion
+    /// before this fix and passed 50 of 50 after it.
+    ///
+    /// The fix only pins time and retries; it removes no coverage.
+    /// `cargo test -p augmentagent-channel-core --lib -- --list` reports
+    /// 589 tests both at the parent commit and with this change applied.
     #[test]
     fn compute_recovery_keeps_locked_initialization_and_legacy_sessions() {
         use std::os::fd::AsRawFd;
         let root = tempfile::tempdir().unwrap();
         let partial = session(root.path(), "jarvis-vm-session-compute-partial", None);
         let legacy = session(root.path(), "jarvis-vm-session-legacy", Some(serde_json::json!({"pid":42,"start_time":"gone"})));
+        let base = pinned_base();
+        pin_mtime(&partial, base);
         let guard = std::fs::File::open(root.path()).unwrap();
         assert_eq!(unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
-        let later = SystemTime::now() + Duration::from_secs(31);
-        assert_eq!(sweep_compute_with(root.path(), &FakeProcs::default(), later).kept_live, 1);
+        // Still inside the startup grace: kept for its age alone, lock aside.
+        assert_eq!(sweep_compute_with(root.path(), &FakeProcs::default(),
+            base + COMPUTE_OWNERLESS_GRACE - Duration::from_secs(1)),
+            SweepReport { kept_live: 1, ..Default::default() });
+        let later = base + COMPUTE_OWNERLESS_GRACE + Duration::from_secs(1);
+        assert_eq!(sweep_compute_with(root.path(), &FakeProcs::default(), later),
+            SweepReport { kept_live: 1, ..Default::default() }, "the lock did not hold off recovery");
         assert!(partial.exists());
         drop(guard);
-        assert_eq!(sweep_compute_with(root.path(), &FakeProcs::default(), later).removed, 1);
+        assert_eq!(
+            sweep_until_removed(|| sweep_compute_with(root.path(), &FakeProcs::default(), later),
+                SweepReport { kept_live: 1, ..Default::default() }),
+            SweepReport { removed: 1, ..Default::default() });
         assert!(legacy.exists(), "frequent compute recovery touched a legacy build");
     }
 
@@ -775,9 +856,15 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let compute = session(root.path(), "jarvis-vm-session-compute-partial", None);
         let legacy = session(root.path(), "jarvis-vm-session-legacy-partial", None);
+        let base = pinned_base();
+        pin_mtime(&compute, base);
+        pin_mtime(&legacy, base);
         let procs = FakeProcs::default();
-        assert_eq!(sweep_with(root.path(), &procs, SystemTime::now()).kept_live, 2);
-        let report = sweep_with(root.path(), &procs, SystemTime::now() + Duration::from_secs(31));
+        assert_eq!(sweep_with(root.path(), &procs,
+            base + COMPUTE_OWNERLESS_GRACE - Duration::from_secs(1)).kept_live, 2);
+        let later = base + COMPUTE_OWNERLESS_GRACE + Duration::from_secs(1);
+        let report = sweep_until_removed(|| sweep_with(root.path(), &procs, later),
+            SweepReport { kept_live: 2, ..Default::default() });
         assert_eq!(report.removed, 1, "partial compute initialization exceeds its recovery bound");
         assert!(!compute.exists());
         assert!(legacy.exists(), "legacy initialization grace changed");
@@ -787,11 +874,15 @@ mod tests {
     fn sweep_waits_out_a_session_that_is_still_being_created() {
         let temp = tempfile::tempdir().unwrap();
         let starting = session(temp.path(), "jarvis-vm-session-starting", None);
+        let base = pinned_base();
+        pin_mtime(&starting, base);
         let procs = FakeProcs::default();
-        assert_eq!(sweep_with(temp.path(), &procs, SystemTime::now()).kept_live, 1);
+        assert_eq!(sweep_with(temp.path(), &procs,
+            base + OWNERLESS_GRACE - Duration::from_secs(1)).kept_live, 1);
         assert!(starting.exists());
-        let later = SystemTime::now() + OWNERLESS_GRACE + Duration::from_secs(1);
-        assert_eq!(sweep_with(temp.path(), &procs, later).removed, 1);
+        let later = base + OWNERLESS_GRACE + Duration::from_secs(1);
+        assert_eq!(sweep_until_removed(|| sweep_with(temp.path(), &procs, later),
+            SweepReport { kept_live: 1, ..Default::default() }).removed, 1);
         assert!(!starting.exists());
         assert_eq!(sweep_with(&temp.path().join("absent"), &procs, later), SweepReport::default());
     }
