@@ -22315,8 +22315,10 @@ mod unverified_placeholder_tests {
         (tmp, s, a)
     }
 
+    // The issue's own case, verbatim: Revise was told "add the meeting link"
+    // and came back with a well-formed, entirely invented Google Meet URL.
     const FLAGGED: &str =
-        "Looking forward to it — join here: [[UNVERIFIED: conferencing link for Thursday's call]]";
+        "Looking forward to it — join here: [[UNVERIFIED: Google Meet link for Thursday's call]]";
 
     #[tokio::test]
     async fn schedule_refuses_a_flagged_draft_before_arming_or_noticing() {

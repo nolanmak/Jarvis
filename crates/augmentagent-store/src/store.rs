@@ -8765,6 +8765,22 @@ pub struct ActionWithEmail {
 /// already means "someone else resolved the row", so a placeholder refusal
 /// has to be a distinct `Err`. A missing row, or one with no draft text
 /// (identity-merge, gcal create-event), is a no-op.
+///
+/// The new `Err` variant is only safe because the callers of the three
+/// guarded helpers are a closed, small set — every non-test caller in the
+/// workspace, and all of them now match it explicitly rather than falling
+/// into a generic `{context}: {e}`:
+///   - `claim_action_for_send`: cli `run_approve`, `run_send_now` and the
+///     identity-merge claim, `imessage_send::ReplyApprover::approve`, and
+///     slack `contact::send_claimed` — the first four via
+///     `ReplyApprover::claim_failure_message`, which ships the store's own
+///     owner-facing text verbatim; the last via its own `Err(e @ …)` arm.
+///   - `schedule_action`: cli `run_schedule` only, via the same helper.
+///   - `claim_due_action_for_send`: slack `contact::send_claimed` (shared
+///     with the claim above) and the email `ScheduledSendEngine` fire path,
+///     which returns the row to the queue instead of erroring it.
+/// Tests call the helpers with `unwrap()`, which is the behaviour we want
+/// there: a refusal in a test that did not expect one must be loud.
 fn reject_unverified_draft(conn: &Connection, action_id: &str) -> StoreResult<()> {
     if unverified_draft_columns(conn, action_id)? {
         return Err(StoreError::UnverifiedPlaceholder);
