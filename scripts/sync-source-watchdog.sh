@@ -15,9 +15,35 @@
 # one unavailable app would stop the other from being checked.
 set -uo pipefail
 
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# The launchd plist exports only PATH, so the webhook has to come from .env the
+# way the other standalone jobs load it. `set +u` while sourcing because an
+# .env line referencing an unset variable would otherwise abort the whole tick,
+# and a missing webhook must never cost us a relaunch.
+if [ -f "$REPO_ROOT/.env" ]; then
+  set -a
+  set +u
+  # shellcheck disable=SC1091
+  . "$REPO_ROOT/.env" || true
+  set +a
+  set -u
+fi
+
+NOTIFY_OWNER_PREFIX="🧊"
+if [ -f "$REPO_ROOT/scripts/lib/notify-owner.sh" ]; then
+  # shellcheck source=lib/notify-owner.sh
+  . "$REPO_ROOT/scripts/lib/notify-owner.sh"
+else
+  # 2 = "nothing to deliver with", matching the real helper, so a missing
+  # library never stamps the throttle marker for a message nobody got.
+  notify_owner() { return 2; }
+fi
+
 MAX_AGE_S="${WATCHDOG_MAX_AGE_S:-21600}"        # 6 h: longer than any normal gap
 ALARM_AGE_S="${WATCHDOG_ALARM_AGE_S:-172800}"   # 48 h: relaunching is not working
 BACKOFF_S="${WATCHDOG_BACKOFF_S:-1800}"         # 30 min between relaunch attempts
+ALARM_NOTIFY_INTERVAL_S="${WATCHDOG_ALARM_NOTIFY_INTERVAL_S:-86400}"  # 1 post/day
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/augmentagent"
 mkdir -p "$STATE_DIR"
 
@@ -55,6 +81,31 @@ may_relaunch() {
   return 0
 }
 
+alarm_marker() { printf '%s' "$STATE_DIR/watchdog-$1.alarm-notified"; }
+
+# True when the last *delivered* alarm post for this app is older than
+# ALARM_NOTIFY_INTERVAL_S. An alarming store stays alarming until a human
+# fixes it, so at a 15-minute tick an unthrottled post is ~96 Discord messages
+# a day for the same fact.
+alarm_notify_due() {
+  local marker last now
+  marker=$(alarm_marker "$1")
+  [ -f "$marker" ] || return 0
+  now=$(date +%s)
+  last=$(cat "$marker" 2>/dev/null || echo 0)
+  [ $(( now - last )) -ge "$ALARM_NOTIFY_INTERVAL_S" ]
+}
+
+# Stamps the throttle window. Called only after the webhook accepted the post:
+# a marker written on a failed delivery would silence the next day of retries
+# while the owner was never told anything.
+alarm_notify_recorded() {
+  # 2>/dev/null comes first so the shell's own message about a failed `>`
+  # redirect is suppressed too, not just printf's.
+  printf '%s' "$(date +%s)" 2>/dev/null > "$(alarm_marker "$1")" \
+    || say "state dir is not writable; alarm notifications cannot be throttled"
+}
+
 # check <key> <app name> <database>
 check() {
   local key="$1" app="$2" db="$3" age
@@ -72,6 +123,20 @@ check() {
   # to end.
   if [ "$age" -ge "$ALARM_AGE_S" ]; then
     say "ALARM: $app store has been cold for $(( age / 86400 ))d; relaunching is not fixing it — check that $app is installed and signed in"
+    # A line in a log file nobody reads is how the original outage lasted two
+    # weeks. The alarm is the one state the watchdog cannot fix itself, so it
+    # has to reach a human channel too.
+    if alarm_notify_due "$key"; then
+      notify_owner "$app store has been cold for $(( age / 86400 ))d ($(( age / 3600 ))h); its archive is frozen and relaunching is not fixing it — check that $app is installed and signed in"
+      case $? in
+        0) alarm_notify_recorded "$key"
+           say "alarm posted to the owner channel" ;;
+        1) say "alarm post to the owner channel failed; retrying on the next tick" ;;
+        *) ;;  # no webhook configured; the log line above is the only channel
+      esac
+    else
+      say "alarm notification suppressed; already posted within the notify window"
+    fi
   fi
   if ! may_relaunch "$key"; then
     say "$app relaunch suppressed; already attempted within the backoff window"
