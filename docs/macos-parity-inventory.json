@@ -567,20 +567,6 @@
     "evidence": null
   },
   {
-    "id": "cli:composio-auth-tool",
-    "source": "crates/augmentagent-cli/src/main.rs",
-    "linux_baseline": "Owner-gated MCP start, live status, and verified completion of Composio consent; selected DB credentials and port reach the child.",
-    "macos_target": "Owner-gated MCP start, live status, and verified completion of Composio consent; selected DB credentials and port reach the child.",
-    "prerequisites": [
-      "Rust CLI",
-      "synthetic dashboard and database"
-    ],
-    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1474",
-    "test_plan": "Run cargo test -p augmentagent-cli --bin augmentagent composio_auth_tool on native Linux and macOS; record OS, architecture and result.",
-    "status": "unverified",
-    "evidence": null
-  },
-  {
     "id": "cli:compute-tool",
     "source": "crates/augmentagent-cli/src/main.rs",
     "linux_baseline": "Provider-free Python compute with per-task wheel environments in the Linux KVM sandbox.",
@@ -609,20 +595,6 @@
     "evidence": null
   },
   {
-    "id": "cli:db",
-    "source": "crates/augmentagent-cli/src/main.rs",
-    "linux_baseline": "Database compaction and optional vacuum.",
-    "macos_target": "Same CLI behavior and safety guards on macOS; native evidence has not been recorded.",
-    "prerequisites": [
-      "Rust CLI",
-      "Disposable test data; no live deployment or archive writes"
-    ],
-    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1412",
-    "test_plan": "Use a synthetic database; compare dry-run counts, retained rows and vacuum results. Run on both Linux and macOS.",
-    "status": "unverified",
-    "evidence": null
-  },
-  {
     "id": "cli:deft",
     "source": "crates/augmentagent-cli/src/main.rs",
     "linux_baseline": "Linux exposes augmentagent deft; record its command-specific effects and authorization.",
@@ -633,20 +605,6 @@
     ],
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
     "test_plan": "Run augmentagent deft --help on both hosts, then add a synthetic behavior/guard test for this command.",
-    "status": "unverified",
-    "evidence": null
-  },
-  {
-    "id": "cli:deploy",
-    "source": "crates/augmentagent-cli/src/main.rs",
-    "linux_baseline": "Pre-deploy snapshots, restore and retention.",
-    "macos_target": "Same CLI behavior and safety guards on macOS; native evidence has not been recorded.",
-    "prerequisites": [
-      "Rust CLI",
-      "Disposable test data; no live deployment or archive writes"
-    ],
-    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1410",
-    "test_plan": "Use disposable database/binary snapshots; verify restoration, retention and overwrite guards. Run on both Linux and macOS.",
     "status": "unverified",
     "evidence": null
   },
@@ -675,20 +633,6 @@
     ],
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
     "test_plan": "Run augmentagent discord --help on both hosts, then add a synthetic behavior/guard test for this command.",
-    "status": "unverified",
-    "evidence": null
-  },
-  {
-    "id": "cli:disk",
-    "source": "crates/augmentagent-cli/src/main.rs",
-    "linux_baseline": "Bounded build-output pruning.",
-    "macos_target": "Same CLI behavior and safety guards on macOS; native evidence has not been recorded.",
-    "prerequisites": [
-      "Rust CLI",
-      "Disposable test data; no live deployment or archive writes"
-    ],
-    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1406",
-    "test_plan": "Use synthetic target directories; verify dry-run, age/size limits and active-build protection. Run on both Linux and macOS.",
     "status": "unverified",
     "evidence": null
   },
@@ -924,20 +868,6 @@
     "evidence": null
   },
   {
-    "id": "cli:log-rotate",
-    "source": "crates/augmentagent-cli/src/main.rs",
-    "linux_baseline": "Rotation and compression of state logs.",
-    "macos_target": "Same CLI behavior and safety guards on macOS; native evidence has not been recorded.",
-    "prerequisites": [
-      "Rust CLI",
-      "Disposable test data; no live deployment or archive writes"
-    ],
-    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1413",
-    "test_plan": "Use synthetic logs; verify dry-run, compression and retention boundaries. Run on both Linux and macOS.",
-    "status": "unverified",
-    "evidence": null
-  },
-  {
     "id": "cli:logs",
     "source": "crates/augmentagent-cli/src/main.rs",
     "linux_baseline": "Linux exposes augmentagent logs; record its command-specific effects and authorization.",
@@ -1046,20 +976,6 @@
     ],
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
     "test_plan": "Run augmentagent newsletter --help on both hosts, then add a synthetic behavior/guard test for this command.",
-    "status": "unverified",
-    "evidence": null
-  },
-  {
-    "id": "cli:ops-archive",
-    "source": "crates/augmentagent-cli/src/main.rs",
-    "linux_baseline": "Opt-in private archive of rotated logs.",
-    "macos_target": "Same CLI behavior and safety guards on macOS; native evidence has not been recorded.",
-    "prerequisites": [
-      "Rust CLI",
-      "Disposable test data; no live deployment or archive writes"
-    ],
-    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1414",
-    "test_plan": "Use an injected transport and synthetic logs; verify disabled behavior, private-repository requirement and retry safety. Run on both Linux and macOS.",
     "status": "unverified",
     "evidence": null
   },
@@ -1674,20 +1590,6 @@
     "evidence": null
   },
   {
-    "id": "installer:install-sync-watchdog.sh",
-    "source": "scripts/install-sync-watchdog.sh",
-    "macos_target": "Mac install-sync-watchdog.sh manages only the source-app watchdog LaunchAgent idempotently, relaunching Notes/WhatsApp/Messages when their local store stops being written.",
-    "linux_baseline": "No Linux equivalent: the exporters' source apps are macOS-only, so there is no store for a Linux host to watch.",
-    "prerequisites": [
-      "signed-in launchd user session",
-      "the source apps installed and signed in"
-    ],
-    "status": "in_progress",
-    "evidence": null,
-    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1463",
-    "test_plan": "Run sync_source_watchdog_test in a disposable home, then verify on a real Mac that a cold store relaunches its app and a fresh one does not."
-  },
-  {
     "id": "installer:install-tenant.sh",
     "source": "scripts/install-tenant.sh",
     "linux_baseline": "Linux install-tenant.sh installs or removes its matching component.",
@@ -1874,19 +1776,6 @@
     "evidence": null
   },
   {
-    "id": "installer:uninstall-sync-watchdog.sh",
-    "source": "scripts/uninstall-sync-watchdog.sh",
-    "macos_target": "Mac uninstall-sync-watchdog.sh removes the watchdog LaunchAgent and leaves every source database and exported bundle untouched.",
-    "linux_baseline": "No Linux equivalent: nothing to uninstall where the watchdog never installs.",
-    "prerequisites": [
-      "signed-in launchd user session"
-    ],
-    "status": "in_progress",
-    "evidence": null,
-    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1463",
-    "test_plan": "Covered by sync_source_watchdog_test's uninstall case; confirm on a real Mac that the job is gone and the stores remain."
-  },
-  {
     "id": "installer:uninstall-tenant.sh",
     "source": "scripts/uninstall-tenant.sh",
     "linux_baseline": "Linux uninstall-tenant.sh installs or removes its matching component.",
@@ -1914,20 +1803,6 @@
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1250",
     "test_plan": "Run scheduled_sync_installers_test for uninstall-wiki-sync.sh in a disposable home, then verify two real Mac triggers and sleep/wake behavior.",
     "status": "in_progress",
-    "evidence": null
-  },
-  {
-    "id": "route:composioAuthRoutes:POST:/:operation",
-    "source": "src/composioAuthRoutes.ts",
-    "linux_baseline": "Authenticated POST /api/composio/auth/{start,status,complete}; isolated attempts, strict identity/status validation, expiry and idempotent persistence.",
-    "macos_target": "Authenticated POST /api/composio/auth/{start,status,complete}; isolated attempts, strict identity/status validation, expiry and idempotent persistence.",
-    "prerequisites": [
-      "Node dashboard",
-      "synthetic Composio and persistence fixtures"
-    ],
-    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1474",
-    "test_plan": "Run npm test on native Linux and macOS; record OS, architecture and result.",
-    "status": "unverified",
     "evidence": null
   },
   {
@@ -3383,36 +3258,6 @@
     "evidence": null
   },
   {
-    "id": "unit:augmentagent-disk-prune.service",
-    "source": "scripts/systemd/augmentagent-disk-prune.service",
-    "linux_baseline": "Daily systemd user housekeeping: disk pruning, log rotation, optional archive sync and snapshot retention.",
-    "macos_target": "Equivalent launchd scheduling and housekeeping lifecycle; systemd unit itself is Linux-only.",
-    "prerequisites": [
-      "User service manager",
-      "Rust CLI",
-      "Synthetic housekeeping directories"
-    ],
-    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1406",
-    "test_plan": "Verify 04:37 daily schedule and catch-up behavior, synthetic cleanup, active-build protection and service install/uninstall on each platform.",
-    "status": "gap",
-    "evidence": null
-  },
-  {
-    "id": "unit:augmentagent-disk-prune.timer",
-    "source": "scripts/systemd/augmentagent-disk-prune.timer",
-    "linux_baseline": "Daily systemd user housekeeping: disk pruning, log rotation, optional archive sync and snapshot retention.",
-    "macos_target": "Equivalent launchd scheduling and housekeeping lifecycle; systemd unit itself is Linux-only.",
-    "prerequisites": [
-      "User service manager",
-      "Rust CLI",
-      "Synthetic housekeeping directories"
-    ],
-    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1406",
-    "test_plan": "Verify 04:37 daily schedule and catch-up behavior, synthetic cleanup, active-build protection and service install/uninstall on each platform.",
-    "status": "gap",
-    "evidence": null
-  },
-  {
     "id": "unit:augmentagent-fetch.service",
     "source": "systemd/augmentagent-fetch.service",
     "linux_baseline": "Linux runs the layered fetch worker as a private user service.",
@@ -3553,20 +3398,6 @@
     "evidence": null
   },
   {
-    "id": "unit:augmentagent-wa-sidecar.service",
-    "source": "systemd/augmentagent-wa-sidecar.service",
-    "linux_baseline": "Linux runs the WhatsApp linked-device worker as a private user service.",
-    "macos_target": "Mac runs the same worker as a private, restartable LaunchAgent without deleting sessions.",
-    "prerequisites": [
-      "pinned Go sidecar build",
-      "private socket and session store"
-    ],
-    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1256",
-    "test_plan": "Run Go wire and launcher contracts on native Mac and Linux; verify controlled test-account pairing separately.",
-    "status": "in_progress",
-    "evidence": null
-  },
-  {
     "id": "unit:augmentagent-wiki-sync.service",
     "source": "scripts/systemd/augmentagent-wiki-sync.service",
     "linux_baseline": "Linux has the augmentagent-wiki-sync.service systemd job with its current start/schedule and recovery behavior.",
@@ -3592,6 +3423,20 @@
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1250",
     "test_plan": "Install the equivalent of augmentagent-wiki-sync.timer in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
     "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-wa-sidecar.service",
+    "source": "systemd/augmentagent-wa-sidecar.service",
+    "linux_baseline": "Linux runs the WhatsApp linked-device worker as a private user service.",
+    "macos_target": "Mac runs the same worker as a private, restartable LaunchAgent without deleting sessions.",
+    "prerequisites": [
+      "pinned Go sidecar build",
+      "private socket and session store"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1256",
+    "test_plan": "Run Go wire and launcher contracts on native Mac and Linux; verify controlled test-account pairing separately.",
+    "status": "in_progress",
     "evidence": null
   },
   {
@@ -3633,6 +3478,161 @@
     ],
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1256",
     "test_plan": "Install the equivalent of augmentagent-xvfb.service in a disposable Mac home; check trigger, status, logs, restart and recovery against Linux.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:db",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Database compaction and optional vacuum.",
+    "macos_target": "Same CLI behavior and safety guards on macOS; native evidence has not been recorded.",
+    "prerequisites": [
+      "Rust CLI",
+      "Disposable test data; no live deployment or archive writes"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1412",
+    "test_plan": "Use a synthetic database; compare dry-run counts, retained rows and vacuum results. Run on both Linux and macOS.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:deploy",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Pre-deploy snapshots, restore and retention.",
+    "macos_target": "Same CLI behavior and safety guards on macOS; native evidence has not been recorded.",
+    "prerequisites": [
+      "Rust CLI",
+      "Disposable test data; no live deployment or archive writes"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1410",
+    "test_plan": "Use disposable database/binary snapshots; verify restoration, retention and overwrite guards. Run on both Linux and macOS.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:disk",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Bounded build-output pruning.",
+    "macos_target": "Same CLI behavior and safety guards on macOS; native evidence has not been recorded.",
+    "prerequisites": [
+      "Rust CLI",
+      "Disposable test data; no live deployment or archive writes"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1406",
+    "test_plan": "Use synthetic target directories; verify dry-run, age/size limits and active-build protection. Run on both Linux and macOS.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:log-rotate",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Rotation and compression of state logs.",
+    "macos_target": "Same CLI behavior and safety guards on macOS; native evidence has not been recorded.",
+    "prerequisites": [
+      "Rust CLI",
+      "Disposable test data; no live deployment or archive writes"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1413",
+    "test_plan": "Use synthetic logs; verify dry-run, compression and retention boundaries. Run on both Linux and macOS.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:ops-archive",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Opt-in private archive of rotated logs.",
+    "macos_target": "Same CLI behavior and safety guards on macOS; native evidence has not been recorded.",
+    "prerequisites": [
+      "Rust CLI",
+      "Disposable test data; no live deployment or archive writes"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1414",
+    "test_plan": "Use an injected transport and synthetic logs; verify disabled behavior, private-repository requirement and retry safety. Run on both Linux and macOS.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-disk-prune.service",
+    "source": "scripts/systemd/augmentagent-disk-prune.service",
+    "linux_baseline": "Daily systemd user housekeeping: disk pruning, log rotation, optional archive sync and snapshot retention.",
+    "macos_target": "Equivalent launchd scheduling and housekeeping lifecycle; systemd unit itself is Linux-only.",
+    "prerequisites": [
+      "User service manager",
+      "Rust CLI",
+      "Synthetic housekeeping directories"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1406",
+    "test_plan": "Verify 04:37 daily schedule and catch-up behavior, synthetic cleanup, active-build protection and service install/uninstall on each platform.",
+    "status": "gap",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-disk-prune.timer",
+    "source": "scripts/systemd/augmentagent-disk-prune.timer",
+    "linux_baseline": "Daily systemd user housekeeping: disk pruning, log rotation, optional archive sync and snapshot retention.",
+    "macos_target": "Equivalent launchd scheduling and housekeeping lifecycle; systemd unit itself is Linux-only.",
+    "prerequisites": [
+      "User service manager",
+      "Rust CLI",
+      "Synthetic housekeeping directories"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1406",
+    "test_plan": "Verify 04:37 daily schedule and catch-up behavior, synthetic cleanup, active-build protection and service install/uninstall on each platform.",
+    "status": "gap",
+    "evidence": null
+  },
+  {
+    "id": "installer:install-sync-watchdog.sh",
+    "source": "scripts/install-sync-watchdog.sh",
+    "macos_target": "Mac install-sync-watchdog.sh manages only the source-app watchdog LaunchAgent idempotently, relaunching Notes/WhatsApp/Messages when their local store stops being written.",
+    "linux_baseline": "No Linux equivalent: the exporters' source apps are macOS-only, so there is no store for a Linux host to watch.",
+    "prerequisites": [
+      "signed-in launchd user session",
+      "the source apps installed and signed in"
+    ],
+    "status": "in_progress",
+    "evidence": null,
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1463",
+    "test_plan": "Run sync_source_watchdog_test in a disposable home, then verify on a real Mac that a cold store relaunches its app and a fresh one does not."
+  },
+  {
+    "id": "installer:uninstall-sync-watchdog.sh",
+    "source": "scripts/uninstall-sync-watchdog.sh",
+    "macos_target": "Mac uninstall-sync-watchdog.sh removes the watchdog LaunchAgent and leaves every source database and exported bundle untouched.",
+    "linux_baseline": "No Linux equivalent: nothing to uninstall where the watchdog never installs.",
+    "prerequisites": [
+      "signed-in launchd user session"
+    ],
+    "status": "in_progress",
+    "evidence": null,
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1463",
+    "test_plan": "Covered by sync_source_watchdog_test's uninstall case; confirm on a real Mac that the job is gone and the stores remain."
+  },
+  {
+    "id": "cli:composio-auth-tool",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Owner-gated MCP start, live status, and verified completion of Composio consent; selected DB credentials and port reach the child.",
+    "macos_target": "Owner-gated MCP start, live status, and verified completion of Composio consent; selected DB credentials and port reach the child.",
+    "prerequisites": [
+      "Rust CLI",
+      "synthetic dashboard and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1474",
+    "test_plan": "Run cargo test -p augmentagent-cli --bin augmentagent composio_auth_tool on native Linux and macOS; record OS, architecture and result.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:composioAuthRoutes:POST:/:operation",
+    "source": "src/composioAuthRoutes.ts",
+    "linux_baseline": "Authenticated POST /api/composio/auth/{start,status,complete}; isolated attempts, strict identity/status validation, expiry and idempotent persistence.",
+    "macos_target": "Authenticated POST /api/composio/auth/{start,status,complete}; isolated attempts, strict identity/status validation, expiry and idempotent persistence.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic Composio and persistence fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1474",
+    "test_plan": "Run npm test on native Linux and macOS; record OS, architecture and result.",
     "status": "unverified",
     "evidence": null
   }
