@@ -697,13 +697,13 @@ pub fn code_mode_repair_user_message(
 /// slack, telegram, …) share this prompt and have no subject at all, so they
 /// keep the pre-#652 bytes.
 ///
-/// #1464 — the revise reasoner is text-only: it has no calendar, mailbox or
-/// knowledge-base access, so "add the link for tomorrow's call" is literally
-/// unanswerable and the model's failure mode under that constraint is to
-/// invent a well-formed value (the reported case fabricated a conferencing
-/// URL that matched no real meeting). The lookup-discipline clause gives it a
-/// way to refuse: emit `[[UNVERIFIED: …]]` instead. The store's send-ward CAS
-/// guard is what makes that marker binding.
+/// #1464 — the revise reasoner is text-only: with no calendar, mailbox or
+/// knowledge-base access, "add the link for tomorrow's call" is unanswerable,
+/// and the model's failure mode is to invent a well-formed value (the
+/// reported case fabricated a conferencing URL matching no real meeting). The
+/// lookup-discipline clause gives it a way to refuse — emit
+/// `[[UNVERIFIED: …]]` — and the store's send-ward CAS guard makes that
+/// marker binding.
 pub fn redraft_message(email: &Email, previous_draft: &str, feedback: &str) -> String {
     let subject_clause = if email.platform == "gmail" {
         " If — and only if — the user's feedback asks for a different subject line, put the new subject on the very first line as `Subject: <new subject>`, followed by one blank line, then the body. Otherwise never include a Subject line."
@@ -1055,22 +1055,12 @@ mod tests {
             let mut e = email();
             e.platform = platform.into();
             let got = redraft_message(&e, "the previous draft", "add the link for tomorrow's call");
-            for forbidden in [
+            for needed in [
                 "URL", "ID", "address", "phone number", "date", "time", "amount", "filename",
+                augmentagent_store::UNVERIFIED_OPEN, "cannot be sent or scheduled",
             ] {
-                assert!(
-                    got.contains(forbidden),
-                    "{platform} redraft does not forbid inventing a {forbidden}:\n{got}"
-                );
+                assert!(got.contains(needed), "{platform} redraft lacks {needed:?}:\n{got}");
             }
-            assert!(
-                got.contains(augmentagent_store::UNVERIFIED_OPEN),
-                "{platform} redraft never names the placeholder token:\n{got}"
-            );
-            assert!(
-                got.contains("cannot be sent or scheduled"),
-                "{platform} redraft does not say the marker blocks the send:\n{got}"
-            );
         }
     }
 

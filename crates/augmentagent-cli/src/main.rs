@@ -14423,12 +14423,10 @@ impl ReplyApprover {
                 };
             }
         };
-        // #1464 — the redraft refused a lookup it had no tool for and left a
-        // marker instead of inventing a value. It is deliberately NOT
-        // stripped: it stays legible in the staged draft and on the reposted
-        // card, and the store's send-ward CAS guard refuses every rail while
-        // it is there. The #652 revised subject is checked too — it persists
-        // to its own column.
+        // #1464 — a marker the redraft left where it had no tool to look a
+        // fact up is deliberately NOT stripped: it stays legible in the
+        // staged draft and on the reposted card, and the store's send-ward
+        // CAS guard refuses every rail while it is there.
         if augmentagent_store::has_unverified_placeholder(&redraft)
             || augmentagent_store::has_unverified_placeholder(&subject)
         {
@@ -22372,11 +22370,9 @@ mod unverified_placeholder_tests {
     /// (gmail, slack, imessage) are also covered by the store's CAS guard;
     /// the ones that do not (discord, telegram, github, socialapi, linkedin)
     /// call their transport and then stamp the row, so the ladder check is
-    /// their only gate. `document-signing` and the Slack error-retry arm
-    /// return above the pending check, which is why the guard sits above the
-    /// whole ladder: a refusal naming the marker proves it ran before any
-    /// dispatch, since each arm's own first failure would name a missing
-    /// client or credential instead.
+    /// their only gate. A refusal naming the marker proves the guard ran
+    /// before any dispatch, since each arm's own first failure would name a
+    /// missing client or credential instead.
     #[tokio::test]
     async fn approve_refuses_a_flagged_draft_on_every_transport_rail() {
         let rails: &[(&str, &str, Option<&str>, &str)] = &[
@@ -22421,38 +22417,25 @@ mod unverified_placeholder_tests {
     }
 
     /// The guard must not swallow the status of a row that can no longer reach
-    /// a transport: an already-resolved card still reports `AlreadyResolved`,
-    /// marker or not, so the owner sees what actually happened to it.
+    /// a transport (a resolved card still reports `AlreadyResolved`, so the
+    /// owner sees what happened to it), and it must not block a clean draft,
+    /// which gets past it and on to the real send path.
     #[tokio::test]
-    async fn a_resolved_flagged_card_still_reports_its_real_status() {
+    async fn the_guard_refuses_only_a_flagged_unresolved_card() {
         let (_tmp, store, approver) = fx();
-        let id = seed_flagged_gmail_card(&store, "m-1464-resolved", FLAGGED);
-        store
-            .update_action_status(&id, ActionStatus::Skipped, None, None)
-            .unwrap();
-
-        match approver.run_approve(&id).await {
-            ApprovalActionOutcome::AlreadyResolved { status, .. } => {
-                assert_eq!(status, "skipped")
-            }
+        let resolved = seed_flagged_gmail_card(&store, "m-1464-resolved", FLAGGED);
+        store.update_action_status(&resolved, ActionStatus::Skipped, None, None).unwrap();
+        match approver.run_approve(&resolved).await {
+            ApprovalActionOutcome::AlreadyResolved { status, .. } => assert_eq!(status, "skipped"),
             other => panic!("a resolved card must report its status, got {other:?}"),
         }
-    }
 
-    /// Control: the same card without the marker gets past the guard and on
-    /// to the real send path (which then fails on the test credential). The
-    /// guard is a placeholder check, not a blanket block on Approve.
-    #[tokio::test]
-    async fn a_clean_draft_is_not_refused_by_the_placeholder_guard() {
-        let (_tmp, store, approver) = fx();
-        let id = seed_flagged_gmail_card(&store, "m-1464-clean", "Looking forward to it.");
-
-        let out = approver.run_approve(&id).await;
-        if let ApprovalActionOutcome::Failed { message } = &out {
+        let clean = seed_flagged_gmail_card(&store, "m-1464-clean", "Looking forward to it.");
+        if let ApprovalActionOutcome::Failed { message } = &approver.run_approve(&clean).await {
             assert!(!message.contains("[[UNVERIFIED:"), "clean draft refused: {message}");
         }
         assert_ne!(
-            store.get_action_with_email(&id).unwrap().unwrap().action.status,
+            store.get_action_with_email(&clean).unwrap().unwrap().action.status,
             "pending",
             "a clean draft must get past the claim"
         );

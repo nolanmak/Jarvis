@@ -8766,21 +8766,11 @@ pub struct ActionWithEmail {
 /// has to be a distinct `Err`. A missing row, or one with no draft text
 /// (identity-merge, gcal create-event), is a no-op.
 ///
-/// The new `Err` variant is only safe because the callers of the three
-/// guarded helpers are a closed, small set — every non-test caller in the
-/// workspace, and all of them now match it explicitly rather than falling
-/// into a generic `{context}: {e}`:
-///   - `claim_action_for_send`: cli `run_approve`, `run_send_now` and the
-///     identity-merge claim, `imessage_send::ReplyApprover::approve`, and
-///     slack `contact::send_claimed` — the first four via
-///     `ReplyApprover::claim_failure_message`, which ships the store's own
-///     owner-facing text verbatim; the last via its own `Err(e @ …)` arm.
-///   - `schedule_action`: cli `run_schedule` only, via the same helper.
-///   - `claim_due_action_for_send`: slack `contact::send_claimed` (shared
-///     with the claim above) and the email `ScheduledSendEngine` fire path,
-///     which returns the row to the queue instead of erroring it.
-/// Tests call the helpers with `unwrap()`, which is the behaviour we want
-/// there: a refusal in a test that did not expect one must be loud.
+/// The new `Err` variant is only safe if EVERY production caller of the
+/// three guarded helpers handles it explicitly rather than falling into a
+/// generic `{context}: {e}`. That caller set is not asserted in prose here —
+/// `tests/send_ward_callers.rs` enumerates it from the workspace sources and
+/// fails on a caller, old or new, that has no refusal arm.
 fn reject_unverified_draft(conn: &Connection, action_id: &str) -> StoreResult<()> {
     if unverified_draft_columns(conn, action_id)? {
         return Err(StoreError::UnverifiedPlaceholder);
@@ -10708,16 +10698,17 @@ mod tests {
     }
 
     /// The fire-time claim refuses a row armed while clean and then repointed
-    /// at a flagged body by `update-draft`, and leaves it armed.
+    /// at a flagged body by `update-draft`, and leaves it armed. The control
+    /// half proves the guard is a placeholder check, not a blanket block: a
+    /// clean row walks the whole rail, and a card with no draft text at all
+    /// (identity-merge, gcal create-event) is a no-op for it.
     #[test]
-    fn claim_due_action_for_send_refuses_a_draft_with_an_unverified_placeholder() {
+    fn claim_due_action_for_send_refuses_only_an_unverified_placeholder() {
         let (s, _f) = fresh_store();
-        let id = pending_action(&s, "m-unverified-due");
         let now = now_millis();
+        let id = pending_action(&s, "m-unverified-due");
         assert!(s.schedule_action(&id, now - 1_000, "t").unwrap());
-        s.set_action_draft_body(&id, "[[UNVERIFIED: invoice number]]")
-            .unwrap();
-
+        s.set_action_draft_body(&id, "[[UNVERIFIED: invoice number]]").unwrap();
         assert!(matches!(
             s.claim_due_action_for_send(&id, now, "engine"),
             Err(StoreError::UnverifiedPlaceholder)
@@ -10725,25 +10716,14 @@ mod tests {
         let (status, at, _) = raw_action_row(&s, &id);
         assert_eq!(status, "scheduled", "a refused fire must leave it armed");
         assert_eq!(at, Some(now - 1_000));
-    }
 
-    /// Control: the guard is a placeholder check, not a blanket block. A clean
-    /// row walks the whole rail, and a card with no draft text at all
-    /// (identity-merge, gcal create-event) is a no-op for it.
-    #[test]
-    fn send_ward_cas_helpers_still_claim_a_clean_or_draftless_row() {
-        let (s, _f) = fresh_store();
-        let id = pending_action(&s, "m-unverified-clean");
-        let now = now_millis();
-        assert!(s.schedule_action(&id, now - 1_000, "t").unwrap());
-        assert!(s.claim_due_action_for_send(&id, now, "engine").unwrap());
-
+        let clean = pending_action(&s, "m-unverified-clean");
+        assert!(s.schedule_action(&clean, now - 1_000, "t").unwrap());
+        assert!(s.claim_due_action_for_send(&clean, now, "engine").unwrap());
         let bare = s
             .log_action("m-bare", None, "peer@example.com", "merge", None, None, ActionStatus::Pending)
             .unwrap();
-        assert!(s
-            .claim_action_for_send(&bare, ActionStatus::Pending, "discord")
-            .unwrap());
+        assert!(s.claim_action_for_send(&bare, ActionStatus::Pending, "discord").unwrap());
     }
 
     #[test]
