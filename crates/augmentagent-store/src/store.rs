@@ -8766,11 +8766,12 @@ pub struct ActionWithEmail {
 /// has to be a distinct `Err`. A missing row, or one with no draft text
 /// (identity-merge, gcal create-event), is a no-op.
 ///
-/// The new `Err` variant is only safe if EVERY production caller of the
-/// three guarded helpers handles it explicitly rather than falling into a
-/// generic `{context}: {e}`. That caller set is not asserted in prose here —
-/// `tests/send_ward_callers.rs` enumerates it from the workspace sources and
-/// fails on a caller, old or new, that has no refusal arm.
+/// The new `Err` variant has to reach the owner as an instruction, not as an
+/// internal error, so every production caller routes it through an explicit
+/// arm: `claim_failure_message` in the CLI and iMessage approvers, a named
+/// match arm in the Slack contact path and the scheduled-send engine. A
+/// caller added later that folds it into a generic `{context}: {e}` would
+/// still refuse the send — it would just explain it badly.
 fn reject_unverified_draft(conn: &Connection, action_id: &str) -> StoreResult<()> {
     if unverified_draft_columns(conn, action_id)? {
         return Err(StoreError::UnverifiedPlaceholder);
