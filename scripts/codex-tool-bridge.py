@@ -578,6 +578,8 @@ def read_only_operation(name, arguments):
                 'mcp__memory__search_messages', 'mcp__memory__conversation_stats',
                 'mcp__memory__search_notes'):
         return True
+    if name == 'mcp__composio_auth__auth_status':
+        return set(arguments) == {'attempt_id'} and isinstance(arguments.get('attempt_id'), str)
     if name.startswith('mcp__socialapi__'):
         verb = re.split(r'[_-]', name[len('mcp__socialapi__'):].lower(), maxsplit=1)[0]
         return verb in {'list', 'get', 'fetch', 'read', 'search', 'show', 'view',
