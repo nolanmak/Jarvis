@@ -395,6 +395,13 @@ async fn send_claimed(
     match claimed {
         Ok(true) => {}
         Ok(false) => return resolved(store, action_id),
+        // #1464 — the store refused the claim because the draft still carries
+        // an `[[UNVERIFIED: …]]` marker. The error text is already the
+        // owner-facing explanation; the row keeps its status, so the card
+        // stays live for another Revise.
+        Err(e @ augmentagent_store::StoreError::UnverifiedPlaceholder) => {
+            return failed(e.to_string())
+        }
         Err(e) => return failed(format!("claim for send failed: {e}")),
     }
 

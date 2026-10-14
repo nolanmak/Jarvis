@@ -13726,6 +13726,23 @@ impl ReplyApprover {
         let Some(action) = self.handle_load(action_id) else {
             return ApprovalActionOutcome::NotFound;
         };
+        // #1464 — refuse a draft still carrying an `[[UNVERIFIED: …]]` marker
+        // ABOVE the whole dispatch ladder, so no arm's position can bypass it
+        // (the Slack-error retry and the signing arm below both return before
+        // the pending check). The store's send-ward CAS guard covers the arms
+        // that claim; the ones that do not — discord, telegram, github,
+        // socialapi, linkedin call their transport and then stamp the row —
+        // have nothing for it to gate, and this is their gate. Only statuses
+        // that can still reach a transport are refused, so an already-resolved
+        // row keeps reporting its real status.
+        if matches!(action.action.status.as_str(), "pending" | "error")
+            && self.store.has_unverified_draft(action_id).unwrap_or(false)
+        {
+            tracing::warn!(action_id, "approve: refused a draft with an unverified placeholder");
+            return ApprovalActionOutcome::Failed {
+                message: augmentagent_store::StoreError::UnverifiedPlaceholder.to_string(),
+            };
+        }
         // #1290 — a Slack contact send that failed after approval is retried
         // by approving again; the contact path decides whether the row is
         // retryable and never sends a delivered message twice.
@@ -13833,7 +13850,7 @@ impl ReplyApprover {
             }
             Err(e) => {
                 return ApprovalActionOutcome::Failed {
-                    message: format!("claim for send failed: {e}"),
+                    message: Self::claim_failure_message("claim for send failed", &e),
                 };
             }
         }
@@ -14081,7 +14098,7 @@ impl ReplyApprover {
                 return Self::resolved_outcome(store, action_id);
             }
             Err(e) => {
-                let message = format!("identity merge: claim failed: {e}");
+                let message = Self::claim_failure_message("identity merge: claim failed", &e);
                 return ApprovalActionOutcome::Failed { message };
             }
         }
@@ -14153,6 +14170,20 @@ impl ReplyApprover {
                 status: "resolved".into(),
                 detail: None,
             },
+        }
+    }
+
+    /// #1464 — owner-facing text for a failed send-ward CAS. An
+    /// `UnverifiedPlaceholder` refusal is not an internal error: the store's
+    /// own message already explains what the owner has to do, so it ships
+    /// verbatim instead of being wrapped in `{context}`.
+    pub(crate) fn claim_failure_message(
+        context: &str,
+        e: &augmentagent_store::StoreError,
+    ) -> String {
+        match e {
+            augmentagent_store::StoreError::UnverifiedPlaceholder => e.to_string(),
+            _ => format!("{context}: {e}"),
         }
     }
 
@@ -14392,6 +14423,17 @@ impl ReplyApprover {
                 };
             }
         };
+        // #1464 — the redraft refused a lookup it had no tool for and left a
+        // marker instead of inventing a value. It is deliberately NOT
+        // stripped: it stays legible in the staged draft and on the reposted
+        // card, and the store's send-ward CAS guard refuses every rail while
+        // it is there. The #652 revised subject is checked too — it persists
+        // to its own column.
+        if augmentagent_store::has_unverified_placeholder(&redraft)
+            || augmentagent_store::has_unverified_placeholder(&subject)
+        {
+            tracing::info!(action_id, "revise: redraft carries an unverified placeholder");
+        }
         let split = |v: &Option<String>| -> Vec<String> {
             v.as_deref()
                 .map(augmentagent_channel_email::gmail::split_recipients)
@@ -14576,7 +14618,7 @@ impl ReplyApprover {
             }
             Err(e) => {
                 return ApprovalActionOutcome::Failed {
-                    message: format!("schedule failed: {e}"),
+                    message: Self::claim_failure_message("schedule failed", &e),
                 };
             }
         }
@@ -14664,7 +14706,7 @@ impl ReplyApprover {
             }
             Err(e) => {
                 return ApprovalActionOutcome::Failed {
-                    message: format!("claim for send failed: {e}"),
+                    message: Self::claim_failure_message("claim for send failed", &e),
                 };
             }
         }
@@ -22206,6 +22248,252 @@ mod linkedin_composed_card_dispatch_tests {
         .await
         .expect("a draft-only run needs no credentials");
         assert_eq!(row_counts(&store), (0, 0));
+    }
+}
+
+/// #1464 — the Revise agent is text-only, so an instruction needing a fact it
+/// cannot look up (the reported case: "add the meeting link") used to come
+/// back as a fabricated, well-formed value. The prompt now makes it emit an
+/// `[[UNVERIFIED: …]]` marker instead, and the store refuses every send-ward
+/// CAS while that marker is present. These drive the PRODUCTION verbs so the
+/// refusal is proven at the button, not just at the store.
+#[cfg(test)]
+mod unverified_placeholder_tests {
+    use super::*;
+    use augmentagent_store::{ActionStatus, Email};
+
+    /// A card on `platform` carrying `draft`, with the draft id and account
+    /// entity its arm needs, so the only thing that can stop a verb is the
+    /// placeholder guard. Without it, Approve would reach a real transport.
+    fn seed_card(
+        store: &Store,
+        msg: &str,
+        draft: &str,
+        platform: &str,
+        kind: &str,
+        entity: Option<&str>,
+    ) -> String {
+        store
+            .upsert_email(&Email {
+                attachments: Vec::new(),
+                to: String::new(),
+                cc: String::new(),
+                message_id: msg.into(),
+                thread_id: Some(format!("th-{msg}")),
+                from: "peer@example.com".into(),
+                subject: "subj".into(),
+                body: "body".into(),
+                date: String::new(),
+                account_entity_id: entity.map(Into::into),
+                platform: platform.into(),
+                kind: kind.into(),
+            })
+            .unwrap();
+        let id = store
+            .log_action(
+                msg,
+                Some(&format!("th-{msg}")),
+                "peer@example.com",
+                "subj",
+                Some("body"),
+                Some(draft),
+                ActionStatus::Pending,
+            )
+            .unwrap();
+        store.set_action_draft_id(&id, "draft-1").unwrap();
+        id
+    }
+
+    fn seed_flagged_gmail_card(store: &Store, msg: &str, draft: &str) -> String {
+        seed_card(store, msg, draft, "gmail", "dm", Some("acc"))
+    }
+
+    fn fx() -> (tempfile::TempDir, Arc<Store>, ReplyApprover) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = Arc::new(Store::open(tmp.path().join("data.db")).unwrap());
+        let a = crate::test_support::approver_with_store(Arc::clone(&s));
+        (tmp, s, a)
+    }
+
+    const FLAGGED: &str =
+        "Looking forward to it — join here: [[UNVERIFIED: conferencing link for Thursday's call]]";
+
+    #[tokio::test]
+    async fn schedule_refuses_a_flagged_draft_before_arming_or_noticing() {
+        let (_tmp, store, approver) = fx();
+        let id = seed_flagged_gmail_card(&store, "m-1464-schedule", FLAGGED);
+        let at_ms = chrono::Utc::now().timestamp_millis() + 24 * 3_600_000;
+
+        match approver.run_schedule(&id, at_ms).await {
+            ApprovalActionOutcome::Failed { message } => assert!(
+                message.contains("[[UNVERIFIED:"),
+                "the refusal must name the marker, got {message:?}"
+            ),
+            other => panic!("schedule must refuse a flagged draft, got {other:?}"),
+        }
+        let row = store.get_action_with_email(&id).unwrap().unwrap();
+        assert_eq!(row.action.status, "pending");
+        assert_eq!(
+            store.action_scheduled_at(&id).unwrap(),
+            None,
+            "a refused schedule must not arm a fire time, and no \"Sends at …\" \
+             notice may claim one"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_now_refuses_a_flagged_draft_and_leaves_it_armed() {
+        let (_tmp, store, approver) = fx();
+        let id = seed_flagged_gmail_card(&store, "m-1464-sendnow", "a clean draft");
+        // Armed while clean, then repointed at a flagged body.
+        assert!(store
+            .schedule_action(&id, chrono::Utc::now().timestamp_millis() + 3_600_000, "t")
+            .unwrap());
+        store.set_action_draft_body(&id, FLAGGED).unwrap();
+
+        match approver.run_send_now(&id).await {
+            ApprovalActionOutcome::Failed { message } => assert!(
+                message.contains("[[UNVERIFIED:"),
+                "the refusal must name the marker, got {message:?}"
+            ),
+            other => panic!("send now must refuse a flagged draft, got {other:?}"),
+        }
+        let row = store.get_action_with_email(&id).unwrap().unwrap();
+        assert_eq!(
+            row.action.status, "scheduled",
+            "a refused Send Now must never leave the row in `sending`"
+        );
+    }
+
+    /// EVERY transport entry point Approve can reach, enumerated from the
+    /// `run_approve` dispatch ladder — not a sample. The arms that claim
+    /// (gmail, slack, imessage) are also covered by the store's CAS guard;
+    /// the ones that do not (discord, telegram, github, socialapi, linkedin)
+    /// call their transport and then stamp the row, so the ladder check is
+    /// their only gate. `document-signing` and the Slack error-retry arm
+    /// return above the pending check, which is why the guard sits above the
+    /// whole ladder: a refusal naming the marker proves it ran before any
+    /// dispatch, since each arm's own first failure would name a missing
+    /// client or credential instead.
+    #[tokio::test]
+    async fn approve_refuses_a_flagged_draft_on_every_transport_rail() {
+        let rails: &[(&str, &str, Option<&str>, &str)] = &[
+            // The reported case: a Gmail card whose Revise was asked to add a
+            // conferencing link it had no way to look up.
+            ("gmail", "dm", Some("acc"), "pending"),
+            ("discord", "dm", Some("discord:bot"), "pending"),
+            ("telegram", "dm", Some("telegram:bot"), "pending"),
+            ("github", "issue_comment", Some("gh"), "pending"),
+            (augmentagent_channel_socialapi::PLATFORM, "dm", Some("sa"), "pending"),
+            ("linkedin", "dm", None, "pending"),
+            (imessage_send::PLATFORM, "dm", Some("im"), "pending"),
+            ("document-signing", "sign_pdf", None, "pending"),
+            // The #1290 retry arm: an errored Slack row re-approved.
+            ("slack", "dm", Some("slack:T1"), "error"),
+            ("slack", "dm", Some("slack:T1"), "pending"),
+        ];
+        for (platform, kind, entity, status) in rails {
+            let (_tmp, store, approver) = fx();
+            let msg = format!("m-1464-{platform}-{status}");
+            let id = seed_card(&store, &msg, FLAGGED, platform, kind, *entity);
+            if *status == "error" {
+                store
+                    .update_action_status(&id, ActionStatus::Error, None, Some("send failed"))
+                    .unwrap();
+            }
+
+            match approver.run_approve(&id).await {
+                ApprovalActionOutcome::Failed { message } => assert!(
+                    message.contains("[[UNVERIFIED:"),
+                    "{platform}/{status} was not refused by the placeholder check — it got \
+                     past the guard and into its own arm: {message:?}"
+                ),
+                other => panic!("{platform}/{status} must refuse a flagged draft, got {other:?}"),
+            }
+            assert_eq!(
+                store.get_action_with_email(&id).unwrap().unwrap().action.status,
+                *status,
+                "{platform}/{status}: a refused approve must not move the row"
+            );
+        }
+    }
+
+    /// The guard must not swallow the status of a row that can no longer reach
+    /// a transport: an already-resolved card still reports `AlreadyResolved`,
+    /// marker or not, so the owner sees what actually happened to it.
+    #[tokio::test]
+    async fn a_resolved_flagged_card_still_reports_its_real_status() {
+        let (_tmp, store, approver) = fx();
+        let id = seed_flagged_gmail_card(&store, "m-1464-resolved", FLAGGED);
+        store
+            .update_action_status(&id, ActionStatus::Skipped, None, None)
+            .unwrap();
+
+        match approver.run_approve(&id).await {
+            ApprovalActionOutcome::AlreadyResolved { status, .. } => {
+                assert_eq!(status, "skipped")
+            }
+            other => panic!("a resolved card must report its status, got {other:?}"),
+        }
+    }
+
+    /// Control: the same card without the marker gets past the guard and on
+    /// to the real send path (which then fails on the test credential). The
+    /// guard is a placeholder check, not a blanket block on Approve.
+    #[tokio::test]
+    async fn a_clean_draft_is_not_refused_by_the_placeholder_guard() {
+        let (_tmp, store, approver) = fx();
+        let id = seed_flagged_gmail_card(&store, "m-1464-clean", "Looking forward to it.");
+
+        let out = approver.run_approve(&id).await;
+        if let ApprovalActionOutcome::Failed { message } = &out {
+            assert!(!message.contains("[[UNVERIFIED:"), "clean draft refused: {message}");
+        }
+        assert_ne!(
+            store.get_action_with_email(&id).unwrap().unwrap().action.status,
+            "pending",
+            "a clean draft must get past the claim"
+        );
+    }
+
+    /// #1464 review — a flagged #652 revised SUBJECT over a clean body must
+    /// still be refused, or the marker ships in the header.
+    #[tokio::test]
+    async fn approve_and_schedule_refuse_a_flagged_subject_over_a_clean_body() {
+        let (_tmp, store, approver) = fx();
+        let id = seed_flagged_gmail_card(&store, "m-1464-subj", "Attached, as promised.");
+        store
+            .set_action_subject(&id, Some("Re: invoice [[UNVERIFIED: invoice number]]"))
+            .unwrap();
+        let at_ms = chrono::Utc::now().timestamp_millis() + 24 * 3_600_000;
+
+        for out in [approver.run_approve(&id).await, approver.run_schedule(&id, at_ms).await] {
+            match out {
+                ApprovalActionOutcome::Failed { message } => {
+                    assert!(message.contains("[[UNVERIFIED:"), "got {message:?}")
+                }
+                other => panic!("a flagged subject must be refused, got {other:?}"),
+            }
+        }
+        assert_eq!(store.action_scheduled_at(&id).unwrap(), None);
+        assert_eq!(
+            store.get_action_with_email(&id).unwrap().unwrap().action.status,
+            "pending"
+        );
+    }
+
+    /// The marker must survive staging verbatim: `strip_assumes_for_send`
+    /// scrubs the `<!--aa:assumes-->` fence before the body reaches Gmail,
+    /// but the owner has to see the gap in the staged draft and on the card.
+    #[test]
+    fn stripping_card_markers_leaves_the_placeholder_in_place() {
+        let body = format!("{FLAGGED}\n\n<!--aa:assumes guessed the tone-->");
+        let staged = augmentagent_approval_discord::strip_assumes_for_send(&body);
+        assert!(
+            augmentagent_store::has_unverified_placeholder(&staged),
+            "the marker must survive card-marker stripping: {staged:?}"
+        );
+        assert!(!staged.contains("aa:assumes"), "the fence still goes: {staged:?}");
     }
 }
 

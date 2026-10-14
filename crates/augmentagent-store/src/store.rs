@@ -26,9 +26,30 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// #1464 — the draft still carries an `[[UNVERIFIED: …]]` marker the
+    /// revise agent left where it could not look a fact up.
+    #[error(
+        "this draft still contains an [[UNVERIFIED: …]] marker where the agent could not verify \
+         a fact, so it was not sent. Revise again with the real value, or edit the draft in \
+         Gmail first"
+    )]
+    UnverifiedPlaceholder,
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
+
+/// #1464 — the marker the revise prompt makes the model emit instead of
+/// inventing a value it has no tool to look up. Deliberately NOT stripped
+/// before staging (unlike the `<!--aa:assumes-->` fence): it must stay
+/// legible in the staged Gmail draft and on the card, and the send-ward CAS
+/// guard is what makes leaving it there safe.
+pub const UNVERIFIED_OPEN: &str = "[[UNVERIFIED:";
+
+/// True when `body` carries the marker. Matches the OPEN token only: a
+/// truncated `[[UNVERIFIED:` is just as unsendable as a balanced one.
+pub fn has_unverified_placeholder(body: &str) -> bool {
+    body.contains(UNVERIFIED_OPEN)
+}
 
 /// A Discord text conversation bound to one real native agent session.
 /// Audit request IDs are deliberately not stored here.
@@ -4688,6 +4709,15 @@ impl Store {
         Ok(())
     }
 
+    /// #1464 — true when any text column this row would ship still carries
+    /// an `[[UNVERIFIED: …]]` marker. The ladder guard in `run_approve` reads
+    /// it rather than re-deriving the column set, so the ladder and the
+    /// send-ward CAS refuse exactly the same rows.
+    pub fn has_unverified_draft(&self, action_id: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        unverified_draft_columns(&guard, action_id)
+    }
+
     /// #473 — the envelope recorded by [`set_action_envelope`] (and the #652
     /// subject override), or `None` when the row doesn't exist or no field was
     /// ever set (pre-#473 rows, auto-triage replies): callers then fall back
@@ -6687,6 +6717,7 @@ impl Store {
     ) -> StoreResult<bool> {
         let now = now_millis();
         let guard = self.conn.lock().expect("store mutex poisoned");
+        reject_unverified_draft(&guard, action_id)?;
         let n = guard.execute(
             "UPDATE actions \
                 SET status = 'scheduled', scheduledAtMs = ?2, \
@@ -6710,6 +6741,7 @@ impl Store {
     ) -> StoreResult<bool> {
         let now = now_millis();
         let guard = self.conn.lock().expect("store mutex poisoned");
+        reject_unverified_draft(&guard, action_id)?;
         let n = guard.execute(
             "UPDATE actions \
                 SET status = 'sending', \
@@ -6813,6 +6845,7 @@ impl Store {
     ) -> StoreResult<bool> {
         let now = now_millis();
         let guard = self.conn.lock().expect("store mutex poisoned");
+        reject_unverified_draft(&guard, action_id)?;
         let n = guard.execute(
             "UPDATE actions \
                 SET status = 'sending', \
@@ -8722,6 +8755,44 @@ pub struct ActionWithEmail {
     pub email: Email,
 }
 
+/// #1464 — the send-ward guard, called by every CAS helper that moves a row
+/// toward `sending` or `scheduled` while it already holds the connection
+/// mutex. Checking here rather than in each handler is what makes the
+/// invariant enumerable: no status transition toward a transport bypasses
+/// one of those three helpers.
+///
+/// Deliberately NOT folded into the helpers' `WHERE` clauses: `n == 0`
+/// already means "someone else resolved the row", so a placeholder refusal
+/// has to be a distinct `Err`. A missing row, or one with no draft text
+/// (identity-merge, gcal create-event), is a no-op.
+fn reject_unverified_draft(conn: &Connection, action_id: &str) -> StoreResult<()> {
+    if unverified_draft_columns(conn, action_id)? {
+        return Err(StoreError::UnverifiedPlaceholder);
+    }
+    Ok(())
+}
+
+/// Every persisted column a revise pass can write free model text into.
+/// `envelopeSubject` is #652's revised Gmail subject, which `run_revise`
+/// splits off the body BEFORE persisting, so checking `draftBody` alone let
+/// a flagged subject ride a clean body all the way out (#1464 review).
+fn unverified_draft_columns(conn: &Connection, action_id: &str) -> StoreResult<bool> {
+    let row: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT draftBody, envelopeSubject FROM actions WHERE id = ?1",
+            params![action_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((body, subject)) = row else {
+        return Ok(false);
+    };
+    Ok([body, subject]
+        .into_iter()
+        .flatten()
+        .any(|t| has_unverified_placeholder(&t)))
+}
+
 fn column_exists(conn: &Connection, table: &str, column: &str) -> StoreResult<bool> {
     let sql = format!("PRAGMA table_info({table})");
     let mut stmt = conn.prepare(&sql)?;
@@ -10579,6 +10650,84 @@ mod tests {
         drop(guard);
         // Unschedule on a non-scheduled row is a no-op.
         assert!(!s.unschedule_action(&id, "discord").unwrap());
+    }
+
+    /// #1464 — a draft the revise agent flagged as unverifiable must not be
+    /// claimable for a send by ANY of the three send-ward CAS helpers. The
+    /// refusal is distinguishable from a lost race (`Ok(false)`) and leaves
+    /// the row's status alone, so the card stays live for another Revise.
+    /// The flagged text is tried in `draftBody` and then in #652's revised
+    /// `envelopeSubject` over a clean body — the subject persists to its own
+    /// column, so a body-only guard would let it ship in the header.
+    #[test]
+    fn send_ward_cas_helpers_refuse_a_draft_with_an_unverified_placeholder() {
+        // Unclosed in one case: a truncated marker is just as unsendable.
+        let flagged = ["Here is the link: [[UNVERIFIED: Meet link for the call]]",
+                       "call me on [[UNVERIFIED: owner phone number"];
+        for (i, text) in flagged.iter().enumerate() {
+            for in_subject in [false, true] {
+                let (s, _f) = fresh_store();
+                let id = pending_action(&s, &format!("m-unverified-{i}-{in_subject}"));
+                if in_subject {
+                    s.set_action_draft_body(&id, "Attached, as promised.").unwrap();
+                    s.set_action_subject(&id, Some(text)).unwrap();
+                } else {
+                    s.set_action_draft_body(&id, text).unwrap();
+                }
+                assert!(s.has_unverified_draft(&id).unwrap());
+
+                assert!(matches!(
+                    s.claim_action_for_send(&id, ActionStatus::Pending, "discord"),
+                    Err(StoreError::UnverifiedPlaceholder)
+                ));
+                assert!(matches!(
+                    s.schedule_action(&id, 1_000_000, "discord"),
+                    Err(StoreError::UnverifiedPlaceholder)
+                ));
+                let (status, at, _) = raw_action_row(&s, &id);
+                assert_eq!(status, "pending", "a refused claim must not consume the row");
+                assert_eq!(at, None, "a refused schedule must not arm a fire time");
+            }
+        }
+    }
+
+    /// The fire-time claim refuses a row armed while clean and then repointed
+    /// at a flagged body by `update-draft`, and leaves it armed.
+    #[test]
+    fn claim_due_action_for_send_refuses_a_draft_with_an_unverified_placeholder() {
+        let (s, _f) = fresh_store();
+        let id = pending_action(&s, "m-unverified-due");
+        let now = now_millis();
+        assert!(s.schedule_action(&id, now - 1_000, "t").unwrap());
+        s.set_action_draft_body(&id, "[[UNVERIFIED: invoice number]]")
+            .unwrap();
+
+        assert!(matches!(
+            s.claim_due_action_for_send(&id, now, "engine"),
+            Err(StoreError::UnverifiedPlaceholder)
+        ));
+        let (status, at, _) = raw_action_row(&s, &id);
+        assert_eq!(status, "scheduled", "a refused fire must leave it armed");
+        assert_eq!(at, Some(now - 1_000));
+    }
+
+    /// Control: the guard is a placeholder check, not a blanket block. A clean
+    /// row walks the whole rail, and a card with no draft text at all
+    /// (identity-merge, gcal create-event) is a no-op for it.
+    #[test]
+    fn send_ward_cas_helpers_still_claim_a_clean_or_draftless_row() {
+        let (s, _f) = fresh_store();
+        let id = pending_action(&s, "m-unverified-clean");
+        let now = now_millis();
+        assert!(s.schedule_action(&id, now - 1_000, "t").unwrap());
+        assert!(s.claim_due_action_for_send(&id, now, "engine").unwrap());
+
+        let bare = s
+            .log_action("m-bare", None, "peer@example.com", "merge", None, None, ActionStatus::Pending)
+            .unwrap();
+        assert!(s
+            .claim_action_for_send(&bare, ActionStatus::Pending, "discord")
+            .unwrap());
     }
 
     #[test]

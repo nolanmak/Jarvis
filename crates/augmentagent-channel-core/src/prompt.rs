@@ -696,6 +696,14 @@ pub fn code_mode_repair_user_message(
 /// [`split_redraft_subject`] parses it back out. Chat platforms (discord,
 /// slack, telegram, …) share this prompt and have no subject at all, so they
 /// keep the pre-#652 bytes.
+///
+/// #1464 — the revise reasoner is text-only: it has no calendar, mailbox or
+/// knowledge-base access, so "add the link for tomorrow's call" is literally
+/// unanswerable and the model's failure mode under that constraint is to
+/// invent a well-formed value (the reported case fabricated a conferencing
+/// URL that matched no real meeting). The lookup-discipline clause gives it a
+/// way to refuse: emit `[[UNVERIFIED: …]]` instead. The store's send-ward CAS
+/// guard is what makes that marker binding.
 pub fn redraft_message(email: &Email, previous_draft: &str, feedback: &str) -> String {
     let subject_clause = if email.platform == "gmail" {
         " If — and only if — the user's feedback asks for a different subject line, put the new subject on the very first line as `Subject: <new subject>`, followed by one blank line, then the body. Otherwise never include a Subject line."
@@ -704,6 +712,8 @@ pub fn redraft_message(email: &Email, previous_draft: &str, feedback: &str) -> S
     };
     format!(
         r#"You are a professional email draft editor. Revise the draft based on the user's feedback and return ONLY the revised email text — no JSON, no quotes, no commentary, except the optional `<!--aa:assumes …-->` block described in your system prompt. Do not add To:, Cc:, Bcc:, or other recipient/header lines; recipients are managed separately from the email body.{subject_clause}
+
+You have no tools: you cannot read a calendar, a mailbox, a file or any other live source. Never invent a URL (including a meeting or conferencing link), an ID, an invoice or order number, a street or email address, a phone number, a date, a time, an amount, or a filename. Use such a value ONLY if it appears verbatim in <original_email>, <previous_draft> or <user_feedback>. If the feedback asks you to add one that does not, write `[[UNVERIFIED: <what is needed>]]` exactly where the value belongs — for example `[[UNVERIFIED: conferencing link for Thursday's call]]` — and write nothing else in its place. A plausible-looking invented value is far worse than a visible gap: the draft cannot be sent or scheduled while an `[[UNVERIFIED: …]]` marker is present, so the owner will see it and supply the real value.
 
 <original_email>
 From: {from}
@@ -1034,6 +1044,34 @@ mod tests {
             !got.contains("Subject: <new subject>"),
             "chat redraft must not talk about subject lines:\n{got}"
         );
+    }
+
+    /// #1464 — the revise reasoner has no tools, so the only honest answer to
+    /// "add the meeting link" is a marker. Every platform gets the clause:
+    /// the fabrication hole is not email-specific.
+    #[test]
+    fn redraft_forbids_inventing_lookup_shaped_values_on_every_platform() {
+        for platform in ["gmail", "slack"] {
+            let mut e = email();
+            e.platform = platform.into();
+            let got = redraft_message(&e, "the previous draft", "add the link for tomorrow's call");
+            for forbidden in [
+                "URL", "ID", "address", "phone number", "date", "time", "amount", "filename",
+            ] {
+                assert!(
+                    got.contains(forbidden),
+                    "{platform} redraft does not forbid inventing a {forbidden}:\n{got}"
+                );
+            }
+            assert!(
+                got.contains(augmentagent_store::UNVERIFIED_OPEN),
+                "{platform} redraft never names the placeholder token:\n{got}"
+            );
+            assert!(
+                got.contains("cannot be sent or scheduled"),
+                "{platform} redraft does not say the marker blocks the send:\n{got}"
+            );
+        }
     }
 
     #[test]

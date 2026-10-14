@@ -95,7 +95,7 @@ impl ReplyApprover {
         ) {
             Ok(true) => {}
             Ok(false) => return Self::resolved_outcome(&self.store, action_id),
-            Err(e) => return failed(format!("claim for send failed: {e}")),
+            Err(e) => return failed(Self::claim_failure_message("claim for send failed", &e)),
         }
         let item = NewImessageOutboxItem {
             action_id,

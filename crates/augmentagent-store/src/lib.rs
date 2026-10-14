@@ -52,7 +52,7 @@ pub use store::{
     JournalSyncCursor,
     NativeConversation, PendingActionRow, PendingNudge, RetryableReply, RevisionRecord, Store,
     StoreError, StoreResult, SurfaceTurnResolution, SurfaceTurnState, SurfaceTurnStatus,
-    NUDGE_INTERVAL_MS,
+    has_unverified_placeholder, NUDGE_INTERVAL_MS, UNVERIFIED_OPEN,
 };
 
 /// Re-exported so extension crates (`augmentagent-proactive`, …) can write
