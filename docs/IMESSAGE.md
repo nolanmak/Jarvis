@@ -364,8 +364,11 @@ the elapsed time is under 60 seconds while healthy, and separately ask the owner
 to confirm phone receipt and notification visibility. Check again after reloading
 the sender job; login and awake operation remain prerequisites. Test high urgency
 with `--urgency high --escalation-seconds 60`, then repeat with acknowledgment
-before that threshold. `alerts acknowledge ID` means seen; `alerts resolve ID`
-means completed. Neither authorizes any reply. `alerts snooze ID --seconds 600`
+before that threshold. `alerts acknowledge ID` (alias `seen`) is the CLI form of
+the **Mark as seen** button: it records that you saw the item, which stays open
+with its preparation reminders armed. `alerts resolve ID` (alias `done`) is the
+CLI form of **Mark done / stop reminders** and is the only control that ends
+them. Neither authorizes any reply. `alerts snooze ID --seconds 600`
 rejects crossing the deadline unless `--override-deadline` is explicit.
 
 Acknowledgment/resolution cancels queued texts at reconciliation or the final
