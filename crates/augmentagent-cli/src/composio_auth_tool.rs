@@ -214,8 +214,23 @@ async fn dispatch(req: &Value) -> Value {
 pub async fn serve() -> Result<()> {
     let stdin = std::io::stdin();
     let mut out = std::io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let request: Value = serde_json::from_str(&line?)?;
+    serve_stream(stdin.lock(), &mut out).await
+}
+
+async fn serve_stream(input: impl BufRead, out: &mut impl Write) -> Result<()> {
+    for line in input.lines() {
+        let request: Value = match serde_json::from_str(&line?) {
+            Ok(request) => request,
+            Err(_) => {
+                writeln!(
+                    out,
+                    "{}",
+                    json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}})
+                )?;
+                out.flush()?;
+                continue;
+            }
+        };
         if request.get("id").is_none() {
             continue;
         }
@@ -228,6 +243,23 @@ pub async fn serve() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn malformed_json_does_not_terminate_the_mcp_session() {
+        let input = b"invalid json\n{\"id\":1,\"method\":\"ping\"}\n";
+        let mut output = Vec::new();
+        serve_stream(&input[..], &mut output).await.unwrap();
+        let replies: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0]["error"]["code"], -32700);
+        assert!(replies[0]["id"].is_null());
+        assert_eq!(replies[1]["id"], 1);
+        assert_eq!(replies[1]["result"], json!({}));
+    }
 
     #[test]
     fn owner_gate_and_database_do_not_depend_on_discord_channel_or_history() {

@@ -10755,10 +10755,16 @@ impl QueryHandler for WikiQuerier {
         enable_newsletter_tools(&mut opts, ctx);
         computer_tool::configure(&mut opts, ctx, &self.repo_root);
         model_tool::configure(&mut opts, ctx, &self.reasoner, &self.repo_root.join("target/release/augmentagent"));
+        // Unit-test query fixtures launch synthetic MCP servers: the test
+        // executable has libtest's entry point, not the CLI subcommands.
+        #[cfg(test)]
+        let auth_bin = self.repo_root.join("target/release/augmentagent");
+        #[cfg(not(test))]
+        let auth_bin = std::env::current_exe()?;
         composio_auth_tool::configure(
             &mut opts,
             ctx,
-            &std::env::current_exe()?,
+            &auth_bin,
             self.conversation_store.as_ref().map(|store| store.db_path()),
         )?;
         let compute_turn = match compute_tool::attach(&mut opts, ctx, &std::env::current_exe()?).await {

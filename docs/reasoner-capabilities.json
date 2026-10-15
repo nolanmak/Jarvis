@@ -110,6 +110,14 @@
       "operations": [
         "mcp__compute__run"
       ]
+    },
+    "composio-auth-mcp": {
+      "scope": "Owner-authorized hosted consent attempts; credentials stay in the MCP child and dashboard; existing preset permissions and model preserved.",
+      "operations": [
+        "mcp__composio_auth__start_auth",
+        "mcp__composio_auth__auth_status",
+        "mcp__composio_auth__complete_auth"
+      ]
     }
   },
   "presets": [
@@ -615,6 +623,19 @@
       "conformance": [
         "runner::tests::heartbeat_opts_are_read_only_fast_and_scoped_to_the_wiki"
       ]
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/composio_auth_tool.rs::configure",
+      "permission_profile": "composio-auth-mcp",
+      "output_contract": "Preserve the wrapped preset output contract; only report connected after verified persistence.",
+      "model_tier": "preserved",
+      "tier_rationale": "Adds owner-gated authentication tools without changing the wrapped model.",
+      "conformance": [
+        "composio_auth_tool::tests::owner_gate_and_database_do_not_depend_on_discord_channel_or_history",
+        "composio_auth_tool::tests::malformed_arguments_fail_before_credentials_or_network_access",
+        "scripts/tests/composio_auth_smoke.py"
+      ],
+      "provider_conformance": "verified"
     }
   ]
 }
