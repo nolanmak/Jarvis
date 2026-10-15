@@ -3607,5 +3607,33 @@
     "evidence": null,
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1463",
     "test_plan": "Covered by sync_source_watchdog_test's uninstall case; confirm on a real Mac that the job is gone and the stores remain."
+  },
+  {
+    "id": "cli:composio-auth-tool",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Owner-gated MCP start, live status, and verified completion of Composio consent; selected DB credentials and port reach the child.",
+    "macos_target": "Owner-gated MCP start, live status, and verified completion of Composio consent; selected DB credentials and port reach the child.",
+    "prerequisites": [
+      "Rust CLI",
+      "synthetic dashboard and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1474",
+    "test_plan": "Run cargo test -p augmentagent-cli --bin augmentagent composio_auth_tool on native Linux and macOS; record OS, architecture and result.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:composioAuthRoutes:POST:/:operation",
+    "source": "src/composioAuthRoutes.ts",
+    "linux_baseline": "Authenticated POST /api/composio/auth/{start,status,complete}; isolated attempts, strict identity/status validation, expiry and idempotent persistence.",
+    "macos_target": "Authenticated POST /api/composio/auth/{start,status,complete}; isolated attempts, strict identity/status validation, expiry and idempotent persistence.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic Composio and persistence fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1474",
+    "test_plan": "Run npm test on native Linux and macOS; record OS, architecture and result.",
+    "status": "unverified",
+    "evidence": null
   }
 ]

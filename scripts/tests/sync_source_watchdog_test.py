@@ -31,7 +31,7 @@ class SyncSourceWatchdogTest(unittest.TestCase):
         self.home = self.root / "home"
         (self.repo / "scripts/lib").mkdir(parents=True)
         self.home.mkdir()
-        for name in ("launchd-install.sh",):
+        for name in ("launchd-install.sh", "notify-owner.sh"):
             src = SOURCE / "scripts/lib" / name
             if src.exists():
                 shutil.copy2(src, self.repo / "scripts/lib")
@@ -63,6 +63,11 @@ class SyncSourceWatchdogTest(unittest.TestCase):
             "pgrep": 'case "$*" in *Notes*) [ -n "${NOTES_RUNNING:-}" ] ;; '
                      '*WhatsApp*) [ -n "${WA_RUNNING:-}" ] ;; *) false ;; esac\n'
                      'exit $?\n',
+            # Stands in for the HTTP client: records the arguments and the
+            # posted body so a test can assert what reached the owner channel
+            # without any network traffic.
+            "curl": 'printf "%s\\n" "$*" >> "$CURL_LOG"\n'
+                    'exit "${CURL_EXIT:-0}"\n',
         }
         for name, body in stubs.items():
             path = self.bin / name
@@ -77,6 +82,8 @@ class SyncSourceWatchdogTest(unittest.TestCase):
             "LAUNCHCTL_LOG": str(self.root / "launchctl.log"),
             "LAUNCHCTL_LOADED": str(self.root / "loaded"),
             "OPEN_LOG": str(self.root / "open.log"),
+            "CURL_LOG": str(self.root / "curl.log"),
+            "DISCORD_WEBHOOK_URL": "https://hooks.example.invalid/watchdog-stub",
             "WATCHDOG_NOTES_DB": str(self.notes_db),
             "WATCHDOG_WHATSAPP_DB": str(self.wa_db),
             "WATCHDOG_MAX_AGE_S": "3600",
@@ -89,12 +96,20 @@ class SyncSourceWatchdogTest(unittest.TestCase):
         os.utime(path, (when, when))
 
     def run_watchdog(self, **overrides):
+        # An override of None unsets the variable, so a test can run with no
+        # webhook configured at all.
+        env = {**self.env, **overrides}
+        env = {k: v for k, v in env.items() if v is not None}
         return subprocess.run([str(self.repo / "scripts/sync-source-watchdog.sh")],
-                              cwd=self.repo, env={**self.env, **overrides},
+                              cwd=self.repo, env=env,
                               text=True, capture_output=True)
 
     def opened(self):
         log = self.root / "open.log"
+        return log.read_text() if log.exists() else ""
+
+    def posted(self):
+        log = self.root / "curl.log"
         return log.read_text() if log.exists() else ""
 
     # --- the contract ----------------------------------------------------
@@ -179,6 +194,70 @@ class SyncSourceWatchdogTest(unittest.TestCase):
                                    WATCHDOG_ALARM_AGE_S="86400")
         self.assertIn("Notes", self.opened())
         self.assertNotIn("ALARM", result.stdout + result.stderr)
+
+    def test_an_alarm_escalation_reaches_the_owner_channel(self):
+        # A log line nobody reads is not an alert. The ALARM is the one state
+        # the watchdog cannot fix itself, so it has to leave the log file and
+        # reach the owner the way the updater's stall alerts do.
+        self.age(self.notes_db, 3 * 86400)
+        result = self.run_watchdog(WATCHDOG_ALARM_AGE_S="86400")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ALARM", result.stdout + result.stderr)
+        posted = self.posted()
+        self.assertIn("hooks.example.invalid/watchdog-stub", posted)
+        self.assertIn("Notes", posted)
+
+    def test_a_cold_store_below_the_alarm_threshold_does_not_notify(self):
+        # Cold enough to relaunch is the routine case the watchdog handles on
+        # its own; paging the owner for it would train him to ignore the page.
+        self.age(self.notes_db, 7 * 3600)
+        result = self.run_watchdog(WATCHDOG_MAX_AGE_S="21600",
+                                   WATCHDOG_ALARM_AGE_S="86400")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Notes", self.opened())
+        self.assertEqual(self.posted().strip(), "")
+
+    def test_repeated_alarms_do_not_notify_every_tick(self):
+        # The alarm state persists for as long as the app stays uninstalled.
+        # At a 15-minute interval an unthrottled post is ~96 messages a day.
+        self.age(self.notes_db, 3 * 86400)
+        self.run_watchdog(WATCHDOG_ALARM_AGE_S="86400")
+        first = self.posted().count("watchdog-stub")
+        self.assertEqual(first, 1, self.posted())
+        self.run_watchdog(WATCHDOG_ALARM_AGE_S="86400")
+        self.assertEqual(self.posted().count("watchdog-stub"), first,
+                         "watchdog posted again inside the throttle window")
+
+    def test_an_unconfigured_webhook_is_not_fatal(self):
+        self.age(self.notes_db, 3 * 86400)
+        result = self.run_watchdog(DISCORD_WEBHOOK_URL=None,
+                                   WATCHDOG_ALARM_AGE_S="86400")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ALARM", result.stdout + result.stderr)
+        self.assertEqual(self.posted().strip(), "")
+
+    def test_a_failing_webhook_does_not_fail_the_tick(self):
+        # Same invariant as a failed `open`: one undeliverable alert must not
+        # stop the apps after it from being judged.
+        self.age(self.notes_db, 3 * 86400)
+        self.age(self.wa_db, 3 * 86400)
+        result = self.run_watchdog(CURL_EXIT="1", WATCHDOG_ALARM_AGE_S="86400")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ALARM", result.stdout + result.stderr)
+        self.assertIn("WhatsApp", self.opened())
+
+    def test_a_failed_post_is_retried_on_the_next_tick(self):
+        # A Discord outage must not consume the throttle window: nobody was
+        # told, so the next tick still owes the owner an alert.
+        self.age(self.notes_db, 3 * 86400)
+        self.run_watchdog(CURL_EXIT="1", WATCHDOG_ALARM_AGE_S="86400")
+        self.assertEqual(self.posted().count("watchdog-stub"), 1, self.posted())
+        self.run_watchdog(WATCHDOG_ALARM_AGE_S="86400")
+        self.assertEqual(self.posted().count("watchdog-stub"), 2,
+                         "watchdog did not retry after a failed delivery")
+        # Once delivery succeeds the window applies again.
+        self.run_watchdog(WATCHDOG_ALARM_AGE_S="86400")
+        self.assertEqual(self.posted().count("watchdog-stub"), 2, self.posted())
 
     def test_install_writes_a_loaded_launchd_job(self):
         result = subprocess.run([str(self.repo / "scripts/install-sync-watchdog.sh")],

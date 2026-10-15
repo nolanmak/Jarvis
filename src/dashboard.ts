@@ -1,3 +1,4 @@
+import { createComposioAuthRouter } from "./composioAuthRoutes";
 import { Router, Request } from "express";
 import { exec, execSync, spawn } from "child_process";
 import crypto from "crypto";
@@ -796,6 +797,36 @@ async function getOrCreateAuthConfig(
   console.log(`Created auth config for ${toolkit}: ${authConfigId}`);
   return authConfigId;
 }
+
+// Agent consent is independent of browser callback state and works across devices.
+router.use("/api/composio/auth", createComposioAuthRouter({
+  getClient: getComposioClient,
+  getAuthConfig: getOrCreateAuthConfig,
+  getConfig, setConfig, getActiveGmailAccounts,
+  persist: async (provider, connectionId, entityId, account) => {
+    const email = (account as any).member_email || (account as any).email;
+    if (provider === "gmail") {
+      if (!getGmailAccounts().some((item) => item.connectionId === connectionId)) {
+        addGmailAccount(connectionId, entityId, email, email || "Gmail");
+      }
+    } else if (provider === "googledrive") {
+      const profile = await getComposioClient()!.tools.execute("GOOGLEDRIVE_GET_ABOUT", {
+        connected_account_id: connectionId, user_id: entityId,
+        version: "20261001_00", arguments: { fields: "user(emailAddress,displayName)" },
+      });
+      if (profile.successful === false) throw new Error("Could not verify Drive account identity");
+      const data = profile.data as any;
+      const address = data?.user?.emailAddress || data?.response_data?.user?.emailAddress || email;
+      addDriveAccount(connectionId, entityId, address, address || "Google Drive");
+    } else if (provider === "slack") {
+      const result = await persistSlackAuth({ entityId, connectionId,
+        composioApiKey: getConfig("composio_api_key") || process.env.COMPOSIO_API_KEY || "" });
+      if (!result.ok) throw new Error("Slack account persistence failed");
+    } else {
+      calendarStatusCache = null;
+    }
+  },
+}));
 
 router.get("/oauth/gmail/start", async (_req, res) => {
   try {

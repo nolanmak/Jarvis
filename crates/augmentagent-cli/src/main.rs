@@ -5,6 +5,7 @@ mod document_signing;
 #[cfg(test)]
 mod provider_migration_tests;
 mod model_tool;
+mod composio_auth_tool;
 mod voice_tool;
 mod computer_tool;
 #[cfg(test)]
@@ -699,6 +700,9 @@ enum Cmd {
         #[arg(long)]
         readiness: String,
     },
+    /// Internal owner-authorized MCP server for Composio hosted consent links.
+    #[command(hide = true)]
+    ComposioAuthTool,
     /// Internal conversation-bound MCP server for Discord speech.
     #[command(hide = true)]
     VoiceTool,
@@ -2845,6 +2849,9 @@ async fn main() -> Result<()> {
 
     if let Cmd::ModelTool { channel, ref readiness } = cli.cmd {
         return model_tool::serve(channel, readiness);
+    }
+    if let Cmd::ComposioAuthTool = cli.cmd {
+        return composio_auth_tool::serve().await;
     }
     if let Cmd::VoiceTool = cli.cmd {
         return voice_tool::serve();
@@ -5218,6 +5225,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Env { ref op, json } => env_cfg::run_env(op, json),
         Cmd::ModelTool { channel, ref readiness } => model_tool::serve(channel, readiness),
+        Cmd::ComposioAuthTool => composio_auth_tool::serve().await,
         Cmd::VoiceTool => voice_tool::serve(),
         Cmd::ComputeTool => compute_tool::serve(),
         Cmd::ReasonerSelftest { ref prompt, ref profile, tool_probe } =>
@@ -10747,6 +10755,18 @@ impl QueryHandler for WikiQuerier {
         enable_newsletter_tools(&mut opts, ctx);
         computer_tool::configure(&mut opts, ctx, &self.repo_root);
         model_tool::configure(&mut opts, ctx, &self.reasoner, &self.repo_root.join("target/release/augmentagent"));
+        // Unit-test query fixtures launch synthetic MCP servers: the test
+        // executable has libtest's entry point, not the CLI subcommands.
+        #[cfg(test)]
+        let auth_bin = self.repo_root.join("target/release/augmentagent");
+        #[cfg(not(test))]
+        let auth_bin = std::env::current_exe()?;
+        composio_auth_tool::configure(
+            &mut opts,
+            ctx,
+            &auth_bin,
+            self.conversation_store.as_ref().map(|store| store.db_path()),
+        )?;
         let compute_turn = match compute_tool::attach(&mut opts, ctx, &std::env::current_exe()?).await {
             Ok(turn) => turn,
             Err(_) => {
