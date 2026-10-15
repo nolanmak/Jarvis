@@ -13754,10 +13754,8 @@ impl ReplyApprover {
         // socialapi, linkedin call their transport and then stamp the row —
         // have nothing for it to gate, and this is their gate. Only statuses
         // that can still reach a transport are refused, so an already-resolved
-        // row keeps reporting its real status. The lookup FAILS CLOSED: for
-        // the non-claiming arms this is the only gate, so a store read error
-        // must refuse the send rather than wave a possibly-flagged draft
-        // through (#1464 review).
+        // row keeps reporting its real status. FAILS CLOSED: for the
+        // non-claiming arms this is the only gate (#1464 review).
         if matches!(action.action.status.as_str(), "pending" | "error") {
             match self.store.has_unverified_draft(action_id) {
                 Ok(false) => {}
@@ -14213,8 +14211,8 @@ impl ReplyApprover {
 
     /// #1464 — owner-facing text for a failed send-ward CAS. An
     /// `UnverifiedPlaceholder` refusal is not an internal error: the store's
-    /// own message already explains what the owner has to do, so it ships
-    /// verbatim instead of being wrapped in `{context}`.
+    /// message already says what the owner must do, so it ships verbatim
+    /// rather than wrapped in `{context}`.
     pub(crate) fn claim_failure_message(
         context: &str,
         e: &augmentagent_store::StoreError,
@@ -14463,8 +14461,8 @@ impl ReplyApprover {
         };
         // #1464 — a marker the redraft left where it had no tool to look a
         // fact up is deliberately NOT stripped here: it stays legible in the
-        // staged draft and on the reposted card, and the store's send-ward
-        // CAS guard refuses every rail while it is there.
+        // staged draft and on the reposted card, and the send-ward CAS guard
+        // refuses every rail while it is there.
         let split = |v: &Option<String>| -> Vec<String> {
             v.as_deref()
                 .map(augmentagent_channel_email::gmail::split_recipients)
@@ -22294,8 +22292,7 @@ mod unverified_placeholder_tests {
     use augmentagent_store::{ActionStatus, Email};
 
     /// A card on `platform` carrying `draft`, with the draft id and account
-    /// entity its arm needs, so the only thing that can stop a verb is the
-    /// placeholder guard. Without it, Approve would reach a real transport.
+    /// entity its arm needs, so only the placeholder guard can stop a verb.
     fn seed_card(
         store: &Store,
         msg: &str,
@@ -22347,8 +22344,8 @@ mod unverified_placeholder_tests {
         (tmp, s, a)
     }
 
-    // The issue's own case, verbatim: Revise was told "add the meeting link"
-    // and came back with a well-formed, entirely invented Google Meet URL.
+    // The issue's own case: Revise was told "add the meeting link" and came
+    // back with a well-formed, entirely invented conferencing URL.
     const FLAGGED: &str =
         "Looking forward to it — join here: [[UNVERIFIED: Google Meet link for Thursday's call]]";
 
@@ -22373,8 +22370,7 @@ mod unverified_placeholder_tests {
         let at_ms = chrono::Utc::now().timestamp_millis() + 24 * 3_600_000;
 
         refused(&approver.run_schedule(&id, at_ms).await, "schedule");
-        let row = store.get_action_with_email(&id).unwrap().unwrap();
-        assert_eq!(row.action.status, "pending");
+        assert_eq!(row_status(&store, &id), "pending");
         assert_eq!(
             store.action_scheduled_at(&id).unwrap(),
             None,
@@ -22394,22 +22390,18 @@ mod unverified_placeholder_tests {
         store.set_action_draft_body(&id, FLAGGED).unwrap();
 
         refused(&approver.run_send_now(&id).await, "send now");
-        let row = store.get_action_with_email(&id).unwrap().unwrap();
         assert_eq!(
-            row.action.status, "scheduled",
+            row_status(&store, &id),
+            "scheduled",
             "a refused Send Now must never leave the row in `sending`"
         );
     }
 
     /// EVERY transport entry point Approve can reach, enumerated from the
-    /// `run_approve` dispatch ladder — not a sample. The arms that claim
-    /// (gmail, slack, imessage) are also covered by the store's CAS guard;
-    /// the ones that do not call their transport and then stamp the row, so
-    /// the ladder check is their only gate. A refusal naming the marker proves
-    /// the guard ran before any dispatch, since each arm's own first failure
-    /// would name a missing client or credential instead. The first row is the
-    /// reported case: a Gmail card asked to add a link it cannot look up; the
-    /// last two are #1290's retry arm, an errored Slack row re-approved.
+    /// `run_approve` dispatch ladder — not a sample. A refusal naming the
+    /// marker proves the guard ran before any dispatch, since each arm's own
+    /// first failure would name a missing client or credential. Row 1 is the
+    /// reported case; the last two are #1290's retry arm, an errored Slack row.
     #[tokio::test]
     async fn approve_refuses_a_flagged_draft_on_every_transport_rail() {
         let rails: &[(&str, &str, Option<&str>, &str)] = &[
@@ -22444,9 +22436,8 @@ mod unverified_placeholder_tests {
     }
 
     /// The guard must not swallow the status of a row that can no longer reach
-    /// a transport (a resolved card still reports `AlreadyResolved`, so the
-    /// owner sees what happened to it), and it must not block a clean draft,
-    /// which gets past it and on to the real send path.
+    /// a transport (a resolved card still reports `AlreadyResolved`), nor
+    /// block a clean draft, which gets past it onto the real send path.
     #[tokio::test]
     async fn the_guard_refuses_only_a_flagged_unresolved_card() {
         let (_tmp, store, approver) = fx();
@@ -22466,7 +22457,6 @@ mod unverified_placeholder_tests {
 
     /// #1464 review — a flagged #652 revised SUBJECT over a clean body must
     /// still be refused at the button, or the marker ships in the header.
-    /// (The CAS half is `send_ward_cas_helpers_refuse_…` in the store.)
     #[tokio::test]
     async fn approve_refuses_a_flagged_subject_over_a_clean_body() {
         let (_tmp, store, approver) = fx();
@@ -22476,9 +22466,8 @@ mod unverified_placeholder_tests {
         assert_eq!(row_status(&store, &id), "pending");
     }
 
-    /// #1464 review — the ladder check is the ONLY gate for the arms that do
-    /// not claim, so a failed store read must refuse the send, not wave a
-    /// possibly-flagged draft through to a real transport.
+    /// #1464 review — the ladder check is the ONLY gate for arms that do not
+    /// claim, so a failed store read must refuse the send.
     #[tokio::test]
     async fn a_failed_placeholder_lookup_refuses_the_send() {
         let (_tmp, store, approver) = fx();
@@ -22500,8 +22489,8 @@ mod unverified_placeholder_tests {
     }
 
     /// The marker must survive staging verbatim: `strip_assumes_for_send`
-    /// scrubs the `<!--aa:assumes-->` fence before the body reaches Gmail,
-    /// but the owner has to see the gap in the staged draft and on the card.
+    /// scrubs the `<!--aa:assumes-->` fence before the body reaches Gmail, but
+    /// the owner has to see the gap in the staged draft and on the card.
     #[test]
     fn stripping_card_markers_leaves_the_placeholder_in_place() {
         let body = format!("{FLAGGED}\n\n<!--aa:assumes guessed the tone-->");

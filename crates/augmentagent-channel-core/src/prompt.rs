@@ -699,11 +699,10 @@ pub fn code_mode_repair_user_message(
 ///
 /// #1464 — the revise reasoner is text-only: with no calendar, mailbox or
 /// knowledge-base access, "add the link for tomorrow's call" is unanswerable,
-/// and the model's failure mode is to invent a well-formed value (the
-/// reported case fabricated a conferencing URL matching no real meeting). The
+/// and the model's failure mode is to invent a well-formed value (the reported
+/// case fabricated a conferencing URL matching no real meeting). The
 /// lookup-discipline clause gives it a way to refuse — emit
-/// `[[UNVERIFIED: …]]` — and the store's send-ward CAS guard makes that
-/// marker binding.
+/// `[[UNVERIFIED: …]]` — which the store's send-ward CAS guard makes binding.
 pub fn redraft_message(email: &Email, previous_draft: &str, feedback: &str) -> String {
     let subject_clause = if email.platform == "gmail" {
         " If — and only if — the user's feedback asks for a different subject line, put the new subject on the very first line as `Subject: <new subject>`, followed by one blank line, then the body. Otherwise never include a Subject line."
@@ -1047,8 +1046,8 @@ mod tests {
     }
 
     /// #1464 — the revise reasoner has no tools, so the only honest answer to
-    /// "add the meeting link" is a marker. Every platform gets the clause:
-    /// the fabrication hole is not email-specific.
+    /// "add the meeting link" is a marker. Every platform gets the clause: the
+    /// fabrication hole is not email-specific.
     #[test]
     fn redraft_forbids_inventing_lookup_shaped_values_on_every_platform() {
         for platform in ["gmail", "slack"] {

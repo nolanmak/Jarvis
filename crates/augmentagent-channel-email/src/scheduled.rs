@@ -611,10 +611,10 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
         // Cancel / Send Now / supersede / re-arm got there first.
         // #1464 — a draft repointed at an `[[UNVERIFIED: …]]` body while it
         // sat armed is refused by the claim itself, so the row never reaches
-        // `sending` and `finish_send_error` (CAS-gated on it) could not
-        // record the outcome. Back to the queue instead: the schedule is
-        // dead, but the fix is a Revise the owner has to run, so the card
-        // must be live again — same shape as a send that could not start.
+        // `sending` and `finish_send_error` (CAS-gated on it) could not record
+        // the outcome. Back to the queue instead: the schedule is dead, but
+        // the fix is a Revise only the owner can run, so the card must be
+        // live again — same shape as a send that could not start.
         match self
             .store
             .claim_due_action_for_send(action_id, now_ms, "scheduled-send-engine")
@@ -978,10 +978,9 @@ mod tests {
         assert!(ids.contains("sent-id"));
     }
 
-    /// #1464 — a row armed while its draft was clean, then repointed at a
-    /// body carrying an `[[UNVERIFIED: …]]` marker, must not reach Gmail. The
-    /// claim itself refuses, so the engine puts it back in the queue (the fix
-    /// is a Revise only the owner can run) and tells them why.
+    /// #1464 — a row armed while clean, then repointed at a body carrying an
+    /// `[[UNVERIFIED: …]]` marker, must not reach Gmail. The claim refuses, so
+    /// the engine puts it back in the queue and tells the owner why.
     #[tokio::test]
     async fn refuses_to_fire_a_draft_with_an_unverified_placeholder() {
         let (store, _f) = test_store();

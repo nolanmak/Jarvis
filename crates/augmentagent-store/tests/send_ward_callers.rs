@@ -1,21 +1,19 @@
 //! #1464 — the send-ward CAS helpers now refuse a draft still carrying an
 //! `[[UNVERIFIED: …]]` marker. A caller that treats their `Err` as a plain
 //! internal failure hands the owner an opaque message, and one added later
-//! could route a flagged draft somewhere unguarded. A hand-written list of
-//! callers proves neither, so this generates the inventory from `crates/*/src`
-//! and pins it: every production caller is enumerated, and each must handle
-//! the typed refusal by name.
+//! could route a flagged draft somewhere unguarded. A hand-written list proves
+//! neither, so this generates the inventory from `crates/*/src` and pins it:
+//! every production caller is enumerated and must handle the refusal by name.
 use std::path::{Path, PathBuf};
 
-/// The guarded helpers. The leading dot keeps `reschedule_action` /
-/// `unschedule_action` — which move a row AWAY from a transport and are
-/// deliberately unguarded — out.
+/// The guarded helpers. The leading dot keeps out `reschedule_action` /
+/// `unschedule_action`, which move a row AWAY from a transport.
 const GUARDED: [&str; 3] =
     [".claim_action_for_send(", ".claim_due_action_for_send(", ".schedule_action("];
 
 /// Every production file allowed to call one. A new entry means a new path
 /// from a persisted draft to a real transport: it owes the refusal handling
-/// asserted below and a rail test in its own crate.
+/// asserted below, plus a rail test in its own crate.
 const CALLERS: [&str; 4] = [
     "crates/augmentagent-channel-email/src/scheduled.rs",
     "crates/augmentagent-channel-slack/src/contact/mod.rs",
@@ -26,7 +24,7 @@ const CALLERS: [&str; 4] = [
 /// The source outside every `#[cfg(test)] mod … {}` block: test callers
 /// `unwrap()`, and panicking on an unexpected refusal is what we want from
 /// them. `store.rs` calls the helpers only from its own tests, so its absence
-/// from the inventory is this stripper's canary.
+/// from `CALLERS` is this stripper's canary.
 fn production(text: &str) -> String {
     let (mut out, mut depth, mut cfg_test) = (String::new(), 0i32, false);
     for line in text.lines() {

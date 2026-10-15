@@ -40,13 +40,12 @@ pub type StoreResult<T> = Result<T, StoreError>;
 
 /// #1464 — the marker the revise prompt makes the model emit instead of
 /// inventing a value it has no tool to look up. Deliberately NOT stripped
-/// before staging (unlike the `<!--aa:assumes-->` fence): it must stay
-/// legible in the staged Gmail draft and on the card, and the send-ward CAS
-/// guard is what makes leaving it there safe.
+/// before staging (unlike the `<!--aa:assumes-->` fence): it stays legible in
+/// the staged draft and on the card, and the send-ward CAS guard is what
+/// makes leaving it there safe.
 pub const UNVERIFIED_OPEN: &str = "[[UNVERIFIED:";
 
-/// True when `body` carries the marker. Matches the OPEN token only: a
-/// truncated `[[UNVERIFIED:` is just as unsendable as a balanced one.
+/// Matches the OPEN token only: a truncated marker is just as unsendable.
 pub fn has_unverified_placeholder(body: &str) -> bool {
     body.contains(UNVERIFIED_OPEN)
 }
@@ -4709,10 +4708,10 @@ impl Store {
         Ok(())
     }
 
-    /// #1464 — true when any text column this row would ship still carries
-    /// an `[[UNVERIFIED: …]]` marker. The ladder guard in `run_approve` reads
-    /// it rather than re-deriving the column set, so the ladder and the
-    /// send-ward CAS refuse exactly the same rows.
+    /// #1464 — true when any text column this row would ship still carries an
+    /// `[[UNVERIFIED: …]]` marker. The ladder guard in `run_approve` reads it
+    /// rather than re-deriving the column set, so the ladder and the send-ward
+    /// CAS refuse exactly the same rows.
     pub fn has_unverified_draft(&self, action_id: &str) -> StoreResult<bool> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         unverified_draft_columns(&guard, action_id)
@@ -8758,19 +8757,17 @@ pub struct ActionWithEmail {
 /// #1464 — the send-ward guard, called by every CAS helper that moves a row
 /// toward `sending` or `scheduled` while it already holds the connection
 /// mutex. Checking here rather than in each handler is what makes the
-/// invariant enumerable: no status transition toward a transport bypasses
-/// one of those three helpers.
+/// invariant enumerable: no status transition toward a transport bypasses one
+/// of those three helpers. Deliberately NOT folded into their `WHERE`
+/// clauses: `n == 0` already means "someone else resolved the row", so a
+/// placeholder refusal has to be a distinct `Err`. A missing row, or one with
+/// no draft text (identity-merge, gcal create-event), is a no-op.
 ///
-/// Deliberately NOT folded into the helpers' `WHERE` clauses: `n == 0`
-/// already means "someone else resolved the row", so a placeholder refusal
-/// has to be a distinct `Err`. A missing row, or one with no draft text
-/// (identity-merge, gcal create-event), is a no-op.
-///
-/// The production call-site inventory of the three guarded helpers is
-/// GENERATED and pinned by `tests/send_ward_callers.rs`, which also asserts
-/// each handles the refusal by name rather than as an opaque internal error.
-/// No caller can turn it into a send regardless: the helpers return
-/// `StoreResult<bool>`, so `Err` is never the `Ok(true)` that authorizes one.
+/// The production call-site inventory is GENERATED and pinned by
+/// `tests/send_ward_callers.rs`, which also asserts each caller handles the
+/// refusal by name rather than as an opaque internal error. No caller can
+/// turn it into a send regardless: the helpers return `StoreResult<bool>`, so
+/// `Err` is never the `Ok(true)` that authorizes one.
 fn reject_unverified_draft(conn: &Connection, action_id: &str) -> StoreResult<()> {
     if unverified_draft_columns(conn, action_id)? {
         return Err(StoreError::UnverifiedPlaceholder);
@@ -8780,8 +8777,8 @@ fn reject_unverified_draft(conn: &Connection, action_id: &str) -> StoreResult<()
 
 /// Every persisted column a revise pass can write free model text into.
 /// `envelopeSubject` is #652's revised Gmail subject, which `run_revise`
-/// splits off the body BEFORE persisting, so checking `draftBody` alone let
-/// a flagged subject ride a clean body all the way out (#1464 review).
+/// splits off the body BEFORE persisting, so checking `draftBody` alone let a
+/// flagged subject ride a clean body all the way out (#1464 review).
 fn unverified_draft_columns(conn: &Connection, action_id: &str) -> StoreResult<bool> {
     let row: Option<(Option<String>, Option<String>)> = conn
         .query_row(
@@ -10655,11 +10652,11 @@ mod tests {
 
     /// #1464 — a draft the revise agent flagged as unverifiable must not be
     /// claimable for a send by ANY of the three send-ward CAS helpers. The
-    /// refusal is distinguishable from a lost race (`Ok(false)`) and leaves
-    /// the row's status alone, so the card stays live for another Revise.
-    /// The flagged text is tried in `draftBody` and then in #652's revised
-    /// `envelopeSubject` over a clean body — the subject persists to its own
-    /// column, so a body-only guard would let it ship in the header.
+    /// refusal is distinguishable from a lost race (`Ok(false)`) and leaves the
+    /// row's status alone, so the card stays live for another Revise. Tried in
+    /// `draftBody` and then in #652's revised `envelopeSubject` over a clean
+    /// body: the subject has its own column, so a body-only guard would let it
+    /// ship in the header.
     #[test]
     fn send_ward_cas_helpers_refuse_a_draft_with_an_unverified_placeholder() {
         // The second is truncated on purpose: so is an unclosed marker.
@@ -10692,9 +10689,9 @@ mod tests {
 
     /// The fire-time claim refuses a row armed while clean and then repointed
     /// at a flagged body by `update-draft`, and leaves it armed. The control
-    /// half proves the guard is a placeholder check, not a blanket block: a
-    /// clean row walks the whole rail, and a card with no draft text at all
-    /// (identity-merge, gcal create-event) is a no-op for it.
+    /// half proves it is a placeholder check, not a blanket block: a clean row
+    /// walks the rail, and a card with no draft text (identity-merge,
+    /// gcal create-event) is a no-op for it.
     #[test]
     fn claim_due_action_for_send_refuses_only_an_unverified_placeholder() {
         let (s, _f) = fresh_store();
