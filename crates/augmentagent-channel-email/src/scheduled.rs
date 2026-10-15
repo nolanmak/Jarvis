@@ -990,9 +990,7 @@ mod tests {
             .set_action_draft_body(&id, "Here it is: [[UNVERIFIED: conferencing link]]")
             .unwrap();
         let gmail = Arc::new(MockGmail::ok());
-        let broker = Arc::new(RecordingBroker {
-            notices: Mutex::new(Vec::new()),
-        });
+        let broker = Arc::new(RecordingBroker { notices: Mutex::new(Vec::new()) });
         let engine = ScheduledSendEngine::new(
             Arc::clone(&store),
             Arc::clone(&gmail),

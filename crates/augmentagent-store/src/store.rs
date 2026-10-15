@@ -8766,23 +8766,11 @@ pub struct ActionWithEmail {
 /// has to be a distinct `Err`. A missing row, or one with no draft text
 /// (identity-merge, gcal create-event), is a no-op.
 ///
-/// The complete production call-site inventory of the three guarded helpers,
-/// and how each handles the refusal (the rest of the callers are tests, which
-/// `unwrap` and would panic on an unexpected refusal):
-///
-/// * `claim_action_for_send` — `ReplyApprover::approve_gmail`,
-///   `approve_identity_merge` and `run_send_now` (CLI), `ImessageApprover`
-///   (`imessage_send.rs`) and the Slack contact path (`contact/mod.rs`).
-/// * `schedule_action` — `ReplyApprover::run_schedule` (CLI).
-/// * `claim_due_action_for_send` — the scheduled-send engine
-///   (`scheduled.rs`) and the Slack contact path's `Due` claim.
-///
-/// The CLI and iMessage arms route it through `claim_failure_message`; the
-/// Slack contact path and the engine match the variant by name. No caller can
-/// turn the refusal into a send: the helpers return `StoreResult<bool>`, so
-/// `Err` is never the `Ok(true)` that authorizes one, and `Display` is a
-/// complete owner-facing instruction even when a caller added later wraps it
-/// in a generic `{context}: {e}`.
+/// The production call-site inventory of the three guarded helpers is
+/// GENERATED and pinned by `tests/send_ward_callers.rs`, which also asserts
+/// each handles the refusal by name rather than as an opaque internal error.
+/// No caller can turn it into a send regardless: the helpers return
+/// `StoreResult<bool>`, so `Err` is never the `Ok(true)` that authorizes one.
 fn reject_unverified_draft(conn: &Connection, action_id: &str) -> StoreResult<()> {
     if unverified_draft_columns(conn, action_id)? {
         return Err(StoreError::UnverifiedPlaceholder);
@@ -8802,13 +8790,8 @@ fn unverified_draft_columns(conn: &Connection, action_id: &str) -> StoreResult<b
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let Some((body, subject)) = row else {
-        return Ok(false);
-    };
-    Ok([body, subject]
-        .into_iter()
-        .flatten()
-        .any(|t| has_unverified_placeholder(&t)))
+    let Some((body, subject)) = row else { return Ok(false) };
+    Ok([body, subject].into_iter().flatten().any(|t| has_unverified_placeholder(&t)))
 }
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> StoreResult<bool> {
@@ -10679,21 +10662,19 @@ mod tests {
     /// column, so a body-only guard would let it ship in the header.
     #[test]
     fn send_ward_cas_helpers_refuse_a_draft_with_an_unverified_placeholder() {
-        // Unclosed in one case: a truncated marker is just as unsendable.
-        let flagged = ["Here is the link: [[UNVERIFIED: Meet link for the call]]",
+        // The second is truncated on purpose: so is an unclosed marker.
+        let flagged = ["link: [[UNVERIFIED: Meet link for the call]]",
                        "call me on [[UNVERIFIED: owner phone number"];
         for (i, text) in flagged.iter().enumerate() {
             for in_subject in [false, true] {
                 let (s, _f) = fresh_store();
                 let id = pending_action(&s, &format!("m-unverified-{i}-{in_subject}"));
+                let body = if in_subject { "Attached, as promised." } else { text };
+                s.set_action_draft_body(&id, body).unwrap();
                 if in_subject {
-                    s.set_action_draft_body(&id, "Attached, as promised.").unwrap();
                     s.set_action_subject(&id, Some(text)).unwrap();
-                } else {
-                    s.set_action_draft_body(&id, text).unwrap();
                 }
                 assert!(s.has_unverified_draft(&id).unwrap());
-
                 assert!(matches!(
                     s.claim_action_for_send(&id, ActionStatus::Pending, "discord"),
                     Err(StoreError::UnverifiedPlaceholder)
