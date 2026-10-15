@@ -8766,12 +8766,23 @@ pub struct ActionWithEmail {
 /// has to be a distinct `Err`. A missing row, or one with no draft text
 /// (identity-merge, gcal create-event), is a no-op.
 ///
-/// The new `Err` variant has to reach the owner as an instruction, not as an
-/// internal error, so every production caller routes it through an explicit
-/// arm: `claim_failure_message` in the CLI and iMessage approvers, a named
-/// match arm in the Slack contact path and the scheduled-send engine. A
-/// caller added later that folds it into a generic `{context}: {e}` would
-/// still refuse the send — it would just explain it badly.
+/// The complete production call-site inventory of the three guarded helpers,
+/// and how each handles the refusal (the rest of the callers are tests, which
+/// `unwrap` and would panic on an unexpected refusal):
+///
+/// * `claim_action_for_send` — `ReplyApprover::approve_gmail`,
+///   `approve_identity_merge` and `run_send_now` (CLI), `ImessageApprover`
+///   (`imessage_send.rs`) and the Slack contact path (`contact/mod.rs`).
+/// * `schedule_action` — `ReplyApprover::run_schedule` (CLI).
+/// * `claim_due_action_for_send` — the scheduled-send engine
+///   (`scheduled.rs`) and the Slack contact path's `Due` claim.
+///
+/// The CLI and iMessage arms route it through `claim_failure_message`; the
+/// Slack contact path and the engine match the variant by name. No caller can
+/// turn the refusal into a send: the helpers return `StoreResult<bool>`, so
+/// `Err` is never the `Ok(true)` that authorizes one, and `Display` is a
+/// complete owner-facing instruction even when a caller added later wraps it
+/// in a generic `{context}: {e}`.
 fn reject_unverified_draft(conn: &Connection, action_id: &str) -> StoreResult<()> {
     if unverified_draft_columns(conn, action_id)? {
         return Err(StoreError::UnverifiedPlaceholder);

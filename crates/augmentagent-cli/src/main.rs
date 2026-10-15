@@ -13754,14 +13754,32 @@ impl ReplyApprover {
         // socialapi, linkedin call their transport and then stamp the row —
         // have nothing for it to gate, and this is their gate. Only statuses
         // that can still reach a transport are refused, so an already-resolved
-        // row keeps reporting its real status.
-        if matches!(action.action.status.as_str(), "pending" | "error")
-            && self.store.has_unverified_draft(action_id).unwrap_or(false)
-        {
-            tracing::warn!(action_id, "approve: refused a draft with an unverified placeholder");
-            return ApprovalActionOutcome::Failed {
-                message: augmentagent_store::StoreError::UnverifiedPlaceholder.to_string(),
-            };
+        // row keeps reporting its real status. The lookup FAILS CLOSED: for
+        // the non-claiming arms this is the only gate, so a store read error
+        // must refuse the send rather than wave a possibly-flagged draft
+        // through (#1464 review).
+        if matches!(action.action.status.as_str(), "pending" | "error") {
+            match self.store.has_unverified_draft(action_id) {
+                Ok(false) => {}
+                Ok(true) => {
+                    tracing::warn!(
+                        action_id,
+                        "approve: refused a draft with an unverified placeholder"
+                    );
+                    return ApprovalActionOutcome::Failed {
+                        message: augmentagent_store::StoreError::UnverifiedPlaceholder.to_string(),
+                    };
+                }
+                Err(e) => {
+                    tracing::warn!(action_id, "approve: placeholder check failed: {e}");
+                    return ApprovalActionOutcome::Failed {
+                        message: format!(
+                            "could not check the draft for [[UNVERIFIED: …]] markers, so it was \
+                             not sent: {e}"
+                        ),
+                    };
+                }
+            }
         }
         // #1290 — a Slack contact send that failed after approval is retried
         // by approving again; the contact path decides whether the row is
@@ -22481,6 +22499,32 @@ mod unverified_placeholder_tests {
             }
         }
         assert_eq!(store.action_scheduled_at(&id).unwrap(), None);
+        assert_eq!(
+            store.get_action_with_email(&id).unwrap().unwrap().action.status,
+            "pending"
+        );
+    }
+
+    /// #1464 review — the ladder check is the ONLY gate for the arms that do
+    /// not claim, so a failed store read must refuse the send, not wave a
+    /// possibly-flagged draft through to a real transport.
+    #[tokio::test]
+    async fn a_failed_placeholder_lookup_refuses_the_send() {
+        let (_tmp, store, approver) = fx();
+        let id = seed_card(&store, "m-1464-lookup", FLAGGED, "discord", "dm", Some("discord:bot"));
+        // Break only the placeholder query: `get_action_with_email` never
+        // reads `envelopeSubject`, so the row still loads.
+        store
+            .with_conn(|c| c.execute_batch("ALTER TABLE actions DROP COLUMN envelopeSubject"))
+            .unwrap();
+
+        match approver.run_approve(&id).await {
+            ApprovalActionOutcome::Failed { message } => assert!(
+                message.contains("could not check the draft"),
+                "a failed lookup must refuse the send, got {message:?}"
+            ),
+            other => panic!("a failed lookup must not dispatch, got {other:?}"),
+        }
         assert_eq!(
             store.get_action_with_email(&id).unwrap().unwrap().action.status,
             "pending"
