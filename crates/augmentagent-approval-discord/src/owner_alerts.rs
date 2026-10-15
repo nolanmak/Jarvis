@@ -2,12 +2,12 @@
 use crate::ApprovalBroker;
 use augmentagent_store::{
     alert_schedule::AlertNotice,
-    owner_alerts::{AlertState, Urgency},
+    owner_alerts::{AlertState, OwnerAlert, Urgency},
     Store,
 };
 use serenity::all::{
     ButtonStyle, CreateActionRow, CreateAllowedMentions, CreateButton, CreateEmbed, CreateMessage,
-    Nonce, UserId,
+    EditMessage, Embed, Nonce, UserId,
 };
 use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
@@ -26,11 +26,7 @@ pub fn message(
     text_status: Option<&str>,
 ) -> CreateMessage {
     let a = &notice.alert;
-    let heading = if a.urgency == Urgency::Critical {
-        "🚨 CRITICAL — action required"
-    } else {
-        "⚠️ Action required"
-    };
+    let heading = heading(a, now);
     let subject = notice
         .details
         .as_ref()
@@ -74,15 +70,11 @@ pub fn message(
     {
         description.push_str(&format!("\n[Open meeting]({url})"));
     }
-    if a.state == AlertState::Acknowledged {
-        description.push_str("\nSeen, still unresolved — preparation reminder.");
-    }
     if let Some(status) = text_status.filter(|s| matches!(*s, "failed" | "unknown" | "expired")) {
         description.push_str(&format!(
             "\n**Text delivery: {status}.** Discord reminders remain active."
         ));
     }
-    let _ = now;
     CreateMessage::new()
         .content(format!("<@{}> {heading}", owner.get()))
         .allowed_mentions(
@@ -106,19 +98,80 @@ pub fn message(
                     a.id, notice.id
                 ))),
         )
-        .components(vec![CreateActionRow::Buttons(vec![
-            CreateButton::new(format!("oa:ack:{}", a.id))
-                .label("Acknowledge")
-                .style(ButtonStyle::Primary),
-            CreateButton::new(format!("oa:snooze:{}", a.id))
-                .label("Snooze 10 min")
-                .style(ButtonStyle::Secondary),
-            CreateButton::new(format!("oa:resolve:{}", a.id))
-                .label("Resolved")
-                .style(ButtonStyle::Success),
-        ])])
+        .components(controls(a))
         .nonce(Nonce::String(format!("owner-alert-{}", notice.id)))
         .enforce_nonce(true)
+}
+
+fn heading(alert: &OwnerAlert, now: i64) -> String {
+    if alert.state == AlertState::Resolved {
+        return "✅ Done — reminders stopped".into();
+    }
+    if let Some(until) = alert.snoozed_until_ms.filter(|until| *until > now) {
+        return format!("💤 Snoozed until <t:{}:t> — still open", until / 1000);
+    }
+    if alert.state == AlertState::Acknowledged {
+        return "👀 Seen — still open; preparation reminders remain".into();
+    }
+    if alert.urgency == Urgency::Critical {
+        "🚨 CRITICAL — action required".into()
+    } else {
+        "⚠️ Action required".into()
+    }
+}
+
+fn controls(alert: &OwnerAlert) -> Vec<CreateActionRow> {
+    if alert.state == AlertState::Resolved {
+        return vec![];
+    }
+    vec![CreateActionRow::Buttons(vec![
+        CreateButton::new(format!("oa:ack:{}", alert.id))
+            .label("Mark as seen")
+            .disabled(alert.state == AlertState::Acknowledged)
+            .style(ButtonStyle::Primary),
+        CreateButton::new(format!("oa:snooze:{}", alert.id))
+            .label("Snooze 10 min")
+            .style(ButtonStyle::Secondary),
+        CreateButton::new(format!("oa:resolve:{}", alert.id))
+            .label("Mark done / stop reminders")
+            .style(ButtonStyle::Success),
+    ])]
+}
+
+/// Preserve the source embed while refreshing status and controls without pinging again.
+pub fn status_update(alert: &OwnerAlert, now: i64, embeds: &[Embed]) -> EditMessage {
+    let embeds = embeds
+        .iter()
+        .cloned()
+        .map(|mut embed| {
+            // Older preparation cards included dynamic state inside the source details.
+            if let Some(description) = embed.description.as_mut() {
+                *description = description
+                    .lines()
+                    .filter(|line| *line != "Seen, still unresolved — preparation reminder.")
+                    .map(|line| {
+                        if line.starts_with("**Text delivery:") {
+                            line.trim_end_matches(" Discord reminders remain active.")
+                        } else {
+                            line
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            CreateEmbed::from(embed)
+        })
+        .collect();
+    EditMessage::new()
+        .embeds(embeds)
+        .content(heading(alert, now))
+        .allowed_mentions(
+            CreateAllowedMentions::new()
+                .all_users(false)
+                .all_roles(false)
+                .everyone(false),
+        )
+        .components(controls(alert))
 }
 
 /// Owner identity must be checked by the transport before invoking this function.
@@ -139,7 +192,7 @@ pub fn control(store: &Store, custom_id: &str, now: i64) -> anyhow::Result<Strin
         "ack" => {
             store.set_owner_alert_state(id, AlertState::Acknowledged, now)?;
             store.reconcile_owner_alert_texts(now)?;
-            Ok("Acknowledged as seen. Preparation reminders continue until resolved; no reply was sent.".into())
+            Ok("Marked as seen — still open. Ordinary follow-ups and queued text escalation are stopped; preparation reminders remain. To stop all reminders, click Mark done / stop reminders. No reply was sent.".into())
         }
         "resolve" => {
             store.set_owner_alert_state(id, AlertState::Resolved, now)?;
@@ -247,11 +300,70 @@ mod tests {
             json["components"][0]["components"][0]["custom_id"],
             "oa:ack:sample"
         );
-        control(&store, "oa:ack:sample", 3).unwrap();
+        assert_eq!(
+            json["components"][0]["components"][0]["label"],
+            "Mark as seen"
+        );
+        assert_eq!(
+            json["components"][0]["components"][2]["label"],
+            "Mark done / stop reminders"
+        );
+        let response = control(&store, "oa:ack:sample", 3).unwrap();
+        assert!(response.contains("still open"));
+        assert!(response.contains("Mark done / stop reminders"));
+        let embeds: Vec<Embed> = serde_json::from_value(json["embeds"].clone()).unwrap();
+        let seen = serde_json::to_value(status_update(
+            &store.owner_alert("sample").unwrap().unwrap(),
+            3,
+            &embeds,
+        ))
+        .unwrap();
+        assert!(seen["content"]
+            .as_str()
+            .unwrap()
+            .contains("Seen — still open"));
+        assert_eq!(seen["components"][0]["components"][0]["disabled"], true);
+        assert_eq!(
+            seen["components"][0]["components"][2]["custom_id"],
+            "oa:resolve:sample"
+        );
+        assert_eq!(seen["allowed_mentions"]["parse"], serde_json::json!([]));
+        assert_eq!(seen["embeds"][0]["title"], json["embeds"][0]["title"]);
+        assert!(seen["embeds"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Open source"));
         assert_eq!(
             store.owner_alert("sample").unwrap().unwrap().state,
             AlertState::Acknowledged
         );
+        control(&store, "oa:snooze:sample", 4).unwrap_err(); // beyond expiry
+        control(&store, "oa:resolve:sample", 5).unwrap();
+        let mut old_embeds = embeds.clone();
+        old_embeds[0]
+            .description
+            .as_mut()
+            .unwrap()
+            .push_str("\nSeen, still unresolved — preparation reminder.");
+        let done = serde_json::to_value(status_update(
+            &store.owner_alert("sample").unwrap().unwrap(),
+            5,
+            &old_embeds,
+        ))
+        .unwrap();
+        assert_eq!(done["content"], "✅ Done — reminders stopped");
+        assert_eq!(done["components"], serde_json::json!([]));
+        assert!(!done["embeds"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("still unresolved"));
+        assert!(!done["embeds"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("reminders remain active"));
+        assert!(control(&store, "oa:ack:sample", 6)
+            .unwrap()
+            .contains("Already resolved"));
     }
     struct AlertBroker {
         fail: bool,
@@ -360,6 +472,23 @@ mod tests {
         };
         assert_eq!(tick(&store, &good, now + 61_000).await.unwrap(), 1);
         control(&store, "oa:snooze:test", now + 61_001).unwrap();
+        let snoozed = serde_json::to_value(status_update(
+            &store.owner_alert("test").unwrap().unwrap(),
+            now + 61_001,
+            &[],
+        ))
+        .unwrap();
+        assert!(snoozed["content"]
+            .as_str()
+            .unwrap()
+            .contains("Snoozed until"));
+        assert_eq!(
+            snoozed["components"][0]["components"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
         drop(store);
         let store = Store::open(path).unwrap();
         assert_eq!(tick(&store, &good, now + 650_000).await.unwrap(), 0);
