@@ -47,6 +47,10 @@ jobs:
       # main can sit broken for a day. This is the PR gate, so it belongs here.
       - name: Whole workspace compiles
         run: cargo build --workspace --locked
+      - name: Agent Composio authentication
+        run: |
+          cargo test -p augmentagent-cli --bin augmentagent composio_auth_tool
+          python3 scripts/tests/composio_auth_smoke.py
       - name: Owner alerts and iMessage delivery
         run: |
           cargo test -p augmentagent-store --test owner_alerts --test imessage_outbox

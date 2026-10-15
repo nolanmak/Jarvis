@@ -962,6 +962,20 @@ console.log('DEPENDENCY_FIXTURE_OK');
 
 
 class HandoffTests(unittest.TestCase):
+    def test_composio_status_remains_live_but_start_and_complete_are_mutations(self):
+        args = {'attempt_id': 'synthetic-attempt'}
+        self.assertTrue(bridge.read_only_operation('mcp__composio_auth__auth_status', args))
+        for name in ('start_auth', 'complete_auth', 'unknown'):
+            self.assertFalse(bridge.read_only_operation('mcp__composio_auth__' + name, args))
+        self.assertFalse(bridge.read_only_operation('mcp__composio_auth__auth_status', {**args, 'extra': True}))
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            for identifier in ('poll-1', 'poll-2'):
+                event = {'tool_name': 'mcp__composio_auth__auth_status', 'tool_input': args, 'tool_use_id': identifier}
+                journal.observe_hook({**event, 'hook_event_name': 'PreToolUse'})
+                journal.observe_hook({**event, 'hook_event_name': 'PostToolUse', 'tool_response': 'INITIATED'})
+            self.assertEqual(journal.inspect(), [])
+
     def test_computer_status_polls_remain_live_while_mutations_keep_replay_protection(self):
         name = 'mcp__computer__computer_task'
         arguments = {'operation': 'status', 'taskId': 'synthetic-task'}
