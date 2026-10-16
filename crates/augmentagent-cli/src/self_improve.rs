@@ -8220,9 +8220,14 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // literal, not a failed run: let the builder correct exactly the lines
     // the guard named and try the commit once more. Anything else (a merge
     // conflict, an empty commit, another hook) falls through unchanged.
+    // #1487 review — a repair edits the tree after every review ran, so the
+    // result is guard-checked again and can only open as a draft: the resume
+    // lane re-gates and re-reviews it before anything merges.
+    let mut repaired_after_review = false;
     if !ok {
         let hits = pii_guard_hits(&e);
-        if !hits.is_empty() {
+        if !hits.is_empty() && round < max_rounds {
+            round += 1;
             info!(
                 issue = issue.number,
                 files = hits.len(),
@@ -8249,11 +8254,27 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         let (_ok, full_now, _) =
                             run("git", &["diff", "origin/main...HEAD"], &worktree).await?;
                         lines = diff_line_count(&full_now);
+                        repaired_after_review = true;
                         info!(
                             issue = issue.number,
                             "personal-data repair landed the commit: {}",
                             truncate(&summary_of_fix, 200)
                         );
+                        if let Some((pattern, line)) = blast_radius_hit_in_diff(&full_now) {
+                            warn!(issue = issue.number, pattern, %line, "personal-data repair hit the blast-radius guard");
+                            cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                            let message = format!(
+                                "issue #{}: personal-data repair touched `{pattern}`; refused, no PR opened",
+                                issue.number
+                            );
+                            if !park_charged {
+                                let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "publish:pii-repair", &format!("matched `{pattern}` on: {line}"), &diff_touched_paths(&full_now), lines))).await.unwrap_or_else(|_| Tally::uncounted());
+                                if attempts.exhausted() {
+                                    label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                                }
+                            }
+                            return Ok(RunReport::built(message));
+                        }
                     } else {
                         warn!(
                             issue = issue.number,
@@ -8330,8 +8351,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // and the drift is silent: a PR the fresh path would never merge gets
         // merged a day later by the sweep, on rules nobody compared.
         let owner = merge_policy_owner(repo_root).await;
-        // #1488/#1489 — parked work is always a draft.
-        park.is_none() && may_automerge(&MergePolicy {
+        // #1488/#1489 — parked work is always a draft, and so is a tree a
+        // personal-data repair changed after review.
+        park.is_none() && !repaired_after_review && may_automerge(&MergePolicy {
             automerge_enabled: automerge_enabled_value(
                 std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE").ok().as_deref(),
             ),
@@ -8358,6 +8380,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
              LGTM.",
             park.as_ref().map(ParkReason::headline).unwrap_or_default()
         ),
+        _ if repaired_after_review => "Draft — a personal-data repair edited the tree after \
+             review; the resume lane re-verifies it before any merge."
+            .to_string(),
         (true, _) => format!(
             "Auto-merged: owner-authored issue graded ≤medium, \
              AUGMENTAGENT_AUTOPR_AUTOMERGE=1, and two independent codex \
@@ -18197,6 +18222,19 @@ mod iterate_not_delete_tests {
         let shrink = body.find("initial diff over cap; one shrink attempt").unwrap();
         assert!(body[shrink..shrink + 120].contains("spent += 1;"));
         assert!(body.contains("let mut round = spent;"));
+    }
+
+    /// Re-review — a personal-data repair after review spends the budget,
+    /// is guard-checked again, and never auto-merges.
+    #[test]
+    fn a_post_review_repair_is_guarded_budgeted_and_never_auto_merged() {
+        let body = run_once_src();
+        let at = body.find("let hits = pii_guard_hits(&e);").unwrap();
+        let block = &body[at..at + body[at..].find("if !ok {\n        cleanup").unwrap()];
+        assert!(block.contains("&& round < max_rounds") && block.contains("round += 1;"));
+        assert!(block.contains("repaired_after_review = true;"));
+        assert!(block.contains("blast_radius_hit_in_diff(&full_now)"));
+        assert!(body.contains("park.is_none() && !repaired_after_review && may_automerge("));
     }
 
     /// Review #6 — a parked run whose publish fails is not charged twice.
