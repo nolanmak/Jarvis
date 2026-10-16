@@ -65,6 +65,8 @@ const GIVE_UP_SCOPER_NOT_FIXABLE: &str = "scoper:not-fixable";
 const GIVE_UP_SCOPER_PREDICTS_REFUSAL: &str = "scoper:predicts-refusal";
 const GIVE_UP_BLAST_RADIUS_NAMED: &str = "guard:blast-radius-named";
 const GIVE_UP_UNTRUSTED_AUTHOR: &str = "held:untrusted-author";
+/// #1491 — the builder says the issue is already fixed or under-specified.
+const GIVE_UP_OWNER_TRIAGE: &str = "held:owner-triage";
 /// What [`run_once`] returns when no labeled issue is waiting. The #630
 /// auto-PR loop matches on this to tell an idle tick (one cheap `gh issue
 /// list`, no reasoner spend) from an engaged run (counts against the daily
@@ -2680,6 +2682,222 @@ fn shrink_findings(lines: usize) -> String {
     )
 }
 
+/// #1488 — what the fresh lane does once the review passes have spoken.
+///
+/// Stage 3 (QA) used to be terminal: a reject deleted the built, gate-green
+/// diff and posted the notes on the issue, where no builder ever read them.
+/// Its findings now drive revision rounds exactly as Stage 4's do, out of the
+/// same `revise_rounds()` budget, and a reject that outlasts the budget parks
+/// the work as a draft instead of discarding it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Next {
+    /// Spend one revision round against these findings.
+    Revise(Findings),
+    /// QA approved and Stage 4 approved, could not run, or ran out of rounds:
+    /// publish under the existing merge policy.
+    Publish,
+    /// QA still rejects with no rounds left: open a draft carrying its notes.
+    ParkDraft,
+}
+
+/// Whose findings the next revision round works from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Findings {
+    Qa,
+    Independent,
+}
+
+/// The decision itself, pure so every branch is testable without a worktree.
+/// `independent` is `(available, approved)`, `None` until Stage 4 has run —
+/// it only runs on a diff QA approved. QA's findings come first: a revision
+/// against Stage 4's notes would be judged by a QA pass that still rejects.
+fn after_review(qa_ok: bool, independent: Option<(bool, bool)>, round: u32, max_rounds: u32) -> Next {
+    let independent_wants_changes = matches!(independent, Some((true, false)));
+    if qa_ok && !independent_wants_changes {
+        return Next::Publish;
+    }
+    if round < max_rounds {
+        return Next::Revise(if qa_ok { Findings::Independent } else { Findings::Qa });
+    }
+    if qa_ok {
+        Next::Publish
+    } else {
+        Next::ParkDraft
+    }
+}
+
+/// #1488 — a resumed draft merges only when every reviewer agrees: QA, the
+/// independent double LGTM, and CodeRabbit when it is required.
+fn resume_may_merge(qa_ok: bool, independent_approved: bool, rabbit_approved: bool) -> bool {
+    qa_ok && independent_approved && rabbit_approved
+}
+
+/// The Stage-3 prompt, shared by the fresh lane and resume. `prior` is the
+/// last QA verdict on this work, so a re-review judges whether its findings
+/// were resolved instead of re-scoping from nothing (the #889 rule, applied
+/// to QA).
+fn qa_review_prompt(issue: &Issue, summary: &str, prior: Option<&str>) -> String {
+    let prior = prior
+        .map(|p| {
+            format!(
+                "\n\nPrevious QA findings on this work — check whether each is \
+                 resolved, and do not re-raise one that is:\n{}",
+                truncate(p, 1500)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "GitHub issue #{}: {}\n\n{}\n\nBuilder's summary of its change:\n{}{prior}\n\n\
+         The change under review is `git diff origin/main...HEAD` (committed \
+         work) plus `git diff --cached` (staged work); read both. \
+         Review the worktree's diff now and output your verdict.",
+        issue.number,
+        issue.title,
+        truncate(&issue.body, 2000),
+        truncate(summary, 1000)
+    )
+}
+
+/// #1488 — marks the PR comment that carries a parked draft's QA findings,
+/// so resume can hand them back to the next QA pass.
+const QA_FINDINGS_MARKER: &str = "<!-- autopr:qa-findings -->";
+
+fn qa_findings_comment(notes: &str) -> String {
+    format!("{QA_FINDINGS_MARKER}\n**QA review findings**\n\n{}", truncate(notes, 3000))
+}
+
+/// The newest marked QA findings among a PR's comments, oldest first.
+fn parse_qa_findings(comments: &[String]) -> Option<String> {
+    comments.iter().rev().find_map(|c| {
+        let at = c.find(QA_FINDINGS_MARKER)?;
+        let rest = c[at + QA_FINDINGS_MARKER.len()..].trim_start();
+        let rest = rest.strip_prefix("**QA review findings**").unwrap_or(rest);
+        Some(rest.trim().to_string())
+    })
+}
+
+/// #1489 — marks the PR comment explaining why a run parked its work.
+const PARK_MARKER: &str = "<!-- autopr:park-reason -->";
+
+/// #1488/#1489 — why a fresh run parked its built diff as a draft instead of
+/// deleting it. Resume re-derives the gate and size facts against current
+/// `main` itself (its round 0 runs the full gate, and an oversized diff gets
+/// a shrink round), so only the QA findings need to travel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ParkReason {
+    /// QA still rejected after the revision budget; its last notes.
+    QaReject(String),
+    /// QA could not run mid-loop (provider trouble): not a verdict.
+    QaUnavailable(String),
+    /// The gate stayed red after the repair budget; its output.
+    GateRed(String),
+    /// Still over the size cap after the shrink budget; the line count.
+    Oversize(usize),
+}
+
+impl ParkReason {
+    fn headline(&self) -> String {
+        match self {
+            Self::QaReject(_) => "QA review still requested changes after the revision budget".into(),
+            Self::QaUnavailable(_) => "the QA reviewer could not run".into(),
+            Self::GateRed(_) => "the verification gate stayed red after the repair budget".into(),
+            Self::Oversize(n) => format!("the diff is {n} lines, over the {MAX_DIFF_LINES}-line cap"),
+        }
+    }
+
+    /// The PR comment: the reason under [`PARK_MARKER`], plus the QA findings
+    /// under [`QA_FINDINGS_MARKER`] when there are any.
+    fn comment(&self) -> String {
+        let detail = match self {
+            Self::QaReject(notes) => qa_findings_comment(notes),
+            Self::QaUnavailable(e) => format!("Reviewer error:\n```\n{}\n```", truncate(e, 1000)),
+            Self::GateRed(out) => format!("Gate output:\n```\n{}\n```", truncate(out, 2500)),
+            Self::Oversize(_) => String::new(),
+        };
+        format!(
+            "{PARK_MARKER}\nParked as a draft: {}. The work is kept here instead of \
+             being deleted; the resume lane picks it up and keeps revising, and \
+             it cannot merge until QA approves and the independent review gives \
+             a double LGTM.\n\n{detail}",
+            self.headline()
+        )
+    }
+
+    /// The PR body's verification lines: never a pass the run did not see.
+    fn verification(&self) -> String {
+        match self {
+            Self::QaReject(_) | Self::QaUnavailable(_) => {
+                "- verification gate: passed on the reviewed diff (the full suite runs again before any merge)".into()
+            }
+            Self::GateRed(_) => "- verification gate: FAILED (output in the park comment)".into(),
+            Self::Oversize(_) => "- verification gate: not run on this diff (over the size cap)".into(),
+        }
+    }
+}
+
+/// Every path a unified diff touches, from its `diff --git` headers.
+fn touched_path_set(diff: &str) -> std::collections::BTreeSet<String> {
+    diff.lines()
+        .filter_map(|l| l.strip_prefix("diff --git "))
+        .flat_map(|rest| rest.split(' '))
+        .filter_map(|p| p.strip_prefix("a/").or_else(|| p.strip_prefix("b/")))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The touched paths the blast-radius guard refuses.
+fn guarded_paths(diff: &str) -> Vec<String> {
+    touched_path_set(diff)
+        .into_iter()
+        .filter(|p| blast_radius_hit_in_diff(&format!("diff --git a/{p} b/{p}")).is_some())
+        .collect()
+}
+
+/// #1490 — did narrowing only take paths away? The result must touch a
+/// non-empty subset of what it started from and pass the guard; anything else
+/// is refused exactly as an unnarrowed hit is. Narrowing itself is a
+/// deterministic `git checkout`, so unguarded files cannot change — this is
+/// the belt to that brace.
+fn narrowed_only(before: &str, after: &str) -> bool {
+    let (b, a) = (touched_path_set(before), touched_path_set(after));
+    !a.is_empty() && a.is_subset(&b) && blast_radius_hit_in_diff(after).is_none()
+}
+
+/// #1491 — what a builder said when asked why it changed nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NoChange {
+    AlreadyFixed(String),
+    Underspecified(String),
+    Silent,
+}
+
+/// Only a sentinel on the reply's first non-blank line counts, so one quoted
+/// from the issue, fenced, or mentioned in passing is not an answer.
+fn parse_no_change_reply(raw: &str) -> NoChange {
+    let text = raw.trim_start();
+    let first = text.lines().next().unwrap_or("");
+    for (sentinel, make) in [
+        ("ALREADY_FIXED:", NoChange::AlreadyFixed as fn(String) -> NoChange),
+        ("UNDERSPECIFIED:", NoChange::Underspecified),
+    ] {
+        if first.starts_with(sentinel) {
+            return make(text[sentinel.len()..].trim().to_string());
+        }
+    }
+    NoChange::Silent
+}
+
+fn build_no_change_prompt(issue: &Issue) -> String {
+    format!(
+        "You were asked to fix GitHub issue #{} ({}) in this worktree, but you \
+         made no changes to any file. Either make the change now, or reply \
+         with exactly one of these on the first line:\n\
+         `ALREADY_FIXED: <evidence — the file:line on main that already does it>`\n\
+         `UNDERSPECIFIED: <what the issue must say before it can be fixed>`",
+        issue.number, issue.title
+    )
+}
+
 /// #851-follow-up — may this PR auto-merge despite touching a receipt-gated
 /// path? Owner policy (2026-08-31): a DOUBLE codex LGTM overrides the
 /// receipt gate when `AUGMENTAGENT_AUTOPR_LGTM_OVERRIDES_RECEIPT=1`.
@@ -3000,6 +3218,20 @@ impl IndependentReview {
             (true, false) => "changes requested on system interaction".into(),
             (false, true) => "changes requested on the diff".into(),
             (false, false) => "changes requested (diff + system)".into(),
+        }
+    }
+
+    /// #1488 — Stage 4 never ran because the run parked first. Not a
+    /// verdict, and never an approval.
+    fn not_run(reason: String) -> Self {
+        Self {
+            provider: None,
+            model: None,
+            available: false,
+            diff_ok: false,
+            system_ok: false,
+            notes: format!("Independent review not run: {reason}."),
+            why_unavailable: None,
         }
     }
 
@@ -4588,6 +4820,64 @@ fn build_pii_fix_prompt(hits: &[(String, Vec<u32>)]) -> String {
     )
 }
 
+/// #1488 — the staged tree as it stands, so a revision round that errors or
+/// trips a guard can be undone. Verdicts describe a tree; that tree is the
+/// one that ships, never a half-applied edit on top of it.
+async fn snapshot_tree(worktree: &Path) -> Result<String> {
+    let _ = run("git", &["add", "-A"], worktree).await?;
+    let (ok, tree, e) = run("git", &["write-tree"], worktree).await?;
+    anyhow::ensure!(ok, "git write-tree failed: {e}");
+    Ok(tree.trim().to_string())
+}
+
+/// Put the index and the working tree back to `tree`, dropping any file the
+/// round created. The worktree is pipeline-owned, so nothing else lives there.
+async fn restore_tree(worktree: &Path, tree: &str) -> Result<()> {
+    let (ok, _o, e) = run("git", &["read-tree", "-u", "--reset", tree], worktree).await?;
+    anyhow::ensure!(ok, "git read-tree failed: {e}");
+    let _ = run("git", &["clean", "-fdq"], worktree).await?;
+    Ok(())
+}
+
+/// #1490 — put every guarded path in `before` back to `base` (deleting the
+/// ones `base` does not have) and nothing else. Deterministic — no model
+/// call, so no budget and no way to touch an unguarded file. `Some` with the
+/// narrowed diff when the result passes [`narrowed_only`]; otherwise the tree
+/// is restored and `None` lets the caller refuse exactly as before. The gate
+/// and QA judge whether the fix still works without those files.
+async fn narrow_guarded_paths(worktree: &Path, base: &str, before: &str) -> Result<Option<String>> {
+    let paths = guarded_paths(before);
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let snapshot = snapshot_tree(worktree).await?;
+    for path in &paths {
+        let spec = format!("{base}:{path}");
+        let (on_base, _, _) = run("git", &["cat-file", "-e", &spec], worktree).await?;
+        let (ok, _o, e) = if on_base {
+            run("git", &["checkout", base, "--", path], worktree).await?
+        } else {
+            run("git", &["rm", "-rfq", "--cached", "--ignore-unmatch", "--", path], worktree).await?
+        };
+        anyhow::ensure!(ok, "reverting guarded path {path}: {e}");
+        if !on_base {
+            let file = worktree.join(path);
+            if file.is_dir() {
+                tokio::fs::remove_dir_all(&file).await.ok();
+            } else {
+                tokio::fs::remove_file(&file).await.ok();
+            }
+        }
+    }
+    let _ = run("git", &["add", "-A"], worktree).await?;
+    let (_ok, after, _) = run("git", &["diff", "--cached", base], worktree).await?;
+    if !narrowed_only(before, &after) {
+        restore_tree(worktree, &snapshot).await?;
+        return Ok(None);
+    }
+    Ok(Some(after))
+}
+
 /// #817 — delete untracked files the builder left at the worktree ROOT,
 /// returning what was dropped.
 ///
@@ -5782,6 +6072,25 @@ async fn resume_draft_pr(
     // complexity. A resumed run must be graded against the criteria the
     // original scoping pass wrote, not a fresh set nobody agreed to.
     let resumed_criteria = criteria_from_pr_body(&pr_body);
+    // #1488 — a draft a fresh run parked carries QA's findings in a marked
+    // comment; they seed this run's first QA pass so it judges convergence.
+    let mut prior_qa: Option<String> = match run(
+        &gh,
+        // Only comments by the PR's author — the account the loop runs as —
+        // so nobody else can plant "findings" in the QA prompt.
+        &[
+            "pr", "view", &pr.to_string(), "--json", "author,comments", "-q",
+            ".author.login as $me | [.comments[] | select(.author.login == $me) | .body]",
+        ],
+        repo_root,
+    )
+    .await
+    {
+        Ok((true, out, _)) => serde_json::from_str::<Vec<String>>(&out)
+            .ok()
+            .and_then(|c| parse_qa_findings(&c)),
+        _ => None,
+    };
 
     // #1037 M1 — a record that cannot be read when it is bound (corrupt, not
     // owner-private, a busy lock) is unverifiable provenance, not a failed
@@ -6191,47 +6500,83 @@ async fn resume_draft_pr(
             )));
         }
 
-        let independent =
-            independent_review(reasoner, &issue, &summary, &diff, worktree.clone(), prior_notes.as_deref(), &resumed_criteria)
-                .await;
-        prior_notes = Some(independent.notes.clone());
-        match independent.outcome() {
-            ReviewOutcome::Unavailable(why) => {
-                // Reachable only when the reviewer went away AFTER the
-                // preflight above (a latch mid-run, a failed call). Another
-                // code revision cannot repair it, so preserve whatever this
-                // run committed and let the one mapping decide the rest —
-                // including whether this run is billed, which it is only if a
-                // builder call was actually made.
+        // #1488 — QA reviews every resumed round, as it does every fresh one:
+        // a draft never merges on a diff QA has not approved.
+        let (qa_ok, qa_notes) = match reasoner
+            .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, prior_qa.as_deref()))
+            .await
+        {
+            Ok(r) => parse_review_output(&r),
+            Err(e) => {
+                warn!(pr, "resume QA review failed; keeping the draft: {e:#}");
+                record_reasoner_error(
+                    issue.number,
+                    failure_record(reasoner, FailureKind::ReasonerError, "resume:qa-review", &format!("{e:#}")),
+                );
                 if !dry_run {
-                    let (ok, _, error) = run("git", &["push", "origin", branch], &worktree).await?;
-                    if !ok {
-                        cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
-                        bail!("resume: preserving draft failed: {error}");
-                    }
+                    let _ = run("git", &["push", "origin", branch], &worktree).await;
                 }
                 cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
-                return Ok(hold_unreviewable(
-                    repo_root,
-                    pr,
-                    issue.number,
-                    &why,
-                    reasoner.calls() > 0,
-                    dry_run,
-                )
-                .await);
+                // Billed only when a builder round ran this tick (#1037).
+                let message = format!("PR #{pr}: resume QA review errored; draft kept");
+                return Ok(if rounds_done > 0 {
+                    RunReport::built(message)
+                } else {
+                    RunReport::triage(message)
+                });
             }
-            // A verdict, either way: the draft was reviewable today, so its
-            // run of unreviewable days is over.
-            ReviewOutcome::Approved | ReviewOutcome::ChangesRequested => {
-                if !dry_run {
-                    forget_unreviewable(&unreviewable_path(), pr);
+        };
+        prior_qa = Some(qa_notes.clone());
+        // Stage 4 only reviews a diff QA approved.
+        let independent = if qa_ok {
+            independent_review(reasoner, &issue, &summary, &diff, worktree.clone(), prior_notes.as_deref(), &resumed_criteria)
+                .await
+        } else {
+            IndependentReview::not_run("QA requested changes".into())
+        };
+        if qa_ok {
+            prior_notes = Some(independent.notes.clone());
+        }
+        if qa_ok {
+            match independent.outcome() {
+                ReviewOutcome::Unavailable(why) => {
+                    // Reachable only when the reviewer went away AFTER the
+                    // preflight above (a latch mid-run, a failed call). Another
+                    // code revision cannot repair it, so preserve whatever this
+                    // run committed and let the one mapping decide the rest —
+                    // including whether this run is billed, which it is only if a
+                    // builder call was actually made.
+                    if !dry_run {
+                        let (ok, _, error) = run("git", &["push", "origin", branch], &worktree).await?;
+                        if !ok {
+                            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                            bail!("resume: preserving draft failed: {error}");
+                        }
+                    }
+                    cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                    return Ok(hold_unreviewable(
+                        repo_root,
+                        pr,
+                        issue.number,
+                        &why,
+                        reasoner.calls() > 0,
+                        dry_run,
+                    )
+                    .await);
+                }
+                // A verdict, either way: the draft was reviewable today, so its
+                // run of unreviewable days is over.
+                ReviewOutcome::Approved | ReviewOutcome::ChangesRequested => {
+                    if !dry_run {
+                        forget_unreviewable(&unreviewable_path(), pr);
+                    }
                 }
             }
         }
         // #936 — CodeRabbit is the (advisory) third reviewer. It judges the
-        // PUSHED head, so push first (a no-op when nothing changed).
-        let rabbit = if dry_run {
+        // PUSHED head, so push first (a no-op when nothing changed). Not
+        // consulted while QA still wants changes.
+        let rabbit = if dry_run || !qa_ok {
             RabbitReview::skipped()
         } else {
             match rabbit_policy(!rabbit_pr_comments(repo_root, pr).await.is_empty(), rabbit_policy_env()) {
@@ -6246,13 +6591,17 @@ async fn resume_draft_pr(
                 }
             }
         };
-        notes_log.push(format!(
-            "round {rounds_done}: independent {}; CodeRabbit {} ({})",
-            independent.status(),
-            rabbit.status(),
-            rabbit.note
-        ));
-        if independent.approved() && rabbit.approved() {
+        notes_log.push(if qa_ok {
+            format!(
+                "round {rounds_done}: QA approve; independent {}; CodeRabbit {} ({})",
+                independent.status(),
+                rabbit.status(),
+                rabbit.note
+            )
+        } else {
+            format!("round {rounds_done}: QA changes requested")
+        });
+        if resume_may_merge(qa_ok, independent.approved(), rabbit.approved()) {
             if rounds_done > 0 {
                 // Revisions were verified crate-targeted; nothing merges
                 // without the full suite passing once (#870).
@@ -6300,7 +6649,7 @@ async fn resume_draft_pr(
             let _ = run(
                 &gh,
                 &["pr", "comment", &pr.to_string(), "--body",
-                  &format!("Auto-resume: LGTM from every reviewer (independent: {}; CodeRabbit: {}) \
+                  &format!("Auto-resume: LGTM from every reviewer (QA approve; independent: {}; CodeRabbit: {}) \
                             after {rounds_done} revision round(s) against current \
                             `main`.\n\n{}",
                            independent.status(),
@@ -6353,9 +6702,14 @@ async fn resume_draft_pr(
             return Ok(RunReport::built(format!("PR #{pr}: resumed and MERGED")));
         }
 
+        // Whichever reviewer still objects; QA first.
+        let open_notes = if qa_ok { independent.notes.clone() } else { qa_notes.clone() };
         if rounds_done >= revise_rounds() {
             // Out of rounds: publish the improved state + verdicts, stay draft.
             let _ = run("git", &["push", "origin", branch], &worktree).await;
+            if !qa_ok {
+                let _ = run(&gh, &["pr", "comment", &pr.to_string(), "--body", &qa_findings_comment(&qa_notes)], repo_root).await;
+            }
             let _ = run(
                 &gh,
                 &["pr", "comment", &pr.to_string(), "--body",
@@ -6364,17 +6718,17 @@ async fn resume_draft_pr(
                             changed crates' tests; the full workspace suite \
                             runs before any merge. Latest findings:\n\n{}",
                            notes_log.join("; "),
-                           truncate(&independent.notes, 2500))],
+                           truncate(&open_notes, 2500))],
                 repo_root,
             )
             .await;
             cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
-            let attempts = record_attempt(repo_root, issue.number, Some(failure_record(reasoner, FailureKind::ReviewReject, "resume:review", &independent.notes))).await.unwrap_or_else(|_| Tally::uncounted());
+            let attempts = record_attempt(repo_root, issue.number, Some(failure_record(reasoner, FailureKind::ReviewReject, "resume:review", &open_notes))).await.unwrap_or_else(|_| Tally::uncounted());
             if attempts.exhausted() {
                 // Every future resume would replay the same disagreement;
                 // the label hands it to a human with the exchange attached.
                 label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
-                close_gave_up_pr(repo_root, pr, issue.number, &gave_up_close_comment(pr, issue.number, attempts.n, &independent.notes)).await;
+                close_gave_up_pr(repo_root, pr, issue.number, &gave_up_close_comment(pr, issue.number, attempts.n, &open_notes)).await;
             }
             notify_review(&format!(
                 "📝 resumed draft still needs review after {rounds_done} rounds: {} — PR #{pr}",
@@ -6387,8 +6741,11 @@ async fn resume_draft_pr(
         }
 
         rounds_done += 1;
-        // #936 — codex findings first; with codex satisfied, CodeRabbit's.
-        let (findings, kind) = if !independent.approved() {
+        // #936 — QA's findings first (#1488), then codex's; with both
+        // satisfied, CodeRabbit's.
+        let (findings, kind) = if !qa_ok {
+            (qa_notes.clone(), "QA findings")
+        } else if !independent.approved() {
             (independent.notes.clone(), "independent findings")
         } else {
             (rabbit_findings_prompt(&rabbit), "coderabbit findings")
@@ -6422,7 +6779,7 @@ async fn resume_draft_pr(
         };
         let _ = drop_root_scratch(&worktree).await;
         let _ = run("git", &["add", "-A"], &worktree).await?;
-        let msg = format!("review round {rounds_done}: address independent findings");
+        let msg = format!("review round {rounds_done}: address {kind}");
         let _ = run(
             "git",
             &["-c", &name_arg, "-c", &email_arg, "commit", "--allow-empty", "-m", &msg],
@@ -7069,33 +7426,102 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     let mut dropped = drop_root_scratch(&worktree).await;
     let _ = run("git", &["add", "-A"], &worktree).await?;
     let (_ok, mut diff, _) = run("git", &["diff", "--cached", "--stat"], &worktree).await?;
+    // Every revision call this run makes — the no-change follow-up, the
+    // initial shrink, gate repairs, review rounds — comes out of one budget.
+    let mut spent = 0u32;
     if diff.trim().is_empty() {
-        cleanup(worktree, branch, repo_root.to_path_buf()).await;
-        let attempts = record_attempt(
-            repo_root,
-            issue.number,
-            Some(rec(FailureKind::NoChanges, "build", &truncate(&summary, 800), "", 0)),
-        )
-        .await
-        .unwrap_or_else(|_| Tally::uncounted());
-        if attempts.exhausted() {
-            backoff_comment(
+        // #1491 — an empty diff is asked once why: make the change now, or
+        // say the issue is already fixed or under-specified. Either answer is
+        // the owner's to verify, and neither is a failed attempt.
+        let mut reply = NoChange::Silent;
+        if spent < revise_rounds() {
+            spent += 1;
+            info!(issue = issue.number, "builder made no changes; one follow-up");
+            match reasoner
+                .call_revision(&fix_opts(worktree.clone()), &build_no_change_prompt(&issue))
+                .await
+            {
+                Ok(text) => {
+                    dropped.extend(drop_root_scratch(&worktree).await);
+                    let _ = run("git", &["add", "-A"], &worktree).await?;
+                    diff = run("git", &["diff", "--cached", "--stat"], &worktree).await?.1;
+                    summary = format!("{summary}\n\nNo-change follow-up: {}", truncate(&text, 300));
+                    reply = parse_no_change_reply(&text);
+                }
+                Err(e) => warn!(issue = issue.number, "no-change follow-up failed: {e:#}"),
+            }
+        }
+        if diff.trim().is_empty() {
+            cleanup(worktree, branch, repo_root.to_path_buf()).await;
+            // #1491 — a no-change run is minutes, not a build: never billed
+            // against the daily cap. The ledger mark (record_attempt makes
+            // one too) keeps the picker off this issue for the rest of today.
+            AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue.number);
+            let held = match &reply {
+                NoChange::AlreadyFixed(why) => Some(("already fixed", why)),
+                NoChange::Underspecified(why) => Some(("under-specified", why)),
+                NoChange::Silent => None,
+            };
+            if let Some((what, why)) = held {
+                backoff_comment(
+                    repo_root,
+                    issue.number,
+                    &format!(
+                        "Auto-fix made no change: the builder reports this issue is \
+                         {what}.\n\n{}\n\nHeld for the owner to verify — it is not \
+                         closed. Remove the `{GAVE_UP_LABEL}` label to put it back \
+                         in the pool.",
+                        truncate(why, 1500)
+                    ),
+                )
+                .await
+                .ok();
+                label_gave_up(repo_root, issue.number, GIVE_UP_OWNER_TRIAGE).await.ok();
+                return Ok(RunReport::triage(format!(
+                    "issue #{}: no changes — builder reports it {what}; held for owner triage",
+                    issue.number
+                )));
+            }
+            let attempts = record_attempt(
                 repo_root,
                 issue.number,
-                &format!(
-                    "Self-improve gave up after {attempts} attempts: the \
-                     reasoner produced no changes for this issue. Needs a \
-                     human (or a more concrete issue body)."
-                ),
+                Some(rec(FailureKind::NoChanges, "build", &truncate(&summary, 800), "", 0)),
             )
             .await
-            .ok();
-            label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+            .unwrap_or_else(|_| Tally::uncounted());
+            if attempts.exhausted() {
+                backoff_comment(
+                    repo_root,
+                    issue.number,
+                    &format!(
+                        "Self-improve gave up after {attempts} attempts: the \
+                         reasoner produced no changes for this issue. Needs a \
+                         human (or a more concrete issue body)."
+                    ),
+                )
+                .await
+                .ok();
+                label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+            }
+            return Ok(RunReport::triage(format!(
+                "issue #{}: reasoner made no changes; skipped (attempt {attempts}, not charged to the daily cap)",
+                issue.number
+            )));
         }
-        return Ok(RunReport::built(format!(
-            "issue #{}: reasoner made no changes; skipped (attempt {attempts})",
-            issue.number
-        )));
+    }
+
+    // #1490 — blast-radius hit: narrow first. The guarded paths go back to
+    // `main` deterministically and nothing else changes; if the result still
+    // trips the guard (or nothing would be left), the refusal below runs
+    // exactly as before. The guard itself is untouched.
+    let (_ok, mut full_diff, _) = run("git", &["diff", "--cached"], &worktree).await?;
+    if let Some((pattern, _)) = blast_radius_hit_in_diff(&full_diff) {
+        if let Some(clean) = narrow_guarded_paths(&worktree, "origin/main", &full_diff).await? {
+            info!(issue = issue.number, pattern, "narrowing reverted the guarded paths");
+            full_diff = clean;
+            diff = run("git", &["diff", "--cached", "--stat"], &worktree).await?.1;
+            summary = format!("{summary}\n\nNarrowed: reverted changes to `{pattern}` paths.");
+        }
     }
 
     // Blast-radius + size guard on the actual diff. Each refusal burned a
@@ -7103,7 +7529,6 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // rollout MAY produce an acceptable diff, but after MAX_ATTEMPTS the
     // gave-up label pulls the issue from the pool — otherwise the unattended
     // loop would re-spend its whole daily cap on the same issue forever.
-    let (_ok, full_diff, _) = run("git", &["diff", "--cached"], &worktree).await?;
     if let Some((pattern, line)) = blast_radius_hit_in_diff(&full_diff) {
         cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
         let attempts = record_attempt(
@@ -7153,9 +7578,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // rather than refusing the work.
     let (_ok, staged_names, _) = run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
     let mut gated = touches_verify_gated_path(&staged_names);
-
     let mut lines = diff_line_count(&full_diff);
-    if lines > MAX_DIFF_LINES && revise_enabled() {
+    if lines > MAX_DIFF_LINES && spent < revise_rounds() {
         // #875 — the FIRST diff gets one shrink attempt too. #868 added
         // shrink rounds inside the revise loop, but the initial size check
         // stayed terminal — and promptly discarded a completed build at 652
@@ -7163,455 +7587,607 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // trivially. One build-tier call risks nothing: still over after the
         // shrink ⇒ the refusal below proceeds unchanged.
         info!(issue = issue.number, lines, "initial diff over cap; one shrink attempt");
-        if let Ok(rs) = reasoner
+        spent += 1;
+        let snapshot = snapshot_tree(&worktree).await?;
+        match reasoner
             .call_revision(
                 &fix_opts(worktree.clone()),
                 &build_revise_prompt(&issue, &shrink_findings(lines), lines, prior_attempts.as_deref()),
             )
             .await
         {
-            let _ = drop_root_scratch(&worktree).await;
-            let _ = run("git", &["add", "-A"], &worktree).await?;
-            let (_ok, d2, _) = run("git", &["diff", "--cached"], &worktree).await?;
-            // Shrinking must not smuggle in a guarded path.
-            if blast_radius_hit_in_diff(&d2).is_none() {
-                lines = diff_line_count(&d2);
-                summary = format!("{summary}\n\nShrink: {}", truncate(&rs, 200));
-            }
-        }
-    }
-    if lines > MAX_DIFF_LINES {
-        cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
-        let attempts = record_attempt(
-            repo_root,
-            issue.number,
-            Some(rec(
-                FailureKind::GuardRefusal,
-                "guard:size",
-                &format!("diff is {lines} lines (cap {MAX_DIFF_LINES})"),
-                &diff,
-                lines,
-            )),
-        )
-        .await
-        .unwrap_or_else(|_| Tally::uncounted());
-        backoff_comment(
-            repo_root,
-            issue.number,
-            &format!(
-                "Self-improve refused: diff is {lines} lines (cap {MAX_DIFF_LINES}) \
-                 after a shrink attempt. Needs a human (or a split issue)."
-            ),
-        )
-        .await
-        .ok();
-        if attempts.exhausted() {
-            label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
-        }
-        return Ok(RunReport::built(format!(
-            "issue #{}: refused — diff too large ({lines} lines, attempt {attempts})",
-            issue.number
-        )));
-    }
-
-    // Verification gate. #873 gave the resume lane and the post-revision
-    // gate repair rounds; the FIRST gate after a fresh build stayed
-    // terminal and threw the whole build away on its first red — the #875
-    // shape again. Red→fix is the other half of TDD: the builder sees the
-    // compiler/test output verbatim and repairs while budget remains. The
-    // rounds come out of the same revise budget the review loop draws on,
-    // so a run never spends more revision calls than it could before.
-    let mut gate_repairs = 0u32;
-    let mut gate_result = verification_gate(&worktree).await;
-    while let Err(gate_err) = &gate_result {
-        let gate_text = format!("{gate_err:#}");
-        let verdict = preexisting_on_main(repo_root, &gate_text).await;
-        let preexisting_only = verdict.as_ref().is_some_and(|v| v.introduced.is_empty())
-            && !is_red_main_issue(&issue.body);
-        if !gate_repair_wanted(gate_repairs, revise_rounds(), &gate_text, preexisting_only) {
-            break;
-        }
-        // Only the failures this diff introduced are its job.
-        let gate_text = match verdict.as_ref() {
-            Some(v) if !v.preexisting.is_empty() => format!(
-                "{gate_text}\n\nAlready failing on `main` before this change — NOT yours, \
-                 ignore: {}",
-                v.preexisting.join(", ")
-            ),
-            _ => gate_text,
-        };
-        gate_repairs += 1;
-        info!(
-            issue = issue.number,
-            round = gate_repairs,
-            max_rounds = revise_rounds(),
-            "initial gate red; repair round"
-        );
-        match reasoner
-            .call_revision(
-                &fix_opts(worktree.clone()),
-                &build_revise_prompt(&issue, &gate_findings(&gate_text), lines, prior_attempts.as_deref()),
-            )
-            .await
-        {
-            Err(e) => {
-                // Provider trouble, not a verdict — the red result stands.
-                warn!(issue = issue.number, "gate-repair round failed; keeping the red verdict: {e:#}");
-                break;
-            }
             Ok(rs) => {
                 let _ = drop_root_scratch(&worktree).await;
                 let _ = run("git", &["add", "-A"], &worktree).await?;
                 let (_ok, d2, _) = run("git", &["diff", "--cached"], &worktree).await?;
-                // A repair may not smuggle in a guarded path or blow the cap:
-                // the red verdict stands and the run ends below as before.
-                if blast_radius_hit_in_diff(&d2).is_some() || diff_line_count(&d2) > MAX_DIFF_LINES {
-                    warn!(issue = issue.number, "gate repair tripped a guard; keeping the red verdict");
-                    break;
+                // Shrinking must not smuggle in a guarded path — and the tree it
+                // left must not ship either, so put the guarded-clean one back.
+                if blast_radius_hit_in_diff(&d2).is_none() {
+                    lines = diff_line_count(&d2);
+                    full_diff = d2;
+                    summary = format!("{summary}\n\nShrink: {}", truncate(&rs, 200));
+                } else {
+                    restore_tree(&worktree, &snapshot).await?;
                 }
-                lines = diff_line_count(&d2);
-                diff = d2;
-                summary = format!("{summary}\n\nGate repair {gate_repairs}: {}", truncate(&rs, 200));
-                gate_result = verification_gate(&worktree).await;
+            }
+            // A call that errors may still have edited files; none of that
+            // was checked, so none of it may ship.
+            Err(e) => {
+                warn!(issue = issue.number, "initial shrink failed; keeping the unshrunk tree: {e:#}");
+                restore_tree(&worktree, &snapshot).await?;
             }
         }
+        diff = run("git", &["diff", "--cached", "--stat"], &worktree).await?.1;
+        let names = run("git", &["diff", "--cached", "--name-only"], &worktree).await?.1;
+        gated = touches_verify_gated_path(&names);
     }
-    if let Err(gate_err) = gate_result {
-        warn!(
-            issue = issue.number,
-            "verification gate failed: {gate_err:#}"
-        );
-        // #931 — a failure `main` already has is not this diff's. Leave
-        // unbilled and unrecorded (no attempt, no comment); the ledger mark
-        // alone keeps the picker from re-buying the same build this tick.
-        if let Some(verdict) = preexisting_on_main(repo_root, &gate_err.to_string()).await {
-            // #932 — except for the red-main issue itself: those failures
-            // ARE its job, so a still-red gate is a real attempt that must
-            // accumulate toward gave-up instead of retrying daily forever.
-            if verdict.introduced.is_empty() && !is_red_main_issue(&issue.body) {
-                AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue.number);
-                cleanup(worktree, branch, repo_root.to_path_buf()).await;
-                return Ok(RunReport::triage(format!(
-                    "issue #{}: gate red on main too ({}); not charged",
-                    issue.number,
-                    verdict.preexisting.join(", ")
-                )));
-            }
-        }
-        let attempts = record_attempt(
-            repo_root,
-            issue.number,
-            Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "gate", &detail, &diff, lines) }),
-        )
-        .await
-        .unwrap_or_else(|_| Tally::uncounted());
-        if attempts.exhausted() {
-            backoff_comment(
+
+    // What the publish step reads, set by the stages below.
+    let max_rounds = revise_rounds();
+    let mut qa_ok = false;
+    let mut review_notes = String::new();
+    let mut independent: Option<IndependentReview> = None;
+    let mut revision_note = String::new();
+    // Gate repairs and review rounds continue the same budget.
+    let mut round = spent;
+    // #1488 — set while the tree on disk is one a round left oversized or
+    // red, and cleared once a round gets it back under the cap and green. If
+    // the run stops iterating while it is set, the work parks for that reason:
+    // the reviews it holds describe an earlier tree.
+    let mut pending_guard: Option<ParkReason> = None;
+    // #1488/#1489 — once a diff has built, a stage that runs out of budget
+    // parks it as a draft PR instead of deleting it: the resume lane has gate
+    // repair, shrink and QA rounds of its own, and MAX_ATTEMPTS still bounds
+    // it. Only an exhausted issue (or a guard refusal) ends without a PR.
+    let park: Option<ParkReason> = 'stages: {
+        if lines > MAX_DIFF_LINES {
+            let attempts = record_attempt(
                 repo_root,
                 issue.number,
-                &format!(
-                    "Self-improve gave up after {attempts} attempts. \
-                     Last gate failure:\n```\n{}\n```",
-                    truncate(&gate_err.to_string(), 1500)
-                ),
+                Some(rec(
+                    FailureKind::GuardRefusal,
+                    "guard:size",
+                    &format!("diff is {lines} lines (cap {MAX_DIFF_LINES})"),
+                    &diff,
+                    lines,
+                )),
             )
             .await
-            .ok();
-            label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+            .unwrap_or_else(|_| Tally::uncounted());
+            if attempts.exhausted() {
+                cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
+                backoff_comment(
+                    repo_root,
+                    issue.number,
+                    &format!(
+                        "Self-improve refused: diff is {lines} lines (cap {MAX_DIFF_LINES}) \
+                         after a shrink attempt. Needs a human (or a split issue)."
+                    ),
+                )
+                .await
+                .ok();
+                label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                return Ok(RunReport::built(format!(
+                    "issue #{}: refused — diff too large ({lines} lines, attempt {attempts})",
+                    issue.number
+                )));
+            }
+            break 'stages Some(ParkReason::Oversize(lines));
         }
-        cleanup(worktree, branch, repo_root.to_path_buf()).await;
-        return Ok(RunReport::built(format!(
-            "issue #{}: verification gate failed (attempt {attempts}); no PR opened",
-            issue.number
-        )));
-    }
 
-    // Stage 3 (#653): QA review of the diff by the stronger tier. A reject
-    // is a failed attempt — same treatment as a red gate. Runs before the
-    // dry-run exit so dry runs exercise the full pipeline.
-    let review_prompt = format!(
-        "GitHub issue #{}: {}\n\n{}\n\nBuilder's summary of its change:\n{}\n\n\
-         Review the worktree's diff now and output your verdict.",
-        issue.number,
-        issue.title,
-        truncate(&issue.body, 2000),
-        truncate(&summary, 1000)
-    );
-    let (review_ok, review_notes) = match reasoner
-        .call(&review_opts(worktree.clone()), &review_prompt)
-        .await
-    {
-        Ok(r) => parse_review_output(&r),
-        Err(e) => {
-            // Transient reviewer failure (session limit etc.) — don't burn an
-            // attempt on infrastructure noise; the next tick retries whole.
-            record_reasoner_error(
-                issue.number,
-                rec(FailureKind::ReasonerError, "qa-review", &format!("{e:#}"), &diff, lines),
-            );
-            cleanup(worktree, branch, repo_root.to_path_buf()).await;
-            return Err(e).context("QA review pass failed during self-improve");
-        }
-    };
-    if !review_ok {
-        warn!(issue = issue.number, "QA review rejected the diff");
-        let attempts = record_attempt(
-            repo_root,
-            issue.number,
-            Some(rec(FailureKind::ReviewReject, "qa-review", &review_notes, &diff, lines)),
-        )
-        .await
-        .unwrap_or_else(|_| Tally::uncounted());
-        backoff_comment(
-            repo_root,
-            issue.number,
-            &format!(
-                "Auto-fix QA review rejected the attempt:\n\n{}",
-                truncate(&review_notes, 1200)
-            ),
-        )
-        .await
-        .ok();
-        if attempts.exhausted() {
-            label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
-        }
-        cleanup(worktree, branch, repo_root.to_path_buf()).await;
-        return Ok(RunReport::built(format!(
-            "issue #{}: QA review rejected the diff (attempt {attempts}); no PR opened",
-            issue.number
-        )));
-    }
-
-    // Stage 4 (#828): INDEPENDENT review by a different provider. Two passes
-    // — one focused on the diff, one on how the change lands in the rest of
-    // the system — both with read-only access to the whole worktree. Runs
-    // before the dry-run exit so dry runs exercise the full pipeline.
-    //
-    // A rejection here does NOT discard the work: the diff built, passed the
-    // gate, and satisfied the author's own QA, so it opens as a draft PR
-    // carrying both verdicts for a human. It does count as a failed attempt,
-    // because a second opinion disagreeing is exactly what this stage is for.
-    let mut independent =
-        independent_review(&reasoner, &issue, &summary, &full_diff, worktree.clone(), None, &criteria).await;
-    let mut revision_note = String::new();
-    if independent.available && !independent.approved() {
-        warn!(
-            issue = issue.number,
-            diff_ok = independent.diff_ok,
-            system_ok = independent.system_ok,
-            "independent review requested changes"
-        );
-        // Not recorded as an attempt: the run continues either to a revision
-        // or to a draft PR, and dedup keeps the issue out of the pool while
-        // that PR is open (recording here double-counted — see #852).
-    }
-
-    // Iterate revisions until the reviewer approves (owner directive
-    // 2026-08-31), bounded by `revise_rounds`. Seven drafts accumulated over
-    // three days because a codex rejection just parked the work with nobody
-    // acting on the findings; this loop is what turns findings into merges.
-    // Every round re-runs everything downstream of the edit: scratch sweep,
-    // blast/size guards, the full verification gate, and BOTH codex passes —
-    // a revised diff earns its verdict, it does not inherit one.
-    let max_rounds = revise_rounds();
-    // Gate repairs on the initial build already drew on this budget.
-    let mut round = gate_repairs;
-    // Set when a round overgrew the size cap: the next round revises against
-    // a shrink instruction instead of codex notes, and codex is not consulted
-    // on a diff that cannot ship anyway.
-    let mut findings_override: Option<String> = None;
-    while independent.available && !independent.approved() && round < max_rounds {
-        round += 1;
-        let findings = findings_override
-            .take()
-            .unwrap_or_else(|| independent.notes.clone());
-        info!(issue = issue.number, round, max_rounds, "revising against the independent findings");
-        let round1 = independent.status();
-        match reasoner
-            .call_revision(
-                &fix_opts(worktree.clone()),
-                &build_revise_prompt(&issue, &findings, lines, prior_attempts.as_deref()),
-            )
-            .await
-        {
-            Err(e) => {
-                // Provider trouble, not a verdict — keep the last outcome and
-                // stop iterating rather than burning rounds on a flaky call.
-                warn!(
-                    issue = issue.number,
-                    round, "revision pass failed; keeping the prior outcome: {e:#}"
-                );
+        // Verification gate. #873 gave the resume lane and the post-revision
+        // gate repair rounds; the FIRST gate after a fresh build stayed
+        // terminal and threw the whole build away on its first red — the #875
+        // shape again. Red→fix is the other half of TDD: the builder sees the
+        // compiler/test output verbatim and repairs while budget remains. The
+        // rounds come out of the same revise budget the review loop draws on,
+        // so a run never spends more revision calls than it could before.
+        let mut gate_result = verification_gate(&worktree).await;
+        while let Err(gate_err) = &gate_result {
+            let gate_text = format!("{gate_err:#}");
+            let verdict = preexisting_on_main(repo_root, &gate_text).await;
+            let preexisting_only = verdict.as_ref().is_some_and(|v| v.introduced.is_empty())
+                && !is_red_main_issue(&issue.body);
+            if !gate_repair_wanted(round, max_rounds, &gate_text, preexisting_only) {
                 break;
             }
-            Ok(rev_summary) => {
-                dropped.extend(drop_root_scratch(&worktree).await);
-                let _ = run("git", &["add", "-A"], &worktree).await?;
-                let (_ok, diff2, _) = run("git", &["diff", "--cached"], &worktree).await?;
-                if let Some((pattern, line)) = blast_radius_hit_in_diff(&diff2) {
-                    warn!(issue = issue.number, pattern, %line, "revision hit the blast-radius guard");
-                    let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "revise:blast-radius", &format!("matched `{pattern}` on: {line}"), &diff_touched_paths(&diff2), diff_line_count(&diff2)))).await.unwrap_or_else(|_| Tally::uncounted());
-                    backoff_comment(
-                        repo_root,
-                        issue.number,
-                        &format!(
-                            "Self-improve refused after revision: the revised diff \
-                             touches `{pattern}`:\n```\n{line}\n```"
-                        ),
-                    )
-                    .await
-                    .ok();
-                    if attempts.exhausted() {
-                        label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
-                    }
-                    cleanup(worktree, branch, repo_root.to_path_buf()).await;
-                    return Ok(RunReport::built(format!(
-                        "issue #{}: revision hit blast-radius guard on `{pattern}` (attempt {attempts})",
-                        issue.number
-                    )));
+            // Only the failures this diff introduced are its job.
+            let gate_text = match verdict.as_ref() {
+                Some(v) if !v.preexisting.is_empty() => format!(
+                    "{gate_text}\n\nAlready failing on `main` before this change — NOT yours, \
+                     ignore: {}",
+                    v.preexisting.join(", ")
+                ),
+                _ => gate_text,
+            };
+            round += 1;
+            info!(issue = issue.number, round, max_rounds, "initial gate red; repair round");
+            let snapshot = snapshot_tree(&worktree).await?;
+            match reasoner
+                .call_revision(
+                    &fix_opts(worktree.clone()),
+                    &build_revise_prompt(&issue, &gate_findings(&gate_text), lines, prior_attempts.as_deref()),
+                )
+                .await
+            {
+                Err(e) => {
+                    // Provider trouble, not a verdict — the red result stands,
+                    // on the tree it was measured on.
+                    warn!(issue = issue.number, "gate-repair round failed; keeping the red verdict: {e:#}");
+                    restore_tree(&worktree, &snapshot).await?;
+                    break;
                 }
-                let lines2 = diff_line_count(&diff2);
-                if lines2 > MAX_DIFF_LINES {
-                    // Shrink round while budget remains — a terminal refusal
-                    // here discards every round of paid work (seen live on
-                    // the #839 resume). Terminal only when rounds are spent.
-                    if round < max_rounds {
-                        warn!(
-                            issue = issue.number,
-                            round, lines2, "revision overgrew the cap; scheduling a shrink round"
-                        );
-                        findings_override = Some(shrink_findings(lines2));
-                        lines = lines2;
-                        revision_note.push_str(&format!(
-                            "\n### Revision round {round}: overgrew the cap \
-                             ({lines2} lines); next round shrinks\n"
-                        ));
-                        continue;
+                Ok(rs) => {
+                    let _ = drop_root_scratch(&worktree).await;
+                    let _ = run("git", &["add", "-A"], &worktree).await?;
+                    let (_ok, d2, _) = run("git", &["diff", "--cached"], &worktree).await?;
+                    // A repair may not smuggle in a guarded path or blow the cap:
+                    // the red verdict stands on the tree before the repair.
+                    if blast_radius_hit_in_diff(&d2).is_some() || diff_line_count(&d2) > MAX_DIFF_LINES {
+                        warn!(issue = issue.number, "gate repair tripped a guard; keeping the red verdict");
+                        restore_tree(&worktree, &snapshot).await?;
+                        break;
                     }
-                    let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "revise:size", &format!("diff is {lines2} lines (cap {MAX_DIFF_LINES})"), &diff_touched_paths(&diff2), lines2))).await.unwrap_or_else(|_| Tally::uncounted());
-                    backoff_comment(
-                        repo_root,
-                        issue.number,
-                        &format!(
-                            "Self-improve refused after revision: diff grew to \
-                             {lines2} lines (cap {MAX_DIFF_LINES}) and the \
-                             revision budget is exhausted."
-                        ),
-                    )
-                    .await
-                    .ok();
-                    if attempts.exhausted() {
-                        label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
-                    }
-                    cleanup(worktree, branch, repo_root.to_path_buf()).await;
-                    return Ok(RunReport::built(format!(
-                        "issue #{}: revision oversized ({lines2} lines, attempt {attempts})",
-                        issue.number
-                    )));
+                    lines = diff_line_count(&d2);
+                    full_diff = d2;
+                    diff = run("git", &["diff", "--cached", "--stat"], &worktree).await?.1;
+                    let names = run("git", &["diff", "--cached", "--name-only"], &worktree).await?.1;
+                    gated = touches_verify_gated_path(&names);
+                    summary = format!("{summary}\n\nGate repair {round}: {}", truncate(&rs, 200));
+                    gate_result = verification_gate(&worktree).await;
                 }
-                let (_ok, names2, _) =
-                    run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
-                if let Err(gate_err) = gate_for_round(&worktree, &names2).await {
-                    warn!(issue = issue.number, "post-revision gate failed: {gate_err:#}");
-                    // #873 — a red gate gets a repair round while budget
-                    // remains: red→fix is the other half of TDD, and a
-                    // compile error is the easiest failure to iterate on.
-                    // Codex is not consulted on a diff that does not build.
-                    if round < max_rounds {
-                        findings_override = Some(gate_findings(&gate_err.to_string()));
-                        revision_note.push_str(&format!(
-                            "\n### Revision round {round}: failed the gate; \
-                             next round repairs\n"
-                        ));
-                        continue;
-                    }
-                    let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "revise:gate", &detail, &diff_touched_paths(&diff2), lines2) })).await.unwrap_or_else(|_| Tally::uncounted());
-                    if attempts.exhausted() {
-                        backoff_comment(
-                            repo_root,
-                            issue.number,
-                            &format!(
-                                "Self-improve gave up after {attempts} attempts. \
-                                 Post-revision gate failure:\n```\n{}\n```",
-                                truncate(&gate_err.to_string(), 1500)
-                            ),
-                        )
-                        .await
-                        .ok();
-                        label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
-                    }
-                    cleanup(worktree, branch, repo_root.to_path_buf()).await;
-                    return Ok(RunReport::built(format!(
-                        "issue #{}: post-revision gate failed (attempt {attempts}); no PR opened",
-                        issue.number
-                    )));
-                }
-                // The revised diff may touch different files.
-                gated = touches_verify_gated_path(&names2);
-                lines = lines2;
-                let prior = independent.notes.clone();
-                independent =
-                    independent_review(&reasoner, &issue, &rev_summary, &diff2, worktree.clone(), Some(&prior), &criteria)
-                        .await;
-                revision_note.push_str(&format!(
-                    "\n### Revision round {round} (prior verdict: {round1})\n{}\n\n\
-                     Verdict after round {round}: {}\n",
-                    truncate(&rev_summary, 1000),
-                    independent.status()
-                ));
-                summary = format!("{summary}\n\nRevision {round}: {}", truncate(&rev_summary, 300));
             }
         }
-    }
-    if round > 0 {
-        info!(
-            issue = issue.number,
-            rounds = round,
-            approved = independent.approved(),
-            "iterative review finished"
-        );
-        // Intermediate rounds ran the targeted gate (#870); everything that
-        // ships — or even lands as a PR claiming workspace-pass — gets the
-        // FULL suite exactly once here.
-        // Revisions changed the worktree: refresh what the final-gate and
-        // publish records below describe (the outer `diff`/`lines` are the
-        // pre-revision snapshot).
-        let (_ok, stat_after, _) = run("git", &["diff", "--cached", "--stat"], &worktree).await?;
-        let (_ok, full_after, _) = run("git", &["diff", "--cached"], &worktree).await?;
-        diff = stat_after;
-        lines = diff_line_count(&full_after);
-        if let Err(gate_err) = verification_gate(&worktree).await {
-            warn!(issue = issue.number, "final full gate failed after revisions: {gate_err:#}");
-            let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "revise:final-gate", &detail, &diff_touched_paths(&full_after), lines) })).await.unwrap_or_else(|_| Tally::uncounted());
+        if let Err(gate_err) = gate_result {
+            warn!(
+                issue = issue.number,
+                "verification gate failed: {gate_err:#}"
+            );
+            // #931 — a failure `main` already has is not this diff's. Leave
+            // unbilled and unrecorded (no attempt, no comment); the ledger mark
+            // alone keeps the picker from re-buying the same build this tick.
+            if let Some(verdict) = preexisting_on_main(repo_root, &gate_err.to_string()).await {
+                // #932 — except for the red-main issue itself: those failures
+                // ARE its job, so a still-red gate is a real attempt that must
+                // accumulate toward gave-up instead of retrying daily forever.
+                if verdict.introduced.is_empty() && !is_red_main_issue(&issue.body) {
+                    AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue.number);
+                    cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                    return Ok(RunReport::triage(format!(
+                        "issue #{}: gate red on main too ({}); not charged",
+                        issue.number,
+                        verdict.preexisting.join(", ")
+                    )));
+                }
+            }
+            let attempts = record_attempt(
+                repo_root,
+                issue.number,
+                Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "gate", &detail, &diff, lines) }),
+            )
+            .await
+            .unwrap_or_else(|_| Tally::uncounted());
             if attempts.exhausted() {
                 backoff_comment(
                     repo_root,
                     issue.number,
                     &format!(
-                        "Self-improve gave up after {attempts} attempts. Final \
-                         full-workspace gate failure after revisions:\n```\n{}\n```",
+                        "Self-improve gave up after {attempts} attempts. \
+                         Last gate failure:\n```\n{}\n```",
                         truncate(&gate_err.to_string(), 1500)
                     ),
                 )
                 .await
                 .ok();
                 label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                return Ok(RunReport::built(format!(
+                    "issue #{}: verification gate failed (attempt {attempts}); no PR opened",
+                    issue.number
+                )));
             }
-            cleanup(worktree, branch, repo_root.to_path_buf()).await;
-            return Ok(RunReport::built(format!(
-                "issue #{}: final full gate failed after {round} revision round(s)",
-                issue.number
-            )));
+            break 'stages Some(ParkReason::GateRed(format!("{gate_err:#}")));
         }
-    }
+
+        // Stage 3 (#653): QA review of the diff by the stronger tier. Since
+        // #1488 a reject is not terminal: its notes drive revision rounds,
+        // and the revised diff is QA'd again before Stage 4 sees it. Runs
+        // before the dry-run exit so dry runs exercise the full pipeline.
+        match reasoner
+            .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, None))
+            .await
+        {
+            Ok(r) => (qa_ok, review_notes) = parse_review_output(&r),
+            Err(e) => {
+                // Transient reviewer failure (session limit etc.) — don't burn an
+                // attempt on infrastructure noise; the next tick retries whole.
+                record_reasoner_error(
+                    issue.number,
+                    rec(FailureKind::ReasonerError, "qa-review", &format!("{e:#}"), &diff, lines),
+                );
+                cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                return Err(e).context("QA review pass failed during self-improve");
+            }
+        }
+        if !qa_ok {
+            warn!(issue = issue.number, "QA review requested changes");
+        }
+
+        // Stage 4 (#828): INDEPENDENT review by a different provider. Two passes
+        // — one focused on the diff, one on how the change lands in the rest of
+        // the system — both with read-only access to the whole worktree. Runs
+        // before the dry-run exit so dry runs exercise the full pipeline. It
+        // only reviews a diff QA approved.
+        //
+        // A rejection here does NOT discard the work: the diff built, passed the
+        // gate, and satisfied the author's own QA, so it opens as a draft PR
+        // carrying both verdicts for a human. It does count as a failed attempt,
+        // because a second opinion disagreeing is exactly what this stage is for.
+        if qa_ok {
+            let review =
+                independent_review(&reasoner, &issue, &summary, &full_diff, worktree.clone(), None, &criteria).await;
+            if review.available && !review.approved() {
+                warn!(
+                    issue = issue.number,
+                    diff_ok = review.diff_ok,
+                    system_ok = review.system_ok,
+                    "independent review requested changes"
+                );
+                // Not recorded as an attempt: the run continues either to a revision
+                // or to a draft PR, and dedup keeps the issue out of the pool while
+                // that PR is open (recording here double-counted — see #852).
+            }
+            independent = Some(review);
+        }
+
+        // Iterate revisions until every reviewer approves (owner directive
+        // 2026-08-31; Stage 3 joined in #1488), bounded by `revise_rounds`.
+        // Seven drafts accumulated over three days because a codex rejection
+        // just parked the work with nobody acting on the findings; this loop is
+        // what turns findings into merges. Every round re-runs everything
+        // downstream of the edit: scratch sweep, blast/size guards, the
+        // verification gate, QA, and BOTH codex passes — a revised diff earns
+        // its verdict, it does not inherit one.
+        // Set when a round overgrew the size cap or broke the gate: the next
+        // round revises against that instead of review notes, and no reviewer
+        // is consulted on a diff that cannot ship anyway.
+        let mut findings_override: Option<String> = None;
+        loop {
+            let source = match after_review(
+                qa_ok,
+                independent.as_ref().map(|r| (r.available, r.approved())),
+                round,
+                max_rounds,
+            ) {
+                Next::Publish | Next::ParkDraft => break,
+                Next::Revise(source) => source,
+            };
+            round += 1;
+            let findings = findings_override.take().unwrap_or_else(|| match source {
+                Findings::Qa => review_notes.clone(),
+                Findings::Independent => independent.as_ref().map(|r| r.notes.clone()).unwrap_or_default(),
+            });
+            let round1 = match source {
+                Findings::Qa => "QA changes requested".to_string(),
+                Findings::Independent => independent.as_ref().map(|r| r.status()).unwrap_or_default(),
+            };
+            info!(issue = issue.number, round, max_rounds, ?source, "revising against the findings");
+            let snapshot = snapshot_tree(&worktree).await?;
+            match reasoner
+                .call_revision(
+                    &fix_opts(worktree.clone()),
+                    &build_revise_prompt(&issue, &findings, lines, prior_attempts.as_deref()),
+                )
+                .await
+            {
+                Err(e) => {
+                    // Provider trouble, not a verdict — keep the last outcome and
+                    // stop iterating rather than burning rounds on a flaky call.
+                    // The verdicts describe the tree before this call, so that
+                    // is the tree that ships (#1488 AC2).
+                    warn!(
+                        issue = issue.number,
+                        round, "revision pass failed; keeping the prior outcome: {e:#}"
+                    );
+                    restore_tree(&worktree, &snapshot).await?;
+                    break;
+                }
+                Ok(rev_summary) => {
+                    dropped.extend(drop_root_scratch(&worktree).await);
+                    let _ = run("git", &["add", "-A"], &worktree).await?;
+                    let (_ok, mut diff2, _) = run("git", &["diff", "--cached"], &worktree).await?;
+                    if blast_radius_hit_in_diff(&diff2).is_some() {
+                        // #1490 AC6 — the same deterministic narrowing the
+                        // initial diff gets.
+                        if let Some(clean) = narrow_guarded_paths(&worktree, "origin/main", &diff2).await? {
+                            diff2 = clean;
+                        }
+                    }
+                    if let Some((pattern, line)) = blast_radius_hit_in_diff(&diff2) {
+                        warn!(issue = issue.number, pattern, %line, "revision hit the blast-radius guard");
+                        let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "revise:blast-radius", &format!("matched `{pattern}` on: {line}"), &diff_touched_paths(&diff2), diff_line_count(&diff2)))).await.unwrap_or_else(|_| Tally::uncounted());
+                        backoff_comment(
+                            repo_root,
+                            issue.number,
+                            &format!(
+                                "Self-improve refused after revision: the revised diff \
+                                 touches `{pattern}`:\n```\n{line}\n```"
+                            ),
+                        )
+                        .await
+                        .ok();
+                        if attempts.exhausted() {
+                            label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                        }
+                        cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                        return Ok(RunReport::built(format!(
+                            "issue #{}: revision hit blast-radius guard on `{pattern}` (attempt {attempts})",
+                            issue.number
+                        )));
+                    }
+                    let lines2 = diff_line_count(&diff2);
+                    if lines2 > MAX_DIFF_LINES {
+                        // Shrink round while budget remains — a terminal refusal
+                        // here discards every round of paid work (seen live on
+                        // the #839 resume). Out of rounds, the work parks (#1489).
+                        lines = lines2;
+                        if round < max_rounds {
+                            warn!(
+                                issue = issue.number,
+                                round, lines2, "revision overgrew the cap; scheduling a shrink round"
+                            );
+                            findings_override = Some(shrink_findings(lines2));
+                            pending_guard = Some(ParkReason::Oversize(lines2));
+                            revision_note.push_str(&format!(
+                                "\n### Revision round {round}: overgrew the cap \
+                                 ({lines2} lines); next round shrinks\n"
+                            ));
+                            continue;
+                        }
+                        let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "revise:size", &format!("diff is {lines2} lines (cap {MAX_DIFF_LINES})"), &diff_touched_paths(&diff2), lines2))).await.unwrap_or_else(|_| Tally::uncounted());
+                        if attempts.exhausted() {
+                            backoff_comment(
+                                repo_root,
+                                issue.number,
+                                &format!(
+                                    "Self-improve refused after revision: diff grew to \
+                                     {lines2} lines (cap {MAX_DIFF_LINES}) and the \
+                                     revision budget is exhausted."
+                                ),
+                            )
+                            .await
+                            .ok();
+                            label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                            cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                            return Ok(RunReport::built(format!(
+                                "issue #{}: revision oversized ({lines2} lines); gave up (attempt {attempts})",
+                                issue.number
+                            )));
+                        }
+                        break 'stages Some(ParkReason::Oversize(lines2));
+                    }
+                    let (_ok, names2, _) =
+                        run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
+                    if let Err(gate_err) = gate_for_round(&worktree, &names2).await {
+                        warn!(issue = issue.number, "post-revision gate failed: {gate_err:#}");
+                        // #873 — a red gate gets a repair round while budget
+                        // remains: red→fix is the other half of TDD, and a
+                        // compile error is the easiest failure to iterate on.
+                        // No reviewer is consulted on a diff that does not build.
+                        lines = lines2;
+                        if round < max_rounds {
+                            findings_override = Some(gate_findings(&gate_err.to_string()));
+                            pending_guard = Some(ParkReason::GateRed(format!("{gate_err:#}")));
+                            revision_note.push_str(&format!(
+                                "\n### Revision round {round}: failed the gate; \
+                                 next round repairs\n"
+                            ));
+                            continue;
+                        }
+                        let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "revise:gate", &detail, &diff_touched_paths(&diff2), lines2) })).await.unwrap_or_else(|_| Tally::uncounted());
+                        if attempts.exhausted() {
+                            backoff_comment(
+                                repo_root,
+                                issue.number,
+                                &format!(
+                                    "Self-improve gave up after {attempts} attempts. \
+                                     Post-revision gate failure:\n```\n{}\n```",
+                                    truncate(&gate_err.to_string(), 1500)
+                                ),
+                            )
+                            .await
+                            .ok();
+                            label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                            cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                            return Ok(RunReport::built(format!(
+                                "issue #{}: post-revision gate red; gave up (attempt {attempts})",
+                                issue.number
+                            )));
+                        }
+                        break 'stages Some(ParkReason::GateRed(format!("{gate_err:#}")));
+                    }
+                    // Under the cap and green again: the guard that was
+                    // pending is satisfied by this tree.
+                    pending_guard = None;
+                    // The revised diff may touch different files.
+                    gated = touches_verify_gated_path(&names2);
+                    lines = lines2;
+                    summary = format!("{summary}\n\nRevision {round}: {}", truncate(&rev_summary, 300));
+                    // #1488 AC2 — QA re-reviews every revised diff, with its
+                    // previous findings, before Stage 4 is asked about it.
+                    let prior_qa = review_notes.clone();
+                    match reasoner
+                        .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, Some(&prior_qa)))
+                        .await
+                    {
+                        Ok(r) => (qa_ok, review_notes) = parse_review_output(&r),
+                        Err(e) => {
+                            // The diff built and passed the gate; a reviewer
+                            // outage is no reason to delete it. Park it
+                            // unbilled and let resume QA it.
+                            record_reasoner_error(
+                                issue.number,
+                                rec(FailureKind::ReasonerError, "revise:qa-review", &format!("{e:#}"), &diff_touched_paths(&diff2), lines),
+                            );
+                            break 'stages Some(ParkReason::QaUnavailable(format!("{e:#}")));
+                        }
+                    }
+                    if qa_ok {
+                        let prior = independent.as_ref().map(|r| r.notes.clone());
+                        independent = Some(
+                            independent_review(&reasoner, &issue, &rev_summary, &diff2, worktree.clone(), prior.as_deref(), &criteria)
+                                .await,
+                        );
+                    }
+                    let verdict = match (qa_ok, independent.as_ref()) {
+                        (false, _) => "QA changes requested".to_string(),
+                        (true, Some(r)) => format!("QA approve; independent {}", r.status()),
+                        (true, None) => "QA approve".to_string(),
+                    };
+                    revision_note.push_str(&format!(
+                        "\n### Revision round {round} (prior verdict: {round1})\n{}\n\n\
+                         Verdict after round {round}: {verdict}\n",
+                        truncate(&rev_summary, 1000),
+                    ));
+                }
+            }
+        }
+        if let Some(pending) = pending_guard.take() {
+            // The loop stopped (a revision call errored) on a tree that is
+            // still oversized or red: that is why it parks, not the reviews
+            // of an earlier tree. One attempt, with the right kind.
+            let (_ok, full_pending, _) = run("git", &["diff", "--cached"], &worktree).await?;
+            let paths = diff_touched_paths(&full_pending);
+            let n = diff_line_count(&full_pending);
+            let record = match &pending {
+                ParkReason::Oversize(lines2) => rec(FailureKind::GuardRefusal, "revise:size", &format!("diff is {lines2} lines (cap {MAX_DIFF_LINES})"), &paths, n),
+                ParkReason::GateRed(out) => { let (kind, detail) = gate_outcome(out); rec(kind, "revise:gate", &detail, &paths, n) }
+                ParkReason::QaReject(_) | ParkReason::QaUnavailable(_) => unreachable!("only guards are pending"),
+            };
+            let attempts = record_attempt(repo_root, issue.number, Some(record)).await.unwrap_or_else(|_| Tally::uncounted());
+            if attempts.exhausted() {
+                backoff_comment(
+                    repo_root,
+                    issue.number,
+                    &format!("Self-improve gave up after {attempts} attempts: {}.", pending.headline()),
+                )
+                .await
+                .ok();
+                label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                return Ok(RunReport::built(format!(
+                    "issue #{}: revision stopped on a tree that {}; gave up (attempt {attempts})",
+                    issue.number,
+                    pending.headline()
+                )));
+            }
+            lines = n;
+            break 'stages Some(pending);
+        }
+        if round > 0 {
+            info!(
+                issue = issue.number,
+                rounds = round,
+                qa_ok,
+                approved = independent.as_ref().is_some_and(|r| r.approved()),
+                "iterative review finished"
+            );
+            // Revisions changed the worktree: refresh what the final-gate and
+            // publish records below describe (the outer `diff`/`lines` are the
+            // pre-revision snapshot).
+            let (_ok, stat_after, _) = run("git", &["diff", "--cached", "--stat"], &worktree).await?;
+            let (_ok, full_after, _) = run("git", &["diff", "--cached"], &worktree).await?;
+            diff = stat_after;
+            lines = diff_line_count(&full_after);
+        }
+        // What the stages ended on — the revised tree when there were rounds.
+        let (_ok, full_after, _) = run("git", &["diff", "--cached"], &worktree).await?;
+        if !qa_ok {
+            // #1488 — QA still rejects with the budget spent: one attempt for
+            // the run (#852), and the work parks with QA's notes on the PR.
+            let attempts = record_attempt(
+                repo_root,
+                issue.number,
+                Some(rec(FailureKind::ReviewReject, "qa-review", &review_notes, &diff_touched_paths(&full_after), lines)),
+            )
+            .await
+            .unwrap_or_else(|_| Tally::uncounted());
+            if attempts.exhausted() {
+                backoff_comment(
+                    repo_root,
+                    issue.number,
+                    &format!(
+                        "Auto-fix QA review rejected the attempt:\n\n{}",
+                        truncate(&review_notes, 1200)
+                    ),
+                )
+                .await
+                .ok();
+                label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                return Ok(RunReport::built(format!(
+                    "issue #{}: QA review rejected the diff; gave up (attempt {attempts})",
+                    issue.number
+                )));
+            }
+            break 'stages Some(ParkReason::QaReject(review_notes.clone()));
+        }
+        if round > 0 {
+            // Intermediate rounds ran the targeted gate (#870); everything that
+            // ships — or even lands as a PR claiming workspace-pass — gets the
+            // FULL suite exactly once here.
+            if let Err(gate_err) = verification_gate(&worktree).await {
+                warn!(issue = issue.number, "final full gate failed after revisions: {gate_err:#}");
+                let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "revise:final-gate", &detail, &diff_touched_paths(&full_after), lines) })).await.unwrap_or_else(|_| Tally::uncounted());
+                if attempts.exhausted() {
+                    backoff_comment(
+                        repo_root,
+                        issue.number,
+                        &format!(
+                            "Self-improve gave up after {attempts} attempts. Final \
+                             full-workspace gate failure after revisions:\n```\n{}\n```",
+                            truncate(&gate_err.to_string(), 1500)
+                        ),
+                    )
+                    .await
+                    .ok();
+                    label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                    cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                    return Ok(RunReport::built(format!(
+                        "issue #{}: final full gate red after {round} revision round(s); gave up",
+                        issue.number
+                    )));
+                }
+                break 'stages Some(ParkReason::GateRed(format!("{gate_err:#}")));
+            }
+        }
+        None
+    };
+    // A run that parked before Stage 4 ran publishes with no independent
+    // verdict, which the merge policy reads as "not approved".
+    // Every park except a reviewer outage has already recorded this run's
+    // attempt; a publish failure after it must not record a second (#852).
+    let park_charged = matches!(
+        park,
+        Some(ParkReason::QaReject(_) | ParkReason::GateRed(_) | ParkReason::Oversize(_))
+    );
+    let independent = independent.unwrap_or_else(|| {
+        IndependentReview::not_run(match &park {
+            Some(p) => p.headline(),
+            None => "QA did not approve".into(),
+        })
+    });
 
     if dry_run {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
         return Ok(RunReport::built(format!(
-            "issue #{}: DRY RUN — gate + QA review passed, {lines}-line diff \
-             (complexity: {}), independent review: {}, would open PR",
+            "issue #{}: DRY RUN — {}, {lines}-line diff \
+             (complexity: {}), independent review: {}, would open {}",
             issue.number,
+            park.as_ref().map_or("gate + QA review passed".to_string(), |p| format!("parked: {}", p.headline())),
             complexity.as_str(),
             independent.status(),
+            if park.is_some() { "a draft PR" } else { "PR" },
         )));
     }
 
@@ -7644,9 +8220,14 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // literal, not a failed run: let the builder correct exactly the lines
     // the guard named and try the commit once more. Anything else (a merge
     // conflict, an empty commit, another hook) falls through unchanged.
+    // #1487 review — a repair edits the tree after every review ran, so the
+    // result is guard-checked again and can only open as a draft: the resume
+    // lane re-gates and re-reviews it before anything merges.
+    let mut repaired_after_review = false;
     if !ok {
         let hits = pii_guard_hits(&e);
-        if !hits.is_empty() {
+        if !hits.is_empty() && round < max_rounds {
+            round += 1;
             info!(
                 issue = issue.number,
                 files = hits.len(),
@@ -7673,11 +8254,27 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         let (_ok, full_now, _) =
                             run("git", &["diff", "origin/main...HEAD"], &worktree).await?;
                         lines = diff_line_count(&full_now);
+                        repaired_after_review = true;
                         info!(
                             issue = issue.number,
                             "personal-data repair landed the commit: {}",
                             truncate(&summary_of_fix, 200)
                         );
+                        if let Some((pattern, line)) = blast_radius_hit_in_diff(&full_now) {
+                            warn!(issue = issue.number, pattern, %line, "personal-data repair hit the blast-radius guard");
+                            cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                            let message = format!(
+                                "issue #{}: personal-data repair touched `{pattern}`; refused, no PR opened",
+                                issue.number
+                            );
+                            if !park_charged {
+                                let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "publish:pii-repair", &format!("matched `{pattern}` on: {line}"), &diff_touched_paths(&full_now), lines))).await.unwrap_or_else(|_| Tally::uncounted());
+                                if attempts.exhausted() {
+                                    label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                                }
+                            }
+                            return Ok(RunReport::built(message));
+                        }
                     } else {
                         warn!(
                             issue = issue.number,
@@ -7695,6 +8292,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     }
     if !ok {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
+        if park_charged {
+            return Ok(RunReport::built(parked_publish_failed(issue.number, "git commit failed", &e)));
+        }
         return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git commit failed", &e, { let (kind, detail) = publish_outcome(&e); rec(kind, "publish:git commit", &detail, &diff, lines) }).await));
     }
     // #815 — a run killed between the push and `gh pr create` leaves the
@@ -7723,6 +8323,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     }
     if !ok {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
+        if park_charged {
+            return Ok(RunReport::built(parked_publish_failed(issue.number, "git push failed", &e)));
+        }
         return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git push failed", &e, { let (kind, detail) = publish_outcome(&e); rec(kind, "publish:git push", &detail, &diff, lines) }).await));
     }
     // #1037 — the push landed, plainly or by superseding an orphan above, so
@@ -7748,7 +8351,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // and the drift is silent: a PR the fresh path would never merge gets
         // merged a day later by the sweep, on rules nobody compared.
         let owner = merge_policy_owner(repo_root).await;
-        may_automerge(&MergePolicy {
+        // #1488/#1489 — parked work is always a draft, and so is a tree a
+        // personal-data repair changed after review.
+        park.is_none() && !repaired_after_review && may_automerge(&MergePolicy {
             automerge_enabled: automerge_enabled_value(
                 std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE").ok().as_deref(),
             ),
@@ -7769,6 +8374,15 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         .map(|p| format!("\n\n## Implementation spec (scoping pass)\n{}", truncate(p, 1500)))
         .unwrap_or_default();
     let merge_note = match (automerge, gated.as_deref()) {
+        _ if park.is_some() => format!(
+            "Draft — parked: {}. The resume lane keeps revising it; it cannot \
+             merge until QA approves and the independent review gives a double \
+             LGTM.",
+            park.as_ref().map(ParkReason::headline).unwrap_or_default()
+        ),
+        _ if repaired_after_review => "Draft — a personal-data repair edited the tree after \
+             review; the resume lane re-verifies it before any merge."
+            .to_string(),
         (true, _) => format!(
             "Auto-merged: owner-authored issue graded ≤medium, \
              AUGMENTAGENT_AUTOPR_AUTOMERGE=1, and two independent codex \
@@ -7815,11 +8429,23 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // #1012 — durable, so a resumed run reviews against the same criteria the
     // original run was given rather than inventing new ones.
     let criteria_section = criteria_pr_section(&criteria);
+    // #1489 — a parked PR never claims a gate pass or a QA approval it did
+    // not get.
+    let qa_heading = match (&park, qa_ok) {
+        (Some(ParkReason::QaUnavailable(_)), _) => "QA review (could not run)",
+        (_, true) => "QA review (approved)",
+        (Some(_), false) if review_notes.is_empty() => "QA review (not run)",
+        (_, false) => "QA review (changes requested)",
+    };
+    let verification = park.as_ref().map_or_else(
+        || "- `cargo build --workspace`: pass\n- `cargo test --workspace`: pass".to_string(),
+        ParkReason::verification,
+    );
     let pr_body = format!(
         "{SELF_IMPROVE_BODY_MARKER}{}.\n\n## Summary\n{}{plan_section}\n\n\
-         ## QA review (approved)\n{}{independent_section}{criteria_section}\n## Verification\n\
+         ## {qa_heading}\n{}{independent_section}{criteria_section}\n## Verification\n\
          - complexity (scoping pass): {}\n\
-         - `cargo build --workspace`: pass\n- `cargo test --workspace`: pass\n\
+         {verification}\n\
          - diff size: {lines} lines (cap {MAX_DIFF_LINES}){scratch_note}\n\n\
          {merge_note} Fixes #{}",
         issue.number,
@@ -7841,9 +8467,39 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     if !ok {
         // #815 — the branch is pushed but has no PR. Left as an `Err` this
         // re-picks the same issue next tick and dies at the push above.
+        if park_charged {
+            return Ok(RunReport::built(parked_publish_failed(issue.number, "gh pr create failed", &e)));
+        }
         return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "gh pr create failed", &e, { let (kind, detail) = publish_outcome(&e); rec(kind, "publish:gh pr create", &detail, &diff, lines) }).await));
     }
     let pr_url = stdout.trim().to_string();
+    if let Some(reason) = &park {
+        // The findings go where the next builder will read them: on the PR,
+        // under a marker resume parses back (#1488 AC3).
+        let _ = run(&gh, &["pr", "comment", &pr_url, "--body", &reason.comment()], repo_root).await;
+        backoff_comment(
+            repo_root,
+            issue.number,
+            &format!(
+                "Auto-fix parked its work as a draft PR instead of deleting it: {}. \
+                 The resume lane keeps revising it — {pr_url}",
+                reason.headline()
+            ),
+        )
+        .await
+        .ok();
+        notify_review(&format!(
+            "📝 auto-PR parked as draft: {} — {pr_url}\n{}",
+            issue.title,
+            reason.headline()
+        ))
+        .await;
+        return Ok(RunReport::built(format!(
+            "issue #{}: parked as draft PR ({}) — {pr_url}",
+            issue.number,
+            reason.headline()
+        )));
+    }
     if !automerge {
         // Visibility (#851): drafts sat unseen for three days. Tell the owner.
         notify_review(&format!(
@@ -8101,6 +8757,14 @@ async fn record_hard_failure(
         label_gave_up(repo_root, issue, attempts.reason()).await.ok();
     }
     format!("issue #{issue}: {what} (attempt {attempts}); no PR opened")
+}
+
+/// #1488/#1489 — a parked run failed to publish. Its attempt is already on
+/// record, so this only reports; the work is lost exactly as a hard failure
+/// loses it today.
+fn parked_publish_failed(issue: u64, what: &str, err: &str) -> String {
+    warn!(issue, "self-improve: parked work not published: {what}: {err}");
+    format!("issue #{issue}: {what} while parking (attempt already recorded); no PR opened")
 }
 
 /// Bump an attempt counter encoded as a hidden marker comment, return the new
@@ -14876,8 +15540,8 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let end = start + src[start..].find("\n}\n").expect("resume fn end");
         let body = &src[start..end];
         let gate = body
-            .find("if independent.approved() && rabbit.approved() {")
-            .expect("both approvals guard the merge");
+            .find("if resume_may_merge(qa_ok, independent.approved(), rabbit.approved()) {")
+            .expect("every approval guards the merge (QA joined in #1488)");
         let ready = body
             .find(r#"["pr", "ready", &pr.to_string()]"#)
             .expect("gh pr ready");
@@ -17199,5 +17863,465 @@ mod public_write_tests {
             assert!(err.starts_with("public report blocked:"));
             assert!(!err.contains(&private));
         }
+    }
+}
+
+/// #1487 — built work is iterated on or parked, never deleted.
+#[cfg(test)]
+mod iterate_not_delete_tests {
+    use super::*;
+
+    const DIFF_FIX_PLUS_DEPLOY: &str = "diff --git a/crates/x/src/lib.rs b/crates/x/src/lib.rs\n\
+        --- a/crates/x/src/lib.rs\n+++ b/crates/x/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n\
+        diff --git a/scripts/deploy-box.sh b/scripts/deploy-box.sh\n\
+        --- a/scripts/deploy-box.sh\n+++ b/scripts/deploy-box.sh\n@@ -1 +1 @@\n-c\n+d\n";
+    const DIFF_FIX_ONLY: &str = "diff --git a/crates/x/src/lib.rs b/crates/x/src/lib.rs\n\
+        --- a/crates/x/src/lib.rs\n+++ b/crates/x/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n";
+    const DIFF_NEW_PATH: &str = "diff --git a/crates/x/src/lib.rs b/crates/x/src/lib.rs\n\
+        --- a/crates/x/src/lib.rs\n+++ b/crates/x/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n\
+        diff --git a/crates/y/src/other.rs b/crates/y/src/other.rs\n\
+        --- a/crates/y/src/other.rs\n+++ b/crates/y/src/other.rs\n@@ -1 +1 @@\n-e\n+f\n";
+
+    fn run_once_src() -> &'static str {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("pub async fn run_once(").expect("run_once");
+        let end = start + src[start..].find("\n}\n").expect("end of run_once");
+        &src[start..end]
+    }
+
+    fn resume_src() -> &'static str {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let end = start + src[start..].find("\n}\n").expect("end of resume");
+        &src[start..end]
+    }
+
+    // ---- #1488: Stage 3 joins the revision loop -------------------------
+
+    #[test]
+    fn qa_reject_with_budget_left_revises_against_the_qa_notes() {
+        assert_eq!(after_review(false, None, 0, 3), Next::Revise(Findings::Qa));
+        // QA's findings come first even when Stage 4 also wants changes.
+        assert_eq!(
+            after_review(false, Some((true, false)), 1, 3),
+            Next::Revise(Findings::Qa)
+        );
+    }
+
+    #[test]
+    fn qa_reject_with_budget_spent_parks_a_draft_never_deletes() {
+        assert_eq!(after_review(false, None, 3, 3), Next::ParkDraft);
+        assert_eq!(
+            after_review(false, Some((true, true)), 3, 3),
+            Next::ParkDraft
+        );
+        // AC7: the kill switch means "don't revise", not "throw away".
+        assert_eq!(after_review(false, None, 0, 0), Next::ParkDraft);
+    }
+
+    #[test]
+    fn qa_approve_with_independent_reject_revises_against_independent_notes() {
+        assert_eq!(
+            after_review(true, Some((true, false)), 0, 3),
+            Next::Revise(Findings::Independent)
+        );
+        // Stage 4 out of budget: a draft PR carrying the verdicts, as before.
+        assert_eq!(after_review(true, Some((true, false)), 3, 3), Next::Publish);
+    }
+
+    #[test]
+    fn qa_approve_with_double_lgtm_or_no_reviewer_publishes() {
+        assert_eq!(after_review(true, Some((true, true)), 0, 3), Next::Publish);
+        // An unreachable Stage 4 is the merge policy's call (it withholds
+        // auto-merge), not another revision round.
+        assert_eq!(
+            after_review(true, Some((false, false)), 0, 3),
+            Next::Publish
+        );
+    }
+
+    #[test]
+    fn merge_requires_qa_approve_and_double_lgtm() {
+        assert!(resume_may_merge(true, true, true));
+        assert!(
+            !resume_may_merge(false, true, true),
+            "a QA reject never merges"
+        );
+        assert!(!resume_may_merge(true, false, true));
+        assert!(!resume_may_merge(true, true, false));
+    }
+
+    #[test]
+    fn qa_findings_marker_round_trips_and_the_newest_wins() {
+        let comments = vec![
+            "an ordinary comment".to_string(),
+            qa_findings_comment("REVIEW: reject\n\nold finding at a.rs:1"),
+            "Auto-resume: something".to_string(),
+            qa_findings_comment("REVIEW: reject\n\nnew finding at b.rs:2"),
+        ];
+        let got = parse_qa_findings(&comments).expect("marker found");
+        assert!(got.contains("new finding at b.rs:2"), "{got}");
+        assert!(!got.contains("old finding"), "{got}");
+        assert_eq!(parse_qa_findings(&["no marker here".to_string()]), None);
+    }
+
+    #[test]
+    fn the_qa_prompt_carries_prior_findings_so_qa_judges_convergence() {
+        let issue = Issue {
+            number: 7,
+            title: "t".into(),
+            body: "b".into(),
+            author: "o".into(),
+            author_trusted: true,
+            research_filed: false,
+        };
+        let first = qa_review_prompt(&issue, "summary", None);
+        assert!(first.contains("GitHub issue #7"));
+        assert!(!first.contains("Previous QA findings"));
+        let again = qa_review_prompt(&issue, "summary", Some("missing test at a.rs:3"));
+        assert!(again.contains("Previous QA findings"));
+        assert!(again.contains("missing test at a.rs:3"));
+        // Resume reviews committed work, the fresh lane staged work.
+        assert!(
+            first.contains("git diff origin/main...HEAD") && first.contains("git diff --cached")
+        );
+    }
+
+    /// AC2 — every revised diff goes back through Stage 3, and Stage 4
+    /// only sees a diff Stage 3 approved.
+    #[test]
+    fn fresh_lane_re_runs_qa_after_every_revision() {
+        let body = run_once_src();
+        let lp = body
+            .find("match after_review(")
+            .expect("the decision drives the loop");
+        let rest = &body[lp..];
+        let rev = rest.find(".call_revision(").expect("a revision round");
+        let qa = rest[rev..]
+            .find("review_opts(")
+            .expect("QA after the revision");
+        let ind = rest[rev..]
+            .find("independent_review(")
+            .expect("Stage 4 after the revision");
+        assert!(
+            qa < ind,
+            "QA re-reviews before Stage 4 sees the revised diff"
+        );
+    }
+
+    /// AC3 — the reject branch no longer deletes the worktree; parking does.
+    #[test]
+    fn a_qa_reject_parks_instead_of_returning() {
+        let body = run_once_src();
+        assert!(
+            !body.contains("QA review rejected the diff (attempt"),
+            "the terminal exit is gone"
+        );
+        assert!(body.contains("ParkReason::QaReject("));
+        let park = body.find("ParkReason::QaReject(").unwrap();
+        let publish = body.find("\"pr\", \"create\"").expect("pr create");
+        assert!(park < publish, "a parked run reaches the publish step");
+    }
+
+    #[test]
+    fn resume_runs_qa_every_round_and_reads_the_parked_findings() {
+        let body = resume_src();
+        let lp = body.find("    loop {").expect("round loop");
+        assert!(
+            body[lp..].contains("review_opts("),
+            "QA inside the round loop"
+        );
+        assert!(
+            body.contains("parse_qa_findings("),
+            "parked findings seed the QA prompt"
+        );
+        assert!(
+            body.contains("resume_may_merge("),
+            "merge needs QA approve too"
+        );
+        // Only the loop's own comments can seed the prompt.
+        assert!(
+            body.contains("select(.author.login == $me)"),
+            "untrusted comments filtered"
+        );
+    }
+
+    // ---- #1489: exhausted budgets park a draft ---------------------------
+
+    #[test]
+    fn budget_exhausted_exits_park_instead_of_deleting() {
+        let body = run_once_src();
+        for gone in [
+            "post-revision gate failed (attempt",
+            "final full gate failed after {round} revision round(s)\"",
+            "revision oversized ({lines2} lines, attempt",
+        ] {
+            assert!(!body.contains(gone), "terminal exit still present: {gone}");
+        }
+        assert!(body.contains("ParkReason::GateRed("));
+        assert!(body.contains("ParkReason::Oversize("));
+    }
+
+    #[test]
+    fn park_comment_names_the_reason_under_a_stable_marker() {
+        let gate = ParkReason::GateRed("error[E0308]: mismatched types".into());
+        let c = gate.comment();
+        assert!(c.starts_with(PARK_MARKER), "{c}");
+        assert!(c.contains("E0308"), "{c}");
+        assert!(ParkReason::Oversize(812).comment().contains("812"));
+        let qa = ParkReason::QaReject("REVIEW: reject\n\nx.rs:1".into()).comment();
+        assert!(
+            qa.contains(QA_FINDINGS_MARKER),
+            "resume reads QA findings back: {qa}"
+        );
+        assert_eq!(
+            parse_qa_findings(&[qa])
+                .as_deref()
+                .map(|s| s.contains("x.rs:1")),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_parked_pr_never_claims_a_green_gate_it_did_not_have() {
+        assert!(!ParkReason::GateRed("boom".into())
+            .verification()
+            .contains("pass"));
+        assert!(!ParkReason::Oversize(900).verification().contains("pass"));
+        let qa = ParkReason::QaReject("r".into()).verification();
+        assert!(
+            qa.contains("passed") && !qa.contains("--workspace`: pass"),
+            "{qa}"
+        );
+    }
+
+    // ---- #1490: one narrowing round before a blast-radius refusal --------
+
+    #[test]
+    fn narrowing_may_only_remove_paths() {
+        assert!(
+            narrowed_only(DIFF_FIX_PLUS_DEPLOY, DIFF_FIX_ONLY),
+            "dropped the guarded file"
+        );
+        assert!(
+            !narrowed_only(DIFF_FIX_PLUS_DEPLOY, DIFF_FIX_PLUS_DEPLOY),
+            "guarded path left"
+        );
+        assert!(
+            !narrowed_only(DIFF_FIX_PLUS_DEPLOY, DIFF_NEW_PATH),
+            "touched a new path"
+        );
+        assert!(
+            !narrowed_only(DIFF_FIX_PLUS_DEPLOY, ""),
+            "dropped the fix too"
+        );
+    }
+
+    #[test]
+    fn only_the_guarded_paths_are_selected_for_narrowing() {
+        assert_eq!(guarded_paths(DIFF_FIX_PLUS_DEPLOY), vec!["scripts/deploy-box.sh".to_string()]);
+        assert!(guarded_paths(DIFF_FIX_ONLY).is_empty());
+    }
+
+    /// A throwaway repo whose `origin/main` holds `lib.rs` and a deploy
+    /// script, with the worktree carrying a fix plus guarded edits.
+    async fn repo_with_guarded_edits() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path();
+        let git = |args: &'static [&'static str]| async move {
+            let (ok, _o, e) = run("git", args, wt).await.unwrap();
+            assert!(ok, "git {args:?}: {e}");
+        };
+        git(&["init", "-q", "-b", "main"]).await;
+        git(&["config", "user.email", "t@example.com"]).await;
+        git(&["config", "user.name", "t"]).await;
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::create_dir_all(wt.join("scripts")).unwrap();
+        std::fs::write(wt.join("src/lib.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(wt.join("scripts/deploy-box.sh"), "echo old\n").unwrap();
+        git(&["add", "-A"]).await;
+        git(&["commit", "-qm", "base"]).await;
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]).await;
+        // The fix, an edit to a guarded file, and a new guarded file.
+        std::fs::write(wt.join("src/lib.rs"), "fn a() { fixed() }\n").unwrap();
+        std::fs::write(wt.join("scripts/deploy-box.sh"), "echo changed\n").unwrap();
+        std::fs::write(wt.join("scripts/deploy-new.sh"), "echo new\n").unwrap();
+        git(&["add", "-A"]).await;
+        dir
+    }
+
+    /// #1490 — narrowing reverts exactly the guarded files (deleting new
+    /// ones) and leaves the fix byte-for-byte as the builder wrote it.
+    #[tokio::test]
+    async fn narrowing_reverts_only_the_guarded_files() {
+        let dir = repo_with_guarded_edits().await;
+        let wt = dir.path();
+        let before = run("git", &["diff", "--cached"], wt).await.unwrap().1;
+        assert!(blast_radius_hit_in_diff(&before).is_some());
+        let after = narrow_guarded_paths(wt, "origin/main", &before).await.unwrap().expect("narrowed");
+        assert!(blast_radius_hit_in_diff(&after).is_none(), "{after}");
+        assert_eq!(std::fs::read_to_string(wt.join("scripts/deploy-box.sh")).unwrap(), "echo old\n");
+        assert!(!wt.join("scripts/deploy-new.sh").exists(), "a new guarded file is removed");
+        assert_eq!(std::fs::read_to_string(wt.join("src/lib.rs")).unwrap(), "fn a() { fixed() }\n");
+        assert!(after.contains("+fn a() { fixed() }"), "the fix survives: {after}");
+    }
+
+    /// Nothing left once the guarded files go back ⇒ refuse, tree untouched.
+    #[tokio::test]
+    async fn narrowing_that_would_leave_nothing_refuses_and_restores() {
+        let dir = repo_with_guarded_edits().await;
+        let wt = dir.path();
+        std::fs::write(wt.join("src/lib.rs"), "fn a() {}\n").unwrap();
+        run("git", &["add", "-A"], wt).await.unwrap();
+        let before = run("git", &["diff", "--cached"], wt).await.unwrap().1;
+        assert!(narrow_guarded_paths(wt, "origin/main", &before).await.unwrap().is_none());
+        assert_eq!(std::fs::read_to_string(wt.join("scripts/deploy-box.sh")).unwrap(), "echo changed\n");
+        assert!(wt.join("scripts/deploy-new.sh").exists());
+    }
+
+    /// #1488 — a round that errors or trips a guard is undone: edits,
+    /// deletions and newly created files all go back to the snapshot.
+    #[tokio::test]
+    async fn restore_tree_undoes_a_round_completely() {
+        let dir = repo_with_guarded_edits().await;
+        let wt = dir.path();
+        let snap = snapshot_tree(wt).await.unwrap();
+        let staged = run("git", &["diff", "--cached"], wt).await.unwrap().1;
+        std::fs::write(wt.join("src/lib.rs"), "half-applied edit\n").unwrap();
+        std::fs::remove_file(wt.join("scripts/deploy-new.sh")).unwrap();
+        std::fs::write(wt.join("src/stray.rs"), "created by the round\n").unwrap();
+        restore_tree(wt, &snap).await.unwrap();
+        assert_eq!(std::fs::read_to_string(wt.join("src/lib.rs")).unwrap(), "fn a() { fixed() }\n");
+        assert!(wt.join("scripts/deploy-new.sh").exists());
+        assert!(!wt.join("src/stray.rs").exists());
+        run("git", &["add", "-A"], wt).await.unwrap();
+        assert_eq!(run("git", &["diff", "--cached"], wt).await.unwrap().1, staged);
+    }
+
+    /// Review #1 — a round that stops on an oversized or red tree parks for
+    /// that reason, never on the reviews of an earlier tree.
+    #[test]
+    fn a_pending_guard_outranks_stale_reviews() {
+        let body = run_once_src();
+        let set_size = body.find("pending_guard = Some(ParkReason::Oversize(").expect("set on shrink");
+        let set_gate = body.find("pending_guard = Some(ParkReason::GateRed(").expect("set on red");
+        let cleared = body.find("pending_guard = None;").expect("cleared when green");
+        let checked = body.find("if let Some(pending) = pending_guard.take()").expect("checked after loop");
+        let qa_park = body.find("break 'stages Some(ParkReason::QaReject(").expect("QA park");
+        assert!(set_size < checked && set_gate < checked && cleared < checked);
+        assert!(checked < qa_park, "the pending guard decides before the QA verdict does");
+    }
+
+    /// Review #4 — the follow-up and the initial shrink come out of the same
+    /// budget the review loop uses.
+    #[test]
+    fn every_revision_call_spends_the_shared_budget() {
+        let body = run_once_src();
+        let follow = body.find("build_no_change_prompt(").unwrap();
+        assert!(body[..follow].contains("if spent < revise_rounds() {\n            spent += 1;"));
+        let shrink = body.find("initial diff over cap; one shrink attempt").unwrap();
+        assert!(body[shrink..shrink + 120].contains("spent += 1;"));
+        assert!(body.contains("let mut round = spent;"));
+    }
+
+    /// Re-review — a personal-data repair after review spends the budget,
+    /// is guard-checked again, and never auto-merges.
+    #[test]
+    fn a_post_review_repair_is_guarded_budgeted_and_never_auto_merged() {
+        let body = run_once_src();
+        let at = body.find("let hits = pii_guard_hits(&e);").unwrap();
+        let block = &body[at..at + body[at..].find("if !ok {\n        cleanup").unwrap()];
+        assert!(block.contains("&& round < max_rounds") && block.contains("round += 1;"));
+        assert!(block.contains("repaired_after_review = true;"));
+        assert!(block.contains("blast_radius_hit_in_diff(&full_now)"));
+        assert!(body.contains("park.is_none() && !repaired_after_review && may_automerge("));
+    }
+
+    /// Review #6 — a parked run whose publish fails is not charged twice.
+    #[test]
+    fn a_parked_publish_failure_records_no_second_attempt() {
+        let body = run_once_src();
+        for what in ["git commit failed", "git push failed", "gh pr create failed"] {
+            let hard = body.find(&format!("record_hard_failure(repo_root, issue.number, \"{what}\"")).expect(what);
+            let guard = body[..hard].rfind("if park_charged {").expect("guard");
+            assert!(body[guard..hard].contains(&format!("parked_publish_failed(issue.number, \"{what}\"")));
+        }
+    }
+
+    #[test]
+    fn a_blast_radius_hit_tries_one_narrowing_round_first() {
+        let body = run_once_src();
+        let narrow = body.find("narrow_guarded_paths(").expect("narrowing round");
+        let refuse = body
+            .find("Self-improve refused: the produced diff touches")
+            .expect("refusal");
+        assert!(narrow < refuse, "narrow before the (unchanged) refusal");
+    }
+
+    // ---- #1491: an empty diff gets one follow-up -------------------------
+
+    #[test]
+    fn no_change_reply_sentinels_parse_only_at_the_start() {
+        assert_eq!(
+            parse_no_change_reply("ALREADY_FIXED: main has the guard at a.rs:10"),
+            NoChange::AlreadyFixed("main has the guard at a.rs:10".into())
+        );
+        assert_eq!(
+            parse_no_change_reply("\n\nUNDERSPECIFIED: which channel?\nmore"),
+            NoChange::Underspecified("which channel?\nmore".into())
+        );
+        assert_eq!(
+            parse_no_change_reply("I changed nothing."),
+            NoChange::Silent
+        );
+        // Quoted or fenced sentinels are not answers.
+        assert_eq!(
+            parse_no_change_reply("> ALREADY_FIXED: quoted"),
+            NoChange::Silent
+        );
+        assert_eq!(
+            parse_no_change_reply("```\nALREADY_FIXED: x\n```"),
+            NoChange::Silent
+        );
+        assert_eq!(
+            parse_no_change_reply("Looked around.\nALREADY_FIXED: late"),
+            NoChange::Silent,
+            "only the first line counts"
+        );
+    }
+
+    #[test]
+    fn the_no_change_prompt_asks_for_a_change_or_a_reason() {
+        let issue = Issue {
+            number: 3,
+            title: "t".into(),
+            body: String::new(),
+            author: "o".into(),
+            author_trusted: true,
+            research_filed: false,
+        };
+        let p = build_no_change_prompt(&issue);
+        assert!(p.contains("ALREADY_FIXED:") && p.contains("UNDERSPECIFIED:"));
+        assert!(p.contains("#3"));
+    }
+
+    /// AC4 — a no-change run is never billed against the daily cap, and
+    /// every no-change exit keeps the issue off the picker for the day.
+    #[test]
+    fn no_change_outcomes_are_unbilled_but_ledgered() {
+        let body = run_once_src();
+        let at = body.find("build_no_change_prompt(").expect("follow-up");
+        let end = at
+            + body[at..]
+                .find("// #1490")
+                .expect("blast-radius section follows");
+        let section = &body[at..end];
+        assert!(
+            !section.contains("RunReport::built("),
+            "no billed exit:\n{section}"
+        );
+        assert!(section.contains("RunReport::triage("));
+        assert!(section.contains("AttemptLedger::mark_persist("));
+        assert!(section.contains("GIVE_UP_OWNER_TRIAGE"));
     }
 }
