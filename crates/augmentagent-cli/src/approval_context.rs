@@ -95,7 +95,14 @@ impl ReplyApprover {
             )
         );
         let kind = format!("{}:{}", action.email.platform, action.email.kind);
-        let summary = if action.email.platform == "gcal" {
+        let summary = if action.email.platform == "gcal" && action.email.kind.starts_with("rsvp") {
+            let payload: serde_json::Value =
+                serde_json::from_str(&action.email.body).unwrap_or_default();
+            format!(
+                "{} | event={} | response={}",
+                action.email.subject, payload["event_id"], payload["response"]
+            )
+        } else if action.email.platform == "gcal" {
             let payload: serde_json::Value =
                 serde_json::from_str(&action.email.body).unwrap_or_default();
             format!(
@@ -140,6 +147,9 @@ impl ReplyApprover {
                     html_link.as_deref().unwrap_or("")
                 ),
             ),
+            ApprovalActionOutcome::CalendarResponded { response, .. } => {
+                ("completed", format!("rsvp={response}"))
+            }
             ApprovalActionOutcome::Skipped => ("skipped", String::new()),
             ApprovalActionOutcome::Revised { .. } => ("revised", String::new()),
             ApprovalActionOutcome::Scheduled { at_ms, .. } => {
