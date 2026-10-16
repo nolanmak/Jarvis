@@ -6534,9 +6534,13 @@ async fn resume_draft_pr(
                     let _ = run("git", &["push", "origin", branch], &worktree).await;
                 }
                 cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
-                return Ok(RunReport::built(format!(
-                    "PR #{pr}: resume QA review errored; draft kept"
-                )));
+                // Billed only when a builder round ran this tick (#1037).
+                let message = format!("PR #{pr}: resume QA review errored; draft kept");
+                return Ok(if rounds_done > 0 {
+                    RunReport::built(message)
+                } else {
+                    RunReport::triage(message)
+                });
             }
         };
         prior_qa = Some(qa_notes.clone());
