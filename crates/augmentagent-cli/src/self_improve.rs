@@ -2835,9 +2835,6 @@ impl ParkReason {
     }
 }
 
-/// #1490 — the reply a builder gives when a fix cannot avoid a guarded path.
-const NEEDS_GUARDED_PATH: &str = "NEEDS_GUARDED_PATH";
-
 /// Every path a unified diff touches, from its `diff --git` headers.
 fn touched_path_set(diff: &str) -> std::collections::BTreeSet<String> {
     diff.lines()
@@ -2856,31 +2853,14 @@ fn guarded_paths(diff: &str) -> Vec<String> {
         .collect()
 }
 
-/// #1490 — did a narrowing round only take paths away? The result must touch
-/// a non-empty subset of what it started from and pass the guard. Anything
-/// else is refused exactly as an unnarrowed hit is.
+/// #1490 — did narrowing only take paths away? The result must touch a
+/// non-empty subset of what it started from and pass the guard; anything else
+/// is refused exactly as an unnarrowed hit is. Narrowing itself is a
+/// deterministic `git checkout`, so unguarded files cannot change — this is
+/// the belt to that brace.
 fn narrowed_only(before: &str, after: &str) -> bool {
     let (b, a) = (touched_path_set(before), touched_path_set(after));
     !a.is_empty() && a.is_subset(&b) && blast_radius_hit_in_diff(after).is_none()
-}
-
-fn build_narrow_prompt(issue: &Issue, pattern: &str, paths: &[String]) -> String {
-    format!(
-        "Your fix for GitHub issue #{} ({}) changed files the pipeline may not \
-         touch unattended (guard pattern `{pattern}`):\n{}\n\n\
-         Revert every change to exactly those files, so they match `main` \
-         again. Make no other changes: do not edit, add or remove any other \
-         file. If the fix genuinely cannot be done without changing them, \
-         revert nothing and reply with `{NEEDS_GUARDED_PATH}` on the first \
-         line followed by why.",
-        issue.number,
-        issue.title,
-        paths.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n"),
-    )
-}
-
-fn reply_needs_guarded_path(reply: &str) -> bool {
-    reply.trim_start().starts_with(NEEDS_GUARDED_PATH)
 }
 
 /// #1491 — what a builder said when asked why it changed nothing.
@@ -4859,37 +4839,40 @@ async fn restore_tree(worktree: &Path, tree: &str) -> Result<()> {
     Ok(())
 }
 
-/// #1490 — one round whose only job is to revert the guarded files. `Some`
-/// with the narrowed diff when the result passes [`narrowed_only`]; `None`
-/// (and the caller refuses exactly as before) otherwise, including when the
-/// revise budget is switched off or the builder answers
-/// [`NEEDS_GUARDED_PATH`].
-async fn narrow_guarded_paths(
-    reasoner: &Arc<FallbackReasoner>,
-    worktree: &Path,
-    issue: &Issue,
-    pattern: &str,
-    before: &str,
-) -> Result<Option<String>> {
+/// #1490 — put every guarded path in `before` back to `base` (deleting the
+/// ones `base` does not have) and nothing else. Deterministic — no model
+/// call, so no budget and no way to touch an unguarded file. `Some` with the
+/// narrowed diff when the result passes [`narrowed_only`]; otherwise the tree
+/// is restored and `None` lets the caller refuse exactly as before. The gate
+/// and QA judge whether the fix still works without those files.
+async fn narrow_guarded_paths(worktree: &Path, base: &str, before: &str) -> Result<Option<String>> {
     let paths = guarded_paths(before);
-    if revise_rounds() == 0 || paths.is_empty() {
+    if paths.is_empty() {
         return Ok(None);
     }
-    info!(issue = issue.number, pattern, paths = %paths.join(", "), "blast-radius hit; one narrowing round");
-    let reply = match reasoner
-        .call_revision(&fix_opts(worktree.to_path_buf()), &build_narrow_prompt(issue, pattern, &paths))
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(issue = issue.number, "narrowing round failed: {e:#}");
-            return Ok(None);
+    let snapshot = snapshot_tree(worktree).await?;
+    for path in &paths {
+        let spec = format!("{base}:{path}");
+        let (on_base, _, _) = run("git", &["cat-file", "-e", &spec], worktree).await?;
+        let (ok, _o, e) = if on_base {
+            run("git", &["checkout", base, "--", path], worktree).await?
+        } else {
+            run("git", &["rm", "-rfq", "--cached", "--ignore-unmatch", "--", path], worktree).await?
+        };
+        anyhow::ensure!(ok, "reverting guarded path {path}: {e}");
+        if !on_base {
+            let file = worktree.join(path);
+            if file.is_dir() {
+                tokio::fs::remove_dir_all(&file).await.ok();
+            } else {
+                tokio::fs::remove_file(&file).await.ok();
+            }
         }
-    };
-    let _ = drop_root_scratch(worktree).await;
+    }
     let _ = run("git", &["add", "-A"], worktree).await?;
-    let (_ok, after, _) = run("git", &["diff", "--cached"], worktree).await?;
-    if reply_needs_guarded_path(&reply) || !narrowed_only(before, &after) {
+    let (_ok, after, _) = run("git", &["diff", "--cached", base], worktree).await?;
+    if !narrowed_only(before, &after) {
+        restore_tree(worktree, &snapshot).await?;
         return Ok(None);
     }
     Ok(Some(after))
@@ -7443,12 +7426,16 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     let mut dropped = drop_root_scratch(&worktree).await;
     let _ = run("git", &["add", "-A"], &worktree).await?;
     let (_ok, mut diff, _) = run("git", &["diff", "--cached", "--stat"], &worktree).await?;
+    // Every revision call this run makes — the no-change follow-up, the
+    // initial shrink, gate repairs, review rounds — comes out of one budget.
+    let mut spent = 0u32;
     if diff.trim().is_empty() {
         // #1491 — an empty diff is asked once why: make the change now, or
         // say the issue is already fixed or under-specified. Either answer is
         // the owner's to verify, and neither is a failed attempt.
         let mut reply = NoChange::Silent;
-        if revise_enabled() {
+        if spent < revise_rounds() {
+            spent += 1;
             info!(issue = issue.number, "builder made no changes; one follow-up");
             match reasoner
                 .call_revision(&fix_opts(worktree.clone()), &build_no_change_prompt(&issue))
@@ -7523,16 +7510,14 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         }
     }
 
-    // #1490 — blast-radius hit: one narrowing round first. The builder may
-    // only revert the guarded files; `narrowed_only` refuses anything that
-    // adds a path or leaves a guarded one, and then the refusal below runs
+    // #1490 — blast-radius hit: narrow first. The guarded paths go back to
+    // `main` deterministically and nothing else changes; if the result still
+    // trips the guard (or nothing would be left), the refusal below runs
     // exactly as before. The guard itself is untouched.
     let (_ok, mut full_diff, _) = run("git", &["diff", "--cached"], &worktree).await?;
-    let mut narrowed = 0u32;
     if let Some((pattern, _)) = blast_radius_hit_in_diff(&full_diff) {
-        if let Some(clean) = narrow_guarded_paths(&reasoner, &worktree, &issue, pattern, &full_diff).await? {
-            info!(issue = issue.number, pattern, "narrowing round removed the guarded paths");
-            narrowed = 1;
+        if let Some(clean) = narrow_guarded_paths(&worktree, "origin/main", &full_diff).await? {
+            info!(issue = issue.number, pattern, "narrowing reverted the guarded paths");
             full_diff = clean;
             diff = run("git", &["diff", "--cached", "--stat"], &worktree).await?.1;
             summary = format!("{summary}\n\nNarrowed: reverted changes to `{pattern}` paths.");
@@ -7594,7 +7579,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     let (_ok, staged_names, _) = run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
     let mut gated = touches_verify_gated_path(&staged_names);
     let mut lines = diff_line_count(&full_diff);
-    if lines > MAX_DIFF_LINES && revise_enabled() {
+    if lines > MAX_DIFF_LINES && spent < revise_rounds() {
         // #875 — the FIRST diff gets one shrink attempt too. #868 added
         // shrink rounds inside the revise loop, but the initial size check
         // stayed terminal — and promptly discarded a completed build at 652
@@ -7602,26 +7587,39 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // trivially. One build-tier call risks nothing: still over after the
         // shrink ⇒ the refusal below proceeds unchanged.
         info!(issue = issue.number, lines, "initial diff over cap; one shrink attempt");
+        spent += 1;
         let snapshot = snapshot_tree(&worktree).await?;
-        if let Ok(rs) = reasoner
+        match reasoner
             .call_revision(
                 &fix_opts(worktree.clone()),
                 &build_revise_prompt(&issue, &shrink_findings(lines), lines, prior_attempts.as_deref()),
             )
             .await
         {
-            let _ = drop_root_scratch(&worktree).await;
-            let _ = run("git", &["add", "-A"], &worktree).await?;
-            let (_ok, d2, _) = run("git", &["diff", "--cached"], &worktree).await?;
-            // Shrinking must not smuggle in a guarded path — and the tree it
-            // left must not ship either, so put the reviewed one back.
-            if blast_radius_hit_in_diff(&d2).is_none() {
-                lines = diff_line_count(&d2);
-                summary = format!("{summary}\n\nShrink: {}", truncate(&rs, 200));
-            } else {
+            Ok(rs) => {
+                let _ = drop_root_scratch(&worktree).await;
+                let _ = run("git", &["add", "-A"], &worktree).await?;
+                let (_ok, d2, _) = run("git", &["diff", "--cached"], &worktree).await?;
+                // Shrinking must not smuggle in a guarded path — and the tree it
+                // left must not ship either, so put the guarded-clean one back.
+                if blast_radius_hit_in_diff(&d2).is_none() {
+                    lines = diff_line_count(&d2);
+                    full_diff = d2;
+                    summary = format!("{summary}\n\nShrink: {}", truncate(&rs, 200));
+                } else {
+                    restore_tree(&worktree, &snapshot).await?;
+                }
+            }
+            // A call that errors may still have edited files; none of that
+            // was checked, so none of it may ship.
+            Err(e) => {
+                warn!(issue = issue.number, "initial shrink failed; keeping the unshrunk tree: {e:#}");
                 restore_tree(&worktree, &snapshot).await?;
             }
         }
+        diff = run("git", &["diff", "--cached", "--stat"], &worktree).await?.1;
+        let names = run("git", &["diff", "--cached", "--name-only"], &worktree).await?.1;
+        gated = touches_verify_gated_path(&names);
     }
 
     // What the publish step reads, set by the stages below.
@@ -7630,8 +7628,13 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     let mut review_notes = String::new();
     let mut independent: Option<IndependentReview> = None;
     let mut revision_note = String::new();
-    // Gate repairs and the narrowing round draw on the same revise budget.
-    let mut round = narrowed;
+    // Gate repairs and review rounds continue the same budget.
+    let mut round = spent;
+    // #1488 — set while the tree on disk is one a round left oversized or
+    // red, and cleared once a round gets it back under the cap and green. If
+    // the run stops iterating while it is set, the work parks for that reason:
+    // the reviews it holds describe an earlier tree.
+    let mut pending_guard: Option<ParkReason> = None;
     // #1488/#1489 — once a diff has built, a stage that runs out of budget
     // parks it as a draft PR instead of deleting it: the resume lane has gate
     // repair, shrink and QA rounds of its own, and MAX_ATTEMPTS still bounds
@@ -7726,7 +7729,10 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         break;
                     }
                     lines = diff_line_count(&d2);
-                    diff = d2;
+                    full_diff = d2;
+                    diff = run("git", &["diff", "--cached", "--stat"], &worktree).await?.1;
+                    let names = run("git", &["diff", "--cached", "--name-only"], &worktree).await?.1;
+                    gated = touches_verify_gated_path(&names);
                     summary = format!("{summary}\n\nGate repair {round}: {}", truncate(&rs, 200));
                     gate_result = verification_gate(&worktree).await;
                 }
@@ -7890,17 +7896,11 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     dropped.extend(drop_root_scratch(&worktree).await);
                     let _ = run("git", &["add", "-A"], &worktree).await?;
                     let (_ok, mut diff2, _) = run("git", &["diff", "--cached"], &worktree).await?;
-                    if let Some((pattern, _)) = blast_radius_hit_in_diff(&diff2) {
-                        // #1490 AC6 — the same single narrowing round as the
-                        // initial diff gets, once per run.
-                        if narrowed == 0 {
-                            if let Some(clean) =
-                                narrow_guarded_paths(&reasoner, &worktree, &issue, pattern, &diff2).await?
-                            {
-                                narrowed = 1;
-                                round += 1;
-                                diff2 = clean;
-                            }
+                    if blast_radius_hit_in_diff(&diff2).is_some() {
+                        // #1490 AC6 — the same deterministic narrowing the
+                        // initial diff gets.
+                        if let Some(clean) = narrow_guarded_paths(&worktree, "origin/main", &diff2).await? {
+                            diff2 = clean;
                         }
                     }
                     if let Some((pattern, line)) = blast_radius_hit_in_diff(&diff2) {
@@ -7937,6 +7937,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                                 round, lines2, "revision overgrew the cap; scheduling a shrink round"
                             );
                             findings_override = Some(shrink_findings(lines2));
+                            pending_guard = Some(ParkReason::Oversize(lines2));
                             revision_note.push_str(&format!(
                                 "\n### Revision round {round}: overgrew the cap \
                                  ({lines2} lines); next round shrinks\n"
@@ -7976,6 +7977,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         lines = lines2;
                         if round < max_rounds {
                             findings_override = Some(gate_findings(&gate_err.to_string()));
+                            pending_guard = Some(ParkReason::GateRed(format!("{gate_err:#}")));
                             revision_note.push_str(&format!(
                                 "\n### Revision round {round}: failed the gate; \
                                  next round repairs\n"
@@ -8004,6 +8006,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         }
                         break 'stages Some(ParkReason::GateRed(format!("{gate_err:#}")));
                     }
+                    // Under the cap and green again: the guard that was
+                    // pending is satisfied by this tree.
+                    pending_guard = None;
                     // The revised diff may touch different files.
                     gated = touches_verify_gated_path(&names2);
                     lines = lines2;
@@ -8046,6 +8051,38 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     ));
                 }
             }
+        }
+        if let Some(pending) = pending_guard.take() {
+            // The loop stopped (a revision call errored) on a tree that is
+            // still oversized or red: that is why it parks, not the reviews
+            // of an earlier tree. One attempt, with the right kind.
+            let (_ok, full_pending, _) = run("git", &["diff", "--cached"], &worktree).await?;
+            let paths = diff_touched_paths(&full_pending);
+            let n = diff_line_count(&full_pending);
+            let record = match &pending {
+                ParkReason::Oversize(lines2) => rec(FailureKind::GuardRefusal, "revise:size", &format!("diff is {lines2} lines (cap {MAX_DIFF_LINES})"), &paths, n),
+                ParkReason::GateRed(out) => { let (kind, detail) = gate_outcome(out); rec(kind, "revise:gate", &detail, &paths, n) }
+                ParkReason::QaReject(_) | ParkReason::QaUnavailable(_) => unreachable!("only guards are pending"),
+            };
+            let attempts = record_attempt(repo_root, issue.number, Some(record)).await.unwrap_or_else(|_| Tally::uncounted());
+            if attempts.exhausted() {
+                backoff_comment(
+                    repo_root,
+                    issue.number,
+                    &format!("Self-improve gave up after {attempts} attempts: {}.", pending.headline()),
+                )
+                .await
+                .ok();
+                label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                return Ok(RunReport::built(format!(
+                    "issue #{}: revision stopped on a tree that {}; gave up (attempt {attempts})",
+                    issue.number,
+                    pending.headline()
+                )));
+            }
+            lines = n;
+            break 'stages Some(pending);
         }
         if round > 0 {
             info!(
@@ -8128,6 +8165,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     };
     // A run that parked before Stage 4 ran publishes with no independent
     // verdict, which the merge policy reads as "not approved".
+    // Every park except a reviewer outage has already recorded this run's
+    // attempt; a publish failure after it must not record a second (#852).
+    let park_charged = matches!(
+        park,
+        Some(ParkReason::QaReject(_) | ParkReason::GateRed(_) | ParkReason::Oversize(_))
+    );
     let independent = independent.unwrap_or_else(|| {
         IndependentReview::not_run(match &park {
             Some(p) => p.headline(),
@@ -8228,6 +8271,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     }
     if !ok {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
+        if park_charged {
+            return Ok(RunReport::built(parked_publish_failed(issue.number, "git commit failed", &e)));
+        }
         return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git commit failed", &e, { let (kind, detail) = publish_outcome(&e); rec(kind, "publish:git commit", &detail, &diff, lines) }).await));
     }
     // #815 — a run killed between the push and `gh pr create` leaves the
@@ -8256,6 +8302,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     }
     if !ok {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
+        if park_charged {
+            return Ok(RunReport::built(parked_publish_failed(issue.number, "git push failed", &e)));
+        }
         return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git push failed", &e, { let (kind, detail) = publish_outcome(&e); rec(kind, "publish:git push", &detail, &diff, lines) }).await));
     }
     // #1037 — the push landed, plainly or by superseding an orphan above, so
@@ -8393,6 +8442,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     if !ok {
         // #815 — the branch is pushed but has no PR. Left as an `Err` this
         // re-picks the same issue next tick and dies at the push above.
+        if park_charged {
+            return Ok(RunReport::built(parked_publish_failed(issue.number, "gh pr create failed", &e)));
+        }
         return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "gh pr create failed", &e, { let (kind, detail) = publish_outcome(&e); rec(kind, "publish:gh pr create", &detail, &diff, lines) }).await));
     }
     let pr_url = stdout.trim().to_string();
@@ -8680,6 +8732,14 @@ async fn record_hard_failure(
         label_gave_up(repo_root, issue, attempts.reason()).await.ok();
     }
     format!("issue #{issue}: {what} (attempt {attempts}); no PR opened")
+}
+
+/// #1488/#1489 — a parked run failed to publish. Its attempt is already on
+/// record, so this only reports; the work is lost exactly as a hard failure
+/// loses it today.
+fn parked_publish_failed(issue: u64, what: &str, err: &str) -> String {
+    warn!(issue, "self-improve: parked work not published: {what}: {err}");
+    format!("issue #{issue}: {what} while parking (attempt already recorded); no PR opened")
 }
 
 /// Bump an attempt counter encoded as a hidden marker comment, return the new
@@ -18033,34 +18093,121 @@ mod iterate_not_delete_tests {
     }
 
     #[test]
-    fn the_narrow_prompt_names_only_the_guarded_paths_and_forbids_other_edits() {
-        let issue = Issue {
-            number: 9,
-            title: "t".into(),
-            body: String::new(),
-            author: "o".into(),
-            author_trusted: true,
-            research_filed: false,
-        };
-        let paths = guarded_paths(DIFF_FIX_PLUS_DEPLOY);
-        assert_eq!(paths, vec!["scripts/deploy-box.sh".to_string()]);
-        let p = build_narrow_prompt(&issue, "deploy", &paths);
-        assert!(p.contains("scripts/deploy-box.sh"));
-        assert!(
-            !p.contains("crates/x/src/lib.rs"),
-            "the fix's own files are not named"
-        );
-        assert!(p.contains(NEEDS_GUARDED_PATH));
-        assert!(p.to_ascii_lowercase().contains("no other changes"));
+    fn only_the_guarded_paths_are_selected_for_narrowing() {
+        assert_eq!(guarded_paths(DIFF_FIX_PLUS_DEPLOY), vec!["scripts/deploy-box.sh".to_string()]);
+        assert!(guarded_paths(DIFF_FIX_ONLY).is_empty());
     }
 
+    /// A throwaway repo whose `origin/main` holds `lib.rs` and a deploy
+    /// script, with the worktree carrying a fix plus guarded edits.
+    async fn repo_with_guarded_edits() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path();
+        let git = |args: &'static [&'static str]| async move {
+            let (ok, _o, e) = run("git", args, wt).await.unwrap();
+            assert!(ok, "git {args:?}: {e}");
+        };
+        git(&["init", "-q", "-b", "main"]).await;
+        git(&["config", "user.email", "t@example.com"]).await;
+        git(&["config", "user.name", "t"]).await;
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::create_dir_all(wt.join("scripts")).unwrap();
+        std::fs::write(wt.join("src/lib.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(wt.join("scripts/deploy-box.sh"), "echo old\n").unwrap();
+        git(&["add", "-A"]).await;
+        git(&["commit", "-qm", "base"]).await;
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]).await;
+        // The fix, an edit to a guarded file, and a new guarded file.
+        std::fs::write(wt.join("src/lib.rs"), "fn a() { fixed() }\n").unwrap();
+        std::fs::write(wt.join("scripts/deploy-box.sh"), "echo changed\n").unwrap();
+        std::fs::write(wt.join("scripts/deploy-new.sh"), "echo new\n").unwrap();
+        git(&["add", "-A"]).await;
+        dir
+    }
+
+    /// #1490 — narrowing reverts exactly the guarded files (deleting new
+    /// ones) and leaves the fix byte-for-byte as the builder wrote it.
+    #[tokio::test]
+    async fn narrowing_reverts_only_the_guarded_files() {
+        let dir = repo_with_guarded_edits().await;
+        let wt = dir.path();
+        let before = run("git", &["diff", "--cached"], wt).await.unwrap().1;
+        assert!(blast_radius_hit_in_diff(&before).is_some());
+        let after = narrow_guarded_paths(wt, "origin/main", &before).await.unwrap().expect("narrowed");
+        assert!(blast_radius_hit_in_diff(&after).is_none(), "{after}");
+        assert_eq!(std::fs::read_to_string(wt.join("scripts/deploy-box.sh")).unwrap(), "echo old\n");
+        assert!(!wt.join("scripts/deploy-new.sh").exists(), "a new guarded file is removed");
+        assert_eq!(std::fs::read_to_string(wt.join("src/lib.rs")).unwrap(), "fn a() { fixed() }\n");
+        assert!(after.contains("+fn a() { fixed() }"), "the fix survives: {after}");
+    }
+
+    /// Nothing left once the guarded files go back ⇒ refuse, tree untouched.
+    #[tokio::test]
+    async fn narrowing_that_would_leave_nothing_refuses_and_restores() {
+        let dir = repo_with_guarded_edits().await;
+        let wt = dir.path();
+        std::fs::write(wt.join("src/lib.rs"), "fn a() {}\n").unwrap();
+        run("git", &["add", "-A"], wt).await.unwrap();
+        let before = run("git", &["diff", "--cached"], wt).await.unwrap().1;
+        assert!(narrow_guarded_paths(wt, "origin/main", &before).await.unwrap().is_none());
+        assert_eq!(std::fs::read_to_string(wt.join("scripts/deploy-box.sh")).unwrap(), "echo changed\n");
+        assert!(wt.join("scripts/deploy-new.sh").exists());
+    }
+
+    /// #1488 — a round that errors or trips a guard is undone: edits,
+    /// deletions and newly created files all go back to the snapshot.
+    #[tokio::test]
+    async fn restore_tree_undoes_a_round_completely() {
+        let dir = repo_with_guarded_edits().await;
+        let wt = dir.path();
+        let snap = snapshot_tree(wt).await.unwrap();
+        let staged = run("git", &["diff", "--cached"], wt).await.unwrap().1;
+        std::fs::write(wt.join("src/lib.rs"), "half-applied edit\n").unwrap();
+        std::fs::remove_file(wt.join("scripts/deploy-new.sh")).unwrap();
+        std::fs::write(wt.join("src/stray.rs"), "created by the round\n").unwrap();
+        restore_tree(wt, &snap).await.unwrap();
+        assert_eq!(std::fs::read_to_string(wt.join("src/lib.rs")).unwrap(), "fn a() { fixed() }\n");
+        assert!(wt.join("scripts/deploy-new.sh").exists());
+        assert!(!wt.join("src/stray.rs").exists());
+        run("git", &["add", "-A"], wt).await.unwrap();
+        assert_eq!(run("git", &["diff", "--cached"], wt).await.unwrap().1, staged);
+    }
+
+    /// Review #1 — a round that stops on an oversized or red tree parks for
+    /// that reason, never on the reviews of an earlier tree.
     #[test]
-    fn needs_guarded_path_sentinel_refuses() {
-        assert!(reply_needs_guarded_path(
-            "NEEDS_GUARDED_PATH: the fix is the deploy script"
-        ));
-        assert!(reply_needs_guarded_path("\n  NEEDS_GUARDED_PATH\n"));
-        assert!(!reply_needs_guarded_path("Reverted scripts/deploy-box.sh."));
+    fn a_pending_guard_outranks_stale_reviews() {
+        let body = run_once_src();
+        let set_size = body.find("pending_guard = Some(ParkReason::Oversize(").expect("set on shrink");
+        let set_gate = body.find("pending_guard = Some(ParkReason::GateRed(").expect("set on red");
+        let cleared = body.find("pending_guard = None;").expect("cleared when green");
+        let checked = body.find("if let Some(pending) = pending_guard.take()").expect("checked after loop");
+        let qa_park = body.find("break 'stages Some(ParkReason::QaReject(").expect("QA park");
+        assert!(set_size < checked && set_gate < checked && cleared < checked);
+        assert!(checked < qa_park, "the pending guard decides before the QA verdict does");
+    }
+
+    /// Review #4 — the follow-up and the initial shrink come out of the same
+    /// budget the review loop uses.
+    #[test]
+    fn every_revision_call_spends_the_shared_budget() {
+        let body = run_once_src();
+        let follow = body.find("build_no_change_prompt(").unwrap();
+        assert!(body[..follow].contains("if spent < revise_rounds() {\n            spent += 1;"));
+        let shrink = body.find("initial diff over cap; one shrink attempt").unwrap();
+        assert!(body[shrink..shrink + 120].contains("spent += 1;"));
+        assert!(body.contains("let mut round = spent;"));
+    }
+
+    /// Review #6 — a parked run whose publish fails is not charged twice.
+    #[test]
+    fn a_parked_publish_failure_records_no_second_attempt() {
+        let body = run_once_src();
+        for what in ["git commit failed", "git push failed", "gh pr create failed"] {
+            let hard = body.find(&format!("record_hard_failure(repo_root, issue.number, \"{what}\"")).expect(what);
+            let guard = body[..hard].rfind("if park_charged {").expect("guard");
+            assert!(body[guard..hard].contains(&format!("parked_publish_failed(issue.number, \"{what}\"")));
+        }
     }
 
     #[test]
