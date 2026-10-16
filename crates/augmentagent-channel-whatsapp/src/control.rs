@@ -260,7 +260,9 @@ impl WhatsappControlSurface {
                 self.active_card.lock().await.remove(chat_jid);
                 self.send_to_control("Sent.").await.ok();
             }
-            receipt @ (ApprovalActionOutcome::CalendarCreated { .. } | ApprovalActionOutcome::DocumentSigned { .. }) => {
+            receipt @ (ApprovalActionOutcome::CalendarCreated { .. }
+            | ApprovalActionOutcome::CalendarResponded { .. }
+            | ApprovalActionOutcome::DocumentSigned { .. }) => {
                 self.active_card.lock().await.remove(chat_jid);
                 self.send_to_control(&augmentagent_approval_discord::outcome::describe(&receipt))
                     .await

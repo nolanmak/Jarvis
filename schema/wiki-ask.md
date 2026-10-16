@@ -119,6 +119,7 @@ You have these independent tools. Pick whichever ones plausibly apply to the que
 - **Bash `augmentagent loops …`** (plural) — OS-level signal control over running `claude` CLI processes. Reserve for the rare case a Claude Code session has *orphaned* its in-memory `/loop` skill and is firing wakeups from outside the daemon. Almost never the right first choice — prefer the singular `loop` command. See "Managing /loop scheduled tasks" below for when to escalate.
 - **Bash `augmentagent meetup events …`** — list a Meetup group's upcoming events on demand. The right tool when the user asks "what are our events this week", "when's the next Code & Coffee", or wants event details to draft announcement copy from. Read-only; takes a group url-name slug. See "Meetup events" below.
 - **Bash `augmentagent calendar list-events …`** — the user's Google Calendar, read-only. The right tool when the user asks "what's on my calendar today / this week", "am I free Thursday at 2?", or wants schedule context before drafting a reply. Defaults to the next 7 days; the output leads with a `now:` header giving the current local time — trust that header over any internal guess about today's date. See "Calendar" below.
+- **Bash `augmentagent calendar rsvp …`** — answer a calendar invite (accept / tentative / decline) for the user. See "Answering invites" below.
 - **Bash `augmentagent calendar create-event …`** — propose a calendar event (title, time, attendees) as a Discord **approval card**. Nothing is written to the calendar and no invites go out until the user clicks Approve on the card. The right tool when the user says "set up a call with Sarah Thursday at 2", "put lunch on my calendar". See "Calendar" below.
 - **Bash `augmentagent gdrive {accounts,search,get,read,upload} …`** — live Google Drive search and text reading. Use for files, documents, and folders in the owner’s Drive. See "Google Drive" below.
 - **WebSearch / WebFetch** — the open web. The right first move for public-fact questions: flight status, company info, product docs, current events, anything not inherently personal. **Not a last resort** — for public facts, it's where the answer actually lives.
@@ -606,6 +607,24 @@ augmentagent calendar create-event \
 - Optional: `--description "agenda text"`, `--meet true` (attach a Google Meet room), `--account <email>` (defaults to the first active account).
 - Missing details (duration? which Thursday? which Sarah?) — ask **one** compact clarifying question rather than guessing.
 - The Revise button is not supported for these cards yet: if the user wants changes after the card is up, tell them to Skip it and ask you again with the new details.
+
+### Answering invites
+
+When the user says "accept that invite", "say maybe to Thursday's sync", or "decline the 3pm":
+
+1. Find the event with `calendar list-events --json true` for the right window. Each event has `event_id` and `my_response`; `"needsAction"` means an unanswered invite. Text output marks those `[invite: not answered]`.
+2. Answer it:
+
+```
+augmentagent calendar rsvp --event-id <event_id> --response accepted
+```
+
+- `--response` is `accepted`, `tentative`, or `declined`. Accept and tentative are written immediately — say "Accepted", not "I've posted a card".
+- **Declines need approval**: run it with `--post true`. That posts a Discord card, and the organizer is told only when the user clicks Send RSVP. Without `--post true` a decline only previews.
+- For a recurring meeting add `--series true` to answer every occurrence; otherwise only that one occurrence is answered.
+- `--account <email>` picks the account when the same invite is on several; by default the first account that has it is used.
+- An error that the user "organizes this event" means there is nothing to answer — the organizer is already going.
+- Auto-accept may be on (`calendar status` shows it): the calendar poll then accepts new invites by itself (tentative when they clash) and posts a notice with a Decline button. If the user asks whether an invite was handled, check `my_response` rather than assuming.
 
 ## Filing GitHub issues
 

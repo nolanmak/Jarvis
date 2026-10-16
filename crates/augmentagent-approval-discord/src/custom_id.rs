@@ -58,6 +58,11 @@ pub enum Verb {
     /// "Dismiss" on a `/loop` reminder nag (#1135): closes the open nag cycle
     /// (skip this cycle). Same silence-until-next-cadence effect as LoopAck.
     LoopDismiss,
+    /// "Decline" on a calendar auto-accept notice (#1224): replace the
+    /// automatic answer with a decline. The `action_id` is the auto-RSVP's
+    /// receipt row (status `sent`), never a pending card, so it stays out
+    /// of the nudge queue and the scrollback sweep.
+    CalendarDecline,
 }
 
 impl Verb {
@@ -78,6 +83,7 @@ impl Verb {
             Self::Recompose => "recompose",
             Self::LoopAck => "loop_ack",
             Self::LoopDismiss => "loop_dismiss",
+            Self::CalendarDecline => "cal_decline",
         }
     }
 
@@ -98,6 +104,7 @@ impl Verb {
             "recompose" => Self::Recompose,
             "loop_ack" => Self::LoopAck,
             "loop_dismiss" => Self::LoopDismiss,
+            "cal_decline" => Self::CalendarDecline,
             _ => return None,
         })
     }
@@ -165,6 +172,7 @@ mod tests {
             Verb::Recompose,
             Verb::LoopAck,
             Verb::LoopDismiss,
+            Verb::CalendarDecline,
         ] {
             let cid = CustomId::new("550e8400-e29b-41d4-a716-446655440000", v);
             let s = cid.to_string();

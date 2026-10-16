@@ -1305,6 +1305,53 @@ impl EventHandler for Handler {
                             warn!(loop_id = %loop_id, "failed to finalize reminder message: {e}");
                         }
                     }
+                    Verb::CalendarDecline => {
+                        // #1224 — Decline on an auto-accept notice. The write
+                        // is a provider round-trip, so defer first; on success
+                        // the notice keeps its text, loses the button, and
+                        // gains the outcome line.
+                        if let Err(e) = defer_ephemeral(&ctx, &comp).await {
+                            warn!("failed to defer calendar Decline: {e}");
+                            return;
+                        }
+                        let handler = crate::interaction::contextual(self.state.action_handler.clone(), crate::interaction::DecisionContext {
+                            surface: "discord".into(), actor: comp.user.id.to_string(),
+                            conversation: comp.channel_id.to_string(), interaction_id: comp.id.to_string(),
+                            revision: None,
+                        });
+                        let action_id = cid.action_id.clone();
+                        let ctx_clone = ctx.clone();
+                        let comp_clone = comp.clone();
+                        tokio::spawn(async move {
+                            let outcome = match handler {
+                                Some(h) => h.calendar_decline(&action_id).await,
+                                None => ApprovalActionOutcome::Failed {
+                                    message: "no action handler configured".into(),
+                                },
+                            };
+                            followup_with_recovery(&ctx_clone, &comp_clone, &outcome, &action_id)
+                                .await;
+                            let note = match &outcome {
+                                ApprovalActionOutcome::CalendarResponded { .. } => "❌ Declined — the organizer has been told.",
+                                ApprovalActionOutcome::AlreadyResolved { .. } => "❌ Already declined.",
+                                _ => return,
+                            };
+                            let mut content = comp_clone.message.content.clone();
+                            content.push('\n');
+                            content.push_str(note);
+                            if let Err(e) = comp_clone
+                                .channel_id
+                                .edit_message(
+                                    &ctx_clone.http,
+                                    comp_clone.message.id,
+                                    EditMessage::new().content(content).components(vec![]),
+                                )
+                                .await
+                            {
+                                warn!(%action_id, "failed to finalize auto-accept notice: {e}");
+                            }
+                        });
+                    }
                     Verb::ReviseModal | Verb::FillAskModal | Verb::ScheduleModal => {
                         debug!("unexpected modal verb on component interaction");
                     }
@@ -1942,6 +1989,7 @@ fn should_delete_source(outcome: &ApprovalActionOutcome) -> bool {
         outcome,
         ApprovalActionOutcome::Approved
             | ApprovalActionOutcome::CalendarCreated { .. }
+            | ApprovalActionOutcome::CalendarResponded { .. }
             | ApprovalActionOutcome::DocumentSigned { .. }
             | ApprovalActionOutcome::Skipped
             | ApprovalActionOutcome::Revised { .. }
@@ -2089,7 +2137,10 @@ fn classify_custom_id(raw: &str) -> Option<(String, SweptKind)> {
         // are resolved by their own component arm; never sweep them as a
         // card/notice.
         | Verb::LoopAck
-        | Verb::LoopDismiss => return None,
+        | Verb::LoopDismiss
+        // #1224 — an auto-accept notice records a completed RSVP; it is
+        // informational and must survive restarts with its Decline button.
+        | Verb::CalendarDecline => return None,
     };
     Some((parsed.action_id, kind))
 }

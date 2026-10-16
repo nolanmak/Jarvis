@@ -5,8 +5,10 @@
 //! Reads retry with bounded backoff; creates are never automatically replayed. The `CalendarApi` trait is the seam tests inject
 //! a fake into.
 //!
-//! Phase 1 surfaces only `list_events` (the `GOOGLECALENDAR_EVENTS_LIST`
-//! action) and `get_event` (`GOOGLECALENDAR_EVENTS_GET`). Recurrence-master
+//! Tool actions cover listing (`GOOGLECALENDAR_EVENTS_LIST`) and creating.
+//! Single-event reads and own-response writes go to Google directly through
+//! Composio's proxy (`get_event`, `respond`): Composio retired its events.get
+//! tool, and its PATCH tool's `rsvp_response` fails on any multi-guest event. Recurrence-master
 //! fetch + `CALENDARLIST_LIST` land in Phase 2 (#400).
 
 use async_trait::async_trait;
@@ -15,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 
-use crate::types::CalendarEvent;
+use crate::types::{CalendarEvent, RawAttendee};
 
 /// Proposed event for `GOOGLECALENDAR_CREATE_EVENT` (#398). This is the
 /// machine payload the approval flow round-trips through sqlite: the
@@ -44,6 +46,40 @@ pub struct CreatedEvent {
     pub id: Option<String>,
     #[serde(default, rename = "htmlLink")]
     pub html_link: Option<String>,
+    /// The created event's attendee list as the provider echoed it. #1456
+    /// reads the organizing account's own entry off it; `None` when the
+    /// response omitted attendees.
+    #[serde(default)]
+    pub attendees: Option<Vec<RawAttendee>>,
+}
+
+/// An attendee's answer to an invite (#1224). Google's `responseStatus`
+/// values minus `needsAction`, which is the absence of an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RsvpResponse {
+    Accepted,
+    Declined,
+    Tentative,
+}
+
+impl RsvpResponse {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Declined => "declined",
+            Self::Tentative => "tentative",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "accepted" | "accept" | "yes" => Some(Self::Accepted),
+            "declined" | "decline" | "no" => Some(Self::Declined),
+            "tentative" | "maybe" => Some(Self::Tentative),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -102,12 +138,69 @@ pub trait CalendarApi: Send + Sync {
         calendar_id: &str,
         draft: &EventDraft,
     ) -> Result<CreatedEvent, CalendarError>;
+
+    /// #1224 — set the authenticated account's own response on an event
+    /// (`GOOGLECALENDAR_PATCH_EVENT` with `rsvp_response`, which touches
+    /// only that attendee entry). `notify` controls whether Google emails
+    /// the organizer. Requires the `calendar.events` scope.
+    async fn respond(
+        &self,
+        entity_id: &str,
+        calendar_id: &str,
+        event_id: &str,
+        response: RsvpResponse,
+        notify: bool,
+    ) -> Result<(), CalendarError> {
+        let _ = (entity_id, calendar_id, event_id, response, notify);
+        Err(CalendarError::Invalid(
+            "RSVP is not supported by this calendar client".into(),
+        ))
+    }
+}
+
+/// #1456 — the account that created an event is its organizer, so creating
+/// it is an implicit accept. When the provider still lists that account's
+/// own attendee entry as `needsAction` (it happens when the organizer is
+/// also on the attendee list), set it to accepted without notifying anyone.
+/// Returns whether a response had to be written. Falls back to a read when
+/// the create response carried no attendee list.
+pub async fn ensure_organizer_accepted(
+    api: &dyn CalendarApi,
+    entity_id: &str,
+    calendar_id: &str,
+    created: &CreatedEvent,
+) -> Result<bool, CalendarError> {
+    let Some(event_id) = created.id.as_deref().filter(|id| !id.trim().is_empty()) else {
+        return Ok(false);
+    };
+    let attendees = match &created.attendees {
+        Some(list) => list.clone(),
+        None => api
+            .get_event(entity_id, calendar_id, event_id)
+            .await?
+            .attendees
+            .unwrap_or_default(),
+    };
+    let pending = attendees.iter().any(|a| {
+        a.self_ == Some(true)
+            && a.response_status
+                .as_deref()
+                .is_none_or(|s| s.eq_ignore_ascii_case("needsAction"))
+    });
+    if !pending {
+        return Ok(false);
+    }
+    api.respond(entity_id, calendar_id, event_id, RsvpResponse::Accepted, false)
+        .await?;
+    Ok(true)
 }
 
 pub struct ComposioCalendarClient {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
+    /// entity → active googlecalendar connected-account id, for proxy calls.
+    connected_accounts: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl ComposioCalendarClient {
@@ -119,6 +212,7 @@ impl ComposioCalendarClient {
                 .expect("calendar HTTP client"),
             base_url: "https://backend.composio.dev".into(),
             api_key,
+            connected_accounts: Default::default(),
         }
     }
 
@@ -211,6 +305,125 @@ impl ComposioCalendarClient {
     }
 }
 
+impl ComposioCalendarClient {
+    /// The entity's active Google Calendar connected account (cached).
+    async fn connected_account(&self, entity_id: &str) -> Result<String, CalendarError> {
+        if let Some(id) = self.connected_accounts.lock().expect("cache").get(entity_id) {
+            return Ok(id.clone());
+        }
+        let resp = self
+            .http
+            .get(format!("{}/api/v3/connected_accounts", self.base_url))
+            .header("x-api-key", &self.api_key)
+            .query(&[
+                ("user_ids", entity_id),
+                ("toolkit_slugs", "googlecalendar"),
+                ("statuses", "ACTIVE"),
+            ])
+            .send()
+            .await?;
+        let status = resp.status();
+        let v: serde_json::Value = resp.json().await?;
+        if !status.is_success() {
+            return Err(CalendarError::Composio {
+                message: format!("connected_accounts → {status}: {}", bounded(&v.to_string(), 300)),
+            });
+        }
+        // Newest active connection: a re-link leaves the old one behind.
+        let id = v["items"]
+            .as_array()
+            .and_then(|items| items.iter().max_by_key(|i| i["created_at"].as_str().unwrap_or("").to_string()))
+            .and_then(|i| i["id"].as_str())
+            .map(str::to_string)
+            .ok_or_else(|| CalendarError::Composio {
+                message: format!(
+                    "no active googlecalendar connection for {entity_id} — link Google Calendar in Composio"
+                ),
+            })?;
+        self.connected_accounts
+            .lock()
+            .expect("cache")
+            .insert(entity_id.to_string(), id.clone());
+        Ok(id)
+    }
+
+    /// One raw Google Calendar API call through Composio's proxy, as the
+    /// entity's connected account. Returns Google's JSON body; a non-2xx
+    /// Google status is an error (403 ⇒ [`CalendarError::Forbidden`]).
+    async fn proxy(
+        &self,
+        entity_id: &str,
+        method: &str,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, CalendarError> {
+        let result = self.proxy_once(entity_id, method, path, query, body).await;
+        if result.is_err() {
+            // The cached connection may be stale (re-linked in Composio);
+            // resolve it afresh next time instead of failing until restart.
+            self.connected_accounts.lock().expect("cache").remove(entity_id);
+        }
+        result
+    }
+
+    async fn proxy_once(
+        &self,
+        entity_id: &str,
+        method: &str,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, CalendarError> {
+        let account = self.connected_account(entity_id).await?;
+        let mut req = serde_json::json!({
+            "connected_account_id": account,
+            "endpoint": format!("https://www.googleapis.com/calendar/v3/{path}"),
+            "method": method,
+            "parameters": query.iter().map(|(k, v)| serde_json::json!({"name": k, "value": v, "type": "query"})).collect::<Vec<_>>(),
+        });
+        if let Some(b) = body {
+            req["body"] = b;
+        }
+        let resp = self
+            .http
+            .post(format!("{}/api/v3/tools/execute/proxy", self.base_url))
+            .header("x-api-key", &self.api_key)
+            .json(&req)
+            .send()
+            .await?;
+        let http_status = resp.status();
+        let v: serde_json::Value = resp.json().await?;
+        let status = v["status"].as_u64().unwrap_or(http_status.as_u16() as u64);
+        if !http_status.is_success() || status >= 400 {
+            let detail = v
+                .pointer("/data/error/message")
+                .or_else(|| v.pointer("/error/message"))
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| bounded(&v.to_string(), 300));
+            let message = format!("calendar {method} {path} → {status}: {detail}");
+            return Err(if status == 403 {
+                CalendarError::Forbidden { message }
+            } else {
+                CalendarError::Composio { message }
+            });
+        }
+        Ok(v.get("data").cloned().unwrap_or(serde_json::Value::Null))
+    }
+}
+
+/// Percent-encode one URL path segment (event ids are base32hex, but an
+/// instance id carries `_` and a calendar id may carry `@`).
+fn path_segment(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 fn bounded(value: &str, max_chars: usize) -> String {
     let mut chars = value.trim().chars();
     let mut result: String = chars.by_ref().take(max_chars).collect();
@@ -294,11 +507,6 @@ struct ListData {
     next_page_token: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct GetResp {
-    #[serde(default)]
-    data: CalendarEvent,
-}
 
 #[async_trait]
 impl CalendarApi for ComposioCalendarClient {
@@ -358,25 +566,23 @@ impl CalendarApi for ComposioCalendarClient {
         calendar_id: &str,
         event_id: &str,
     ) -> Result<CalendarEvent, CalendarError> {
-        let args = serde_json::json!({
-            "calendarId": calendar_id,
-            "eventId": event_id,
-        });
-        let v = self
-            .execute("GOOGLECALENDAR_EVENTS_GET", entity_id, args)
-            .await?;
-        if let Ok(GetResp { data }) = serde_json::from_value::<GetResp>(v.clone()) {
-            return Ok(data);
-        }
-        if let Some(inner) = v.get("data").and_then(|d| d.get("response_data")).cloned() {
-            if let Ok(ev) = serde_json::from_value::<CalendarEvent>(inner) {
-                return Ok(ev);
-            }
-        }
-        Err(CalendarError::Decode(format!(
-            "events.get: unrecognised response shape: {}",
-            serde_json::to_string(&v).unwrap_or_default()
-        )))
+        // Composio retired GOOGLECALENDAR_EVENTS_GET ("Tool not found"), so
+        // read the event straight from Google through the proxy.
+        let path = format!(
+            "calendars/{}/events/{}",
+            path_segment(calendar_id),
+            path_segment(event_id)
+        );
+        let v = self.proxy(entity_id, "GET", &path, &[], None).await?;
+        serde_json::from_value::<CalendarEvent>(v.clone())
+            .ok()
+            .filter(|ev| !ev.id.is_empty())
+            .ok_or_else(|| {
+                CalendarError::Decode(format!(
+                    "events.get: unrecognised response shape: {}",
+                    bounded(&v.to_string(), 300)
+                ))
+            })
     }
 
     async fn create_event(
@@ -444,6 +650,67 @@ impl CalendarApi for ComposioCalendarClient {
         Err(CalendarError::Unconfirmed(format!(
             "GOOGLECALENDAR_CREATE_EVENT returned no nonempty event ID (composio log_id {log_id})"
         )))
+    }
+
+    async fn respond(
+        &self,
+        entity_id: &str,
+        calendar_id: &str,
+        event_id: &str,
+        response: RsvpResponse,
+        notify: bool,
+    ) -> Result<(), CalendarError> {
+        if event_id.trim().is_empty() {
+            return Err(CalendarError::Invalid("event_id is empty".into()));
+        }
+        // Not GOOGLECALENDAR_PATCH_EVENT's `rsvp_response`: Composio rewrites
+        // the whole attendee list, which Google rejects with
+        // `omittedAttendeesSpecified` on any event with other guests. Use
+        // Google's documented own-response update instead: the caller's
+        // attendee entry alone, with `attendeesOmitted: true`, which leaves
+        // every other guest's status untouched.
+        let path = format!(
+            "calendars/{}/events/{}",
+            path_segment(calendar_id),
+            path_segment(event_id)
+        );
+        let ev = self.proxy(entity_id, "GET", &path, &[], None).await?;
+        let me = ev["attendees"]
+            .as_array()
+            .and_then(|list| list.iter().find(|a| a["self"] == true))
+            .and_then(|a| a["email"].as_str())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                CalendarError::Invalid(format!(
+                    "this account is not an attendee of event {event_id}"
+                ))
+            })?;
+        let body = serde_json::json!({
+            "attendeesOmitted": true,
+            "attendees": [{"email": me, "responseStatus": response.as_str()}],
+        });
+        let updated = self
+            .proxy(
+                entity_id,
+                "PATCH",
+                &path,
+                &[("sendUpdates", if notify { "all" } else { "none" })],
+                Some(body),
+            )
+            .await?;
+        let confirmed = updated["attendees"]
+            .as_array()
+            .and_then(|list| list.iter().find(|a| a["self"] == true))
+            .and_then(|a| a["responseStatus"].as_str());
+        if confirmed != Some(response.as_str()) {
+            return Err(CalendarError::Composio {
+                message: format!(
+                    "rsvp not confirmed: response shows {}",
+                    confirmed.unwrap_or("no own attendee entry")
+                ),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -568,6 +835,175 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(events.len(), 2);
+    }
+
+    /// Mocks the proxy RSVP flow: connected-account lookup, the event GET
+    /// (own entry `me@x.example.com` at `before`), and the PATCH, which must
+    /// carry only the own entry with `attendeesOmitted`.
+    async fn mock_rsvp(
+        server: &mut mockito::ServerGuard,
+        event_id: &str,
+        before: &str,
+        response: &str,
+        send_updates: &str,
+    ) -> (mockito::Mock, mockito::Mock) {
+        let path = format!("calendars/primary/events/{event_id}");
+        server
+            .mock("GET", "/api/v3/connected_accounts")
+            .match_query(mockito::Matcher::UrlEncoded("toolkit_slugs".into(), "googlecalendar".into()))
+            .with_status(200)
+            .with_body(r#"{"items":[{"id":"ca_test","status":"ACTIVE"}]}"#)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/api/v3/tools/execute/proxy")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "connected_account_id": "ca_test", "method": "GET",
+                "endpoint": format!("https://www.googleapis.com/calendar/v3/{path}"),
+            })))
+            .with_status(200)
+            .with_body(serde_json::json!({"status": 200, "data": {"id": event_id, "attendees": [
+                {"email": "boss@y.example.com", "organizer": true, "responseStatus": "accepted"},
+                {"email": "me@x.example.com", "self": true, "responseStatus": before},
+            ]}}).to_string())
+            .create_async()
+            .await;
+        let patch = server
+            .mock("POST", "/api/v3/tools/execute/proxy")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "connected_account_id": "ca_test", "method": "PATCH",
+                "endpoint": format!("https://www.googleapis.com/calendar/v3/{path}"),
+                "parameters": [{"name": "sendUpdates", "value": send_updates, "type": "query"}],
+                "body": {"attendeesOmitted": true,
+                         "attendees": [{"email": "me@x.example.com", "responseStatus": response}]},
+            })))
+            .with_status(200)
+            .with_body(serde_json::json!({"status": 200, "data": {"id": event_id, "attendees": [
+                {"email": "boss@y.example.com", "organizer": true, "responseStatus": "accepted"},
+                {"email": "me@x.example.com", "self": true, "responseStatus": response},
+            ]}}).to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let unused = server
+            .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_PATCH_EVENT")
+            .expect(0)
+            .create_async()
+            .await;
+        (patch, unused)
+    }
+
+    #[tokio::test]
+    async fn respond_patches_only_the_own_response() {
+        let mut server = Server::new_async().await;
+        let (patch, unused) = mock_rsvp(&mut server, "evt-9", "needsAction", "tentative", "all").await;
+        let client = ComposioCalendarClient::new("k".into()).with_base_url(server.url());
+        client
+            .respond("ent", "primary", "evt-9", RsvpResponse::Tentative, true)
+            .await
+            .unwrap();
+        patch.assert_async().await;
+        unused.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn respond_surfaces_google_rejections_and_non_attendance() {
+        let mut server = Server::new_async().await;
+        server
+            .mock("GET", "/api/v3/connected_accounts")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"items":[{"id":"ca_test"}]}"#)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/api/v3/tools/execute/proxy")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({"method": "GET"})))
+            .with_status(200)
+            .with_body(r#"{"status":200,"data":{"id":"evt-9","attendees":[{"email":"other@y.example.com"}]}}"#)
+            .create_async()
+            .await;
+        let client = ComposioCalendarClient::new("k".into()).with_base_url(server.url());
+        let err = client
+            .respond("ent", "primary", "evt-9", RsvpResponse::Accepted, true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not an attendee"), "{err}");
+
+        let mut server = Server::new_async().await;
+        server
+            .mock("GET", "/api/v3/connected_accounts")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"items":[{"id":"ca_test"}]}"#)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/api/v3/tools/execute/proxy")
+            .with_status(200)
+            .with_body(r#"{"status":403,"data":{"error":{"message":"Insufficient Permission"}}}"#)
+            .create_async()
+            .await;
+        let client = ComposioCalendarClient::new("k".into()).with_base_url(server.url());
+        let err = client
+            .respond("ent", "primary", "evt-9", RsvpResponse::Accepted, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CalendarError::Forbidden { .. }), "{err}");
+    }
+
+    /// #1456 — the organizer's own `needsAction` entry is flipped to
+    /// accepted silently; an organizer already accepted triggers no write.
+    #[tokio::test]
+    async fn create_then_ensure_organizer_accepted() {
+        let mut server = Server::new_async().await;
+        let _create = server
+            .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_CREATE_EVENT")
+            .with_status(200)
+            .with_body(
+                r#"{"data":{"response_data":{"id":"new-1","attendees":[
+                    {"email":"me@x.example.com","self":true,"organizer":true,"responseStatus":"needsAction"},
+                    {"email":"sarah@acme.example.com","responseStatus":"needsAction"}]}},"successful":true}"#,
+            )
+            .create_async()
+            .await;
+        let (patch, _) = mock_rsvp(&mut server, "new-1", "needsAction", "accepted", "none").await;
+        let client = ComposioCalendarClient::new("k".into()).with_base_url(server.url());
+        let draft = EventDraft {
+            summary: "Sync".into(),
+            start_datetime: "2026-07-10T15:00:00-04:00".into(),
+            duration_minutes: 30,
+            attendees: vec!["sarah@acme.example.com".into()],
+            description: None,
+            create_meeting_room: false,
+        };
+        let created = client.create_event("ent", "primary", &draft).await.unwrap();
+        assert!(ensure_organizer_accepted(&client, "ent", "primary", &created).await.unwrap());
+        patch.assert_async().await;
+
+        let already = CreatedEvent {
+            id: Some("new-2".into()),
+            html_link: None,
+            attendees: Some(vec![RawAttendee {
+                email: Some("me@x.example.com".into()),
+                self_: Some(true),
+                response_status: Some("accepted".into()),
+                ..Default::default()
+            }]),
+        };
+        assert!(!ensure_organizer_accepted(&client, "ent", "primary", &already).await.unwrap());
+        patch.assert_async().await; // still exactly one PATCH
+    }
+
+    /// #1456 — a create response without attendees falls back to a read.
+    #[tokio::test]
+    async fn ensure_organizer_accepted_reads_when_the_create_echo_lacks_attendees() {
+        let mut server = Server::new_async().await;
+        let (patch, _) = mock_rsvp(&mut server, "new-3", "needsAction", "accepted", "none").await;
+        let client = ComposioCalendarClient::new("k".into()).with_base_url(server.url());
+        let created = CreatedEvent { id: Some("new-3".into()), ..Default::default() };
+        assert!(ensure_organizer_accepted(&client, "ent", "primary", &created).await.unwrap());
+        patch.assert_async().await;
     }
 
     #[tokio::test]
