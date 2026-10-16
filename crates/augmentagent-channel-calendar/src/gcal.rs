@@ -329,9 +329,10 @@ impl ComposioCalendarClient {
                 message: format!("connected_accounts → {status}: {}", bounded(&v.to_string(), 300)),
             });
         }
+        // Newest active connection: a re-link leaves the old one behind.
         let id = v["items"]
             .as_array()
-            .and_then(|items| items.first())
+            .and_then(|items| items.iter().max_by_key(|i| i["created_at"].as_str().unwrap_or("").to_string()))
             .and_then(|i| i["id"].as_str())
             .map(str::to_string)
             .ok_or_else(|| CalendarError::Composio {
@@ -350,6 +351,23 @@ impl ComposioCalendarClient {
     /// entity's connected account. Returns Google's JSON body; a non-2xx
     /// Google status is an error (403 ⇒ [`CalendarError::Forbidden`]).
     async fn proxy(
+        &self,
+        entity_id: &str,
+        method: &str,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, CalendarError> {
+        let result = self.proxy_once(entity_id, method, path, query, body).await;
+        if result.is_err() {
+            // The cached connection may be stale (re-linked in Composio);
+            // resolve it afresh next time instead of failing until restart.
+            self.connected_accounts.lock().expect("cache").remove(entity_id);
+        }
+        result
+    }
+
+    async fn proxy_once(
         &self,
         entity_id: &str,
         method: &str,

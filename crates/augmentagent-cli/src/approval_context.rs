@@ -132,6 +132,9 @@ impl ReplyApprover {
             Ok(None)=>return ApprovalActionOutcome::Failed{message:"This interaction was already recorded, or this action has an in-progress/unconfirmed operation. Check approval history and the provider before retrying; nothing was repeated.".into()},
             Err(_)=>return ApprovalActionOutcome::Failed{message:"Approval history could not be saved; nothing executed.".into()},
         };
+        // An own-response RSVP is idempotent: a failure is safe to retry, so
+        // never fence it as "unconfirmed" (that blocks every later click).
+        let idempotent = action.email.platform == "gcal" && action.email.kind.starts_with("rsvp");
         let outcome = f.await;
         let (state, detail) = match &outcome {
             ApprovalActionOutcome::DocumentSigned { receipt, .. } => ("completed", receipt.clone()),
@@ -183,7 +186,8 @@ impl ReplyApprover {
                     "no message id",
                 ]
                 .iter()
-                .any(|v| lower.contains(v));
+                .any(|v| lower.contains(v))
+                    && !idempotent;
                 (
                     if unknown { "unconfirmed" } else { "failed" },
                     bounded(message, 800),

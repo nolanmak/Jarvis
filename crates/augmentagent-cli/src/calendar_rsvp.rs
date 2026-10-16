@@ -155,6 +155,11 @@ pub(crate) async fn run_rsvp(
     let mut errors = Vec::new();
     for acct in &candidates {
         match client.get_event(&acct.entity_id, "primary", &event_id).await {
+            // Without --account, an organizer copy is not an invite: keep
+            // looking (an invite between two owned accounts shares its id).
+            Ok(ev) if account.is_none() && ev.organizer.as_ref().and_then(|o| o.self_) == Some(true) => {
+                errors.push(format!("{}: organizer", acct.email));
+            }
             Ok(ev) if self_response(&ev).is_some() || ev.organizer.as_ref().and_then(|o| o.self_) == Some(true) => {
                 found = Some((acct.clone(), ev));
                 break;
@@ -360,9 +365,20 @@ pub(crate) async fn auto_accept_pass(
             .respond(&d.entity_id, "primary", &d.target_event_id, d.response, true)
             .await
         {
-            report.failed += 1;
-            warn!(account = %d.account_email, event = %d.target_event_id, "calendar auto-accept: rsvp failed, will retry next poll: {e}");
-            continue;
+            // The write may have landed with its response lost. If the
+            // calendar already shows the answer, record it like a success so
+            // the notice (and its Decline button) still goes out.
+            let landed = api
+                .get_event(&d.entity_id, "primary", &d.target_event_id)
+                .await
+                .ok()
+                .is_some_and(|ev| self_response(&ev) == Some(d.response.as_str()));
+            if !landed {
+                report.failed += 1;
+                warn!(account = %d.account_email, event = %d.target_event_id, "calendar auto-accept: rsvp failed, will retry next poll: {e}");
+                continue;
+            }
+            warn!(event = %d.target_event_id, "calendar auto-accept: response lost but the answer is on the calendar: {e}");
         }
         report.answered += 1;
         let action_id = match record_auto_rsvp(store, d, &message_id, &text) {
@@ -653,6 +669,34 @@ mod tests {
         assert!(matches!(out, ApprovalActionOutcome::CalendarResponded { ref response, .. } if response == "declined"), "{out:?}");
         let again = approver.calendar_decline(&id).await;
         assert!(matches!(again, ApprovalActionOutcome::AlreadyResolved { .. } | ApprovalActionOutcome::Failed { .. }), "{again:?}");
+        m.assert_async().await;
+    }
+
+    /// A failed Decline (provider 503, lost connection) must not fence the
+    /// receipt: an own-response write is idempotent, so the next click runs.
+    #[tokio::test]
+    async fn a_failed_decline_can_be_retried() {
+        let (store, _d) = store();
+        let d = decision(RsvpResponse::Accepted);
+        let mid = auto_rsvp_message_id(&d.entity_id, &d.target_event_id);
+        let id = record_auto_rsvp(&store, &d, &mid, "notice").unwrap();
+        let mut down = mockito::Server::new_async().await;
+        down.mock("GET", "/api/v3/connected_accounts")
+            .match_query(mockito::Matcher::Any)
+            .with_status(503)
+            .with_body(r#"{"error":"connection reset, upstream 503"}"#)
+            .create_async()
+            .await;
+        let mut approver = test_support::approver_with_store(store.clone());
+        approver.calendar = Arc::new(ComposioCalendarClient::new("k".into()).with_base_url(down.url()));
+        let first = approver.calendar_decline(&id).await;
+        assert!(matches!(first, ApprovalActionOutcome::Failed { .. }), "{first:?}");
+
+        let mut up = mockito::Server::new_async().await;
+        let m = mock_proxy_rsvp(&mut up, "evt-1", "declined", "all").await;
+        approver.calendar = Arc::new(ComposioCalendarClient::new("k".into()).with_base_url(up.url()));
+        let second = approver.calendar_decline(&id).await;
+        assert!(matches!(second, ApprovalActionOutcome::CalendarResponded { .. }), "{second:?}");
         m.assert_async().await;
     }
 

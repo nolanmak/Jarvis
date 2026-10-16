@@ -14080,10 +14080,23 @@ impl ReplyApprover {
                 let html_link =
                     Self::calendar_account_link(created.html_link.as_deref(), &action.email.from);
                 let link = html_link.clone().unwrap_or_else(|| event_id.clone());
+                let base_body = action.action.draft_body.clone().unwrap_or_default();
+                let final_body = format!("{base_body}\ncreated: {link}\nevent ID: {event_id}");
+                if let Err(e) = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Sent,
+                    Some(&final_body),
+                    None,
+                ) {
+                    return ApprovalActionOutcome::Failed {
+                        message: format!("calendar event {event_id} was created, but recording its receipt failed: {e}; check the calendar before retrying"),
+                    };
+                }
                 // #1456 — creating is an implicit accept; never leave the
-                // organizer's own entry at needsAction. Best-effort: the
-                // event exists either way. The note goes BEFORE the terminal
-                // `created:`/`event ID:` lines recover_calendar_receipt parses.
+                // organizer's own entry at needsAction. Runs only after the
+                // receipt is saved (the event exists either way), and its
+                // note goes BEFORE the terminal `created:`/`event ID:` lines
+                // recover_calendar_receipt parses.
                 let organizer_check = if draft.attendees.is_empty() {
                     Ok(false) // no guest list ⇒ no attendee entry to answer
                 } else {
@@ -14103,19 +14116,9 @@ impl ReplyApprover {
                         "\norganizer RSVP: still needs action (self-accept failed)"
                     }
                 };
-                let final_body = format!(
-                    "{}{organizer_note}\ncreated: {link}\nevent ID: {event_id}",
-                    action.action.draft_body.clone().unwrap_or_default()
-                );
-                if let Err(e) = self.store.update_action_status(
-                    action_id,
-                    ActionStatus::Sent,
-                    Some(&final_body),
-                    None,
-                ) {
-                    return ApprovalActionOutcome::Failed {
-                        message: format!("calendar event {event_id} was created, but recording its receipt failed: {e}; check the calendar before retrying"),
-                    };
+                if !organizer_note.is_empty() {
+                    let noted = format!("{base_body}{organizer_note}\ncreated: {link}\nevent ID: {event_id}");
+                    let _ = self.store.update_action_status(action_id, ActionStatus::Sent, Some(&noted), None);
                 }
                 let _ = self
                     .store
@@ -19726,8 +19729,10 @@ async fn run_calendar_poll_once(
         Some(sink) => channel = channel.with_alert_sink(sink),
         None => info!("calendar alerts: no notification surface is configured (Discord bot channel or Slack app); alert delivery disabled"),
     }
-    let outcome = channel.poll_once().await?;
-    println!("{:#?}", outcome);
+    let ingest = channel.poll_once().await;
+    if let Ok(outcome) = &ingest {
+        println!("{:#?}", outcome);
+    }
     // #1224 — answer pending invites on auto-accept accounts. Isolated from
     // the ingest result: a failure here is logged, never fails the poll.
     let surface = calendar_rsvp::NoticeSurface::from_env();
@@ -19735,6 +19740,7 @@ async fn run_calendar_poll_once(
         Ok(report) => println!("{report:#?}"),
         Err(e) => warn!("calendar auto-accept pass failed: {e:#}"),
     }
+    ingest?;
     Ok(())
 }
 
