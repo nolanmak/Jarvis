@@ -2348,7 +2348,7 @@ async fn download_images(attachments: &[Attachment], msg_id: u64) -> Vec<PathBuf
         let path = PathBuf::from(format!("/tmp/aa-img-{msg_id}-{idx}.{ext}"));
         match reqwest::get(&att.url).await {
             Ok(resp) => match resp.bytes().await {
-                Ok(bytes) => match tokio::fs::write(&path, &bytes).await {
+                Ok(bytes) => match augmentagent_docs::inbound::write_private_attachment(&path, &bytes).await {
                     Ok(()) => out.push(path),
                     Err(e) => warn!("write image tempfile {} failed: {e}", path.display()),
                 },
@@ -2391,7 +2391,7 @@ async fn download_text_files(
             Ok(resp) => match resp.bytes().await {
                 Ok(bytes) => {
                     let (to_write, truncated) = truncate_text_bytes(&bytes);
-                    match tokio::fs::write(&path, to_write).await {
+                    match augmentagent_docs::inbound::write_private_attachment(&path, to_write).await {
                         Ok(()) => out.push(DownloadedTextFile {
                             path,
                             truncated,
@@ -2447,7 +2447,7 @@ async fn extract_doc_attachments(
         // Download binary.
         let download_ok = match reqwest::get(&att.url).await {
             Ok(resp) => match resp.bytes().await {
-                Ok(bytes) => match tokio::fs::write(&in_path, &bytes).await {
+                Ok(bytes) => match augmentagent_docs::inbound::write_private_attachment(&in_path, &bytes).await {
                     Ok(()) => true,
                     Err(e) => {
                         warn!("write doc tempfile {} failed: {e}", in_path.display());
@@ -2475,7 +2475,7 @@ async fn extract_doc_attachments(
                     }
                     let (to_write, truncated) = truncate_text_bytes(text.as_bytes());
                     let extracted_len = text.len() as u64;
-                    match tokio::fs::write(&out_path, to_write).await {
+                    match augmentagent_docs::inbound::write_private_attachment(&out_path, to_write).await {
                         Ok(()) => out.push(DownloadedTextFile {
                             path: out_path,
                             truncated,

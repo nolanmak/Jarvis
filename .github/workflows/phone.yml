@@ -5,6 +5,8 @@ on:
     paths:
       - 'crates/augmentagent-phone/**'
       - 'crates/augmentagent-store/**'
+      - 'crates/augmentagent-docs/**'
+      - 'crates/augmentagent-channel-journal/**'
       - 'crates/augmentagent-channel-core/**'
       - 'crates/augmentagent-cli/**'
       - 'crates/augmentagent-approval-discord/**'

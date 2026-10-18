@@ -608,14 +608,14 @@ impl Drop for QueryAttachmentFiles {
 /// query preset's environment. Codex: the packaged bridge with the query preset's
 /// policy (which also runs that guard). Every probe must get the same decision
 /// from both, and the expected one. Files live where the daemon writes them
-/// (`/tmp`, `/tmp/aa-imsg/<session>`), with the mode its umask 0002 gives them
-/// (0664), uniquely named and removed afterwards.
+/// (`/tmp`, `/tmp/aa-imsg/<session>`), with explicit owner-only mode 0600,
+/// uniquely named and removed afterwards.
 #[test]
 fn query_attachments_read_identically_under_claude_guard_and_codex_bridge() {
     use augmentagent_channel_core::{reasoner::*, codex_tools::BridgeLaunch};
     use serde_json::{json, Value};
     use std::io::Write;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     use std::process::{Command, Stdio};
     if rerun_with_query_attachment_features("query_attachments_read_identically_under_claude_guard_and_codex_bridge") {
         return;
@@ -633,12 +633,12 @@ fn query_attachments_read_identically_under_claude_guard_and_codex_bridge() {
     let session = PathBuf::from(env_value(&opts, "AUGMENTAGENT_IMESSAGE_TMP_DIR").expect("session dir minted"));
     let transcripts = PathBuf::from(env_value(&opts, "AUGMENTAGENT_TRANSCRIPTS_DIR").unwrap());
 
-    // As the daemon writes them: its unit runs with UMask=0002.
+    // Attachment writers explicitly use owner-only permissions, independent of
+    // the daemon umask and BSD directory group inheritance.
     let daemon_file = |path: &Path, text: &str| {
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
             .unwrap_or_else(|error| panic!("create {}: {error}", path.display()));
         file.write_all(text.as_bytes()).unwrap();
-        file.set_permissions(std::fs::Permissions::from_mode(0o664)).unwrap();
     };
     let unique = format!("{}{:09}", std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos());

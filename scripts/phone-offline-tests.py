@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # Each invocation must run exactly one target, with no name filters. Minimum
 # counts prevent silent deletion of the current required coverage.
 SUITES = [
+    ("augmentagent-docs", "--test", "private_attachments", 2),
     ("augmentagent-phone", "--lib", None, 10),
     ("augmentagent-phone", "--test", "relay", 3),
     ("augmentagent-phone", "--test", "service", 23),
@@ -75,6 +76,10 @@ def main():
     for module, minimum in [("notify_tests::", 17), ("phone_runtime::tests::", 3), ("surface_conformance_tests::", 2), ("discord_voice_session_tests::", 6), ("discord_phone_session_tests::", 1), ("whatsapp_phone_session_tests::", 1), ("whatsapp_phone::tests::", 3), ("discord_phone::tests::", 2), ("discord_phone::installation_tests::", 1)]:
         jobs.append(("augmentagent-cli-" + module.rstrip(":").replace("::", "-"),
                      ["cargo", "test", "--locked", "-p", "augmentagent-cli", "--bin", "augmentagent", module, "--", "--test-threads=1"], minimum, True))
+    # Captured iMessage/Notes files remain readable across the voice migration.
+    jobs.append(("augmentagent-channel-journal-s3",
+                 ["cargo", "test", "--locked", "-p", "augmentagent-channel-journal", "--lib",
+                  "s3::tests::", "--", "--test-threads=1"], 7, True))
     # This library also contains explicitly ignored live-provider qualification
     # tests. Require the deterministic privacy regression by its exact name.
     jobs.append(("augmentagent-channel-discord-dm-phone-privacy",

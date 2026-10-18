@@ -1106,3 +1106,19 @@ portable matcher-parent-death test. Nine local capability tests pass. Both
 portable Grep tests and the bridge parent-lifetime tests now run explicitly in
 Linux/macOS phone CI. Actual macOS results remain required; attachment Read
 failures still need writer/permission investigation and are not declared fixed.
+
+### Owner-only captured attachments
+
+Discord image, text, binary-document and converted-text downloads now publish
+owner-only temporary files through a shared atomic writer. Replacing a preexisting
+symlink or hard link does not modify its target inode; failed publication removes
+the temporary file. iMessage/Notes S3 fetches explicitly create mode-0600 files
+while preserving their existing exclusive-create and partial-download cleanup.
+This removes dependence on the daemon umask and inherited directory group for
+new captured files; the bridge's owner/group and no-follow checks are unchanged.
+
+The S3 permissions test failed against the prior writer and passes after the
+change. Both private-writer tests, all seven S3 tests, nine capability-inventory
+tests and the offline runner tests pass locally. Private-writer and S3 tests are
+now required by the phone acceptance runner. Actual macOS attachment conformance
+remains unverified until CI passes; no live migration receipt is claimed.
