@@ -382,7 +382,13 @@ impl PhoneService {
             }
             _ => return Err(Error::InvalidArguments),
         };
-        serde_json::to_value(call).map_err(|_| Error::InvalidArguments)
+        let mut receipt = serde_json::to_value(&call).map_err(|_| Error::InvalidArguments)?;
+        if name == "phone_status" {
+            receipt["maintenance"] = serde_json::to_value(
+                self.store.phone_maintenance_status(&grant.owner_id, &call.id)?
+            ).map_err(|_| Error::InvalidArguments)?;
+        }
+        Ok(receipt)
     }
     async fn dial(&self, call: &PhoneCall, twiml: String) -> Result<(), Error> {
         // Removal can race an in-flight create. Check before send, and again

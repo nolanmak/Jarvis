@@ -233,3 +233,25 @@ The normal watchdog handles these reads; disabled-start cleanup can reconcile
 calls it is retiring, but does not start solely to refresh old accounting.
 
 Provider field semantics: [Twilio Call resource](https://www.twilio.com/docs/voice/api/call-resource).
+
+## Inspecting stalled maintenance
+
+The owner-authorized `phone_status` tool returns a `maintenance` object with
+`provider_sid_known`, `cleanup_attempts`, `usage_attempts`, and
+`final_usage_recorded`. This is a read-only snapshot: asking for status neither
+retries provider requests nor resets durable retry limits. It contains no phone
+number or verification code. The ordinary `phone status` command still provides
+the short lifecycle summary; ask the agent for detailed call status to inspect
+maintenance evidence.
+
+Attempt counters count reserved attempts, including a request still in flight.
+Three means no further automatic attempts remain, not that the last attempt has
+finished. For a nonterminal call with cleanup exhausted, investigate the call in
+the provider console and terminate it there if necessary; allow signed callbacks
+to reconcile local state. If the provider SID is unknown after an uncertain
+create, do not infer that the call never existed and do not clear the active slot
+to redial. Investigate provider request/callback evidence first. Terminal calls
+without final usage retain conservative budget accounting even after usage
+retries are exhausted. Manual unknown-SID resolution and retry-reset tooling
+remain incomplete; these status fields expose the condition without inventing a
+successful recovery.

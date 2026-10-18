@@ -1158,3 +1158,15 @@ over-budget and parent-death regressions remain the required macOS proof.
 Separately, the offline run at `fe4de3df` completed all 587 tests across 41 suites
 on Linux. That receipt predates these matcher fixes and is not current-head or
 live qualification.
+
+### Observable maintenance retries
+
+The owner-only status tool now exposes persisted cleanup/usage attempt counters,
+whether a provider SID is known, and whether final usage was recorded. A failing
+service regression first observed the missing status fields; all 24 service
+tests pass after implementation. The expanded regression also verifies counters
+survive reopening the database, another owner cannot inspect them, finalized
+usage changes the snapshot, and status causes no provider calls or hangups.
+This adds observability; operator retry/reset and unknown-SID resolution remain
+open requirements. Counters include in-flight reservations and do not claim that
+the last attempt has finished.

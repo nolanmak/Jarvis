@@ -371,6 +371,21 @@ impl Store {
             Ok(call)
         })
     }
+    /// Read-only operational evidence. Attempts count reservations, including
+    /// any request still in flight; they do not assert provider completion.
+    pub fn phone_maintenance_status(&self, owner: &str, id: &str) -> PhoneResult<PhoneMaintenanceStatus> {
+        transaction(self, |tx| {
+            let call = call_by_id(tx, id)?;
+            if call.owner != owner { return Err(PhoneError::NotFound); }
+            let (cleanup_attempts, usage_attempts, final_usage_recorded) = tx.query_row(
+                "SELECT COALESCE((SELECT attempts FROM phone_cleanup WHERE call_id=?1),0),
+                 COALESCE((SELECT attempts FROM phone_usage_reconciliation WHERE call_id=?1),0),
+                 EXISTS(SELECT 1 FROM phone_call_usage WHERE call_id=?1)",
+                [id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            Ok(PhoneMaintenanceStatus { provider_sid_known: call.provider_sid.is_some(),
+                cleanup_attempts, usage_attempts, final_usage_recorded })
+        })
+    }
     /// For the provider adapter only; never serialize this into a tool receipt.
     pub fn phone_dial_destination(&self, id: &str) -> PhoneResult<PhoneDestination> {
         self.with_conn(|c| {
@@ -823,4 +838,13 @@ impl Store {
     pub fn phone_latest_call(&self, owner: &str) -> PhoneResult<Option<PhoneCall>> {
         Ok(self.with_conn(|c|c.query_row(&format!("SELECT {CALL_COLUMNS} FROM phone_calls WHERE owner=?1 ORDER BY created_ms DESC,id DESC LIMIT 1"),[owner],read_call).optional())?)
     }
+}
+
+/// Contains no destination, provider SID, transcript or verification material.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PhoneMaintenanceStatus {
+    pub provider_sid_known: bool,
+    pub cleanup_attempts: i64,
+    pub usage_attempts: i64,
+    pub final_usage_recorded: bool,
 }
