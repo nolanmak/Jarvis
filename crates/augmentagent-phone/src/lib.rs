@@ -148,7 +148,7 @@ pub struct Grant {
     owner_id: String,
     conversation: SurfaceConversationRef,
     expires_ms: i64,
-    binding_confirmed_ms: i64,
+    binding_revision: i64,
 }
 pub struct PhoneService {
     store: Arc<Store>,
@@ -203,7 +203,7 @@ impl PhoneService {
             owner_id: link.owner_id.clone(),
             conversation: conversation.clone(),
             expires_ms: self.clock.now_ms() + 300_000,
-            binding_confirmed_ms: binding.confirmed_at_ms,
+            binding_revision: binding.revision,
         })
     }
     fn check(&self, grant: &Grant, private: bool) -> Result<(), Error> {
@@ -211,9 +211,7 @@ impl PhoneService {
             return Err(Error::Expired);
         }
         let fresh = self.authorize(&grant.surface_owner, &grant.conversation)?;
-        if fresh.owner_id != grant.owner_id
-            || fresh.binding_confirmed_ms != grant.binding_confirmed_ms
-        {
+        if fresh.owner_id != grant.owner_id || fresh.binding_revision != grant.binding_revision {
             return Err(Error::Unauthorized);
         }
         if private {
@@ -277,6 +275,7 @@ impl PhoneService {
                             owner: grant.surface_owner.clone(),
                             conversation: grant.conversation.clone(),
                         },
+                        grant.binding_revision,
                     )?;
                     self.dial(&reserved.call, twiml).await?;
                 }
@@ -507,7 +506,10 @@ impl PhoneService {
     pub(crate) fn authorize_call_origin(&self, call: &PhoneCall) -> Result<Grant, Error> {
         let origin = self.store.phone_origin(&call.id)?;
         let grant = self.authorize(&origin.owner, &origin.conversation)?;
-        if grant.owner_id != call.owner || grant.conversation.storage_key() != call.conversation {
+        if grant.owner_id != call.owner
+            || grant.conversation.storage_key() != call.conversation
+            || self.store.phone_origin_revision(&call.id)? != grant.binding_revision
+        {
             return Err(Error::Unauthorized);
         }
         Ok(grant)

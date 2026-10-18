@@ -43,3 +43,8 @@ CREATE TABLE IF NOT EXISTS phone_origins (
     call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
     origin_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS phone_origin_authority (
+    call_id TEXT PRIMARY KEY REFERENCES phone_origins(call_id),
+    revision INTEGER NOT NULL CHECK(revision > 0)
+);

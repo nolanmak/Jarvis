@@ -71,6 +71,30 @@ pub(crate) fn migrate(conn: &Connection) -> StoreResult<()> {
         CREATE INDEX IF NOT EXISTS idx_surface_auth_rejections_account
         ON surface_auth_rejections(platform, account_id, id);"#,
     )?;
+    // Retain revisions across unbinding. Wall-clock timestamps can repeat or
+    // move backwards and cannot identify an authorization generation.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS surface_authority_revisions (
+            platform TEXT NOT NULL, account_id TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            PRIMARY KEY(platform, account_id)
+        );
+        INSERT OR IGNORE INTO surface_authority_revisions(platform,account_id,revision)
+            SELECT platform,account_id,1 FROM surface_owner_bindings;",
+    )?;
+    for table in ["surface_owner_bindings", "surface_control_conversations"] {
+        for event in ["INSERT", "UPDATE", "DELETE"] {
+            let row = if event == "DELETE" { "OLD" } else { "NEW" };
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER IF NOT EXISTS {table}_authority_{event}
+                 AFTER {event} ON {table} BEGIN
+                 INSERT INTO surface_authority_revisions(platform,account_id,revision)
+                 VALUES({row}.platform,{row}.account_id,1)
+                 ON CONFLICT(platform,account_id) DO UPDATE SET revision=revision+1;
+                 END;"
+            ))?;
+        }
+    }
     Ok(())
 }
 
@@ -114,6 +138,8 @@ pub struct ControlConversation {
 pub struct SurfaceOwnerBinding {
     pub owner: SurfaceOwnerRef,
     pub confirmed_at_ms: i64,
+    /// Durable authorization generation, retained across unbinding.
+    pub revision: i64,
     /// Ordered `direct` first, then `channel`.
     pub control: Vec<ControlConversation>,
 }
@@ -245,9 +271,15 @@ fn load_binding(
             added_at_ms,
         });
     }
+    let revision = conn.query_row(
+        "SELECT revision FROM surface_authority_revisions WHERE platform=?1 AND account_id=?2",
+        params![platform, account_id],
+        |r| r.get(0),
+    )?;
     Ok(Some(SurfaceOwnerBinding {
         owner,
         confirmed_at_ms,
+        revision,
         control,
     }))
 }

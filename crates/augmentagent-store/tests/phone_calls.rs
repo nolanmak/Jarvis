@@ -398,13 +398,40 @@ fn origin_is_bound_to_the_call_and_survives_restart() {
         .phone_reserve_call(request("r1", &chat.storage_key(), 100))
         .unwrap()
         .call;
-    store.phone_register_origin(&call.id, &origin).unwrap();
-    store.phone_register_origin(&call.id, &origin).unwrap();
+    store.bind_surface_owner(&origin.owner, 0).unwrap();
+    let revision = store
+        .surface_owner_binding(origin.owner.account())
+        .unwrap()
+        .unwrap()
+        .revision;
+    store
+        .phone_register_origin(&call.id, &origin, revision)
+        .unwrap();
+    store
+        .phone_register_origin(&call.id, &origin, revision)
+        .unwrap();
     let mut other = origin.clone();
     other.conversation =
         SurfaceConversationRef::new(other.owner.account().clone(), "elsewhere", None).unwrap();
-    assert!(store.phone_register_origin(&call.id, &other).is_err());
+    assert!(store
+        .phone_register_origin(&call.id, &other, revision)
+        .is_err());
     drop(store);
     let reopened = Store::open(dir.path().join("phone.db")).unwrap();
     assert_eq!(reopened.phone_origin(&call.id).unwrap(), origin);
+    assert_eq!(reopened.phone_origin_revision(&call.id).unwrap(), revision);
+    reopened.bind_surface_owner(&origin.owner, 0).unwrap();
+    let fresh_revision = reopened
+        .surface_owner_binding(origin.owner.account())
+        .unwrap()
+        .unwrap()
+        .revision;
+    assert!(fresh_revision > revision);
+    assert!(reopened
+        .phone_register_origin(&call.id, &origin, revision)
+        .is_err());
+    assert!(reopened
+        .phone_register_origin(&call.id, &origin, fresh_revision)
+        .is_err());
+    assert_eq!(reopened.phone_origin_revision(&call.id).unwrap(), revision);
 }

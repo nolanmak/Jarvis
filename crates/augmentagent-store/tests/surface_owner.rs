@@ -385,3 +385,44 @@ fn migration_is_idempotent_on_an_existing_database() {
         assert!(store.surface_owner_binding(&acct).unwrap().is_some());
     }
 }
+
+#[test]
+fn authority_revision_survives_unbind_restart_and_control_restore_at_same_time() {
+    let (dir, store) = temp_store();
+    let account = slack_account();
+    let owner = owner(&account, "owner");
+    let chat = conv(&account, "dm");
+    let revision = |store: &Store| {
+        store
+            .surface_owner_binding(&account)
+            .unwrap()
+            .unwrap()
+            .revision
+    };
+    store.bind_surface_owner(&owner, T0).unwrap();
+    let first = revision(&store);
+    store
+        .set_surface_control_conversation(&chat, ControlConversationKind::Direct, T0)
+        .unwrap();
+    let second = revision(&store);
+    assert!(second > first);
+    store.remove_surface_control_conversation(&chat).unwrap();
+    store
+        .set_surface_control_conversation(&chat, ControlConversationKind::Direct, T0)
+        .unwrap();
+    let third = revision(&store);
+    assert!(third > second);
+    store.unbind_surface_owner(&account).unwrap();
+    drop(store);
+    let reopened = Store::open(dir.path().join("data.db")).unwrap();
+    reopened.bind_surface_owner(&owner, T0).unwrap();
+    assert!(revision(&reopened) > third);
+    let fourth = revision(&reopened);
+    drop(reopened);
+    let reopened = Store::open(dir.path().join("data.db")).unwrap();
+    assert_eq!(
+        revision(&reopened),
+        fourth,
+        "migration must preserve existing revisions"
+    );
+}

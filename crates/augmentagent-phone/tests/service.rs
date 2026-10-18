@@ -851,3 +851,59 @@ async fn ac04_revoked_owner_cannot_start_or_accept_but_terminal_status_still_rec
         assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
     }
 }
+
+#[tokio::test]
+async fn ac04_same_timestamp_rebind_invalidates_existing_call_and_grant() {
+    use augmentagent_store::phone::CallState;
+    for connected in [false, true] {
+        let f = fixture("discord", true, true, false);
+        let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
+        let call = f
+            .service
+            .tool(&grant, "call_owner", json!({"request_id":"old"}))
+            .await
+            .unwrap();
+        let id = call["id"].as_str().unwrap();
+        f.store
+            .phone_provider_event(id, "CA-test", CallState::AwaitingAcceptance, 100)
+            .unwrap();
+        if connected {
+            f.store.phone_accept(id, "CA-test", 101).unwrap();
+        }
+        f.store.unbind_surface_owner(f.owner.account()).unwrap();
+        f.store.bind_surface_owner(&f.owner, 0).unwrap();
+        f.store
+            .set_surface_control_conversation(&f.conversation, ControlConversationKind::Direct, 0)
+            .unwrap();
+        assert!(
+            f.service
+                .tool(&grant, "phone_status", json!({"call_id":id}))
+                .await
+                .is_err(),
+            "old grants must not revive at the same timestamp"
+        );
+        assert!(f.service.authorize(&f.owner, &f.conversation).is_ok());
+        if connected {
+            assert!(f.service.authorize_call(id).is_err());
+        } else {
+            let auth = augmentagent_phone::webhook::WebhookAuth::new("AC-test", "callback-secret");
+            let fields = vec![
+                ("AccountSid".into(), "AC-test".into()),
+                ("CallSid".into(), "CA-test".into()),
+                ("Digits".into(), "1".into()),
+            ];
+            let sig = signed(
+                "callback-secret",
+                &format!("https://phone.example.test/phone/accept/{id}"),
+                &fields,
+            );
+            assert_eq!(
+                f.service
+                    .accept_callback(&auth, id, &fields, &sig)
+                    .await
+                    .unwrap(),
+                "<Response><Hangup/></Response>"
+            );
+        }
+    }
+}

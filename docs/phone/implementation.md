@@ -285,5 +285,32 @@ terminal status still records the outcome. Test-first evidence:
 `/tmp/1496-revoked-callback-red.log` reproduced acceptance after unbinding;
 `/tmp/1496-revoked-callback-green.log` passes all 15 service tests, including
 revocation before start and between start/accept. This does not yet prove
-same-owner rebind invalidation: persisting the original binding revision remains
-required.
+same-owner rebind invalidation; the subsequent revision checkpoint below addresses
+that gap.
+
+
+### Durable authorization revision
+
+Phone grants and call origins now use a durable per-account revision instead of
+`confirmed_at_ms`. The revision survives owner removal and advances on owner or
+control-conversation changes, including changes with the same timestamp.
+Origin registration checks the grant revision in its write transaction and
+persists an immutable snapshot. Start/accept callbacks and native phone-turn
+authorization compare that snapshot with current authority. Calls lacking a
+snapshot fail authorization rather than inheriting a fresh binding.
+
+`/tmp/1496-binding-revision-red.log` reproduces a grant reviving after a same-time
+unbind/rebind. The service regression now passes for both acceptance and
+connected-call authorization. `/tmp/1496-binding-revision-store.log` passes all
+11 call-store and 15 owner-store tests, including restart, control-chat restore,
+immutable snapshots and migration preserving existing revisions. The offline
+runner now requires the owner-store regression suite as well. Live callback and
+streaming revocation qualification remain outstanding.
+
+The expanded Linux offline run passes 21 suites / 158 tests; receipt:
+`/tmp/1496-binding-revision-offline/receipt.json` (worktree dirty at execution).
+Phone-library strict clippy passes in
+`/tmp/1496-binding-revision-phone-clippy.log`. Including the store library in
+strict clippy reports eight existing findings in unchanged `store.rs` (type
+complexity, argument counts and doc-list indentation); see
+`/tmp/1496-binding-revision-clippy.log`. No live provider calls were made.

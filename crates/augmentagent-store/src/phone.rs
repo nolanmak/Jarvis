@@ -621,7 +621,12 @@ pub struct PhoneOrigin {
     pub conversation: crate::SurfaceConversationRef,
 }
 impl Store {
-    pub fn phone_register_origin(&self, id: &str, origin: &PhoneOrigin) -> PhoneResult<()> {
+    pub fn phone_register_origin(
+        &self,
+        id: &str,
+        origin: &PhoneOrigin,
+        revision: i64,
+    ) -> PhoneResult<()> {
         if origin.owner.account() != origin.conversation.account() {
             return Err(PhoneError::Conflict);
         }
@@ -629,6 +634,25 @@ impl Store {
         transaction(self, |tx| {
             let call = call_by_id(tx, id)?;
             if call.conversation != origin.conversation.storage_key() {
+                return Err(PhoneError::Conflict);
+            }
+            let current: Option<i64> = tx.query_row(
+                "SELECT r.revision FROM surface_authority_revisions r JOIN surface_owner_bindings b
+                 USING(platform,account_id) WHERE r.platform=?1 AND r.account_id=?2 AND b.owner_sender_id=?3",
+                params![origin.owner.account().platform().as_str(), origin.owner.account().account_id(), origin.owner.sender_id()],
+                |r| r.get(0),
+            ).optional()?;
+            if current != Some(revision) {
+                return Err(PhoneError::Conflict);
+            }
+            let saved: Option<i64> = tx
+                .query_row(
+                    "SELECT revision FROM phone_origin_authority WHERE call_id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if saved.is_some_and(|old| old != revision) {
                 return Err(PhoneError::Conflict);
             }
             let existing: Option<String> = tx
@@ -645,8 +669,22 @@ impl Store {
                 "INSERT OR IGNORE INTO phone_origins(call_id,origin_json) VALUES(?1,?2)",
                 params![id, json],
             )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO phone_origin_authority(call_id,revision) VALUES(?1,?2)",
+                params![id, revision],
+            )?;
             Ok(())
         })
+    }
+    pub fn phone_origin_revision(&self, id: &str) -> PhoneResult<i64> {
+        self.with_conn(|c| {
+            c.query_row(
+                "SELECT revision FROM phone_origin_authority WHERE call_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+        })
+        .map_err(PhoneError::from)
     }
     pub fn phone_origin(&self, id: &str) -> PhoneResult<PhoneOrigin> {
         let json: Option<String> = self.with_conn(|c| {
