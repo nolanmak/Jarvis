@@ -11,11 +11,11 @@ pub struct TwilioClient {
     http: reqwest::Client,
     account: String,
     token: String,
-    from: String,
+    from: Option<String>,
     base: String,
 }
 impl TwilioClient {
-    pub fn new(account: &str, token: &str, from: &str) -> Result<Self, Error> {
+    fn validate_credentials(account: &str, token: &str) -> Result<(), Error> {
         if account.len() != 34
             || !account.starts_with("AC")
             || !account[2..].bytes().all(|b| b.is_ascii_hexdigit())
@@ -23,12 +23,24 @@ impl TwilioClient {
         {
             return Err(Error::NotConfigured);
         }
+        Ok(())
+    }
+    pub fn new(account: &str, token: &str, from: &str) -> Result<Self, Error> {
+        Self::validate_credentials(account, token)?;
         Self::with_base(account, token, from, "https://api.twilio.com")
+    }
+    /// Stop-only transport: no caller number, ingress or dialing capability.
+    pub fn for_cleanup(account: &str, token: &str) -> Result<Self, Error> {
+        Self::validate_credentials(account, token)?;
+        Self::build(account, token, None, "https://api.twilio.com")
     }
     // Test endpoint injection stays private: production cannot forward credentials
     // to model-provided URLs or follow a redirect to another origin.
     fn with_base(account: &str, token: &str, from: &str, base: &str) -> Result<Self, Error> {
         augmentagent_store::phone::validate_e164(from).map_err(|_| Error::NotConfigured)?;
+        Self::build(account, token, Some(from), base)
+    }
+    fn build(account: &str, token: &str, from: Option<&str>, base: &str) -> Result<Self, Error> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(15))
@@ -39,7 +51,7 @@ impl TwilioClient {
             http,
             account: account.into(),
             token: token.into(),
-            from: from.into(),
+            from: from.map(str::to_owned),
             base: base.into(),
         })
     }
@@ -50,10 +62,11 @@ impl TwilioClient {
 #[async_trait]
 impl Telephony for TwilioClient {
     async fn create(&self, request: DialRequest) -> Result<String, ProviderError> {
+        let from = self.from.as_deref().ok_or(ProviderError::Rejected)?;
         let duration = request.max_duration_seconds.to_string();
         let form = vec![
             ("To", request.destination.expose()),
-            ("From", &self.from),
+            ("From", from),
             ("Twiml", &request.twiml),
             ("StatusCallback", &request.status_callback),
             ("StatusCallbackMethod", "POST"),
@@ -224,6 +237,17 @@ mod tests {
             status_callback: "https://phone.example.test/phone/status/id".into(),
             max_duration_seconds: 900,
         }
+    }
+    #[tokio::test]
+    async fn cleanup_client_requires_only_credentials_and_cannot_dial() {
+        let client =
+            TwilioClient::for_cleanup("AC00000000000000000000000000000000", "test-token").unwrap();
+        assert!(matches!(
+            client.create(request()).await,
+            Err(ProviderError::Rejected)
+        ));
+        assert!(TwilioClient::for_cleanup("invalid", "test-token").is_err());
+        assert!(TwilioClient::for_cleanup("AC00000000000000000000000000000000", "").is_err());
     }
     #[tokio::test]
     async fn create_sends_bounded_call_no_recording_and_callbacks_without_retry() {

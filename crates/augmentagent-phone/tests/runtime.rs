@@ -293,3 +293,42 @@ async fn ac09_shutdown_reports_pending_cleanup_before_daemon_drain_expires() {
         .await
         .is_err());
 }
+
+#[tokio::test]
+async fn ac12_disabled_runtime_cleans_existing_calls_without_ingress_or_dialing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(dir.path().join("db")).unwrap());
+    store
+        .phone_import_destination("owner", "+12025550123", 0)
+        .unwrap();
+    let call = store
+        .phone_reserve_call(augmentagent_store::phone::ReserveCall {
+            owner: "owner",
+            request_id: "old",
+            conversation: "chat",
+            now_ms: 1,
+        })
+        .unwrap()
+        .call;
+    store
+        .phone_provider_event(&call.id, "CA-1", CallState::Ringing, 2)
+        .unwrap();
+    let provider = Arc::new(Provider::default());
+    provider.release.notify_one();
+    augmentagent_phone::runtime::cleanup_without_runtime(store.clone(), provider.clone())
+        .await
+        .unwrap();
+    let stopped = store.phone_provider_call(&call.id).unwrap();
+    assert!(stopped.stop_requested);
+    assert!(stopped.state.terminal());
+    assert_eq!(*provider.starts.lock().unwrap(), 0);
+    assert_eq!(*provider.stops.lock().unwrap(), vec!["CA-1"]);
+    augmentagent_phone::runtime::cleanup_without_runtime(store.clone(), provider.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        provider.stops.lock().unwrap().len(),
+        1,
+        "restart must not redial or repeat terminal cleanup"
+    );
+}

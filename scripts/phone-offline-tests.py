@@ -16,12 +16,12 @@ ROOT = Path(__file__).resolve().parents[1]
 # Each invocation must run exactly one target, with no name filters. Minimum
 # counts prevent silent deletion of the current required coverage.
 SUITES = [
-    ("augmentagent-phone", "--lib", None, 8),
+    ("augmentagent-phone", "--lib", None, 9),
     ("augmentagent-phone", "--test", "relay", 3),
     ("augmentagent-phone", "--test", "service", 21),
     ("augmentagent-phone", "--test", "mcp", 2),
     ("augmentagent-phone", "--test", "config", 1),
-    ("augmentagent-phone", "--test", "runtime", 2),
+    ("augmentagent-phone", "--test", "runtime", 3),
     ("augmentagent-store", "--test", "phone_calls", 15),
     ("augmentagent-store", "--test", "surface_owner", 18),
     ("augmentagent-store", "--test", "surface_delivery", 36),
@@ -72,7 +72,7 @@ def main():
     # These required CLI modules share a binary with unrelated, environment-
     # dependent tests. Only unrelated tests may be filtered; zero/ignored cases
     # or fewer than the required number still fail.
-    for module, minimum in [("notify_tests::", 17), ("phone_runtime::tests::", 2), ("surface_conformance_tests::", 2), ("discord_voice_session_tests::", 6), ("discord_phone_session_tests::", 1), ("whatsapp_phone_session_tests::", 1), ("whatsapp_phone::tests::", 3), ("discord_phone::tests::", 2), ("discord_phone::installation_tests::", 1)]:
+    for module, minimum in [("notify_tests::", 17), ("phone_runtime::tests::", 3), ("surface_conformance_tests::", 2), ("discord_voice_session_tests::", 6), ("discord_phone_session_tests::", 1), ("whatsapp_phone_session_tests::", 1), ("whatsapp_phone::tests::", 3), ("discord_phone::tests::", 2), ("discord_phone::installation_tests::", 1)]:
         jobs.append(("augmentagent-cli-" + module.rstrip(":").replace("::", "-"),
                      ["cargo", "test", "--locked", "-p", "augmentagent-cli", "--bin", "augmentagent", module, "--", "--test-threads=1"], minimum, True))
     # This library also contains explicitly ignored live-provider qualification

@@ -1020,3 +1020,19 @@ integration tests pass (`/tmp/1496-drain-green.log`); the failing baseline is
 `/tmp/1496-drain-red.log`. This proves bounded local shutdown reporting, not
 provider-side hangup when the provider is unreachable. Disable-at-start cleanup
 and the live graceful-stop receipt remain outstanding.
+
+### Disabled or unavailable startup cleanup
+
+The daemon now schedules cleanup when normal phone startup returns no endpoint,
+including disabled configuration, missing wiki configuration and startup errors.
+Stop intent is persisted before provider configuration is read; missing SIDs are
+marked uncertain. The stop-only Twilio client needs account credentials but no
+caller number, verification key, owner links or public ingress. Its create method
+rejects locally. Cleanup reuses the shared watchdog, persisted retry limits and
+bounded drain without constructing agent tools or a listener. Missing credentials
+or failed cleanup produce a generic notice while unrelated daemon tasks continue.
+
+The runtime regression verifies cleanup, no dialing and idempotent restart. The
+transport regression verifies credential validation and local dial rejection.
+The daemon regression covers dry-run nonmutation, missing credentials and durable
+uncertain-call stop requests. Full live disable/restart receipts are still absent.

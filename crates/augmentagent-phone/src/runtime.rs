@@ -107,6 +107,47 @@ impl Drop for PhoneRuntime {
         self.stop.cancel();
     }
 }
+/// Persist stop intent before reading provider configuration. Missing credentials
+/// must not leave calls eligible to resume on a later startup.
+pub fn mark_cleanup_pending(store: &augmentagent_store::Store) -> Result<bool, RuntimeError> {
+    let calls = store.phone_active_calls().map_err(Error::from)?;
+    for call in &calls {
+        store
+            .phone_request_stop(&call.owner, &call.id)
+            .map_err(Error::from)?;
+        if call.provider_sid.is_none() {
+            store.phone_mark_uncertain(&call.id).map_err(Error::from)?;
+        }
+    }
+    Ok(!calls.is_empty())
+}
+
+/// Retire persisted calls when normal phone startup is disabled or unavailable.
+/// No listener, agent adapter, owner grant or tool socket is constructed.
+pub async fn cleanup_without_runtime(
+    store: Arc<augmentagent_store::Store>,
+    provider: Arc<dyn crate::Telephony>,
+) -> Result<(), RuntimeError> {
+    if !mark_cleanup_pending(&store)? {
+        return Ok(());
+    }
+    let service = Arc::new(PhoneService::new(
+        store,
+        provider,
+        Arc::new(crate::SystemClock),
+        crate::PhoneConfig {
+            enabled: false,
+            public_base: String::new(),
+            verification_key: Vec::new(),
+            links: Vec::new(),
+        },
+    ));
+    let initial = service.cleanup_due(true)?;
+    let stop = CancellationToken::new();
+    stop.cancel();
+    watchdog(service, initial, stop).await
+}
+
 fn spawn_cleanup(
     service: &Arc<PhoneService>,
     calls: Vec<CleanupCall>,

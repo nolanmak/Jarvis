@@ -137,9 +137,15 @@ propagating them into unrelated text/approval runners. All phone tasks share one
 20-second process drain budget. A compile-time assertion preserves that ordering.
 Pending records and provider-side caps remain the recovery mechanism. A full graceful-stop qualification is still required.
 
-Disable-at-start handling still needs daemon integration: turning the flag off
-must reconcile existing calls while leaving text and approvals usable. Do not
-claim the configuration parser's `None` result alone performs that cleanup.
+When normal phone startup is disabled or unavailable (including missing wiki
+configuration or a listener/configuration error), the daemon marks persisted
+active calls for cleanup and runs a bounded stop-only worker. This path requires
+only `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN`; it does not open ingress or a
+tool socket, require a caller number or verification key, or enable dialing.
+Missing credentials leave stop requests durable and emit a configuration notice;
+unknown call SIDs remain uncertain. Text and approvals remain available. Dry run
+performs neither cleanup mutations nor provider requests. Live disable/restart
+qualification is still required.
 
 ## Offline validation
 

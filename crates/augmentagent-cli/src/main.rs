@@ -3514,6 +3514,12 @@ async fn main() -> Result<()> {
             } else { None };
 
 
+            if phone.is_none() {
+                if let Some(cleanup) = phone_runtime::cleanup_when_unavailable(store.clone(), dry_run) {
+                    tasks.push(cleanup);
+                }
+            }
+
             let pending_discord = discord_phone_pending.lock().ok().and_then(|mut pending| pending.take());
             let _discord_phone_registration = match (phone.as_ref(), pending_discord) {
                 (Some(endpoint), Some(connection)) => match discord_phone::install(endpoint, connection, store.clone(), shutdown.clone()) {

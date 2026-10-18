@@ -53,6 +53,41 @@ pub async fn start(
     });
     Ok(Some((endpoint, runtime)))
 }
+/// Cleanup remains available when normal phone startup is disabled or fails.
+pub fn cleanup_when_unavailable(
+    store: Arc<Store>,
+    dry_run: bool,
+) -> Option<tokio::task::JoinHandle<Result<()>>> {
+    cleanup_with_lookup(store, dry_run, |key| std::env::var(key).ok())
+}
+fn cleanup_with_lookup(
+    store: Arc<Store>,
+    dry_run: bool,
+    get: impl Fn(&str) -> Option<String>,
+) -> Option<tokio::task::JoinHandle<Result<()>>> {
+    if dry_run { return None; }
+    match augmentagent_phone::runtime::mark_cleanup_pending(&store) {
+        Ok(false) => return None,
+        Ok(true) => {},
+        Err(_) => {
+            tracing::warn!("phone cleanup could not persist stop requests; inspect phone storage");
+            return None;
+        }
+    }
+    let provider = get("TWILIO_ACCOUNT_SID").zip(get("TWILIO_AUTH_TOKEN"))
+        .and_then(|(account, token)| augmentagent_phone::twilio::TwilioClient::for_cleanup(&account, &token).ok());
+    let Some(provider) = provider else {
+        tracing::warn!("phone calls remain pending cleanup: restore Twilio account credentials; phone dialing remains disabled");
+        return None;
+    };
+    Some(tokio::spawn(async move {
+        if augmentagent_phone::runtime::cleanup_without_runtime(store, Arc::new(provider)).await.is_err() {
+            tracing::warn!("phone cleanup remains pending; inspect phone status; text service remains available");
+        }
+        Ok(())
+    }))
+}
+
 pub async fn supervise(runtime: PhoneRuntime, shutdown: CancellationToken) -> Result<()> {
     let unexpected = loop {
         tokio::select! {
@@ -112,6 +147,25 @@ pub fn attach_slack(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unavailable_phone_marks_uncertain_calls_even_without_credentials_but_dry_run_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("db")).unwrap());
+        store.phone_import_destination("owner", "+12025550123", 0).unwrap();
+        let call = store.phone_reserve_call(augmentagent_store::phone::ReserveCall {
+            owner: "owner", request_id: "pending", conversation: "chat", now_ms: 1,
+        }).unwrap().call;
+        assert!(cleanup_with_lookup(store.clone(), true, |_| panic!("dry run must not read credentials")).is_none());
+        assert!(!store.phone_provider_call(&call.id).unwrap().stop_requested);
+        assert!(cleanup_with_lookup(store.clone(), false, |_| None).is_none());
+        let pending = store.phone_provider_call(&call.id).unwrap();
+        assert!(pending.stop_requested);
+        assert_eq!(pending.state, augmentagent_store::phone::CallState::Uncertain);
+        drop(store);
+        let reopened = Store::open(dir.path().join("db")).unwrap();
+        assert!(reopened.phone_provider_call(&call.id).unwrap().stop_requested);
+    }
+
     use augmentagent_channel_core::{
         providers::ProviderKind, surface_conformance::RecordingNativeProvider, Reasoner,
     };
