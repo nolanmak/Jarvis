@@ -15,6 +15,10 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+/// Fits inside the daemon's shared stop budget, including task teardown.
+pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(18);
+const CLEANUP_BUDGET: Duration = Duration::from_secs(16);
+
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
     #[error(transparent)]
@@ -78,8 +82,9 @@ impl PhoneRuntime {
         self.service.stopping.store(true, Ordering::SeqCst);
         self.stop.cancel();
         let mut failed = false;
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_BUDGET;
         for mut task in self.tasks.drain(..) {
-            match tokio::time::timeout(Duration::from_secs(40), &mut task).await {
+            match tokio::time::timeout_at(deadline, &mut task).await {
                 Ok(Ok(Ok(()))) => {}
                 Ok(_) => failed = true,
                 Err(_) => {
@@ -137,7 +142,7 @@ async fn watchdog(
                 if let Some(at)=shutdown_at {
                     let active=service.store.phone_active_calls().map_err(Error::from)?;
                     if active.is_empty() && jobs.is_empty(){break;}
-                    if at.elapsed()>=Duration::from_secs(35){
+                    if at.elapsed()>=CLEANUP_BUDGET{
                         // Durable pending cleanup remains observable and will
                         // reconcile on restart; do not claim successful hangup.
                         failure=true;break;

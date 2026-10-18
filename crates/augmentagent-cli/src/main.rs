@@ -2807,6 +2807,7 @@ enum RatelimitOp {
 /// #1071 — how long a stop waits for cancelled runners to unwind. Kept well under
 /// systemd's `TimeoutStopSec` so the drain always ends before SIGKILL does.
 const DRAIN_BUDGET: Duration = Duration::from_secs(20);
+const _: () = assert!(augmentagent_phone::runtime::SHUTDOWN_BUDGET.as_secs() < DRAIN_BUDGET.as_secs());
 
 /// Join the daemon's tasks, bounding only the stop (#1071). Until `shutdown` fires the join is
 /// unbounded — the runners are the daemon's lifetime, and a runner error still ends it. Once

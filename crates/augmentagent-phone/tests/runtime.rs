@@ -220,3 +220,76 @@ async fn ac09_slow_cleanup_does_not_delay_other_deadlines_or_repeat_inflight_att
     assert_eq!(*provider.starts.lock().unwrap(), 2);
     assert!(store.phone_active_calls().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn ac09_shutdown_reports_pending_cleanup_before_daemon_drain_expires() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(dir.path().join("db")).unwrap());
+    let account = SurfaceAccountRef::new(SurfacePlatform::new("slack").unwrap(), "team").unwrap();
+    let owner = SurfaceOwnerRef::new(account.clone(), "owner").unwrap();
+    let chat = SurfaceConversationRef::new(account, "D-owner", None).unwrap();
+    store.bind_surface_owner(&owner, 0).unwrap();
+    store
+        .set_surface_control_conversation(&chat, ControlConversationKind::Direct, 0)
+        .unwrap();
+    store
+        .phone_import_destination("owner", "+12025550123", 0)
+        .unwrap();
+    let provider = Arc::new(Provider::default());
+    let service = Arc::new(PhoneService::new(
+        store.clone(),
+        provider.clone(),
+        Arc::new(Time(AtomicI64::new(100))),
+        PhoneConfig::new(
+            true,
+            "https://phone.example.test",
+            "runtime-test-verification-secret-32",
+            vec![OwnerLink {
+                surface_owner: owner.clone(),
+                owner_id: "owner".into(),
+            }],
+        )
+        .unwrap(),
+    ));
+    let runtime = PhoneRuntime::start(
+        service.clone(),
+        Arc::new(WebhookAuth::new("AC-test", "token")),
+        Arc::new(Agent),
+        tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+    )
+    .await
+    .unwrap();
+    let grant = service.authorize(&owner, &chat).unwrap();
+    let call = service
+        .tool(
+            &grant,
+            "call_owner",
+            serde_json::json!({"request_id":"shutdown"}),
+        )
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(19), runtime.shutdown())
+        .await
+        .expect("phone cleanup must finish before the daemon's 20-second drain deadline");
+    assert!(
+        result.is_err(),
+        "unresolved provider hangup must be reported"
+    );
+    let pending = store
+        .phone_provider_call(call["id"].as_str().unwrap())
+        .unwrap();
+    assert!(pending.stop_requested);
+    assert!(
+        !pending.state.terminal(),
+        "shutdown must not invent a successful hangup"
+    );
+    assert!(!provider.stops.lock().unwrap().is_empty());
+    assert!(service
+        .tool(
+            &grant,
+            "call_owner",
+            serde_json::json!({"request_id":"after-stop"})
+        )
+        .await
+        .is_err());
+}

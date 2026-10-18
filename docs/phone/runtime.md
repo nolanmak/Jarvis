@@ -128,15 +128,14 @@ maximum duration remains the last bound if the daemon dies.
 
 `shutdown()` immediately rejects new starts, requests stops and drains cleanup.
 Dropping the handle initiates the same cancellation. Cleanup has a bounded
-35-second drain window; unresolved records remain durably pending and shutdown
+16-second drain window; unresolved records remain durably pending and shutdown
 reports failure, rather than claiming hangup succeeded. A missing provider SID
 remains uncertain and cannot be automatically redialed. Runtime task failure
 cancels the sibling listener/watchdog. `is_running()` supports daemon supervision;
 `shutdown()` provides the final task result. The daemon logs phone failures without
-propagating them into unrelated text/approval runners. Its existing shared
-20-second process drain budget can end before the standalone runtime’s
-35-second cleanup window; pending records and provider-side caps remain the
-recovery mechanism. A full graceful-stop qualification is still required.
+propagating them into unrelated text/approval runners. All phone tasks share one 18-second shutdown deadline, inside the daemon’s
+20-second process drain budget. A compile-time assertion preserves that ordering.
+Pending records and provider-side caps remain the recovery mechanism. A full graceful-stop qualification is still required.
 
 Disable-at-start handling still needs daemon integration: turning the flag off
 must reconcile existing calls while leaving text and approvals usable. Do not

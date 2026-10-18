@@ -1006,3 +1006,17 @@ Linux pidfd lifetime tracking and uses its own parent relationship on systems
 without pidfd support. A subprocess regression removes pidfd support and proves
 that parent exit terminates the bridge even while its input pipe stays open.
 These local checks do not replace the required macOS CI or live audio receipts.
+
+### Phone shutdown inside the daemon drain budget
+
+The phone watchdog now drains for at most 16 seconds, and all runtime tasks
+share one 18-second shutdown deadline. The daemon statically requires that
+deadline to remain below its 20-second process drain budget. This replaces the
+previous 35-second watchdog / per-task 40-second waits, which could be cut off
+by daemon exit before reporting failure. A stalled-provider regression first
+failed at the 19-second test deadline, then passed with an error result, a
+durable nonterminal stop request and rejection of new starts. Both runtime
+integration tests pass (`/tmp/1496-drain-green.log`); the failing baseline is
+`/tmp/1496-drain-red.log`. This proves bounded local shutdown reporting, not
+provider-side hangup when the provider is unreachable. Disable-at-start cleanup
+and the live graceful-stop receipt remain outstanding.

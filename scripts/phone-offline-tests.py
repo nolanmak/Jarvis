@@ -21,7 +21,7 @@ SUITES = [
     ("augmentagent-phone", "--test", "service", 21),
     ("augmentagent-phone", "--test", "mcp", 2),
     ("augmentagent-phone", "--test", "config", 1),
-    ("augmentagent-phone", "--test", "runtime", 1),
+    ("augmentagent-phone", "--test", "runtime", 2),
     ("augmentagent-store", "--test", "phone_calls", 15),
     ("augmentagent-store", "--test", "surface_owner", 18),
     ("augmentagent-store", "--test", "surface_delivery", 36),
