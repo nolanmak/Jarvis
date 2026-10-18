@@ -77,11 +77,11 @@ AUGMENTAGENT_GH_DISABLE=1 cargo test -p augmentagent-phone
 | AC04 | Signed/reordered callbacks, local ingress, immutable final duration and signed event-time accounting | Live callbacks and provider reconciliation receipts |
 | AC05 | Signed acceptance, fake-clock deadline tests and concurrent runtime watchdog | Voicemail and live acceptance timing |
 | AC06 | Installed Claude/Codex CLIs pass text → three PhoneAgent turns → text with fresh synthetic reads on Linux; shared queue and daemon fixtures | Production agent tool/approval conformance and live phone matrix |
-| AC07 | Relay/barge-in generations, final suppression, one-time claims, local WSS round trip and cancellation | Complete live streaming/interruption and tool-disconnect proof |
+| AC07 | Relay/barge-in generations, final suppression, one-time claims, local WSS round trip and cancellation | Live streaming/interruption and real native tool-disconnect qualification |
 | AC08 | Discord, Slack and WhatsApp daemon adapters; authenticated tools; durable transcript outboxes; 13 shared presets checked | [Entry-point audit](surfaces.md): local CLI phone adapter missing; custom constructors/wrappers and live origin receipts outstanding |
 | AC09 | Persistent budgets, provider-duration callbacks, bounded shutdown and disabled/unavailable-start cleanup | Live stop/restart/disable evidence and unknown-SID recovery; known-SID reconciliation available |
 | AC10 | Recorded-audio receipt validator and synthetic regression tests only | Actual consented audio, native traces and full live matrix; no live receipt exists |
-| AC11 | No legacy voice removed yet | Replacement qualification, upgrade/rollback fixtures and retirement |
+| AC11 | No legacy voice removed yet | Replacement qualification, old-release upgrade/rollback fixtures and retirement; synthetic additive-schema preservation passes |
 | AC12 | Required offline runner and local regression receipts; OS CI configured | Passing current-head OS CI, complete evidence map and live receipts |
 | AC13–15 | Private commands, verification, durable settings and privacy tests across all three adapters | Live private setup/verification followed by a successful conversational call |
 
@@ -1316,3 +1316,22 @@ Linux phone CI run `39166966417` passed for `fff20302`, including the new
 additive migration suite. macOS was still running when this evidence was
 recorded; neither that observation nor the local probe is a current-head
 cross-platform pass.
+
+### Disconnect while agent work is active
+
+`ac07_disconnect_during_tool_work_cancels_without_replaying_queued_turns`
+uses the signed local WebSocket ingress with an accepted fake call. Its agent
+records one synthetic completed effect and waits for cancellation. The test
+queues another utterance and closes the socket, then requires cancellation
+within two seconds, one provider hangup, a terminal call, and exactly one effect.
+A signed reconnect is rejected with HTTP 409; restart maintenance and replaying
+the original call request produce neither another dial nor another agent effect.
+All 25 service tests passed locally. This proves the ingress cancellation and
+queue contract using a controlled agent, not actual native process teardown or
+live provider audio behavior. The required offline suite minimum is now 25.
+
+Both phone CI jobs in run `39166966417` completed successfully. The downloaded
+macOS receipt records Darwin arm64, a clean worktree, 595 passing tests across
+43 suites, and synthetic merge commit `871483a4` (parents `886c0950` and branch
+`fff20302`). This establishes that checkpoint's offline host parity, not current
+HEAD qualification, Intel macOS live coverage, or any audible call receipt.

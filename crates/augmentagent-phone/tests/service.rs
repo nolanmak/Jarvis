@@ -1463,3 +1463,131 @@ async fn ac09_status_exposes_persisted_retry_usage_without_provider_actions() {
         assert!(!status.to_string().contains("+12025550123"));
     }
 }
+
+#[tokio::test]
+async fn ac07_disconnect_during_tool_work_cancels_without_replaying_queued_turns() {
+    use augmentagent_phone::ingress::{AgentError, ConversationAgent, SpeechSender};
+    use augmentagent_store::phone::{CallState, PhoneCall};
+    use futures::SinkExt;
+    use std::sync::atomic::AtomicUsize;
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+
+    #[derive(Default)]
+    struct WorkingAgent {
+        effects: AtomicUsize,
+        entered: tokio::sync::Notify,
+        cancelled: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl ConversationAgent for WorkingAgent {
+        async fn answer(
+            &self,
+            _: &PhoneCall,
+            _: &str,
+            _: &str,
+            _: SpeechSender,
+            cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<String, AgentError> {
+            // A synthetic completed external effect followed by ongoing work.
+            // Disconnect must neither repeat this effect nor start queued work.
+            self.effects.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            cancel.cancelled().await;
+            self.cancelled.notify_one();
+            Ok("late result after disconnect".into())
+        }
+        async fn interrupted(&self, _: &PhoneCall, _: &str) -> Result<(), AgentError> {
+            Ok(())
+        }
+    }
+    let f = fixture("discord", true, true, false);
+    let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
+    let receipt = f
+        .service
+        .tool(&grant, "call_owner", json!({"request_id":"disconnect"}))
+        .await
+        .unwrap();
+    let id = receipt["id"].as_str().unwrap();
+    f.store
+        .phone_provider_event(id, "CA-test", CallState::AwaitingAcceptance, 100)
+        .unwrap();
+    f.store.phone_accept(id, "CA-test", 100).unwrap();
+    let service = Arc::new(f.service);
+    let auth = Arc::new(augmentagent_phone::webhook::WebhookAuth::new(
+        "AC-test",
+        "callback-secret",
+    ));
+    let agent = Arc::new(WorkingAgent::default());
+    let router = augmentagent_phone::ingress::router(service.clone(), auth, agent.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let mut request = format!("ws://{addr}/phone/relay/{id}")
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "x-twilio-signature",
+        signed(
+            "callback-secret",
+            &format!("wss://phone.example.test/phone/relay/{id}"),
+            &[],
+        )
+        .parse()
+        .unwrap(),
+    );
+    let (mut socket, _) = tokio_tungstenite::connect_async(request.clone())
+        .await
+        .unwrap();
+    socket.send(Message::Text(json!({"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX-test"}).to_string().into())).await.unwrap();
+    socket
+        .send(Message::Text(
+            json!({"type":"prompt","voicePrompt":"start synthetic tool","last":true})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), agent.entered.notified())
+        .await
+        .unwrap();
+    socket
+        .send(Message::Text(
+            json!({"type":"prompt","voicePrompt":"queued second turn","last":true})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    socket.close(None).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        agent.cancelled.notified(),
+    )
+    .await
+    .expect("disconnect must cancel ongoing work");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !f.store.phone_provider_call(id).unwrap().state.terminal() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(agent.effects.load(Ordering::SeqCst), 1);
+    assert_eq!(*f.provider.stops.lock().unwrap(), vec!["CA-test"]);
+    assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
+    let reconnect = tokio_tungstenite::connect_async(request).await.unwrap_err();
+    assert!(
+        matches!(reconnect, tokio_tungstenite::tungstenite::Error::Http(response) if response.status().as_u16() == 409)
+    );
+    // Restart cleanup and redelivery of the same dial request cannot redial.
+    service.maintenance(true).await.unwrap();
+    let repeated = service
+        .tool(&grant, "call_owner", json!({"request_id":"disconnect"}))
+        .await
+        .unwrap();
+    assert_eq!(repeated["id"], receipt["id"]);
+    assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
+    assert_eq!(agent.effects.load(Ordering::SeqCst), 1);
+    server.abort();
+    let _ = server.await;
+}
