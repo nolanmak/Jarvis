@@ -310,8 +310,8 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
             outcome.groups_dropped += 1;
             return Ok(());
         }
-        // Never triage our own outbound echoes.
-        if msg.is_outbound() {
+        // A dry-run channel must never start verification or owner calls.
+        if self.config.dry_run && augmentagent_phone::commands::recognizes(&msg.text) {
             return Ok(());
         }
         let chat_jid = msg.chat.bare();
@@ -334,6 +334,9 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                 }
             }
         }
+        // The control adapter may consume authenticated self-chat commands;
+        // every other outbound message remains excluded from ordinary triage.
+        if msg.is_outbound() { return Ok(()); }
         // Private setup must not fall through to durable inbox/triage when
         // this chat has no installed control adapter (including edited text).
         if augmentagent_phone::commands::sensitive(&msg.text) {

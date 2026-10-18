@@ -57,6 +57,12 @@ pub(crate) fn migrate(conn: &Connection) -> StoreResult<()> {
             PRIMARY KEY(platform, account_id, conversation_id),
             UNIQUE(platform, account_id, kind)
         );
+        CREATE TABLE IF NOT EXISTS surface_private_command_receipts (
+            platform TEXT NOT NULL, account_id TEXT NOT NULL,
+            conversation_id TEXT NOT NULL, event_id TEXT NOT NULL,
+            consumed_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(platform,account_id,conversation_id,event_id)
+        );
         CREATE TABLE IF NOT EXISTS surface_auth_rejections (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             platform TEXT NOT NULL,
@@ -285,6 +291,29 @@ fn load_binding(
 }
 
 impl Store {
+    /// Consume an already-authorized private command before executing it.
+    /// Only provider IDs are retained, never command bodies or verification
+    /// codes. A crash leaves the receipt consumed: retry requires a new message.
+    pub fn consume_private_surface_command(
+        &self,
+        conversation: &SurfaceConversationRef,
+        event_id: &str,
+        now_ms: i64,
+    ) -> StoreResult<bool> {
+        bounded(event_id, "private command event ID")?;
+        if event_id.trim().is_empty() || conversation.thread_id().is_some() {
+            return Err(StoreError::InvalidInput(
+                "invalid private command identity".into(),
+            ));
+        }
+        write_tx(self, |tx| {
+            Ok(tx.execute(
+                "INSERT INTO surface_private_command_receipts(platform,account_id,conversation_id,event_id,consumed_at_ms) VALUES(?1,?2,?3,?4,?5) ON CONFLICT DO NOTHING",
+                params![conversation.account().platform().as_str(), conversation.account().account_id(), conversation.conversation_id(), event_id, now_ms],
+            )? == 1)
+        })
+    }
+
     /// Initialize a never-bound account and its authenticated private chat in one
     /// transaction. The caller must verify transport identity and explicit owner
     /// configuration. Returns false for any previous binding, including revoked

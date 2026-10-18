@@ -99,6 +99,7 @@ pub struct WhatsappControlSurface {
     /// Most-recently-posted card per control chat. WhatsApp has no per-message
     /// buttons, so a bare `approve` applies to the chat's active card.
     active_card: Arc<Mutex<HashMap<String, String>>>,
+    phone: Option<Arc<crate::phone::PhoneControl>>,
 }
 
 impl WhatsappControlSurface {
@@ -116,7 +117,15 @@ impl WhatsappControlSurface {
             action_handler,
             query_handler,
             active_card: Arc::new(Mutex::new(HashMap::new())),
+            phone: None,
         }
+    }
+
+    /// Install phone commands using the authenticated linked-device identity.
+    /// Owner/control bindings and explicit phone links must already exist.
+    pub fn with_phone_tools(mut self, linked_owner: crate::Jid, tools: Arc<augmentagent_phone::tools::ToolServer>) -> anyhow::Result<Self> {
+        self.phone = Some(Arc::new(crate::phone::PhoneControl::new(self.store.clone(), tools, linked_owner, &self.config.control_chat_jid)?));
+        Ok(self)
     }
 
     /// True iff `chat_jid` is the designated control chat.
@@ -170,17 +179,27 @@ impl WhatsappControlSurface {
         msg: &WaMessage,
     ) -> Result<bool, ApprovalError> {
         let chat_jid = msg.chat.bare();
-        if !self.is_control_chat(&chat_jid) || msg.is_outbound() {
+        if !self.is_control_chat(&chat_jid) {
             return Ok(false);
         }
         // Reserve phone controls before generic queries, even while no phone
         // adapter is installed. Numbers and verification codes must never
         // become model input through a fallback path.
         if augmentagent_phone::commands::recognizes(&msg.text) {
+            if let Some(phone) = &self.phone {
+                if self.check_send_gate(&chat_jid).is_err() { return Ok(true); }
+                if let Some(reply) = phone.execute(msg).await.map_err(|_| ApprovalError::Discord("private phone command failed; check phone status before retrying".into()))? {
+                    self.send_to_control(&reply).await?;
+                }
+                return Ok(true);
+            }
+            if msg.is_outbound() { return Ok(false); }
+
             self.send_to_control("Phone commands are unavailable in this WhatsApp connection.")
                 .await.ok();
             return Ok(true);
         }
+        if msg.is_outbound() { return Ok(false); }
         let cmd = parse_control_command(&msg.text);
         match cmd {
             ControlCommand::Approve | ControlCommand::Decline | ControlCommand::Revise(_) => {

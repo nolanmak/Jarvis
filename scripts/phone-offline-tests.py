@@ -23,7 +23,7 @@ SUITES = [
     ("augmentagent-phone", "--test", "config", 1),
     ("augmentagent-phone", "--test", "runtime", 1),
     ("augmentagent-store", "--test", "phone_calls", 11),
-    ("augmentagent-store", "--test", "surface_owner", 17),
+    ("augmentagent-store", "--test", "surface_owner", 18),
     ("augmentagent-store", "--test", "surface_delivery", 36),
     ("augmentagent-approval-discord", "--lib", None, 255),
     ("augmentagent-approval-discord", "--test", "phone_boundary", 2),
@@ -41,6 +41,7 @@ SUITES = [
     ("augmentagent-channel-whatsapp", "--lib", None, 44),
     ("augmentagent-channel-whatsapp", "--test", "phone_privacy", 1),
     ("augmentagent-channel-whatsapp", "--test", "self_chat", 1),
+    ("augmentagent-channel-whatsapp", "--test", "phone_commands", 1),
     ("augmentagent-channel-whatsapp-history", "--test", "history", 10),
 ]
 SUMMARY = re.compile(r"test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out;")

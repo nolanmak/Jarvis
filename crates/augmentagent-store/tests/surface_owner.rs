@@ -500,3 +500,27 @@ fn concurrent_initial_private_chats_have_exactly_one_winner() {
         Some(&results.iter().find(|(won, _)| *won).unwrap().1)
     );
 }
+
+#[test]
+fn private_command_receipt_is_durable_and_scoped_without_body_storage() {
+    let (dir, store) = temp_store();
+    let acct = account("whatsapp", "device:12025550111");
+    let chat = conv(&acct, "12025550111@s.whatsapp.net");
+    assert!(store
+        .consume_private_surface_command(&chat, "provider-event", T0)
+        .unwrap());
+    assert!(!store
+        .consume_private_surface_command(&chat, "provider-event", T0 + 1)
+        .unwrap());
+    assert!(store
+        .consume_private_surface_command(&conv(&acct, "other"), "provider-event", T0)
+        .unwrap());
+    drop(store);
+    let store = Store::open(dir.path().join("data.db")).unwrap();
+    assert!(!store
+        .consume_private_surface_command(&chat, "provider-event", T0 + 2)
+        .unwrap());
+    assert!(store
+        .consume_private_surface_command(&chat, "", T0)
+        .is_err());
+}

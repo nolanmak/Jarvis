@@ -666,3 +666,45 @@ missing binary. Go `test -race` and `vet`, WhatsApp all-target Clippy with
 `/tmp/1496-wa-echo-vet.log`, `/tmp/1496-wa-echo-clippy.log`.
 No real WhatsApp messages or phone calls were sent; remote CI and live acceptance
 are not claimed by these local checks.
+
+### WhatsApp self-chat phone commands
+
+An installed WhatsApp control adapter can now pass verified owner self-chat
+phone controls directly to the shared tool server, before generic query/triage.
+Its linked identity must come from authenticated sidecar status; the account key
+is `device:<linked number>`, the sender is the bare owner JID, and the control
+conversation must be that owner's self-chat. Every command checks the explicit
+phone owner link and stored control binding. This adapter does not provision
+those bindings or infer owner links from messages.
+
+Echo/unknown classification, wrong sender, edits/revocations and non-self input
+cannot execute phone commands. The existing outbound allowlist and control
+feature flag must permit execution; the channel also blocks all phone commands
+in dry run. Rejected inputs do not consume legitimate provider event IDs.
+Authorized private commands commit a durable receipt before executing. Receipts
+contain provider identifiers and time only, never bodies, destinations or codes.
+Duplicates after restart return a status-check instruction without re-executing.
+An interrupted command stays consumed rather than automatically retrying an
+uncertain action; the owner can check status and send a new command if needed.
+
+Test-first evidence: `/tmp/1496-wa-command-store-red.log` and
+`/tmp/1496-wa-command-red.log` (missing receipt/adapter APIs), plus
+`/tmp/1496-wa-command-dry-red.log` (the event queue dialed in dry run). The green
+fixture in `/tmp/1496-wa-command-green.log` uses the real channel event queue,
+control handler, local fake sidecar, temporary database and shared PhoneService
+with fake telephony. It exercises setup → verify → call → remove, replay after
+reopen, stable receipt counts, revoked authority, disabled/allowlist/dry-run
+zero-call gates, rejected echoes/forged inputs, and redacted replies. Private
+setup entering the reasoner would panic the fixture.
+
+This is library integration, not daemon installation or live WhatsApp calling.
+Initial WhatsApp identity/control provisioning, ordinary native text/phone
+session continuity, tool/approval continuation, durable transcript delivery and
+prompt event dispatch remain required. The shared provider lifecycle, final
+duration, remote OS CI and live qualification/migration gates also remain open.
+
+Validation: all 34 required offline suites / 522 tests pass in
+`/tmp/1496-wa-command-offline/receipt.json` (dirty worktree at execution).
+WhatsApp all-target Clippy with `--no-deps -D warnings` and both Python runner
+checks pass. No live WhatsApp messages or Twilio calls were made; the test's
+provider and local sidecar responses are scripted.
