@@ -91,3 +91,24 @@ WhatsApp bans bot-like accounts aggressively. The channel is conservative:
 - The sidecar reconnects whatsmeow internally; if the websocket drops,
   `send_text` returns `NotConnected` and the next inbound event re-arms it.
 - Supervised installation and health checks are tracked in #1243.
+
+### Outgoing-message identity for owner self-chat
+
+The sidecar retains agent-generated message IDs in a private SQLite file at
+`<AUGMENTAGENT_WA_STORE>.outbound.db` (or alongside the default session store).
+Each ID is committed before `SendMessage`, scoped to the linked account and
+chat, and supplied explicitly to whatsmeow. Failed or uncertain sends retain
+that reservation. Message bodies are not stored in this ledger.
+
+`received-message` includes nullable `agent_outbound`: `true` identifies an agent
+echo, `false` means the ID was not reserved, and `null` means classification is
+unavailable. Events at or before the ledger's persisted creation second are
+unknown, so historical messages from before this protocol cannot become owner
+commands. Missing/failed storage also yields unknown. Ledger failure prevents
+new sends. Keep this file with the session state across restarts.
+
+A `false` value is not authorization by itself: the Rust adapter must also check
+self-chat, sender, authenticated linked-account identity, explicit owner links,
+control bindings, feature gates and replay handling. Old sidecars omit the field
+and cannot authorize self-chat commands. The existing control adapter still
+rejects outbound messages until the full phone/self-chat route is installed.

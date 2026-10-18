@@ -10,6 +10,7 @@ on:
       - 'crates/augmentagent-approval-discord/**'
       - 'crates/augmentagent-channel-slack/**'
       - 'crates/augmentagent-channel-whatsapp/**'
+      - 'crates/augmentagent-channel-whatsapp-history/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'

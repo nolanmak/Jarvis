@@ -625,3 +625,44 @@ Validation: all 32 required offline suites / 519 tests pass in
 `/tmp/1496-wa-privacy-offline/receipt.json` (dirty worktree at execution).
 Both Python runner validation tests pass. No live calls or chat messages were
 sent, and live acceptance remains unqualified.
+
+### Durable WhatsApp echo classification
+
+The Go sidecar now records each generated outgoing message ID in a private
+SQLite ledger before sending it, and supplies that same ID to whatsmeow. Records
+are keyed by account/chat/message ID and survive restart and uncertain outcomes.
+Every message event carries a nullable agent-outbound classification. Missing or
+failed storage, and events at/before the persisted ledger creation second, are
+unknown rather than owner-authored. The ledger contains no message text.
+
+Rust decodes missing/null classification as unknown. The new self-chat predicate
+requires a positively classified non-agent message, `from_me`, the exact linked
+owner's personal chat and sender, nonempty ID/text, and no edit/revoke flags.
+This predicate is a transport check, not owner authorization. Existing outbound
+filtering remains in place until the authenticated phone adapter and replay
+handling can use it safely. This does not yet enable WhatsApp calling.
+
+Test-first evidence: `/tmp/1496-wa-echo-red.log` and
+`/tmp/1496-wa-self-red.log` show the missing APIs. Go tests cover durable
+reservation/reopen, account/chat scoping, duplicate rejection, private file mode,
+unknown-on-storage-failure and actual event wire classification. The Rust test
+covers valid self-chat and rejected echo, missing/null classification, wrong
+sender/chat, group, empty input, edit/revoke and wrong linked account type.
+Go race tests and vet pass; the sidecar is built locally for the offline compiled
+process contract. The existing both-OS sidecar workflow runs those Go tests.
+The phone workflow now also triggers on archive importer changes.
+
+Remaining work includes using this boundary in authenticated WhatsApp command
+execution, owner/control provisioning, replay protection, native sessions,
+durable transcript delivery and daemon installation, plus the shared lifecycle,
+provider-duration, tool/approval, remote CI and live qualification gates.
+
+Validation: all 33 required Rust offline suites / 520 tests pass in
+`/tmp/1496-wa-echo-offline/receipt.json` (dirty worktree at execution). The compiled
+Go-process contract passes with `/tmp/1496-wa-sidecar`, without skipping for a
+missing binary. Go `test -race` and `vet`, WhatsApp all-target Clippy with
+`--no-deps -D warnings`, and both Python runner checks pass. Logs:
+`/tmp/1496-wa-echo-green.log`, `/tmp/1496-wa-echo-contract.log`,
+`/tmp/1496-wa-echo-vet.log`, `/tmp/1496-wa-echo-clippy.log`.
+No real WhatsApp messages or phone calls were sent; remote CI and live acceptance
+are not claimed by these local checks.
