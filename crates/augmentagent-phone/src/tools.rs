@@ -103,6 +103,25 @@ impl ToolServer {
         crate::commands::execute(&self.service, owner, conversation, event_id, text).await
     }
 
+    /// Authenticated Discord direct-message setup only; never exposed over MCP.
+    pub async fn discord_private_command(
+        &self,
+        owner: &SurfaceOwnerRef,
+        conversation: &SurfaceConversationRef,
+        event_id: &str,
+        text: &str,
+    ) -> Option<String> {
+        if crate::commands::sets_number(text) {
+            if let Err(error) = self
+                .service
+                .initialize_discord_private_owner(owner, conversation)
+            {
+                return Some(error.to_string());
+            }
+        }
+        self.command(owner, conversation, event_id, text).await
+    }
+
     pub fn socket_path(&self) -> &Path {
         &self.socket
     }

@@ -426,3 +426,77 @@ fn authority_revision_survives_unbind_restart_and_control_restore_at_same_time()
         "migration must preserve existing revisions"
     );
 }
+
+#[test]
+fn initial_private_binding_is_atomic_idempotent_and_never_revives_revocation() {
+    let (dir, store) = temp_store();
+    let acct = account("discord", "dm:11");
+    let who = owner(&acct, "33");
+    let chat = conv(&acct, "22");
+    assert!(store
+        .initialize_private_surface_owner(&who, &chat, T0)
+        .unwrap());
+    let original = store.surface_owner_binding(&acct).unwrap().unwrap();
+    assert_eq!(original.direct_conversation(), Some(&chat));
+    assert!(!store
+        .initialize_private_surface_owner(&who, &chat, T0 + 1)
+        .unwrap());
+    assert_eq!(
+        store.surface_owner_binding(&acct).unwrap().unwrap(),
+        original
+    );
+    assert!(!store
+        .initialize_private_surface_owner(&owner(&acct, "44"), &conv(&acct, "55"), T0)
+        .unwrap());
+    assert_eq!(
+        store.surface_owner_binding(&acct).unwrap().unwrap(),
+        original
+    );
+    store.unbind_surface_owner(&acct).unwrap();
+    drop(store);
+    let store = Store::open(dir.path().join("data.db")).unwrap();
+    assert!(!store
+        .initialize_private_surface_owner(&who, &chat, T0)
+        .unwrap());
+    assert!(store.surface_owner_binding(&acct).unwrap().is_none());
+    let other = account("discord", "dm:12");
+    assert!(store
+        .initialize_private_surface_owner(&owner(&other, "33"), &chat, T0)
+        .is_err());
+    assert!(store.surface_owner_binding(&other).unwrap().is_none());
+}
+
+#[test]
+fn concurrent_initial_private_chats_have_exactly_one_winner() {
+    let (_dir, store) = temp_store();
+    let store = std::sync::Arc::new(store);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let acct = account("discord", "dm:11");
+    let who = owner(&acct, "33");
+    let jobs: Vec<_> = ["22", "23"]
+        .into_iter()
+        .map(|id| {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            let who = who.clone();
+            let chat = conv(&acct, id);
+            std::thread::spawn(move || {
+                barrier.wait();
+                (
+                    store
+                        .initialize_private_surface_owner(&who, &chat, T0)
+                        .unwrap(),
+                    chat,
+                )
+            })
+        })
+        .collect();
+    let results: Vec<_> = jobs.into_iter().map(|job| job.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|(won, _)| *won).count(), 1);
+    let binding = store.surface_owner_binding(&acct).unwrap().unwrap();
+    assert_eq!(binding.control.len(), 1);
+    assert_eq!(
+        binding.direct_conversation(),
+        Some(&results.iter().find(|(won, _)| *won).unwrap().1)
+    );
+}

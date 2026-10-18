@@ -330,8 +330,7 @@ mod installation_tests {
         ProviderError, Telephony,
     };
     use augmentagent_store::{
-        owner::ControlConversationKind, SurfaceAccountRef, SurfaceConversationRef, SurfaceOwnerRef,
-        SurfacePlatform,
+        SurfaceAccountRef, SurfaceConversationRef, SurfaceOwnerRef, SurfacePlatform,
     };
     #[derive(Default)]
     struct Phone(std::sync::Mutex<Vec<DialRequest>>);
@@ -354,10 +353,6 @@ mod installation_tests {
             SurfaceAccountRef::new(SurfacePlatform::new("discord").unwrap(), "dm:11").unwrap();
         let owner = SurfaceOwnerRef::new(account.clone(), "33").unwrap();
         let chat = SurfaceConversationRef::new(account, "22", None).unwrap();
-        store.bind_surface_owner(&owner, 0).unwrap();
-        store
-            .set_surface_control_conversation(&chat, ControlConversationKind::Direct, 0)
-            .unwrap();
         let provider = Arc::new(Phone::default());
         let service = Arc::new(PhoneService::new(
             store.clone(),
@@ -411,12 +406,12 @@ mod installation_tests {
             stop.clone(),
         )
         .unwrap();
-        assert!(query.phone_origin(&context).is_some());
+        assert!(query.phone_origin(&context).is_none());
         let response = query
             .phone_command(&context, "phone number status")
             .await
             .unwrap();
-        assert!(response.contains("not configured"), "{response}");
+        assert!(response.contains("authorization"), "{response}");
         let mut forged = context.clone();
         forged.author_id = 34;
         assert!(query
@@ -424,6 +419,22 @@ mod installation_tests {
             .await
             .unwrap()
             .contains("authorization"));
+        assert!(query
+            .phone_command(&forged, "phone number set +12025550123")
+            .await
+            .unwrap()
+            .contains("authorization"));
+        let mut public = context.clone();
+        public.guild_id = Some(99);
+        assert!(query
+            .phone_command(&public, "phone number set +12025550123")
+            .await
+            .unwrap()
+            .contains("authorization"));
+        assert!(store
+            .surface_owner_binding(owner.account())
+            .unwrap()
+            .is_none());
         assert!(provider.0.lock().unwrap().is_empty());
         let setup = query
             .phone_command(&context, "phone number set +12025550123")
@@ -431,6 +442,33 @@ mod installation_tests {
             .unwrap();
         assert!(setup.contains("Verification call requested"), "{setup}");
         assert!(!setup.contains("+12025550123"));
+        assert!(query.phone_origin(&context).is_some());
+        let binding = store
+            .surface_owner_binding(owner.account())
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.direct_conversation(), Some(&chat));
+        let mut other_chat = context.clone();
+        other_chat.channel_id = 23;
+        assert!(query
+            .phone_command(&other_chat, "phone number set +12025550124")
+            .await
+            .unwrap()
+            .contains("authorization"));
+        query
+            .phone_command(&context, "phone number set +12025550123")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .surface_owner_binding(owner.account())
+                .unwrap()
+                .unwrap()
+                .revision,
+            binding.revision
+        );
+        assert_eq!(provider.0.lock().unwrap().len(), 1);
+
         let code = provider.0.lock().unwrap()[0]
             .twiml
             .split(" is ")
@@ -483,6 +521,17 @@ mod installation_tests {
             provider.0.lock().unwrap()[1].destination.expose(),
             "+12025550123"
         );
+        store.unbind_surface_owner(owner.account()).unwrap();
+        assert!(query
+            .phone_command(&context, "phone number set +12025550123")
+            .await
+            .unwrap()
+            .contains("authorization"));
+        assert!(store
+            .surface_owner_binding(owner.account())
+            .unwrap()
+            .is_none());
+        assert_eq!(provider.0.lock().unwrap().len(), 2);
         stop.cancel();
         tokio::time::timeout(Duration::from_secs(2), worker)
             .await
@@ -503,8 +552,8 @@ pub struct PendingConnection {
 }
 pub type PendingSlot = Arc<std::sync::Mutex<Option<PendingConnection>>>;
 
-/// Install only accounts already linked to this allowlisted owner. Identity
-/// provisioning is separate from destination verification; no inferred links.
+/// Install stored authorized accounts and explicitly configured owner DM accounts.
+/// Initial DM authority is provisioned only by authenticated private number setup.
 pub fn install(
     endpoint: &Arc<crate::phone_runtime::Endpoint>,
     connection: PendingConnection,
@@ -536,6 +585,18 @@ pub fn install(
                 .authorize(&binding.owner, &control.conversation)
                 .is_ok()
         }) {
+            accounts.push(account.clone());
+        }
+    }
+    // Install the configured DM account before first setup, without granting
+    // chat authority. The authenticated setup command creates that binding.
+    for owner in endpoint.service.linked_surface_owners() {
+        let account = owner.account();
+        if account.platform().as_str() == "discord"
+            && account.account_id() == format!("dm:{}", connection.bot_user_id)
+            && owner.sender_id() == connection.owner_user_id.to_string()
+            && !accounts.contains(account)
+        {
             accounts.push(account.clone());
         }
     }

@@ -71,7 +71,7 @@ AUGMENTAGENT_GH_DISABLE=1 cargo test -p augmentagent-phone
 
 | Criteria | Evidence so far | Remaining proof/work |
 | --- | --- | --- |
-| AC01 | Disabled/config validation, listener/watchdog, Slack/Discord daemon installation and operator contract | WhatsApp adapter, initial Discord identity setup, deployed ingress and live TLS receipts |
+| AC01 | Disabled/config validation, listener/watchdog, Slack/Discord daemon installation and operator contract | WhatsApp adapter, deployed ingress and live TLS receipts |
 | AC02 | Grant, revocation, expiry, forged target tests | Production surface and MCP boundaries |
 | AC03 | Ten concurrent reservations; restart/uncertain tests | Provider reconciliation and runtime concurrency fault injection |
 | AC04 | Known signature fixture, signed/reordered callbacks and local HTTP ingress | Complete stale-binding callback coverage, live callbacks and final-duration accounting |
@@ -83,7 +83,7 @@ AUGMENTAGENT_GH_DISABLE=1 cargo test -p augmentagent-phone
 | AC10 | None for live conversations | Full live host/provider/origin and audible-latency matrix |
 | AC11 | No legacy voice removed yet | Replacement qualification, migration and retirement |
 | AC12 | Targeted local tests | OS CI, full regression map and live receipts |
-| AC13–15 | Verification/store tests; Slack private command, history/edit/catch-up/poll privacy and interrupted-command recovery tests | Discord/WhatsApp routers, daemon setup, account-link UX and live number setup |
+| AC13–15 | Verification/store tests; Slack/Discord private command routing and privacy tests; first-time Discord DM setup from explicit owner links | WhatsApp adapter and live number setup |
 
 The old conversational voice stack must not be removed before replacement
 qualification. Its shared session/history functionality and inbound voice-file
@@ -555,3 +555,41 @@ Python runner checks pass. Phone all-target Clippy with `--no-deps -D warnings`
 passes; including dependencies still fails on eight existing errors in unchanged
 store code (`/tmp/1496-revocation-clippy.log`). No live calls or chat posts were
 made for this checkpoint.
+
+### First-time Discord private setup
+
+Discord installation now includes the bot-specific DM account when the operator
+has explicitly linked the gateway-allowlisted owner in phone configuration. It
+installs the adapter and delivery worker without creating any chat authority.
+The owner's first `phone number set +<country code><number>` in an authenticated
+DM atomically creates the owner binding and private control conversation before
+requesting verification. Status and ordinary messages never create bindings.
+No destination or code passes through the model for this setup.
+
+The store initializer requires a never-bound account, using durable authority
+revision history to reject previously revoked accounts even after restart. It
+cannot replace an existing owner or control conversation. Repeated setup in the
+same authorized chat preserves the authority revision. Concurrent first-time
+chats have exactly one winner, with a single complete owner/control binding.
+Existing or revoked account recovery remains a trusted operator operation.
+
+The installation fixture now begins with no stored binding and exercises
+set → verify → call through the installed WikiQuerier and fake telephony. It
+rejects forged owners, public-channel setup, another DM and post-revocation
+setup without extra provider creates. Same-event setup/call retries do not dial
+again. Store tests cover reopen after revocation, identity mismatch, stable
+idempotence and competing initial chats. Red evidence:
+`/tmp/1496-discord-bootstrap-store-red.log` (missing store API) and
+`/tmp/1496-discord-bootstrap-install-red.log` (real installer rejected the empty
+store). Targeted green: `/tmp/1496-discord-bootstrap-install-green.log`.
+
+This closes the pre-populated database requirement for initial Discord DM setup.
+It does not qualify live Discord/Twilio behavior or complete WhatsApp integration,
+disabled-start cleanup, final duration accounting, tool/approval continuation,
+remote OS checks or the required live migration gates.
+
+All 29 required offline suites / 464 tests pass:
+`/tmp/1496-discord-bootstrap-offline/receipt.json` (dirty worktree at execution).
+Both Python runner validation tests and phone all-target Clippy with
+`--no-deps -D warnings` pass. No live calls, Discord posts or provider credentials
+were used in this checkpoint's tests.

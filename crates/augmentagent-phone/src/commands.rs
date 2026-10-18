@@ -12,6 +12,9 @@ fn words(text: &str) -> Option<Vec<&str>> {
         .is_some_and(|w| w.eq_ignore_ascii_case("phone"))
         .then_some(words)
 }
+pub fn sets_number(text: &str) -> bool {
+    words(text).is_some_and(|w| matches!(w.as_slice(), [_, "number", "set", _]))
+}
 pub fn recognizes(text: &str) -> bool {
     words(text).is_some()
 }

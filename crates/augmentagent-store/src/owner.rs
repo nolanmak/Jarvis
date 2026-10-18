@@ -285,6 +285,44 @@ fn load_binding(
 }
 
 impl Store {
+    /// Initialize a never-bound account and its authenticated private chat in one
+    /// transaction. The caller must verify transport identity and explicit owner
+    /// configuration. Returns false for any previous binding, including revoked
+    /// bindings; this operation never replaces or restores authority.
+    pub fn initialize_private_surface_owner(
+        &self,
+        owner: &SurfaceOwnerRef,
+        conversation: &SurfaceConversationRef,
+        now_ms: i64,
+    ) -> StoreResult<bool> {
+        if owner.account() != conversation.account() || conversation.thread_id().is_some() {
+            return Err(StoreError::InvalidInput(
+                "private owner conversation mismatch".into(),
+            ));
+        }
+        let account = owner.account();
+        let platform = account.platform().as_str();
+        let account_id = account.account_id();
+        write_tx(self, |tx| {
+            let seen: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM surface_authority_revisions WHERE platform=?1 AND account_id=?2)",
+                params![platform, account_id], |r| r.get(0),
+            )?;
+            if seen {
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT INTO surface_owner_bindings(platform,account_id,owner_sender_id,confirmed_at_ms) VALUES(?1,?2,?3,?4)",
+                params![platform, account_id, owner.sender_id(), now_ms],
+            )?;
+            tx.execute(
+                "INSERT INTO surface_control_conversations(platform,account_id,conversation_id,kind,added_at_ms) VALUES(?1,?2,?3,?4,?5)",
+                params![platform, account_id, conversation.conversation_id(), ControlConversationKind::Direct.as_str(), now_ms],
+            )?;
+            Ok(true)
+        })
+    }
+
     /// Bind `owner` as the only identity with owner authority on its account.
     /// A different owner than the stored one replaces it and clears the
     /// control conversations; the same owner only refreshes the timestamp.

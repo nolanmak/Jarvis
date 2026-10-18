@@ -174,6 +174,45 @@ impl PhoneService {
             cleanup_inflight: Arc::new(std::sync::Mutex::new(Default::default())),
         }
     }
+    /// Explicit operator-configured identities, for installing transport adapters
+    /// before the first private control conversation has been provisioned.
+    pub fn linked_surface_owners(&self) -> Vec<SurfaceOwnerRef> {
+        self.config
+            .links
+            .iter()
+            .map(|link| link.surface_owner.clone())
+            .collect()
+    }
+
+    /// Called only by an authenticated Discord DM adapter on explicit number
+    /// setup. Never restores an account that has previously held authority.
+    pub fn initialize_discord_private_owner(
+        &self,
+        owner: &SurfaceOwnerRef,
+        conversation: &SurfaceConversationRef,
+    ) -> Result<(), Error> {
+        self.enabled()?;
+        if owner.account().platform().as_str() != "discord"
+            || !owner
+                .account()
+                .account_id()
+                .strip_prefix("dm:")
+                .is_some_and(|id| id.parse::<u64>().is_ok_and(|n| n > 0))
+            || !self
+                .config
+                .links
+                .iter()
+                .any(|link| link.surface_owner == *owner)
+        {
+            return Err(Error::Unauthorized);
+        }
+        self.store
+            .initialize_private_surface_owner(owner, conversation, self.clock.now_ms())
+            .map_err(|_| Error::Unauthorized)?;
+        self.authorize(owner, conversation)?;
+        Ok(())
+    }
+
     pub fn authorize(
         &self,
         owner: &SurfaceOwnerRef,

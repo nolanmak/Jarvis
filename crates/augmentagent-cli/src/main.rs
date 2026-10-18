@@ -10980,7 +10980,12 @@ impl QueryHandler for WikiQuerier {
     async fn phone_command(&self, context: &augmentagent_approval_discord::phone::PhoneCommandContext, text: &str) -> Option<String> {
         let tools = self.phone_tools.get()?;
         let origin = match context.origin() { Ok(origin) => origin, Err(_) => return Some("Discord phone identity unavailable".into()) };
-        tools.command(&origin.owner, &origin.conversation, &format!("discord:{}:{}", context.channel_id, context.message_id), text).await
+        let event_id = format!("discord:{}:{}", context.channel_id, context.message_id);
+        if context.guild_id.is_none() {
+            tools.discord_private_command(&origin.owner, &origin.conversation, &event_id, text).await
+        } else {
+            tools.command(&origin.owner, &origin.conversation, &event_id, text).await
+        }
     }
 
     fn phone_origin(&self, context: &augmentagent_approval_discord::phone::PhoneCommandContext) -> Option<augmentagent_store::phone::PhoneOrigin> {
