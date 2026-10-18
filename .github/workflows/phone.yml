@@ -16,6 +16,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
+      - 'scripts/aa-wiki-protected-names.sh'
       - 'scripts/aa-journal-guard.sh'
       - 'scripts/tests/aa-journal-guard.test.sh'
       - 'scripts/phone-offline-tests.py'

@@ -1217,3 +1217,9 @@ exhausted retries, unknown/nonterminal/contradictory evidence, confirmed nonansw
 callbacks during provider reads, and provider failure. All 24 service and 17
 phone-store tests pass locally. These are synthetic fixtures; unknown-ID
 association and live recovery evidence remain outstanding.
+
+The explicit journal-guard macOS step then exposed Bash 3.2 rejecting the shared
+protected-name helper's lowercase expansion (`${component,,}`). That helper now
+uses portable `tr` conversion under the guards' C locale. The reserved-name list
+is unchanged. All 22 journal checks and 57 scope-guard checks pass locally; the
+actual macOS rerun remains required.
