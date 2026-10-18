@@ -181,6 +181,12 @@ impl WaClient {
                 path: path.display().to_string(),
                 source,
             })?;
+        // Owner self-chat commands trust events from this local process. A path
+        // alone is not authentication: verify the connected peer before reading
+        // status or accepting any event, including when a socket was replaced.
+        if stream.peer_cred()?.uid() != users_uid() {
+            return Err(WaError::Config("WhatsApp sidecar must run as the current user".into()));
+        }
         let (read, write) = stream.into_split();
         let pending: Pending = Arc::new(StdMutex::new(HashMap::new()));
         let pending_reader = Arc::clone(&pending);

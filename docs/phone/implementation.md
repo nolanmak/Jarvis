@@ -894,3 +894,50 @@ Validation: all 36 required offline suites / 529 tests pass in
 `/tmp/1496-wa-bootstrap-offline/receipt.json` (dirty worktree recorded).
 Targeted phone/WhatsApp all-target Clippy with `--no-deps -D warnings` and both
 Python runner checks pass. No live provider calls or chat posts were made.
+
+
+### WhatsApp daemon installation and reconnect supervision
+
+`serve` now installs WhatsApp phone control when the shared endpoint, wiki root,
+control feature flag and explicit WhatsApp owner link are present. The sidecar
+socket connection checks the peer UID before reading status or events. Startup
+requires connected/paired status, a personal numeric linked identity matching the
+configured owner and an allowed outbound self-chat. No sender text establishes
+the linked device identity. Pairing and outbound allowlist provisioning remain
+operator tasks; this installer does not implement the separate WhatsApp login
+CLI.
+
+The installed adapter shares one query handler between self-chat and PhoneAgent,
+registers the WhatsApp phone router, recovers only its account's durable outbox
+and starts transcript delivery. It dispatches verified self-chat messages through
+bounded tasks with separate stop capacity, so blocked native turns cannot hold
+up phone stop. Existing native scheduling still serializes conversational turns.
+Disconnect/shutdown durably request call cleanup; logout or identity changes
+also revoke stored owner authority. A five-second reconnect loop recreates the
+transport without replaying requests, redialing or restoring revoked bindings.
+Registration, delivery and command tasks are released on connection exit.
+
+The initial phone history source is the imported self-chat archive, limited to
+40 rows, bounded row sizes and 64 KiB output. Setup/code commands are filtered,
+and other accounts/conversations are excluded. This is not live provider history;
+the sidecar's `fetch_history` is still unavailable. Existing native sessions do
+not reload archive history. Approval handlers are passed through when available,
+but this does not prove complete WhatsApp approval-card delivery/continuation.
+
+The installation fixture first failed for the missing installer API
+(`/tmp/1496-wa-install-red.log`). The fake sidecar exercises rejection of an
+unlinked status identity, an actual installed call command, stop while a query is
+blocked, reconnect with no redial, logout revocation and bounded shutdown.
+Additional cases validate status and private/scoped/bounded archive history.
+The fixture uses fake telephony and local sockets; it sends no real WhatsApp
+messages or calls. This integration does not close live qualification, approval
+continuation, provider lifecycle/limit gaps or legacy voice retirement.
+
+Validation: all 37 required offline suites / 532 tests pass in
+`/tmp/1496-wa-install-offline/receipt.json` (dirty worktree recorded). The final
+installer/history target passes in `/tmp/1496-wa-install-complete-tests.log`.
+The compiled Go process/Rust wire contract passes without skipping in
+`/tmp/1496-wa-install-sidecar-contract.log`. WhatsApp all-target Clippy with
+`--no-deps -D warnings` and both Python runner checks pass. CLI Clippy completes
+with warnings outside the new module; this is not a warning-free workspace
+claim. No live chat messages or provider calls were made.

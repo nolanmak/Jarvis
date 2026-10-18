@@ -84,6 +84,7 @@ use augmentagent_store::{ActionStatus, GmailRateRefusal, Store, TriageResult};
 use async_trait::async_trait;
 
 mod whatsapp_history;
+mod whatsapp_phone;
 mod messages_cmd;
 mod embeddings_cmd;
 mod triage_prefilter_cmd;
@@ -3520,6 +3521,27 @@ async fn main() -> Result<()> {
                 },
                 _ => None,
             };
+
+            if let (Some(endpoint), Some(wiki)) = (phone.as_ref(), cli.wiki_dir.as_ref()) {
+                if augmentagent_channel_whatsapp::control_enabled()
+                    && endpoint.service.linked_surface_owners().iter().any(|owner| {
+                        owner.account().platform().as_str() == "whatsapp"
+                    })
+                {
+                    let query = wiki_querier(
+                        build_reasoner(), wiki.clone(),
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                        store.clone(), false,
+                    );
+                    let _ = query.phone_tools.set(endpoint.tools.clone());
+                    tasks.push(whatsapp_phone::spawn(
+                        endpoint.clone(), store.clone(), Arc::new(query),
+                        approver.clone().map(|handler| handler as Arc<dyn ApprovalActionHandler>),
+                        wiki.clone(), augmentagent_channel_whatsapp::default_socket_path(),
+                        shutdown.clone(),
+                    ));
+                }
+            }
 
             // #1412 — drop action bodies that only repeat the stored email,
             // shortly after start and hourly, in small batches.

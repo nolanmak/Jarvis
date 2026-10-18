@@ -15,9 +15,26 @@ handler and starts the durable transcript worker. In the configured owner's DM,
 control chat and requests number verification. Ordinary messages and status
 commands do not create bindings. Existing bindings are never replaced; revoked
 accounts require trusted operator reprovisioning and cannot be restored by chat.
-WhatsApp is not yet installed. Public TLS/provider setup,
-actual audio, approvals during a phone call and the full live host matrix still
-need qualification. This is not a declaration of production readiness.
+WhatsApp now installs when phone is enabled, an explicit WhatsApp owner link is
+configured, and `AUGMENTAGENT_WHATSAPP_CONTROL_ENABLED=1`. The paired sidecar
+must run as the daemon user and report a connected personal device matching the
+owner link. Its self-chat must already be in the outbound allowlist. The socket
+uses the channel default, overridable with `AUGMENTAGENT_WA_SOCK`. The existing
+sidecar must be running; this adapter does not pair or provision devices.
+
+The WhatsApp supervisor reconnects after sidecar failures without redialing.
+It marks active calls for shared watchdog cleanup on disconnect or shutdown;
+logout or a changed linked identity also revokes the stored owner binding.
+First-time number setup can establish a never-before-bound private control chat;
+revoked bindings require trusted operator reprovisioning. Long-running text turns
+cannot occupy the separate stop-command task capacity. Phone transcript delivery
+uses the durable outbox, and reconnect recovers only this WhatsApp account.
+For an unbound native session, phone history uses a bounded, filtered imported
+self-chat archive. The sidecar's live history fetch remains unavailable.
+
+Public TLS/provider setup, actual audio, approvals during a phone call and the
+full live host matrix still need qualification. This is not a declaration of
+production readiness.
 
 ## Configuration contract
 
