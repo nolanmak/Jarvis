@@ -380,9 +380,11 @@ elif sys.platform == 'darwin':
     ready_read, ready_write = os.pipe()
     guardian = os.fork()
     if guardian == 0:
+        stage = 'create exit monitor'
         try:
             os.close(ready_read)
             with select.kqueue() as watcher:
+                stage = 'register process exits'
                 watcher.control([select.kevent(pid, filter=select.KQ_FILTER_PROC,
                     flags=select.KQ_EV_ADD, fflags=select.KQ_NOTE_EXIT)
                     for pid in (parent, matcher)], 0, 0)
@@ -398,6 +400,12 @@ elif sys.platform == 'darwin':
                         os.kill(matcher, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+        except Exception as error:
+            # Fixed stage and exception class only, never file content or
+            # configuration. Synthetic tests retain this diagnostic; the
+            # production bridge discards matcher stderr.
+            sys.stderr.write('matcher ' + stage + ': ' + type(error).__name__ + '\n')
+            sys.stderr.flush()
         finally:
             os._exit(0)
     os.close(ready_write)

@@ -2060,6 +2060,16 @@ GREP_PARITY_TABLE = [
 
 
 class PortableGrepTests(unittest.TestCase):
+    def test_matcher_starts_and_reports_valid_result(self):
+        import os
+        data = b'SYNTHETIC_MATCH\n'
+        header = json.dumps({'pattern': 'SYNTHETIC_MATCH', 'ignore_case': False, 'limit': 10}).encode() + b'\n'
+        result = subprocess.run([sys.executable, '-I', '-S', '-c', bridge.GREP_MATCHER, str(os.getpid())],
+            input=header + str(len(data)).encode() + b'\n' + data,
+            capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+        self.assertEqual(json.loads(result.stdout)['matches'], [[0, 1, 'SYNTHETIC_MATCH']])
+
     def test_matcher_dies_with_parent_during_pathological_regex(self):
         import os
         import select
