@@ -1054,3 +1054,21 @@ Local regression coverage simulates trusted alias spelling, checks rejection
 of untrusted aliases and user symlinks, and runs the real guard without GNU
 `-m`. The Linux capability inventory passes all nine tests; all 57 shell scope
 guard cases pass. Actual macOS CI remains required before declaring parity.
+
+### Deferred history at the shared conversation queue
+
+Phone now resolves initial history after acquiring the same conversation queue
+used by text and after rechecking the native binding. If an earlier queued text
+turn established a native session, phone resumes it without fetching history.
+An unavailable history source therefore cannot block that native resume. Loading
+initial history is cancellable before the turn claim and model dispatch, and
+phone authority is checked again before fetching. The owner transcript mirror
+occurs after loading history, preventing the current utterance from entering its
+own initial-history prompt. Existing text callers retain their supplied-history
+API through the shared implementation.
+
+All ten surface-turn tests and three phone-agent tests pass locally, including
+Claude/Codex queued resume without a history fetch, cancellation during a pending
+history load without a turn claim, native continuity and late authority changes.
+The required offline runner includes both new regression cases. Full live tool
+and approval continuity receipts remain outstanding.

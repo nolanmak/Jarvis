@@ -30,7 +30,7 @@ SUITES = [
     ("augmentagent-approval-discord", "--test", "phone_delivery", 3),
     ("augmentagent-channel-core", "--test", "phone_agent", 3),
     ("augmentagent-channel-core", "--test", "capability_inventory", 9),
-    ("augmentagent-channel-core", "--test", "surface_turn", 8),
+    ("augmentagent-channel-core", "--test", "surface_turn", 10),
     ("augmentagent-channel-slack", "--test", "interactive_surface", 20),
     ("augmentagent-channel-slack", "--test", "conversation_harness", 11),
     ("augmentagent-channel-slack", "--test", "conversation_history", 5),

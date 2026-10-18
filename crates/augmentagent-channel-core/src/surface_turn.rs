@@ -133,6 +133,28 @@ where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = anyhow::Result<String>>,
 {
+    run_surface_turn_with_history(store, request, select, cancel, answer,
+        || async { Ok(request.history.to_string()) }).await
+}
+
+/// Resolve initial history only after entering the shared conversation queue.
+/// Bound native sessions never fetch history. Cancellation while loading does
+/// not claim a turn or dispatch model work. `request.history` is overridden.
+pub async fn run_surface_turn_with_history<S, F, Fut, H, History>(
+    store: &Store,
+    request: SurfaceTurnRequest<'_>,
+    select: S,
+    cancel: Option<&CancellationToken>,
+    answer: F,
+    load_history: H,
+) -> anyhow::Result<SurfaceTurnOutcome>
+where
+    S: FnOnce() -> anyhow::Result<Option<ProviderKind>>,
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = anyhow::Result<String>>,
+    H: FnOnce() -> History,
+    History: Future<Output = anyhow::Result<String>>,
+{
     let turn = request.turn;
     let chat = turn.conversation();
     // Text and phone enter through different transport queues. Serialize at
@@ -153,6 +175,19 @@ where
         anyhow::bail!("Native conversation has an uncertain turn; inspect it before continuing");
     }
     let selection = select()?;
+    let history = if binding.is_none() {
+        match cancel {
+            Some(token) => tokio::select! {
+                biased;
+                _ = token.cancelled() => return Ok(SurfaceTurnOutcome::Cancelled),
+                history = load_history() => history?,
+            },
+            None => load_history().await?,
+        }
+    } else {
+        String::new()
+    };
+
     let provider = if let Some(item) = &binding {
         let bound = match item.provider.as_str() {
             "claude" => ProviderKind::Claude,
@@ -169,7 +204,7 @@ where
             // Profiles without a native session keep their existing text
             // route until the owner explicitly selects Claude or Codex.
             return Ok(SurfaceTurnOutcome::Answered(
-                answer(legacy_prompt(request.history, request.current)).await?,
+                answer(legacy_prompt(&history, request.current)).await?,
             ));
         }
         selected
@@ -181,7 +216,7 @@ where
     let prompt = if binding.is_some() {
         request.current.to_string()
     } else {
-        legacy_prompt(request.history, request.current)
+        legacy_prompt(&history, request.current)
     };
     // Persist the claim before the CLI can run tools. If the daemon dies
     // before recording a result or native ID, restart must not silently

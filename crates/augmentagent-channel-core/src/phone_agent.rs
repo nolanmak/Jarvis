@@ -2,7 +2,7 @@
 //! work enters the same session runner as text, with the same QueryHandler.
 use crate::{
     providers::ProviderKind,
-    surface_turn::{run_surface_turn, SurfaceTurnOutcome, SurfaceTurnRequest},
+    surface_turn::{run_surface_turn_with_history, SurfaceTurnOutcome, SurfaceTurnRequest},
 };
 use async_trait::async_trait;
 use augmentagent_approval_discord::{AuditCtx, QueryHandler};
@@ -74,22 +74,6 @@ impl PhoneAgent {
             anyhow::bail!("phone origin mismatch");
         }
         let turn = SurfaceTurnRef::new(origin.conversation.clone(), turn_id)?;
-        let history = if self
-            .store
-            .surface_conversation(&origin.conversation)?
-            .is_none()
-        {
-            self.io.history(&origin).await?
-        } else {
-            String::new()
-        };
-        self.io
-            .mirror(
-                &origin,
-                &format!("{turn_id}:owner"),
-                &format!("Phone — you: {text}"),
-            )
-            .await?;
         let interrupted = self
             .interrupted
             .lock()
@@ -102,11 +86,11 @@ impl PhoneAgent {
         let outcome = augmentagent_phone::context::scope(
             origin.clone(),
             speech,
-            run_surface_turn(
+            run_surface_turn_with_history(
                 &self.store,
                 SurfaceTurnRequest {
                     turn: &turn,
-                    history: &history,
+                    history: "",
                     current: &current,
                     cwd: &cwd,
                 },
@@ -131,6 +115,11 @@ impl PhoneAgent {
                     // The queue may have waited behind a long text turn. Check
                     // authority and call liveness again immediately before work.
                     self.service.authorize_call(&call.id)?;
+                    // Initial history was loaded before adding this utterance
+                    // to the originating chat, so it cannot appear twice.
+                    self.io.mirror(&execution_origin, &format!("{turn_id}:owner"),
+                        &format!("Phone — you: {text}")).await?;
+                    self.service.authorize_call(&call.id)?;
                     let private = self
                         .store
                         .surface_owner_binding(execution_origin.owner.account())?
@@ -143,6 +132,10 @@ impl PhoneAgent {
                         self.agent.answer(&ctx, &prompt),
                     )
                     .await
+                },
+                || async {
+                    self.service.authorize_call(&call.id)?;
+                    self.io.history(&origin).await
                 },
             ),
         )
