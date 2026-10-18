@@ -47,3 +47,15 @@ pub async fn execute(
     };
     Some(result.unwrap_or_else(|e| e.to_string()))
 }
+
+/// Detect private commands in provider payloads too (edited messages and block
+/// text can carry the original code). Used before durable ingestion, never to
+/// grant authority or execute instructions from nested content.
+pub fn contains_sensitive_text(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => sensitive(text),
+        serde_json::Value::Array(items) => items.iter().any(contains_sensitive_text),
+        serde_json::Value::Object(fields) => fields.values().any(contains_sensitive_text),
+        _ => false,
+    }
+}

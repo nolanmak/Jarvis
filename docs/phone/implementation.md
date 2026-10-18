@@ -71,19 +71,19 @@ AUGMENTAGENT_GH_DISABLE=1 cargo test -p augmentagent-phone
 
 | Criteria | Evidence so far | Remaining proof/work |
 | --- | --- | --- |
-| AC01 | Disabled-service test; fixed-origin validation | Environment/readiness wiring, deployed ingress and runbook |
+| AC01 | Disabled/config validation, loopback listener and runtime tests; operator contract | Daemon installation, deployed ingress and live TLS receipts |
 | AC02 | Grant, revocation, expiry, forged target tests | Production surface and MCP boundaries |
 | AC03 | Ten concurrent reservations; restart/uncertain tests | Provider reconciliation and runtime concurrency fault injection |
 | AC04 | Known Twilio signature fixture; signed status callbacks; reordered events; real local HTTP ingress | Live callbacks and final-duration accounting |
 | AC05 | Signed start/accept tests; fake-clock watchdog | Runtime watchdog and voicemail/live timing |
-| AC06 | Existing shared session runner identified | Agent bridge, tools/approvals and mixed text/phone serialization |
+| AC06 | Offline Claude/Codex text → phone → text continuity, common queue and Slack harness regressions | Actual tool/approval continuation and live native-agent evidence |
 | AC07 | Relay protocol, barge-in generations, final suppression, one-time claim; real local WSS-protocol round trip and disconnect cleanup | Native durable turn integration, cancellation/streaming |
-| AC08 | Service contract parameterized across three surface refs | Actual chat command/tool injection, preset inventory, durable mirrors |
-| AC09 | Rate/daily budgets, restart, cleanup claims | Runtime scheduling, provider-duration reconciliation, failure receipts |
+| AC08 | Shared contract plus Slack socket command path, private entry, outbox replies and trusted turn context | Daemon installation, Discord/WhatsApp adapters, preset inventory and durable spoken-turn mirrors |
+| AC09 | Rate/daily budgets, restart, concurrent watchdog and shared cleanup guards | Provider-duration reconciliation, disable-at-start cleanup and live failure receipts |
 | AC10 | None for live conversations | Full live host/provider/origin and audible-latency matrix |
 | AC11 | No legacy voice removed yet | Replacement qualification, migration and retirement |
 | AC12 | Targeted local tests | OS CI, full regression map and live receipts |
-| AC13–15 | Verification/store/private-service tests | Actual chat routers, explicit account-link setup, live number setup |
+| AC13–15 | Verification/store tests; Slack private command, history/edit/catch-up/poll privacy and interrupted-command recovery tests | Discord/WhatsApp routers, daemon setup, account-link UX and live number setup |
 
 The old conversational voice stack must not be removed before replacement
 qualification. Its shared session/history functionality and inbound voice-file
@@ -181,3 +181,46 @@ suites / 45 Rust tests (`/tmp/1496-phone-offline/receipt.json`), its Python
 validation test passed, `cargo check -p augmentagent-cli --locked` passed with
 preexisting warnings, and phone Clippy passed with warnings denied. Remote
 macOS/Linux workflow results and live evidence are still absent.
+
+
+## Slack adapter checkpoint
+
+The actual Slack Socket Mode → dispatcher → outbox path accepts a shared phone
+service with `with_phone`. Private setup consumes input before ordinary inbox
+persistence. Only authenticated routing metadata is persisted; a bounded map
+holds up to 128 inputs, each at most 8 KiB, expiring after five minutes. The
+Socket Mode ACK does not await provider HTTP (tested with a held create call).
+Restart loses the private input deliberately and delivers an instruction to
+check status/resend, rather than replaying a code or an uncertain call.
+
+Setup/code-bearing edits and nested provider payloads are excluded too. Agent
+history fetches, subscribed live ingestion, catch-up conversion and Composio
+poll ingestion all exclude private phone commands, including edited messages.
+The transport does not claim to delete the original message from Slack.
+
+Phone call controls use independent command dispatch lanes; a blocked agent turn
+cannot hold up stop/removal. Authenticated Slack native turns carry the trusted
+phone origin. The shared queue exposed detached Slack workers during simulated
+restart: aborting the surface now aborts its worker tasks, allowing the native
+conversation to resume. Existing text, cancellation and restart regressions pass.
+
+Behavioral red logs: `/tmp/1496-slack-history-red.log`,
+`/tmp/1496-slack-context-red.log`, `/tmp/1496-slack-urgent-red.log`,
+`/tmp/1496-slack-restart-diagnostic.log`, `/tmp/1496-slack-ingestion-red.log`,
+`/tmp/1496-slack-catchup-red.log`, `/tmp/1496-slack-poll-red.log`.
+`/tmp/1496-slack-private-red.log` first failed for the absent phone dependency/API.
+Passing targeted results are in `/tmp/1496-slack-checkpoint-tests.log` (84 tests).
+The required offline CI runner now includes all seven of those Slack suites.
+
+This is adapter-level evidence using the actual socket/outbox code with fake
+telephony and agent implementations. `serve` still must install the runtime and
+service, attach the query-handler endpoint, and provide platform-specific phone
+history/mirror adapters. Discord/WhatsApp and live qualification remain open;
+no legacy voice removal is justified by these offline results.
+
+Checkpoint validation: `/tmp/1496-phone-slack-offline/receipt.json` reports all
+16 required suites / 129 Rust tests passing locally; the runner's Python test,
+CLI `cargo check --locked`, and Slack library Clippy with warnings denied also
+pass. These development logs ran against uncommitted changes; their HEAD SHA
+alone does not identify the tested tree. Future runner receipts explicitly mark
+`worktree_dirty`; remote clean-checkout CI remains the commit-specific evidence.

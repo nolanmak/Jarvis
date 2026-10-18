@@ -358,3 +358,37 @@ async fn a_history_in_prompt_provider_keeps_multi_turn_context_on_slack() {
     );
     assert!(asked[0].ends_with("user's current message:\nwhich day was it?"));
 }
+
+#[tokio::test]
+async fn private_phone_setup_messages_never_enter_agent_history() {
+    let history = vec![
+        msg(
+            &ts(NOW_SECS - 30, 1),
+            Some(OWNER),
+            false,
+            "phone number set +12025550973",
+        ),
+        msg(
+            &ts(NOW_SECS - 20, 1),
+            Some(OWNER),
+            false,
+            "/phone number verify 654321",
+        ),
+        msg(
+            &ts(NOW_SECS - 10, 1),
+            Some(OWNER),
+            false,
+            "continue the project",
+        ),
+    ];
+    let web = Arc::new(FakeHistory {
+        history,
+        ..FakeHistory::default()
+    });
+    let out = provider(web, HistoryLimits::default())
+        .transcript(TEAM, DM, None, None, OWNER)
+        .await;
+    assert!(!out.contains("12025550973"));
+    assert!(!out.contains("654321"));
+    assert!(out.contains("continue the project"));
+}

@@ -812,6 +812,7 @@ dependencies = [
  "augmentagent-docs",
  "augmentagent-loops",
  "augmentagent-messages",
+ "augmentagent-phone",
  "augmentagent-store",
  "augmentagent-wiki",
  "chrono",

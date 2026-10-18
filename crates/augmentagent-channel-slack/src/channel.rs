@@ -328,7 +328,7 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
             if !msg.is_default_user_message() {
                 continue;
             }
-            if msg.text.is_empty() {
+            if msg.text.is_empty() || augmentagent_phone::commands::sensitive(&msg.text) {
                 continue;
             }
 

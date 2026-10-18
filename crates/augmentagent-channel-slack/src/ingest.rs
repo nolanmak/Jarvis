@@ -99,6 +99,9 @@ fn non_empty(v: Option<&str>) -> Option<String> {
 /// anything. `app_mention` is not a message of its own (the same message
 /// also arrives as `message`).
 pub fn subscribed_event(envelope: &EventEnvelope) -> Option<SubscribedEvent> {
+    if augmentagent_phone::commands::contains_sensitive_text(&envelope.payload) {
+        return None;
+    }
     let team = non_empty(
         envelope
             .events_api

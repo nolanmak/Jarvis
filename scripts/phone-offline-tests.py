@@ -25,6 +25,13 @@ SUITES = [
     ("augmentagent-store", "--test", "phone_calls", 11),
     ("augmentagent-channel-core", "--test", "phone_agent", 2),
     ("augmentagent-channel-core", "--test", "surface_turn", 8),
+    ("augmentagent-channel-slack", "--test", "interactive_surface", 20),
+    ("augmentagent-channel-slack", "--test", "conversation_harness", 11),
+    ("augmentagent-channel-slack", "--test", "conversation_history", 5),
+    ("augmentagent-channel-slack", "--test", "phone_privacy", 1),
+    ("augmentagent-channel-slack", "--test", "ingest_reconcile", 11),
+    ("augmentagent-channel-slack", "--test", "ingest_catch_up", 5),
+    ("augmentagent-channel-slack", "--test", "owner_auth", 31),
 ]
 SUMMARY = re.compile(r"test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out;")
 
@@ -43,7 +50,7 @@ def main():
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, AUGMENTAGENT_GH_DISABLE="1", AUGMENTAGENT_PHONE_ENABLED="0", CARGO_TERM_COLOR="never")
-    receipt = {"kind":"offline-only", "commit":subprocess.check_output(["git","rev-parse","HEAD"],cwd=ROOT,text=True).strip(), "os":platform.system(), "architecture":platform.machine(), "suites":[], "passed":False}
+    receipt = {"kind":"offline-only", "commit":subprocess.check_output(["git","rev-parse","HEAD"],cwd=ROOT,text=True).strip(), "worktree_dirty":bool(subprocess.check_output(["git","status","--porcelain"],cwd=ROOT,text=True).strip()), "os":platform.system(), "architecture":platform.machine(), "suites":[], "passed":False}
     try:
         for package, selector, target, minimum in SUITES:
             label = package + "-" + (target or "lib")
