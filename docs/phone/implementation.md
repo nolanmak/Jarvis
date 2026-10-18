@@ -435,3 +435,43 @@ all 35 shared delivery tests and three Discord phone-delivery tests. Receipt:
 `/tmp/1496-discord-delivery-offline/receipt.json` (dirty worktree recorded).
 The two Python runner validation tests pass. Real Discord API delivery and
 reconciliation behavior remain live qualification requirements.
+
+
+### Discord conversation IO and delivery worker
+
+`DiscordPhoneIo` now connects `PhoneAgent` to the durable Discord outbox. It checks
+the bot-specific DM account (or guild account), stored owner/control conversation,
+and numeric provider IDs before fetching history or queuing a mirror. Audit
+contexts preserve the originating Discord channel, guild and HTTP client so
+existing approval notifications can use their normal route.
+
+The phone history adapter shares `fetch_owner_history` with ordinary Discord
+text: the owner/bot filter, bounded age/length, and private setup/reply exclusion
+remain in one implementation. Phone bootstrap propagates unavailable history
+instead of silently treating it as empty. Authorization is checked again after
+history retrieval. The existing text path retains its empty-history fallback.
+
+The account-scoped delivery worker handles outbox wakes and periodic retries,
+uses the bounded delivery/reconciliation boundary, and observes daemon
+cancellation. Cancelling during a provider send leaves the durable sending row
+for startup reconciliation. Startup recovery must run before spawning workers;
+the worker does not reset another running surface's delivery state.
+
+Test-first evidence: `/tmp/1496-discord-io-red.log` and
+`/tmp/1496-discord-worker-red.log`; green:
+`/tmp/1496-discord-io-worker-green.log` (three tests). The real query-handler
+fixture now exercises text → three phone turns → text for both Claude and Codex,
+with one native session, five agent invocations and six durable mirrors delivered
+through a reopened store. Wrong-bot and revoked-owner contexts fetch no additional
+history and enqueue no transcript; shutdown during a send finishes within the
+test's one-second deadline and recovery parks the send without resending.
+
+Provider/model/HTTP boundaries remain scripted. This is not live Discord or
+approval-tool qualification. Daemon registration, private setup routing and DM
+model-command continuity remain unfinished; Discord calls are not enabled yet.
+
+The expanded required offline run passes all 28 suites / 457 tests:
+`/tmp/1496-discord-io-offline/receipt.json` (dirty worktree recorded). This includes
+the shared Discord history/privacy tests, the three-turn native fixture, the new
+IO/worker tests and existing Slack/voice/session regressions. Both Python runner
+validation tests pass. No live phone calls or Discord messages were sent.

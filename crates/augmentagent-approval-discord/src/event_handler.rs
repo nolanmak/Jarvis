@@ -2576,14 +2576,25 @@ async fn fetch_conversation_context(
     bot_user_id: Option<UserId>,
     allowed_user_id: Option<UserId>,
 ) -> String {
-    let builder = GetMessages::new().before(before).limit(HISTORY_LIMIT);
-    let messages = match channel_id.messages(&ctx.http, builder).await {
-        Ok(m) => m,
-        Err(e) => {
-            warn!("fetch conversation history failed: {e}");
-            return String::new();
-        }
-    };
+    match fetch_owner_history(&ctx.http, channel_id, Some(before), bot_user_id, allowed_user_id).await {
+        Ok(history) => history,
+        Err(_) => { warn!("fetch conversation history failed"); String::new() }
+    }
+}
+
+/// Shared bounded owner-only history for text and phone session bootstrap.
+/// Private setup controls and their replies use the same filter on both paths.
+pub async fn fetch_owner_history(
+    http: &serenity::http::Http,
+    channel_id: ChannelId,
+    before: Option<MessageId>,
+    bot_user_id: Option<UserId>,
+    allowed_user_id: Option<UserId>,
+) -> anyhow::Result<String> {
+    let mut builder = GetMessages::new().limit(HISTORY_LIMIT);
+    if let Some(before) = before { builder = builder.before(before); }
+    let messages = channel_id.messages(http, builder).await
+        .map_err(|_| anyhow::anyhow!("Discord history unavailable"))?;
 
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2629,7 +2640,7 @@ async fn fetch_conversation_context(
     }
     // `messages` was newest-first; the Vec we built is therefore newest-first too.
     turns.reverse();
-    format_transcript(&history_without_model_controls(&turns), HISTORY_CHAR_CAP)
+    Ok(format_transcript(&history_without_model_controls(&turns), HISTORY_CHAR_CAP))
 }
 
 /// Pure renderer so unit tests don't need a live Discord connection.

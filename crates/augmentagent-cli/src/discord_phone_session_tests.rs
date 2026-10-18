@@ -179,7 +179,16 @@ async fn discord_phone_dm_text_reuses_native_session_without_legacy_voice() {
                     .unwrap();
                 store.phone_accept(call_id, "CA-fixture", now).unwrap();
                 let call = store.phone_provider_call(call_id).unwrap();
-                let io = Arc::new(Mirrors::default());
+                let io = Arc::new(
+                    crate::discord_phone::DiscordPhoneIo::new(
+                        store.clone(),
+                        Arc::new(History),
+                        None,
+                        11,
+                        Arc::new(tokio::sync::Notify::new()),
+                    )
+                    .unwrap(),
+                );
                 let bridge = augmentagent_channel_core::phone_agent::PhoneAgent::new(
                     store.clone(),
                     service.clone(),
@@ -188,22 +197,40 @@ async fn discord_phone_dm_text_reuses_native_session_without_legacy_voice() {
                     wiki.clone(),
                     Arc::new(|_| Ok(None)),
                 );
-                bridge
-                    .run(
-                        &call,
-                        "phone-turn",
-                        "spoken follow-up",
-                        None,
-                        tokio_util::sync::CancellationToken::new(),
-                    )
-                    .await
+                for index in 0..3 {
+                    bridge
+                        .run(
+                            &call,
+                            &format!("phone-turn-{index}"),
+                            &format!("spoken follow-up {index}"),
+                            None,
+                            tokio_util::sync::CancellationToken::new(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                let reopened = Store::open(dir.path().join("db")).unwrap();
+                let queued = reopened
+                    .outbound_sends_with_key_prefix(owner.account(), "phone-mirror:", &[])
                     .unwrap();
-                assert_eq!(io.0.lock().unwrap().len(), 2);
+                assert_eq!(queued.len(), 6);
+                assert!(queued.iter().all(|send| send.conversation == chat));
+                let posts = Posts::default();
+                while augmentagent_approval_discord::phone_delivery::deliver_one(
+                    &reopened,
+                    owner.account(),
+                    &posts,
+                    i64::MAX / 2,
+                )
+                .await
+                .unwrap()
+                {}
+                assert_eq!(posts.0.lock().unwrap().len(), 6);
             }
         }
         assert!(augmentagent_phone::context::current().is_none());
         let rows = calls.lock().unwrap();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 5);
         assert!(rows
             .iter()
             .all(|(id, prompt)| id == &native_id && !prompt.contains("private old history")));
@@ -226,32 +253,26 @@ async fn discord_phone_dm_text_reuses_native_session_without_legacy_voice() {
         )
         .await
         .is_err());
-        assert_eq!(calls.lock().unwrap().len(), 3);
+        assert_eq!(calls.lock().unwrap().len(), 5);
     }
 }
 
-#[derive(Default)]
-struct Mirrors(Mutex<Vec<String>>);
+struct History;
 #[async_trait]
-impl augmentagent_channel_core::phone_agent::ConversationIo for Mirrors {
-    async fn history(&self, _: &PhoneOrigin) -> Result<String> {
+impl crate::discord_phone::History for History {
+    async fn transcript(&self, _: &PhoneOrigin) -> Result<String> {
         anyhow::bail!("bound session must not reload history")
     }
-    async fn mirror(&self, _: &PhoneOrigin, _: &str, text: &str) -> Result<()> {
-        self.0.lock().unwrap().push(text.into());
-        Ok(())
-    }
-    fn audit_context(
+}
+#[derive(Default)]
+struct Posts(Mutex<Vec<String>>);
+#[async_trait]
+impl augmentagent_approval_discord::phone_delivery::Transport for Posts {
+    async fn send(
         &self,
-        _: &PhoneOrigin,
-        turn: &str,
-    ) -> augmentagent_approval_discord::AuditCtx {
-        augmentagent_approval_discord::AuditCtx {
-            session_id: turn.into(),
-            guild_id: None,
-            http: None,
-            channel_id: Some(serenity::model::id::ChannelId::new(22)),
-            owner_authorized: true,
-        }
+        payload: &augmentagent_approval_discord::phone_delivery::Payload,
+    ) -> std::result::Result<String, augmentagent_approval_discord::phone_delivery::SendError> {
+        self.0.lock().unwrap().push(payload.content.clone());
+        Ok("55".into())
     }
 }

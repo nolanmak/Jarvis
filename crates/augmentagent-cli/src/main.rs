@@ -8,6 +8,7 @@ mod model_tool;
 mod composio_auth_tool;
 mod voice_tool;
 mod phone_runtime;
+mod discord_phone;
 mod computer_tool;
 #[cfg(test)]
 mod provider_channel_tests;
