@@ -1223,3 +1223,17 @@ protected-name helper's lowercase expansion (`${component,,}`). That helper now
 uses portable `tr` conversion under the guards' C locale. The reserved-name list
 is unchanged. All 22 journal checks and 57 scope-guard checks pass locally; the
 actual macOS rerun remains required.
+
+### Tool requests inside session-continuity fixtures
+
+The shared Discord/WhatsApp native-provider fixture now invokes the production
+private tool broker using the capability in its actual turn options. It reads
+masked phone status while holding the native-session lease, before marking the
+turn finished. Both surface tests pass for Claude and Codex selections, across
+text and phone turns; a dropped/expired grant or disconnected broker now fails
+these tests rather than passing a configuration-only assertion. Full numbers
+must not appear in the tool response.
+
+These still use scripted native providers. They do not establish actual native
+CLI/model tool execution, approval-gated actions, Slack tool execution during
+phone turns, or live audio qualification. Those remain open AC06/AC10 evidence.
