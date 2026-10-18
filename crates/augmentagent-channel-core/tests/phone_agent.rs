@@ -226,6 +226,41 @@ async fn phone_tool_configuration_requires_authenticated_context_and_preserves_o
     let server = augmentagent_phone::tools::ToolServer::start(service)
         .await
         .unwrap();
+    // AC08: every shared preset starts without phone authority. Imported
+    // content cannot gain it merely by selecting a more capable preset.
+    use augmentagent_channel_core::reasoner::*;
+    let wiki = dir.path().join("wiki");
+    std::fs::create_dir(&wiki).unwrap();
+    let presets = vec![
+        ("triage_opts", triage_opts(Some(wiki.clone()))),
+        ("draft_opts", draft_opts("Synthetic instructions".into(), Some(wiki.clone()))),
+        ("socialapi_draft_opts", socialapi_draft_opts("Synthetic instructions".into(), Some(wiki.clone()))),
+        ("digest_opts", digest_opts(Some(wiki.clone()))),
+        ("lint_opts", lint_opts("Synthetic instructions".into(), wiki.clone())),
+        ("wiki_migrate_opts", wiki_migrate_opts("Synthetic instructions".into(), wiki.clone())),
+        ("ingest_opts", ingest_opts("Synthetic instructions".into(), wiki.clone())),
+        ("resume_opts", resume_opts(wiki.clone())),
+        ("ask_opts", ask_opts(wiki, dir.path().into())),
+        ("tone_summarize_opts", tone_summarize_opts()),
+        ("social_adapter_opts", social_adapter_opts("Synthetic instructions".into())),
+        ("loop_parse_opts", loop_parse_opts()),
+        ("archetype_pick_opts", archetype_pick_opts()),
+    ];
+    let manifest: serde_json::Value = serde_json::from_str(include_str!("../../../docs/reasoner-capabilities.json")).unwrap();
+    let expected: std::collections::BTreeSet<_> = manifest["presets"].as_array().unwrap().iter()
+        .filter_map(|entry| entry["callsite"].as_str().unwrap()
+            .strip_prefix("crates/augmentagent-channel-core/src/reasoner.rs::"))
+        .filter(|name| name.ends_with("_opts")).collect();
+    assert_eq!(presets.iter().map(|(name, _)| *name).collect::<std::collections::BTreeSet<_>>(), expected,
+        "shared preset inventory changed: review phone authorization coverage");
+    for (name, mut preset) in presets {
+        assert!(!preset.allowed_tools.iter().any(|tool| tool.starts_with("mcp__phone__")), "{name}");
+        let settings: serde_json::Value = serde_json::from_str(preset.settings_json.as_deref().unwrap_or("{}")).unwrap();
+        assert!(settings["mcpServers"]["phone"].is_null(), "{name}");
+        let before = (preset.allowed_tools.clone(), preset.settings_json.clone(), preset.system_prompt.clone());
+        assert!(attach_tools(&mut preset, &server, std::path::Path::new("/fixture/bin")).unwrap().is_none(), "{name}");
+        assert_eq!((preset.allowed_tools, preset.settings_json, preset.system_prompt), before, "{name}");
+    }
     let mut opts = augmentagent_channel_core::reasoner::triage_opts(None);
     opts.settings_json =
         Some(serde_json::json!({"mcpServers":{"existing":{"command":"kept"}}}).to_string());

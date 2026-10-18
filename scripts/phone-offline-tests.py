@@ -19,7 +19,7 @@ SUITES = [
     ("augmentagent-docs", "--test", "private_attachments", 2),
     ("augmentagent-phone", "--lib", None, 10),
     ("augmentagent-phone", "--test", "relay", 3),
-    ("augmentagent-phone", "--test", "service", 23),
+    ("augmentagent-phone", "--test", "service", 24),
     ("augmentagent-phone", "--test", "mcp", 2),
     ("augmentagent-phone", "--test", "config", 1),
     ("augmentagent-phone", "--test", "runtime", 3),

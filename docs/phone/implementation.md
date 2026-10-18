@@ -1170,3 +1170,19 @@ usage changes the snapshot, and status causes no provider calls or hangups.
 This adds observability; operator retry/reset and unknown-SID resolution remain
 open requirements. Counters include in-flight reservations and do not claim that
 the last attempt has finished.
+
+### Shared preset phone-authority coverage
+
+The existing phone-tool configuration regression now enumerates all 13 shared
+`reasoner.rs` presets, including ingestion, drafting, query, migration and resume.
+Each starts without phone MCP permissions or a phone server. Calling the phone
+attachment adapter outside authenticated transport scope returns no grant and
+preserves tools, settings and system instructions. The list is checked against
+`reasoner-capabilities.json`; the existing source scanner separately verifies
+that manifest against production preset callsites.
+
+All three phone-agent tests and the production preset inventory check pass
+locally. The offline service-suite minimum is now 24, including maintenance
+status coverage. This closes shared-preset omission risk, not the entire AC08
+inventory: custom constructors, wrappers and all authenticated transport entry
+points still require explicit phone conformance coverage.
