@@ -447,6 +447,23 @@ impl EventHandler for Handler {
         }
 
         let user_text = msg.content.trim().to_string();
+        // #1496: consume phone setup before attachments, history, native turn
+        // claims or model inference, even if the phone adapter is unavailable.
+        let phone_context = crate::phone::PhoneCommandContext {
+            guild_id: msg.guild_id.map(|id| id.get()),
+            bot_user_id: self.state.bot_user_id.get().map(|id| id.get()).unwrap_or(0),
+            channel_id: msg.channel_id.get(),
+            author_id: msg.author.id.get(),
+            message_id: msg.id.get(),
+        };
+        if let Some(reply) = crate::phone::dispatch(handler.as_ref(), &phone_context, &user_text).await {
+            let builder = CreateMessage::new().content(reply)
+                .reference_message(MessageReference::from((msg.channel_id, msg.id)));
+            if msg.channel_id.send_message(&ctx.http, builder).await.is_err() {
+                warn!("failed to post phone command reply");
+            }
+            return;
+        }
         // Model selection is an owner control, never part of the model prompt.
         // This runs after the existing fail-closed allowlist and before any
         // attachment download or history collection.
@@ -2538,7 +2555,7 @@ fn is_model_control_text(text: &str) -> bool {
 
 fn history_without_model_controls(turns: &[HistoryTurn]) -> Vec<(&'static str, String)> {
     let control_ids: std::collections::HashSet<u64> = turns.iter()
-        .filter(|turn| turn.role == "user" && is_model_control_text(&turn.body))
+        .filter(|turn| turn.role == "user" && (is_model_control_text(&turn.body) || crate::phone::is_private_control(&turn.body)))
         .map(|turn| turn.id)
         .collect();
     turns.iter()
@@ -3538,6 +3555,19 @@ mod tests {
         assert!(history.contains("> /model set glm is quoted text"), "{history}");
         assert!(history.contains("/models is a different word"), "{history}");
         assert!(history.contains("What did I ask you to remember?"), "{history}");
+    }
+
+    #[test]
+    fn private_phone_setup_and_its_replies_never_enter_later_history() {
+        let turns = vec![
+            HistoryTurn { role: "user", body: "phone number set +12025550123".into(), id: 1, reply_to: None },
+            HistoryTurn { role: "assistant", body: "Verification requested".into(), id: 2, reply_to: Some(1) },
+            HistoryTurn { role: "user", body: " /PHONE NUMBER verify 123456 ".into(), id: 3, reply_to: None },
+            HistoryTurn { role: "assistant", body: "Number verified".into(), id: 4, reply_to: Some(3) },
+            HistoryTurn { role: "user", body: "What were we discussing?".into(), id: 5, reply_to: None },
+        ];
+        let history = history_without_model_controls(&turns);
+        assert_eq!(history, vec![("user", "What were we discussing?".into())]);
     }
 
     #[test]

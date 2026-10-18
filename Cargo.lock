@@ -286,6 +286,7 @@ dependencies = [
  "async-trait",
  "augmentagent-docs",
  "augmentagent-loops",
+ "augmentagent-phone",
  "augmentagent-store",
  "chrono",
  "chrono-tz",

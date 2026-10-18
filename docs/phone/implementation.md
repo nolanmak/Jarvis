@@ -314,3 +314,43 @@ Phone-library strict clippy passes in
 strict clippy reports eight existing findings in unchanged `store.rs` (type
 complexity, argument counts and doc-list indentation); see
 `/tmp/1496-binding-revision-clippy.log`. No live provider calls were made.
+
+
+### Discord command and privacy boundary
+
+The authenticated Discord gateway now dispatches phone commands before attachment
+fetches, conversation-history retrieval and native agent turns. The hook receives
+provider message/author/channel/bot/guild IDs independently from command text.
+An uninstalled adapter consumes the command with a generic unavailable response;
+it does not submit number setup or verification codes to the agent. This is the
+entry point for the remaining Discord runtime adapter, not working Discord calls.
+
+Later Discord history omits private number controls and assistant replies to those
+controls. The separate Discord subscription poller skips private controls before
+attachment download, and its ingestion handler repeats the check before writing
+an email/inbox record. Red logs:
+`/tmp/1496-discord-phone-history-red.log` and
+`/tmp/1496-discord-phone-ingest-red.log` reproduce the previous history/inbox
+leaks; `/tmp/1496-discord-phone-boundary-red.log` records the missing command API.
+Green logs run all 255 Discord broker unit tests plus the new dispatch integration
+test, and all 44 offline Discord subscription tests. Two existing live digest
+qualification tests remain ignored because they require native-provider login.
+The required phone runner selects the new ingestion regression explicitly and
+still rejects ignored or absent required cases.
+
+Outstanding Discord work includes authenticated account/control-chat setup,
+installing the service and tool endpoint, DM native-session continuity, durable
+transcript delivery and actual phone calls. Legacy voice remains installed.
+
+Inspection of `WikiQuerier::answer_turn` confirms that current Discord DM turns
+fall back to the legacy answer path: shared native scheduling is gated on a guild
+ID and the old voice flag. Discord phone installation must remove that dependency
+for authenticated phone-enabled DMs and reuse their native session, rather than
+creating a separate phone conversation.
+
+The expanded required offline run passes all 24 suites / 415 tests, with no
+ignored required cases. Receipt:
+`/tmp/1496-discord-boundary-offline/receipt.json` (dirty worktree recorded).
+It includes CLI daemon phone, surface-conformance and legacy voice-session
+regressions. The runner's two Python validation tests also pass. No live Discord
+messages or phone calls were sent during this checkpoint.

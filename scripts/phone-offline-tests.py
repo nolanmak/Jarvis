@@ -24,6 +24,8 @@ SUITES = [
     ("augmentagent-phone", "--test", "runtime", 1),
     ("augmentagent-store", "--test", "phone_calls", 11),
     ("augmentagent-store", "--test", "surface_owner", 15),
+    ("augmentagent-approval-discord", "--lib", None, 255),
+    ("augmentagent-approval-discord", "--test", "phone_boundary", 1),
     ("augmentagent-channel-core", "--test", "phone_agent", 2),
     ("augmentagent-channel-core", "--test", "surface_turn", 8),
     ("augmentagent-channel-slack", "--test", "interactive_surface", 20),
@@ -64,6 +66,11 @@ def main():
     for module, minimum in [("phone_runtime::tests::", 2), ("surface_conformance_tests::", 2), ("discord_voice_session_tests::", 6)]:
         jobs.append(("augmentagent-cli-" + module.rstrip(":").replace("::", "-"),
                      ["cargo", "test", "--locked", "-p", "augmentagent-cli", "--bin", "augmentagent", module, "--", "--test-threads=1"], minimum, True))
+    # This library also contains explicitly ignored live-provider qualification
+    # tests. Require the deterministic privacy regression by its exact name.
+    jobs.append(("augmentagent-channel-discord-dm-phone-privacy",
+                 ["cargo", "test", "--locked", "-p", "augmentagent-channel-discord-dm", "--lib",
+                  "channel::tests::private_phone_setup_is_not_stored_or_sent_to_reasoner", "--", "--exact"], 1, True))
     try:
         for label, command, minimum, allow_filtered in jobs:
             print("Running " + label, flush=True)

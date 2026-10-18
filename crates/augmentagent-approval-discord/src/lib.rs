@@ -24,6 +24,7 @@ mod nudge;
 pub mod owner_alerts;
 // #1292 — the shared owner-command registry (Discord triggers, Slack mapping).
 pub mod owner_commands;
+pub mod phone;
 mod process_loops;
 // #994 — register (casing) audit for outbound drafts. Public: the delivery
 // layer checks receipts here and `gmail compose` gates its body on them.
@@ -438,6 +439,10 @@ pub trait QueryHandler: Send + Sync {
         };
         self.answer(ctx, &prompt).await
     }
+
+    /// Deterministic phone command after Discord owner admission. Implementations
+    /// must validate stored owner links before executing a phone operation.
+    async fn phone_command(&self, _context: &phone::PhoneCommandContext, _text: &str) -> Option<String> { None }
 
     /// Owner-only deterministic control command, intercepted before history,
     /// attachments or model inference. `None` means an ordinary message.
