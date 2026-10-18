@@ -267,6 +267,13 @@ impl PhoneService {
                         "<Response><Redirect method=\"POST\">{}</Redirect></Response>",
                         xml(&action)
                     );
+                    self.store.phone_register_origin(
+                        &reserved.call.id,
+                        &augmentagent_store::phone::PhoneOrigin {
+                            owner: grant.surface_owner.clone(),
+                            conversation: grant.conversation.clone(),
+                        },
+                    )?;
                     self.dial(&reserved.call, twiml).await?;
                 }
                 self.store.phone_call(&grant.owner_id, &reserved.call.id)?
@@ -457,3 +464,33 @@ impl PhoneService {
 }
 
 pub mod ingress;
+
+impl PhoneService {
+    /// Revalidate the original transport owner before each phone turn. A call
+    /// cannot inherit permissions from a different conversation or account.
+    pub fn authorize_call(&self, call_id: &str) -> Result<Grant, Error> {
+        let call = self.store.phone_provider_call(call_id)?;
+        if call.state != CallState::Connected || call.stop_requested || call.verification {
+            return Err(Error::Unauthorized);
+        }
+        let origin = self.store.phone_origin(call_id)?;
+        let grant = self.authorize(&origin.owner, &origin.conversation)?;
+        if grant.owner_id != call.owner || grant.conversation.storage_key() != call.conversation {
+            return Err(Error::Unauthorized);
+        }
+        Ok(grant)
+    }
+}
+
+pub mod commands;
+pub mod context;
+pub mod tools;
+
+impl PhoneService {
+    pub fn latest_call(&self, grant: &Grant) -> Result<Option<PhoneCall>, Error> {
+        self.check(grant, false)?;
+        Ok(self.store.phone_latest_call(&grant.owner_id)?)
+    }
+}
+
+pub mod mcp;

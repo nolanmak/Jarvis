@@ -379,3 +379,32 @@ fn ac09_connected_minutes_cap_and_utc_day_reset() {
         900
     );
 }
+
+#[test]
+fn origin_is_bound_to_the_call_and_survives_restart() {
+    use augmentagent_store::{
+        phone::PhoneOrigin, SurfaceAccountRef, SurfaceConversationRef, SurfaceOwnerRef,
+        SurfacePlatform,
+    };
+    let (dir, store) = fixture();
+    let account =
+        SurfaceAccountRef::new(SurfacePlatform::new("discord").unwrap(), "guild").unwrap();
+    let chat = SurfaceConversationRef::new(account.clone(), "thread", None).unwrap();
+    let origin = PhoneOrigin {
+        owner: SurfaceOwnerRef::new(account, "sender").unwrap(),
+        conversation: chat.clone(),
+    };
+    let call = store
+        .phone_reserve_call(request("r1", &chat.storage_key(), 100))
+        .unwrap()
+        .call;
+    store.phone_register_origin(&call.id, &origin).unwrap();
+    store.phone_register_origin(&call.id, &origin).unwrap();
+    let mut other = origin.clone();
+    other.conversation =
+        SurfaceConversationRef::new(other.owner.account().clone(), "elsewhere", None).unwrap();
+    assert!(store.phone_register_origin(&call.id, &other).is_err());
+    drop(store);
+    let reopened = Store::open(dir.path().join("phone.db")).unwrap();
+    assert_eq!(reopened.phone_origin(&call.id).unwrap(), origin);
+}

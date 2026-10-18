@@ -39,3 +39,7 @@ CREATE TABLE IF NOT EXISTS phone_cleanup (
     attempts INTEGER NOT NULL DEFAULT 0,
     next_ms INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS phone_origins (
+    call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
+    origin_json TEXT NOT NULL
+);

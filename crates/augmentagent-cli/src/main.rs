@@ -706,6 +706,9 @@ enum Cmd {
     /// Internal conversation-bound MCP server for Discord speech.
     #[command(hide = true)]
     VoiceTool,
+    /// Internal owner-bound phone MCP facade.
+    #[command(hide = true)]
+    PhoneTool,
     /// Internal owner-DM-bound computation MCP facade.
     #[command(hide = true)]
     ComputeTool,
@@ -2852,6 +2855,9 @@ async fn main() -> Result<()> {
     }
     if let Cmd::ComposioAuthTool = cli.cmd {
         return composio_auth_tool::serve().await;
+    }
+    if let Cmd::PhoneTool = cli.cmd {
+        return Ok(augmentagent_phone::mcp::serve()?);
     }
     if let Cmd::VoiceTool = cli.cmd {
         return voice_tool::serve();
@@ -5227,6 +5233,7 @@ async fn main() -> Result<()> {
         Cmd::ModelTool { channel, ref readiness } => model_tool::serve(channel, readiness),
         Cmd::ComposioAuthTool => composio_auth_tool::serve().await,
         Cmd::VoiceTool => voice_tool::serve(),
+        Cmd::PhoneTool => Ok(augmentagent_phone::mcp::serve()?),
         Cmd::ComputeTool => compute_tool::serve(),
         Cmd::ReasonerSelftest { ref prompt, ref profile, tool_probe } =>
             run_reasoner_selftest(prompt, profile.as_deref(), tool_probe).await,
@@ -10535,6 +10542,7 @@ struct WikiQuerier {
     conversation_scheduler: Arc<augmentagent_approval_discord::conversation::ConversationScheduler>,
     voice_enabled: bool,
     voice_tools: std::sync::OnceLock<Arc<augmentagent_approval_discord::voice_tool::VoiceToolService>>,
+    phone_tools: std::sync::OnceLock<Arc<augmentagent_phone::tools::ToolServer>>,
     final_spoken_turns: dashmap::DashMap<String, ()>,
 }
 
@@ -10557,6 +10565,7 @@ fn wiki_querier(
             augmentagent_approval_discord::conversation::ConversationScheduler::new(),
         ),
         voice_enabled,
+        phone_tools: std::sync::OnceLock::new(),
         voice_tools: std::sync::OnceLock::new(),
         final_spoken_turns: dashmap::DashMap::new(),
     }
@@ -10773,6 +10782,19 @@ impl QueryHandler for WikiQuerier {
                 warn!("owner compute unavailable: host policy or runtime setup failed");
                 None
             }
+        };
+        // The scoped origin comes only from an authenticated interactive transport.
+        // Keep this capability alive through the native provider call below.
+        let _phone_grant = if ctx.owner_authorized {
+            self.phone_tools
+                .get()
+                .map(|server| {
+                    augmentagent_channel_core::phone_agent::attach_tools(&mut opts, server, &auth_bin)
+                })
+                .transpose()?
+                .flatten()
+        } else {
+            None
         };
         let voice_grant = self.voice_tools.get().and_then(|service| {
             let guild = ctx.guild_id?;
@@ -11136,6 +11158,7 @@ mod query_delivery_contract_tests {
         ], CooldownLatch::at(repo.join("cooldowns.json"))));
         let handler = WikiQuerier { reasoner: reasoner.clone(), wiki_root: wiki.clone(), repo_root: repo.into(),
             conversation_store: None, conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()), voice_enabled: false,
+            phone_tools: std::sync::OnceLock::new(),
             voice_tools: std::sync::OnceLock::new(), final_spoken_turns: dashmap::DashMap::new() };
         for turn in 0..2 {
             let mut ctx = augmentagent_approval_discord::AuditCtx::empty();
@@ -11198,6 +11221,7 @@ mod query_delivery_contract_tests {
         let handler = WikiQuerier { reasoner: reasoner.clone(), wiki_root: wiki.clone(),
             repo_root: fixture.path().to_path_buf(), conversation_store: None,
             conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()), voice_enabled: false,
+            phone_tools: std::sync::OnceLock::new(),
             voice_tools: std::sync::OnceLock::new(), final_spoken_turns: dashmap::DashMap::new() };
         let mut context = augmentagent_approval_discord::AuditCtx::empty();
         context.session_id = "synthetic-channel:synthetic-turn".into();

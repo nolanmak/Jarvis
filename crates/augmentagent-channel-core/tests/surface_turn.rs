@@ -401,3 +401,62 @@ async fn turn_env_reaches_the_agent_inside_the_turn_only() {
     assert_eq!(seen.load(Ordering::SeqCst), 1);
     assert!(turn_env().is_empty());
 }
+
+#[tokio::test]
+async fn phone_and_text_turns_share_one_queue_and_native_session() {
+    for kind in [ProviderKind::Claude, ProviderKind::Codex] {
+        let (_dir, store) = store();
+        let provider = RecordingNativeProvider::new(kind);
+        let chat = slack("D-phone-owner", None);
+        let text = SurfaceTurnRef::new(chat.clone(), "slack:text-1").unwrap();
+        let phone = SurfaceTurnRef::new(chat, "phone:call-1:1").unwrap();
+        let active = AtomicUsize::new(0);
+        let maximum = AtomicUsize::new(0);
+        let answer = |turn: &SurfaceTurnRef, prompt: String| {
+            let provider = &provider;
+            let active = &active;
+            let maximum = &maximum;
+            let opts = opts(turn);
+            async move {
+                let n = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(n, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                let result = provider.call(&opts, &prompt).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                result
+            }
+        };
+        let (first, second) = tokio::join!(
+            run_surface_turn(
+                &store,
+                SurfaceTurnRequest {
+                    turn: &text,
+                    history: "earlier text",
+                    current: "text question",
+                    cwd: "/fixture"
+                },
+                || Ok(Some(kind)),
+                None,
+                |p| answer(&text, p)
+            ),
+            run_surface_turn(
+                &store,
+                SurfaceTurnRequest {
+                    turn: &phone,
+                    history: "earlier text",
+                    current: "phone question",
+                    cwd: "/fixture"
+                },
+                || Ok(Some(kind)),
+                None,
+                |p| answer(&phone, p)
+            ),
+        );
+        assert!(first.is_ok(), "text: {first:?}");
+        assert!(second.is_ok(), "phone: {second:?}");
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].native_session_id, calls[1].native_session_id);
+    }
+}

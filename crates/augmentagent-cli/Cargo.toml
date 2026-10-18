@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 tempfile = "3"
 augmentagent-finance = { path = "../augmentagent-finance" }
+augmentagent-phone = { path = "../augmentagent-phone" }
 augmentagent-store = { path = "../augmentagent-store" }
 augmentagent-channel-core = { path = "../augmentagent-channel-core" }
 augmentagent-channel-reddit = { path = "../augmentagent-channel-reddit" }

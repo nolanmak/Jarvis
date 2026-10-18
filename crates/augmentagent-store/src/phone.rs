@@ -614,3 +614,56 @@ impl Store {
         })
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PhoneOrigin {
+    pub owner: crate::SurfaceOwnerRef,
+    pub conversation: crate::SurfaceConversationRef,
+}
+impl Store {
+    pub fn phone_register_origin(&self, id: &str, origin: &PhoneOrigin) -> PhoneResult<()> {
+        if origin.owner.account() != origin.conversation.account() {
+            return Err(PhoneError::Conflict);
+        }
+        let json = serde_json::to_string(origin).map_err(|_| PhoneError::InvalidInput)?;
+        transaction(self, |tx| {
+            let call = call_by_id(tx, id)?;
+            if call.conversation != origin.conversation.storage_key() {
+                return Err(PhoneError::Conflict);
+            }
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT origin_json FROM phone_origins WHERE call_id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if existing.as_ref().is_some_and(|old| old != &json) {
+                return Err(PhoneError::Conflict);
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO phone_origins(call_id,origin_json) VALUES(?1,?2)",
+                params![id, json],
+            )?;
+            Ok(())
+        })
+    }
+    pub fn phone_origin(&self, id: &str) -> PhoneResult<PhoneOrigin> {
+        let json: Option<String> = self.with_conn(|c| {
+            c.query_row(
+                "SELECT origin_json FROM phone_origins WHERE call_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()
+        })?;
+        serde_json::from_str(&json.ok_or(PhoneError::NotFound)?)
+            .map_err(|_| PhoneError::InvalidInput)
+    }
+}
+
+impl Store {
+    pub fn phone_latest_call(&self, owner: &str) -> PhoneResult<Option<PhoneCall>> {
+        Ok(self.with_conn(|c|c.query_row(&format!("SELECT {CALL_COLUMNS} FROM phone_calls WHERE owner=?1 ORDER BY created_ms DESC,id DESC LIMIT 1"),[owner],read_call).optional())?)
+    }
+}

@@ -91,6 +91,33 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
+fn conversation_queue(
+    store: &Store,
+    conversation: &augmentagent_store::SurfaceConversationRef,
+) -> Arc<tokio::sync::Mutex<()>> {
+    use std::sync::{Mutex, OnceLock, Weak};
+    type Queues =
+        std::collections::HashMap<(std::path::PathBuf, String), Weak<tokio::sync::Mutex<()>>>;
+    static QUEUES: OnceLock<Mutex<Queues>> = OnceLock::new();
+    let db = store
+        .db_path()
+        .canonicalize()
+        .unwrap_or_else(|_| store.db_path().to_path_buf());
+    let key = (db, conversation.storage_key());
+    let mut queues = QUEUES
+        .get_or_init(Mutex::default)
+        .lock()
+        .expect("conversation queues poisoned");
+    // Weak entries do not retain idle conversations or cross-test databases.
+    queues.retain(|_, queue| queue.strong_count() > 0);
+    if let Some(queue) = queues.get(&key).and_then(Weak::upgrade) {
+        return queue;
+    }
+    let queue = Arc::new(tokio::sync::Mutex::new(()));
+    queues.insert(key, Arc::downgrade(&queue));
+    queue
+}
+
 /// Run one turn. `select` is read after the binding (the conversation's
 /// model selection); `answer` gets the prompt to send and runs the shared
 /// agent (tools, wiki, skills, audit, fallback). See the module docs.
@@ -108,6 +135,18 @@ where
 {
     let turn = request.turn;
     let chat = turn.conversation();
+    // Text and phone enter through different transport queues. Serialize at
+    // their common native-session boundary before reading the binding or
+    // claiming a turn, so a second input resumes the first input's session.
+    let queue = conversation_queue(store, chat);
+    let _queue_guard = match cancel {
+        Some(token) => tokio::select! {
+            biased;
+            _ = token.cancelled() => return Ok(SurfaceTurnOutcome::Cancelled),
+            guard = queue.lock() => guard,
+        },
+        None => queue.lock().await,
+    };
     let discord = chat.account().platform().as_str() == "discord";
     let binding = store.surface_conversation(chat)?;
     if binding.as_ref().is_some_and(|item| item.uncertain) {

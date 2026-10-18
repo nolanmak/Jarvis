@@ -104,3 +104,51 @@ shared agent-turn integration, conversation-bound MCP tools, early private chat
 command routing for all three platforms, configuration/runbook, CI, then live
 qualification and legacy retirement. Keep the goal and issue open until the
 entire acceptance map is proved.
+
+## Native-session and MCP checkpoint
+
+The phone agent bridge now enters `run_surface_turn` with the persisted origin.
+That common runner serializes phone and text before loading the native binding
+or claiming a turn. A scripted-provider test runs text → three phone turns →
+text for both Claude and Codex and observes one session; a concurrent-turn test
+observes at most one native turn executing. These are offline harness tests,
+not live model/tool/approval qualification.
+
+The private Unix-socket tool broker issues revocable owner/conversation grants.
+The `phone-tool` CLI subcommand provides bounded stdio MCP frames; its schemas
+accept no destination, origin or verification-code fields. The agent option
+adapter preserves other tools and only adds phone tools inside trusted transport
+context. `WikiQuerier` retains the grant for the provider call, but its endpoint
+still needs installation at daemon startup. No production surface is claimed
+connected by this checkpoint.
+
+The structured private setup command implementation consumes numbers and codes
+without returning them in replies. The actual chat routers still must intercept
+these **before** inbox persistence, history capture or model invocation. In
+particular, Slack currently persists an event before owner dispatch, so adding
+phone handling only in its existing command dispatcher would violate AC15.
+WhatsApp's existing CLI runtime is not wired and its control path ignores
+outbound messages; an authenticated self-chat adapter is still required.
+
+Test-first records from this workspace:
+
+| Behavior | Failing run | Passing run |
+| --- | --- | --- |
+| Shared text/phone queue | `/tmp/1496-serialization-red.log` (concurrent native turn marked uncertain) | `/tmp/1496-serialization-green.log` |
+| Persisted immutable call origin | `/tmp/1496-origin-red.log` (missing API) | `/tmp/1496-origin-green.log` |
+| Private MCP grant/number commands | `/tmp/1496-mcp-red.log` (missing API) | `/tmp/1496-mcp-green.log` |
+| Same native session through phone | `/tmp/1496-agent-bridge-red.log` (missing bridge) | `/tmp/1496-agent-bridge-green.log` |
+| Bounded MCP facade and error handling | `/tmp/1496-mcp-facade-red.log` (missing module) | `/tmp/1496-mcp-facade-green.log` |
+| Scoped tool injection | `/tmp/1496-tools-injection-red.log` (missing adapter) | `/tmp/1496-tools-injection-green.log` |
+
+The `/tmp` logs are local development evidence. Required CI and live receipts
+remain outstanding. AC06 still requires real tool and approval behavior; AC08
+and AC13 still require actual Discord/Slack/WhatsApp adapter coverage. Runtime
+watchdog scheduling, provider-duration accounting, configuration, durable mirror
+adapters, live qualification and legacy retirement also remain open.
+
+Validation for this checkpoint: 36 targeted integration tests passed (11 store,
+13 phone service, 2 MCP facade, 2 phone-agent bridge/configuration, 8 common
+session runner), plus `cargo check -p augmentagent-cli` and phone-crate Clippy
+with warnings denied. Existing unrelated CLI/docs warnings remain in the CLI
+check. This is Linux local validation only.

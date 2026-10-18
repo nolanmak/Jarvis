@@ -627,3 +627,117 @@ async fn ac07_real_websocket_routes_final_transcript_and_hangup_without_replay()
     assert_eq!(f.provider.stops.lock().unwrap().len(), 1);
     server.abort();
 }
+
+#[tokio::test]
+async fn ac02_mcp_socket_grants_are_private_bound_revocable_and_reject_target_arguments() {
+    use augmentagent_phone::tools::ToolServer;
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let f = fixture("discord", true, true, false);
+    let server = ToolServer::start(Arc::new(f.service)).await.unwrap();
+    assert_eq!(
+        std::fs::metadata(server.socket_path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let grant = server.grant(&f.owner, &f.conversation, None).unwrap();
+    async fn invoke(
+        path: &std::path::Path,
+        token: &str,
+        args: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut stream = tokio::net::UnixStream::connect(path).await.unwrap();
+        stream
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"version":1,"grant":token,"method":"call_owner","arguments":args})
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).await.unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+    let rejected = invoke(
+        server.socket_path(),
+        grant.token(),
+        json!({"request_id":"r","to":"+12025550999"}),
+    )
+    .await;
+    assert_eq!(rejected["ok"], false);
+    assert!(f.provider.calls.lock().unwrap().is_empty());
+    let valid = invoke(
+        server.socket_path(),
+        grant.token(),
+        json!({"request_id":"r"}),
+    )
+    .await;
+    assert_eq!(valid["ok"], true);
+    assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
+    let token = grant.token().to_string();
+    drop(grant);
+    assert_eq!(
+        invoke(server.socket_path(), &token, json!({"request_id":"r"})).await["ok"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn ac13_number_commands_consume_codes_without_returning_them_to_history() {
+    use augmentagent_phone::commands::{execute, recognizes, sensitive};
+    let f = fixture("slack", true, true, false);
+    assert!(recognizes("phone number verify 123456"));
+    assert!(sensitive("/phone number set +12025550456"));
+    assert!(sensitive("phone number verify invalid code"));
+    assert!(!recognizes("telephone support"));
+    let reply = execute(
+        &f.service,
+        &f.owner,
+        &f.conversation,
+        "event-1",
+        "phone number set +12025550456",
+    )
+    .await
+    .unwrap();
+    assert!(!reply.contains("+12025550456"));
+    let code = {
+        let calls = f.provider.calls.lock().unwrap();
+        calls[0]
+            .twiml
+            .split(" is ")
+            .nth(1)
+            .unwrap()
+            .split('.')
+            .next()
+            .unwrap()
+            .replace(' ', "")
+    };
+    let reply = execute(
+        &f.service,
+        &f.owner,
+        &f.conversation,
+        "event-2",
+        &format!("phone number verify {code}"),
+    )
+    .await
+    .unwrap();
+    assert!(reply.contains("verified"));
+    assert!(!reply.contains(&code));
+    let status = execute(
+        &f.service,
+        &f.owner,
+        &f.conversation,
+        "event-3",
+        "phone number status",
+    )
+    .await
+    .unwrap();
+    assert!(status.contains("0456"));
+    assert!(!status.contains("+12025550456"));
+}
