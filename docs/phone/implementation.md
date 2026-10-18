@@ -78,7 +78,7 @@ AUGMENTAGENT_GH_DISABLE=1 cargo test -p augmentagent-phone
 | AC05 | Signed acceptance, fake-clock deadline tests and concurrent runtime watchdog | Voicemail and live acceptance timing |
 | AC06 | Both native providers: text → phone → text continuity; shared queue; deferred/cancellable initial history | Actual native tool/approval continuation and live evidence |
 | AC07 | Relay/barge-in generations, final suppression, one-time claims, local WSS round trip and cancellation | Complete live streaming/interruption and tool-disconnect proof |
-| AC08 | Discord, Slack and WhatsApp daemon adapters; authenticated tools; durable transcript outboxes | Exhaustive authenticated-surface/preset inventory and live origin receipts |
+| AC08 | Discord, Slack and WhatsApp daemon adapters; authenticated tools; durable transcript outboxes; 13 shared presets checked | [Entry-point audit](surfaces.md): local CLI phone adapter missing; custom constructors/wrappers and live origin receipts outstanding |
 | AC09 | Persistent budgets, provider-duration callbacks, bounded shutdown and disabled/unavailable-start cleanup | Exhausted-retry operator recovery and live stop/restart/disable evidence |
 | AC10 | Recorded-audio receipt validator and synthetic regression tests only | Actual consented audio, native traces and full live matrix; no live receipt exists |
 | AC11 | No legacy voice removed yet | Replacement qualification, upgrade/rollback fixtures and retirement |
