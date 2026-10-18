@@ -93,6 +93,19 @@ pub trait GmailApi: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// #1494 — the draft (if any) already sitting on `thread_id`. Used only
+    /// to recover from a lost create-draft response during a throttle, so a
+    /// retry adopts the draft that landed instead of making a second one.
+    /// Default impl returns `Ok(None)` — "nothing to adopt, create normally" —
+    /// so fakes that don't model drafts keep compiling.
+    async fn find_draft_on_thread(
+        &self,
+        _entity_id: &str,
+        _thread_id: &str,
+    ) -> Result<Option<String>, GmailError> {
+        Ok(None)
+    }
+
     /// Create a reply draft. Returns the draft ID.
     async fn create_draft(
         &self,
@@ -542,6 +555,56 @@ impl ComposioClient {
                     (Some(m), Some(t)) if m != t => Some(t.to_string()),
                     _ => None,
                 });
+            }
+            page_token = v
+                .pointer("/data/next_page_token")
+                .or_else(|| v.pointer("/data/nextPageToken"))
+                .and_then(serde_json::Value::as_str)
+                .map(String::from);
+            if page_token.is_none() {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
+    /// #1494 — find a draft already sitting on `thread_id`, so a compose whose
+    /// response was lost to a throttle adopts the draft that actually landed
+    /// instead of creating a second one. Same `GMAIL_LIST_DRAFTS` walk as
+    /// [`get_draft_thread_id`], matching on the thread and returning the draft.
+    /// `Ok(None)` when the thread holds no draft in the first `MAX_PAGES`.
+    pub async fn find_draft_on_thread(
+        &self,
+        entity_id: &str,
+        thread_id: &str,
+    ) -> Result<Option<String>, GmailError> {
+        const MAX_PAGES: u32 = 5;
+        let mut page_token: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let mut args = serde_json::json!({
+                "max_results": 100,
+                "verbose": false,
+            });
+            if let Some(t) = &page_token {
+                args["page_token"] = serde_json::Value::String(t.clone());
+            }
+            let v = self.execute("GMAIL_LIST_DRAFTS", entity_id, args).await?;
+            let drafts = v
+                .pointer("/data/drafts")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for d in &drafts {
+                let on_thread = d
+                    .pointer("/message/threadId")
+                    .or_else(|| d.pointer("/message/thread_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(thread_id);
+                if on_thread {
+                    if let Some(id) = d.get("id").and_then(serde_json::Value::as_str) {
+                        return Ok(Some(id.to_string()));
+                    }
+                }
             }
             page_token = v
                 .pointer("/data/next_page_token")
@@ -2205,6 +2268,34 @@ mod tests {
             .expect("list should succeed");
         assert_eq!(standalone, None);
     }
+
+    /// #1494 — the lost-response probe: a draft that landed on the thread
+    /// before the throttle must be findable so the retry adopts it.
+    #[tokio::test]
+    async fn find_draft_on_thread_returns_the_draft_sitting_on_that_thread() {
+        let body = r#"{"successful":true,"data":{"drafts":[
+            {"id":"D1","message":{"id":"M1","threadId":"T9"}},
+            {"id":"D2","message":{"id":"M2","threadId":"M2"}}
+        ]}}"#;
+        let addr = spawn_repeating_http(200, body, "").await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        assert_eq!(
+            client
+                .find_draft_on_thread("entity-x", "T9")
+                .await
+                .expect("list should succeed")
+                .as_deref(),
+            Some("D1")
+        );
+        assert_eq!(
+            client
+                .find_draft_on_thread("entity-x", "T-none")
+                .await
+                .expect("list should succeed"),
+            None
+        );
+    }
 }
 
 /// Composio v3 wraps TOOL-level failures in an HTTP 200 envelope:
@@ -2843,6 +2934,14 @@ impl GmailApi for ComposioClient {
     ) -> Result<String, GmailError> {
         self.create_draft_with_attachment(entity_id, to, subject, body, thread_id, None, cc, &[])
             .await
+    }
+
+    async fn find_draft_on_thread(
+        &self,
+        entity_id: &str,
+        thread_id: &str,
+    ) -> Result<Option<String>, GmailError> {
+        ComposioClient::find_draft_on_thread(self, entity_id, thread_id).await
     }
 
     async fn send_draft(

@@ -1192,6 +1192,15 @@ impl Store {
         if !column_exists(conn, "actions", "recomposedAtMs")? {
             conn.execute("ALTER TABLE actions ADD COLUMN recomposedAtMs INTEGER", [])?;
         }
+        // #1494 — the upstream retry-after a throttled compose was handed.
+        // NULL (every pre-existing row, and every failure that wasn't a rate
+        // limit) means "no clock", i.e. the pre-change retry schedule.
+        if !column_exists(conn, "actions", "retryNotBeforeMs")? {
+            conn.execute(
+                "ALTER TABLE actions ADD COLUMN retryNotBeforeMs INTEGER",
+                [],
+            )?;
+        }
         // Mirrors idx_scheduled_posts_fire: the engine's due query is
         // `status = 'scheduled' AND scheduledAtMs <= now`.
         conn.execute(
@@ -4651,6 +4660,25 @@ impl Store {
         Ok(())
     }
 
+    /// #1494 — hold an errored action out of the retry queue until the
+    /// upstream retry-after boundary it was handed. Takes the MAX of any
+    /// existing clock, like `set_gmail_fetch_cooldown`, so a shorter later
+    /// boundary can't pull the row back inside a throttle we already saw.
+    pub fn set_action_retry_not_before(
+        &self,
+        action_id: &str,
+        not_before_ms: i64,
+    ) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE actions SET retryNotBeforeMs = MAX(COALESCE(retryNotBeforeMs, 0), ?2), \
+                updatedAt = ?3 WHERE id = ?1",
+            params![action_id, not_before_ms, now],
+        )?;
+        Ok(())
+    }
+
     /// #473 — persist the outbound envelope (To/cc/bcc, comma-joined bare
     /// addresses) of a compose-originated card. Empty strings are stored as
     /// NULL so `get_action_envelope` cleanly reports "no envelope recorded".
@@ -4844,6 +4872,13 @@ impl Store {
     /// - `actions.createdAt` within `max_age_ms` (don't retry ancient errors forever)
     /// - `actions.updatedAt` older than `min_gap_ms` ago (space attempts out)
     /// - `actions.retryCount < max_attempts`
+    /// - `actions.retryNotBeforeMs` (#1494) already passed, when the failure
+    ///   was an upstream rate limit that named a boundary. NULL — every other
+    ///   failure, and every row written before the column existed — retries on
+    ///   exactly the pre-#1494 schedule. Scheduled-send failures can't be
+    ///   affected: `finish_send_error` stamps them at the retry cap so they
+    ///   never reach this query at all, which is why `scheduled.rs`'s
+    ///   no-engine-retries contract survives a compose-side clock untouched.
     /// - `emails.platform` equals the caller's channel — each channel's retry
     ///   tick only sees its own rows (#670); otherwise e.g. a socialapi Error
     ///   row lands in the gmail tick and is dispatched through gmail plumbing
@@ -4871,6 +4906,7 @@ impl Store {
                AND a.createdAt >= ?2 \
                AND a.updatedAt <= ?3 \
                AND COALESCE(a.retryCount, 0) < ?4 \
+               AND COALESCE(a.retryNotBeforeMs, 0) <= ?6 \
              ORDER BY a.createdAt ASC \
              LIMIT ?5",
         )?;
@@ -4881,6 +4917,7 @@ impl Store {
                 now_ms - min_gap_ms,
                 max_attempts,
                 limit,
+                now_ms,
             ],
             |r| {
                 Ok(RetryableReply {
@@ -10684,6 +10721,60 @@ mod tests {
     /// (logged by the DM handler's parse-failure / post_approval-failure paths)
     /// must never surface to the gmail tick, whose recovery path dispatches
     /// through gmail plumbing.
+    /// #1494 — a compose throttled by Composio stamps the upstream
+    /// retry-after onto its action row; the retry tick must not touch the row
+    /// before that boundary, and rows that never set one keep the old
+    /// schedule exactly.
+    #[test]
+    fn a_retry_after_clock_holds_a_row_until_its_boundary() {
+        let (s, _f) = fresh_store();
+        let mut ids = Vec::new();
+        for mid in ["m-clock", "m-no-clock"] {
+            let email = sample_email(mid);
+            s.upsert_email(&email).unwrap();
+            ids.push(
+                s.log_action(
+                    mid,
+                    None,
+                    &email.from,
+                    &email.subject,
+                    Some(&email.body),
+                    Some("draft"),
+                    ActionStatus::Error,
+                )
+                .unwrap(),
+            );
+        }
+        let now = now_millis();
+        let ten_min = 10 * 60 * 1_000;
+        s.set_action_retry_not_before(&ids[0], now + ten_min)
+            .unwrap();
+
+        let ids_at = |at: i64| {
+            s.list_retryable_replies("gmail", at, 86_400_000, 0, 5, 10)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.action.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids_at(now),
+            [ids[1].clone()],
+            "the clocked row must be held and the unclocked one untouched"
+        );
+        let mut after = ids_at(now + ten_min + 60_000);
+        after.sort();
+        let mut both = ids.clone();
+        both.sort();
+        assert_eq!(after, both, "both rows are retryable past the boundary");
+
+        // A clock never moves backwards: a later write wins, an earlier one
+        // is ignored (the boundary we already promised upstream stands).
+        s.set_action_retry_not_before(&ids[0], now - ten_min)
+            .unwrap();
+        assert_eq!(ids_at(now), [ids[1].clone()]);
+    }
+
     #[test]
     fn list_retryable_replies_is_scoped_to_caller_platform() {
         let (s, _f) = fresh_store();
