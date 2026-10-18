@@ -263,7 +263,7 @@ fn core_presets_match_permission_contracts() {
         assert_eq!(policy["allowed_tools"], serde_json::json!(opts.allowed_tools), "{name}: tools dropped");
         let writes = policy["write_roots"].as_array().unwrap();
         assert_eq!(!writes.is_empty(), writable, "{name}: wrong write scope");
-        if writable { assert_eq!(writes, &[serde_json::json!(wiki)], "{name}: writes escaped wiki"); }
+        if writable { assert_eq!(writes, &[serde_json::json!(wiki.canonicalize().unwrap())], "{name}: writes escaped wiki"); }
         let site = format!("crates/augmentagent-channel-core/src/reasoner.rs::{name}");
         let entry = manifest["presets"].as_array().unwrap().iter().find(|entry| entry["callsite"] == site).unwrap();
         assert!(entry["conformance"].as_array().unwrap().iter().any(|test|

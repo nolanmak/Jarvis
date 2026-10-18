@@ -978,3 +978,31 @@ crate suite and strict targeted Clippy pass; the eight macOS inventory tests and
 two runner checks pass. The pinned release scanner reports zero findings on the
 updated release tree in `/tmp/1496-secret-scan/final.log`. Remote checks need a
 new run on the pushed commit; old-head failures are not described as passing.
+
+### Provider duration and late budget updates
+
+Signed terminal callbacks now persist immutable provider `CallDuration` seconds
+and the signed event `Timestamp`. Late callbacks can finalize usage after local
+cleanup; exact replays are idempotent and conflicting durations are rejected.
+Daily accounting allocates the reported interval across UTC day boundaries,
+rather than assigning usage to the day a delayed callback arrives. Calls that
+may have connected but lack final usage retain their full duration reservation.
+The watchdog also rechecks the current daily budget, so late usage from an older
+call can shorten an active call's remaining allowance.
+
+Store regressions cover restart, additive migration, missing answer callbacks,
+late/replayed/conflicting usage, invalid values and midnight allocation. Service
+regressions cover signature validation, malformed final usage and the shortened
+active-call deadline. This does not implement REST reconciliation for missing
+final callbacks; those calls remain conservatively reserved.
+
+### Cross-platform and notification CI corrections
+
+Phone transcript delivery is registered as an origin-bound reply in the
+notification inventory, and the required offline runner includes all seventeen
+notification registry/routing tests. The preset permission test compares the
+canonical wiki path, accounting for macOS `/var` aliases. The Codex bridge keeps
+Linux pidfd lifetime tracking and uses its own parent relationship on systems
+without pidfd support. A subprocess regression removes pidfd support and proves
+that parent exit terminates the bridge even while its input pipe stays open.
+These local checks do not replace the required macOS CI or live audio receipts.

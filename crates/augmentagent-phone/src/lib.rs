@@ -506,6 +506,7 @@ impl PhoneService {
                 || expired
                 || !self.config.enabled
                 || self.stopping.load(std::sync::atomic::Ordering::SeqCst)
+                || self.store.phone_budget_remaining_ms(&call.owner, now)? == 0
             {
                 self.store.phone_request_stop(&call.owner, &call.id)?;
                 if call.provider_sid.is_none() {

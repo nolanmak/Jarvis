@@ -2861,6 +2861,12 @@ class TransportTests(unittest.TestCase):
                 child.terminate();child.communicate(timeout=5)
 
     def test_bridge_stops_when_parent_process_exits_even_if_stdin_stays_open(self):
+        self.check_parent_lifetime(False)
+
+    def test_bridge_without_pidfd_stops_when_parent_exits_with_stdin_open(self):
+        self.check_parent_lifetime(True)
+
+    def check_parent_lifetime(self, without_pidfd):
         import os
         import select
         with tempfile.TemporaryDirectory() as temporary:
@@ -2871,23 +2877,41 @@ class TransportTests(unittest.TestCase):
             # EOF alone cannot provide the lifecycle guarantee being tested.
             read_fd,write_fd=os.pipe()
             program="""import json,os,subprocess,sys
-child=subprocess.Popen([sys.executable,sys.argv[1],sys.argv[2]],stdin=int(sys.argv[3]),stdout=subprocess.PIPE)
+command=[sys.executable,sys.argv[1],sys.argv[2]]
+if sys.argv[4]=='True':
+    command=[sys.executable,'-c',"import os,runpy,sys; os.__dict__.pop('pidfd_open',None); sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')",sys.argv[1],sys.argv[2]]
+child=subprocess.Popen(command,stdin=int(sys.argv[3]),stdout=subprocess.PIPE)
 ready=child.stdout.readline()
 assert 'result' in json.loads(ready)
 print(child.pid,flush=True)
 sys.stdin.readline()
 """
-            parent=subprocess.Popen([sys.executable,'-c',program,str(SPEC.origin),str(config),str(read_fd)],
+            parent=subprocess.Popen([sys.executable,'-c',program,str(SPEC.origin),str(config),str(read_fd),str(without_pidfd)],
                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,pass_fds=(read_fd,),text=True)
             pidfd=None
+            exit_queue=None
             try:
                 os.write(write_fd,(json.dumps({'jsonrpc':'2.0','id':1,'method':'initialize'})+'\n').encode())
-                pid=int(parent.stdout.readline());pidfd=os.pidfd_open(pid)
+                line=parent.stdout.readline()
+                self.assertTrue(line, 'bridge failed to initialize')
+                pid=int(line)
+                if hasattr(os, 'pidfd_open'):
+                    pidfd=os.pidfd_open(pid)
+                else:
+                    exit_queue=select.kqueue()
+                    exit_queue.control([select.kevent(pid, filter=select.KQ_FILTER_PROC,
+                        flags=select.KQ_EV_ADD, fflags=select.KQ_NOTE_EXIT)], 0, 0)
                 parent.communicate('exit\n',timeout=5)
-                watcher=select.poll();watcher.register(pidfd,select.POLLIN)
-                self.assertTrue(watcher.poll(5000),'bridge outlived its parent process')
+                if pidfd is not None:
+                    watcher=select.poll();watcher.register(pidfd,select.POLLIN)
+                    ended=watcher.poll(5000)
+                else:
+                    ended=exit_queue.control([], 1, 5)
+                self.assertTrue(ended,'bridge outlived its parent process')
             finally:
                 os.close(read_fd);os.close(write_fd)
+                if exit_queue is not None:
+                    exit_queue.close()
                 if pidfd is not None:
                     import signal
                     try: signal.pidfd_send_signal(pidfd,signal.SIGKILL)

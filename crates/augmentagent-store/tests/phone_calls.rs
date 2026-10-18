@@ -435,3 +435,215 @@ fn origin_is_bound_to_the_call_and_survives_restart() {
         .is_err());
     assert_eq!(reopened.phone_origin_revision(&call.id).unwrap(), revision);
 }
+
+#[test]
+fn provider_duration_counts_when_answer_callback_is_missing_and_survives_reopen() {
+    use augmentagent_store::phone::ProviderUsage;
+    let (dir, store) = fixture();
+    for i in 0..4 {
+        let start = i * 1_000_000;
+        let call = store
+            .phone_reserve_call(request(&format!("duration-{i}"), "thread", start))
+            .unwrap()
+            .call;
+        let usage = ProviderUsage {
+            duration_seconds: 900,
+            ended_ms: start + 900_000,
+        };
+        store
+            .phone_provider_event_with_usage(
+                &call.id,
+                &format!("CA-duration-{i}"),
+                CallState::Completed,
+                start + 950_000,
+                Some(usage),
+            )
+            .unwrap();
+        assert_eq!(store.phone_usage(&call.id).unwrap(), Some(usage));
+    }
+    drop(store);
+    let store = Store::open(dir.path().join("phone.db")).unwrap();
+    assert!(matches!(
+        store.phone_reserve_call(request("over", "thread", 4_000_000)),
+        Err(PhoneError::BudgetExhausted)
+    ));
+}
+
+#[test]
+fn late_duration_is_atomic_idempotent_and_allocated_by_provider_time() {
+    use augmentagent_store::phone::ProviderUsage;
+    let (_dir, store) = fixture();
+    let day = 86_400_000;
+    let call = store
+        .phone_reserve_call(request("cross-midnight", "thread", day - 600_000))
+        .unwrap()
+        .call;
+    // Local cleanup already ended the call; provider callback arrives later.
+    store
+        .phone_provider_event(&call.id, "CA-cross", CallState::Completed, day + 300_000)
+        .unwrap();
+    let usage = ProviderUsage {
+        duration_seconds: 900,
+        ended_ms: day + 300_000,
+    };
+    assert!(store
+        .phone_provider_event_with_usage(
+            &call.id,
+            "CA-other",
+            CallState::Completed,
+            day + 600_000,
+            Some(usage)
+        )
+        .is_err());
+    assert_eq!(store.phone_usage(&call.id).unwrap(), None);
+    for _ in 0..2 {
+        store
+            .phone_provider_event_with_usage(
+                &call.id,
+                "CA-cross",
+                CallState::Completed,
+                day + 600_000,
+                Some(usage),
+            )
+            .unwrap();
+    }
+    assert!(store
+        .phone_provider_event_with_usage(
+            &call.id,
+            "CA-cross",
+            CallState::Completed,
+            day + 700_000,
+            Some(ProviderUsage {
+                duration_seconds: 0,
+                ..usage
+            })
+        )
+        .is_err());
+    assert_eq!(store.phone_usage(&call.id).unwrap(), Some(usage));
+    // Three more full calls leave exactly ten minutes today: 300+2700 seconds.
+    for i in 0..3 {
+        let start = day + 1_000_000 + i * 1_000_000;
+        let c = store
+            .phone_reserve_call(request(&format!("today-{i}"), "thread", start))
+            .unwrap()
+            .call;
+        store
+            .phone_provider_event_with_usage(
+                &c.id,
+                &format!("CA-today-{i}"),
+                CallState::Completed,
+                start + 900_000,
+                Some(ProviderUsage {
+                    duration_seconds: 900,
+                    ended_ms: start + 900_000,
+                }),
+            )
+            .unwrap();
+    }
+    let last = store
+        .phone_reserve_call(request("remaining", "thread", day + 4_000_000))
+        .unwrap()
+        .call;
+    assert_eq!(last.max_duration_seconds, 600);
+}
+
+#[test]
+fn missing_final_duration_reserves_the_full_limit_instead_of_free_calls() {
+    let (dir, store) = fixture();
+    for i in 0..4 {
+        let start = i * 1_000_000;
+        let call = store
+            .phone_reserve_call(request(&format!("unknown-{i}"), "thread", start))
+            .unwrap()
+            .call;
+        store
+            .phone_provider_event(
+                &call.id,
+                &format!("CA-unknown-{i}"),
+                CallState::Completed,
+                start + 100,
+            )
+            .unwrap();
+    }
+    // Simulate upgrading a previous database that has calls but no usage table.
+    store
+        .with_conn(|conn| conn.execute_batch("DROP TABLE phone_call_usage"))
+        .unwrap();
+    drop(store);
+    let store = Store::open(dir.path().join("phone.db")).unwrap();
+    assert!(matches!(
+        store.phone_reserve_call(request("no-free-call", "thread", 4_000_000)),
+        Err(PhoneError::BudgetExhausted)
+    ));
+}
+
+#[test]
+fn late_usage_uses_event_day_and_invalid_reports_leave_no_partial_mutation() {
+    use augmentagent_store::phone::ProviderUsage;
+    let (_dir, store) = fixture();
+    let call = store
+        .phone_reserve_call(request("late-day", "thread", 0))
+        .unwrap()
+        .call;
+    let now = 86_400_000 + 1_000;
+    for usage in [
+        ProviderUsage {
+            duration_seconds: -1,
+            ended_ms: 900_000,
+        },
+        ProviderUsage {
+            duration_seconds: i64::MAX,
+            ended_ms: 900_000,
+        },
+        ProviderUsage {
+            duration_seconds: 900,
+            ended_ms: 899_000,
+        },
+        ProviderUsage {
+            duration_seconds: 1,
+            ended_ms: now + 300_001,
+        },
+    ] {
+        assert!(store
+            .phone_provider_event_with_usage(
+                &call.id,
+                "CA-late",
+                CallState::Completed,
+                now,
+                Some(usage)
+            )
+            .is_err());
+        assert_eq!(store.phone_usage(&call.id).unwrap(), None);
+        let unchanged = store.phone_provider_call(&call.id).unwrap();
+        assert_eq!(unchanged.state, CallState::Requesting);
+        assert_eq!(unchanged.provider_sid, None);
+    }
+    let usage = ProviderUsage {
+        duration_seconds: 900,
+        ended_ms: 900_000,
+    };
+    assert!(store
+        .phone_provider_event_with_usage(&call.id, "CA-late", CallState::Ringing, now, Some(usage))
+        .is_err());
+    store
+        .phone_provider_event_with_usage(
+            &call.id,
+            "CA-late",
+            CallState::Completed,
+            now,
+            Some(usage),
+        )
+        .unwrap();
+    assert_eq!(
+        store.phone_budget_remaining_ms(OWNER, now).unwrap(),
+        3_600_000
+    );
+    assert_eq!(
+        store
+            .phone_reserve_call(request("today", "thread", now))
+            .unwrap()
+            .call
+            .max_duration_seconds,
+        900
+    );
+}

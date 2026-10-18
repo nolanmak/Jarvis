@@ -1,7 +1,7 @@
 //! Signed provider callbacks. HTTP adapters must pass every decoded form field,
 //! with no trimming, and reject non-form content types and oversized requests.
 use crate::{twilio::validate_signature, xml, Error, PhoneService};
-use augmentagent_store::phone::{CallState, PhoneCall, PhoneError};
+use augmentagent_store::phone::{CallState, PhoneCall, PhoneError, ProviderUsage};
 
 pub struct WebhookAuth {
     account: String,
@@ -91,8 +91,32 @@ impl PhoneService {
             "failed" => CallState::Failed,
             _ => return Err(Error::InvalidArguments),
         };
+        let usage = if fields.iter().any(|(name, _)| name == "CallDuration") {
+            let seconds = field(fields, "CallDuration")?;
+            if !state.terminal()
+                || seconds.is_empty()
+                || !seconds.bytes().all(|c| c.is_ascii_digit())
+            {
+                return Err(Error::InvalidArguments);
+            }
+            let duration_seconds = seconds
+                .parse::<i64>()
+                .map_err(|_| Error::InvalidArguments)?;
+            // Callback receipt time is not the call end time: delivery can be
+            // late or cross midnight. Configured progress callbacks carry the
+            // signed RFC 2822 event Timestamp alongside CallDuration (seconds).
+            let ended_ms = chrono::DateTime::parse_from_rfc2822(field(fields, "Timestamp")?)
+                .map_err(|_| Error::InvalidArguments)?
+                .timestamp_millis();
+            Some(ProviderUsage {
+                duration_seconds,
+                ended_ms,
+            })
+        } else {
+            None
+        };
         self.store
-            .phone_provider_event(id, &sid, state, self.clock.now_ms())?;
+            .phone_provider_event_with_usage(id, &sid, state, self.clock.now_ms(), usage)?;
         Ok(())
     }
     pub fn start_callback(

@@ -48,3 +48,10 @@ CREATE TABLE IF NOT EXISTS phone_origin_authority (
     call_id TEXT PRIMARY KEY REFERENCES phone_origins(call_id),
     revision INTEGER NOT NULL CHECK(revision > 0)
 );
+
+-- Separate additive table so existing call rows and native sessions survive upgrade.
+CREATE TABLE IF NOT EXISTS phone_call_usage (
+    call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
+    duration_seconds INTEGER NOT NULL CHECK(duration_seconds >= 0),
+    ended_ms INTEGER NOT NULL CHECK(ended_ms >= 0)
+);

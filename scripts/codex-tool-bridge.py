@@ -2593,17 +2593,31 @@ def serve(config_path):
     # PR_SET_PDEATHSIG follows the spawning *thread*, which may retire while
     # a multithreaded Codex process remains healthy. A pidfd follows the whole
     # process and cannot be confused by PID reuse.
-    parent_fd = os.pidfd_open(parent)
-    if os.getppid() != parent:
-        os.close(parent_fd)
+    parent_fd = os.pidfd_open(parent) if hasattr(os, 'pidfd_open') else None
+    if parent <= 1 or os.getppid() != parent:
+        if parent_fd is not None:
+            os.close(parent_fd)
         raise Denied('cannot bind bridge lifetime to parent')
+    parent_watch_stopped = threading.Event()
     def watch_parent():
-        watcher = select.poll()
-        watcher.register(parent_fd, select.POLLIN)
-        events = watcher.poll()
-        if any(flags & (select.POLLIN | select.POLLHUP) for _, flags in events):
-            os.kill(os.getpid(), signal.SIGTERM)
-    threading.Thread(target=watch_parent, daemon=True).start()
+        if parent_fd is not None:
+            watcher = select.poll()
+            watcher.register(parent_fd, select.POLLIN)
+            while not parent_watch_stopped.is_set():
+                events = watcher.poll(100)
+                if any(flags & (select.POLLIN | select.POLLHUP) for _, flags in events):
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    return
+        else:
+            # macOS has no pidfd. Observe our own parent relationship, not
+            # whether a numeric PID exists: reparenting remains detectable
+            # even if the old parent's PID has already been reused.
+            while not parent_watch_stopped.wait(0.05):
+                if os.getppid() != parent:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    return
+    parent_watch = threading.Thread(target=watch_parent, daemon=True)
+    parent_watch.start()
     policy = Policy(config)
     startup_failure = None
     try:
@@ -2621,8 +2635,11 @@ def serve(config_path):
             if response is not None:
                 print(response, flush=True)
     finally:
+        parent_watch_stopped.set()
+        parent_watch.join(timeout=1)
         server.close()
-        os.close(parent_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
 
 
 if __name__ == '__main__':

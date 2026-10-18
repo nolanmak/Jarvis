@@ -127,6 +127,13 @@ pub struct PhoneCall {
     pub stop_requested: bool,
     pub verification: bool,
 }
+/// Final duration and event time from an authenticated provider callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderUsage {
+    pub duration_seconds: i64,
+    pub ended_ms: i64,
+}
+
 #[derive(Debug)]
 pub struct CallReservation {
     pub call: PhoneCall,
@@ -268,10 +275,7 @@ fn reserve(
     if count >= 3 {
         return Err(PhoneError::RateLimited);
     }
-    let day_start = request.now_ms / 86_400_000 * 86_400_000;
-    let used_ms: i64 = tx.query_row(
-                "SELECT COALESCE(SUM(MAX(0,MIN(COALESCE(ended_ms,?2),?2)-MAX(answered_ms,?3))),0) FROM phone_calls WHERE owner=?1 AND answered_ms IS NOT NULL",
-                params![request.owner,request.now_ms,day_start], |r|r.get(0))?;
+    let used_ms = used_budget_ms(tx, request.owner, request.now_ms)?;
     let seconds = ((3_600_000 - used_ms) / 1000).min(if verification { 30 } else { 900 });
     if seconds <= 0 {
         return Err(PhoneError::BudgetExhausted);
@@ -285,7 +289,32 @@ fn reserve(
     })
 }
 
+// Verified duration is allocated by provider event time, not callback arrival.
+// Until final usage arrives, reserve the full limit for potentially answered
+// terminal calls; a missed answer callback must never create free call minutes.
+fn used_budget_ms(conn: &Connection, owner: &str, now_ms: i64) -> rusqlite::Result<i64> {
+    let day_start = now_ms / 86_400_000 * 86_400_000;
+    conn.query_row(
+                "SELECT COALESCE(SUM(CASE
+                    WHEN u.call_id IS NOT NULL THEN MAX(0,MIN(u.ended_ms,?3+86400000)-MAX(u.ended_ms-u.duration_seconds*1000,?3))
+                    WHEN c.ended_ms IS NOT NULL AND (c.answered_ms IS NOT NULL OR c.state IN ('completed','canceled'))
+                        THEN CASE WHEN c.ended_ms>?3 AND c.created_ms<=?2 THEN MAX(c.max_duration_seconds*1000,MAX(0,MIN(c.ended_ms,?2)-MAX(COALESCE(c.answered_ms,c.ended_ms),?3))) ELSE 0 END
+                    WHEN c.answered_ms IS NOT NULL THEN MAX(0,?2-MAX(c.answered_ms,?3))
+                    ELSE 0 END),0)
+                 FROM phone_calls c LEFT JOIN phone_call_usage u ON u.call_id=c.id WHERE c.owner=?1",
+                params![owner,now_ms,day_start], |r|r.get(0))
+}
+
 impl Store {
+    pub fn phone_budget_remaining_ms(&self, owner: &str, now_ms: i64) -> PhoneResult<i64> {
+        identifier(owner)?;
+        if now_ms < 0 {
+            return Err(PhoneError::InvalidInput);
+        }
+        let used = self.with_conn(|conn| used_budget_ms(conn, owner, now_ms))?;
+        Ok(3_600_000i64.saturating_sub(used).max(0))
+    }
+
     /// Explicit one-time operator migration only. A tombstone left by removal
     /// prevents a restart from silently restoring an environment destination.
     pub fn phone_import_destination(
@@ -387,6 +416,44 @@ impl Store {
         state: CallState,
         now_ms: i64,
     ) -> PhoneResult<()> {
+        self.phone_provider_event_with_usage(id, sid, state, now_ms, None)
+    }
+
+    pub fn phone_usage(&self, id: &str) -> PhoneResult<Option<ProviderUsage>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT duration_seconds,ended_ms FROM phone_call_usage WHERE call_id=?1",
+                [id],
+                |r| {
+                    Ok(ProviderUsage {
+                        duration_seconds: r.get(0)?,
+                        ended_ms: r.get(1)?,
+                    })
+                },
+            )
+            .optional()
+        })
+        .map_err(PhoneError::from)
+    }
+
+    pub fn phone_provider_event_with_usage(
+        &self,
+        id: &str,
+        sid: &str,
+        state: CallState,
+        now_ms: i64,
+        usage: Option<ProviderUsage>,
+    ) -> PhoneResult<()> {
+        if let Some(usage) = usage {
+            if !state.terminal()
+                || usage.duration_seconds < 0
+                || usage.duration_seconds > i64::MAX / 1000
+                || usage.ended_ms < usage.duration_seconds * 1000
+                || usage.ended_ms > now_ms.saturating_add(300_000)
+            {
+                return Err(PhoneError::InvalidInput);
+            }
+        }
         if matches!(
             state,
             CallState::Requesting | CallState::Uncertain | CallState::Connected
@@ -399,6 +466,29 @@ impl Store {
             let call = call_by_id(tx, id)?;
             if call.provider_sid.as_deref().is_some_and(|old| old != sid) {
                 return Err(PhoneError::Conflict);
+            }
+            if let Some(usage) = usage {
+                if usage.ended_ms - usage.duration_seconds * 1000
+                    < call.created_ms.saturating_sub(300_000)
+                {
+                    return Err(PhoneError::InvalidInput);
+                }
+                let old: Option<ProviderUsage> = tx
+                    .query_row(
+                        "SELECT duration_seconds,ended_ms FROM phone_call_usage WHERE call_id=?1",
+                        [id],
+                        |r| {
+                            Ok(ProviderUsage {
+                                duration_seconds: r.get(0)?,
+                                ended_ms: r.get(1)?,
+                            })
+                        },
+                    )
+                    .optional()?;
+                if old.is_some_and(|old| old != usage) {
+                    return Err(PhoneError::Conflict);
+                }
+                tx.execute("INSERT INTO phone_call_usage(call_id,duration_seconds,ended_ms) VALUES(?1,?2,?3) ON CONFLICT(call_id) DO NOTHING",params![id,usage.duration_seconds,usage.ended_ms])?;
             }
             tx.execute(
                 "UPDATE phone_calls SET provider_sid=?2 WHERE id=?1",

@@ -1171,3 +1171,149 @@ fn whatsapp_private_bootstrap_requires_explicit_link_and_never_restores_revocati
         assert!(store.surface_owner_binding(&account).unwrap().is_none());
     }
 }
+
+#[tokio::test]
+async fn final_duration_requires_signed_valid_terminal_fields_and_updates_after_cleanup() {
+    use augmentagent_phone::webhook::WebhookAuth;
+    use augmentagent_store::phone::{CallState, ProviderUsage};
+    let f = fixture("discord", true, true, false);
+    let auth = WebhookAuth::new("AC-test", "callback-secret");
+    let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
+    let call = f
+        .service
+        .tool(&grant, "call_owner", json!({"request_id":"duration"}))
+        .await
+        .unwrap();
+    let id = call["id"].as_str().unwrap();
+    let url = format!("https://phone.example.test/phone/status/{id}");
+    f.clock.0.store(200_000, Ordering::SeqCst);
+    let fields = vec![
+        ("AccountSid".into(), "AC-test".into()),
+        ("CallSid".into(), "CA-test".into()),
+        ("CallStatus".into(), "completed".into()),
+        ("CallDuration".into(), "120".into()),
+        ("Timestamp".into(), "Thu, 01 Jan 1970 00:02:00 +0000".into()),
+    ];
+    assert!(f
+        .service
+        .status_callback(&auth, id, &fields, "forged")
+        .is_err());
+    for mode in 0..7 {
+        let mut bad = fields.clone();
+        match mode {
+            0 => bad[3].1 = "-1".into(),
+            1 => bad[3].1 = "1.2".into(),
+            2 => bad[3].1 = "99999999999999999999999".into(),
+            3 => bad[4].1 = "not a timestamp".into(),
+            4 => bad.push(("CallDuration".into(), "0".into())),
+            5 => bad[2].1 = "ringing".into(),
+            _ => {
+                bad.pop();
+            }
+        }
+        let sig = signed("callback-secret", &url, &bad);
+        assert!(
+            f.service.status_callback(&auth, id, &bad, &sig).is_err(),
+            "invalid duration mode {mode}"
+        );
+        assert_eq!(f.store.phone_usage(id).unwrap(), None);
+        assert_eq!(
+            f.store.phone_provider_call(id).unwrap().state,
+            CallState::Queued
+        );
+    }
+    f.store
+        .phone_provider_event(id, "CA-test", CallState::Completed, 150_000)
+        .unwrap();
+    let sig = signed("callback-secret", &url, &fields);
+    for _ in 0..2 {
+        f.service.status_callback(&auth, id, &fields, &sig).unwrap();
+    }
+    assert_eq!(
+        f.store.phone_usage(id).unwrap(),
+        Some(ProviderUsage {
+            duration_seconds: 120,
+            ended_ms: 120_000
+        })
+    );
+    let mut conflicting = fields.clone();
+    conflicting[3].1 = "0".into();
+    let sig = signed("callback-secret", &url, &conflicting);
+    assert!(f
+        .service
+        .status_callback(&auth, id, &conflicting, &sig)
+        .is_err());
+    assert_eq!(
+        f.store.phone_usage(id).unwrap().unwrap().duration_seconds,
+        120
+    );
+}
+
+#[tokio::test]
+async fn late_provider_usage_shortens_an_active_calls_daily_budget() {
+    use augmentagent_store::phone::{CallState, ProviderUsage};
+    let f = fixture("discord", true, true, false);
+    let mut first = String::new();
+    for i in 0..3 {
+        let now = 100 + i * 1_000_000;
+        f.clock.0.store(now, Ordering::SeqCst);
+        let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
+        let call = f
+            .service
+            .tool(
+                &grant,
+                "call_owner",
+                json!({"request_id":format!("past-{i}")}),
+            )
+            .await
+            .unwrap();
+        let id = call["id"].as_str().unwrap();
+        let sid = f
+            .store
+            .phone_provider_call(id)
+            .unwrap()
+            .provider_sid
+            .unwrap();
+        f.store
+            .phone_provider_event(id, &sid, CallState::Completed, now + 100)
+            .unwrap();
+        if i == 0 {
+            first = id.into();
+        }
+    }
+    f.clock.0.store(3_000_100, Ordering::SeqCst);
+    let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
+    let call = f
+        .service
+        .tool(&grant, "call_owner", json!({"request_id":"active"}))
+        .await
+        .unwrap();
+    let id = call["id"].as_str().unwrap();
+    f.store
+        .phone_provider_event(id, "CA-test-4", CallState::AwaitingAcceptance, 3_000_100)
+        .unwrap();
+    f.store.phone_accept(id, "CA-test-4", 3_000_101).unwrap();
+    // A provider overrun beyond the original limit must reduce this call's
+    // remaining allowance, even though it was already dialed with a 900s cap.
+    f.store
+        .phone_provider_event_with_usage(
+            &first,
+            "CA-test",
+            CallState::Completed,
+            3_000_100,
+            Some(ProviderUsage {
+                duration_seconds: 1200,
+                ended_ms: 1_200_100,
+            }),
+        )
+        .unwrap();
+    f.clock.0.store(3_600_100, Ordering::SeqCst);
+    f.service.maintenance(false).await.unwrap();
+    assert!(f
+        .provider
+        .stops
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|sid| sid == "CA-test-4"));
+}
