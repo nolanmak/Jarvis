@@ -334,6 +334,11 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                 }
             }
         }
+        // Private setup must not fall through to durable inbox/triage when
+        // this chat has no installed control adapter (including edited text).
+        if augmentagent_phone::commands::sensitive(&msg.text) {
+            return Ok(());
+        }
         // Inbound allowlist gate — even reading requires explicit opt-in.
         if !self.store.is_whatsapp_inbound_allowed(&chat_jid)? {
             outcome.not_allowlisted_dropped += 1;
@@ -987,6 +992,23 @@ mod tests {
             from_me: false,
             metadata: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn private_phone_setup_is_not_stored_or_triaged_without_control_adapter() {
+        let (store, _f) = tmp_store();
+        store.allow_whatsapp_inbound("15551234567@s.whatsapp.net").unwrap();
+        let r = Arc::new(ScriptedReasoner::new([r#"{"decision":"skip","reason":"must remain unused"}"#]));
+        let ch = channel(store.clone(), r.clone(), Arc::new(CountingBroker::default()));
+        for (i, text) in ["phone number set +12025550123", "phone number verify 123456", "/phone number remove"].iter().enumerate() {
+            let message = msg(&format!("private-{i}"), text);
+            let id = message.clone().into_email("15559998888").message_id;
+            ch.inbox.lock().await.push(message);
+            let out = ch.poll_once().await.unwrap();
+            assert_eq!(out.errors, 0);
+            assert!(store.email_first_seen_at(&id).unwrap().is_none());
+        }
+        assert_eq!(r.responses.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

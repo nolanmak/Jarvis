@@ -38,6 +38,9 @@ SUITES = [
     ("augmentagent-channel-slack", "--test", "ingest_catch_up", 5),
     ("augmentagent-channel-slack", "--test", "owner_auth", 31),
     ("augmentagent-channel-slack", "--test", "phone_delivery", 1),
+    ("augmentagent-channel-whatsapp", "--lib", None, 44),
+    ("augmentagent-channel-whatsapp", "--test", "phone_privacy", 1),
+    ("augmentagent-channel-whatsapp-history", "--test", "history", 10),
 ]
 SUMMARY = re.compile(r"test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out;")
 

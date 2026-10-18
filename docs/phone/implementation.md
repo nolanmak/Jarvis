@@ -593,3 +593,35 @@ All 29 required offline suites / 464 tests pass:
 Both Python runner validation tests and phone all-target Clippy with
 `--no-deps -D warnings` pass. No live calls, Discord posts or provider credentials
 were used in this checkpoint's tests.
+
+### WhatsApp setup privacy before phone installation
+
+The existing WhatsApp control surface previously treated phone controls as
+ordinary queries. It now reserves them before the query/approval parser and
+returns a generic unavailable reply while the phone adapter is uninstalled.
+The live channel also drops private number controls before durable email/inbox
+storage and triage when no control adapter consumes them. The same shared
+command classifier protects the independent archive importer: setup entries
+are omitted from searchable history and incremental wiki capture, while the
+cursor advances over their original archive positions. Ordinary history keeps
+its original message identities and remains importable after restart.
+
+Test-first evidence: `/tmp/1496-wa-privacy-red.log` (five controls reached the
+query handler), `/tmp/1496-wa-inbox-red.log` (private setup reached triage), and
+`/tmp/1496-wa-archive-red.log` (two private entries were imported). Green targets:
+`/tmp/1496-wa-lib-green.log`, `/tmp/1496-wa-privacy-green.log`, and
+`/tmp/1496-wa-archive-green.log`. The archive regression checks search, wiki
+capture, restart, and subsequent ordinary messages. These tests use temporary
+stores and a local Unix socket; they do not contact WhatsApp or Twilio.
+
+This checkpoint does not enable WhatsApp calling. Authenticated owner/self-chat
+handling, durable outbound echo suppression, native session/tool integration,
+phone command execution, daemon installation and live qualification are still
+required. It prevents unavailable phone controls from falling into ordinary
+model/history paths while those adapters are being built. Previously imported
+history is not rewritten by this change.
+
+Validation: all 32 required offline suites / 519 tests pass in
+`/tmp/1496-wa-privacy-offline/receipt.json` (dirty worktree at execution).
+Both Python runner validation tests pass. No live calls or chat messages were
+sent, and live acceptance remains unqualified.

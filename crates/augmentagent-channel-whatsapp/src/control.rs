@@ -173,6 +173,14 @@ impl WhatsappControlSurface {
         if !self.is_control_chat(&chat_jid) || msg.is_outbound() {
             return Ok(false);
         }
+        // Reserve phone controls before generic queries, even while no phone
+        // adapter is installed. Numbers and verification codes must never
+        // become model input through a fallback path.
+        if augmentagent_phone::commands::recognizes(&msg.text) {
+            self.send_to_control("Phone commands are unavailable in this WhatsApp connection.")
+                .await.ok();
+            return Ok(true);
+        }
         let cmd = parse_control_command(&msg.text);
         match cmd {
             ControlCommand::Approve | ControlCommand::Decline | ControlCommand::Revise(_) => {
