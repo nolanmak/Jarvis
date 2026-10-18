@@ -114,3 +114,21 @@ and cannot authorize self-chat commands. When phone tools are installed, the con
 phone controls after stored owner authorization. Authenticated ordinary self-chat turns now enter the shared native-session
 path when the library adapter is installed. Daemon installation and durable
 phone transcript delivery remain outstanding.
+
+### Transcript delivery keys and lookup
+
+Phone transcript sends include `account` (the authenticated bare linked JID) and
+`delivery_key` in `send_text`. The sidecar rejects an account mismatch and
+atomically reserves the key, content hash and generated message ID before
+network I/O. Repeating a key never starts another send: a persisted successful
+provider response returns its original ID, while an unfinished attempt returns
+`Uncertain`. Changed content cannot reuse a key. Ordinary unkeyed sends keep
+their existing behavior.
+
+`lookup_delivery` takes `account`, `chat_jid` and `delivery_key`. It returns
+`{"sent":true,"message_id":"..."}` only after a successful provider response
+has been committed. Unknown keys and unfinished attempts return `sent:false`;
+this is not evidence that sending again is safe. Lookup works while disconnected
+if the linked identity and ledger are still available. A crash before persisting
+provider confirmation can remain uncertain; the client must not resend it.
+No message body is retained in the delivery-key table.

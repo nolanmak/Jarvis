@@ -264,6 +264,18 @@ async fn actual_transport_checks_gates_and_parks_unknown_sidecar_results() {
         let mut lines = BufReader::new(read).lines();
         while let Some(line) = lines.next_line().await.unwrap() {
             let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(req["params"]["account"], "12025550111@s.whatsapp.net");
+            assert!(req["params"]["delivery_key"]
+                .as_str()
+                .is_some_and(|key| !key.is_empty()));
+            if req["op"] == "lookup_delivery" {
+                let response = serde_json::json!({"version":1,"request_id":req["request_id"],"ok":true,"result":{"sent":true,"message_id":"delivered-two"}});
+                write
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+                continue;
+            }
             assert_eq!(req["op"], "send_text");
             assert_eq!(req["params"]["chat_jid"], "12025550111@s.whatsapp.net");
             let index = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -323,6 +335,10 @@ async fn actual_transport_checks_gates_and_parks_unknown_sidecar_results() {
         .unwrap()
     );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let rows = store
+        .outbound_sends_with_key_prefix(origin.owner.account(), "phone-mirror:", &[])
+        .unwrap();
+    assert!(rows.iter().all(|row| row.status == SendStatus::Sent));
     store
         .deny_whatsapp_outbound(origin.owner.sender_id())
         .unwrap();

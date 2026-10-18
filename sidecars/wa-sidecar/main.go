@@ -424,6 +424,8 @@ func (s *sidecar) dispatch(conn net.Conn, req rpcRequest) {
 		s.opFetchHistory(conn, req)
 	case "send_text":
 		s.opSendText(conn, req)
+	case "lookup_delivery":
+		s.opLookupDelivery(conn, req)
 	default:
 		s.fail(conn, req.RequestID, "BadRequest", "unknown op: "+req.Op)
 	}
@@ -510,6 +512,8 @@ func (s *sidecar) opSendText(conn net.Conn, req rpcRequest) {
 	var p struct {
 		ChatJID string `json:"chat_jid"`
 		Text    string `json:"text"`
+		Key     string `json:"delivery_key"`
+		Account string `json:"account"`
 	}
 	if err := json.Unmarshal(req.Params, &p); err != nil || p.ChatJID == "" || p.Text == "" {
 		s.fail(conn, req.RequestID, "BadRequest", "chat_jid and text required")
@@ -517,6 +521,10 @@ func (s *sidecar) opSendText(conn net.Conn, req rpcRequest) {
 	}
 	if s.client == nil || s.client.Store.ID == nil {
 		s.fail(conn, req.RequestID, "NotPaired", "no linked device")
+		return
+	}
+	if p.Key != "" && (len(p.Key) > 256 || p.Account != s.client.Store.ID.ToNonAD().String()) {
+		s.fail(conn, req.RequestID, "BadRequest", "invalid delivery identity")
 		return
 	}
 	if !s.client.IsConnected() {
@@ -533,7 +541,23 @@ func (s *sidecar) opSendText(conn net.Conn, req rpcRequest) {
 		return
 	}
 	messageID := s.client.GenerateMessageID()
-	if err := s.outbound.reserve(s.client.Store.ID.ToNonAD().String(), jid.ToNonAD().String(), string(messageID)); err != nil {
+	account := s.client.Store.ID.ToNonAD().String()
+	chat := jid.ToNonAD().String()
+	if p.Key != "" {
+		rec, fresh, err := s.outbound.reserveDelivery(account, chat, p.Key, p.Text, string(messageID))
+		if err != nil {
+			s.fail(conn, req.RequestID, "Internal", "delivery reservation failed")
+			return
+		}
+		if !fresh {
+			if rec.Sent {
+				s.ok(conn, req.RequestID, map[string]interface{}{"message_id": rec.ID})
+			} else {
+				s.fail(conn, req.RequestID, "Uncertain", "delivery outcome unknown")
+			}
+			return
+		}
+	} else if err := s.outbound.reserve(account, chat, string(messageID)); err != nil {
 		s.fail(conn, req.RequestID, "Internal", "outbound identity reservation failed")
 		return
 	}
@@ -544,6 +568,12 @@ func (s *sidecar) opSendText(conn net.Conn, req rpcRequest) {
 	if err != nil {
 		s.fail(conn, req.RequestID, "SendFailed", err.Error())
 		return
+	}
+	if p.Key != "" {
+		if resp.ID != messageID || s.outbound.confirmDelivery(account, chat, p.Key, string(resp.ID)) != nil {
+			s.fail(conn, req.RequestID, "Uncertain", "delivery confirmation unavailable")
+			return
+		}
 	}
 	s.ok(conn, req.RequestID, map[string]interface{}{"message_id": resp.ID})
 }

@@ -798,3 +798,43 @@ Validation: all 36 required offline suites / 527 tests pass in
 `/tmp/1496-wa-delivery-offline/receipt.json` (dirty worktree at execution).
 WhatsApp all-target Clippy with `--no-deps -D warnings` and both Python runner
 checks pass. No live WhatsApp messages or Twilio calls were made.
+
+### WhatsApp delivery-key reconciliation
+
+Phone transcript transport now supplies a stable delivery key and expected
+linked account to the sidecar. The sidecar atomically reserves key/content hash/
+message ID together with echo identity before the provider send. Concurrent
+requests for one key allow exactly one sender. Reused keys never launch another
+send, changed content is rejected, and successful provider responses are
+persisted before the Unix-socket reply. A lost reply can therefore be recovered
+through `lookup_delivery` using the same account/chat/key after restart.
+
+The Rust transport checks current owner authority and WhatsApp send gates before
+lookup, and resolves its outbox row only from a positive persisted confirmation.
+An unknown key, unconfirmed attempt, old sidecar, failed storage or failed lookup
+remains inconclusive and does not cause resend. A crash between provider success
+and the ledger commit can still remain uncertain. A successful send response is
+not proof that the owner read the message.
+
+Test-first logs: `/tmp/1496-wa-key-red.log` (missing durable-key APIs) and
+`/tmp/1496-wa-lookup-red.log` (the transport did not send keys or perform lookup).
+Go tests cover reopen with an unfinished reservation, content conflict, wrong
+provider ID, account scoping, persisted positive lookup through the real event
+connection while disconnected, and concurrent reservation with one winner.
+Rust's actual WaClient transport fixture resolves an initially unknown send via
+lookup without increasing the number of send requests. Go `test -race` and vet
+pass; WhatsApp Clippy with `--no-deps -D warnings` passes.
+
+This replaces the prior missing-sidecar-lookup limitation. Daemon delivery
+worker/registration, initial WhatsApp provisioning, filtered live history,
+tool/approval continuation, shared lifecycle/final-duration work and remote/live
+migration qualification remain required.
+
+Validation: all 36 required Rust offline suites / 527 tests pass in
+`/tmp/1496-wa-lookup-offline/receipt.json` (dirty worktree at execution). Go race
+tests and vet, the compiled Go/Rust sidecar contract, WhatsApp all-target Clippy
+with `--no-deps -D warnings`, and both Python runner tests pass. Evidence logs:
+`/tmp/1496-wa-key-green.log`, `/tmp/1496-wa-key-vet.log`,
+`/tmp/1496-wa-lookup-contract.log`, `/tmp/1496-wa-lookup-clippy.log`.
+No live WhatsApp messages or phone calls were made. Remote OS checks and live
+acceptance are still unqualified.

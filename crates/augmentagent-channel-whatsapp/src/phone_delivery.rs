@@ -15,8 +15,7 @@ pub struct Payload {
     pub origin: PhoneOrigin,
     pub revision: i64,
     pub content: String,
-    /// Stable local part identity; the current sidecar does not yet accept it
-    /// as an idempotency key or expose provider lookup by this key.
+    /// Stable part identity, reserved and looked up through the sidecar ledger.
     pub delivery_key: String,
     message_hash: String,
 }
@@ -250,6 +249,31 @@ impl WhatsappTransport {
 }
 #[async_trait::async_trait]
 impl Transport for WhatsappTransport {
+    async fn lookup(&self, payload: &Payload) -> Option<String> {
+        if !crate::control_enabled()
+            || payload.origin.owner.sender_id() != self.linked_owner.bare()
+            || !authority(&self.store, &payload.origin).is_ok_and(|r| r == payload.revision)
+            || !self
+                .store
+                .is_whatsapp_outbound_allowed(&self.linked_owner.bare())
+                .unwrap_or(false)
+            || self
+                .tools
+                .grant(&payload.origin.owner, &payload.origin.conversation, None)
+                .is_err()
+        {
+            return None;
+        }
+        self.client
+            .lookup_delivery(
+                &self.linked_owner.bare(),
+                &self.linked_owner.bare(),
+                &payload.delivery_key,
+            )
+            .await
+            .ok()
+            .flatten()
+    }
     async fn send(&self, payload: &Payload) -> Result<String, SendError> {
         if payload.origin.owner.sender_id() != self.linked_owner.bare()
             || !authority(&self.store, &payload.origin).is_ok_and(|r| r == payload.revision)
@@ -269,7 +293,12 @@ impl Transport for WhatsappTransport {
         }
         match self
             .client
-            .send_text(&self.linked_owner.bare(), &payload.content)
+            .send_text_with_key(
+                &self.linked_owner.bare(),
+                &self.linked_owner.bare(),
+                &payload.delivery_key,
+                &payload.content,
+            )
             .await
         {
             Ok(id) if !id.is_empty() => Ok(id),

@@ -371,6 +371,19 @@ impl WaClient {
             .to_string())
     }
 
+    /// Reserve a stable delivery key at the sidecar before network I/O.
+    pub async fn send_text_with_key(&self, account: &str, chat: &str, key: &str, text: &str) -> Result<String, WaError> {
+        let result = self.call("send_text", serde_json::json!({"account":account,"chat_jid":chat,"delivery_key":key,"text":text})).await?;
+        Ok(result.get("message_id").and_then(Value::as_str).unwrap_or_default().to_owned())
+    }
+
+    /// Only positive persisted provider confirmation proves delivery. Unknown
+    /// keys, uncertain sends and unsupported old sidecars never imply absence.
+    pub async fn lookup_delivery(&self, account: &str, chat: &str, key: &str) -> Result<Option<String>, WaError> {
+        let result = self.call("lookup_delivery", serde_json::json!({"account":account,"chat_jid":chat,"delivery_key":key})).await?;
+        Ok((result.get("sent").and_then(Value::as_bool) == Some(true)).then(|| result.get("message_id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_owned)).flatten())
+    }
+
     /// `status` — sidecar self-report (paired? connected? which device JID?).
     pub async fn status(&self) -> Result<Value, WaError> {
         self.call("status", serde_json::json!({})).await

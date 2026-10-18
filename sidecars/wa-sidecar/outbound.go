@@ -33,7 +33,8 @@ func openOutboundLedger(path string) (*outboundLedger, error) {
 	db.SetMaxOpenConns(1)
 	if _, err = db.Exec(`PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS agent_outbound (
  account TEXT NOT NULL, chat TEXT NOT NULL, message_id TEXT NOT NULL,
- PRIMARY KEY(account,chat,message_id))`); err != nil {
+ PRIMARY KEY(account,chat,message_id));
+ CREATE TABLE IF NOT EXISTS agent_deliveries(account TEXT NOT NULL, chat TEXT NOT NULL, delivery_key TEXT NOT NULL, message_id TEXT NOT NULL, content_hash TEXT NOT NULL, sent INTEGER NOT NULL CHECK(sent IN (0,1)), PRIMARY KEY(account,chat,delivery_key))`); err != nil {
 		db.Close()
 		return nil, err
 	}
