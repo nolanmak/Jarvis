@@ -1298,3 +1298,21 @@ and qualified legacy retirement are complete. The parity inventory also tracks
 the operator-only `phone-reconcile` command under #1496 as unverified; adding
 the inventory entry fixes the two inventory assertions that failed CI at
 `736a8ebe` without claiming live macOS evidence.
+
+### Native owner request reaches the phone MCP facade
+
+The `phone_native_live` probe now attaches the actual private phone ToolServer
+and freshly built CLI MCP facade to each native turn. Its initial owner prompt
+requests a call; the test no longer invokes `call_owner` itself. Both installed
+Claude and Codex cases passed locally on Linux (260.02 seconds total), creating
+exactly one fake provider call, returning its persisted local ID, and preserving
+the existing five-turn file-read and native-session assertions. The runtime
+runbook requires an explicit `AUGMENTAGENT_PHONE_PROBE_BIN` path after building
+the CLI. There were no Twilio requests or real calls. This closes the previous
+native phone-tool invocation evidence gap for this fixture; it does not prove
+live transport, audible performance or production approval-tool execution.
+
+Linux phone CI run `39166966417` passed for `fff20302`, including the new
+additive migration suite. macOS was still running when this evidence was
+recorded; neither that observation nor the local probe is a current-head
+cross-platform pass.

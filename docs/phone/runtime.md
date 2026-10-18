@@ -292,13 +292,18 @@ adapter turns → hangup → text, using disposable native sessions and fake
 telephony:
 
 ```sh
+cargo build --locked -p augmentagent-cli --bin augmentagent
+AUGMENTAGENT_PHONE_PROBE_BIN="$PWD/target/debug/augmentagent" \
 AUGMENTAGENT_GH_DISABLE=1 cargo test --locked -p augmentagent-channel-core \
   --test phone_native_live -- --ignored --test-threads=1
 ```
 
 This opt-in probe makes paid model requests. Each turn must read a newly changed
 synthetic file whose value is absent from the prompt, and all five turns must
-retain one native session ID. It requires working native CLI authentication.
+retain one native session ID. The initial owner prompt must invoke `call_owner`
+through the real MCP facade, return its persisted call ID and cause exactly one
+fake provider create. It requires working native CLI authentication and a
+freshly built CLI binary selected by `AUGMENTAGENT_PHONE_PROBE_BIN`.
 No Twilio requests, real phone calls, or chat sends occur. CI compiles the probe
 without running it. Passing it establishes native tool/session compatibility
 through the shared phone adapter, not audible performance, live ingress,

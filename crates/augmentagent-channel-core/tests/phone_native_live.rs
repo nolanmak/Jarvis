@@ -5,13 +5,14 @@ use augmentagent_approval_discord::{AuditCtx, QueryHandler};
 use augmentagent_channel_core::{
     codex::CodexCliReasoner,
     native_session::CURRENT,
-    phone_agent::{ConversationIo, PhoneAgent},
+    phone_agent::{attach_tools, ConversationIo, PhoneAgent},
     providers::{ModelTier, ProviderKind},
     surface_turn::{run_surface_turn, SurfaceTurnOutcome, SurfaceTurnRequest},
     ClaudeCliReasoner, Reasoner, ReasonerOpts,
 };
 use augmentagent_phone::{
-    Clock, DialRequest, OwnerLink, PhoneConfig, PhoneService, ProviderError, SystemClock, Telephony,
+    tools::ToolServer, Clock, DialRequest, OwnerLink, PhoneConfig, PhoneService, ProviderError,
+    SystemClock, Telephony,
 };
 use augmentagent_store::{
     owner::ControlConversationKind,
@@ -21,14 +22,21 @@ use augmentagent_store::{
 };
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 use tokio_util::sync::CancellationToken;
 
-struct FakePhone;
+#[derive(Default)]
+struct FakePhone {
+    creates: AtomicUsize,
+}
 #[async_trait]
 impl Telephony for FakePhone {
     async fn create(&self, _: DialRequest) -> Result<String, ProviderError> {
+        self.creates.fetch_add(1, Ordering::SeqCst);
         Ok("CA-synthetic".into())
     }
     async fn hangup(&self, _: &str) -> Result<(), ProviderError> {
@@ -39,16 +47,20 @@ struct NativeQuery {
     provider: Box<dyn Reasoner>,
     root: PathBuf,
     observed: Mutex<Vec<String>>,
+    tools: Arc<ToolServer>,
+    bin: PathBuf,
 }
 #[async_trait]
 impl QueryHandler for NativeQuery {
     async fn answer(&self, ctx: &AuditCtx, question: &str) -> anyhow::Result<String> {
         let mut opts = ReasonerOpts::pinned(ModelTier::Fast,
-            "Read the requested synthetic file anew on every turn. Reply with its exact current content only. Use no other tools.");
+            "Read the requested synthetic file anew on every turn. Reply with its exact current content. When explicitly requested, use the bound phone tool to call the owner, and report the call ID. All phone effects in this probe are synthetic.");
         opts.cwd = Some(self.root.clone());
         opts.add_dirs = vec![self.root.clone()];
         opts.allowed_tools = vec!["Read".into()];
         opts.session_id = Some(ctx.session_id.clone());
+        let _grant = attach_tools(&mut opts, &self.tools, &self.bin)?
+            .expect("authenticated probe must expose phone tools");
         let answer = self.provider.call(&opts, question).await?;
         let id = CURRENT
             .try_with(|session| session.id())?
@@ -78,6 +90,12 @@ impl ConversationIo for Io {
     }
 }
 async fn exercise(kind: ProviderKind) {
+    let bin = PathBuf::from(
+        std::env::var_os("AUGMENTAGENT_PHONE_PROBE_BIN")
+            .expect("set AUGMENTAGENT_PHONE_PROBE_BIN to the freshly built augmentagent binary"),
+    )
+    .canonicalize()
+    .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
     let account =
@@ -91,9 +109,10 @@ async fn exercise(kind: ProviderKind) {
     store
         .phone_import_destination("owner", "+12025550123", 0)
         .unwrap();
+    let provider = Arc::new(FakePhone::default());
     let service = Arc::new(PhoneService::new(
         store.clone(),
-        Arc::new(FakePhone),
+        provider.clone(),
         Arc::new(SystemClock),
         PhoneConfig::new(
             true,
@@ -106,6 +125,7 @@ async fn exercise(kind: ProviderKind) {
         )
         .unwrap(),
     ));
+    let tools = ToolServer::start(service.clone()).await.unwrap();
     let agent = Arc::new(NativeQuery {
         provider: match kind {
             ProviderKind::Claude => Box::new(ClaudeCliReasoner::new()),
@@ -114,6 +134,8 @@ async fn exercise(kind: ProviderKind) {
         },
         root: dir.path().into(),
         observed: Mutex::new(Vec::new()),
+        tools,
+        bin,
     });
     let origin = PhoneOrigin {
         owner: owner.clone(),
@@ -136,22 +158,31 @@ async fn exercise(kind: ProviderKind) {
         let marker = format!("SYNTHETIC_PHONE_READ_{}", uuid::Uuid::new_v4());
         std::fs::write(dir.path().join("marker.txt"), &marker).unwrap();
         let turn_id = format!("synthetic-turn-{index}");
+        let prompt = if index == 0 {
+            format!("{question} Also call me now using call_owner with request_id synthetic-call. Report the returned call ID as well as the file content.")
+        } else {
+            question.to_owned()
+        };
         let answer = if index == 0 || index == 4 {
             let turn = SurfaceTurnRef::new(chat.clone(), &turn_id).unwrap();
             let ctx = io.audit_context(&origin, &turn_id);
             let cwd = dir.path().to_string_lossy();
             let query = agent.clone();
-            match run_surface_turn(
-                &store,
-                SurfaceTurnRequest {
-                    turn: &turn,
-                    history: "",
-                    current: question,
-                    cwd: &cwd,
-                },
-                || Ok(Some(kind)),
+            match augmentagent_phone::context::scope(
+                origin.clone(),
                 None,
-                |prompt| async move { query.answer(&ctx, &prompt).await },
+                run_surface_turn(
+                    &store,
+                    SurfaceTurnRequest {
+                        turn: &turn,
+                        history: "",
+                        current: &prompt,
+                        cwd: &cwd,
+                    },
+                    || Ok(Some(kind)),
+                    None,
+                    |prompt| async move { query.answer(&ctx, &prompt).await },
+                ),
             )
             .await
             .unwrap()
@@ -176,16 +207,17 @@ async fn exercise(kind: ProviderKind) {
             "native read did not return the current synthetic marker: {answer}"
         );
         if index == 0 {
-            let grant = service.authorize(&owner, &chat).unwrap();
-            let receipt = service
-                .tool(
-                    &grant,
-                    "call_owner",
-                    serde_json::json!({"request_id":"synthetic-call"}),
-                )
-                .await
-                .unwrap();
-            let id = receipt["id"].as_str().unwrap();
+            let created = store
+                .phone_latest_call("owner")
+                .unwrap()
+                .expect("native CLI must invoke call_owner through MCP");
+            assert_eq!(created.request_id, "synthetic-call");
+            assert_eq!(created.provider_sid.as_deref(), Some("CA-synthetic"));
+            assert!(
+                answer.contains(&created.id),
+                "native reply must include the tool's call ID"
+            );
+            let id = created.id.as_str();
             let now = SystemClock.now_ms();
             store
                 .phone_provider_event(id, "CA-synthetic", CallState::AwaitingAcceptance, now)
@@ -216,6 +248,7 @@ async fn exercise(kind: ProviderKind) {
         ids[0]
     );
     assert_eq!(io.mirrors.lock().unwrap().len(), 6);
+    assert_eq!(provider.creates.load(Ordering::SeqCst), 1);
     assert!(store
         .phone_call("owner", &call.unwrap().id)
         .unwrap()
