@@ -701,7 +701,7 @@ impl EventHandler for Handler {
                 channel_id,
                 crate::interaction::owner_history(
                     allowed_user_id.is_some() && (is_dm || in_query_channel),
-                    crate::compute_inputs::SELECTED.scope(selected, handler.answer_turn(&audit_ctx, &history, &current))),
+                    crate::compute_inputs::SELECTED.scope(selected, crate::phone::answer_turn(handler.as_ref(), &phone_context, &audit_ctx, &history, &current))),
             ).await;
             info!(%channel_id, %msg_id, success = result.is_ok(), "discord query completed");
 

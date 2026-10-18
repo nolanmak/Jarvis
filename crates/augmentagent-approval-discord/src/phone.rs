@@ -30,3 +30,46 @@ pub async fn dispatch(
             .unwrap_or_else(|| "Phone commands are unavailable in this Discord connection.".into()),
     )
 }
+
+impl PhoneCommandContext {
+    /// Identity conversion only; callers must authorize the result against the
+    /// stored owner and control conversation before installing a turn context.
+    pub fn origin(&self) -> anyhow::Result<augmentagent_store::phone::PhoneOrigin> {
+        use augmentagent_store::{
+            SurfaceAccountRef, SurfaceConversationRef, SurfaceOwnerRef, SurfacePlatform,
+        };
+        anyhow::ensure!(
+            self.bot_user_id != 0
+                && self.author_id != 0
+                && self.channel_id != 0
+                && self.message_id != 0
+                && self.guild_id != Some(0),
+            "Discord phone identity is unavailable"
+        );
+        let account_id = self
+            .guild_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| format!("dm:{}", self.bot_user_id));
+        let account = SurfaceAccountRef::new(SurfacePlatform::new("discord")?, account_id)?;
+        Ok(augmentagent_store::phone::PhoneOrigin {
+            owner: SurfaceOwnerRef::new(account.clone(), self.author_id.to_string())?,
+            conversation: SurfaceConversationRef::new(account, self.channel_id.to_string(), None)?,
+        })
+    }
+}
+
+pub async fn answer_turn(
+    handler: &dyn QueryHandler,
+    context: &PhoneCommandContext,
+    audit: &crate::AuditCtx,
+    history: &str,
+    current: &str,
+) -> anyhow::Result<String> {
+    let answer = handler.answer_turn(audit, history, current);
+    match handler.phone_origin(context) {
+        Some(origin) if audit.owner_authorized => {
+            augmentagent_phone::context::scope(origin, None, answer).await
+        }
+        _ => answer.await,
+    }
+}

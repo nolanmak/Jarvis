@@ -354,3 +354,40 @@ ignored required cases. Receipt:
 It includes CLI daemon phone, surface-conformance and legacy voice-session
 regressions. The runner's two Python validation tests also pass. No live Discord
 messages or phone calls were sent during this checkpoint.
+
+
+### Discord DM native-session route
+
+The gateway now has a phone-aware text-turn wrapper. It builds a scoped origin
+only when the query handler can authorize it through its installed phone tool
+server. Discord identities come from the authenticated gateway: guild
+conversations retain the existing guild account key; DMs use `dm:<bot-user-id>`
+as their account key and the DM channel ID as their conversation key. Zero or
+missing provider IDs are rejected. This conversion never creates owner bindings
+or control chats; those still require authenticated setup.
+
+For an authorized phone-enabled Discord turn, `WikiQuerier` now uses the shared
+native session runner without requiring a guild or the legacy voice flag. It
+checks the audit channel/account, rechecks stored owner authority after queueing,
+and uses the same conversation key as `PhoneAgent`. It refuses unsupported native
+providers; duplicate turn IDs retain the store's no-replay behavior.
+
+`/tmp/1496-discord-native-red.log` reproduced DM execution without native session
+context. `/tmp/1496-discord-native-green.log` exercises the real query handler,
+MCP tool configuration and phone bridge with fake provider/model transports:
+Claude and Codex both reuse the original session across text → phone → text,
+exclude old history on resume, reject duplicate native submission and reject
+wrong-channel/revoked origins. The fixture's phone mirrors are in memory; this
+is not proof of durable Discord delivery or audible calls.
+`/tmp/1496-discord-origin-{red,green}.log` covers gateway ID conversion and
+separation of bot DM accounts.
+
+The daemon still does not install a Discord phone tool endpoint. Durable Discord
+mirrors, runtime registration, authenticated account/control-chat setup and DM
+model-control continuity remain required before enabling calls on Discord.
+
+The expanded offline receipt passes all 25 required suites / 417 tests:
+`/tmp/1496-discord-native-offline/receipt.json` (dirty worktree at execution).
+The new native-DM regression is required by CI, alongside existing Discord voice,
+Slack daemon, session-conformance and privacy regressions. The two Python runner
+validation tests pass. These checks used no live phone calls or Discord messages.

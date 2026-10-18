@@ -48,3 +48,30 @@ async fn phone_controls_dispatch_with_transport_identity_and_fail_closed_when_un
     assert!(!reply.contains("123456"));
     assert!(reply.contains("unavailable"));
 }
+
+#[test]
+fn phone_origin_uses_gateway_ids_and_separates_dm_bot_accounts() {
+    let mut ctx = PhoneCommandContext {
+        guild_id: None,
+        bot_user_id: 11,
+        channel_id: 22,
+        author_id: 33,
+        message_id: 44,
+    };
+    let origin = ctx.origin().unwrap();
+    assert_eq!(origin.owner.sender_id(), "33");
+    assert_eq!(origin.conversation.account().account_id(), "dm:11");
+    assert_eq!(origin.conversation.conversation_id(), "22");
+    ctx.bot_user_id = 12;
+    assert_ne!(origin.conversation, ctx.origin().unwrap().conversation);
+    ctx.guild_id = Some(77);
+    assert_eq!(
+        ctx.origin().unwrap().conversation.account().account_id(),
+        "77"
+    );
+    ctx.author_id = 0;
+    assert!(ctx.origin().is_err());
+    ctx.author_id = 33;
+    ctx.bot_user_id = 0;
+    assert!(ctx.origin().is_err());
+}

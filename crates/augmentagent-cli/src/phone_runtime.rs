@@ -407,3 +407,88 @@ mod tests {
         assert_eq!(pending[0].state, CallState::Uncertain);
     }
 }
+
+/// Discord phone-enabled text uses the same native turn queue as PhoneAgent,
+/// including DMs that have no guild and do not enable the legacy voice bridge.
+#[allow(clippy::too_many_arguments)]
+pub async fn discord_text_turn(
+    store: &Store,
+    tools: &Arc<ToolServer>,
+    query: &dyn QueryHandler,
+    audit: &augmentagent_approval_discord::AuditCtx,
+    origin: &augmentagent_store::phone::PhoneOrigin,
+    wiki: &std::path::Path,
+    history: &str,
+    current: &str,
+) -> Result<String> {
+    use augmentagent_channel_core::surface_turn::{
+        run_surface_turn, SurfaceTurnOutcome, SurfaceTurnRequest,
+    };
+    anyhow::ensure!(
+        audit.owner_authorized,
+        "Discord phone turn is not owner authorized"
+    );
+    let channel = audit
+        .channel_id
+        .ok_or_else(|| anyhow::anyhow!("Discord channel unavailable"))?
+        .get()
+        .to_string();
+    anyhow::ensure!(
+        origin.conversation.account().platform().as_str() == "discord"
+            && origin.conversation.conversation_id() == channel
+            && origin.conversation.thread_id().is_none(),
+        "Discord phone origin mismatch"
+    );
+    match audit.guild_id {
+        Some(guild) => anyhow::ensure!(
+            origin.conversation.account().account_id() == guild.to_string(),
+            "Discord guild mismatch"
+        ),
+        None => anyhow::ensure!(
+            origin
+                .conversation
+                .account()
+                .account_id()
+                .starts_with("dm:"),
+            "Discord DM account mismatch"
+        ),
+    }
+    let _grant = tools.grant(&origin.owner, &origin.conversation, None)?;
+    let turn = augmentagent_store::SurfaceTurnRef::new(
+        origin.conversation.clone(),
+        audit.session_id.clone(),
+    )?;
+    let cwd = wiki.to_string_lossy();
+    let outcome = run_surface_turn(
+        store,
+        SurfaceTurnRequest {
+            turn: &turn,
+            history,
+            current,
+            cwd: &cwd,
+        },
+        || {
+            use augmentagent_channel_core::{
+                model_selection::{config_path, SelectionStore},
+                providers::ProviderKind,
+            };
+            let selected = SelectionStore::new(config_path()).selected(Some(&channel))?;
+            anyhow::ensure!(
+                selected
+                    .is_none_or(|kind| matches!(kind, ProviderKind::Claude | ProviderKind::Codex)),
+                "Phone conversations require Claude or Codex"
+            );
+            Ok(selected)
+        },
+        None,
+        |prompt| async move {
+            let _grant = tools.grant(&origin.owner, &origin.conversation, None)?;
+            query.answer(audit, &prompt).await
+        },
+    )
+    .await?;
+    match outcome {
+        SurfaceTurnOutcome::Answered(answer) => Ok(answer),
+        SurfaceTurnOutcome::Cancelled => anyhow::bail!("Discord phone text turn cancelled"),
+    }
+}

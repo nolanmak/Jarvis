@@ -16,6 +16,8 @@ mod model_switch_sequence_tests;
 #[cfg(test)]
 mod discord_voice_session_tests;
 #[cfg(test)]
+mod discord_phone_session_tests;
+#[cfg(test)]
 mod surface_conformance_tests;
 #[cfg(test)]
 mod calendar_approval_tests;
@@ -10898,6 +10900,14 @@ impl QueryHandler for WikiQuerier {
             if history.is_empty() { current.to_string() }
             else { format!("{history}\n\nuser's current message:\n{current}") }
         };
+        if let Some(turn) = augmentagent_phone::context::current() {
+            if turn.origin.conversation.account().platform().as_str() == "discord" {
+                let store = self.conversation_store.as_ref().context("Discord conversation store unavailable")?;
+                let tools = self.phone_tools.get().context("Discord phone tools unavailable")?;
+                return phone_runtime::discord_text_turn(store, tools, self, ctx, &turn.origin,
+                    &self.wiki_root, history, current).await;
+            }
+        }
         let (Some(guild_id), Some(channel_id), Some(store)) =
             (ctx.guild_id, ctx.channel_id, self.conversation_store.as_ref())
         else {
@@ -10953,6 +10963,12 @@ impl QueryHandler for WikiQuerier {
             })
             .await
             .map_err(anyhow::Error::msg)
+    }
+
+    fn phone_origin(&self, context: &augmentagent_approval_discord::phone::PhoneCommandContext) -> Option<augmentagent_store::phone::PhoneOrigin> {
+        let origin = context.origin().ok()?;
+        let _grant = self.phone_tools.get()?.grant(&origin.owner, &origin.conversation, None).ok()?;
+        Some(origin)
     }
 
     async fn model_command(&self, channel_id: u64, text: &str) -> Option<String> {

@@ -440,6 +440,10 @@ pub trait QueryHandler: Send + Sync {
         self.answer(ctx, &prompt).await
     }
 
+    /// Return a phone origin only after checking the stored owner/control-chat
+    /// authority. Disabled or unlinked transports keep ordinary text behavior.
+    fn phone_origin(&self, _context: &phone::PhoneCommandContext) -> Option<augmentagent_store::phone::PhoneOrigin> { None }
+
     /// Deterministic phone command after Discord owner admission. Implementations
     /// must validate stored owner links before executing a phone operation.
     async fn phone_command(&self, _context: &phone::PhoneCommandContext, _text: &str) -> Option<String> { None }
