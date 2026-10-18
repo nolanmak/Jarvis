@@ -233,6 +233,10 @@ async fn relay(
     {
         return StatusCode::CONFLICT.into_response();
     }
+    if state.service.authorize_call(&id).is_err() {
+        let _ = state.service.store.phone_request_stop(&call.owner, &id);
+        return StatusCode::CONFLICT.into_response();
+    }
     let Ok(permit) = state.sockets.clone().try_acquire_owned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -256,6 +260,16 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
         }
         _ => false,
     };
+    // Only a valid setup may trigger cleanup for revoked authority. Invalid
+    // setup or a duplicate socket must not terminate an existing relay.
+    if setup_ok && state.service.authorize_call(&call.id).is_err() {
+        let _ = state
+            .service
+            .store
+            .phone_request_stop(&call.owner, &call.id);
+        let _ = tokio::time::timeout(Duration::from_secs(2), socket.close()).await;
+        return;
+    }
     if !setup_ok
         || state
             .service
@@ -272,9 +286,13 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
     let worker_cancel = cancel.clone();
     let agent = state.agent.clone();
     let worker_call = call.clone();
+    let worker_service = state.service.clone();
     let mut worker = tokio::spawn(async move {
         loop {
             let turn = tokio::select! { _=worker_cancel.cancelled()=>break, t=turn_rx.recv()=>match t {Some(t)=>t,None=>break} };
+            if worker_service.authorize_call(&worker_call.id).is_err() {
+                break;
+            }
             let speech = SpeechSender {
                 sender: speech_tx.clone(),
                 turn: turn.clone(),
@@ -313,6 +331,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
     loop {
         tokio::select! {
             incoming=socket.recv()=>{
+                if state.service.authorize_call(&call.id).is_err() {break;}
                 match incoming {
                     Some(Ok(Message::Text(frame)))=>match session.receive(&frame) {
                         Ok(RelayInput::Turn(turn))=>if turn_tx.try_send(Arc::new(turn)).is_err() {break;},
@@ -331,6 +350,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
             },
             output=speech_rx.recv()=>{
                 let Some(output)=output else {break};
+                if state.service.authorize_call(&call.id).is_err() {break;}
                 let result=if output.automatic {session.finish(&output.turn,&output.text)} else {session.speech(&output.turn,&output.utterance_id,&output.text,output.final_output)};
                 match result {
                     Ok(Some(frame))=>if !matches!(tokio::time::timeout(Duration::from_secs(2),socket.send(Message::Text(frame.to_string().into()))).await,Ok(Ok(()))) {break;},
@@ -338,8 +358,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                 }
             },
             _=tick.tick()=>{
-                let active=state.service.store.phone_provider_call(&call.id);
-                if !matches!(active,Ok(ref c) if c.state==CallState::Connected && !c.stop_requested) {break;}
+                if state.service.authorize_call(&call.id).is_err() {break;}
                 if call.answered_ms.is_some_and(|at|state.service.clock.now_ms()-at>=call.max_duration_seconds*1000) {break;}
             }
         }

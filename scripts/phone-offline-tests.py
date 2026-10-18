@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SUITES = [
     ("augmentagent-phone", "--lib", None, 4),
     ("augmentagent-phone", "--test", "relay", 3),
-    ("augmentagent-phone", "--test", "service", 16),
+    ("augmentagent-phone", "--test", "service", 18),
     ("augmentagent-phone", "--test", "mcp", 2),
     ("augmentagent-phone", "--test", "config", 1),
     ("augmentagent-phone", "--test", "runtime", 1),
@@ -28,7 +28,7 @@ SUITES = [
     ("augmentagent-approval-discord", "--lib", None, 255),
     ("augmentagent-approval-discord", "--test", "phone_boundary", 2),
     ("augmentagent-approval-discord", "--test", "phone_delivery", 3),
-    ("augmentagent-channel-core", "--test", "phone_agent", 2),
+    ("augmentagent-channel-core", "--test", "phone_agent", 3),
     ("augmentagent-channel-core", "--test", "surface_turn", 8),
     ("augmentagent-channel-slack", "--test", "interactive_surface", 20),
     ("augmentagent-channel-slack", "--test", "conversation_harness", 11),

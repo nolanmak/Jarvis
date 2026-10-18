@@ -149,6 +149,9 @@ impl PhoneAgent {
         .await?;
         match outcome {
             SurfaceTurnOutcome::Answered(answer) => {
+                // A long model/tool turn may outlive its owner's authority or
+                // call. Do not mirror or return its final output on a stale call.
+                self.service.authorize_call(&call.id)?;
                 self.io
                     .mirror(
                         &self.store.phone_origin(&call.id)?,
@@ -156,6 +159,7 @@ impl PhoneAgent {
                         &format!("Phone — Jarvis: {answer}"),
                     )
                     .await?;
+                self.service.authorize_call(&call.id)?;
                 Ok(answer)
             }
             SurfaceTurnOutcome::Cancelled => anyhow::bail!("phone turn cancelled"),

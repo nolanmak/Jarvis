@@ -907,3 +907,171 @@ async fn ac04_same_timestamp_rebind_invalidates_existing_call_and_grant() {
         }
     }
 }
+
+#[tokio::test]
+async fn late_speech_is_suppressed_and_call_stops_after_authority_changes() {
+    use augmentagent_phone::ingress::{AgentError, ConversationAgent, SpeechSender};
+    use augmentagent_store::phone::{CallState, PhoneCall};
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+    struct WaitingAgent {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl ConversationAgent for WaitingAgent {
+        async fn interrupted(&self, _: &PhoneCall, _: &str) -> Result<(), AgentError> {
+            Ok(())
+        }
+        async fn answer(
+            &self,
+            _: &PhoneCall,
+            _: &str,
+            _: &str,
+            speech: SpeechSender,
+            _: tokio_util::sync::CancellationToken,
+        ) -> Result<String, AgentError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            let _ = speech.speak("late", "private late speech", false).await;
+            Ok("private late final".into())
+        }
+    }
+    let f = fixture("discord", true, true, false);
+    let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
+    let call = f
+        .service
+        .tool(&grant, "call_owner", json!({"request_id":"late"}))
+        .await
+        .unwrap();
+    let id = call["id"].as_str().unwrap().to_owned();
+    f.store
+        .phone_provider_event(&id, "CA-test", CallState::AwaitingAcceptance, 100)
+        .unwrap();
+    f.store.phone_accept(&id, "CA-test", 100).unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let router = augmentagent_phone::ingress::router(
+        Arc::new(f.service),
+        Arc::new(augmentagent_phone::webhook::WebhookAuth::new(
+            "AC-test",
+            "callback-secret",
+        )),
+        Arc::new(WaitingAgent {
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let mut request = format!("ws://{addr}/phone/relay/{id}")
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "x-twilio-signature",
+        signed(
+            "callback-secret",
+            &format!("wss://phone.example.test/phone/relay/{id}"),
+            &[],
+        )
+        .parse()
+        .unwrap(),
+    );
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    socket.send(Message::Text(json!({"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX-test"}).to_string().into())).await.unwrap();
+    socket
+        .send(Message::Text(
+            json!({"type":"prompt","voicePrompt":"private question","last":true})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    f.store.bind_surface_owner(&f.owner, 0).unwrap();
+    release.notify_one();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+        .await
+        .unwrap();
+    assert!(
+        result.is_none() || matches!(result, Some(Ok(Message::Close(_)))),
+        "revoked call must close without another speech frame"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while f.provider.stops.lock().unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn revoked_signed_relay_upgrade_requests_stop_but_bad_signature_does_not() {
+    use augmentagent_store::phone::CallState;
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Error};
+    let f = fixture("discord", true, true, false);
+    let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
+    let call = f
+        .service
+        .tool(
+            &grant,
+            "call_owner",
+            json!({"request_id":"revoked-upgrade"}),
+        )
+        .await
+        .unwrap();
+    let id = call["id"].as_str().unwrap().to_owned();
+    f.store
+        .phone_provider_event(&id, "CA-test", CallState::AwaitingAcceptance, 100)
+        .unwrap();
+    f.store.phone_accept(&id, "CA-test", 100).unwrap();
+    f.store.bind_surface_owner(&f.owner, 0).unwrap();
+    let router = augmentagent_phone::ingress::router(
+        Arc::new(f.service),
+        Arc::new(augmentagent_phone::webhook::WebhookAuth::new(
+            "AC-test",
+            "callback-secret",
+        )),
+        Arc::new(ScriptedAgent),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    for valid in [false, true] {
+        let mut request = format!("ws://{addr}/phone/relay/{id}")
+            .into_client_request()
+            .unwrap();
+        let signature = if valid {
+            signed(
+                "callback-secret",
+                &format!("wss://phone.example.test/phone/relay/{id}"),
+                &[],
+            )
+        } else {
+            "invalid".into()
+        };
+        request
+            .headers_mut()
+            .insert("x-twilio-signature", signature.parse().unwrap());
+        let error = tokio_tungstenite::connect_async(request).await.unwrap_err();
+        assert!(
+            matches!(error, Error::Http(ref response) if response.status().as_u16() == if valid {409} else {403})
+        );
+        assert_eq!(
+            f.store.phone_provider_call(&id).unwrap().stop_requested,
+            valid
+        );
+    }
+    assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
+    server.abort();
+}

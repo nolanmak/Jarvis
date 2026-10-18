@@ -271,3 +271,104 @@ async fn phone_tool_configuration_requires_authenticated_context_and_preserves_o
     .await
     .is_err());
 }
+
+struct RebindingAgent {
+    inner: Agent,
+    store: Arc<Store>,
+    owner: SurfaceOwnerRef,
+}
+#[async_trait]
+impl QueryHandler for RebindingAgent {
+    async fn answer(&self, ctx: &AuditCtx, question: &str) -> anyhow::Result<String> {
+        let answer = self.inner.answer(ctx, question).await?;
+        self.store.bind_surface_owner(&self.owner, 0)?;
+        Ok(answer)
+    }
+}
+#[tokio::test]
+async fn late_reply_is_not_mirrored_or_returned_after_authority_changes() {
+    for kind in [ProviderKind::Claude, ProviderKind::Codex] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("db")).unwrap());
+        let account =
+            SurfaceAccountRef::new(SurfacePlatform::new("slack").unwrap(), "team").unwrap();
+        let owner = SurfaceOwnerRef::new(account.clone(), "owner").unwrap();
+        let chat = SurfaceConversationRef::new(account, "dm", None).unwrap();
+        store.bind_surface_owner(&owner, 0).unwrap();
+        store
+            .set_surface_control_conversation(&chat, ControlConversationKind::Direct, 0)
+            .unwrap();
+        store
+            .phone_import_destination("owner", "+12025550123", 0)
+            .unwrap();
+        let service = Arc::new(PhoneService::new(
+            store.clone(),
+            Arc::new(TestPhone),
+            Arc::new(TestClock),
+            PhoneConfig::new(
+                true,
+                "https://phone.example.test",
+                "test-verification-key-separate-32bytes",
+                vec![OwnerLink {
+                    surface_owner: owner.clone(),
+                    owner_id: "owner".into(),
+                }],
+            )
+            .unwrap(),
+        ));
+        let grant = service.authorize(&owner, &chat).unwrap();
+        let receipt = service
+            .tool(
+                &grant,
+                "call_owner",
+                serde_json::json!({"request_id":"start"}),
+            )
+            .await
+            .unwrap();
+        let id = receipt["id"].as_str().unwrap();
+        store
+            .phone_provider_event(id, "CA-test", CallState::AwaitingAcceptance, 100)
+            .unwrap();
+        store.phone_accept(id, "CA-test", 100).unwrap();
+        let call = store.phone_provider_call(id).unwrap();
+        let provider = Arc::new(RecordingNativeProvider::new(kind));
+        let io = Arc::new(Io::default());
+        let agent = Arc::new(RebindingAgent {
+            inner: Agent {
+                provider: provider.clone(),
+            },
+            store: store.clone(),
+            owner: owner.clone(),
+        });
+        let bridge = PhoneAgent::new(
+            store.clone(),
+            service.clone(),
+            agent,
+            io.clone(),
+            "/fixture".into(),
+            Arc::new(move |_| Ok(Some(kind))),
+        );
+        assert!(bridge
+            .run(
+                &call,
+                "phone-late",
+                "private question",
+                None,
+                CancellationToken::new()
+            )
+            .await
+            .is_err());
+        assert!(
+            service.authorize(&owner, &chat).is_ok(),
+            "current owner remains linked"
+        );
+        assert_eq!(provider.calls().len(), 1);
+        let mirrors = io.mirrors.lock().unwrap();
+        assert_eq!(
+            mirrors.len(),
+            1,
+            "only the pre-revocation owner transcript may be queued"
+        );
+        assert!(mirrors[0].0.ends_with(":owner"));
+    }
+}

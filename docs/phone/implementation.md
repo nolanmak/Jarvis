@@ -524,3 +524,34 @@ switch protection, and prior Slack/voice regressions. Receipt:
 `/tmp/1496-discord-install-offline/receipt.json` (dirty worktree at execution).
 Both Python runner validation tests pass. No live calls or Discord posts were
 made; real deployment and live acceptance remain unqualified.
+
+### Revocation during an active answer
+
+The phone bridge now revalidates the persisted call authority before mirroring a
+completed native answer and again before returning it for speech. The Relay
+socket checks authority before dispatching queued turns, processing incoming
+frames and emitting speech, plus its existing 250 ms lifecycle tick. A revoked
+call cancels its worker, closes the socket and requests provider cleanup. A
+correctly signed upgrade or valid setup for a revoked call also marks it for
+watchdog cleanup; invalid signatures cannot change call state.
+
+Three test-first regressions cover a same-timestamp owner rebind during a native
+Claude/Codex answer, queued explicit/final speech after a rebind, and a signed
+upgrade rejected after revocation. They assert no late assistant mirror or
+speech frame, provider stop for the active socket, and no additional dial.
+Unsigned upgrade rejection does not request a stop. Red evidence:
+`/tmp/1496-late-reply-red.log`, `/tmp/1496-late-speech-red.log` and
+`/tmp/1496-revoked-upgrade-red.log`.
+
+These checks establish offline authorization boundaries, not live audible
+interruption timing or recall of already delivered bytes. Initial Discord
+identity/control-chat setup, WhatsApp installation, disabled-start cleanup,
+provider duration accounting, tool/approval continuity and live qualification
+remain required. Legacy voice remains installed until migration gates pass.
+
+Validation: all 29 required offline suites / 462 tests pass in
+`/tmp/1496-revocation-offline/receipt.json` (dirty worktree at execution). Both
+Python runner checks pass. Phone all-target Clippy with `--no-deps -D warnings`
+passes; including dependencies still fails on eight existing errors in unchanged
+store code (`/tmp/1496-revocation-clippy.log`). No live calls or chat posts were
+made for this checkpoint.
