@@ -284,3 +284,22 @@ the active-call restriction. Provider failures/timeouts also leave that
 restriction intact. A still-active provider call must be ended separately in the
 provider console; this command only reconciles authoritative final evidence.
 Do not guess a provider ID or delete local rows to enable another call.
+
+## Native tool/session probe without telephone calls
+
+To exercise the installed Claude and Codex CLIs through text → three phone
+adapter turns → hangup → text, using disposable native sessions and fake
+telephony:
+
+```sh
+AUGMENTAGENT_GH_DISABLE=1 cargo test --locked -p augmentagent-channel-core \
+  --test phone_native_live -- --ignored --test-threads=1
+```
+
+This opt-in probe makes paid model requests. Each turn must read a newly changed
+synthetic file whose value is absent from the prompt, and all five turns must
+retain one native session ID. It requires working native CLI authentication.
+No Twilio requests, real phone calls, or chat sends occur. CI compiles the probe
+without running it. Passing it establishes native tool/session compatibility
+through the shared phone adapter, not audible performance, live ingress,
+approval gating, or production transport qualification.

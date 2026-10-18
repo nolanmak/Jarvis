@@ -76,7 +76,7 @@ AUGMENTAGENT_GH_DISABLE=1 cargo test -p augmentagent-phone
 | AC03 | Concurrent reservations, durable deduplication and uncertain-create/restart tests | Unknown-SID association and live runtime fault evidence; known-SID operator reconciliation implemented |
 | AC04 | Signed/reordered callbacks, local ingress, immutable final duration and signed event-time accounting | Live callbacks and provider reconciliation receipts |
 | AC05 | Signed acceptance, fake-clock deadline tests and concurrent runtime watchdog | Voicemail and live acceptance timing |
-| AC06 | Both native providers: text → phone → text continuity; shared queue; deferred/cancellable initial history | Actual native tool/approval continuation and live evidence |
+| AC06 | Installed Claude/Codex CLIs pass text → three PhoneAgent turns → text with fresh synthetic reads on Linux; shared queue and daemon fixtures | Production agent tool/approval conformance and live phone matrix |
 | AC07 | Relay/barge-in generations, final suppression, one-time claims, local WSS round trip and cancellation | Complete live streaming/interruption and tool-disconnect proof |
 | AC08 | Discord, Slack and WhatsApp daemon adapters; authenticated tools; durable transcript outboxes; 13 shared presets checked | [Entry-point audit](surfaces.md): local CLI phone adapter missing; custom constructors/wrappers and live origin receipts outstanding |
 | AC09 | Persistent budgets, provider-duration callbacks, bounded shutdown and disabled/unavailable-start cleanup | Live stop/restart/disable evidence and unknown-SID recovery; known-SID reconciliation available |
@@ -1243,3 +1243,26 @@ call. Its three runtime tests pass locally; this tests the production broker and
 adapter around a recording provider, not a native model choosing/executing tools.
 The journal write guard also passes its explicit CI step on Linux and macOS at
 `27462482`; the full offline suites at that commit remain in progress.
+
+### Installed native CLI compatibility (Linux)
+
+On 2026-10-18, the two existing `native_session_live` probes passed with installed
+Claude Code 2.1.302 and codex-cli 0.162.1. The new opt-in `phone_native_live` target
+also passed both provider cases (246.40 seconds total): text, three accepted
+PhoneAgent turns, fake-provider hangup, then text. Every turn read a newly changed
+synthetic file whose value was absent from the prompt; all five observed native
+session IDs and the durable conversation binding matched. Six phone transcript
+mirror entries were retained and the fake call ended terminally.
+
+This uses actual native CLI/model requests with a read-only fixture QueryHandler
+and fake telephony. It does not run the complete production WikiQuerier toolset,
+exercise approval-gated actions, reach Twilio, measure audible latency, or prove
+macOS native compatibility. CI compiles this opt-in target without making model
+requests; see the runtime runbook for the explicit execution command. The local
+result is stronger than the recording-provider fixtures but is not an AC10 live
+phone receipt.
+
+The Linux CI artifact from run `39164986729` reports 594 tests across 42 suites,
+all passing, on clean synthetic merge commit `5434fb98` (parents `886c0950` and
+`27462482`). CLI compilation and phone lint also passed. This is checkpoint
+CI evidence, not a current-head or macOS pass.
