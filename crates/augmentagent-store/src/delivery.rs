@@ -808,58 +808,33 @@ impl Store {
         now_ms: i64,
         due_at_ms: i64,
     ) -> StoreResult<EnqueueOutcome> {
-        required(&send.idempotency_key, "idempotency key")?;
-        if send.max_attempts == 0 {
-            return Err(invalid("max_attempts must be at least 1"));
-        }
-        if send.operation == OutboundOperation::Update && send.target_message_id.is_none() {
-            return Err(invalid("an update needs target_message_id"));
-        }
-        let c = cols(&send.conversation);
         write_tx(self, |tx| {
-            let inserted = tx.execute(
-                "INSERT INTO surface_outbox
-                 (platform, account_id, conversation_id, thread_id, idempotency_key, operation,
-                  target_message_id, payload, max_attempts, next_attempt_at_ms,
-                  interaction_expires_at_ms, created_at_ms, updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?12, ?11, ?10, ?10)
-                 ON CONFLICT(platform, account_id, idempotency_key) DO NOTHING",
-                params![
-                    c.platform,
-                    c.account_id,
-                    c.conversation_id,
-                    c.thread_id,
-                    send.idempotency_key,
-                    send.operation.as_str(),
-                    send.target_message_id,
-                    send.payload,
-                    send.max_attempts,
-                    now_ms,
-                    send.interaction_expires_at_ms,
-                    due_at_ms
-                ],
-            )?;
-            let (id, status): (i64, String) = tx.query_row(
-                "SELECT id, status FROM surface_outbox
-                 WHERE platform = ?1 AND account_id = ?2 AND idempotency_key = ?3",
-                params![c.platform, c.account_id, send.idempotency_key],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            Ok(if inserted == 1 {
-                EnqueueOutcome::Queued { id }
-            } else {
-                EnqueueOutcome::Duplicate {
-                    id,
-                    status: SendStatus::parse(&status)?,
-                }
-            })
+            enqueue_outbound_tx(tx, send, now_ms, due_at_ms, false)
+        })
+    }
+
+    /// Atomically queue one logical message's parts. Unlike the legacy single
+    /// send API, duplicate keys must describe exactly the same immutable send.
+    pub fn enqueue_outbound_batch(
+        &self,
+        sends: &[NewOutboundSend],
+        now_ms: i64,
+    ) -> StoreResult<Vec<EnqueueOutcome>> {
+        if sends.is_empty() || sends.len() > 256 {
+            return Err(invalid("outbound batch size must be 1..256"));
+        }
+        write_tx(self, |tx| {
+            sends
+                .iter()
+                .map(|send| enqueue_outbound_tx(tx, send, now_ms, now_ms, true))
+                .collect()
         })
     }
 
     /// Claim the next due send whose conversation has nothing earlier still
     /// open. Expired interaction responses are rewritten to a normal post.
     pub fn claim_next_outbound_send(&self, now_ms: i64) -> StoreResult<Option<OutboundSend>> {
-        self.claim_outbound(None, now_ms)
+        self.claim_outbound(None, None, now_ms)
     }
 
     /// [`claim_next_outbound_send`](Self::claim_next_outbound_send) limited
@@ -870,12 +845,24 @@ impl Store {
         account: &SurfaceAccountRef,
         now_ms: i64,
     ) -> StoreResult<Option<OutboundSend>> {
-        self.claim_outbound(Some(account), now_ms)
+        self.claim_outbound(Some(account), None, now_ms)
+    }
+
+    /// Claim only this transport's namespace while preserving conversation order.
+    pub fn claim_next_outbound_send_for_prefix(
+        &self,
+        account: &SurfaceAccountRef,
+        prefix: &str,
+        now_ms: i64,
+    ) -> StoreResult<Option<OutboundSend>> {
+        required(prefix, "outbound key prefix")?;
+        self.claim_outbound(Some(account), Some(prefix), now_ms)
     }
 
     fn claim_outbound(
         &self,
         account: Option<&SurfaceAccountRef>,
+        prefix: Option<&str>,
         now_ms: i64,
     ) -> StoreResult<Option<OutboundSend>> {
         let platform = account.map(|a| a.platform().as_str());
@@ -886,6 +873,7 @@ impl Store {
                     "SELECT o.id FROM surface_outbox o
                      WHERE o.status IN ('queued', 'failed') AND o.next_attempt_at_ms <= ?1
                        AND (?2 IS NULL OR (o.platform = ?2 AND o.account_id = ?3))
+                       AND (?4 IS NULL OR substr(o.idempotency_key,1,length(?4)) = ?4)
                        AND NOT EXISTS (
                          SELECT 1 FROM surface_outbox p
                          WHERE p.platform = o.platform AND p.account_id = o.account_id
@@ -893,7 +881,7 @@ impl Store {
                            AND p.id < o.id
                            AND p.status IN ('queued', 'sending', 'failed', 'reconcile'))
                      ORDER BY o.id LIMIT 1",
-                    params![now_ms, platform, account_id],
+                    params![now_ms, platform, account_id, prefix],
                     |r| r.get(0),
                 )
                 .optional()?;
@@ -1445,4 +1433,70 @@ impl Store {
             Ok(())
         })
     }
+}
+
+fn enqueue_outbound_tx(
+    tx: &Transaction<'_>,
+    send: &NewOutboundSend,
+    now_ms: i64,
+    due_at_ms: i64,
+    strict: bool,
+) -> StoreResult<EnqueueOutcome> {
+    required(&send.idempotency_key, "idempotency key")?;
+    if send.max_attempts == 0 {
+        return Err(invalid("max_attempts must be at least 1"));
+    }
+    if send.operation == OutboundOperation::Update && send.target_message_id.is_none() {
+        return Err(invalid("an update needs target_message_id"));
+    }
+    let c = cols(&send.conversation);
+
+    let inserted = tx.execute(
+        "INSERT INTO surface_outbox
+                 (platform, account_id, conversation_id, thread_id, idempotency_key, operation,
+                  target_message_id, payload, max_attempts, next_attempt_at_ms,
+                  interaction_expires_at_ms, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?12, ?11, ?10, ?10)
+                 ON CONFLICT(platform, account_id, idempotency_key) DO NOTHING",
+        params![
+            c.platform,
+            c.account_id,
+            c.conversation_id,
+            c.thread_id,
+            send.idempotency_key,
+            send.operation.as_str(),
+            send.target_message_id,
+            send.payload,
+            send.max_attempts,
+            now_ms,
+            send.interaction_expires_at_ms,
+            due_at_ms
+        ],
+    )?;
+    let (id, status): (i64, String) = tx.query_row(
+        "SELECT id, status FROM surface_outbox
+                 WHERE platform = ?1 AND account_id = ?2 AND idempotency_key = ?3",
+        params![c.platform, c.account_id, send.idempotency_key],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if inserted == 0 && strict {
+        let existing = load_send(tx, id)?.ok_or_else(|| invalid("missing duplicate send"))?;
+        if existing.conversation != send.conversation
+            || existing.payload != send.payload
+            || existing.operation != send.operation
+            || existing.target_message_id != send.target_message_id
+            || existing.max_attempts != send.max_attempts
+            || existing.interaction_expires_at_ms != send.interaction_expires_at_ms
+        {
+            return Err(invalid("outbound batch conflicts with existing send"));
+        }
+    }
+    Ok(if inserted == 1 {
+        EnqueueOutcome::Queued { id }
+    } else {
+        EnqueueOutcome::Duplicate {
+            id,
+            status: SendStatus::parse(&status)?,
+        }
+    })
 }

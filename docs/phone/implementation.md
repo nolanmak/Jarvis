@@ -391,3 +391,47 @@ The expanded offline receipt passes all 25 required suites / 417 tests:
 The new native-DM regression is required by CI, alongside existing Discord voice,
 Slack daemon, session-conformance and privacy regressions. The two Python runner
 validation tests pass. These checks used no live phone calls or Discord messages.
+
+
+### Durable Discord transcript delivery
+
+`phone_delivery` now enqueues complete transcript messages as atomic batches of
+Discord-sized parts in the shared outbox. Each part has an immutable whole-message
+hash, stable nonce, original conversation and owner-authority revision. Changed
+payloads under an existing key fail the entire batch. Duplicate identical enqueue
+is idempotent. The new scoped-prefix claim API prevents the phone worker from
+claiming another transport's outbox work while retaining conversation order.
+
+The delivery boundary rechecks authorization, bounds provider work to 20 seconds,
+backs off explicit temporary rejection, and parks ambiguous outcomes for
+reconciliation. An interrupted sending row is recovered to reconcile by the
+existing daemon-start recovery contract; workers must start after that recovery.
+A bounded nonce lookup only marks positively identified bot/channel messages
+sent. An inconclusive lookup stays pending with a 30-second lookup backoff and
+never requeues a blind send. Unknown delivery remains visible in the shared
+outbox status. Agent execution is not part of delivery or reconciliation.
+
+The Serenity transport creates messages with mention parsing disabled and nonce
+uniqueness enabled. Discord's nonce uniqueness window is only a few minutes, so
+it is defense in depth, not the durable retry rule:
+[Discord Create Message documentation](https://docs.discord.com/developers/resources/message#create-message).
+Lookup checks the most recent 100 messages; older/absent results are inconclusive.
+
+Test-first logs: `/tmp/1496-discord-delivery-batch-red.log`,
+`/tmp/1496-discord-delivery-prefix-red.log`, `/tmp/1496-discord-delivery-red.log`
+and `/tmp/1496-discord-reconcile-red.log`. The green delivery suite covers atomic
+multipart replay, changed payload rejection, reopen, explicit retry, unknown
+outcome, positive reconciliation without a resend, same-time reauthorization,
+and crash recovery with no proof of delivery. Provider requests are checked via
+the serialized production builder; sends/lookups use fake transport responses.
+
+This transport is not yet connected to the daemon or `ConversationIo`. Remaining
+Discord work includes sharing filtered history, registering the phone agent and
+delivery loop, account/control-chat setup and DM model-command continuity. No
+live Discord delivery is claimed by these tests.
+
+The expanded required offline run passes all 27 suites / 455 tests, including
+all 35 shared delivery tests and three Discord phone-delivery tests. Receipt:
+`/tmp/1496-discord-delivery-offline/receipt.json` (dirty worktree recorded).
+The two Python runner validation tests pass. Real Discord API delivery and
+reconciliation behavior remain live qualification requirements.

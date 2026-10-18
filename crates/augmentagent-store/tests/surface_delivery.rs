@@ -1486,3 +1486,62 @@ fn reschedule_moves_and_rewrites_only_sends_that_have_not_gone_out() {
         SendStatus::Sent
     );
 }
+
+#[test]
+fn outbound_batch_is_atomic_and_rejects_changed_duplicate_payloads() {
+    let (_dir, _path, store) = temp_store();
+    let chat = conv("discord", "dm:11", "22", None);
+    let first = send(&chat, "part-1");
+    let mut second = send(&chat, "part-2");
+    second.max_attempts = 0;
+    assert!(store
+        .enqueue_outbound_batch(&[first.clone(), second.clone()], T0)
+        .is_err());
+    assert!(store.claim_next_outbound_send(T0).unwrap().is_none());
+    second.max_attempts = 3;
+    let result = store
+        .enqueue_outbound_batch(&[first.clone(), second.clone()], T0)
+        .unwrap();
+    assert_eq!(result.len(), 2);
+    assert!(store
+        .enqueue_outbound_batch(&[first.clone(), second.clone()], T0)
+        .unwrap()
+        .iter()
+        .all(|r| matches!(r, EnqueueOutcome::Duplicate { .. })));
+    second.payload = "changed".into();
+    let third = send(&chat, "part-3");
+    assert!(store.enqueue_outbound_batch(&[third, second], T0).is_err());
+    assert_eq!(
+        store
+            .outbound_sends_with_key_prefix(chat.account(), "part-", &[])
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn prefix_claim_leaves_other_transport_work_untouched() {
+    let (_dir, _path, store) = temp_store();
+    let chat = conv("discord", "dm:11", "22", None);
+    let other = conv("discord", "dm:11", "23", None);
+    store
+        .enqueue_outbound_send(&send(&other, "ordinary"), T0)
+        .unwrap();
+    store
+        .enqueue_outbound_send(&send(&chat, "phone-mirror:1"), T0)
+        .unwrap();
+    let claimed = store
+        .claim_next_outbound_send_for_prefix(chat.account(), "phone-mirror:", T0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.conversation, chat);
+    assert_eq!(
+        store
+            .claim_next_outbound_send(T0)
+            .unwrap()
+            .unwrap()
+            .idempotency_key,
+        "ordinary"
+    );
+}

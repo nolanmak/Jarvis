@@ -25,6 +25,7 @@ pub mod owner_alerts;
 // #1292 — the shared owner-command registry (Discord triggers, Slack mapping).
 pub mod owner_commands;
 pub mod phone;
+pub mod phone_delivery;
 mod process_loops;
 // #994 — register (casing) audit for outbound drafts. Public: the delivery
 // layer checks receipts here and `gmail compose` gates its body on them.
