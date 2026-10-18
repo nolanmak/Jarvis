@@ -1335,3 +1335,22 @@ macOS receipt records Darwin arm64, a clean worktree, 595 passing tests across
 43 suites, and synthetic merge commit `871483a4` (parents `886c0950` and branch
 `fff20302`). This establishes that checkpoint's offline host parity, not current
 HEAD qualification, Intel macOS live coverage, or any audible call receipt.
+
+### Local CLI transport foundation (not connected yet)
+
+`local_phone_transport.rs` provides a private Unix listener/client for the
+persistent local conversation adapter. The directory must be private and owned
+by the daemon user, the socket is mode 0600, and both peers check OS user
+credentials. A no-follow private lock protects stale-socket recovery; another
+listener cannot unlink a live endpoint. Frames are bounded, request IDs must be
+UUIDs, unknown identity fields are rejected, and handler errors are not returned
+with their potentially private details. Requests are never automatically retried.
+Four tests pass for round-trip framing, duplicate listeners, unsafe/stale paths,
+symlink/replaced files and malformed/impersonating requests. They are included
+in required offline CI. The adapter is not yet registered in the daemon or
+connected to `wiki ask`; no local CLI call capability is claimed.
+
+Model-router CI job `117794694827` failed the existing
+`hung_cli_times_out_with_typed_error` test with an unverified cleanup result.
+The same test passed in isolation locally (1.04 seconds). The full-suite failure
+remains unresolved; the isolated pass is not proof of safe cleanup under load.

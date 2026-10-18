@@ -8,6 +8,7 @@ mod model_tool;
 mod composio_auth_tool;
 mod voice_tool;
 mod phone_runtime;
+mod local_phone_transport;
 mod discord_phone;
 mod computer_tool;
 #[cfg(test)]
