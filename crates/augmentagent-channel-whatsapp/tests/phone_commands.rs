@@ -14,6 +14,50 @@ use augmentagent_store::{
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[derive(Default)]
+struct TextHandler(
+    std::sync::atomic::AtomicUsize,
+    Mutex<Option<(Arc<Store>, SurfaceOwnerRef)>>,
+);
+#[async_trait]
+impl augmentagent_approval_discord::QueryHandler for TextHandler {
+    async fn answer(
+        &self,
+        _: &augmentagent_approval_discord::AuditCtx,
+        _: &str,
+    ) -> anyhow::Result<String> {
+        panic!("self-chat skipped authenticated answer_turn");
+    }
+    async fn answer_turn(
+        &self,
+        ctx: &augmentagent_approval_discord::AuditCtx,
+        history: &str,
+        current: &str,
+    ) -> anyhow::Result<String> {
+        let origin = augmentagent_phone::context::current()
+            .expect("missing trusted phone origin")
+            .origin;
+        assert_eq!(
+            origin.conversation.account().platform().as_str(),
+            "whatsapp"
+        );
+        assert_eq!(
+            origin.owner.sender_id(),
+            origin.conversation.conversation_id()
+        );
+        assert!(
+            !ctx.owner_authorized,
+            "must not inherit Discord-specific authority"
+        );
+        assert!(history.is_empty());
+        assert_eq!(current, "can you call me?");
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some((store, owner)) = self.1.lock().unwrap().take() {
+            store.bind_surface_owner(&owner, 0)?;
+        }
+        Ok("ordinary native reply".into())
+    }
+}
 struct NoReasoner;
 #[async_trait]
 impl augmentagent_channel_core::Reasoner for NoReasoner {
@@ -108,6 +152,7 @@ async fn self_chat_phone_setup_verify_call_and_replay_use_shared_service() {
             write.write_all(format!("{}\n",json!({"version":1,"request_id":request["request_id"],"ok":true,"result":{"message_id":"reply"}})).as_bytes()).await.unwrap();
         }
     });
+    let text_handler = Arc::new(TextHandler::default());
     let make_control = |store: Arc<Store>| {
         WhatsappControlSurface::new(
             client.clone(),
@@ -116,7 +161,7 @@ async fn self_chat_phone_setup_verify_call_and_replay_use_shared_service() {
                 control_chat_jid: linked.bare(),
             },
             None,
-            None,
+            Some(text_handler.clone()),
         )
         .with_phone_tools(linked.clone(), tools.clone())
         .unwrap()
@@ -158,6 +203,13 @@ async fn self_chat_phone_setup_verify_call_and_replay_use_shared_service() {
     dry_channel.inbox_handle().lock().await.push(setup.clone());
     dry_channel.poll_once().await.unwrap();
     assert!(provider.0.lock().unwrap().is_empty(), "dry run dialed");
+    dry_channel
+        .inbox_handle()
+        .lock()
+        .await
+        .push(message("dry-text", "can you call me?"));
+    dry_channel.poll_once().await.unwrap();
+    assert_eq!(text_handler.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     let channel = WhatsappChannel::new(
         store.clone(),
         Arc::new(NoReasoner),
@@ -175,6 +227,14 @@ async fn self_chat_phone_setup_verify_call_and_replay_use_shared_service() {
     assert_eq!(polled.errors, 0);
     assert_eq!(polled.messages_dispatched, 1);
     assert_eq!(provider.0.lock().unwrap().len(), 1);
+    let text = message("native-text", "can you call me?");
+    channel.inbox_handle().lock().await.push(text.clone());
+    assert_eq!(channel.poll_once().await.unwrap().messages_dispatched, 1);
+    assert_eq!(text_handler.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let mut echo = text.clone();
+    echo.metadata.agent_outbound = Some(true);
+    control.handle_control_message(&echo).await.unwrap();
+    assert_eq!(text_handler.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     let code = provider.0.lock().unwrap()[0]
         .twiml
         .split(" is ")
@@ -210,12 +270,28 @@ async fn self_chat_phone_setup_verify_call_and_replay_use_shared_service() {
         .last()
         .unwrap()
         .contains("already received"));
+    let before = replies.lock().unwrap().len();
+    *text_handler.1.lock().unwrap() = Some((store.clone(), owner.clone()));
+    restarted
+        .handle_control_message(&message("late-text", "can you call me?"))
+        .await
+        .unwrap();
+    assert_eq!(
+        replies.lock().unwrap().len(),
+        before,
+        "late reply escaped changed authority"
+    );
     store.unbind_surface_owner(owner.account()).unwrap();
     restarted
         .handle_control_message(&message("revoked", "phone number set +12025550123"))
         .await
         .unwrap();
     assert_eq!(provider.0.lock().unwrap().len(), 2);
+    restarted
+        .handle_control_message(&message("revoked-text", "can you call me?"))
+        .await
+        .unwrap();
+    assert_eq!(text_handler.0.load(std::sync::atomic::Ordering::SeqCst), 2);
     for reply in replies.lock().unwrap().iter() {
         assert!(!reply.contains("12025550123") && !reply.contains(&code));
     }

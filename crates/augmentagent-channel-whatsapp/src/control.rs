@@ -199,7 +199,15 @@ impl WhatsappControlSurface {
                 .await.ok();
             return Ok(true);
         }
-        if msg.is_outbound() { return Ok(false); }
+        let trusted = match &self.phone {
+            Some(phone) => {
+                if self.check_send_gate(&chat_jid).is_err() { return Ok(true); }
+                let Some(origin) = phone.authorized_origin(msg) else { return Ok(true); };
+                Some(origin)
+            }
+            None => None,
+        };
+        if msg.is_outbound() && trusted.is_none() { return Ok(false); }
         let cmd = parse_control_command(&msg.text);
         match cmd {
             ControlCommand::Approve | ControlCommand::Decline | ControlCommand::Revise(_) => {
@@ -256,9 +264,21 @@ impl WhatsappControlSurface {
                     // WhatsApp sender must not inherit that authority.
                     owner_authorized: false,
                 };
-                match augmentagent_approval_discord::interaction::owner_history(!chat_jid.ends_with("@g.us"), qh.answer(&audit_ctx, &q)).await {
+                let answer = match &trusted {
+                    Some((origin, _)) => augmentagent_phone::context::scope(origin.clone(), None,
+                        augmentagent_approval_discord::interaction::owner_history(true, qh.answer_turn(&audit_ctx, "", &q))).await,
+                    None => augmentagent_approval_discord::interaction::owner_history(!chat_jid.ends_with("@g.us"), qh.answer(&audit_ctx, &q)).await,
+                };
+                // A queued or long-running native turn may outlive its binding.
+                if let Some((_, revision)) = &trusted {
+                    if self.phone.as_ref().and_then(|phone| phone.authorized_origin(msg)).is_none_or(|(_, current)| current != *revision) { return Ok(true); }
+                }
+                match answer {
                     Ok(answer) => {
                         for chunk in chunk_for_whatsapp(&answer) {
+                            if let Some((_, revision)) = &trusted {
+                                if self.phone.as_ref().and_then(|phone| phone.authorized_origin(msg)).is_none_or(|(_, current)| current != *revision) { break; }
+                            }
                             if let Err(e) = self.send_to_control(&chunk).await {
                                 warn!("control: query answer send failed: {e}");
                                 break;

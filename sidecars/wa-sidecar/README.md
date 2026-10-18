@@ -111,5 +111,6 @@ A `false` value is not authorization by itself: the Rust adapter must also check
 self-chat, sender, authenticated linked-account identity, explicit owner links,
 control bindings, feature gates and replay handling. Old sidecars omit the field
 and cannot authorize self-chat commands. When phone tools are installed, the control adapter accepts verified self-chat
-phone controls after stored owner authorization. Ordinary self-chat agent turns
-and daemon installation remain separate work.
+phone controls after stored owner authorization. Authenticated ordinary self-chat turns now enter the shared native-session
+path when the library adapter is installed. Daemon installation and durable
+phone transcript delivery remain outstanding.

@@ -19,6 +19,8 @@ mod discord_voice_session_tests;
 #[cfg(test)]
 mod discord_phone_session_tests;
 #[cfg(test)]
+mod whatsapp_phone_session_tests;
+#[cfg(test)]
 mod surface_conformance_tests;
 #[cfg(test)]
 mod calendar_approval_tests;
@@ -10814,17 +10816,14 @@ impl QueryHandler for WikiQuerier {
         };
         // The scoped origin comes only from an authenticated interactive transport.
         // Keep this capability alive through the native provider call below.
-        let _phone_grant = if ctx.owner_authorized {
-            self.phone_tools
-                .get()
-                .map(|server| {
-                    augmentagent_channel_core::phone_agent::attach_tools(&mut opts, server, &auth_bin)
-                })
-                .transpose()?
-                .flatten()
-        } else {
-            None
-        };
+        // Phone authority is the scoped transport origin plus the server grant,
+        // independently of Discord's owner_authorized flag. attach_tools returns
+        // no capability without a scope and revalidates explicit owner bindings.
+        let _phone_grant = self.phone_tools
+            .get()
+            .map(|server| augmentagent_channel_core::phone_agent::attach_tools(&mut opts, server, &auth_bin))
+            .transpose()?
+            .flatten();
         let voice_grant = self.voice_tools.get().and_then(|service| {
             let guild = ctx.guild_id?;
             let channel = ctx.channel_id?;
@@ -10913,6 +10912,12 @@ impl QueryHandler for WikiQuerier {
             else { format!("{history}\n\nuser's current message:\n{current}") }
         };
         if let Some(turn) = augmentagent_phone::context::current() {
+            if turn.origin.conversation.account().platform().as_str() == "whatsapp" {
+                let store = self.conversation_store.as_ref().context("WhatsApp conversation store unavailable")?;
+                let tools = self.phone_tools.get().context("WhatsApp phone tools unavailable")?;
+                return phone_runtime::whatsapp_text_turn(store, tools, self, ctx, &turn.origin,
+                    &self.wiki_root, history, current).await;
+            }
             if turn.origin.conversation.account().platform().as_str() == "discord" {
                 let store = self.conversation_store.as_ref().context("Discord conversation store unavailable")?;
                 let tools = self.phone_tools.get().context("Discord phone tools unavailable")?;

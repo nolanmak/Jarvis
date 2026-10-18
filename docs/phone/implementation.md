@@ -708,3 +708,47 @@ Validation: all 34 required offline suites / 522 tests pass in
 WhatsApp all-target Clippy with `--no-deps -D warnings` and both Python runner
 checks pass. No live WhatsApp messages or Twilio calls were made; the test's
 provider and local sidecar responses are scripted.
+
+### WhatsApp ordinary text and native phone session continuity
+
+An installed self-chat adapter now routes authenticated ordinary messages through
+`QueryHandler::answer_turn` with a trusted phone origin. Echo/unknown events,
+wrong owners, disabled controls and revoked bindings cannot enter this route.
+Dry run also excludes ordinary self-chat execution. The adapter retains
+Discord's `owner_authorized = false`: phone access now relies on the transport
+scope and server grant, which revalidates explicit owner/control authority,
+rather than inheriting Discord-specific authorization. No scope still means no
+phone tools.
+
+The real WikiQuerier recognizes WhatsApp origins and uses the same native turn
+queue, durable turn claims and provider session binding as PhoneAgent. Its
+identity checks require the linked `device:<number>` account, exact owner
+self-chat, matching `wa:<chat>:<event>` identity, and no Discord audit context.
+Discord and WhatsApp share the lower native execution helper after their
+transport checks. It snapshots authority revision and checks again after queue
+wait and after the answer; the WhatsApp adapter also checks before reply chunks.
+
+Test-first logs `/tmp/1496-wa-native-control-red.log` and
+`/tmp/1496-wa-native-red.log` reproduce ignored ordinary text and missing phone
+tools. `/tmp/1496-wa-native-late-red.log` reproduces a late native reply returning
+after a same-timestamp rebind. Green logs:
+`/tmp/1496-wa-native-control-green.log` and `/tmp/1496-wa-native-green.log`.
+The CLI fixture runs real WikiQuerier/PhoneAgent with fake native providers for
+both Claude and Codex: text → three phone turns → text, five invocations on the
+original native ID, phone tools present, no repeated history, duplicate text
+rejected, invalid event/revoked identity rejected, and an additional late answer
+suppressed after rebind. The channel fixture checks scope, dry run, echo rejection
+and late reply suppression. Phone conversation IO in the CLI fixture is a stub;
+it is not evidence of WhatsApp transcript delivery.
+
+Remaining WhatsApp work includes initial identity/control provisioning, durable
+transcript delivery/history integration and actual daemon installation with
+prompt event dispatch. Approval/tool continuation beyond phone-tool availability
+and the shared lifecycle, provider duration, remote OS CI and live qualification
+requirements remain open. No replacement voice stack is retired yet.
+
+Validation: all 35 required offline suites / 523 tests pass in
+`/tmp/1496-wa-native-offline/receipt.json` (dirty worktree at execution), including
+the existing Discord native-session and legacy voice regressions. WhatsApp
+all-target Clippy with `--no-deps -D warnings` and both Python runner checks pass.
+No real model, WhatsApp or Twilio calls were made for these fixtures.

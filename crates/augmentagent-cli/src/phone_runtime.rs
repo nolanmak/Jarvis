@@ -1,6 +1,6 @@
 //! Daemon phone lifecycle and adapters. One listener and provider service are
 //! shared by authenticated chat surfaces; passive ingestion gets no endpoint.
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use augmentagent_approval_discord::QueryHandler;
 use augmentagent_channel_core::phone_agent::PhoneAgent;
@@ -421,9 +421,6 @@ pub async fn discord_text_turn(
     history: &str,
     current: &str,
 ) -> Result<String> {
-    use augmentagent_channel_core::surface_turn::{
-        run_surface_turn, SurfaceTurnOutcome, SurfaceTurnRequest,
-    };
     anyhow::ensure!(
         audit.owner_authorized,
         "Discord phone turn is not owner authorized"
@@ -453,7 +450,63 @@ pub async fn discord_text_turn(
             "Discord DM account mismatch"
         ),
     }
+    native_text_turn(store, tools, query, audit, origin, wiki, history, current).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn whatsapp_text_turn(
+    store: &Store,
+    tools: &Arc<ToolServer>,
+    query: &dyn QueryHandler,
+    audit: &augmentagent_approval_discord::AuditCtx,
+    origin: &augmentagent_store::phone::PhoneOrigin,
+    wiki: &std::path::Path,
+    history: &str,
+    current: &str,
+) -> Result<String> {
+    let sender = origin.owner.sender_id();
+    let number = sender.strip_suffix("@s.whatsapp.net").unwrap_or("");
+    let prefix = format!("wa:{}:", origin.conversation.conversation_id());
+    anyhow::ensure!(
+        origin.conversation.account().platform().as_str() == "whatsapp"
+            && origin.owner.account() == origin.conversation.account()
+            && !number.is_empty()
+            && number.bytes().all(|c| c.is_ascii_digit())
+            && origin.conversation.account().account_id() == format!("device:{number}")
+            && origin.conversation.conversation_id() == sender
+            && origin.conversation.thread_id().is_none()
+            && audit.guild_id.is_none()
+            && audit.channel_id.is_none()
+            && audit.http.is_none()
+            && audit
+                .session_id
+                .strip_prefix(&prefix)
+                .is_some_and(|id| !id.is_empty()),
+        "WhatsApp phone origin mismatch"
+    );
+    native_text_turn(store, tools, query, audit, origin, wiki, history, current).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn native_text_turn(
+    store: &Store,
+    tools: &Arc<ToolServer>,
+    query: &dyn QueryHandler,
+    audit: &augmentagent_approval_discord::AuditCtx,
+    origin: &augmentagent_store::phone::PhoneOrigin,
+    wiki: &std::path::Path,
+    history: &str,
+    current: &str,
+) -> Result<String> {
+    use augmentagent_channel_core::surface_turn::{
+        run_surface_turn, SurfaceTurnOutcome, SurfaceTurnRequest,
+    };
+    let channel = origin.conversation.conversation_id();
     let _grant = tools.grant(&origin.owner, &origin.conversation, None)?;
+    let revision = store
+        .surface_owner_binding(origin.owner.account())?
+        .context("Phone owner binding unavailable")?
+        .revision;
     let turn = augmentagent_store::SurfaceTurnRef::new(
         origin.conversation.clone(),
         audit.session_id.clone(),
@@ -483,12 +536,24 @@ pub async fn discord_text_turn(
         None,
         |prompt| async move {
             let _grant = tools.grant(&origin.owner, &origin.conversation, None)?;
+            anyhow::ensure!(
+                store
+                    .surface_owner_binding(origin.owner.account())?
+                    .is_some_and(|binding| binding.revision == revision),
+                "Phone owner authority changed while queued"
+            );
             query.answer(audit, &prompt).await
         },
     )
     .await?;
+    anyhow::ensure!(
+        store
+            .surface_owner_binding(origin.owner.account())?
+            .is_some_and(|binding| binding.revision == revision),
+        "Phone owner authority changed during the answer"
+    );
     match outcome {
         SurfaceTurnOutcome::Answered(answer) => Ok(answer),
-        SurfaceTurnOutcome::Cancelled => anyhow::bail!("Discord phone text turn cancelled"),
+        SurfaceTurnOutcome::Cancelled => anyhow::bail!("Phone text turn cancelled"),
     }
 }

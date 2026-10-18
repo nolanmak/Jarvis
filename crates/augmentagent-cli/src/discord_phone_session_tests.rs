@@ -13,7 +13,7 @@ use augmentagent_store::{
     SurfaceConversationRef, SurfaceOwnerRef, SurfacePlatform,
 };
 use std::sync::Mutex;
-struct FixturePhone;
+pub(super) struct FixturePhone;
 #[async_trait]
 impl Telephony for FixturePhone {
     async fn create(&self, _: DialRequest) -> std::result::Result<String, ProviderError> {
@@ -23,9 +23,9 @@ impl Telephony for FixturePhone {
         Ok(())
     }
 }
-struct Native {
-    kind: ProviderKind,
-    calls: Arc<Mutex<Vec<(String, String)>>>,
+pub(super) struct Native {
+    pub(super) kind: ProviderKind,
+    pub(super) calls: Arc<Mutex<Vec<(String, String)>>>,
 }
 #[async_trait]
 impl Reasoner for Native {

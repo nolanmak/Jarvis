@@ -311,7 +311,7 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
             return Ok(());
         }
         // A dry-run channel must never start verification or owner calls.
-        if self.config.dry_run && augmentagent_phone::commands::recognizes(&msg.text) {
+        if self.config.dry_run && (msg.is_outbound() || augmentagent_phone::commands::recognizes(&msg.text)) {
             return Ok(());
         }
         let chat_jid = msg.chat.bare();

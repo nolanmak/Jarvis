@@ -45,6 +45,21 @@ impl PhoneControl {
             origin,
         })
     }
+    pub fn authorized_origin(&self, message: &WaMessage) -> Option<(PhoneOrigin, i64)> {
+        if !message.is_verified_self_command(&self.linked_owner) {
+            return None;
+        }
+        let _grant = self
+            .tools
+            .grant(&self.origin.owner, &self.origin.conversation, None)
+            .ok()?;
+        let binding = self
+            .store
+            .surface_owner_binding(self.origin.owner.account())
+            .ok()??;
+        Some((self.origin.clone(), binding.revision))
+    }
+
     pub async fn execute(&self, message: &WaMessage) -> anyhow::Result<Option<String>> {
         if !message.is_verified_self_command(&self.linked_owner) {
             return Ok(None);
