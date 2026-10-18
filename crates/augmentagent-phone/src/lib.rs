@@ -155,6 +155,8 @@ pub struct PhoneService {
     provider: Arc<dyn Telephony>,
     clock: Arc<dyn Clock>,
     config: PhoneConfig,
+    stopping: std::sync::atomic::AtomicBool,
+    cleanup_inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 impl PhoneService {
     pub fn new(
@@ -168,6 +170,8 @@ impl PhoneService {
             provider,
             clock,
             config,
+            stopping: std::sync::atomic::AtomicBool::new(false),
+            cleanup_inflight: Arc::new(std::sync::Mutex::new(Default::default())),
         }
     }
     pub fn authorize(
@@ -228,7 +232,7 @@ impl PhoneService {
         Ok(())
     }
     fn enabled(&self) -> Result<(), Error> {
-        if self.config.enabled {
+        if self.config.enabled && !self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
             Ok(())
         } else {
             Err(Error::Disabled)
@@ -290,11 +294,9 @@ impl PhoneService {
                     .store
                     .phone_request_stop(&grant.owner_id, &args.call_id)?;
                 if !call.state.terminal() {
-                    if let Some(sid) = &call.provider_sid {
-                        self.provider.hangup(sid).await?;
-                    }
+                    self.maintenance(false).await?;
                 }
-                call
+                self.store.phone_call(&grant.owner_id, &args.call_id)?
             }
             _ => return Err(Error::InvalidArguments),
         };
@@ -317,7 +319,7 @@ impl PhoneService {
                 self.store.phone_bind_provider(&call.id, &sid)?;
                 let latest = self.store.phone_call(&call.owner, &call.id)?;
                 if latest.stop_requested {
-                    self.provider.hangup(&sid).await?;
+                    self.maintenance(false).await?;
                 } else {
                     self.store.phone_provider_event(
                         &call.id,
@@ -397,15 +399,9 @@ impl PhoneService {
     }
     pub async fn remove_number(&self, grant: &Grant) -> Result<(), Error> {
         self.check(grant, true)?;
-        for id in self
-            .store
-            .phone_remove_destination(&grant.owner_id, self.clock.now_ms())?
-        {
-            let call = self.store.phone_call(&grant.owner_id, &id)?;
-            if let Some(sid) = call.provider_sid {
-                self.provider.hangup(&sid).await?;
-            }
-        }
+        self.store
+            .phone_remove_destination(&grant.owner_id, self.clock.now_ms())?;
+        self.maintenance(false).await?;
         Ok(())
     }
 }
@@ -423,41 +419,73 @@ pub mod webhook;
 pub mod relay;
 
 impl PhoneService {
-    /// Called on startup (restart=true) and every 250 ms thereafter. Provider
-    /// duration caps remain effective even if the daemon is no longer running.
-    pub async fn maintenance(&self, restart: bool) -> Result<(), Error> {
+    /// Snapshot and claim due cleanup without waiting for provider HTTP. The
+    /// runtime excludes in-flight IDs so a slow request cannot spend all retries.
+    fn cleanup_due(&self, restart: bool) -> Result<Vec<CleanupCall>, Error> {
         let now = self.clock.now_ms();
+        let mut due = Vec::new();
         for call in self.store.phone_active_calls()? {
             let expired = match (call.state, call.answered_ms) {
                 (CallState::AwaitingAcceptance, Some(at)) => now - at >= 15_000,
                 (_, Some(at)) => now - at >= call.max_duration_seconds * 1000,
                 _ => now - call.created_ms >= 60_000,
             };
-            if restart || expired || !self.config.enabled {
+            if restart
+                || expired
+                || !self.config.enabled
+                || self.stopping.load(std::sync::atomic::Ordering::SeqCst)
+            {
                 self.store.phone_request_stop(&call.owner, &call.id)?;
                 if call.provider_sid.is_none() {
                     self.store.phone_mark_uncertain(&call.id)?;
                 }
             }
-            if self.store.phone_claim_cleanup(&call.id, now)? {
-                if let Some(sid) = &call.provider_sid {
-                    // Failed cleanup remains visible and is retried by the
-                    // durable bounded schedule. Never create another call.
-                    if self.provider.hangup(sid).await.is_ok() {
-                        let terminal = if call.answered_ms.is_some() {
-                            CallState::Completed
-                        } else {
-                            CallState::Canceled
-                        };
-                        self.store.phone_provider_event(
-                            &call.id,
-                            sid,
-                            terminal,
-                            self.clock.now_ms(),
-                        )?;
-                    }
-                }
+            let mut inflight = self
+                .cleanup_inflight
+                .lock()
+                .expect("phone cleanup poisoned");
+            if !inflight.contains(&call.id) && self.store.phone_claim_cleanup(&call.id, now)? {
+                inflight.insert(call.id.clone());
+                due.push(CleanupCall {
+                    call,
+                    inflight: self.cleanup_inflight.clone(),
+                });
             }
+        }
+        Ok(due)
+    }
+    async fn cleanup_call(&self, cleanup: CleanupCall) -> Result<(), Error> {
+        let call = &cleanup.call;
+        if let Some(sid) = &call.provider_sid {
+            // A failed or timed-out attempt stays durably pending for the next
+            // bounded retry. A terminal provider callback never regresses.
+            if matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(32),
+                    self.provider.hangup(sid)
+                )
+                .await,
+                Ok(Ok(()))
+            ) {
+                let terminal = if call.answered_ms.is_some() {
+                    CallState::Completed
+                } else {
+                    CallState::Canceled
+                };
+                self.store
+                    .phone_provider_event(&call.id, sid, terminal, self.clock.now_ms())?;
+            }
+        }
+        Ok(())
+    }
+    /// One maintenance pass for explicit cleanup and tests. The continuous
+    /// runtime keeps scanning while these provider requests are in flight.
+    pub async fn maintenance(&self, restart: bool) -> Result<(), Error> {
+        let calls = self.cleanup_due(restart)?;
+        let outcomes =
+            futures::future::join_all(calls.into_iter().map(|call| self.cleanup_call(call))).await;
+        for outcome in outcomes {
+            outcome?;
         }
         Ok(())
     }
@@ -494,3 +522,23 @@ impl PhoneService {
 }
 
 pub mod mcp;
+
+pub mod runtime;
+
+/// Shared by watchdog, disconnect and explicit maintenance, including while a
+/// cleanup future is cancelled. Dropping a job releases only the local lease;
+/// the durable attempt/backoff remains recorded.
+struct CleanupCall {
+    call: PhoneCall,
+    inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+impl Drop for CleanupCall {
+    fn drop(&mut self) {
+        self.inflight
+            .lock()
+            .expect("phone cleanup poisoned")
+            .remove(&self.call.id);
+    }
+}
+
+pub mod config;

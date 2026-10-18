@@ -152,3 +152,32 @@ Validation for this checkpoint: 36 targeted integration tests passed (11 store,
 session runner), plus `cargo check -p augmentagent-cli` and phone-crate Clippy
 with warnings denied. Existing unrelated CLI/docs warnings remain in the CLI
 check. This is Linux local validation only.
+
+## Runtime, configuration and CI checkpoint
+
+`PhoneRuntime` owns the phone-only listener, private tool broker and watchdog.
+The runtime test holds one provider hangup indefinitely while another call reaches
+its acceptance deadline: the second hangup begins within one second. Behavioral
+red tests also found duplicate cleanup attempts from disconnect and explicit
+stop/removal; all paths now share in-flight cleanup guards and durable retries.
+The test confirms restart stop marking, rejection of starts after shutdown, and
+an unrelated HTTP route returning 404.
+
+Configuration tests cover default-off, missing/invalid settings, loopback-only
+binding and explicit identity links without inventing authentication bindings.
+The configuration/runtime contract and remaining deployment work are documented
+in [runtime.md](runtime.md). The actual daemon and chat adapters still need wiring.
+
+Red/green records: `/tmp/1496-runtime-{red,green}.log`,
+`/tmp/1496-concurrent-cleanup-{red,green}.log`,
+`/tmp/1496-stop-paths-{red,green}.log`, `/tmp/1496-config-{red,green}.log`, and
+`/tmp/1496-ci-runner-{red,green}.log`. The cleanup regressions failed behaviorally;
+new runtime/config APIs first failed compilation. The CI runner's test rejects
+empty, skipped, filtered, short and failed results. The phone workflow adds
+Linux/macOS offline jobs; actual remote execution remains unverified.
+
+Local Linux validation for this checkpoint: the required runner passed all nine
+suites / 45 Rust tests (`/tmp/1496-phone-offline/receipt.json`), its Python
+validation test passed, `cargo check -p augmentagent-cli --locked` passed with
+preexisting warnings, and phone Clippy passed with warnings denied. Remote
+macOS/Linux workflow results and live evidence are still absent.

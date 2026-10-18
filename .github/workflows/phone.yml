@@ -1,0 +1,63 @@
+name: Phone offline acceptance
+
+on:
+  pull_request:
+    paths:
+      - 'crates/augmentagent-phone/**'
+      - 'crates/augmentagent-store/**'
+      - 'crates/augmentagent-channel-core/**'
+      - 'crates/augmentagent-cli/**'
+      - 'crates/augmentagent-approval-discord/**'
+      - 'crates/augmentagent-channel-slack/**'
+      - 'crates/augmentagent-channel-whatsapp/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'scripts/phone-offline-tests.py'
+      - 'scripts/tests/phone_offline_ci_test.py'
+      - '.github/workflows/phone.yml'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      AUGMENTAGENT_GH_DISABLE: '1'
+      AUGMENTAGENT_PHONE_ENABLED: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          components: clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: phone-offline
+      - name: Check that the runner rejects missing or skipped coverage
+        run: python3 -m unittest discover -s scripts/tests -p phone_offline_ci_test.py -v
+      - name: Required offline suites
+        run: python3 scripts/phone-offline-tests.py
+      - name: CLI integration compiles
+        run: cargo check -p augmentagent-cli --locked
+      - name: Phone lint
+        run: cargo clippy -p augmentagent-phone --all-targets --no-deps --locked -- -D warnings
+      - name: Upload offline evidence (not live qualification)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phone-offline-${{ matrix.os }}
+          path: target/phone-offline/
+          if-no-files-found: error
