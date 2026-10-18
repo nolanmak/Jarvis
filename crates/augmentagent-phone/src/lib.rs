@@ -561,10 +561,16 @@ impl PhoneService {
                     std::time::Duration::from_secs(5), self.provider.final_usage(sid)).await {
                     let usage = match result {
                         FinalUsage::Completed(usage) => usage,
-                        FinalUsage::NeverAnswered if call.answered_ms.is_none() => augmentagent_store::phone::ProviderUsage {
-                            duration_seconds: 0, ended_ms: call.ended_ms.unwrap_or(call.created_ms),
+                        FinalUsage::NeverAnswered => {
+                            if self.store.phone_usage(&call.id)?.is_none() {
+                                if let Err(error) = self.store.phone_confirm_never_answered(&call.id, sid, self.clock.now_ms()) {
+                                    // An answer/final callback may win during provider I/O.
+                                    // Conflicting evidence must retain the existing budget.
+                                    if !matches!(error, PhoneError::Conflict) { return Err(error.into()); }
+                                }
+                            }
+                            return Ok(());
                         },
-                        FinalUsage::NeverAnswered => return Ok(()),
                     };
                     // A signed callback may have won while REST was in flight.
                     // Preserve that immutable evidence instead of overwriting it.
@@ -669,3 +675,5 @@ impl Drop for CleanupCall {
 pub mod config;
 
 pub mod router;
+
+pub mod recovery;

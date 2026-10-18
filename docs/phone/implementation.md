@@ -73,13 +73,13 @@ AUGMENTAGENT_GH_DISABLE=1 cargo test -p augmentagent-phone
 | --- | --- | --- |
 | AC01 | Disabled/config validation; signed ingress; all three daemon adapters; cleanup when normal startup is unavailable | Deployed ingress and live TLS receipts |
 | AC02 | Grants, revocation, expiry, forged targets, authenticated MCP and surface boundaries | Complete live boundary evidence |
-| AC03 | Concurrent reservations, durable deduplication and uncertain-create/restart tests | Exhausted/unknown-SID reconciliation handling and live runtime fault evidence |
+| AC03 | Concurrent reservations, durable deduplication and uncertain-create/restart tests | Unknown-SID association and live runtime fault evidence; known-SID operator reconciliation implemented |
 | AC04 | Signed/reordered callbacks, local ingress, immutable final duration and signed event-time accounting | Live callbacks and provider reconciliation receipts |
 | AC05 | Signed acceptance, fake-clock deadline tests and concurrent runtime watchdog | Voicemail and live acceptance timing |
 | AC06 | Both native providers: text → phone → text continuity; shared queue; deferred/cancellable initial history | Actual native tool/approval continuation and live evidence |
 | AC07 | Relay/barge-in generations, final suppression, one-time claims, local WSS round trip and cancellation | Complete live streaming/interruption and tool-disconnect proof |
 | AC08 | Discord, Slack and WhatsApp daemon adapters; authenticated tools; durable transcript outboxes; 13 shared presets checked | [Entry-point audit](surfaces.md): local CLI phone adapter missing; custom constructors/wrappers and live origin receipts outstanding |
-| AC09 | Persistent budgets, provider-duration callbacks, bounded shutdown and disabled/unavailable-start cleanup | Exhausted-retry operator recovery and live stop/restart/disable evidence |
+| AC09 | Persistent budgets, provider-duration callbacks, bounded shutdown and disabled/unavailable-start cleanup | Live stop/restart/disable evidence and unknown-SID recovery; known-SID reconciliation available |
 | AC10 | Recorded-audio receipt validator and synthetic regression tests only | Actual consented audio, native traces and full live matrix; no live receipt exists |
 | AC11 | No legacy voice removed yet | Replacement qualification, upgrade/rollback fixtures and retirement |
 | AC12 | Required offline runner and local regression receipts; OS CI configured | Passing current-head OS CI, complete evidence map and live receipts |
@@ -1202,3 +1202,18 @@ after the fix, all 22 journal-guard checks pass. The packaged-bridge scoped-file
 contract also passes locally. Journal-guard tests now run explicitly in both OS
 CI jobs. New macOS conformance remains pending; this does not establish live
 phone or migration readiness.
+
+### Explicit recovery after automatic retries
+
+`phone-reconcile --call-id` performs one bounded provider read using the stored
+provider ID, including when dialing is disabled. It can finalize an active call
+from authoritative terminal evidence or recover missing usage without resetting
+retry counters, dialing or hanging up. Unknown IDs and contradictory/nonterminal
+results retain the active-call restriction. The never-answered database operation
+rechecks answer evidence atomically; background reconciliation uses it too.
+
+The recovery suite first failed for the missing API, then passed five cases:
+exhausted retries, unknown/nonterminal/contradictory evidence, confirmed nonanswer,
+callbacks during provider reads, and provider failure. All 24 service and 17
+phone-store tests pass locally. These are synthetic fixtures; unknown-ID
+association and live recovery evidence remain outstanding.

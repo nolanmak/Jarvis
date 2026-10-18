@@ -253,6 +253,34 @@ to reconcile local state. If the provider SID is unknown after an uncertain
 create, do not infer that the call never existed and do not clear the active slot
 to redial. Investigate provider request/callback evidence first. Terminal calls
 without final usage retain conservative budget accounting even after usage
-retries are exhausted. Manual unknown-SID resolution and retry-reset tooling
-remain incomplete; these status fields expose the condition without inventing a
-successful recovery.
+retries are exhausted. For a known provider ID, use the explicit recovery command below after
+investigation. Unknown-ID association remains unresolved; no retry-reset or
+manual active-slot clearing command is provided.
+
+## Explicit provider reconciliation
+
+An operator with access to the daemon database can request one bounded,
+authenticated provider read even after automatic retries have been used:
+
+```sh
+augmentagent --db /path/to/daemon.db phone-reconcile --call-id <local-call-id>
+```
+
+Use the local call ID from phone status. The command reads the provider ID
+already bound in the database; it does not accept a replacement provider ID or
+a phone number. It needs `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN`, but works
+with phone dialing disabled and requires no caller number or public callback URL.
+It issues no dial or hangup request and does not reset automatic retry counters.
+
+A confirmed completed call supplies final usage and closes a still-active local
+record. A confirmed never-answered call releases its reservation only when the
+same database transaction observes no local answer evidence. Signed final usage
+that arrives during the read takes precedence. The command prints `finalized`
+or `already_finalized` as a JSON string and exits successfully for those outcomes.
+
+Unknown provider IDs, nonterminal provider responses, and contradictory answer
+evidence print a descriptive outcome and exit unsuccessfully without clearing
+the active-call restriction. Provider failures/timeouts also leave that
+restriction intact. A still-active provider call must be ended separately in the
+provider console; this command only reconciles authoritative final evidence.
+Do not guess a provider ID or delete local rows to enable another call.

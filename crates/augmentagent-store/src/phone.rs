@@ -459,6 +459,18 @@ impl Store {
         now_ms: i64,
         usage: Option<ProviderUsage>,
     ) -> PhoneResult<()> {
+        self.phone_provider_event_usage(id, sid, state, now_ms, usage, false)
+    }
+    /// Apply provider-confirmed nonanswer only if no answer was recorded in
+    /// the same transaction. A concurrent answer callback must not refund usage.
+    pub fn phone_confirm_never_answered(&self, id: &str, sid: &str, now_ms: i64) -> PhoneResult<()> {
+        self.phone_provider_event_usage(id, sid, CallState::Canceled, now_ms,
+            Some(ProviderUsage { duration_seconds: 0, ended_ms: now_ms }), true)
+    }
+    fn phone_provider_event_usage(
+        &self, id: &str, sid: &str, state: CallState, now_ms: i64,
+        usage: Option<ProviderUsage>, require_unanswered: bool,
+    ) -> PhoneResult<()> {
         if let Some(usage) = usage {
             if !state.terminal()
                 || usage.duration_seconds < 0
@@ -479,6 +491,9 @@ impl Store {
         identifier(sid)?;
         transaction(self, |tx| {
             let call = call_by_id(tx, id)?;
+            if require_unanswered && (call.answered_ms.is_some() || call.provider_sid.as_deref() != Some(sid)) {
+                return Err(PhoneError::Conflict);
+            }
             if call.provider_sid.as_deref().is_some_and(|old| old != sid) {
                 return Err(PhoneError::Conflict);
             }

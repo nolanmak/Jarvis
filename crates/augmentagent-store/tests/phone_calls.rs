@@ -708,3 +708,15 @@ fn usage_reconciliation_is_bounded_durable_and_stops_after_final_usage() {
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn never_answered_reconciliation_rechecks_answer_evidence_and_known_sid_atomically() {
+    let (_dir, store) = fixture();
+    let call = store.phone_reserve_call(request("recovery", "chat", 0)).unwrap().call;
+    assert!(store.phone_confirm_never_answered(&call.id, "CA-test", 1000).is_err());
+    store.phone_bind_provider(&call.id, "CA-test").unwrap();
+    store.phone_provider_event(&call.id, "CA-test", CallState::AwaitingAcceptance, 1000).unwrap();
+    assert!(store.phone_confirm_never_answered(&call.id, "CA-test", 2000).is_err());
+    assert!(store.phone_usage(&call.id).unwrap().is_none());
+    assert!(!store.phone_call(OWNER, &call.id).unwrap().state.terminal());
+}

@@ -611,3 +611,20 @@ async fn native_text_turn(
         SurfaceTurnOutcome::Cancelled => anyhow::bail!("Phone text turn cancelled"),
     }
 }
+
+/// Explicit operator action against the selected local database. It works with
+/// dialing disabled and needs no ingress or caller number configuration.
+pub async fn reconcile_local(store: &Store, call_id: &str) -> Result<()> {
+    let account = std::env::var("TWILIO_ACCOUNT_SID").context("TWILIO_ACCOUNT_SID is required")?;
+    let token = std::env::var("TWILIO_AUTH_TOKEN").context("TWILIO_AUTH_TOKEN is required")?;
+    let provider = augmentagent_phone::twilio::TwilioClient::for_cleanup(&account, &token)?;
+    let outcome = augmentagent_phone::recovery::reconcile(
+        store, &provider, &augmentagent_phone::SystemClock, call_id,
+    ).await?;
+    println!("{}", serde_json::to_string(&outcome)?);
+    if !matches!(outcome, augmentagent_phone::recovery::RecoveryOutcome::Finalized
+        | augmentagent_phone::recovery::RecoveryOutcome::AlreadyFinalized) {
+        anyhow::bail!("phone recovery remains unresolved; no retry limits or active-call restrictions were cleared");
+    }
+    Ok(())
+}

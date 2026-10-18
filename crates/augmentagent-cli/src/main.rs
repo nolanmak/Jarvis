@@ -716,6 +716,11 @@ enum Cmd {
     /// Internal owner-bound phone MCP facade.
     #[command(hide = true)]
     PhoneTool,
+    /// Reconcile one known phone call from provider evidence; never dials.
+    PhoneReconcile {
+        #[arg(long)]
+        call_id: String,
+    },
     /// Internal owner-DM-bound computation MCP facade.
     #[command(hide = true)]
     ComputeTool,
@@ -5294,6 +5299,7 @@ async fn main() -> Result<()> {
         Cmd::ComposioAuthTool => composio_auth_tool::serve().await,
         Cmd::VoiceTool => voice_tool::serve(),
         Cmd::PhoneTool => Ok(augmentagent_phone::mcp::serve()?),
+        Cmd::PhoneReconcile { ref call_id } => phone_runtime::reconcile_local(&store, call_id).await,
         Cmd::ComputeTool => compute_tool::serve(),
         Cmd::ReasonerSelftest { ref prompt, ref profile, tool_probe } =>
             run_reasoner_selftest(prompt, profile.as_deref(), tool_probe).await,
