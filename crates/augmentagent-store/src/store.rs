@@ -995,6 +995,7 @@ impl Store {
         crate::delivery::migrate(conn)?;
         // #1286 / #1230 — owner binding, control conversations, rejection audit.
         crate::owner::migrate(conn)?;
+        crate::phone::migrate(conn)?;
         // #1287 — live listener health reported by interactive surfaces.
         crate::surface_health::migrate(conn)?;
         // #1289 — approval-card pointers per surface.

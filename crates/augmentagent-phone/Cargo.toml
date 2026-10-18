@@ -1,0 +1,31 @@
+[package]
+name = "augmentagent-phone"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+augmentagent-store = { path = "../augmentagent-store" }
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+reqwest.workspace = true
+uuid.workspace = true
+hmac = "0.12"
+sha1 = "0.10"
+sha2.workspace = true
+base64 = "0.22"
+rand = "0.8"
+axum = { version = "0.8", features = ["ws"] }
+futures.workspace = true
+tokio-util.workspace = true
+serde_urlencoded = "0.7"
+
+[dev-dependencies]
+tempfile = "3"
+mockito = "1"
+tokio-tungstenite = "0.29"
