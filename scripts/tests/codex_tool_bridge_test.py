@@ -2070,6 +2070,24 @@ class PortableGrepTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
         self.assertEqual(json.loads(result.stdout)['matches'], [[0, 1, 'SYNTHETIC_MATCH']])
 
+    def test_matcher_respects_lower_inherited_resource_limits(self):
+        import os
+        launcher = """import os,resource,sys
+kind=resource.RLIMIT_DATA if sys.platform=='darwin' else resource.RLIMIT_AS
+soft,hard=resource.getrlimit(kind)
+limit=min([256*1024*1024]+[n for n in (soft,hard) if n!=resource.RLIM_INFINITY])
+resource.setrlimit(kind,(limit,limit))
+resource.setrlimit(resource.RLIMIT_CPU,(2,2))
+os.execv(sys.executable,[sys.executable,'-I','-S','-c',sys.argv[1],sys.argv[2]])
+"""
+        data = b'SYNTHETIC_MATCH\n'
+        header = json.dumps({'pattern': 'SYNTHETIC_MATCH', 'ignore_case': False, 'limit': 10}).encode() + b'\n'
+        result = subprocess.run([sys.executable, '-I', '-S', '-c', launcher, bridge.GREP_MATCHER, str(os.getpid())],
+            input=header + str(len(data)).encode() + b'\n' + data,
+            capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+        self.assertEqual(json.loads(result.stdout)['matches'], [[0, 1, 'SYNTHETIC_MATCH']])
+
     def test_matcher_dies_with_parent_during_pathological_regex(self):
         import os
         import select

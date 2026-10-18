@@ -1122,3 +1122,14 @@ change. Both private-writer tests, all seven S3 tests, nine capability-inventory
 tests and the offline runner tests pass locally. Private-writer and S3 tests are
 now required by the phone acceptance runner. Actual macOS attachment conformance
 remains unverified until CI passes; no live migration receipt is claimed.
+
+### Inherited matcher resource limits
+
+The direct macOS subprocess diagnostic identified `ValueError: current limit
+exceeds maximum limit` during matcher memory-limit setup. The matcher now caps
+CPU and memory at the minimum of its intended ceiling and both inherited limits,
+never trying to raise an inherited soft or hard limit. A subprocess regression
+with a two-second CPU cap and lower memory cap reproduced the failure locally
+before the fix. All eight portable-search and bridge-lifetime tests pass locally
+afterward; macOS must still verify kernel-event monitoring and scoped attachment
+reads in the full acceptance job.

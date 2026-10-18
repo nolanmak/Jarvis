@@ -364,9 +364,14 @@ class SearchBudget:
 # implementation.
 GREP_MATCHER = r'''
 import ctypes, json, os, re, resource, sys
-resource.setrlimit(resource.RLIMIT_CPU, (3, 3))
-resource.setrlimit(resource.RLIMIT_DATA if sys.platform == 'darwin' else resource.RLIMIT_AS,
-                   (1 << 30, 1 << 30))
+def cap_resource(kind, ceiling):
+    # A child may tighten inherited limits, never raise them. macOS commonly
+    # supplies a data-segment hard limit below our nominal memory ceiling.
+    soft, hard = resource.getrlimit(kind)
+    ceiling = min([ceiling] + [n for n in (soft, hard) if n != resource.RLIM_INFINITY])
+    resource.setrlimit(kind, (ceiling, ceiling))
+cap_resource(resource.RLIMIT_CPU, 3)
+cap_resource(resource.RLIMIT_DATA if sys.platform == 'darwin' else resource.RLIMIT_AS, 1 << 30)
 parent = int(sys.argv[1])
 if sys.platform == 'linux':
     if ctypes.CDLL(None).prctl(1, 9, 0, 0, 0) != 0:
