@@ -793,3 +793,61 @@ async fn phone_router_uses_persisted_origin_and_revocable_adapter_registration()
     assert!(router.interrupted(&call, "heard").await.is_err());
     assert_eq!(agent.0.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn ac04_revoked_owner_cannot_start_or_accept_but_terminal_status_still_records() {
+    use augmentagent_phone::webhook::WebhookAuth;
+    for revoke_before_start in [true, false] {
+        let f = fixture("discord", true, true, false);
+        let auth = WebhookAuth::new("AC-test", "callback-secret");
+        let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
+        let call = f
+            .service
+            .tool(&grant, "call_owner", json!({"request_id":"revoked"}))
+            .await
+            .unwrap();
+        let id = call["id"].as_str().unwrap();
+        let mut fields = vec![
+            ("AccountSid".into(), "AC-test".into()),
+            ("CallSid".into(), "CA-test".into()),
+        ];
+        if revoke_before_start {
+            f.store.unbind_surface_owner(f.owner.account()).unwrap();
+        }
+        let sig = signed(
+            "callback-secret",
+            &format!("https://phone.example.test/phone/start/{id}"),
+            &fields,
+        );
+        let reply = f.service.start_callback(&auth, id, &fields, &sig).unwrap();
+        if revoke_before_start {
+            assert_eq!(reply, "<Response><Hangup/></Response>");
+        } else {
+            assert!(reply.contains("Gather"));
+            f.store.unbind_surface_owner(f.owner.account()).unwrap();
+        }
+        fields.push(("Digits".into(), "1".into()));
+        let sig = signed(
+            "callback-secret",
+            &format!("https://phone.example.test/phone/accept/{id}"),
+            &fields,
+        );
+        assert_eq!(
+            f.service
+                .accept_callback(&auth, id, &fields, &sig)
+                .await
+                .unwrap(),
+            "<Response><Hangup/></Response>"
+        );
+        assert!(f.store.phone_provider_call(id).unwrap().stop_requested);
+        fields.push(("CallStatus".into(), "completed".into()));
+        let sig = signed(
+            "callback-secret",
+            &format!("https://phone.example.test/phone/status/{id}"),
+            &fields,
+        );
+        f.service.status_callback(&auth, id, &fields, &sig).unwrap();
+        assert!(f.store.phone_provider_call(id).unwrap().state.terminal());
+        assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
+    }
+}

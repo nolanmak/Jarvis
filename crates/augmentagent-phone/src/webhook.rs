@@ -107,6 +107,10 @@ impl PhoneService {
         {
             return Ok(HANGUP.into());
         }
+        if self.authorize_call_origin(&call).is_err() {
+            self.store.phone_request_stop(&call.owner, id)?;
+            return Ok(HANGUP.into());
+        }
         self.store.phone_provider_event(
             id,
             &sid,
@@ -135,6 +139,10 @@ impl PhoneService {
         let (call, sid) = self.callback_call(auth, "accept", id, fields, signature)?;
         if call.verification || call.stop_requested || call.state.terminal() || !self.config.enabled
         {
+            return Ok(HANGUP.into());
+        }
+        if self.authorize_call_origin(&call).is_err() {
+            self.store.phone_request_stop(&call.owner, id)?;
             return Ok(HANGUP.into());
         }
         if field(fields, "Digits")? != "1" {

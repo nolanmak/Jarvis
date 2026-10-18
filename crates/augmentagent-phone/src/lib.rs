@@ -501,7 +501,11 @@ impl PhoneService {
         if call.state != CallState::Connected || call.stop_requested || call.verification {
             return Err(Error::Unauthorized);
         }
-        let origin = self.store.phone_origin(call_id)?;
+        self.authorize_call_origin(&call)
+    }
+
+    pub(crate) fn authorize_call_origin(&self, call: &PhoneCall) -> Result<Grant, Error> {
+        let origin = self.store.phone_origin(&call.id)?;
         let grant = self.authorize(&origin.owner, &origin.conversation)?;
         if grant.owner_id != call.owner || grant.conversation.storage_key() != call.conversation {
             return Err(Error::Unauthorized);

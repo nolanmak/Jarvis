@@ -275,3 +275,15 @@ window, so full graceful-stop/disable qualification remains open.
 The follow-up supervisor and daemon integration tests both pass in
 `/tmp/1496-daemon-cleanup-isolation-green.log` (2 tests). This is targeted
 evidence after the 140-test full runner receipt above.
+
+### Callback revocation follow-up
+
+Signed start and acceptance callbacks now revalidate the persisted call origin
+against current owner/control-chat authorization before offering acceptance or
+opening Relay. Revocation requests durable cleanup and returns Hangup; signed
+terminal status still records the outcome. Test-first evidence:
+`/tmp/1496-revoked-callback-red.log` reproduced acceptance after unbinding;
+`/tmp/1496-revoked-callback-green.log` passes all 15 service tests, including
+revocation before start and between start/accept. This does not yet prove
+same-owner rebind invalidation: persisting the original binding revision remains
+required.

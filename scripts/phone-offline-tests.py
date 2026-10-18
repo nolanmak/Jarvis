@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SUITES = [
     ("augmentagent-phone", "--lib", None, 4),
     ("augmentagent-phone", "--test", "relay", 3),
-    ("augmentagent-phone", "--test", "service", 14),
+    ("augmentagent-phone", "--test", "service", 15),
     ("augmentagent-phone", "--test", "mcp", 2),
     ("augmentagent-phone", "--test", "config", 1),
     ("augmentagent-phone", "--test", "runtime", 1),
