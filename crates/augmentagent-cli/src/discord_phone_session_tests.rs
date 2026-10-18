@@ -43,28 +43,32 @@ impl Reasoner for Native {
         // Exercise the actual owner capability while this native turn is
         // active. Recording allowed_tools alone would miss an expired or
         // prematurely dropped grant and a disconnected tool broker.
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let settings: serde_json::Value = serde_json::from_str(
-            opts.settings_json.as_deref().context("phone settings missing")?)?;
-        let env = &settings["mcpServers"]["phone"]["env"];
-        let socket = env["AUGMENTAGENT_PHONE_TOOL_SOCKET"].as_str().context("phone socket missing")?;
-        let token = env["AUGMENTAGENT_PHONE_TOOL_GRANT"].as_str().context("phone grant missing")?;
-        let response = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            let mut stream = tokio::net::UnixStream::connect(socket).await?;
-            let request = serde_json::json!({"version":1,"grant":token,
-                "method":"phone_number_status","arguments":{}});
-            stream.write_all(format!("{request}\n").as_bytes()).await?;
-            let mut response = String::new();
-            BufReader::new(stream).read_line(&mut response).await?;
-            anyhow::Ok(serde_json::from_str::<serde_json::Value>(&response)?)
-        }).await??;
-        assert_eq!(response["ok"], true, "native turn lost its phone capability");
-        assert!(response["result"].get("masked").is_some());
-        assert!(!response.to_string().contains("+12025550123"));
+        check_phone_status(opts).await?;
         lease.finish()?;
         self.calls.lock().unwrap().push((id, prompt.into()));
         Ok("native reply".into())
     }
+}
+pub(super) async fn check_phone_status(opts: &ReasonerOpts) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let settings: serde_json::Value = serde_json::from_str(
+        opts.settings_json.as_deref().context("phone settings missing")?)?;
+    let env = &settings["mcpServers"]["phone"]["env"];
+    let socket = env["AUGMENTAGENT_PHONE_TOOL_SOCKET"].as_str().context("phone socket missing")?;
+    let token = env["AUGMENTAGENT_PHONE_TOOL_GRANT"].as_str().context("phone grant missing")?;
+    let response = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let mut stream = tokio::net::UnixStream::connect(socket).await?;
+        let request = serde_json::json!({"version":1,"grant":token,
+            "method":"phone_number_status","arguments":{}});
+        stream.write_all(format!("{request}\n").as_bytes()).await?;
+        let mut response = String::new();
+        BufReader::new(stream).read_line(&mut response).await?;
+        anyhow::Ok(serde_json::from_str::<serde_json::Value>(&response)?)
+    }).await??;
+    assert_eq!(response["ok"], true, "native turn lost its phone capability");
+    assert!(response["result"].get("masked").is_some());
+    assert!(!response.to_string().contains("+12025550123"));
+    Ok(())
 }
 #[tokio::test]
 async fn discord_phone_dm_text_reuses_native_session_without_legacy_voice() {

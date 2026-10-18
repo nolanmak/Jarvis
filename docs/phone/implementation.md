@@ -1235,5 +1235,11 @@ these tests rather than passing a configuration-only assertion. Full numbers
 must not appear in the tool response.
 
 These still use scripted native providers. They do not establish actual native
-CLI/model tool execution, approval-gated actions, Slack tool execution during
-phone turns, or live audio qualification. Those remain open AC06/AC10 evidence.
+CLI/model tool execution, approval-gated actions, or live audio qualification. Those remain open AC06/AC10 evidence.
+
+The Slack daemon adapter fixture now uses the same real read-only broker request
+inside its text/phone turn handler, in addition to its existing broker-initiated
+call. Its three runtime tests pass locally; this tests the production broker and
+adapter around a recording provider, not a native model choosing/executing tools.
+The journal write guard also passes its explicit CI step on Linux and macOS at
+`27462482`; the full offline suites at that commit remain in progress.

@@ -237,6 +237,7 @@ mod tests {
                 let reply: serde_json::Value = serde_json::from_str(&line)?;
                 assert_eq!(reply["ok"], true);
             }
+            crate::discord_phone_session_tests::check_phone_status(&opts).await?;
             self.provider.call(&opts, text).await
         }
     }
