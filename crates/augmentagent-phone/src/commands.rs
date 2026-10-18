@@ -37,7 +37,7 @@ pub async fn execute(
     };
     let result=match w.as_slice() {
         [_,"call"]=>service.tool(&grant,"call_owner",json!({"request_id":format!("command:{event_id}")})).await.map(|v|format!("Phone call {}: {}.",v["id"].as_str().unwrap_or("unknown"),v["state"].as_str().unwrap_or("unknown"))),
-        [_,"status"]=>service.latest_call(&grant).map(|c|match c {Some(c)=>format!("Phone call {}: {}{}.",c.id,c.state.as_str(),if c.stop_requested {" (stop requested)"}else{""}),None=>"No phone calls yet.".into()}),
+        [_,"status"]=>call_status(service, &grant),
         [_,"stop"]=>match service.latest_call(&grant) {
             Ok(Some(call))=>service.tool(&grant,"phone_hangup",json!({"call_id":call.id})).await.map(|_|"Phone hangup requested.".into()),
             Ok(None)=>Ok("No phone calls to stop.".into()),Err(e)=>Err(e),
@@ -61,4 +61,23 @@ pub fn contains_sensitive_text(value: &serde_json::Value) -> bool {
         serde_json::Value::Object(fields) => fields.values().any(contains_sensitive_text),
         _ => false,
     }
+}
+
+fn call_status(service: &PhoneService, grant: &crate::Grant) -> Result<String, crate::Error> {
+    let Some(call) = service.latest_call(grant)? else {
+        return Ok("No phone calls yet.".into());
+    };
+    let maintenance = service.store.phone_maintenance_status(&call.owner, &call.id)?;
+    let mut reply = format!("Phone call {}: {}{}.", call.id, call.state.as_str(),
+        if call.stop_requested { " (stop requested)" } else { "" });
+    if !call.state.terminal() {
+        if call.state == augmentagent_store::phone::CallState::Uncertain && !maintenance.provider_sid_known {
+            reply.push_str(" Missing provider confirmation. Ask the operator to investigate before trying another call.");
+        } else if call.stop_requested && maintenance.cleanup_attempts >= 3 {
+            reply.push_str(" All automatic cleanup attempts have been issued; the last may still be pending. If the call remains active, ask the operator to check and end it with the phone provider.");
+        }
+    } else if !maintenance.final_usage_recorded && maintenance.usage_attempts >= 3 {
+        reply.push_str(" Provider final usage is still missing after all automatic checks were issued. The call allowance remains reserved until usage is confirmed; ask the operator to investigate.");
+    }
+    Ok(reply)
 }

@@ -240,9 +240,10 @@ The owner-authorized `phone_status` tool returns a `maintenance` object with
 `provider_sid_known`, `cleanup_attempts`, `usage_attempts`, and
 `final_usage_recorded`. This is a read-only snapshot: asking for status neither
 retries provider requests nor resets durable retry limits. It contains no phone
-number or verification code. The ordinary `phone status` command still provides
-the short lifecycle summary; ask the agent for detailed call status to inspect
-maintenance evidence.
+number or verification code. The ordinary `phone status` command adds actionable notices for uncertain calls
+without provider confirmation, issued cleanup retries, and exhausted final-usage
+checks. Ask the agent for detailed call status to inspect the counters. Notices
+do not claim the last reserved attempt has finished.
 
 Attempt counters count reserved attempts, including a request still in flight.
 Three means no further automatic attempts remain, not that the last attempt has

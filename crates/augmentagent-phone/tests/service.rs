@@ -1414,8 +1414,9 @@ async fn contradictory_unanswered_status_does_not_refund_a_locally_answered_call
 #[tokio::test]
 async fn ac09_status_exposes_persisted_retry_usage_without_provider_actions() {
     use augmentagent_store::phone::CallState;
-    for uncertain in [false, true] {
-        let f = fixture("discord", true, true, uncertain);
+    for (platform, uncertain) in ["discord", "slack", "whatsapp"].into_iter()
+        .flat_map(|platform| [false, true].map(|uncertain| (platform, uncertain))) {
+        let f = fixture(platform, true, true, uncertain);
         let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
         let call = f.service.tool(&grant, "call_owner", json!({"request_id":"status-recovery"})).await.unwrap();
         let id = call["id"].as_str().unwrap();
@@ -1430,6 +1431,10 @@ async fn ac09_status_exposes_persisted_retry_usage_without_provider_actions() {
         assert_eq!(status["maintenance"]["cleanup_attempts"], if uncertain {0} else {3});
         assert_eq!(status["maintenance"]["usage_attempts"], 0);
         assert_eq!(status["maintenance"]["final_usage_recorded"], false);
+        let reply = augmentagent_phone::commands::execute(&f.service, &f.owner, &f.conversation,
+            "inspect", "phone status").await.unwrap();
+        assert!(reply.contains(if uncertain { "provider confirmation" } else { "cleanup attempts" }), "{reply}");
+        assert!(!reply.contains("+12025550123"));
         if !uncertain {
             f.store.phone_provider_event(id, "CA-test", CallState::Canceled, 4000).unwrap();
             for now in [4000, 5000, 7000] {
@@ -1437,6 +1442,9 @@ async fn ac09_status_exposes_persisted_retry_usage_without_provider_actions() {
             }
             let status = f.service.tool(&grant, "phone_status", json!({"call_id":id})).await.unwrap();
             assert_eq!(status["maintenance"]["usage_attempts"], 3);
+            let reply = augmentagent_phone::commands::execute(&f.service, &f.owner, &f.conversation,
+                "inspect-usage", "phone status").await.unwrap();
+            assert!(reply.contains("final usage"), "{reply}");
             let reopened = Store::open(f.store.db_path()).unwrap();
             let persisted = reopened.phone_maintenance_status("canonical-owner", id).unwrap();
             assert_eq!(persisted.cleanup_attempts, 3);
@@ -1445,6 +1453,9 @@ async fn ac09_status_exposes_persisted_retry_usage_without_provider_actions() {
             f.store.phone_provider_event_with_usage(id, "CA-test", CallState::Canceled, 8000,
                 Some(augmentagent_store::phone::ProviderUsage { duration_seconds: 0, ended_ms: 4000 })).unwrap();
             assert!(reopened.phone_maintenance_status("canonical-owner", id).unwrap().final_usage_recorded);
+            let reply = augmentagent_phone::commands::execute(&f.service, &f.owner, &f.conversation,
+                "inspect-final", "phone status").await.unwrap();
+            assert!(!reply.contains("final usage"), "{reply}");
         }
         assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
         assert!(f.provider.stops.lock().unwrap().is_empty());
