@@ -941,3 +941,40 @@ The compiled Go process/Rust wire contract passes without skipping in
 `--no-deps -D warnings` and both Python runner checks pass. CLI Clippy completes
 with warnings outside the new module; this is not a warning-free workspace
 claim. No live chat messages or provider calls were made.
+
+### Immediate Twilio stop requests and CI inventory corrections
+
+Twilio cleanup now posts a terminal status before any provider status lookup.
+The persisted answer timestamp selects cancellation for unanswered calls and
+completion for answered calls. A definite HTTP 400 / Twilio 21220 invalid-state
+response permits one attempt with the other terminal status, handling a call
+advancing during cancellation. Timeouts, redirects, server errors and other
+rejections stay uncertain and do not trigger an immediate second mutation.
+Only after both terminal mutations are rejected does a GET reconcile an
+already-ended call; the SID must match and the status must be terminal.
+Each stop-related HTTP request has a five-second timeout. This removes the
+preliminary read from the deadline path; it does not guarantee provider/network
+latency or close the outstanding final-duration and startup/shutdown gaps.
+
+Provider references: [Call resource](https://www.twilio.com/docs/voice/api/call-resource)
+and [21220 invalid call state](https://www.twilio.com/docs/api/errors/21220).
+The regression first failed when a failed preliminary GET prevented the POST
+(`/tmp/1496-hangup-post-red.log`). The transport tests cover immediate POST,
+answer-state races, uncertain outcomes, and terminal reconciliation. The existing
+watchdog test also checks that persisted answer state reaches the provider while
+retaining its one-second cross-call deadline assertion.
+
+Draft PR #1497's initial CI exposed missing inventory entries for `phone-tool`
+and the `attach_tools` options wrapper, plus a secret-scanner false positive on
+a synthetic verification-key fixture. Both inventories now describe the actual
+capability and reference its conformance tests without claiming live parity.
+The fixture is an obvious all-zero test placeholder; no scanner rule was relaxed.
+The capability inventory suite is now mandatory in the phone offline runner.
+The same pinned release scanner reports zero findings after the fixture change.
+
+Validation: all 38 required offline suites / 545 tests pass in
+`/tmp/1496-hangup-offline/receipt.json` (dirty worktree recorded). The full phone
+crate suite and strict targeted Clippy pass; the eight macOS inventory tests and
+two runner checks pass. The pinned release scanner reports zero findings on the
+updated release tree in `/tmp/1496-secret-scan/final.log`. Remote checks need a
+new run on the pushed commit; old-head failures are not described as passing.

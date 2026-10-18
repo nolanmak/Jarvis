@@ -26,6 +26,7 @@ impl Clock for Time {
 struct Provider {
     starts: Mutex<usize>,
     stops: Mutex<Vec<String>>,
+    phases: Mutex<Vec<(String, bool)>>,
     release: tokio::sync::Notify,
 }
 #[async_trait]
@@ -34,6 +35,10 @@ impl Telephony for Provider {
         let mut n = self.starts.lock().unwrap();
         *n += 1;
         Ok(format!("CA-{n}"))
+    }
+    async fn hangup_known_state(&self, sid: &str, answered: bool) -> Result<(), ProviderError> {
+        self.phases.lock().unwrap().push((sid.into(), answered));
+        self.hangup(sid).await
     }
     async fn hangup(&self, sid: &str) -> Result<(), ProviderError> {
         self.stops.lock().unwrap().push(sid.into());
@@ -149,6 +154,16 @@ async fn ac09_slow_cleanup_does_not_delay_other_deadlines_or_repeat_inflight_att
     })
     .await
     .expect("second hangup must start within one second despite first hanging");
+    assert!(provider
+        .phases
+        .lock()
+        .unwrap()
+        .contains(&("CA-1".into(), false)));
+    assert!(provider
+        .phases
+        .lock()
+        .unwrap()
+        .contains(&("CA-2".into(), true)));
     // Move past the retry interval while CA-1 is still in flight.
     clock.0.store(30_100, Ordering::SeqCst);
     tokio::time::sleep(std::time::Duration::from_millis(550)).await;

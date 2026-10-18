@@ -47,6 +47,11 @@ pub enum ProviderError {
 pub trait Telephony: Send + Sync {
     async fn create(&self, request: DialRequest) -> Result<String, ProviderError>;
     async fn hangup(&self, sid: &str) -> Result<(), ProviderError>;
+    /// Persisted answer state is a hint, not a fresh provider read. Providers
+    /// must handle a call advancing while its cancellation is being requested.
+    async fn hangup_known_state(&self, sid: &str, _answered: bool) -> Result<(), ProviderError> {
+        self.hangup(sid).await
+    }
 }
 #[derive(Debug, Error)]
 pub enum Error {
@@ -529,7 +534,8 @@ impl PhoneService {
             if matches!(
                 tokio::time::timeout(
                     std::time::Duration::from_secs(32),
-                    self.provider.hangup(sid)
+                    self.provider
+                        .hangup_known_state(sid, call.answered_ms.is_some())
                 )
                 .await,
                 Ok(Ok(()))

@@ -994,6 +994,21 @@
     "evidence": null
   },
   {
+    "id": "cli:phone-tool",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Private MCP facade delegates owner phone tools through the local authenticated phone broker; offline contracts run on Linux.",
+    "macos_target": "The same private broker, revocable owner grants and native-session phone tools work on macOS without platform voice dependencies.",
+    "prerequisites": [
+      "Rust CLI",
+      "Configured owner phone service and native agent provider",
+      "Synthetic provider for offline tests; Twilio and public TLS for live qualification"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1496",
+    "test_plan": "Run scripts/phone-offline-tests.py on Linux and macOS, including MCP authorization and Claude/Codex session continuity; attach live host receipts required by AC10 before marking verified.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
     "id": "cli:poll-once",
     "source": "crates/augmentagent-cli/src/main.rs",
     "linux_baseline": "Linux exposes augmentagent poll-once; record its command-specific effects and authorization.",

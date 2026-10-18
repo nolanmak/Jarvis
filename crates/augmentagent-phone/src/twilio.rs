@@ -93,14 +93,58 @@ impl Telephony for TwilioClient {
         Ok(sid.into())
     }
     async fn hangup(&self, sid: &str) -> Result<(), ProviderError> {
+        self.stop_call(sid, true).await
+    }
+    async fn hangup_known_state(&self, sid: &str, answered: bool) -> Result<(), ProviderError> {
+        self.stop_call(sid, answered).await
+    }
+}
+impl TwilioClient {
+    async fn stop_call(&self, sid: &str, answered: bool) -> Result<(), ProviderError> {
         if !valid_sid(sid) {
             return Err(ProviderError::Rejected);
         }
         let url = format!("{}/{}.json", self.calls_url(), sid);
+        let statuses = if answered {
+            ["completed", "canceled"]
+        } else {
+            ["canceled", "completed"]
+        };
+        for status in statuses {
+            // Send the mutation first. An unavailable/eventually-consistent GET
+            // must not hold up a duration deadline or explicit stop request.
+            let response = self
+                .http
+                .post(&url)
+                .basic_auth(&self.account, Some(&self.token))
+                .timeout(Duration::from_secs(5))
+                .form(&[("Status", status)])
+                .send()
+                .await
+                .map_err(|_| ProviderError::Uncertain)?;
+            if response.status().is_success() {
+                return Ok(());
+            }
+            if response.status() != reqwest::StatusCode::BAD_REQUEST {
+                return Err(ProviderError::Uncertain);
+            }
+            let body: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|_| ProviderError::Uncertain)?;
+            if body["code"].as_u64() != Some(21220) {
+                return Err(ProviderError::Uncertain);
+            }
+            // Only a definite invalid-state rejection permits trying the other
+            // terminal status. No retry on timeouts, redirects or server errors.
+        }
+        // Both mutations were rejected as invalid state. Already-ended calls
+        // are idempotent success only with positive terminal-state evidence.
         let response = self
             .http
             .get(&url)
             .basic_auth(&self.account, Some(&self.token))
+            .timeout(Duration::from_secs(5))
             .send()
             .await
             .map_err(|_| ProviderError::Uncertain)?;
@@ -111,27 +155,19 @@ impl Telephony for TwilioClient {
             .json()
             .await
             .map_err(|_| ProviderError::Uncertain)?;
-        let status = match body["status"].as_str() {
-            Some("queued" | "ringing") => "canceled",
-            Some("in-progress") => "completed",
-            Some("completed" | "canceled" | "failed" | "busy" | "no-answer") => return Ok(()),
-            _ => return Err(ProviderError::Uncertain),
-        };
-        let response = self
-            .http
-            .post(&url)
-            .basic_auth(&self.account, Some(&self.token))
-            .form(&[("Status", status)])
-            .send()
-            .await
-            .map_err(|_| ProviderError::Uncertain)?;
-        if response.status().is_success() {
+        if body["sid"].as_str() == Some(sid)
+            && matches!(
+                body["status"].as_str(),
+                Some("completed" | "canceled" | "failed" | "busy" | "no-answer")
+            )
+        {
             Ok(())
         } else {
             Err(ProviderError::Uncertain)
         }
     }
 }
+
 fn valid_sid(s: &str) -> bool {
     s.len() == 34 && s.starts_with("CA") && s[2..].bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -254,6 +290,137 @@ mod tests {
         assert!(!error.to_string().contains("sensitive"));
         mock.assert_async().await;
     }
+    #[tokio::test]
+    async fn hangup_posts_immediately_without_waiting_for_status_read() {
+        let mut server = mockito::Server::new_async().await;
+        let path = "/2010-04-01/Accounts/ACtest/Calls/CA01234567890123456789012345678901.json";
+        let read = server
+            .mock("GET", path)
+            .with_status(503)
+            .expect(0)
+            .create_async()
+            .await;
+        let stop = server
+            .mock("POST", path)
+            .match_body(Matcher::UrlEncoded("Status".into(), "completed".into()))
+            .with_status(200)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        let client =
+            TwilioClient::with_base("ACtest", "test-token", "+12025550456", &server.url()).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            client.hangup("CA01234567890123456789012345678901"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        stop.assert_async().await;
+        read.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cancel_race_tries_completion_only_after_definite_invalid_state() {
+        let mut server = mockito::Server::new_async().await;
+        let path = "/2010-04-01/Accounts/ACtest/Calls/CA01234567890123456789012345678901.json";
+        let cancel = server
+            .mock("POST", path)
+            .match_body(Matcher::UrlEncoded("Status".into(), "canceled".into()))
+            .with_status(400)
+            .with_body(r#"{"code":21220}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let complete = server
+            .mock("POST", path)
+            .match_body(Matcher::UrlEncoded("Status".into(), "completed".into()))
+            .with_status(200)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        let read = server.mock("GET", path).expect(0).create_async().await;
+        let client =
+            TwilioClient::with_base("ACtest", "test-token", "+12025550456", &server.url()).unwrap();
+        client
+            .hangup_known_state("CA01234567890123456789012345678901", false)
+            .await
+            .unwrap();
+        cancel.assert_async().await;
+        complete.assert_async().await;
+        read.assert_async().await;
+    }
+    #[tokio::test]
+    async fn hangup_unknown_outcomes_never_trigger_a_second_mutation() {
+        for (status, body) in [
+            (500, "failure"),
+            (401, "private rejection"),
+            (302, "redirect"),
+            (400, r#"{"code":20003}"#),
+            (400, "malformed"),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let path = "/2010-04-01/Accounts/ACtest/Calls/CA01234567890123456789012345678901.json";
+            let stop = server
+                .mock("POST", path)
+                .with_status(status)
+                .with_body(body)
+                .expect(1)
+                .create_async()
+                .await;
+            let read = server.mock("GET", path).expect(0).create_async().await;
+            let client =
+                TwilioClient::with_base("ACtest", "test-token", "+12025550456", &server.url())
+                    .unwrap();
+            assert!(matches!(
+                client.hangup("CA01234567890123456789012345678901").await,
+                Err(ProviderError::Uncertain)
+            ));
+            stop.assert_async().await;
+            read.assert_async().await;
+        }
+    }
+    #[tokio::test]
+    async fn already_ended_hangup_requires_matching_terminal_provider_evidence() {
+        for (sid, status, success) in [
+            ("CA01234567890123456789012345678901", "completed", true),
+            ("CA01234567890123456789012345678901", "canceled", true),
+            ("CA01234567890123456789012345678901", "in-progress", false),
+            ("CA99999999999999999999999999999999", "completed", false),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let path = "/2010-04-01/Accounts/ACtest/Calls/CA01234567890123456789012345678901.json";
+            let stop = server
+                .mock("POST", path)
+                .with_status(400)
+                .with_body(r#"{"code":21220}"#)
+                .expect(2)
+                .create_async()
+                .await;
+            let read = server
+                .mock("GET", path)
+                .with_status(200)
+                .with_body(serde_json::json!({"sid":sid,"status":status}).to_string())
+                .expect(1)
+                .create_async()
+                .await;
+            let client =
+                TwilioClient::with_base("ACtest", "test-token", "+12025550456", &server.url())
+                    .unwrap();
+            assert_eq!(
+                client
+                    .hangup("CA01234567890123456789012345678901")
+                    .await
+                    .is_ok(),
+                success
+            );
+            stop.assert_async().await;
+            read.assert_async().await;
+        }
+    }
+
     #[test]
     fn signature_requires_exact_public_url_all_parameters_and_authentic_signature() {
         let fields = vec![

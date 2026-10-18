@@ -118,6 +118,18 @@
         "mcp__composio_auth__auth_status",
         "mcp__composio_auth__complete_auth"
       ]
+    },
+    "owner-phone-mcp": {
+      "scope": "Transport-authenticated owner and conversation only; revocable private broker grants. Preserve existing tool permissions and approval policy. Number/code entry bypasses the model; speech is present only during an accepted phone turn.",
+      "operations": [
+        "mcp__phone__call_owner",
+        "mcp__phone__phone_status",
+        "mcp__phone__phone_hangup",
+        "mcp__phone__phone_number_setup",
+        "mcp__phone__phone_number_status",
+        "mcp__phone__phone_number_remove",
+        "mcp__phone__speak (accepted phone turn only)"
+      ]
     }
   },
   "presets": [
@@ -636,6 +648,21 @@
         "scripts/tests/composio_auth_smoke.py"
       ],
       "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/phone_agent.rs::attach_tools",
+      "permission_profile": "owner-phone-mcp",
+      "output_contract": "Preserve the originating query contract; phone speech and durable transcript delivery use separate receipts.",
+      "model_tier": "preserved",
+      "tier_rationale": "Adds scoped MCP tools to the existing native session without replacing its model or approval configuration.",
+      "conformance": [
+        "phone_agent::phone_tool_configuration_requires_authenticated_context_and_preserves_other_tools",
+        "phone_agent::ac06_text_three_phone_turns_text_resume_the_same_native_session",
+        "phone_agent::late_reply_is_not_mirrored_or_returned_after_authority_changes",
+        "discord_phone_session_tests::discord_phone_dm_text_reuses_native_session_without_legacy_voice",
+        "whatsapp_phone_session_tests::whatsapp_text_phone_text_preserves_native_session_and_tools"
+      ],
+      "provider_conformance": "unverified"
     }
   ]
 }
