@@ -73,3 +73,17 @@ pub async fn answer_turn(
         _ => answer.await,
     }
 }
+
+/// Model controls use the same authenticated origin as the following text turn,
+/// so a bound DM cannot silently switch away from its native phone session.
+pub async fn model_command(
+    handler: &dyn QueryHandler,
+    context: &PhoneCommandContext,
+    text: &str,
+) -> Option<String> {
+    let command = handler.model_command_in_guild(context.guild_id, context.channel_id, text);
+    match handler.phone_origin(context) {
+        Some(origin) => augmentagent_phone::context::scope(origin, None, command).await,
+        None => command.await,
+    }
+}

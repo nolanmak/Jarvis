@@ -7,7 +7,11 @@ bound owner. The text handler and phone bridge share the same query handler,
 native session scheduler and durable Slack outbox. The debug synthetic Slack
 handler does not enable real phone commands.
 
-Discord and WhatsApp adapters are not yet installed. Public TLS/provider setup,
+The daemon also installs Discord after authenticated gateway READY when the
+allowlisted owner has an explicit phone link and stored control chat. It reuses
+Discord's existing query handler and starts the durable transcript worker.
+Discord's initial identity/control-chat provisioning UX remains unfinished;
+preexisting trusted bindings are currently required. WhatsApp is not yet installed. Public TLS/provider setup,
 actual audio, approvals during a phone call and the full live host matrix still
 need qualification. This is not a declaration of production readiness.
 
@@ -34,15 +38,19 @@ Synthetic link example (replace identifiers with actual authenticated bindings):
 
 ```json
 [
-  {"platform":"slack","account":"T-example","surface_owner":"U-example","owner":"owner-main"},
-  {"platform":"discord","account":"guild-example","surface_owner":"user-example","owner":"owner-main"}
+  {"platform":"slack","account":"team:T00000001","surface_owner":"U00000001","owner":"owner-main"},
+  {"platform":"discord","account":"dm:100000000000000001","surface_owner":"100000000000000002","owner":"owner-main"}
 ]
 ```
 
 The mapping does not create authenticated owner bindings or private control
 conversations. Those must already exist in the surface's trusted setup. Never
 link accounts by display name or by finding the same phone number. Account IDs
-must match the surface adapter's canonical `SurfaceAccountRef` exactly.
+must match the surface adapter's canonical `SurfaceAccountRef` exactly. Discord DM
+accounts are `dm:<bot-user-id>`; guild accounts are the numeric guild ID. The
+Discord sender must match `DISCORD_ALLOWED_USER_ID`. Stored owner/control-chat
+bindings must match the mapping; the daemon does not infer or overwrite them.
+Restart after changing configured identity links or adding a new account.
 
 ## Listener and proxy contract
 
@@ -71,16 +79,24 @@ successful earlier one-way test call is not evidence for Relay operation.
 
 The daemon loads `config::Settings`, builds it against the shared store, binds
 the loopback listener, and calls `runtime::PhoneRuntime::start`. It installs the
-private tool endpoint on Slack's existing query handler. Authenticated text turns
+private tool endpoint on the existing Slack and eligible Discord query handlers. Authenticated text turns
 carry a trusted `PhoneOrigin`; the phone router resolves the persisted origin
 and selects the registered platform adapter. Registration ends with that
-surface's handler. A missing adapter fails closed rather than selecting another
+surface's handler or daemon registration guard. A missing adapter fails closed rather than selecting another
 conversation.
 
 Slack speech transcripts and answers are enqueued on its existing outbox with
 stable idempotency keys and a shared sender wakeup. Delivery retries do not
 rerun the native turn or dial another call. The same outbox is recovered on
 restart. The daemon supervises phone runtime health and drains it on shutdown.
+
+Discord uses the shared outbox for transcripts, with account-scoped startup
+recovery and its own cancellation-aware worker. Slack recovery is account-scoped
+as well, so starting either surface does not reset the other's active sends.
+The authenticated Discord command path handles private number set/verify/status/
+remove before history/model inference. A normal call remains blocked until a
+pending verification call has ended. Existing native DM bindings reject model
+switches that would move the conversation into a different session.
 
 Startup marks preexisting active calls stopped **before** handing the runtime
 back to command adapters. It never redials them. The watchdog scans every 250 ms

@@ -1545,3 +1545,36 @@ fn prefix_claim_leaves_other_transport_work_untouched() {
         "ordinary"
     );
 }
+
+#[test]
+fn account_recovery_does_not_reset_another_running_surface() {
+    let (_dir, _path, store) = temp_store();
+    let discord = conv("discord", "dm:11", "22", None);
+    let slack = slack("D-owner");
+    store
+        .enqueue_outbound_send(&send(&discord, "discord"), T0)
+        .unwrap();
+    store
+        .enqueue_outbound_send(&send(&slack, "slack"), T0)
+        .unwrap();
+    let d = store
+        .claim_next_outbound_send_for(discord.account(), T0)
+        .unwrap()
+        .unwrap();
+    let s = store
+        .claim_next_outbound_send_for(slack.account(), T0)
+        .unwrap()
+        .unwrap();
+    let recovered = store
+        .recover_surface_delivery_for(slack.account(), T0 + 1)
+        .unwrap();
+    assert_eq!(recovered.sends_to_reconcile, 1);
+    assert_eq!(
+        store.outbound_send(s.id).unwrap().unwrap().status,
+        SendStatus::Reconcile
+    );
+    assert_eq!(
+        store.outbound_send(d.id).unwrap().unwrap().status,
+        SendStatus::Sending
+    );
+}

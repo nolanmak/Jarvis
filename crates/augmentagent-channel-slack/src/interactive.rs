@@ -1072,12 +1072,15 @@ impl SlackInteractiveSurface {
             subscribed: self.subscribed,
         });
 
-        // This process owns the database: claims and in-flight sends left
-        // behind belong to a daemon that died.
-        let report = ctx
-            .store
-            .recover_surface_delivery(ctx.now())
-            .context("recover durable surface delivery")?;
+        // Recover only these Slack accounts. Other surface workers may have
+        // started already and their in-flight sends must remain untouched.
+        let mut report = augmentagent_store::delivery::RecoveryReport { inbound_requeued:0, sends_to_reconcile:0 };
+        for runtime in ctx.workspaces.values() {
+            let recovered = ctx.store.recover_surface_delivery_for(&runtime.workspace.account(), ctx.now())
+                .context("recover durable Slack delivery")?;
+            report.inbound_requeued += recovered.inbound_requeued;
+            report.sends_to_reconcile += recovered.sends_to_reconcile;
+        }
         if report.inbound_requeued > 0 || report.sends_to_reconcile > 0 {
             info!(
                 inbound_requeued = report.inbound_requeued,

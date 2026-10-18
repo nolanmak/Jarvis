@@ -320,3 +320,278 @@ pub async fn run_delivery(
         }
     }
 }
+
+#[cfg(test)]
+mod installation_tests {
+    use super::*;
+    use augmentagent_approval_discord::QueryHandler;
+    use augmentagent_phone::{
+        router::AgentRouter, tools::ToolServer, DialRequest, OwnerLink, PhoneConfig, PhoneService,
+        ProviderError, Telephony,
+    };
+    use augmentagent_store::{
+        owner::ControlConversationKind, SurfaceAccountRef, SurfaceConversationRef, SurfaceOwnerRef,
+        SurfacePlatform,
+    };
+    #[derive(Default)]
+    struct Phone(std::sync::Mutex<Vec<DialRequest>>);
+    #[async_trait]
+    impl Telephony for Phone {
+        async fn create(&self, request: DialRequest) -> std::result::Result<String, ProviderError> {
+            let mut calls = self.0.lock().unwrap();
+            calls.push(request);
+            Ok(format!("CA-fixture-{}", calls.len()))
+        }
+        async fn hangup(&self, _: &str) -> std::result::Result<(), ProviderError> {
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn installation_routes_private_setup_verification_and_call_with_fake_telephony() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("db")).unwrap());
+        let account =
+            SurfaceAccountRef::new(SurfacePlatform::new("discord").unwrap(), "dm:11").unwrap();
+        let owner = SurfaceOwnerRef::new(account.clone(), "33").unwrap();
+        let chat = SurfaceConversationRef::new(account, "22", None).unwrap();
+        store.bind_surface_owner(&owner, 0).unwrap();
+        store
+            .set_surface_control_conversation(&chat, ControlConversationKind::Direct, 0)
+            .unwrap();
+        let provider = Arc::new(Phone::default());
+        let service = Arc::new(PhoneService::new(
+            store.clone(),
+            provider.clone(),
+            Arc::new(SystemClock),
+            PhoneConfig::new(
+                true,
+                "https://phone.example.test",
+                "a-test-verification-secret-32bytes",
+                vec![OwnerLink {
+                    surface_owner: owner.clone(),
+                    owner_id: "owner".into(),
+                }],
+            )
+            .unwrap(),
+        ));
+        let tools = ToolServer::start(service.clone()).await.unwrap();
+        let endpoint = Arc::new(crate::phone_runtime::Endpoint {
+            service,
+            tools,
+            router: AgentRouter::new(store.clone()),
+        });
+        let query = Arc::new(crate::wiki_querier(
+            Arc::new(crate::FallbackReasoner::for_tests(
+                vec![],
+                augmentagent_channel_core::cooldown::CooldownLatch::at(dir.path().join("cooldown")),
+            )),
+            dir.path().to_owned(),
+            dir.path().to_owned(),
+            store.clone(),
+            false,
+        ));
+        let context = augmentagent_approval_discord::phone::PhoneCommandContext {
+            guild_id: None,
+            bot_user_id: 11,
+            channel_id: 22,
+            author_id: 33,
+            message_id: 44,
+        };
+        assert!(query.phone_origin(&context).is_none());
+        let stop = tokio_util::sync::CancellationToken::new();
+        let (registration, worker) = install(
+            &endpoint,
+            PendingConnection {
+                query: query.clone(),
+                http: Arc::new(Http::new("fixture-token")),
+                bot_user_id: 11,
+                owner_user_id: 33,
+            },
+            store.clone(),
+            stop.clone(),
+        )
+        .unwrap();
+        assert!(query.phone_origin(&context).is_some());
+        let response = query
+            .phone_command(&context, "phone number status")
+            .await
+            .unwrap();
+        assert!(response.contains("not configured"), "{response}");
+        let mut forged = context.clone();
+        forged.author_id = 34;
+        assert!(query
+            .phone_command(&forged, "phone number status")
+            .await
+            .unwrap()
+            .contains("authorization"));
+        assert!(provider.0.lock().unwrap().is_empty());
+        let setup = query
+            .phone_command(&context, "phone number set +12025550123")
+            .await
+            .unwrap();
+        assert!(setup.contains("Verification call requested"), "{setup}");
+        assert!(!setup.contains("+12025550123"));
+        let code = provider.0.lock().unwrap()[0]
+            .twiml
+            .split(" is ")
+            .nth(1)
+            .unwrap()
+            .split('.')
+            .next()
+            .unwrap()
+            .replace(' ', "");
+        let mut verify_context = context.clone();
+        verify_context.message_id = 45;
+        let verified = query
+            .phone_command(&verify_context, &format!("phone number verify {code}"))
+            .await
+            .unwrap();
+        assert!(verified.contains("Phone number verified"), "{verified}");
+        assert!(!verified.contains(&code));
+        let mut call_context = context.clone();
+        call_context.message_id = 46;
+        let called = query
+            .phone_command(&call_context, "phone call")
+            .await
+            .unwrap();
+        assert!(called.contains("already pending or active"), "{called}");
+        assert_eq!(provider.0.lock().unwrap().len(), 1);
+        let verification = store.phone_latest_call("owner").unwrap().unwrap();
+        store
+            .phone_provider_event(
+                &verification.id,
+                "CA-fixture-1",
+                augmentagent_store::phone::CallState::Completed,
+                SystemClock.now_ms(),
+            )
+            .unwrap();
+        let called = query
+            .phone_command(&call_context, "phone call")
+            .await
+            .unwrap();
+        assert!(called.contains("queued"), "{called}");
+        query
+            .phone_command(&call_context, "phone call")
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.0.lock().unwrap().len(),
+            2,
+            "one verification and one normal call, even on replay"
+        );
+        assert_eq!(
+            provider.0.lock().unwrap()[1].destination.expose(),
+            "+12025550123"
+        );
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop(registration);
+        assert!(store.phone_latest_call("owner").unwrap().is_some());
+    }
+}
+
+/// Captured after gateway READY; held until the shared phone runtime starts.
+pub struct PendingConnection {
+    pub query: Arc<crate::WikiQuerier>,
+    pub http: Arc<Http>,
+    pub bot_user_id: u64,
+    pub owner_user_id: u64,
+}
+pub type PendingSlot = Arc<std::sync::Mutex<Option<PendingConnection>>>;
+
+/// Install only accounts already linked to this allowlisted owner. Identity
+/// provisioning is separate from destination verification; no inferred links.
+pub fn install(
+    endpoint: &Arc<crate::phone_runtime::Endpoint>,
+    connection: PendingConnection,
+    store: Arc<Store>,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(
+    augmentagent_phone::router::Registration,
+    tokio::task::JoinHandle<Result<()>>,
+)> {
+    use augmentagent_store::SurfacePlatform;
+    anyhow::ensure!(
+        connection.bot_user_id > 0 && connection.owner_user_id > 0,
+        "Discord phone owner identity unavailable"
+    );
+    let mut accounts = Vec::new();
+    for binding in store.surface_owner_bindings(&SurfacePlatform::new("discord")?)? {
+        if binding.owner.sender_id() != connection.owner_user_id.to_string() {
+            continue;
+        }
+        let account = binding.owner.account();
+        if account.account_id().starts_with("dm:")
+            && account.account_id() != format!("dm:{}", connection.bot_user_id)
+        {
+            continue;
+        }
+        if binding.control.iter().any(|control| {
+            endpoint
+                .service
+                .authorize(&binding.owner, &control.conversation)
+                .is_ok()
+        }) {
+            accounts.push(account.clone());
+        }
+    }
+    anyhow::ensure!(
+        !accounts.is_empty() && accounts.len() <= 64,
+        "Discord phone needs an explicitly linked owner control chat"
+    );
+    let wake = Arc::new(Notify::new());
+    let history = Arc::new(DiscordHistory::new(
+        connection.http.clone(),
+        connection.bot_user_id,
+    )?);
+    let io = Arc::new(DiscordPhoneIo::new(
+        store.clone(),
+        history,
+        Some(connection.http.clone()),
+        connection.bot_user_id,
+        wake.clone(),
+    )?);
+    let bridge = Arc::new(augmentagent_channel_core::phone_agent::PhoneAgent::new(
+        store.clone(),
+        endpoint.service.clone(),
+        connection.query.clone(),
+        io,
+        connection.query.wiki_root.clone(),
+        Arc::new(|chat| {
+            augmentagent_channel_core::model_selection::SelectionStore::new(
+                augmentagent_channel_core::model_selection::config_path(),
+            )
+            .selected(Some(chat.conversation_id()))
+        }),
+    ));
+    let transport = Arc::new(phone_delivery::DiscordTransport::new(
+        connection.http,
+        connection.bot_user_id,
+    )?);
+    let registration = endpoint.router.register("discord", bridge)?;
+    for account in &accounts {
+        store.recover_surface_delivery_for(account, SystemClock.now_ms())?;
+    }
+    connection
+        .query
+        .phone_tools
+        .set(endpoint.tools.clone())
+        .map_err(|_| anyhow::anyhow!("Discord phone tools already installed"))?;
+    let worker = tokio::spawn(async move {
+        if run_delivery(store, accounts, transport, wake, shutdown)
+            .await
+            .is_err()
+        {
+            // Optional phone delivery must not fail the daemon's task drain.
+            tracing::warn!(
+                "Discord phone delivery stopped; queued transcripts remain in the outbox"
+            );
+        }
+        Ok(())
+    });
+    Ok((registration, worker))
+}

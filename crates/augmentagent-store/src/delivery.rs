@@ -482,17 +482,37 @@ impl Store {
     /// database, so claims and in-flight sends left behind belong to a
     /// process that died.
     pub fn recover_surface_delivery(&self, now_ms: i64) -> StoreResult<RecoveryReport> {
+        self.recover_delivery(None, now_ms)
+    }
+
+    /// Recover one account before starting its worker, without resetting other
+    /// surfaces that may already be running in this daemon.
+    pub fn recover_surface_delivery_for(
+        &self,
+        account: &SurfaceAccountRef,
+        now_ms: i64,
+    ) -> StoreResult<RecoveryReport> {
+        self.recover_delivery(Some(account), now_ms)
+    }
+
+    fn recover_delivery(
+        &self,
+        account: Option<&SurfaceAccountRef>,
+        now_ms: i64,
+    ) -> StoreResult<RecoveryReport> {
+        let platform = account.map(|a| a.platform().as_str());
+        let account_id = account.map(|a| a.account_id());
         write_tx(self, |tx| {
             let inbound_requeued = tx.execute(
                 "UPDATE surface_inbound_events SET status = 'received',
                      last_error = COALESCE(last_error, 'interrupted by restart')
-                 WHERE status = 'claimed'",
-                [],
+                 WHERE status = 'claimed' AND (?1 IS NULL OR (platform=?1 AND account_id=?2))",
+                params![platform, account_id],
             )?;
             let sends_to_reconcile = tx.execute(
                 "UPDATE surface_outbox SET status = 'reconcile', updated_at_ms = ?1
-                 WHERE status = 'sending'",
-                params![now_ms],
+                 WHERE status = 'sending' AND (?2 IS NULL OR (platform=?2 AND account_id=?3))",
+                params![now_ms, platform, account_id],
             )?;
             Ok(RecoveryReport {
                 inbound_requeued,

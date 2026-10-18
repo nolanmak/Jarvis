@@ -235,6 +235,25 @@ async fn discord_phone_dm_text_reuses_native_session_without_legacy_voice() {
             .iter()
             .all(|(id, prompt)| id == &native_id && !prompt.contains("private old history")));
         drop(rows);
+        let other_model = if kind == ProviderKind::Claude {
+            "codex"
+        } else {
+            "claude"
+        };
+        let command = format!("/model set {other_model}");
+        let reply =
+            augmentagent_approval_discord::phone::model_command(query.as_ref(), &gateway, &command)
+                .await
+                .unwrap();
+        assert!(reply.contains("bound to native"), "{reply}");
+        assert_eq!(
+            store
+                .surface_conversation(&chat)
+                .unwrap()
+                .unwrap()
+                .native_session_id,
+            native_id
+        );
         audit.channel_id = Some(serenity::model::id::ChannelId::new(23));
         assert!(augmentagent_phone::context::scope(
             origin.clone(),

@@ -3254,6 +3254,7 @@ async fn main() -> Result<()> {
             } else {
                 interrupt_dead_discord_turns(&store)
             };
+            let discord_phone_pending: discord_phone::PendingSlot = Arc::new(std::sync::Mutex::new(None));
             let (broker, approver) = match build_approval_surfaces(
                 &cli,
                 Arc::clone(&store),
@@ -3262,6 +3263,7 @@ async fn main() -> Result<()> {
                 slack_approvals.clone(),
                 card_surfaces.clone(),
                 interrupted_discord_turns,
+                Some(discord_phone_pending.clone()),
             )
             .await
             {
@@ -3507,6 +3509,15 @@ async fn main() -> Result<()> {
                 }
             } else { None };
 
+
+            let pending_discord = discord_phone_pending.lock().ok().and_then(|mut pending| pending.take());
+            let _discord_phone_registration = match (phone.as_ref(), pending_discord) {
+                (Some(endpoint), Some(connection)) => match discord_phone::install(endpoint, connection, store.clone(), shutdown.clone()) {
+                    Ok((registration, worker)) => { tasks.push(worker); Some(registration) }
+                    Err(_) => { warn!("Discord phone unavailable: check explicit owner link and control-chat binding"); None }
+                },
+                _ => None,
+            };
 
             // #1412 — drop action bodies that only repeat the stored email,
             // shortly after start and hourly, in small batches.
@@ -10966,6 +10977,12 @@ impl QueryHandler for WikiQuerier {
             .map_err(anyhow::Error::msg)
     }
 
+    async fn phone_command(&self, context: &augmentagent_approval_discord::phone::PhoneCommandContext, text: &str) -> Option<String> {
+        let tools = self.phone_tools.get()?;
+        let origin = match context.origin() { Ok(origin) => origin, Err(_) => return Some("Discord phone identity unavailable".into()) };
+        tools.command(&origin.owner, &origin.conversation, &format!("discord:{}:{}", context.channel_id, context.message_id), text).await
+    }
+
     fn phone_origin(&self, context: &augmentagent_approval_discord::phone::PhoneCommandContext) -> Option<augmentagent_store::phone::PhoneOrigin> {
         let origin = context.origin().ok()?;
         let _grant = self.phone_tools.get()?.grant(&origin.owner, &origin.conversation, None).ok()?;
@@ -10986,22 +11003,22 @@ impl QueryHandler for WikiQuerier {
         channel_id: u64,
         text: &str,
     ) -> Option<String> {
+        if let (Some(turn), Some(store)) = (augmentagent_phone::context::current(), self.conversation_store.as_ref()) {
+            if turn.origin.conversation.account().platform().as_str() == "discord" {
+                match store.surface_conversation(&turn.origin.conversation) {
+                    Ok(Some(binding)) => {
+                        if let Some(reply) = native_model_switch_refusal(&binding.provider, &binding.native_session_id, text) { return Some(reply); }
+                    }
+                    Ok(None) => {}
+                    Err(_) => return Some("Model selection unavailable: conversation storage failed".into()),
+                }
+            }
+        }
         if self.voice_enabled {
             if let (Some(guild), Some(store)) = (guild_id, self.conversation_store.as_ref()) {
                 match store.discord_conversation(&guild.to_string(), &channel_id.to_string()) {
                     Ok(Some(binding)) => {
-                        let mut words = text.split_whitespace();
-                        if matches!(words.next(), Some("/model" | "model")) {
-                            let args: Vec<_> = words.collect();
-                            let same = matches!(args.as_slice(), ["set", name] | [name]
-                                if *name == binding.provider);
-                            if !same && !matches!(args.as_slice(), [] | ["help"] | ["list"] | ["status"]) {
-                                return Some(format!(
-                                    "This conversation is bound to native {} session {}. Switching models would start a different session; the current binding stays unchanged.",
-                                    binding.provider, binding.native_session_id
-                                ));
-                            }
-                        }
+                        if let Some(reply) = native_model_switch_refusal(&binding.provider, &binding.native_session_id, text) { return Some(reply); }
                     }
                     Ok(None) => {}
                     Err(error) => return Some(format!("Model selection unavailable: {error}")),
@@ -11010,6 +11027,15 @@ impl QueryHandler for WikiQuerier {
         }
         self.model_command(channel_id, text).await
     }
+}
+
+fn native_model_switch_refusal(provider: &str, session: &str, text: &str) -> Option<String> {
+    let mut words = text.split_whitespace();
+    if !matches!(words.next(), Some("/model" | "model")) { return None; }
+    let args: Vec<_> = words.collect();
+    let same = matches!(args.as_slice(), ["set", name] | [name] if *name == provider);
+    if same || matches!(args.as_slice(), [] | ["help"] | ["list"] | ["status"]) { return None; }
+    Some(format!("This conversation is bound to native {provider} session {session}. Switching models would start a different session; the current binding stays unchanged."))
 }
 
 fn model_profile_ready(reasoner: &FallbackReasoner, profile: augmentagent_channel_core::providers::ProviderKind) -> Result<(), String> {
@@ -15125,6 +15151,7 @@ async fn build_broker(
         // A one-shot command may run beside the daemon, whose pending turn
         // is then live: only `serve` closes interrupted turns (#1396).
         Vec::new(),
+        None,
     )
     .await
 }
@@ -15143,6 +15170,7 @@ async fn build_approval_surfaces(
     slack: Option<Arc<augmentagent_channel_slack::approvals::SlackApprovals>>,
     surfaces: augmentagent_approval_discord::CardSurfaces,
     interrupted_discord_turns: Vec<augmentagent_store::InterruptedDiscordTurn>,
+    phone_pending: Option<discord_phone::PendingSlot>,
 ) -> Result<(Arc<dyn ApprovalBroker>, Option<Arc<ReplyApprover>>)> {
     if dry_run {
         return Ok((Arc::new(NoopBroker), None));
@@ -15238,6 +15266,7 @@ async fn build_approval_surfaces(
             &reasoner,
             &repo_root,
             interrupted_discord_turns,
+            phone_pending,
         )
         .await
         {
@@ -15316,6 +15345,7 @@ async fn start_discord_broker(
     reasoner: &Arc<FallbackReasoner>,
     repo_root: &Path,
     interrupted_turns: Vec<augmentagent_store::InterruptedDiscordTurn>,
+    phone_pending: Option<discord_phone::PendingSlot>,
 ) -> Result<DiscordApprovalBroker> {
     let channel_id: u64 = std::env::var("DISCORD_CHANNEL_ID")
         .context("DISCORD_CHANNEL_ID env var required")?
@@ -15336,14 +15366,14 @@ async fn start_discord_broker(
     let voice_socket_path = resolve_discord_voice_socket(voice_enabled,
         std::env::var_os("AUGMENTAGENT_DISCORD_VOICE_SOCKET"), std::env::var_os("XDG_RUNTIME_DIR"))?;
 
-    let query_handler: Option<Arc<dyn QueryHandler>> = cli.wiki_dir.as_ref().map(|root| {
+    let query_handler: Option<Arc<WikiQuerier>> = cli.wiki_dir.as_ref().map(|root| {
         Arc::new(wiki_querier(
             Arc::clone(reasoner),
             root.clone(),
             repo_root.to_path_buf(),
             Arc::clone(&store),
             voice_enabled,
-        )) as Arc<dyn QueryHandler>
+        ))
     });
     // #428 — `!journal` write-back bridge. Present iff SHADOWNOTE_* config
     // exists (keyring/env); without it the command replies with the
@@ -15354,12 +15384,12 @@ async fn start_discord_broker(
             reasoner: Arc::clone(reasoner),
         }),
     );
-    DiscordApprovalBroker::start(DiscordConfig {
+    let broker = DiscordApprovalBroker::start(DiscordConfig {
         bot_token: token,
         channel_id,
         query_channel_id,
         allowed_user_id,
-        query_handler,
+        query_handler: query_handler.clone().map(|query| query as Arc<dyn QueryHandler>),
         action_handler: Some(handler),
         store: Some(store),
         loop_parser,
@@ -15369,7 +15399,13 @@ async fn start_discord_broker(
         interrupted_turns,
     })
     .await
-    .context("start discord broker")
+    .context("start discord broker")?;
+    if let (Some(slot), Some(query), Some(owner_user_id), Some((http, bot_user_id))) =
+        (phone_pending, query_handler, allowed_user_id, broker.phone_connection()) {
+        *slot.lock().map_err(|_| anyhow::anyhow!("Discord phone startup state unavailable"))? =
+            Some(discord_phone::PendingConnection { query, http, bot_user_id, owner_user_id });
+    }
+    Ok(broker)
 }
 
 /// #428 — the `!journal` write-back bridge, present iff SHADOWNOTE_* config

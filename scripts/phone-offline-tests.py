@@ -24,7 +24,7 @@ SUITES = [
     ("augmentagent-phone", "--test", "runtime", 1),
     ("augmentagent-store", "--test", "phone_calls", 11),
     ("augmentagent-store", "--test", "surface_owner", 15),
-    ("augmentagent-store", "--test", "surface_delivery", 35),
+    ("augmentagent-store", "--test", "surface_delivery", 36),
     ("augmentagent-approval-discord", "--lib", None, 255),
     ("augmentagent-approval-discord", "--test", "phone_boundary", 2),
     ("augmentagent-approval-discord", "--test", "phone_delivery", 3),
@@ -65,7 +65,7 @@ def main():
     # These required CLI modules share a binary with unrelated, environment-
     # dependent tests. Only unrelated tests may be filtered; zero/ignored cases
     # or fewer than the required number still fail.
-    for module, minimum in [("phone_runtime::tests::", 2), ("surface_conformance_tests::", 2), ("discord_voice_session_tests::", 6), ("discord_phone_session_tests::", 1), ("discord_phone::tests::", 2)]:
+    for module, minimum in [("phone_runtime::tests::", 2), ("surface_conformance_tests::", 2), ("discord_voice_session_tests::", 6), ("discord_phone_session_tests::", 1), ("discord_phone::tests::", 2), ("discord_phone::installation_tests::", 1)]:
         jobs.append(("augmentagent-cli-" + module.rstrip(":").replace("::", "-"),
                      ["cargo", "test", "--locked", "-p", "augmentagent-cli", "--bin", "augmentagent", module, "--", "--test-threads=1"], minimum, True))
     # This library also contains explicitly ignored live-provider qualification

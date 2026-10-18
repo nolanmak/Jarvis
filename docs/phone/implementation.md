@@ -71,14 +71,14 @@ AUGMENTAGENT_GH_DISABLE=1 cargo test -p augmentagent-phone
 
 | Criteria | Evidence so far | Remaining proof/work |
 | --- | --- | --- |
-| AC01 | Disabled/config validation, listener/watchdog, Slack daemon installation and operator contract | Remaining surface adapters, deployed ingress and live TLS receipts |
+| AC01 | Disabled/config validation, listener/watchdog, Slack/Discord daemon installation and operator contract | WhatsApp adapter, initial Discord identity setup, deployed ingress and live TLS receipts |
 | AC02 | Grant, revocation, expiry, forged target tests | Production surface and MCP boundaries |
 | AC03 | Ten concurrent reservations; restart/uncertain tests | Provider reconciliation and runtime concurrency fault injection |
 | AC04 | Known signature fixture, signed/reordered callbacks and local HTTP ingress | Complete stale-binding callback coverage, live callbacks and final-duration accounting |
 | AC05 | Signed start/accept tests; fake-clock watchdog | Runtime watchdog and voicemail/live timing |
 | AC06 | Offline Claude/Codex text → phone → text continuity, common queue and Slack harness regressions | Actual tool/approval continuation and live native-agent evidence |
 | AC07 | Relay protocol, barge-in generations, final suppression, one-time claim; real local WSS-protocol round trip and disconnect cleanup | Native durable turn integration, cancellation/streaming |
-| AC08 | Slack daemon/tool adapter, private socket entry and durable speech mirrors with retry/reopen tests | Discord/WhatsApp adapters, preset inventory and live surface receipts |
+| AC08 | Slack/Discord daemon adapters, private socket entry and durable speech mirrors with retry/reopen tests | WhatsApp adapter, preset inventory and live surface receipts |
 | AC09 | Rate/daily budgets, restart, concurrent watchdog and shared cleanup guards | Provider-duration reconciliation, disable-at-start cleanup and live failure receipts |
 | AC10 | None for live conversations | Full live host/provider/origin and audible-latency matrix |
 | AC11 | No legacy voice removed yet | Replacement qualification, migration and retirement |
@@ -475,3 +475,52 @@ The expanded required offline run passes all 28 suites / 457 tests:
 the shared Discord history/privacy tests, the three-turn native fixture, the new
 IO/worker tests and existing Slack/voice/session regressions. Both Python runner
 validation tests pass. No live phone calls or Discord messages were sent.
+
+
+### Discord daemon installation
+
+`serve` captures the existing Discord query handler plus authenticated bot HTTP
+identity after gateway READY. Once the shared phone runtime starts, the daemon
+registers a Discord `PhoneAgent` with that same query handler, installs its private
+phone tools, recovers eligible accounts and starts the transcript worker on the
+daemon cancellation token. A registration guard lasts until daemon shutdown.
+One-shot commands and dry runs do not install this path. Failed Discord phone
+installation leaves the existing text/approval service running.
+
+Installation requires an explicit phone owner link, the matching Discord
+allowlist identity, and a stored owner/control-chat binding. Wrong-bot DM accounts
+and other owners are excluded. It does not invent bindings. Private number
+commands now reach the service directly through the tool server's trusted chat
+entry point, before agent history/inference. Discord DM model commands receive
+the same authenticated origin and refuse changes that would leave a bound native
+session; legacy guild voice model guards are preserved.
+
+The startup audit found that Slack's global recovery could reset an active
+Discord send. Both adapters now recover only their own accounts. The regression
+proves that recovering Slack leaves an in-flight Discord row in `sending`.
+
+Test-first evidence: `/tmp/1496-discord-install-red.log`,
+`/tmp/1496-discord-recovery-red.log` and
+`/tmp/1496-discord-model-boundary-red.log`. Targeted green logs:
+`/tmp/1496-discord-install-model-green.log` and
+`/tmp/1496-discord-install-private-green.log`. The installation fixture exercises
+private set → spoken-code verification → normal call through the installed query
+handler with fake telephony, rejects a forged owner, and proves replay creates
+no second call. It explicitly completes the verification call before starting
+the normal call; the earlier attempt is rejected by the one-active-call limit.
+There are no real Discord HTTP sends, model calls or Twilio calls in this fixture.
+
+Discord initial identity/control-chat provisioning remains unfinished: this
+checkpoint enables the path only for preexisting trusted bindings. WhatsApp,
+disable-at-start cleanup and native-session continuity with phone disabled,
+streaming/late-output revocation, final provider durations, tool/approval
+qualification, production preset inventory, both-OS CI and live qualification
+remain required. Legacy conversational voice is still installed pending those
+gates.
+
+The required offline runner passes 29 suites / 459 tests, including all 36 shared
+outbox tests, the installed Discord private setup/call fixture, native DM model
+switch protection, and prior Slack/voice regressions. Receipt:
+`/tmp/1496-discord-install-offline/receipt.json` (dirty worktree at execution).
+Both Python runner validation tests pass. No live calls or Discord posts were
+made; real deployment and live acceptance remain unqualified.

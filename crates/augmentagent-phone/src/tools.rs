@@ -92,6 +92,17 @@ impl ToolServer {
         *server.abort.lock().expect("phone task poisoned") = Some(task.abort_handle());
         Ok(server)
     }
+    /// Trusted chat adapter entry point; command text never enters the agent.
+    pub async fn command(
+        &self,
+        owner: &SurfaceOwnerRef,
+        conversation: &SurfaceConversationRef,
+        event_id: &str,
+        text: &str,
+    ) -> Option<String> {
+        crate::commands::execute(&self.service, owner, conversation, event_id, text).await
+    }
+
     pub fn socket_path(&self) -> &Path {
         &self.socket
     }

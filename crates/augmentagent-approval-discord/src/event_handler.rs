@@ -467,9 +467,7 @@ impl EventHandler for Handler {
         // Model selection is an owner control, never part of the model prompt.
         // This runs after the existing fail-closed allowlist and before any
         // attachment download or history collection.
-        if let Some(reply) = handler.model_command_in_guild(
-            msg.guild_id.map(|guild| guild.get()), msg.channel_id.get(), &user_text
-        ).await {
+        if let Some(reply) = crate::phone::model_command(handler.as_ref(), &phone_context, &user_text).await {
             let builder = CreateMessage::new().content(reply)
                 .reference_message(MessageReference::from((msg.channel_id, msg.id)));
             if let Err(error) = msg.channel_id.send_message(&ctx.http, builder).await {
