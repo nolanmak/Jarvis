@@ -16,13 +16,13 @@ ROOT = Path(__file__).resolve().parents[1]
 # Each invocation must run exactly one target, with no name filters. Minimum
 # counts prevent silent deletion of the current required coverage.
 SUITES = [
-    ("augmentagent-phone", "--lib", None, 9),
+    ("augmentagent-phone", "--lib", None, 10),
     ("augmentagent-phone", "--test", "relay", 3),
-    ("augmentagent-phone", "--test", "service", 21),
+    ("augmentagent-phone", "--test", "service", 23),
     ("augmentagent-phone", "--test", "mcp", 2),
     ("augmentagent-phone", "--test", "config", 1),
     ("augmentagent-phone", "--test", "runtime", 3),
-    ("augmentagent-store", "--test", "phone_calls", 15),
+    ("augmentagent-store", "--test", "phone_calls", 16),
     ("augmentagent-store", "--test", "surface_owner", 18),
     ("augmentagent-store", "--test", "surface_delivery", 36),
     ("augmentagent-approval-discord", "--lib", None, 255),

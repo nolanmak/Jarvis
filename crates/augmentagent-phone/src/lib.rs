@@ -43,10 +43,20 @@ pub enum ProviderError {
     #[error("provider outcome is unknown")]
     Uncertain,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalUsage {
+    Completed(augmentagent_store::phone::ProviderUsage),
+    NeverAnswered,
+}
 #[async_trait]
 pub trait Telephony: Send + Sync {
     async fn create(&self, request: DialRequest) -> Result<String, ProviderError>;
     async fn hangup(&self, sid: &str) -> Result<(), ProviderError>;
+    /// Read-only final usage recovery. None means no authoritative final result.
+    async fn final_usage(&self, _sid: &str) -> Result<Option<FinalUsage>, ProviderError> {
+        Ok(None)
+    }
+
     /// Persisted answer state is a hint, not a fresh provider read. Providers
     /// must handle a call advancing while its cancellation is being requested.
     async fn hangup_known_state(&self, sid: &str, _answered: bool) -> Result<(), ProviderError> {
@@ -525,11 +535,39 @@ impl PhoneService {
                 });
             }
         }
+        for call in self.store.phone_usage_reconciliation_due(now)? {
+            let mut inflight = self.cleanup_inflight.lock().expect("phone cleanup poisoned");
+            // Hangups have priority; historical usage reads must not create an
+            // unbounded set of HTTP jobs while a provider is slow.
+            if inflight.len() >= 8 { break; }
+            if !inflight.contains(&call.id) && self.store.phone_claim_usage_reconciliation(&call.id, now)? {
+                inflight.insert(call.id.clone());
+                due.push(CleanupCall { call, inflight: self.cleanup_inflight.clone() });
+            }
+        }
         Ok(due)
     }
     async fn cleanup_call(&self, cleanup: CleanupCall) -> Result<(), Error> {
         let call = &cleanup.call;
         if let Some(sid) = &call.provider_sid {
+            if call.state.terminal() {
+                if let Ok(Ok(Some(result))) = tokio::time::timeout(
+                    std::time::Duration::from_secs(5), self.provider.final_usage(sid)).await {
+                    let usage = match result {
+                        FinalUsage::Completed(usage) => usage,
+                        FinalUsage::NeverAnswered if call.answered_ms.is_none() => augmentagent_store::phone::ProviderUsage {
+                            duration_seconds: 0, ended_ms: call.ended_ms.unwrap_or(call.created_ms),
+                        },
+                        FinalUsage::NeverAnswered => return Ok(()),
+                    };
+                    // A signed callback may have won while REST was in flight.
+                    // Preserve that immutable evidence instead of overwriting it.
+                    if self.store.phone_usage(&call.id)?.is_none() {
+                        self.store.phone_provider_event_with_usage(&call.id, sid, call.state, self.clock.now_ms(), Some(usage))?;
+                    }
+                }
+                return Ok(());
+            }
             // A failed or timed-out attempt stays durably pending for the next
             // bounded retry. A terminal provider callback never regresses.
             if matches!(

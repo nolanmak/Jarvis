@@ -678,6 +678,35 @@ impl Store {
             Ok(calls)
         })?)
     }
+    /// Bounded candidates for authenticated REST recovery of missing final usage.
+    pub fn phone_usage_reconciliation_due(&self, now_ms: i64) -> PhoneResult<Vec<PhoneCall>> {
+        if now_ms < 0 { return Err(PhoneError::InvalidInput); }
+        Ok(self.with_conn(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {CALL_COLUMNS} FROM phone_calls WHERE ended_ms IS NOT NULL AND provider_sid IS NOT NULL
+                 AND NOT EXISTS(SELECT 1 FROM phone_call_usage WHERE call_id=phone_calls.id)
+                 AND COALESCE((SELECT attempts FROM phone_usage_reconciliation WHERE call_id=phone_calls.id),0)<3
+                 AND COALESCE((SELECT next_ms FROM phone_usage_reconciliation WHERE call_id=phone_calls.id),0)<=?1
+                 ORDER BY ended_ms LIMIT 8"))?;
+            let calls = stmt.query_map([now_ms], read_call)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(calls)
+        })?)
+    }
+    pub fn phone_claim_usage_reconciliation(&self, id: &str, now_ms: i64) -> PhoneResult<bool> {
+        if now_ms < 0 { return Err(PhoneError::InvalidInput); }
+        transaction(self, |tx| {
+            let call = call_by_id(tx, id)?;
+            if !call.state.terminal() || call.provider_sid.is_none() { return Ok(false); }
+            let finalized: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM phone_call_usage WHERE call_id=?1)", [id], |r| r.get(0))?;
+            if finalized { return Ok(false); }
+            tx.execute("INSERT OR IGNORE INTO phone_usage_reconciliation(call_id) VALUES(?1)", [id])?;
+            let (attempts, next): (i64, i64) = tx.query_row("SELECT attempts,next_ms FROM phone_usage_reconciliation WHERE call_id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            if attempts >= 3 || now_ms < next { return Ok(false); }
+            tx.execute("UPDATE phone_usage_reconciliation SET attempts=attempts+1,next_ms=?2 WHERE call_id=?1", params![id, now_ms.saturating_add(1000 * (1 << attempts))])?;
+            Ok(true)
+        })
+    }
+
     pub fn phone_claim_cleanup(&self, id: &str, now_ms: i64) -> PhoneResult<bool> {
         transaction(self, |tx| {
             let call = call_by_id(tx, id)?;

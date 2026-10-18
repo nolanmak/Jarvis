@@ -214,3 +214,22 @@ read-only tool and confirmed hangup; at least one call demonstrates approval
 gating. These are structural/timing checks, not proof that annotations or
 declared tool events are truthful. Review the audio and native traces before
 accepting AC10, and retain the separate migration/rollback evidence for AC11–12.
+
+## Missing final usage callbacks
+
+Terminal calls with a known provider SID and no finalized usage are reconciled
+through authenticated, read-only Twilio Call-resource requests. Completed-call
+seconds and end time are applied through the same immutable validation as signed
+callbacks. A provider-confirmed never-answered call releases its reservation only
+when local state also has no answer evidence. Contradictory or incomplete results
+leave the conservative reservation intact.
+
+Reconciliation uses three persisted attempts with backoff, including across
+restart, at most eight jobs alongside cleanup, and five-second request limits.
+It never creates a call or requests another hangup. Existing signed usage wins
+over a late REST response. A missing SID or exhausted attempts still requires
+operator investigation; absence of final usage is not treated as zero cost.
+The normal watchdog handles these reads; disabled-start cleanup can reconcile
+calls it is retiring, but does not start solely to refresh old accounting.
+
+Provider field semantics: [Twilio Call resource](https://www.twilio.com/docs/voice/api/call-resource).

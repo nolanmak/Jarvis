@@ -73,13 +73,13 @@ AUGMENTAGENT_GH_DISABLE=1 cargo test -p augmentagent-phone
 | --- | --- | --- |
 | AC01 | Disabled/config validation; signed ingress; all three daemon adapters; cleanup when normal startup is unavailable | Deployed ingress and live TLS receipts |
 | AC02 | Grants, revocation, expiry, forged targets, authenticated MCP and surface boundaries | Complete live boundary evidence |
-| AC03 | Concurrent reservations, durable deduplication and uncertain-create/restart tests | Missing-callback provider reconciliation and live runtime fault evidence |
-| AC04 | Signed/reordered callbacks, local ingress, immutable final duration and signed event-time accounting | Live callbacks and reconciliation when final callbacks never arrive |
+| AC03 | Concurrent reservations, durable deduplication and uncertain-create/restart tests | Exhausted/unknown-SID reconciliation handling and live runtime fault evidence |
+| AC04 | Signed/reordered callbacks, local ingress, immutable final duration and signed event-time accounting | Live callbacks and provider reconciliation receipts |
 | AC05 | Signed acceptance, fake-clock deadline tests and concurrent runtime watchdog | Voicemail and live acceptance timing |
 | AC06 | Both native providers: text → phone → text continuity; shared queue; deferred/cancellable initial history | Actual native tool/approval continuation and live evidence |
 | AC07 | Relay/barge-in generations, final suppression, one-time claims, local WSS round trip and cancellation | Complete live streaming/interruption and tool-disconnect proof |
 | AC08 | Discord, Slack and WhatsApp daemon adapters; authenticated tools; durable transcript outboxes | Exhaustive authenticated-surface/preset inventory and live origin receipts |
-| AC09 | Persistent budgets, provider-duration callbacks, bounded shutdown and disabled/unavailable-start cleanup | Missing-callback reconciliation and live stop/restart/disable evidence |
+| AC09 | Persistent budgets, provider-duration callbacks, bounded shutdown and disabled/unavailable-start cleanup | Exhausted-retry operator recovery and live stop/restart/disable evidence |
 | AC10 | Recorded-audio receipt validator and synthetic regression tests only | Actual consented audio, native traces and full live matrix; no live receipt exists |
 | AC11 | No legacy voice removed yet | Replacement qualification, upgrade/rollback fixtures and retirement |
 | AC12 | Required offline runner and local regression receipts; OS CI configured | Passing current-head OS CI, complete evidence map and live receipts |
@@ -1072,3 +1072,20 @@ Claude/Codex queued resume without a history fetch, cancellation during a pendin
 history load without a turn claim, native continuity and late authority changes.
 The required offline runner includes both new regression cases. Full live tool
 and approval continuity receipts remain outstanding.
+
+### Authenticated recovery of missing final usage
+
+The watchdog now claims bounded read-only reconciliation work for terminal calls
+without final usage. Twilio responses must match the account and call SID; only
+completed-call duration/end-time fields or explicit never-answered states are
+accepted. Local answer evidence prevents a contradictory zero-cost refund.
+Three attempts and their backoff persist across restart. Historical reads share
+the in-flight guard, yield to hangups and cannot dial or issue another hangup.
+
+Regressions cover persisted retry exhaustion, delayed signed final usage,
+provider account validation, malformed duration, nonterminal responses, budget
+recovery without a callback, and contradictory answer evidence. The transport
+test failed before implementation (`/tmp/1496-reconcile-transport-red.log`).
+Ten transport tests, 22 service tests plus the added contradictory-answer test,
+and all three runtime tests pass; strict phone-only Clippy passes. These are
+offline tests, not a live provider reconciliation receipt.

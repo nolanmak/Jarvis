@@ -23,6 +23,8 @@ struct FakeProvider {
     calls: Mutex<Vec<DialRequest>>,
     stops: Mutex<Vec<String>>,
     uncertain: bool,
+    usage: Mutex<Option<augmentagent_phone::FinalUsage>>,
+    usage_reads: Mutex<Vec<String>>,
 }
 #[async_trait]
 impl Telephony for FakeProvider {
@@ -38,6 +40,13 @@ impl Telephony for FakeProvider {
                 format!("CA-test-{}", calls.len())
             })
         }
+    }
+    async fn final_usage(
+        &self,
+        sid: &str,
+    ) -> Result<Option<augmentagent_phone::FinalUsage>, ProviderError> {
+        self.usage_reads.lock().unwrap().push(sid.into());
+        Ok(*self.usage.lock().unwrap())
     }
     async fn hangup(&self, sid: &str) -> Result<(), ProviderError> {
         self.stops.lock().unwrap().push(sid.into());
@@ -1316,4 +1325,88 @@ async fn late_provider_usage_shortens_an_active_calls_daily_budget() {
         .unwrap()
         .iter()
         .any(|sid| sid == "CA-test-4"));
+}
+
+#[tokio::test]
+async fn lost_final_callback_recovers_usage_without_another_dial_or_hangup() {
+    use augmentagent_phone::FinalUsage;
+    use augmentagent_store::phone::{CallState, ProviderUsage, ReserveCall};
+    for usage in [
+        FinalUsage::Completed(ProviderUsage {
+            duration_seconds: 120,
+            ended_ms: 120_000,
+        }),
+        FinalUsage::NeverAnswered,
+    ] {
+        let f = fixture("slack", true, true, false);
+        let call = f
+            .store
+            .phone_reserve_call(ReserveCall {
+                owner: "canonical-owner",
+                request_id: "lost-callback",
+                conversation: "chat",
+                now_ms: 0,
+            })
+            .unwrap()
+            .call;
+        f.store
+            .phone_provider_event(&call.id, "CA-test", CallState::Canceled, 120_000)
+            .unwrap();
+        f.clock.0.store(120_000, Ordering::SeqCst);
+        assert_eq!(
+            f.store
+                .phone_budget_remaining_ms("canonical-owner", 120_000)
+                .unwrap(),
+            2_700_000
+        );
+        *f.provider.usage.lock().unwrap() = Some(usage);
+        f.service.maintenance(false).await.unwrap();
+        let expected = if matches!(usage, FinalUsage::NeverAnswered) {
+            3_600_000
+        } else {
+            3_480_000
+        };
+        assert_eq!(
+            f.store
+                .phone_budget_remaining_ms("canonical-owner", 120_000)
+                .unwrap(),
+            expected
+        );
+        f.service.maintenance(true).await.unwrap();
+        assert_eq!(f.provider.usage_reads.lock().unwrap().len(), 1);
+        assert!(f.provider.calls.lock().unwrap().is_empty());
+        assert!(f.provider.stops.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn contradictory_unanswered_status_does_not_refund_a_locally_answered_call() {
+    use augmentagent_store::phone::{CallState, ReserveCall};
+    let f = fixture("slack", true, true, false);
+    let call = f
+        .store
+        .phone_reserve_call(ReserveCall {
+            owner: "canonical-owner",
+            request_id: "answered",
+            conversation: "chat",
+            now_ms: 0,
+        })
+        .unwrap()
+        .call;
+    f.store
+        .phone_provider_event(&call.id, "CA-test", CallState::AwaitingAcceptance, 1000)
+        .unwrap();
+    f.store
+        .phone_provider_event(&call.id, "CA-test", CallState::Completed, 120_000)
+        .unwrap();
+    f.clock.0.store(120_000, Ordering::SeqCst);
+    *f.provider.usage.lock().unwrap() = Some(augmentagent_phone::FinalUsage::NeverAnswered);
+    f.service.maintenance(false).await.unwrap();
+    assert!(f.store.phone_usage(&call.id).unwrap().is_none());
+    assert_eq!(
+        f.store
+            .phone_budget_remaining_ms("canonical-owner", 120_000)
+            .unwrap(),
+        2_700_000
+    );
 }

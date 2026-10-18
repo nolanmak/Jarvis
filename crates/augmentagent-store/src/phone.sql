@@ -55,3 +55,9 @@ CREATE TABLE IF NOT EXISTS phone_call_usage (
     duration_seconds INTEGER NOT NULL CHECK(duration_seconds >= 0),
     ended_ms INTEGER NOT NULL CHECK(ended_ms >= 0)
 );
+
+CREATE TABLE IF NOT EXISTS phone_usage_reconciliation (
+    call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 3),
+    next_ms INTEGER NOT NULL DEFAULT 0
+);

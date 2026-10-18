@@ -105,6 +105,61 @@ impl Telephony for TwilioClient {
             .ok_or(ProviderError::Uncertain)?;
         Ok(sid.into())
     }
+    async fn final_usage(&self, sid: &str) -> Result<Option<crate::FinalUsage>, ProviderError> {
+        if !valid_sid(sid) {
+            return Err(ProviderError::Rejected);
+        }
+        let response = self
+            .http
+            .get(format!("{}/{}.json", self.calls_url(), sid))
+            .basic_auth(&self.account, Some(&self.token))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|_| ProviderError::Uncertain)?;
+        if !response.status().is_success() {
+            return Err(ProviderError::Uncertain);
+        }
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|_| ProviderError::Uncertain)?;
+        if body["sid"].as_str() != Some(sid)
+            || body["account_sid"].as_str() != Some(self.account.as_str())
+        {
+            return Err(ProviderError::Uncertain);
+        }
+        match body["status"].as_str() {
+            Some("canceled" | "failed" | "busy" | "no-answer") => {
+                Ok(Some(crate::FinalUsage::NeverAnswered))
+            }
+            Some("queued" | "ringing" | "in-progress") => Ok(None),
+            Some("completed") => {
+                let Some(seconds) = body["duration"].as_str().filter(|s| !s.is_empty()) else {
+                    return Ok(None);
+                };
+                if !seconds.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(ProviderError::Uncertain);
+                }
+                let duration_seconds = seconds
+                    .parse::<i64>()
+                    .map_err(|_| ProviderError::Uncertain)?;
+                let Some(end) = body["end_time"].as_str().filter(|s| !s.is_empty()) else {
+                    return Ok(None);
+                };
+                let ended_ms = chrono::DateTime::parse_from_rfc2822(end)
+                    .map_err(|_| ProviderError::Uncertain)?
+                    .timestamp_millis();
+                Ok(Some(crate::FinalUsage::Completed(
+                    augmentagent_store::phone::ProviderUsage {
+                        duration_seconds,
+                        ended_ms,
+                    },
+                )))
+            }
+            _ => Err(ProviderError::Uncertain),
+        }
+    }
     async fn hangup(&self, sid: &str) -> Result<(), ProviderError> {
         self.stop_call(sid, true).await
     }
@@ -236,6 +291,52 @@ mod tests {
             twiml: "<Response><Hangup/></Response>".into(),
             status_callback: "https://phone.example.test/phone/status/id".into(),
             max_duration_seconds: 900,
+        }
+    }
+    #[tokio::test]
+    async fn final_usage_requires_matching_identity_and_completed_seconds() {
+        let mut server = mockito::Server::new_async().await;
+        let sid = "CA01234567890123456789012345678901";
+        let client =
+            TwilioClient::with_base("ACtest", "test-token", "+12025550456", &server.url()).unwrap();
+        for (status, duration, account, outcome) in [
+            ("completed", "120", "ACtest", "completed"),
+            ("ringing", "120", "ACtest", "pending"),
+            ("canceled", "", "ACtest", "unanswered"),
+            ("completed", "-1", "ACtest", "error"),
+            ("completed", "120", "ACother", "error"),
+        ] {
+            let mock = server
+                .mock(
+                    "GET",
+                    format!("/2010-04-01/Accounts/ACtest/Calls/{sid}.json").as_str(),
+                )
+                .match_header("authorization", Matcher::Regex("^Basic ".into()))
+                .with_status(200)
+                .with_body(
+                    serde_json::json!({"sid":sid,"account_sid":account,"status":status,
+                    "duration":duration,"end_time":"Thu, 01 Jan 1970 00:02:00 +0000"})
+                    .to_string(),
+                )
+                .expect(1)
+                .create_async()
+                .await;
+            let result = client.final_usage(sid).await;
+            match outcome {
+                "completed" => assert_eq!(
+                    result.unwrap(),
+                    Some(crate::FinalUsage::Completed(
+                        augmentagent_store::phone::ProviderUsage {
+                            duration_seconds: 120,
+                            ended_ms: 120_000
+                        }
+                    ))
+                ),
+                "pending" => assert_eq!(result.unwrap(), None),
+                "unanswered" => assert_eq!(result.unwrap(), Some(crate::FinalUsage::NeverAnswered)),
+                _ => assert!(result.is_err()),
+            }
+            mock.assert_async().await;
         }
     }
     #[tokio::test]

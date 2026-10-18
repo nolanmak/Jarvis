@@ -647,3 +647,64 @@ fn late_usage_uses_event_day_and_invalid_reports_leave_no_partial_mutation() {
         900
     );
 }
+
+#[test]
+fn usage_reconciliation_is_bounded_durable_and_stops_after_final_usage() {
+    use augmentagent_store::phone::ProviderUsage;
+    let (dir, store) = fixture();
+    let call = store
+        .phone_reserve_call(request("usage", "chat", 0))
+        .unwrap()
+        .call;
+    store
+        .phone_provider_event(&call.id, "CA-test", CallState::Completed, 120_000)
+        .unwrap();
+    assert_eq!(
+        store.phone_usage_reconciliation_due(120_000).unwrap().len(),
+        1
+    );
+    assert!(store
+        .phone_claim_usage_reconciliation(&call.id, 120_000)
+        .unwrap());
+    assert!(!store
+        .phone_claim_usage_reconciliation(&call.id, 120_000)
+        .unwrap());
+    assert!(store
+        .phone_usage_reconciliation_due(120_000)
+        .unwrap()
+        .is_empty());
+    drop(store);
+    let store = Store::open(dir.path().join("phone.db")).unwrap();
+    assert!(!store
+        .phone_claim_usage_reconciliation(&call.id, 120_999)
+        .unwrap());
+    assert!(store
+        .phone_claim_usage_reconciliation(&call.id, 121_000)
+        .unwrap());
+    assert!(store
+        .phone_claim_usage_reconciliation(&call.id, 123_000)
+        .unwrap());
+    assert!(!store
+        .phone_claim_usage_reconciliation(&call.id, 999_000)
+        .unwrap());
+    assert!(store
+        .phone_usage_reconciliation_due(999_000)
+        .unwrap()
+        .is_empty());
+    store
+        .phone_provider_event_with_usage(
+            &call.id,
+            "CA-test",
+            CallState::Completed,
+            999_000,
+            Some(ProviderUsage {
+                duration_seconds: 120,
+                ended_ms: 120_000,
+            }),
+        )
+        .unwrap();
+    assert!(store
+        .phone_usage_reconciliation_due(999_000)
+        .unwrap()
+        .is_empty());
+}
