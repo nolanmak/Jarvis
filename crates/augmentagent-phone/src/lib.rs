@@ -213,6 +213,35 @@ impl PhoneService {
         Ok(())
     }
 
+    /// Trusted WhatsApp adapter only, after authenticated sidecar identity and
+    /// self-message checks. Explicit operator links are required before setup.
+    /// Previously revoked bindings cannot be recreated by chat.
+    pub fn initialize_whatsapp_private_owner(
+        &self,
+        owner: &SurfaceOwnerRef,
+        conversation: &SurfaceConversationRef,
+    ) -> Result<(), Error> {
+        self.enabled()?;
+        let number = owner.account().account_id().strip_prefix("device:");
+        if owner.account().platform().as_str() != "whatsapp"
+            || !number.is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+            || owner.sender_id() != format!("{}@s.whatsapp.net", number.unwrap_or_default())
+            || conversation.conversation_id() != owner.sender_id()
+            || !self
+                .config
+                .links
+                .iter()
+                .any(|link| link.surface_owner == *owner)
+        {
+            return Err(Error::Unauthorized);
+        }
+        self.store
+            .initialize_private_surface_owner(owner, conversation, self.clock.now_ms())
+            .map_err(|_| Error::Unauthorized)?;
+        self.authorize(owner, conversation)?;
+        Ok(())
+    }
+
     pub fn authorize(
         &self,
         owner: &SurfaceOwnerRef,

@@ -8,8 +8,7 @@ use augmentagent_phone::{
     SystemClock, Telephony,
 };
 use augmentagent_store::{
-    owner::ControlConversationKind, phone::CallState, Store, SurfaceAccountRef,
-    SurfaceConversationRef, SurfaceOwnerRef, SurfacePlatform,
+    phone::CallState, Store, SurfaceAccountRef, SurfaceOwnerRef, SurfacePlatform,
 };
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -108,11 +107,6 @@ async fn self_chat_phone_setup_verify_call_and_replay_use_shared_service() {
     )
     .unwrap();
     let owner = SurfaceOwnerRef::new(acct.clone(), linked.bare()).unwrap();
-    let chat = SurfaceConversationRef::new(acct, linked.bare(), None).unwrap();
-    store.bind_surface_owner(&owner, 0).unwrap();
-    store
-        .set_surface_control_conversation(&chat, ControlConversationKind::Direct, 0)
-        .unwrap();
     store.allow_whatsapp_outbound(&linked.bare()).unwrap();
     let provider = Arc::new(Phone::default());
     let service = Arc::new(PhoneService::new(
@@ -222,6 +216,10 @@ async fn self_chat_phone_setup_verify_call_and_replay_use_shared_service() {
         },
     )
     .with_control(Arc::new(control.clone()));
+    assert!(store
+        .surface_owner_binding(owner.account())
+        .unwrap()
+        .is_none());
     channel.inbox_handle().lock().await.push(setup.clone());
     let polled = channel.poll_once().await.unwrap();
     assert_eq!(polled.errors, 0);

@@ -64,6 +64,14 @@ impl PhoneControl {
         if !message.is_verified_self_command(&self.linked_owner) {
             return Ok(None);
         }
+        if augmentagent_phone::commands::sets_number(&message.text) {
+            if let Err(error) = self
+                .tools
+                .initialize_whatsapp_private_owner(&self.origin.owner, &self.origin.conversation)
+            {
+                return Ok(Some(error.to_string()));
+            }
+        }
         // Do not let a rejected sender consume a legitimate provider event ID.
         if self
             .tools

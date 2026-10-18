@@ -122,7 +122,8 @@ impl WhatsappControlSurface {
     }
 
     /// Install phone commands using the authenticated linked-device identity.
-    /// Owner/control bindings and explicit phone links must already exist.
+    /// Explicit phone links are required. First-time number setup initializes
+    /// the private binding; previously revoked bindings are never restored.
     pub fn with_phone_tools(mut self, linked_owner: crate::Jid, tools: Arc<augmentagent_phone::tools::ToolServer>) -> anyhow::Result<Self> {
         self.phone = Some(Arc::new(crate::phone::PhoneControl::new(self.store.clone(), tools, linked_owner, &self.config.control_chat_jid)?));
         Ok(self)

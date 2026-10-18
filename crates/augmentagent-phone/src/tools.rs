@@ -122,6 +122,17 @@ impl ToolServer {
         self.command(owner, conversation, event_id, text).await
     }
 
+    /// Bootstrap only from the trusted WhatsApp self-chat adapter, before its
+    /// durable command receipt. This method is never exposed over MCP.
+    pub fn initialize_whatsapp_private_owner(
+        &self,
+        owner: &SurfaceOwnerRef,
+        conversation: &SurfaceConversationRef,
+    ) -> Result<(), Error> {
+        self.service
+            .initialize_whatsapp_private_owner(owner, conversation)
+    }
+
     pub fn socket_path(&self) -> &Path {
         &self.socket
     }

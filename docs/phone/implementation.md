@@ -869,3 +869,28 @@ strengthening the ordinary-outbox isolation assertion, all five delivery tests
 were rerun successfully in `/tmp/1496-wa-worker-green.log`. WhatsApp all-target
 Clippy with `--no-deps -D warnings` and both Python runner checks pass. No live
 WhatsApp messages or phone calls were made.
+
+
+### WhatsApp first-time private setup
+
+The authenticated self-chat adapter now initializes the private owner binding
+on an explicit `phone number set` command, using the operator-configured owner
+link and linked device identity. Ordinary messages do not create bindings.
+Disabled control, dry run, denied outbound access, unknown/agent echoes and
+forged senders are rejected before initialization. Previously revoked accounts
+still require trusted operator reprovisioning; repeating setup does not restore
+access or change an existing binding revision.
+
+The existing end-to-end fake-sidecar command test now starts without any stored
+owner binding. It failed with zero verification calls before the fix
+(`/tmp/1496-wa-bootstrap-red.log`) and passes the setup, verification, calling,
+replay, removal and revocation sequence afterward
+(`/tmp/1496-wa-bootstrap-green.log`). Service coverage additionally rejects
+unlinked, disabled, mismatched-device/sender/chat and threaded setup and checks
+idempotency and revocation. WhatsApp daemon installation and live qualification
+remain required; this is not evidence of deployed WhatsApp support.
+
+Validation: all 36 required offline suites / 529 tests pass in
+`/tmp/1496-wa-bootstrap-offline/receipt.json` (dirty worktree recorded).
+Targeted phone/WhatsApp all-target Clippy with `--no-deps -D warnings` and both
+Python runner checks pass. No live provider calls or chat posts were made.

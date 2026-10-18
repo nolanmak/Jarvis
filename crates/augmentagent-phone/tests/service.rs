@@ -1075,3 +1075,99 @@ async fn revoked_signed_relay_upgrade_requests_stop_but_bad_signature_does_not()
     assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
     server.abort();
 }
+
+#[test]
+fn whatsapp_private_bootstrap_requires_explicit_link_and_never_restores_revocation() {
+    for mode in [
+        "valid",
+        "disabled",
+        "unlinked",
+        "wrong-chat",
+        "thread",
+        "wrong-account",
+        "wrong-sender",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("db")).unwrap());
+        let account = SurfaceAccountRef::new(
+            SurfacePlatform::new("whatsapp").unwrap(),
+            if mode == "wrong-account" {
+                "device:garbage"
+            } else {
+                "device:12025550111"
+            },
+        )
+        .unwrap();
+        let owner = SurfaceOwnerRef::new(
+            account.clone(),
+            if mode == "wrong-sender" {
+                "12025550112@s.whatsapp.net"
+            } else {
+                "12025550111@s.whatsapp.net"
+            },
+        )
+        .unwrap();
+        let chat = SurfaceConversationRef::new(
+            account.clone(),
+            if mode == "wrong-chat" {
+                "12025550112@s.whatsapp.net"
+            } else {
+                "12025550111@s.whatsapp.net"
+            },
+            (mode == "thread").then(|| "thread".to_owned()),
+        )
+        .unwrap();
+        let linked = if mode == "unlinked" {
+            SurfaceOwnerRef::new(account.clone(), "12025550113@s.whatsapp.net").unwrap()
+        } else {
+            owner.clone()
+        };
+        let service = PhoneService::new(
+            store.clone(),
+            Arc::new(FakeProvider::default()),
+            Arc::new(FakeClock(AtomicI64::new(100))),
+            PhoneConfig::new(
+                mode != "disabled",
+                "https://phone.example.test",
+                "fixture-secret-at-least-32-bytes",
+                vec![OwnerLink {
+                    surface_owner: linked,
+                    owner_id: "owner".into(),
+                }],
+            )
+            .unwrap(),
+        );
+        let result = service.initialize_whatsapp_private_owner(&owner, &chat);
+        if mode != "valid" {
+            assert!(result.is_err(), "{mode}");
+            assert!(
+                store.surface_owner_binding(&account).unwrap().is_none(),
+                "{mode}"
+            );
+            continue;
+        }
+        result.unwrap();
+        let revision = store
+            .surface_owner_binding(&account)
+            .unwrap()
+            .unwrap()
+            .revision;
+        service
+            .initialize_whatsapp_private_owner(&owner, &chat)
+            .unwrap();
+        assert_eq!(
+            store
+                .surface_owner_binding(&account)
+                .unwrap()
+                .unwrap()
+                .revision,
+            revision
+        );
+        assert!(service.authorize(&owner, &chat).is_ok());
+        store.unbind_surface_owner(&account).unwrap();
+        assert!(service
+            .initialize_whatsapp_private_owner(&owner, &chat)
+            .is_err());
+        assert!(store.surface_owner_binding(&account).unwrap().is_none());
+    }
+}
