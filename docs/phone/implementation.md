@@ -1150,3 +1150,11 @@ over-budget regression is skipped on Linux and must pass on macOS CI. The test
 forces the resident threshold below startup usage and requires rejection before
 matching. Actual macOS verification remains pending; these results do not qualify
 live phone operation.
+
+The first resident-monitor CI run (`cad7928d`) reached guardian startup but
+failed because `kqueue` does not implement Python's context-manager protocol.
+The guardian now wraps it with `contextlib.closing`; the existing direct matcher,
+over-budget and parent-death regressions remain the required macOS proof.
+Separately, the offline run at `fe4de3df` completed all 587 tests across 41 suites
+on Linux. That receipt predates these matcher fixes and is not current-head or
+live qualification.

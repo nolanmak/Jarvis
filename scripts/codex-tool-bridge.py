@@ -383,6 +383,7 @@ elif sys.platform == 'darwin':
     # cannot acquire the GIL during a pathological regex. The registration
     # handshake plus parent check closes the startup/PID-reuse window.
     import select, signal
+    from contextlib import closing
     # Darwin may reserve more virtual/data space at startup than the nominal
     # ceiling. Monitor actual resident bytes outside the regex process/GIL.
     class TaskInfo(ctypes.Structure):
@@ -405,7 +406,7 @@ elif sys.platform == 'darwin':
         stage = 'create exit monitor'
         try:
             os.close(ready_read)
-            with select.kqueue() as watcher:
+            with closing(select.kqueue()) as watcher:
                 stage = 'register process exits'
                 watcher.control([select.kevent(pid, filter=select.KQ_FILTER_PROC,
                     flags=select.KQ_EV_ADD, fflags=select.KQ_NOTE_EXIT)
