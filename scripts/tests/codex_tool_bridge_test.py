@@ -265,6 +265,69 @@ class ToolPolicyTests(unittest.TestCase):
             p.write('bad.txt', 'bad')
         self.assertFalse((self.root / 'bad.txt').exists())
 
+    def test_scope_guard_resolves_paths_without_gnu_readlink_m(self):
+        import os
+        import shutil
+        guard = Path(SPEC.origin).with_name('aa-wiki-scope-guard.sh')
+        shim = Path(self.temp.name) / 'bin'
+        shim.mkdir()
+        executable = shim / 'readlink'
+        executable.write_text('#!/bin/sh\nif [ "$1" = "-m" ]; then exit 1; fi\nexec ' + shutil.which('readlink') + ' "$@"\n')
+        executable.chmod(0o700)
+        alias = Path(self.temp.name) / 'alias'
+        alias.symlink_to(self.root, target_is_directory=True)
+        (self.root / 'note.txt').write_text('SYNTHETIC')
+        env = dict(os.environ, WIKI_ROOT=str(self.root), PATH=str(shim)+os.pathsep+os.environ['PATH'])
+        for tool, key in [('Read','file_path'), ('Write','file_path'), ('Grep','path'), ('Glob','path')]:
+            path = alias / 'note.txt' if key == 'file_path' else alias
+            run = subprocess.run(['bash', str(guard)], input=json.dumps({'tool_name':tool, 'tool_input':{key:str(path)}}),
+                env=env, text=True, capture_output=True, timeout=10)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertFalse(run.stdout.strip(), f'{tool}: {run.stdout}')
+
+    def test_system_alias_discovery_rejects_untrusted_links_and_parent_directories(self):
+        import stat
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        def metadata(path):
+            return SimpleNamespace(st_uid=0, st_mode=(stat.S_IFDIR | 0o755) if path in ('/', '/private') else (stat.S_IFLNK | 0o777))
+        with patch.object(bridge.sys, 'platform', 'darwin'), patch.object(bridge.os, 'lstat', side_effect=metadata), patch.object(bridge.os, 'readlink', side_effect=lambda p: 'private' + p):
+            self.assertEqual(bridge.system_path_aliases(), {'/tmp':'/private/tmp', '/var':'/private/var', '/etc':'/private/etc'})
+            with patch.object(bridge.os, 'readlink', return_value='/untrusted'):
+                self.assertEqual(bridge.system_path_aliases(), {})
+            with patch.object(bridge.os, 'lstat', return_value=SimpleNamespace(st_uid=1000, st_mode=stat.S_IFDIR | 0o777)):
+                self.assertEqual(bridge.system_path_aliases(), {})
+        with patch.object(bridge.sys, 'platform', 'linux'):
+            self.assertEqual(bridge.system_path_aliases(), {})
+
+    def test_trusted_system_aliases_allow_scoped_files_but_not_user_symlinks(self):
+        from unittest.mock import patch
+        alias = Path(self.temp.name) / 'alias'
+        alias.symlink_to(self.root, target_is_directory=True)
+        with patch.object(bridge, 'system_path_aliases', return_value={str(alias): str(self.root)}):
+            policy = bridge.Policy({'cwd': str(self.root), 'read_roots': [str(self.root)],
+                'write_roots': [str(self.root)], 'allowed_tools': ['Read', 'Write', 'Glob', 'Grep']})
+        (self.root / 'allowed.txt').write_text('SYNTHETIC_ALLOWED')
+        self.assertEqual(policy.read(str(alias / 'allowed.txt')), 'SYNTHETIC_ALLOWED')
+        self.root.chmod(0o700)
+        with patch.object(bridge, 'system_path_aliases', return_value={str(alias): str(self.root)}):
+            attachments = bridge.Policy({'cwd': str(self.root), 'read_roots': [], 'write_roots': [],
+                'allowed_tools': ['Read', 'Glob'], 'read_allowances': [{'tools':['Read'],
+                'directory':str(alias), 'name_pattern':r'allowed\.txt'}]})
+        self.assertEqual(attachments.read(str(alias / 'allowed.txt')), 'SYNTHETIC_ALLOWED')
+        self.assertEqual(attachments.read(str(self.root / 'allowed.txt')), 'SYNTHETIC_ALLOWED')
+        with self.assertRaises(bridge.Denied):
+            attachments.glob('*', str(alias))
+
+        policy.write(str(alias / 'new.txt'), 'SYNTHETIC_NEW')
+        self.assertEqual((self.root / 'new.txt').read_text(), 'SYNTHETIC_NEW')
+        self.assertIn('allowed.txt', str(policy.glob('*.txt', str(alias))))
+        (self.root / 'escape').symlink_to(self.outside)
+        with self.assertRaises(bridge.Denied):
+            policy.read(str(alias / 'escape'))
+        with self.assertRaises(bridge.Denied):
+            policy.read(str(alias.parent / 'outside.txt'))
+
     def test_traversal_absolute_and_symlink_escape_are_denied(self):
         (self.root / 'link').symlink_to(self.outside)
         for name in ['../outside.txt', str(self.outside), 'link']:

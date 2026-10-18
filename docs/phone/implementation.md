@@ -1036,3 +1036,21 @@ The runtime regression verifies cleanup, no dialing and idempotent restart. The
 transport regression verifies credential validation and local dial rejection.
 The daemon regression covers dry-run nonmutation, missing credentials and durable
 uncertain-call stop requests. Full live disable/restart receipts are still absent.
+
+### macOS canonical paths and shared tool permissions
+
+The macOS acceptance job progressed past bridge startup and exposed permitted
+file/attachment reads denied by `/var` versus `/private/var` spelling, plus the
+scope guard's reliance on GNU `readlink -m`. The bridge now normalizes only
+verified root-owned macOS `/tmp`, `/var` and `/etc` aliases; model-controlled
+symlinks still go through descriptor-based no-follow checks. Single-file Read
+allowances normalize both their configured directory and incoming path without
+granting Glob/Grep access. The shell guard uses Python canonicalization when
+GNU `-m` is unavailable, preserves protected requested names through system
+alias normalization, and compares attachment carve-outs using their `/tmp`
+spelling while other roots remain canonical.
+
+Local regression coverage simulates trusted alias spelling, checks rejection
+of untrusted aliases and user symlinks, and runs the real guard without GNU
+`-m`. The Linux capability inventory passes all nine tests; all 57 shell scope
+guard cases pass. Actual macOS CI remains required before declaring parity.

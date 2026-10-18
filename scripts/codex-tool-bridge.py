@@ -6,6 +6,7 @@ component. Commands are parsed into argv; model text is never evaluated by a she
 The execution transport is wired separately from this policy core.
 """
 import os
+import sys
 import json
 import hashlib
 import math
@@ -901,8 +902,34 @@ class HandoffJournal:
             self.save(state)
 
 
+def system_path_aliases():
+    """Only macOS root-controlled OS aliases may bypass component no-follow.
+
+    Never resolve arbitrary model paths: workspace symlinks remain forbidden.
+    """
+    if sys.platform != 'darwin':
+        return {}
+    try:
+        private = os.lstat('/private')
+        root = os.lstat('/')
+        if any(not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022
+               for info in (root, private)):
+            return {}
+        aliases = {}
+        for name in ('tmp', 'var', 'etc'):
+            alias = '/' + name
+            info = os.lstat(alias)
+            if (stat.S_ISLNK(info.st_mode) and info.st_uid == 0
+                    and os.readlink(alias) in ('private/' + name, '/private/' + name)):
+                aliases[alias] = '/private/' + name
+        return aliases
+    except OSError:
+        return {}
+
+
 class Policy:
     def __init__(self, config):
+        self.path_aliases = system_path_aliases()
         self.cwd = Path(config['cwd']).resolve(strict=True)
         self.environment = {k: os.environ[k] for k in
                             ('HOME', 'PATH', 'USER', 'LOGNAME', 'LANG', 'TERM',
@@ -998,8 +1025,13 @@ class Policy:
             result.append(path)
         return result
 
-    @staticmethod
-    def _allowances(entries):
+    def _system_path(self, name):
+        for alias, canonical in self.path_aliases.items():
+            if name == alias or name.startswith(alias + '/'):
+                return canonical + name[len(alias):]
+        return name
+
+    def _allowances(self, entries):
         """Validate Read allowances: exactly Read, a normalized absolute directory, a name pattern."""
         if not isinstance(entries, list):
             raise Denied('read allowances must be a list')
@@ -1016,7 +1048,7 @@ class Policy:
             if not isinstance(pattern, str) or not pattern:
                 raise Denied('read allowance requires a name pattern')
             try:
-                result.append((directory, re.compile(pattern)))
+                result.append((self._system_path(directory), re.compile(pattern)))
             except re.error as exc:
                 raise Denied('invalid read allowance pattern') from exc
         return result
@@ -1032,7 +1064,7 @@ class Policy:
                 or len(os.fsencode(name)) > MAX_PATH_BYTES
                 or any(part in ('', '.', '..') for part in name.split('/')[1:])):
             return None
-        directory, _, leaf = name.rpartition('/')
+        directory, _, leaf = self._system_path(name).rpartition('/')
         for allowed, expression in self.read_allowances:
             if directory == allowed and expression.fullmatch(leaf):
                 return directory, leaf
@@ -1099,7 +1131,7 @@ class Policy:
         # String form of Path(os.path.abspath(cwd / name)).relative_to(root):
         # abspath output is normalized and roots are resolved without a
         # trailing separator. Searches call this per entry, so avoid pathlib.
-        candidate = os.path.abspath(os.path.join(str(self.cwd), name))
+        candidate = self._system_path(os.path.abspath(os.path.join(str(self.cwd), name)))
         if len(os.fsencode(candidate)) > MAX_PATH_BYTES:
             raise Denied('path exceeds length limit')
         roots = self.write_roots if writing else self.read_roots
@@ -1348,7 +1380,7 @@ class Policy:
         The descriptor is the entry's verified parent directory and stays open
         only until the generator resumes.
         """
-        base = Path(os.path.abspath(self.cwd / path))
+        base = Path(self._system_path(os.path.abspath(self.cwd / path)))
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         verification = file_verification(self.write_roots)
         count = 0
