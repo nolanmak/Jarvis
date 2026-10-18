@@ -1186,3 +1186,19 @@ locally. The offline service-suite minimum is now 24, including maintenance
 status coverage. This closes shared-preset omission risk, not the entire AC08
 inventory: custom constructors, wrappers and all authenticated transport entry
 points still require explicit phone conformance coverage.
+
+### Portable journal write guard
+
+At `332110f7`, macOS passed the portable matcher tests and attachment-read
+conformance, but the ingest preset's ordinary Write failed in the full capability
+suite. Its journal guard still lacked the scope guard's fallback for GNU
+`readlink -m`. It now canonicalizes missing destinations using Python when that
+option is unavailable and preserves requested protected names across macOS
+system aliases.
+
+A local shim reproduces the absent `-m` behavior. Before the fix, two regressions
+incorrectly allowed writes through symlinks outside the wiki and into journal;
+after the fix, all 22 journal-guard checks pass. The packaged-bridge scoped-file
+contract also passes locally. Journal-guard tests now run explicitly in both OS
+CI jobs. New macOS conformance remains pending; this does not establish live
+phone or migration readiness.

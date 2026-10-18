@@ -16,6 +16,8 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
+      - 'scripts/aa-journal-guard.sh'
+      - 'scripts/tests/aa-journal-guard.test.sh'
       - 'scripts/phone-offline-tests.py'
       - 'scripts/tests/phone_offline_ci_test.py'
       - 'scripts/phone-live-receipt.py'
@@ -57,6 +59,8 @@ jobs:
         run: python3 -m unittest discover -s scripts/tests -p phone_live_receipt_test.py -v
       - name: Portable bridge search and parent lifetime
         run: python3 -m unittest scripts.tests.codex_tool_bridge_test.PortableGrepTests scripts.tests.codex_tool_bridge_test.TransportTests -v
+      - name: Journal write guard including portable path resolution
+        run: bash scripts/tests/aa-journal-guard.test.sh
       - name: Required offline suites
         run: python3 scripts/phone-offline-tests.py
       - name: CLI integration compiles
