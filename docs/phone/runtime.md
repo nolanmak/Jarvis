@@ -161,3 +161,56 @@ and nonzero exits. Entire integration targets must be unfiltered; explicitly
 named CLI test modules may filter only unrelated tests in the shared binary. `.github/workflows/phone.yml` runs the required targets on
 Linux and macOS. A workflow definition is not a passing CI run; neither offline
 CI nor local sockets substitute for the issue's live acceptance matrix.
+
+## Live qualification receipt format
+
+No live receipt is included in the repository. Offline fixtures are synthetic
+and must never be submitted as qualification. After opt-in owner participation,
+keep a JSON receipt and its consented WAV recordings together in a private
+directory outside the repository. Do not include destinations, verification
+codes, credentials or raw private conversation text in the JSON. Run:
+
+```sh
+python3 scripts/phone-live-receipt.py /private/evidence/receipt.json
+```
+
+Version 1 requires these top-level fields:
+
+- `version: 1`, `kind: "phone-live"`, `commit`: tested 40-character Git SHA.
+- `owner_audio_consent: true`, `number_setup_verified: true`: observed live
+  private setup, verification and subsequent call, not an operator assumption.
+- `measurement`: `{ "method": "recorded_audio", "description": "..." }`.
+  Explain capture placement, annotation method and clock alignment. The audio
+  must include the owner's speech and audible received playback. Server text
+  send/receive times do not measure end-to-end audible latency.
+- `calls`: the measured call records described below.
+- `approval`: `call_index` (zero-based), `session_id`, `pending_observed: true`,
+  `executed_before_resolution: false`, `resolution: "approved"`, and
+  `executed_after_resolution: true`, backed by the existing approval system's
+  native event trace. Review that trace alongside the receipt.
+
+Each call records `host` (`linux` or `macos`), `architecture` (`x86_64` or
+`arm64`), `provider` (`claude` or `codex`), `origin` (`discord`, `slack` or
+`whatsapp`), `voice`, `provider_settings` (including
+`transport: "conversationrelay"`), `outcome: "completed"`, and
+`hangup_confirmed: true`. The `sessions` array contains the native session IDs
+for text before the call, every measured phone turn, and text after the call.
+All must be the same. `read_only_tool` records `completed: true` and its
+`session_id`; verify the invocation and result in the native event trace.
+
+`audio` contains `path` (relative WAV path within the receipt directory) and
+`sha256`. `turns` contains at least three objects with `owner_end_ms`,
+`response_start_ms`, and Boolean `used_tools`. `interruptions` contains at least
+one object with `owner_start_ms` and `playback_stop_ms`. All offsets refer to
+the associated audio file, in milliseconds. Hashes, complete WAV frame data,
+nonnegative finite offsets and audio bounds are checked. Reusing the same
+recorded response sample does not add coverage.
+
+The matrix requires both native providers on Linux and on macOS ARM and Intel,
+with all three chat origins represented. At least 20 no-tool turns must yield
+nearest-rank p95 ≤5000 ms. At least five interruption trials must each stop
+audible playback within 1000 ms. Every call must include an interruption,
+read-only tool and confirmed hangup; at least one call demonstrates approval
+gating. These are structural/timing checks, not proof that annotations or
+declared tool events are truthful. Review the audio and native traces before
+accepting AC10, and retain the separate migration/rollback evidence for AC11–12.

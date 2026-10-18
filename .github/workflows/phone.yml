@@ -16,6 +16,8 @@ on:
       - 'rust-toolchain.toml'
       - 'scripts/phone-offline-tests.py'
       - 'scripts/tests/phone_offline_ci_test.py'
+      - 'scripts/phone-live-receipt.py'
+      - 'scripts/tests/phone_live_receipt_test.py'
       - '.github/workflows/phone.yml'
   push:
     branches: [main]
@@ -49,6 +51,8 @@ jobs:
           key: phone-offline
       - name: Check that the runner rejects missing or skipped coverage
         run: python3 -m unittest discover -s scripts/tests -p phone_offline_ci_test.py -v
+      - name: Live receipt validator (synthetic fixtures only)
+        run: python3 -m unittest discover -s scripts/tests -p phone_live_receipt_test.py -v
       - name: Required offline suites
         run: python3 scripts/phone-offline-tests.py
       - name: CLI integration compiles

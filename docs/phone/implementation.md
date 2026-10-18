@@ -71,19 +71,19 @@ AUGMENTAGENT_GH_DISABLE=1 cargo test -p augmentagent-phone
 
 | Criteria | Evidence so far | Remaining proof/work |
 | --- | --- | --- |
-| AC01 | Disabled/config validation, listener/watchdog, Slack/Discord daemon installation and operator contract | WhatsApp adapter, deployed ingress and live TLS receipts |
-| AC02 | Grant, revocation, expiry, forged target tests | Production surface and MCP boundaries |
-| AC03 | Ten concurrent reservations; restart/uncertain tests | Provider reconciliation and runtime concurrency fault injection |
-| AC04 | Known signature fixture, signed/reordered callbacks and local HTTP ingress | Complete stale-binding callback coverage, live callbacks and final-duration accounting |
-| AC05 | Signed start/accept tests; fake-clock watchdog | Runtime watchdog and voicemail/live timing |
-| AC06 | Offline Claude/Codex text → phone → text continuity, common queue and Slack harness regressions | Actual tool/approval continuation and live native-agent evidence |
-| AC07 | Relay protocol, barge-in generations, final suppression, one-time claim; real local WSS-protocol round trip and disconnect cleanup | Native durable turn integration, cancellation/streaming |
-| AC08 | Slack/Discord daemon adapters, private socket entry and durable speech mirrors with retry/reopen tests | WhatsApp adapter, preset inventory and live surface receipts |
-| AC09 | Rate/daily budgets, restart, concurrent watchdog and shared cleanup guards | Provider-duration reconciliation, disable-at-start cleanup and live failure receipts |
-| AC10 | None for live conversations | Full live host/provider/origin and audible-latency matrix |
-| AC11 | No legacy voice removed yet | Replacement qualification, migration and retirement |
-| AC12 | Targeted local tests | OS CI, full regression map and live receipts |
-| AC13–15 | Verification/store tests; Slack/Discord private command routing and privacy tests; first-time Discord DM setup from explicit owner links | WhatsApp adapter and live number setup |
+| AC01 | Disabled/config validation; signed ingress; all three daemon adapters; cleanup when normal startup is unavailable | Deployed ingress and live TLS receipts |
+| AC02 | Grants, revocation, expiry, forged targets, authenticated MCP and surface boundaries | Complete live boundary evidence |
+| AC03 | Concurrent reservations, durable deduplication and uncertain-create/restart tests | Missing-callback provider reconciliation and live runtime fault evidence |
+| AC04 | Signed/reordered callbacks, local ingress, immutable final duration and signed event-time accounting | Live callbacks and reconciliation when final callbacks never arrive |
+| AC05 | Signed acceptance, fake-clock deadline tests and concurrent runtime watchdog | Voicemail and live acceptance timing |
+| AC06 | Both native providers: text → phone → text continuity; shared queue; deferred/cancellable initial history | Actual native tool/approval continuation and live evidence |
+| AC07 | Relay/barge-in generations, final suppression, one-time claims, local WSS round trip and cancellation | Complete live streaming/interruption and tool-disconnect proof |
+| AC08 | Discord, Slack and WhatsApp daemon adapters; authenticated tools; durable transcript outboxes | Exhaustive authenticated-surface/preset inventory and live origin receipts |
+| AC09 | Persistent budgets, provider-duration callbacks, bounded shutdown and disabled/unavailable-start cleanup | Missing-callback reconciliation and live stop/restart/disable evidence |
+| AC10 | Recorded-audio receipt validator and synthetic regression tests only | Actual consented audio, native traces and full live matrix; no live receipt exists |
+| AC11 | No legacy voice removed yet | Replacement qualification, upgrade/rollback fixtures and retirement |
+| AC12 | Required offline runner and local regression receipts; OS CI configured | Passing current-head OS CI, complete evidence map and live receipts |
+| AC13–15 | Private commands, verification, durable settings and privacy tests across all three adapters | Live private setup/verification followed by a successful conversational call |
 
 The old conversational voice stack must not be removed before replacement
 qualification. Its shared session/history functionality and inbound voice-file
