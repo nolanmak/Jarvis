@@ -1281,3 +1281,20 @@ This exercises production query context and approval handling around scripted
 native providers. It does not establish a live model proposing/using an
 approval-gated tool, real external effects, or complete Slack/WhatsApp approval
 conformance. Those remaining proofs are not replaced by this fixture.
+# Additive database migration regression
+
+`augmentagent-store/tests/phone_migration.rs` seeds six native bindings
+(Discord, Slack and WhatsApp, each with Claude and Codex), pending native turns,
+retained inbound history and a pending approval in a temporary database. It
+removes the empty phone tables to model the pre-phone migration boundary, then
+opens the store twice. Both starts must recreate the phone tables, preserve all
+columns of the seeded non-phone rows, retain native IDs and pending approval
+status, and continue rejecting overlapping native turns. The test is required
+by `scripts/phone-offline-tests.py` and passed locally.
+
+This is a synthetic additive-schema fixture, not an old-release binary upgrade
+or rollback receipt. AC11 remains incomplete until installer/rollback coverage
+and qualified legacy retirement are complete. The parity inventory also tracks
+the operator-only `phone-reconcile` command under #1496 as unverified; adding
+the inventory entry fixes the two inventory assertions that failed CI at
+`736a8ebe` without claiming live macOS evidence.

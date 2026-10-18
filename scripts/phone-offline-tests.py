@@ -25,6 +25,7 @@ SUITES = [
     ("augmentagent-phone", "--test", "config", 1),
     ("augmentagent-phone", "--test", "runtime", 3),
     ("augmentagent-store", "--test", "phone_calls", 17),
+    ("augmentagent-store", "--test", "phone_migration", 1),
     ("augmentagent-store", "--test", "surface_owner", 18),
     ("augmentagent-store", "--test", "surface_delivery", 36),
     ("augmentagent-approval-discord", "--lib", None, 255),
