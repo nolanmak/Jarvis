@@ -222,6 +222,15 @@ async fn discord_phone_dm_text_reuses_native_session_without_legacy_voice() {
                     wiki.clone(),
                     Arc::new(|_| Ok(None)),
                 );
+                let proposal = crate::calendar_approval_tests::proposal(&store);
+                let mut provider = mockito::Server::new_async().await;
+                let effect = provider.mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_CREATE_EVENT")
+                    .with_status(200)
+                    .with_body(r#"{"successful":true,"data":{"response_data":{"id":"synthetic-phone-event"}}}"#)
+                    .expect(1).create_async().await;
+                let mut approver = crate::test_support::approver_with_store(store.clone());
+                approver.calendar = Arc::new(augmentagent_channel_calendar::ComposioCalendarClient::new("test".into())
+                    .with_base_url(provider.url()));
                 for index in 0..3 {
                     bridge
                         .run(
@@ -233,7 +242,26 @@ async fn discord_phone_dm_text_reuses_native_session_without_legacy_voice() {
                         )
                         .await
                         .unwrap();
+                    if index < 2 {
+                        assert_eq!(store.get_action_with_email(&proposal).unwrap().unwrap().action.status, "pending");
+                        assert!(!effect.matched_async().await, "phone turn executed an unapproved proposal");
+                    }
+                    if index == 1 {
+                        let decision = augmentagent_approval_discord::interaction::DecisionContext {
+                            surface:"discord".into(), actor:"33".into(), conversation:"22".into(),
+                            interaction_id:"synthetic-phone-approval".into(), revision:None,
+                        };
+                        let outcome = augmentagent_approval_discord::interaction::deciding(decision,
+                            approver.approve(&proposal)).await;
+                        assert!(matches!(outcome, ApprovalActionOutcome::CalendarCreated { .. }));
+                    }
                 }
+                effect.assert_async().await;
+                assert_eq!(store.get_action_with_email(&proposal).unwrap().unwrap().action.status, "sent");
+                let approval_turns = calls.lock().unwrap();
+                assert!(approval_turns.last().unwrap().1.contains(&proposal));
+                assert!(approval_turns.last().unwrap().1.contains("completed"));
+                drop(approval_turns);
                 let reopened = Store::open(dir.path().join("db")).unwrap();
                 let queued = reopened
                     .outbound_sends_with_key_prefix(owner.account(), "phone-mirror:", &[])

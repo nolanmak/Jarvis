@@ -1266,3 +1266,18 @@ The Linux CI artifact from run `39164986729` reports 594 tests across 42 suites,
 all passing, on clean synthetic merge commit `5434fb98` (parents `886c0950` and
 `27462482`). CLI compilation and phone lint also passed. This is checkpoint
 CI evidence, not a current-head or macOS pass.
+
+### Approval remains explicit during Discord phone turns
+
+The production Discord query/PhoneAgent fixture now seeds a pending synthetic
+calendar proposal and uses the real ReplyApprover with a local mock provider.
+Two phone turns leave the action pending and produce zero matching provider
+requests. An explicit owner decision through the existing interaction context
+then creates exactly one provider request; the next phone turn receives the
+completed approval record while preserving the native session. The test passes
+for both Claude and Codex provider selections.
+
+This exercises production query context and approval handling around scripted
+native providers. It does not establish a live model proposing/using an
+approval-gated tool, real external effects, or complete Slack/WhatsApp approval
+conformance. Those remaining proofs are not replaced by this fixture.
