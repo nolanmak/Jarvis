@@ -24,6 +24,7 @@ augmentagent-channel-twitter = { path = "../augmentagent-channel-twitter" }
 augmentagent-channel-socialapi = { path = "../augmentagent-channel-socialapi" }
 augmentagent-channel-discord-dm = { path = "../augmentagent-channel-discord-dm" }
 augmentagent-channel-slack = { path = "../augmentagent-channel-slack" }
+augmentagent-channel-whatsapp = { path = "../augmentagent-channel-whatsapp" }
 augmentagent-channel-github = { path = "../augmentagent-channel-github" }
 augmentagent-channel-meetup = { path = "../augmentagent-channel-meetup" }
 augmentagent-channel-gdrive = { path = "../augmentagent-channel-gdrive" }

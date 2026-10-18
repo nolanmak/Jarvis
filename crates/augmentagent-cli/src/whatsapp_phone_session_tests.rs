@@ -1,9 +1,6 @@
 use super::discord_phone_session_tests::{FixturePhone, Native};
 use super::*;
-use augmentagent_channel_core::{
-    phone_agent::{ConversationIo, PhoneAgent},
-    providers::ProviderKind,
-};
+use augmentagent_channel_core::{phone_agent::PhoneAgent, providers::ProviderKind};
 use augmentagent_phone::{tools::ToolServer, OwnerLink, PhoneConfig, PhoneService, SystemClock};
 use augmentagent_store::{
     owner::ControlConversationKind,
@@ -32,19 +29,11 @@ impl augmentagent_channel_core::Reasoner for RebindingNative {
         Ok(answer)
     }
 }
-struct Io;
+struct History;
 #[async_trait]
-impl ConversationIo for Io {
-    async fn history(&self, _: &PhoneOrigin) -> Result<String> {
+impl augmentagent_channel_whatsapp::phone_delivery::History for History {
+    async fn transcript(&self, _: &PhoneOrigin) -> Result<String> {
         anyhow::bail!("bound history must not be reloaded")
-    }
-    async fn mirror(&self, _: &PhoneOrigin, _: &str, _: &str) -> Result<()> {
-        Ok(())
-    }
-    fn audit_context(&self, _: &PhoneOrigin, id: &str) -> augmentagent_approval_discord::AuditCtx {
-        let mut ctx = augmentagent_approval_discord::AuditCtx::empty();
-        ctx.session_id = id.into();
-        ctx
     }
 }
 #[tokio::test]
@@ -129,7 +118,7 @@ async fn whatsapp_text_phone_text_preserves_native_session_and_tools() {
             store.clone(),
             false,
         ));
-        assert!(query.phone_tools.set(tools).is_ok());
+        assert!(query.phone_tools.set(tools.clone()).is_ok());
         let origin = PhoneOrigin {
             owner: owner.clone(),
             conversation: chat.clone(),
@@ -170,7 +159,16 @@ async fn whatsapp_text_phone_text_preserves_native_session_and_tools() {
             store.clone(),
             service,
             query.clone(),
-            Arc::new(Io),
+            Arc::new(
+                augmentagent_channel_whatsapp::phone_delivery::WhatsappPhoneIo::new(
+                    store.clone(),
+                    tools,
+                    augmentagent_channel_whatsapp::Jid::new(owner.sender_id()),
+                    Arc::new(History),
+                    Arc::new(tokio::sync::Notify::new()),
+                )
+                .unwrap(),
+            ),
             wiki,
             Arc::new(|_| Ok(None)),
         );
@@ -186,6 +184,12 @@ async fn whatsapp_text_phone_text_preserves_native_session_and_tools() {
                 .await
                 .unwrap();
         }
+        let reopened = Store::open(dir.path().join("db")).unwrap();
+        let mirrors = reopened
+            .outbound_sends_with_key_prefix(owner.account(), "phone-mirror:", &[])
+            .unwrap();
+        assert_eq!(mirrors.len(), 6);
+        assert!(mirrors.iter().all(|send| send.conversation == chat));
         audit.session_id = format!("wa:{}:text-two", chat.conversation_id());
         augmentagent_phone::context::scope(
             origin.clone(),

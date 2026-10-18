@@ -752,3 +752,49 @@ Validation: all 35 required offline suites / 523 tests pass in
 the existing Discord native-session and legacy voice regressions. WhatsApp
 all-target Clippy with `--no-deps -D warnings` and both Python runner checks pass.
 No real model, WhatsApp or Twilio calls were made for these fixtures.
+
+### Durable WhatsApp phone transcript IO
+
+`WhatsappPhoneIo` now queues PhoneAgent transcript messages in the shared outbox
+and wakes delivery. It checks the authenticated linked owner, explicit phone
+link and stored direct self-chat binding. Its history source is injected and
+bounded; history errors propagate rather than silently replacing context.
+Messages are split into bounded WhatsApp parts and inserted atomically, with
+stable local delivery keys and a hash of the complete message. Repeating the
+same key/content is idempotent; changed content or authority cannot append a
+partial replacement. Queue claims are scoped to the WhatsApp account and phone
+mirror prefix.
+
+The actual WaClient transport rechecks authority revision, linked identity,
+phone grant, outbound allowlist and control flag before sending. Confirmed
+NotPaired/NotConnected failures may retry with bounded backoff; BadRequest is
+permanent. Lost replies, timeouts, empty IDs and other uncertain results enter
+reconciliation without another send. Restart recovery also leaves interrupted
+sends for reconciliation. Unknown outcomes remain visible in the outbox.
+
+The generic reconciliation interface accepts positive delivery evidence, but the
+current WhatsApp sidecar does not yet expose lookup by the local delivery key.
+The production transport therefore cannot automatically resolve unknown posts;
+they remain parked. Extending the sidecar protocol with durable delivery-key
+lookup is required before this part is complete. Local keys are not claimed to
+provide provider-side deduplication.
+
+Test-first logs: `/tmp/1496-wa-delivery-red.log` and
+`/tmp/1496-wa-mirror-red.log`. Green tests cover atomic multipart reopen/retry,
+changed-content rejection, revoked binding, interrupted-send recovery, positive
+fake reconciliation and inconclusive parking. A real WaClient with a local fake
+sidecar checks send gates, successful posting and unknown SendFailed handling,
+with no extra requests on retry. The CLI native-session fixture now uses real
+WhatsappPhoneIo rather than a transcript stub and verifies six durable owner/
+assistant mirror rows after three phone turns and store reopen. Its history
+fixture still requires an existing native session; this does not qualify a live
+history source or real WhatsApp delivery.
+
+Daemon registration, delivery worker, initial WhatsApp owner provisioning,
+filtered history, sidecar reconciliation, tool/approval continuation and the
+shared lifecycle/duration/live migration gates remain unfinished.
+
+Validation: all 36 required offline suites / 527 tests pass in
+`/tmp/1496-wa-delivery-offline/receipt.json` (dirty worktree at execution).
+WhatsApp all-target Clippy with `--no-deps -D warnings` and both Python runner
+checks pass. No live WhatsApp messages or Twilio calls were made.
