@@ -115,3 +115,7 @@ mockito = "1"
 # Same version the workspace already resolves (serenity, the Slack crate).
 tokio-tungstenite = "0.21"
 futures = { workspace = true }
+# Phone callback signatures in the offline daemon adapter test.
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"

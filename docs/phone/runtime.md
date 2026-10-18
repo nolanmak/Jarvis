@@ -1,10 +1,15 @@
 # Phone runtime and operator configuration
 
-Implementation status: the configuration loader, private MCP broker, phone-only
-HTTP/WSS server and continuous watchdog exist and have offline tests. `serve`
-still needs to install this runtime and its Discord/Slack/WhatsApp conversation
-adapters. Setting these variables alone does **not** enable working chat calls
-in the current checkpoint. Live TLS, provider and host qualification remain open.
+Implementation status: `serve` now installs the shared phone runtime and Slack
+adapter when phone is enabled, configuration is complete, `--wiki-dir` is set,
+and the daemon is not in dry run. Slack must also have an installed app and a
+bound owner. The text handler and phone bridge share the same query handler,
+native session scheduler and durable Slack outbox. The debug synthetic Slack
+handler does not enable real phone commands.
+
+Discord and WhatsApp adapters are not yet installed. Public TLS/provider setup,
+actual audio, approvals during a phone call and the full live host matrix still
+need qualification. This is not a declaration of production readiness.
 
 ## Configuration contract
 
@@ -64,11 +69,18 @@ successful earlier one-way test call is not evidence for Relay operation.
 
 ## Runtime integration and shutdown
 
-The daemon will load `config::Settings`, build it against the shared store,
-construct the existing-agent bridge with durable conversation delivery, bind the
-loopback listener, then call `runtime::PhoneRuntime::start`. Install
-`runtime.tools()` on the existing query handler and scope each authenticated
-text turn with its trusted `PhoneOrigin`. Keep the runtime handle alive.
+The daemon loads `config::Settings`, builds it against the shared store, binds
+the loopback listener, and calls `runtime::PhoneRuntime::start`. It installs the
+private tool endpoint on Slack's existing query handler. Authenticated text turns
+carry a trusted `PhoneOrigin`; the phone router resolves the persisted origin
+and selects the registered platform adapter. Registration ends with that
+surface's handler. A missing adapter fails closed rather than selecting another
+conversation.
+
+Slack speech transcripts and answers are enqueued on its existing outbox with
+stable idempotency keys and a shared sender wakeup. Delivery retries do not
+rerun the native turn or dial another call. The same outbox is recovered on
+restart. The daemon supervises phone runtime health and drains it on shutdown.
 
 Startup marks preexisting active calls stopped **before** handing the runtime
 back to command adapters. It never redials them. The watchdog scans every 250 ms
@@ -83,7 +95,11 @@ Dropping the handle initiates the same cancellation. Cleanup has a bounded
 reports failure, rather than claiming hangup succeeded. A missing provider SID
 remains uncertain and cannot be automatically redialed. Runtime task failure
 cancels the sibling listener/watchdog. `is_running()` supports daemon supervision;
-`shutdown()` provides the final task result.
+`shutdown()` provides the final task result. The daemon logs phone failures without
+propagating them into unrelated text/approval runners. Its existing shared
+20-second process drain budget can end before the standalone runtime’s
+35-second cleanup window; pending records and provider-side caps remain the
+recovery mechanism. A full graceful-stop qualification is still required.
 
 Disable-at-start handling still needs daemon integration: turning the flag off
 must reconcile existing calls while leaving text and approvals usable. Do not
@@ -98,7 +114,8 @@ cargo clippy -p augmentagent-phone --all-targets --no-deps --locked -- -D warnin
 ```
 
 The runner produces `target/phone-offline/receipt.json` and per-suite logs. It
-rejects missing targets, zero/insufficient executed tests, skipped/filtered tests
-and nonzero exits. `.github/workflows/phone.yml` runs the required targets on
+rejects missing targets, zero/insufficient executed tests, skipped required tests
+and nonzero exits. Entire integration targets must be unfiltered; explicitly
+named CLI test modules may filter only unrelated tests in the shared binary. `.github/workflows/phone.yml` runs the required targets on
 Linux and macOS. A workflow definition is not a passing CI run; neither offline
 CI nor local sockets substitute for the issue's live acceptance matrix.

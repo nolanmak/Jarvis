@@ -71,14 +71,14 @@ AUGMENTAGENT_GH_DISABLE=1 cargo test -p augmentagent-phone
 
 | Criteria | Evidence so far | Remaining proof/work |
 | --- | --- | --- |
-| AC01 | Disabled/config validation, loopback listener and runtime tests; operator contract | Daemon installation, deployed ingress and live TLS receipts |
+| AC01 | Disabled/config validation, listener/watchdog, Slack daemon installation and operator contract | Remaining surface adapters, deployed ingress and live TLS receipts |
 | AC02 | Grant, revocation, expiry, forged target tests | Production surface and MCP boundaries |
 | AC03 | Ten concurrent reservations; restart/uncertain tests | Provider reconciliation and runtime concurrency fault injection |
-| AC04 | Known Twilio signature fixture; signed status callbacks; reordered events; real local HTTP ingress | Live callbacks and final-duration accounting |
+| AC04 | Known signature fixture, signed/reordered callbacks and local HTTP ingress | Complete stale-binding callback coverage, live callbacks and final-duration accounting |
 | AC05 | Signed start/accept tests; fake-clock watchdog | Runtime watchdog and voicemail/live timing |
 | AC06 | Offline Claude/Codex text → phone → text continuity, common queue and Slack harness regressions | Actual tool/approval continuation and live native-agent evidence |
 | AC07 | Relay protocol, barge-in generations, final suppression, one-time claim; real local WSS-protocol round trip and disconnect cleanup | Native durable turn integration, cancellation/streaming |
-| AC08 | Shared contract plus Slack socket command path, private entry, outbox replies and trusted turn context | Daemon installation, Discord/WhatsApp adapters, preset inventory and durable spoken-turn mirrors |
+| AC08 | Slack daemon/tool adapter, private socket entry and durable speech mirrors with retry/reopen tests | Discord/WhatsApp adapters, preset inventory and live surface receipts |
 | AC09 | Rate/daily budgets, restart, concurrent watchdog and shared cleanup guards | Provider-duration reconciliation, disable-at-start cleanup and live failure receipts |
 | AC10 | None for live conversations | Full live host/provider/origin and audible-latency matrix |
 | AC11 | No legacy voice removed yet | Replacement qualification, migration and retirement |
@@ -224,3 +224,54 @@ CLI `cargo check --locked`, and Slack library Clippy with warnings denied also
 pass. These development logs ran against uncommitted changes; their HEAD SHA
 alone does not identify the tested tree. Future runner receipts explicitly mark
 `worktree_dirty`; remote clean-checkout CI remains the commit-specific evidence.
+
+
+## Slack daemon and durable phone conversation checkpoint
+
+`serve` now creates one shared phone runtime (default off, no dry-run calls) and
+hands its endpoint to Slack's existing query handler and interactive surface.
+The phone router uses the persisted call origin and a revocable platform
+registration. Slack's phone bridge uses the same `WikiQuerier`, selection policy
+and common native session runner as text. Runtime health is supervised and
+shutdown drains the phone service. Missing/invalid configuration leaves phone
+unavailable while other daemon surfaces continue.
+
+`SlackPhoneIo` rechecks the owner/control binding, fetches the existing filtered
+history for a cold session, and enqueues spoken turns/final answers through the
+existing durable Slack delivery planner. It shares the sender wakeup and retains
+the original channel/thread. A reopen/rate-limit fixture retries delivery without
+rerunning the agent or duplicating transcript sends.
+
+The CLI adapter test drives an authenticated text `call me` through the private
+Unix tool endpoint, accepts a fake call, sends three finalized WebSocket prompts
+through the real listener/router, checks tool injection, drains six Slack
+transcript posts, then resumes text. Claude and Codex both observe the same native
+session throughout. Provider transport and native model execution remain fakes;
+this does not prove real speech timing or gated tool approvals.
+
+Test-first records: `/tmp/1496-slack-delivery-{red,green}.log` and
+`/tmp/1496-router-{red,green}.log` first failed on missing adapter APIs;
+`/tmp/1496-cli-ci-selector-{red,green}.log` covers explicit named CLI selection
+without permitting zero/ignored required cases. The full CLI test build found
+nine fixture constructors missing the earlier phone endpoint field; those are
+now updated. The daemon adapter passes in `/tmp/1496-daemon-slack-test.log`.
+
+The expanded offline runner passed 20 suites / 140 tests locally, with a dirty
+worktree recorded in `/tmp/1496-daemon-slack-offline/receipt.json`. It includes
+the new delivery/daemon tests and existing CLI surface-conformance and Discord
+voice-session regressions. Remote CI and live receipts remain outstanding.
+Disable-at-start cleanup, complete stale-binding/final-duration handling,
+Discord/WhatsApp installation, the production preset inventory, real approval/tool
+qualification and legacy voice retirement are still required for #1496.
+
+
+A follow-up supervisor regression (`/tmp/1496-daemon-cleanup-isolation-red.log`)
+proved that propagating a phone cleanup error would fail the daemon task drain.
+The CLI supervisor now logs the incomplete cleanup and returns without failing
+other runners; the uncertain call remains marked for cleanup in the store.
+The shared process drain budget is shorter than the standalone phone cleanup
+window, so full graceful-stop/disable qualification remains open.
+
+The follow-up supervisor and daemon integration tests both pass in
+`/tmp/1496-daemon-cleanup-isolation-green.log` (2 tests). This is targeted
+evidence after the 140-test full runner receipt above.

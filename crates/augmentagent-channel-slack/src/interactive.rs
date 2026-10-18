@@ -871,7 +871,7 @@ struct Ctx {
     health: SlackSurfaceHealth,
     clock: Clock,
     dispatch_wake: Notify,
-    send_wake: Notify,
+    send_wake: Arc<Notify>,
     /// Where owner files go (`None`: no state directory on this host).
     inbound: Option<InboundOptions>,
     /// #1288 — the running turn of each conversation, by storage key, so a
@@ -943,6 +943,7 @@ impl OwnerInputSink for CollectInput {
 /// The interactive Slack surface. Build with [`new`](Self::new), then
 /// [`run`](Self::run) until shutdown.
 pub struct SlackInteractiveSurface {
+    outbox_wake: Arc<Notify>,
     store: Arc<Store>,
     workspaces: Vec<SlackWorkspaceRuntime>,
     connectors: Vec<Arc<dyn SocketConnector>>,
@@ -970,6 +971,7 @@ impl SlackInteractiveSurface {
         config: SlackSurfaceConfig,
     ) -> Self {
         Self {
+            outbox_wake: Arc::new(Notify::new()),
             store,
             workspaces,
             connectors,
@@ -987,6 +989,12 @@ impl SlackInteractiveSurface {
     /// ordinary inbox persistence even when this endpoint is not configured.
     pub fn with_phone(mut self, phone: Arc<augmentagent_phone::PhoneService>) -> Self {
         self.phone = Some(phone);
+        self
+    }
+
+    /// Share the sender wakeup with durable phone transcript delivery.
+    pub fn with_outbox_wake(mut self, wake: Arc<Notify>) -> Self {
+        self.outbox_wake = wake;
         self
     }
 
@@ -1054,7 +1062,7 @@ impl SlackInteractiveSurface {
             health: health.clone(),
             clock: self.clock,
             dispatch_wake: Notify::new(),
-            send_wake: Notify::new(),
+            send_wake: self.outbox_wake,
             inbound,
             running: Mutex::new(HashMap::new()),
             approvals: self.approvals,

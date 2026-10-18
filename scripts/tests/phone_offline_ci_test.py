@@ -16,3 +16,13 @@ class PhoneOfflineCiTest(unittest.TestCase):
             with self.subTest(output=output, code=code):
                 with self.assertRaises(ValueError):
                     module.validate_output(output, code, 3)
+
+    def test_named_cli_target_can_filter_unrelated_tests_but_cannot_skip_required_case(self):
+        spec = importlib.util.spec_from_file_location("phone_offline", PATH)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        good = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2000 filtered out; finished in 0.1s"
+        self.assertEqual(module.validate_output(good, 0, 1, allow_filtered=True), 1)
+        for bad in [good.replace("1 passed", "0 passed"), good.replace("0 ignored", "1 ignored")]:
+            with self.assertRaises(ValueError):
+                module.validate_output(bad, 0, 1, allow_filtered=True)

@@ -7,6 +7,7 @@ mod provider_migration_tests;
 mod model_tool;
 mod composio_auth_tool;
 mod voice_tool;
+mod phone_runtime;
 mod computer_tool;
 #[cfg(test)]
 mod provider_channel_tests;
@@ -3492,6 +3493,17 @@ async fn main() -> Result<()> {
             });
             // Collect the enabled channels' runners + optional digest scheduler.
             let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
+            let phone = if cli.wiki_dir.is_some() {
+                match phone_runtime::start(Arc::clone(&store), dry_run).await {
+                    Ok(Some((endpoint, runtime))) => {
+                        tasks.push(tokio::spawn(phone_runtime::supervise(runtime, shutdown.clone())));
+                        Some(endpoint)
+                    }
+                    Ok(None) => None,
+                    Err(_) => { warn!("phone runtime unavailable: check private phone configuration and loopback listener"); None }
+                }
+            } else { None };
+
 
             // #1412 — drop action bodies that only repeat the stored email,
             // shortly after start and hourly, in small batches.
@@ -3774,33 +3786,36 @@ async fn main() -> Result<()> {
             {
                 let store_q = Arc::clone(&store);
                 let wiki_root = cli.wiki_dir.clone();
+                let phone_q = phone.clone();
+                let phone_service = phone.as_ref().map(|endpoint| endpoint.service.clone());
                 // Only a surface that got the approval handler takes clicks.
                 let slack_approvals = slack_approvals.filter(|_| approver.is_some());
                 tasks.push(slack_serve::spawn(
                     Arc::clone(&store),
                     slack_plan,
-                    move |history| -> Arc<dyn augmentagent_channel_slack::interactive::SlackTurnHandler> {
-                        match wiki_root {
-                            // #1288 — the shared conversation harness over
-                            // the same WikiQuerier Discord answers with.
-                            Some(root) => slack_serve::conversation_handler(
-                                Arc::clone(&store_q),
-                                Arc::new(wiki_querier(
-                                    build_reasoner(),
-                                    root.clone(),
-                                    std::env::current_dir()
-                                        .unwrap_or_else(|_| PathBuf::from(".")),
-                                    store_q,
-                                    false,
-                                )),
-                                root,
-                                history,
-                            ),
-                            None => Arc::new(slack_serve::NoQueryHandler),
+                    move |history, wake| -> Result<Arc<dyn augmentagent_channel_slack::interactive::SlackTurnHandler>> {
+                        let Some(root) = wiki_root else { return Ok(Arc::new(slack_serve::NoQueryHandler)); };
+                        let query = wiki_querier(
+                            build_reasoner(), root.clone(),
+                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                            store_q.clone(), false,
+                        );
+                        if let Some(endpoint) = &phone_q {
+                            let _ = query.phone_tools.set(endpoint.tools.clone());
+                        }
+                        let query: Arc<dyn QueryHandler> = Arc::new(query);
+                        let handler = slack_serve::conversation_handler(
+                            store_q.clone(), query.clone(), root.clone(),
+                            history.clone().map(|h| h as Arc<dyn augmentagent_channel_slack::history::TurnHistory>),
+                        );
+                        match phone_q {
+                            Some(endpoint) => phone_runtime::attach_slack(&endpoint, store_q, query, root, history, wake, handler),
+                            None => Ok(handler),
                         }
                     },
                     slack_approvals,
                     slack_commands,
+                    phone_service,
                     slack_live,
                     dry_run,
                     shutdown.clone(),

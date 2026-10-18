@@ -741,3 +741,55 @@ async fn ac13_number_commands_consume_codes_without_returning_them_to_history() 
     assert!(status.contains("0456"));
     assert!(!status.contains("+12025550456"));
 }
+
+#[tokio::test]
+async fn phone_router_uses_persisted_origin_and_revocable_adapter_registration() {
+    use augmentagent_phone::{
+        ingress::{AgentError, ConversationAgent, SpeechSender},
+        router::AgentRouter,
+    };
+    use augmentagent_store::phone::PhoneCall;
+    struct Agent(std::sync::atomic::AtomicUsize);
+    #[async_trait]
+    impl ConversationAgent for Agent {
+        async fn answer(
+            &self,
+            _: &PhoneCall,
+            _: &str,
+            _: &str,
+            _: SpeechSender,
+            _: tokio_util::sync::CancellationToken,
+        ) -> Result<String, AgentError> {
+            Ok("answer".into())
+        }
+        async fn interrupted(&self, _: &PhoneCall, _: &str) -> Result<(), AgentError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let f = fixture("slack", true, true, false);
+    let router = AgentRouter::new(f.store.clone());
+    let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
+    let receipt = f
+        .service
+        .tool(&grant, "call_owner", json!({"request_id":"routed"}))
+        .await
+        .unwrap();
+    let call = f
+        .store
+        .phone_provider_call(receipt["id"].as_str().unwrap())
+        .unwrap();
+    let agent = Arc::new(Agent(std::sync::atomic::AtomicUsize::new(0)));
+    let wrong = router.register("discord", agent.clone()).unwrap();
+    assert!(router.interrupted(&call, "heard").await.is_err());
+    drop(wrong);
+    let registration = router.register("slack", agent.clone()).unwrap();
+    assert!(router.register("slack", agent.clone()).is_err());
+    router.interrupted(&call, "heard").await.unwrap();
+    let mut forged = call.clone();
+    forged.conversation = "another conversation".into();
+    assert!(router.interrupted(&forged, "secret").await.is_err());
+    drop(registration);
+    assert!(router.interrupted(&call, "heard").await.is_err());
+    assert_eq!(agent.0.load(Ordering::SeqCst), 1);
+}
