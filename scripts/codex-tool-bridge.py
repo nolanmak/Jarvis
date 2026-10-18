@@ -18,7 +18,7 @@ import shlex
 import stat
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from pathlib import Path
 
 
@@ -358,15 +358,58 @@ class SearchBudget:
 
 # Runs as `python3 -I -S -c GREP_MATCHER <bridge pid>` with an empty environment.
 # It receives the pattern and already scope-checked file bytes on stdin (an
-# in-memory file), never a path, so it cannot open anything itself. It exits
-# with the bridge (parent death signal) and on a 3 s CPU limit even if the
+# private unlinked file), never a path, so it cannot open anything itself. It exits
+# with the bridge (parent death signal or kernel exit monitor) and on a 3 s CPU limit even if the
 # bridge is SIGKILLed. Per-line matching is the same as the earlier in-process
 # implementation.
 GREP_MATCHER = r'''
 import ctypes, json, os, re, resource, sys
 resource.setrlimit(resource.RLIMIT_CPU, (3, 3))
-resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
-if ctypes.CDLL(None).prctl(1, 9, 0, 0, 0) != 0 or os.getppid() != int(sys.argv[1]):
+resource.setrlimit(resource.RLIMIT_DATA if sys.platform == 'darwin' else resource.RLIMIT_AS,
+                   (1 << 30, 1 << 30))
+parent = int(sys.argv[1])
+if sys.platform == 'linux':
+    if ctypes.CDLL(None).prctl(1, 9, 0, 0, 0) != 0:
+        sys.exit(3)
+elif sys.platform == 'darwin':
+    # A separate process observes kernel exit events: a Python watcher thread
+    # cannot acquire the GIL during a pathological regex. The registration
+    # handshake plus parent check closes the startup/PID-reuse window.
+    import select, signal
+    matcher = os.getpid()
+    ready_read, ready_write = os.pipe()
+    guardian = os.fork()
+    if guardian == 0:
+        try:
+            os.close(ready_read)
+            with select.kqueue() as watcher:
+                watcher.control([select.kevent(pid, filter=select.KQ_FILTER_PROC,
+                    flags=select.KQ_EV_ADD, fflags=select.KQ_NOTE_EXIT)
+                    for pid in (parent, matcher)], 0, 0)
+                os.write(ready_write, b'1')
+                os.close(ready_write)
+                for fd in (0, 1, 2):
+                    os.close(fd)
+                events = watcher.control([], 2, None)
+                if (any(event.ident == parent for event in events)
+                        and not any(event.ident == matcher for event in events)
+                        and os.getppid() == matcher):
+                    try:
+                        os.kill(matcher, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+        finally:
+            os._exit(0)
+    os.close(ready_write)
+    armed = os.read(ready_read, 1) == b'1'
+    os.close(ready_read)
+    if not armed or os.getppid() != parent:
+        os.kill(guardian, signal.SIGKILL)
+        os.waitpid(guardian, 0)
+        sys.exit(3)
+else:
+    sys.exit(3)
+if os.getppid() != parent:
     sys.exit(3)
 source = sys.stdin.buffer
 header = json.loads(source.readline())
@@ -1446,7 +1489,7 @@ class Policy:
         """Line search in two bounded phases (#1038).
 
         Walk and read: the bridge walks and reads files itself, through the
-        scoped, symlink- and hard-link-refusing path, into an in-memory file.
+        scoped, symlink- and hard-link-refusing path, into a private unlinked file.
         The phase stops at SearchBudget's limits and keeps what it has.
         Match: only the model-supplied regular expression runs elsewhere, in a
         short-lived child killed after GREP_MATCH_SECONDS, so no pattern can
@@ -1463,10 +1506,14 @@ class Policy:
             candidates = [(str(candidate), candidate.name, None, None)]
         else:
             candidates = self._walk(path, budget=budget)
-        source = os.memfd_create('jarvis-grep-input', os.MFD_CLOEXEC)
-        output = os.memfd_create('jarvis-grep-output', os.MFD_CLOEXEC)
+        import tempfile
+        buffers = ExitStack()
         process = None
         try:
+            # TemporaryFile is private and unlinked on POSIX. Only descriptors
+            # cross into the matcher, including on hosts without Linux memfd.
+            source = buffers.enter_context(tempfile.TemporaryFile()).fileno()
+            output = buffers.enter_context(tempfile.TemporaryFile()).fileno()
             def emit(data):
                 view = memoryview(data)
                 while view:
@@ -1535,8 +1582,7 @@ class Policy:
                 if process.poll() is None:
                     process.kill()
                 process.wait()
-            os.close(source)
-            os.close(output)
+            buffers.close()
 
     def check_service_argv(self, argv):
         name = Path(argv[0]).name

@@ -1089,3 +1089,20 @@ test failed before implementation (`/tmp/1496-reconcile-transport-red.log`).
 Ten transport tests, 22 service tests plus the added contradictory-answer test,
 and all three runtime tests pass; strict phone-only Clippy passes. These are
 offline tests, not a live provider reconciliation receipt.
+
+### Portable bounded Grep
+
+macOS CI advanced to successful ordinary file reads after system-alias fixes,
+but Grep still failed at Linux-only memfd creation. Grep now uses private
+unlinked temporary buffers and passes only descriptors to its matcher. The
+matching CPU/wall-time, input/output-size and scoped-read limits remain in place.
+Linux retains parent-death signaling; macOS uses a separate kernel-event monitor
+so a regex holding Python's GIL cannot prevent parent-death cleanup. Registration
+is acknowledged before matching, and both parent relationships and exit events
+are checked. macOS uses its data-segment resource limit for matcher allocation.
+
+The local bridge suite passes 166 tests with eight existing skips, plus the new
+portable matcher-parent-death test. Nine local capability tests pass. Both
+portable Grep tests and the bridge parent-lifetime tests now run explicitly in
+Linux/macOS phone CI. Actual macOS results remain required; attachment Read
+failures still need writer/permission investigation and are not declared fixed.

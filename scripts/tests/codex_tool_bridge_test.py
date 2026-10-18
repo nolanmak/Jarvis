@@ -2059,6 +2059,80 @@ GREP_PARITY_TABLE = [
 ]
 
 
+class PortableGrepTests(unittest.TestCase):
+    def test_matcher_dies_with_parent_during_pathological_regex(self):
+        import os
+        import select
+        import time
+        program = r"""import json,os,subprocess,sys
+child=subprocess.Popen([sys.executable,'-I','-S','-c',sys.argv[1],str(os.getpid())],
+    stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+header=json.dumps({'pattern':'(a+)+$','ignore_case':False,'limit':1000}).encode()+b'\n'
+data=b'a'*40+b'b\n'
+child.stdin.write(header+str(len(data)).encode()+b'\n'+data);child.stdin.flush()
+assert child.stdout.readline()==b'MATCHING\n'
+print(child.pid,flush=True)
+sys.stdin.readline()
+"""
+        matcher = bridge.GREP_MATCHER.replace('    for number, line in enumerate(text.splitlines(), 1):',
+            "    print('MATCHING', flush=True)\n    for number, line in enumerate(text.splitlines(), 1):")
+        parent = subprocess.Popen([sys.executable, '-c', program, matcher],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        pidfd = None
+        watcher = None
+        try:
+            pid = int(parent.stdout.readline())
+            if hasattr(os, 'pidfd_open'):
+                pidfd = os.pidfd_open(pid)
+                watcher = select.poll()
+                watcher.register(pidfd, select.POLLIN)
+            else:
+                watcher = select.kqueue()
+                watcher.control([select.kevent(pid, filter=select.KQ_FILTER_PROC,
+                    flags=select.KQ_EV_ADD, fflags=select.KQ_NOTE_EXIT)], 0, 0)
+            time.sleep(0.2)
+            # It must still be matching, otherwise startup failure would falsely
+            # appear to satisfy the parent-death guarantee.
+            events = watcher.poll(0) if pidfd is not None else watcher.control([], 1, 0)
+            self.assertFalse(events, 'matcher exited before parent-death test')
+            parent.communicate('exit\n', timeout=5)
+            events = watcher.poll(1000) if pidfd is not None else watcher.control([], 1, 1)
+            self.assertTrue(events, 'matcher outlived its parent during regex execution')
+        finally:
+            if pidfd is not None:
+                import signal
+                try:
+                    signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                os.close(pidfd)
+            elif watcher is not None:
+                watcher.close()
+            if parent.poll() is None:
+                parent.kill()
+                parent.communicate(timeout=5)
+
+    def test_grep_without_linux_memfd_preserves_results_and_matching_limit(self):
+        import os
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / 'note.txt').write_text('SYNTHETIC_MATCH\n')
+            policy = bridge.Policy({'cwd': str(root), 'read_roots': [str(root)],
+                'write_roots': [], 'allowed_tools': ['Grep']})
+            self.addCleanup(policy.close)
+            saved = os.__dict__.pop('memfd_create', None)
+            try:
+                result = policy.grep('SYNTHETIC_MATCH')
+                self.assertEqual(len(result), 1)
+                self.assertEqual(result[0]['text'], 'SYNTHETIC_MATCH')
+                (root / 'bait.txt').write_text('a' * 40 + 'b\n')
+                with self.assertRaises(bridge.SearchLimit):
+                    policy.grep('(a+)+$')
+            finally:
+                if saved is not None:
+                    os.memfd_create = saved
+
+
 class BoundedGrepTests(unittest.TestCase):
     """#1038: a model-supplied pattern cannot stall the bridge or its CLI slot."""
     PATHOLOGICAL = '(a+)+$'
