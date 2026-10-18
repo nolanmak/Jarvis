@@ -42,7 +42,7 @@ SUITES = [
     ("augmentagent-channel-whatsapp", "--test", "phone_privacy", 1),
     ("augmentagent-channel-whatsapp", "--test", "self_chat", 1),
     ("augmentagent-channel-whatsapp", "--test", "phone_commands", 1),
-    ("augmentagent-channel-whatsapp", "--test", "phone_delivery", 4),
+    ("augmentagent-channel-whatsapp", "--test", "phone_delivery", 5),
     ("augmentagent-channel-whatsapp-history", "--test", "history", 10),
 ]
 SUMMARY = re.compile(r"test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out;")

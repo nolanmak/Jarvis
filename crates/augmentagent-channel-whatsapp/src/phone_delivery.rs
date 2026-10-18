@@ -394,3 +394,57 @@ impl augmentagent_channel_core::phone_agent::ConversationIo for WhatsappPhoneIo 
         ctx
     }
 }
+
+/// Run the installed account's phone outbox. The daemon must recover this
+/// account before starting the worker, while no other sender owns it. Cancelling
+/// an in-flight request leaves its sending row for restart reconciliation.
+pub async fn run_delivery(
+    store: Arc<Store>,
+    account: SurfaceAccountRef,
+    transport: Arc<dyn Transport>,
+    wake: Arc<tokio::sync::Notify>,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<()> {
+    use augmentagent_phone::Clock;
+    let number = account.account_id().strip_prefix("device:").unwrap_or("");
+    anyhow::ensure!(
+        account.platform().as_str() == "whatsapp"
+            && !number.is_empty()
+            && number.bytes().all(|c| c.is_ascii_digit()),
+        "invalid WhatsApp delivery account"
+    );
+    loop {
+        let sweep = async {
+            let sent = deliver_one(
+                &store,
+                &account,
+                transport.as_ref(),
+                augmentagent_phone::SystemClock.now_ms(),
+            )
+            .await?;
+            let reconciled = reconcile_one(
+                &store,
+                &account,
+                transport.as_ref(),
+                augmentagent_phone::SystemClock.now_ms(),
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(sent || reconciled)
+        };
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Ok(()),
+            result = sweep => result,
+        };
+        match result {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(_) => tracing::warn!("WhatsApp phone transcript delivery remains pending"),
+        }
+        tokio::select! {
+            _ = shutdown.cancelled() => return Ok(()),
+            _ = wake.notified() => {},
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+        }
+    }
+}

@@ -838,3 +838,34 @@ with `--no-deps -D warnings`, and both Python runner tests pass. Evidence logs:
 `/tmp/1496-wa-lookup-contract.log`, `/tmp/1496-wa-lookup-clippy.log`.
 No live WhatsApp messages or phone calls were made. Remote OS checks and live
 acceptance are still unqualified.
+
+### WhatsApp phone delivery worker
+
+The WhatsApp phone outbox now has an account-scoped async worker. It drains only
+phone mirror rows, performs bounded sends and reconciliation, responds to wake
+notifications, and polls due retries once per second when idle. Cancellation has
+priority over an in-flight operation; dropping that request leaves the durable
+sending row for startup reconciliation rather than requeueing it for resend.
+Account recovery remains an explicit daemon startup step before the worker is
+spawned, so a running sender is not reset by another worker's initialization.
+
+Test-first evidence: `/tmp/1496-wa-worker-red.log` (missing worker API).
+`/tmp/1496-wa-worker-green.log` covers cancellation while a transport is blocked,
+reopen plus account recovery, positive reconciliation without another send, and
+ordinary outbound rows remaining queued/untouched. The worker exits within the
+fixture's one-second timeout. The real WikiQuerier/PhoneAgent fixture now drains
+all six transcript rows from its three phone turns through this worker using a
+fake transport, while retaining the original Claude/Codex native session.
+Targeted evidence: `/tmp/1496-wa-worker-native-green.log`.
+
+This worker is not yet started by `serve`. Actual WhatsApp startup/status and
+identity provisioning, agent/history installation, prompt event dispatch,
+logout cleanup, shared lifecycle/duration fixes, remote CI and live migration
+qualification remain outstanding. The tests send no real chat messages or calls.
+
+Validation: the 36-suite required offline run passes 528 tests in
+`/tmp/1496-wa-worker-offline/receipt.json` (dirty worktree at execution). After
+strengthening the ordinary-outbox isolation assertion, all five delivery tests
+were rerun successfully in `/tmp/1496-wa-worker-green.log`. WhatsApp all-target
+Clippy with `--no-deps -D warnings` and both Python runner checks pass. No live
+WhatsApp messages or phone calls were made.

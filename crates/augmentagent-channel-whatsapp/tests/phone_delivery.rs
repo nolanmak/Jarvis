@@ -349,3 +349,101 @@ async fn actual_transport_checks_gates_and_parks_unknown_sidecar_results() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     server.abort();
 }
+
+struct Hanging {
+    entered: tokio::sync::Notify,
+    calls: std::sync::atomic::AtomicUsize,
+}
+#[async_trait::async_trait]
+impl Transport for Hanging {
+    async fn send(&self, _: &Payload) -> Result<String, SendError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.entered.notify_one();
+        std::future::pending().await
+    }
+    async fn lookup(&self, _: &Payload) -> Option<String> {
+        Some("confirmed-before-restart".into())
+    }
+}
+#[tokio::test]
+async fn worker_cancels_inflight_send_and_restart_reconciles_without_resending() {
+    use augmentagent_channel_whatsapp::phone_delivery::run_delivery;
+    use std::{sync::Arc, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(dir.path().join("db")).unwrap());
+    let origin = origin(&store);
+    enqueue(&store, &origin, "worker", "private transcript", 0).unwrap();
+    let ordinary = store
+        .enqueue_outbound_send(
+            &augmentagent_store::delivery::NewOutboundSend {
+                conversation: origin.conversation.clone(),
+                idempotency_key: "ordinary:one".into(),
+                operation: augmentagent_store::delivery::OutboundOperation::Post,
+                target_message_id: None,
+                payload: "{}".into(),
+                max_attempts: 3,
+                interaction_expires_at_ms: None,
+            },
+            0,
+        )
+        .unwrap();
+    let augmentagent_store::delivery::EnqueueOutcome::Queued { id: ordinary } = ordinary else {
+        panic!("ordinary fixture was not queued")
+    };
+    let transport = Arc::new(Hanging {
+        entered: tokio::sync::Notify::new(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let stop = tokio_util::sync::CancellationToken::new();
+    let worker = tokio::spawn(run_delivery(
+        store.clone(),
+        origin.owner.account().clone(),
+        transport.clone(),
+        Arc::new(tokio::sync::Notify::new()),
+        stop.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(2), transport.entered.notified())
+        .await
+        .unwrap();
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(1), worker)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let row = store
+        .outbound_sends_with_key_prefix(origin.owner.account(), "phone-mirror:", &[])
+        .unwrap()
+        .remove(0);
+    assert_eq!(row.status, SendStatus::Sending);
+    let reopened = Arc::new(Store::open(dir.path().join("db")).unwrap());
+    reopened
+        .recover_surface_delivery_for(origin.owner.account(), 1)
+        .unwrap();
+    let stop = tokio_util::sync::CancellationToken::new();
+    let worker = tokio::spawn(run_delivery(
+        reopened.clone(),
+        origin.owner.account().clone(),
+        transport.clone(),
+        Arc::new(tokio::sync::Notify::new()),
+        stop.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while reopened.outbound_send(row.id).unwrap().unwrap().status != SendStatus::Sent {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(1), worker)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reopened.outbound_send(ordinary).unwrap().unwrap().status,
+        SendStatus::Queued
+    );
+    assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}

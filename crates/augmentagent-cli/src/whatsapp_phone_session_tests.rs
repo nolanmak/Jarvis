@@ -29,6 +29,18 @@ impl augmentagent_channel_core::Reasoner for RebindingNative {
         Ok(answer)
     }
 }
+#[derive(Default)]
+struct Posts(Mutex<Vec<String>>);
+#[async_trait]
+impl augmentagent_channel_whatsapp::phone_delivery::Transport for Posts {
+    async fn send(
+        &self,
+        payload: &augmentagent_channel_whatsapp::phone_delivery::Payload,
+    ) -> std::result::Result<String, augmentagent_channel_whatsapp::phone_delivery::SendError> {
+        self.0.lock().unwrap().push(payload.content.clone());
+        Ok(payload.delivery_key.clone())
+    }
+}
 struct History;
 #[async_trait]
 impl augmentagent_channel_whatsapp::phone_delivery::History for History {
@@ -190,6 +202,39 @@ async fn whatsapp_text_phone_text_preserves_native_session_and_tools() {
             .unwrap();
         assert_eq!(mirrors.len(), 6);
         assert!(mirrors.iter().all(|send| send.conversation == chat));
+        let posts = Arc::new(Posts::default());
+        let stop = tokio_util::sync::CancellationToken::new();
+        let worker = tokio::spawn(augmentagent_channel_whatsapp::phone_delivery::run_delivery(
+            store.clone(),
+            owner.account().clone(),
+            posts.clone(),
+            Arc::new(tokio::sync::Notify::new()),
+            stop.clone(),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let delivered = store
+                    .outbound_sends_with_key_prefix(owner.account(), "phone-mirror:", &[])
+                    .unwrap();
+                if delivered
+                    .iter()
+                    .all(|row| row.status == augmentagent_store::delivery::SendStatus::Sent)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        stop.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(posts.0.lock().unwrap().len(), 6);
+
         audit.session_id = format!("wa:{}:text-two", chat.conversation_id());
         augmentagent_phone::context::scope(
             origin.clone(),
