@@ -371,7 +371,9 @@ def cap_resource(kind, ceiling):
     ceiling = min([ceiling] + [n for n in (soft, hard) if n != resource.RLIM_INFINITY])
     resource.setrlimit(kind, (ceiling, ceiling))
 cap_resource(resource.RLIMIT_CPU, 3)
-cap_resource(resource.RLIMIT_DATA if sys.platform == 'darwin' else resource.RLIMIT_AS, 1 << 30)
+if sys.platform != 'darwin':
+    cap_resource(resource.RLIMIT_AS, 1 << 30)
+MAX_MATCHER_RESIDENT = 1 << 30
 parent = int(sys.argv[1])
 if sys.platform == 'linux':
     if ctypes.CDLL(None).prctl(1, 9, 0, 0, 0) != 0:
@@ -381,7 +383,22 @@ elif sys.platform == 'darwin':
     # cannot acquire the GIL during a pathological regex. The registration
     # handshake plus parent check closes the startup/PID-reuse window.
     import select, signal
+    # Darwin may reserve more virtual/data space at startup than the nominal
+    # ceiling. Monitor actual resident bytes outside the regex process/GIL.
+    class TaskInfo(ctypes.Structure):
+        _fields_ = [('virtual_size', ctypes.c_uint64), ('resident_size', ctypes.c_uint64),
+                    ('times', ctypes.c_uint64 * 4), ('counters', ctypes.c_int32 * 12)]
+    libproc = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
+    libproc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+    libproc.proc_pidinfo.restype = ctypes.c_int
     matcher = os.getpid()
+    def check_memory():
+        info = TaskInfo()
+        size = ctypes.sizeof(info)
+        if libproc.proc_pidinfo(matcher, 4, 0, ctypes.byref(info), size) != size:
+            raise OSError('cannot monitor matcher memory')
+        if info.resident_size > MAX_MATCHER_RESIDENT:
+            raise MemoryError('matcher resident limit exceeded')
     ready_read, ready_write = os.pipe()
     guardian = os.fork()
     if guardian == 0:
@@ -393,19 +410,27 @@ elif sys.platform == 'darwin':
                 watcher.control([select.kevent(pid, filter=select.KQ_FILTER_PROC,
                     flags=select.KQ_EV_ADD, fflags=select.KQ_NOTE_EXIT)
                     for pid in (parent, matcher)], 0, 0)
+                stage = 'check resident memory'
+                check_memory()
                 os.write(ready_write, b'1')
                 os.close(ready_write)
-                for fd in (0, 1, 2):
+                for fd in (0, 1):
                     os.close(fd)
-                events = watcher.control([], 2, None)
-                if (any(event.ident == parent for event in events)
-                        and not any(event.ident == matcher for event in events)
-                        and os.getppid() == matcher):
-                    try:
-                        os.kill(matcher, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                while True:
+                    events = watcher.control([], 2, 0.05)
+                    if any(event.ident == matcher for event in events):
+                        break
+                    if any(event.ident == parent for event in events):
+                        if os.getppid() == matcher:
+                            os.kill(matcher, signal.SIGKILL)
+                        break
+                    check_memory()
         except Exception as error:
+            if os.getppid() == matcher:
+                try:
+                    os.kill(matcher, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             # Fixed stage and exception class only, never file content or
             # configuration. Synthetic tests retain this diagnostic; the
             # production bridge discards matcher stderr.

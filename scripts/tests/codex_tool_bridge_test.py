@@ -2073,10 +2073,11 @@ class PortableGrepTests(unittest.TestCase):
     def test_matcher_respects_lower_inherited_resource_limits(self):
         import os
         launcher = """import os,resource,sys
-kind=resource.RLIMIT_DATA if sys.platform=='darwin' else resource.RLIMIT_AS
-soft,hard=resource.getrlimit(kind)
-limit=min([256*1024*1024]+[n for n in (soft,hard) if n!=resource.RLIM_INFINITY])
-resource.setrlimit(kind,(limit,limit))
+if sys.platform!='darwin':
+    kind=resource.RLIMIT_AS
+    soft,hard=resource.getrlimit(kind)
+    limit=min([256*1024*1024]+[n for n in (soft,hard) if n!=resource.RLIM_INFINITY])
+    resource.setrlimit(kind,(limit,limit))
 resource.setrlimit(resource.RLIMIT_CPU,(2,2))
 os.execv(sys.executable,[sys.executable,'-I','-S','-c',sys.argv[1],sys.argv[2]])
 """
@@ -2087,6 +2088,15 @@ os.execv(sys.executable,[sys.executable,'-I','-S','-c',sys.argv[1],sys.argv[2]])
             capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
         self.assertEqual(json.loads(result.stdout)['matches'], [[0, 1, 'SYNTHETIC_MATCH']])
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Darwin resident-memory monitor; Linux uses RLIMIT_AS')
+    def test_darwin_memory_monitor_refuses_over_budget_matcher(self):
+        import os
+        code = bridge.GREP_MATCHER.replace('MAX_MATCHER_RESIDENT = 1 << 30', 'MAX_MATCHER_RESIDENT = 1')
+        result = subprocess.run([sys.executable, '-I', '-S', '-c', code, str(os.getpid())],
+            input=b'', capture_output=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b'check resident memory: MemoryError', result.stderr)
 
     def test_matcher_dies_with_parent_during_pathological_regex(self):
         import os

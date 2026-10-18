@@ -1099,7 +1099,7 @@ matching CPU/wall-time, input/output-size and scoped-read limits remain in place
 Linux retains parent-death signaling; macOS uses a separate kernel-event monitor
 so a regex holding Python's GIL cannot prevent parent-death cleanup. Registration
 is acknowledged before matching, and both parent relationships and exit events
-are checked. macOS uses its data-segment resource limit for matcher allocation.
+are checked. The initial macOS data-segment limit was rejected by the kernel; the resident-memory monitor described below supersedes it.
 
 The local bridge suite passes 166 tests with eight existing skips, plus the new
 portable matcher-parent-death test. Nine local capability tests pass. Both
@@ -1133,3 +1133,20 @@ with a two-second CPU cap and lower memory cap reproduced the failure locally
 before the fix. All eight portable-search and bridge-lifetime tests pass locally
 afterward; macOS must still verify kernel-event monitoring and scoped attachment
 reads in the full acceptance job.
+
+### Darwin resident-memory enforcement
+
+CI at `3744fe95` still rejected the memory limit despite clamping inherited
+limits. Darwin can reject data/address-space limits below current mapped usage.
+The matcher therefore retains the hard address-space cap on Linux and uses its
+separate macOS guardian to query resident memory through `proc_pidinfo`. The
+guardian checks before acknowledging startup and every 50 milliseconds, killing
+the matcher if resident usage exceeds 1 GiB or monitoring fails. This is sampled
+enforcement: allocations can overshoot between samples. CPU, wall-time, scoped
+input and output limits remain in force.
+
+The local portable-search/lifetime run passes eight tests; the Darwin-specific
+over-budget regression is skipped on Linux and must pass on macOS CI. The test
+forces the resident threshold below startup usage and requires rejection before
+matching. Actual macOS verification remains pending; these results do not qualify
+live phone operation.
