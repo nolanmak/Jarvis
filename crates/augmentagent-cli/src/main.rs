@@ -14037,8 +14037,17 @@ impl ReplyApprover {
                 let html_link =
                     Self::calendar_account_link(created.html_link.as_deref(), &action.email.from);
                 let link = html_link.clone().unwrap_or_else(|| event_id.clone());
+                // #1456 — the auto-accept is best effort so the receipt still
+                // lands, but a silent miss is what the owner complained about:
+                // say so instead. Ahead of the two terminal lines, which
+                // `recover_calendar_receipt` parses as the trailing suffix.
+                let rsvp = if created.organizer_rsvp_pending {
+                    "\nnote: your RSVP could not be set — accept it on the event"
+                } else {
+                    ""
+                };
                 let final_body = format!(
-                    "{}\ncreated: {link}\nevent ID: {event_id}",
+                    "{}{rsvp}\ncreated: {link}\nevent ID: {event_id}",
                     action.action.draft_body.clone().unwrap_or_default()
                 );
                 if let Err(e) = self.store.update_action_status(

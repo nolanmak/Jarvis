@@ -103,6 +103,58 @@ async fn accepts_the_organizer_entry_after_a_confirmed_create() {
     }
 }
 
+/// The patch replaces the attendee array, so every attribute Google set on
+/// the invitees has to survive the round trip — including the ones no local
+/// struct models — while the output-only keys it rejects on a write are
+/// dropped. Matched as an exact body so an added or lost field both fail.
+#[tokio::test]
+async fn the_patch_preserves_every_attendee_field_it_did_not_change() {
+    let mut server = Server::new_async().await;
+    let _create = server
+        .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_CREATE_EVENT")
+        .with_status(200)
+        .with_body(created_body())
+        .create_async()
+        .await;
+    let _get = server
+        .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_EVENTS_GET")
+        .with_status(200)
+        .with_body(
+            serde_json::json!({"successful":true,"data":{"id":"created","attendees":[
+                {"email":ORGANIZER,"self":true,"organizer":true,"id":"att-0",
+                 "displayName":"Owner","responseStatus":"needsAction"},
+                {"email":"owner-one@example.test","responseStatus":"needsAction",
+                 "optional":true,"comment":"joining late","additionalGuests":2},
+                {"email":"room@example.test","resource":true,"responseStatus":"accepted"}]}})
+            .to_string(),
+        )
+        .create_async()
+        .await;
+    let patch = server
+        .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_PATCH_EVENT")
+        .match_body(Matcher::Json(serde_json::json!({
+            "user_id":"organizer","arguments":{
+                "calendar_id":"primary","event_id":"created","send_updates":false,
+                "attendees":[
+                    {"email":ORGANIZER,"displayName":"Owner","responseStatus":"accepted"},
+                    {"email":"owner-one@example.test","responseStatus":"needsAction",
+                     "optional":true,"comment":"joining late","additionalGuests":2},
+                    {"email":"room@example.test","resource":true,"responseStatus":"accepted"}]}
+        })))
+        .with_status(200)
+        .with_body(r#"{"successful":true,"data":{"id":"created"}}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    let created = ComposioCalendarClient::new("test".into())
+        .with_base_url(server.url())
+        .create_event("organizer", "primary", &organizer_draft())
+        .await
+        .unwrap();
+    assert!(!created.organizer_rsvp_pending);
+    patch.assert_async().await;
+}
+
 #[tokio::test]
 async fn appends_the_organizer_when_the_read_back_omits_their_entry() {
     let mut server = Server::new_async().await;
@@ -200,12 +252,34 @@ async fn no_follow_up_when_already_accepted_without_attendees_or_without_an_orga
 async fn a_failed_accept_never_unconfirms_the_create() {
     // The event exists and its invitations are out. Reporting anything but
     // success here would invite a retry, and a retried create duplicates a
-    // real event with real invites.
-    for (status, body) in [
-        (500, "patch exploded"),
-        (403, "insufficient_scope"),
-        (200, r#"{"successful":false,"error":"unknown parameter"}"#),
+    // real event with real invites — but the miss is flagged on the handle so
+    // the owner is told the RSVP is still theirs rather than left guessing.
+    let needs_action = read_back(
+        serde_json::json!({"email":ORGANIZER,"self":true,"responseStatus":"needsAction"}),
+    );
+    let patch_ok = r#"{"successful":true,"data":{"id":"created"}}"#;
+    for (get_body, status, body) in [
+        (needs_action.clone(), 500, "patch exploded"),
+        (needs_action.clone(), 403, "insufficient_scope"),
+        (
+            needs_action,
+            200,
+            r#"{"successful":false,"error":"unknown parameter"}"#,
+        ),
+        // A read we cannot parse must not lead to a guessed attendee array:
+        // patching one would uninvite everybody the create just invited.
+        (
+            r#"{"successful":false,"error":"read rejected","data":{}}"#.into(),
+            200,
+            patch_ok,
+        ),
+        (
+            r#"{"successful":true,"data":{"id":"created"}}"#.into(),
+            200,
+            patch_ok,
+        ),
     ] {
+        let read_failed = !get_body.contains("attendees");
         let mut server = Server::new_async().await;
         let create = server
             .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_CREATE_EVENT")
@@ -217,56 +291,26 @@ async fn a_failed_accept_never_unconfirms_the_create() {
         let _get = server
             .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_EVENTS_GET")
             .with_status(200)
-            .with_body(read_back(
-                serde_json::json!({"email":ORGANIZER,"self":true,"responseStatus":"needsAction"}),
-            ))
+            .with_body(get_body)
             .create_async()
             .await;
-        let _patch = server
+        let patch = server
             .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_PATCH_EVENT")
             .with_status(status)
             .with_body(body)
+            .expect_at_most(if read_failed { 0 } else { 3 })
             .create_async()
             .await;
-        let result = ComposioCalendarClient::new("test".into())
+        let created = ComposioCalendarClient::new("test".into())
             .with_base_url(server.url())
             .create_event("organizer", "primary", &organizer_draft())
-            .await;
-        assert_eq!(result.unwrap().id.as_deref(), Some("created"), "{body}");
+            .await
+            .unwrap();
+        assert_eq!(created.id.as_deref(), Some("created"), "{body}");
+        assert!(created.organizer_rsvp_pending, "{body}");
         create.assert_async().await;
+        patch.assert_async().await;
     }
-}
-
-#[tokio::test]
-async fn a_failed_read_back_never_unconfirms_the_create() {
-    let mut server = Server::new_async().await;
-    let create = server
-        .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_CREATE_EVENT")
-        .with_status(200)
-        .with_body(created_body())
-        .expect(1)
-        .create_async()
-        .await;
-    let _get = server
-        .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_EVENTS_GET")
-        .with_status(200)
-        .with_body(r#"{"successful":false,"error":"read rejected","data":{}}"#)
-        .create_async()
-        .await;
-    let patch = server
-        .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_PATCH_EVENT")
-        .with_status(200)
-        .with_body(r#"{"successful":true,"data":{"id":"created"}}"#)
-        .expect(0)
-        .create_async()
-        .await;
-    let result = ComposioCalendarClient::new("test".into())
-        .with_base_url(server.url())
-        .create_event("organizer", "primary", &organizer_draft())
-        .await;
-    assert_eq!(result.unwrap().id.as_deref(), Some("created"));
-    create.assert_async().await;
-    patch.assert_async().await;
 }
 
 #[tokio::test]

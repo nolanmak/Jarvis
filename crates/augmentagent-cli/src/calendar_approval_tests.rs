@@ -212,7 +212,9 @@ async fn legacy_payload_accepts_on_behalf_of_the_card_sender() {
         |store, id| {
             let row = store.get_action_with_email(id).unwrap().unwrap();
             assert_eq!(row.action.status, "sent");
-            assert!(row.action.draft_body.unwrap().contains("event_1436"));
+            let saved = row.action.draft_body.unwrap();
+            assert!(saved.contains("event_1436"));
+            assert!(!saved.contains("your RSVP"), "{saved}");
         },
     )
     .await;
@@ -231,6 +233,12 @@ async fn a_failed_organizer_accept_still_persists_the_sent_receipt() {
             let saved = row.action.draft_body.unwrap();
             assert!(saved.contains("event_1436"), "{saved}");
             assert!(!saved.contains("patch rejected"), "{saved}");
+            // #1456 — the owner is told the one RSVP that is still theirs
+            // rather than finding the invite sitting at needsAction.
+            assert!(
+                saved.contains("your RSVP could not be set — accept it on the event"),
+                "{saved}"
+            );
         },
     )
     .await;
