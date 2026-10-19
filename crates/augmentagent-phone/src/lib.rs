@@ -57,6 +57,12 @@ pub trait Telephony: Send + Sync {
         Ok(None)
     }
 
+    /// Read-only provider evidence tying a candidate SID to this exact local
+    /// call's callback URL. No evidence means no association is permitted.
+    async fn confirms_origin(&self, _sid: &str, _call_id: &str, _public_base: &str) -> Result<bool, ProviderError> {
+        Ok(false)
+    }
+
     /// Persisted answer state is a hint, not a fresh provider read. Providers
     /// must handle a call advancing while its cancellation is being requested.
     async fn hangup_known_state(&self, sid: &str, _answered: bool) -> Result<(), ProviderError> {

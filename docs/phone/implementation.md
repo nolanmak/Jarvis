@@ -73,13 +73,13 @@ AUGMENTAGENT_GH_DISABLE=1 cargo test -p augmentagent-phone
 | --- | --- | --- |
 | AC01 | Disabled/config validation; signed ingress; all three daemon adapters; cleanup when normal startup is unavailable | Deployed ingress and live TLS receipts |
 | AC02 | Grants, revocation, expiry, forged targets, authenticated MCP and surface boundaries | Complete live boundary evidence |
-| AC03 | Concurrent reservations, durable deduplication and uncertain-create/restart tests | Unknown-SID association and live runtime fault evidence; known-SID operator reconciliation implemented |
+| AC03 | Concurrent reservations, durable deduplication and uncertain-create/restart tests | Operator candidate association implemented using terminal state plus exact callback-origin evidence; live recovery/fault qualification outstanding |
 | AC04 | Signed/reordered callbacks, local ingress, immutable final duration and signed event-time accounting | Live callbacks and provider reconciliation receipts |
 | AC05 | Signed acceptance, fake-clock deadline tests and concurrent runtime watchdog | Voicemail and live acceptance timing |
 | AC06 | Installed Claude/Codex CLIs pass text → three PhoneAgent turns → text with fresh synthetic reads on Linux; shared queue and daemon fixtures | Production agent tool/approval conformance and live phone matrix |
 | AC07 | Relay/barge-in generations, final suppression, one-time claims, local WSS round trip and cancellation | Live streaming/interruption and real native tool-disconnect qualification |
 | AC08 | Discord, Slack and WhatsApp daemon adapters; authenticated tools; durable transcript outboxes; 13 shared presets checked | [Entry-point audit](surfaces.md): local CLI daemon adapter has signed loopback session coverage; custom constructors/wrappers and live origin receipts outstanding |
-| AC09 | Persistent budgets, provider-duration callbacks, bounded shutdown and disabled/unavailable-start cleanup | Live stop/restart/disable evidence and unknown-SID recovery; known-SID reconciliation available |
+| AC09 | Persistent budgets, provider-duration callbacks, bounded shutdown and disabled/unavailable-start cleanup | Live stop/restart/disable and candidate-association qualification; operator reconciliation available |
 | AC10 | Recorded-audio receipt validator and synthetic regression tests only | Actual consented audio, native traces and full live matrix; no live receipt exists |
 | AC11 | No legacy voice removed yet | Replacement qualification, old-release upgrade/rollback fixtures and retirement; synthetic additive-schema preservation passes |
 | AC12 | Required offline runner and local regression receipts; OS CI configured | Passing current-head OS CI, complete evidence map and live receipts |
@@ -1387,3 +1387,18 @@ returns a valid success response with a truncation notice. The local adapter's
 separate raw-text truncation was removed; complete output is retained by its
 transcript writer. All six local adapter/transport tests pass, and the required
 transport suite minimum is five. Provider/handler errors remain sanitized.
+
+
+### Evidence-based candidate provider association
+
+`phone-reconcile --provider-id` adds an operator-only route for a missing SID.
+The provider must report terminal state and a matching POST event URL containing
+the local call UUID, with the expected account and candidate SID. A real HTTP
+mock regression failed before the Twilio implementation and passes with it;
+wrong URL, method, account or SID never confirms association. Recovery fixtures
+leave state untouched for missing/nonterminal evidence, finalize a confirmed
+candidate, reject a different ID after binding, and preserve a concurrent
+callback's binding. Event bodies are bounded and not exposed in diagnostics.
+This remains unqualified against live Twilio event records; the runbook states
+the provider's post-call availability delay and conservative missing-evidence
+behavior. No guessed match, automatic discovery, dial or force-clear was added.

@@ -105,6 +105,37 @@ impl Telephony for TwilioClient {
             .ok_or(ProviderError::Uncertain)?;
         Ok(sid.into())
     }
+    async fn confirms_origin(&self, sid: &str, call_id: &str, public_base: &str) -> Result<bool, ProviderError> {
+        let url = reqwest::Url::parse(public_base).map_err(|_| ProviderError::Rejected)?;
+        if !valid_sid(sid) || uuid::Uuid::parse_str(call_id).is_err()
+            || url.scheme() != "https" || url.host_str().is_none() || url.port().is_some()
+            || url.path() != "/" || url.query().is_some() || url.fragment().is_some()
+            || !url.username().is_empty() || url.password().is_some() {
+            return Err(ProviderError::Rejected);
+        }
+        let mut response = self.http.get(format!("{}/{sid}/Events.json",self.calls_url()))
+            .basic_auth(&self.account,Some(&self.token)).query(&[("PageSize","100")])
+            .timeout(Duration::from_secs(5)).send().await.map_err(|_| ProviderError::Uncertain)?;
+        if !response.status().is_success() { return Err(ProviderError::Uncertain); }
+        // Event bodies may contain numbers and verification TwiML. Bound their
+        // memory use and never include them in errors, logs or command output.
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| ProviderError::Uncertain)? {
+            if bytes.len() + chunk.len() > 1024 * 1024 { return Err(ProviderError::Uncertain); }
+            bytes.extend_from_slice(&chunk);
+        }
+        let body: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| ProviderError::Uncertain)?;
+        let events = body["events"].as_array().filter(|events| events.len() <= 100).ok_or(ProviderError::Uncertain)?;
+        let origin = url.origin().ascii_serialization();
+        let paths: Vec<_> = ["start","accept","status"].iter().map(|kind| format!("{origin}/phone/{kind}/{call_id}")).collect();
+        Ok(events.iter().any(|event| {
+            let request = &event["request"];
+            request["method"].as_str() == Some("POST")
+                && request["url"].as_str().is_some_and(|url| paths.iter().any(|path| path == url))
+                && request["parameters"]["account_sid"].as_str() == Some(self.account.as_str())
+                && request["parameters"]["call_sid"].as_str() == Some(sid)
+        }))
+    }
     async fn final_usage(&self, sid: &str) -> Result<Option<crate::FinalUsage>, ProviderError> {
         if !valid_sid(sid) {
             return Err(ProviderError::Rejected);
@@ -272,6 +303,30 @@ mod tests {
     use crate::{DialRequest, ProviderError, Telephony};
     use augmentagent_store::Store;
     use mockito::Matcher;
+
+    #[tokio::test]
+    async fn recovery_origin_evidence_requires_exact_url_method_account_and_sid() {
+        let mut server = mockito::Server::new_async().await;
+        let client = TwilioClient::with_base("ACtest", "test-token", "+12025550456", &server.url()).unwrap();
+        let sid = "CAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let id = "00000000-0000-4000-8000-000000000001";
+        for mutation in ["valid", "url", "method", "account", "sid"] {
+            let mut event = serde_json::json!({"request":{"url":format!("https://phone.example.test/phone/status/{id}"),"method":"POST","parameters":{"account_sid":"ACtest","call_sid":sid}}});
+            match mutation {
+                "url" => event["request"]["url"] = "https://other.example.test/phone/status/elsewhere".into(),
+                "method" => event["request"]["method"] = "GET".into(),
+                "account" => event["request"]["parameters"]["account_sid"] = "ACother".into(),
+                "sid" => event["request"]["parameters"]["call_sid"] = "CAother".into(),
+                _ => {},
+            }
+            let mock = server.mock("GET",format!("/2010-04-01/Accounts/ACtest/Calls/{sid}/Events.json").as_str())
+                .match_query(Matcher::UrlEncoded("PageSize".into(),"100".into()))
+                .match_header("authorization",Matcher::Regex("^Basic ".into()))
+                .with_status(200).with_body(serde_json::json!({"events":[event]}).to_string()).expect(1).create_async().await;
+            assert_eq!(client.confirms_origin(sid,id,"https://phone.example.test").await.unwrap(),mutation=="valid");
+            mock.assert_async().await;
+        }
+    }
 
     fn request() -> DialRequest {
         let d = tempfile::tempdir().unwrap();

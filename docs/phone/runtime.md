@@ -345,3 +345,31 @@ The local adapter passed a synthetic Claude-provider session test through signed
 loopback WebSocket ingress, three accepted phone turns and a local listener
 restart. This is not an installed native CLI or live telephone qualification
 receipt for the local origin.
+
+
+### Recovering a missing provider ID
+
+An operator can supply a candidate Twilio SID from the provider console:
+
+```sh
+augmentagent phone-reconcile --call-id <local-call-id> --provider-id <candidate-call-sid>
+```
+
+Use the original `AUGMENTAGENT_PHONE_PUBLIC_URL` for that call alongside the
+Twilio account credentials. The command first requires terminal provider state,
+then reads up to 100 call events and requires a POST to the exact local call's
+start, acceptance or status URL, with matching account and call IDs. Only then
+may the store bind the previously unknown SID and run normal final-usage
+reconciliation. A concurrent different SID or another call's existing SID cannot
+be replaced. The command performs no creates, hangups or retry-counter resets.
+
+Twilio documents that [call events](https://www.twilio.com/docs/voice/api/call-event-resource)
+become available 15 minutes after the call ends and include the application's
+request URL, method and parameters. The event body is bounded to 1 MiB and never
+printed or logged, because it can contain private numbers and verification
+content. This path does not guess from destination/time similarity and does not
+follow event-provided URLs or pagination links. If the first page has no exact
+match, events are unavailable, the origin changed, or evidence conflicts, the
+call stays unresolved. `unverified_provider_id` is not permission to redial.
+Provider-event availability and this recovery path still require live
+qualification; absence of evidence cannot establish that a call was never made.

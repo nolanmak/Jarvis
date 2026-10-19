@@ -722,6 +722,9 @@ enum Cmd {
     PhoneReconcile {
         #[arg(long)]
         call_id: String,
+        /// Candidate Twilio SID; bind only after exact provider-origin evidence.
+        #[arg(long)]
+        provider_id: Option<String>,
     },
     /// Internal owner-DM-bound computation MCP facade.
     #[command(hide = true)]
@@ -5320,7 +5323,7 @@ async fn main() -> Result<()> {
         Cmd::ComposioAuthTool => composio_auth_tool::serve().await,
         Cmd::VoiceTool => voice_tool::serve(),
         Cmd::PhoneTool => Ok(augmentagent_phone::mcp::serve()?),
-        Cmd::PhoneReconcile { ref call_id } => phone_runtime::reconcile_local(&store, call_id).await,
+        Cmd::PhoneReconcile { ref call_id, ref provider_id } => phone_runtime::reconcile_local(&store, call_id, provider_id.as_deref()).await,
         Cmd::ComputeTool => compute_tool::serve(),
         Cmd::ReasonerSelftest { ref prompt, ref profile, tool_probe } =>
             run_reasoner_selftest(prompt, profile.as_deref(), tool_probe).await,

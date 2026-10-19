@@ -230,3 +230,124 @@ async fn provider_failure_does_not_clear_local_state_or_counters() {
         1
     );
 }
+
+struct CandidateEvidence {
+    confirmed: bool,
+    terminal: bool,
+}
+#[async_trait]
+impl Telephony for CandidateEvidence {
+    async fn create(&self, _: DialRequest) -> Result<String, ProviderError> {
+        panic!("must not dial")
+    }
+    async fn hangup(&self, _: &str) -> Result<(), ProviderError> {
+        panic!("must not hang up")
+    }
+    async fn final_usage(&self, _: &str) -> Result<Option<FinalUsage>, ProviderError> {
+        Ok(self.terminal.then_some(FinalUsage::NeverAnswered))
+    }
+    async fn confirms_origin(&self, _: &str, _: &str, _: &str) -> Result<bool, ProviderError> {
+        Ok(self.confirmed)
+    }
+}
+#[tokio::test]
+async fn unknown_provider_association_requires_terminal_exact_origin_evidence() {
+    use augmentagent_phone::recovery::associate_and_reconcile;
+    for (confirmed, terminal) in [(false, true), (true, false), (true, true)] {
+        let (_dir, store, id) = fixture();
+        store.phone_mark_uncertain(&id).unwrap();
+        let provider = CandidateEvidence {
+            confirmed,
+            terminal,
+        };
+        let result = associate_and_reconcile(
+            &store,
+            &provider,
+            &Now,
+            &id,
+            "CA-candidate",
+            "https://phone.example.test",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result,
+            if !terminal {
+                RecoveryOutcome::ProviderNotFinal
+            } else if !confirmed {
+                RecoveryOutcome::UnverifiedProviderId
+            } else {
+                RecoveryOutcome::Finalized
+            }
+        );
+        let call = store.phone_provider_call(&id).unwrap();
+        assert_eq!(call.provider_sid.is_some(), confirmed && terminal);
+        assert_eq!(call.state.terminal(), confirmed && terminal);
+        if confirmed && terminal {
+            assert!(associate_and_reconcile(
+                &store,
+                &provider,
+                &Now,
+                &id,
+                "CA-other",
+                "https://phone.example.test"
+            )
+            .await
+            .is_err());
+            assert_eq!(
+                store
+                    .phone_provider_call(&id)
+                    .unwrap()
+                    .provider_sid
+                    .as_deref(),
+                Some("CA-candidate")
+            );
+        }
+    }
+}
+
+struct AssociationRace<'a> {
+    store: &'a Store,
+    id: &'a str,
+}
+#[async_trait]
+impl Telephony for AssociationRace<'_> {
+    async fn create(&self, _: DialRequest) -> Result<String, ProviderError> {
+        panic!("must not dial")
+    }
+    async fn hangup(&self, _: &str) -> Result<(), ProviderError> {
+        panic!("must not hang up")
+    }
+    async fn final_usage(&self, _: &str) -> Result<Option<FinalUsage>, ProviderError> {
+        Ok(Some(FinalUsage::NeverAnswered))
+    }
+    async fn confirms_origin(&self, _: &str, _: &str, _: &str) -> Result<bool, ProviderError> {
+        self.store
+            .phone_bind_provider(self.id, "CA-concurrent-callback")
+            .unwrap();
+        Ok(true)
+    }
+}
+#[tokio::test]
+async fn concurrent_callback_binding_cannot_be_overwritten_by_candidate_association() {
+    let (_dir, store, id) = fixture();
+    store.phone_mark_uncertain(&id).unwrap();
+    let provider = AssociationRace {
+        store: &store,
+        id: &id,
+    };
+    assert!(augmentagent_phone::recovery::associate_and_reconcile(
+        &store,
+        &provider,
+        &Now,
+        &id,
+        "CA-candidate",
+        "https://phone.example.test"
+    )
+    .await
+    .is_err());
+    let call = store.phone_provider_call(&id).unwrap();
+    assert_eq!(call.provider_sid.as_deref(), Some("CA-concurrent-callback"));
+    assert!(!call.state.terminal());
+    assert!(store.phone_usage(&id).unwrap().is_none());
+}

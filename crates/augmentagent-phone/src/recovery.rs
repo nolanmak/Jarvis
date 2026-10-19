@@ -13,6 +13,7 @@ pub enum RecoveryOutcome {
     Finalized,
     AlreadyFinalized,
     UnknownProviderId,
+    UnverifiedProviderId,
     ProviderNotFinal,
     ContradictoryEvidence,
 }
@@ -72,4 +73,48 @@ pub async fn reconcile(
         Err(_) if store.phone_usage(call_id)?.is_some() => Ok(RecoveryOutcome::AlreadyFinalized),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Explicit operator-selected candidate. A terminal provider result and exact
+/// callback-origin evidence are required before persisting its ID. Never dial.
+pub async fn associate_and_reconcile(
+    store: &Store,
+    provider: &dyn Telephony,
+    clock: &dyn Clock,
+    call_id: &str,
+    candidate: &str,
+    public_base: &str,
+) -> Result<RecoveryOutcome, Error> {
+    let call = store.phone_provider_call(call_id)?;
+    if let Some(existing) = call.provider_sid.as_deref() {
+        if existing != candidate {
+            return Err(Error::InvalidArguments);
+        }
+        return reconcile(store, provider, clock, call_id).await;
+    }
+    let final_usage = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        provider.final_usage(candidate),
+    )
+    .await
+    .map_err(|_| ProviderError::Uncertain)??;
+    if final_usage.is_none() {
+        return Ok(RecoveryOutcome::ProviderNotFinal);
+    }
+    if matches!(final_usage, Some(FinalUsage::NeverAnswered)) && call.answered_ms.is_some() {
+        return Ok(RecoveryOutcome::ContradictoryEvidence);
+    }
+    let confirmed = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        provider.confirms_origin(candidate, call_id, public_base),
+    )
+    .await
+    .map_err(|_| ProviderError::Uncertain)??;
+    if !confirmed {
+        return Ok(RecoveryOutcome::UnverifiedProviderId);
+    }
+    // The store atomically refuses replacement of a SID supplied by a racing
+    // callback or reuse of another local call's provider SID.
+    store.phone_bind_provider(call_id, candidate)?;
+    reconcile(store, provider, clock, call_id).await
 }
