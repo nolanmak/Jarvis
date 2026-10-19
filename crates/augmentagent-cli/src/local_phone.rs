@@ -139,18 +139,6 @@ impl Handler for LocalHandler {
             ),
         )
         .await?;
-        // Keep the transport frame bounded while retaining the full result in
-        // durable local history. Do not turn a completed action into a retry.
-        if answer.len() > 28000 {
-            let mut end = 28000;
-            while !answer.is_char_boundary(end) {
-                end -= 1;
-            }
-            return Ok(format!(
-                "{}\n[Response truncated; retained in local conversation storage.]",
-                &answer[..end]
-            ));
-        }
         Ok(answer)
     }
 }

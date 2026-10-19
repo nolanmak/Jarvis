@@ -1376,3 +1376,14 @@ owner-conversation isolation and bounded Unicode history. CLI parsing accepts
 `--daemon --stdin` and rejects `--daemon --post`. Installed native provider and
 live local-origin qualification remain separate gates; this test uses a scripted
 Claude native provider and fake telephony.
+
+### Encoded local reply bounds
+
+A new real Unix-client regression failed before the fix: a successful 30 KiB
+reply containing Unicode and control characters exceeded the 64 KiB frame limit
+once JSON-escaped, closing the connection after completed work. The transport
+now bounds serialized response bytes, truncates only at UTF-8 boundaries and
+returns a valid success response with a truncation notice. The local adapter's
+separate raw-text truncation was removed; complete output is retained by its
+transcript writer. All six local adapter/transport tests pass, and the required
+transport suite minimum is five. Provider/handler errors remain sanitized.

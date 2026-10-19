@@ -26,7 +26,7 @@ pub struct Request {
     pub request_id: String,
     pub text: String,
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Response {
     pub ok: bool,
@@ -147,11 +147,19 @@ async fn frame(stream: &mut UnixStream) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 async fn write_frame(stream: &mut UnixStream, response: &Response) -> Result<()> {
-    let mut bytes = serde_json::to_vec(response)?;
-    ensure!(
-        bytes.len() < MAX_FRAME as usize,
-        "local chat response too large"
-    );
+    let mut response = response.clone();
+    let mut bytes = serde_json::to_vec(&response)?;
+    // JSON escaping can expand text by six bytes per control character. Bound
+    // the serialized frame, preserving a valid success response after effects.
+    while bytes.len() >= MAX_FRAME as usize {
+        let mut end = response.text.len() / 2;
+        while !response.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        response.text.truncate(end);
+        response.text.push_str("\n[Response truncated.]");
+        bytes = serde_json::to_vec(&response)?;
+    }
     bytes.push(b'\n');
     tokio::time::timeout(Duration::from_secs(10), stream.write_all(&bytes)).await??;
     Ok(())
@@ -165,7 +173,7 @@ async fn connection(mut stream: UnixStream, handler: &dyn Handler) -> Result<()>
         "invalid local chat request"
     );
     let response = match handler.handle(request).await {
-        Ok(text) if text.len() < MAX_FRAME as usize / 2 => Response { ok: true, text },
+        Ok(text) => Response { ok: true, text },
         _ => Response {
             ok: false,
             text: "Local conversation could not complete. Check status before retrying an action."
@@ -308,5 +316,33 @@ mod tests {
         assert_eq!(echo.0.load(Ordering::SeqCst), 0);
         stop.cancel();
         task.await.unwrap().unwrap();
+    }
+    #[tokio::test]
+    async fn escaped_large_reply_is_bounded_without_losing_completed_result() {
+        struct Escaped;
+        #[async_trait]
+        impl Handler for Escaped {
+            async fn handle(&self, _: Request) -> Result<String> {
+                Ok("\u{0001}Ω".repeat(10000))
+            }
+        }
+        let dir = directory();
+        let path = dir.path().join("chat.sock");
+        let listener = Listener::bind(&path).unwrap();
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(listener.serve(Arc::new(Escaped), stop.clone()));
+        let input = Request {
+            version: 1,
+            request_id: uuid::Uuid::new_v4().to_string(),
+            text: "synthetic".into(),
+        };
+        let result = request(&path, &input).await;
+        stop.cancel();
+        task.await.unwrap().unwrap();
+        let response = result.expect("completed result must remain a valid protocol reply");
+        assert!(response.ok);
+        assert!(response.text.starts_with("\u{0001}Ω"));
+        assert!(response.text.ends_with("[Response truncated.]"));
+        assert!(serde_json::to_vec(&response).unwrap().len() < MAX_FRAME as usize);
     }
 }
