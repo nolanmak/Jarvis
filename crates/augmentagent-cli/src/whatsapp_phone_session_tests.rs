@@ -113,6 +113,7 @@ async fn whatsapp_text_phone_text_preserves_native_session_and_tools() {
                 kind,
                 Arc::new(RebindingNative {
                     inner: Native {
+                        check_discord_wrappers: false,
                         kind,
                         calls: calls.clone(),
                     },

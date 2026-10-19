@@ -25,6 +25,7 @@ impl Telephony for FixturePhone {
 }
 pub(super) struct Native {
     pub(super) kind: ProviderKind,
+    pub(super) check_discord_wrappers: bool,
     pub(super) calls: Arc<Mutex<Vec<(String, String)>>>,
 }
 #[async_trait]
@@ -33,6 +34,24 @@ impl Reasoner for Native {
         assert!(opts
             .allowed_tools
             .contains(&"mcp__phone__call_owner".into()));
+        if self.check_discord_wrappers {
+            // Validate the final production options, after all wrappers and
+            // phone attachment, on both text and accepted phone turns.
+            let settings: serde_json::Value = serde_json::from_str(
+                opts.settings_json.as_deref().context("settings missing")?)?;
+            for (server, tool) in [
+                ("computer", "computer_task"),
+                ("model", "switch_model"),
+                ("composio_auth", "start_auth"),
+            ] {
+                assert!(settings["mcpServers"][server].is_object(), "lost {server} configuration");
+                assert!(opts.allowed_tools.contains(&format!("mcp__{server}__{tool}")), "lost {server} permission");
+            }
+            assert_eq!(settings["mcpServers"]["computer"]["args"][1], "22");
+            assert_eq!(settings["mcpServers"]["computer"]["args"][2], opts.session_id.as_deref().unwrap());
+            assert!(opts.allowed_tools.iter().any(|tool| tool.contains("approvals history")), "lost approval history access");
+            assert!(!opts.allowed_tools.iter().any(|tool| tool.starts_with("mcp__voice__")), "legacy voice capability leaked into phone turn");
+        }
         let session = CURRENT.try_with(Arc::clone)?;
         let mut lease = session.begin(self.kind)?;
         let id = match lease.launch() {
@@ -91,6 +110,8 @@ async fn discord_phone_dm_text_reuses_native_session_without_legacy_voice() {
         let dir = tempfile::tempdir().unwrap();
         let wiki = dir.path().join("wiki");
         std::fs::create_dir(&wiki).unwrap();
+        std::fs::create_dir_all(dir.path().join("sidecars/computer-use")).unwrap();
+        std::fs::write(dir.path().join("sidecars/computer-use/mcp.mjs"), "// synthetic fixture; never executed").unwrap();
         let store = Arc::new(Store::open(dir.path().join("db")).unwrap());
         let account =
             SurfaceAccountRef::new(SurfacePlatform::new("discord").unwrap(), "dm:11").unwrap();
@@ -132,6 +153,7 @@ async fn discord_phone_dm_text_reuses_native_session_without_legacy_voice() {
                 kind,
                 Arc::new(Native {
                     kind,
+                    check_discord_wrappers: true,
                     calls: calls.clone(),
                 }),
             )],

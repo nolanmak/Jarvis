@@ -38,3 +38,24 @@ The three mandatory chat adapters have offline initiation/status/stop coverage.
 They still need live receipts, and this audit does not establish that every
 integration can initiate a call. The local CLI requires `--daemon` and explicit operator setup; iMessage
 initiation remains unsupported.
+
+## Production wrapper composition regression
+
+The Discord session fixture now installs a synthetic computer-tool entry point
+and inspects the final production WikiQuerier options on both text and accepted
+phone turns for both provider selections. Computer-use, model-switch and
+Composio-auth MCP entries and permissions must survive phone attachment;
+computer identity must remain bound to the current conversation/turn, approval
+history access must remain available, and legacy voice permissions must be
+absent. The fixture uses scripted providers and never executes the synthetic
+computer entry point. It does not establish external-tool behavior or complete
+custom-constructor conformance.
+
+This regression initially failed because authenticated private Discord text
+turns still depended on the legacy query-channel environment for approval
+history. The shared native text runner now enters the existing owner-history
+scope only after revalidating its private origin grant and owner revision,
+matching accepted phone turns. The scope is enabled only when the origin equals
+the stored direct conversation. Passive ingestion does not enter this runner.
+The Discord and WhatsApp session regressions pass after this change (two tests,
+both provider selections within each test).

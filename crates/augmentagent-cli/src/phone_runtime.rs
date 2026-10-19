@@ -597,7 +597,17 @@ pub(crate) async fn native_text_turn(
                     .is_some_and(|binding| binding.revision == revision),
                 "Phone owner authority changed while queued"
             );
-            query.answer(audit, &prompt).await
+            // A validated private origin has the same approval-history
+            // authority as its accepted phone turns. Do not depend on the
+            // legacy Discord query-channel environment for authenticated DMs.
+            let private = store
+                .surface_owner_binding(origin.owner.account())?
+                .and_then(|binding| binding.direct_conversation().cloned())
+                .is_some_and(|conversation| conversation == origin.conversation);
+            augmentagent_approval_discord::interaction::owner_history(
+                private,
+                query.answer(audit, &prompt),
+            ).await
         },
     )
     .await?;
