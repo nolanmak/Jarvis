@@ -21529,6 +21529,59 @@ mod stale_reconcile_tests {
         );
     }
 
+    /// #1503 — a PDF-signing card is an owner decision on a local file, filed
+    /// exactly as `document_signing::propose` files it (`Owner signature`, no
+    /// thread). Its sender has no `@`, so Rule 2 used to retire it on the first
+    /// tick and Approve & Sign always failed "superseded". It must survive
+    /// repeated sweeps while a bulk-mail card beside it is still retired.
+    #[test]
+    fn reconcile_never_retires_a_pdf_signing_card() {
+        let (store, _t) = fresh_store();
+        store
+            .upsert_email(&Email {
+                attachments: Vec::new(),
+                to: String::new(),
+                cc: String::new(),
+                message_id: "doc-sign:1".into(),
+                thread_id: None,
+                from: "Owner signature".into(),
+                subject: "Sign PDF: deliverables/x.pdf".into(),
+                body: "{}".into(),
+                date: "2026-10-19T15:32:58Z".into(),
+                account_entity_id: None,
+                platform: "document-signing".into(),
+                kind: "sign_pdf".into(),
+            })
+            .unwrap();
+        let signing = store
+            .log_action(
+                "doc-sign:1",
+                None,
+                "Owner signature",
+                "Sign PDF: deliverables/x.pdf",
+                Some("{}"),
+                Some("Apply signature 'default' to deliverables/x.pdf (1 pages)."),
+                ActionStatus::Pending,
+            )
+            .unwrap();
+        let blast =
+            seed_pending(&store, "m-blast", Some("T-b"), "Brand <marketing@engage.brand.example.com>"); // pii-ok: synthetic
+
+        assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 1);
+        assert_eq!(
+            status_of(&store, &blast),
+            "superseded",
+            "Rule 2 still retires bulk mail"
+        );
+        assert_eq!(status_of(&store, &signing), "pending");
+        assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 0);
+        assert_eq!(
+            status_of(&store, &signing),
+            "pending",
+            "durable across ticks"
+        );
+    }
+
     /// The sweep must be safe to run on every tick forever.
     #[test]
     fn reconcile_is_idempotent_and_noop_on_a_clean_queue() {
