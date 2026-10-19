@@ -9,6 +9,7 @@ mod composio_auth_tool;
 mod voice_tool;
 mod phone_runtime;
 mod local_phone_transport;
+mod local_phone;
 mod discord_phone;
 mod computer_tool;
 #[cfg(test)]
@@ -2725,6 +2726,10 @@ enum WikiOp {
         /// Needs DISCORD_BOT_TOKEN + DISCORD_CHANNEL_ID in the env.
         #[arg(long, default_value_t = false)]
         post: bool,
+        /// Continue the persistent local conversation in the running phone-enabled daemon.
+        /// Uses AUGMENTAGENT_PHONE_LOCAL_SOCKET and the daemon's configured wiki.
+        #[arg(long, conflicts_with = "post")]
+        daemon: bool,
     },
     /// Backfill v2 schema fields onto cold person pages via Haiku. See #78.
     ///
@@ -3526,6 +3531,18 @@ async fn main() -> Result<()> {
                 }
             }
 
+            if let (Some(endpoint), Some(wiki), Some(socket)) = (
+                phone.as_ref(), cli.wiki_dir.as_ref(), std::env::var_os("AUGMENTAGENT_PHONE_LOCAL_SOCKET"),
+            ) {
+                let query = wiki_querier(build_reasoner(), wiki.clone(),
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")), store.clone(), false);
+                let _ = query.phone_tools.set(endpoint.tools.clone());
+                match local_phone::spawn(endpoint.clone(), store.clone(), Arc::new(query), wiki.clone(), socket.into(), shutdown.clone()) {
+                    Ok(worker) => tasks.push(worker),
+                    Err(_) => warn!("local phone conversation unavailable: check private socket directory and explicit OS-owner link"),
+                }
+            }
+
             let pending_discord = discord_phone_pending.lock().ok().and_then(|mut pending| pending.take());
             let _discord_phone_registration = match (phone.as_ref(), pending_discord) {
                 (Some(endpoint), Some(connection)) => match discord_phone::install(endpoint, connection, store.clone(), shutdown.clone()) {
@@ -4226,10 +4243,13 @@ async fn main() -> Result<()> {
         },
         Cmd::Wiki { ref op } => match op {
             WikiOp::Lint { out } => run_wiki_lint(&cli, Arc::clone(&store), out.clone()).await,
-            WikiOp::Ask { question, stdin, post } => {
+            WikiOp::Ask { question, stdin, post, daemon } => {
                 let question = if *stdin { read_wiki_question(std::io::stdin().lock())? }
                     else { question.clone().context("question or --stdin is required")? };
-                run_wiki_ask(&cli, question, *post).await
+                if *daemon {
+                    println!("{}", local_phone::ask(question).await?);
+                    Ok(())
+                } else { run_wiki_ask(&cli, question, *post).await }
             },
             WikiOp::Migrate {
                 to,
@@ -8884,6 +8904,8 @@ mod wiki_question_stdin_tests {
         assert!(matches!(cli.cmd, Cmd::Wiki { op: WikiOp::Ask { question: None, stdin: true, .. } }));
         assert!(Cli::try_parse_from(["augmentagent", "wiki", "ask"]).is_err());
         assert!(Cli::try_parse_from(["augmentagent", "wiki", "ask", "private", "--stdin"]).is_err());
+        assert!(Cli::try_parse_from(["augmentagent", "wiki", "ask", "--stdin", "--daemon"]).is_ok());
+        assert!(Cli::try_parse_from(["augmentagent", "wiki", "ask", "--stdin", "--daemon", "--post"]).is_err());
     }
 }
 

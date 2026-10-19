@@ -16,6 +16,7 @@ pub mod models;
 pub mod notes;
 pub mod owner;
 pub mod phone;
+mod local_chat;
 pub mod owner_alerts;
 pub mod redact;
 // #1290 — Slack contact send targets and the per-action send ledger.

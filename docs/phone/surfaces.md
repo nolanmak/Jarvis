@@ -12,7 +12,7 @@ sharing `ask_opts` does not confer phone authority.
 | Slack interactive owner conversation | Slack owner binding, control conversation and canonical owner link; harness scopes phone context | `augmentagent-channel-slack/src/harness.rs`, `interactive.rs`, CLI `slack_serve.rs`; interactive-surface tests; live origin evidence outstanding |
 | WhatsApp authenticated self-chat | Device identity and self-message checks, stored owner/control binding and canonical owner link | `augmentagent-channel-whatsapp/src/control.rs`, CLI `whatsapp_phone.rs`, `whatsapp_phone_session_tests`; live origin evidence outstanding |
 | Accepted phone call | Persisted originating conversation; acceptance and current authority checked before entering shared native-session runner | `augmentagent-channel-core/src/phone_agent.rs`; phone-agent/session tests; actual native tool/approval and audible qualification outstanding |
-| Local `wiki ask` | OS-owner authority for other tools, but no phone context, owner-link mapping or phone tool attachment | CLI `run_wiki_ask`; **authenticated agent entry point missing phone support**. Private Unix transport foundation exists in CLI `local_phone_transport.rs`; daemon registration, local owner/conversation binding, durable transcript delivery and `wiki ask` routing remain unwired. Needs end-to-end conformance before claiming all authenticated surfaces |
+| Local `wiki ask --daemon` | Same-UID private Unix endpoint, explicit `cli` owner link, persisted local control conversation and shared native turn runner | CLI `local_phone.rs`, `local_phone_transport.rs`; signed loopback three-phone-turn test preserves native ID across local listener restart. Live qualification remains outstanding. Plain one-shot `wiki ask` does not attach phone tools |
 | Scheduled `/loop` prompts | Uses `ask_opts`, without phone tool attachment | CLI `LoopReasonerRunner::run_prompt`; scheduled unsolicited calls are explicitly outside #1496. Do not infer phone permission from its owner ID |
 | Telegram bot owner DM / subscribed messages | Subscription allowlist feeds triage/draft/approval, not the authenticated interactive phone harness | `augmentagent-channel-telegram-bot/src/channel.rs` calls `triage_opts` and `draft_opts`; no phone initiation claimed. Owner-DM delivery alone must not grant phone authority |
 | iMessage | History ingestion and existing message delivery; no authenticated phone command adapter established | `docs/IMESSAGE.md`; authenticated control adapter is a dependency before claiming iMessage call initiation. Preserve sender and attachment ingestion |
@@ -30,11 +30,11 @@ existing tools/settings survive attachment and revoked bindings fail.
 This is necessary but not sufficient for AC08. Finish auditing the custom
 constructors and option wrappers listed in `reasoner-capabilities.json`, and
 trace every production call path that establishes owner authority. Add executable
-conformance for those paths, including the local CLI gap above. Preserve the
+conformance for those paths, including the new local daemon path above. Preserve the
 explicit exclusion of passive ingestion and unsolicited scheduled calls; do not
 solve missing coverage by granting those paths a default owner context.
 
 The three mandatory chat adapters have offline initiation/status/stop coverage.
 They still need live receipts, and this audit does not establish that every
-integration can initiate a call. No local CLI or iMessage initiation support is
-claimed by the current implementation.
+integration can initiate a call. The local CLI requires `--daemon` and explicit operator setup; iMessage
+initiation remains unsupported.

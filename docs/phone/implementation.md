@@ -78,7 +78,7 @@ AUGMENTAGENT_GH_DISABLE=1 cargo test -p augmentagent-phone
 | AC05 | Signed acceptance, fake-clock deadline tests and concurrent runtime watchdog | Voicemail and live acceptance timing |
 | AC06 | Installed Claude/Codex CLIs pass text → three PhoneAgent turns → text with fresh synthetic reads on Linux; shared queue and daemon fixtures | Production agent tool/approval conformance and live phone matrix |
 | AC07 | Relay/barge-in generations, final suppression, one-time claims, local WSS round trip and cancellation | Live streaming/interruption and real native tool-disconnect qualification |
-| AC08 | Discord, Slack and WhatsApp daemon adapters; authenticated tools; durable transcript outboxes; 13 shared presets checked | [Entry-point audit](surfaces.md): local CLI phone adapter missing; custom constructors/wrappers and live origin receipts outstanding |
+| AC08 | Discord, Slack and WhatsApp daemon adapters; authenticated tools; durable transcript outboxes; 13 shared presets checked | [Entry-point audit](surfaces.md): local CLI daemon adapter has signed loopback session coverage; custom constructors/wrappers and live origin receipts outstanding |
 | AC09 | Persistent budgets, provider-duration callbacks, bounded shutdown and disabled/unavailable-start cleanup | Live stop/restart/disable evidence and unknown-SID recovery; known-SID reconciliation available |
 | AC10 | Recorded-audio receipt validator and synthetic regression tests only | Actual consented audio, native traces and full live matrix; no live receipt exists |
 | AC11 | No legacy voice removed yet | Replacement qualification, old-release upgrade/rollback fixtures and retirement; synthetic additive-schema preservation passes |
@@ -1354,3 +1354,25 @@ Model-router CI job `117794694827` failed the existing
 `hung_cli_times_out_with_typed_error` test with an unverified cleanup result.
 The same test passed in isolation locally (1.04 seconds). The full-suite failure
 remains unresolved; the isolated pass is not proof of safe cleanup under load.
+
+
+### Local daemon conversation adapter
+
+`wiki ask --daemon --stdin` now sends to the configured same-UID private socket.
+The phone-enabled daemon registers a `cli` PhoneAgent with the same WikiQuerier
+and native scheduler used for the local text turn. An exact `uid:<effective UID>`
+operator owner link is mandatory; startup initializes the private conversation
+once and cannot restore revocation. Number commands bypass the model/history;
+`phone history` reads bounded durable local transcripts. Text transcript writes
+remain inside the shared turn queue so phone turns cannot overtake them.
+
+The synthetic local adapter test passes two text turns, private number setup and
+duplicate suppression, a second fake call through signed loopback WebSocket
+ingress with three phone turns, then another text turn after local listener
+restart. The persisted native session ID remains unchanged; private setup does
+not enter the model/history; revoked ownership rejects a later startup. Three
+store tests prove transcript restart persistence, event conflict detection,
+owner-conversation isolation and bounded Unicode history. CLI parsing accepts
+`--daemon --stdin` and rejects `--daemon --post`. Installed native provider and
+live local-origin qualification remain separate gates; this test uses a scripted
+Claude native provider and fake telephony.

@@ -308,3 +308,40 @@ No Twilio requests, real phone calls, or chat sends occur. CI compiles the probe
 without running it. Passing it establishes native tool/session compatibility
 through the shared phone adapter, not audible performance, live ingress,
 approval gating, or production transport qualification.
+
+
+## Persistent local CLI conversation
+
+Configure `AUGMENTAGENT_PHONE_LOCAL_SOCKET` in the daemon and CLI environments
+with an absolute Unix socket path in a directory owned by the daemon user and
+mode 0700. The daemon creates the socket mode 0600; both processes must run as
+the same OS user. The path must fit the host's Unix socket length limit. The
+socket's `.lock` sibling is retained to serialize startup and stale recovery.
+
+Add an explicit owner link alongside your chat links, replacing `1000` with
+`id -u` and `owner-main` with the same canonical owner used by your other links:
+
+```json
+{"platform":"cli","account":"uid:1000","surface_owner":"uid:1000","owner":"owner-main"}
+```
+
+With phone enabled, valid provider/TLS settings, and `serve --wiki-dir` running,
+restart the daemon after adding this configuration. It initializes the local
+private conversation once. Revoked bindings require trusted operator recovery;
+restart does not restore them. No CLI listener is started unless the socket is
+configured and the exact OS-user owner link exists.
+
+Use `augmentagent wiki ask --daemon --stdin` and enter the prompt through stdin
+(then EOF). This uses the daemon's wiki and the persistent `local` conversation,
+so later invocations and accepted phone turns reuse the same native session.
+Number setup/verification/status/removal commands work through this path and
+bypass the model and transcript. `phone history` returns bounded recent text and
+phone transcripts from durable local storage. Calls continue in the daemon after
+the client exits. A lost response is not automatically retried; inspect phone
+status before requesting another action. `--daemon` cannot be combined with
+`--post`. Ordinary one-shot `wiki ask` retains its previous behavior.
+
+The local adapter passed a synthetic Claude-provider session test through signed
+loopback WebSocket ingress, three accepted phone turns and a local listener
+restart. This is not an installed native CLI or live telephone qualification
+receipt for the local origin.

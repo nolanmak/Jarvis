@@ -543,7 +543,7 @@ pub async fn whatsapp_text_turn(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn native_text_turn(
+pub(crate) async fn native_text_turn(
     store: &Store,
     tools: &Arc<ToolServer>,
     query: &dyn QueryHandler,
