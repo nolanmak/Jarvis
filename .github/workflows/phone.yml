@@ -21,6 +21,9 @@ on:
       - 'scripts/tests/aa-journal-guard.test.sh'
       - 'scripts/phone-offline-tests.py'
       - 'scripts/phone-upgrade-test.py'
+      - 'scripts/install-autostart.sh'
+      - 'scripts/lib/launchd-install.sh'
+      - 'scripts/tests/install-autostart.test.sh'
       - 'scripts/tests/phone_offline_ci_test.py'
       - 'scripts/phone-live-receipt.py'
       - 'scripts/tests/phone_live_receipt_test.py'
@@ -67,6 +70,8 @@ jobs:
         run: cargo test --locked -p augmentagent-channel-core --test phone_native_live --no-run
       - name: Required offline suites
         run: python3 scripts/phone-offline-tests.py
+      - name: Service installation preserves private phone configuration
+        run: bash scripts/tests/install-autostart.test.sh
       - name: Pre-phone database upgrade and rollback compatibility
         run: python3 scripts/phone-upgrade-test.py
       - name: CLI integration compiles

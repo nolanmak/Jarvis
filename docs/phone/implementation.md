@@ -1424,3 +1424,13 @@ checkout while adding this fixture; CI receipts identify the tested commit.
 This qualifies the tested Store schema compatibility with synthetic data only.
 Installer/service upgrade and rollback, live replacement qualification, and
 legacy retirement remain open under AC11–12.
+
+### Service installer configuration preservation
+
+The actual autostart installer is exercised in temporary checkouts for Linux
+and Darwin with stubbed service managers. Fresh installation and reinstallation
+preserve the synthetic phone `.env` byte-for-byte and retain mode 0600, leave a
+durable-state sentinel untouched, and render no Twilio or phone settings in the
+unit/plist. Both paths pass locally and are required by phone CI. This is
+installer file-preservation evidence, not real systemd/launchd execution or an
+old-release service rollback. The separate Store fixture covers schema data.
