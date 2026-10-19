@@ -77,6 +77,13 @@ pub enum ActionStatus {
     /// crash are flipped to `error` (retry-exempt) by the engine's startup
     /// reconcile — never auto-resent, because the send may have landed.
     Sending,
+    /// #1486 — a compose the Gmail provider throttled before a draft could
+    /// be created. `scheduledAtMs` holds the next attempt, `retryCount` the
+    /// attempts so far; the ScheduledSendEngine's sweep creates the draft and
+    /// posts the card when the throttle clears, flipping the row to
+    /// `pending`. Distinct from `pending` so the queue-hygiene sweeps (nudge
+    /// carousel, 7-day expiry, reconcile) skip a row that has no card yet.
+    QueuedCompose,
 }
 
 impl ActionStatus {
@@ -94,6 +101,7 @@ impl ActionStatus {
             Self::Superseded => "superseded",
             Self::Scheduled => "scheduled",
             Self::Sending => "sending",
+            Self::QueuedCompose => "queued_compose",
         }
     }
 }

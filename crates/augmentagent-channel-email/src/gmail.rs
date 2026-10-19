@@ -26,10 +26,14 @@ pub enum GmailError {
     Decode(String),
     #[error("invalid input: {0}")]
     Invalid(String),
-    #[error("composio Gmail rate limit; retry after {retry_after} (composio log_id {log_id})")]
+    /// #1486 — the provider does not always say when to come back: the
+    /// draft-create throttle arrives as a bare `…: 429`, so both fields are
+    /// optional and every consumer must tolerate their absence.
+    #[error("composio Gmail rate limit; retry after {} (composio log_id {log_id})",
+        .retry_after.as_deref().unwrap_or("no retry-after reported"))]
     RateLimited {
-        retry_after_ms: i64,
-        retry_after: String,
+        retry_after_ms: Option<i64>,
+        retry_after: Option<String>,
         log_id: String,
     },
 }
@@ -242,6 +246,9 @@ impl ComposioClient {
                     if status.is_success() {
                         let v = resp.json::<serde_json::Value>().await?;
                         let checked = check_envelope(action, v);
+                        // #1486 — an envelope throttle on a non-fetch action
+                        // consumes the same backoff budget an HTTP 429 does.
+                        let mut retry_envelope = false;
                         match &checked {
                             Err(err @ GmailError::RateLimited { retry_after_ms, retry_after, log_id }) => {
                                 // Ledgered for every action, not just fetch, so a
@@ -254,21 +261,40 @@ impl ComposioClient {
                                     action: action.to_string(),
                                     class: "envelope".into(),
                                     origin: self.call_origin.to_string(),
-                                    retry_after_ms: Some(*retry_after_ms),
-                                    retry_after_raw: Some(retry_after.clone()),
+                                    retry_after_ms: *retry_after_ms,
+                                    retry_after_raw: retry_after.clone(),
                                     provider_message: err.to_string(),
                                     headers_json: None,
                                     log_id: Some(log_id.clone()),
                                     attempt: attempt as i64,
                                 });
                                 if action == "GMAIL_FETCH_EMAILS" {
-                                    self.record_cooldown(entity_id, *retry_after_ms, Some(log_id))?;
+                                    // The poller's own cadence is its retry:
+                                    // in-process retries here would fight the
+                                    // #1384 cooldown this very call installs.
+                                    if let Some(ms) = *retry_after_ms {
+                                        self.record_cooldown(entity_id, ms, Some(log_id))?;
+                                    }
+                                } else {
+                                    // Every other action gets the same bounded
+                                    // in-process backoff an HTTP 429 gets; a
+                                    // throttle that outlives the budget is the
+                                    // caller's to queue (#1486).
+                                    retry_envelope = attempt < MAX_ATTEMPTS;
                                 }
                             }
                             Ok(_) if action == "GMAIL_FETCH_EMAILS" => {
                                 self.clear_cooldown(entity_id)?;
                             }
                             _ => {}
+                        }
+                        if retry_envelope {
+                            tracing::warn!(
+                                action, attempt,
+                                "composio envelope rate limit; backing off"
+                            );
+                            backoff(attempt).await;
+                            continue;
                         }
                         return checked;
                     }
@@ -1122,6 +1148,35 @@ mod tests {
         assert!(parse_rate_limit_retry_after("invalid credentials").is_none());
     }
 
+    /// #1486 — the exact envelope the issue reported on draft creation is a
+    /// throttle, even though it carries no retry-after.
+    #[test]
+    fn draft_create_envelope_429_is_a_rate_limit() {
+        let err = check_envelope(
+            "GMAIL_CREATE_EMAIL_DRAFT",
+            serde_json::json!({
+                "successful": false,
+                "error": "Failed to fetch user profile: 429",
+                "log_id": "log_x",
+            }),
+        )
+        .expect_err("a throttled draft create must not read as success");
+        assert!(
+            matches!(&err, GmailError::RateLimited { retry_after_ms: None, retry_after: None, log_id } if log_id == "log_x"),
+            "got: {err:?}"
+        );
+        assert!(err.to_string().contains("no retry-after reported"), "{err}");
+
+        assert_eq!(classify_envelope_rate_limit("Too Many Requests"), Some((None, None)));
+        assert_eq!(
+            classify_envelope_rate_limit("User-rate limit exceeded. Retry after 2099-01-01T00:00:00Z"),
+            Some((Some(4_070_908_800_000), Some("2099-01-01T00:00:00Z".to_string())))
+        );
+        // A 429 buried in a longer number is not a status code.
+        assert_eq!(classify_envelope_rate_limit("quota 14290 of 20000"), None);
+        assert_eq!(classify_envelope_rate_limit("invalid credentials"), None);
+    }
+
     // ---- #629: To/Cc recovery from the fetch payload ----
     //
     // Composio returns the full To list top-level and the Cc only inside
@@ -1498,6 +1553,47 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// Replies with `bodies[i]` (status 200) to the i-th request, repeating
+    /// the last entry, so a test can script a refuse-refuse-succeed
+    /// provider sequence (#1486).
+    async fn spawn_scripted_http(bodies: Vec<&'static str>) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut next = 0usize;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let body = bodies[next.min(bodies.len() - 1)];
+                next += 1;
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+                        len = body.len(),
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn draft_create_retries_an_envelope_rate_limit_then_succeeds() {
+        const REFUSED: &str =
+            r#"{"successful":false,"error":"Failed to fetch user profile: 429","log_id":"log_x"}"#;
+        const OK: &str = r#"{"successful":true,"data":{"id":"draft_ok"}}"#;
+        let addr = spawn_scripted_http(vec![REFUSED, REFUSED, OK]).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        let draft_id = client
+            .create_draft("entity-x", "sam@example.com", "Hi", "body", None)
+            .await
+            .expect("the third attempt must land");
+        assert_eq!(draft_id, "draft_ok");
     }
 
     /// One-shot mock that CAPTURES the request (headers + body) and sends it
@@ -2234,20 +2330,47 @@ fn check_envelope(
         .get("log_id")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("-");
-    if action == "GMAIL_FETCH_EMAILS" {
-        if let Some((retry_after_ms, retry_after)) = parse_rate_limit_retry_after(err_text) {
-            return Err(GmailError::RateLimited {
-                retry_after_ms,
-                retry_after,
-                log_id: log_id.to_string(),
-            });
-        }
+    // #1486 — classified for EVERY action, not just fetch. The old
+    // fetch-only gate is why the search path reported a retry-after window
+    // while an identically-throttled draft create surfaced a raw
+    // "Failed to fetch user profile: 429".
+    if let Some((retry_after_ms, retry_after)) = classify_envelope_rate_limit(err_text) {
+        return Err(GmailError::RateLimited {
+            retry_after_ms,
+            retry_after,
+            log_id: log_id.to_string(),
+        });
     }
     Err(GmailError::Composio {
         message: format!(
             "{action} reported successful:false — {} (composio log_id {log_id})",
             err_text.trim()
         ),
+    })
+}
+
+/// #1486 — is this envelope error a provider throttle, and when may we come
+/// back? Composio spells the same upstream refusal at least two ways: the
+/// Gmail user-rate wording the search path has always matched, and a bare
+/// status code (`Failed to fetch user profile: 429`) on draft creation. Only
+/// the first carries a boundary, so the retry-after is optional — the
+/// classification is not.
+fn classify_envelope_rate_limit(error: &str) -> Option<(Option<i64>, Option<String>)> {
+    let lower = error.to_ascii_lowercase();
+    let worded = ["rate limit", "ratelimit", "too many requests"]
+        .iter()
+        .any(|needle| lower.contains(needle));
+    // A standalone `429`, not the digits inside a longer number (`14290`).
+    let status_code = lower.match_indices("429").any(|(at, _)| {
+        let alnum = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
+        !alnum(lower[..at].chars().next_back()) && !alnum(lower[at + 3..].chars().next())
+    });
+    if !worded && !status_code {
+        return None;
+    }
+    Some(match parse_rate_limit_retry_after(error) {
+        Some((ms, raw)) => (Some(ms), Some(raw)),
+        None => (None, None),
     })
 }
 
@@ -2303,8 +2426,8 @@ fn rate_limited_error(retry_after_ms: i64, log_id: &str) -> GmailError {
         .map(|dt| dt.to_rfc3339())
         .unwrap_or_else(|| retry_after_ms.to_string());
     GmailError::RateLimited {
-        retry_after_ms,
-        retry_after,
+        retry_after_ms: Some(retry_after_ms),
+        retry_after: Some(retry_after),
         log_id: log_id.to_string(),
     }
 }

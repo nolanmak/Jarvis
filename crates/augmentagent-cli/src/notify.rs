@@ -246,7 +246,7 @@ pub static PRODUCERS: &[Producer] = &[
     p("discord_dm_flags", "crates/augmentagent-channel-discord-dm/src/channel.rs", ".post_flag_notice(", 1, BROKER, "Discord DM triage flags"),
     p("subscription_digest", "crates/augmentagent-channel-discord-dm/src/digest.rs", ".post_digest(", 1, BROKER, "subscription digests (Discord DM and Slack channels)"),
     p("email_flags", "crates/augmentagent-channel-email/src/channel.rs", ".post_flag_notice(", 3, BROKER, "email triage flags"),
-    p("email_scheduled", "crates/augmentagent-channel-email/src/scheduled.rs", ".post_flag_notice(", 6, BROKER, "scheduled-send results"),
+    p("email_scheduled", "crates/augmentagent-channel-email/src/scheduled.rs", ".post_flag_notice(", 7, BROKER, "scheduled-send results"),
     p("gdrive_digest", "crates/augmentagent-channel-gdrive/src/channel.rs", ".post_digest(", 1, BROKER, "Drive digest"),
     p("github_flags", "crates/augmentagent-channel-github/src/channel.rs", ".post_flag_notice(", 1, BROKER, "GitHub flags"),
     p("imessage_flags", "crates/augmentagent-channel-imessage/src/reply.rs", ".post_flag_notice(", 1, BROKER, "iMessage flags"),

@@ -2942,16 +2942,18 @@ impl Store {
 
     /// True iff there's already an in-flight action for this message —
     /// `pending` (awaiting Discord approval), `error` (will be picked up by
-    /// the retry tick), or `scheduled`/`sending` (#500 — armed for a future
-    /// send / mid-send). The poll loop uses this to avoid spawning duplicate
-    /// actions for the same email while one is still mid-flight.
+    /// the retry tick), `scheduled`/`sending` (#500 — armed for a future
+    /// send / mid-send), or `queued_compose` (#1486 — a throttled reply
+    /// waiting for the engine to draft it). The poll loop uses this to avoid
+    /// spawning duplicate actions for the same email while one is still
+    /// mid-flight.
     pub fn has_open_action(&self, message_id: &str) -> StoreResult<bool> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let row: Option<i64> = guard
             .query_row(
                 "SELECT 1 FROM actions \
                  WHERE messageId = ?1 \
-                   AND status IN ('pending', 'error', 'scheduled', 'sending') \
+                   AND status IN ('pending', 'error', 'scheduled', 'sending', 'queued_compose') \
                  LIMIT 1",
                 params![message_id],
                 |r| r.get(0),
@@ -4407,6 +4409,10 @@ impl Store {
     /// Companion to `mark_pending_drafts_superseded_by_thread` for the cases
     /// where staleness is decided per-card (bulk sender) rather than
     /// per-thread (user already replied). Returns the number of rows flipped.
+    ///
+    /// #1486 — `queued_compose` rows are retired here too: a follow-up
+    /// compose that replaces a throttle-queued one must leave nothing behind
+    /// for the engine's sweep to turn into a second card.
     pub fn mark_pending_superseded_by_ids(
         &self,
         ids: &[String],
@@ -4426,7 +4432,7 @@ impl Store {
              SET status = 'superseded', \
                  errorMessage = COALESCE(NULLIF(?1, ''), 'superseded: stale'), \
                  updatedAt = ?2 \
-             WHERE status = 'pending' AND id IN ({placeholders})"
+             WHERE status IN ('pending', 'queued_compose') AND id IN ({placeholders})"
         );
         let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() + 2);
         params_vec.push(&reason);
@@ -4738,7 +4744,7 @@ impl Store {
             .query_row(
                 "SELECT a.id, a.draftId, a.status FROM actions a \
                  JOIN emails e ON a.messageId = e.messageId \
-                 WHERE a.status IN ('pending', 'scheduled') \
+                 WHERE a.status IN ('pending', 'scheduled', 'queued_compose') \
                    AND e.accountEntityId = ?1 \
                    AND LOWER(COALESCE(a.toEmails, a.fromEmail)) = LOWER(?2) \
                    AND a.subject = ?3 \
@@ -6932,6 +6938,84 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// #1486 — throttle-queued composes whose next attempt is due, oldest
+    /// first, as `(action_id, attempts_so_far)`. The attempts live in the
+    /// reused `retryCount` column: the row never reaches the generic retry
+    /// tick, which is `status = 'error'` only.
+    pub fn due_queued_composes(&self, now_ms: i64, limit: i64) -> StoreResult<Vec<(String, i64)>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, COALESCE(retryCount, 0) \
+               FROM actions \
+              WHERE status = 'queued_compose' AND scheduledAtMs IS NOT NULL \
+                AND scheduledAtMs <= ?1 \
+              ORDER BY scheduledAtMs ASC \
+              LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![now_ms, limit], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// #1486 — the queued compose landed: `queued_compose → pending`, with
+    /// the nudge pointer armed exactly as [`Self::unschedule_action`] does,
+    /// because the caller has posted the card by the time this CAS runs.
+    /// `false` when something else resolved the row first.
+    pub fn promote_queued_compose(&self, action_id: &str, source: &str) -> StoreResult<bool> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE actions \
+                SET status = 'pending', scheduledAtMs = NULL, errorMessage = NULL, \
+                    nudgeCount = 1, nextNudgeAtMs = ?2, \
+                    status_source = ?3, status_updated_at = ?4, updatedAt = ?4 \
+              WHERE id = ?1 AND status = 'queued_compose'",
+            params![action_id, now + NUDGE_INTERVAL_MS, source, now],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// #1486 — still throttled: count the attempt and move the next one out
+    /// to `next_at_ms`. CAS-gated on the row still being queued.
+    pub fn defer_queued_compose(&self, action_id: &str, next_at_ms: i64, source: &str) -> StoreResult<bool> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE actions \
+                SET retryCount = COALESCE(retryCount, 0) + 1, scheduledAtMs = ?2, \
+                    status_source = ?3, status_updated_at = ?4, updatedAt = ?4 \
+              WHERE id = ?1 AND status = 'queued_compose'",
+            params![action_id, next_at_ms, source, now],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// #1486 — give up on a queued compose: `queued_compose → error`, with a
+    /// retry-exempt `retryCount` so the generic retry tick (which would
+    /// re-dispatch it as a triage reply) never picks it up.
+    pub fn fail_queued_compose(
+        &self,
+        action_id: &str,
+        reason: &str,
+        retry_count_override: i64,
+        source: &str,
+    ) -> StoreResult<bool> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE actions \
+                SET status = 'error', scheduledAtMs = NULL, errorMessage = ?2, \
+                    retryCount = ?5, \
+                    status_source = ?3, status_updated_at = ?4, updatedAt = ?4 \
+              WHERE id = ?1 AND status = 'queued_compose'",
+            params![action_id, reason, source, now, retry_count_override],
+        )?;
+        Ok(n == 1)
     }
 
     /// Bounded, per-row cancellation of an armed scheduled send:

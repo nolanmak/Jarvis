@@ -44,7 +44,7 @@ use augmentagent_approval_discord::{
 use augmentagent_channel_core::reasoner::{ask_opts, digest_opts, draft_opts};
 use augmentagent_channel_core::{build_reasoner, FallbackReasoner, Reasoner};
 use augmentagent_channel_email::gmail::{
-    normalize_subject, Attachment, ComposioClient, GmailApi, ThreadSubject,
+    normalize_subject, Attachment, ComposioClient, GmailApi, GmailError, ThreadSubject,
 };
 use augmentagent_channel_email::sigextract::{
     detect_signature_block, is_human_sender, signature_patch, strip_quoted_reply,
@@ -6803,7 +6803,7 @@ async fn run_gmail_compose(
         ensure_subject_matches_thread(&gmail, &entity_id, t, &subject).await?;
     }
     let attachment = upload_attach_if_given(&gmail, attach).await?;
-    let draft_id = gmail
+    let created = gmail
         .create_draft_with_attachment(
             &entity_id,
             &to,
@@ -6814,8 +6814,74 @@ async fn run_gmail_compose(
             &cc,
             &bcc,
         )
-        .await
-        .context("create_draft via Composio failed")?;
+        .await;
+    // #1486 — the provider throttles a connection for far longer than any
+    // in-process backoff can wait, so a plain `--post` compose is parked for
+    // the daemon to land instead of being lost (matched BEFORE `.context`
+    // erases the typed error). The other shapes get the error: an `--attach`
+    // upload is CLI-local state the daemon cannot reproduce, a `--send-at`
+    // may be stale once the throttle clears, a `--bcc` is not expressible
+    // through the trait the daemon drafts with, and without `--post` there
+    // is no card to deliver later.
+    if let Err(GmailError::RateLimited { retry_after_ms, retry_after, .. }) = &created {
+        if post && attachment.is_none() && send_at_ms.is_none() && bcc.is_empty() {
+            const DEFAULT_RETRY_DELAY_MS: i64 = 5 * 60 * 1000;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let next_at_ms = retry_after_ms
+                .filter(|ms| *ms > now_ms)
+                .unwrap_or(now_ms + DEFAULT_RETRY_DELAY_MS);
+            let action_id = queue_throttled_compose(
+                &store,
+                &entity_id,
+                &email,
+                &to,
+                &cc,
+                &bcc,
+                &subject,
+                &body_str,
+                thread_id.as_deref(),
+                reply_to_message_id.as_deref(),
+                reply_to_from.as_deref(),
+                reply_to_subject.as_deref(),
+                next_at_ms,
+            )?;
+            // Retire the card this compose replaces, or the queued row lands
+            // as a second card for the same email (#419). Best-effort: the
+            // queued row already exists.
+            if let Some((old_action_id, old_draft_id)) = &pending_replacement {
+                let _ = store.mark_pending_superseded_by_ids(
+                    std::slice::from_ref(old_action_id),
+                    "superseded by follow-up compose",
+                );
+                if let Some(old_draft_id) = old_draft_id {
+                    let _ = gmail.delete_draft(&entity_id, old_draft_id).await;
+                }
+            }
+            let window = retry_after.clone().unwrap_or_else(|| "unknown".into());
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "queued": true,
+                        "action_id": action_id,
+                        "account": email,
+                        "entity_id": entity_id,
+                        "to": to,
+                        "subject": subject,
+                        "retry_after": window,
+                    })
+                );
+            } else {
+                println!(
+                    "queued {action_id} — gmail rate-limited this account \
+                     (retry after {window}); the daemon will create the draft \
+                     and post the approval card when the throttle clears"
+                );
+            }
+            return Ok(());
+        }
+    }
+    let draft_id = created.context("create_draft via Composio failed")?;
     if post {
         post_reply_approval_card(
             &store,
@@ -6922,6 +6988,90 @@ async fn run_gmail_compose(
     Ok(())
 }
 
+/// #1486 — the Re:-stripped subject a compose card's `emails`/`actions` rows
+/// carry, which is the inbound's own subject on a reply.
+fn compose_card_subject(out_subject: &str, reply_to_subject: Option<&str>) -> String {
+    let stripped = out_subject
+        .strip_prefix("Re:")
+        .or_else(|| out_subject.strip_prefix("re:"))
+        .or_else(|| out_subject.strip_prefix("RE:"))
+        .unwrap_or(out_subject)
+        .trim_start()
+        .to_string();
+    reply_to_subject
+        .map(str::to_string)
+        .unwrap_or_else(|| if stripped.is_empty() { out_subject.to_string() } else { stripped })
+}
+
+/// #1486 — park a compose the provider throttled: the same `emails` +
+/// `actions` pair [`post_reply_approval_card`] writes, but with no draft id
+/// and status `queued_compose`. `scheduledAtMs` carries the next attempt and
+/// `actions.subject` the OUTBOUND subject, so the daemon's sweep can create
+/// the draft and post the card once the throttle clears.
+#[allow(clippy::too_many_arguments)]
+fn queue_throttled_compose(
+    store: &Store,
+    entity_id: &str,
+    account_email: &str,
+    to: &str,
+    cc: &[String],
+    bcc: &[String],
+    out_subject: &str,
+    draft_body: &str,
+    thread_id: Option<&str>,
+    reply_to_message_id: Option<&str>,
+    reply_to_from: Option<&str>,
+    reply_to_subject: Option<&str>,
+    next_attempt_at_ms: i64,
+) -> Result<String> {
+    let thread = thread_id.filter(|t| !t.is_empty());
+    let reply_msg_id = reply_to_message_id.filter(|s| !s.is_empty());
+    // No draft exists yet, so the usual `compose:<draft_id>` key is not
+    // available; a uuid keeps the `compose:` convention and stays unique.
+    let synthetic_msg_id = format!("compose:queued:{}", uuid::Uuid::new_v4());
+    let msg_id: &str = reply_msg_id.unwrap_or(&synthetic_msg_id);
+    let card_from =
+        compose_card_identity(reply_msg_id.is_some(), reply_to_from, to, account_email);
+    let card_subject = compose_card_subject(out_subject, reply_to_subject);
+    store
+        .upsert_email(&augmentagent_store::Email {
+            attachments: Vec::new(),
+            message_id: msg_id.to_string(),
+            to: String::new(),
+            cc: String::new(),
+            thread_id: thread.map(str::to_string),
+            from: card_from.clone(),
+            subject: card_subject.clone(),
+            body: String::new(),
+            date: String::new(),
+            account_entity_id: Some(entity_id.to_string()),
+            platform: "gmail".into(),
+            kind: "dm".into(),
+        })
+        .context("upsert inbound email for action linkage")?;
+    let action_id = store
+        .log_action_with_envelope(
+            msg_id,
+            thread,
+            &card_from,
+            &card_subject,
+            Some(""),
+            Some(draft_body),
+            ActionStatus::QueuedCompose,
+            Some(to),
+            Some(&cc.join(", ")),
+            Some(&bcc.join(", ")),
+        )
+        .context("log action row")?;
+    store
+        .set_action_subject(&action_id, Some(out_subject))
+        .context("record the queued compose's outgoing subject")?;
+    store
+        .set_action_scheduled_at(&action_id, Some(next_attempt_at_ms))
+        .context("record the queued compose's next attempt")?;
+    Ok(action_id)
+}
+
 /// #352 / #412 — Post a Discord approval card for a draft the wiki-ask agent
 /// just composed in a chat session. Writes the same `actions`-table shape as
 /// the auto-triage path so the daemon's Approve/Revise/Skip handlers don't
@@ -6994,16 +7144,8 @@ async fn post_reply_approval_card(
     };
     let original_from =
         compose_card_identity(reply_msg_id.is_some(), reply_to_from, to, account_email);
-    let stripped = out_subject
-        .strip_prefix("Re:")
-        .or_else(|| out_subject.strip_prefix("re:"))
-        .or_else(|| out_subject.strip_prefix("RE:"))
-        .unwrap_or(out_subject)
-        .trim_start()
-        .to_string();
-    let original_subject = reply_to_subject
-        .map(str::to_string)
-        .unwrap_or_else(|| if stripped.is_empty() { out_subject.to_string() } else { stripped });
+    let original_subject =
+        compose_card_subject(out_subject, reply_to_subject);
 
     // Upsert an inbound row when the daemon hasn't already ingested this
     // message. The Revise handler reads `emails.body` to redraft against the
