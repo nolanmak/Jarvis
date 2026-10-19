@@ -213,21 +213,18 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         );
     }
 
-    /// #1494 — bound a provider-supplied retry-after before it is persisted.
-    /// The boundary is parsed out of Composio's error prose, so a malformed
-    /// timestamp could otherwise park a row past any plausible retry; cap it
-    /// at the queue's own max age, where the row is given up on deliberately
-    /// (with an owner notice) rather than expiring in silence.
-    fn clamp_retry_boundary(&self, retry_after_ms: i64) -> i64 {
-        let now = now_millis();
-        let cap = now + self.config.retry_max_age.as_millis() as i64;
-        if retry_after_ms > cap {
-            warn!(
-                retry_after_ms,
-                cap, "upstream retry-after beyond the retry max age; clamping"
-            );
-        }
-        retry_after_ms.clamp(now, cap)
+    /// #1494 — how far past its own `createdAt` a throttled row's retry clock
+    /// may be parked; the store clamps the provider's boundary into it.
+    ///
+    /// The window must stay strictly inside `retry_max_age`, which
+    /// `list_retryable_replies` also applies to `createdAt`: a row held at or
+    /// past that edge is never retried, never reaches the attempt cap, and so
+    /// never earns its give-up notice — it just disappears. Two retry
+    /// intervals of slack leave at least one tick inside the age window.
+    fn retry_hold_window_ms(&self) -> i64 {
+        let max_age = self.config.retry_max_age.as_millis() as i64;
+        let slack = 2 * self.config.retry_interval.as_millis() as i64;
+        (max_age - slack).max(0)
     }
 
     /// #1494 — recover from a create-draft whose response was lost to a
@@ -237,8 +234,8 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
     /// Deliberately narrow. A thread can also hold a draft the OWNER typed,
     /// and adopting that would put their own text on an approval card, so this
     /// probes only when the row's own last failure was a rate limit and no
-    /// `draftId` was ever recorded. A failed probe is not fatal — fall through
-    /// and let `dispatch_reply` create the draft.
+    /// `draftId` was ever recorded. A failed probe falls through to
+    /// `dispatch_reply` creating the draft.
     async fn adopt_landed_draft(&self, entity_id: &str, item: &RetryableReply) {
         let rate_limited = item
             .action
@@ -1677,11 +1674,16 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     // #1494 — a sustained throttle outlives the in-loop
                     // backoff (#1493). Keep the row in the one existing retry
                     // queue (status stays `error`) but hold it until the
-                    // boundary the provider named, instead of burning all five
-                    // attempts inside `retry_min_gap`.
+                    // boundary the provider named (bounded by the hold
+                    // window), instead of burning all five attempts inside
+                    // `retry_min_gap`.
                     if let crate::gmail::GmailError::RateLimited { retry_after_ms, .. } = &e {
-                        let until = self.clamp_retry_boundary(*retry_after_ms);
-                        if let Err(se) = self.store.set_action_retry_not_before(&action_id, until) {
+                        let window = self.retry_hold_window_ms();
+                        if let Err(se) = self.store.set_action_retry_not_before(
+                            &action_id,
+                            *retry_after_ms,
+                            window,
+                        ) {
                             warn!(action_id, "retry-after persist failed: {se}");
                         }
                     }
@@ -3650,11 +3652,14 @@ Where: Microsoft Teams
         );
     }
 
-    /// #1494 — a provider timestamp far past the queue's max age must be
-    /// clamped before it is stored, so a malformed boundary cannot park a row
-    /// indefinitely.
+    /// #1494 REGRESSION — a provider timestamp far past the queue's max age
+    /// must be clamped into the hold window, not merely under some cap: the
+    /// queue drops rows whose `createdAt` is older than the SAME max age, so
+    /// a row held at that edge would silently disappear instead of retrying
+    /// and eventually earning its give-up notice. Queried with the production
+    /// `retry_max_age` the retry tick itself passes.
     #[tokio::test]
-    async fn an_absurd_retry_after_is_clamped_to_the_queue_max_age() {
+    async fn an_absurd_retry_after_still_leaves_the_row_retryable() {
         let (store, _f) = tmp_store();
         // Year 2098, the shape a prior live parse produced.
         let gmail = Arc::new(ThrottledGmail::new(
@@ -3670,15 +3675,16 @@ Where: Microsoft Teams
             .latest_action_for_message("m-throttle")
             .unwrap()
             .unwrap();
-        let cap = now_millis() + GmailChannelConfig::default().retry_max_age.as_millis() as i64;
-        let visible_at_cap = store
-            .list_retryable_replies("gmail", cap + 1_000, i64::MAX / 4, 0, 99, 10)
+        let max_age = ch.config.retry_max_age.as_millis() as i64;
+        let eligible_at = now_millis() + ch.retry_hold_window_ms() + 60_000;
+        let visible = store
+            .list_retryable_replies("gmail", eligible_at, max_age, 0, 5, 10)
             .unwrap()
             .into_iter()
             .any(|r| r.action.id == action_id);
         assert!(
-            visible_at_cap,
-            "a clamped boundary must leave the row reachable by the max-age cap"
+            visible,
+            "a clamped boundary must leave the row inside the max-age window"
         );
     }
 

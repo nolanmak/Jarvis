@@ -4664,17 +4664,26 @@ impl Store {
     /// upstream retry-after boundary it was handed. Takes the MAX of any
     /// existing clock, like `set_gmail_fetch_cooldown`, so a shorter later
     /// boundary can't pull the row back inside a throttle we already saw.
+    ///
+    /// The boundary is then bounded by the row's OWN clock:
+    /// `createdAt + hold_window_ms`. [`Self::list_retryable_replies`] also
+    /// drops rows whose `createdAt` is older than its `max_age_ms`, so a hold
+    /// past that window would make the row vanish — never retried, never
+    /// given up on. The caller sizes `hold_window_ms` to leave retry ticks
+    /// inside the age window (see `GmailChannel::retry_hold_window_ms`).
     pub fn set_action_retry_not_before(
         &self,
         action_id: &str,
         not_before_ms: i64,
+        hold_window_ms: i64,
     ) -> StoreResult<()> {
         let now = now_millis();
         let guard = self.conn.lock().expect("store mutex poisoned");
         guard.execute(
-            "UPDATE actions SET retryNotBeforeMs = MAX(COALESCE(retryNotBeforeMs, 0), ?2), \
-                updatedAt = ?3 WHERE id = ?1",
-            params![action_id, not_before_ms, now],
+            "UPDATE actions SET retryNotBeforeMs = \
+                MIN(MAX(COALESCE(retryNotBeforeMs, 0), ?2), createdAt + ?3), \
+                updatedAt = ?4 WHERE id = ?1",
+            params![action_id, not_before_ms, hold_window_ms, now],
         )?;
         Ok(())
     }
@@ -4876,9 +4885,8 @@ impl Store {
     ///   was an upstream rate limit that named a boundary. NULL — every other
     ///   failure, and every row written before the column existed — retries on
     ///   exactly the pre-#1494 schedule. Scheduled-send failures can't be
-    ///   affected: `finish_send_error` stamps them at the retry cap so they
-    ///   never reach this query at all, which is why `scheduled.rs`'s
-    ///   no-engine-retries contract survives a compose-side clock untouched.
+    ///   affected: `finish_send_error` stamps them at the retry cap, so they
+    ///   never reach this query at all.
     /// - `emails.platform` equals the caller's channel — each channel's retry
     ///   tick only sees its own rows (#670); otherwise e.g. a socialapi Error
     ///   row lands in the gmail tick and is dispatched through gmail plumbing
@@ -10717,10 +10725,6 @@ mod tests {
         );
     }
 
-    /// #670 REGRESSION — the retry queue is per-channel. A socialapi Error row
-    /// (logged by the DM handler's parse-failure / post_approval-failure paths)
-    /// must never surface to the gmail tick, whose recovery path dispatches
-    /// through gmail plumbing.
     /// #1494 — a compose throttled by Composio stamps the upstream
     /// retry-after onto its action row; the retry tick must not touch the row
     /// before that boundary, and rows that never set one keep the old
@@ -10747,11 +10751,13 @@ mod tests {
         }
         let now = now_millis();
         let ten_min = 10 * 60 * 1_000;
-        s.set_action_retry_not_before(&ids[0], now + ten_min)
+        let day = 86_400_000;
+        let window = day - 2 * 5 * 60 * 1_000;
+        s.set_action_retry_not_before(&ids[0], now + ten_min, window)
             .unwrap();
 
         let ids_at = |at: i64| {
-            s.list_retryable_replies("gmail", at, 86_400_000, 0, 5, 10)
+            s.list_retryable_replies("gmail", at, day, 0, 5, 10)
                 .unwrap()
                 .into_iter()
                 .map(|r| r.action.id)
@@ -10770,11 +10776,25 @@ mod tests {
 
         // A clock never moves backwards: a later write wins, an earlier one
         // is ignored (the boundary we already promised upstream stands).
-        s.set_action_retry_not_before(&ids[0], now - ten_min)
+        s.set_action_retry_not_before(&ids[0], now - ten_min, window)
             .unwrap();
         assert_eq!(ids_at(now), [ids[1].clone()]);
+
+        // A boundary past the hold window is clamped INTO it, so the row is
+        // still reachable while its `createdAt` is inside `max_age_ms` —
+        // a hold at or past that edge would make the row disappear.
+        s.set_action_retry_not_before(&ids[0], now + 100 * day, window)
+            .unwrap();
+        assert!(
+            ids_at(now + window + 60_000).contains(&ids[0]),
+            "a clamped boundary must still leave the row retryable"
+        );
     }
 
+    /// #670 REGRESSION — the retry queue is per-channel. A socialapi Error row
+    /// (logged by the DM handler's parse-failure / post_approval-failure paths)
+    /// must never surface to the gmail tick, whose recovery path dispatches
+    /// through gmail plumbing.
     #[test]
     fn list_retryable_replies_is_scoped_to_caller_platform() {
         let (s, _f) = fresh_store();
