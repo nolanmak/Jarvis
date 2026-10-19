@@ -59,3 +59,11 @@ matching accepted phone turns. The scope is enabled only when the origin equals
 the stored direct conversation. Passive ingestion does not enter this runner.
 The Discord and WhatsApp session regressions pass after this change (two tests,
 both provider selections within each test).
+
+`native_text_history_requires_registered_direct_conversation_and_current_owner`
+adds the negative boundary checks for both scripted native providers: a direct
+conversation receives history scope; an authorized control channel does not,
+even inside an outer history-enabled scope; revocation rejects before another
+provider call; and the task-local history scope does not escape the turn. All
+four runtime tests pass locally, including the Slack adapter session test.
+The required CI runner now expects at least four runtime tests.

@@ -241,6 +241,58 @@ mod tests {
             self.provider.call(&opts, text).await
         }
     }
+    struct HistoryQuery {
+        provider: RecordingNativeProvider,
+        expected: bool,
+    }
+    #[async_trait]
+    impl QueryHandler for HistoryQuery {
+        async fn answer(&self, _: &augmentagent_approval_discord::AuditCtx, text: &str) -> Result<String> {
+            assert_eq!(augmentagent_approval_discord::interaction::history_allowed(), self.expected);
+            self.provider.call(&augmentagent_channel_core::reasoner::triage_opts(None), text).await
+        }
+    }
+    #[tokio::test]
+    async fn native_text_history_requires_registered_direct_conversation_and_current_owner() {
+        use augmentagent_store::{SurfaceAccountRef, SurfaceConversationRef, SurfaceOwnerRef, SurfacePlatform};
+        for kind in [ProviderKind::Claude, ProviderKind::Codex] {
+            for (control, private) in [(ControlConversationKind::Direct, true), (ControlConversationKind::Channel, false)] {
+                let dir = tempfile::tempdir().unwrap();
+                let store = Store::open(dir.path().join("db")).unwrap();
+                let account = SurfaceAccountRef::new(SurfacePlatform::new("discord").unwrap(), "fixture").unwrap();
+                let owner = SurfaceOwnerRef::new(account.clone(), "owner").unwrap();
+                let chat = SurfaceConversationRef::new(account, "private-control", None).unwrap();
+                store.bind_surface_owner(&owner, 0).unwrap();
+                store.set_surface_control_conversation(&chat, control, 0).unwrap();
+                store.bind_surface_conversation(&NativeConversation {
+                    conversation: chat.clone(), provider: kind.name().into(),
+                    native_session_id: uuid::Uuid::new_v4().to_string(),
+                    cwd: dir.path().to_string_lossy().into(), uncertain: false,
+                }).unwrap();
+                let store = Arc::new(store);
+                let service = Arc::new(PhoneService::new(store.clone(), Arc::new(Phone), Arc::new(SystemClock),
+                    PhoneConfig::new(true, "https://phone.example.test", "history-fixture-verification-secret", vec![OwnerLink {
+                        surface_owner: owner.clone(), owner_id: "owner".into(),
+                    }]).unwrap()));
+                let tools = ToolServer::start(service).await.unwrap();
+                let origin = augmentagent_store::phone::PhoneOrigin { owner: owner.clone(), conversation: chat };
+                let mut audit = augmentagent_approval_discord::AuditCtx::empty();
+                audit.session_id = "first".into();
+                let query = HistoryQuery { provider: RecordingNativeProvider::new(kind), expected: private };
+                // Even an outer history grant must not leak into a registered
+                // control channel that is not the owner's direct conversation.
+                augmentagent_approval_discord::interaction::owner_history(true,
+                    native_text_turn(&store, &tools, &query, &audit, &origin, dir.path(), "", "first")
+                ).await.unwrap();
+                assert_eq!(query.provider.calls().len(), 1);
+                store.unbind_surface_owner(owner.account()).unwrap();
+                audit.session_id = "after-revocation".into();
+                assert!(native_text_turn(&store, &tools, &query, &audit, &origin, dir.path(), "", "denied").await.is_err());
+                assert_eq!(query.provider.calls().len(), 1, "revocation must reject before the native provider");
+                assert!(!augmentagent_approval_discord::interaction::history_allowed(), "history scope leaked after turn");
+            }
+        }
+    }
     fn text_turn(workspace: &SlackWorkspace, text: &str, n: u32) -> SlackTurn {
         let chat = workspace.conversation("D0000001", None).unwrap();
         let id = format!("1800000000.{n:06}");
