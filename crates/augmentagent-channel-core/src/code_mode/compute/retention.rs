@@ -277,6 +277,16 @@ pub struct Lease {
     task: Directory,
     root: Directory,
 }
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // Closing our descriptor alone does not release flock while a
+        // concurrently forked child still holds the same open file description.
+        // The owning lease has ended; explicitly release before closing it.
+        unsafe {
+            libc::flock(self._live.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
 impl Lease {
     pub fn reserve(
         path: &Path,
@@ -519,8 +529,12 @@ mod tests {
             task.exists(),
             "live lease must survive any apparent timestamp expiry"
         );
+        // A concurrent fork may retain this open file description until exec,
+        // even with CLOEXEC. Model that interval without forking a test runtime.
+        let inherited = lease._live.try_clone().unwrap();
         drop(lease);
         assert_eq!(sweep_at(&path, 11).unwrap().removed, 1);
+        drop(inherited);
         assert!(
             !task.exists(),
             "abandoned task should not wait for daemon PID exit"
