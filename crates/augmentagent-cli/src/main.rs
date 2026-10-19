@@ -14007,7 +14007,7 @@ impl ReplyApprover {
                 message: "no accountEntityId on gcal action; cannot create".into(),
             };
         };
-        let draft: EventDraft = match serde_json::from_str(&action.email.body) {
+        let mut draft: EventDraft = match serde_json::from_str(&action.email.body) {
             Ok(d) => d,
             Err(e) => {
                 let msg = format!("gcal proposal payload parse failed: {e}");
@@ -14020,6 +14020,15 @@ impl ReplyApprover {
                 return ApprovalActionOutcome::Failed { message: msg };
             }
         };
+        // #1456 — payloads written before the organizer travelled in the
+        // draft: the card's sender is the account the event is created on.
+        if draft
+            .organizer_email
+            .as_deref()
+            .is_none_or(|email| email.trim().is_empty())
+        {
+            draft.organizer_email = Some(action.email.from.clone());
+        }
         match self.calendar.create_event(entity_id, "primary", &draft).await {
             Ok(created) => {
                 // The concrete calendar client returns success only with a
@@ -19995,6 +20004,7 @@ async fn run_calendar_create_event(
         attendees: attendee_list.clone(),
         description: description.clone(),
         create_meeting_room: meet,
+        organizer_email: Some(acct.email.clone()),
     };
     let payload_json =
         serde_json::to_string_pretty(&draft).context("serialize event draft")?;

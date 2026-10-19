@@ -35,6 +35,15 @@ pub struct EventDraft {
     /// Attach a Google Meet room.
     #[serde(default)]
     pub create_meeting_room: bool,
+    /// Email of the account the event is created on. Used only to accept on
+    /// the organizer's behalf after the create (#1456). Two sites build a
+    /// draft and one call reaches `create_event`: `calendar create-event`
+    /// fills this from the account it proposes on, and the Approve handler —
+    /// the sole deserializer and the sole caller of `create_event` — backfills
+    /// the card's sender when the stored payload predates this field, so the
+    /// organizer is known on every creation path.
+    #[serde(default)]
+    pub organizer_email: Option<String>,
 }
 
 /// Handle returned by a successful create.
@@ -125,6 +134,71 @@ impl ComposioCalendarClient {
     pub fn with_base_url(mut self, base_url: String) -> Self {
         self.base_url = base_url;
         self
+    }
+
+    /// Google's `events.insert` leaves the organizer's own attendee entry at
+    /// `needsAction`, so the owner is asked to RSVP to an event they just
+    /// created (#1456). Flip that one entry to `accepted` with a follow-up
+    /// patch. `events.patch` replaces the attendee array wholesale, so the
+    /// current array is read back and resent in full — a partial array would
+    /// drop the invitees — with update notifications suppressed, since the
+    /// invitations already went out on the create.
+    ///
+    /// Arguments follow the snake_case convention of the other Composio write
+    /// actions (`CREATE_EVENT`, `DELETE_EVENT`) rather than the camelCase of
+    /// the `EVENTS_*` reads; the live #1436 harness is what confirms it
+    /// against the real provider.
+    async fn accept_as_organizer(
+        &self,
+        entity_id: &str,
+        calendar_id: &str,
+        event_id: &str,
+        organizer_email: &str,
+    ) -> Result<(), CalendarError> {
+        let event = self.get_event(entity_id, calendar_id, event_id).await?;
+        let mut attendees = event.attendees.unwrap_or_default();
+        let own = attendees.iter_mut().find(|a| {
+            a.self_ == Some(true)
+                || a.email
+                    .as_deref()
+                    .is_some_and(|e| e.eq_ignore_ascii_case(organizer_email))
+        });
+        match own {
+            Some(a) if a.response_status.as_deref() == Some("accepted") => return Ok(()),
+            Some(a) => a.response_status = Some("accepted".into()),
+            None => attendees.push(crate::types::RawAttendee {
+                email: Some(organizer_email.to_string()),
+                response_status: Some("accepted".into()),
+                ..Default::default()
+            }),
+        }
+        // Hand-built entries rather than serialized `RawAttendee`s: `self` and
+        // `organizer` are output-only fields on the Calendar API.
+        let attendees: Vec<serde_json::Value> = attendees
+            .iter()
+            .map(|a| {
+                let mut entry = serde_json::json!({ "email": a.email });
+                if let Some(status) = &a.response_status {
+                    entry["responseStatus"] = serde_json::Value::String(status.clone());
+                }
+                if a.resource == Some(true) {
+                    entry["resource"] = serde_json::Value::Bool(true);
+                }
+                entry
+            })
+            .collect();
+        self.execute(
+            "GOOGLECALENDAR_PATCH_EVENT",
+            entity_id,
+            serde_json::json!({
+                "calendar_id": calendar_id,
+                "event_id": event_id,
+                "attendees": attendees,
+                "send_updates": false,
+            }),
+        )
+        .await?;
+        Ok(())
     }
 
     async fn execute(
@@ -424,11 +498,35 @@ impl CalendarApi for ComposioCalendarClient {
         ];
         for cand in candidates.into_iter().flatten() {
             if let Ok(created) = serde_json::from_value::<CreatedEvent>(cand.clone()) {
-                if created
+                if let Some(id) = created
                     .id
                     .as_deref()
-                    .is_some_and(|id| !id.trim().is_empty())
+                    .filter(|id| !id.trim().is_empty())
+                    .map(str::to_string)
                 {
+                    // Best effort, and deliberately so: the event exists and
+                    // the invites are out. An error here must never surface as
+                    // `Unconfirmed` — that text invites a retry, and a retried
+                    // create duplicates a real event with real invites. A
+                    // zero-attendee event has no attendee array to patch;
+                    // adding one changes how Calendar renders it.
+                    let organizer = draft
+                        .organizer_email
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|email| !email.is_empty());
+                    if let Some(organizer) = organizer.filter(|_| !draft.attendees.is_empty()) {
+                        if let Err(e) = self
+                            .accept_as_organizer(entity_id, calendar_id, &id, organizer)
+                            .await
+                        {
+                            warn!(
+                                event_id = %id,
+                                "organizer auto-accept failed; event stands as created: {}",
+                                bounded(&e.to_string(), 900)
+                            );
+                        }
+                    }
                     return Ok(created);
                 }
             }
@@ -606,6 +704,7 @@ mod tests {
             attendees: vec!["sarah@acme.example.com".into()],
             description: None,
             create_meeting_room: false,
+            organizer_email: None,
         };
         let created = client.create_event("ent", "primary", &draft).await.unwrap();
         assert_eq!(created.id.as_deref(), Some("new-evt-1"));
@@ -633,6 +732,7 @@ mod tests {
             attendees: vec![],
             description: None,
             create_meeting_room: false,
+            organizer_email: None,
         };
         let err = client
             .create_event("ent", "primary", &draft)
