@@ -81,7 +81,7 @@ AUGMENTAGENT_GH_DISABLE=1 cargo test -p augmentagent-phone
 | AC08 | Discord, Slack and WhatsApp daemon adapters; authenticated tools; durable transcript outboxes; 13 shared presets checked | [Entry-point audit](surfaces.md): local CLI daemon adapter has signed loopback session coverage; custom constructors/wrappers and live origin receipts outstanding |
 | AC09 | Persistent budgets, provider-duration callbacks, bounded shutdown and disabled/unavailable-start cleanup | Live stop/restart/disable and candidate-association qualification; operator reconciliation available |
 | AC10 | Recorded-audio receipt validator and synthetic regression tests only | Actual consented audio, native traces and full live matrix; no live receipt exists |
-| AC11 | No legacy voice removed yet | Replacement qualification, old-release upgrade/rollback fixtures and retirement; synthetic additive-schema preservation passes |
+| AC11 | No legacy voice removed yet | Replacement qualification, installer/service rollback and retirement; pinned pre-phone Store upgrade/rollback/reupgrade passes locally |
 | AC12 | Required offline runner and local regression receipts; OS CI configured | Passing current-head OS CI, complete evidence map and live receipts |
 | AC13–15 | Private commands, verification, durable settings and privacy tests across all three adapters | Live private setup/verification followed by a successful conversational call |
 
@@ -1402,3 +1402,25 @@ callback's binding. Event bodies are bounded and not exposed in diagnostics.
 This remains unqualified against live Twilio event records; the runbook states
 the provider's post-call availability delay and conservative missing-evidence
 behavior. No guessed match, automatic discovery, dial or force-clear was added.
+
+### Pinned pre-phone database upgrade and rollback
+
+`scripts/phone-upgrade-test.py` builds the same compatibility fixture against
+pre-phone commit `4caf3942414a3f499fcd2b4be539ee788cea1a65` and the current
+checkout, using separate Cargo target directories. All four phases passed
+locally: baseline seed, current upgrade, baseline rollback, current reupgrade.
+The fixture verifies the baseline has no phone table and that upgrade creates
+it. Across every reopen it compares all columns of six native bindings, pending
+turns, inbound history and pending approvals. The old Store also writes a new
+pending approval after rollback, which the current Store must retain on
+reupgrade. Phone tables remain present through rollback.
+
+The first harness attempt shared a Cargo target directory and accidentally
+reused the baseline binary for upgrade; the missing-phone-table assertion
+rejected that run. Separate version-specific build directories resolve that
+harness ambiguity. Both Linux and macOS CI now run the four phases and upload
+phase logs and a source/dirty-state receipt. Local passing evidence used a dirty
+checkout while adding this fixture; CI receipts identify the tested commit.
+This qualifies the tested Store schema compatibility with synthetic data only.
+Installer/service upgrade and rollback, live replacement qualification, and
+legacy retirement remain open under AC11–12.

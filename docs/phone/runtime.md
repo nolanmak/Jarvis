@@ -373,3 +373,20 @@ match, events are unavailable, the origin changed, or evidence conflicts, the
 call stays unresolved. `unverified_provider_id` is not permission to redial.
 Provider-event availability and this recovery path still require live
 qualification; absence of evidence cannot establish that a call was never made.
+
+
+### Database upgrade and rollback fixture
+
+Run `python3 scripts/phone-upgrade-test.py` to exercise a temporary synthetic
+database through pre-phone Store → current Store → pre-phone Store → current
+Store. The baseline is pinned to `4caf3942414a3f499fcd2b4be539ee788cea1a65`;
+the driver fetches that commit if absent, creates an isolated temporary worktree,
+and uses separate build directories for old and current sources. It requires
+Git, Cargo and access to dependencies. It does not open the deployed database
+or contact a phone provider.
+
+Logs and `receipt.json` are written to `target/phone-upgrade/` (override with
+`--output`). Check `passed`, all four phase results, `commit`, and
+`worktree_dirty` before citing a receipt. This checks retained sessions,
+history, pending turns and approvals, including writes by the rolled-back Store.
+It does not test installer/service rollback or authorize legacy voice removal.

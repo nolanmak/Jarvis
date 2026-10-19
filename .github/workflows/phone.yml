@@ -20,6 +20,7 @@ on:
       - 'scripts/aa-journal-guard.sh'
       - 'scripts/tests/aa-journal-guard.test.sh'
       - 'scripts/phone-offline-tests.py'
+      - 'scripts/phone-upgrade-test.py'
       - 'scripts/tests/phone_offline_ci_test.py'
       - 'scripts/phone-live-receipt.py'
       - 'scripts/tests/phone_live_receipt_test.py'
@@ -66,6 +67,8 @@ jobs:
         run: cargo test --locked -p augmentagent-channel-core --test phone_native_live --no-run
       - name: Required offline suites
         run: python3 scripts/phone-offline-tests.py
+      - name: Pre-phone database upgrade and rollback compatibility
+        run: python3 scripts/phone-upgrade-test.py
       - name: CLI integration compiles
         run: cargo check -p augmentagent-cli --locked
       - name: Phone lint
@@ -75,5 +78,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: phone-offline-${{ matrix.os }}
-          path: target/phone-offline/
+          path: |
+            target/phone-offline/
+            target/phone-upgrade/
           if-no-files-found: error
