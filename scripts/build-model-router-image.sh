@@ -26,6 +26,12 @@ old = 'COPY package.json ./\nRUN npm install --registry=https://registry.npmmirr
 new = 'COPY package.json package-lock.json ./\nRUN npm ci --no-audit --no-fund'
 if dockerfile.count(old) != 1:
     raise SystemExit('upstream Dockerfile dependency step changed')
+# Keep the base image's official Alpine repositories. The upstream mirror
+# can publish its package index before the referenced archives are available.
+mirror = "RUN sed -i 's|dl-cdn.alpinelinux.org|mirrors.aliyun.com|g' /etc/apk/repositories\n"
+if dockerfile.count(mirror) != 1:
+    raise SystemExit('upstream Dockerfile apk mirror step changed')
+dockerfile = dockerfile.replace(mirror, '')
 path.write_text(dockerfile.replace(old, new))
 PY
 
