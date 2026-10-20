@@ -50,6 +50,20 @@ const GAVE_UP_LABEL: &str = "agent-gave-up";
 const SCOPE_GAVE_UP_MARKER: &str = "the scoping pass judged this issue not agent-fixable";
 /// Hidden marker prefixing every recorded-attempt comment.
 const ATTEMPT_MARKER: &str = "<!-- self-improve-attempt -->";
+/// #1517 — posted by `readmit --reset-history`: every durable marker before
+/// it is history, not evidence. The attempt count, the stuck-fingerprint
+/// comparison and the label-out evidence all read only what follows it.
+const ATTEMPTS_RESET_MARKER: &str = "<!-- self-improve-attempts-reset -->";
+
+/// #1517 — the part of a `--json comments` blob after the last reset marker
+/// (the whole blob when there is none). Comments are chronological, so a
+/// substring cut is a time cut.
+fn since_last_reset(comments: &str) -> &str {
+    match comments.rfind(ATTEMPTS_RESET_MARKER) {
+        Some(at) => &comments[at + ATTEMPTS_RESET_MARKER.len()..],
+        None => comments,
+    }
+}
 /// Max changed lines we'll allow in a single self-improvement diff.
 const MAX_DIFF_LINES: usize = 600;
 /// Consecutive failed attempts before we comment + back off (label marker).
@@ -73,6 +87,8 @@ const GIVE_UP_OVERTAKEN: &str = "held:overtaken";
 /// #1516 — a parent issue the pipeline split into child issues. The picker
 /// skips it; the children are ordinary candidates.
 const SLICED_LABEL: &str = "agent-sliced";
+/// #787 — the research pipeline's label, inherited by a research parent's slices.
+const RESEARCH_LABEL: &str = "research";
 /// #1516 — stamped into every child issue body so a slice is never sliced
 /// again and the parent is findable from the child.
 const SLICE_MARKER_PREFIX: &str = "<!-- self-improve-slice parent=";
@@ -797,9 +813,8 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
         if !ok {
             bail!("gh api issues failed: {stderr}");
         }
-        let batch: serde_json::Value =
+        let rows: Vec<serde_json::Value> =
             serde_json::from_str(&stdout).context("parse gh api issues")?;
-        let rows = batch.as_array().cloned().unwrap_or_default();
         let short = rows.len() < 100;
         all.extend(rows);
         if short {
@@ -2445,9 +2460,10 @@ pub(crate) fn build_slice_prompt(issue: &Issue, scope: &ScopeOutcome) -> String 
 
 /// `### Slice N: title` blocks → children, in order. Anything degraded —
 /// a `CANNOT-SLICE` line, fewer than [`MIN_SLICES`], a header with no body,
-/// an empty title — yields an empty plan, and the caller falls back to the
-/// refusal it would have made anyway. More than [`MAX_SLICES`] keeps the
-/// first six; bodies are clipped to [`MAX_SLICE_BODY_CHARS`].
+/// an empty title, more than [`MAX_SLICES`] (a plan that long is a tree,
+/// not a sequence, and truncating it would lose the last steps unseen) —
+/// yields an empty plan, and the caller falls back to the refusal it would
+/// have made anyway. Bodies are clipped to [`MAX_SLICE_BODY_CHARS`].
 pub(crate) fn parse_slice_plan(raw: &str) -> Vec<Slice> {
     if raw.trim_start().starts_with("CANNOT-SLICE") {
         return Vec::new();
@@ -2476,8 +2492,7 @@ pub(crate) fn parse_slice_plan(raw: &str) -> Vec<Slice> {
         }
     }
     finish(cur, &mut out);
-    out.truncate(MAX_SLICES);
-    if out.len() < MIN_SLICES {
+    if out.len() < MIN_SLICES || out.len() > MAX_SLICES {
         return Vec::new();
     }
     out
@@ -2485,13 +2500,39 @@ pub(crate) fn parse_slice_plan(raw: &str) -> Vec<Slice> {
 
 /// The body a child issue is filed with: the planner's text, then the
 /// marker and a human-readable pointer to the parent.
-pub(crate) fn slice_issue_body(parent: u64, index: usize, total: usize, body: &str) -> String {
+pub(crate) fn slice_issue_body(
+    parent: u64,
+    index: usize,
+    total: usize,
+    body: &str,
+    research_filed: bool,
+) -> String {
+    // #787 — a research-filed parent's children stay research-filed: picked
+    // last, never auto-merged. The stamp is the phrase `is_research_filed`
+    // keys on.
+    let stamp = if research_filed {
+        "\nThe parent was auto-filed by the daily `augmentagent research` \
+         pipeline, and this part inherits that status."
+    } else {
+        ""
+    };
     format!(
         "{body}\n\n---\n{SLICE_MARKER_PREFIX}#{parent} index={index}/{total} -->\n\
          Part {index} of {total} of #{parent}, split by the auto-PR pipeline \
          because the parent does not fit one unattended change. Ship this \
-         part on its own; the parent closes when every part has."
+         part on its own; the parent closes when every part has.{stamp}"
     )
+}
+
+/// Best-effort `gh label create --force`: the repo may never have had it.
+async fn ensure_label(repo_root: &Path, name: &str, color: &str, description: &str) {
+    let gh = gh_bin();
+    let _ = run(
+        &gh,
+        &["label", "create", name, "--force", "--color", color, "--description", description],
+        repo_root,
+    )
+    .await;
 }
 
 /// File the children, comment the list on the parent, label the parent
@@ -2501,16 +2542,32 @@ pub(crate) fn slice_issue_body(parent: u64, index: usize, total: usize, body: &s
 async fn file_slices(repo_root: &Path, issue: &Issue, plan: &[Slice]) -> Result<Vec<u64>> {
     let gh = gh_bin();
     let total = plan.len();
+    // Labels first: `gh issue create --label` fails outright on a label the
+    // repo never had, and a fresh deployment has neither.
+    ensure_label(repo_root, FIXABLE_LABEL, "0E8A16", "Eligible for the auto-PR pipeline").await;
+    ensure_label(
+        repo_root,
+        SLICED_LABEL,
+        "BFD4F2",
+        "Parent issue split into child issues by the auto-PR pipeline; the picker skips it",
+    )
+    .await;
+    let mut labels = vec![FIXABLE_LABEL.to_string()];
+    if issue.research_filed {
+        ensure_label(repo_root, RESEARCH_LABEL, "D4C5F9", "Filed by the daily research pipeline").await;
+        labels.push(RESEARCH_LABEL.to_string());
+    }
+    let labels = labels.join(",");
     let mut children: Vec<(u64, String)> = Vec::new();
     for (i, slice) in plan.iter().enumerate() {
-        let body = slice_issue_body(issue.number, i + 1, total, &slice.body);
+        let body = slice_issue_body(issue.number, i + 1, total, &slice.body, issue.research_filed);
         if let Err(e) = augmentagent_channel_core::public_report::validate(&slice.title, &body) {
             warn!(issue = issue.number, slice = i + 1, "slice failed the public-output check: {e:#}");
             continue;
         }
         let (ok, out, err) = run(
             &gh,
-            &["issue", "create", "--title", &slice.title, "--body", &body, "--label", FIXABLE_LABEL],
+            &["issue", "create", "--title", &slice.title, "--body", &body, "--label", &labels],
             repo_root,
         )
         .await?;
@@ -2545,14 +2602,6 @@ async fn file_slices(repo_root: &Path, issue: &Issue, plan: &[Slice]) -> Result<
     )
     .await
     .ok();
-    // Best-effort: the label may not exist yet on a fresh repo.
-    let _ = run(
-        &gh,
-        &["label", "create", SLICED_LABEL, "--force", "--color", "BFD4F2", "--description",
-          "Parent issue split into child issues by the auto-PR pipeline; the picker skips it"],
-        repo_root,
-    )
-    .await;
     let (ok, _o, err) = run(
         &gh,
         &["issue", "edit", &issue.number.to_string(), "--add-label", SLICED_LABEL],
@@ -7690,11 +7739,13 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // the expensive version of this exact conclusion.
     if let Some(sc) = &scope {
         if let Some(reason) = scope_predicts_refusal(sc) {
-            // #1516 — an honest over-cap estimate on an issue that is not
-            // itself a slice is an epic, not a refusal: split it into child
-            // issues each inside the pipeline's bounds. One scoping-tier
-            // call, unbilled. Guarded paths are never sliced around.
-            if !sc.guarded_paths && !is_slice_body(&issue.body) {
+            // #1516 — an honest over-cap estimate on a fixable issue that is
+            // not itself a slice is an epic, not a refusal: split it into
+            // child issues each inside the pipeline's bounds. One
+            // scoping-tier call, unbilled. Guarded paths are never sliced
+            // around, and a not-fixable verdict is not: its objection would
+            // reach none of the children.
+            if sc.fixable && !sc.guarded_paths && !is_slice_body(&issue.body) {
                 let plan = reasoner
                     .call(&slice_opts(worktree.clone()), &build_slice_prompt(&issue, sc))
                     .await
@@ -9179,6 +9230,7 @@ async fn record_attempt(repo_root: &Path, issue: u64, rec: Option<AttemptRecord>
         repo_root,
     )
     .await?;
+    let stdout = since_last_reset(&stdout).to_string();
     let prior = stdout.matches(ATTEMPT_MARKER).count() as u32;
     // #1214 — the verdict reads the durable markers (not the local history,
     // which rolls over), and an uncharged harness failure writes no marker,
@@ -9432,10 +9484,26 @@ pub(crate) async fn readmit(
             }
         }
         // #1517 — an issue that gave up at `MAX_ATTEMPTS` keeps its count
-        // otherwise, and the next failure gives up again at once. Only the
-        // matched issues are forgotten; everything else keeps its context.
-        if reset_history && history.forget_all(&matched) {
-            history.save(&history_path);
+        // otherwise, and the next failure gives up again at once. The count
+        // that decides lives in the durable attempt-marker comments, so the
+        // reset is itself a comment every reader cuts at; the local history
+        // is forgotten too so the next scoping pass sees no stale digest.
+        if reset_history {
+            for n in &matched {
+                let note = format!(
+                    "{ATTEMPTS_RESET_MARKER}\nAuto-PR attempt history reset by \
+                     `autopr readmit --reset-history`: earlier attempts above no \
+                     longer count toward the attempt ceiling."
+                );
+                let (ok, _o, e) =
+                    run(&gh, &["issue", "comment", &n.to_string(), "--body", &note], repo_root).await?;
+                if !ok {
+                    bail!("posting the reset marker on #{n} failed: {}", truncate(&e, 300));
+                }
+            }
+            if history.forget_all(&matched) {
+                history.save(&history_path);
+            }
         }
     }
     Ok(matched)
@@ -9537,7 +9605,7 @@ async fn label_out_evidence(repo_root: &Path, issue: u64) -> Option<Vec<FailureK
     )
     .await
     {
-        Ok((true, comments, _)) => Some(marker_kinds(&comments)),
+        Ok((true, comments, _)) => Some(marker_kinds(since_last_reset(&comments))),
         _ => None,
     }
 }
@@ -9556,6 +9624,7 @@ async fn label_out_evidence(repo_root: &Path, issue: u64) -> Option<Vec<FailureK
 /// and later built to exhaustion would be revived on every tick forever — and
 /// any label-out with no scoping verdict behind it.
 fn gave_up_is_stale(comments: &str) -> bool {
+    let comments = since_last_reset(comments);
     if !comments.contains(SCOPE_GAVE_UP_MARKER) {
         return false;
     }
@@ -9572,6 +9641,8 @@ fn gave_up_is_stale(comments: &str) -> bool {
 /// #1517 — gave-up issues whose comments the idle-tick sweep reads per tick.
 /// The old newest-50 listing bounded this implicitly.
 const MAX_RETRIAGE_READS: usize = 50;
+/// #1517 — the UTC day the sweep last ran in this process; 0 = never.
+static LAST_RETRIAGE_DAY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn gave_up_numbers(v: &serde_json::Value) -> Vec<u64> {
     v.as_array()
@@ -9600,6 +9671,13 @@ fn stale_gave_up(fetched: &[(u64, String)]) -> Vec<u64> {
 /// is the whole re-triage: the next tick sees them as ordinary candidates
 /// again.
 async fn retriage_gave_up(repo_root: &Path, issues: &serde_json::Value) {
+    // #1517 — once per UTC day per process: the comment sets it reads do
+    // not change between idle ticks, and with the whole open set listed a
+    // per-tick sweep would be fifty GitHub reads every few minutes.
+    let today = utc_day_now();
+    if LAST_RETRIAGE_DAY.swap(today, std::sync::atomic::Ordering::SeqCst) == today {
+        return;
+    }
     let gh = gh_bin();
     let mut fetched = Vec::new();
     // #1517 — the listing is now the whole open set, so bound the reads to
@@ -16601,7 +16679,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(hold.contains("GIVE_UP_OVERTAKEN") && hold.contains("RunReport::triage("), "held, unbilled");
         assert!(hold.contains("AttemptLedger::mark_persist("), "off the picker for the day");
         assert!(!hold.contains("record_attempt("), "an overtaken issue is not an attempt");
-        let slice = body.find("!sc.guarded_paths && !is_slice_body(&issue.body)").expect("slice guard");
+        let slice = body.find("sc.fixable && !sc.guarded_paths && !is_slice_body(&issue.body)").expect("slice guard");
         let refusal = body.find("GIVE_UP_SCOPER_PREDICTS_REFUSAL").expect("size refusal");
         assert!(slice < refusal, "slicing is tried before the refusal");
         assert!(body[slice..refusal].contains("slice_opts(") && body[slice..refusal].contains("file_slices("));
@@ -16620,18 +16698,23 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(parse_slice_plan("### Slice 1: No body\n### Slice 2: Has body\nx").is_empty(), "a bodiless slice is dropped, leaving one");
         assert!(parse_slice_plan("prose with no headers at all").is_empty());
         let many: String = (1..=9).map(|i| format!("### Slice {i}: T{i}\nb{i}\n")).collect();
-        assert_eq!(parse_slice_plan(&many).len(), MAX_SLICES);
+        assert!(parse_slice_plan(&many).is_empty(), "more than MAX_SLICES is degraded, never truncated");
+        let six: String = (1..=6).map(|i| format!("### Slice {i}: T{i}\nb{i}\n")).collect();
+        assert_eq!(parse_slice_plan(&six).len(), MAX_SLICES);
         let long = format!("### Slice 1: a\n{}\n### Slice 2: b\nx", "y".repeat(MAX_SLICE_BODY_CHARS + 500));
         assert!(parse_slice_plan(&long)[0].body.len() <= MAX_SLICE_BODY_CHARS + 4);
     }
 
     #[test]
     fn slice_bodies_carry_the_marker_and_are_never_sliced_again() {
-        let body = slice_issue_body(1500, 2, 4, "do the thing");
+        let body = slice_issue_body(1500, 2, 4, "do the thing", false);
         assert!(body.starts_with("do the thing"));
         assert!(body.contains("<!-- self-improve-slice parent=#1500 index=2/4 -->"));
         assert!(body.contains("Part 2 of 4 of #1500"));
         assert!(is_slice_body(&body));
+        assert!(!is_research_filed(&body), "a human parent's children are human-filed");
+        let research = slice_issue_body(1500, 1, 2, "x", true);
+        assert!(is_research_filed(&research), "a research parent's children stay research-filed (#787)");
         assert!(!is_slice_body("an ordinary issue that mentions #1500"));
         let issue = Issue {
             number: 7,
@@ -16668,6 +16751,26 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(body.contains("per_page=100&sort=created&direction=desc&page={page}"));
         assert!(body.contains("if short {"), "stops at a short page");
         assert!(!body.contains("per_page=50"), "the newest-50 window is gone");
+    }
+
+    // #1517 — the reset comment cuts every durable-marker reader.
+    #[test]
+    fn a_reset_marker_hides_the_attempts_before_it() {
+        let before = format!("{ATTEMPT_MARKER} a {ATTEMPT_MARKER} b");
+        let blob = format!("{before} {ATTEMPTS_RESET_MARKER} later {ATTEMPT_MARKER} c");
+        assert_eq!(since_last_reset(&blob).matches(ATTEMPT_MARKER).count(), 1);
+        assert_eq!(since_last_reset(&before), before.as_str(), "no reset: everything counts");
+        let twice = format!("{blob} {ATTEMPTS_RESET_MARKER} tail");
+        assert_eq!(since_last_reset(&twice).trim(), "tail", "the LAST reset wins");
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn record_attempt(").expect("record_attempt");
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        assert!(body.contains("since_last_reset("), "the attempt count honours the reset");
+        let start = src.find("async fn label_out_evidence(").expect("label_out_evidence");
+        assert!(src[start..start + 400].contains("since_last_reset("));
+        let start = src.find("pub(crate) async fn readmit(").expect("readmit");
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        assert!(body.contains("ATTEMPTS_RESET_MARKER"), "reset posts the marker comment");
     }
 
     #[test]

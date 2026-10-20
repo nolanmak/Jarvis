@@ -162,15 +162,11 @@ fn filing_decision(gap: &Gap, open_research: &[OpenIssue], open_titles: &[String
         if open_research.iter().any(|o| o.number == n) {
             return Filing::Extends(n);
         }
-        if title_is_duplicate(&gap.title, open_titles) {
-            return Filing::DuplicateTitle;
-        }
-        return Filing::FileDespiteClaim(n);
     }
     if title_is_duplicate(&gap.title, open_titles) {
         return Filing::DuplicateTitle;
     }
-    Filing::File
+    gap.duplicate_of.map_or(Filing::File, Filing::FileDespiteClaim)
 }
 
 #[derive(Debug, Deserialize)]
@@ -308,22 +304,26 @@ pub(crate) async fn run_research(
     // a near-duplicate of something already open. The daily pipeline had been
     // filing ~identical issues (e.g. the code-mode postmortems). Best-effort: a
     // gh failure yields an empty list and filing proceeds exactly as before.
-    let open_titles = if dry_run {
-        Vec::new()
-    } else {
-        fetch_open_issue_titles(&cfg).await
-    };
+    // Read-only, so a dry run fetches too (#1513): the preview must show the
+    // same dedup decisions a live run would make.
+    let open_titles = fetch_open_issue_titles(&cfg).await;
     let mut created: Vec<(u64, String)> = Vec::new();
     let mut also_noted: Vec<String> = Vec::new();
     for (i, gap) in ranked.iter().enumerate() {
         if i < cap {
             if dry_run {
+                let what = match filing_decision(gap, &open_research, &open_titles) {
+                    Filing::File => "would file".to_string(),
+                    Filing::FileDespiteClaim(n) => format!("would file; driver's duplicate_of #{n} is not open"),
+                    Filing::Extends(n) => format!("would extend #{n}, not file"),
+                    Filing::DuplicateTitle => "would skip: near-duplicate title already open".to_string(),
+                };
                 info!(
                     title = %gap.title,
                     confidence = gap.confidence,
-                    "research: [dry-run] would file issue"
+                    "research: [dry-run] {what}"
                 );
-                also_noted.push(format!("(dry-run) {}", gap.title));
+                also_noted.push(format!("(dry-run: {what}) {}", gap.title));
             } else {
                 match filing_decision(gap, &open_research, &open_titles) {
                     Filing::DuplicateTitle => {
@@ -802,17 +802,14 @@ async fn fetch_open_research_issues(cfg: &ResearchConfig) -> Vec<OpenIssue> {
 /// #1513 — record a new supporting source on the open issue the gap extends.
 async fn comment_extends(cfg: &ResearchConfig, issue: u64, gap: &Gap) -> Result<()> {
     let body = format!(
-        "New supporting source from the daily `augmentagent research` pipeline          (not filed separately — this issue already asks for the mechanism):
-
-         **{}**
-
-{}
-
-_Source: {}_",
+        "New supporting source from the daily `augmentagent research` pipeline \
+         (not filed separately: this issue already asks for the mechanism):\n\n\
+         **{}**\n\n{}\n\n_Source: {}_",
         gap.title,
         truncate(&gap.body, 2500),
         gap.source
     );
+    debug_assert!(!body.contains("  ("), "no source indentation leaks into the comment");
     augmentagent_channel_core::public_report::validate(&gap.title, &body)?;
     let out = tokio::process::Command::new(&cfg.gh_bin)
         .args(["issue", "comment", &issue.to_string(), "--repo"])
@@ -878,6 +875,19 @@ mod dedup_tests {
         assert_eq!(filing_decision(&gap("Close the draft feedback loop", None), &open, &titles), Filing::DuplicateTitle);
         assert_eq!(filing_decision(&gap("Something new entirely", None), &open, &titles), Filing::File);
         assert_eq!(filing_decision(&gap("Something new entirely", Some(808)), &[], &[]), Filing::FileDespiteClaim(808));
+    }
+
+    #[test]
+    fn extends_comment_has_no_source_indentation() {
+        let g = gap("A title", Some(1));
+        let body = format!(
+            "New supporting source from the daily `augmentagent research` pipeline \
+             (not filed separately: this issue already asks for the mechanism):\n\n\
+             **{}**\n\n{}\n\n_Source: {}_",
+            g.title, g.body, g.source
+        );
+        assert!(body.contains("pipeline (not filed"), "{body}");
+        assert!(body.contains("\n\n**A title**\n\n"), "{body}");
     }
 
     #[test]
