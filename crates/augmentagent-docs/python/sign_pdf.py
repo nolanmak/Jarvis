@@ -12,6 +12,56 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
 
+ACTIVE_ACTIONS = {'/JavaScript', '/Launch'}
+
+
+def resolve(value):
+    return value.get_object() if hasattr(value, 'get_object') else value
+
+
+def is_active_action(action, depth=0):
+    action = resolve(action)
+    if depth > 32:
+        return True
+    if isinstance(action, list):
+        return any(is_active_action(a, depth + 1) for a in action)
+    if not isinstance(action, dict):
+        return False
+    if action.get('/S') in ACTIVE_ACTIONS or '/JS' in action:
+        return True
+    return '/Next' in action and is_active_action(action['/Next'], depth + 1)
+
+
+def triggers_active(holder):
+    holder = resolve(holder)
+    if not isinstance(holder, dict):
+        return False
+    if is_active_action(holder.get('/OpenAction')) or is_active_action(holder.get('/A')):
+        return True
+    aa = resolve(holder.get('/AA'))
+    return isinstance(aa, dict) and any(is_active_action(v) for v in aa.values())
+
+
+def refuse_active_content(reader):
+    root = reader.trailer['/Root']
+    names = resolve(root.get('/Names'))
+    form = resolve(root.get('/AcroForm'))
+    if (triggers_active(root) or (isinstance(names, dict) and '/JavaScript' in names)
+            or (isinstance(form, dict) and '/XFA' in form)):
+        raise ValueError('PDFs with scripts, launch actions or XFA forms require manual signing')
+    holders = list(reader.pages)
+    for page in reader.pages:
+        holders.extend(resolve(page.get('/Annots')) or [])
+    fields = list(resolve(form.get('/Fields')) or []) if isinstance(form, dict) else []
+    while fields and len(holders) < 100_000:
+        field = resolve(fields.pop())
+        holders.append(field)
+        if isinstance(field, dict):
+            fields.extend(resolve(field.get('/Kids')) or [])
+    if any(triggers_active(h) for h in holders):
+        raise ValueError('PDFs with scripts, launch actions or XFA forms require manual signing')
+
+
 def process(data, sign):
     pdf = base64.b64decode(data['pdf'], validate=True)
     png = base64.b64decode(data['png'], validate=True)
@@ -25,9 +75,9 @@ def process(data, sign):
         raise ValueError('PDF must have readable text for signing review')
     if re.search(r'\b(affidavit|sworn\s+statement|penalty\s+of\s+perjury|government\s+filing)\b', text, re.I):
         raise ValueError('this document requires manual signing outside Jarvis')
-    # Generated PDFs have ordinary page boxes; fail closed for imported active content.
-    if '/AcroForm' in reader.trailer['/Root'] or '/OpenAction' in reader.trailer['/Root']:
-        raise ValueError('interactive PDFs require manual signing')
+    # Owner uploads routinely carry a view-setting /OpenAction or a plain form;
+    # those are inert. Fail closed only for content that executes or reflows.
+    refuse_active_content(reader)
     page_number = data['page']
     if not isinstance(page_number, int) or not 1 <= page_number <= len(reader.pages):
         raise ValueError('page number is outside the document')
@@ -59,12 +109,17 @@ def process(data, sign):
         c.setFont('Helvetica', 10)
         c.drawString(x, y - 12, date)
     c.save()
-    writer = PdfWriter()
-    writer.append(reader)
+    # ISO 32000-1 §7.5.6 incremental update: the original bytes are kept
+    # verbatim and only the changed page plus its new content are appended,
+    # so the signed file is the input file, edited, never a re-encoding.
+    writer = PdfWriter(io.BytesIO(pdf), incremental=True)
     writer.pages[page_number - 1].merge_page(PdfReader(overlay).pages[0])
     output = io.BytesIO()
     writer.write(output)
-    return output.getvalue()
+    signed = output.getvalue()
+    if len(signed) <= len(pdf) or signed[:len(pdf)] != pdf:
+        raise ValueError('signing would alter the original document bytes')
+    return signed
 
 
 if __name__ == '__main__':

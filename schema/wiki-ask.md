@@ -771,8 +771,8 @@ augmentagent gdrive upload --account owner@example.com --file /absolute/wiki/del
 ### Owner signature on a PDF
 
 `augmentagent doc signatures` lists installed logical signature names, never image bytes.
-For an owner-requested signature, first generate the reviewed document with `augmentagent doc render-pdf`.
+Signable PDFs are ones Jarvis rendered (`augmentagent doc render-pdf`) or ones the owner attached in Discord. An owner-attached PDF is saved unchanged and its attachment note names the saved path. Sign that exact path; never re-render, convert, or rebuild an uploaded document.
 Then `augmentagent doc sign <wiki-relative.pdf> --out <new-signed.pdf> --signature default --page <1-based> --x <points> --y <points> --width <points> [--date YYYY-MM-DD]`
 posts a separate Approve & Sign card with the unsigned PDF. Coordinates are PDF points from the bottom-left; choose placement from the rendered page layout, never guess over document text.
-Nothing is signed until that card is approved. Changes to the document or signature require a fresh proposal. The completed approval history supplies the signed PDF's ATTACH marker and hash; use that receipt to deliver the file. Emailing it requires the normal separate email approval.
+Nothing is signed until that card is approved. Changes to the document or signature require a fresh proposal. Signing appends the signature to the original file without re-encoding it, so the signed PDF is the original file plus the signature. The completed approval history supplies the signed PDF's ATTACH marker and hash; use that receipt to deliver the file. To email it, pass that exact signed path to `compose --attach`; that still needs the normal separate email approval. If the signed file doesn't exist, the card wasn't approved: check `approval_history` before telling the owner it was signed.
 Do not read, export, copy, or attempt to install signature image assets. Installation is operator-only. Do not bypass refusals, imitate a missing signature with typed text, or claim cryptographic/e-signature-platform verification.
