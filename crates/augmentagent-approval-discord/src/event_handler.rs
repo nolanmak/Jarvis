@@ -7,7 +7,7 @@
 //! Also routes qualifying messages in the query channel (or DMs) to the
 //! `QueryHandler` for wiki-ask answers.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -661,7 +661,8 @@ impl EventHandler for Handler {
             // path treats them uniformly.
             let downloaded_imgs = download_images(&images, msg_id.get()).await;
             let mut downloaded_txts = download_text_files(&text_files, msg_id.get()).await;
-            let extracted_docs = extract_doc_attachments(&docs, msg_id.get()).await;
+            let signable_root = signable_root(wiki_root.as_deref(), allowed_user_id);
+            let extracted_docs = extract_doc_attachments(&docs, msg_id.get(), signable_root).await;
             downloaded_txts.extend(extracted_docs);
 
             let mut current = build_prompt(&user_text, &downloaded_imgs, &downloaded_txts);
@@ -808,6 +809,13 @@ impl EventHandler for Handler {
                     debug!("unrecognized custom_id: {}", comp.data.custom_id);
                     return;
                 };
+                // #1507 — without this line the log cannot say which card a
+                // click landed on; only its side effects were visible.
+                info!(
+                    action_id = %cid.action_id,
+                    verb = cid.verb.as_str(),
+                    "discord card control clicked"
+                );
                 // Enforce user allowlist on clicks.
                 if !is_authorized(self.state.allowed_user_id, comp.user.id) {
                     ack_ephemeral(
@@ -1705,6 +1713,7 @@ async fn followup_with_recovery(
     outcome: &ApprovalActionOutcome,
     action_id: &str,
 ) {
+    log_resolved(comp, outcome, action_id);
     if let Err(e) = comp
         .create_followup(&ctx.http, approval_followup(outcome, action_id))
         .await
@@ -1760,17 +1769,66 @@ async fn deliver_approval_outcome(
     outcome: &ApprovalActionOutcome,
     action_id: &str,
 ) -> Result<(), serenity::Error> {
+    log_resolved(comp, outcome, action_id);
     let mut followup = approval_followup(outcome, action_id);
+    // #1507 — name the card the click acted on, so a reply can't be mistaken
+    // for another card's (the owner approved a DM thinking it was a signature).
+    if let Some(title) = card_title(&comp.message) {
+        // Embed titles are capped at 256 by Discord; keep well inside the
+        // 2000-char message limit so naming the card can't fail the reply.
+        let title: String = title.chars().take(200).collect();
+        let body: String = describe(outcome).chars().take(1700).collect();
+        followup = followup.content(format!("**{title}** — {body}"));
+    }
     if let ApprovalActionOutcome::DocumentSigned { output: Some((path, hash)), .. } = outcome {
         let bytes = augmentagent_docs::signing::verified_output(path, hash)
             .map_err(|_| serenity::Error::Other("Signed PDF is missing or changed; approval card retained"))?;
-        followup = followup.add_file(serenity::all::CreateAttachment::bytes(bytes, "signed-document.pdf"));
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("signed-document.pdf")
+            .to_string();
+        followup = followup.add_file(serenity::all::CreateAttachment::bytes(bytes, name));
     }
     comp.create_followup(http, followup).await?;
     if should_delete_source(outcome) {
         comp.channel_id.delete_message(http, comp.message.id).await?;
     }
     Ok(())
+}
+
+/// The card's embed title (its subject line), if it has one.
+fn card_title(message: &Message) -> Option<&str> {
+    message
+        .embeds
+        .first()
+        .and_then(|e| e.title.as_deref())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+}
+
+/// The outcome variant's name, for logs — never its payload (drafts, PII).
+fn outcome_kind(outcome: &ApprovalActionOutcome) -> String {
+    format!("{outcome:?}")
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// #1507 — one line per resolved card control, pairing with "clicked".
+fn log_resolved(
+    comp: &serenity::all::ComponentInteraction,
+    outcome: &ApprovalActionOutcome,
+    action_id: &str,
+) {
+    let verb = CustomId::parse(&comp.data.custom_id).map(|c| c.verb.as_str());
+    info!(
+        %action_id,
+        verb = verb.unwrap_or("-"),
+        outcome = %outcome_kind(outcome),
+        "discord card control resolved"
+    );
 }
 
 /// Non-deferred immediate ephemeral ack — used only for the authorization
@@ -2428,6 +2486,7 @@ async fn download_text_files(
 async fn extract_doc_attachments(
     attachments: &[Attachment],
     msg_id: u64,
+    signable_root: Option<&Path>,
 ) -> Vec<DownloadedTextFile> {
     let mut out = Vec::with_capacity(attachments.len());
     // One key lookup per message, not per attachment. `None` ⇒ OCR skipped.
@@ -2445,10 +2504,16 @@ async fn extract_doc_attachments(
         let out_path = PathBuf::from(format!("/tmp/aa-doc-{msg_id}-{idx}.txt"));
 
         // Download binary.
+        let mut staged: Option<String> = None;
         let download_ok = match reqwest::get(&att.url).await {
             Ok(resp) => match resp.bytes().await {
                 Ok(bytes) => match augmentagent_docs::inbound::write_private_attachment(&in_path, &bytes).await {
-                    Ok(()) => true,
+                    Ok(()) => {
+                        if let Some(root) = signable_root.filter(|_| matches!(kind, DocKind::Pdf)) {
+                            staged = stage_signable_upload(root, &att.filename, &bytes);
+                        }
+                        true
+                    }
                     Err(e) => {
                         warn!("write doc tempfile {} failed: {e}", in_path.display());
                         false
@@ -2469,7 +2534,10 @@ async fn extract_doc_attachments(
             match extract_text(kind, &in_path, ocr.as_ref()).await {
                 Ok(extracted) => {
                     let text = extracted.text;
-                    let note = extracted.ocr.note();
+                    let note = match (extracted.ocr.note(), staged) {
+                        (Some(ocr), Some(saved)) => Some(format!("{ocr}; {saved}")),
+                        (ocr, saved) => ocr.or(saved),
+                    };
                     if let Some(n) = &note {
                         info!(file = %att.filename, "{n}");
                     }
@@ -2504,6 +2572,36 @@ async fn extract_doc_attachments(
         }
     }
     out
+}
+
+/// #1507 — only the allowlisted owner's PDFs become signable; with no
+/// allowlist anyone who can message the bot could plant a document for an
+/// Approve & Sign card.
+fn signable_root(wiki_root: Option<&Path>, allowed_user_id: Option<UserId>) -> Option<&Path> {
+    wiki_root.filter(|_| allowed_user_id.is_some())
+}
+
+/// #1507 — keep the owner's original PDF byte-for-byte so it can be signed
+/// as-is. Returns the prompt note naming the staged path, or `None` (logged)
+/// when staging fails; the text extraction still proceeds either way.
+fn stage_signable_upload(root: &Path, filename: &str, bytes: &[u8]) -> Option<String> {
+    let staged = augmentagent_docs::signing::state_root().and_then(|state| {
+        augmentagent_docs::signing::stage_owner_upload(root, &state, filename, bytes)
+    });
+    match staged {
+        Ok(path) => {
+            info!(file = %filename, path = %path.display(), "owner PDF staged for signing");
+            Some(format!(
+                "original PDF saved unchanged at {}; to sign this exact file use `augmentagent doc sign {} --out <new-signed.pdf> ...`",
+                path.display(),
+                path.display()
+            ))
+        }
+        Err(e) => {
+            warn!(file = %filename, "stage owner PDF for signing failed: {e:#}");
+            None
+        }
+    }
 }
 
 /// Combine the user's text (possibly empty) with lists of locally-downloaded
@@ -3597,6 +3695,14 @@ mod tests {
     fn transcript_returns_empty_when_nothing_fits() {
         let turns = vec![("user", "x".repeat(10_000))];
         assert_eq!(format_transcript(&turns, 100), "");
+    }
+
+    #[test]
+    fn owner_uploads_are_signable_only_with_an_owner_allowlist() {
+        let wiki = std::path::Path::new("/wiki");
+        assert_eq!(signable_root(Some(wiki), Some(UserId::new(7))), Some(wiki));
+        assert_eq!(signable_root(Some(wiki), None), None, "no allowlist: nothing registered");
+        assert_eq!(signable_root(None, Some(UserId::new(7))), None);
     }
 
     #[test]

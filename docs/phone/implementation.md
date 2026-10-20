@@ -1434,3 +1434,15 @@ durable-state sentinel untouched, and render no Twilio or phone settings in the
 unit/plist. Both paths pass locally and are required by phone CI. This is
 installer file-preservation evidence, not real systemd/launchd execution or an
 old-release service rollback. The separate Store fixture covers schema data.
+
+### Completed cross-platform CI before main integration
+
+[Phone run 39190665069](https://github.com/nolanmak/Jarvis/actions/runs/39190665069)
+passed all 47 required suites on Linux x86_64 (611 tests) and Darwin
+arm64 (611 tests), plus all four pinned database compatibility phases
+on each host. Downloaded receipts report clean synthetic merge commit
+`2e215953350a9a85c6730f4ada504e6766d5a237` for PR head `b115db04`.
+These receipts precede the subsequent main integration and help-snapshot fix;
+new-head CI is required. They provide no Intel macOS or live audio qualification.
+The separate Rust job reached 912 passing CLI tests but failed the stale
+`wiki_ask_help` snapshot, which omitted the implemented `--daemon` option.

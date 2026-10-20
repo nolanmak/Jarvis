@@ -31,5 +31,8 @@ Options:
       --post
           Also post the answer to the Discord approval channel via a one-shot HTTP client, honoring `ATTACH:` file markers (#440). Needs DISCORD_BOT_TOKEN + DISCORD_CHANNEL_ID in the env
 
+      --daemon
+          Continue the persistent local conversation in the running phone-enabled daemon. Uses AUGMENTAGENT_PHONE_LOCAL_SOCKET and the daemon's configured wiki
+
   -h, --help
           Print help (see a summary with '-h')

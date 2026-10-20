@@ -268,6 +268,10 @@ mod tests {
         ));
         assert!(!a.wiki_root.as_ref().unwrap().join("signed.pdf").exists());
         assert!(a.store.document_signature(&id).unwrap().is_none());
+        // #1507 AC11 — the failure is recorded, never a silent no-op.
+        let row = a.store.get_action_with_email(&id).unwrap().unwrap().action;
+        assert_eq!(row.status, "error");
+        assert!(row.error_message.as_deref().is_some_and(|m| m.contains("changed")), "{:?}", row.error_message);
     }
     #[tokio::test]
     async fn audit_failure_after_publication_is_unconfirmed_and_never_replayed() {
