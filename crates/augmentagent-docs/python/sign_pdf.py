@@ -142,35 +142,65 @@ def stamp_page(writer, page, overlay):
     page[NameObject('/Resources')] = private
 
 
-def canonical(value, depth=0):
+def canonical(value, depth=0, memo=None):
     """Reader-independent structure of a PDF value: references by object
     number plus their resolved content (a few levels deep), streams by their
-    raw bytes. Two readers of the same bytes produce equal results."""
+    raw bytes. Two readers of the same bytes produce equal results.
+
+    `memo` caches resolved references so pages sharing thousands of XObjects
+    cost one hash each instead of one per page. It must belong to a single
+    reader (an incremental update redefines object numbers, so sharing a memo
+    across readers would hide a mutation) and is keyed by depth as well,
+    because expansion is truncated at depth 6."""
     if hasattr(value, 'idnum'):
         if depth >= 6:
             return ('ref', value.idnum, value.generation)
-        return ('ref', value.idnum, value.generation, canonical(value.get_object(), depth + 1))
+        key = (value.idnum, value.generation, depth)
+        if memo is not None and key in memo:
+            return memo[key]
+        result = ('ref', value.idnum, value.generation, canonical(value.get_object(), depth + 1, memo))
+        if memo is not None:
+            memo[key] = result
+        return result
     if isinstance(value, dict):
-        items = tuple(sorted((str(k), canonical(v, depth + 1)) for k, v in value.items()))
+        items = tuple(sorted((str(k), canonical(v, depth + 1, memo)) for k, v in value.items()))
         raw = getattr(value, '_data', None)
         return ('stream', items, hashlib.sha256(raw).hexdigest()) if raw is not None else ('dict', items)
     if isinstance(value, list):
-        return ('array', tuple(canonical(v, depth + 1) for v in value))
+        return ('array', tuple(canonical(v, depth + 1, memo) for v in value))
     return ('value', str(value))
 
 
-def page_fingerprint(page):
+def page_fingerprint(page, memo=None):
     contents = page.get_contents()
     return (contents.get_data() if contents is not None else b'',
-            canonical(inherited_resources(page)),
+            canonical(inherited_resources(page), 0, memo),
             [float(v) for v in page.mediabox], page.rotation)
+
+
+def unflatten_other_pages(writer, original, signed_index):
+    """Undo pypdf's page flattening on the pages we are not signing.
+
+    Cloning a document copies every attribute a page inherits from its /Pages
+    node (/Resources, /MediaBox, ...) onto the page object itself, so an
+    incremental update would re-emit pages the signature never touched, with an
+    inline copy of the shared dictionary. Dropping the keys the page does not
+    carry on file restores its original bytes, and pypdf then omits it from the
+    appended revision."""
+    for i, page in enumerate(writer.pages):
+        if i == signed_index:
+            continue
+        on_file = original.pages[i].indirect_reference.get_object()
+        for key in [k for k in page.keys() if k not in on_file]:
+            del page[key]
 
 
 def verify_other_pages(original, signed, signed_index):
     if len(original.pages) != len(signed.pages):
         raise ValueError('signing changed the page count')
+    original_memo, signed_memo = {}, {}
     for i, (a, b) in enumerate(zip(original.pages, signed.pages)):
-        if i != signed_index and page_fingerprint(a) != page_fingerprint(b):
+        if i != signed_index and page_fingerprint(a, original_memo) != page_fingerprint(b, signed_memo):
             raise ValueError(f'signing would change page {i + 1}; nothing was signed')
 
 
@@ -226,6 +256,7 @@ def process(data, sign):
     # so the signed file is the input file, edited, never a re-encoding.
     writer = PdfWriter(io.BytesIO(pdf), incremental=True)
     stamp_page(writer, writer.pages[page_number - 1], PdfReader(overlay).pages[0])
+    unflatten_other_pages(writer, reader, page_number - 1)
     output = io.BytesIO()
     writer.write(output)
     signed = output.getvalue()
