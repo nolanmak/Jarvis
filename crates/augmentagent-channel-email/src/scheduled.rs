@@ -58,12 +58,10 @@ pub const RETRY_EXEMPT_RETRY_COUNT: i64 = 9_999;
 /// later) — never silently dropped.
 const PER_TICK_LIMIT: i64 = 10;
 
-/// #1486 — how long a throttle-queued compose waits for its next
-/// draft-create attempt when the provider reported no retry-after of its own
-/// (a reported boundary always wins), and how many attempts it gets before
-/// the engine gives up and tells the owner — together well past the
-/// half-hour windows the provider applies, and bounded, so a compose can
-/// never retry forever.
+/// #1486 — the wait before a throttle-queued compose's next draft-create
+/// attempt when the provider named no retry-after of its own (a reported
+/// boundary always wins), and the attempt budget after which the engine
+/// gives up and tells the owner — an hour, so a compose cannot retry forever.
 const QUEUED_COMPOSE_RETRY_MS: i64 = 5 * 60 * 1000;
 const QUEUED_COMPOSE_MAX_ATTEMPTS: i64 = 12;
 /// `status_source` every queued-compose transition is stamped with.
@@ -171,8 +169,7 @@ pub struct TickSummary {
     pub stuck_flagged: usize,
     /// #1486 — throttle-queued composes that got their draft and card, that
     /// are still throttled and pushed to a later attempt, and that were
-    /// abandoned (attempts exhausted or a non-throttle failure) with the
-    /// owner told.
+    /// abandoned with the owner told.
     pub queued_landed: usize,
     pub queued_deferred: usize,
     pub queued_failed: usize,
@@ -410,13 +407,8 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
         let envelope = self.store.get_action_envelope(action_id)?;
         let to = envelope.as_ref().and_then(|e| e.to.clone());
         let (Some(entity_id), Some(to)) = (action.email.account_entity_id.clone(), to) else {
-            self.abandon_queued_compose(
-                action_id,
-                &action.email,
-                "the sending account or the recipient was not recorded",
-                summary,
-            )
-            .await;
+            self.abandon_queued_compose(action_id, &action.email, "no sending account or recipient was recorded", summary)
+                .await;
             return Ok(());
         };
         // Bcc never reaches here: the CLI refuses to queue a compose that
@@ -426,8 +418,7 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
             .and_then(|e| e.cc.clone())
             .unwrap_or_default()
             .split(',')
-            .map(|p| p.trim().to_string())
-            .filter(|p| !p.is_empty())
+            .filter_map(|p| Some(p.trim()).filter(|p| !p.is_empty()).map(str::to_string))
             .collect();
         let subject = envelope
             .as_ref()
@@ -438,58 +429,49 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
         let draft_id = match action.draft_id.clone() {
             // A previous tick created the draft but could not post the card.
             Some(existing) => existing,
-            None => match self
-                .gmail
-                .create_draft_with_cc(
-                    &entity_id,
-                    &to,
-                    &cc,
-                    &subject,
-                    &body,
-                    action.email.thread_id.as_deref(),
-                )
-                .await
-            {
-                Ok(draft_id) => {
-                    self.store.set_action_draft_id(action_id, &draft_id)?;
-                    draft_id
-                }
-                // Still throttled: come back at the provider's own boundary
-                // when it named one, else after a fixed wait — but only
-                // while the attempt budget lasts.
-                Err(crate::gmail::GmailError::RateLimited { retry_after_ms, .. })
-                    if attempts + 1 < QUEUED_COMPOSE_MAX_ATTEMPTS =>
+            None => {
+                let thread = action.email.thread_id.clone();
+                match self
+                    .gmail
+                    .create_draft_with_cc(&entity_id, &to, &cc, &subject, &body, thread.as_deref())
+                    .await
                 {
-                    let next_at_ms = retry_after_ms
-                        .filter(|ms| *ms > now_ms)
-                        .unwrap_or(now_ms + QUEUED_COMPOSE_RETRY_MS);
-                    if self.store.defer_queued_compose(action_id, next_at_ms, SRC)? {
-                        info!(action_id, next_at_ms, "scheduled-send: still throttled");
-                        summary.queued_deferred += 1;
+                    Ok(draft_id) => {
+                        self.store.set_action_draft_id(action_id, &draft_id)?;
+                        draft_id
                     }
-                    return Ok(());
+                    Err(e) => {
+                        // Still throttled and budget left: come back at the
+                        // provider's own boundary when it named one, else
+                        // after a fixed wait. Anything else is terminal.
+                        let retry_at = match &e {
+                            crate::gmail::GmailError::RateLimited { retry_after_ms, .. }
+                                if attempts + 1 < QUEUED_COMPOSE_MAX_ATTEMPTS =>
+                            {
+                                Some(
+                                    retry_after_ms
+                                        .filter(|ms| *ms > now_ms)
+                                        .unwrap_or(now_ms + QUEUED_COMPOSE_RETRY_MS),
+                                )
+                            }
+                            _ => None,
+                        };
+                        match retry_at {
+                            Some(at) if self.store.defer_queued_compose(action_id, at, SRC)? => {
+                                info!(action_id, at, "scheduled-send: compose still throttled");
+                                summary.queued_deferred += 1;
+                            }
+                            Some(_) => {}
+                            None => {
+                                let why = format!("creating the draft failed: {e}");
+                                self.abandon_queued_compose(action_id, &action.email, &why, summary)
+                                    .await;
+                            }
+                        }
+                        return Ok(());
+                    }
                 }
-                Err(e @ crate::gmail::GmailError::RateLimited { .. }) => {
-                    self.abandon_queued_compose(
-                        action_id,
-                        &action.email,
-                        &format!("Gmail is still rate-limiting this account ({e})"),
-                        summary,
-                    )
-                    .await;
-                    return Ok(());
-                }
-                Err(e) => {
-                    self.abandon_queued_compose(
-                        action_id,
-                        &action.email,
-                        &format!("creating the draft failed: {e}"),
-                        summary,
-                    )
-                    .await;
-                    return Ok(());
-                }
-            },
+            }
         };
 
         let card_body = augmentagent_approval_discord::append_envelope_markers(
@@ -513,7 +495,8 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
             }
             return Ok(());
         }
-        if !self.store.promote_queued_compose(action_id, SRC)? {
+        // `queued_compose → pending`, the same landing a back-to-queue does.
+        if !self.store.unschedule_action(action_id, SRC)? {
             warn!(action_id, "scheduled-send: queued compose was resolved elsewhere");
             return Ok(());
         }
@@ -534,7 +517,7 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
     ) {
         match self
             .store
-            .fail_queued_compose(action_id, why, RETRY_EXEMPT_RETRY_COUNT, SRC)
+            .finish_send_error(action_id, why, Some(RETRY_EXEMPT_RETRY_COUNT), SRC)
         {
             Ok(true) => {}
             Ok(false) => return,
@@ -984,8 +967,8 @@ mod tests {
         /// #1486 — scripted draft-create refusals: each entry rate-limits one
         /// call with that retry-after; calls past the end succeed.
         draft_script: Mutex<Vec<Option<i64>>>,
-        /// `(to, cc, subject, body, thread_id)` per draft create.
-        drafts: Mutex<Vec<(String, String, String, String, Option<String>)>>,
+        /// `to|cc|subject|body|thread_id` per draft create.
+        drafts: Mutex<Vec<String>>,
     }
 
     impl MockGmail {
@@ -1048,12 +1031,10 @@ mod tests {
             body: &str,
             thread_id: Option<&str>,
         ) -> Result<String, GmailError> {
-            self.drafts.lock().unwrap().push((
-                to.into(),
+            self.drafts.lock().unwrap().push(format!(
+                "{to}|{}|{subject}|{body}|{}",
                 cc.join(", "),
-                subject.into(),
-                body.into(),
-                thread_id.map(str::to_string),
+                thread_id.unwrap_or("-"),
             ));
             let mut script = self.draft_script.lock().unwrap();
             if script.is_empty() {
@@ -1842,17 +1823,10 @@ mod tests {
 
         let s = engine.tick_once(2_000).await.unwrap();
         assert_eq!((s.queued_landed, s.queued_deferred, s.queued_failed), (1, 0, 0));
+        // The envelope the owner typed, under the OUTBOUND subject.
         assert_eq!(
             *gmail.drafts.lock().unwrap(),
-            // (to, cc, subject, body, thread) — the envelope the owner typed,
-            // under the OUTBOUND subject.
-            vec![(
-                "sam@example.com".to_string(),
-                "cc1@example.com, cc2@example.com".to_string(),
-                "Re: Intro".to_string(),
-                "the draft body".to_string(),
-                Some("th-1".to_string()),
-            )]
+            ["sam@example.com|cc1@example.com, cc2@example.com|Re: Intro|the draft body|th-1"]
         );
         let row = store.get_action_with_email(&id).unwrap().unwrap();
         assert_eq!(row.action.status, "pending");
@@ -1867,40 +1841,31 @@ mod tests {
     }
 
     /// #1486 — the issue's own failure mode: a provider throttle must not
-    /// retry forever. The reported boundary wins, then exponential backoff,
-    /// and when the attempt budget runs out the owner is told.
+    /// retry forever. The reported boundary wins over the fixed wait, and
+    /// when the attempt budget runs out the owner is told.
     #[tokio::test]
     async fn a_still_throttled_compose_backs_off_then_gives_up_loudly() {
         let (store, _f) = test_store();
         let id = seed_queued(&store, 1_000);
         let broker = Arc::new(Surfaces::default());
-        let gmail = Arc::new(MockGmail::throttled(vec![Some(50_000)]));
+        let mut script = vec![Some(50_000)];
+        script.resize(QUEUED_COMPOSE_MAX_ATTEMPTS as usize + 1, None);
+        let gmail = Arc::new(MockGmail::throttled(script));
         let engine = queue_engine(&store, &gmail, &broker);
 
-        let s = engine.tick_once(2_000).await.unwrap();
-        assert_eq!(s.queued_deferred, 1);
+        assert_eq!(engine.tick_once(2_000).await.unwrap().queued_deferred, 1);
         assert_eq!(status_of(&store, &id), "queued_compose");
-        assert!(broker.reposts.lock().unwrap().is_empty());
         assert!(
             store.due_queued_composes(49_999, 10).unwrap().is_empty(),
             "the provider's own boundary must be honored"
         );
-        assert_eq!(
-            store.due_queued_composes(50_000, 10).unwrap(),
-            vec![(id.clone(), 1)]
-        );
+        assert_eq!(store.due_queued_composes(50_000, 10).unwrap(), [(id.clone(), 1)]);
 
-        // Refused without a boundary from here on: the fixed wait applies,
-        // and the attempt budget still runs out.
-        let gmail = Arc::new(MockGmail::throttled(vec![
-            None;
-            QUEUED_COMPOSE_MAX_ATTEMPTS as usize
-        ]));
-        let engine = queue_engine(&store, &gmail, &broker);
+        // Refused without a boundary from here on: the fixed wait applies.
         assert_eq!(engine.tick_once(50_000).await.unwrap().queued_deferred, 1);
         let next = 50_000 + QUEUED_COMPOSE_RETRY_MS;
         assert!(store.due_queued_composes(next - 1, 10).unwrap().is_empty());
-        assert_eq!(store.due_queued_composes(next, 10).unwrap(), vec![(id.clone(), 2)]);
+        assert_eq!(store.due_queued_composes(next, 10).unwrap(), [(id.clone(), 2)]);
 
         let mut failed = 0usize;
         for i in 1..=QUEUED_COMPOSE_MAX_ATTEMPTS {
@@ -1915,6 +1880,6 @@ mod tests {
         assert!(store.due_queued_composes(i64::MAX, 10).unwrap().is_empty());
         assert!(broker.reposts.lock().unwrap().is_empty());
         let flags = broker.flags.lock().unwrap().clone();
-        assert!(flags[0].contains("still rate-limiting"), "{flags:?}");
+        assert!(flags[0].contains("rate limit"), "{flags:?}");
     }
 }

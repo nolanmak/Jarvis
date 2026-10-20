@@ -6763,6 +6763,10 @@ impl Store {
     /// before the caller recorded its own (#501 review).
     /// Clearing `scheduledAtMs` here is load-bearing: a later Approve on the
     /// reposted card must send immediately, not re-arm a stale proposal.
+    ///
+    /// #1486 — also lands a `queued_compose` (throttled compose whose draft
+    /// the engine has now created): same destination, same reason for the
+    /// armed nudge pointer, since that caller has posted the card too.
     pub fn unschedule_action(&self, action_id: &str, source: &str) -> StoreResult<bool> {
         let now = now_millis();
         let guard = self.conn.lock().expect("store mutex poisoned");
@@ -6772,7 +6776,7 @@ impl Store {
                     noticeChannelId = NULL, noticeMessageId = NULL, \
                     nudgeCount = 1, nextNudgeAtMs = ?2, \
                     status_source = ?3, status_updated_at = ?4, updatedAt = ?4 \
-              WHERE id = ?1 AND status = 'scheduled'",
+              WHERE id = ?1 AND status IN ('scheduled', 'queued_compose')",
             params![action_id, now + NUDGE_INTERVAL_MS, source, now],
         )?;
         Ok(n == 1)
@@ -6882,6 +6886,8 @@ impl Store {
     ///   tick may re-dispatch as before.
     /// - `Some(cap)` (engine / stuck-claim reconcile): stamp retryCount to
     ///   the retry cap so `list_retryable_replies` NEVER picks the row up.
+    ///   This is also how a `queued_compose` is abandoned (#1486) — that row
+    ///   has no draft to re-dispatch either.
     ///   The generic retry path routes through `dispatch_reply`, which would
     ///   repost an approval card for a send that may have actually landed
     ///   (Composio timeout-but-delivered) — the double-send the scheduled
@@ -6902,7 +6908,7 @@ impl Store {
                     errorMessage = ?2, \
                     retryCount = COALESCE(?3, retryCount), \
                     status_source = ?4, status_updated_at = ?5, updatedAt = ?5 \
-              WHERE id = ?1 AND status = 'sending'",
+              WHERE id = ?1 AND status IN ('sending', 'queued_compose')",
             params![action_id, error_message, retry_count_override, source, now],
         )?;
         Ok(n == 1)
@@ -6967,27 +6973,16 @@ impl Store {
         Ok(rows)
     }
 
-    /// #1486 — the queued compose landed: `queued_compose → pending`, with
-    /// the nudge pointer armed exactly as [`Self::unschedule_action`] does,
-    /// because the caller has posted the card by the time this CAS runs.
-    /// `false` when something else resolved the row first.
-    pub fn promote_queued_compose(&self, action_id: &str, source: &str) -> StoreResult<bool> {
-        let now = now_millis();
-        let guard = self.conn.lock().expect("store mutex poisoned");
-        let n = guard.execute(
-            "UPDATE actions \
-                SET status = 'pending', scheduledAtMs = NULL, errorMessage = NULL, \
-                    nudgeCount = 1, nextNudgeAtMs = ?2, \
-                    status_source = ?3, status_updated_at = ?4, updatedAt = ?4 \
-              WHERE id = ?1 AND status = 'queued_compose'",
-            params![action_id, now + NUDGE_INTERVAL_MS, source, now],
-        )?;
-        Ok(n == 1)
-    }
-
     /// #1486 — still throttled: count the attempt and move the next one out
-    /// to `next_at_ms`. CAS-gated on the row still being queued.
-    pub fn defer_queued_compose(&self, action_id: &str, next_at_ms: i64, source: &str) -> StoreResult<bool> {
+    /// to `next_at_ms`. CAS-gated on the row still being queued. (Landing and
+    /// abandoning a queued compose reuse [`Self::unschedule_action`] and
+    /// [`Self::finish_send_error`].)
+    pub fn defer_queued_compose(
+        &self,
+        action_id: &str,
+        next_at_ms: i64,
+        source: &str,
+    ) -> StoreResult<bool> {
         let now = now_millis();
         let guard = self.conn.lock().expect("store mutex poisoned");
         let n = guard.execute(
@@ -6996,29 +6991,6 @@ impl Store {
                     status_source = ?3, status_updated_at = ?4, updatedAt = ?4 \
               WHERE id = ?1 AND status = 'queued_compose'",
             params![action_id, next_at_ms, source, now],
-        )?;
-        Ok(n == 1)
-    }
-
-    /// #1486 — give up on a queued compose: `queued_compose → error`, with a
-    /// retry-exempt `retryCount` so the generic retry tick (which would
-    /// re-dispatch it as a triage reply) never picks it up.
-    pub fn fail_queued_compose(
-        &self,
-        action_id: &str,
-        reason: &str,
-        retry_count_override: i64,
-        source: &str,
-    ) -> StoreResult<bool> {
-        let now = now_millis();
-        let guard = self.conn.lock().expect("store mutex poisoned");
-        let n = guard.execute(
-            "UPDATE actions \
-                SET status = 'error', scheduledAtMs = NULL, errorMessage = ?2, \
-                    retryCount = ?5, \
-                    status_source = ?3, status_updated_at = ?4, updatedAt = ?4 \
-              WHERE id = ?1 AND status = 'queued_compose'",
-            params![action_id, reason, source, now, retry_count_override],
         )?;
         Ok(n == 1)
     }

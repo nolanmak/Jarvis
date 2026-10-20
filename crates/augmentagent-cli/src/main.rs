@@ -6836,7 +6836,6 @@ async fn run_gmail_compose(
                 &email,
                 &to,
                 &cc,
-                &bcc,
                 &subject,
                 &body_str,
                 thread_id.as_deref(),
@@ -6864,8 +6863,6 @@ async fn run_gmail_compose(
                     serde_json::json!({
                         "queued": true,
                         "action_id": action_id,
-                        "account": email,
-                        "entity_id": entity_id,
                         "to": to,
                         "subject": subject,
                         "retry_after": window,
@@ -6988,90 +6985,6 @@ async fn run_gmail_compose(
     Ok(())
 }
 
-/// #1486 — the Re:-stripped subject a compose card's `emails`/`actions` rows
-/// carry, which is the inbound's own subject on a reply.
-fn compose_card_subject(out_subject: &str, reply_to_subject: Option<&str>) -> String {
-    let stripped = out_subject
-        .strip_prefix("Re:")
-        .or_else(|| out_subject.strip_prefix("re:"))
-        .or_else(|| out_subject.strip_prefix("RE:"))
-        .unwrap_or(out_subject)
-        .trim_start()
-        .to_string();
-    reply_to_subject
-        .map(str::to_string)
-        .unwrap_or_else(|| if stripped.is_empty() { out_subject.to_string() } else { stripped })
-}
-
-/// #1486 — park a compose the provider throttled: the same `emails` +
-/// `actions` pair [`post_reply_approval_card`] writes, but with no draft id
-/// and status `queued_compose`. `scheduledAtMs` carries the next attempt and
-/// `actions.subject` the OUTBOUND subject, so the daemon's sweep can create
-/// the draft and post the card once the throttle clears.
-#[allow(clippy::too_many_arguments)]
-fn queue_throttled_compose(
-    store: &Store,
-    entity_id: &str,
-    account_email: &str,
-    to: &str,
-    cc: &[String],
-    bcc: &[String],
-    out_subject: &str,
-    draft_body: &str,
-    thread_id: Option<&str>,
-    reply_to_message_id: Option<&str>,
-    reply_to_from: Option<&str>,
-    reply_to_subject: Option<&str>,
-    next_attempt_at_ms: i64,
-) -> Result<String> {
-    let thread = thread_id.filter(|t| !t.is_empty());
-    let reply_msg_id = reply_to_message_id.filter(|s| !s.is_empty());
-    // No draft exists yet, so the usual `compose:<draft_id>` key is not
-    // available; a uuid keeps the `compose:` convention and stays unique.
-    let synthetic_msg_id = format!("compose:queued:{}", uuid::Uuid::new_v4());
-    let msg_id: &str = reply_msg_id.unwrap_or(&synthetic_msg_id);
-    let card_from =
-        compose_card_identity(reply_msg_id.is_some(), reply_to_from, to, account_email);
-    let card_subject = compose_card_subject(out_subject, reply_to_subject);
-    store
-        .upsert_email(&augmentagent_store::Email {
-            attachments: Vec::new(),
-            message_id: msg_id.to_string(),
-            to: String::new(),
-            cc: String::new(),
-            thread_id: thread.map(str::to_string),
-            from: card_from.clone(),
-            subject: card_subject.clone(),
-            body: String::new(),
-            date: String::new(),
-            account_entity_id: Some(entity_id.to_string()),
-            platform: "gmail".into(),
-            kind: "dm".into(),
-        })
-        .context("upsert inbound email for action linkage")?;
-    let action_id = store
-        .log_action_with_envelope(
-            msg_id,
-            thread,
-            &card_from,
-            &card_subject,
-            Some(""),
-            Some(draft_body),
-            ActionStatus::QueuedCompose,
-            Some(to),
-            Some(&cc.join(", ")),
-            Some(&bcc.join(", ")),
-        )
-        .context("log action row")?;
-    store
-        .set_action_subject(&action_id, Some(out_subject))
-        .context("record the queued compose's outgoing subject")?;
-    store
-        .set_action_scheduled_at(&action_id, Some(next_attempt_at_ms))
-        .context("record the queued compose's next attempt")?;
-    Ok(action_id)
-}
-
 /// #352 / #412 — Post a Discord approval card for a draft the wiki-ask agent
 /// just composed in a chat session. Writes the same `actions`-table shape as
 /// the auto-triage path so the daemon's Approve/Revise/Skip handlers don't
@@ -7093,7 +7006,7 @@ async fn post_reply_approval_card(
     store: &Store,
     entity_id: &str,
     account_email: &str,
-    draft_id: &str,
+    draft_id: Option<&str>,
     to: &str,
     cc: &[String],
     bcc: &[String],
@@ -7107,7 +7020,12 @@ async fn post_reply_approval_card(
     reply_to_body: Option<&str>,
     reply_to_body_file: Option<&str>,
     send_at_ms: Option<i64>,
-) -> Result<()> {
+    // #1486 — set when the provider throttled the draft create: the rows are
+    // written with status `queued_compose` and this next-attempt time, and no
+    // card is posted. The daemon's scheduled-send engine creates the draft
+    // and posts the card once the throttle clears.
+    queued_until_ms: Option<i64>,
+) -> Result<String> {
     use augmentagent_store::Email as StoreEmail;
 
     let thread = thread_id.filter(|t| !t.is_empty());
@@ -7125,7 +7043,12 @@ async fn post_reply_approval_card(
     // approve/skip/revise handlers — which join actions→emails on messageId —
     // find the upserted row below. `compose:` prefix matches the fan-out
     // convention and can never collide with a real Gmail hex id.
-    let synthetic_msg_id = format!("compose:{draft_id}");
+    // No draft id on a throttle-queued compose (#1486): a uuid keeps the
+    // `compose:` convention and stays unique.
+    let synthetic_msg_id = match draft_id {
+        Some(draft_id) => format!("compose:{draft_id}"),
+        None => format!("compose:queued:{}", uuid::Uuid::new_v4()),
+    };
     let msg_id: &str = reply_msg_id.unwrap_or(&synthetic_msg_id);
     let token = std::env::var("DISCORD_BOT_TOKEN")
         .context("DISCORD_BOT_TOKEN required for --post (set it in the daemon's .env)")?;
@@ -7144,8 +7067,16 @@ async fn post_reply_approval_card(
     };
     let original_from =
         compose_card_identity(reply_msg_id.is_some(), reply_to_from, to, account_email);
-    let original_subject =
-        compose_card_subject(out_subject, reply_to_subject);
+    let stripped = out_subject
+        .strip_prefix("Re:")
+        .or_else(|| out_subject.strip_prefix("re:"))
+        .or_else(|| out_subject.strip_prefix("RE:"))
+        .unwrap_or(out_subject)
+        .trim_start()
+        .to_string();
+    let original_subject = reply_to_subject
+        .map(str::to_string)
+        .unwrap_or_else(|| if stripped.is_empty() { out_subject.to_string() } else { stripped });
 
     // Upsert an inbound row when the daemon hasn't already ingested this
     // message. The Revise handler reads `emails.body` to redraft against the
@@ -7188,15 +7119,33 @@ async fn post_reply_approval_card(
             &original_subject,
             Some(&original_body),
             Some(draft_body),
-            ActionStatus::Pending,
+            if queued_until_ms.is_some() {
+                ActionStatus::QueuedCompose
+            } else {
+                ActionStatus::Pending
+            },
             Some(to),
             Some(&cc.join(", ")),
             Some(&bcc.join(", ")),
         )
         .context("log action row")?;
-    store
-        .set_action_draft_id(&action_id, draft_id)
-        .context("set action draft id")?;
+    if let Some(draft_id) = draft_id {
+        store
+            .set_action_draft_id(&action_id, draft_id)
+            .context("set action draft id")?;
+    }
+    // #1486 — park the row for the engine instead of posting a card: the
+    // outbound subject (the card subject above is the Re:-stripped inbound
+    // one) and the next draft-create attempt.
+    if let Some(at_ms) = queued_until_ms {
+        store
+            .set_action_subject(&action_id, Some(out_subject))
+            .context("record the queued compose's outgoing subject")?;
+        store
+            .set_action_scheduled_at(&action_id, Some(at_ms))
+            .context("record the queued compose's next attempt")?;
+        return Ok(action_id);
+    }
     // #502 — persist the --send-at proposal on the still-PENDING row. The
     // owner still approves; run_approve sees the future proposal and ARMS
     // the schedule instead of sending. Back-to-queue and unschedule clear
@@ -7264,7 +7213,7 @@ async fn post_reply_approval_card(
         tracing::warn!(action_id, "record_nudge after compose card failed: {e}");
     }
 
-    Ok(())
+    Ok(action_id)
 }
 
 
