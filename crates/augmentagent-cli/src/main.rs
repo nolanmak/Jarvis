@@ -2077,12 +2077,24 @@ enum DocOp {
         #[arg(long)] out: PathBuf,
         #[arg(long, default_value = "default")] signature: String,
         #[arg(long)] page: u32,
-        /// PDF points from bottom-left.
-        #[arg(long)] x: f64,
-        #[arg(long)] y: f64,
-        #[arg(long, default_value = "144")] width: f64,
-        /// Optional ISO date printed below the signature.
+        /// Text directly under the signature line, e.g. the signer's printed
+        /// name. The signature's ink is placed on that line.
+        #[arg(long, conflicts_with_all = ["line", "x", "y"])] anchor_text: Option<String>,
+        /// Line number from `doc sign-lines` (1-based, top to bottom).
+        #[arg(long, conflicts_with_all = ["x", "y"])] line: Option<u32>,
+        /// Bottom-left of the visible ink, PDF points from bottom-left. Only
+        /// for pages with no signature line.
+        #[arg(long, requires = "y")] x: Option<f64>,
+        #[arg(long, requires = "x")] y: Option<f64>,
+        /// Ink width in points (on a line: min(180, line length − 12); else 144).
+        #[arg(long)] width: Option<f64>,
+        /// Optional ISO date printed beside the signature.
         #[arg(long)] date: Option<String>,
+    },
+    /// List the signature lines on a PDF's pages (JSON), with the text under each.
+    SignLines {
+        file: PathBuf,
+        #[arg(long)] page: Option<u32>,
     },
     /// Operator-only: install a PNG under a logical signature name. Never overwrites a name.
     SignatureInstall { file: PathBuf, #[arg(long, default_value = "default")] name: String },
@@ -2987,6 +2999,14 @@ async fn main() -> Result<()> {
     }
     // PDF exports need no database or network credentials. In particular, do
     // not try to create data.db when invoked from a fresh wiki directory.
+    if let Cmd::Doc { op: DocOp::SignLines { ref file, page } } = cli.cmd {
+        let root = std::env::var_os("WIKI_ROOT")
+            .map(PathBuf::from)
+            .context("WIKI_ROOT must be set to the wiki directory")?;
+        let lines = augmentagent_docs::signing::sign_lines(&root, file, page).await?;
+        println!("{}", serde_json::to_string(&lines)?);
+        return Ok(());
+    }
     if let Cmd::Doc {
         op:
             DocOp::RenderPdf {
@@ -4315,10 +4335,19 @@ async fn main() -> Result<()> {
             DocOp::Signatures => {
                 println!("{}", serde_json::to_string(&augmentagent_docs::signing::list(&augmentagent_docs::signing::state_root()?)?)?); Ok(())
             }
-            DocOp::Sign { ref file, ref out, ref signature, page, x, y, width, ref date } => {
+            DocOp::Sign { ref file, ref out, ref signature, page, ref anchor_text, line, x, y, width, ref date } => {
+                use augmentagent_docs::signing::{PlacementRequest, Target};
+                let target = match (anchor_text, line, x, y) {
+                    (Some(text), ..) => Target::AnchorText(text.clone()),
+                    (_, Some(line), ..) => Target::Line(*line),
+                    (_, _, Some(x), Some(y)) => Target::Ink { x: *x, y: *y, width: width.unwrap_or(144.) },
+                    _ => anyhow::bail!("give --anchor-text (preferred), --line, or --x/--y; run doc sign-lines to see the page's lines"),
+                };
+                let width = if matches!(target, Target::Ink { .. }) { None } else { *width };
                 document_signing::propose(store.clone(), file, out, signature,
-                    augmentagent_docs::signing::Placement { page: *page, x: *x, y: *y, width: *width, date: date.clone() }).await
+                    PlacementRequest { page: *page, target, width, date: date.clone() }).await
             }
+            DocOp::SignLines { .. } => unreachable!("sign-lines dispatched before store initialization"),
             DocOp::RenderPdf { .. } => unreachable!("PDF rendering dispatched before store initialization"),
             DocOp::Extract { file, out, kind, no_ocr, json } => {
                 doc_cmd::run_doc_extract(file.clone(), out.clone(), kind.clone(), *no_ocr, *json)

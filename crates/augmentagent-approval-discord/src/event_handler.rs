@@ -2577,7 +2577,8 @@ fn stage_signable_upload(root: &Path, filename: &str, bytes: &[u8]) -> Option<St
         Ok(path) => {
             info!(file = %filename, path = %path.display(), "owner PDF staged for signing");
             Some(format!(
-                "original PDF saved unchanged at {}; to sign this exact file use `augmentagent doc sign {} --out <new-signed.pdf> ...`",
+                "original PDF saved unchanged at {}; to sign this exact file run `augmentagent doc sign-lines {}` then `augmentagent doc sign {} --out <new-signed.pdf> --page <n> --anchor-text \"<text under the line>\"`",
+                path.display(),
                 path.display(),
                 path.display()
             ))

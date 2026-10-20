@@ -1,15 +1,9 @@
 use augmentagent_docs::{
     pdf,
-    signing::{self, Placement},
+    signing::{self, PlacementRequest},
 };
-fn place() -> Placement {
-    Placement {
-        page: 1,
-        x: 72.,
-        y: 72.,
-        width: 144.,
-        date: Some("2026-10-12".into()),
-    }
+fn place() -> PlacementRequest {
+    PlacementRequest::ink(1, 72., 72., 144., Some("2026-10-12".into()))
 }
 #[tokio::test]
 async fn signature_is_revision_bound_and_published_once() {
@@ -172,10 +166,11 @@ async fn signed_output_is_the_original_bytes_plus_the_signature_only() {
     signing::register_at(&state, &original).unwrap();
     let pages = page_count(&root.join("letter.pdf"));
     assert!(pages >= 2, "fixture must span pages, got {pages}");
-    let placement = Placement { page: pages, x: 95., y: 300., width: 180., date: None };
-    let p = signing::propose(&root, &state, "letter.pdf".as_ref(), "letter-signed.pdf".as_ref(), "default", placement.clone())
+    let request = PlacementRequest::ink(pages, 95., 300., 180., None);
+    let p = signing::propose(&root, &state, "letter.pdf".as_ref(), "letter-signed.pdf".as_ref(), "default", request)
         .await
         .unwrap();
+    let placement = p.placement.clone();
     signing::execute(&root, &state, &p).await.unwrap();
     let signed = std::fs::read(root.join("letter-signed.pdf")).unwrap();
 
@@ -227,7 +222,7 @@ async fn owner_upload_is_staged_verbatim_and_only_then_signable() {
     let (_dir, root, state, original) = multi_page_fixture().await;
     std::fs::write(root.join("planted.pdf"), &original).unwrap();
     let refused = signing::propose(&root, &state, "planted.pdf".as_ref(), "planted-signed.pdf".as_ref(), "default",
-        Placement { page: 1, x: 72., y: 72., width: 144., date: None }).await;
+        PlacementRequest::ink(1, 72., 50., 100., None)).await;
     assert!(refused.unwrap_err().to_string().contains("neither rendered by Jarvis nor uploaded by the owner"));
 
     assert!(signing::stage_owner_upload(&root, &state, "notes.pdf", b"not a pdf").is_err());
@@ -236,7 +231,7 @@ async fn owner_upload_is_staged_verbatim_and_only_then_signable() {
     assert_eq!(std::fs::read(root.join(&rel)).unwrap(), original, "staged bytes must equal the upload");
     let out = rel.with_file_name("Upload Name-signed.pdf");
     let p = signing::propose(&root, &state, &rel, &out, "default",
-        Placement { page: 1, x: 72., y: 72., width: 144., date: None }).await.unwrap();
+        PlacementRequest::ink(1, 72., 50., 100., None)).await.unwrap();
     signing::execute(&root, &state, &p).await.unwrap();
     assert!(std::fs::read(root.join(&out)).unwrap().starts_with(&original));
 }
@@ -288,7 +283,7 @@ async fn benign_view_actions_and_forms_sign_but_scripts_launch_and_xfa_are_refus
         let rel = signing::stage_owner_upload(&root, &state, &format!("{name}.pdf"), &bytes).unwrap();
         let out = rel.with_file_name(format!("{name}-signed.pdf"));
         let proposed = signing::propose(&root, &state, &rel, &out, "default",
-            Placement { page: 1, x: 72., y: 72., width: 144., date: None }).await;
+            PlacementRequest::ink(1, 72., 50., 100., None)).await;
         assert_eq!(proposed.is_ok(), *signable, "{name}: {proposed:?}");
         if let Ok(p) = proposed {
             signing::execute(&root, &state, &p).await.unwrap();
@@ -316,7 +311,7 @@ async fn shared_content_streams_never_leak_the_signature_onto_other_pages() {
         let rel = signing::stage_owner_upload(&root, &state, &format!("{name}.pdf"), &bytes).unwrap();
         let out = rel.with_file_name(format!("{name}-signed.pdf"));
         let p = signing::propose(&root, &state, &rel, &out, "default",
-            Placement { page: 1, x: 72., y: 72., width: 144., date: Some("2026-10-20".into()) }).await.unwrap();
+            PlacementRequest::ink(1, 72., 50., 100., Some("2026-10-20".into()))).await.unwrap();
         signing::execute(&root, &state, &p).await.unwrap();
         let signed = std::fs::read(root.join(&out)).unwrap();
         assert!(signed.starts_with(&bytes), "{name}: prefix");
@@ -336,6 +331,389 @@ async fn javascript_in_a_bookmark_is_refused() {
         o[NameObject('/A')] = DictionaryObject({NameObject('/S'): NameObject('/JavaScript'), NameObject('/JS'): TextStringObject('x')})");
     let rel = signing::stage_owner_upload(&root, &state, "bookmark-js.pdf", &bytes).unwrap();
     let err = signing::propose(&root, &state, &rel, &rel.with_file_name("bookmark-js-signed.pdf"), "default",
-        Placement { page: 1, x: 72., y: 72., width: 144., date: None }).await.unwrap_err();
+        PlacementRequest::ink(1, 72., 50., 100., None)).await.unwrap_err();
     assert!(format!("{err:#}").contains("require manual signing"), "{err:#}");
+}
+
+// ---- #1510: the signature sits on the line it was meant for ----
+
+fn runtime_python() -> std::path::PathBuf {
+    std::env::var_os("AUGMENTAGENT_PDF_PYTHON").map(std::path::PathBuf::from).unwrap_or_else(|| {
+        std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".local/share/augmentagent/pdf-runtime/bin/python3")
+    })
+}
+
+/// Run `script` in the PDF runtime and return its stdout bytes.
+fn python(script: &str) -> Vec<u8> {
+    let out = std::process::Command::new(runtime_python()).args(["-I", "-c", script]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    out.stdout
+}
+
+/// A letter-size PDF drawn by ReportLab: `pages` is one script body per page,
+/// each drawing on canvas `c`.
+fn reportlab_pdf(pages: &[&str]) -> Vec<u8> {
+    let body: String = pages
+        .iter()
+        .map(|page| format!("{}\nc.showPage()\n", page.lines().map(|l| l.trim()).collect::<Vec<_>>().join("\n")))
+        .collect();
+    python(&format!(
+        "import io,sys\nfrom reportlab.pdfgen import canvas\nb = io.BytesIO()\n\
+         c = canvas.Canvas(b, pagesize=(612, 792), invariant=1)\n{body}c.save()\nsys.stdout.buffer.write(b.getvalue())\n"
+    ))
+}
+
+/// A signature PNG whose ink is exactly 1031x117 px, surrounded by `pad` px of
+/// transparency — the real asset that misplaced the signature had pad 20.
+fn padded_signature(pad: u32) -> Vec<u8> {
+    python(&format!(
+        "import io,sys\nfrom PIL import Image, ImageDraw\np = {pad}\n\
+         im = Image.new('RGBA', (1031 + 2 * p, 117 + 2 * p), (0, 0, 0, 0))\n\
+         d = ImageDraw.Draw(im)\nd.ellipse([p, p, p + 1030, p + 116], outline=(20, 30, 80, 255), width=8)\n\
+         d.line([p + 100, p + 100, p + 900, p + 20], fill=(20, 30, 80, 255), width=8)\n\
+         o = io.BytesIO(); im.save(o, 'PNG'); sys.stdout.buffer.write(o.getvalue())\n"
+    ))
+}
+
+/// Grayscale page render at 300 dpi: (width, height, pixels).
+fn gray_page(pdf: &std::path::Path, page: u32) -> (usize, usize, Vec<u8>) {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("page");
+    let out = std::process::Command::new("pdftoppm")
+        .args(["-gray", "-r", "300", "-singlefile", "-f", &page.to_string(), "-l", &page.to_string()])
+        .arg(pdf)
+        .arg(&base)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let pgm = std::fs::read(base.with_extension("pgm")).unwrap();
+    let mut fields = Vec::new();
+    let mut i = 0;
+    while fields.len() < 4 {
+        while pgm[i].is_ascii_whitespace() { i += 1; }
+        let start = i;
+        while !pgm[i].is_ascii_whitespace() { i += 1; }
+        fields.push(String::from_utf8(pgm[start..i].to_vec()).unwrap());
+    }
+    assert_eq!(fields[0], "P5");
+    (fields[1].parse().unwrap(), fields[2].parse().unwrap(), pgm[i + 1..].to_vec())
+}
+
+/// Topmost pixel row of the first rule (a dark run >= 1 inch) on a page.
+fn rule_top_row((w, h, px): &(usize, usize, Vec<u8>)) -> usize {
+    (0..*h)
+        .find(|y| {
+            let row = &px[y * w..(y + 1) * w];
+            row.split(|&v| v >= 235).any(|run| run.len() >= 300)
+        })
+        .expect("page has a rule")
+}
+
+/// Bounding box (x0, y0, x1, y1) in pixels of everything signing changed.
+fn ink_px(before: &(usize, usize, Vec<u8>), after: &(usize, usize, Vec<u8>)) -> (usize, usize, usize, usize) {
+    let (w, h) = (before.0, before.1);
+    assert_eq!((w, h), (after.0, after.1));
+    let mut b = (usize::MAX, usize::MAX, 0, 0);
+    for y in 0..h {
+        for x in 0..w {
+            if before.2[y * w + x] != after.2[y * w + x] {
+                b = (b.0.min(x), b.1.min(y), b.2.max(x), b.3.max(y));
+            }
+        }
+    }
+    assert!(b.0 != usize::MAX, "the signature must be visible");
+    b
+}
+
+/// A fresh wiki whose only document is `pdf` (staged as an owner upload) and
+/// whose `default` signature is `signature`.
+fn upload_fixture(pdf: &[u8], signature: &[u8]) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("wiki");
+    let state = dir.path().join("private");
+    std::fs::create_dir(&root).unwrap();
+    let png = dir.path().join("sig.png");
+    std::fs::write(&png, signature).unwrap();
+    signing::install(&state, "default", &png).unwrap();
+    let rel = signing::stage_owner_upload(&root, &state, "letter.pdf", pdf).unwrap();
+    (dir, root, state, rel)
+}
+
+/// The signature block that misplaced the owner's signature: a 1 pt light-gray
+/// rule drawn under a translated CTM at y=708, the signer's name under it.
+const LETTER_SIGNATURE_BLOCK: &str = "c.setFont('Helvetica', 10)
+    c.drawString(60, 760, 'This letter supports the application in full.')
+    c.saveState(); c.translate(60, 708); c.setLineWidth(1); c.setLineCap(1)
+    c.setStrokeColorRGB(.827451, .827451, .827451); c.line(0, 0, 492, 0); c.restoreState()
+    c.drawString(60, 690, 'Jane Signer Founder, Example Labs')
+    c.drawString(60, 675, 'jane@example.com')";
+
+/// #1510 AC1 — the exact geometry of the bug. The legacy request (image box at
+/// y=702) put the ink 2.6 pt *below* the rule; anchoring on the name puts the
+/// ink's lowest row above the rule with a 0.5–3 pt gap.
+#[tokio::test]
+async fn regression_signature_ink_sits_on_the_rule() {
+    let pdf = reportlab_pdf(&[LETTER_SIGNATURE_BLOCK]);
+    let (_dir, root, state, rel) = upload_fixture(&pdf, &padded_signature(20));
+    let before = gray_page(&root.join(&rel), 1);
+    let rule = rule_top_row(&before);
+    let pt = |px: f64| px * 72. / 300.;
+
+    // What main shipped: the agent's coordinates address the padded bitmap.
+    let mut legacy = signing::propose(&root, &state, &rel, "legacy.pdf".as_ref(), "default",
+        PlacementRequest::ink(1, 100., 720., 180., None)).await.unwrap();
+    legacy.placement = serde_json::from_value(serde_json::json!({"page": 1, "x": 95., "y": 702., "width": 180., "date": null})).unwrap();
+    legacy.expected_output_sha256 = None;
+    signing::execute(&root, &state, &legacy).await.unwrap();
+    let low = ink_px(&before, &gray_page(&root.join("legacy.pdf"), 1)).3;
+    assert!(low > rule, "legacy placement must reproduce the bug (ink row {low}, rule row {rule})");
+
+    let p = signing::propose(&root, &state, &rel, "signed.pdf".as_ref(), "default",
+        PlacementRequest::anchor_text(1, "Jane Signer")).await.unwrap();
+    let anchor = p.placement.anchor.clone().expect("anchored placement records its line");
+    assert!((anchor.top - 708.5).abs() <= 0.5, "{anchor:?}");
+    signing::execute(&root, &state, &p).await.unwrap();
+    let (_, _, _, low) = ink_px(&before, &gray_page(&root.join("signed.pdf"), 1));
+    assert!(low < rule, "ink row {low} must be above rule row {rule}");
+    let gap = pt((rule - low - 1) as f64);
+    assert!((0.5..=3.0).contains(&gap), "gap {gap} pt");
+}
+
+/// #1510 AC2 — every way a document draws a signature line is found, in page
+/// space, and a page of (long, serif) text has none.
+#[tokio::test]
+async fn sign_lines_finds_stroked_filled_and_underscore_rules() {
+    let pdf = reportlab_pdf(&[
+        "c.saveState(); c.translate(100, 500); c.line(0, 0, 300, 0); c.restoreState()
+         c.drawString(100, 485, 'Stroked Signer')",
+        "c.rect(100, 449.5, 300, 1, fill=1, stroke=0)",
+        "c.setFont('Helvetica', 12); c.drawString(100, 400, '_' * 20)",
+        "c.setFont('Times-Roman', 12)
+         c.drawString(72, 700, 'Supercalifragilisticexpialidociousnessmeasurement https://example.com/a/very/long/path/to/a/resource')
+         c.setFont('Helvetica-Bold', 14); c.drawString(72, 650, 'WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW')",
+    ]);
+    let (_dir, root, _state, rel) = upload_fixture(&pdf, &padded_signature(0));
+    let lines = signing::sign_lines(&root, &rel, None).await.unwrap();
+    let on = |page: u64| lines.iter().filter(|l| l["page"] == page).collect::<Vec<_>>();
+    let near = |v: &serde_json::Value, want: f64, tol: f64| (v.as_f64().unwrap() - want).abs() <= tol;
+    // Helvetica's underscore glyph spans 0..556 units and -125..-75 below the
+    // baseline (398.5..399.1 pt here). Base-14 fonts are not embedded, so the
+    // viewer's substitute decides the exact row: accept ±0.5 pt of that band.
+    for (page, y, y_tol, x0, x1) in [(1, 500., 0.5, 100., 400.), (2, 450., 0.5, 100., 400.), (3, 398.8, 0.8, 100., 100. + 20. * 6.672)] {
+        let found = on(page);
+        assert_eq!(found.len(), 1, "page {page}: {lines:?}");
+        let l = found[0];
+        assert!(near(&l["y"], y, y_tol) && near(&l["x0"], x0, 1.) && near(&l["x1"], x1, 1.), "page {page}: {l}");
+    }
+    assert_eq!(on(1)[0]["below"], "Stroked Signer");
+    assert!(on(4).is_empty(), "text is not a line: {:?}", on(4));
+    let only = signing::sign_lines(&root, &rel, Some(2)).await.unwrap();
+    assert_eq!(only.len(), 1);
+}
+
+/// #1510 — rules inside nested/scaled CTMs are reported where a reader sees them.
+#[tokio::test]
+async fn rules_under_a_transformed_ctm_are_reported_in_page_space() {
+    let pdf = reportlab_pdf(&["c.drawString(60, 760, 'Header text')
+        c.saveState(); c.translate(50, 300); c.scale(2, 2); c.setLineWidth(.5); c.line(0, 0, 100, 0); c.restoreState()"]);
+    let (_dir, root, _state, rel) = upload_fixture(&pdf, &padded_signature(0));
+    let lines = signing::sign_lines(&root, &rel, Some(1)).await.unwrap();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let l = &lines[0];
+    assert!((l["y"].as_f64().unwrap() - 300.).abs() <= 0.5, "{l}");
+    assert!((l["x0"].as_f64().unwrap() - 50.).abs() <= 1. && (l["x1"].as_f64().unwrap() - 250.).abs() <= 1., "{l}");
+}
+
+/// #1510 AC3 — transparent padding in the asset never moves the visible ink.
+#[tokio::test]
+async fn padding_in_the_asset_does_not_move_the_ink() {
+    let pdf = reportlab_pdf(&[LETTER_SIGNATURE_BLOCK]);
+    let (dir, root, state, rel) = upload_fixture(&pdf, &padded_signature(0));
+    let before = gray_page(&root.join(&rel), 1);
+    let mut boxes = Vec::new();
+    for pad in [0, 20, 80] {
+        let png = dir.path().join(format!("pad{pad}.png"));
+        std::fs::write(&png, padded_signature(pad)).unwrap();
+        signing::install(&state, &format!("pad{pad}"), &png).unwrap();
+        let out = format!("pad{pad}.pdf");
+        let p = signing::propose(&root, &state, &rel, out.as_ref(), &format!("pad{pad}"),
+            PlacementRequest::anchor_text(1, "Jane Signer")).await.unwrap();
+        signing::execute(&root, &state, &p).await.unwrap();
+        boxes.push(ink_px(&before, &gray_page(&root.join(&out), 1)));
+    }
+    for b in &boxes[1..] {
+        let d = [b.0.abs_diff(boxes[0].0), b.1.abs_diff(boxes[0].1), b.2.abs_diff(boxes[0].2), b.3.abs_diff(boxes[0].3)];
+        assert!(d.iter().all(|&v| v <= 1), "{boxes:?}");
+    }
+}
+
+/// #1510 AC4 — ambiguous, missing and line-less anchors are refused with the reason.
+#[tokio::test]
+async fn ambiguous_or_missing_anchor_is_refused() {
+    let pdf = reportlab_pdf(&["c.drawString(60, 760, 'Two signers')
+        c.line(60, 200, 250, 200); c.line(330, 200, 520, 200)
+        c.drawString(60, 186, 'Signer'); c.drawString(330, 186, 'Signer')
+        c.drawString(60, 600, 'Witness')"]);
+    let (_dir, root, state, rel) = upload_fixture(&pdf, &padded_signature(0));
+    for (text, why) in [("Signer", "is under 2 lines"), ("Nobody", "is not on this page"), ("Witness", "no signature line directly above")] {
+        let err = signing::propose(&root, &state, &rel, "out.pdf".as_ref(), "default",
+            PlacementRequest::anchor_text(1, text)).await.unwrap_err();
+        assert!(format!("{err:#}").contains(why), "{text}: {err:#}");
+    }
+    let err = signing::propose(&root, &state, &rel, "out.pdf".as_ref(), "default",
+        PlacementRequest { page: 1, target: signing::Target::Line(3), width: None, date: None }).await.unwrap_err();
+    assert!(format!("{err:#}").contains("there is no line 3"), "{err:#}");
+    let ok = signing::propose(&root, &state, &rel, "out.pdf".as_ref(), "default",
+        PlacementRequest { page: 1, target: signing::Target::Line(2), width: None, date: None }).await.unwrap();
+    assert!(ok.placement.ink.unwrap().x > 330.);
+    assert!(!root.join("out.pdf").exists());
+}
+
+/// #1510 AC4 — explicit coordinates that would cover text or cross a line are refused.
+#[tokio::test]
+async fn ink_overlapping_text_is_refused() {
+    let pdf = reportlab_pdf(&[LETTER_SIGNATURE_BLOCK]);
+    let (_dir, root, state, rel) = upload_fixture(&pdf, &padded_signature(20));
+    let over_text = signing::propose(&root, &state, &rel, "out.pdf".as_ref(), "default",
+        PlacementRequest::ink(1, 60., 755., 120., None)).await.unwrap_err();
+    assert!(format!("{over_text:#}").contains("would overlap the text"), "{over_text:#}");
+    let across = signing::propose(&root, &state, &rel, "out.pdf".as_ref(), "default",
+        PlacementRequest::ink(1, 100., 705., 120., None)).await.unwrap_err();
+    assert!(format!("{across:#}").contains("would cross line 1"), "{across:#}");
+    let date_over_text = signing::propose(&root, &state, &rel, "out.pdf".as_ref(), "default",
+        PlacementRequest::ink(1, 10., 690., 40., Some("2026-10-20".into()))).await.unwrap_err();
+    assert!(format!("{date_over_text:#}").contains("would overlap"), "{date_over_text:#}");
+}
+
+/// #1510 AC5 — the card's preview is the signed page, and approval publishes
+/// exactly the bytes the preview was rendered from.
+#[tokio::test]
+async fn card_attaches_a_preview_that_matches_the_signed_output() {
+    let pdf = reportlab_pdf(&[LETTER_SIGNATURE_BLOCK]);
+    let (_dir, root, state, rel) = upload_fixture(&pdf, &padded_signature(20));
+    let proposed = signing::propose_with_preview(&root, &state, &rel, "signed.pdf".as_ref(), "default",
+        PlacementRequest { date: Some("2026-10-20".into()), ..PlacementRequest::anchor_text(1, "Jane Signer") }).await.unwrap();
+    let p = &proposed.proposal;
+    assert!(proposed.preview_png.starts_with(b"\x89PNG"));
+    assert_eq!(p.preview_sha256.as_deref(), Some(signing::digest(&proposed.preview_png).as_str()));
+    let receipt = signing::execute(&root, &state, p).await.unwrap();
+    assert_eq!(Some(&receipt.output_sha256), p.expected_output_sha256.as_ref());
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("page");
+    let out = std::process::Command::new("pdftoppm")
+        .args(["-png", "-singlefile", "-r", "150", "-f", "1", "-l", "1"])
+        .arg(root.join("signed.pdf")).arg(&base).output().unwrap();
+    assert!(out.status.success());
+    assert!(std::fs::read(base.with_extension("png")).unwrap() == proposed.preview_png, "preview must be the signed page");
+
+    // A proposal whose output would differ from its preview never publishes.
+    let mut tampered = signing::propose(&root, &state, &rel, "other.pdf".as_ref(), "default",
+        PlacementRequest::anchor_text(1, "Jane Signer")).await.unwrap();
+    tampered.placement.x += 5.;
+    let err = signing::execute(&root, &state, &tampered).await.unwrap_err();
+    assert!(err.to_string().contains("differs from the approved preview"), "{err:#}");
+    assert!(!root.join("other.pdf").exists());
+}
+
+/// #1510 review — "Signature: ______" is the most common form line. The
+/// underscores are both the detected rule and a pdftotext "word"; they must not
+/// count as text the ink overlaps, with or without a space after the label.
+#[tokio::test]
+async fn underscore_signature_lines_can_be_signed() {
+    for label in ["Signature: ", "Signature:"] {
+        let pdf = reportlab_pdf(&[&format!("c.drawString(72, 760, 'Agreement terms.')
+            c.setFont('Helvetica', 12); c.drawString(100, 400, '{label}' + '_' * 30)
+            c.drawString(170, 385, 'Jane Signer')")]);
+        let (_dir, root, state, rel) = upload_fixture(&pdf, &padded_signature(20));
+        let before = gray_page(&root.join(&rel), 1);
+        let p = signing::propose(&root, &state, &rel, "signed.pdf".as_ref(), "default",
+            PlacementRequest::anchor_text(1, "Jane Signer")).await.unwrap_or_else(|e| panic!("{label:?}: {e:#}"));
+        let anchor = p.placement.anchor.clone().unwrap();
+        let ink = p.placement.ink.unwrap();
+        assert!(ink.x >= anchor.x0 && ink.x + ink.width <= anchor.x1, "{label:?}: {ink:?} {anchor:?}");
+        signing::execute(&root, &state, &p).await.unwrap();
+        let low = ink_px(&before, &gray_page(&root.join("signed.pdf"), 1)).3;
+        let rule = ((792. - anchor.top) * 300. / 72.).round() as usize;
+        assert!(low < rule, "{label:?}: ink row {low}, rule row {rule}");
+        // The label itself is still protected.
+        let err = signing::propose(&root, &state, &rel, "over.pdf".as_ref(), "default",
+            PlacementRequest::ink(1, 100., 398., 40., None)).await.unwrap_err();
+        assert!(format!("{err:#}").contains("overlap the text \"Signature:"), "{label:?}: {err:#}");
+    }
+}
+
+/// #1510 review — pdftotext can't see images, scans or outlined text; the
+/// rendered page can. Ink that would land on any visible mark is refused.
+#[tokio::test]
+async fn ink_over_an_image_or_graphic_is_refused() {
+    let pdf = reportlab_pdf(&[&format!("{LETTER_SIGNATURE_BLOCK}\nc.setFillColorRGB(.2, .2, .2); c.rect(120, 712, 40, 10, fill=1, stroke=0)")]);
+    let (_dir, root, state, rel) = upload_fixture(&pdf, &padded_signature(20));
+    let err = signing::propose(&root, &state, &rel, "out.pdf".as_ref(), "default",
+        PlacementRequest::anchor_text(1, "Jane Signer")).await.unwrap_err();
+    assert!(format!("{err:#}").contains("would cover existing marks"), "{err:#}");
+}
+
+/// #1510 review — a page too large to rasterize safely is refused up front.
+#[tokio::test]
+async fn oversized_pages_are_refused_before_rendering() {
+    let pdf = python("import io,sys\nfrom reportlab.pdfgen import canvas\nb = io.BytesIO()\n\
+        c = canvas.Canvas(b, pagesize=(5000, 5000)); c.drawString(72, 72, 'Huge'); c.showPage(); c.save()\n\
+        sys.stdout.buffer.write(b.getvalue())\n");
+    let (_dir, root, state, rel) = upload_fixture(&pdf, &padded_signature(0));
+    let err = signing::sign_lines(&root, &rel, None).await.unwrap_err();
+    assert!(format!("{err:#}").contains("cannot be measured"), "{err:#}");
+    let err = signing::propose(&root, &state, &rel, "out.pdf".as_ref(), "default",
+        PlacementRequest::ink(1, 72., 200., 100., None)).await.unwrap_err();
+    assert!(format!("{err:#}").contains("cannot be measured"), "{err:#}");
+}
+
+/// #1510 review — an update to the signer between proposal and approval is
+/// reported as such, never as tampering, and publishes nothing.
+#[tokio::test]
+async fn a_signer_update_after_proposal_asks_for_a_fresh_card() {
+    let pdf = reportlab_pdf(&[LETTER_SIGNATURE_BLOCK]);
+    let (_dir, root, state, rel) = upload_fixture(&pdf, &padded_signature(20));
+    let mut p = signing::propose(&root, &state, &rel, "signed.pdf".as_ref(), "default",
+        PlacementRequest::anchor_text(1, "Jane Signer")).await.unwrap();
+    assert_eq!(p.worker_sha256.as_deref(), Some(signing::worker_fingerprint().as_str()));
+    p.worker_sha256 = Some("an-older-signer".into());
+    let err = signing::execute(&root, &state, &p).await.unwrap_err();
+    assert!(err.to_string().contains("signer was updated"), "{err:#}");
+    assert!(!root.join("signed.pdf").exists());
+}
+
+/// #1510 AC8 — opt-in live check on a real document and signature, in a
+/// throwaway wiki/state. Prints the receipt the acceptance criteria ask for:
+///   AUGMENTAGENT_E2E_PDF=… AUGMENTAGENT_E2E_SIGNATURE=… AUGMENTAGENT_E2E_PAGE=4 \
+///   AUGMENTAGENT_E2E_ANCHOR="Printed Name" cargo test -p augmentagent-docs --test signing live_ -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn live_owner_document_signs_on_its_line() {
+    let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} is required"));
+    let pdf = std::fs::read(var("AUGMENTAGENT_E2E_PDF")).unwrap();
+    let page: u32 = var("AUGMENTAGENT_E2E_PAGE").parse().unwrap();
+    let (_dir, root, state, rel) = upload_fixture(&pdf, &std::fs::read(var("AUGMENTAGENT_E2E_SIGNATURE")).unwrap());
+    let lines = signing::sign_lines(&root, &rel, Some(page)).await.unwrap();
+    println!("sign-lines page {page}: {}", serde_json::to_string(&lines).unwrap());
+    let proposed = signing::propose_with_preview(&root, &state, &rel, "signed.pdf".as_ref(), "default",
+        PlacementRequest::anchor_text(page, &var("AUGMENTAGENT_E2E_ANCHOR"))).await.unwrap();
+    let p = &proposed.proposal;
+    let receipt = signing::execute(&root, &state, p).await.unwrap();
+    let signed = root.join("signed.pdf");
+    let bytes = std::fs::read(&signed).unwrap();
+    assert!(bytes.starts_with(&pdf), "original bytes must be an exact prefix");
+    assert_eq!(Some(&receipt.output_sha256), p.expected_output_sha256.as_ref());
+    for other in (1..=page_count(&root.join(&rel))).filter(|&n| n != page) {
+        assert!(render_page(&root.join(&rel), other) == render_page(&signed, other), "page {other} changed");
+    }
+    let before = gray_page(&root.join(&rel), page);
+    let rule = rule_top_row(&before);
+    let ink = ink_px(&before, &gray_page(&signed, page));
+    let gap = (rule as f64 - ink.3 as f64 - 1.) * 72. / 300.;
+    println!("anchor: {:?}\nink: {:?}\nrule top row {rule}, ink bottom row {}, gap {gap:.2} pt\nin={} out={} sha={}",
+        p.placement.anchor, p.placement.ink, ink.3, pdf.len(), bytes.len(), receipt.output_sha256);
+    assert!(ink.3 < rule && (0.5..=3.0).contains(&gap), "gap {gap}");
+    if let Ok(out) = std::env::var("AUGMENTAGENT_E2E_PREVIEW_OUT") {
+        std::fs::write(out, &proposed.preview_png).unwrap();
+    }
 }

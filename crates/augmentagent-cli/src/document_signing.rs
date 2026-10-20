@@ -1,30 +1,28 @@
 use super::*;
 use anyhow::bail;
-use augmentagent_docs::signing::{self, Placement, Proposal, Receipt};
+use augmentagent_docs::signing::{self, PlacementRequest, Proposal, Receipt};
 
 pub async fn propose(
     store: Arc<Store>,
     input: &Path,
     output: &Path,
     signature: &str,
-    placement: Placement,
+    request: PlacementRequest,
 ) -> Result<()> {
     let root = std::env::var_os("WIKI_ROOT")
         .map(PathBuf::from)
         .context("WIKI_ROOT is required")?
         .canonicalize()?;
-    let proposal = signing::propose(
+    let signing::Proposed { proposal, preview_png } = signing::propose_with_preview(
         &root,
         &signing::state_root()?,
         input,
         output,
         signature,
-        placement,
+        request,
     )
     .await?;
-    let human = format!("Apply signature '{}' to {} ({} pages).\nPage {}; x={}, y={}, width={} PDF points from bottom-left; date: {}.\nOutput: {}\nDocument SHA-256: {}\nSignature SHA-256: {}\nReview the attached unsigned PDF. Approve signs this exact revision only; it does not send the document.",
-        proposal.signature, proposal.source, proposal.pages, proposal.placement.page, proposal.placement.x, proposal.placement.y, proposal.placement.width,
-        proposal.placement.date.as_deref().unwrap_or("none"), proposal.output, proposal.document_sha256, proposal.signature_sha256);
+    let human = card_text(&proposal);
     let token = std::env::var("DISCORD_BOT_TOKEN")
         .context("DISCORD_BOT_TOKEN required to post signing approval")?;
     let cid: u64 = std::env::var("DISCORD_CHANNEL_ID")
@@ -55,14 +53,43 @@ pub async fn propose(
         ActionStatus::Pending,
     )?;
     let unsigned = signing::review_bytes(&root, &proposal)?;
-    let attachment = serenity::all::CreateAttachment::bytes(unsigned, "unsigned-review.pdf");
-    let card = approval_message(&id, &email, &human, 0).add_file(attachment);
+    let card = approval_message(&id, &email, &human, 0).add_files(card_files(unsigned, preview_png));
     serenity::all::ChannelId::new(cid)
         .send_message(&serenity::http::Http::new(&token), card)
         .await
         .context("post signing approval card")?;
     println!("Signature approval posted: {id}\n{human}");
     Ok(())
+}
+
+/// What the owner reads before approving: where the ink lands (and on which
+/// detected line), plus the hashes binding the preview to the published bytes.
+fn card_text(p: &Proposal) -> String {
+    let pl = &p.placement;
+    let placed = match (&pl.ink, &pl.anchor) {
+        (Some(ink), Some(a)) => format!(
+            "on line {} (top y={}, x {}–{}{}): ink bottom y={}, {:.1} pt above the line; ink x={}, width={}",
+            a.line, a.top, a.x0, a.x1,
+            a.text.as_deref().map(|t| format!(", above \"{t}\"")).unwrap_or_default(),
+            ink.y, ink.y - a.top, ink.x, ink.width),
+        (Some(ink), None) => format!("ink bottom-left x={}, y={}, width={}", ink.x, ink.y, ink.width),
+        _ => format!("image box x={}, y={}, width={}", pl.x, pl.y, pl.width),
+    };
+    let mut text = format!(
+        "Apply signature '{}' to {} ({} pages).\nPage {}, {placed} (PDF points from bottom-left); date: {}.\nOutput: {}\nDocument SHA-256: {}\nSignature SHA-256: {}",
+        p.signature, p.source, p.pages, pl.page, pl.date.as_deref().unwrap_or("none"), p.output, p.document_sha256, p.signature_sha256);
+    if let (Some(preview), Some(out)) = (&p.preview_sha256, &p.expected_output_sha256) {
+        text.push_str(&format!("\nPreview SHA-256: {preview}\nSigned output SHA-256: {out}"));
+    }
+    text.push_str("\nThe preview image is the signed page exactly as approval will publish it. Approve signs this exact revision only; it does not send the document.");
+    text
+}
+
+fn card_files(unsigned: Vec<u8>, preview_png: Vec<u8>) -> Vec<serenity::all::CreateAttachment> {
+    vec![
+        serenity::all::CreateAttachment::bytes(preview_png, "signed-page-preview.png"),
+        serenity::all::CreateAttachment::bytes(unsigned, "unsigned-review.pdf"),
+    ]
 }
 
 impl ReplyApprover {
@@ -147,13 +174,7 @@ mod tests {
             "agreement.pdf".as_ref(),
             "signed.pdf".as_ref(),
             "default",
-            Placement {
-                page: 1,
-                x: 72.,
-                y: 72.,
-                width: 144.,
-                date: None,
-            },
+            PlacementRequest::ink(1, 72., 72., 144., None),
         )
         .await
         .unwrap();
@@ -272,6 +293,32 @@ mod tests {
         let row = a.store.get_action_with_email(&id).unwrap().unwrap().action;
         assert_eq!(row.status, "error");
         assert!(row.error_message.as_deref().is_some_and(|m| m.contains("changed")), "{:?}", row.error_message);
+    }
+    /// #1510 AC5 — the card attaches the signed-page preview and states where
+    /// the ink lands relative to the detected line, with the binding hashes.
+    #[test]
+    fn card_shows_the_line_the_preview_and_its_hashes() {
+        let mut p: Proposal = serde_json::from_value(serde_json::json!({
+            "source": "letter.pdf", "output": "letter-signed.pdf", "document_sha256": "d", "signature": "default",
+            "signature_sha256": "s", "pages": 4, "expected_output_sha256": "o", "preview_sha256": "v",
+            "placement": {"page": 4, "x": 70.1, "y": 707.1, "width": 187.0, "date": null,
+                "ink": {"x": 72.0, "y": 709.98, "width": 180.0, "height": 20.4},
+                "anchor": {"line": 1, "x0": 60.0, "x1": 552.0, "top": 708.48, "text": "Jane Signer"}}
+        })).unwrap();
+        let text = card_text(&p);
+        for want in ["Page 4, on line 1 (top y=708.48", "above \"Jane Signer\"", "ink bottom y=709.98, 1.5 pt above the line",
+                     "Preview SHA-256: v", "Signed output SHA-256: o", "The preview image is the signed page"] {
+            assert!(text.contains(want), "missing {want:?} in {text}");
+        }
+        // Proposals made before #1510 still describe what they will draw.
+        p.placement.ink = None;
+        p.placement.anchor = None;
+        p.preview_sha256 = None;
+        assert!(card_text(&p).contains("image box x=70.1, y=707.1, width=187"), "{}", card_text(&p));
+        let files = card_files(b"%PDF-".to_vec(), b"\x89PNG".to_vec());
+        let names: Vec<_> = files.iter().map(|f| f.filename.as_str()).collect();
+        assert_eq!(names, ["signed-page-preview.png", "unsigned-review.pdf"]);
+        assert_eq!(files[0].data, b"\x89PNG");
     }
     #[tokio::test]
     async fn audit_failure_after_publication_is_unconfirmed_and_never_replayed() {
