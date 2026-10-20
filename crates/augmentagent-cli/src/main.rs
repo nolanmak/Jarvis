@@ -988,6 +988,10 @@ enum AutoprOp {
         /// List the matching issue numbers, one per line; change nothing.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        /// #1517 — also forget the matched issues' recorded attempts, so one
+        /// that gave up at the attempt ceiling starts from a clean count.
+        #[arg(long, default_value_t = false)]
+        reset_history: bool,
     },
 }
 
@@ -5232,9 +5236,9 @@ async fn main() -> Result<()> {
             .await?;
             std::process::exit(code);
         }
-        Cmd::Autopr { op: AutoprOp::Readmit { reason, dry_run } } => {
+        Cmd::Autopr { op: AutoprOp::Readmit { reason, dry_run, reset_history } } => {
             let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            for n in self_improve::readmit(&root, &reason, dry_run).await? {
+            for n in self_improve::readmit(&root, &reason, dry_run, reset_history).await? {
                 if dry_run {
                     println!("{n}");
                 } else {
