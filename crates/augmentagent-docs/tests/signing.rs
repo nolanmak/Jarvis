@@ -615,6 +615,73 @@ async fn card_attaches_a_preview_that_matches_the_signed_output() {
     assert!(!root.join("other.pdf").exists());
 }
 
+/// #1510 review — "Signature: ______" is the most common form line. The
+/// underscores are both the detected rule and a pdftotext "word"; they must not
+/// count as text the ink overlaps, with or without a space after the label.
+#[tokio::test]
+async fn underscore_signature_lines_can_be_signed() {
+    for label in ["Signature: ", "Signature:"] {
+        let pdf = reportlab_pdf(&[&format!("c.drawString(72, 760, 'Agreement terms.')
+            c.setFont('Helvetica', 12); c.drawString(100, 400, '{label}' + '_' * 30)
+            c.drawString(170, 385, 'Jane Signer')")]);
+        let (_dir, root, state, rel) = upload_fixture(&pdf, &padded_signature(20));
+        let before = gray_page(&root.join(&rel), 1);
+        let p = signing::propose(&root, &state, &rel, "signed.pdf".as_ref(), "default",
+            PlacementRequest::anchor_text(1, "Jane Signer")).await.unwrap_or_else(|e| panic!("{label:?}: {e:#}"));
+        let anchor = p.placement.anchor.clone().unwrap();
+        let ink = p.placement.ink.unwrap();
+        assert!(ink.x >= anchor.x0 && ink.x + ink.width <= anchor.x1, "{label:?}: {ink:?} {anchor:?}");
+        signing::execute(&root, &state, &p).await.unwrap();
+        let low = ink_px(&before, &gray_page(&root.join("signed.pdf"), 1)).3;
+        let rule = ((792. - anchor.top) * 300. / 72.).round() as usize;
+        assert!(low < rule, "{label:?}: ink row {low}, rule row {rule}");
+        // The label itself is still protected.
+        let err = signing::propose(&root, &state, &rel, "over.pdf".as_ref(), "default",
+            PlacementRequest::ink(1, 100., 398., 40., None)).await.unwrap_err();
+        assert!(format!("{err:#}").contains("overlap the text \"Signature:"), "{label:?}: {err:#}");
+    }
+}
+
+/// #1510 review — pdftotext can't see images, scans or outlined text; the
+/// rendered page can. Ink that would land on any visible mark is refused.
+#[tokio::test]
+async fn ink_over_an_image_or_graphic_is_refused() {
+    let pdf = reportlab_pdf(&[&format!("{LETTER_SIGNATURE_BLOCK}\nc.setFillColorRGB(.2, .2, .2); c.rect(120, 712, 40, 10, fill=1, stroke=0)")]);
+    let (_dir, root, state, rel) = upload_fixture(&pdf, &padded_signature(20));
+    let err = signing::propose(&root, &state, &rel, "out.pdf".as_ref(), "default",
+        PlacementRequest::anchor_text(1, "Jane Signer")).await.unwrap_err();
+    assert!(format!("{err:#}").contains("would cover existing marks"), "{err:#}");
+}
+
+/// #1510 review — a page too large to rasterize safely is refused up front.
+#[tokio::test]
+async fn oversized_pages_are_refused_before_rendering() {
+    let pdf = python("import io,sys\nfrom reportlab.pdfgen import canvas\nb = io.BytesIO()\n\
+        c = canvas.Canvas(b, pagesize=(5000, 5000)); c.drawString(72, 72, 'Huge'); c.showPage(); c.save()\n\
+        sys.stdout.buffer.write(b.getvalue())\n");
+    let (_dir, root, state, rel) = upload_fixture(&pdf, &padded_signature(0));
+    let err = signing::sign_lines(&root, &rel, None).await.unwrap_err();
+    assert!(format!("{err:#}").contains("cannot be measured"), "{err:#}");
+    let err = signing::propose(&root, &state, &rel, "out.pdf".as_ref(), "default",
+        PlacementRequest::ink(1, 72., 200., 100., None)).await.unwrap_err();
+    assert!(format!("{err:#}").contains("cannot be measured"), "{err:#}");
+}
+
+/// #1510 review — an update to the signer between proposal and approval is
+/// reported as such, never as tampering, and publishes nothing.
+#[tokio::test]
+async fn a_signer_update_after_proposal_asks_for_a_fresh_card() {
+    let pdf = reportlab_pdf(&[LETTER_SIGNATURE_BLOCK]);
+    let (_dir, root, state, rel) = upload_fixture(&pdf, &padded_signature(20));
+    let mut p = signing::propose(&root, &state, &rel, "signed.pdf".as_ref(), "default",
+        PlacementRequest::anchor_text(1, "Jane Signer")).await.unwrap();
+    assert_eq!(p.worker_sha256.as_deref(), Some(signing::worker_fingerprint().as_str()));
+    p.worker_sha256 = Some("an-older-signer".into());
+    let err = signing::execute(&root, &state, &p).await.unwrap_err();
+    assert!(err.to_string().contains("signer was updated"), "{err:#}");
+    assert!(!root.join("signed.pdf").exists());
+}
+
 /// #1510 AC8 — opt-in live check on a real document and signature, in a
 /// throwaway wiki/state. Prints the receipt the acceptance criteria ask for:
 ///   AUGMENTAGENT_E2E_PDF=… AUGMENTAGENT_E2E_SIGNATURE=… AUGMENTAGENT_E2E_PAGE=4 \

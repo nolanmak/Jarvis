@@ -268,7 +268,33 @@ def page_layout(data, page):
     rows = text_rows([tuple(w) for w in layout['words']], page_h)
     for r in rules:
         r['below'] = label_below(r, rows)
-    return rules, rows
+    return rules, rows, raster
+
+
+RULE_TEXT = re.compile(r'^[_\-\u2010-\u2015.\u00b7\u2026]+:?$')
+
+
+def marks_in(raster, dpi, page_h, box, rules):
+    """Dark pixels a reader would see inside `box` that are not a detected
+    rule: images, scans and outlined text that pdftotext cannot report."""
+    im = Image.open(io.BytesIO(raster))
+    im.load()
+    im = im.convert('L')
+    k = dpi / 72
+    x0, x1 = max(0, int(box[0] * k)), min(im.width, int(math.ceil(box[2] * k)))
+    y0, y1 = max(0, int((page_h - box[3]) * k)), min(im.height, int(math.ceil((page_h - box[1]) * k)))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    region = im.crop((x0, y0, x1, y1)).load()
+    for py in range(y1 - y0):
+        y_pt = page_h - (y0 + py + 0.5) / k
+        on_rule = [r for r in rules if r['bottom'] - 1.5 / k <= y_pt <= r['top'] + 1.5 / k]
+        for px in range(x1 - x0):
+            if region[px, py] < DARK:
+                x_pt = (x0 + px + 0.5) / k
+                if not any(r['x0'] - 1 <= x_pt <= r['x1'] + 1 for r in on_rule):
+                    return round(y_pt, 1)
+    return None
 
 
 def anchored_rule(target, rules, rows):
@@ -329,7 +355,7 @@ def resolve_placement(data, page, im):
     signature's visible ink (not its bitmap, which may carry padding) and
     refusing anything that would cover text or cross a line."""
     page_w, page_h = float(page.mediabox.width), float(page.mediabox.height)
-    rules, rows = page_layout(data, page)
+    rules, rows, raster = page_layout(data, page)
     target = data['target']
     if not isinstance(target, dict) or len(target) != 1:
         raise ValueError('placement needs exactly one of anchor text, line or coordinates')
@@ -343,8 +369,8 @@ def resolve_placement(data, page, im):
         rule = anchored_rule(target, rules, rows)
         x = rule['x0'] + INSET_PT
         y = rule['top'] + GAP_PT
-        width = data.get('width') or min(DEFAULT_INK_PT, rule['x1'] - x)
-        width = float(width)
+        width = data.get('width')
+        width = float(min(DEFAULT_INK_PT, rule['x1'] - x) if width is None else width)
         anchor = dict(line=rule['line'], x0=rule['x0'], x1=rule['x1'], top=rule['top'],
                       text=target.get('anchor_text'))
     height = width * aspect
@@ -367,12 +393,25 @@ def resolve_placement(data, page, im):
             raise ValueError('signature or date falls outside the page')
         for row in rows:
             for w in row['words']:
-                if overlaps(b, (w['x0'], w['y0'], w['x1'], w['y1'])):
+                # An underscore run is the signature line itself; the rule
+                # check below covers it, its glyph box would always "overlap".
+                if RULE_TEXT.match(w['text']):
+                    continue
+                wx1 = w['x1']
+                if '__' in w['text']:  # "Signature:____" is one word: keep only its label
+                    starts = [r['x0'] for r in rules if r['x0'] > w['x0'] and r['x0'] < w['x1']
+                              and r['bottom'] - 3 <= w['y1'] and r['top'] + 3 >= w['y0']]
+                    wx1 = min(starts, default=wx1)
+                if overlaps(b, (w['x0'], w['y0'], wx1, w['y1'])):
                     raise ValueError(f'signature would overlap the text "{w["text"]}" at y={round(w["y0"], 1)}; '
                                      'choose a line with doc sign-lines')
         for r in rules:
             if overlaps(b, (r['x0'], r['bottom'], r['x1'], r['top']), 0.5):
                 raise ValueError(f'signature would cross line {r["line"]} at y={r["y"]}')
+        mark = marks_in(raster, int(data['layout']['dpi']), page_h, b, rules)
+        if mark is not None:
+            raise ValueError(f'signature would cover existing marks (an image or graphics) at y={mark}; '
+                             'choose another line or a smaller --width')
     box = {k: round(v, 3) for k, v in box.items()}
     box['ink'] = dict(x=round(x, 3), y=round(y, 3), width=round(width, 3), height=round(height, 3))
     if anchor:
@@ -390,21 +429,32 @@ def load(data):
     return pdf, reader
 
 
-def target_page(data, reader):
+def target_page(data, reader, measured):
     page_number = data['page']
     if not isinstance(page_number, int) or not 1 <= page_number <= len(reader.pages):
         raise ValueError('page number is outside the document')
     page = reader.pages[page_number - 1]
-    if (page.rotation or float(page.mediabox.left) != 0 or float(page.mediabox.bottom) != 0
-            or [float(v) for v in page.cropbox] != [float(v) for v in page.mediabox]):
-        raise ValueError('rotated/offset/cropped pages are not supported')
+    if page.rotation or float(page.mediabox.left) != 0 or float(page.mediabox.bottom) != 0:
+        raise ValueError('rotated/offset pages are not supported')
+    # Poppler renders the CropBox; measuring needs it to be the page.
+    if measured and [float(v) for v in page.cropbox] != [float(v) for v in page.mediabox]:
+        raise ValueError('cropped pages cannot be measured; give explicit coordinates or sign manually')
     return page_number, page
+
+
+MAX_MEASURED_PT = 1440  # 20 in; a 300 dpi render stays well under PIL's bomb limit
+
+
+def info(data):
+    _, reader = load(data)
+    sizes = [[float(p.mediabox.width), float(p.mediabox.height)] for p in reader.pages]
+    return dict(pages=len(reader.pages), sizes=sizes, max_pt=MAX_MEASURED_PT)
 
 
 def lines(data):
     _, reader = load(data)
-    _, page = target_page(data, reader)
-    rules, _ = page_layout(data, page)
+    _, page = target_page(data, reader, True)
+    rules, _, _ = page_layout(data, page)
     return dict(pages=len(reader.pages), lines=rules)
 
 
@@ -421,7 +471,7 @@ def process(data, op):
     # Owner uploads routinely carry a view-setting /OpenAction or a plain form;
     # those are inert. Fail closed only for content that executes or reflows.
     refuse_active_content(reader)
-    page_number, page = target_page(data, reader)
+    page_number, page = target_page(data, reader, op == 'resolve')
     im = Image.open(io.BytesIO(png))
     if im.format != 'PNG' or not 1 <= im.width <= 4096 or not 1 <= im.height <= 4096:
         raise ValueError('signature must be a PNG up to 4096 x 4096')
@@ -475,9 +525,9 @@ if __name__ == '__main__':
     try:
         data = json.loads(sys.stdin.buffer.read(40 * 1024 * 1024))
         op = data.pop('op')
-        if op not in ('lines', 'resolve', 'sign'):
+        if op not in ('info', 'lines', 'resolve', 'sign'):
             raise ValueError('unknown signing operation')
-        result = lines(data) if op == 'lines' else process(data, op)
+        result = info(data) if op == 'info' else lines(data) if op == 'lines' else process(data, op)
         sys.stdout.buffer.write(result if op == 'sign' else json.dumps(result).encode())
     except Exception as error:
         # Do not print input, signature data, or parser dumps to logs/model context.

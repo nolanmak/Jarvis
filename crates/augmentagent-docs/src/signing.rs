@@ -12,6 +12,12 @@ use std::{
 use tokio::io::AsyncWriteExt;
 
 const WORKER: &str = include_str!("../python/sign_pdf.py");
+const RUNTIME_PINS: &str = include_str!("../python/requirements.txt");
+/// Identifies the code that turns a placement into bytes: the worker and the
+/// pinned runtime. A proposal's output hash is only reproducible under it.
+pub fn worker_fingerprint() -> String {
+    digest(format!("{WORKER}\0{RUNTIME_PINS}").as_bytes())
+}
 pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -232,6 +238,8 @@ pub struct Proposal {
     pub expected_output_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_sha256: Option<String>,
 }
 /// A proposal plus the PNG of its signed page, for the approval card.
 pub struct Proposed {
@@ -321,6 +329,27 @@ async fn page_words(pdf: &[u8], page: u32) -> Result<Vec<serde_json::Value>> {
     }
     Ok(words)
 }
+/// Page count, and refuse to rasterize a page too large to measure (a huge
+/// MediaBox would cost gigabytes at 300 dpi before anything validated it).
+async fn page_count_checked(pdf: &[u8], page: Option<u32>) -> Result<u32> {
+    let info: serde_json::Value = serde_json::from_slice(
+        &worker(serde_json::json!({"op": "info", "pdf": STANDARD.encode(pdf)})).await?,
+    )?;
+    let pages = info["pages"].as_u64().context("page count")? as u32;
+    let max = info["max_pt"].as_f64().context("size limit")?;
+    let sizes = info["sizes"].as_array().context("page sizes")?;
+    for (i, size) in sizes.iter().enumerate() {
+        let n = i as u32 + 1;
+        if page.is_some_and(|p| p != n) {
+            continue;
+        }
+        let (w, h) = (size[0].as_f64().unwrap_or(f64::MAX), size[1].as_f64().unwrap_or(f64::MAX));
+        if !(w > 0. && h > 0. && w <= max && h <= max) {
+            bail!("page {n} is {w}x{h} pt; pages larger than {max} pt cannot be measured for signing");
+        }
+    }
+    Ok(pages)
+}
 async fn layout(pdf: &[u8], page: u32) -> Result<serde_json::Value> {
     let raster = render_png(pdf, page, LAYOUT_DPI, true).await?;
     Ok(serde_json::json!({
@@ -373,15 +402,17 @@ async fn sign_bytes(pdf: &[u8], png: &[u8], placement: &Placement) -> Result<Vec
 pub async fn sign_lines(root: &Path, source: &Path, page: Option<u32>) -> Result<Vec<serde_json::Value>> {
     let source = scoped(&root.canonicalize()?, source, true)?;
     let pdf = read(&source, crate::pdf::MAX_PDF_BYTES)?;
+    let pages = page_count_checked(&pdf, page).await?;
     let mut all = Vec::new();
-    let (mut current, mut last) = (page.unwrap_or(1), page.unwrap_or(1));
+    let (mut current, last) = match page {
+        Some(p) if p == 0 || p > pages => bail!("page number is outside the document"),
+        Some(p) => (p, p),
+        None => (1, pages),
+    };
     while current <= last {
         let mut request = serde_json::json!({"op": "lines", "page": current, "layout": layout(&pdf, current).await?});
         request["pdf"] = STANDARD.encode(&pdf).into();
         let result: serde_json::Value = serde_json::from_slice(&worker(request).await?)?;
-        if page.is_none() {
-            last = result["pages"].as_u64().context("page count")? as u32;
-        }
         for mut line in result["lines"].as_array().cloned().unwrap_or_default() {
             line["page"] = current.into();
             all.push(line);
@@ -424,6 +455,9 @@ pub async fn propose_with_preview(
     }
     let png =
         read(&asset_path(state, signature)?, 1024 * 1024).context("signature is not installed")?;
+    if request.page == 0 || request.page > page_count_checked(&pdf, Some(request.page)).await? {
+        bail!("page number is outside the document");
+    }
     let mut call = serde_json::to_value(&request)?;
     call["op"] = "resolve".into();
     call["pdf"] = STANDARD.encode(&pdf).into();
@@ -447,6 +481,7 @@ pub async fn propose_with_preview(
             pages,
             expected_output_sha256: Some(digest(&signed)),
             preview_sha256: Some(digest(&preview_png)),
+            worker_sha256: Some(worker_fingerprint()),
         },
         preview_png,
     })
@@ -468,6 +503,9 @@ pub async fn execute(root: &Path, state: &Path, proposal: &Proposal) -> Result<R
     }
     let signed = sign_bytes(&pdf, &png, &proposal.placement).await?;
     if let Some(expected) = &proposal.expected_output_sha256 {
+        if proposal.worker_sha256.as_deref() != Some(worker_fingerprint().as_str()) {
+            bail!("Jarvis's signer was updated after this card was proposed, so the preview may not match; nothing was published. Propose the signature again");
+        }
         if &digest(&signed) != expected {
             bail!("signed output differs from the approved preview; nothing was published");
         }

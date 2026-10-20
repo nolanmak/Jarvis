@@ -47,6 +47,19 @@ class SigningTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'manual signing'):
                 sign_pdf.process(request(text=text), 'sign')
 
+    def test_cropped_pages_still_sign_with_image_box_placements(self):
+        # Proposals made before #1510 never measured the page; a CropBox must
+        # not strand them at approval.
+        from pypdf import PdfWriter
+        from pypdf.generic import RectangleObject
+        data = request()
+        w = PdfWriter(clone_from=PdfReader(io.BytesIO(base64.b64decode(data['pdf']))))
+        w.pages[0].cropbox = RectangleObject([10, 10, 600, 780])
+        out = io.BytesIO()
+        w.write(out)
+        data['pdf'] = base64.b64encode(out.getvalue()).decode()
+        self.assertTrue(sign_pdf.process(data, 'sign').startswith(base64.b64decode(data['pdf'])))
+
     def test_rules_are_measured_from_the_rendered_page(self):
         # 100 dpi raster of a 612x792 page: one 1 px dark rule, one thick bar
         # (a box, not a line), one short dash (not a line), light-gray rule.
