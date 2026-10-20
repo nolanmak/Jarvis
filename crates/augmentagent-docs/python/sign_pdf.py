@@ -1,6 +1,7 @@
 """Private stdin/stdout worker; never accepts filesystem paths or network URLs."""
 import base64
 import datetime
+import hashlib
 import io
 import json
 import math
@@ -8,6 +9,7 @@ import re
 import sys
 from PIL import Image
 from pypdf import PdfReader, PdfWriter
+from pypdf.generic import ArrayObject, DecodedStreamObject, DictionaryObject, FloatObject, NameObject
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
@@ -52,14 +54,124 @@ def refuse_active_content(reader):
     holders = list(reader.pages)
     for page in reader.pages:
         holders.extend(resolve(page.get('/Annots')) or [])
-    fields = list(resolve(form.get('/Fields')) or []) if isinstance(form, dict) else []
-    while fields and len(holders) < 100_000:
-        field = resolve(fields.pop())
-        holders.append(field)
-        if isinstance(field, dict):
-            fields.extend(resolve(field.get('/Kids')) or [])
+    # Walk form fields and bookmarks (both can carry actions). Each indirect
+    # object is visited once, so cycles terminate; an absurd size fails closed.
+    pending = list(resolve(form.get('/Fields')) or []) if isinstance(form, dict) else []
+    outlines = resolve(root.get('/Outlines'))
+    if isinstance(outlines, dict) and '/First' in outlines:
+        pending.append(outlines.raw_get('/First'))
+    seen = set()
+    while pending:
+        item = pending.pop()
+        key = getattr(item, 'idnum', None)
+        if key is not None:
+            if key in seen:
+                continue
+            seen.add(key)
+        if len(holders) > 100_000:
+            raise ValueError('PDF structure is too large to check; sign it manually')
+        node = resolve(item)
+        if not isinstance(node, dict):
+            continue
+        holders.append(node)
+        pending.extend(resolve(node.get('/Kids')) or [])
+        for link in ('/First', '/Next'):
+            if link in node:
+                pending.append(node.raw_get(link))
     if any(triggers_active(h) for h in holders):
         raise ValueError('PDFs with scripts, launch actions or XFA forms require manual signing')
+
+
+def inherited_resources(page):
+    node, depth = page, 0
+    while isinstance(node, dict) and depth < 64:
+        if '/Resources' in node:
+            return resolve(node['/Resources'])
+        node, depth = resolve(node.get('/Parent')), depth + 1
+    return DictionaryObject()
+
+
+def stamp_page(writer, page, overlay):
+    """Draw `overlay` on `page` without touching any object another page could
+    share. pypdf's merge_page rewrites the page's existing content streams in
+    place (and nulls array elements), which corrupts every other page that
+    references the same stream. Here the signature is a new Form XObject, the
+    page gets a new /Contents array that only *references* its original
+    streams, and a private copy of its resource dictionary."""
+    width, height = float(page.mediabox.width), float(page.mediabox.height)
+    form = DecodedStreamObject()
+    form.set_data(overlay.get_contents().get_data())
+    form.update({
+        NameObject('/Type'): NameObject('/XObject'),
+        NameObject('/Subtype'): NameObject('/Form'),
+        NameObject('/BBox'): ArrayObject([FloatObject(0), FloatObject(0), FloatObject(width), FloatObject(height)]),
+        NameObject('/Resources'): overlay['/Resources'].clone(writer),
+    })
+    form_ref = writer._add_object(form)
+
+    resources = inherited_resources(page)
+    xobjects = resolve(resources.get('/XObject')) or DictionaryObject()
+    name, n = '/JarvisSignature', 0
+    while NameObject(name) in xobjects:
+        n += 1
+        name = f'/JarvisSignature{n}'
+    private_x = DictionaryObject(dict(xobjects.items()))
+    private_x[NameObject(name)] = form_ref
+    private = DictionaryObject(dict(resources.items()))
+    private[NameObject('/XObject')] = private_x
+
+    raw = page.get('/Contents')
+    contents = resolve(raw)
+    if contents is None:
+        parts = []
+    elif isinstance(contents, list):
+        parts = list(contents)  # the elements are references; copy the array, never edit it
+    elif hasattr(raw, 'idnum'):
+        parts = [raw]
+    else:
+        parts = [writer._add_object(contents)]
+
+    def stream(data):
+        s = DecodedStreamObject()
+        s.set_data(data)
+        return writer._add_object(s)
+
+    # Balance any unclosed graphics state the original content leaves behind.
+    page[NameObject('/Contents')] = ArrayObject(
+        [stream(b'q\n'), *parts, stream(f'Q\nq {name} Do Q\n'.encode())])
+    page[NameObject('/Resources')] = private
+
+
+def canonical(value, depth=0):
+    """Reader-independent structure of a PDF value: references by object
+    number plus their resolved content (a few levels deep), streams by their
+    raw bytes. Two readers of the same bytes produce equal results."""
+    if hasattr(value, 'idnum'):
+        if depth >= 6:
+            return ('ref', value.idnum, value.generation)
+        return ('ref', value.idnum, value.generation, canonical(value.get_object(), depth + 1))
+    if isinstance(value, dict):
+        items = tuple(sorted((str(k), canonical(v, depth + 1)) for k, v in value.items()))
+        raw = getattr(value, '_data', None)
+        return ('stream', items, hashlib.sha256(raw).hexdigest()) if raw is not None else ('dict', items)
+    if isinstance(value, list):
+        return ('array', tuple(canonical(v, depth + 1) for v in value))
+    return ('value', str(value))
+
+
+def page_fingerprint(page):
+    contents = page.get_contents()
+    return (contents.get_data() if contents is not None else b'',
+            canonical(inherited_resources(page)),
+            [float(v) for v in page.mediabox], page.rotation)
+
+
+def verify_other_pages(original, signed, signed_index):
+    if len(original.pages) != len(signed.pages):
+        raise ValueError('signing changed the page count')
+    for i, (a, b) in enumerate(zip(original.pages, signed.pages)):
+        if i != signed_index and page_fingerprint(a) != page_fingerprint(b):
+            raise ValueError(f'signing would change page {i + 1}; nothing was signed')
 
 
 def process(data, sign):
@@ -113,12 +225,13 @@ def process(data, sign):
     # verbatim and only the changed page plus its new content are appended,
     # so the signed file is the input file, edited, never a re-encoding.
     writer = PdfWriter(io.BytesIO(pdf), incremental=True)
-    writer.pages[page_number - 1].merge_page(PdfReader(overlay).pages[0])
+    stamp_page(writer, writer.pages[page_number - 1], PdfReader(overlay).pages[0])
     output = io.BytesIO()
     writer.write(output)
     signed = output.getvalue()
     if len(signed) <= len(pdf) or signed[:len(pdf)] != pdf:
         raise ValueError('signing would alter the original document bytes')
+    verify_other_pages(reader, PdfReader(io.BytesIO(signed), strict=True), page_number - 1)
     return signed
 
 

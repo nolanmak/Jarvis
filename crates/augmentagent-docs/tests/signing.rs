@@ -185,9 +185,8 @@ async fn signed_output_is_the_original_bytes_plus_the_signature_only() {
 
     // AC2 — unsigned pages identical.
     for page in 1..pages {
-        assert_eq!(
-            render_page(&root.join("letter.pdf"), page),
-            render_page(&root.join("letter-signed.pdf"), page),
+        assert!(
+            render_page(&root.join("letter.pdf"), page) == render_page(&root.join("letter-signed.pdf"), page),
             "page {page} changed"
         );
     }
@@ -300,3 +299,43 @@ async fn benign_view_actions_and_forms_sign_but_scripts_launch_and_xfa_are_refus
     }
 }
 
+
+/// #1507 review — producers that dedupe streams (Acrobat "Reduce size",
+/// Ghostscript, templated letterheads) make pages share content objects.
+/// Signing one page must not change how any other page renders: pypdf's
+/// merge_page rewrote the shared stream in place, stamping the signature onto
+/// every page that referenced it, or nulling a shared letterhead off them.
+#[tokio::test]
+async fn shared_content_streams_never_leak_the_signature_onto_other_pages() {
+    let (_dir, root, state, original) = multi_page_fixture().await;
+    let shared_stream = "w.pages[1][NameObject('/Contents')] = w.pages[0].raw_get('/Contents')";
+    let shared_letterhead = "s = DecodedStreamObject()\ns.set_data(b'0 0 1 rg 20 20 100 10 re f')\nr = w._add_object(s)\n\
+        for p in w.pages:\n    c = p.raw_get('/Contents')\n    p[NameObject('/Contents')] = ArrayObject([r, *(c.get_object() if isinstance(c.get_object(), list) else [c])])";
+    for (name, edit) in [("shared-stream", shared_stream), ("shared-letterhead", shared_letterhead)] {
+        let bytes = with_feature(&original, edit);
+        let rel = signing::stage_owner_upload(&root, &state, &format!("{name}.pdf"), &bytes).unwrap();
+        let out = rel.with_file_name(format!("{name}-signed.pdf"));
+        let p = signing::propose(&root, &state, &rel, &out, "default",
+            Placement { page: 1, x: 72., y: 72., width: 144., date: Some("2026-10-20".into()) }).await.unwrap();
+        signing::execute(&root, &state, &p).await.unwrap();
+        let signed = std::fs::read(root.join(&out)).unwrap();
+        assert!(signed.starts_with(&bytes), "{name}: prefix");
+        let pages = page_count(&root.join(&rel));
+        for page in 2..=pages {
+            assert!(render_page(&root.join(&rel), page) == render_page(&root.join(&out), page), "{name}: page {page} changed");
+        }
+        assert!(render_page(&root.join(&rel), 1) != render_page(&root.join(&out), 1), "{name}: signature missing");
+    }
+}
+
+/// #1507 review — bookmarks can carry actions too.
+#[tokio::test]
+async fn javascript_in_a_bookmark_is_refused() {
+    let (_dir, root, state, original) = multi_page_fixture().await;
+    let bytes = with_feature(&original, "o = w.add_outline_item('Intro', 0).get_object()\n\
+        o[NameObject('/A')] = DictionaryObject({NameObject('/S'): NameObject('/JavaScript'), NameObject('/JS'): TextStringObject('x')})");
+    let rel = signing::stage_owner_upload(&root, &state, "bookmark-js.pdf", &bytes).unwrap();
+    let err = signing::propose(&root, &state, &rel, &rel.with_file_name("bookmark-js-signed.pdf"), "default",
+        Placement { page: 1, x: 72., y: 72., width: 144., date: None }).await.unwrap_err();
+    assert!(format!("{err:#}").contains("require manual signing"), "{err:#}");
+}

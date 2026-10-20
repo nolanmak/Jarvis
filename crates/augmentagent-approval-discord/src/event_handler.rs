@@ -799,7 +799,6 @@ impl EventHandler for Handler {
                 info!(
                     action_id = %cid.action_id,
                     verb = cid.verb.as_str(),
-                    card = %card_title(&comp.message).unwrap_or("-"),
                     "discord card control clicked"
                 );
                 // Enforce user allowlist on clicks.
@@ -1760,7 +1759,11 @@ async fn deliver_approval_outcome(
     // #1507 — name the card the click acted on, so a reply can't be mistaken
     // for another card's (the owner approved a DM thinking it was a signature).
     if let Some(title) = card_title(&comp.message) {
-        followup = followup.content(format!("**{title}** — {}", describe(outcome)));
+        // Embed titles are capped at 256 by Discord; keep well inside the
+        // 2000-char message limit so naming the card can't fail the reply.
+        let title: String = title.chars().take(200).collect();
+        let body: String = describe(outcome).chars().take(1700).collect();
+        followup = followup.content(format!("**{title}** — {body}"));
     }
     if let ApprovalActionOutcome::DocumentSigned { output: Some((path, hash)), .. } = outcome {
         let bytes = augmentagent_docs::signing::verified_output(path, hash)
