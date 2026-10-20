@@ -50,6 +50,12 @@ const GAVE_UP_LABEL: &str = "agent-gave-up";
 const SCOPE_GAVE_UP_MARKER: &str = "the scoping pass judged this issue not agent-fixable";
 /// Hidden marker prefixing every recorded-attempt comment.
 const ATTEMPT_MARKER: &str = "<!-- self-improve-attempt -->";
+/// #1517 — hidden marker `autopr readmit --reset-history` leaves on an issue.
+/// Every reader of [`ATTEMPT_MARKER`] counts only the markers after the last
+/// one of these, so a re-admitted issue starts from a clean attempt count
+/// without destroying the audit trail. Must never contain [`ATTEMPT_MARKER`]
+/// as a substring: the readers split on it.
+const ATTEMPT_RESET_MARKER: &str = "<!-- self-improve-attempts-reset -->";
 /// Max changed lines we'll allow in a single self-improvement diff.
 const MAX_DIFF_LINES: usize = 600;
 /// Consecutive failed attempts before we comment + back off (label marker).
@@ -739,6 +745,47 @@ fn author_is_trusted(login: &str, association: &str, allowlist: &[String]) -> bo
     )
 }
 
+/// #1517 — issues per REST page (GitHub's maximum).
+const ISSUES_PER_PAGE: u32 = 100;
+/// #1517 — how many pages of open issues the picker walks before it settles
+/// for what it has. A bound, not a guess at the backlog: without one a repo
+/// with thousands of open issues would spend a tick listing them.
+const MAX_ISSUE_PAGES: u32 = 5;
+
+/// #1517 — walk `fetch` over pages 1.. and merge the rows into one REST
+/// issues array, preserving the newest-first order the pages arrive in.
+///
+/// Stops on an empty page, on a body that is not an array (a rate-limit
+/// object — the single-page call always tolerated that shape) or at
+/// [`MAX_ISSUE_PAGES`]. Rows are deduped by `number`: an issue filed
+/// mid-walk shifts every later row one position down, so the same issue can
+/// land on two pages.
+async fn fetch_issue_pages<F, Fut>(mut fetch: F) -> Result<serde_json::Value>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<serde_json::Value>>,
+{
+    let mut merged: Vec<serde_json::Value> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for page in 1..=MAX_ISSUE_PAGES {
+        let body = fetch(page).await?;
+        let Some(rows) = body.as_array() else { break };
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            let fresh = match row.get("number").and_then(serde_json::Value::as_u64) {
+                Some(n) => seen.insert(n),
+                None => true,
+            };
+            if fresh {
+                merged.push(row.clone());
+            }
+        }
+    }
+    Ok(serde_json::Value::Array(merged))
+}
+
 /// Pick the first `agent-fixable` issue that isn't already claimed (open agent
 /// PR) and isn't blast-radius and isn't `agent-gave-up`.
 ///
@@ -751,10 +798,10 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     let allowlist = trusted_authors(repo_root).await;
     let gh = gh_bin();
     // #653 — no label gate: every open issue is considered (newest first, up
-    // to 50) and the stage-1 scoping pass decides fixability itself. Issues
-    // it judges not-fixable get the gave-up label + a comment, so each is
-    // scoped at most once. `agent-fixable` is no longer required — it remains
-    // only as documentation on old issues.
+    // to MAX_ISSUE_PAGES pages) and the stage-1 scoping pass decides
+    // fixability itself. Issues it judges not-fixable get the gave-up label
+    // + a comment, so each is scoped at most once. `agent-fixable` is no
+    // longer required — it remains only as documentation on old issues.
     //
     // #676 — fetched via the REST API, not `gh issue list --json`: the
     // installed gh build rejects `authorAssociation` as a list field
@@ -762,20 +809,25 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     // is part of the REST issue schema on every gh version. The `{owner}/
     // {repo}` placeholders resolve from the cwd repo's origin, same as the
     // list command did.
-    let (ok, stdout, stderr) = run(
-        &gh,
-        &[
-            "api",
-            "repos/{owner}/{repo}/issues?state=open&per_page=50&sort=created&direction=desc",
-        ],
-        repo_root,
-    )
+    //
+    // #1517 — paginated: one page of 50 made every issue older than the
+    // newest 50 invisible to the loop forever, including everything `autopr
+    // readmit` hands back.
+    let issues = fetch_issue_pages(|page| {
+        let gh = gh.clone();
+        async move {
+            let path = format!(
+                "repos/{{owner}}/{{repo}}/issues?state=open&per_page={ISSUES_PER_PAGE}\
+                 &sort=created&direction=desc&page={page}"
+            );
+            let (ok, stdout, stderr) = run(&gh, &["api", &path], repo_root).await?;
+            if !ok {
+                bail!("gh api issues failed: {stderr}");
+            }
+            serde_json::from_str(&stdout).context("parse gh api issues")
+        }
+    })
     .await?;
-    if !ok {
-        bail!("gh api issues failed: {stderr}");
-    }
-    let issues: serde_json::Value =
-        serde_json::from_str(&stdout).context("parse gh api issues")?;
 
     // #787 — human-filed issues first, newest-first within each group. The
     // research pipeline files 3/day and the daily cap is 3, so strict
@@ -8799,7 +8851,9 @@ async fn record_attempt(repo_root: &Path, issue: u64, rec: Option<AttemptRecord>
         repo_root,
     )
     .await?;
-    let prior = stdout.matches(ATTEMPT_MARKER).count() as u32;
+    // #1517 — markers before the last `readmit --reset-history` are audit
+    // trail, not charged attempts.
+    let prior = after_last_reset(&stdout).matches(ATTEMPT_MARKER).count() as u32;
     // #1214 — the verdict reads the durable markers (not the local history,
     // which rolls over), and an uncharged harness failure writes no marker,
     // so it can never break a run of identical failures.
@@ -8932,10 +8986,21 @@ fn failure_signal(detail: &str) -> String {
         .unwrap_or_default()
 }
 
+/// #1517 — the slice of a comments blob the attempt-marker readers may look
+/// at: everything after the last [`ATTEMPT_RESET_MARKER`], or the whole blob
+/// when the issue was never re-admitted. Only the LAST reset truncates, so an
+/// issue re-admitted repeatedly is judged on its newest run of attempts.
+fn after_last_reset(comments: &str) -> &str {
+    match comments.rfind(ATTEMPT_RESET_MARKER) {
+        Some(at) => &comments[at + ATTEMPT_RESET_MARKER.len()..],
+        None => comments,
+    }
+}
+
 /// #1214 — the fingerprint of every attempt marker, oldest first; `None`
 /// for markers written before fingerprints existed.
 fn marker_fingerprints(comments: &str) -> Vec<Option<String>> {
-    comments
+    after_last_reset(comments)
         .split(ATTEMPT_MARKER)
         .skip(1)
         .map(|tail| {
@@ -9023,7 +9088,18 @@ const LABELLED_LIST_ARGS: [&str; 10] = [
 /// #1214 — `augmentagent autopr readmit`: the labelled issues whose reason
 /// matches `wanted`. With `dry_run` nothing on GitHub changes; otherwise the
 /// label comes off each, which puts it back in the pool.
-pub(crate) async fn readmit(repo_root: &Path, wanted: &str, dry_run: bool) -> Result<Vec<u64>> {
+///
+/// #1517 — with `reset_history` each re-admitted issue also gets an
+/// [`ATTEMPT_RESET_MARKER`] comment (so the marker-derived attempt count, the
+/// thing that actually drives the back-off, starts over) and loses its local
+/// [`AttemptHistory`] records. Without it an issue that gave up at
+/// [`MAX_ATTEMPTS`] gives up again on its very next failure.
+pub(crate) async fn readmit(
+    repo_root: &Path,
+    wanted: &str,
+    dry_run: bool,
+    reset_history: bool,
+) -> Result<Vec<u64>> {
     let gh = gh_bin();
     let (ok, stdout, stderr) = run(&gh, &LABELLED_LIST_ARGS, repo_root).await?;
     if !ok {
@@ -9039,10 +9115,39 @@ pub(crate) async fn readmit(repo_root: &Path, wanted: &str, dry_run: bool) -> Re
         .collect();
     if !dry_run {
         for n in &matched {
+            if reset_history {
+                // Reset marker first, label second: the label is what keeps
+                // the issue out of the pool, so a comment failure after
+                // unlabelling would hand the issue back carrying its old
+                // charged markers — it would give up again on its first
+                // failure. This way a failure here leaves the issue exactly
+                // as it was, and a re-run is safe: only the last reset
+                // marker counts, so a duplicate changes nothing.
+                backoff_comment(
+                    repo_root,
+                    *n,
+                    &format!(
+                        "{ATTEMPT_RESET_MARKER}\nAuto-PR attempt count reset by \
+                         `autopr readmit --reset-history`. The earlier attempt \
+                         comments stay for the record, but the loop now counts \
+                         from zero."
+                    ),
+                )
+                .await
+                .with_context(|| format!("resetting the attempt count on #{n}"))?;
+            }
             let (ok, _o, e) =
                 run(&gh, &["issue", "edit", &n.to_string(), "--remove-label", GAVE_UP_LABEL], repo_root).await?;
             if !ok {
                 bail!("removing `{GAVE_UP_LABEL}` from #{n} failed: {}", truncate(&e, 300));
+            }
+            if reset_history {
+                // Per issue, not batched after the loop: a bail mid-walk must
+                // not leave an already-unlabelled issue with stale records.
+                let path = attempt_history_path();
+                let mut history = AttemptHistory::load(&path);
+                history.remove(&[*n]);
+                history.save(&path);
             }
         }
     }
@@ -9119,7 +9224,7 @@ const MAX_RETRIAGE_PER_TICK: usize = 10;
 /// comments` blob, oldest first. Marker shape (see [`attempt_marker_body`]):
 /// `<!-- self-improve-attempt --> attempt 2 — gate-red at gate after 41s: …`.
 fn marker_kinds(comments: &str) -> Vec<FailureKind> {
-    comments
+    after_last_reset(comments)
         .split(ATTEMPT_MARKER)
         .skip(1)
         .filter_map(|tail| {
@@ -10374,6 +10479,14 @@ impl AttemptHistory {
         recs.push(rec);
         let overflow = recs.len().saturating_sub(MAX_HISTORY_PER_ISSUE);
         recs.drain(..overflow);
+    }
+
+    /// #1517 — drop `issues`' records so a re-admitted issue's next attempt
+    /// is prompted as its first. Leaves every other issue untouched.
+    fn remove(&mut self, issues: &[u64]) {
+        for n in issues {
+            self.issues.remove(n);
+        }
     }
 
     /// Atomic replace: serialize to `<path>.tmp`, keep the previous file as
@@ -16470,6 +16583,146 @@ else:
         assert!(reason_matches("scoper:not-fixable", "scoper"));
         assert!(!reason_matches("stuck:gate-red:aaaaaaaa", "gate"), "segments, not substrings");
         assert!(!reason_matches("unrecorded", "gate-red"));
+    }
+
+    // ---- #1517: paginated issue pool + readmit --reset-history ----
+
+    fn issue_page(numbers: &[u64]) -> serde_json::Value {
+        serde_json::Value::Array(
+            numbers
+                .iter()
+                .map(|n| {
+                    serde_json::json!({"number": n, "title": format!("issue {n}"), "body": "",
+                        "user": {"login": "nolanmak"}, "author_association": "OWNER"})
+                })
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn issue_pagination_stops_on_an_empty_page_and_at_the_bound() {
+        let calls = std::cell::Cell::new(0u32);
+        let merged = fetch_issue_pages(|page| {
+            calls.set(calls.get() + 1);
+            async move {
+                Ok(match page {
+                    1 => issue_page(&(1..=100).collect::<Vec<_>>()),
+                    2 => issue_page(&[200, 201]),
+                    _ => issue_page(&[]),
+                })
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.get(), 3, "stops the page after the last non-empty one");
+        assert_eq!(merged.as_array().unwrap().len(), 102);
+
+        let calls = std::cell::Cell::new(0u32);
+        fetch_issue_pages(|_| {
+            calls.set(calls.get() + 1);
+            async move { Ok(issue_page(&(1..=100).collect::<Vec<_>>())) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.get(), MAX_ISSUE_PAGES, "endless pages stop at the bound");
+
+        // A rate-limit object ends the walk without failing the tick.
+        let calls = std::cell::Cell::new(0u32);
+        let merged = fetch_issue_pages(|page| {
+            calls.set(calls.get() + 1);
+            async move {
+                Ok(if page == 1 {
+                    issue_page(&[9])
+                } else {
+                    serde_json::json!({"message": "rate limited"})
+                })
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert_eq!(merged.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn merged_pages_keep_page_order_dedup_and_the_human_first_partition() {
+        let merged = fetch_issue_pages(|page| async move {
+            Ok(match page {
+                // #12 is research-filed; #11 repeats across pages (an issue
+                // filed mid-walk shifts every later row down a position).
+                1 => serde_json::json!([
+                    {"number": 14, "title": "human a", "body": "",
+                     "user": {"login": "nolanmak"}, "author_association": "OWNER"},
+                    {"number": 12, "title": "research", "body": "Auto-filed by the daily research sweep.",
+                     "user": {"login": "nolanmak"}, "author_association": "OWNER"},
+                    {"number": 11, "title": "human b", "body": "",
+                     "user": {"login": "nolanmak"}, "author_association": "OWNER"},
+                ]),
+                2 => serde_json::json!([
+                    {"number": 11, "title": "human b", "body": "",
+                     "user": {"login": "nolanmak"}, "author_association": "OWNER"},
+                    {"number": 9, "title": "human c", "body": "",
+                     "user": {"login": "nolanmak"}, "author_association": "OWNER"},
+                ]),
+                _ => serde_json::json!([]),
+            })
+        })
+        .await
+        .unwrap();
+        let (human, research): (Vec<_>, Vec<_>) = rest_issue_candidates(&merged)
+            .into_iter()
+            .partition(|i| !i.research_filed);
+        let order: Vec<u64> = human.into_iter().chain(research).map(|i| i.number).collect();
+        assert_eq!(order, vec![14, 11, 9, 12], "page1 then page2, research last, #11 once");
+    }
+
+    #[test]
+    fn the_reset_marker_truncates_what_the_attempt_readers_see() {
+        assert!(
+            !ATTEMPT_RESET_MARKER.contains(ATTEMPT_MARKER),
+            "the readers split on ATTEMPT_MARKER; a reset marker containing it would miscount"
+        );
+        assert_eq!(after_last_reset("no reset here"), "no reset here");
+        assert_eq!(after_last_reset(&format!("old{ATTEMPT_RESET_MARKER}new")), "new");
+        assert_eq!(
+            after_last_reset(&format!("a{ATTEMPT_RESET_MARKER}b{ATTEMPT_RESET_MARKER}c")),
+            "c",
+            "only the last reset truncates"
+        );
+
+        let rec = test_record(FailureKind::GateRed, "gate", "boom");
+        let mut bodies: Vec<String> = (1..=5).map(|n| attempt_marker_body(n, &rec)).collect();
+        bodies.push(ATTEMPT_RESET_MARKER.to_string());
+        bodies.push(attempt_marker_body(1, &rec));
+        let blob = comments_blob(&bodies);
+        assert_eq!(after_last_reset(&blob).matches(ATTEMPT_MARKER).count(), 1, "charged count");
+        assert_eq!(marker_fingerprints(&blob), vec![Some(fingerprint(&rec))]);
+        assert_eq!(marker_kinds(&blob), vec![FailureKind::GateRed]);
+    }
+
+    #[test]
+    fn attempt_history_remove_drops_only_the_listed_issues() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.json");
+        let mut h = AttemptHistory::default();
+        for n in [1u64, 2, 3] {
+            h.push(n, synthetic_rec(FailureKind::GateRed, "gate", "", ""));
+        }
+        h.save(&path);
+        let before: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut h = AttemptHistory::load(&path);
+        h.remove(&[1, 3]);
+        h.save(&path);
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            after["issues"]["2"], before["issues"]["2"],
+            "the surviving records round-trip unchanged, field for field"
+        );
+        let back = AttemptHistory::load(&path);
+        assert_eq!(back.issues.keys().copied().collect::<Vec<_>>(), vec![2]);
+        assert!(AttemptHistory::bak_path(&path).exists(), "the atomic save keeps a .bak");
     }
 
     /// C7 — the label is added in exactly one place, and that place records
