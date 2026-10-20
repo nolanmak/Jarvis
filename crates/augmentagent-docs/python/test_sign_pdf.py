@@ -33,8 +33,20 @@ class SigningTests(unittest.TestCase):
             self.assertEqual(len(result.pages), n)
             self.assertIn('Agreement for services', result.pages[-1].extract_text())
             self.assertIn('2026-10-12', result.pages[-1].extract_text())
-            images = result.pages[-1]['/Resources']['/XObject'].get_object()
-            self.assertTrue(any('/SMask' in obj.get_object() for obj in images.values()))
+            # A byte-preserving stamp nests images inside a Form XObject.
+            # Follow resource dictionaries so the assertion tests transparency,
+            # independently of whether an image is directly on the page.
+            def images(resources):
+                objects = resources.get('/XObject')
+                if objects is None:
+                    return
+                for ref in objects.get_object().values():
+                    obj = ref.get_object()
+                    if obj.get('/Subtype') == '/Image':
+                        yield obj
+                    elif obj.get('/Subtype') == '/Form' and '/Resources' in obj:
+                        yield from images(obj['/Resources'])
+            self.assertTrue(any('/SMask' in obj for obj in images(result.pages[-1]['/Resources'])))
             if n > 1:
                 self.assertNotIn('2026-10-12', result.pages[0].extract_text())
 
