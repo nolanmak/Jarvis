@@ -8504,12 +8504,16 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
             continue;
         }
         // Rule 2 — bulk/marketing sender. Cheap, purely local, so check first.
-        // #1289 — not for Slack contact replies: their `from` is a name and
-        // a Slack user ID (`Name <slack:U…>`), never an address, so the rule
-        // would retire every one of them. (Other chat platforms share the
-        // shape; they are outside #1289 and keep the old behaviour.)
-        let addressless = row.platform == augmentagent_channel_slack::PLATFORM;
-        if !addressless && !is_human_sender(&row.from_email, &row.body) {
+        // `is_human_sender` reads a mailbox address, which only email cards
+        // have: every chat platform's `from` is a name plus a platform id
+        // (`Name <slack:U…>`, `Name <twitter:…>`, `user-{id}`, …) and always
+        // fails the check, so the rule retired all of them (#1289 Slack, #1503
+        // signing, #1505 the rest). Gate on the email platform instead of
+        // exempting platforms one at a time. A card with no joined email row
+        // surfaces platform '' — unknown provenance, so skip Rule 2 there too;
+        // Rule 3, Rule 1 and the 7-day expiry still apply.
+        let email_platform = row.platform == augmentagent_channel_email::inbound::PLATFORM;
+        if email_platform && !is_human_sender(&row.from_email, &row.body) {
             info!(
                 action_id = %row.id,
                 from = %row.from_email,
@@ -21298,6 +21302,20 @@ mod stale_reconcile_tests {
         from: &str,
         draft: Option<&str>,
     ) -> String {
+        seed_pending_draft_on(store, msg, thread, from, draft, "gmail")
+    }
+
+    /// #1505 — same as `seed_pending_draft` but the inbound is recorded on an
+    /// explicit platform, so a test can assert what the sweep does to a
+    /// non-email reply card.
+    fn seed_pending_draft_on(
+        store: &Store,
+        msg: &str,
+        thread: Option<&str>,
+        from: &str,
+        draft: Option<&str>,
+        platform: &str,
+    ) -> String {
         store
             .upsert_email(&Email {
                 attachments: Vec::new(),
@@ -21310,7 +21328,7 @@ mod stale_reconcile_tests {
                 body: "body".into(),
                 date: "2026-07-13T12:00:00Z".into(),
                 account_entity_id: Some("acc".into()),
-                platform: "gmail".into(),
+                platform: platform.into(),
                 kind: "dm".into(),
             })
             .unwrap();
@@ -21668,6 +21686,121 @@ mod stale_reconcile_tests {
             status_of(&store, &human),
             "pending",
             "a real person's card must never be swept as bulk"
+        );
+    }
+
+    /// #1505 — Rule 2 reads a mailbox address, which only email cards have.
+    /// Every chat platform's reply-card `from` is a name plus a platform id, so
+    /// the rule used to retire all of them on the first tick — #1289 exempted
+    /// Slack, and everyone else inherited the bug. None of these cards may move.
+    #[test]
+    fn reconcile_never_retires_a_non_email_platform_card() {
+        let cases: &[(&str, &str)] = &[
+            (augmentagent_channel_slack::PLATFORM, "Jade Quinn <slack:U0123ABC>"), // pii-ok: synthetic
+            ("twitter", "Jade Quinn <twitter:12345>"),                             // pii-ok: synthetic
+            (
+                augmentagent_channel_linkedin::inbound::PLATFORM,
+                "Jade Quinn <linkedin:urn:li:fsd_profile:ABC>", // pii-ok: synthetic
+            ),
+            ("whatsapp", "Jade Quinn <whatsapp:15550001111@s.whatsapp.net>"), // pii-ok: synthetic
+            (augmentagent_channel_deft::PLATFORM, "Deft form <deft:3f2a9c>"),
+            (augmentagent_channel_discord_dm::PLATFORM, "user-123456789012345678"),
+            (augmentagent_channel_voice::PLATFORM, "voice:chat-1"),
+        ];
+
+        for (i, (platform, from)) in cases.iter().enumerate() {
+            let (store, _t) = fresh_store();
+            let card = seed_pending_draft_on(
+                &store,
+                &format!("m-{i}"),
+                Some(&format!("T-{i}")),
+                from,
+                Some("a draft"),
+                platform,
+            );
+
+            let n = reconcile_stale_approvals_tick(&store).unwrap();
+            assert_eq!(n, 0, "{platform}: nothing to retire");
+            assert_eq!(
+                status_of(&store, &card),
+                "pending",
+                "{platform}: a reply card must survive the sweep"
+            );
+        }
+    }
+
+    /// #1505 — a pending card whose inbound row is gone surfaces platform `''`.
+    /// Provenance is unknown, so Rule 2 stays out of it; Rules 1 and 3 and the
+    /// 7-day expiry still cover the row.
+    #[test]
+    fn reconcile_skips_rule_two_when_the_platform_is_unknown() {
+        let (store, _t) = fresh_store();
+        let card = store
+            .log_action(
+                "orphan-1",
+                Some("T-orphan"),
+                "Jade Quinn <twitter:12345>", // pii-ok: synthetic
+                "subj",
+                Some("body"),
+                Some("a draft"),
+                ActionStatus::Pending,
+            )
+            .unwrap();
+
+        assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 0);
+        assert_eq!(status_of(&store, &card), "pending");
+    }
+
+    /// #1503 — a PDF-signing card is an owner decision on a local file, filed
+    /// exactly as `document_signing::propose` files it (`Owner signature`, no
+    /// thread). Its sender has no `@`, so Rule 2 used to retire it on the first
+    /// tick and Approve & Sign always failed "superseded". It must survive
+    /// repeated sweeps while a bulk-mail card beside it is still retired.
+    #[test]
+    fn reconcile_never_retires_a_pdf_signing_card() {
+        let (store, _t) = fresh_store();
+        store
+            .upsert_email(&Email {
+                attachments: Vec::new(),
+                to: String::new(),
+                cc: String::new(),
+                message_id: "doc-sign:1".into(),
+                thread_id: None,
+                from: "Owner signature".into(),
+                subject: "Sign PDF: deliverables/x.pdf".into(),
+                body: "{}".into(),
+                date: "2026-10-19T15:32:58Z".into(),
+                account_entity_id: None,
+                platform: "document-signing".into(),
+                kind: "sign_pdf".into(),
+            })
+            .unwrap();
+        let signing = store
+            .log_action(
+                "doc-sign:1",
+                None,
+                "Owner signature",
+                "Sign PDF: deliverables/x.pdf",
+                Some("{}"),
+                Some("Apply signature 'default' to deliverables/x.pdf (1 pages)."),
+                ActionStatus::Pending,
+            )
+            .unwrap();
+        let blast =
+            seed_pending(&store, "m-blast", Some("T-b"), "Brand <marketing@engage.brand.example.com>"); // pii-ok: synthetic
+
+        assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 1);
+        assert_eq!(
+            status_of(&store, &blast),
+            "superseded",
+            "Rule 2 still retires bulk mail"
+        );
+        assert_eq!(status_of(&store, &signing), "pending");
+        assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 0);
+        assert_eq!(
+            status_of(&store, &signing),
+            "pending",
+            "durable across ticks"
         );
     }
 
@@ -22443,17 +22576,20 @@ mod identity_merge_tests {
     }
 
     /// The card names the stub, per the contract — and must survive the daemon:
-    /// the sweep's bulk-sender rule fails any `from` without an `@`.
+    /// the sweep's bulk-sender rule fails any `from` without an `@`, and the
+    /// merge kind is off the sweep's list besides.
     #[test]
     fn a_proposed_merge_card_survives_the_stale_approval_sweep() {
         let (store, _t, wiki) = seeded_env();
         let (email, payload, draft) = build_identity_merge_card(&dry_run(&store, &wiki));
         assert_eq!(email.from, "Landlord Philly", "the sender field IS the stub");
         let proposed = record_identity_merge_proposal(&store, &email, &payload, &draft).unwrap();
-        // Control — the identical row under any other kind IS retired, so this
-        // cannot pass on a sweep that does nothing at all.
+        // Control — the same row as an ordinary email card IS retired, so this
+        // cannot pass on a sweep that does nothing at all. (#1505 gates Rule 2
+        // on the email platform, so the control has to be on it.)
         let mut other = email.clone();
         (other.message_id, other.kind) = ("merge:control".into(), "dm".into());
+        other.platform = augmentagent_channel_email::inbound::PLATFORM.into();
         let control = record_identity_merge_proposal(&store, &other, &payload, &draft).unwrap();
         assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 1);
         assert_eq!(status_of(&store, &proposed), "pending", "must stay clickable");
