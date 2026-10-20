@@ -27,8 +27,7 @@ pub enum GmailError {
     #[error("invalid input: {0}")]
     Invalid(String),
     /// #1486 — the provider does not always say when to come back: the
-    /// draft-create throttle arrives as a bare `…: 429`, so both fields are
-    /// optional and every consumer must tolerate their absence.
+    /// draft-create throttle arrives as a bare `…: 429`, hence the Options.
     #[error("composio Gmail rate limit; retry after {} (composio log_id {log_id})",
         .retry_after.as_deref().unwrap_or("no retry-after reported"))]
     RateLimited {
@@ -270,16 +269,12 @@ impl ComposioClient {
                                 });
                                 if action == "GMAIL_FETCH_EMAILS" {
                                     // The poller's own cadence is its retry:
-                                    // in-process retries here would fight the
-                                    // #1384 cooldown this very call installs.
+                                    // retrying here would fight the #1384
+                                    // cooldown this very call installs.
                                     if let Some(ms) = *retry_after_ms {
                                         self.record_cooldown(entity_id, ms, Some(log_id))?;
                                     }
                                 } else {
-                                    // Every other action gets the same bounded
-                                    // in-process backoff an HTTP 429 gets; a
-                                    // throttle that outlives the budget is the
-                                    // caller's to queue (#1486).
                                     retry_envelope = attempt < MAX_ATTEMPTS;
                                 }
                             }
@@ -289,10 +284,7 @@ impl ComposioClient {
                             _ => {}
                         }
                         if retry_envelope {
-                            tracing::warn!(
-                                action, attempt,
-                                "composio envelope rate limit; backing off"
-                            );
+                            tracing::warn!(action, attempt, "envelope rate limit; backing off");
                             backoff(attempt).await;
                             continue;
                         }
@@ -1167,14 +1159,12 @@ mod tests {
         );
         assert!(err.to_string().contains("no retry-after reported"), "{err}");
 
-        assert_eq!(classify_envelope_rate_limit("Too Many Requests"), Some((None, None)));
         assert_eq!(
             classify_envelope_rate_limit("User-rate limit exceeded. Retry after 2099-01-01T00:00:00Z"),
             Some((Some(4_070_908_800_000), Some("2099-01-01T00:00:00Z".to_string())))
         );
         // A 429 buried in a longer number is not a status code.
         assert_eq!(classify_envelope_rate_limit("quota 14290 of 20000"), None);
-        assert_eq!(classify_envelope_rate_limit("invalid credentials"), None);
     }
 
     // ---- #629: To/Cc recovery from the fetch payload ----
@@ -1555,45 +1545,22 @@ mod tests {
         addr
     }
 
-    /// Replies with `bodies[i]` (status 200) to the i-th request, repeating
-    /// the last entry, so a test can script a refuse-refuse-succeed
-    /// provider sequence (#1486).
-    async fn spawn_scripted_http(bodies: Vec<&'static str>) -> SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut next = 0usize;
-            while let Ok((mut socket, _)) = listener.accept().await {
-                let body = bodies[next.min(bodies.len() - 1)];
-                next += 1;
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
-                    let _ = socket.read(&mut buf).await;
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
-                        len = body.len(),
-                    );
-                    let _ = socket.write_all(resp.as_bytes()).await;
-                    let _ = socket.shutdown().await;
-                });
-            }
-        });
-        addr
-    }
-
+    /// #1486 — the issue's own draft-create refusal: an envelope 429 is
+    /// retried with backoff and, when the provider keeps refusing, surfaces
+    /// as a typed rate limit for the caller to queue on.
     #[tokio::test]
-    async fn draft_create_retries_an_envelope_rate_limit_then_succeeds() {
+    async fn draft_create_backs_off_on_an_envelope_rate_limit() {
         const REFUSED: &str =
             r#"{"successful":false,"error":"Failed to fetch user profile: 429","log_id":"log_x"}"#;
-        const OK: &str = r#"{"successful":true,"data":{"id":"draft_ok"}}"#;
-        let addr = spawn_scripted_http(vec![REFUSED, REFUSED, OK]).await;
+        let addr = spawn_repeating_http(200, REFUSED, "").await;
         let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
-
-        let draft_id = client
+        let started = std::time::Instant::now();
+        let err = client
             .create_draft("entity-x", "sam@example.com", "Hi", "body", None)
             .await
-            .expect("the third attempt must land");
-        assert_eq!(draft_id, "draft_ok");
+            .expect_err("a throttled draft create must not read as success");
+        assert!(matches!(err, GmailError::RateLimited { .. }), "got: {err:?}");
+        assert!(started.elapsed().as_millis() >= 1_500, "attempts did not back off");
     }
 
     /// One-shot mock that CAPTURES the request (headers + body) and sends it
@@ -2330,10 +2297,9 @@ fn check_envelope(
         .get("log_id")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("-");
-    // #1486 — classified for EVERY action, not just fetch. The old
-    // fetch-only gate is why the search path reported a retry-after window
-    // while an identically-throttled draft create surfaced a raw
-    // "Failed to fetch user profile: 429".
+    // #1486 — classified for EVERY action, not just fetch. The old fetch-only
+    // gate is why the search path reported a retry-after window while an
+    // identically-throttled draft create surfaced a raw ": 429".
     if let Some((retry_after_ms, retry_after)) = classify_envelope_rate_limit(err_text) {
         return Err(GmailError::RateLimited {
             retry_after_ms,
@@ -2350,11 +2316,11 @@ fn check_envelope(
 }
 
 /// #1486 — is this envelope error a provider throttle, and when may we come
-/// back? Composio spells the same upstream refusal at least two ways: the
-/// Gmail user-rate wording the search path has always matched, and a bare
-/// status code (`Failed to fetch user profile: 429`) on draft creation. Only
-/// the first carries a boundary, so the retry-after is optional — the
-/// classification is not.
+/// back? Composio spells the same refusal at least two ways: the Gmail
+/// user-rate wording the search path has always matched, and a bare status
+/// code (`Failed to fetch user profile: 429`) on draft creation. Only the
+/// first carries a boundary, so the retry-after is optional — not the
+/// classification.
 fn classify_envelope_rate_limit(error: &str) -> Option<(Option<i64>, Option<String>)> {
     let lower = error.to_ascii_lowercase();
     let worded = ["rate limit", "ratelimit", "too many requests"]

@@ -2942,11 +2942,10 @@ impl Store {
 
     /// True iff there's already an in-flight action for this message —
     /// `pending` (awaiting Discord approval), `error` (will be picked up by
-    /// the retry tick), `scheduled`/`sending` (#500 — armed for a future
-    /// send / mid-send), or `queued_compose` (#1486 — a throttled reply
-    /// waiting for the engine to draft it). The poll loop uses this to avoid
-    /// spawning duplicate actions for the same email while one is still
-    /// mid-flight.
+    /// the retry tick), or `scheduled`/`sending` (#500 — armed for a future
+    /// send / mid-send). The poll loop uses this to avoid spawning duplicate
+    /// actions for the same email while one is still mid-flight.
+    /// `queued_compose` counts too (#1486 — awaiting a draft).
     pub fn has_open_action(&self, message_id: &str) -> StoreResult<bool> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let row: Option<i64> = guard
@@ -4414,10 +4413,8 @@ impl Store {
     /// Companion to `mark_pending_drafts_superseded_by_thread` for the cases
     /// where staleness is decided per-card (bulk sender) rather than
     /// per-thread (user already replied). Returns the number of rows flipped.
-    ///
-    /// #1486 — `queued_compose` rows are retired here too: a follow-up
-    /// compose that replaces a throttle-queued one must leave nothing behind
-    /// for the engine's sweep to turn into a second card.
+    /// #1486 — `queued_compose` rows are retired here too, so a replaced
+    /// throttle-queued compose leaves nothing for the sweep to re-card.
     pub fn mark_pending_superseded_by_ids(
         &self,
         ids: &[String],
@@ -6763,10 +6760,8 @@ impl Store {
     /// before the caller recorded its own (#501 review).
     /// Clearing `scheduledAtMs` here is load-bearing: a later Approve on the
     /// reposted card must send immediately, not re-arm a stale proposal.
-    ///
-    /// #1486 — also lands a `queued_compose` (throttled compose whose draft
-    /// the engine has now created): same destination, same reason for the
-    /// armed nudge pointer, since that caller has posted the card too.
+    /// #1486 — also lands a `queued_compose` whose draft the engine has now
+    /// created: same destination, and that caller posts a card too.
     pub fn unschedule_action(&self, action_id: &str, source: &str) -> StoreResult<bool> {
         let now = now_millis();
         let guard = self.conn.lock().expect("store mutex poisoned");
@@ -6952,9 +6947,9 @@ impl Store {
     }
 
     /// #1486 — throttle-queued composes whose next attempt is due, oldest
-    /// first, as `(action_id, attempts_so_far)`. The attempts live in the
-    /// reused `retryCount` column: the row never reaches the generic retry
-    /// tick, which is `status = 'error'` only.
+    /// first, as `(action_id, attempts_so_far)`. The attempts reuse the
+    /// `retryCount` column: the row never reaches the generic retry tick,
+    /// which is `status = 'error'` only.
     pub fn due_queued_composes(&self, now_ms: i64, limit: i64) -> StoreResult<Vec<(String, i64)>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = guard.prepare(
@@ -6973,10 +6968,9 @@ impl Store {
         Ok(rows)
     }
 
-    /// #1486 — still throttled: count the attempt and move the next one out
-    /// to `next_at_ms`. CAS-gated on the row still being queued. (Landing and
-    /// abandoning a queued compose reuse [`Self::unschedule_action`] and
-    /// [`Self::finish_send_error`].)
+    /// #1486 — still throttled: count the attempt and move the next one out to
+    /// `next_at_ms`, CAS-gated on the row still being queued. (Landing and
+    /// abandoning reuse [`Self::unschedule_action`]/[`Self::finish_send_error`].)
     pub fn defer_queued_compose(
         &self,
         action_id: &str,

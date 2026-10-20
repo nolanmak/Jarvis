@@ -6815,14 +6815,14 @@ async fn run_gmail_compose(
             &bcc,
         )
         .await;
-    // #1486 — the provider throttles a connection for far longer than any
+    // #1486 — the provider throttles an account for far longer than any
     // in-process backoff can wait, so a plain `--post` compose is parked for
     // the daemon to land instead of being lost (matched BEFORE `.context`
-    // erases the typed error). The other shapes get the error: an `--attach`
-    // upload is CLI-local state the daemon cannot reproduce, a `--send-at`
-    // may be stale once the throttle clears, a `--bcc` is not expressible
-    // through the trait the daemon drafts with, and without `--post` there
-    // is no card to deliver later.
+    // erases the typed error). The other shapes still get the error: an
+    // `--attach` upload is CLI-local state the daemon cannot reproduce, a
+    // `--send-at` may be stale once the throttle clears, a `--bcc` is not
+    // expressible through the trait the daemon drafts with, and without
+    // `--post` there is no card to deliver later.
     if let Err(GmailError::RateLimited { retry_after_ms, retry_after, .. }) = &created {
         if post && attachment.is_none() && send_at_ms.is_none() && bcc.is_empty() {
             const DEFAULT_RETRY_DELAY_MS: i64 = 5 * 60 * 1000;
@@ -6830,20 +6830,14 @@ async fn run_gmail_compose(
             let next_at_ms = retry_after_ms
                 .filter(|ms| *ms > now_ms)
                 .unwrap_or(now_ms + DEFAULT_RETRY_DELAY_MS);
-            let action_id = queue_throttled_compose(
-                &store,
-                &entity_id,
-                &email,
-                &to,
-                &cc,
-                &subject,
-                &body_str,
-                thread_id.as_deref(),
-                reply_to_message_id.as_deref(),
-                reply_to_from.as_deref(),
-                reply_to_subject.as_deref(),
-                next_at_ms,
-            )?;
+            // No draft id and no attachment; `Some(next_at_ms)` parks the rows
+            // as `queued_compose` instead of posting a card.
+            let action_id = post_reply_approval_card(
+                &store, &entity_id, &email, None, &to, &cc, &bcc, &subject, &body_str, None,
+                thread_id.as_deref(), reply_to_message_id.as_deref(), reply_to_from.as_deref(),
+                reply_to_subject.as_deref(), inbound.as_deref(), None, None, Some(next_at_ms),
+            )
+            .await?;
             // Retire the card this compose replaces, or the queued row lands
             // as a second card for the same email (#419). Best-effort: the
             // queued row already exists.
@@ -6858,16 +6852,11 @@ async fn run_gmail_compose(
             }
             let window = retry_after.clone().unwrap_or_else(|| "unknown".into());
             if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "queued": true,
-                        "action_id": action_id,
-                        "to": to,
-                        "subject": subject,
-                        "retry_after": window,
-                    })
-                );
+                let out = serde_json::json!({
+                    "queued": true, "action_id": action_id, "to": to,
+                    "subject": subject, "retry_after": window,
+                });
+                println!("{out}");
             } else {
                 println!(
                     "queued {action_id} — gmail rate-limited this account \
@@ -6884,7 +6873,7 @@ async fn run_gmail_compose(
             &store,
             &entity_id,
             &email,
-            &draft_id,
+            Some(&draft_id),
             &to,
             &cc,
             &bcc,
@@ -6898,6 +6887,7 @@ async fn run_gmail_compose(
             inbound.as_deref(),
             None,
             send_at_ms,
+            None,
         )
         .await?;
         if let Some((old_action_id, old_draft_id)) = pending_replacement {
@@ -7021,9 +7011,8 @@ async fn post_reply_approval_card(
     reply_to_body_file: Option<&str>,
     send_at_ms: Option<i64>,
     // #1486 — set when the provider throttled the draft create: the rows are
-    // written with status `queued_compose` and this next-attempt time, and no
-    // card is posted. The daemon's scheduled-send engine creates the draft
-    // and posts the card once the throttle clears.
+    // written `queued_compose` with this next-attempt time and no card posted,
+    // for the daemon's scheduled-send engine to land once that clears.
     queued_until_ms: Option<i64>,
 ) -> Result<String> {
     use augmentagent_store::Email as StoreEmail;
@@ -7043,8 +7032,8 @@ async fn post_reply_approval_card(
     // approve/skip/revise handlers — which join actions→emails on messageId —
     // find the upserted row below. `compose:` prefix matches the fan-out
     // convention and can never collide with a real Gmail hex id.
-    // No draft id on a throttle-queued compose (#1486): a uuid keeps the
-    // `compose:` convention and stays unique.
+    // A throttle-queued compose has no draft id yet (#1486): a uuid keeps the
+    // convention and stays unique.
     let synthetic_msg_id = match draft_id {
         Some(draft_id) => format!("compose:{draft_id}"),
         None => format!("compose:queued:{}", uuid::Uuid::new_v4()),
