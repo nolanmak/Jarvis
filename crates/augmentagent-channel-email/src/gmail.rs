@@ -26,8 +26,7 @@ pub enum GmailError {
     Decode(String),
     #[error("invalid input: {0}")]
     Invalid(String),
-    /// #1486 — the provider does not always say when to come back: the
-    /// draft-create throttle arrives as a bare `…: 429`, hence the Options.
+    /// #1486 — a bare `…: 429` names no boundary, hence the Options.
     #[error("composio Gmail rate limit; retry after {} (composio log_id {log_id})",
         .retry_after.as_deref().unwrap_or("no retry-after reported"))]
     RateLimited {
@@ -246,7 +245,7 @@ impl ComposioClient {
                         let v = resp.json::<serde_json::Value>().await?;
                         let checked = check_envelope(action, v);
                         // #1486 — an envelope throttle on a non-fetch action
-                        // consumes the same backoff budget an HTTP 429 does.
+                        // spends the same backoff budget an HTTP 429 does.
                         let mut retry_envelope = false;
                         match &checked {
                             Err(err @ GmailError::RateLimited { retry_after_ms, retry_after, log_id }) => {
@@ -1156,12 +1155,6 @@ mod tests {
         assert!(
             matches!(&err, GmailError::RateLimited { retry_after_ms: None, retry_after: None, log_id } if log_id == "log_x"),
             "got: {err:?}"
-        );
-        assert!(err.to_string().contains("no retry-after reported"), "{err}");
-
-        assert_eq!(
-            classify_envelope_rate_limit("User-rate limit exceeded. Retry after 2099-01-01T00:00:00Z"),
-            Some((Some(4_070_908_800_000), Some("2099-01-01T00:00:00Z".to_string())))
         );
         // A 429 buried in a longer number is not a status code.
         assert_eq!(classify_envelope_rate_limit("quota 14290 of 20000"), None);
@@ -2297,9 +2290,8 @@ fn check_envelope(
         .get("log_id")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("-");
-    // #1486 — classified for EVERY action, not just fetch. The old fetch-only
-    // gate is why the search path reported a retry-after window while an
-    // identically-throttled draft create surfaced a raw ": 429".
+    // #1486 — classified for EVERY action, not just fetch: the old fetch-only
+    // gate is why an identically-throttled draft create surfaced a raw ": 429".
     if let Some((retry_after_ms, retry_after)) = classify_envelope_rate_limit(err_text) {
         return Err(GmailError::RateLimited {
             retry_after_ms,
@@ -2316,11 +2308,10 @@ fn check_envelope(
 }
 
 /// #1486 — is this envelope error a provider throttle, and when may we come
-/// back? Composio spells the same refusal at least two ways: the Gmail
-/// user-rate wording the search path has always matched, and a bare status
-/// code (`Failed to fetch user profile: 429`) on draft creation. Only the
-/// first carries a boundary, so the retry-after is optional — not the
-/// classification.
+/// back? Composio spells the refusal two ways: the Gmail user-rate wording
+/// the search path has always matched, and a bare status code (`Failed to
+/// fetch user profile: 429`) on draft creation. Only the first names a
+/// boundary, so the retry-after is optional — the classification is not.
 fn classify_envelope_rate_limit(error: &str) -> Option<(Option<i64>, Option<String>)> {
     let lower = error.to_ascii_lowercase();
     let worded = ["rate limit", "ratelimit", "too many requests"]

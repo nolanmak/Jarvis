@@ -59,9 +59,8 @@ pub const RETRY_EXEMPT_RETRY_COUNT: i64 = 9_999;
 const PER_TICK_LIMIT: i64 = 10;
 
 /// #1486 — wait before a throttle-queued compose's next draft-create attempt
-/// when the provider named no retry-after of its own (a reported boundary
-/// always wins), and the attempt budget after which the engine gives up and
-/// tells the owner — an hour, so a compose cannot retry forever.
+/// when the provider named no boundary of its own (a reported one wins), and
+/// the budget — an hour — after which the engine gives up and tells the owner.
 const QUEUED_COMPOSE_RETRY_MS: i64 = 5 * 60 * 1000;
 const QUEUED_COMPOSE_MAX_ATTEMPTS: i64 = 12;
 const SRC: &str = "scheduled-send-engine";
@@ -166,8 +165,7 @@ pub struct TickSummary {
     pub superseded: usize,
     /// Rows found stuck in the `sending` claim and flagged for the owner.
     pub stuck_flagged: usize,
-    /// #1486 — throttle-queued composes that got their draft and card this
-    /// tick. Still-throttled and abandoned ones are logged per row.
+    /// #1486 — throttle-queued composes that got their draft and card here.
     pub queued_landed: usize,
 }
 
@@ -377,11 +375,10 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
         Ok(summary)
     }
 
-    /// #1486 — land a compose the Gmail provider throttled before a draft
-    /// could be created: create the draft now, then post the approval card the
-    /// owner was promised. The card is posted BEFORE the flip to `pending`, so
-    /// a failed post leaves the row queued with its draftId recorded and the
-    /// next tick retries the card alone — never a second draft.
+    /// #1486 — land a compose the provider throttled before a draft could be
+    /// created: draft it, then post the promised approval card. The card goes
+    /// out BEFORE the flip to `pending`, so a failed post leaves the row queued
+    /// with its draftId recorded and the next tick retries the card alone.
     async fn land_queued_compose(
         &self,
         action_id: &str,
@@ -487,8 +484,7 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
     }
 
     /// Terminal for a queued compose: no draft, no card, and the owner is told
-    /// so the email is not silently lost. Retry-exempt, like every other
-    /// engine failure — this row has no draft to re-dispatch.
+    /// so the email is not silently lost. Retry-exempt — no draft to re-send.
     async fn abandon_queued_compose(
         &self,
         action_id: &str,

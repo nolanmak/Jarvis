@@ -6819,10 +6819,9 @@ async fn run_gmail_compose(
     // in-process backoff can wait, so a plain `--post` compose is parked for
     // the daemon to land instead of being lost (matched BEFORE `.context`
     // erases the typed error). The other shapes still get the error: an
-    // `--attach` upload is CLI-local state the daemon cannot reproduce, a
-    // `--send-at` may be stale once the throttle clears, a `--bcc` is not
-    // expressible through the trait the daemon drafts with, and without
-    // `--post` there is no card to deliver later.
+    // `--attach` is CLI-local state the daemon cannot reproduce, a `--send-at`
+    // may be stale once the throttle clears, a `--bcc` is not expressible
+    // through the drafting trait, and with no `--post` there is no card.
     if let Err(GmailError::RateLimited { retry_after_ms, retry_after, .. }) = &created {
         if post && attachment.is_none() && send_at_ms.is_none() && bcc.is_empty() {
             const DEFAULT_RETRY_DELAY_MS: i64 = 5 * 60 * 1000;

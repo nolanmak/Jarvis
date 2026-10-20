@@ -4413,8 +4413,8 @@ impl Store {
     /// Companion to `mark_pending_drafts_superseded_by_thread` for the cases
     /// where staleness is decided per-card (bulk sender) rather than
     /// per-thread (user already replied). Returns the number of rows flipped.
-    /// #1486 — `queued_compose` rows are retired here too, so a replaced
-    /// throttle-queued compose leaves nothing for the sweep to re-card.
+    /// #1486 — retires `queued_compose` rows too, so a replaced one is not
+    /// re-carded by the sweep.
     pub fn mark_pending_superseded_by_ids(
         &self,
         ids: &[String],
@@ -6881,8 +6881,7 @@ impl Store {
     ///   tick may re-dispatch as before.
     /// - `Some(cap)` (engine / stuck-claim reconcile): stamp retryCount to
     ///   the retry cap so `list_retryable_replies` NEVER picks the row up.
-    ///   This is also how a `queued_compose` is abandoned (#1486) — that row
-    ///   has no draft to re-dispatch either.
+    ///   Also how a `queued_compose` is abandoned (#1486): no draft either.
     ///   The generic retry path routes through `dispatch_reply`, which would
     ///   repost an approval card for a send that may have actually landed
     ///   (Composio timeout-but-delivered) — the double-send the scheduled
