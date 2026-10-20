@@ -15,6 +15,7 @@ built binary.
 |---|---|---|
 | `fake-claude-ok.sh` | `claude -p --output-format stream-json` | answers `PONG-FROM-FAKE-CLAUDE`, exit 0 |
 | `fake-claude-quota.sh` | ditto, out of quota | the session-limit refusal as a **successful** completion (#448's shape) → `RateLimited` |
+| `fake-claude-auth-expired.sh` | ditto, OAuth login expired | the CLI's auth error as a **successful** completion (#1499) → `Unavailable` |
 | `fake-claude-hang.sh` | ditto, wedged | accepts the prompt, never answers → `Timeout` once the watchdog fires |
 | `fake-codex-ok.sh` | `codex exec --json` | JSONL stream ending in `PONG-FROM-FAKE-CODEX` and a `turn.completed` usage report (recorded in `token-usage.jsonl`, #1047), exit 0 |
 | `fake-codex-usage-limit.sh` | ditto, out of quota | `turn.failed` + exit 1 → `RateLimited` |
@@ -54,7 +55,7 @@ posture): a `FAKE_*` variable would reach the claude stub and nothing else.
 `crates/augmentagent-cli/tests/reasoner_failover_e2e.rs` drives
 `augmentagent reasoner-selftest` — one text-only round trip through the
 production `build_reasoner()` — as a subprocess, once per scenario: quota
-refusal → codex, hung primary → codex, whole chain refusing, gemini serving
+refusal → codex, expired login → codex, hung primary → codex, whole chain refusing, gemini serving
 and latching, and healthy primary with no fallback spawn.
 `a_fallback_served_call_is_counted_under_codex_in_token_usage` then runs
 `augmentagent token-usage` in the same scratch home and checks that the
