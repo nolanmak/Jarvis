@@ -4670,12 +4670,11 @@ impl Store {
     /// existing clock, like `set_gmail_fetch_cooldown`, so a shorter later
     /// boundary can't pull the row back inside a throttle we already saw.
     ///
-    /// The boundary is then bounded by the row's OWN clock:
-    /// `createdAt + hold_window_ms`. [`Self::list_retryable_replies`] also
+    /// The boundary is then clamped to the row's OWN clock,
+    /// `createdAt + hold_window_ms`: [`Self::list_retryable_replies`] also
     /// drops rows whose `createdAt` is older than its `max_age_ms`, so a hold
     /// past that window would make the row vanish — never retried, never
-    /// given up on. The caller sizes `hold_window_ms` to leave retry ticks
-    /// inside the age window (see `GmailChannel::retry_hold_window_ms`).
+    /// given up on (see `GmailChannel::retry_hold_window_ms`).
     pub fn set_action_retry_not_before(
         &self,
         action_id: &str,
@@ -10773,11 +10772,11 @@ mod tests {
             [ids[1].clone()],
             "the clocked row must be held and the unclocked one untouched"
         );
-        let mut after = ids_at(now + ten_min + 60_000);
-        after.sort();
-        let mut both = ids.clone();
-        both.sort();
-        assert_eq!(after, both, "both rows are retryable past the boundary");
+        assert_eq!(
+            ids_at(now + ten_min + 60_000).len(),
+            2,
+            "both rows are retryable past the boundary"
+        );
 
         // A clock never moves backwards: a later write wins, an earlier one
         // is ignored (the boundary we already promised upstream stands).

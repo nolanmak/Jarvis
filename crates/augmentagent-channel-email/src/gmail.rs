@@ -93,15 +93,19 @@ pub trait GmailApi: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// #1494 — the draft (if any) already sitting on `thread_id`. Used only
-    /// to recover from a lost create-draft response during a throttle, so a
-    /// retry adopts the draft that landed instead of making a second one.
-    /// Default impl returns `Ok(None)` — "nothing to adopt, create normally" —
-    /// so fakes that don't model drafts keep compiling.
-    async fn find_draft_on_thread(
+    /// #1494 — the draft sitting on `thread_id` whose text is the `body` we
+    /// tried to save, if there is one. Used only to recover from a lost
+    /// create-draft response during a throttle, so a retry adopts the draft
+    /// that landed instead of making a second one. The body is half the key,
+    /// not a nicety: a thread routinely also holds a draft the OWNER typed,
+    /// and a thread-only match would adopt that and card their private text
+    /// as ours. Default impl returns `Ok(None)` — "nothing to adopt, create
+    /// normally" — so fakes that don't model drafts keep compiling.
+    async fn find_matching_draft_on_thread(
         &self,
         _entity_id: &str,
         _thread_id: &str,
+        _body: &str,
     ) -> Result<Option<String>, GmailError> {
         Ok(None)
     }
@@ -568,22 +572,25 @@ impl ComposioClient {
         Ok(None)
     }
 
-    /// #1494 — find a draft already sitting on `thread_id`, so a compose whose
-    /// response was lost to a throttle adopts the draft that actually landed
-    /// instead of creating a second one. Same `GMAIL_LIST_DRAFTS` walk as
-    /// [`get_draft_thread_id`], matching on the thread and returning the draft.
-    /// `Ok(None)` when the thread holds no draft in the first `MAX_PAGES`.
-    pub async fn find_draft_on_thread(
+    /// #1494 — find the draft on `thread_id` carrying `body`, so a compose
+    /// whose response was lost to a throttle adopts the draft that actually
+    /// landed instead of creating a second one. Same `GMAIL_LIST_DRAFTS` walk
+    /// as [`get_draft_thread_id`], but `verbose` so each listed draft brings
+    /// its text: the thread alone is not an identity (see the trait method),
+    /// so a draft whose text isn't ours is skipped, as is one Composio
+    /// returned without any text at all. `Ok(None)` ⇒ create normally.
+    pub async fn find_matching_draft_on_thread(
         &self,
         entity_id: &str,
         thread_id: &str,
+        body: &str,
     ) -> Result<Option<String>, GmailError> {
         const MAX_PAGES: u32 = 5;
         let mut page_token: Option<String> = None;
         for _ in 0..MAX_PAGES {
             let mut args = serde_json::json!({
                 "max_results": 100,
-                "verbose": false,
+                "verbose": true,
             });
             if let Some(t) = &page_token {
                 args["page_token"] = serde_json::Value::String(t.clone());
@@ -600,7 +607,9 @@ impl ComposioClient {
                     .or_else(|| d.pointer("/message/thread_id"))
                     .and_then(serde_json::Value::as_str)
                     == Some(thread_id);
-                if on_thread {
+                let is_ours = find_string_field(d, &["messageText", "snippet", "body"])
+                    .is_some_and(|text| draft_text_matches(body, &text));
+                if on_thread && is_ours {
                     if let Some(id) = d.get("id").and_then(serde_json::Value::as_str) {
                         return Ok(Some(id.to_string()));
                     }
@@ -2269,32 +2278,37 @@ mod tests {
         assert_eq!(standalone, None);
     }
 
-    /// #1494 — the lost-response probe: a draft that landed on the thread
-    /// before the throttle must be findable so the retry adopts it.
+    /// #1494 REGRESSION — the lost-response probe is keyed on the BODY as
+    /// well as the thread. `D-owner` is a draft the owner typed on the very
+    /// same thread: adopting it would put their text on an approval card.
     #[tokio::test]
-    async fn find_draft_on_thread_returns_the_draft_sitting_on_that_thread() {
+    async fn the_lost_response_probe_adopts_only_the_draft_carrying_our_body() {
+        let ours = "Thursday 3pm works for me, I'll send an invite.";
         let body = r#"{"successful":true,"data":{"drafts":[
-            {"id":"D1","message":{"id":"M1","threadId":"T9"}},
-            {"id":"D2","message":{"id":"M2","threadId":"M2"}}
+            {"id":"D-owner","message":{"id":"M0","threadId":"T9",
+             "messageText":"hold off here, I want to call them first"}},
+            {"id":"D-ours","message":{"id":"M1","threadId":"T9",
+             "messageText":"Thursday 3pm works for me, I'll send an"}}
         ]}}"#;
         let addr = spawn_repeating_http(200, body, "").await;
         let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
 
+        let probe = |thread: &'static str, body: &'static str| {
+            let client = &client;
+            async move {
+                client
+                    .find_matching_draft_on_thread("entity-x", thread, body)
+                    .await
+                    .expect("list should succeed")
+            }
+        };
         assert_eq!(
-            client
-                .find_draft_on_thread("entity-x", "T9")
-                .await
-                .expect("list should succeed")
-                .as_deref(),
-            Some("D1")
+            probe("T9", ours).await.as_deref(),
+            Some("D-ours"),
+            "a snippet-truncated copy of our own body is still ours"
         );
-        assert_eq!(
-            client
-                .find_draft_on_thread("entity-x", "T-none")
-                .await
-                .expect("list should succeed"),
-            None
-        );
+        assert_eq!(probe("T-none", ours).await, None, "wrong thread");
+        assert_eq!(probe("T9", "another thing entirely").await, None);
     }
 }
 
@@ -2405,6 +2419,26 @@ fn wallclock_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_default()
+}
+
+/// #1494 — is `candidate` (a listed draft's text, which Composio returns
+/// truncated to a snippet on longer bodies) the text of `expected` (the body
+/// we handed `create_draft`)? Whitespace-normalized prefix match in either
+/// direction, so a truncation still matches — and so does an `expected` still
+/// carrying the #35/#785 markers, which only ever trail the human text — with
+/// a floor so a near-empty draft can't match everything.
+pub(crate) fn draft_text_matches(expected: &str, candidate: &str) -> bool {
+    let norm = |s: &str| {
+        s.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    let (expected, candidate) = (norm(expected), norm(candidate));
+    let floor = 24.min(expected.chars().count());
+    !expected.is_empty()
+        && candidate.chars().count() >= floor
+        && (expected.starts_with(&candidate) || candidate.starts_with(&expected))
 }
 
 /// Recursively search a JSON value for the first string-valued field whose
@@ -2936,12 +2970,13 @@ impl GmailApi for ComposioClient {
             .await
     }
 
-    async fn find_draft_on_thread(
+    async fn find_matching_draft_on_thread(
         &self,
         entity_id: &str,
         thread_id: &str,
+        body: &str,
     ) -> Result<Option<String>, GmailError> {
-        ComposioClient::find_draft_on_thread(self, entity_id, thread_id).await
+        ComposioClient::find_matching_draft_on_thread(self, entity_id, thread_id, body).await
     }
 
     async fn send_draft(
