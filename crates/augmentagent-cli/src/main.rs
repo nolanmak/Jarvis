@@ -2297,6 +2297,12 @@ enum GmailOp {
         /// Must be between 2 minutes and 60 days out.
         #[arg(long)]
         send_at: Option<String>,
+        /// #1451 — the owner explicitly asked to share this phone number with
+        /// the recipients: a contact's slug or display name, or the number
+        /// itself (repeatable). Without it, a body carrying a number this
+        /// message cannot account for is refused.
+        #[arg(long)]
+        shared_contact: Vec<String>,
     },
     /// Replace an existing draft's content. Composio has no update-in-place
     /// tool (#382), so this creates a replacement draft and deletes the old
@@ -2341,6 +2347,9 @@ enum GmailOp {
         reply_to_body: Option<String>,
         #[arg(long)]
         reply_to_body_file: Option<String>,
+        /// #1451 — same flag as `gmail compose`.
+        #[arg(long)]
+        shared_contact: Vec<String>,
     },
     /// Send an existing draft.
     Send {
@@ -2389,6 +2398,9 @@ enum GmailOp {
         reply_to_body: Option<String>,
         #[arg(long)]
         reply_to_body_file: Option<String>,
+        /// #1451 — same flag as `gmail compose`.
+        #[arg(long)]
+        shared_contact: Vec<String>,
     },
 }
 
@@ -4235,9 +4247,11 @@ async fn main() -> Result<()> {
                 account, to, cc, bcc, subject, body, body_file, thread_id, json,
                 post, allow_duplicate, attach, reply_to_message_id, reply_to_from,
                 reply_to_subject, reply_to_body, reply_to_body_file, send_at,
+                shared_contact,
             } => {
                 run_gmail_compose(
                     store,
+                    cli.wiki_dir.clone(),
                     account.clone(),
                     to.clone(),
                     cc.clone(),
@@ -4256,15 +4270,17 @@ async fn main() -> Result<()> {
                     reply_to_body.clone(),
                     reply_to_body_file.clone(),
                     send_at.clone(),
+                    shared_contact.clone(),
                 )
                 .await
             }
             GmailOp::UpdateDraft {
                 account, draft_id, to, cc, bcc, subject, body, body_file, thread_id, attach,
-                reply_to_body, reply_to_body_file,
+                reply_to_body, reply_to_body_file, shared_contact,
             } => {
                 run_gmail_update_draft(
                     store,
+                    cli.wiki_dir.clone(),
                     account.clone(),
                     draft_id.clone(),
                     to.clone(),
@@ -4277,6 +4293,7 @@ async fn main() -> Result<()> {
                     attach.clone(),
                     reply_to_body.clone(),
                     reply_to_body_file.clone(),
+                    shared_contact.clone(),
                 )
                 .await
             }
@@ -4288,10 +4305,11 @@ async fn main() -> Result<()> {
             }
             GmailOp::SendNow {
                 account, to, cc, bcc, subject, body, body_file, thread_id, attach,
-                reply_to_body, reply_to_body_file,
+                reply_to_body, reply_to_body_file, shared_contact,
             } => {
                 run_gmail_send_now(
                     store,
+                    cli.wiki_dir.clone(),
                     account.clone(),
                     to.clone(),
                     cc.clone(),
@@ -4303,6 +4321,7 @@ async fn main() -> Result<()> {
                     attach.clone(),
                     reply_to_body.clone(),
                     reply_to_body_file.clone(),
+                    shared_contact.clone(),
                 )
                 .await
             }
@@ -6492,6 +6511,65 @@ fn strip_register_receipt(body: &str, inbound: Option<&str>) -> Result<(String, 
     Ok((clean.to_string(), receipt))
 }
 
+/// #1451 — the contact-provenance gate on a Gmail body, shared by compose,
+/// update-draft and send-now so they cannot drift apart (the #994 lesson).
+///
+/// Refuses a body carrying a phone number this message cannot account for —
+/// stored under a person who is not on it, or claimed by no record at all:
+/// that is how an unrelated contact's mobile ended up in a draft to
+/// strangers, labelled as the owner's own. `--wiki-dir` is a top-level flag
+/// the drafting agent cannot pass (its Bash allowlist requires `gmail` as the
+/// first token), so the wiki scan falls back to `WIKI_ROOT`.
+#[allow(clippy::too_many_arguments)]
+fn gate_contact_provenance(
+    store: &Store,
+    wiki_dir: Option<&Path>,
+    body: &str,
+    inbound: Option<&str>,
+    sender: &str,
+    to: &str,
+    cc: &[String],
+    bcc: &[String],
+    shared_contact: &[String],
+) -> Result<()> {
+    use augmentagent_channel_contacts::provenance;
+    let numbers = provenance::candidate_numbers(body);
+    if numbers.is_empty() {
+        return Ok(());
+    }
+    let participants: Vec<String> = std::iter::once(sender.to_string())
+        .chain(to.split(',').map(|a| a.trim().to_string()))
+        .chain(cc.iter().cloned())
+        .chain(bcc.iter().cloned())
+        .filter(|a| !a.is_empty())
+        .collect();
+    let (mut records, slugs) = wiki_dir
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("WIKI_ROOT").map(PathBuf::from))
+        .filter(|p| p.is_dir())
+        .map(|root| provenance::scan_wiki(&root, &participants))
+        .unwrap_or_default();
+    for number in &numbers {
+        // A lookup failure must not open the gate: an unreadable index means
+        // we cannot trace the number, which is exactly the refusal case.
+        if let Some(hit) = store
+            .lookup_person_by_phone(number)
+            .context("phone identity lookup failed; refusing to write (#1451)")?
+        {
+            records.push(provenance::PhoneRecord {
+                phone_e164: number.clone(),
+                slug: hit.person_slug,
+                display_name: hit.display_name,
+            });
+        }
+    }
+    let inbound = inbound.map(provenance::candidate_numbers).unwrap_or_default();
+    if let Some(refusal) = provenance::check(&numbers, &records, &slugs, shared_contact, &inbound) {
+        anyhow::bail!("{refusal}");
+    }
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ComposePendingDisposition {
     Create,
@@ -6688,6 +6766,7 @@ fn thread_for_revised_subject<'a>(
 #[allow(clippy::too_many_arguments)]
 async fn run_gmail_compose(
     store: Arc<Store>,
+    wiki_dir: Option<PathBuf>,
     account: Option<String>,
     to: Vec<String>,
     cc: Vec<String>,
@@ -6706,6 +6785,7 @@ async fn run_gmail_compose(
     reply_to_body: Option<String>,
     reply_to_body_file: Option<String>,
     send_at: Option<String>,
+    shared_contact: Vec<String>,
 ) -> Result<()> {
     // #502 — resolve and bound the proposed send time BEFORE any Gmail
     // write, so a bad value can't strand an orphan draft (#412 discipline).
@@ -6758,6 +6838,18 @@ async fn run_gmail_compose(
         );
     }
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
+    // #1451 — before any draft, card or action row exists.
+    gate_contact_provenance(
+        &store,
+        wiki_dir.as_deref(),
+        &body_str,
+        inbound.as_deref(),
+        &email,
+        &to,
+        &cc,
+        &bcc,
+        &shared_contact,
+    )?;
     // #419 / #596 — preserve one active approval identity while allowing a
     // conversational follow-up to replace its body/envelope. The old action
     // is superseded only after the replacement Gmail draft and Discord card
@@ -7761,6 +7853,7 @@ fn redraw_unconfigured_warning(repointed_ids: &[String]) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn run_gmail_update_draft(
     store: Arc<Store>,
+    wiki_dir: Option<PathBuf>,
     account: Option<String>,
     draft_id: String,
     to: Vec<String>,
@@ -7773,6 +7866,7 @@ async fn run_gmail_update_draft(
     attach: Option<PathBuf>,
     reply_to_body: Option<String>,
     reply_to_body_file: Option<String>,
+    shared_contact: Vec<String>,
 ) -> Result<()> {
     let to = normalize_recipients("--to", &to)?;
     anyhow::ensure!(!to.is_empty(), "--to requires at least one email address");
@@ -7786,6 +7880,18 @@ async fn run_gmail_update_draft(
     let inbound = read_optional_body(reply_to_body, reply_to_body_file)?;
     let body_str = body_for_gmail_write(read_body(body, body_file)?, &subject, inbound.as_deref())?;
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
+    // #1451 — the replacement body is new outbound text; gate it like a compose.
+    gate_contact_provenance(
+        &store,
+        wiki_dir.as_deref(),
+        &body_str,
+        inbound.as_deref(),
+        &email,
+        &to,
+        &cc,
+        &bcc,
+        &shared_contact,
+    )?;
     // #500 — refuse while a send of exactly this draft is in flight: update
     // is create-replacement + DELETE-old, which would yank the draft out
     // from under the Composio send. The window is short (bounded by
@@ -8028,6 +8134,7 @@ async fn run_gmail_delete_draft(
 #[allow(clippy::too_many_arguments)]
 async fn run_gmail_send_now(
     store: Arc<Store>,
+    wiki_dir: Option<PathBuf>,
     account: Option<String>,
     to: Vec<String>,
     cc: Vec<String>,
@@ -8039,6 +8146,7 @@ async fn run_gmail_send_now(
     attach: Option<PathBuf>,
     reply_to_body: Option<String>,
     reply_to_body_file: Option<String>,
+    shared_contact: Vec<String>,
 ) -> Result<()> {
     let to = normalize_recipients("--to", &to)?;
     anyhow::ensure!(!to.is_empty(), "--to requires at least one email address");
@@ -8052,6 +8160,18 @@ async fn run_gmail_send_now(
     let inbound = read_optional_body(reply_to_body, reply_to_body_file)?;
     let body_str = body_for_gmail_write(read_body(body, body_file)?, &subject, inbound.as_deref())?;
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
+    // #1451 — no approval card stands between this body and the inbox.
+    gate_contact_provenance(
+        &store,
+        wiki_dir.as_deref(),
+        &body_str,
+        inbound.as_deref(),
+        &email,
+        &to,
+        &cc,
+        &bcc,
+        &shared_contact,
+    )?;
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
     let thread_id = resolve_compose_thread_id(&gmail, &entity_id, &email, thread_id).await?;

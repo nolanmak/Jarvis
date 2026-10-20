@@ -9,6 +9,8 @@
 //!
 //! - [`vcard`] — pure RFC 6350/2426 parser (no IO, unit-tested).
 //! - [`phone`] — `phonenumber`-backed E.164 normalizer.
+//! - [`provenance`] — #1451: refuses an outbound body carrying a stored
+//!   contact's phone number when that contact isn't on the message.
 //! - [`source`] — `ContactsSource` trait + the upsert/index engine.
 //! - [`google`] — Backend A: Google People API via the Composio Google grant.
 //! - [`carddav`] — Backend B: generic CardDAV (Nextcloud/Fastmail/Radicale).
@@ -17,6 +19,7 @@
 pub mod carddav;
 pub mod google;
 pub mod phone;
+pub mod provenance;
 pub mod source;
 pub mod vcard;
 
