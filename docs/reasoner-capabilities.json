@@ -600,6 +600,18 @@
       "provider_conformance": "verified"
     },
     {
+      "callsite": "crates/augmentagent-cli/src/self_improve.rs::slice_opts",
+      "permission_profile": "source-inspect",
+      "output_contract": "Ordered `## CHILD:` plan slicing an oversized issue into agent-sized children",
+      "model_tier": "preserved",
+      "tier_rationale": "Wraps the scope preset, swapping only the system prompt: same read-only policy, same pinned scope model.",
+      "conformance": [
+        "self_improve::tests::source_inspection_presets_enforce_read_only_bridge_access",
+        "self_improve::tests::slice_plan_parses_only_well_formed_two_to_six_child_plans"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
       "callsite": "crates/augmentagent-cli/src/voice_tool.rs::configure",
       "permission_profile": "discord-voice-mcp",
       "output_contract": "Preserve the wrapped Discord query output contract; audio and text mirrors have separate receipts",

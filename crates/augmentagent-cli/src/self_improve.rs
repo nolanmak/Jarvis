@@ -43,6 +43,23 @@ const BRANCH_PREFIX: &str = "agent-fix/issue-";
 const FIXABLE_LABEL: &str = "agent-fixable";
 /// Label stamped on an issue once the loop has given up on it (back-off).
 const GAVE_UP_LABEL: &str = "agent-gave-up";
+/// #1516 — label on a parent sliced into children. Like [`GAVE_UP_LABEL`] it
+/// takes the issue out of the pool, but because the work is now being done.
+const AGENT_SLICED_LABEL: &str = "agent-sliced";
+/// #1516 — prefix of the marker every sliced child's body opens with, closed
+/// by the parent number and ` -->`. It enforces depth 1: a body carrying it is
+/// never sliced again.
+const SLICE_CHILD_MARKER_PREFIX: &str = "<!-- agent-slice-of #";
+/// #1516 — marker on the comment the slicer leaves on the parent before it
+/// files anything, so a partially-filed slice is never filed a second time.
+const SLICE_PARENT_MARKER: &str = "<!-- agent-sliced-parent -->";
+/// #1516 — a plan outside this range is not a plan: one child is a rename,
+/// seven are a task list. Either way the pre-build refusal stays the fallback.
+const MIN_SLICE_CHILDREN: usize = 2;
+const MAX_SLICE_CHILDREN: usize = 6;
+/// Caps applied at the parser, because a slice plan is model text.
+const MAX_SLICE_CHILD_BODY_CHARS: usize = 4000;
+const MAX_SLICE_TITLE_CHARS: usize = 200;
 /// The sentence the not-fixable scoping verdict leaves on the issue, and the
 /// marker #955's re-triage sweep matches on: it tells a scoper label-out apart
 /// from a back-off at [`MAX_ATTEMPTS`] or a blast-radius refusal, both of
@@ -294,8 +311,9 @@ struct RestIssue {
 /// Map the REST issues array into pick candidates, dropping what can never
 /// be picked: pull requests (the REST issues endpoint interleaves them —
 /// they carry a `pull_request` key), rows without a number, and issues
-/// already labeled [`GAVE_UP_LABEL`]. Order is preserved (the query sorts
-/// newest-first).
+/// already labeled [`GAVE_UP_LABEL`] or [`AGENT_SLICED_LABEL`] (#1516 — a
+/// sliced parent's work lives in its children now). Order is preserved (the
+/// query sorts newest-first).
 fn rest_issue_candidates(v: &serde_json::Value) -> Vec<RestIssue> {
     let Some(arr) = v.as_array() else {
         return Vec::new();
@@ -304,7 +322,7 @@ fn rest_issue_candidates(v: &serde_json::Value) -> Vec<RestIssue> {
         .filter(|iss| iss.get("pull_request").is_none())
         .filter_map(|iss| {
             let number = iss.get("number").and_then(serde_json::Value::as_u64)?;
-            if has_gave_up_label(iss) {
+            if has_label(iss, GAVE_UP_LABEL) || has_label(iss, AGENT_SLICED_LABEL) {
                 return None;
             }
             let s = |k: &str| {
@@ -330,13 +348,13 @@ fn rest_issue_candidates(v: &serde_json::Value) -> Vec<RestIssue> {
         .collect()
 }
 
-/// Does this REST issue row carry [`GAVE_UP_LABEL`]?
-fn has_gave_up_label(iss: &serde_json::Value) -> bool {
+/// Does this REST issue row carry the label `name`?
+fn has_label(iss: &serde_json::Value, name: &str) -> bool {
     iss.get("labels")
         .and_then(serde_json::Value::as_array)
         .is_some_and(|ls| {
             ls.iter()
-                .any(|l| l.get("name").and_then(|n| n.as_str()) == Some(GAVE_UP_LABEL))
+                .any(|l| l.get("name").and_then(|n| n.as_str()) == Some(name))
         })
 }
 
@@ -787,7 +805,7 @@ where
 }
 
 /// Pick the first `agent-fixable` issue that isn't already claimed (open agent
-/// PR) and isn't blast-radius and isn't `agent-gave-up`.
+/// PR) and isn't blast-radius and isn't `agent-gave-up` or `agent-sliced`.
 ///
 /// #300 trust gate: the returned [`Issue::author_trusted`] flag records
 /// whether the author passed the trust check. Untrusted-authored issues are
@@ -2297,6 +2315,290 @@ fn scope_predicts_refusal(s: &ScopeOutcome) -> Option<String> {
         )),
         _ => None,
     }
+}
+
+// #1516 — slice an oversized issue into agent-sized children instead of
+// ending its life at the size half of `scope_predicts_refusal`, which never
+// worked epics even though every piece of them fits the cap. One extra
+// scoping-tier call produces the plan; the refusal stays the fallback for
+// EVERY degraded outcome below, so today's behaviour is the worst case.
+
+const SLICE_SYSTEM: &str = "PUBLIC OUTPUT RULE: This response becomes public GitHub issues. Use only technical behavior and invented examples. Never copy private messages, personal names, account or invoice details, live traces, local paths, or generated programs with private inputs.\n\
+You are the slicing pass of a staged autonomous fix pipeline for this codebase. A scoping pass \
+has judged the given issue fixable but too large for one unattended run: the pipeline only ships \
+focused diffs under 600 changed lines. Your job is to READ the relevant code and split the issue \
+into ordered child issues, each of which a separate coding agent will be given on its own, with \
+no memory of this plan and no access to its siblings.\n\
+\n\
+Rules:\n\
+- Emit between 2 and 6 children. If the issue genuinely cannot be split into at least two \
+independently shippable units, emit NO children and say why in one sentence instead.\n\
+- Each child must be SELF-CONTAINED: it states the problem from scratch, names the files and \
+functions it touches, and carries its own acceptance criteria. A child that only makes sense \
+after reading its siblings is a task list entry, not an issue.\n\
+- Each child must be shippable on its own: a focused diff well under 600 changed lines that \
+leaves the tree green and the product working. Order them so each one builds on the merged \
+result of the ones before it.\n\
+- Do NOT plan changes to deploy/auth/secret/CI paths (systemd, scripts/check-for-updates, \
+.github/workflows, credentials/keyring/.env).\n\
+\n\
+Output format, exactly: for each child a line\n\
+## CHILD: <imperative title, under 120 characters>\n\
+followed by its body in markdown. Any preamble before the first such header is ignored. Emit \
+nothing after the last child's body.\n\
+Constraints: read-only — do NOT edit files, and do NOT create issues yourself. Stay inside the \
+given working directory.";
+
+/// The slicing pass reuses [`scope_opts`]' read-only tier and worktree.
+fn slice_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
+    augmentagent_channel_core::ReasonerOpts {
+        system_prompt: SLICE_SYSTEM.to_string(),
+        ..scope_opts(worktree)
+    }
+}
+
+fn build_slice_prompt(issue: &Issue, spec: &str) -> String {
+    format!(
+        "GitHub issue #{} is too large for one unattended run. Split it into \
+         {MIN_SLICE_CHILDREN}-{MAX_SLICE_CHILDREN} ordered child issues, each a focused diff \
+         under {MAX_DIFF_LINES} changed lines.\n\nTitle: {}\n\nBody:\n{}\n\n\
+         The scoping pass read the code and produced this spec; use it as your map of the \
+         work:\n\n{}",
+        issue.number,
+        issue.title,
+        truncate(&issue.body, 6000),
+        truncate(spec, 6000),
+    )
+}
+
+/// Parse a slice plan into ordered `(title, body)` children. Every degraded
+/// shape yields NO children: a guessed split would file wrong issues under the
+/// owner's account and take the parent out of the pool to pay for them.
+fn parse_slice_plan(raw: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut body: Vec<&str> = Vec::new();
+    for line in raw.lines() {
+        match slice_child_title(line) {
+            Some(title) => {
+                if let Some(last) = out.last_mut() {
+                    last.1 = body.join("\n").trim().to_string();
+                }
+                body.clear();
+                out.push((title, String::new()));
+            }
+            None if !out.is_empty() => body.push(line),
+            None => {}
+        }
+    }
+    if let Some(last) = out.last_mut() {
+        last.1 = body.join("\n").trim().to_string();
+    }
+    if !(MIN_SLICE_CHILDREN..=MAX_SLICE_CHILDREN).contains(&out.len())
+        || out.iter().any(|(t, b)| t.is_empty() || b.is_empty())
+    {
+        return Vec::new();
+    }
+    out.into_iter()
+        .map(|(t, b)| {
+            (
+                truncate(&t, MAX_SLICE_TITLE_CHARS),
+                truncate(&b, MAX_SLICE_CHILD_BODY_CHARS),
+            )
+        })
+        .collect()
+}
+
+/// The title of a `## CHILD: <title>` header line, if this line is one.
+fn slice_child_title(line: &str) -> Option<String> {
+    let t = line.trim();
+    if !t.starts_with('#') {
+        return None;
+    }
+    const KEY: &str = "CHILD:";
+    let rest = t.trim_start_matches('#').trim_start();
+    if !rest.get(..KEY.len()).is_some_and(|h| h.eq_ignore_ascii_case(KEY)) {
+        return None;
+    }
+    Some(rest[KEY.len()..].trim().to_string())
+}
+
+/// The body of one filed child: the parent marker first, so both the depth-1
+/// guard and a human reading the issue see the link immediately.
+fn slice_child_body(parent: u64, body: &str) -> String {
+    format!(
+        "{SLICE_CHILD_MARKER_PREFIX}{parent} -->\nPart of #{parent}, which the auto-fix \
+         pipeline sliced into agent-sized pieces because the whole of it does not fit one \
+         unattended run.\n\n{body}"
+    )
+}
+
+/// The parent issue number a sliced child's body names, if it is one.
+fn slice_parent_of(body: &str) -> Option<u64> {
+    let rest = body.strip_prefix(SLICE_CHILD_MARKER_PREFIX)?;
+    rest.split_once(" -->")?.0.trim().parse().ok()
+}
+
+/// #1516 — depth 1: a child is never sliced again. Checked BEFORE the slice
+/// call, so an over-cap child costs nothing extra and takes the ordinary
+/// pre-build refusal.
+fn is_slice_child(body: &str) -> bool {
+    slice_parent_of(body).is_some()
+}
+
+/// One slicing attempt: ask for a plan, parse it, file it. Every failure is an
+/// `Err` the caller turns back into the ordinary pre-build refusal.
+async fn slice_oversized_issue(
+    repo_root: &Path,
+    worktree: &Path,
+    reasoner: &FallbackReasoner,
+    issue: &Issue,
+    scope: &ScopeOutcome,
+) -> Result<Vec<u64>> {
+    let raw = reasoner
+        .call(
+            &slice_opts(worktree.to_path_buf()),
+            &build_slice_prompt(issue, &scope.body),
+        )
+        .await
+        .context("slicing pass failed")?;
+    let plan = parse_slice_plan(&raw);
+    if plan.is_empty() {
+        bail!(
+            "the slicing pass produced no usable plan ({MIN_SLICE_CHILDREN}-\
+             {MAX_SLICE_CHILDREN} `## CHILD:` sections expected)"
+        );
+    }
+    slice_issue(repo_root, issue.number, &issue.title, &plan).await
+}
+
+/// Comment on `parent` naming the plan, file it as child issues, then label
+/// the parent [`AGENT_SLICED_LABEL`]; returns the child numbers `gh` printed.
+/// Refuses to run twice over the same parent: the label OR the comment marker
+/// means the slice already happened. That marker goes up BEFORE the first
+/// child, because it is the only durable dedup — a slice that dies halfway
+/// (two children filed, the third `gh issue create` failing) would otherwise
+/// be re-sliced later and file its plan on top of the children that landed.
+/// The price is that a parent whose FIRST child failed is not re-sliced
+/// either: it falls back to the pre-#1516 refusal, which is what it would
+/// have got anyway. The filed numbers reach the parent timeline through each
+/// child's own `Part of #parent` back-link.
+async fn slice_issue(
+    repo_root: &Path,
+    parent: u64,
+    parent_title: &str,
+    plan: &[(String, String)],
+) -> Result<Vec<u64>> {
+    if plan.is_empty() {
+        bail!("empty slice plan for #{parent}");
+    }
+    let gh = gh_bin();
+    let (ok, view, err) = run(
+        &gh,
+        &["issue", "view", &parent.to_string(), "--json", "labels,comments"],
+        repo_root,
+    )
+    .await?;
+    if !ok {
+        bail!("gh issue view #{parent} failed: {}", truncate(&err, 300));
+    }
+    let view: serde_json::Value = serde_json::from_str(&view).context("parse gh issue view")?;
+    let commented = view
+        .get("comments")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|cs| {
+            cs.iter().any(|c| {
+                c.get("body")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|b| b.contains(SLICE_PARENT_MARKER))
+            })
+        });
+    if commented || has_label(&view, AGENT_SLICED_LABEL) {
+        bail!("#{parent} was already sliced");
+    }
+    // The label is new to every repo the loop runs in, so create it once and
+    // treat "already exists" as success — `gh` says so on stderr with a
+    // non-zero status, which is not an error here.
+    let _ = run(
+        &gh,
+        &[
+            "label",
+            "create",
+            AGENT_SLICED_LABEL,
+            "--description",
+            "Sliced by the auto-fix pipeline into agent-sized child issues",
+            "--color",
+            "5319E7",
+        ],
+        repo_root,
+    )
+    .await;
+
+    let mut note = format!(
+        "{SLICE_PARENT_MARKER}\nAuto-fix triage: this issue is too large for one unattended \
+         run, so the pipeline is slicing it into {} child issues instead of refusing it:\n\n",
+        plan.len()
+    );
+    for (title, _) in plan {
+        note.push_str(&format!("- {title}\n"));
+    }
+    note.push_str(&format!(
+        "\nEach child links back here and is scoped and built on its own. This issue is \
+         labelled `{AGENT_SLICED_LABEL}` so the picker skips it; close it once the children \
+         are done.\n"
+    ));
+    backoff_comment(repo_root, parent, &note).await?;
+
+    let mut filed: Vec<u64> = Vec::new();
+    for (title, body) in plan {
+        filed.push(file_slice_child(repo_root, parent, title, body).await?);
+    }
+    let (ok, _out, err) = run(
+        &gh,
+        &["issue", "edit", &parent.to_string(), "--add-label", AGENT_SLICED_LABEL],
+        repo_root,
+    )
+    .await?;
+    if !ok {
+        bail!(
+            "labelling #{parent} `{AGENT_SLICED_LABEL}` failed: {}",
+            truncate(&err, 300)
+        );
+    }
+    info!(parent, children = ?filed, title = parent_title, "sliced an oversized issue");
+    Ok(filed)
+}
+
+/// `gh issue create` for one slice child; the number parsed from the URL gh
+/// prints. Labels are best-effort, exactly as in [`file_red_main_issue`].
+async fn file_slice_child(
+    repo_root: &Path,
+    parent: u64,
+    title: &str,
+    body: &str,
+) -> Result<u64> {
+    let gh = gh_bin();
+    let body = slice_child_body(parent, body);
+    let labelled = [
+        "issue", "create", "--title", title, "--body", &body, "--label", FIXABLE_LABEL,
+    ];
+    let plain = ["issue", "create", "--title", title, "--body", &body];
+    let (mut ok, mut out, mut err) = run(&gh, &labelled, repo_root).await?;
+    if !ok {
+        warn!(
+            "gh issue create for a slice child of #{parent} failed with labels ({}); \
+             retrying without",
+            err.trim()
+        );
+        (ok, out, err) = run(&gh, &plain, repo_root).await?;
+    }
+    if !ok {
+        bail!("gh issue create failed: {}", truncate(&err, 300));
+    }
+    out.trim()
+        .rsplit('/')
+        .next()
+        .and_then(|n| n.parse::<u64>().ok())
+        .ok_or_else(|| anyhow::anyhow!("could not parse issue number from `{}`", out.trim()))
 }
 
 /// Stage 3 (#653): read-only QA review of the builder's diff, on the same
@@ -7391,6 +7693,30 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // the expensive version of this exact conclusion.
     if let Some(sc) = &scope {
         if let Some(reason) = scope_predicts_refusal(sc) {
+            // #1516 — the SIZE case is not a dead end: each piece of an epic
+            // fits the cap even when the whole does not, so spend one more
+            // scoping-tier call on a slice plan and file it as children. Size
+            // only (guarded paths are not smaller in pieces), never on a child
+            // (depth stays 1), never in a dry run (filing is irreversible).
+            if !dry_run && !sc.guarded_paths && !is_slice_child(&issue.body) {
+                match slice_oversized_issue(repo_root, &worktree, &reasoner, &issue, sc).await {
+                    Ok(children) => {
+                        cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                        let list: Vec<String> = children.iter().map(|n| format!("#{n}")).collect();
+                        return Ok(RunReport::triage(format!(
+                            "issue #{}: too large to build in one run — sliced into {} child \
+                             issues ({}) and labeled `{AGENT_SLICED_LABEL}`",
+                            issue.number,
+                            children.len(),
+                            list.join(", "),
+                        )));
+                    }
+                    Err(e) => warn!(
+                        issue = issue.number,
+                        "could not slice an oversized issue; refusing it instead: {e:#}"
+                    ),
+                }
+            }
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
             backoff_comment(
                 repo_root,
@@ -9281,12 +9607,13 @@ fn gave_up_is_stale(comments: &str) -> bool {
 }
 
 /// The open issues in a REST issues array that carry [`GAVE_UP_LABEL`] —
-/// exactly the rows [`rest_issue_candidates`] drops.
+/// the rows [`rest_issue_candidates`] drops for a back-off (it also drops
+/// [`AGENT_SLICED_LABEL`], which is not a back-off and is never re-admitted).
 fn gave_up_numbers(v: &serde_json::Value) -> Vec<u64> {
     v.as_array()
         .map(|arr| {
             arr.iter()
-                .filter(|iss| iss.get("pull_request").is_none() && has_gave_up_label(iss))
+                .filter(|iss| iss.get("pull_request").is_none() && has_label(iss, GAVE_UP_LABEL))
                 .filter_map(|iss| iss.get("number").and_then(serde_json::Value::as_u64))
                 .collect()
         })
@@ -9541,16 +9868,13 @@ async fn pick_issue_for_repo(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let gave_up = iss
-            .get("labels")
-            .and_then(|v| v.as_array())
-            .map(|ls| {
-                ls.iter()
-                    .any(|l| l.get("name").and_then(|n| n.as_str()) == Some(GAVE_UP_LABEL))
-            })
-            .unwrap_or(false);
-        if gave_up {
-            info!(repo = %repo.full_name, issue = number, "skip: agent-gave-up");
+        if has_label(&iss, GAVE_UP_LABEL) {
+            info!(repo = %repo.full_name, issue = number, "skip: {GAVE_UP_LABEL}");
+            continue;
+        }
+        // #1516 — a sliced parent is out of the pool; its children are in it.
+        if has_label(&iss, AGENT_SLICED_LABEL) {
+            info!(repo = %repo.full_name, issue = number, "skip: {AGENT_SLICED_LABEL}");
             continue;
         }
         if is_blast_radius_for_repo(&format!("{title} {body}"), repo) {
@@ -11013,7 +11337,7 @@ mod tests {
         let repo = fixture.path().join("source");
         std::fs::create_dir(&repo).unwrap();
         std::fs::write(repo.join("fixture.txt"), "SYNTHETIC_SOURCE").unwrap();
-        for opts in [scope_opts(repo.clone()), review_opts(repo.clone())] {
+        for opts in [scope_opts(repo.clone()), review_opts(repo.clone()), slice_opts(repo.clone())] {
             let launch = tempfile::tempdir().unwrap();
             let bridge = BridgeLaunch::prepare(&opts, launch.path()).unwrap();
             let script = r#"
@@ -12925,6 +13249,192 @@ CODEX-REVIEW: lgtm").0);
             "VERDICT: fixable\nCOMPLEXITY: simple\nEST-DIFF-LINES: 50\nGUARDED-PATHS: yes\n\nspec",
         );
         assert!(scope_predicts_refusal(&guarded).is_some());
+    }
+
+    // ---- #1516: oversized issues are sliced, not refused ----
+
+    fn slice_plan(children: &[(&str, &str)]) -> String {
+        let mut s = String::from("Here is the plan.\n\n");
+        for (title, body) in children {
+            s.push_str(&format!("## CHILD: {title}\n\n{body}\n\n"));
+        }
+        s
+    }
+
+    #[test]
+    fn slice_plan_parses_only_well_formed_two_to_six_child_plans() {
+        let got = parse_slice_plan(&slice_plan(&[
+            ("add the parser", "Parse the thing.\n\nAcceptance: a unit test."),
+            ("wire the parser in", "Call it from run_once."),
+            ("document it", "Update the README."),
+        ]));
+        let titles: Vec<&str> = got.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(titles, ["add the parser", "wire the parser in", "document it"], "ordered");
+        assert_eq!(got[0].1, "Parse the thing.\n\nAcceptance: a unit test.");
+
+        // Every malformed shape degrades to NO slicing, so the pre-build
+        // refusal stays the fallback instead of a guessed plan.
+        let too_many: Vec<(&str, &str)> = (0..MAX_SLICE_CHILDREN + 1).map(|_| ("t", "b")).collect();
+        for (why, raw) in [
+            ("prose with no headers", "Too big. Split it into a parser and a caller.".into()),
+            ("empty output", String::new()),
+            ("one child is a rename", slice_plan(&[("only one", "body")])),
+            ("seven children is a task list", slice_plan(&too_many)),
+            ("a child with no title", slice_plan(&[("t", "b"), ("", "b")])),
+            ("a child with no body", slice_plan(&[("t", "b"), ("u", "   ")])),
+        ] {
+            assert!(parse_slice_plan(&raw).is_empty(), "{why}");
+        }
+
+        let huge ="x".repeat(MAX_SLICE_CHILD_BODY_CHARS * 2);
+        let long = "t".repeat(MAX_SLICE_TITLE_CHARS * 2);
+        let capped = parse_slice_plan(&slice_plan(&[(&long, &huge), ("b", &huge)]));
+        assert_eq!(capped.len(), 2);
+        assert!(capped[0].0.chars().count() <= MAX_SLICE_TITLE_CHARS + 1);
+        assert!(capped[1].1.chars().count() <= MAX_SLICE_CHILD_BODY_CHARS + 1);
+    }
+
+    #[test]
+    fn a_sliced_child_is_never_sliced_again() {
+        let child = slice_child_body(1516, "Add the parser.");
+        assert!(child.starts_with(&format!("{SLICE_CHILD_MARKER_PREFIX}1516 -->")));
+        assert_eq!(slice_parent_of(&child), Some(1516));
+        assert!(is_slice_child(&child));
+        assert!(!is_slice_child("An ordinary issue body."));
+        assert!(!is_slice_child(""));
+
+        // The marker test runs BEFORE the slice call, so an oversized child
+        // takes the ordinary refusal rather than a second slice.
+        let src = include_str!("self_improve.rs");
+        let at = src.find("if let Some(reason) = scope_predicts_refusal(sc)").expect("refusal site");
+        let end = at + src[at..].find("let complexity = scope.as_ref()").expect("end of the arm");
+        let arm = &src[at..end];
+        let call = arm.find("slice_oversized_issue(").expect("the slice call");
+        for needle in ["is_slice_child(&issue.body)", "!sc.guarded_paths"] {
+            assert!(arm.find(needle).expect(needle) < call, "{needle} must precede the slice call");
+        }
+        // Every slice outcome is unbilled and records no attempt.
+        assert!(arm[call..].contains("RunReport::triage("), "the success path is unbilled");
+        assert!(!arm.contains("record_attempt("), "slicing charges no attempt");
+    }
+
+    #[test]
+    fn sliced_parents_leave_both_pickers_pool() {
+        let v = serde_json::json!([
+            {"number": 20, "title": "epic", "body": "b",
+             "labels": [{"name": AGENT_SLICED_LABEL}],
+             "user": {"login": "repo-owner"}, "author_association": "OWNER"},
+            {"number": 21, "title": "child", "body": "b", "labels": [{"name": "bug"}],
+             "user": {"login": "repo-owner"}, "author_association": "OWNER"}
+        ]);
+        let kept: Vec<u64> = rest_issue_candidates(&v).iter().map(|i| i.number).collect();
+        assert_eq!(kept, vec![21], "the sliced parent is dropped, the child is kept");
+        // ... and it is never re-admitted: slicing is not a back-off.
+        assert!(gave_up_numbers(&v).is_empty());
+
+        // The multi-repo picker skips it on the same label, before it picks.
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn pick_issue_for_repo(").expect("pick_issue_for_repo");
+        let body = &src[start..start + 4000];
+        let sliced = body.find("has_label(&iss, AGENT_SLICED_LABEL)").expect("sliced skip");
+        assert!(sliced < body.find("return Ok(Some(Issue {").expect("pick"));
+    }
+
+    /// The filing sequence against a scripted `gh`: the parent marked first,
+    /// then marker-prefixed children, then the parent labelled — and a slice
+    /// that dies between children is never filed twice.
+    #[test]
+    fn slicing_marks_the_parent_before_filing_children_and_never_files_them_twice() {
+        const CHILD: &str = "JARVIS_1516_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let gh = fake_gh_1214(root.path());
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "self_improve::tests::slicing_marks_the_parent_before_filing_children_and_never_files_them_twice",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("JARVIS_1214_ROOT", root.path())
+                .env("HOME", root.path().join("home"))
+                .env("GH_BIN", gh)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os("JARVIS_1214_ROOT").unwrap());
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let plan = parse_slice_plan(&slice_plan(&[
+                ("slice one: the parser", "Parse it."),
+                ("slice two: the caller", "Call it."),
+            ]));
+            let filed = slice_issue(&root, 1516, "an oversized epic", &plan).await.unwrap();
+            assert_eq!(filed, vec![1u64, 2], "the numbers gh printed, in order");
+
+            let read_calls = || -> Vec<Vec<String>> {
+                std::fs::read_to_string(root.join("gh-calls.jsonl"))
+                    .unwrap()
+                    .lines()
+                    .map(|l| serde_json::from_str(l).unwrap())
+                    .collect()
+            };
+            let calls = read_calls();
+            let arg = |c: &Vec<String>, k: &str| c[c.iter().position(|a| a == k).unwrap() + 1].clone();
+            let creates: Vec<&Vec<String>> =
+                calls.iter().filter(|c| gh_call_is(c, &["issue", "create"])).collect();
+            assert_eq!(creates.len(), 2, "one child per plan entry: {calls:?}");
+            for c in &creates {
+                assert!(arg(c, "--title").contains("slice"), "{c:?}");
+                let body = arg(c, "--body");
+                assert!(
+                    body.starts_with(&format!("{SLICE_CHILD_MARKER_PREFIX}1516 -->"))
+                        && is_slice_child(&body),
+                    "each child is machine-readably linked to its parent: {body}"
+                );
+            }
+            let find = |p: &[&str]| {
+                calls.iter().find(|c| gh_call_is(c, p)).unwrap_or_else(|| panic!("{p:?}: {calls:?}"))
+            };
+            let text = arg(find(&["issue", "comment", "1516"]), "--body");
+            assert!(text.contains(SLICE_PARENT_MARKER), "{text}");
+            assert!(text.contains("slice one") && text.contains("slice two"), "the plan: {text}");
+            let edit = find(&["issue", "edit", "1516"]);
+            assert_eq!(arg(edit, "--add-label"), AGENT_SLICED_LABEL, "{edit:?}");
+            let order = |p: &[&str]| calls.iter().position(|c| gh_call_is(c, p)).unwrap();
+            assert!(order(&["issue", "comment", "1516"]) < order(&["issue", "create"]));
+            assert!(order(&["issue", "create"]) < order(&["issue", "edit", "1516"]));
+
+            // A second tick over the same parent files nothing more: the
+            // comment marker is the durable dedup even if labelling failed.
+            let err = slice_issue(&root, 1516, "an oversized epic", &plan).await.unwrap_err();
+            assert!(format!("{err:#}").contains("already sliced"), "{err:#}");
+            let created =
+                |cs: &[Vec<String>]| cs.iter().filter(|c| gh_call_is(c, &["issue", "create"])).count();
+            assert_eq!(created(&read_calls()), 2, "no duplicate children");
+
+            // A slice that dies between children — the second `gh issue
+            // create` fails — is still marked, so the next tick refuses the
+            // parent instead of re-filing the whole plan on top of the child
+            // that did land.
+            for f in ["comments-1516.json", "labels-1516.json", "gh-calls.jsonl"] {
+                std::fs::remove_file(root.join(f)).unwrap();
+            }
+            std::fs::write(root.join("fail-create-after"), "3").unwrap();
+            let err = slice_issue(&root, 1516, "an oversized epic", &plan).await.unwrap_err();
+            assert!(format!("{err:#}").contains("gh issue create failed"), "{err:#}");
+            assert_eq!(created(&read_calls()), 3, "one child landed, the next failed twice");
+            let err = slice_issue(&root, 1516, "an oversized epic", &plan).await.unwrap_err();
+            assert!(format!("{err:#}").contains("already sliced"), "{err:#}");
+            assert_eq!(created(&read_calls()), 3, "a half-filed parent is never re-sliced");
+        });
     }
 
     #[test]
@@ -16505,6 +17015,8 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         });
     }
 
+    /// A scripted `gh` that keeps each issue's comments and labels under
+    /// `JARVIS_1214_ROOT` and logs every call to `gh-calls.jsonl`.
     fn fake_gh_1214(root: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let gh = root.join("fake-gh.py");
@@ -16519,12 +17031,33 @@ def store(n):
 def load(n):
     p = store(n)
     return json.loads(p.read_text()) if p.exists() else []
+def labels(n, add=None):
+    p = root/('labels-%s.json' % n)
+    have = json.loads(p.read_text()) if p.exists() else []
+    if add and add not in have:
+        have.append(add); p.write_text(json.dumps(have))
+    return have
 if args[:2]==['issue','view'] and '--json' in args:
-    print(json.dumps({'comments':[{'body':b} for b in load(args[2])]}))
+    n = args[2]
+    print(json.dumps({'comments':[{'body':b} for b in load(n)],
+                      'labels':[{'name':l} for l in labels(n)]}))
 elif args[:2]==['issue','comment']:
     n = args[2]; body = args[args.index('--body')+1]
     store(n).write_text(json.dumps(load(n)+[body]))
+elif args[:2]==['issue','create']:
+    counter = root/'next-issue'
+    n = int(counter.read_text()) if counter.exists() else 1
+    cap = root/'fail-create-after'
+    if cap.exists() and n > int(cap.read_text()):
+        sys.stderr.write('scripted create failure\n'); sys.exit(1)
+    counter.write_text(str(n+1))
+    print('https://github.test/owner/repo/issues/%d' % n)
 elif args[:2]==['issue','edit']:
+    n = args[2]
+    if '--add-label' in args:
+        labels(n, args[args.index('--add-label')+1])
+    print('ok')
+elif args[:2]==['label','create']:
     print('ok')
 else:
     sys.stderr.write('unsupported fake gh call: '+json.dumps(args)+'\n'); sys.exit(1)
@@ -16731,7 +17264,20 @@ else:
     fn the_gave_up_label_is_never_applied_without_a_reason() {
         let src = include_str!("self_improve.rs");
         let prod = &src[..src.find("\n#[cfg(test)]\n#[path = \"self_improve_lifecycle_tests.rs\"]").expect("tests")];
-        assert_eq!(prod.matches("\"--add-label\"").count(), 1, "one labelling site");
+        // #1516 added a second label (`agent-sliced`, in `slice_issue`), so the
+        // invariant is per-label: one site puts the gave-up label on, and every
+        // labelling site names a label this file owns.
+        let sites: Vec<String> =
+            prod.split("\"--add-label\"").skip(1).map(|s| s.chars().take(60).collect()).collect();
+        assert_eq!(
+            sites.iter().filter(|s| s.contains("GAVE_UP_LABEL")).count(),
+            1,
+            "one gave-up labelling site: {sites:?}"
+        );
+        assert!(
+            sites.iter().all(|s| s.contains("GAVE_UP_LABEL") || s.contains("AGENT_SLICED_LABEL")),
+            "{sites:?}"
+        );
         let start = prod.find("async fn label_gave_up(").expect("label_gave_up");
         let body = &prod[start..start + prod[start..].find("\n}\n").unwrap()];
         assert!(body.starts_with("async fn label_gave_up(repo_root: &Path, issue: u64, reason: &str)"), "{}", &body[..80]);
