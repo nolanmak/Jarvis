@@ -2197,6 +2197,8 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             format!("Bash({} finance summary *)", bin.display()),
             "Bash(augmentagent doc sign *)".into(),
             format!("Bash({} doc sign *)", bin.display()),
+            "Bash(augmentagent doc sign-lines *)".into(),
+            format!("Bash({} doc sign-lines *)", bin.display()),
             "Bash(augmentagent doc signatures)".into(),
             format!("Bash({} doc signatures)", bin.display()),
             "Bash(augmentagent doc render-pdf *)".into(),
@@ -3551,6 +3553,9 @@ mod tests {
             .iter()
             .any(|(k, v)| k == "WIKI_ROOT" && v == wiki.path().to_str().unwrap()));
         assert!(opts.allowed_tools.contains(&"Bash(augmentagent doc sign *)".into()));
+        assert!(opts.allowed_tools.contains(&"Bash(augmentagent doc sign-lines *)".into()));
+        assert!(opts.system_prompt.contains("doc sign-lines"));
+        assert!(opts.system_prompt.contains("--anchor-text"));
         assert!(opts.allowed_tools.contains(&"Bash(augmentagent doc signatures)".into()));
         assert!(!opts.allowed_tools.iter().any(|tool| tool.contains("signature-install")));
         assert!(opts.system_prompt.contains("augmentagent doc sign"));
