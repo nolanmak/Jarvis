@@ -147,14 +147,15 @@ impl ComposioCalendarClient {
     /// invitees, a lossy one their attributes — with notifications
     /// suppressed, since the invitations went out on the create.
     ///
-    /// Which action spells that patch, and how, cannot be checked from inside
-    /// this repo, so no single contract is bet on: both spellings Composio
-    /// uses are tried in turn — the snake_case write convention of
-    /// `CREATE_EVENT` / `DELETE_EVENT`, then the raw `events.patch` mirror of
-    /// the camelCase `EVENTS_*` reads — and each attempt is judged on the
-    /// organizer status the provider echoes back, never on a 200. A rejected
-    /// name or argument therefore costs one extra call, and only if neither
-    /// contract lands does the miss become the owner-visible RSVP note.
+    /// Exactly one patch goes out, on Composio's write convention — the
+    /// `<VERB>_EVENT` action name and snake_case `calendar_id` /
+    /// `send_updates` arguments `GOOGLECALENDAR_CREATE_EVENT` is already
+    /// proven to take above, not the Google-native camelCase of the
+    /// `EVENTS_*` reads. Nothing in this repo can confirm the provider
+    /// accepts it, so it is never inferred from a 200: the accept is read
+    /// back off the event `events.patch` answers with, and a wrong name, a
+    /// rejected argument or an ignored write all land the same way — no
+    /// second attempt, no retry of the create, an owner-visible RSVP note.
     async fn accept_as_organizer(
         &self,
         entity_id: &str,
@@ -204,43 +205,26 @@ impl ComposioCalendarClient {
                 }
             }
         }
-        let candidates = [
-            (
+        // Resending the same full array sets the same statuses, so the
+        // transport's 429/5xx retry cannot double-write anything.
+        let patched = self
+            .execute(
                 "GOOGLECALENDAR_PATCH_EVENT",
+                entity_id,
                 serde_json::json!({ "calendar_id": calendar_id, "event_id": event_id,
-                    "attendees": attendees.clone(), "send_updates": false }),
-            ),
-            (
-                "GOOGLECALENDAR_EVENTS_PATCH",
-                serde_json::json!({ "calendarId": calendar_id, "eventId": event_id,
-                    "attendees": attendees, "sendUpdates": "none" }),
-            ),
-        ];
-        let mut last = None;
-        for (action, args) in candidates {
-            // `events.patch` answers with the updated event, so the accept is
-            // taken from the provider rather than inferred from a 200.
-            match self.execute(action, entity_id, args).await {
-                Ok(patched)
-                    if attendee_array(&patched).is_some_and(|list| {
-                        list.iter().any(|a| {
-                            is_own(a)
-                                && a.get("responseStatus").and_then(|s| s.as_str())
-                                    == Some("accepted")
-                        })
-                    }) =>
-                {
-                    return Ok(())
-                }
-                Ok(_) => {
-                    last = Some(CalendarError::Decode(format!(
-                        "{action}: {event_id} did not come back with the organizer accepted"
-                    )))
-                }
-                Err(e) => last = Some(e),
-            }
+                    "attendees": attendees, "send_updates": false }),
+            )
+            .await?;
+        if attendee_array(&patched).is_some_and(|list| {
+            list.iter().any(|a| {
+                is_own(a) && a.get("responseStatus").and_then(|s| s.as_str()) == Some("accepted")
+            })
+        }) {
+            return Ok(());
         }
-        Err(last.unwrap_or_else(|| CalendarError::Decode("no patch action attempted".into())))
+        Err(CalendarError::Decode(format!(
+            "patch_event: {event_id} did not come back with the organizer accepted"
+        )))
     }
 
     async fn execute(

@@ -162,40 +162,6 @@ async fn the_patch_preserves_every_attendee_field_it_did_not_change() {
     patch.assert_async().await;
 }
 
-/// The patch contract cannot be verified from inside this repo, so a rejected
-/// name or argument spelling must not be the end of it: the raw `events.patch`
-/// mirror is tried next and the organizer still ends up accepted (#1456).
-#[tokio::test]
-async fn falls_back_to_the_raw_patch_contract_when_the_first_is_rejected() {
-    let needs_action =
-        serde_json::json!({"email":ORGANIZER,"self":true,"responseStatus":"needsAction"});
-    let mut server = Server::new_async().await;
-    let _create = create_mock(&mut server).await;
-    let read = read_back(needs_action);
-    let _get = mock(&mut server, "GOOGLECALENDAR_EVENTS_GET", &read, 1).await;
-    let unknown = r#"{"successful":false,"error":"unknown tool"}"#;
-    let rejected = mock(&mut server, "GOOGLECALENDAR_PATCH_EVENT", unknown, 1).await;
-    let raw = server
-        .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_EVENTS_PATCH")
-        // Google-native argument spelling, and `sendUpdates` as the enum the
-        // raw API takes rather than the native action's boolean.
-        .match_body(Matcher::PartialJson(serde_json::json!({"arguments":{
-            "calendarId":"primary","eventId":"created","sendUpdates":"none"}})))
-        .with_status(200)
-        .with_body(PATCHED)
-        .expect(1)
-        .create_async()
-        .await;
-    let created = ComposioCalendarClient::new("test".into())
-        .with_base_url(server.url())
-        .create_event("organizer", "primary", &organizer_draft())
-        .await
-        .unwrap();
-    assert!(!created.organizer_rsvp_pending);
-    rejected.assert_async().await;
-    raw.assert_async().await;
-}
-
 #[tokio::test]
 async fn appends_the_organizer_when_the_read_back_omits_their_entry() {
     let mut server = Server::new_async().await;
@@ -266,39 +232,34 @@ async fn a_failed_accept_never_unconfirms_the_create() {
     let needs_action = read_back(
         serde_json::json!({"email":ORGANIZER,"self":true,"responseStatus":"needsAction"}),
     );
-    for (get_body, status, body) in [
-        (needs_action.clone(), 500, "patch exploded"),
+    for (get_body, body, patches) in [
+        // A wrong action name or argument spelling reads as a tool failure;
+        // there is no second contract to try, so it costs one call.
         (
             needs_action.clone(),
-            200,
-            r#"{"successful":false,"error":"unknown parameter"}"#,
+            r#"{"successful":false,"error":"unknown tool"}"#,
+            1,
         ),
         // The provider took the patch but the organizer came back unchanged:
         // the action contract did not do what it was asked, and the owner
         // hears about it rather than being left at needsAction.
-        (needs_action, 200, PATCH_IGNORED),
+        (needs_action, PATCH_IGNORED, 1),
         // A read without an attendee array must not lead to a guessed one:
         // patching that would uninvite everybody the create just invited.
         (
             r#"{"successful":true,"data":{"id":"created"}}"#.into(),
-            200,
             PATCHED,
+            0,
         ),
     ] {
-        let read_failed = !get_body.contains("attendees");
         let mut server = Server::new_async().await;
         let create = create_mock(&mut server).await;
         let _get = mock(&mut server, "GOOGLECALENDAR_EVENTS_GET", &get_body, 1).await;
-        // Both patch contracts are tried, so either may be hit; neither
-        // lands, so the create still has to come back with the note.
         let patch = server
-            .mock(
-                "POST",
-                Matcher::Regex("/GOOGLECALENDAR_(PATCH_EVENT|EVENTS_PATCH)$".into()),
-            )
-            .with_status(status)
+            .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_PATCH_EVENT")
+            .with_status(200)
             .with_body(body)
-            .expect_at_most(if read_failed { 0 } else { 8 })
+            .expect(patches)
             .create_async()
             .await;
         let created = ComposioCalendarClient::new("test".into())
