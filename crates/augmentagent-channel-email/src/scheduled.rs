@@ -393,8 +393,7 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
             self.abandon_queued_compose(action_id, &action.email, why).await;
             return Ok(());
         };
-        // Bcc never reaches here: the CLI refuses to queue a compose that
-        // carries one, because `create_draft_with_cc` cannot express it.
+        // Bcc never reaches here: the CLI queues only bcc-less composes.
         let cc = crate::gmail::split_recipients(&cc);
         // The CLI records the OUTBOUND subject on the envelope (#652); the
         // row's own is the Re:-stripped inbound one the card shows.
@@ -1777,6 +1776,14 @@ mod tests {
         assert!(retries.unwrap().is_empty());
         assert!(store.stuck_sending_actions(i64::MAX, 0).unwrap().is_empty());
         assert!(store.due_scheduled_actions(i64::MAX, 10).unwrap().is_empty());
+        // … including the manual-reply and heuristic cancellations and the
+        // scheduled reconcile, which its `scheduledAtMs` already excludes (#1191).
+        let by_thread = store.mark_pending_drafts_superseded_by_thread("th-1", "manual reply");
+        assert!(by_thread.unwrap().is_empty());
+        let heuristic = store.mark_pending_heuristic_superseded_by_ids(&[id.clone()], "stale");
+        assert_eq!(heuristic.unwrap(), 0);
+        assert!(store.scheduled_actions_for_reconcile().unwrap().is_empty());
+        assert_eq!(store.pending_reply_count().unwrap(), 0);
         // … while still counting as open work for the observer's cursor.
         assert!(store.oldest_pending_action_created_at().unwrap().is_some());
 

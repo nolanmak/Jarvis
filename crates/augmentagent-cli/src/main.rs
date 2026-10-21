@@ -6851,8 +6851,7 @@ async fn run_gmail_compose(
     // #1486 — a throttle outlasts any in-process backoff, so a plain `--post`
     // compose is parked for the daemon instead of being lost (matched BEFORE
     // `.context` erases the typed error). The other shapes keep the hard error:
-    // an `--attach`/`--bcc` the daemon's drafting path cannot reproduce, a
-    // `--send-at` stale by then, and with no `--post` no card to promise.
+    // an `--attach`/`--bcc` the daemon cannot reproduce, a `--send-at` stale by then, no card owed.
     if let Err(GmailError::RateLimited { retry_after_ms, retry_after, .. }) = &created {
         if post && attachment.is_none() && send_at_ms.is_none() && bcc.is_empty() {
             const DEFAULT_RETRY_DELAY_MS: i64 = 5 * 60 * 1000;
@@ -6880,14 +6879,11 @@ async fn run_gmail_compose(
             }
             let window = retry_after.clone().unwrap_or_else(|| "unknown".into());
             if json {
-                let out = serde_json::json!({ "queued": true, "action_id": action_id,
-                    "to": to, "subject": subject, "retry_after": window });
-                println!("{out}");
+                println!("{}", serde_json::json!({ "queued": true, "action_id": action_id,
+                    "to": to, "subject": subject, "retry_after": window }));
             } else {
-                println!(
-                    "queued {action_id} — gmail rate-limited this account (retry after \
-                     {window}); the daemon will draft it and post the card once it clears"
-                );
+                println!("queued {action_id} — gmail rate-limited this account (retry after \
+                     {window}); the daemon will draft it and post the card once it clears");
             }
             return Ok(());
         }
