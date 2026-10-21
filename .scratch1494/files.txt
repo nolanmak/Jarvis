@@ -1,0 +1,16 @@
+crates/augmentagent-channel-email/src/channel.rs
+crates/augmentagent-channel-email/src/gmail.rs
+crates/augmentagent-channel-email/src/inbound.rs
+crates/augmentagent-channel-email/src/lib.rs
+crates/augmentagent-channel-email/src/outbound.rs
+crates/augmentagent-channel-email/src/scheduled.rs
+crates/augmentagent-channel-email/src/sigextract.rs
+crates/augmentagent-channel-email/src/tone.rs
+crates/augmentagent-store/src/imessage.rs
+crates/augmentagent-store/src/lib.rs
+crates/augmentagent-store/src/notes.rs
+crates/augmentagent-store/src/owner_alerts.rs
+crates/augmentagent-store/src/store.rs
+crates/augmentagent-store/tests/action_body_compaction.rs
+crates/augmentagent-store/tests/discord_conversation.rs
+crates/augmentagent-store/tests/owner_alerts.rs

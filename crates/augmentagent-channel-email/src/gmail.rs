@@ -93,14 +93,10 @@ pub trait GmailApi: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// #1494 — the draft sitting on `thread_id` whose text is the `body` we
-    /// tried to save, if there is one. Used only to recover from a lost
-    /// create-draft response during a throttle, so a retry adopts the draft
-    /// that landed instead of making a second one. The body is half the key,
-    /// not a nicety: a thread routinely also holds a draft the OWNER typed,
-    /// and a thread-only match would adopt that and card their private text
-    /// as ours. Default impl returns `Ok(None)` — "nothing to adopt, create
-    /// normally" — so fakes that don't model drafts keep compiling.
+    /// #1494 — the draft on `thread_id` carrying exactly the `body` we tried
+    /// to save, used to recover a create-draft response lost to a throttle.
+    /// The body is the key, not the thread: a thread routinely also holds a
+    /// draft the OWNER typed. `Ok(None)` ⇒ nothing to adopt, create normally.
     async fn find_matching_draft_on_thread(
         &self,
         _entity_id: &str,
@@ -572,13 +568,12 @@ impl ComposioClient {
         Ok(None)
     }
 
-    /// #1494 — find the draft on `thread_id` carrying `body`, so a compose
-    /// whose response was lost to a throttle adopts the draft that actually
-    /// landed instead of creating a second one. Same `GMAIL_LIST_DRAFTS` walk
-    /// as [`get_draft_thread_id`], but `verbose` so each listed draft brings
-    /// its text: the thread alone is not an identity (see the trait method),
-    /// so a draft whose text isn't ours is skipped, as is one Composio
-    /// returned without any text at all. `Ok(None)` ⇒ create normally.
+    /// #1494 — find the draft on `thread_id` carrying `body`. Same
+    /// `GMAIL_LIST_DRAFTS` walk as [`get_draft_thread_id`], but `verbose` so
+    /// each listed draft brings its text; a draft whose text isn't ours is
+    /// skipped, as is one Composio returned with no text at all. The walk is
+    /// bounded at `MAX_PAGES`, and an error is returned rather than swallowed
+    /// so the caller can decline to create a possible duplicate.
     pub async fn find_matching_draft_on_thread(
         &self,
         entity_id: &str,
@@ -2331,35 +2326,31 @@ mod tests {
         assert_eq!(standalone, None);
     }
 
-    /// #1494 REGRESSION — the lost-response probe is keyed on the BODY as
-    /// well as the thread. `D-owner` is a draft the owner typed on the very
-    /// same thread: adopting it would put their text on an approval card.
+    /// #1494 REGRESSION — the lost-response probe is keyed on the BODY, not
+    /// the thread. `D-owner` is a draft the owner typed on the very same
+    /// thread, opening with our first sentence: adopting it would put their
+    /// own text on an approval card.
     #[tokio::test]
     async fn the_lost_response_probe_adopts_only_the_draft_carrying_our_body() {
-        let ours = "Thursday 3pm works for me, I'll send an invite.";
+        let ours = "Thursday 3pm works for me. I'll send a calendar invite \
+                    with the dial-in shortly, and loop in the design folks.";
         let body = r#"{"successful":true,"data":{"drafts":[
             {"id":"D-owner","message":{"id":"M0","threadId":"T9",
-             "messageText":"hold off here, I want to call them first"}},
+             "messageText":"Thursday 3pm works for me. Hold off though, I want to call them first"}},
             {"id":"D-ours","message":{"id":"M1","threadId":"T9",
-             "messageText":"Thursday 3pm works for me, I'll send an"}}
+             "messageText":"Thursday 3pm works for me. I'll send a calendar invite with the dial-in"}}
         ]}}"#;
         let addr = spawn_repeating_http(200, body, "").await;
         let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
 
-        let probe = |thread: &'static str, body: &'static str| {
-            let client = &client;
-            async move {
-                client
-                    .find_matching_draft_on_thread("entity-x", thread, body)
-                    .await
-                    .expect("list should succeed")
-            }
+        let probe = |thread: &'static str, body: &'static str| async {
+            client
+                .find_matching_draft_on_thread("entity-x", thread, body)
+                .await
+                .expect("list should succeed")
         };
-        assert_eq!(
-            probe("T9", ours).await.as_deref(),
-            Some("D-ours"),
-            "a snippet-truncated copy of our own body is still ours"
-        );
+        let hit = probe("T9", ours).await;
+        assert_eq!(hit.as_deref(), Some("D-ours"), "a snippet of ours is ours");
         assert_eq!(probe("T-none", ours).await, None, "wrong thread");
         assert_eq!(probe("T9", "another thing entirely").await, None);
     }
@@ -2475,12 +2466,13 @@ fn wallclock_ms() -> i64 {
 }
 
 /// #1494 — is `candidate` (a listed draft's text, which Composio returns
-/// truncated to a snippet on longer bodies) the text of `expected` (the body
-/// we handed `create_draft`)? Whitespace-normalized prefix match in either
-/// direction, so a truncation still matches — and so does an `expected` still
-/// carrying the #35/#785 markers, which only ever trail the human text — with
-/// a floor so a near-empty draft can't match everything.
+/// truncated to a snippet on longer bodies) the text of `expected` (the exact
+/// body we handed `create_draft`)? Whitespace-normalized equality, relaxed to
+/// a prefix only in the direction truncation can produce and only past
+/// `MATCH_FLOOR` characters — a draft the owner happened to open with the
+/// same sentence is not ours to adopt.
 pub(crate) fn draft_text_matches(expected: &str, candidate: &str) -> bool {
+    const MATCH_FLOOR: usize = 64;
     let norm = |s: &str| {
         s.split_whitespace()
             .collect::<Vec<_>>()
@@ -2488,10 +2480,24 @@ pub(crate) fn draft_text_matches(expected: &str, candidate: &str) -> bool {
             .to_lowercase()
     };
     let (expected, candidate) = (norm(expected), norm(candidate));
-    let floor = 24.min(expected.chars().count());
+    let floor = MATCH_FLOOR.min(expected.chars().count());
     !expected.is_empty()
         && candidate.chars().count() >= floor
-        && (expected.starts_with(&candidate) || candidate.starts_with(&expected))
+        && expected.starts_with(&candidate)
+}
+
+/// #1494 — the absolute boundary a throttle named, whichever shape it arrived
+/// in: Composio only classifies FETCH envelopes as [`GmailError::RateLimited`],
+/// so a throttled draft arrives as a `Composio` error carrying the same
+/// "rate limit … Retry after <RFC3339>" prose.
+pub(crate) fn rate_limit_boundary_ms(e: &GmailError) -> Option<i64> {
+    match e {
+        GmailError::RateLimited { retry_after_ms, .. } => Some(*retry_after_ms),
+        GmailError::Composio { message } => {
+            parse_rate_limit_retry_after(message).map(|(ms, _)| ms)
+        }
+        _ => None,
+    }
 }
 
 /// Recursively search a JSON value for the first string-valued field whose

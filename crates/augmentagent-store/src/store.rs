@@ -1192,14 +1192,12 @@ impl Store {
         if !column_exists(conn, "actions", "recomposedAtMs")? {
             conn.execute("ALTER TABLE actions ADD COLUMN recomposedAtMs INTEGER", [])?;
         }
-        // #1494 — the upstream retry-after a throttled compose was handed.
-        // NULL (every pre-existing row, and every failure that wasn't a rate
-        // limit) means "no clock", i.e. the pre-change retry schedule.
+        // #1494 — the upstream retry-after a throttled compose was handed;
+        // NULL (every pre-existing row, every non-throttle failure) means
+        // "no clock", i.e. exactly the pre-change retry schedule.
         if !column_exists(conn, "actions", "retryNotBeforeMs")? {
-            conn.execute(
-                "ALTER TABLE actions ADD COLUMN retryNotBeforeMs INTEGER",
-                [],
-            )?;
+            let add = "ALTER TABLE actions ADD COLUMN retryNotBeforeMs INTEGER";
+            conn.execute(add, [])?;
         }
         // Mirrors idx_scheduled_posts_fire: the engine's due query is
         // `status = 'scheduled' AND scheduledAtMs <= now`.
