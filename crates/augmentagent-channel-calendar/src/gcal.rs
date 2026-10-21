@@ -150,8 +150,13 @@ impl ComposioCalendarClient {
     ///
     /// Arguments follow the snake_case convention of the other Composio write
     /// actions (`CREATE_EVENT`, `DELETE_EVENT`) rather than the camelCase of
-    /// the `EVENTS_*` reads; the live #1436 harness is what confirms it
-    /// against the real provider.
+    /// the `EVENTS_*` reads. That contract cannot be checked from inside this
+    /// repo, so nothing here assumes it held: the organizer's status is read
+    /// back off the event the patch echoes, so an action name, argument or
+    /// notification flag that misbehaves becomes the owner-visible RSVP note
+    /// instead of a silent `needsAction`. The live `calendar_live_tests`
+    /// harness is the provider-contract gate — it asserts the organizer ends
+    /// up `accepted` and that nobody gets a second invitation.
     async fn accept_as_organizer(
         &self,
         entity_id: &str,
@@ -173,20 +178,18 @@ impl ComposioCalendarClient {
         // wholesale replace would erase it for real. An absent array means a
         // read shape we do not understand; patching a guessed array would
         // uninvite the real attendees.
-        let Some(mut attendees) = ["/data/attendees", "/data/response_data/attendees"]
-            .iter()
-            .find_map(|p| event.pointer(p).and_then(|a| a.as_array()).cloned())
-        else {
+        let Some(mut attendees) = attendee_array(&event).cloned() else {
             return Err(CalendarError::Decode(format!(
                 "events.get: no attendee array to patch on {event_id}"
             )));
         };
-        let own = attendees.iter_mut().find(|a| {
+        let is_own = |a: &serde_json::Value| {
             a.get("self") == Some(&serde_json::Value::Bool(true))
                 || a.get("email")
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|e| e.eq_ignore_ascii_case(organizer_email))
-        });
+        };
+        let own = attendees.iter_mut().find(|a| is_own(a));
         match own {
             Some(a) if a.get("responseStatus").and_then(|s| s.as_str()) == Some("accepted") => {
                 return Ok(())
@@ -204,17 +207,30 @@ impl ComposioCalendarClient {
                 }
             }
         }
-        self.execute(
-            "GOOGLECALENDAR_PATCH_EVENT",
-            entity_id,
-            serde_json::json!({
-                "calendar_id": calendar_id,
-                "event_id": event_id,
-                "attendees": attendees,
-                "send_updates": false,
-            }),
-        )
-        .await?;
+        let patched = self
+            .execute(
+                "GOOGLECALENDAR_PATCH_EVENT",
+                entity_id,
+                serde_json::json!({
+                    "calendar_id": calendar_id,
+                    "event_id": event_id,
+                    "attendees": attendees,
+                    "send_updates": false,
+                }),
+            )
+            .await?;
+        // `events.patch` answers with the updated event, so the organizer's
+        // status is taken from the provider rather than inferred from a 200.
+        let confirmed = attendee_array(&patched).is_some_and(|list| {
+            list.iter().any(|a| {
+                is_own(a) && a.get("responseStatus").and_then(|s| s.as_str()) == Some("accepted")
+            })
+        });
+        if !confirmed {
+            return Err(CalendarError::Decode(format!(
+                "events.patch: {event_id} did not come back with the organizer accepted"
+            )));
+        }
         Ok(())
     }
 
@@ -309,6 +325,14 @@ fn bounded(value: &str, max_chars: usize) -> String {
         result.push('…');
     }
     result
+}
+
+/// Attendees off an event envelope, under either of the two shapes the read
+/// paths already tolerate.
+fn attendee_array(v: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    ["/data/attendees", "/data/response_data/attendees"]
+        .iter()
+        .find_map(|p| v.pointer(p).and_then(|a| a.as_array()))
 }
 
 /// Composio uses HTTP 200 for tool failures too. Reject those before any
@@ -525,13 +549,12 @@ impl CalendarApi for ComposioCalendarClient {
                     // here must never surface as `Unconfirmed` — that text
                     // invites a retry, and a retried create duplicates a real
                     // event with real invites. The read and the patch are
-                    // idempotent and go through `execute`, which already
-                    // retries a 429 or 5xx three times, so a failure reaching
-                    // here is not transient: it is reported on the handle
-                    // rather than swallowed, and the caller tells the owner
-                    // the RSVP is still theirs. A zero-attendee event has no
-                    // attendee array to patch; adding one changes how
-                    // Calendar renders it.
+                    // idempotent and `execute` has already retried a 429 or
+                    // 5xx three times, so a failure here is not transient: it
+                    // is reported on the handle rather than swallowed, and the
+                    // caller tells the owner the RSVP is still theirs. A
+                    // zero-attendee event has no attendee array to patch;
+                    // adding one changes how Calendar renders it.
                     let organizer = draft
                         .organizer_email
                         .as_deref()

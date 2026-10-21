@@ -31,6 +31,14 @@ fn created_body() -> &'static str {
     r#"{"successful":true,"data":{"response_data":{"id":"created"}}}"#
 }
 
+/// `events.patch` answers with the updated event, and the accept is read back
+/// off it rather than inferred from a 200 (#1456).
+const PATCHED: &str = r#"{"successful":true,"data":{"id":"created",
+    "attendees":[{"email":"owner@example.test","responseStatus":"accepted"}]}}"#;
+/// Same, but with the organizer left exactly as the create left them.
+const PATCH_IGNORED: &str = r#"{"successful":true,"data":{"id":"created",
+    "attendees":[{"email":"owner@example.test","responseStatus":"needsAction"}]}}"#;
+
 /// Read-back of the event Google just inserted: the organizer's own entry
 /// sits at `needsAction`, which is the whole defect.
 fn read_back(organizer_entry: serde_json::Value) -> String {
@@ -88,7 +96,7 @@ async fn accepts_the_organizer_entry_after_a_confirmed_create() {
                 }
             })))
             .with_status(200)
-            .with_body(r#"{"successful":true,"data":{"id":"created"}}"#)
+            .with_body(PATCHED)
             .expect(1)
             .create_async()
             .await;
@@ -142,7 +150,7 @@ async fn the_patch_preserves_every_attendee_field_it_did_not_change() {
                     {"email":"room@example.test","resource":true,"responseStatus":"accepted"}]}
         })))
         .with_status(200)
-        .with_body(r#"{"successful":true,"data":{"id":"created"}}"#)
+        .with_body(PATCHED)
         .expect(1)
         .create_async()
         .await;
@@ -158,18 +166,16 @@ async fn the_patch_preserves_every_attendee_field_it_did_not_change() {
 #[tokio::test]
 async fn appends_the_organizer_when_the_read_back_omits_their_entry() {
     let mut server = Server::new_async().await;
-    let create = server
+    let _create = server
         .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_CREATE_EVENT")
         .with_status(200)
         .with_body(created_body())
-        .expect(1)
         .create_async()
         .await;
-    let get = server
+    let _get = server
         .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_EVENTS_GET")
         .with_status(200)
         .with_body(read_back(serde_json::Value::Null))
-        .expect(1)
         .create_async()
         .await;
     let patch = server
@@ -183,7 +189,7 @@ async fn appends_the_organizer_when_the_read_back_omits_their_entry() {
             ]
         }})))
         .with_status(200)
-        .with_body(r#"{"successful":true,"data":{"id":"created"}}"#)
+        .with_body(PATCHED)
         .expect(1)
         .create_async()
         .await;
@@ -192,8 +198,6 @@ async fn appends_the_organizer_when_the_read_back_omits_their_entry() {
         .create_event("organizer", "primary", &organizer_draft())
         .await;
     assert!(result.is_ok(), "{result:?}");
-    create.assert_async().await;
-    get.assert_async().await;
     patch.assert_async().await;
 }
 
@@ -233,7 +237,7 @@ async fn no_follow_up_when_already_accepted_without_attendees_or_without_an_orga
         let patch = server
             .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_PATCH_EVENT")
             .with_status(200)
-            .with_body(r#"{"successful":true,"data":{"id":"created"}}"#)
+            .with_body(PATCHED)
             .expect(0)
             .create_async()
             .await;
@@ -257,26 +261,29 @@ async fn a_failed_accept_never_unconfirms_the_create() {
     let needs_action = read_back(
         serde_json::json!({"email":ORGANIZER,"self":true,"responseStatus":"needsAction"}),
     );
-    let patch_ok = r#"{"successful":true,"data":{"id":"created"}}"#;
     for (get_body, status, body) in [
         (needs_action.clone(), 500, "patch exploded"),
         (needs_action.clone(), 403, "insufficient_scope"),
         (
-            needs_action,
+            needs_action.clone(),
             200,
             r#"{"successful":false,"error":"unknown parameter"}"#,
         ),
+        // The provider took the patch but the organizer came back unchanged:
+        // the action contract did not do what it was asked, and the owner
+        // hears about it rather than being left at needsAction.
+        (needs_action, 200, PATCH_IGNORED),
         // A read we cannot parse must not lead to a guessed attendee array:
         // patching one would uninvite everybody the create just invited.
         (
             r#"{"successful":false,"error":"read rejected","data":{}}"#.into(),
             200,
-            patch_ok,
+            PATCHED,
         ),
         (
             r#"{"successful":true,"data":{"id":"created"}}"#.into(),
             200,
-            patch_ok,
+            PATCHED,
         ),
     ] {
         let read_failed = !get_body.contains("attendees");

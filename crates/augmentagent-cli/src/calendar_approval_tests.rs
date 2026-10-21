@@ -208,7 +208,8 @@ async fn approve_with_accept_follow_up(patch_body: &str, verify: impl FnOnce(&St
 #[tokio::test]
 async fn legacy_payload_accepts_on_behalf_of_the_card_sender() {
     approve_with_accept_follow_up(
-        r#"{"successful":true,"data":{"id":"event_1436"}}"#,
+        r#"{"successful":true,"data":{"id":"event_1436",
+            "attendees":[{"email":"owner@example.test","responseStatus":"accepted"}]}}"#,
         |store, id| {
             let row = store.get_action_with_email(id).unwrap().unwrap();
             assert_eq!(row.action.status, "sent");
