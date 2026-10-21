@@ -2344,13 +2344,10 @@ mod tests {
         let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
 
         let probe = |thread: &'static str, body: &'static str| async {
-            client
-                .find_matching_draft_on_thread("entity-x", thread, body)
-                .await
-                .expect("list should succeed")
+            let r = client.find_matching_draft_on_thread("entity-x", thread, body);
+            r.await.expect("list should succeed")
         };
-        let hit = probe("T9", ours).await;
-        assert_eq!(hit.as_deref(), Some("D-ours"), "a snippet of ours is ours");
+        assert_eq!(probe("T9", ours).await.as_deref(), Some("D-ours"), "ours");
         assert_eq!(probe("T-none", ours).await, None, "wrong thread");
         assert_eq!(probe("T9", "another thing entirely").await, None);
     }

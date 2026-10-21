@@ -10734,23 +10734,14 @@ mod tests {
     #[test]
     fn a_retry_after_clock_holds_a_row_until_its_boundary() {
         let (s, _f) = fresh_store();
-        let mut ids = Vec::new();
-        for mid in ["m-clock", "m-no-clock"] {
+        let log = |mid: &str| {
             let email = sample_email(mid);
             s.upsert_email(&email).unwrap();
-            ids.push(
-                s.log_action(
-                    mid,
-                    None,
-                    &email.from,
-                    &email.subject,
-                    Some(&email.body),
-                    Some("draft"),
-                    ActionStatus::Error,
-                )
-                .unwrap(),
-            );
-        }
+            let body = Some(email.body.as_str());
+            s.log_action(mid, None, &email.from, &email.subject, body, Some("d"), ActionStatus::Error)
+                .unwrap()
+        };
+        let ids = [log("m-clock"), log("m-no-clock")];
         let now = now_millis();
         let ten_min = 10 * 60 * 1_000;
         let day = 86_400_000;
