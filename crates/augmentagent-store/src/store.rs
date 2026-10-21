@@ -1192,12 +1192,10 @@ impl Store {
         if !column_exists(conn, "actions", "recomposedAtMs")? {
             conn.execute("ALTER TABLE actions ADD COLUMN recomposedAtMs INTEGER", [])?;
         }
-        // #1494 — the upstream retry-after a throttled compose was handed;
-        // NULL (every pre-existing row, every non-throttle failure) means
-        // "no clock", i.e. exactly the pre-change retry schedule.
+        // #1494 — the upstream retry-after a throttled compose was handed. NULL
+        // (pre-existing rows, every non-throttle failure) means "no clock".
         if !column_exists(conn, "actions", "retryNotBeforeMs")? {
-            let add = "ALTER TABLE actions ADD COLUMN retryNotBeforeMs INTEGER";
-            conn.execute(add, [])?;
+            conn.execute("ALTER TABLE actions ADD COLUMN retryNotBeforeMs INTEGER", [])?;
         }
         // Mirrors idx_scheduled_posts_fire: the engine's due query is
         // `status = 'scheduled' AND scheduledAtMs <= now`.
@@ -4666,13 +4664,11 @@ impl Store {
     /// #1494 — hold an errored action out of the retry queue until the
     /// upstream retry-after boundary it was handed. Takes the MAX of any
     /// existing clock, like `set_gmail_fetch_cooldown`, so a shorter later
-    /// boundary can't pull the row back inside a throttle we already saw.
-    ///
-    /// The boundary is then clamped to the row's OWN clock,
-    /// `createdAt + hold_window_ms`: [`Self::list_retryable_replies`] also
-    /// drops rows whose `createdAt` is older than its `max_age_ms`, so a hold
-    /// past that window would make the row vanish — never retried, never
-    /// given up on (see `GmailChannel::retry_hold_window_ms`).
+    /// boundary can't pull the row back inside a throttle we already saw, then
+    /// clamps it to `createdAt + hold_window_ms`: the only reader of this clock
+    /// — [`Self::list_retryable_replies`], the retry queue's ONE selector —
+    /// also drops rows older than its `max_age_ms`, so a hold past that window
+    /// would make the row vanish (see `GmailChannel::retry_hold_window_ms`).
     pub fn set_action_retry_not_before(
         &self,
         action_id: &str,
@@ -4883,12 +4879,8 @@ impl Store {
     /// - `actions.createdAt` within `max_age_ms` (don't retry ancient errors forever)
     /// - `actions.updatedAt` older than `min_gap_ms` ago (space attempts out)
     /// - `actions.retryCount < max_attempts`
-    /// - `actions.retryNotBeforeMs` (#1494) already passed, when the failure
-    ///   was an upstream rate limit that named a boundary. NULL — every other
-    ///   failure, and every row written before the column existed — retries on
-    ///   exactly the pre-#1494 schedule. Scheduled-send failures can't be
-    ///   affected: `finish_send_error` stamps them at the retry cap, so they
-    ///   never reach this query at all.
+    /// - `actions.retryNotBeforeMs` (#1494) already passed. NULL — every
+    ///   non-throttle failure, every row older than the column — is unaffected.
     /// - `emails.platform` equals the caller's channel — each channel's retry
     ///   tick only sees its own rows (#670); otherwise e.g. a socialapi Error
     ///   row lands in the gmail tick and is dispatched through gmail plumbing
@@ -4994,6 +4986,20 @@ impl Store {
             )?;
         }
         Ok(new_count)
+    }
+
+    /// #1494 — hand back the attempt [`Self::increment_retry_count`] just
+    /// charged. Used when the give-up notice for an exhausted row could not be
+    /// delivered: it must not settle into `permanent_error` unannounced.
+    pub fn rewind_retry_count(&self, action_id: &str) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE actions SET retryCount = MAX(COALESCE(retryCount, 0) - 1, 0), \
+                status = 'error', updatedAt = ?2 WHERE id = ?1",
+            params![action_id, now],
+        )?;
+        Ok(())
     }
 
     // --- pending-action nudge loop (serial queue) ---
@@ -10735,20 +10741,16 @@ mod tests {
     fn a_retry_after_clock_holds_a_row_until_its_boundary() {
         let (s, _f) = fresh_store();
         let log = |mid: &str| {
-            let email = sample_email(mid);
-            s.upsert_email(&email).unwrap();
-            let body = Some(email.body.as_str());
-            s.log_action(mid, None, &email.from, &email.subject, body, Some("d"), ActionStatus::Error)
+            let e = sample_email(mid);
+            s.upsert_email(&e).unwrap();
+            let body = Some(e.body.as_str());
+            s.log_action(mid, None, &e.from, &e.subject, body, Some("d"), ActionStatus::Error)
                 .unwrap()
         };
         let ids = [log("m-clock"), log("m-no-clock")];
-        let now = now_millis();
-        let ten_min = 10 * 60 * 1_000;
-        let day = 86_400_000;
+        let (now, ten_min, day) = (now_millis(), 10 * 60 * 1_000, 86_400_000);
         let window = day - 2 * 5 * 60 * 1_000;
-        s.set_action_retry_not_before(&ids[0], now + ten_min, window)
-            .unwrap();
-
+        let set = |at| s.set_action_retry_not_before(&ids[0], at, window).unwrap();
         let ids_at = |at: i64| {
             s.list_retryable_replies("gmail", at, day, 0, 5, 10)
                 .unwrap()
@@ -10756,32 +10758,21 @@ mod tests {
                 .map(|r| r.action.id)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(
-            ids_at(now),
-            [ids[1].clone()],
-            "the clocked row must be held and the unclocked one untouched"
-        );
-        assert_eq!(
-            ids_at(now + ten_min + 60_000).len(),
-            2,
-            "both rows are retryable past the boundary"
-        );
 
-        // A clock never moves backwards: a later write wins, an earlier one
-        // is ignored (the boundary we already promised upstream stands).
-        s.set_action_retry_not_before(&ids[0], now - ten_min, window)
-            .unwrap();
-        assert_eq!(ids_at(now), [ids[1].clone()]);
+        set(now + ten_min);
+        let held = [ids[1].clone()];
+        assert_eq!(ids_at(now), held, "clocked row held, unclocked untouched");
+        assert_eq!(ids_at(now + ten_min + 60_000).len(), 2, "past the boundary");
 
-        // A boundary past the hold window is clamped INTO it, so the row is
-        // still reachable while its `createdAt` is inside `max_age_ms` —
-        // a hold at or past that edge would make the row disappear.
-        s.set_action_retry_not_before(&ids[0], now + 100 * day, window)
-            .unwrap();
-        assert!(
-            ids_at(now + window + 60_000).contains(&ids[0]),
-            "a clamped boundary must still leave the row retryable"
-        );
+        // A clock never moves backwards: the boundary already promised stands.
+        set(now - ten_min);
+        assert_eq!(ids_at(now), held);
+
+        // A boundary past the hold window is clamped INTO it: a hold at or
+        // past the queue's own max-age edge would make the row disappear
+        // instead of earning its give-up notice.
+        set(now + 100 * day);
+        assert!(ids_at(now + window + 60_000).contains(&ids[0]), "clamped");
     }
 
     /// #670 REGRESSION — the retry queue is per-channel. A socialapi Error row

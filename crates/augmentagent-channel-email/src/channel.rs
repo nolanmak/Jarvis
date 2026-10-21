@@ -215,10 +215,10 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
 
     /// #1494 — how far past its own `createdAt` a throttled row's retry clock
     /// may be parked; the store clamps the provider's boundary into it. It must
-    /// stay inside `retry_max_age`, which `list_retryable_replies` also applies
-    /// to `createdAt`: a row held at that edge is never retried, never reaches
-    /// the attempt cap, and so never earns its give-up notice. Two retry
-    /// intervals of slack leave a tick inside the window.
+    /// stay inside `retry_max_age`, which the queue also applies to `createdAt`:
+    /// a row held at that edge is never retried, never reaches the attempt cap,
+    /// never earns its give-up notice. Two retry intervals of slack leave a
+    /// tick inside the window.
     fn retry_hold_window_ms(&self) -> i64 {
         let max_age = self.config.retry_max_age.as_millis() as i64;
         let slack = 2 * self.config.retry_interval.as_millis() as i64;
@@ -233,15 +233,16 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
     /// `create_draft` passes through, so the retry tick, the code-mode rail and
     /// any future caller all probe. (The owner-driven paths that draft outside
     /// it — Discord Revise, the CLI compose/send-now commands — have no lost
-    /// response to recover: Revise deliberately replaces the draft with new
-    /// text, and a compose has no prior action row at all.)
+    /// response to recover: Revise deliberately replaces the draft, and a
+    /// compose has no prior action row at all.)
     ///
     /// Narrow on three keys: the row's last failure must be a rate limit, no
     /// `draftId` may ever have been recorded — together the only state in which
     /// a response can have been lost — and the draft found upstream must carry
-    /// THIS action's body. A thread routinely also holds a draft the OWNER
-    /// typed, and a thread-only match would card their private text as our
-    /// reply. `None` ⇒ nothing to adopt, create the draft as usual.
+    /// THIS action's body, since a thread routinely also holds a draft the
+    /// OWNER typed. `Ok(None)` ⇒ the probe COMPLETED and found nothing, so
+    /// creating a draft is safe; an `Err` proves nothing, and the caller must
+    /// decline rather than risk the duplicate card this path prevents.
     async fn adopt_landed_draft(
         &self,
         entity_id: &str,
@@ -249,35 +250,31 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         email: &augmentagent_store::Email,
         prior_error: Option<&str>,
         body: &str,
-    ) -> Option<String> {
-        let thread_id = email.thread_id.as_deref()?;
+    ) -> anyhow::Result<Option<String>> {
+        let Some(thread_id) = email.thread_id.as_deref() else {
+            return Ok(None);
+        };
         if !prior_error.is_some_and(|m| m.to_ascii_lowercase().contains("rate limit")) {
-            return None;
+            return Ok(None);
         }
-        match self
+        let found = self
             .gmail
             .find_matching_draft_on_thread(entity_id, thread_id, body)
-            .await
-        {
-            Ok(Some(draft_id)) => {
+            .await?;
+        match found {
+            Some(draft_id) => {
                 info!(action_id, %draft_id, "adopting draft that landed before the throttle");
-                if let Err(e) = self.store.set_action_draft_id(action_id, &draft_id) {
-                    warn!(action_id, "adopting landed draft failed: {e}");
-                    return None;
-                }
-                Some(draft_id)
+                self.store.set_action_draft_id(action_id, &draft_id)?;
+                Ok(Some(draft_id))
             }
-            Ok(None) => None,
-            Err(e) => {
-                warn!(action_id, "landed-draft probe failed: {e}");
-                None
-            }
+            None => Ok(None),
         }
     }
 
     /// #1494 — the row just hit `permanent_error`; tell the owner rather than
-    /// letting the compose disappear. Best-effort, on the flag-notice rail.
-    async fn post_give_up_notice(&self, item: &RetryableReply, attempts: i64) {
+    /// letting the compose disappear. `false` ⇒ the notice did NOT reach the
+    /// owner, which the caller must not treat as a finished give-up.
+    async fn post_give_up_notice(&self, item: &RetryableReply, attempts: i64) -> bool {
         let reason = format!(
             "giving up on the reply to \"{}\" after {attempts} failed attempts \
              (last error: {})",
@@ -286,7 +283,9 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         );
         if let Err(e) = self.approvals.post_flag_notice(&item.email, &reason).await {
             warn!(action_id = %item.action.id, "give-up notice failed: {e}");
+            return false;
         }
+        true
     }
 
     /// One pass of the retry queue. Returns the number of actions re-attempted.
@@ -339,8 +338,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
 
             // #1494 — `increment_retry_count` has already flipped the row to
             // `permanent_error` at the cap, so if THIS attempt fails nothing
-            // will ever pick it up again. A compose abandoned under a sustained
-            // throttle must say so; silence is the failure mode the issue names.
+            // picks it up again. Silence is the failure mode the issue names.
             let last_attempt = new_count >= self.config.retry_max_attempts;
 
             let draft = item.action.draft_body.clone().unwrap_or_default();
@@ -412,8 +410,14 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 .await;
             if let Err(e) = result {
                 warn!(action_id = %item.action.id, "retry attempt failed: {e:#}");
-                if last_attempt {
-                    self.post_give_up_notice(&item, new_count).await;
+                // #1494 — the notice is the abandoned compose's only
+                // owner-visible trace, so a broker outage must not finalize
+                // the row: give the attempt back and let a later tick deliver
+                // it. `retry_max_age` still bounds the retrying.
+                if last_attempt && !self.post_give_up_notice(&item, new_count).await {
+                    if let Err(e) = self.store.rewind_retry_count(&item.action.id) {
+                        warn!(action_id = %item.action.id, "give-up rewind failed: {e}");
+                    }
                 }
             }
             attempted += 1;
@@ -1659,17 +1663,27 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         // #1494 — before creating a draft for a row whose last attempt was
         // throttled, check whether that attempt's draft actually landed and we
         // merely lost the response.
+        let prior = prior_error.as_deref();
         let existing_draft_id = match existing_draft_id {
             Some(d) => Some(d),
             None => {
-                self.adopt_landed_draft(
-                    entity_id,
-                    &action_id,
-                    &email,
-                    prior_error.as_deref(),
-                    &gmail_body,
-                )
-                .await
+                let probe = self
+                    .adopt_landed_draft(entity_id, &action_id, &email, prior, &gmail_body)
+                    .await;
+                match probe {
+                    Ok(found) => found,
+                    Err(e) => {
+                        // An unanswered probe can't rule out a landed draft,
+                        // so creating one now is the duplicate card this path
+                        // guards against. Leave the row errored — carrying the
+                        // text the next probe keys on — for a later tick.
+                        warn!(action_id, "landed-draft probe failed, not drafting: {e:#}");
+                        let status = ActionStatus::Error;
+                        self.store
+                            .update_action_status(&action_id, status, None, prior)?;
+                        return Err(e);
+                    }
+                }
             }
         };
         let draft_id = match existing_draft_id {
@@ -1694,15 +1708,12 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     // #1494 — a sustained throttle outlives the in-loop
                     // backoff (#1493). Keep the row in the one existing retry
                     // queue (status stays `error`) but hold it until the
-                    // boundary the provider named (bounded by the hold
-                    // window), instead of burning all five attempts inside
-                    // `retry_min_gap`.
-                    if let Some(boundary) = crate::gmail::rate_limit_boundary_ms(&e) {
-                        let window = self.retry_hold_window_ms();
-                        if let Err(se) =
-                            self.store
-                                .set_action_retry_not_before(&action_id, boundary, window)
-                        {
+                    // boundary the provider named (bounded by the hold window),
+                    // instead of burning every attempt inside `retry_min_gap`.
+                    if let Some(at) = crate::gmail::rate_limit_boundary_ms(&e) {
+                        let hold = self.retry_hold_window_ms();
+                        let set = self.store.set_action_retry_not_before(&action_id, at, hold);
+                        if let Err(se) = set {
                             warn!(action_id, "retry-after persist failed: {se}");
                         }
                     }
@@ -2354,6 +2365,8 @@ mod tests {
     struct RecordingBroker {
         posts: std::sync::Mutex<Vec<String>>,
         flag_posts: std::sync::Mutex<Vec<(String, String)>>,
+        /// #1494 — when set, notices fail to reach the owner (Discord outage).
+        flags_fail: bool,
     }
     #[async_trait]
     impl ApprovalBroker for RecordingBroker {
@@ -2372,6 +2385,9 @@ mod tests {
             email: &Email,
             reason: &str,
         ) -> Result<(), augmentagent_approval_discord::ApprovalError> {
+            if self.flags_fail {
+                return Err(augmentagent_approval_discord::ApprovalError::NotReady);
+            }
             self.flag_posts
                 .lock()
                 .unwrap()
@@ -3396,11 +3412,12 @@ Where: Microsoft Teams
 
     /// #1494 — what, if anything, a throttled thread already holds.
     enum ThreadDraft {
-        /// Our own throttled `create_draft` landed before its response was
-        /// lost, so the draft carries the body we sent.
+        /// Our own throttled `create_draft` landed, carrying the body we sent.
         Landed,
         /// A draft the OWNER typed there, carrying their own text.
         Owner(&'static str),
+        /// The probe can't answer: a list outage, or a truncated walk.
+        Unknown,
     }
 
     /// A Gmail stub that fails create_draft the first N times, then succeeds.
@@ -3411,8 +3428,8 @@ Where: Microsoft Teams
         /// #1494 — when set, create_draft is instead PERMANENTLY throttled,
         /// reporting this upstream boundary.
         retry_after_ms: Option<i64>,
-        /// #1494 — what the thread holds for the lost-response probe, which
-        /// answers through the production body matcher.
+        /// #1494 — what the thread holds for the lost-response probe, whose
+        /// answer runs through the production body matcher.
         thread_draft: Option<ThreadDraft>,
         create_calls: std::sync::Mutex<u32>,
         sent_bodies: std::sync::Mutex<Vec<String>>,
@@ -3444,19 +3461,16 @@ Where: Microsoft Teams
         ) -> Result<String, crate::gmail::GmailError> {
             *self.create_calls.lock().unwrap() += 1;
             self.sent_bodies.lock().unwrap().push(b.to_string());
-            if let Some(retry_after_ms) = self.retry_after_ms {
-                // The shape Composio really returns for a throttled draft:
-                // a `successful:false` envelope, NOT a 429 — `check_envelope`
+            if let Some(ms) = self.retry_after_ms {
+                // The shape Composio really returns for a throttled draft: a
+                // `successful:false` envelope, NOT a 429 — `check_envelope`
                 // only classifies FETCH as `RateLimited`.
-                let at = chrono::DateTime::from_timestamp_millis(retry_after_ms)
-                    .unwrap()
-                    .to_rfc3339();
-                return Err(crate::gmail::GmailError::Composio {
-                    message: format!(
-                        "GMAIL_CREATE_EMAIL_DRAFT reported successful:false — User-rate \
-                         limit exceeded. Retry after {at} (composio log_id log-throttle)"
-                    ),
-                });
+                let at = chrono::DateTime::from_timestamp_millis(ms).unwrap().to_rfc3339();
+                let message = format!(
+                    "GMAIL_CREATE_EMAIL_DRAFT reported successful:false — User-rate limit \
+                     exceeded. Retry after {at} (composio log_id log-throttle)"
+                );
+                return Err(crate::gmail::GmailError::Composio { message });
             }
             let mut lock = self.create_failures_remaining.lock().unwrap();
             if *lock > 0 {
@@ -3473,18 +3487,17 @@ Where: Microsoft Teams
             _t: &str,
             body: &str,
         ) -> Result<Option<String>, crate::gmail::GmailError> {
+            let sent = || self.sent_bodies.lock().unwrap().last().cloned().unwrap_or_default();
             let (draft_id, held) = match &self.thread_draft {
                 None => return Ok(None),
-                Some(ThreadDraft::Landed) => {
-                    let sent = self.sent_bodies.lock().unwrap();
-                    ("draft-landed", sent.last().cloned().unwrap_or_default())
-                }
+                Some(ThreadDraft::Landed) => ("draft-landed", sent()),
                 Some(ThreadDraft::Owner(text)) => ("owner-draft", (*text).to_string()),
+                Some(ThreadDraft::Unknown) => {
+                    let message = "GMAIL_LIST_DRAFTS unavailable".into();
+                    return Err(crate::gmail::GmailError::Composio { message });
+                }
             };
-            if !crate::gmail::draft_text_matches(body, &held) {
-                return Ok(None);
-            }
-            Ok(Some(draft_id.to_string()))
+            Ok(crate::gmail::draft_text_matches(body, &held).then(|| draft_id.to_string()))
         }
         async fn send_draft(
             &self,
@@ -3498,30 +3511,35 @@ Where: Microsoft Teams
         }
     }
 
-    fn throttle_email() -> Email {
-        Email {
-            message_id: "m-throttle".into(),
-            thread_id: Some("t-throttle".into()),
-            subject: "quick q".into(),
-            body: "free Thursday?".into(),
-            ..threaded_inbound()
-        }
-    }
-
-    /// #1494 — throttled on `boundary`, `thread_draft` already on the thread.
+    /// #1494 — permanently throttled on `boundary`, `thread_draft` on the
+    /// inbound email's thread.
     fn throttled_gmail(boundary: i64, thread_draft: Option<ThreadDraft>) -> Arc<FlakyGmail> {
         Arc::new(FlakyGmail {
-            emails: vec![throttle_email()],
+            emails: vec![Email {
+                message_id: "m-throttle".into(),
+                thread_id: Some("t-throttle".into()),
+                subject: "quick q".into(),
+                body: "free Thursday?".into(),
+                ..threaded_inbound()
+            }],
             retry_after_ms: Some(boundary),
             thread_draft,
             ..Default::default()
         })
     }
 
-    /// #1494 — the action row `throttle_email` produced, draft id included.
     fn throttle_row(store: &Store) -> augmentagent_store::ActionWithEmail {
         let (id, ..) = store.latest_action_for_message("m-throttle").unwrap().unwrap();
         store.get_action_with_email(&id).unwrap().unwrap()
+    }
+
+    /// #1494 — can a later retry tick still reach the row?
+    fn still_queued(store: &Store, id: &str) -> bool {
+        store
+            .list_retryable_replies("gmail", now_millis(), 86_400_000, 0, 5, 10)
+            .unwrap()
+            .iter()
+            .any(|r| r.action.id == id)
     }
 
     fn throttle_channel(
@@ -3529,13 +3547,14 @@ Where: Microsoft Teams
         gmail: Arc<FlakyGmail>,
         broker: Arc<RecordingBroker>,
     ) -> GmailChannel<FlakyGmail, ScriptedReasoner> {
+        let reasoner = ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"actionable"}"#,
+            "Thursday 3pm works.",
+        ]);
         GmailChannel::new(
             store,
             gmail,
-            Arc::new(ScriptedReasoner::new([
-                r#"{"decision":"reply","reason":"actionable"}"#,
-                "Thursday 3pm works.",
-            ])),
+            Arc::new(reasoner),
             broker,
             GmailChannelConfig {
                 skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
@@ -3554,112 +3573,93 @@ Where: Microsoft Teams
         let boundary = now_millis() + 15 * 60 * 1_000;
         let gmail = throttled_gmail(boundary, None);
         let broker = Arc::new(RecordingBroker::default());
-        let ch = throttle_channel(store.clone(), gmail.clone(), broker.clone());
+        let ch = throttle_channel(store.clone(), gmail.clone(), broker);
 
         assert_eq!(ch.poll_once().await.unwrap().errors, 1);
         let row = throttle_row(&store);
         assert_eq!(row.action.status, "error", "the row stays in the one queue");
-
         // Held: the tick sees nothing, and create_draft is not called again.
         assert_eq!(ch.retry_once().await.unwrap(), 0);
         assert_eq!(*gmail.create_calls.lock().unwrap(), 1);
         assert_eq!(row.retry_count, 0, "a held row burns no attempt");
-        // Past the boundary the same row is eligible again.
-        let after = store
+        let past = store
             .list_retryable_replies("gmail", boundary + 1_000, 86_400_000, 0, 5, 10)
             .unwrap();
-        assert!(after.iter().any(|r| r.action.id == row.action.id));
-        assert!(broker.posts.lock().unwrap().is_empty());
+        assert!(past.iter().any(|r| r.action.id == row.action.id), "then due");
     }
 
-    /// #1494 — the draft may have landed upstream even though the response was
-    /// lost to the throttle. The retry must adopt it rather than create a
-    /// second draft (and a second card).
+    /// #1494 — the throttled `create_draft` may have landed upstream with only
+    /// its response lost, so the retry probes the thread before drafting again.
+    /// Three answers, each a card the owner must not be shown twice: our own
+    /// landed draft is adopted, not duplicated; a draft the OWNER typed there
+    /// is left alone (REGRESSION — adopting it would card their private text);
+    /// and a probe that cannot answer proves nothing, so it declines to create
+    /// and leaves the row queued to probe again.
     #[tokio::test]
-    async fn retry_adopts_a_draft_that_landed_before_the_throttle() {
-        let (store, _f) = tmp_store();
-        // Boundary in the past: eligible immediately, so one tick exercises
-        // the adopt path without waiting on a clock.
-        let gmail = throttled_gmail(now_millis() - 1_000, Some(ThreadDraft::Landed));
-        let broker = Arc::new(RecordingBroker::default());
-        let ch = throttle_channel(store.clone(), gmail.clone(), broker.clone());
+    async fn the_landed_draft_probe_adopts_only_our_own_draft() {
+        let owner = ThreadDraft::Owner("hold off here, I want to call them first");
+        // what the thread holds, the adopted draft, create_draft calls, cards
+        let cases = [
+            (ThreadDraft::Landed, Some("draft-landed"), 1, 1),
+            (owner, None, 2, 0),
+            (ThreadDraft::Unknown, None, 1, 0),
+        ];
+        for (held, adopted, calls, cards) in cases {
+            // Boundary in the past: due at once, so one tick exercises the
+            // probe without waiting on a clock.
+            let (store, _f) = tmp_store();
+            let gmail = throttled_gmail(now_millis() - 1_000, Some(held));
+            let broker = Arc::new(RecordingBroker::default());
+            let ch = throttle_channel(store.clone(), gmail.clone(), broker.clone());
 
-        assert_eq!(ch.poll_once().await.unwrap().errors, 1);
-        assert_eq!(*gmail.create_calls.lock().unwrap(), 1);
+            assert_eq!(ch.poll_once().await.unwrap().errors, 1);
+            assert_eq!(ch.retry_once().await.unwrap(), 1);
 
-        assert_eq!(ch.retry_once().await.unwrap(), 1);
-        assert_eq!(throttle_row(&store).draft_id.as_deref(), Some("draft-landed"));
-        let calls = *gmail.create_calls.lock().unwrap();
-        assert_eq!(calls, 1, "the landed draft must be adopted, never recreated");
-        assert_eq!(broker.posts.lock().unwrap().len(), 1, "one approval card");
-    }
-
-    /// #1494 REGRESSION — the thread may instead hold a draft the OWNER
-    /// typed. Adopting that would card their private text as our reply, so
-    /// the retry must leave it alone and draft its own.
-    #[tokio::test]
-    async fn retry_never_adopts_a_draft_the_owner_typed_on_the_thread() {
-        let (store, _f) = tmp_store();
-        let owner_draft = ThreadDraft::Owner("hold off here, I want to call them first");
-        let gmail = throttled_gmail(now_millis() - 1_000, Some(owner_draft));
-        let broker = Arc::new(RecordingBroker::default());
-        let ch = throttle_channel(store.clone(), gmail.clone(), broker.clone());
-
-        assert_eq!(ch.poll_once().await.unwrap().errors, 1);
-        assert_eq!(ch.retry_once().await.unwrap(), 1);
-
-        let draft_id = throttle_row(&store).draft_id;
-        assert_eq!(draft_id, None, "the owner's draft is not ours to adopt");
-        let calls = *gmail.create_calls.lock().unwrap();
-        assert_eq!(calls, 2, "the retry drafts its own reply instead");
-        assert!(broker.posts.lock().unwrap().is_empty());
+            let row = throttle_row(&store);
+            assert_eq!(row.draft_id.as_deref(), adopted, "adopted draft");
+            assert_eq!(*gmail.create_calls.lock().unwrap(), calls, "draft calls");
+            assert_eq!(broker.posts.lock().unwrap().len(), cards, "cards");
+            assert!(adopted.is_some() || still_queued(&store, &row.action.id));
+        }
     }
 
     /// #1494 — a throttle that never clears must end in an owner-visible
-    /// notice, not a silent flip to `permanent_error`.
+    /// notice, not a silent flip to `permanent_error`. REGRESSION: if that
+    /// notice cannot be delivered either (a Discord outage), the row may not
+    /// settle at the cap — the attempt is handed back so a later tick can
+    /// still tell the owner.
     #[tokio::test]
-    async fn exhausted_compose_retries_post_a_give_up_notice() {
-        let (store, _f) = tmp_store();
-        let gmail = throttled_gmail(now_millis() - 1_000, None);
-        let broker = Arc::new(RecordingBroker::default());
-        let ch = throttle_channel(store.clone(), gmail, broker.clone());
+    async fn exhausted_compose_retries_never_end_in_silence() {
+        for flags_fail in [false, true] {
+            let (store, _f) = tmp_store();
+            let gmail = throttled_gmail(now_millis() - 1_000, None);
+            let broker = Arc::new(RecordingBroker {
+                flags_fail,
+                ..Default::default()
+            });
+            let ch = throttle_channel(store.clone(), gmail, broker.clone());
 
-        assert_eq!(ch.poll_once().await.unwrap().errors, 1);
-        let max_attempts = GmailChannelConfig::default().retry_max_attempts;
-        for _ in 0..max_attempts {
-            ch.retry_once().await.unwrap();
+            assert_eq!(ch.poll_once().await.unwrap().errors, 1);
+            let max_attempts = GmailChannelConfig::default().retry_max_attempts;
+            for _ in 0..max_attempts {
+                ch.retry_once().await.unwrap();
+            }
+
+            let row = throttle_row(&store);
+            if flags_fail {
+                assert_eq!(row.action.status, "error", "not silently permanent");
+                assert!(still_queued(&store, &row.action.id), "can still notify");
+                continue;
+            }
+            // Delivered on the capped attempt, after which `retryCount` keeps
+            // the row out of the queue for good.
+            assert_eq!(row.retry_count, max_attempts);
+            assert!(!still_queued(&store, &row.action.id));
+            let flags = broker.flag_posts.lock().unwrap();
+            let notices: Vec<_> = flags.iter().filter(|f| f.1.contains("giving")).collect();
+            assert_eq!(notices.len(), 1, "exactly one owner notice: {flags:?}");
+            assert!(notices[0].1.contains("quick q"), "name the compose");
         }
-
-        // `increment_retry_count` stamped the cap, so the queue can never pick
-        // the row up again — the attempt that fired the notice was the last.
-        assert_eq!(throttle_row(&store).retry_count, max_attempts);
-        let far = now_millis() + 86_400_000;
-        let still = store.list_retryable_replies("gmail", far, 86_400_000, 0, 5, 10).unwrap();
-        assert!(still.is_empty());
-        let flags = broker.flag_posts.lock().unwrap();
-        let notices: Vec<_> = flags.iter().filter(|f| f.1.contains("giving")).collect();
-        assert_eq!(notices.len(), 1, "exactly one owner notice: {flags:?}");
-        let reason = &notices[0].1;
-        assert!(reason.contains("quick q"), "name the compose: {reason}");
-    }
-
-    /// #1494 REGRESSION — a boundary far past the queue's max age must be
-    /// clamped into the hold window; the queue drops rows whose `createdAt`
-    /// is older than that same max age, so a row held at the edge would
-    /// silently disappear instead of earning its give-up notice.
-    #[tokio::test]
-    async fn an_absurd_retry_after_still_leaves_the_row_retryable() {
-        let (store, _f) = tmp_store();
-        // Year 2098, the shape a prior live parse produced.
-        let gmail = throttled_gmail(4_050_000_000_000, None);
-        let ch = throttle_channel(store.clone(), gmail, Arc::new(RecordingBroker::default()));
-        assert_eq!(ch.poll_once().await.unwrap().errors, 1);
-        let at = now_millis() + ch.retry_hold_window_ms() + 60_000;
-        let max_age = ch.config.retry_max_age.as_millis() as i64;
-        assert!(
-            !store.list_retryable_replies("gmail", at, max_age, 0, 5, 10).unwrap().is_empty(),
-            "a clamped boundary must leave the row inside the max-age window"
-        );
     }
 
     #[tokio::test]

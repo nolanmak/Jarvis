@@ -93,10 +93,10 @@ pub trait GmailApi: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// #1494 — the draft on `thread_id` carrying exactly the `body` we tried
-    /// to save, used to recover a create-draft response lost to a throttle.
-    /// The body is the key, not the thread: a thread routinely also holds a
-    /// draft the OWNER typed. `Ok(None)` ⇒ nothing to adopt, create normally.
+    /// #1494 — the draft on `thread_id` carrying exactly the `body` we tried to
+    /// save, recovering a create-draft response lost to a throttle. The body is
+    /// the key, not the thread (which routinely also holds a draft the OWNER
+    /// typed), and only `Ok(None)` licenses creating a draft.
     async fn find_matching_draft_on_thread(
         &self,
         _entity_id: &str,
@@ -570,10 +570,11 @@ impl ComposioClient {
 
     /// #1494 — find the draft on `thread_id` carrying `body`. Same
     /// `GMAIL_LIST_DRAFTS` walk as [`get_draft_thread_id`], but `verbose` so
-    /// each listed draft brings its text; a draft whose text isn't ours is
-    /// skipped, as is one Composio returned with no text at all. The walk is
-    /// bounded at `MAX_PAGES`, and an error is returned rather than swallowed
-    /// so the caller can decline to create a possible duplicate.
+    /// each listed draft brings its text; one whose text isn't ours is skipped,
+    /// as is one Composio returned with no text at all. A list failure OR a
+    /// walk that exhausts `MAX_PAGES` with pages left is an error, never
+    /// `Ok(None)`: only a COMPLETED walk proves the draft absent, and the
+    /// caller creates one on that proof.
     pub async fn find_matching_draft_on_thread(
         &self,
         entity_id: &str,
@@ -591,21 +592,17 @@ impl ComposioClient {
                 args["page_token"] = serde_json::Value::String(t.clone());
             }
             let v = self.execute("GMAIL_LIST_DRAFTS", entity_id, args).await?;
-            let drafts = v
-                .pointer("/data/drafts")
-                .and_then(serde_json::Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            for d in &drafts {
+            let drafts = v.pointer("/data/drafts").and_then(|d| d.as_array());
+            for d in drafts.map(Vec::as_slice).unwrap_or_default() {
                 let on_thread = d
                     .pointer("/message/threadId")
                     .or_else(|| d.pointer("/message/thread_id"))
-                    .and_then(serde_json::Value::as_str)
+                    .and_then(|t| t.as_str())
                     == Some(thread_id);
                 let is_ours = find_string_field(d, &["messageText", "snippet", "body"])
                     .is_some_and(|text| draft_text_matches(body, &text));
                 if on_thread && is_ours {
-                    if let Some(id) = d.get("id").and_then(serde_json::Value::as_str) {
+                    if let Some(id) = d.get("id").and_then(|i| i.as_str()) {
                         return Ok(Some(id.to_string()));
                     }
                 }
@@ -613,13 +610,15 @@ impl ComposioClient {
             page_token = v
                 .pointer("/data/next_page_token")
                 .or_else(|| v.pointer("/data/nextPageToken"))
-                .and_then(serde_json::Value::as_str)
+                .and_then(|t| t.as_str())
                 .map(String::from);
             if page_token.is_none() {
-                break;
+                return Ok(None);
             }
         }
-        Ok(None)
+        let message =
+            format!("GMAIL_LIST_DRAFTS: thread {thread_id} unresolved after {MAX_PAGES} pages");
+        Err(GmailError::Composio { message })
     }
 
     /// #417 — Upload a local file into Composio's attachment store and return
@@ -2332,8 +2331,8 @@ mod tests {
     /// own text on an approval card.
     #[tokio::test]
     async fn the_lost_response_probe_adopts_only_the_draft_carrying_our_body() {
-        let ours = "Thursday 3pm works for me. I'll send a calendar invite \
-                    with the dial-in shortly, and loop in the design folks.";
+        let ours = "Thursday 3pm works for me. I'll send a calendar invite with \
+                    the dial-in shortly, and loop in the design folks.";
         let body = r#"{"successful":true,"data":{"drafts":[
             {"id":"D-owner","message":{"id":"M0","threadId":"T9",
              "messageText":"Thursday 3pm works for me. Hold off though, I want to call them first"}},
@@ -2350,6 +2349,20 @@ mod tests {
         assert_eq!(probe("T9", ours).await.as_deref(), Some("D-ours"), "ours");
         assert_eq!(probe("T-none", ours).await, None, "wrong thread");
         assert_eq!(probe("T9", "another thing entirely").await, None);
+    }
+
+    /// #1494 REGRESSION — a walk that runs out of pages has NOT proved the
+    /// draft absent, so it must error rather than report "none" and let the
+    /// caller create a draft the throttled attempt may already have landed.
+    #[tokio::test]
+    async fn a_truncated_draft_walk_errors_instead_of_reporting_absence() {
+        let body = r#"{"successful":true,"data":{"drafts":[],"next_page_token":"p2"}}"#;
+        let addr = spawn_repeating_http(200, body, "").await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+        let r = client
+            .find_matching_draft_on_thread("entity-x", "T9", &"a ".repeat(40))
+            .await;
+        assert!(r.is_err(), "an unfinished walk must not look like absence");
     }
 }
 
@@ -2466,16 +2479,14 @@ fn wallclock_ms() -> i64 {
 /// truncated to a snippet on longer bodies) the text of `expected` (the exact
 /// body we handed `create_draft`)? Whitespace-normalized equality, relaxed to
 /// a prefix only in the direction truncation can produce and only past
-/// `MATCH_FLOOR` characters — a draft the owner happened to open with the
-/// same sentence is not ours to adopt.
+/// `MATCH_FLOOR` characters — a draft the owner happened to open with the same
+/// sentence is not ours to adopt. The relaxation can't be dropped (snippets
+/// would stop matching) and 64 is a safe floor: the candidate must be a
+/// VERBATIM prefix of the body this very action composed, which an owner draft
+/// reaches only by retyping our reply word for word.
 pub(crate) fn draft_text_matches(expected: &str, candidate: &str) -> bool {
     const MATCH_FLOOR: usize = 64;
-    let norm = |s: &str| {
-        s.split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase()
-    };
+    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
     let (expected, candidate) = (norm(expected), norm(candidate));
     let floor = MATCH_FLOOR.min(expected.chars().count());
     !expected.is_empty()
