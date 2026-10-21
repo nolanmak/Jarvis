@@ -41,3 +41,4 @@ tempfile = "3"
 
 [dev-dependencies]
 mockito = "1"
+tracing-subscriber = { workspace = true }
