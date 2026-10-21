@@ -6848,12 +6848,11 @@ async fn run_gmail_compose(
             &bcc,
         )
         .await;
-    // #1486 — the provider throttles an account for far longer than any
-    // in-process backoff can wait, so a plain `--post` compose is parked for the
-    // daemon to land instead of being lost (matched BEFORE `.context` erases the
-    // typed error). The other shapes keep the hard error: an `--attach` or
-    // `--bcc` the daemon's drafting path cannot reproduce, a `--send-at` that
-    // may be stale by then, and with no `--post` there is no card to promise.
+    // #1486 — a throttle outlasts any in-process backoff, so a plain `--post`
+    // compose is parked for the daemon instead of being lost (matched BEFORE
+    // `.context` erases the typed error). The other shapes keep the hard error:
+    // an `--attach`/`--bcc` the daemon's drafting path cannot reproduce, a
+    // `--send-at` stale by then, and with no `--post` no card to promise.
     if let Err(GmailError::RateLimited { retry_after_ms, retry_after, .. }) = &created {
         if post && attachment.is_none() && send_at_ms.is_none() && bcc.is_empty() {
             const DEFAULT_RETRY_DELAY_MS: i64 = 5 * 60 * 1000;
@@ -7036,9 +7035,8 @@ async fn post_reply_approval_card(
     reply_to_body: Option<&str>,
     reply_to_body_file: Option<&str>,
     send_at_ms: Option<i64>,
-    // #1486 — set when the provider throttled the draft create: the rows are
-    // written `queued_compose` with this next-attempt time and no card posted,
-    // for the daemon's scheduled-send engine to land once that clears.
+    // #1486 — when the draft create was throttled: write the rows
+    // `queued_compose` due at this time and post no card.
     queued_until_ms: Option<i64>,
 ) -> Result<String> {
     use augmentagent_store::Email as StoreEmail;
@@ -7058,8 +7056,7 @@ async fn post_reply_approval_card(
     // approve/skip/revise handlers — which join actions→emails on messageId —
     // find the upserted row below. `compose:` prefix matches the fan-out
     // convention and can never collide with a real Gmail hex id.
-    // A throttle-queued compose has no draft id yet (#1486): a uuid keeps the
-    // convention and stays unique.
+    // A throttle-queued compose has no draft id yet (#1486); a uuid is unique.
     let synthetic_msg_id = match draft_id {
         Some(draft_id) => format!("compose:{draft_id}"),
         None => format!("compose:queued:{}", uuid::Uuid::new_v4()),
@@ -7149,9 +7146,8 @@ async fn post_reply_approval_card(
             .set_action_draft_id(&action_id, draft_id)
             .context("set action draft id")?;
     }
-    // #1486 — park the row for the engine instead of posting a card: the
-    // outbound subject (the card subject above is the Re:-stripped inbound
-    // one) and the next draft-create attempt.
+    // #1486 — park the row for the engine instead of posting a card, under the
+    // outbound subject (the card's is the Re:-stripped inbound one).
     if let Some(at_ms) = queued_until_ms {
         store
             .set_action_subject(&action_id, Some(out_subject))

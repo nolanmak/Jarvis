@@ -4294,8 +4294,8 @@ impl Store {
     /// #500 — includes `scheduled`/`sending` rows: a scheduled send must be
     /// cancellable by a manual reply, so when the only open work is scheduled
     /// the cursor must still reach back to when it was raised, not seed to
-    /// "now" and go blind to replies the user already sent. #1486 — likewise
-    /// `queued_compose`, whose card is still owed.
+    /// "now" and go blind to replies the user already sent (#1486 — likewise a
+    /// `queued_compose`, whose card is still owed).
     pub fn oldest_pending_action_created_at(&self) -> StoreResult<Option<i64>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let v: Option<i64> = guard
@@ -4414,8 +4414,7 @@ impl Store {
     /// Companion to `mark_pending_drafts_superseded_by_thread` for the cases
     /// where staleness is decided per-card (bulk sender) rather than
     /// per-thread (user already replied). Returns the number of rows flipped.
-    /// #1486 — retires `queued_compose` rows too, or a replaced one still
-    /// lands a card.
+    /// #1486 — `queued_compose` too, or a replaced one still lands a card.
     pub fn mark_pending_superseded_by_ids(
         &self,
         ids: &[String],
@@ -6761,8 +6760,7 @@ impl Store {
     /// before the caller recorded its own (#501 review).
     /// Clearing `scheduledAtMs` here is load-bearing: a later Approve on the
     /// reposted card must send immediately, not re-arm a stale proposal.
-    /// #1486 — also lands a `queued_compose` the engine has now drafted and
-    /// carded: same destination, same reason to clear the schedule.
+    /// #1486 — also lands a `queued_compose` the engine just drafted and carded.
     pub fn unschedule_action(&self, action_id: &str, source: &str) -> StoreResult<bool> {
         let now = now_millis();
         let guard = self.conn.lock().expect("store mutex poisoned");
@@ -6946,9 +6944,9 @@ impl Store {
         Ok(rows)
     }
 
-    /// #1486 — throttle-queued composes whose next attempt is due, oldest
-    /// first, as `(action_id, attempts_so_far)`. The attempts reuse `retryCount`:
-    /// the row never reaches the generic retry tick, which is `error`-only.
+    /// #1486 — throttle-queued composes whose next attempt is due, oldest first,
+    /// as `(action_id, attempts_so_far)`. Attempts reuse `retryCount`: the row
+    /// never reaches the generic retry tick, which is `error`-only.
     pub fn due_queued_composes(&self, now_ms: i64, limit: i64) -> StoreResult<Vec<(String, i64)>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = guard.prepare(

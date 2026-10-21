@@ -60,7 +60,7 @@ const PER_TICK_LIMIT: i64 = 10;
 
 /// #1486 — wait before a throttle-queued compose's next draft-create attempt
 /// when the provider named no boundary of its own (a reported one wins), and
-/// the budget — an hour — after which the engine gives up and tells the owner.
+/// the budget after which the engine gives up and tells the owner.
 const QUEUED_COMPOSE_RETRY_MS: i64 = 5 * 60 * 1000;
 const QUEUED_COMPOSE_MAX_ATTEMPTS: i64 = 12;
 const SRC: &str = "scheduled-send-engine";
@@ -371,10 +371,9 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
         Ok(summary)
     }
 
-    /// #1486 — land a compose the provider throttled before a draft could be
-    /// created: draft it, then post the promised approval card. The card goes
-    /// out BEFORE the flip to `pending`, so a failed post leaves the row queued
-    /// with its draftId recorded and a later attempt retries the card alone.
+    /// #1486 — land a compose throttled before a draft could be created: draft
+    /// it, then post the promised card BEFORE the flip to `pending`, so a failed
+    /// post leaves the row queued with its draftId and a later tick retries it.
     async fn land_queued_compose(
         &self,
         action_id: &str,
@@ -466,9 +465,9 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
         Ok(())
     }
 
-    /// #1486 — the compose could not be landed this tick: spend an attempt and
-    /// come back at `at_ms`, or, with the budget gone, stop and tell the owner.
-    /// Every blocked path routes through here, so nothing retries unboundedly.
+    /// #1486 — blocked this tick: spend an attempt and come back at `at_ms`, or,
+    /// with the budget gone, stop and tell the owner. Every blocked path routes
+    /// through here, so nothing retries unboundedly.
     async fn requeue_or_abandon(
         &self,
         action_id: &str,
@@ -934,8 +933,7 @@ mod tests {
         /// of the script succeed with a fresh id.
         script: Mutex<Vec<Result<Option<String>, String>>>,
         calls: Mutex<Vec<(String, String)>>,
-        /// #1486 — scripted draft-create refusals: each entry rate-limits one
-        /// call with that retry-after; calls past the end succeed.
+        /// #1486 — each entry rate-limits one draft create; past the end they succeed.
         draft_script: Mutex<Vec<Option<i64>>>,
         /// `to|cc|subject|body|thread_id` per draft create.
         drafts: Mutex<Vec<String>>,

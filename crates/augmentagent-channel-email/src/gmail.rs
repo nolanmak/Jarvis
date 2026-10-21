@@ -1136,12 +1136,8 @@ mod tests {
             Some((4_070_908_800_000, "2099-01-01T00:00:00Z".to_string()))
         );
         assert!(parse_rate_limit_retry_after("invalid credentials").is_none());
-    }
-
-    /// #1486 — the exact envelope the issue reported on draft creation is a
-    /// throttle, even though it carries no retry-after.
-    #[test]
-    fn draft_create_envelope_429_is_a_rate_limit() {
+        // #1486 — the exact envelope the issue reported on draft creation is a
+        // throttle too, even though it carries no retry-after.
         let envelope = serde_json::json!({
             "successful": false, "error": "Failed to fetch user profile: 429", "log_id": "log_x",
         });
@@ -1533,8 +1529,7 @@ mod tests {
         addr
     }
 
-    /// Answers each request with the next `bodies` entry (200), repeating the
-    /// last once the script runs out (#1486).
+    /// Answers each request with the next `bodies` entry (200); the last repeats.
     async fn spawn_scripted_http(bodies: &'static [&'static str]) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1552,10 +1547,9 @@ mod tests {
         addr
     }
 
-    /// #1486 — the issue's own draft-create refusal is retried with backoff:
-    /// the draft lands as soon as the provider relents, and a provider that
-    /// keeps refusing surfaces a typed rate limit for the caller to queue on
-    /// rather than being retried in-process forever.
+    /// #1486 — the issue's own draft-create refusal is retried with backoff: the
+    /// draft lands as soon as the provider relents, and one that keeps refusing
+    /// surfaces a typed rate limit for the caller to queue on.
     #[tokio::test]
     async fn draft_create_backs_off_then_succeeds_or_surfaces_a_rate_limit() {
         const NO: &str =
@@ -2384,8 +2378,8 @@ fn check_envelope(
 
 /// #1486 — is this envelope error a provider throttle, and when may we come
 /// back? Composio spells the refusal both as the Gmail user-rate wording the
-/// search path has always matched and as a bare status code on draft creation;
-/// only the first names a boundary, so the retry-after is optional.
+/// search path matched and as a bare status code on draft creation; only the
+/// former names a boundary, so the retry-after is optional.
 fn classify_envelope_rate_limit(error: &str) -> Option<(Option<i64>, Option<String>)> {
     let lower = error.to_ascii_lowercase();
     // `: 429` is the status code as the provider reports it, and never the

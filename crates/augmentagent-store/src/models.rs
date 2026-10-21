@@ -78,10 +78,10 @@ pub enum ActionStatus {
     /// reconcile — never auto-resent, because the send may have landed.
     Sending,
     /// #1486 — a compose the Gmail provider throttled before a draft could be
-    /// created. `scheduledAtMs` holds the next attempt and `retryCount` the
-    /// attempts so far; the ScheduledSendEngine's sweep creates the draft,
-    /// posts the card and flips the row to `pending`. Distinct from `pending`
-    /// so the card-hygiene sweeps skip a row that has no card yet.
+    /// created. `scheduledAtMs` holds the next attempt, `retryCount` the
+    /// attempts so far; the scheduled-send sweep drafts it, posts the card and
+    /// flips it to `pending`. Distinct from `pending`: it has no card yet, so
+    /// the card-hygiene sweeps must pass it by.
     QueuedCompose,
 }
 
