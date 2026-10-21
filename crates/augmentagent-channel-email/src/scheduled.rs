@@ -165,8 +165,6 @@ pub struct TickSummary {
     pub superseded: usize,
     /// Rows found stuck in the `sending` claim and flagged for the owner.
     pub stuck_flagged: usize,
-    /// #1486 — throttle-queued composes that got their draft and card here.
-    pub queued_landed: usize,
 }
 
 pub struct ScheduledSendEngine<G: GmailApi> {
@@ -249,7 +247,6 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
                             failed = s.failed,
                             superseded = s.superseded,
                             stuck_flagged = s.stuck_flagged,
-                            queued_landed = s.queued_landed,
                             "scheduled-send tick"
                         ),
                         Err(e) => error!("scheduled-send tick failed: {e:#}"),
@@ -367,9 +364,8 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
             }
         }
         for (action_id, attempts) in self.store.due_queued_composes(now_ms, PER_TICK_LIMIT)? {
-            match self.land_queued_compose(&action_id, attempts, now_ms).await {
-                Ok(landed) => summary.queued_landed += usize::from(landed),
-                Err(e) => warn!(action_id, "scheduled-send: queued compose errored: {e:#}"),
+            if let Err(e) = self.land_queued_compose(&action_id, attempts, now_ms).await {
+                warn!(action_id, "scheduled-send: queued compose errored: {e:#}");
             }
         }
         Ok(summary)
@@ -378,36 +374,32 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
     /// #1486 — land a compose the provider throttled before a draft could be
     /// created: draft it, then post the promised approval card. The card goes
     /// out BEFORE the flip to `pending`, so a failed post leaves the row queued
-    /// with its draftId recorded and the next tick retries the card alone.
+    /// with its draftId recorded and a later attempt retries the card alone.
     async fn land_queued_compose(
         &self,
         action_id: &str,
         attempts: i64,
         now_ms: i64,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<()> {
         let Some(action) = self.store.get_action_with_email(action_id)? else {
-            return Ok(false);
+            return Ok(());
         };
-        let envelope = self.store.get_action_envelope(action_id)?;
-        let to = envelope.as_ref().and_then(|e| e.to.clone());
+        let (to, cc, envelope_subject) = self
+            .store
+            .get_action_envelope(action_id)?
+            .map(|e| (e.to, e.cc.unwrap_or_default(), e.subject))
+            .unwrap_or_default();
         let (Some(entity_id), Some(to)) = (action.email.account_entity_id.clone(), to) else {
             let why = "no sending account or recipient was recorded";
             self.abandon_queued_compose(action_id, &action.email, why).await;
-            return Ok(false);
+            return Ok(());
         };
         // Bcc never reaches here: the CLI refuses to queue a compose that
         // carries one, because `create_draft_with_cc` cannot express it.
-        let cc: Vec<String> = envelope
-            .as_ref()
-            .and_then(|e| e.cc.clone())
-            .unwrap_or_default()
-            .split(',')
-            .filter_map(|p| Some(p.trim()).filter(|p| !p.is_empty()).map(str::to_string))
-            .collect();
-        let subject = envelope
-            .as_ref()
-            .and_then(|e| e.subject.clone())
-            .unwrap_or_else(|| action.action.subject.clone());
+        let cc = crate::gmail::split_recipients(&cc);
+        // The CLI records the OUTBOUND subject on the envelope (#652); the
+        // row's own is the Re:-stripped inbound one the card shows.
+        let subject = envelope_subject.unwrap_or_else(|| action.action.subject.clone());
         let body = action.action.draft_body.clone().unwrap_or_default();
 
         let draft_id = match action.draft_id.clone() {
@@ -425,32 +417,21 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
                         draft_id
                     }
                     Err(e) => {
-                        // Still throttled and budget left: come back at the
-                        // provider's own boundary when it named one, else
-                        // after a fixed wait. Anything else is terminal.
-                        let retry_at = match &e {
-                            crate::gmail::GmailError::RateLimited { retry_after_ms, .. }
-                                if attempts + 1 < QUEUED_COMPOSE_MAX_ATTEMPTS =>
-                            {
-                                Some(
-                                    retry_after_ms
-                                        .filter(|ms| *ms > now_ms)
-                                        .unwrap_or(now_ms + QUEUED_COMPOSE_RETRY_MS),
-                                )
+                        let why = format!("creating the draft failed: {e}");
+                        match &e {
+                            // Still throttled: come back at the provider's own
+                            // boundary when it named one, else a fixed wait.
+                            crate::gmail::GmailError::RateLimited { retry_after_ms, .. } => {
+                                let at = retry_after_ms
+                                    .filter(|ms| *ms > now_ms)
+                                    .unwrap_or(now_ms + QUEUED_COMPOSE_RETRY_MS);
+                                self.requeue_or_abandon(action_id, &action.email, attempts, at, why)
+                                    .await?;
                             }
-                            _ => None,
-                        };
-                        match retry_at {
-                            Some(at) if self.store.defer_queued_compose(action_id, at, SRC)? => {
-                                info!(action_id, at, "scheduled-send: compose still throttled");
-                            }
-                            Some(_) => {}
-                            None => {
-                                let why = format!("creating the draft failed: {e}");
-                                self.abandon_queued_compose(action_id, &action.email, &why).await;
-                            }
+                            // Anything else will not clear by waiting.
+                            _ => self.abandon_queued_compose(action_id, &action.email, &why).await,
                         }
-                        return Ok(false);
+                        return Ok(());
                     }
                 }
             }
@@ -468,44 +449,58 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
             .post_approval_card(action_id, &action.email, &card_body, 0)
             .await
         {
-            // Left due with its draftId recorded, so the next tick retries the
-            // card alone — and the attempt it spends bounds a broken surface.
-            warn!(action_id, "scheduled-send: queued compose card post failed: {e}");
-            self.store.defer_queued_compose(action_id, now_ms, SRC)?;
-            return Ok(false);
+            // Spending an attempt here bounds an unavailable broker, which
+            // would otherwise hot-loop on every tick.
+            let why = format!("posting the approval card failed: {e}");
+            let at = now_ms + QUEUED_COMPOSE_RETRY_MS;
+            self.requeue_or_abandon(action_id, &action.email, attempts, at, why)
+                .await?;
+            return Ok(());
         }
         // `queued_compose → pending`, the same landing a back-to-queue does.
         if !self.store.unschedule_action(action_id, SRC)? {
             warn!(action_id, "scheduled-send: queued compose was resolved elsewhere");
-            return Ok(false);
+            return Ok(());
         }
         info!(action_id, draft_id, "scheduled-send: throttled compose landed");
-        Ok(true)
+        Ok(())
     }
 
-    /// Terminal for a queued compose: no draft, no card, and the owner is told
-    /// so the email is not silently lost. Retry-exempt — no draft to re-send.
+    /// #1486 — the compose could not be landed this tick: spend an attempt and
+    /// come back at `at_ms`, or, with the budget gone, stop and tell the owner.
+    /// Every blocked path routes through here, so nothing retries unboundedly.
+    async fn requeue_or_abandon(
+        &self,
+        action_id: &str,
+        email: &augmentagent_store::Email,
+        attempts: i64,
+        at_ms: i64,
+        why: String,
+    ) -> anyhow::Result<()> {
+        if attempts + 1 >= QUEUED_COMPOSE_MAX_ATTEMPTS {
+            self.abandon_queued_compose(action_id, email, &why).await;
+        } else if self.store.defer_queued_compose(action_id, at_ms, SRC)? {
+            info!(action_id, at_ms, "scheduled-send: queued compose deferred ({why})");
+        }
+        Ok(())
+    }
+
+    /// Terminal for a queued compose: the owner is told so the email is not
+    /// silently lost. Retry-exempt — the generic retry tick would repost.
     async fn abandon_queued_compose(
         &self,
         action_id: &str,
         email: &augmentagent_store::Email,
         why: &str,
     ) {
-        match self
-            .store
-            .finish_send_error(action_id, why, Some(RETRY_EXEMPT_RETRY_COUNT), SRC)
-        {
+        match self.store.finish_send_error(action_id, why, Some(RETRY_EXEMPT_RETRY_COUNT), SRC) {
             Ok(true) => {}
-            Ok(false) => return,
-            Err(e) => {
-                warn!(action_id, "scheduled-send: abandon failed: {e}");
+            outcome => {
+                warn!(action_id, "scheduled-send: queued compose not abandoned: {outcome:?}");
                 return;
             }
         }
-        let text = format!(
-            "A queued email could not be drafted — {why}. Nothing was sent; \
-             re-run the compose when the account is clear."
-        );
+        let text = format!("A queued email gave up — {why}. Nothing was sent; re-run the compose.");
         let _ = self.broker.post_flag_notice(email, &text).await;
         warn!(action_id, "scheduled-send: queued compose abandoned ({why})");
     }
@@ -956,12 +951,6 @@ mod tests {
                 ..Default::default()
             }
         }
-        fn throttled(draft_script: Vec<Option<i64>>) -> Self {
-            Self {
-                draft_script: Mutex::new(draft_script),
-                ..Default::default()
-            }
-        }
         fn call_count(&self) -> usize {
             self.calls.lock().unwrap().len()
         }
@@ -1006,11 +995,10 @@ mod tests {
             body: &str,
             thread_id: Option<&str>,
         ) -> Result<String, GmailError> {
-            self.drafts.lock().unwrap().push(format!(
-                "{to}|{}|{subject}|{body}|{}",
-                cc.join(", "),
-                thread_id.unwrap_or("-"),
-            ));
+            let cc = cc.join(", ");
+            let thread = thread_id.unwrap_or("-");
+            let d = format!("{to}|{cc}|{subject}|{body}|{thread}");
+            self.drafts.lock().unwrap().push(d);
             let mut script = self.draft_script.lock().unwrap();
             if script.is_empty() {
                 return Ok("draft-new".into());
@@ -1366,6 +1354,8 @@ mod tests {
         flags: Mutex<Vec<String>>,
         reposts: Mutex<Vec<String>>,
         deletes: Mutex<Vec<(u64, u64)>>,
+        /// #1486 — an unavailable card surface.
+        cards_fail: Mutex<bool>,
     }
 
     #[async_trait]
@@ -1384,6 +1374,9 @@ mod tests {
             _: &str,
             _: u32,
         ) -> Result<Option<(u64, u64)>, ApprovalError> {
+            if *self.cards_fail.lock().unwrap() {
+                return Err(ApprovalError::NotReady);
+            }
             self.reposts.lock().unwrap().push(action_id.to_string());
             Ok(Some((7, 8)))
         }
@@ -1732,13 +1725,8 @@ mod tests {
         assert_eq!(status_of(&r.store, &id), "pending");
     }
 
-    /// #1486 — a queued compose exactly as the CLI persists one, with an
-    /// engine over it.
-    fn seed_queued(
-        store: &Arc<Store>,
-        gmail: &Arc<MockGmail>,
-        broker: &Arc<Surfaces>,
-    ) -> (String, ScheduledSendEngine<MockGmail>) {
+    /// #1486 — a queued compose exactly as the CLI persists one.
+    fn seed_queued(store: &Store) -> String {
         let msg_id = "compose:queued:q1";
         store
             .upsert_email(&Email {
@@ -1772,42 +1760,43 @@ mod tests {
             .unwrap();
         store.set_action_subject(&id, Some("Re: Intro")).unwrap();
         store.set_action_scheduled_at(&id, Some(1_000)).unwrap();
-        let engine = ScheduledSendEngine::new(
-            Arc::clone(store),
-            Arc::clone(gmail),
-            Arc::clone(broker) as Arc<dyn ApprovalBroker>,
-            false,
-        );
-        (id, engine)
+        id
     }
 
     #[tokio::test]
     async fn a_due_queued_compose_is_drafted_and_gets_exactly_one_card() {
-        let (store, _f) = test_store();
-        let gmail = Arc::new(MockGmail::ok());
-        let broker = Arc::new(Surfaces::default());
-        let (id, engine) = seed_queued(&store, &gmail, &broker);
+        let r = rig();
+        let id = seed_queued(&r.store);
+        let store = &r.store;
 
-        // Invisible to the pending-only sweeps while it waits — no card yet —
-        // and not a scheduled SEND either.
+        // #1486 — a queued row has no card and no send in flight, so every
+        // status-driven sweep must pass it by until it lands…
         assert!(store.pending_actions().unwrap().is_empty());
+        assert!(store.pending_actions_for_reconcile().unwrap().is_empty());
+        assert!(store.expire_pending_older_than(i64::MAX).unwrap().is_empty());
+        assert!(store.find_active_nudge().unwrap().is_none());
+        let retries = store.list_retryable_replies("gmail", now_ms(), 86_400_000, 0, 5, 10);
+        assert!(retries.unwrap().is_empty());
+        assert!(store.stuck_sending_actions(i64::MAX, 0).unwrap().is_empty());
         assert!(store.due_scheduled_actions(i64::MAX, 10).unwrap().is_empty());
+        // … while still counting as open work for the observer's cursor.
+        assert!(store.oldest_pending_action_created_at().unwrap().is_some());
 
-        assert_eq!(engine.tick_once(2_000).await.unwrap().queued_landed, 1);
+        r.engine().tick_once(2_000).await.unwrap();
         // The envelope the owner typed, under the OUTBOUND subject.
         assert_eq!(
-            *gmail.drafts.lock().unwrap(),
+            *r.gmail.drafts.lock().unwrap(),
             ["sam@example.com|cc1@example.com, cc2@example.com|Re: Intro|the draft body|th-1"]
         );
         let row = store.get_action_with_email(&id).unwrap().unwrap();
         assert_eq!(row.action.status, "pending");
         assert_eq!(row.draft_id.as_deref(), Some("draft-new"));
-        assert_eq!(broker.reposts.lock().unwrap().len(), 1);
+        assert_eq!(r.broker.reposts.lock().unwrap().len(), 1);
 
         // Landed rows leave the queue: a second tick is a no-op.
-        assert_eq!(engine.tick_once(3_000).await.unwrap().queued_landed, 0);
-        assert_eq!(gmail.drafts.lock().unwrap().len(), 1);
-        assert_eq!(broker.reposts.lock().unwrap().len(), 1);
+        r.engine().tick_once(3_000).await.unwrap();
+        assert_eq!(r.gmail.drafts.lock().unwrap().len(), 1);
+        assert_eq!(r.broker.reposts.lock().unwrap().len(), 1);
     }
 
     /// #1486 — the issue's own failure mode: a provider throttle must not
@@ -1815,15 +1804,15 @@ mod tests {
     /// when the attempt budget runs out the owner is told.
     #[tokio::test]
     async fn a_still_throttled_compose_backs_off_then_gives_up_loudly() {
-        let (store, _f) = test_store();
-        let broker = Arc::new(Surfaces::default());
+        let r = rig();
         let mut script = vec![Some(50_000)];
         script.resize(QUEUED_COMPOSE_MAX_ATTEMPTS as usize + 1, None);
-        let gmail = Arc::new(MockGmail::throttled(script));
-        let (id, engine) = seed_queued(&store, &gmail, &broker);
+        *r.gmail.draft_script.lock().unwrap() = script;
+        let id = seed_queued(&r.store);
+        let store = &r.store;
 
-        engine.tick_once(2_000).await.unwrap();
-        assert_eq!(status_of(&store, &id), "queued_compose");
+        r.engine().tick_once(2_000).await.unwrap();
+        assert_eq!(status_of(store, &id), "queued_compose");
         assert!(
             store.due_queued_composes(49_999, 10).unwrap().is_empty(),
             "the provider's own boundary must be honored"
@@ -1831,22 +1820,34 @@ mod tests {
         assert_eq!(store.due_queued_composes(50_000, 10).unwrap(), [(id.clone(), 1)]);
 
         // Refused without a boundary from here on: the fixed wait applies.
-        engine.tick_once(50_000).await.unwrap();
-        let next = 50_000 + QUEUED_COMPOSE_RETRY_MS;
-        assert!(store.due_queued_composes(next - 1, 10).unwrap().is_empty());
-        assert_eq!(store.due_queued_composes(next, 10).unwrap(), [(id.clone(), 2)]);
-
-        for i in 1..=QUEUED_COMPOSE_MAX_ATTEMPTS {
-            engine
-                .tick_once(next + i * QUEUED_COMPOSE_RETRY_MS)
-                .await
-                .unwrap();
+        let mut at = 50_000;
+        for _ in 0..=QUEUED_COMPOSE_MAX_ATTEMPTS {
+            r.engine().tick_once(at).await.unwrap();
+            assert!(store.due_queued_composes(at + 1, 10).unwrap().is_empty());
+            at += QUEUED_COMPOSE_RETRY_MS;
         }
         // The queue terminates instead of retrying forever, and says so.
-        assert_eq!(status_of(&store, &id), "error");
+        assert_eq!(status_of(store, &id), "error");
         assert!(store.due_queued_composes(i64::MAX, 10).unwrap().is_empty());
-        assert!(broker.reposts.lock().unwrap().is_empty());
-        let flags = broker.flags.lock().unwrap().clone();
-        assert!(flags[0].contains("rate limit"), "{flags:?}");
+        assert!(r.broker.reposts.lock().unwrap().is_empty());
+        assert!(r.broker.flags.lock().unwrap()[0].contains("rate limit"));
+    }
+
+    /// #1486 — a broker that cannot take the card must not hot-loop either:
+    /// the draft is kept, each tick spends one attempt, and the budget ends it.
+    #[tokio::test]
+    async fn a_queued_compose_whose_card_cannot_post_is_bounded_too() {
+        let r = rig();
+        *r.broker.cards_fail.lock().unwrap() = true;
+        let id = seed_queued(&r.store);
+
+        for i in 0..=QUEUED_COMPOSE_MAX_ATTEMPTS {
+            r.engine().tick_once(2_000 + i * QUEUED_COMPOSE_RETRY_MS).await.unwrap();
+        }
+        // One draft reused across the card retries, then a bounded give-up.
+        assert_eq!(r.gmail.drafts.lock().unwrap().len(), 1);
+        assert_eq!(status_of(&r.store, &id), "error");
+        assert!(r.store.due_queued_composes(i64::MAX, 10).unwrap().is_empty());
+        assert!(r.broker.flags.lock().unwrap()[0].contains("approval card"));
     }
 }

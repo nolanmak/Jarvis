@@ -4294,13 +4294,14 @@ impl Store {
     /// #500 — includes `scheduled`/`sending` rows: a scheduled send must be
     /// cancellable by a manual reply, so when the only open work is scheduled
     /// the cursor must still reach back to when it was raised, not seed to
-    /// "now" and go blind to replies the user already sent.
+    /// "now" and go blind to replies the user already sent. #1486 — likewise
+    /// `queued_compose`, whose card is still owed.
     pub fn oldest_pending_action_created_at(&self) -> StoreResult<Option<i64>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let v: Option<i64> = guard
             .query_row(
                 "SELECT MIN(createdAt) FROM actions \
-                  WHERE status IN ('pending', 'scheduled', 'sending')",
+                  WHERE status IN ('pending', 'scheduled', 'sending', 'queued_compose')",
                 [],
                 |r| r.get::<_, Option<i64>>(0),
             )
@@ -4413,8 +4414,8 @@ impl Store {
     /// Companion to `mark_pending_drafts_superseded_by_thread` for the cases
     /// where staleness is decided per-card (bulk sender) rather than
     /// per-thread (user already replied). Returns the number of rows flipped.
-    /// #1486 — retires `queued_compose` rows too, so a replaced one is not
-    /// re-carded by the sweep.
+    /// #1486 — retires `queued_compose` rows too, or a replaced one still
+    /// lands a card.
     pub fn mark_pending_superseded_by_ids(
         &self,
         ids: &[String],
@@ -6760,8 +6761,8 @@ impl Store {
     /// before the caller recorded its own (#501 review).
     /// Clearing `scheduledAtMs` here is load-bearing: a later Approve on the
     /// reposted card must send immediately, not re-arm a stale proposal.
-    /// #1486 — also lands a `queued_compose` whose draft the engine has now
-    /// created: same destination, and that caller posts a card too.
+    /// #1486 — also lands a `queued_compose` the engine has now drafted and
+    /// carded: same destination, same reason to clear the schedule.
     pub fn unschedule_action(&self, action_id: &str, source: &str) -> StoreResult<bool> {
         let now = now_millis();
         let guard = self.conn.lock().expect("store mutex poisoned");
@@ -6946,9 +6947,8 @@ impl Store {
     }
 
     /// #1486 — throttle-queued composes whose next attempt is due, oldest
-    /// first, as `(action_id, attempts_so_far)`. The attempts reuse the
-    /// `retryCount` column: the row never reaches the generic retry tick,
-    /// which is `status = 'error'` only.
+    /// first, as `(action_id, attempts_so_far)`. The attempts reuse `retryCount`:
+    /// the row never reaches the generic retry tick, which is `error`-only.
     pub fn due_queued_composes(&self, now_ms: i64, limit: i64) -> StoreResult<Vec<(String, i64)>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = guard.prepare(
@@ -6959,17 +6959,13 @@ impl Store {
               ORDER BY scheduledAtMs ASC \
               LIMIT ?2",
         )?;
-        let rows = stmt
-            .query_map(params![now_ms, limit], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        let rows = stmt.query_map(params![now_ms, limit], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// #1486 — still throttled: count the attempt and move the next one out to
+    /// #1486 — still blocked: count the attempt and move the next one out to
     /// `next_at_ms`, CAS-gated on the row still being queued. (Landing and
-    /// abandoning reuse [`Self::unschedule_action`]/[`Self::finish_send_error`].)
+    /// abandoning reuse `unschedule_action` / `finish_send_error`.)
     pub fn defer_queued_compose(
         &self,
         action_id: &str,

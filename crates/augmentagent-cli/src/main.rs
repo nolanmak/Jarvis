@@ -6849,12 +6849,11 @@ async fn run_gmail_compose(
         )
         .await;
     // #1486 — the provider throttles an account for far longer than any
-    // in-process backoff can wait, so a plain `--post` compose is parked for
-    // the daemon to land instead of being lost (matched BEFORE `.context`
-    // erases the typed error). The other shapes still get the error: an
-    // `--attach` is CLI-local state the daemon cannot reproduce, a `--send-at`
-    // may be stale once the throttle clears, a `--bcc` is not expressible
-    // through the drafting trait, and with no `--post` there is no card.
+    // in-process backoff can wait, so a plain `--post` compose is parked for the
+    // daemon to land instead of being lost (matched BEFORE `.context` erases the
+    // typed error). The other shapes keep the hard error: an `--attach` or
+    // `--bcc` the daemon's drafting path cannot reproduce, a `--send-at` that
+    // may be stale by then, and with no `--post` there is no card to promise.
     if let Err(GmailError::RateLimited { retry_after_ms, retry_after, .. }) = &created {
         if post && attachment.is_none() && send_at_ms.is_none() && bcc.is_empty() {
             const DEFAULT_RETRY_DELAY_MS: i64 = 5 * 60 * 1000;
@@ -6862,17 +6861,15 @@ async fn run_gmail_compose(
             let next_at_ms = retry_after_ms
                 .filter(|ms| *ms > now_ms)
                 .unwrap_or(now_ms + DEFAULT_RETRY_DELAY_MS);
-            // No draft id and no attachment; `Some(next_at_ms)` parks the rows
-            // as `queued_compose` instead of posting a card.
+            // `Some(next_at_ms)` parks the rows instead of posting a card.
             let action_id = post_reply_approval_card(
                 &store, &entity_id, &email, None, &to, &cc, &bcc, &subject, &body_str, None,
                 thread_id.as_deref(), reply_to_message_id.as_deref(), reply_to_from.as_deref(),
                 reply_to_subject.as_deref(), inbound.as_deref(), None, None, Some(next_at_ms),
             )
             .await?;
-            // Retire the card this compose replaces, or the queued row lands
-            // as a second card for the same email (#419). Best-effort: the
-            // queued row already exists.
+            // Retire the card this compose replaces, or the queued row lands as
+            // a second card for the same email (#419). Best-effort.
             if let Some((old_action_id, old_draft_id)) = &pending_replacement {
                 let _ = store.mark_pending_superseded_by_ids(
                     std::slice::from_ref(old_action_id),
@@ -6884,16 +6881,13 @@ async fn run_gmail_compose(
             }
             let window = retry_after.clone().unwrap_or_else(|| "unknown".into());
             if json {
-                let out = serde_json::json!({
-                    "queued": true, "action_id": action_id, "to": to,
-                    "subject": subject, "retry_after": window,
-                });
+                let out = serde_json::json!({ "queued": true, "action_id": action_id,
+                    "to": to, "subject": subject, "retry_after": window });
                 println!("{out}");
             } else {
                 println!(
-                    "queued {action_id} — gmail rate-limited this account \
-                     (retry after {window}); the daemon will create the draft \
-                     and post the approval card when the throttle clears"
+                    "queued {action_id} — gmail rate-limited this account (retry after \
+                     {window}); the daemon will draft it and post the card once it clears"
                 );
             }
             return Ok(());
