@@ -46,18 +46,16 @@ const GAVE_UP_LABEL: &str = "agent-gave-up";
 /// #1516 — label on a parent sliced into children. Like [`GAVE_UP_LABEL`] it
 /// takes the issue out of the pool, but because the work is now being done.
 const AGENT_SLICED_LABEL: &str = "agent-sliced";
-/// #1516 — prefix of the marker every sliced child's body opens with, closed
-/// by the parent number and ` -->`. It enforces depth 1: a body carrying it is
-/// never sliced again.
+/// #1516 — prefix every sliced child's body opens with, closed by the parent
+/// number and ` -->`; it enforces depth 1 (a body carrying it is not sliced).
 const SLICE_CHILD_MARKER_PREFIX: &str = "<!-- agent-slice-of #";
-/// #1516 — marker on the comment the slicer leaves on the parent before it
-/// files anything, so a partially-filed slice is never filed a second time.
+/// #1516 — marks the comment the slicer leaves on the parent before it files
+/// anything, so a partially-filed slice is never filed a second time.
 const SLICE_PARENT_MARKER: &str = "<!-- agent-sliced-parent -->";
-/// #1516 — a plan outside this range is not a plan: one child is a rename,
-/// seven are a task list. Either way the pre-build refusal stays the fallback.
+/// #1516 — one child is a rename, seven are a task list; outside this range
+/// the pre-build refusal stays the fallback. Char caps: a plan is model text.
 const MIN_SLICE_CHILDREN: usize = 2;
 const MAX_SLICE_CHILDREN: usize = 6;
-/// Caps applied at the parser, because a slice plan is model text.
 const MAX_SLICE_CHILD_BODY_CHARS: usize = 4000;
 const MAX_SLICE_TITLE_CHARS: usize = 200;
 /// The sentence the not-fixable scoping verdict leaves on the issue, and the
@@ -2317,11 +2315,11 @@ fn scope_predicts_refusal(s: &ScopeOutcome) -> Option<String> {
     }
 }
 
-// #1516 — slice an oversized issue into agent-sized children instead of
-// ending its life at the size half of `scope_predicts_refusal`, which never
-// worked epics even though every piece of them fits the cap. One extra
-// scoping-tier call produces the plan; the refusal stays the fallback for
-// EVERY degraded outcome below, so today's behaviour is the worst case.
+// #1516 — slice an oversized issue into agent-sized children instead of ending
+// its life at the size half of `scope_predicts_refusal`, which never worked
+// epics even though every piece of them fits the cap. One extra scoping-tier
+// call produces the plan; the refusal stays the fallback for EVERY degraded
+// outcome below, so today's behaviour is the worst case.
 
 const SLICE_SYSTEM: &str = "PUBLIC OUTPUT RULE: This response becomes public GitHub issues. Use only technical behavior and invented examples. Never copy private messages, personal names, account or invoice details, live traces, local paths, or generated programs with private inputs.\n\
 You are the slicing pass of a staged autonomous fix pipeline for this codebase. A scoping pass \
@@ -2398,28 +2396,20 @@ fn parse_slice_plan(raw: &str) -> Vec<(String, String)> {
     {
         return Vec::new();
     }
-    out.into_iter()
-        .map(|(t, b)| {
-            (
-                truncate(&t, MAX_SLICE_TITLE_CHARS),
-                truncate(&b, MAX_SLICE_CHILD_BODY_CHARS),
-            )
-        })
-        .collect()
+    for (t, b) in &mut out {
+        *t = truncate(t, MAX_SLICE_TITLE_CHARS);
+        *b = truncate(b, MAX_SLICE_CHILD_BODY_CHARS);
+    }
+    out
 }
 
 /// The title of a `## CHILD: <title>` header line, if this line is one.
 fn slice_child_title(line: &str) -> Option<String> {
-    let t = line.trim();
-    if !t.starts_with('#') {
-        return None;
-    }
     const KEY: &str = "CHILD:";
-    let rest = t.trim_start_matches('#').trim_start();
-    if !rest.get(..KEY.len()).is_some_and(|h| h.eq_ignore_ascii_case(KEY)) {
-        return None;
-    }
-    Some(rest[KEY.len()..].trim().to_string())
+    let rest = line.trim().strip_prefix('#')?.trim_start_matches('#').trim_start();
+    rest.get(..KEY.len())
+        .filter(|h| h.eq_ignore_ascii_case(KEY))
+        .map(|_| rest[KEY.len()..].trim().to_string())
 }
 
 /// The body of one filed child: the parent marker first, so both the depth-1
@@ -2432,17 +2422,11 @@ fn slice_child_body(parent: u64, body: &str) -> String {
     )
 }
 
-/// The parent issue number a sliced child's body names, if it is one.
-fn slice_parent_of(body: &str) -> Option<u64> {
-    let rest = body.strip_prefix(SLICE_CHILD_MARKER_PREFIX)?;
-    rest.split_once(" -->")?.0.trim().parse().ok()
-}
-
 /// #1516 — depth 1: a child is never sliced again. Checked BEFORE the slice
 /// call, so an over-cap child costs nothing extra and takes the ordinary
 /// pre-build refusal.
 fn is_slice_child(body: &str) -> bool {
-    slice_parent_of(body).is_some()
+    body.starts_with(SLICE_CHILD_MARKER_PREFIX)
 }
 
 /// One slicing attempt: ask for a plan, parse it, file it. Every failure is an
@@ -2472,7 +2456,9 @@ async fn slice_oversized_issue(
 }
 
 /// Comment on `parent` naming the plan, file it as child issues, then label
-/// the parent [`AGENT_SLICED_LABEL`]; returns the child numbers `gh` printed.
+/// the parent [`AGENT_SLICED_LABEL`] and comment again with the children that
+/// were actually filed; returns the child numbers `gh` printed.
+///
 /// Refuses to run twice over the same parent: the label OR the comment marker
 /// means the slice already happened. That marker goes up BEFORE the first
 /// child, because it is the only durable dedup — a slice that dies halfway
@@ -2530,24 +2516,36 @@ async fn slice_issue(
     )
     .await;
 
-    let mut note = format!(
-        "{SLICE_PARENT_MARKER}\nAuto-fix triage: this issue is too large for one unattended \
-         run, so the pipeline is slicing it into {} child issues instead of refusing it:\n\n",
-        plan.len()
-    );
-    for (title, _) in plan {
-        note.push_str(&format!("- {title}\n"));
-    }
-    note.push_str(&format!(
-        "\nEach child links back here and is scoped and built on its own. This issue is \
-         labelled `{AGENT_SLICED_LABEL}` so the picker skips it; close it once the children \
-         are done.\n"
-    ));
-    backoff_comment(repo_root, parent, &note).await?;
+    let titles: String = plan.iter().map(|(t, _)| format!("- {t}\n")).collect();
+    backoff_comment(
+        repo_root,
+        parent,
+        &format!(
+            "{SLICE_PARENT_MARKER}\nAuto-fix triage: this issue is too large for one \
+             unattended run, so the pipeline is slicing it into {} child issues instead of \
+             refusing it:\n\n{titles}",
+            plan.len()
+        ),
+    )
+    .await?;
 
     let mut filed: Vec<u64> = Vec::new();
+    let mut failed = None;
     for (title, body) in plan {
-        filed.push(file_slice_child(repo_root, parent, title, body).await?);
+        match file_slice_child(repo_root, parent, title, body).await {
+            Ok(number) => filed.push(number),
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+        }
+    }
+    // Nothing landed: leave the parent unlabelled so it stays visible and the
+    // caller falls through to the ordinary pre-build refusal. Once one child
+    // exists the label goes on even if a later one failed, or the parent would
+    // re-enter the pool with part of its work already filed.
+    if filed.is_empty() {
+        return Err(failed.expect("a non-empty plan filed no children"));
     }
     let (ok, _out, err) = run(
         &gh,
@@ -2561,7 +2559,28 @@ async fn slice_issue(
             truncate(&err, 300)
         );
     }
+    // Only now are the child numbers known, so this is the comment that leaves
+    // the parent a usable list of its actual children.
+    let links: String = filed.iter().map(|n| format!("- #{n}\n")).collect();
+    backoff_comment(
+        repo_root,
+        parent,
+        &format!(
+            "Sliced into:\n\n{links}\nEach child links back here and is scoped and built on \
+             its own. This issue is labelled `{AGENT_SLICED_LABEL}` so the picker skips it; \
+             close it once the children are done.\n"
+        ),
+    )
+    .await
+    .ok();
     info!(parent, children = ?filed, title = parent_title, "sliced an oversized issue");
+    if let Some(e) = failed {
+        return Err(e.context(format!(
+            "#{parent} filed only {} of {} planned children",
+            filed.len(),
+            plan.len()
+        )));
+    }
     Ok(filed)
 }
 
