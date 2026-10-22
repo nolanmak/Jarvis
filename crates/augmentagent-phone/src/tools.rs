@@ -208,9 +208,8 @@ impl ToolServer {
             }
             "phone_number_setup" => {
                 empty(&request.arguments)?;
-                self.service.check(&entry.grant, true)?;
                 Ok(
-                    json!({"instructions":"Send `phone number set +<country code><number>` in this private chat. Enter the spoken code using `phone number verify <code>`. Keep numbers and verification codes out of agent prompts."}),
+                    json!({"instructions":"Ask: What phone number should I call? The owner can reply with their number or ‘my number is …’. Assume US (+1) for a 10-digit number; otherwise ask for an international country code. Number replies are intercepted by the authenticated chat adapter before model processing. Private DM entry is also supported."}),
                 )
             }
             "speak" => {
@@ -246,11 +245,11 @@ fn empty(value: &Value) -> Result<(), Error> {
 }
 pub fn schemas(speech: bool) -> Vec<Value> {
     let mut tools = vec![
-        json!({"name":"call_owner","description":"Call the owner's verified phone when they request a phone conversation. Reuse request_id only to retry the same request; never redial an uncertain call.","inputSchema":{"type":"object","properties":{"request_id":{"type":"string","maxLength":512}},"required":["request_id"],"additionalProperties":false}}),
+        json!({"name":"call_owner","description":"Call the owner's saved phone when they request a phone conversation. Reuse request_id only to retry the same request; never redial an uncertain call.","inputSchema":{"type":"object","properties":{"request_id":{"type":"string","maxLength":512}},"required":["request_id"],"additionalProperties":false}}),
         json!({"name":"phone_status","description":"Read an owner call's status.","inputSchema":{"type":"object","properties":{"call_id":{"type":"string"}},"required":["call_id"],"additionalProperties":false}}),
         json!({"name":"phone_hangup","description":"Stop an owner call.","inputSchema":{"type":"object","properties":{"call_id":{"type":"string"}},"required":["call_id"],"additionalProperties":false}}),
     ];
-    for (name,description) in [("phone_number_setup","Show private phone-number setup instructions. Number and code entry use private commands outside the model."),("phone_number_status","Read masked phone configuration in the private owner chat."),("phone_number_remove","Remove the owner's phone destination and stop their calls.")] {
+    for (name,description) in [("phone_number_setup","Show conversational phone setup instructions. Number entry is handled by the authenticated chat adapter outside the model."),("phone_number_status","Read masked phone configuration in the private owner chat."),("phone_number_remove","Remove the owner's phone destination and stop their calls.")] {
         tools.push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":{},"additionalProperties":false}}));
     }
     if speech {

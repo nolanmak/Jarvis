@@ -11,8 +11,9 @@ The daemon also installs Discord after authenticated gateway READY when the
 allowlisted owner has an explicit phone link for the bot DM account (or an
 already-authorized guild control chat). It reuses Discord's existing query
 handler and starts the durable transcript worker. In the configured owner's DM,
-`phone number set +<country code><number>` establishes the initial private
-control chat and requests number verification. Ordinary messages and status
+`my number is …` establishes the initial private control chat and saves the
+owner-supplied destination. `phone number set +<country code><number>` remains
+available for optional code verification. Ordinary messages and status
 commands do not create bindings. Existing bindings are never replaced; revoked
 accounts require trusted operator reprovisioning and cannot be restored by chat.
 WhatsApp now installs when phone is enabled, an explicit WhatsApp owner link is
@@ -41,8 +42,18 @@ production readiness.
 Keep provider credentials and the verification key in the existing private
 service environment (`.env` or the host's secret mechanism). Never put them in
 chat, tool arguments, repository files or diagnostic output. The destination is
-configured through private chat verification and stored under the canonical
+configured through authenticated owner chat and stored under the canonical
 owner; it is not supplied by a `call_owner` argument or an environment fallback.
+
+In a linked Discord control chat, `call me` asks for a missing destination.
+Reply with the number or `my number is …`; a 10-digit number defaults to US +1,
+while other national formats prompt for an explicit international country code.
+The pending call intent lasts 15 minutes in that same conversation. A combined
+`my number is …` followed by `call me`, or `call me at …`, saves and calls at once.
+Number entry is intercepted before model/history processing and replies do not
+echo the full number. This flow records `owner_supplied` provenance; it does not
+claim a verification code was completed. Owner binding, call acceptance, rate
+limits and duplicate-call protections still apply. Private DM entry is optional.
 
 | Variable | Meaning |
 | --- | --- |

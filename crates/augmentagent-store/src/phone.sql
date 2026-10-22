@@ -61,3 +61,16 @@ CREATE TABLE IF NOT EXISTS phone_usage_reconciliation (
     attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 3),
     next_ms INTEGER NOT NULL DEFAULT 0
 );
+
+-- Conversational setup intent and replay receipts contain no phone numbers.
+CREATE TABLE IF NOT EXISTS phone_setup_prompts (
+    owner TEXT PRIMARY KEY,
+    conversation TEXT NOT NULL,
+    created_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS phone_number_receipts (
+    owner TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    should_call INTEGER NOT NULL,
+    PRIMARY KEY(owner, event_id)
+);

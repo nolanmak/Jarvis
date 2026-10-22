@@ -306,6 +306,40 @@ fn used_budget_ms(conn: &Connection, owner: &str, now_ms: i64) -> rusqlite::Resu
 }
 
 impl Store {
+    pub fn phone_prompt_for_number(&self, owner: &str, conversation: &str, now_ms: i64) -> PhoneResult<()> {
+        identifier(owner)?;
+        self.with_conn(|c| c.execute("INSERT INTO phone_setup_prompts VALUES(?1,?2,?3) ON CONFLICT(owner) DO UPDATE SET conversation=?2,created_ms=?3", params![owner,conversation,now_ms]))?;
+        Ok(())
+    }
+
+    /// Authenticated owner-supplied destination, distinct from code verification.
+    /// Replay receipts prevent an older delivered message replacing a newer number.
+    pub fn phone_save_owner_number(&self, owner: &str, conversation: &str, event_id: &str, number: &str, call_now: bool, now_ms: i64) -> PhoneResult<Option<CallReservation>> {
+        identifier(owner)?;
+        identifier(event_id)?;
+        validate_e164(number)?;
+        transaction(self, |tx| {
+            if let Some(call) = tx.query_row("SELECT should_call FROM phone_number_receipts WHERE owner=?1 AND event_id=?2", params![owner,event_id], |r|r.get::<_,bool>(0)).optional()? {
+                if !call { return Ok(None); }
+                // Retention may have removed the old call. Never recreate it.
+                let old = tx.query_row(&format!("SELECT {CALL_COLUMNS} FROM phone_calls WHERE owner=?1 AND request_id=?2"), params![owner,event_id], read_call).optional()?;
+                if old.as_ref().is_some_and(|call| call.conversation != conversation) {
+                    return Err(PhoneError::Conflict);
+                }
+                return Ok(old.map(|call| CallReservation { call, should_dial: false }));
+            }
+            let active: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM phone_calls WHERE owner=?1 AND state IN ('requesting','uncertain','queued','ringing','awaiting_acceptance','connected'))", [owner], |r|r.get(0))?;
+            if active { return Err(PhoneError::AlreadyActive); }
+            let pending: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM phone_setup_prompts WHERE owner=?1 AND conversation=?2 AND created_ms BETWEEN ?3 AND ?4)",params![owner,conversation,now_ms.saturating_sub(900_000),now_ms],|r|r.get(0))?;
+            let call = call_now || pending;
+            tx.execute("INSERT INTO phone_destinations VALUES(?1,?2,?3,'owner_supplied') ON CONFLICT(owner) DO UPDATE SET number=?2,updated_ms=?3,provenance='owner_supplied'", params![owner,number,now_ms])?;
+            tx.execute("DELETE FROM phone_verifications WHERE owner=?1",[owner])?;
+            tx.execute("DELETE FROM phone_setup_prompts WHERE owner=?1",[owner])?;
+            tx.execute("INSERT INTO phone_number_receipts VALUES(?1,?2,?3)",params![owner,event_id,call])?;
+            if call { reserve(tx, ReserveCall { owner, request_id: event_id, conversation, now_ms }, Some(number), false).map(Some) } else { Ok(None) }
+        })
+    }
+
     pub fn phone_budget_remaining_ms(&self, owner: &str, now_ms: i64) -> PhoneResult<i64> {
         identifier(owner)?;
         if now_ms < 0 {
@@ -542,6 +576,7 @@ impl Store {
         transaction(self, |tx| {
             tx.execute("INSERT INTO phone_destinations(owner,number,updated_ms,provenance) VALUES(?1,NULL,?2,'removed') ON CONFLICT(owner) DO UPDATE SET number=NULL,updated_ms=?2,provenance='removed'", params![owner,now_ms])?;
             tx.execute("DELETE FROM phone_verifications WHERE owner=?1", [owner])?;
+            tx.execute("DELETE FROM phone_setup_prompts WHERE owner=?1", [owner])?;
             tx.execute(
                 "UPDATE phone_calls SET stop_requested=1 WHERE owner=?1 AND ended_ms IS NULL",
                 [owner],

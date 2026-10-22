@@ -349,26 +349,7 @@ impl PhoneService {
                     conversation: &conversation,
                     now_ms: self.clock.now_ms(),
                 })?;
-                if reserved.should_dial {
-                    let action = format!(
-                        "{}/phone/start/{}",
-                        self.config.public_base, reserved.call.id
-                    );
-                    let twiml = format!(
-                        "<Response><Redirect method=\"POST\">{}</Redirect></Response>",
-                        xml(&action)
-                    );
-                    self.store.phone_register_origin(
-                        &reserved.call.id,
-                        &augmentagent_store::phone::PhoneOrigin {
-                            owner: grant.surface_owner.clone(),
-                            conversation: grant.conversation.clone(),
-                        },
-                        grant.binding_revision,
-                    )?;
-                    self.dial(&reserved.call, twiml).await?;
-                }
-                self.store.phone_call(&grant.owner_id, &reserved.call.id)?
+                self.finish_call_reservation(grant, reserved).await?
             }
             "phone_status" => {
                 let args: Call =
@@ -395,6 +376,28 @@ impl PhoneService {
             ).map_err(|_| Error::InvalidArguments)?;
         }
         Ok(receipt)
+    }
+    async fn finish_call_reservation(&self, grant: &Grant, reserved: augmentagent_store::phone::CallReservation) -> Result<PhoneCall, Error> {
+        if reserved.should_dial {
+            let action = format!(
+                "{}/phone/start/{}",
+                self.config.public_base, reserved.call.id
+            );
+            let twiml = format!(
+                "<Response><Redirect method=\"POST\">{}</Redirect></Response>",
+                xml(&action)
+            );
+            self.store.phone_register_origin(
+                &reserved.call.id,
+                &augmentagent_store::phone::PhoneOrigin {
+                    owner: grant.surface_owner.clone(),
+                    conversation: grant.conversation.clone(),
+                },
+                grant.binding_revision,
+            )?;
+            self.dial(&reserved.call, twiml).await?;
+        }
+        Ok(self.store.phone_call(&grant.owner_id, &reserved.call.id)?)
     }
     async fn dial(&self, call: &PhoneCall, twiml: String) -> Result<(), Error> {
         // Removal can race an in-flight create. Check before send, and again

@@ -1599,17 +1599,17 @@ async fn call_me_routes_directly_and_explains_missing_setup() {
     for text in ["call me", "Call me!", "please call me", "call me please."] {
         assert!(recognizes(text), "{text}");
     }
-    for text in ["don't call me", "if I say call me", "call me tomorrow", "call me at +12025550199"] {
+    for text in ["don't call me", "if I say call me", "call me tomorrow"] {
         assert!(!recognizes(text), "{text}");
     }
     f.store.phone_remove_destination("canonical-owner", 100).unwrap();
     let reply = execute(&f.service, &f.owner, &f.conversation, "missing", "call me").await.unwrap();
-    assert!(reply.contains("private chat"), "{reply}");
-    assert!(reply.contains("phone number set"), "{reply}");
+    assert!(reply.contains("private DM"), "{reply}");
+    assert!(reply.contains("my number is"), "{reply}");
     assert!(f.provider.calls.lock().unwrap().is_empty());
     f.store.unbind_surface_owner(f.owner.account()).unwrap();
     let reply = execute(&f.service, &f.owner, &f.conversation, "unbound", "call me").await.unwrap();
-    assert!(reply.contains("phone number set"), "{reply}");
+    assert!(reply.contains("my number is"), "{reply}");
     assert!(f.provider.calls.lock().unwrap().is_empty());
 }
 
@@ -1621,4 +1621,54 @@ async fn call_me_dials_verified_destination_once_on_replay() {
         assert!(reply.contains("queued"), "{reply}");
     }
     assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn conversational_number_setup_defaults_to_us_and_completes_pending_call() {
+    use augmentagent_phone::commands::{execute, recognizes, sensitive};
+    let f = fixture("discord", true, false, false);
+    f.store.phone_remove_destination("canonical-owner", 100).unwrap();
+    let reply=execute(&f.service,&f.owner,&f.conversation,"ask","call me").await.unwrap();
+    assert!(reply.contains("What phone number"),"{reply}");
+    assert!(reply.contains("US"),"{reply}");
+    assert!(recognizes("my number is (202) 555-0123"));
+    assert!(sensitive("my number is (202) 555-0123"));
+    let reply=execute(&f.service,&f.owner,&f.conversation,"number","my number is (202) 555-0123").await.unwrap();
+    assert!(reply.contains("queued"),"{reply}");
+    assert!(!reply.contains("202"));
+    assert_eq!(f.provider.calls.lock().unwrap()[0].destination.expose(),"+12025550123");
+    execute(&f.service,&f.owner,&f.conversation,"number","my number is (202) 555-0123").await.unwrap();
+    assert_eq!(f.provider.calls.lock().unwrap().len(),1);
+}
+
+#[tokio::test]
+async fn conversational_setup_validates_country_and_rejects_untrusted_requests() {
+    use augmentagent_phone::commands::execute;
+    let f=fixture("discord",true,false,false);
+    let reply=execute(&f.service,&f.owner,&f.conversation,"bad","my number is 020 7946 0958").await.unwrap();
+    assert!(reply.contains("country code"),"{reply}");
+    assert!(f.provider.calls.lock().unwrap().is_empty());
+    let reply=execute(&f.service,&f.owner,&f.conversation,"uk","my number is +44 20 7946 0958\ncall me").await.unwrap();
+    assert!(reply.contains("queued"),"{reply}");
+    assert_eq!(f.provider.calls.lock().unwrap()[0].destination.expose(),"+442079460958");
+    f.store.unbind_surface_owner(f.owner.account()).unwrap();
+    let reply=execute(&f.service,&f.owner,&f.conversation,"forged","my number is 2025550199").await.unwrap();
+    assert!(reply.contains("authorization"));
+    assert_eq!(f.provider.calls.lock().unwrap().len(),1);
+}
+
+#[tokio::test]
+async fn conversational_setup_expires_and_old_messages_cannot_replace_new_number() {
+    use augmentagent_phone::commands::execute;
+    let f=fixture("discord",true,false,false);
+    f.store.phone_remove_destination("canonical-owner",100).unwrap();
+    execute(&f.service,&f.owner,&f.conversation,"ask-expire","call me").await.unwrap();
+    f.clock.0.store(900_101,Ordering::SeqCst);
+    let reply=execute(&f.service,&f.owner,&f.conversation,"first","2025550123").await.unwrap();
+    assert!(reply.contains("Saved"),"{reply}");
+    assert!(f.provider.calls.lock().unwrap().is_empty());
+    execute(&f.service,&f.owner,&f.conversation,"second","my number is 2025550199").await.unwrap();
+    execute(&f.service,&f.owner,&f.conversation,"first","2025550123").await.unwrap();
+    execute(&f.service,&f.owner,&f.conversation,"dial","call me").await.unwrap();
+    assert_eq!(f.provider.calls.lock().unwrap()[0].destination.expose(),"+12025550199");
 }

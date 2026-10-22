@@ -4,6 +4,39 @@ use crate::PhoneService;
 use augmentagent_store::{SurfaceConversationRef, SurfaceOwnerRef};
 use serde_json::json;
 
+/// Explicit owner statements only; never extract numbers from arbitrary prose.
+fn number_statement(text: &str) -> Option<(String, bool)> {
+    let lower = text.trim().to_ascii_lowercase();
+    if normalize_number(&lower).is_ok() {
+        return Some((lower, false));
+    }
+    let (body, call) = if let Some(number) = lower.strip_prefix("call me at ") {
+        (number, true)
+    } else {
+        let body = lower.strip_prefix("my number is ")
+            .or_else(|| lower.strip_prefix("my phone number is "))?;
+        match body.strip_suffix("call me") {
+            Some(number) => (number.trim_end_matches(|c: char| c.is_whitespace() || c == ',' || c == '.'), true),
+            None => (body, false),
+        }
+    };
+    Some((body.trim().to_string(), call))
+}
+
+fn normalize_number(raw: &str) -> Result<String, &'static str> {
+    const QUESTION: &str = "What country code should I use? I assume US (+1) for a 10-digit number. For another country, reply ‘my number is +<country code><number>’.";
+    if !raw.chars().all(|c| c.is_ascii_digit() || matches!(c, '+' | ' ' | '-' | '(' | ')' | '.')) {
+        return Err(QUESTION);
+    }
+    let compact: String = raw.chars().filter(|c| c.is_ascii_digit() || *c == '+').collect();
+    let number = if compact.starts_with('+') { compact }
+        else if compact.len() == 10 { format!("+1{compact}") }
+        else if compact.len() == 11 && compact.starts_with('1') { format!("+{compact}") }
+        else { return Err(QUESTION); };
+    augmentagent_store::phone::validate_e164(&number).map_err(|_| QUESTION)?;
+    Ok(number)
+}
+
 fn words(text: &str) -> Option<Vec<&str>> {
     let body = text.trim().trim_start_matches(['!', '/']);
     // Only complete, immediate requests are aliases. Conditional requests,
@@ -22,16 +55,16 @@ fn words(text: &str) -> Option<Vec<&str>> {
         .then_some(words)
 }
 pub fn sets_number(text: &str) -> bool {
-    words(text).is_some_and(|w| matches!(w.as_slice(), [_, "number", "set", _]))
+    number_statement(text).is_some() || words(text).is_some_and(|w| matches!(w.as_slice(), [_, "number", "set", _]))
 }
 pub fn recognizes(text: &str) -> bool {
-    words(text).is_some()
+    number_statement(text).is_some() || words(text).is_some()
 }
 pub fn sensitive(text: &str) -> bool {
-    words(text).is_some_and(|w| w.get(1).is_some_and(|w| w.eq_ignore_ascii_case("number")))
+    number_statement(text).is_some() || words(text).is_some_and(|w| w.get(1).is_some_and(|w| w.eq_ignore_ascii_case("number")))
 }
 pub const HELP:&str="Phone: `phone call`, `phone status`, `phone stop`. In your private chat: `phone number set +<country code><number>`, `phone number verify <six-digit code>`, `phone number status`, `phone number remove`.";
-const SETUP_HELP: &str = "In your private chat with the agent, send `phone number set +<country code><number>`, answer the verification call, then send `phone number verify <six-digit code>` in that same private chat. After verification, say ‘call me’.";
+const SETUP_HELP: &str = "In your private DM with the agent, reply ‘my number is …’ to set up calling. I assume US (+1) unless you include another country code. Server channels must also be linked to your owner identity.";
 
 pub async fn execute(
     service: &PhoneService,
@@ -40,12 +73,30 @@ pub async fn execute(
     event_id: &str,
     text: &str,
 ) -> Option<String> {
-    let w = words(text)?;
+    let statement = number_statement(text);
+    let w = if statement.is_some() { vec![] } else { words(text)? };
     let grant = match service.authorize(owner, conversation) {
         Ok(g) => g,
         Err(crate::Error::Unauthorized) => return Some(format!("Phone owner authorization is required in this chat. {SETUP_HELP}")),
         Err(e) => return Some(e.to_string()),
     };
+    if let Some((raw, call)) = statement {
+        let number = match normalize_number(&raw) {
+            Ok(number) => number,
+            Err(question) => return Some(question.into()),
+        };
+        let result = async {
+            service.check(&grant, false)?;
+            service.enabled()?;
+            let call = service.store.phone_save_owner_number(&grant.owner_id, &conversation.storage_key(), &format!("number:{event_id}"), &number, call, service.clock.now_ms())?;
+            if let Some(reserved) = call {
+                service.finish_call_reservation(&grant, reserved).await.map(|v| format!("Phone call {}: {}.",v.id,v.state.as_str()))
+            } else {
+                Ok("Saved your phone number. Say ‘call me’ whenever you’re ready.".into())
+            }
+        }.await;
+        return Some(result.unwrap_or_else(|e: crate::Error| e.to_string()));
+    }
     let result=match w.as_slice() {
         [_,"call"]=>service.tool(&grant,"call_owner",json!({"request_id":format!("command:{event_id}")})).await.map(|v|format!("Phone call {}: {}.",v["id"].as_str().unwrap_or("unknown"),v["state"].as_str().unwrap_or("unknown"))),
         [_,"status"]=>call_status(service, &grant),
@@ -60,8 +111,12 @@ pub async fn execute(
         _=>return Some(HELP.into()),
     };
     Some(result.unwrap_or_else(|e| match e {
-        crate::Error::Store(augmentagent_store::phone::PhoneError::NotConfigured) =>
-            format!("No verified phone number is configured. {SETUP_HELP}"),
+        crate::Error::Store(augmentagent_store::phone::PhoneError::NotConfigured) => {
+            match service.store.phone_prompt_for_number(&grant.owner_id, &conversation.storage_key(), service.clock.now_ms()) {
+                Ok(()) => "What phone number should I call? Reply ‘my number is …’. I’ll assume US (+1) unless you include another country code. You can send it in a private DM if you prefer.".into(),
+                Err(error) => error.to_string(),
+            }
+        },
         _ => e.to_string(),
     }))
 }
