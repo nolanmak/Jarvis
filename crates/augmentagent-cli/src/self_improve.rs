@@ -3813,6 +3813,12 @@ async fn merged_since(repo_root: &Path, created_at: &str) -> Option<String> {
 /// appear in a spec by coincidence, a sentence-length one cannot.
 const MERGED_SINCE_NAMED_CHARS: usize = 12;
 
+/// How much spec, beyond the commit subject it quotes, a `partial` reason
+/// must carry to count as stating what remains. Measured in non-whitespace
+/// characters, so the evidence sentence alone ("'<subject>' landed") cannot
+/// clear it while a clause naming the leftover work can.
+const MERGED_SINCE_REMAINS_CHARS: usize = 60;
+
 /// #1515 — a relevance claim is worth exactly as much as its evidence. The
 /// scoper is told to NAME the commit it is ruling on; a `partial` or
 /// `overtaken` verdict whose reason names none of the subjects it was shown
@@ -3820,26 +3826,34 @@ const MERGED_SINCE_NAMED_CHARS: usize = 12;
 /// open issue on a model's say-so. Unsupported claims degrade to
 /// [`Relevance::Current`] — the pre-#1515 behaviour, which only ever builds.
 ///
-/// Whether a `partial` spec usefully DESCRIBES what remains is the model's
-/// to get right; what is checkable here is that it says anything at all.
+/// `partial` carries a second obligation: the spec must say what remains,
+/// because the issue text alone is now stale. A `partial` that names a landed
+/// commit but describes no remaining work is NOT buildable — building it
+/// re-implements the part that landed — so it is treated as
+/// [`Relevance::Overtaken`] and held for the owner, whose triage is exactly
+/// the judgement the scoper declined to make.
 fn supported_relevance(sc: &ScopeOutcome, merged: Option<&str>) -> Relevance {
     if sc.relevance == Relevance::Current {
         return Relevance::Current;
     }
-    if sc.relevance == Relevance::Partial && sc.body.trim().is_empty() {
+    let mut reason = sc.body.to_ascii_lowercase();
+    let mut named = false;
+    for line in merged.unwrap_or_default().lines() {
+        let subject = line.trim().trim_start_matches("- ").trim_end_matches('…').trim();
+        let subject = subject.to_ascii_lowercase();
+        if subject.len() >= MERGED_SINCE_NAMED_CHARS && reason.contains(&subject) {
+            named = true;
+            reason = reason.replace(&subject, " ");
+        }
+    }
+    if !named {
         return Relevance::Current;
     }
-    let reason = sc.body.to_ascii_lowercase();
-    let named = merged.unwrap_or_default().lines().any(|l| {
-        let subject = l.trim().trim_start_matches("- ").trim_end_matches('…').trim();
-        subject.len() >= MERGED_SINCE_NAMED_CHARS
-            && reason.contains(&subject.to_ascii_lowercase())
-    });
-    if named {
-        sc.relevance
-    } else {
-        Relevance::Current
+    let spec_chars = reason.split_whitespace().map(str::len).sum::<usize>();
+    if sc.relevance == Relevance::Partial && spec_chars < MERGED_SINCE_REMAINS_CHARS {
+        return Relevance::Overtaken;
     }
+    sc.relevance
 }
 
 /// Build the stage-1 scoping prompt. Prior failures go in (#803) so the
@@ -7495,8 +7509,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     };
     // #1515 — a commit that merged since the issue was filed already delivers
     // it. Building anyway spends the daily cap on a no-op PR, so hold it for
-    // the owner to close or re-scope. `partial` is not held: the spec says
-    // what remains, which is ordinary work. #932 — a red-main issue is never
+    // the owner to close or re-scope. `partial` is not held when its spec says
+    // what remains, which is ordinary work; one that does not is held too (see
+    // `supported_relevance`). #932 — a red-main issue is never
     // labelled out, not even here: the scoper over-labels (#955), and a
     // mis-scoped "overtaken" verdict would hold the self-heal loop until a
     // human notices while main stays red.
@@ -7505,8 +7520,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         if sc.relevance != relevance {
             info!(
                 issue = issue.number,
-                "scoper claimed relevance {:?} without naming a merged commit \
-                 — treating the issue as current",
+                "scoper's relevance {:?} is not supported as written — \
+                 proceeding as {relevance:?}",
                 sc.relevance
             );
         }
@@ -16503,11 +16518,15 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             Relevance::Current
         );
 
-        // `partial` must both name the commit and say what remains; an empty
-        // spec states nothing, whatever the header claims.
-        let partial = scoped("partial", "'wiki: fix front-matter parse' landed half of it; \
-                                         the pagination half remains.");
+        // `partial` must both name the commit and say what remains.
+        let partial = scoped(
+            "partial",
+            "'wiki: fix front-matter parse' landed the parser half. What remains: \
+             reject a page whose front-matter parses but carries no title, and \
+             cover it with a test.",
+        );
         assert_eq!(supported_relevance(&partial, Some(merged)), Relevance::Partial);
+        // An unevidenced `partial` is an assertion like any other: built.
         assert_eq!(
             supported_relevance(&scoped("partial", ""), Some(merged)),
             Relevance::Current
@@ -16515,6 +16534,16 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert_eq!(
             supported_relevance(&scoped("partial", "some of it landed"), Some(merged)),
             Relevance::Current
+        );
+        // The second reviewer's case: a `partial` that names a landed commit
+        // but specifies no remaining work is unbuildable — the issue text it
+        // would be built from is the stale part — so it is held, not shipped.
+        assert_eq!(
+            supported_relevance(
+                &scoped("partial", "'autopr: paginate the issue pool' landed"),
+                Some(merged)
+            ),
+            Relevance::Overtaken
         );
 
         // `current` never needs evidence: the default must stay free.
