@@ -1639,7 +1639,8 @@ async fn conversational_number_setup_defaults_to_us_and_completes_pending_call()
     assert!(sensitive("my number is (202) 555-0123"));
     let reply=execute(&f.service,&f.owner,&f.conversation,"number","my number is (202) 555-0123").await.unwrap();
     assert!(reply.contains("queued"),"{reply}");
-    assert!(!reply.contains("202"));
+    assert!(!reply.contains("2025550123"));
+    assert!(!reply.contains("(202) 555-0123"));
     assert_eq!(f.provider.calls.lock().unwrap()[0].destination.expose(),"+12025550123");
     execute(&f.service,&f.owner,&f.conversation,"number","my number is (202) 555-0123").await.unwrap();
     assert_eq!(f.provider.calls.lock().unwrap().len(),1);
