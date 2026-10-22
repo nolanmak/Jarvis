@@ -374,10 +374,10 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         .filter(|(pr, ..)| i.open_prs.as_ref().is_none_or(|open| open.contains(pr)))
         .collect();
     if !held.is_empty() {
-        let budget = crate::self_improve::REVIEW_UNAVAILABLE_BUDGET_DAYS;
+        let budget = crate::self_improve::REVIEW_UNAVAILABLE_ALERT_DAYS;
         let which = held
             .iter()
-            .map(|(pr, _, reason, days)| format!("#{pr} {reason} (day {days} of {budget})"))
+            .map(|(pr, _, reason, days)| format!("#{pr} {reason} (waiting {days} days)"))
             .collect::<Vec<_>>()
             .join("; ");
         let mut fixes: Vec<&str> = Vec::new();
@@ -398,12 +398,16 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
             }
         }
         out.push(Finding {
-            severity: Severity::Warn,
+            severity: if held.iter().any(|(_, _, _, days)| *days >= budget) {
+                Severity::Alert
+            } else {
+                Severity::Warn
+            },
             code: "review-held",
             detail: format!(
                 "the loop is not wedged: these drafts are held, unbilled, because no \
-                 independent review is possible: {which}. After {budget} days it gives up on \
-                 each and says why."
+                 independent review is possible: {which}. Drafts remain queued for recovery; \
+                 waits of {budget} days or more are escalated."
             ),
             fix: fixes.join(". "),
         });
@@ -1373,7 +1377,7 @@ mod tests {
         ] {
             assert!(held.detail.contains(pr) && held.detail.contains(reason), "{}", held.detail);
         }
-        assert!(held.detail.contains("day 2 of 3"), "the budget is visible: {}", held.detail);
+        assert!(held.detail.contains("waiting 2 days"), "the wait is visible: {}", held.detail);
         assert!(
             held.detail.contains("not wedged") && held.detail.contains("unbilled"),
             "say plainly that nothing is broken or spent: {}",
@@ -1389,6 +1393,13 @@ mod tests {
         // A draft that has since closed or merged is history, not a hold.
         let closed = HealthInputs { open_prs: Some(vec![987]), ..i.clone() };
         assert!(!analyze(&closed, &Thresholds::default()).iter().any(|x| x.code == "review-held"));
+        let mut prolonged = i.clone();
+        prolonged.unreviewable_drafts[1].3 = 3;
+        let alerts = analyze(&prolonged, &Thresholds::default());
+        let alert = alerts.iter().find(|x| x.code == "review-held").unwrap();
+        assert_eq!(alert.severity, Severity::Alert);
+        assert!(alert.detail.contains("remain queued for recovery"));
+        assert!(!alert.detail.contains("gives up"));
         // And with nothing held, nothing is said.
         assert!(analyze(&healthy(), &Thresholds::default()).is_empty());
     }
