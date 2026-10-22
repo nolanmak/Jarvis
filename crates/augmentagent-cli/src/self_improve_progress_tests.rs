@@ -84,7 +84,7 @@ async fn approved_ready_pr_survives_pending_checks_failed_merge_and_head_change(
         let root = dir.path();
         let gh = root.join("gh.py");
         std::fs::write(&gh, r#"#!/usr/bin/env python3
-import json, os, pathlib, sys
+import json, os, pathlib, sys, time
 root=pathlib.Path(os.environ['AUTOSHIP_PROGRESS_FIXTURE'])
 a=sys.argv[1:]
 with (root/'calls').open('a') as f: f.write(json.dumps(a)+'\n')
@@ -95,8 +95,9 @@ if a[:2]==['pr','list']:
 elif a[:2]==['issue','view']: print(json.dumps(dict(body='Fix synthetic addition',author=dict(login='fixture-owner'))))
 elif a[:2]==['pr','diff']: print('src/synthetic.rs')
 elif a[:2]==['pr','checks']:
-    print(json.dumps([dict(state=s['checks'])])); sys.exit(0 if s['checks']=='SUCCESS' else 8)
+    print(json.dumps([dict(name='rust',state=s['checks']),dict(name='CodeRabbit',state='FAILURE')])); sys.exit(1)
 elif a[0]=='api': print('[]')
+elif a[:2]==['pr','edit']: time.sleep(30)
 elif a[:2]==['pr','ready']:
     assert s['draft'], 'already-ready PR must retain its original state'
 elif a[:2]==['pr','merge']:
@@ -150,6 +151,34 @@ else: raise Exception('unexpected call '+repr(a))
     scenario("SUCCESS", false, false, &head);
     assert_eq!(merge_sweep(&root, true).await, 0);
     assert!(!root.join("merged").exists());
+    let started = std::time::Instant::now();
+    assert!(!write_optional_pr_note(&root, "20", "Optional reviewer observation").await);
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
     assert_eq!(merge_sweep(&root, false).await, 1);
     assert_eq!(std::fs::read_to_string(root.join("merged")).unwrap(), head);
+}
+
+#[test]
+fn coderabbit_never_controls_ci_or_internal_review_approval() {
+    for state in ["PENDING", "FAILURE", "ERROR", "SUCCESS"] {
+        let rows = serde_json::json!([
+            {"name":"rust", "state":"SUCCESS"},
+            {"name":"CodeRabbit", "state":state}
+        ]);
+        assert_eq!(ci_checks_green(&rows.to_string()), Some(true));
+    }
+    assert_eq!(ci_checks_green(r#"[{"name":"CodeRabbit","state":"SUCCESS"}]"#), None);
+    assert_eq!(ci_checks_green(r#"[{"name":"rust","state":"PENDING"}]"#), Some(false));
+    assert_eq!(ci_checks_green(r#"[{"name":"rust","state":"FAILURE"}]"#), Some(false));
+    assert_eq!(ci_checks_green("{}"), None);
+    assert_eq!(ci_checks_green("[]"), None);
+    assert!(failed_ci_checks(r#"[{"name":"CodeRabbit","bucket":"fail"}]"#).is_empty());
+    assert!(resume_may_merge(true, true));
+    assert!(!resume_may_merge(false, true));
+    assert!(!resume_may_merge(true, false));
+    let src = include_str!("self_improve.rs");
+    let production = &src[..src.find("mod tests {").unwrap()];
+    for removed in ["wait_for_rabbit(", "rabbit_blocks", "@coderabbitai review", "AUTOPR_REQUIRE_CODERABBIT"] {
+        assert!(!production.contains(removed), "retired dependency: {removed}");
+    }
 }
