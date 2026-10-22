@@ -377,7 +377,7 @@ async fn ac04_signed_callbacks_reject_account_and_sid_spoofing_before_mutation()
 }
 
 #[tokio::test]
-async fn ac05_signed_start_then_accept_is_the_only_path_to_relay() {
+async fn ac05_signed_owner_start_connects_without_second_acceptance() {
     use augmentagent_phone::webhook::WebhookAuth;
     let f = fixture("discord", true, true, false);
     let auth = WebhookAuth::new("AC-test", "callback-secret");
@@ -398,8 +398,8 @@ async fn ac05_signed_start_then_accept_is_the_only_path_to_relay() {
         &fields,
     );
     let greeting = f.service.start_callback(&auth, id, &fields, &sig).unwrap();
-    assert!(greeting.contains("Gather"));
-    assert!(!greeting.contains("ConversationRelay"));
+    assert!(!greeting.contains("Gather"));
+    assert!(greeting.contains("ConversationRelay"));
     assert!(!greeting.contains("+12025550123"));
     fields.push(("Digits".into(), "1".into()));
     let sig = signed(
@@ -412,7 +412,7 @@ async fn ac05_signed_start_then_accept_is_the_only_path_to_relay() {
         .accept_callback(&auth, id, &fields, &sig)
         .await
         .unwrap();
-    assert!(relay.contains("ConversationRelay"));
+    assert!(relay.contains("Hangup"));
     assert_eq!(
         f.store
             .phone_call("canonical-owner", id)
@@ -529,7 +529,7 @@ async fn ac01_real_http_router_rejects_unsigned_callbacks_and_serves_signed_star
         .await
         .unwrap();
     assert_eq!(response.status().as_u16(), 200);
-    assert!(response.text().await.unwrap().contains("Gather"));
+    assert!(response.text().await.unwrap().contains("ConversationRelay"));
     server.abort();
 }
 
@@ -836,7 +836,7 @@ async fn ac04_revoked_owner_cannot_start_or_accept_but_terminal_status_still_rec
         if revoke_before_start {
             assert_eq!(reply, "<Response><Hangup/></Response>");
         } else {
-            assert!(reply.contains("Gather"));
+            assert!(reply.contains("ConversationRelay"));
             f.store.unbind_surface_owner(f.owner.account()).unwrap();
         }
         fields.push(("Digits".into(), "1".into()));
@@ -1691,7 +1691,7 @@ async fn failed_relay_reports_failure_instead_of_silent_hangup() {
     let sig=signed("secret",&format!("https://phone.example.test/phone/relay-ended/{id}"),&fields);
     let reply=f.service.relay_ended_callback(&auth,id,&fields,&sig).unwrap();
     assert!(reply.contains("could not connect"),"{reply}");
-    assert!(reply.contains("<Say>"));
+    assert!(reply.contains("<Say "));
 }
 
 #[tokio::test]
@@ -1765,4 +1765,180 @@ async fn relay_startup_bounds_control_frames_and_keeps_one_deadline() {
         assert_eq!(f.store.with_conn(|c| c.query_row("SELECT count(*) FROM phone_relay_claims",[],|r|r.get::<_,i64>(0))).unwrap(),0);
         server.abort();
     }
+}
+
+#[tokio::test]
+async fn owner_requested_call_connects_directly_with_female_voice() {
+    use augmentagent_phone::webhook::WebhookAuth;
+    let f = fixture("discord", true, true, false);
+    let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
+    let call = f
+        .service
+        .tool(&grant, "call_owner", json!({"request_id":"direct-answer"}))
+        .await
+        .unwrap();
+    let id = call["id"].as_str().unwrap();
+    let fields = vec![
+        ("AccountSid".into(), "AC-test".into()),
+        ("CallSid".into(), "CA-test".into()),
+    ];
+    let auth = WebhookAuth::new("AC-test", "secret");
+    let sig = signed(
+        "secret",
+        &format!("https://phone.example.test/phone/start/{id}"),
+        &fields,
+    );
+    let reply = f.service.start_callback(&auth, id, &fields, &sig).unwrap();
+    assert!(reply.contains("ConversationRelay"));
+    assert!(!reply.contains("Gather"));
+    for attr in [
+        "ttsProvider=\"Amazon\"",
+        "voice=\"Joanna\"",
+        "language=\"en-US\"",
+    ] {
+        assert!(reply.contains(attr), "{reply}");
+    }
+    assert_eq!(
+        f.store
+            .phone_call("canonical-owner", id)
+            .unwrap()
+            .state
+            .as_str(),
+        "connected"
+    );
+    assert!(f
+        .service
+        .start_callback(&auth, id, &fields, &sig)
+        .unwrap()
+        .contains("Hangup"));
+    assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
+}
+
+struct SlowPhoneAgent {
+    permits: tokio::sync::Semaphore,
+}
+#[async_trait]
+impl augmentagent_phone::ingress::ConversationAgent for SlowPhoneAgent {
+    async fn answer(
+        &self,
+        _: &augmentagent_store::phone::PhoneCall,
+        _: &str,
+        _: &str,
+        _: augmentagent_phone::ingress::SpeechSender,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<String, augmentagent_phone::ingress::AgentError> {
+        tokio::select! {
+            _ = cancel.cancelled() => Err(augmentagent_phone::ingress::AgentError),
+            permit = self.permits.acquire() => { permit.unwrap().forget(); Ok("Here is the result.".into()) }
+        }
+    }
+    async fn interrupted(
+        &self,
+        _: &augmentagent_store::phone::PhoneCall,
+        _: &str,
+    ) -> Result<(), augmentagent_phone::ingress::AgentError> {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        Err(augmentagent_phone::ingress::AgentError)
+    }
+}
+#[tokio::test]
+async fn slow_work_acknowledges_and_slow_interruption_mirror_does_not_hang_up() {
+    let agent = Arc::new(SlowPhoneAgent {
+        permits: tokio::sync::Semaphore::new(0),
+    });
+    use augmentagent_store::phone::CallState;
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+    let f = fixture("discord", true, true, false);
+    let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
+    let call = f
+        .service
+        .tool(&grant, "call_owner", json!({"request_id":"r1"}))
+        .await
+        .unwrap();
+    let id = call["id"].as_str().unwrap().to_string();
+    f.store
+        .phone_provider_event(&id, "CA-test", CallState::AwaitingAcceptance, 100)
+        .unwrap();
+    f.store.phone_accept(&id, "CA-test", 101).unwrap();
+    let router = augmentagent_phone::ingress::router(
+        Arc::new(f.service),
+        Arc::new(augmentagent_phone::webhook::WebhookAuth::new(
+            "AC-test",
+            "callback-secret",
+        )),
+        agent.clone(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let mut request = format!("ws://{addr}/phone/relay/{id}")
+        .into_client_request()
+        .unwrap();
+    let signature = signed(
+        "callback-secret",
+        &format!("wss://phone.example.test/phone/relay/{id}"),
+        &[],
+    );
+    request
+        .headers_mut()
+        .insert("x-twilio-signature", signature.parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request.clone())
+        .await
+        .unwrap();
+
+    socket.send(Message::Text(json!({"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX-test"}).to_string().into())).await.unwrap();
+    socket
+        .send(Message::Text(
+            json!({"type":"prompt","voicePrompt":"look up something","last":true})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let ack = tokio::time::timeout(std::time::Duration::from_millis(500), socket.next())
+        .await
+        .expect("ack must not wait for model/tools")
+        .unwrap()
+        .unwrap();
+    assert!(ack.into_text().unwrap().contains("Got it"));
+    socket.send(Message::Text(json!({"type":"interrupt","utteranceUntilInterrupt":"Got it","durationUntilInterruptMs":100}).to_string().into())).await.unwrap();
+    socket
+        .send(Message::Text(
+            json!({"type":"prompt","voicePrompt":"actually something else","last":true})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let ack = tokio::time::timeout(std::time::Duration::from_millis(500), socket.next())
+        .await
+        .expect("slow transcript mirror must not block speech")
+        .unwrap()
+        .unwrap();
+    assert!(ack.into_text().unwrap().contains("Got it"));
+    agent.permits.add_permits(2);
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(1), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(answer.into_text().unwrap().contains("Here is the result"));
+    tokio::time::sleep(std::time::Duration::from_millis(3200)).await;
+    socket.send(Message::Ping(vec![1].into())).await.unwrap();
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        Message::Pong(_)
+    ));
+    assert!(
+        !f.store
+            .phone_call("canonical-owner", &id)
+            .unwrap()
+            .stop_requested
+    );
+    server.abort();
 }

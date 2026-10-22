@@ -87,3 +87,11 @@ fn ac07_wrong_setup_duplicate_setup_malformed_and_oversized_frames_fail_closed()
         .receive(r#"{"type":"error","description":"sensitive provider data"}"#)
         .is_err());
 }
+
+#[test]
+fn provider_validation_error_does_not_end_an_authenticated_session() {
+    let mut session = RelaySession::new("call-1", "AC-test", "CA-test");
+    session.receive(&setup()).unwrap();
+    assert!(session.receive(r#"{"type":"error","code":64107,"description":"private"}"#).is_ok());
+    assert!(matches!(session.receive(r#"{"type":"prompt","voicePrompt":"try again","last":true}"#).unwrap(), RelayInput::Turn(_)));
+}

@@ -41,6 +41,9 @@ struct Agent {
 impl QueryHandler for Agent {
     async fn answer(&self, ctx: &AuditCtx, question: &str) -> anyhow::Result<String> {
         assert!(ctx.owner_authorized);
+        if question.contains("phone question") {
+            assert!(augmentagent_channel_core::model_router::current()?.is_none(), "phone must bypass the optional model gateway");
+        }
         let mut opts = augmentagent_channel_core::reasoner::triage_opts(None);
         opts.session_id = Some(ctx.session_id.clone());
         self.provider.call(&opts, question).await

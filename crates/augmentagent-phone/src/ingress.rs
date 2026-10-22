@@ -197,14 +197,21 @@ async fn accept(
     )
 }
 async fn relay_ended(
-    State(state): State<Ingress>, Path(id): Path<String>, OriginalUri(uri): OriginalUri,
-    headers: HeaderMap, body: Bytes,
+    State(state): State<Ingress>,
+    Path(id): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
     let (fields, sig) = match form(&headers, &uri, &body) {
         Ok(v) => v,
         Err(r) => return r.into_response(),
     };
-    twiml(state.service.relay_ended_callback(&state.auth, &id, &fields, &sig))
+    twiml(
+        state
+            .service
+            .relay_ended_callback(&state.auth, &id, &fields, &sig),
+    )
 }
 async fn relay(
     State(state): State<Ingress>,
@@ -267,13 +274,22 @@ struct SetupFailure {
 }
 
 fn decode_setup(session: &mut RelaySession, text: &str) -> Result<(), SetupFailure> {
-    let failure = |reason| SetupFailure { reason, provider_code: None };
-    let value: serde_json::Value = serde_json::from_str(text).map_err(|_| failure("invalid_json"))?;
+    let failure = |reason| SetupFailure {
+        reason,
+        provider_code: None,
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|_| failure("invalid_json"))?;
     if value["type"] == "error" {
         let provider_code = value["code"].as_u64().and_then(|n| u32::try_from(n).ok());
-        return Err(SetupFailure { reason: "provider_error", provider_code });
+        return Err(SetupFailure {
+            reason: "provider_error",
+            provider_code,
+        });
     }
-    if value["type"] != "setup" { return Err(failure("unexpected_text_type")); }
+    if value["type"] != "setup" {
+        return Err(failure("unexpected_text_type"));
+    }
     match session.receive(text) {
         Ok(RelayInput::Ready) => Ok(()),
         Err(Error::Unauthorized) => Err(failure("setup_identity_rejected")),
@@ -281,18 +297,29 @@ fn decode_setup(session: &mut RelaySession, text: &str) -> Result<(), SetupFailu
     }
 }
 
-async fn receive_setup(socket: &mut WebSocket, session: &mut RelaySession) -> Result<usize, SetupFailure> {
-    let failure = |reason| SetupFailure { reason, provider_code: None };
+async fn receive_setup(
+    socket: &mut WebSocket,
+    session: &mut RelaySession,
+) -> Result<usize, SetupFailure> {
+    let failure = |reason| SetupFailure {
+        reason,
+        provider_code: None,
+    };
     // One deadline includes all reads and Pong writes. Heartbeats cannot keep
     // an unauthenticated session alive indefinitely.
     tokio::time::timeout(Duration::from_secs(5), async {
         for controls in 0..=32 {
             match socket.recv().await {
                 Some(Ok(Message::Ping(bytes))) if controls < 32 => {
-                    socket.send(Message::Pong(bytes)).await.map_err(|_| failure("pong_write_failed"))?;
+                    socket
+                        .send(Message::Pong(bytes))
+                        .await
+                        .map_err(|_| failure("pong_write_failed"))?;
                 }
-                Some(Ok(Message::Pong(_))) if controls < 32 => {},
-                Some(Ok(Message::Ping(_) | Message::Pong(_))) => return Err(failure("control_frame_limit")),
+                Some(Ok(Message::Pong(_))) if controls < 32 => {}
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
+                    return Err(failure("control_frame_limit"))
+                }
                 Some(Ok(Message::Text(text))) => {
                     decode_setup(session, &text)?;
                     return Ok(controls);
@@ -303,7 +330,9 @@ async fn receive_setup(socket: &mut WebSocket, session: &mut RelaySession) -> Re
             }
         }
         Err(failure("control_frame_limit"))
-    }).await.map_err(|_| failure("setup_timeout"))?
+    })
+    .await
+    .map_err(|_| failure("setup_timeout"))?
 }
 
 async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
@@ -316,11 +345,11 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
         Ok(control_frames) => {
             tracing::info!(call_id = %call.id, control_frames, "phone relay setup accepted");
             true
-        },
+        }
         Err(error) => {
             tracing::warn!(call_id = %call.id, reason = error.reason, provider_code = ?error.provider_code, "phone relay setup rejected");
             false
-        },
+        }
     };
     // Only a valid setup may trigger cleanup for revoked authority. Invalid
     // setup or a duplicate socket must not terminate an existing relay.
@@ -349,6 +378,21 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
     let agent = state.agent.clone();
     let worker_call = call.clone();
     let worker_service = state.service.clone();
+    let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<String>(4);
+    let interrupt_agent = state.agent.clone();
+    let interrupt_call = call.clone();
+    let interrupt_cancel = cancel.clone();
+    let interrupt_worker = tokio::spawn(async move {
+        loop {
+            let heard = tokio::select! { _=interrupt_cancel.cancelled()=>break, value=interrupt_rx.recv()=>match value {Some(v)=>v,None=>break} };
+            tokio::select! {
+                _=interrupt_cancel.cancelled()=>break,
+                result=interrupt_agent.interrupted(&interrupt_call,&heard)=> {
+                    if result.is_err() { tracing::warn!("phone interruption persistence failed; keeping voice connection open"); }
+                }
+            }
+        }
+    });
     let mut worker = tokio::spawn(async move {
         loop {
             let turn = tokio::select! { _=worker_cancel.cancelled()=>break, t=turn_rx.recv()=>match t {Some(t)=>t,None=>break} };
@@ -359,20 +403,23 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                 sender: speech_tx.clone(),
                 turn: turn.clone(),
             };
-            let result = agent
-                .answer(
+            let turn_cancel = worker_cancel.child_token();
+            let result = bounded_answer(
+                agent.answer(
                     &worker_call,
                     &turn.id,
                     &turn.text,
                     speech,
-                    worker_cancel.clone(),
-                )
-                .await;
+                    turn_cancel.clone(),
+                ),
+                &turn_cancel,
+            )
+            .await;
             if worker_cancel.is_cancelled() {
                 break;
             }
             let text = result.unwrap_or_else(|_| {
-                "The agent could not complete this turn. Please continue in chat.".into()
+                "Sorry, I couldn’t complete that request. You can try another question or continue in chat.".into()
             });
             if speech_tx
                 .send(SpeechOutput {
@@ -389,43 +436,72 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
             }
         }
     });
-    let mut tick = tokio::time::interval(Duration::from_millis(250));
-    loop {
+    let mut feedback = std::collections::HashMap::<String, TurnFeedback>::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    let end_reason = 'connection: loop {
         tokio::select! {
             incoming=socket.recv()=>{
-                if state.service.authorize_call(&call.id).is_err() {break;}
+                if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
                 match incoming {
                     Some(Ok(Message::Text(frame)))=>match session.receive(&frame) {
-                        Ok(RelayInput::Turn(turn))=>if turn_tx.try_send(Arc::new(turn)).is_err() {break;},
+                        Ok(RelayInput::Turn(turn))=>{
+                            let turn=Arc::new(turn);
+                            feedback.insert(turn.id.clone(), TurnFeedback::new(turn.clone()));
+                            if turn_tx.try_send(turn).is_err() {break "turn_queue_full";}
+                        },
                         Ok(RelayInput::Interrupted)=>{
+                            feedback.clear();
                             if let Some(heard)=session.take_interrupted_prefix() {
-                                let result=tokio::time::timeout(Duration::from_secs(2),state.agent.interrupted(&call,&heard)).await;
-                                if !matches!(result,Ok(Ok(()))) {break;}
+                                if interrupt_tx.try_send(heard).is_err() {
+                                    tracing::warn!("phone interruption persistence queue full; stale audio already invalidated");
+                                }
                             }
                         },
                         Ok(RelayInput::Ignore)=>{},
-                        _=>break,
+                        Ok(RelayInput::ProviderError(code))=>{
+                            tracing::warn!(call_id = %call.id, provider_code = code, "phone provider error");
+                            if code != 64107 { break "provider_error"; }
+                        },
+                        _=>break "invalid_protocol_frame",
                     },
                     Some(Ok(Message::Ping(_)|Message::Pong(_)))=>{},
-                    _=>break,
+                    Some(Ok(Message::Close(_))) | None => break "peer_closed",
+                    Some(Err(_)) => break "transport_error",
+                    _ => break "unsupported_frame",
                 }
             },
             output=speech_rx.recv()=>{
-                let Some(output)=output else {break};
-                if state.service.authorize_call(&call.id).is_err() {break;}
+                let Some(output)=output else {break "speech_worker_closed"};
+                if output.final_output { feedback.remove(&output.turn.id); }
+                else if let Some(pending) = feedback.get_mut(&output.turn.id) { pending.acked = true; }
+                if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
                 let result=if output.automatic {session.finish(&output.turn,&output.text)} else {session.speech(&output.turn,&output.utterance_id,&output.text,output.final_output)};
                 match result {
-                    Ok(Some(frame))=>if !matches!(tokio::time::timeout(Duration::from_secs(2),socket.send(Message::Text(frame.to_string().into()))).await,Ok(Ok(()))) {break;},
-                    Ok(None)=>{},Err(_)=>break,
+                    Ok(Some(frame))=>if !matches!(tokio::time::timeout(Duration::from_secs(2),socket.send(Message::Text(frame.to_string().into()))).await,Ok(Ok(()))) {break "speech_write_failed";},
+                    Ok(None)=>{},Err(_)=>break "invalid_speech_output",
                 }
             },
             _=tick.tick()=>{
-                if state.service.authorize_call(&call.id).is_err() {break;}
-                if call.answered_ms.is_some_and(|at|state.service.clock.now_ms()-at>=call.max_duration_seconds*1000) {break;}
+                if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
+                for pending in feedback.values_mut() {
+                    let elapsed = pending.started.elapsed();
+                    let notice = pending.notice();
+                    if let Some((utterance,text))=notice {
+                        if let Ok(Some(frame))=session.speech(&pending.turn,utterance,text,false) {
+                            if !matches!(tokio::time::timeout(Duration::from_secs(2),socket.send(Message::Text(frame.to_string().into()))).await,Ok(Ok(()))) {break 'connection "feedback_write_failed";}
+                            tracing::info!(call_id = %call.id, elapsed_ms = elapsed.as_millis() as u64, kind = utterance, "phone feedback queued");
+                        }
+                    }
+                }
+                if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
+
             }
         }
-    }
+    };
+    tracing::info!(call_id = %call.id, reason = end_reason, "phone relay ending");
     cancel.cancel();
+    drop(interrupt_tx);
+    let _ = interrupt_worker.await;
     drop(turn_tx);
     let _ = state
         .service
@@ -455,11 +531,127 @@ mod setup_diagnostic_tests {
         assert_eq!(error.reason, "provider_error");
         assert_eq!(error.provider_code, Some(64101));
         let diagnostic = format!("{error:?}");
-        for private in ["secret-marker", "2025550123", "private.example", "description"] {
+        for private in [
+            "secret-marker",
+            "2025550123",
+            "private.example",
+            "description",
+        ] {
             assert!(!diagnostic.contains(private));
         }
         let error = decode_setup(&mut session, r#"{"type":"setup","accountSid":"secret-marker","callSid":"wrong","sessionId":"secret-marker"}"#).unwrap_err();
         assert_eq!(error.reason, "setup_identity_rejected");
         assert!(!format!("{error:?}").contains("secret-marker"));
     }
+}
+
+async fn bounded_answer<F>(answer: F, cancel: &CancellationToken) -> Result<String, AgentError>
+where
+    F: std::future::Future<Output = Result<String, AgentError>>,
+{
+    tokio::pin!(answer);
+    tokio::select! {
+        result = &mut answer => result,
+        _ = tokio::time::sleep(Duration::from_secs(120)) => {
+            cancel.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(5), &mut answer).await;
+            tracing::warn!("phone agent turn deadline exceeded");
+            Err(AgentError)
+        }
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn feedback_acknowledges_then_reports_progress_once() {
+        let mut session = RelaySession::new("test", "AC", "CA");
+        session
+            .receive(r#"{"type":"setup","accountSid":"AC","callSid":"CA","sessionId":"VX"}"#)
+            .unwrap();
+        let RelayInput::Turn(turn) = session
+            .receive(r#"{"type":"prompt","voicePrompt":"lookup","last":true}"#)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let mut feedback = TurnFeedback::new(Arc::new(turn));
+        assert!(feedback.notice().is_none());
+        tokio::time::advance(Duration::from_millis(250)).await;
+        assert_eq!(feedback.notice().unwrap().0, "runtime_ack");
+        assert!(feedback.notice().is_none());
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(feedback.notice().unwrap().0, "runtime_progress");
+        assert!(feedback.notice().is_none());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn stalled_turn_is_cancelled_and_bounded_without_replaying_work() {
+        let cancel = CancellationToken::new();
+        let started = tokio::time::Instant::now();
+        let result = bounded_answer(std::future::pending(), &cancel).await;
+        assert!(result.is_err());
+        assert!(cancel.is_cancelled());
+        assert_eq!(started.elapsed(), Duration::from_secs(125));
+        assert_eq!(
+            bounded_answer(
+                async { Ok("next answer".into()) },
+                &CancellationToken::new()
+            )
+            .await
+            .unwrap(),
+            "next answer"
+        );
+    }
+}
+
+struct TurnFeedback {
+    turn: Arc<RelayTurn>,
+    started: tokio::time::Instant,
+    acked: bool,
+    progressed: bool,
+}
+impl TurnFeedback {
+    fn new(turn: Arc<RelayTurn>) -> Self {
+        Self {
+            turn,
+            started: tokio::time::Instant::now(),
+            acked: false,
+            progressed: false,
+        }
+    }
+    fn notice(&mut self) -> Option<(&'static str, &'static str)> {
+        let elapsed = self.started.elapsed();
+        if !self.acked && elapsed >= Duration::from_millis(250) {
+            self.acked = true;
+            Some(("runtime_ack", "Got it. Give me a moment."))
+        } else if !self.progressed && elapsed >= Duration::from_secs(10) {
+            self.progressed = true;
+            Some(("runtime_progress", "I’m still working on that."))
+        } else {
+            None
+        }
+    }
+}
+
+fn call_end_reason(service: &PhoneService, original: &PhoneCall) -> Option<&'static str> {
+    if original
+        .answered_ms
+        .is_some_and(|at| service.clock.now_ms() - at >= original.max_duration_seconds * 1000)
+    {
+        return Some("duration_limit");
+    }
+    let Ok(current) = service.store.phone_provider_call(&original.id) else {
+        return Some("call_state_unavailable");
+    };
+    if current.stop_requested {
+        return Some("stop_requested");
+    }
+    if current.state != CallState::Connected {
+        return Some("call_ended");
+    }
+    service
+        .authorize_call(&original.id)
+        .err()
+        .map(|_| "authorization_revoked")
 }

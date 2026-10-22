@@ -36,9 +36,9 @@ before history/agent ingestion. Codes expire after five minutes and five wrong
 attempts. A pending replacement leaves the prior destination active.
 
 Normal outbound calls redirect to a signed start callback. That records the
-answer timestamp before returning a generic DTMF prompt. Only an accepted call
-receives ConversationRelay TwiML. A watchdog enforces the 15-second acceptance
-window independently of Twilio Gather's post-prompt timeout. Relay partial
+answer timestamp and connects directly to ConversationRelay. The authenticated
+owner request authorizes the call; there is no second DTMF step. Callback
+signatures, owner binding, expiry and single-use relay claims still apply. Relay partial
 prompts are disabled explicitly. Finalized utterances get distinct turn IDs;
 identical words in separate utterances are not incorrectly deduplicated.
 

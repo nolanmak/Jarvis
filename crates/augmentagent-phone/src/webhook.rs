@@ -46,15 +46,23 @@ fn field<'a>(fields: &'a [(String, String)], name: &str) -> Result<&'a str, Erro
 }
 const HANGUP: &str = "<Response><Hangup/></Response>";
 impl PhoneService {
-    pub fn relay_ended_callback(&self, auth: &WebhookAuth, id: &str, fields: &[(String, String)], signature: &str) -> Result<String, Error> {
+    pub fn relay_ended_callback(
+        &self,
+        auth: &WebhookAuth,
+        id: &str,
+        fields: &[(String, String)],
+        signature: &str,
+    ) -> Result<String, Error> {
         self.callback_call(auth, "relay-ended", id, fields, signature)?;
         let failed = field(fields, "SessionStatus")? == "failed";
         if failed {
             // Never log provider error text: it can include URLs and caller data.
-            let code = fields.iter().find(|(key, _)| key == "ErrorCode")
+            let code = fields
+                .iter()
+                .find(|(key, _)| key == "ErrorCode")
                 .and_then(|(_, value)| value.parse::<u32>().ok());
             tracing::warn!(call_id = id, error_code = ?code, "phone relay provider connection failed");
-            return Ok("<Response><Say>Sorry, Jarvis could not connect the voice conversation. The connection error has been recorded.</Say><Hangup/></Response>".into());
+            return Ok("<Response><Say voice=\"Polly.Joanna\" language=\"en-US\">Sorry, Jarvis could not connect the voice conversation. The connection error has been recorded.</Say><Hangup/></Response>".into());
         }
         Ok(HANGUP.into())
     }
@@ -162,8 +170,13 @@ impl PhoneService {
         {
             return Ok(HANGUP.into());
         }
-        let action = format!("{}/phone/accept/{id}", self.config.public_base);
-        Ok(format!("<Response><Gather input=\"dtmf\" numDigits=\"1\" timeout=\"15\" action=\"{}\" method=\"POST\"><Say>Jarvis is calling. Press one to continue.</Say></Gather><Hangup/></Response>",xml(&action)))
+        // The authenticated chat request already authorizes this owner call.
+        // The signed answer callback connects it; no second DTMF consent step.
+        match self.store.phone_accept(id, &sid, self.clock.now_ms()) {
+            Ok(_) => Ok(self.relay_twiml(id)),
+            Err(PhoneError::AcceptanceExpired | PhoneError::Conflict) => Ok(HANGUP.into()),
+            Err(error) => Err(error.into()),
+        }
     }
     pub async fn accept_callback(
         &self,
@@ -190,7 +203,10 @@ impl PhoneService {
             Err(PhoneError::AcceptanceExpired | PhoneError::Conflict) => return Ok(HANGUP.into()),
             Err(e) => return Err(e.into()),
         }
+        Ok(self.relay_twiml(id))
+    }
+    fn relay_twiml(&self, id: &str) -> String {
         let ws = self.config.public_base.replacen("https://", "wss://", 1);
-        Ok(format!("<Response><Connect action=\"{}/phone/relay-ended/{id}\" method=\"POST\"><ConversationRelay url=\"{}/phone/relay/{id}\" interruptible=\"true\" partialPrompts=\"false\" welcomeGreeting=\"Connected to Jarvis.\" /></Connect><Hangup/></Response>",xml(&self.config.public_base),xml(&ws)))
+        format!("<Response><Connect action=\"{}/phone/relay-ended/{id}\" method=\"POST\"><ConversationRelay url=\"{}/phone/relay/{id}\" ttsProvider=\"Amazon\" voice=\"Joanna\" language=\"en-US\" interruptible=\"any\" reportInputDuringAgentSpeech=\"any\" partialPrompts=\"false\" welcomeGreeting=\"Hi, I'm here. What can I help you with?\" /></Connect><Hangup/></Response>",xml(&self.config.public_base),xml(&ws))
     }
 }

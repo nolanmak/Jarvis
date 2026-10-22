@@ -401,3 +401,31 @@ Logs and `receipt.json` are written to `target/phone-upgrade/` (override with
 `worktree_dirty` before citing a receipt. This checks retained sessions,
 history, pending turns and approvals, including writes by the rolled-back Store.
 It does not test installer/service rollback or authorize legacy voice removal.
+
+
+## Conversational pickup and response recovery (#1526, #1527)
+
+An owner-requested call now connects on the signed answer callback without a
+keypress. ConversationRelay explicitly selects Amazon Joanna (`en-US`); failure
+announcements use Polly.Joanna. Optional number-verification calls remain separate.
+
+For a final transcript whose agent answer is still pending, the relay queues a
+short acknowledgment after 250 ms (100 ms polling; tested within 500 ms) and one
+progress notice after 10 seconds. These are server enqueue timings, not claims
+about audible latency. A final answer or interruption removes pending notices.
+After 120 seconds the agent receives cancellation, with up to five seconds to
+clean up, then a spoken failure allows the next request without redialing or
+replaying tools. Interrupted audio is invalidated immediately; chat persistence
+runs separately and cannot close the socket on a slow/failing mirror.
+
+Phone turns use the selected native Claude/Codex session directly, bypassing the
+optional model gateway. Text routing, session identity and approval policy are
+unchanged. Provider validation error 64107 is logged by numeric code and leaves
+the authenticated relay open; invalid setup/identity and malformed frames still
+fail closed. Diagnostics exclude raw transcripts and provider descriptions.
+
+Offline regressions cover direct pickup, explicit voice, blocked-agent feedback,
+slow interruption persistence, stale audio suppression, bounded cancellation,
+recoverable provider errors and scoped native routing. Live audible greeting,
+lookup completion and interruption behavior must be recorded separately; passing
+these tests does not establish those live results.

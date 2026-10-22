@@ -15,6 +15,7 @@ pub enum RelayInput {
     Ready,
     Ignore,
     Interrupted,
+    ProviderError(u32),
     Turn(RelayTurn),
 }
 #[derive(Deserialize)]
@@ -45,7 +46,7 @@ enum Incoming {
     #[serde(rename = "dtmf")]
     Dtmf { digit: String },
     #[serde(rename = "error")]
-    Error {},
+    Error { code: Option<u32> },
 }
 struct TurnOutput {
     sent: HashMap<String, ([u8; 32], bool)>,
@@ -132,6 +133,7 @@ impl RelaySession {
                 self.heard_until_interrupt = Some(heard);
                 Ok(RelayInput::Interrupted)
             }
+            Incoming::Error { code: Some(code) } => Ok(RelayInput::ProviderError(code)),
             Incoming::Dtmf { digit } if digit.len() == 1 && "0123456789*#".contains(&digit) => {
                 Ok(RelayInput::Ignore)
             }
