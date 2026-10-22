@@ -575,8 +575,12 @@ async fn ac07_real_websocket_routes_final_transcript_and_hangup_without_replay()
     let (mut socket, _) = tokio_tungstenite::connect_async(request.clone())
         .await
         .unwrap();
+    socket.send(Message::Ping(vec![1, 2, 3].into())).await.unwrap();
+    let pong = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next()).await.unwrap().unwrap().unwrap();
+    assert!(matches!(pong, Message::Pong(ref bytes) if bytes.as_ref() == [1,2,3]));
+    socket.send(Message::Pong(vec![4].into())).await.unwrap();
     let setup =
-        json!({"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX-test"})
+        json!({"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX-test","parentCallSid":"","from":"+12025550123","to":"+12025550124","forwardedFrom":"","callType":"PSTN","callerName":"","direction":"outbound-api","callStatus":"IN_PROGRESS","customParameters":{}})
             .to_string();
     socket
         .send(Message::Text(setup.clone().into()))
@@ -1687,4 +1691,77 @@ async fn failed_relay_reports_failure_instead_of_silent_hangup() {
     let reply=f.service.relay_ended_callback(&auth,id,&fields,&sig).unwrap();
     assert!(reply.contains("could not connect"),"{reply}");
     assert!(reply.contains("<Say>"));
+}
+
+#[tokio::test]
+async fn relay_startup_bounds_control_frames_and_keeps_one_deadline() {
+    for scenario in ["flood", "deadline", "binary", "malformed"] {
+    use augmentagent_store::phone::CallState;
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+    let f = fixture("discord", true, true, false);
+    let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
+    let call = f
+        .service
+        .tool(&grant, "call_owner", json!({"request_id":"r1"}))
+        .await
+        .unwrap();
+    let id = call["id"].as_str().unwrap().to_string();
+    f.store
+        .phone_provider_event(&id, "CA-test", CallState::AwaitingAcceptance, 100)
+        .unwrap();
+    f.store.phone_accept(&id, "CA-test", 101).unwrap();
+    let router = augmentagent_phone::ingress::router(
+        Arc::new(f.service),
+        Arc::new(augmentagent_phone::webhook::WebhookAuth::new(
+            "AC-test",
+            "callback-secret",
+        )),
+        Arc::new(ScriptedAgent),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let mut request = format!("ws://{addr}/phone/relay/{id}")
+        .into_client_request()
+        .unwrap();
+    let signature = signed(
+        "callback-secret",
+        &format!("wss://phone.example.test/phone/relay/{id}"),
+        &[],
+    );
+    request
+        .headers_mut()
+        .insert("x-twilio-signature", signature.parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request.clone())
+        .await
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        if scenario == "flood" {
+            for _ in 0..33 { let _ = socket.send(Message::Pong(vec![1].into())).await; }
+        } else if scenario == "binary" {
+            socket.send(Message::Binary(vec![1].into())).await.unwrap();
+        } else if scenario == "malformed" {
+            socket.send(Message::Text("not json".into())).await.unwrap();
+        }
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+            loop {
+                tokio::select! {
+                    frame = socket.next() => match frame {
+                        None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                        _ => {},
+                    },
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)), if scenario == "deadline" => {
+                        if socket.send(Message::Pong(vec![1].into())).await.is_err() { break; }
+                    }
+                }
+            }
+        }).await;
+        assert!(closed.is_ok(), "{scenario} must close within the original deadline");
+        if scenario == "deadline" { assert!(started.elapsed() >= std::time::Duration::from_secs(4)); }
+        else { assert!(started.elapsed() < std::time::Duration::from_secs(2)); }
+        assert_eq!(f.store.with_conn(|c| c.query_row("SELECT count(*) FROM phone_relay_claims",[],|r|r.get::<_,i64>(0))).unwrap(),0);
+        server.abort();
+    }
 }

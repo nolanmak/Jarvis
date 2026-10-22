@@ -260,22 +260,62 @@ async fn relay(
             run_socket(state, call, socket).await;
         })
 }
+#[derive(Debug)]
+struct SetupFailure {
+    reason: &'static str,
+    provider_code: Option<u32>,
+}
+
+async fn receive_setup(socket: &mut WebSocket, session: &mut RelaySession) -> Result<usize, SetupFailure> {
+    let failure = |reason| SetupFailure { reason, provider_code: None };
+    // One deadline includes all reads and Pong writes. Heartbeats cannot keep
+    // an unauthenticated session alive indefinitely.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for controls in 0..=32 {
+            match socket.recv().await {
+                Some(Ok(Message::Ping(bytes))) if controls < 32 => {
+                    socket.send(Message::Pong(bytes)).await.map_err(|_| failure("pong_write_failed"))?;
+                }
+                Some(Ok(Message::Pong(_))) if controls < 32 => {},
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => return Err(failure("control_frame_limit")),
+                Some(Ok(Message::Text(text))) => {
+                    let value: serde_json::Value = serde_json::from_str(&text).map_err(|_| failure("invalid_json"))?;
+                    if value["type"] == "error" {
+                        let provider_code = value["code"].as_u64().and_then(|n| u32::try_from(n).ok());
+                        return Err(SetupFailure { reason: "provider_error", provider_code });
+                    }
+                    if value["type"] != "setup" { return Err(failure("unexpected_text_type")); }
+                    return match session.receive(&text) {
+                        Ok(RelayInput::Ready) => Ok(controls),
+                        Err(Error::Unauthorized) => Err(failure("setup_identity_rejected")),
+                        _ => Err(failure("invalid_setup_fields")),
+                    };
+                }
+                Some(Ok(Message::Binary(_))) => return Err(failure("binary_before_setup")),
+                Some(Ok(Message::Close(_))) | None => return Err(failure("closed_before_setup")),
+                Some(Err(_)) => return Err(failure("transport_error")),
+            }
+        }
+        Err(failure("control_frame_limit"))
+    }).await.map_err(|_| failure("setup_timeout"))?
+}
+
 async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
     tracing::info!(call_id = %call.id, "phone relay websocket upgraded");
     let Some(sid) = call.provider_sid.as_deref() else {
         return;
     };
     let mut session = RelaySession::new(&call.id, state.auth.account(), sid);
-    let initial = tokio::time::timeout(Duration::from_secs(5), socket.recv()).await;
-    let setup_ok = match initial {
-        Ok(Some(Ok(Message::Text(text)))) => {
-            matches!(session.receive(&text), Ok(RelayInput::Ready))
-        }
-        _ => false,
+    let setup_ok = match receive_setup(&mut socket, &mut session).await {
+        Ok(control_frames) => {
+            tracing::info!(call_id = %call.id, control_frames, "phone relay setup accepted");
+            true
+        },
+        Err(error) => {
+            tracing::warn!(call_id = %call.id, reason = error.reason, provider_code = ?error.provider_code, "phone relay setup rejected");
+            false
+        },
     };
-    if !setup_ok {
-        tracing::warn!(call_id = %call.id, "phone relay setup missing or invalid");
-    }
     // Only a valid setup may trigger cleanup for revoked authority. Invalid
     // setup or a duplicate socket must not terminate an existing relay.
     if setup_ok && state.service.authorize_call(&call.id).is_err() {
