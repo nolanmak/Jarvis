@@ -35,11 +35,11 @@ pub struct EventDraft {
     /// Attach a Google Meet room.
     #[serde(default)]
     pub create_meeting_room: bool,
-    /// Email of the account the event is created on. Used only to accept on
-    /// the organizer's behalf after the create (#1456). `calendar
-    /// create-event` fills it from the account it proposes on; the Approve
-    /// handler — the sole deserializer and sole `create_event` caller —
-    /// backfills the card's sender on payloads predating this field.
+    /// Email of the account the event is created on. Used only to keep the
+    /// organizer off their own guest list (#1456). `calendar create-event`
+    /// fills it from the account it proposes on; the Approve handler — the
+    /// sole deserializer and sole `create_event` caller — backfills the
+    /// card's sender on payloads predating this field.
     #[serde(default)]
     pub organizer_email: Option<String>,
 }
@@ -51,11 +51,6 @@ pub struct CreatedEvent {
     pub id: Option<String>,
     #[serde(default, rename = "htmlLink")]
     pub html_link: Option<String>,
-    /// #1456 — the create landed but the organizer could not be moved off
-    /// `needsAction`. Never sent by the provider; set by `create_event` so the
-    /// caller can tell the owner one RSVP is still theirs to make.
-    #[serde(default)]
-    pub organizer_rsvp_pending: bool,
 }
 
 #[derive(Debug, Error)]
@@ -137,94 +132,6 @@ impl ComposioCalendarClient {
     pub fn with_base_url(mut self, base_url: String) -> Self {
         self.base_url = base_url;
         self
-    }
-
-    /// Google's `events.insert` leaves the organizer's own attendee entry at
-    /// `needsAction`, so the owner is asked to RSVP to an event they just
-    /// created (#1456). Flip that entry to `accepted` with a follow-up patch.
-    /// `events.patch` replaces the attendee array wholesale, so it is read
-    /// back and resent in full and verbatim — a partial array would drop the
-    /// invitees, a lossy one their attributes — with notifications
-    /// suppressed, since the invitations went out on the create.
-    ///
-    /// Exactly one patch goes out, on Composio's write convention — the
-    /// `<VERB>_EVENT` action name and snake_case `calendar_id` /
-    /// `send_updates` arguments `GOOGLECALENDAR_CREATE_EVENT` is already
-    /// proven to take above, not the Google-native camelCase of the
-    /// `EVENTS_*` reads. Nothing in this repo can confirm the provider
-    /// accepts it, so it is never inferred from a 200: the accept is read
-    /// back off the event `events.patch` answers with, and a wrong name, a
-    /// rejected argument or an ignored write all land the same way — no
-    /// second attempt, no retry of the create, an owner-visible RSVP note.
-    async fn accept_as_organizer(
-        &self,
-        entity_id: &str,
-        calendar_id: &str,
-        event_id: &str,
-        organizer_email: &str,
-    ) -> Result<(), CalendarError> {
-        let event = self
-            .execute(
-                "GOOGLECALENDAR_EVENTS_GET",
-                entity_id,
-                serde_json::json!({ "calendarId": calendar_id, "eventId": event_id }),
-            )
-            .await?;
-        // Entries are carried over as the raw objects the provider sent, not
-        // reserialized through `RawAttendee`: that struct models six attendee
-        // fields, so a round trip would drop any other one Google set
-        // (`optional`, `comment`, `additionalGuests`) and the wholesale
-        // replace would erase it for real. An absent array means a read shape
-        // we do not understand; a guessed one would uninvite real attendees.
-        let Some(mut attendees) = attendee_array(&event).cloned() else {
-            return Err(CalendarError::Decode(format!(
-                "events.get: no attendee array to patch on {event_id}"
-            )));
-        };
-        let is_own = |a: &serde_json::Value| {
-            a.get("self") == Some(&serde_json::Value::Bool(true))
-                || a.get("email")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|e| e.eq_ignore_ascii_case(organizer_email))
-        };
-        let own = attendees.iter_mut().find(|a| is_own(a));
-        match own {
-            Some(a) if a.get("responseStatus").and_then(|s| s.as_str()) == Some("accepted") => {
-                return Ok(())
-            }
-            Some(a) => a["responseStatus"] = serde_json::Value::String("accepted".into()),
-            None => attendees.push(
-                serde_json::json!({ "email": organizer_email, "responseStatus": "accepted" }),
-            ),
-        }
-        for attendee in &mut attendees {
-            if let Some(entry) = attendee.as_object_mut() {
-                // Output-only on the Calendar API; echoing them back is an error.
-                for key in ["self", "organizer", "id"] {
-                    entry.remove(key);
-                }
-            }
-        }
-        // Resending the same full array sets the same statuses, so the
-        // transport's 429/5xx retry cannot double-write anything.
-        let patched = self
-            .execute(
-                "GOOGLECALENDAR_PATCH_EVENT",
-                entity_id,
-                serde_json::json!({ "calendar_id": calendar_id, "event_id": event_id,
-                    "attendees": attendees, "send_updates": false }),
-            )
-            .await?;
-        if attendee_array(&patched).is_some_and(|list| {
-            list.iter().any(|a| {
-                is_own(a) && a.get("responseStatus").and_then(|s| s.as_str()) == Some("accepted")
-            })
-        }) {
-            return Ok(());
-        }
-        Err(CalendarError::Decode(format!(
-            "patch_event: {event_id} did not come back with the organizer accepted"
-        )))
     }
 
     async fn execute(
@@ -318,14 +225,6 @@ fn bounded(value: &str, max_chars: usize) -> String {
         result.push('…');
     }
     result
-}
-
-/// Attendees off an event envelope, under either of the two shapes the read
-/// paths already tolerate.
-fn attendee_array(v: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
-    ["/data/attendees", "/data/response_data/attendees"]
-        .iter()
-        .find_map(|p| v.pointer(p).and_then(|a| a.as_array()))
 }
 
 /// Composio uses HTTP 200 for tool failures too. Reject those before any
@@ -505,6 +404,27 @@ impl CalendarApi for ComposioCalendarClient {
             })?
             .with_timezone(&Utc);
         let mins = draft.duration_minutes.max(1);
+        // #1456 — Google's `events.insert` gives an organizer who is also on
+        // the guest list their own attendee entry at `needsAction`, so the
+        // owner is asked to RSVP to the event they just created. Creating it
+        // *is* attending it: the organizer travels in the event's
+        // `organizer`/`creator` fields, so leaving their address off the
+        // guest list removes the prompt. Done here, on the argument contract
+        // `GOOGLECALENDAR_CREATE_EVENT` is already proven to take, rather
+        // than with a follow-up `events.patch`: no Composio action for that
+        // write is in use anywhere in this repo, so its name and arguments
+        // would be a guess, and a guess that silently 200s would leave the
+        // owner exactly where the report found them.
+        let organizer = draft
+            .organizer_email
+            .as_deref()
+            .map(str::trim)
+            .filter(|email| !email.is_empty());
+        let attendees: Vec<&String> = draft
+            .attendees
+            .iter()
+            .filter(|a| !organizer.is_some_and(|o| o.eq_ignore_ascii_case(a.trim())))
+            .collect();
         let mut args = serde_json::json!({
             "calendar_id": calendar_id,
             "summary": draft.summary,
@@ -512,7 +432,7 @@ impl CalendarApi for ComposioCalendarClient {
             "timezone": "UTC",
             "event_duration_hour": mins / 60,
             "event_duration_minutes": mins % 60,
-            "attendees": draft.attendees,
+            "attendees": attendees,
             "send_updates": true,
         });
         if let Some(desc) = &draft.description {
@@ -531,38 +451,12 @@ impl CalendarApi for ComposioCalendarClient {
             Some(&v),
         ];
         for cand in candidates.into_iter().flatten() {
-            if let Ok(mut created) = serde_json::from_value::<CreatedEvent>(cand.clone()) {
-                if let Some(id) = created
+            if let Ok(created) = serde_json::from_value::<CreatedEvent>(cand.clone()) {
+                if created
                     .id
                     .as_deref()
-                    .filter(|id| !id.trim().is_empty())
-                    .map(str::to_string)
+                    .is_some_and(|id| !id.trim().is_empty())
                 {
-                    // The event exists and the invites are out, so an error
-                    // here must never surface as `Unconfirmed` — that text
-                    // invites a retry, and a retried create duplicates a real
-                    // event with real invites. It is reported on the handle
-                    // instead, and the caller tells the owner the RSVP is
-                    // still theirs. A zero-attendee event has no array to
-                    // patch; adding one changes how Calendar renders it.
-                    let organizer = draft
-                        .organizer_email
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|email| !email.is_empty());
-                    if let Some(organizer) = organizer.filter(|_| !draft.attendees.is_empty()) {
-                        if let Err(e) = self
-                            .accept_as_organizer(entity_id, calendar_id, &id, organizer)
-                            .await
-                        {
-                            created.organizer_rsvp_pending = true;
-                            warn!(
-                                event_id = %id,
-                                "organizer auto-accept failed; event stands as created: {}",
-                                bounded(&e.to_string(), 900)
-                            );
-                        }
-                    }
                     return Ok(created);
                 }
             }

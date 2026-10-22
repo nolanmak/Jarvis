@@ -7,6 +7,10 @@ pub(super) fn proposal(store: &Store) -> String {
 }
 
 fn proposal_for_account(store: &Store, account: &str) -> String {
+    proposal_with_attendees(store, account, serde_json::json!(["owner-two@example.test"]))
+}
+
+fn proposal_with_attendees(store: &Store, account: &str, attendees: serde_json::Value) -> String {
     let email = augmentagent_store::Email {
         message_id: "gcal-create:test-1436".into(),
         thread_id: None,
@@ -17,7 +21,7 @@ fn proposal_for_account(store: &Store, account: &str) -> String {
         subject: "Calendar regression".into(),
         body: serde_json::json!({"summary":"Calendar regression",
             "start_datetime":"2026-10-09T16:35:00-04:00", "duration_minutes":5,
-            "attendees":["owner-two@example.test"],"create_meeting_room":true})
+            "attendees":attendees,"create_meeting_room":true})
         .to_string(),
         date: "2026-10-09T16:35:00-04:00".into(),
         account_entity_id: Some("organizer".into()),
@@ -152,43 +156,26 @@ async fn calendar_success_receipt_contains_handle_and_is_persisted() {
 }
 
 // #1456: the owner must not be asked to RSVP to an event they just created.
-// The stored payload predates `organizer_email`, so the handler backfills it
-// from the card's sender.
-async fn approve_with_accept_follow_up(patch_body: &str, verify: impl FnOnce(&Store, &str)) {
+// The stored payload predates `organizer_email`, so the handler backfills the
+// card's sender — the account the event is created on — and the client leaves
+// that address off the guest list it sends.
+#[tokio::test]
+async fn a_legacy_payload_keeps_the_card_sender_off_the_guest_list() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open(dir.path().join("qa.db")).unwrap());
-    let id = proposal(&store);
+    let id = proposal_with_attendees(
+        &store,
+        "owner@example.test",
+        serde_json::json!(["owner@example.test", "owner-two@example.test"]),
+    );
     let mut server = mockito::Server::new_async().await;
-    let _create = server
+    let create = server
         .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_CREATE_EVENT")
-        .with_status(200)
-        .with_body(r#"{"successful":true,"data":{"response_data":{"id":"event_1436"}}}"#)
-        .expect(1)
-        .create_async()
-        .await;
-    let _get = server
-        .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_EVENTS_GET")
-        .with_status(200)
-        .with_body(
-            serde_json::json!({"successful":true,"data":{"id":"event_1436","attendees":[
-                {"email":"owner@example.test","self":true,"responseStatus":"needsAction"},
-                {"email":"owner-two@example.test","responseStatus":"needsAction"}]}})
-            .to_string(),
-        )
-        .expect(1)
-        .create_async()
-        .await;
-    let patch = server
-        .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_PATCH_EVENT")
         .match_body(mockito::Matcher::PartialJson(serde_json::json!({
-            "user_id":"organizer","arguments":{
-                "calendar_id":"primary","event_id":"event_1436","send_updates":false,
-                "attendees":[
-                    {"email":"owner@example.test","responseStatus":"accepted"},
-                    {"email":"owner-two@example.test","responseStatus":"needsAction"}]}
+            "arguments": { "attendees": ["owner-two@example.test"] }
         })))
         .with_status(200)
-        .with_body(patch_body)
+        .with_body(r#"{"successful":true,"data":{"response_data":{"id":"event_1436"}}}"#)
         .expect(1)
         .create_async()
         .await;
@@ -201,48 +188,10 @@ async fn approve_with_accept_follow_up(patch_body: &str, verify: impl FnOnce(&St
         false,
         false,
     );
-    patch.assert_async().await;
-    verify(&store, &id);
-}
-
-#[tokio::test]
-async fn legacy_payload_accepts_on_behalf_of_the_card_sender() {
-    approve_with_accept_follow_up(
-        r#"{"successful":true,"data":{"id":"event_1436",
-            "attendees":[{"email":"owner@example.test","responseStatus":"accepted"}]}}"#,
-        |store, id| {
-            let row = store.get_action_with_email(id).unwrap().unwrap();
-            assert_eq!(row.action.status, "sent");
-            let saved = row.action.draft_body.unwrap();
-            assert!(saved.contains("event_1436"));
-            assert!(!saved.contains("your RSVP"), "{saved}");
-        },
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn a_failed_organizer_accept_still_persists_the_sent_receipt() {
-    // The event exists and the invites are out: the idempotency receipt must
-    // land anyway, or a second Approve would create a duplicate.
-    approve_with_accept_follow_up(
-        r#"{"successful":false,"error":"patch rejected"}"#,
-        |store, id| {
-            let row = store.get_action_with_email(id).unwrap().unwrap();
-            assert_eq!(row.action.status, "sent");
-            assert!(row.action.error_message.is_none());
-            let saved = row.action.draft_body.unwrap();
-            assert!(saved.contains("event_1436"), "{saved}");
-            assert!(!saved.contains("patch rejected"), "{saved}");
-            // #1456 — the owner is told the one RSVP that is still theirs
-            // rather than finding the invite sitting at needsAction.
-            assert!(
-                saved.contains("your RSVP could not be set — accept it on the event"),
-                "{saved}"
-            );
-        },
-    )
-    .await;
+    create.assert_async().await;
+    let row = store.get_action_with_email(&id).unwrap().unwrap();
+    assert_eq!(row.action.status, "sent");
+    assert!(row.action.draft_body.unwrap().contains("event_1436"));
 }
 
 fn assert_calendar_account_receipt(
