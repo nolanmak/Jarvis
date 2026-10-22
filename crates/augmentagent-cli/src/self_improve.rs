@@ -6123,6 +6123,18 @@ const RABBIT_NOT_WAITED_FOR: &str =
     "CodeRabbit is advisory and was not waited for; it reviews the merged \
      commit and anything it finds becomes a follow-up issue.";
 
+/// Optional notes must not hold up a merge, even when GitHub hangs.
+async fn write_optional_pr_note(repo_root: &Path, selector: &str, body: &str) -> bool {
+    if augmentagent_channel_core::public_report::validate("", body).is_err() {
+        return false;
+    }
+    let mut command = Command::new(gh_bin());
+    command.args(["pr", "edit", selector, "--body", body])
+        .current_dir(repo_root).stdin(Stdio::null()).kill_on_drop(true);
+    matches!(tokio::time::timeout(std::time::Duration::from_secs(5), command.output()).await,
+        Ok(Ok(out)) if out.status.success())
+}
+
 /// Record optional CodeRabbit observations without changing merge eligibility.
 fn rabbit_merge_note(review: &RabbitReview) -> String {
     if review.has_findings() {
@@ -8858,7 +8870,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         );
         let observed = pr_body.replace(RABBIT_NOT_WAITED_FOR, &rabbit_merge_note(&unknown));
         if observed != pr_body {
-            let _ = run(&gh, &["pr", "edit", &branch, "--body", &observed], repo_root).await;
+            let _ = write_optional_pr_note(repo_root, &branch, &observed).await;
         }
     }
     if let Some(n) = pr_number {
@@ -8889,23 +8901,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // gate and two reviewers already approved.
         let observed = pr_body.replace(RABBIT_NOT_WAITED_FOR, &rabbit_merge_note(&rabbit));
         if observed != pr_body {
-            let (edited, _, e) = run(
-                &gh,
-                &["pr", "edit", &n.to_string(), "--body", &observed],
-                repo_root,
-            )
-            .await
-            .unwrap_or((false, String::new(), "spawn failed".into()));
-            // One retry: the state is worth a second attempt before it only
-            // exists in a log line.
-            let edited = if edited {
-                true
-            } else {
-                run(&gh, &["pr", "edit", &n.to_string(), "--body", &observed], repo_root)
-                    .await
-                    .map(|(ok, ..)| ok)
-                    .unwrap_or(false)
-            };
+            let edited = write_optional_pr_note(repo_root, &n.to_string(), &observed).await;
             if !edited {
                 // Explicit, not swallowed: the body keeps the placeholder, so
                 // say in the log what the body could not. Still merging — the
@@ -8914,8 +8910,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     issue = issue.number,
                     pr = n,
                     "could not record CodeRabbit's merge-time state in the PR \
-                     body ({}); it was: {}",
-                    truncate(&e, 200),
+                     body; it was: {}",
                     rabbit_merge_note(&rabbit)
                 );
             }
@@ -15885,7 +15880,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // number) but must still RECORD that, via the branch selector `gh`
         // accepts — the same one the merge itself uses.
         let no_num = body.find("no PR number to query").expect("state must be named");
-        let edit = body[no_num..].find(r#""pr", "edit", &branch"#);
+        let edit = body[no_num..].find("write_optional_pr_note(repo_root, &branch");
         assert!(edit.is_some(), "record it on the PR by branch, not only in a log");
 
         for stated in [

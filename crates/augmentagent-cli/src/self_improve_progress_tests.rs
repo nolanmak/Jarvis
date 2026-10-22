@@ -84,7 +84,7 @@ async fn approved_ready_pr_survives_pending_checks_failed_merge_and_head_change(
         let root = dir.path();
         let gh = root.join("gh.py");
         std::fs::write(&gh, r#"#!/usr/bin/env python3
-import json, os, pathlib, sys
+import json, os, pathlib, sys, time
 root=pathlib.Path(os.environ['AUTOSHIP_PROGRESS_FIXTURE'])
 a=sys.argv[1:]
 with (root/'calls').open('a') as f: f.write(json.dumps(a)+'\n')
@@ -97,6 +97,7 @@ elif a[:2]==['pr','diff']: print('src/synthetic.rs')
 elif a[:2]==['pr','checks']:
     print(json.dumps([dict(name='rust',state=s['checks']),dict(name='CodeRabbit',state='FAILURE')])); sys.exit(1)
 elif a[0]=='api': print('[]')
+elif a[:2]==['pr','edit']: time.sleep(30)
 elif a[:2]==['pr','ready']:
     assert s['draft'], 'already-ready PR must retain its original state'
 elif a[:2]==['pr','merge']:
@@ -150,6 +151,9 @@ else: raise Exception('unexpected call '+repr(a))
     scenario("SUCCESS", false, false, &head);
     assert_eq!(merge_sweep(&root, true).await, 0);
     assert!(!root.join("merged").exists());
+    let started = std::time::Instant::now();
+    assert!(!write_optional_pr_note(&root, "20", "Optional reviewer observation").await);
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
     assert_eq!(merge_sweep(&root, false).await, 1);
     assert_eq!(std::fs::read_to_string(root.join("merged")).unwrap(), head);
 }
