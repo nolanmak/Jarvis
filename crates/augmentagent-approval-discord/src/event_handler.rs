@@ -447,12 +447,27 @@ impl EventHandler for Handler {
         }
 
         let user_text = msg.content.trim().to_string();
+        // #1496: consume phone setup before attachments, history, native turn
+        // claims or model inference, even if the phone adapter is unavailable.
+        let phone_context = crate::phone::PhoneCommandContext {
+            guild_id: msg.guild_id.map(|id| id.get()),
+            bot_user_id: self.state.bot_user_id.get().map(|id| id.get()).unwrap_or(0),
+            channel_id: msg.channel_id.get(),
+            author_id: msg.author.id.get(),
+            message_id: msg.id.get(),
+        };
+        if let Some(reply) = crate::phone::dispatch(handler.as_ref(), &phone_context, &user_text).await {
+            let builder = CreateMessage::new().content(reply)
+                .reference_message(MessageReference::from((msg.channel_id, msg.id)));
+            if msg.channel_id.send_message(&ctx.http, builder).await.is_err() {
+                warn!("failed to post phone command reply");
+            }
+            return;
+        }
         // Model selection is an owner control, never part of the model prompt.
         // This runs after the existing fail-closed allowlist and before any
         // attachment download or history collection.
-        if let Some(reply) = handler.model_command_in_guild(
-            msg.guild_id.map(|guild| guild.get()), msg.channel_id.get(), &user_text
-        ).await {
+        if let Some(reply) = crate::phone::model_command(handler.as_ref(), &phone_context, &user_text).await {
             let builder = CreateMessage::new().content(reply)
                 .reference_message(MessageReference::from((msg.channel_id, msg.id)));
             if let Err(error) = msg.channel_id.send_message(&ctx.http, builder).await {
@@ -685,7 +700,7 @@ impl EventHandler for Handler {
                 channel_id,
                 crate::interaction::owner_history(
                     allowed_user_id.is_some() && (is_dm || in_query_channel),
-                    crate::compute_inputs::SELECTED.scope(selected, handler.answer_turn(&audit_ctx, &history, &current))),
+                    crate::compute_inputs::SELECTED.scope(selected, crate::phone::answer_turn(handler.as_ref(), &phone_context, &audit_ctx, &history, &current))),
             ).await;
             info!(%channel_id, %msg_id, success = result.is_ok(), "discord query completed");
 
@@ -2391,7 +2406,7 @@ async fn download_images(attachments: &[Attachment], msg_id: u64) -> Vec<PathBuf
         let path = PathBuf::from(format!("/tmp/aa-img-{msg_id}-{idx}.{ext}"));
         match reqwest::get(&att.url).await {
             Ok(resp) => match resp.bytes().await {
-                Ok(bytes) => match tokio::fs::write(&path, &bytes).await {
+                Ok(bytes) => match augmentagent_docs::inbound::write_private_attachment(&path, &bytes).await {
                     Ok(()) => out.push(path),
                     Err(e) => warn!("write image tempfile {} failed: {e}", path.display()),
                 },
@@ -2434,7 +2449,7 @@ async fn download_text_files(
             Ok(resp) => match resp.bytes().await {
                 Ok(bytes) => {
                     let (to_write, truncated) = truncate_text_bytes(&bytes);
-                    match tokio::fs::write(&path, to_write).await {
+                    match augmentagent_docs::inbound::write_private_attachment(&path, to_write).await {
                         Ok(()) => out.push(DownloadedTextFile {
                             path,
                             truncated,
@@ -2492,7 +2507,7 @@ async fn extract_doc_attachments(
         let mut staged: Option<String> = None;
         let download_ok = match reqwest::get(&att.url).await {
             Ok(resp) => match resp.bytes().await {
-                Ok(bytes) => match tokio::fs::write(&in_path, &bytes).await {
+                Ok(bytes) => match augmentagent_docs::inbound::write_private_attachment(&in_path, &bytes).await {
                     Ok(()) => {
                         if let Some(root) = signable_root.filter(|_| matches!(kind, DocKind::Pdf)) {
                             staged = stage_signable_upload(root, &att.filename, &bytes);
@@ -2528,7 +2543,7 @@ async fn extract_doc_attachments(
                     }
                     let (to_write, truncated) = truncate_text_bytes(text.as_bytes());
                     let extracted_len = text.len() as u64;
-                    match tokio::fs::write(&out_path, to_write).await {
+                    match augmentagent_docs::inbound::write_private_attachment(&out_path, to_write).await {
                         Ok(()) => out.push(DownloadedTextFile {
                             path: out_path,
                             truncated,
@@ -2637,7 +2652,7 @@ fn is_model_control_text(text: &str) -> bool {
 
 fn history_without_model_controls(turns: &[HistoryTurn]) -> Vec<(&'static str, String)> {
     let control_ids: std::collections::HashSet<u64> = turns.iter()
-        .filter(|turn| turn.role == "user" && is_model_control_text(&turn.body))
+        .filter(|turn| turn.role == "user" && (is_model_control_text(&turn.body) || crate::phone::is_private_control(&turn.body)))
         .map(|turn| turn.id)
         .collect();
     turns.iter()
@@ -2658,14 +2673,25 @@ async fn fetch_conversation_context(
     bot_user_id: Option<UserId>,
     allowed_user_id: Option<UserId>,
 ) -> String {
-    let builder = GetMessages::new().before(before).limit(HISTORY_LIMIT);
-    let messages = match channel_id.messages(&ctx.http, builder).await {
-        Ok(m) => m,
-        Err(e) => {
-            warn!("fetch conversation history failed: {e}");
-            return String::new();
-        }
-    };
+    match fetch_owner_history(&ctx.http, channel_id, Some(before), bot_user_id, allowed_user_id).await {
+        Ok(history) => history,
+        Err(_) => { warn!("fetch conversation history failed"); String::new() }
+    }
+}
+
+/// Shared bounded owner-only history for text and phone session bootstrap.
+/// Private setup controls and their replies use the same filter on both paths.
+pub async fn fetch_owner_history(
+    http: &serenity::http::Http,
+    channel_id: ChannelId,
+    before: Option<MessageId>,
+    bot_user_id: Option<UserId>,
+    allowed_user_id: Option<UserId>,
+) -> anyhow::Result<String> {
+    let mut builder = GetMessages::new().limit(HISTORY_LIMIT);
+    if let Some(before) = before { builder = builder.before(before); }
+    let messages = channel_id.messages(http, builder).await
+        .map_err(|_| anyhow::anyhow!("Discord history unavailable"))?;
 
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2711,7 +2737,7 @@ async fn fetch_conversation_context(
     }
     // `messages` was newest-first; the Vec we built is therefore newest-first too.
     turns.reverse();
-    format_transcript(&history_without_model_controls(&turns), HISTORY_CHAR_CAP)
+    Ok(format_transcript(&history_without_model_controls(&turns), HISTORY_CHAR_CAP))
 }
 
 /// Pure renderer so unit tests don't need a live Discord connection.
@@ -3637,6 +3663,19 @@ mod tests {
         assert!(history.contains("> /model set glm is quoted text"), "{history}");
         assert!(history.contains("/models is a different word"), "{history}");
         assert!(history.contains("What did I ask you to remember?"), "{history}");
+    }
+
+    #[test]
+    fn private_phone_setup_and_its_replies_never_enter_later_history() {
+        let turns = vec![
+            HistoryTurn { role: "user", body: "phone number set +12025550123".into(), id: 1, reply_to: None },
+            HistoryTurn { role: "assistant", body: "Verification requested".into(), id: 2, reply_to: Some(1) },
+            HistoryTurn { role: "user", body: " /PHONE NUMBER verify 123456 ".into(), id: 3, reply_to: None },
+            HistoryTurn { role: "assistant", body: "Number verified".into(), id: 4, reply_to: Some(3) },
+            HistoryTurn { role: "user", body: "What were we discussing?".into(), id: 5, reply_to: None },
+        ];
+        let history = history_without_model_controls(&turns);
+        assert_eq!(history, vec![("user", "What were we discussing?".into())]);
     }
 
     #[test]

@@ -263,7 +263,16 @@ impl SlackTurnHandler for SlackConversationHarness {
                             async move {
                                 augmentagent_approval_discord::interaction::owner_history(
                                     session.conversation_id().starts_with('D'),
-                                    self.agent.answer(ctx, &prompt)).await
+                                    augmentagent_phone::context::scope(
+                                        augmentagent_store::phone::PhoneOrigin {
+                                            owner: turn.owner.clone(),
+                                            conversation: session.clone(),
+                                        },
+                                        None,
+                                        self.agent.answer(ctx, &prompt),
+                                    ),
+                                )
+                                .await
                             }
                         },
                     ),

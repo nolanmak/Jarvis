@@ -134,6 +134,7 @@ impl BrokerState {
 
 pub struct DiscordApprovalBroker {
     http: Arc<serenity::http::Http>,
+    bot_user_id: Option<UserId>,
     channel_id: ChannelId,
     owner_id: Option<UserId>,
     /// #1289 — read when another surface decided an action, to redraw the
@@ -144,9 +145,14 @@ pub struct DiscordApprovalBroker {
 impl DiscordApprovalBroker {
     /// HTTP-only operator dispatch; the running daemon handles controls.
     pub fn post_only(token:&str,channel_id:u64,owner_id:u64,store:Arc<Store>)->Self {
-        Self {http:Arc::new(serenity::http::Http::new(token)),channel_id:ChannelId::new(channel_id),
+        Self {http:Arc::new(serenity::http::Http::new(token)),bot_user_id:None,channel_id:ChannelId::new(channel_id),
             owner_id:Some(UserId::new(owner_id)),store:Some(store)}
     }
+    /// Available only after authenticated gateway READY, never in post-only mode.
+    pub fn phone_connection(&self) -> Option<(Arc<serenity::http::Http>, u64)> {
+        Some((self.http.clone(), self.bot_user_id?.get()))
+    }
+
     /// Start the serenity client in a background task. Blocks the current task
     /// until the gateway is `Ready`, after which `post_approval` calls may be
     /// issued.
@@ -226,10 +232,12 @@ impl DiscordApprovalBroker {
 
         // `state` is moved into the Handler and dropped from the broker
         // after client.start. That's intentional: the broker is post-only.
+        let bot_user_id = state.bot_user_id.get().copied();
         drop(state);
 
         Ok(Self {
             http,
+            bot_user_id,
             channel_id: approval_channel,
             owner_id: config.allowed_user_id.map(UserId::new),
             store: config.store.clone(),

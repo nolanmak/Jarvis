@@ -707,11 +707,17 @@ fn is_private_lane(thread: &str) -> bool {
 fn command_lane(e: &EventEnvelope) -> Option<String> {
     match &e.event {
         SlackEvent::Message(m) | SlackEvent::ThreadReply(m)
-            if m.files.is_empty() && !m.ts.is_empty() && recognize(&m.text, false).is_some() =>
+            if m.files.is_empty()
+                && !m.ts.is_empty()
+                && (recognize(&m.text, false).is_some()
+                    || augmentagent_phone::commands::recognizes(&m.text)) =>
         {
             Some(format!("{COMMAND_LANE}{}", m.ts))
         }
-        SlackEvent::SlashCommand(c) if recognize(&c.text, true).is_some() => {
+        SlackEvent::SlashCommand(c)
+            if recognize(&c.text, true).is_some()
+                || augmentagent_phone::commands::recognizes(&c.text) =>
+        {
             Some(format!("{COMMAND_LANE}{}", e.stable_id()))
         }
         _ => None,
@@ -865,7 +871,7 @@ struct Ctx {
     health: SlackSurfaceHealth,
     clock: Clock,
     dispatch_wake: Notify,
-    send_wake: Notify,
+    send_wake: Arc<Notify>,
     /// Where owner files go (`None`: no state directory on this host).
     inbound: Option<InboundOptions>,
     /// #1288 — the running turn of each conversation, by storage key, so a
@@ -875,6 +881,8 @@ struct Ctx {
     approvals: Option<Arc<SlackApprovals>>,
     /// #1292 — owner commands.
     commands: Arc<SlackCommands>,
+    phone: Option<Arc<augmentagent_phone::PhoneService>>,
+    private_phone: Mutex<HashMap<i64, (i64, String)>>,
     /// #1296 — subscribed-conversation ingestion for events that are not
     /// owner turns.
     subscribed: Option<Arc<dyn SubscribedEventSink>>,
@@ -895,6 +903,9 @@ struct DurableSink {
 impl SlackEventSink for DurableSink {
     async fn deliver(&self, delivery: SlackDelivery) -> Result<Ack, HandoffError> {
         let now = self.ctx.now();
+        if augmentagent_phone::commands::contains_sensitive_text(&delivery.envelope.payload) {
+            return record_private_phone(&self.ctx, &delivery.envelope, now);
+        }
         let record = inbound_record(&delivery.envelope, now)
             .map_err(|e| HandoffError::Rejected(e.to_string()))?;
         match self.ctx.store.record_inbound_event(&record, now) {
@@ -932,6 +943,7 @@ impl OwnerInputSink for CollectInput {
 /// The interactive Slack surface. Build with [`new`](Self::new), then
 /// [`run`](Self::run) until shutdown.
 pub struct SlackInteractiveSurface {
+    outbox_wake: Arc<Notify>,
     store: Arc<Store>,
     workspaces: Vec<SlackWorkspaceRuntime>,
     connectors: Vec<Arc<dyn SocketConnector>>,
@@ -944,6 +956,7 @@ pub struct SlackInteractiveSurface {
     /// #1292 — owner commands; `None` uses [`SlackCommandDeps::new`] over
     /// the default model selection file.
     commands: Option<Arc<SlackCommands>>,
+    phone: Option<Arc<augmentagent_phone::PhoneService>>,
     /// #1296 — where non-turn events of subscribed conversations go.
     subscribed: Option<Arc<dyn SubscribedEventSink>>,
 }
@@ -958,6 +971,7 @@ impl SlackInteractiveSurface {
         config: SlackSurfaceConfig,
     ) -> Self {
         Self {
+            outbox_wake: Arc::new(Notify::new()),
             store,
             workspaces,
             connectors,
@@ -966,8 +980,22 @@ impl SlackInteractiveSurface {
             clock: Arc::new(system_now_ms),
             approvals: None,
             commands: None,
+            phone: None,
             subscribed: None,
         }
+    }
+
+    /// Shared owner phone service; number/code commands are consumed before
+    /// ordinary inbox persistence even when this endpoint is not configured.
+    pub fn with_phone(mut self, phone: Arc<augmentagent_phone::PhoneService>) -> Self {
+        self.phone = Some(phone);
+        self
+    }
+
+    /// Share the sender wakeup with durable phone transcript delivery.
+    pub fn with_outbox_wake(mut self, wake: Arc<Notify>) -> Self {
+        self.outbox_wake = wake;
+        self
     }
 
     pub fn with_clock(mut self, clock: Clock) -> Self {
@@ -1034,20 +1062,25 @@ impl SlackInteractiveSurface {
             health: health.clone(),
             clock: self.clock,
             dispatch_wake: Notify::new(),
-            send_wake: Notify::new(),
+            send_wake: self.outbox_wake,
             inbound,
             running: Mutex::new(HashMap::new()),
             approvals: self.approvals,
             commands,
+            phone: self.phone,
+            private_phone: Mutex::new(HashMap::new()),
             subscribed: self.subscribed,
         });
 
-        // This process owns the database: claims and in-flight sends left
-        // behind belong to a daemon that died.
-        let report = ctx
-            .store
-            .recover_surface_delivery(ctx.now())
-            .context("recover durable surface delivery")?;
+        // Recover only these Slack accounts. Other surface workers may have
+        // started already and their in-flight sends must remain untouched.
+        let mut report = augmentagent_store::delivery::RecoveryReport { inbound_requeued:0, sends_to_reconcile:0 };
+        for runtime in ctx.workspaces.values() {
+            let recovered = ctx.store.recover_surface_delivery_for(&runtime.workspace.account(), ctx.now())
+                .context("recover durable Slack delivery")?;
+            report.inbound_requeued += recovered.inbound_requeued;
+            report.sends_to_reconcile += recovered.sends_to_reconcile;
+        }
         if report.inbound_requeued > 0 || report.sends_to_reconcile > 0 {
             info!(
                 inbound_requeued = report.inbound_requeued,
@@ -1105,6 +1138,17 @@ impl SlackInteractiveSurface {
             }));
         }
 
+        // Dropping JoinHandles detaches them. An aborted surface must instead
+        // cancel its workers, including any native conversation queue holder.
+        struct AbortWorkers(Vec<tokio::task::AbortHandle>);
+        impl Drop for AbortWorkers {
+            fn drop(&mut self) {
+                for task in &self.0 {
+                    task.abort();
+                }
+            }
+        }
+        let _workers = AbortWorkers(tasks.iter().map(|task| task.abort_handle()).collect());
         shutdown.cancelled().await;
         for task in tasks {
             if let Err(e) = task.await {
@@ -1140,6 +1184,11 @@ async fn approval_sweep_loop(
 
 async fn health_loop(ctx: Arc<Ctx>, shutdown: CancellationToken) {
     loop {
+        let now = ctx.now();
+        ctx.private_phone
+            .lock()
+            .expect("private phone inputs poisoned")
+            .retain(|_, (at, _)| now.saturating_sub(*at) < 300_000);
         ctx.health.persist(&ctx.store);
         tokio::select! {
             _ = shutdown.cancelled() => return,
@@ -1323,6 +1372,10 @@ fn authorizer(ctx: &Ctx) -> anyhow::Result<SlackOwnerAuthorizer> {
 }
 
 async fn process(ctx: &Ctx, claimed: ClaimedInbound, shutdown: &CancellationToken) {
+    if claimed.kind == "phone_private" {
+        process_private_phone(ctx, claimed, shutdown).await;
+        return;
+    }
     let seq = claimed.seq;
     let account = claimed.conversation.account().clone();
     let envelope = match serde_json::from_str::<Value>(&claimed.payload)
@@ -1451,6 +1504,38 @@ async fn run_turn(
     let text = turn_text(&envelope.event);
     let session = answer_conversation(&account, &input, &envelope);
     let files = message_files(&envelope.event).to_vec();
+    if augmentagent_phone::commands::recognizes(&text) {
+        if let Some(conversation) = &session {
+            let reply = if ctx.config.dry_run {
+                "Phone commands are disabled in dry run.".into()
+            } else if let Some(phone) = &ctx.phone {
+                augmentagent_phone::commands::execute(
+                    phone,
+                    &input.owner,
+                    conversation,
+                    &claimed.event_id,
+                    &text,
+                )
+                .await
+                .unwrap_or_else(|| augmentagent_phone::commands::HELP.into())
+            } else {
+                "Phone is not configured on this daemon.".into()
+            };
+            if enqueue(
+                ctx,
+                conversation,
+                &answer_turn_id(&claimed.event_id),
+                &reply,
+            )
+            .is_err()
+            {
+                release(ctx, claimed.seq, "phone reply enqueue failed");
+                return;
+            }
+        }
+        settle(ctx, claimed.seq);
+        return;
+    }
     // #1292 — owner commands answer at once (their own lane) and never
     // reach the agent.
     if input.source != OwnerInputSource::Interaction && files.is_empty() {
@@ -1469,12 +1554,23 @@ async fn run_turn(
                 return;
             }
         } else if files.is_empty() && !is_cancel_command(&text) {
-            let decision=augmentagent_approval_discord::interaction::DecisionContext {
-                surface:"slack".into(),actor:input.owner.sender_id().into(),
-                conversation:input.conversation.as_ref().map(|c|format!("{}:{}",account.account_id(),c.conversation_id())).unwrap_or_default(),
-                interaction_id:claimed.event_id.clone(),revision:None,
+            let decision = augmentagent_approval_discord::interaction::DecisionContext {
+                surface: "slack".into(),
+                actor: input.owner.sender_id().into(),
+                conversation: input
+                    .conversation
+                    .as_ref()
+                    .map(|c| format!("{}:{}", account.account_id(), c.conversation_id()))
+                    .unwrap_or_default(),
+                interaction_id: claimed.event_id.clone(),
+                revision: None,
             };
-            if let Some(reply) = augmentagent_approval_discord::interaction::deciding(decision,approvals.handle_command(&text)).await {
+            if let Some(reply) = augmentagent_approval_discord::interaction::deciding(
+                decision,
+                approvals.handle_command(&text),
+            )
+            .await
+            {
                 match &session {
                     Some(conversation) => {
                         let turn = answer_turn_id(&claimed.event_id);
@@ -1958,6 +2054,143 @@ async fn post_ephemeral(
         Ok(_) => ctx.health.sent(ctx.now()),
         Err(e) => warn!(error = %e, "slack interactive: ephemeral rejection failed"),
     }
+}
+
+/// Only routing metadata reaches disk. Inputs are bounded and ephemeral; a
+/// restart cannot replay a code or an uncertain verification call.
+fn record_private_phone(
+    ctx: &Ctx,
+    envelope: &EventEnvelope,
+    now: i64,
+) -> Result<Ack, HandoffError> {
+    let auth = authorizer(ctx)
+        .map_err(|_| HandoffError::Rejected("phone authorization unavailable".into()))?;
+    let mut input = CollectInput::default();
+    let outcome = admit(&ctx.store, &auth, envelope, now, &mut input)
+        .map_err(|_| HandoffError::Rejected("phone authorization unavailable".into()))?;
+    if !matches!(outcome, AdmitOutcome::Dispatched) {
+        return Ok(Ack::empty());
+    }
+    let Some(input) = input.0 else {
+        return Ok(Ack::empty());
+    };
+    let Some(conversation) = answer_conversation(input.owner.account(), &input, envelope) else {
+        return Ok(Ack::empty());
+    };
+    let origin = augmentagent_store::phone::PhoneOrigin {
+        owner: input.owner,
+        conversation: conversation.clone(),
+    };
+    let event_id = envelope_event_id(envelope);
+    let lane = SurfaceConversationRef::new(
+        conversation.account().clone(),
+        conversation.conversation_id(),
+        Some(format!("{COMMAND_LANE}phone:{event_id}")),
+    )
+    .map_err(|_| HandoffError::Rejected("phone dispatch lane invalid".into()))?;
+    let record = NewInboundEvent {
+        conversation: lane,
+        event_id,
+        kind: "phone_private".into(),
+        occurred_at_ms: now,
+        payload: serde_json::to_string(&origin)
+            .map_err(|_| HandoffError::Rejected("phone metadata invalid".into()))?,
+    };
+    let mut private = ctx
+        .private_phone
+        .lock()
+        .expect("private phone inputs poisoned");
+    private.retain(|_, (at, _)| now.saturating_sub(*at) < 300_000);
+    if private.len() >= 128 {
+        return Err(HandoffError::Rejected(
+            "private phone queue is busy; retry".into(),
+        ));
+    }
+    // Hold the map lock across the durable write so dispatch cannot claim the
+    // row before its ephemeral value is available. No network calls here.
+    match ctx
+        .store
+        .record_inbound_event(&record, now)
+        .map_err(|_| HandoffError::Rejected("phone metadata persistence failed".into()))?
+    {
+        InboundRecordOutcome::Accepted { seq } => {
+            let text = turn_text(&envelope.event);
+            private.insert(
+                seq,
+                (
+                    now,
+                    if text.len() <= 8192 {
+                        text
+                    } else {
+                        "phone number help".into()
+                    },
+                ),
+            );
+            ctx.health.event_received(now);
+            ctx.dispatch_wake.notify_one();
+        }
+        InboundRecordOutcome::Duplicate { .. } => {}
+    }
+    Ok(Ack::empty())
+}
+async fn process_private_phone(ctx: &Ctx, claimed: ClaimedInbound, shutdown: &CancellationToken) {
+    let value = ctx
+        .private_phone
+        .lock()
+        .expect("private phone inputs poisoned")
+        .remove(&claimed.seq);
+    let origin: augmentagent_store::phone::PhoneOrigin =
+        match serde_json::from_str(&claimed.payload) {
+            Ok(origin) => origin,
+            Err(_) => {
+                settle(ctx, claimed.seq);
+                return;
+            }
+        };
+    let valid_lane = claimed.conversation.account() == origin.conversation.account()
+        && claimed.conversation.conversation_id() == origin.conversation.conversation_id()
+        && claimed.conversation.thread_id()
+            == Some(format!("{COMMAND_LANE}phone:{}", claimed.event_id).as_str());
+    if origin.conversation != claimed.conversation && !valid_lane {
+        settle(ctx, claimed.seq);
+        return;
+    }
+    let turn = answer_turn_id(&claimed.event_id);
+    match ctx.store.outbound_sends_with_key_prefix(
+        origin.owner.account(),
+        &format!("turn:{turn}:"),
+        &[],
+    ) {
+        Ok(existing) if !existing.is_empty() => {
+            settle(ctx, claimed.seq);
+            ctx.send_wake.notify_one();
+            return;
+        }
+        Err(_) => {
+            release(ctx, claimed.seq, "phone reply lookup failed");
+            return;
+        }
+        _ => {}
+    }
+    let reply = if ctx.config.dry_run {
+        "Phone commands are disabled in dry run.".into()
+    } else if let Some(phone) = &ctx.phone {
+        match value.filter(|(at,_)|ctx.now().saturating_sub(*at)<300_000) {
+                Some((_,text))=>tokio::select! {
+                    biased;
+                    _=shutdown.cancelled()=>{release(ctx,claimed.seq,"private phone command interrupted");return;},
+                    result=augmentagent_phone::commands::execute(phone,&origin.owner,&origin.conversation,&claimed.event_id,&text)=>result.unwrap_or_else(||augmentagent_phone::commands::HELP.into()),
+                },
+                None=>"Private phone command was interrupted or expired. Check `phone number status` first. Resend it in your private owner chat if needed; no automatic retry was made.".into(),
+            }
+    } else {
+        "Phone is not configured on this daemon.".into()
+    };
+    if enqueue(ctx, &origin.conversation, &turn, &reply).is_err() {
+        release(ctx, claimed.seq, "phone reply enqueue failed");
+        return;
+    }
+    settle(ctx, claimed.seq);
 }
 
 #[cfg(test)]

@@ -8,7 +8,8 @@ permissions:
   contents: read
 jobs:
   exporter:
-    runs-on: ubuntu-latest
+    # Python 3.9 compatibility coverage requires an available runner build.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
