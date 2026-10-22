@@ -268,7 +268,7 @@ struct SetupFailure {
 
 fn decode_setup(session: &mut RelaySession, text: &str) -> Result<(), SetupFailure> {
     let failure = |reason| SetupFailure { reason, provider_code: None };
-    let value: serde_json::Value = serde_json::from_str(&text).map_err(|_| failure("invalid_json"))?;
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|_| failure("invalid_json"))?;
     if value["type"] == "error" {
         let provider_code = value["code"].as_u64().and_then(|n| u32::try_from(n).ok());
         return Err(SetupFailure { reason: "provider_error", provider_code });
