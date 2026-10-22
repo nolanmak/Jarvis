@@ -13,6 +13,7 @@ test-isolation = []
 
 [dependencies]
 augmentagent-store = { path = "../augmentagent-store" }
+augmentagent-phone = { path = "../augmentagent-phone" }
 augmentagent-wiki = { path = "../augmentagent-wiki" }
 # #58 engagement engine surfaces preview / failure cards through the shared
 # ApprovalBroker trait. approval-discord depends only on -store, so this

@@ -5273,7 +5273,9 @@ echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30
     #[tokio::test]
     async fn hung_cli_times_out_with_typed_error() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = stub_cli(&dir, "fake-claude-hang", "cat >/dev/null\nsleep 600\n");
+        // Keep the watchdog fixture to one process; orphaned shell children can
+        // legitimately produce CleanupUnverified on busy CI hosts.
+        let bin = stub_cli(&dir, "fake-claude-hang", "cat >/dev/null\nexec sleep 600\n");
         let _env = TIMEOUT_ENV_LOCK.lock().await;
         std::env::set_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS", "1");
         let reasoner = ClaudeCliReasoner {

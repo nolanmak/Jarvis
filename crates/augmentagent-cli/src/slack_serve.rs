@@ -547,11 +547,12 @@ pub async fn notify_destination(
 pub fn spawn(
     store: Arc<Store>,
     planned: Option<Plan>,
-    make_handler: impl FnOnce(Option<Arc<dyn TurnHistory>>) -> Arc<dyn SlackTurnHandler>
+    make_handler: impl FnOnce(Option<Arc<SlackConversationHistory>>, Arc<tokio::sync::Notify>) -> Result<Arc<dyn SlackTurnHandler>>
         + Send
         + 'static,
     approvals: Option<Arc<augmentagent_channel_slack::approvals::SlackApprovals>>,
     commands: Option<Arc<SlackCommands>>,
+    mut phone: Option<Arc<augmentagent_phone::PhoneService>>,
     subscribed: Option<Arc<dyn SubscribedEventSink>>,
     dry_run: bool,
     shutdown: CancellationToken,
@@ -597,17 +598,19 @@ pub fn spawn(
             warn!("slack history and catch-up clients unavailable: {e:#}");
             Vec::new()
         });
+        let outbox_wake = Arc::new(tokio::sync::Notify::new());
         let handler = match test_turn_handler(
             std::env::var(TEST_REPLY_ENV).ok().as_deref(),
             Arc::clone(&store),
         ) {
             Some(stub) => {
+                phone = None; // Synthetic query mode never dials a real phone.
                 warn!("{TEST_REPLY_ENV} is set: Slack turns run the real harness with a fake agent, not the reasoner (debug build, tests and local QA only)");
                 stub
             }
             None => make_handler((!runtimes.is_empty()).then(|| {
-                Arc::new(SlackConversationHistory::new(&runtimes)) as Arc<dyn TurnHistory>
-            })),
+                Arc::new(SlackConversationHistory::new(&runtimes))
+            }), outbox_wake.clone())?,
         };
         let surface = match build_surface(
             Arc::clone(&store),
@@ -631,6 +634,8 @@ pub fn spawn(
                 anyhow::bail!(detail);
             }
         };
+        let surface = surface.with_outbox_wake(outbox_wake);
+        let surface = match phone { Some(service) => surface.with_phone(service), None => surface };
         let surface = match approvals {
             Some(a) => surface.with_approvals(a),
             None => surface,

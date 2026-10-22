@@ -1,0 +1,372 @@
+use super::*;
+use augmentagent_channel_core::{
+    native_session::{Launch, CURRENT},
+    providers::ProviderKind,
+    Reasoner, ReasonerOpts,
+};
+use augmentagent_phone::{
+    tools::ToolServer, DialRequest, OwnerLink, PhoneConfig, PhoneService, ProviderError,
+    SystemClock, Telephony,
+};
+use augmentagent_store::{
+    owner::ControlConversationKind, phone::PhoneOrigin, NativeConversation, SurfaceAccountRef,
+    SurfaceConversationRef, SurfaceOwnerRef, SurfacePlatform,
+};
+use std::sync::Mutex;
+pub(super) struct FixturePhone;
+#[async_trait]
+impl Telephony for FixturePhone {
+    async fn create(&self, _: DialRequest) -> std::result::Result<String, ProviderError> {
+        Ok("CA-fixture".into())
+    }
+    async fn hangup(&self, _: &str) -> std::result::Result<(), ProviderError> {
+        Ok(())
+    }
+}
+pub(super) struct Native {
+    pub(super) kind: ProviderKind,
+    pub(super) check_discord_wrappers: bool,
+    pub(super) calls: Arc<Mutex<Vec<(String, String)>>>,
+}
+#[async_trait]
+impl Reasoner for Native {
+    async fn call(&self, opts: &ReasonerOpts, prompt: &str) -> Result<String> {
+        assert!(opts
+            .allowed_tools
+            .contains(&"mcp__phone__call_owner".into()));
+        if self.check_discord_wrappers {
+            // Validate the final production options, after all wrappers and
+            // phone attachment, on both text and accepted phone turns.
+            let settings: serde_json::Value = serde_json::from_str(
+                opts.settings_json.as_deref().context("settings missing")?)?;
+            for (server, tool) in [
+                ("computer", "computer_task"),
+                ("model", "switch_model"),
+                ("composio_auth", "start_auth"),
+            ] {
+                assert!(settings["mcpServers"][server].is_object(), "lost {server} configuration");
+                assert!(opts.allowed_tools.contains(&format!("mcp__{server}__{tool}")), "lost {server} permission");
+            }
+            assert_eq!(settings["mcpServers"]["computer"]["args"][1], "22");
+            assert_eq!(settings["mcpServers"]["computer"]["args"][2], opts.session_id.as_deref().unwrap());
+            assert!(opts.allowed_tools.iter().any(|tool| tool.contains("approvals history")), "lost approval history access");
+            assert!(!opts.allowed_tools.iter().any(|tool| tool.starts_with("mcp__voice__")), "legacy voice capability leaked into phone turn");
+        }
+        let session = CURRENT.try_with(Arc::clone)?;
+        let mut lease = session.begin(self.kind)?;
+        let id = match lease.launch() {
+            Launch::Resume { id } => id,
+            _ => anyhow::bail!("must resume original native session"),
+        };
+        lease.observe(&id)?;
+        // Exercise the actual owner capability while this native turn is
+        // active. Recording allowed_tools alone would miss an expired or
+        // prematurely dropped grant and a disconnected tool broker.
+        check_phone_status(opts).await?;
+        lease.finish()?;
+        self.calls.lock().unwrap().push((id, prompt.into()));
+        Ok("native reply".into())
+    }
+}
+pub(super) async fn check_phone_status(opts: &ReasonerOpts) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let settings: serde_json::Value = serde_json::from_str(
+        opts.settings_json.as_deref().context("phone settings missing")?)?;
+    let env = &settings["mcpServers"]["phone"]["env"];
+    let socket = env["AUGMENTAGENT_PHONE_TOOL_SOCKET"].as_str().context("phone socket missing")?;
+    let token = env["AUGMENTAGENT_PHONE_TOOL_GRANT"].as_str().context("phone grant missing")?;
+    let response = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let mut stream = tokio::net::UnixStream::connect(socket).await?;
+        let request = serde_json::json!({"version":1,"grant":token,
+            "method":"phone_number_status","arguments":{}});
+        stream.write_all(format!("{request}\n").as_bytes()).await?;
+        let mut response = String::new();
+        BufReader::new(stream).read_line(&mut response).await?;
+        anyhow::Ok(serde_json::from_str::<serde_json::Value>(&response)?)
+    }).await??;
+    assert_eq!(response["ok"], true, "native turn lost its phone capability");
+    assert!(response["result"].get("masked").is_some());
+    assert!(!response.to_string().contains("+12025550123"));
+    Ok(())
+}
+#[tokio::test]
+async fn discord_phone_dm_text_reuses_native_session_without_legacy_voice() {
+    if std::env::var_os("DISCORD_PHONE_TEST_CHILD").is_none() {
+        let config = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "discord_phone_session_tests::discord_phone_dm_text_reuses_native_session_without_legacy_voice", "--nocapture"])
+            .env("DISCORD_PHONE_TEST_CHILD", "1")
+            .env("AUGMENTAGENT_MODEL_SELECTION_CONFIG", config.path().join("selection.json"))
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for kind in [ProviderKind::Claude, ProviderKind::Codex] {
+        let dir = tempfile::tempdir().unwrap();
+        let wiki = dir.path().join("wiki");
+        std::fs::create_dir(&wiki).unwrap();
+        std::fs::create_dir_all(dir.path().join("sidecars/computer-use")).unwrap();
+        std::fs::write(dir.path().join("sidecars/computer-use/mcp.mjs"), "// synthetic fixture; never executed").unwrap();
+        let store = Arc::new(Store::open(dir.path().join("db")).unwrap());
+        let account =
+            SurfaceAccountRef::new(SurfacePlatform::new("discord").unwrap(), "dm:11").unwrap();
+        let owner = SurfaceOwnerRef::new(account.clone(), "33").unwrap();
+        let chat = SurfaceConversationRef::new(account, "22", None).unwrap();
+        store.bind_surface_owner(&owner, 0).unwrap();
+        store
+            .set_surface_control_conversation(&chat, ControlConversationKind::Direct, 0)
+            .unwrap();
+        let native_id = uuid::Uuid::new_v4().to_string();
+        store
+            .bind_surface_conversation(&NativeConversation {
+                conversation: chat.clone(),
+                provider: kind.name().into(),
+                native_session_id: native_id.clone(),
+                cwd: wiki.to_string_lossy().into(),
+                uncertain: false,
+            })
+            .unwrap();
+        let service = Arc::new(PhoneService::new(
+            store.clone(),
+            Arc::new(FixturePhone),
+            Arc::new(SystemClock),
+            PhoneConfig::new(
+                true,
+                "https://phone.example.test",
+                "phone-test-verification-key-32bytes",
+                vec![OwnerLink {
+                    surface_owner: owner.clone(),
+                    owner_id: "owner".into(),
+                }],
+            )
+            .unwrap(),
+        ));
+        let tools = ToolServer::start(service.clone()).await.unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let reasoner = Arc::new(FallbackReasoner::for_tests(
+            vec![(
+                kind,
+                Arc::new(Native {
+                    kind,
+                    check_discord_wrappers: true,
+                    calls: calls.clone(),
+                }),
+            )],
+            augmentagent_channel_core::cooldown::CooldownLatch::at(dir.path().join("cooldowns")),
+        ));
+        let query = Arc::new(wiki_querier(
+            reasoner,
+            wiki.clone(),
+            dir.path().to_owned(),
+            store.clone(),
+            false,
+        ));
+        assert!(query.phone_tools.set(tools).is_ok());
+        let origin = PhoneOrigin {
+            owner: owner.clone(),
+            conversation: chat.clone(),
+        };
+        let mut audit = augmentagent_approval_discord::AuditCtx {
+            session_id: "22:1".into(),
+            guild_id: None,
+            http: None,
+            channel_id: Some(serenity::model::id::ChannelId::new(22)),
+            owner_authorized: true,
+        };
+        let gateway = augmentagent_approval_discord::phone::PhoneCommandContext {
+            guild_id: None,
+            bot_user_id: 11,
+            channel_id: 22,
+            author_id: 33,
+            message_id: 1,
+        };
+        assert_eq!(query.phone_origin(&gateway), Some(origin.clone()));
+        for (index, id) in ["22:1", "22:2", "22:2"].into_iter().enumerate() {
+            audit.session_id = id.into();
+            let result = augmentagent_approval_discord::phone::answer_turn(
+                query.as_ref(),
+                &gateway,
+                &audit,
+                "private old history",
+                "new text",
+            )
+            .await;
+            if index == 2 {
+                assert!(result.is_err(), "duplicate must not replay a native turn");
+            } else {
+                result.unwrap();
+            }
+            if id == "22:1" {
+                store
+                    .phone_import_destination("owner", "+12025550123", 0)
+                    .unwrap();
+                let grant = service.authorize(&owner, &chat).unwrap();
+                let call = service
+                    .tool(
+                        &grant,
+                        "call_owner",
+                        serde_json::json!({"request_id":"phone-request"}),
+                    )
+                    .await
+                    .unwrap();
+                let call_id = call["id"].as_str().unwrap();
+                let now = augmentagent_phone::Clock::now_ms(&SystemClock);
+                store
+                    .phone_provider_event(
+                        call_id,
+                        "CA-fixture",
+                        augmentagent_store::phone::CallState::AwaitingAcceptance,
+                        now,
+                    )
+                    .unwrap();
+                store.phone_accept(call_id, "CA-fixture", now).unwrap();
+                let call = store.phone_provider_call(call_id).unwrap();
+                let io = Arc::new(
+                    crate::discord_phone::DiscordPhoneIo::new(
+                        store.clone(),
+                        Arc::new(History),
+                        None,
+                        11,
+                        Arc::new(tokio::sync::Notify::new()),
+                    )
+                    .unwrap(),
+                );
+                let bridge = augmentagent_channel_core::phone_agent::PhoneAgent::new(
+                    store.clone(),
+                    service.clone(),
+                    query.clone(),
+                    io.clone(),
+                    wiki.clone(),
+                    Arc::new(|_| Ok(None)),
+                );
+                let proposal = crate::calendar_approval_tests::proposal(&store);
+                let mut provider = mockito::Server::new_async().await;
+                let effect = provider.mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_CREATE_EVENT")
+                    .with_status(200)
+                    .with_body(r#"{"successful":true,"data":{"response_data":{"id":"synthetic-phone-event"}}}"#)
+                    .expect(1).create_async().await;
+                let mut approver = crate::test_support::approver_with_store(store.clone());
+                approver.calendar = Arc::new(augmentagent_channel_calendar::ComposioCalendarClient::new("test".into())
+                    .with_base_url(provider.url()));
+                for index in 0..3 {
+                    bridge
+                        .run(
+                            &call,
+                            &format!("phone-turn-{index}"),
+                            &format!("spoken follow-up {index}"),
+                            None,
+                            tokio_util::sync::CancellationToken::new(),
+                        )
+                        .await
+                        .unwrap();
+                    if index < 2 {
+                        assert_eq!(store.get_action_with_email(&proposal).unwrap().unwrap().action.status, "pending");
+                        assert!(!effect.matched_async().await, "phone turn executed an unapproved proposal");
+                    }
+                    if index == 1 {
+                        let decision = augmentagent_approval_discord::interaction::DecisionContext {
+                            surface:"discord".into(), actor:"33".into(), conversation:"22".into(),
+                            interaction_id:"synthetic-phone-approval".into(), revision:None,
+                        };
+                        let outcome = augmentagent_approval_discord::interaction::deciding(decision,
+                            approver.approve(&proposal)).await;
+                        assert!(matches!(outcome, ApprovalActionOutcome::CalendarCreated { .. }));
+                    }
+                }
+                effect.assert_async().await;
+                assert_eq!(store.get_action_with_email(&proposal).unwrap().unwrap().action.status, "sent");
+                let approval_turns = calls.lock().unwrap();
+                assert!(approval_turns.last().unwrap().1.contains(&proposal));
+                assert!(approval_turns.last().unwrap().1.contains("completed"));
+                drop(approval_turns);
+                let reopened = Store::open(dir.path().join("db")).unwrap();
+                let queued = reopened
+                    .outbound_sends_with_key_prefix(owner.account(), "phone-mirror:", &[])
+                    .unwrap();
+                assert_eq!(queued.len(), 6);
+                assert!(queued.iter().all(|send| send.conversation == chat));
+                let posts = Posts::default();
+                while augmentagent_approval_discord::phone_delivery::deliver_one(
+                    &reopened,
+                    owner.account(),
+                    &posts,
+                    i64::MAX / 2,
+                )
+                .await
+                .unwrap()
+                {}
+                assert_eq!(posts.0.lock().unwrap().len(), 6);
+            }
+        }
+        assert!(augmentagent_phone::context::current().is_none());
+        let rows = calls.lock().unwrap();
+        assert_eq!(rows.len(), 5);
+        assert!(rows
+            .iter()
+            .all(|(id, prompt)| id == &native_id && !prompt.contains("private old history")));
+        drop(rows);
+        let other_model = if kind == ProviderKind::Claude {
+            "codex"
+        } else {
+            "claude"
+        };
+        let command = format!("/model set {other_model}");
+        let reply =
+            augmentagent_approval_discord::phone::model_command(query.as_ref(), &gateway, &command)
+                .await
+                .unwrap();
+        assert!(reply.contains("bound to native"), "{reply}");
+        assert_eq!(
+            store
+                .surface_conversation(&chat)
+                .unwrap()
+                .unwrap()
+                .native_session_id,
+            native_id
+        );
+        audit.channel_id = Some(serenity::model::id::ChannelId::new(23));
+        assert!(augmentagent_phone::context::scope(
+            origin.clone(),
+            None,
+            query.answer_turn(&audit, "", "wrong channel")
+        )
+        .await
+        .is_err());
+        audit.channel_id = Some(serenity::model::id::ChannelId::new(22));
+        store.unbind_surface_owner(owner.account()).unwrap();
+        assert!(query.phone_origin(&gateway).is_none());
+        assert!(augmentagent_phone::context::scope(
+            origin,
+            None,
+            query.answer_turn(&audit, "", "revoked")
+        )
+        .await
+        .is_err());
+        assert_eq!(calls.lock().unwrap().len(), 5);
+    }
+}
+
+struct History;
+#[async_trait]
+impl crate::discord_phone::History for History {
+    async fn transcript(&self, _: &PhoneOrigin) -> Result<String> {
+        anyhow::bail!("bound session must not reload history")
+    }
+}
+#[derive(Default)]
+struct Posts(Mutex<Vec<String>>);
+#[async_trait]
+impl augmentagent_approval_discord::phone_delivery::Transport for Posts {
+    async fn send(
+        &self,
+        payload: &augmentagent_approval_discord::phone_delivery::Payload,
+    ) -> std::result::Result<String, augmentagent_approval_discord::phone_delivery::SendError> {
+        self.0.lock().unwrap().push(payload.content.clone());
+        Ok("55".into())
+    }
+}

@@ -243,6 +243,9 @@ impl<R: Reasoner + 'static> DiscordChannel<R> {
                 continue;
             }
 
+            if augmentagent_approval_discord::phone::is_private_control(&msg.content) {
+                continue;
+            }
             let mut msg = msg;
             self.inline_text_attachments(&mut msg).await;
             if let Err(e) = self.handle_message(sub, msg, outcome).await {
@@ -264,6 +267,9 @@ impl<R: Reasoner + 'static> DiscordChannel<R> {
         msg: Message,
         outcome: &mut PollOutcome,
     ) -> anyhow::Result<()> {
+        if augmentagent_approval_discord::phone::is_private_control(&msg.content) {
+            return Ok(());
+        }
         let email = message_to_email(&msg, sub, &self.my_user_id);
         self.store.upsert_email(&email)?;
         if self.store.is_email_complete(&email.message_id)? {
@@ -1151,6 +1157,27 @@ mod tests {
             },
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn private_phone_setup_is_not_stored_or_sent_to_reasoner() {
+        let (store, _file) = tmp_store();
+        let reasoner = Arc::new(ScriptedReasoner::new([]));
+        let broker: Arc<dyn ApprovalBroker> = Arc::new(CountingBroker::default());
+        let ch = build_channel(store.clone(), reasoner, broker);
+        let sub = sub_with_mode(SubscriptionMode::StoreOnly);
+        let mut outcome = PollOutcome::default();
+        for mode in [SubscriptionMode::StoreOnly, SubscriptionMode::Digest, SubscriptionMode::Priority] {
+            let private_sub = sub_with_mode(mode);
+            for text in ["phone number verify 123456", "/PHONE NUMBER set +12025550123", "phone number verify"] {
+                ch.handle_message(&private_sub, sample_msg("private-phone", text), &mut outcome).await.unwrap();
+            }
+        }
+        assert_eq!(outcome.store_only_stored, 0);
+        let count: i64 = store.with_conn(|conn| conn.query_row("SELECT COUNT(*) FROM emails", [], |r| r.get(0))).unwrap();
+        assert_eq!(count, 0);
+        ch.handle_message(&sub, sample_msg("ordinary", "hello"), &mut outcome).await.unwrap();
+        assert_eq!(outcome.store_only_stored, 1);
     }
 
     #[tokio::test]
