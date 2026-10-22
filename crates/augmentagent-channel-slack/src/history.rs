@@ -157,6 +157,9 @@ impl SlackConversationHistory {
                 }
                 let role = role_of(m, bot, owner_user_id)?;
                 let text = m.text.as_deref().unwrap_or("").trim().to_string();
+                if augmentagent_phone::commands::sensitive(&text) {
+                    return None;
+                }
                 (!text.is_empty()).then_some((at, role, text))
             })
             .collect();

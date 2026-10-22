@@ -6,6 +6,7 @@ component. Commands are parsed into argv; model text is never evaluated by a she
 The execution transport is wired separately from this policy core.
 """
 import os
+import sys
 import json
 import hashlib
 import math
@@ -17,7 +18,7 @@ import shlex
 import stat
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from pathlib import Path
 
 
@@ -357,15 +358,97 @@ class SearchBudget:
 
 # Runs as `python3 -I -S -c GREP_MATCHER <bridge pid>` with an empty environment.
 # It receives the pattern and already scope-checked file bytes on stdin (an
-# in-memory file), never a path, so it cannot open anything itself. It exits
-# with the bridge (parent death signal) and on a 3 s CPU limit even if the
+# private unlinked file), never a path, so it cannot open anything itself. It exits
+# with the bridge (parent death signal or kernel exit monitor) and on a 3 s CPU limit even if the
 # bridge is SIGKILLed. Per-line matching is the same as the earlier in-process
 # implementation.
 GREP_MATCHER = r'''
 import ctypes, json, os, re, resource, sys
-resource.setrlimit(resource.RLIMIT_CPU, (3, 3))
-resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
-if ctypes.CDLL(None).prctl(1, 9, 0, 0, 0) != 0 or os.getppid() != int(sys.argv[1]):
+def cap_resource(kind, ceiling):
+    # A child may tighten inherited limits, never raise them. macOS commonly
+    # supplies a data-segment hard limit below our nominal memory ceiling.
+    soft, hard = resource.getrlimit(kind)
+    ceiling = min([ceiling] + [n for n in (soft, hard) if n != resource.RLIM_INFINITY])
+    resource.setrlimit(kind, (ceiling, ceiling))
+cap_resource(resource.RLIMIT_CPU, 3)
+if sys.platform != 'darwin':
+    cap_resource(resource.RLIMIT_AS, 1 << 30)
+MAX_MATCHER_RESIDENT = 1 << 30
+parent = int(sys.argv[1])
+if sys.platform == 'linux':
+    if ctypes.CDLL(None).prctl(1, 9, 0, 0, 0) != 0:
+        sys.exit(3)
+elif sys.platform == 'darwin':
+    # A separate process observes kernel exit events: a Python watcher thread
+    # cannot acquire the GIL during a pathological regex. The registration
+    # handshake plus parent check closes the startup/PID-reuse window.
+    import select, signal
+    from contextlib import closing
+    # Darwin may reserve more virtual/data space at startup than the nominal
+    # ceiling. Monitor actual resident bytes outside the regex process/GIL.
+    class TaskInfo(ctypes.Structure):
+        _fields_ = [('virtual_size', ctypes.c_uint64), ('resident_size', ctypes.c_uint64),
+                    ('times', ctypes.c_uint64 * 4), ('counters', ctypes.c_int32 * 12)]
+    libproc = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
+    libproc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+    libproc.proc_pidinfo.restype = ctypes.c_int
+    matcher = os.getpid()
+    def check_memory():
+        info = TaskInfo()
+        size = ctypes.sizeof(info)
+        if libproc.proc_pidinfo(matcher, 4, 0, ctypes.byref(info), size) != size:
+            raise OSError('cannot monitor matcher memory')
+        if info.resident_size > MAX_MATCHER_RESIDENT:
+            raise MemoryError('matcher resident limit exceeded')
+    ready_read, ready_write = os.pipe()
+    guardian = os.fork()
+    if guardian == 0:
+        stage = 'create exit monitor'
+        try:
+            os.close(ready_read)
+            with closing(select.kqueue()) as watcher:
+                stage = 'register process exits'
+                watcher.control([select.kevent(pid, filter=select.KQ_FILTER_PROC,
+                    flags=select.KQ_EV_ADD, fflags=select.KQ_NOTE_EXIT)
+                    for pid in (parent, matcher)], 0, 0)
+                stage = 'check resident memory'
+                check_memory()
+                os.write(ready_write, b'1')
+                os.close(ready_write)
+                for fd in (0, 1):
+                    os.close(fd)
+                while True:
+                    events = watcher.control([], 2, 0.05)
+                    if any(event.ident == matcher for event in events):
+                        break
+                    if any(event.ident == parent for event in events):
+                        if os.getppid() == matcher:
+                            os.kill(matcher, signal.SIGKILL)
+                        break
+                    check_memory()
+        except Exception as error:
+            if os.getppid() == matcher:
+                try:
+                    os.kill(matcher, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            # Fixed stage and exception class only, never file content or
+            # configuration. Synthetic tests retain this diagnostic; the
+            # production bridge discards matcher stderr.
+            sys.stderr.write('matcher ' + stage + ': ' + type(error).__name__ + '\n')
+            sys.stderr.flush()
+        finally:
+            os._exit(0)
+    os.close(ready_write)
+    armed = os.read(ready_read, 1) == b'1'
+    os.close(ready_read)
+    if not armed or os.getppid() != parent:
+        os.kill(guardian, signal.SIGKILL)
+        os.waitpid(guardian, 0)
+        sys.exit(3)
+else:
+    sys.exit(3)
+if os.getppid() != parent:
     sys.exit(3)
 source = sys.stdin.buffer
 header = json.loads(source.readline())
@@ -901,8 +984,34 @@ class HandoffJournal:
             self.save(state)
 
 
+def system_path_aliases():
+    """Only macOS root-controlled OS aliases may bypass component no-follow.
+
+    Never resolve arbitrary model paths: workspace symlinks remain forbidden.
+    """
+    if sys.platform != 'darwin':
+        return {}
+    try:
+        private = os.lstat('/private')
+        root = os.lstat('/')
+        if any(not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022
+               for info in (root, private)):
+            return {}
+        aliases = {}
+        for name in ('tmp', 'var', 'etc'):
+            alias = '/' + name
+            info = os.lstat(alias)
+            if (stat.S_ISLNK(info.st_mode) and info.st_uid == 0
+                    and os.readlink(alias) in ('private/' + name, '/private/' + name)):
+                aliases[alias] = '/private/' + name
+        return aliases
+    except OSError:
+        return {}
+
+
 class Policy:
     def __init__(self, config):
+        self.path_aliases = system_path_aliases()
         self.cwd = Path(config['cwd']).resolve(strict=True)
         self.environment = {k: os.environ[k] for k in
                             ('HOME', 'PATH', 'USER', 'LOGNAME', 'LANG', 'TERM',
@@ -998,8 +1107,13 @@ class Policy:
             result.append(path)
         return result
 
-    @staticmethod
-    def _allowances(entries):
+    def _system_path(self, name):
+        for alias, canonical in self.path_aliases.items():
+            if name == alias or name.startswith(alias + '/'):
+                return canonical + name[len(alias):]
+        return name
+
+    def _allowances(self, entries):
         """Validate Read allowances: exactly Read, a normalized absolute directory, a name pattern."""
         if not isinstance(entries, list):
             raise Denied('read allowances must be a list')
@@ -1016,7 +1130,7 @@ class Policy:
             if not isinstance(pattern, str) or not pattern:
                 raise Denied('read allowance requires a name pattern')
             try:
-                result.append((directory, re.compile(pattern)))
+                result.append((self._system_path(directory), re.compile(pattern)))
             except re.error as exc:
                 raise Denied('invalid read allowance pattern') from exc
         return result
@@ -1032,7 +1146,7 @@ class Policy:
                 or len(os.fsencode(name)) > MAX_PATH_BYTES
                 or any(part in ('', '.', '..') for part in name.split('/')[1:])):
             return None
-        directory, _, leaf = name.rpartition('/')
+        directory, _, leaf = self._system_path(name).rpartition('/')
         for allowed, expression in self.read_allowances:
             if directory == allowed and expression.fullmatch(leaf):
                 return directory, leaf
@@ -1099,7 +1213,7 @@ class Policy:
         # String form of Path(os.path.abspath(cwd / name)).relative_to(root):
         # abspath output is normalized and roots are resolved without a
         # trailing separator. Searches call this per entry, so avoid pathlib.
-        candidate = os.path.abspath(os.path.join(str(self.cwd), name))
+        candidate = self._system_path(os.path.abspath(os.path.join(str(self.cwd), name)))
         if len(os.fsencode(candidate)) > MAX_PATH_BYTES:
             raise Denied('path exceeds length limit')
         roots = self.write_roots if writing else self.read_roots
@@ -1348,7 +1462,7 @@ class Policy:
         The descriptor is the entry's verified parent directory and stays open
         only until the generator resumes.
         """
-        base = Path(os.path.abspath(self.cwd / path))
+        base = Path(self._system_path(os.path.abspath(self.cwd / path)))
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         verification = file_verification(self.write_roots)
         count = 0
@@ -1414,7 +1528,7 @@ class Policy:
         """Line search in two bounded phases (#1038).
 
         Walk and read: the bridge walks and reads files itself, through the
-        scoped, symlink- and hard-link-refusing path, into an in-memory file.
+        scoped, symlink- and hard-link-refusing path, into a private unlinked file.
         The phase stops at SearchBudget's limits and keeps what it has.
         Match: only the model-supplied regular expression runs elsewhere, in a
         short-lived child killed after GREP_MATCH_SECONDS, so no pattern can
@@ -1431,10 +1545,14 @@ class Policy:
             candidates = [(str(candidate), candidate.name, None, None)]
         else:
             candidates = self._walk(path, budget=budget)
-        source = os.memfd_create('jarvis-grep-input', os.MFD_CLOEXEC)
-        output = os.memfd_create('jarvis-grep-output', os.MFD_CLOEXEC)
+        import tempfile
+        buffers = ExitStack()
         process = None
         try:
+            # TemporaryFile is private and unlinked on POSIX. Only descriptors
+            # cross into the matcher, including on hosts without Linux memfd.
+            source = buffers.enter_context(tempfile.TemporaryFile()).fileno()
+            output = buffers.enter_context(tempfile.TemporaryFile()).fileno()
             def emit(data):
                 view = memoryview(data)
                 while view:
@@ -1503,8 +1621,7 @@ class Policy:
                 if process.poll() is None:
                     process.kill()
                 process.wait()
-            os.close(source)
-            os.close(output)
+            buffers.close()
 
     def check_service_argv(self, argv):
         name = Path(argv[0]).name
@@ -2593,17 +2710,31 @@ def serve(config_path):
     # PR_SET_PDEATHSIG follows the spawning *thread*, which may retire while
     # a multithreaded Codex process remains healthy. A pidfd follows the whole
     # process and cannot be confused by PID reuse.
-    parent_fd = os.pidfd_open(parent)
-    if os.getppid() != parent:
-        os.close(parent_fd)
+    parent_fd = os.pidfd_open(parent) if hasattr(os, 'pidfd_open') else None
+    if parent <= 1 or os.getppid() != parent:
+        if parent_fd is not None:
+            os.close(parent_fd)
         raise Denied('cannot bind bridge lifetime to parent')
+    parent_watch_stopped = threading.Event()
     def watch_parent():
-        watcher = select.poll()
-        watcher.register(parent_fd, select.POLLIN)
-        events = watcher.poll()
-        if any(flags & (select.POLLIN | select.POLLHUP) for _, flags in events):
-            os.kill(os.getpid(), signal.SIGTERM)
-    threading.Thread(target=watch_parent, daemon=True).start()
+        if parent_fd is not None:
+            watcher = select.poll()
+            watcher.register(parent_fd, select.POLLIN)
+            while not parent_watch_stopped.is_set():
+                events = watcher.poll(100)
+                if any(flags & (select.POLLIN | select.POLLHUP) for _, flags in events):
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    return
+        else:
+            # macOS has no pidfd. Observe our own parent relationship, not
+            # whether a numeric PID exists: reparenting remains detectable
+            # even if the old parent's PID has already been reused.
+            while not parent_watch_stopped.wait(0.05):
+                if os.getppid() != parent:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    return
+    parent_watch = threading.Thread(target=watch_parent, daemon=True)
+    parent_watch.start()
     policy = Policy(config)
     startup_failure = None
     try:
@@ -2621,8 +2752,11 @@ def serve(config_path):
             if response is not None:
                 print(response, flush=True)
     finally:
+        parent_watch_stopped.set()
+        parent_watch.join(timeout=1)
         server.close()
-        os.close(parent_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
 
 
 if __name__ == '__main__':

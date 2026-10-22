@@ -57,6 +57,11 @@ else
 fi
 if RESOLVED=$(readlink -m -- "$ABS" 2>/dev/null); then
   ABS="$RESOLVED"
+elif RESOLVED=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$ABS" 2>/dev/null); then
+  ABS="$RESOLVED"
+else
+  echo "aa-journal-guard: cannot canonicalize candidate" >&2
+  exit 2
 fi
 
 # #1078 — the protected-name check below also runs against the REQUESTED path,
@@ -67,9 +72,21 @@ fi
 # list, the write is denied. Relative candidates are already wiki-relative;
 # absolute ones are made relative only when they land under the wiki root.
 REQUESTED_REL=""
+REQUESTED_ABS="$CANDIDATE"
+if [[ "$(uname -s)" == Darwin && "$CANDIDATE" = /* ]]; then
+  # Preserve all model-controlled components (including protected symlink
+  # names), normalizing only the fixed OS prefix used by the canonical root.
+  for SYSTEM_ALIAS in /var /tmp /etc; do
+    if [[ "$REQUESTED_ABS" == "$SYSTEM_ALIAS"/* ]] \
+       && [[ "$(readlink -f -- "$SYSTEM_ALIAS" 2>/dev/null)" == "/private$SYSTEM_ALIAS" ]]; then
+      REQUESTED_ABS="/private$REQUESTED_ABS"
+      break
+    fi
+  done
+fi
 if [[ "$CANDIDATE" = /* ]]; then
-  if [[ "$CANDIDATE" == "$WIKI_ROOT_ABS"/* ]]; then
-    REQUESTED_REL="${CANDIDATE#"$WIKI_ROOT_ABS"/}"
+  if [[ "$REQUESTED_ABS" == "$WIKI_ROOT_ABS"/* ]]; then
+    REQUESTED_REL="${REQUESTED_ABS#"$WIKI_ROOT_ABS"/}"
   fi
 else
   REQUESTED_REL="$CANDIDATE"

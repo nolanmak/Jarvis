@@ -127,6 +127,14 @@ pub fn history_record(
     channel: &str,
     message: &SlackHistoryMessage,
 ) -> Option<HistoryMessage> {
+    if message
+        .text
+        .as_deref()
+        .is_some_and(augmentagent_phone::commands::sensitive)
+        || augmentagent_phone::commands::contains_sensitive_text(&message.raw)
+    {
+        return None;
+    }
     let occurred_at_ms = ts_to_ms(&message.ts)?;
     let event_id = format!("{channel}:{}", message.ts);
     let mut event = match &message.raw {
