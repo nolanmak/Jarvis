@@ -155,43 +155,71 @@ async fn calendar_success_receipt_contains_handle_and_is_persisted() {
     }
 }
 
-// #1456: the owner must not be asked to RSVP to an event they just created.
-// The stored payload predates `organizer_email`, so the handler backfills the
-// card's sender — the account the event is created on — and the client leaves
-// that address off the guest list it sends.
+// #1456: the owner must not be left owing an RSVP to an event they just
+// created. The stored payload predates `organizer_email`, so the handler
+// backfills the card's sender — the account the event is created on — and the
+// client accepts on its behalf. Whether that accept lands or not, the event is
+// real by then: the receipt stays `sent` either way, and only its wording
+// changes, so a failed accept can never invite a duplicating retry.
 #[tokio::test]
-async fn a_legacy_payload_keeps_the_card_sender_off_the_guest_list() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(Store::open(dir.path().join("qa.db")).unwrap());
-    let id = proposal_with_attendees(
-        &store,
-        "owner@example.test",
-        serde_json::json!(["owner@example.test", "owner-two@example.test"]),
-    );
-    let mut server = mockito::Server::new_async().await;
-    let create = server
-        .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_CREATE_EVENT")
-        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
-            "arguments": { "attendees": ["owner-two@example.test"] }
-        })))
-        .with_status(200)
-        .with_body(r#"{"successful":true,"data":{"response_data":{"id":"event_1436"}}}"#)
-        .expect(1)
-        .create_async()
-        .await;
-    let mut approver = test_support::approver_with_store(store.clone());
-    approver.calendar =
-        Arc::new(ComposioCalendarClient::new("test".into()).with_base_url(server.url()));
-    assert_calendar_account_receipt(
-        &approver.approve(&id).await,
-        "owner@example.test",
-        false,
-        false,
-    );
-    create.assert_async().await;
-    let row = store.get_action_with_email(&id).unwrap().unwrap();
-    assert_eq!(row.action.status, "sent");
-    assert!(row.action.draft_body.unwrap().contains("event_1436"));
+async fn a_legacy_payload_accepts_for_the_card_sender() {
+    for accepted in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("qa.db")).unwrap());
+        let id = proposal_with_attendees(
+            &store,
+            "owner@example.test",
+            serde_json::json!(["owner@example.test", "owner-two@example.test"]),
+        );
+        let mut server = mockito::Server::new_async().await;
+        let create = server
+            .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_CREATE_EVENT")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "arguments": { "attendees": ["owner@example.test", "owner-two@example.test"] }
+            })))
+            .with_status(200)
+            .with_body(r#"{"successful":true,"data":{"response_data":{"id":"event_1436"}}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let patch = server
+            .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_PATCH_EVENT")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "arguments": { "event_id": "event_1436", "send_updates": false, "attendees": [
+                    { "email": "owner@example.test", "responseStatus": "accepted" },
+                    { "email": "owner-two@example.test" }] }
+            })))
+            .with_status(if accepted { 200 } else { 400 })
+            .with_body(if accepted {
+                r#"{"successful":true,"data":{"attendees":[
+                    {"email":"owner@example.test","responseStatus":"accepted"}]}}"#
+            } else {
+                r#"{"error":"patch_event: no such argument"}"#
+            })
+            .expect(1)
+            .create_async()
+            .await;
+        let mut approver = test_support::approver_with_store(store.clone());
+        approver.calendar =
+            Arc::new(ComposioCalendarClient::new("test".into()).with_base_url(server.url()));
+        assert_calendar_account_receipt(
+            &approver.approve(&id).await,
+            "owner@example.test",
+            false,
+            false,
+        );
+        create.assert_async().await;
+        patch.assert_async().await;
+        let row = store.get_action_with_email(&id).unwrap().unwrap();
+        assert_eq!(row.action.status, "sent");
+        let body = row.action.draft_body.unwrap();
+        assert!(body.contains("event_1436"), "{body}");
+        assert_eq!(
+            body.contains("your RSVP could not be set"),
+            !accepted,
+            "{body}"
+        );
+    }
 }
 
 fn assert_calendar_account_receipt(

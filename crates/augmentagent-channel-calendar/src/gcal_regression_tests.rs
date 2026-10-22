@@ -17,18 +17,14 @@ fn draft() -> EventDraft {
     }
 }
 
-// #1456: the organizer must not be asked to RSVP to their own event.
+// #1456: the organizer must not be left owing an RSVP to their own event.
 const ORGANIZER: &str = "owner@example.test";
 
 /// The reported case: the owner is on the guest list of the event they are
 /// creating, which is what earns them an attendee entry at `needsAction`.
 fn organizer_draft() -> EventDraft {
     EventDraft {
-        attendees: vec![
-            ORGANIZER.into(),
-            "owner-one@example.test".into(),
-            "owner-two@example.test".into(),
-        ],
+        attendees: vec![ORGANIZER.into(), "guest@example.test".into()],
         organizer_email: Some(ORGANIZER.into()),
         ..draft()
     }
@@ -49,63 +45,108 @@ async fn create_mock(server: &mut Server, attendees: serde_json::Value) -> mocki
         .await
 }
 
-async fn created_id(server: &Server, draft: &EventDraft) -> Option<String> {
+fn patch_mock(server: &mut Server) -> mockito::Mock {
+    server.mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_PATCH_EVENT")
+}
+
+async fn created(server: &Server, draft: &EventDraft) -> CreatedEvent {
     ComposioCalendarClient::new("test".into())
         .with_base_url(server.url())
         .create_event("organizer", "primary", draft)
         .await
         .unwrap()
-        .id
 }
 
 #[tokio::test]
-async fn the_organizer_is_left_off_their_own_guest_list() {
+async fn the_organizer_is_accepted_on_their_own_event() {
     // Matched however the account spells its address, since a missed match
-    // puts the RSVP prompt straight back on the owner's event.
+    // leaves the RSVP prompt on the owner's own event.
     for organizer in [
         ORGANIZER.to_string(),
         "OWNER@Example.test".into(),
         format!(" {ORGANIZER} "),
     ] {
         let mut server = Server::new_async().await;
+        // The organizer stays a guest: the create still carries both
+        // addresses, and exactly one patch flips the owner's entry to
+        // `accepted` while resending the guest verbatim, with notifications
+        // suppressed so nobody is invited twice.
         let create = create_mock(
             &mut server,
-            serde_json::json!(["owner-one@example.test", "owner-two@example.test"]),
+            serde_json::json!([ORGANIZER, "guest@example.test"]),
         )
         .await;
+        let patch = patch_mock(&mut server)
+            .match_body(Matcher::PartialJson(serde_json::json!({
+                "arguments": { "calendar_id": "primary", "event_id": "created",
+                    "send_updates": false,
+                    "attendees": [
+                        { "email": ORGANIZER, "responseStatus": "accepted" },
+                        { "email": "guest@example.test" },
+                    ] }
+            })))
+            .with_status(200)
+            .with_body(
+                r#"{"successful":true,"data":{"attendees":[
+                    {"email":"owner@example.test","self":true,"responseStatus":"accepted"},
+                    {"email":"guest@example.test","responseStatus":"needsAction"}]}}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
         let draft = EventDraft {
             organizer_email: Some(organizer.clone()),
             ..organizer_draft()
         };
-        assert_eq!(
-            created_id(&server, &draft).await.as_deref(),
-            Some("created"),
-            "{organizer}"
-        );
+        let handle = created(&server, &draft).await;
+        assert_eq!(handle.id.as_deref(), Some("created"), "{organizer}");
+        assert!(!handle.organizer_rsvp_pending, "{organizer}");
         create.assert_async().await;
+        patch.assert_async().await;
     }
 }
 
 #[tokio::test]
-async fn an_event_the_owner_invited_only_themselves_to_takes_one_call() {
-    // The fix costs no extra provider traffic: no read-back, and above all no
-    // second write on an action contract this repo cannot confirm.
+async fn an_event_the_owner_is_not_a_guest_of_takes_no_follow_up() {
+    // Only the organizer's own attendee entry can sit at `needsAction`, so a
+    // guest list without them — including the empty one — costs no extra
+    // provider traffic at all.
+    for attendees in [vec![], vec!["guest@example.test".to_string()]] {
+        let mut server = Server::new_async().await;
+        let create = create_mock(&mut server, serde_json::json!(attendees)).await;
+        let follow_ups = server
+            .mock(
+                "POST",
+                Matcher::Regex("GOOGLECALENDAR_(EVENTS_GET|PATCH_EVENT)".into()),
+            )
+            .expect(0)
+            .create_async()
+            .await;
+        let draft = EventDraft {
+            attendees,
+            ..organizer_draft()
+        };
+        assert_eq!(created(&server, &draft).await.id.as_deref(), Some("created"));
+        create.assert_async().await;
+        follow_ups.assert_async().await;
+    }
+}
+
+#[tokio::test]
+async fn a_payload_without_an_organizer_keeps_every_attendee_and_patches_nothing() {
     let mut server = Server::new_async().await;
-    let create = create_mock(&mut server, serde_json::json!([])).await;
+    let create = create_mock(
+        &mut server,
+        serde_json::json!(["owner-one@example.test", "owner-two@example.test"]),
+    )
+    .await;
     let follow_ups = server
-        .mock(
-            "POST",
-            Matcher::Regex("GOOGLECALENDAR_(EVENTS_GET|PATCH_EVENT|UPDATE_EVENT)".into()),
-        )
+        .mock("POST", Matcher::Regex("GOOGLECALENDAR_PATCH_EVENT".into()))
         .expect(0)
         .create_async()
         .await;
-    let draft = EventDraft {
-        attendees: vec![ORGANIZER.into()],
-        ..organizer_draft()
-    };
     assert_eq!(
-        created_id(&server, &draft).await.as_deref(),
+        created(&server, &draft()).await.id.as_deref(),
         Some("created")
     );
     create.assert_async().await;
@@ -113,18 +154,37 @@ async fn an_event_the_owner_invited_only_themselves_to_takes_one_call() {
 }
 
 #[tokio::test]
-async fn a_payload_without_an_organizer_keeps_every_attendee() {
-    let mut server = Server::new_async().await;
-    let create = create_mock(
-        &mut server,
-        serde_json::json!(["owner-one@example.test", "owner-two@example.test"]),
-    )
-    .await;
-    assert_eq!(
-        created_id(&server, &draft()).await.as_deref(),
-        Some("created")
-    );
-    create.assert_async().await;
+async fn a_failed_accept_keeps_the_created_event_and_flags_the_rsvp() {
+    // The event and its invitations are real by then, so the create must
+    // still succeed — a retry would duplicate both. A provider that rejects
+    // the patch and one that 200s without applying it land the same way, and
+    // neither earns a second attempt.
+    for (status, body) in [
+        (400, r#"{"error":"patch_event: no such argument"}"#),
+        (
+            200,
+            r#"{"successful":true,"data":{"attendees":[
+                {"email":"owner@example.test","responseStatus":"needsAction"}]}}"#,
+        ),
+    ] {
+        let mut server = Server::new_async().await;
+        let create = create_mock(
+            &mut server,
+            serde_json::json!([ORGANIZER, "guest@example.test"]),
+        )
+        .await;
+        let patch = patch_mock(&mut server)
+            .with_status(status)
+            .with_body(body)
+            .expect(1)
+            .create_async()
+            .await;
+        let handle = created(&server, &organizer_draft()).await;
+        assert_eq!(handle.id.as_deref(), Some("created"), "{status}");
+        assert!(handle.organizer_rsvp_pending, "{status}");
+        create.assert_async().await;
+        patch.assert_async().await;
+    }
 }
 
 #[tokio::test]
