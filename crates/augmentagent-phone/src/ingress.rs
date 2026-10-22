@@ -266,6 +266,21 @@ struct SetupFailure {
     provider_code: Option<u32>,
 }
 
+fn decode_setup(session: &mut RelaySession, text: &str) -> Result<(), SetupFailure> {
+    let failure = |reason| SetupFailure { reason, provider_code: None };
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|_| failure("invalid_json"))?;
+    if value["type"] == "error" {
+        let provider_code = value["code"].as_u64().and_then(|n| u32::try_from(n).ok());
+        return Err(SetupFailure { reason: "provider_error", provider_code });
+    }
+    if value["type"] != "setup" { return Err(failure("unexpected_text_type")); }
+    match session.receive(text) {
+        Ok(RelayInput::Ready) => Ok(()),
+        Err(Error::Unauthorized) => Err(failure("setup_identity_rejected")),
+        _ => Err(failure("invalid_setup_fields")),
+    }
+}
+
 async fn receive_setup(socket: &mut WebSocket, session: &mut RelaySession) -> Result<usize, SetupFailure> {
     let failure = |reason| SetupFailure { reason, provider_code: None };
     // One deadline includes all reads and Pong writes. Heartbeats cannot keep
@@ -279,17 +294,8 @@ async fn receive_setup(socket: &mut WebSocket, session: &mut RelaySession) -> Re
                 Some(Ok(Message::Pong(_))) if controls < 32 => {},
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => return Err(failure("control_frame_limit")),
                 Some(Ok(Message::Text(text))) => {
-                    let value: serde_json::Value = serde_json::from_str(&text).map_err(|_| failure("invalid_json"))?;
-                    if value["type"] == "error" {
-                        let provider_code = value["code"].as_u64().and_then(|n| u32::try_from(n).ok());
-                        return Err(SetupFailure { reason: "provider_error", provider_code });
-                    }
-                    if value["type"] != "setup" { return Err(failure("unexpected_text_type")); }
-                    return match session.receive(&text) {
-                        Ok(RelayInput::Ready) => Ok(controls),
-                        Err(Error::Unauthorized) => Err(failure("setup_identity_rejected")),
-                        _ => Err(failure("invalid_setup_fields")),
-                    };
+                    decode_setup(session, &text)?;
+                    return Ok(controls);
                 }
                 Some(Ok(Message::Binary(_))) => return Err(failure("binary_before_setup")),
                 Some(Ok(Message::Close(_))) | None => return Err(failure("closed_before_setup")),
@@ -436,4 +442,24 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
         let _ = worker.await;
     }
     let _ = state.service.maintenance(false).await;
+}
+
+#[cfg(test)]
+mod setup_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn provider_setup_diagnostics_exclude_raw_fields() {
+        let mut session = RelaySession::new("call", "expected-account", "expected-call");
+        let raw = r#"{"type":"error","code":64101,"description":"secret-marker +12025550123 https://private.example/?token=secret-marker"}"#;
+        let error = decode_setup(&mut session, raw).unwrap_err();
+        assert_eq!(error.reason, "provider_error");
+        assert_eq!(error.provider_code, Some(64101));
+        let diagnostic = format!("{error:?}");
+        for private in ["secret-marker", "2025550123", "private.example", "description"] {
+            assert!(!diagnostic.contains(private));
+        }
+        let error = decode_setup(&mut session, r#"{"type":"setup","accountSid":"secret-marker","callSid":"wrong","sessionId":"secret-marker"}"#).unwrap_err();
+        assert_eq!(error.reason, "setup_identity_rejected");
+        assert!(!format!("{error:?}").contains("secret-marker"));
+    }
 }
