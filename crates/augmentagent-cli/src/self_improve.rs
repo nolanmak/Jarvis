@@ -2476,12 +2476,9 @@ async fn slice_oversized_issue(
 /// Refuses to run twice over the same parent: the label OR the comment marker
 /// means the slice already happened. That marker goes up BEFORE the first
 /// child, because it is the only durable dedup — a slice that dies halfway
-/// (two children filed, the third `gh issue create` failing) would otherwise
-/// be re-sliced later and file its plan on top of the children that landed.
-/// The price is that a parent whose FIRST child failed is not re-sliced
-/// either: it falls back to the pre-#1516 refusal, which is what it would
-/// have got anyway. The filed numbers reach the parent timeline through each
-/// child's own `Part of #parent` back-link.
+/// would otherwise be re-sliced later and file its plan on top of the children
+/// that landed. The price is that a parent whose first child failed is not
+/// re-sliced either: it falls back to the pre-#1516 refusal.
 async fn slice_issue(
     repo_root: &Path,
     parent: u64,
@@ -9868,8 +9865,16 @@ async fn pick_issue_for_repo(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        if has_label(&iss, GAVE_UP_LABEL) {
-            info!(repo = %repo.full_name, issue = number, "skip: {GAVE_UP_LABEL}");
+        let gave_up = iss
+            .get("labels")
+            .and_then(|v| v.as_array())
+            .map(|ls| {
+                ls.iter()
+                    .any(|l| l.get("name").and_then(|n| n.as_str()) == Some(GAVE_UP_LABEL))
+            })
+            .unwrap_or(false);
+        if gave_up {
+            info!(repo = %repo.full_name, issue = number, "skip: agent-gave-up");
             continue;
         }
         // #1516 — a sliced parent is out of the pool; its children are in it.
@@ -17264,20 +17269,13 @@ else:
     fn the_gave_up_label_is_never_applied_without_a_reason() {
         let src = include_str!("self_improve.rs");
         let prod = &src[..src.find("\n#[cfg(test)]\n#[path = \"self_improve_lifecycle_tests.rs\"]").expect("tests")];
-        // #1516 added a second label (`agent-sliced`, in `slice_issue`), so the
-        // invariant is per-label: one site puts the gave-up label on, and every
-        // labelling site names a label this file owns.
-        let sites: Vec<String> =
-            prod.split("\"--add-label\"").skip(1).map(|s| s.chars().take(60).collect()).collect();
-        assert_eq!(
-            sites.iter().filter(|s| s.contains("GAVE_UP_LABEL")).count(),
-            1,
-            "one gave-up labelling site: {sites:?}"
-        );
-        assert!(
-            sites.iter().all(|s| s.contains("GAVE_UP_LABEL") || s.contains("AGENT_SLICED_LABEL")),
-            "{sites:?}"
-        );
+        // #1516 added a second labelling site (`agent-sliced`, in `slice_issue`),
+        // so the invariant is per-label: every site names a label this file owns,
+        // and exactly one of them is the gave-up label.
+        let sites: Vec<&str> =
+            prod.split("\"--add-label\"").skip(1).map(|s| s.get(..40).unwrap_or(s)).collect();
+        assert_eq!(sites.iter().filter(|s| s.contains("GAVE_UP_LABEL")).count(), 1, "{sites:?}");
+        assert!(sites.iter().all(|s| s.contains("GAVE_UP_LABEL") || s.contains("AGENT_SLICED_LABEL")), "{sites:?}");
         let start = prod.find("async fn label_gave_up(").expect("label_gave_up");
         let body = &prod[start..start + prod[start..].find("\n}\n").unwrap()];
         assert!(body.starts_with("async fn label_gave_up(repo_root: &Path, issue: u64, reason: &str)"), "{}", &body[..80]);
