@@ -11545,7 +11545,7 @@ mod tests {
         let repo = fixture.path().join("source");
         std::fs::create_dir(&repo).unwrap();
         std::fs::write(repo.join("fixture.txt"), "SYNTHETIC_SOURCE").unwrap();
-        for opts in [scope_opts(repo.clone()), review_opts(repo.clone())] {
+        for opts in [scope_opts(repo.clone()), review_opts(repo.clone()), slice_opts(repo.clone())] {
             let launch = tempfile::tempdir().unwrap();
             let bridge = BridgeLaunch::prepare(&opts, launch.path()).unwrap();
             let script = r#"

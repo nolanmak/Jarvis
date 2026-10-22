@@ -612,6 +612,17 @@
       "provider_conformance": "verified"
     },
     {
+      "callsite": "crates/augmentagent-cli/src/self_improve.rs::slice_opts",
+      "permission_profile": "source-inspect",
+      "output_contract": "Ordered child-issue plan or a cannot-slice explanation; no repository writes",
+      "model_tier": "preserved",
+      "tier_rationale": "Wraps scope_opts, preserving its pinned scope model and read-only tool policy while replacing the system prompt.",
+      "conformance": [
+        "self_improve::tests::source_inspection_presets_enforce_read_only_bridge_access"
+      ],
+      "provider_conformance": "inherited from scope_opts; slicing prompt not live-provider verified"
+    },
+    {
       "callsite": "crates/augmentagent-cli/src/voice_tool.rs::configure",
       "permission_profile": "discord-voice-mcp",
       "output_contract": "Preserve the wrapped Discord query output contract; audio and text mirrors have separate receipts",
