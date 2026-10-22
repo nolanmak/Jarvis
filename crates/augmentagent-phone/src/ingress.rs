@@ -94,6 +94,7 @@ pub fn router(
         .route("/phone/status/{id}", post(status))
         .route("/phone/start/{id}", post(start))
         .route("/phone/accept/{id}", post(accept))
+        .route("/phone/relay-ended/{id}", post(relay_ended))
         .route("/phone/relay/{id}", get(relay))
         .layer(DefaultBodyLimit::max(32_768))
         .with_state(Ingress {
@@ -195,6 +196,16 @@ async fn accept(
             .await,
     )
 }
+async fn relay_ended(
+    State(state): State<Ingress>, Path(id): Path<String>, OriginalUri(uri): OriginalUri,
+    headers: HeaderMap, body: Bytes,
+) -> Response {
+    let (fields, sig) = match form(&headers, &uri, &body) {
+        Ok(v) => v,
+        Err(r) => return r.into_response(),
+    };
+    twiml(state.service.relay_ended_callback(&state.auth, &id, &fields, &sig))
+}
 async fn relay(
     State(state): State<Ingress>,
     Path(id): Path<String>,
@@ -220,6 +231,7 @@ async fn relay(
             .replacen("https://", "wss://", 1)
     );
     if !state.auth.verify_socket(&public, signature) {
+        tracing::warn!(call_id = %id, "phone relay handshake signature rejected");
         return StatusCode::FORBIDDEN.into_response();
     }
     let call = match state.service.store.phone_provider_call(&id) {
@@ -249,6 +261,7 @@ async fn relay(
         })
 }
 async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
+    tracing::info!(call_id = %call.id, "phone relay websocket upgraded");
     let Some(sid) = call.provider_sid.as_deref() else {
         return;
     };
@@ -260,6 +273,9 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
         }
         _ => false,
     };
+    if !setup_ok {
+        tracing::warn!(call_id = %call.id, "phone relay setup missing or invalid");
+    }
     // Only a valid setup may trigger cleanup for revoked authority. Invalid
     // setup or a duplicate socket must not terminate an existing relay.
     if setup_ok && state.service.authorize_call(&call.id).is_err() {

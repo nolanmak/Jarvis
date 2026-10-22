@@ -46,6 +46,18 @@ fn field<'a>(fields: &'a [(String, String)], name: &str) -> Result<&'a str, Erro
 }
 const HANGUP: &str = "<Response><Hangup/></Response>";
 impl PhoneService {
+    pub fn relay_ended_callback(&self, auth: &WebhookAuth, id: &str, fields: &[(String, String)], signature: &str) -> Result<String, Error> {
+        self.callback_call(auth, "relay-ended", id, fields, signature)?;
+        let failed = field(fields, "SessionStatus")? == "failed";
+        if failed {
+            // Never log provider error text: it can include URLs and caller data.
+            let code = fields.iter().find(|(key, _)| key == "ErrorCode")
+                .and_then(|(_, value)| value.parse::<u32>().ok());
+            tracing::warn!(call_id = id, error_code = ?code, "phone relay provider connection failed");
+            return Ok("<Response><Say>Sorry, Jarvis could not connect the voice conversation. The connection error has been recorded.</Say><Hangup/></Response>".into());
+        }
+        Ok(HANGUP.into())
+    }
     fn callback_call(
         &self,
         auth: &WebhookAuth,
@@ -179,6 +191,6 @@ impl PhoneService {
             Err(e) => return Err(e.into()),
         }
         let ws = self.config.public_base.replacen("https://", "wss://", 1);
-        Ok(format!("<Response><Connect><ConversationRelay url=\"{}/phone/relay/{id}\" interruptible=\"true\" partialPrompts=\"false\" welcomeGreeting=\"Connected to Jarvis.\" /></Connect><Hangup/></Response>",xml(&ws)))
+        Ok(format!("<Response><Connect action=\"{}/phone/relay-ended/{id}\" method=\"POST\"><ConversationRelay url=\"{}/phone/relay/{id}\" interruptible=\"true\" partialPrompts=\"false\" welcomeGreeting=\"Connected to Jarvis.\" /></Connect><Hangup/></Response>",xml(&self.config.public_base),xml(&ws)))
     }
 }

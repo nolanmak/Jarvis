@@ -1672,3 +1672,19 @@ async fn conversational_setup_expires_and_old_messages_cannot_replace_new_number
     execute(&f.service,&f.owner,&f.conversation,"dial","call me").await.unwrap();
     assert_eq!(f.provider.calls.lock().unwrap()[0].destination.expose(),"+12025550199");
 }
+
+#[tokio::test]
+async fn failed_relay_reports_failure_instead_of_silent_hangup() {
+    use augmentagent_phone::webhook::WebhookAuth;
+    let f=fixture("discord",true,true,false);
+    let grant=f.service.authorize(&f.owner,&f.conversation).unwrap();
+    let call=f.service.tool(&grant,"call_owner",json!({"request_id":"relay-failure"})).await.unwrap();
+    let id=call["id"].as_str().unwrap();
+    let auth=WebhookAuth::new("AC-test","secret");
+    let fields=vec![("AccountSid".into(),"AC-test".into()),("CallSid".into(),"CA-test".into()),("SessionStatus".into(),"failed".into()),("ErrorCode".into(),"64102".into())];
+    assert!(f.service.relay_ended_callback(&auth,id,&fields,"invalid").is_err());
+    let sig=signed("secret",&format!("https://phone.example.test/phone/relay-ended/{id}"),&fields);
+    let reply=f.service.relay_ended_callback(&auth,id,&fields,&sig).unwrap();
+    assert!(reply.contains("could not connect"),"{reply}");
+    assert!(reply.contains("<Say>"));
+}
