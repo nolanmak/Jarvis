@@ -6,6 +6,15 @@ use serde_json::json;
 
 fn words(text: &str) -> Option<Vec<&str>> {
     let body = text.trim().trim_start_matches(['!', '/']);
+    // Only complete, immediate requests are aliases. Conditional requests,
+    // quoted text, scheduling, and arbitrary destinations stay with the agent.
+    let request = body.trim_end_matches(['!', '.', '?']).trim();
+    if ["call me", "please call me", "call me please"]
+        .iter()
+        .any(|alias| request.eq_ignore_ascii_case(alias))
+    {
+        return Some(vec!["phone", "call"]);
+    }
     let words: Vec<_> = body.split_whitespace().collect();
     words
         .first()
@@ -22,6 +31,7 @@ pub fn sensitive(text: &str) -> bool {
     words(text).is_some_and(|w| w.get(1).is_some_and(|w| w.eq_ignore_ascii_case("number")))
 }
 pub const HELP:&str="Phone: `phone call`, `phone status`, `phone stop`. In your private chat: `phone number set +<country code><number>`, `phone number verify <six-digit code>`, `phone number status`, `phone number remove`.";
+const SETUP_HELP: &str = "In your private chat with the agent, send `phone number set +<country code><number>`, answer the verification call, then send `phone number verify <six-digit code>` in that same private chat. After verification, say ‘call me’.";
 
 pub async fn execute(
     service: &PhoneService,
@@ -33,6 +43,7 @@ pub async fn execute(
     let w = words(text)?;
     let grant = match service.authorize(owner, conversation) {
         Ok(g) => g,
+        Err(crate::Error::Unauthorized) => return Some(format!("Phone owner authorization is required in this chat. {SETUP_HELP}")),
         Err(e) => return Some(e.to_string()),
     };
     let result=match w.as_slice() {
@@ -48,7 +59,11 @@ pub async fn execute(
         [_,"number","remove"]=>service.remove_number(&grant).await.map(|_|"Phone number removed; pending or active calls have been stopped or marked for cleanup.".into()),
         _=>return Some(HELP.into()),
     };
-    Some(result.unwrap_or_else(|e| e.to_string()))
+    Some(result.unwrap_or_else(|e| match e {
+        crate::Error::Store(augmentagent_store::phone::PhoneError::NotConfigured) =>
+            format!("No verified phone number is configured. {SETUP_HELP}"),
+        _ => e.to_string(),
+    }))
 }
 
 /// Detect private commands in provider payloads too (edited messages and block

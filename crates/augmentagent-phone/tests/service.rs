@@ -1591,3 +1591,34 @@ async fn ac07_disconnect_during_tool_work_cancels_without_replaying_queued_turns
     server.abort();
     let _ = server.await;
 }
+
+#[tokio::test]
+async fn call_me_routes_directly_and_explains_missing_setup() {
+    use augmentagent_phone::commands::{execute, recognizes};
+    let f = fixture("discord", true, true, false);
+    for text in ["call me", "Call me!", "please call me", "call me please."] {
+        assert!(recognizes(text), "{text}");
+    }
+    for text in ["don't call me", "if I say call me", "call me tomorrow", "call me at +12025550199"] {
+        assert!(!recognizes(text), "{text}");
+    }
+    f.store.phone_remove_destination("canonical-owner", 100).unwrap();
+    let reply = execute(&f.service, &f.owner, &f.conversation, "missing", "call me").await.unwrap();
+    assert!(reply.contains("private chat"), "{reply}");
+    assert!(reply.contains("phone number set"), "{reply}");
+    assert!(f.provider.calls.lock().unwrap().is_empty());
+    f.store.unbind_surface_owner(f.owner.account()).unwrap();
+    let reply = execute(&f.service, &f.owner, &f.conversation, "unbound", "call me").await.unwrap();
+    assert!(reply.contains("phone number set"), "{reply}");
+    assert!(f.provider.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn call_me_dials_verified_destination_once_on_replay() {
+    let f = fixture("discord", true, true, false);
+    for _ in 0..2 {
+        let reply = augmentagent_phone::commands::execute(&f.service, &f.owner, &f.conversation, "call-me-event", "call me").await.unwrap();
+        assert!(reply.contains("queued"), "{reply}");
+    }
+    assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
+}
