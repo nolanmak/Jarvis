@@ -61,7 +61,9 @@ async fn live_calendar_self_invite_and_cleanup() -> Result<()> {
         from: accounts[0].email.clone(), to: String::new(), cc: String::new(),
         attachments: Vec::new(), subject: summary.clone(),
         body: json!({"summary":summary,"start_datetime":start.with_timezone(&chrono::FixedOffset::west_opt(4*3600).unwrap()).to_rfc3339(),
-            "duration_minutes":5,"attendees":[accounts[1].email,accounts[2].email],"create_meeting_room":true,
+            // The organizer is on its own guest list so the #1456 accept runs
+            // whether or not the provider adds an organizer entry by itself.
+            "duration_minutes":5,"attendees":[accounts[0].email,accounts[1].email,accounts[2].email],"create_meeting_room":true,
             "description":"Owner-authorized self-invite QA. Temporary; removed after verification."}).to_string(),
         date: start.to_rfc3339(), account_entity_id: Some(accounts[0].entity_id.clone()),
         platform:"gcal".into(), kind:"create_event".into(),

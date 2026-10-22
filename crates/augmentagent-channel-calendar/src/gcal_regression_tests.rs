@@ -31,15 +31,28 @@ fn organizer_draft() -> EventDraft {
 }
 
 /// A create mock that pins the guest list the request carries and answers
-/// with a confirmed event.
-async fn create_mock(server: &mut Server, attendees: serde_json::Value) -> mockito::Mock {
+/// with a confirmed event whose attendee array is `created` — the shape the
+/// follow-up decision reads. `Null` stands for a provider that answers with
+/// the handle alone.
+async fn create_mock(
+    server: &mut Server,
+    attendees: serde_json::Value,
+    created: serde_json::Value,
+) -> mockito::Mock {
+    let mut response_data = serde_json::json!({ "id": "created" });
+    if !created.is_null() {
+        response_data["attendees"] = created;
+    }
     server
         .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_CREATE_EVENT")
         .match_body(Matcher::PartialJson(serde_json::json!({
             "arguments": { "attendees": attendees, "send_updates": true }
         })))
         .with_status(200)
-        .with_body(r#"{"successful":true,"data":{"response_data":{"id":"created"}}}"#)
+        .with_body(
+            serde_json::json!({ "successful": true, "data": { "response_data": response_data } })
+                .to_string(),
+        )
         .expect(1)
         .create_async()
         .await
@@ -74,6 +87,7 @@ async fn the_organizer_is_accepted_on_their_own_event() {
         let create = create_mock(
             &mut server,
             serde_json::json!([ORGANIZER, "guest@example.test"]),
+            serde_json::Value::Null,
         )
         .await;
         let patch = patch_mock(&mut server)
@@ -106,14 +120,76 @@ async fn the_organizer_is_accepted_on_their_own_event() {
     }
 }
 
+/// The issue as reported: `calendar create-event --attendees` named only the
+/// guest, yet the owner was left owing an RSVP — Google gave the organizer an
+/// attendee entry of its own accord. The request cannot see that; the created
+/// event's attendee list can, and the accept has to follow it.
 #[tokio::test]
-async fn an_event_the_owner_is_not_a_guest_of_takes_no_follow_up() {
-    // Only the organizer's own attendee entry can sit at `needsAction`, so a
-    // guest list without them — including the empty one — costs no extra
-    // provider traffic at all.
-    for attendees in [vec![], vec!["guest@example.test".to_string()]] {
+async fn the_owner_absent_from_the_guest_list_is_still_accepted() {
+    let mut server = Server::new_async().await;
+    let create = create_mock(
+        &mut server,
+        serde_json::json!(["guest@example.test"]),
+        serde_json::json!([
+            { "email": ORGANIZER, "self": true, "organizer": true, "responseStatus": "needsAction" },
+            { "email": "guest@example.test", "responseStatus": "needsAction" },
+        ]),
+    )
+    .await;
+    let patch = patch_mock(&mut server)
+        .match_body(Matcher::PartialJson(serde_json::json!({
+            "arguments": { "event_id": "created", "send_updates": false, "attendees": [
+                { "email": ORGANIZER, "responseStatus": "accepted" },
+                { "email": "guest@example.test", "responseStatus": "needsAction" },
+            ] }
+        })))
+        .with_status(200)
+        .with_body(
+            r#"{"successful":true,"data":{"response_data":{"attendees":[
+                {"email":"owner@example.test","self":true,"responseStatus":"accepted"},
+                {"email":"guest@example.test","responseStatus":"needsAction"}]}}}"#,
+        )
+        .expect(1)
+        .create_async()
+        .await;
+    let draft = EventDraft {
+        attendees: vec!["guest@example.test".into()],
+        ..organizer_draft()
+    };
+    let handle = created(&server, &draft).await;
+    assert_eq!(handle.id.as_deref(), Some("created"));
+    assert!(!handle.organizer_rsvp_pending);
+    create.assert_async().await;
+    patch.assert_async().await;
+}
+
+#[tokio::test]
+async fn an_event_without_an_outstanding_owner_rsvp_takes_no_follow_up() {
+    // Nothing to accept: no attendee entry for the owner in the created
+    // event, or one the provider already accepted. Either way the event is
+    // left exactly as created, at no extra provider traffic.
+    for (attendees, created_attendees) in [
+        (vec![], serde_json::Value::Null),
+        (
+            vec!["guest@example.test".to_string()],
+            serde_json::Value::Null,
+        ),
+        (
+            vec!["guest@example.test".to_string()],
+            serde_json::json!([{ "email": "guest@example.test", "responseStatus": "needsAction" }]),
+        ),
+        (
+            vec![ORGANIZER.to_string()],
+            serde_json::json!([{ "email": ORGANIZER, "self": true, "responseStatus": "accepted" }]),
+        ),
+    ] {
         let mut server = Server::new_async().await;
-        let create = create_mock(&mut server, serde_json::json!(attendees)).await;
+        let create = create_mock(
+            &mut server,
+            serde_json::json!(attendees),
+            created_attendees.clone(),
+        )
+        .await;
         let follow_ups = server
             .mock(
                 "POST",
@@ -126,7 +202,11 @@ async fn an_event_the_owner_is_not_a_guest_of_takes_no_follow_up() {
             attendees,
             ..organizer_draft()
         };
-        assert_eq!(created(&server, &draft).await.id.as_deref(), Some("created"));
+        assert_eq!(
+            created(&server, &draft).await.id.as_deref(),
+            Some("created"),
+            "{created_attendees}"
+        );
         create.assert_async().await;
         follow_ups.assert_async().await;
     }
@@ -138,6 +218,7 @@ async fn a_payload_without_an_organizer_keeps_every_attendee_and_patches_nothing
     let create = create_mock(
         &mut server,
         serde_json::json!(["owner-one@example.test", "owner-two@example.test"]),
+        serde_json::Value::Null,
     )
     .await;
     let follow_ups = server
@@ -171,6 +252,7 @@ async fn a_failed_accept_keeps_the_created_event_and_flags_the_rsvp() {
         let create = create_mock(
             &mut server,
             serde_json::json!([ORGANIZER, "guest@example.test"]),
+            serde_json::Value::Null,
         )
         .await;
         let patch = patch_mock(&mut server)
