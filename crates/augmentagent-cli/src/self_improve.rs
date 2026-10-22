@@ -73,6 +73,9 @@ const GIVE_UP_BLAST_RADIUS_NAMED: &str = "guard:blast-radius-named";
 const GIVE_UP_UNTRUSTED_AUTHOR: &str = "held:untrusted-author";
 /// #1491 — the builder says the issue is already fixed or under-specified.
 const GIVE_UP_OWNER_TRIAGE: &str = "held:owner-triage";
+/// #1515 — the scoper says a commit that merged since the issue was filed
+/// already delivers it.
+const GIVE_UP_OVERTAKEN: &str = "held:overtaken";
 /// What [`run_once`] returns when no labeled issue is waiting. The #630
 /// auto-PR loop matches on this to tell an idle tick (one cheap `gh issue
 /// list`, no reasoner spend) from an engaged run (counts against the daily
@@ -264,6 +267,10 @@ pub struct Issue {
     /// they LOOK owner-authored to the trust gate; they are picked last and
     /// never auto-merge.
     pub research_filed: bool,
+    /// #1515 — when the issue was filed (REST `created_at`, ISO-8601). Empty
+    /// when absent. Feeds [`merged_since`]: an aged or re-admitted issue is
+    /// otherwise scoped with no view of what landed after it was written.
+    pub created_at: String,
 }
 
 /// #787 — does this body carry the research pipeline's filing stamp?
@@ -289,6 +296,7 @@ struct RestIssue {
     author: String,
     association: String,
     research_filed: bool,
+    created_at: String,
 }
 
 /// Map the REST issues array into pick candidates, dropping what can never
@@ -325,6 +333,7 @@ fn rest_issue_candidates(v: &serde_json::Value) -> Vec<RestIssue> {
                     .unwrap_or("")
                     .to_string(),
                 association: s("author_association"),
+                created_at: s("created_at"),
             })
         })
         .collect()
@@ -855,6 +864,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
             author,
             association,
             research_filed,
+            created_at,
         } = iss;
         if let Some((pattern, _)) = issue_blast_radius_hit(&format!("{title} {body}")) {
             // #819 — every other refusal in this pipeline leaves a comment
@@ -901,6 +911,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
             author,
             author_trusted,
             research_filed,
+            created_at,
         }));
     }
     // #955 — nothing to build, so this is the tick that can afford to give
@@ -1013,11 +1024,12 @@ vague, under-specified, or not actually fixable by a coding agent at all \
 relevant code first, then judge it and — when fixable — produce an \
 implementation spec for a second, separate agent that will write the code.\n\
 \n\
-Your output MUST start with these four lines EXACTLY (then a blank line):\n\
+Your output MUST start with these five lines EXACTLY (then a blank line):\n\
 VERDICT: fixable | not-fixable\n\
 COMPLEXITY: simple | medium | hard\n\
 EST-DIFF-LINES: <your honest estimate of added+removed lines>\n\
 GUARDED-PATHS: yes | no\n\
+RELEVANCE: current | partial | overtaken\n\
 \n\
 Verdict guide: 'fixable' means a competent engineer could ship it from the \
 issue text plus the code, as a focused diff under 600 changed lines, \
@@ -1030,6 +1042,13 @@ risk. 'medium' = a few files or a subtle interaction, still well-understood. \
 'hard' = cross-cutting, ambiguous, migration-shaped, or high blast radius if \
 wrong. Grade honestly — 'hard' work is NOT auto-merged, it goes to human \
 review.\n\
+Relevance guide: judge the issue against the 'Merged since this issue was \
+filed' section, when one is present. 'overtaken' means a listed commit \
+already delivers what the issue asks — NAME that commit subject in your \
+reason; the pipeline then holds the issue for the owner instead of \
+re-implementing landed work. 'partial' means some of it landed: your spec \
+MUST state exactly what remains. 'current' means nothing listed affects it; \
+say 'current' whenever there is no section, and when in doubt.\n\
 \n\
 For fixable issues, emit an acceptance-criteria block before the spec, as \
 `CRITERIA:` followed by 2-5 `- ` bullets. Each states a CHECKABLE PROPERTY \
@@ -1126,6 +1145,21 @@ impl Complexity {
     }
 }
 
+/// #1515 — the scoper's verdict on whether work that merged since the issue
+/// was filed has already delivered it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Relevance {
+    /// Nothing that landed affects the issue — the default, including when
+    /// the header is missing or unrecognised. Absence must never hold work.
+    #[default]
+    Current,
+    /// Part of the ask landed; the spec states what remains. Flows exactly
+    /// like [`Relevance::Current`].
+    Partial,
+    /// A named commit already delivers the ask. Held for owner triage.
+    Overtaken,
+}
+
 /// Parsed stage-1 output (#653).
 #[derive(Debug)]
 pub(crate) struct ScopeOutcome {
@@ -1147,6 +1181,9 @@ pub(crate) struct ScopeOutcome {
     /// are the one independent target in the pipeline. Empty is always valid
     /// and changes nothing (see [`criteria_pr_section`]).
     pub(crate) criteria: Vec<String>,
+    /// #1515 — did something that merged since the issue was filed already
+    /// deliver it? Defaults to [`Relevance::Current`].
+    pub(crate) relevance: Relevance,
 }
 
 /// #1012 — caps applied at the parser so nothing downstream has to remember.
@@ -2157,6 +2194,7 @@ pub(crate) fn parse_scope_output(raw: &str) -> ScopeOutcome {
     let mut complexity = Complexity::Hard;
     let mut est_diff_lines: Option<usize> = None;
     let mut guarded_paths = false;
+    let mut relevance = Relevance::default();
     let mut body_lines: Vec<&str> = Vec::new();
     for (i, line) in raw.lines().enumerate() {
         let l = line.trim().to_ascii_lowercase();
@@ -2178,6 +2216,23 @@ pub(crate) fn parse_scope_output(raw: &str) -> ScopeOutcome {
             guarded_paths = l.contains("yes");
             continue;
         }
+        if is_header_zone && l.starts_with("relevance:") {
+            // Match the first word of the value EXACTLY, not a substring:
+            // `not-overtaken` is a realistic malformatting and must not hold
+            // the issue. Anything unrecognised stays `current` — a formatting
+            // glitch must never hold work that nothing has overtaken.
+            let word = l["relevance:".len()..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
+            relevance = match word {
+                "overtaken" => Relevance::Overtaken,
+                "partial" => Relevance::Partial,
+                _ => Relevance::Current,
+            };
+            continue;
+        }
         if is_header_zone && l.starts_with("complexity:") {
             complexity = if l.contains("simple") {
                 Complexity::Simple
@@ -2197,6 +2252,7 @@ pub(crate) fn parse_scope_output(raw: &str) -> ScopeOutcome {
         guarded_paths,
         body: body_lines.join("\n").trim().to_string(),
         criteria,
+        relevance,
     }
 }
 
@@ -3717,18 +3773,70 @@ fn build_fix_prompt(issue: &Issue, plan: Option<&str>, prior: Option<&str>) -> S
     prompt
 }
 
+/// #1515 — how many commit subjects the scoper is shown. Order of magnitude:
+/// enough for a months-old issue to see what overtook it, few enough that a
+/// long-aged issue cannot push the spec out of the scoping context.
+const MERGED_SINCE_CAP: usize = 50;
+/// Per-subject cap, same reasoning: subjects are model-prompt input.
+const MERGED_SINCE_SUBJECT_CHARS: usize = 160;
+
+/// #1515 — the subjects of commits on `main` since `created_at`, newest
+/// first, for the scoping prompt. `None` when there is nothing to show:
+/// no filing date, a `git log` failure, or an issue filed after the last
+/// commit. The degraded path must leave the prompt byte-identical to what a
+/// freshly-filed issue gets — history is context, never a gate.
+async fn merged_since(repo_root: &Path, created_at: &str) -> Option<String> {
+    let since = created_at.trim();
+    if since.is_empty() {
+        return None;
+    }
+    let cap = MERGED_SINCE_CAP.to_string();
+    let since_arg = format!("--since={since}");
+    for rev in ["origin/main", "HEAD"] {
+        let args = ["log", rev, &since_arg, "--pretty=format:%s", "-n", &cap];
+        if let Ok((true, out, _)) = run("git", &args, repo_root).await {
+            let subjects: Vec<String> = out
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(|l| format!("- {}", truncate(l, MERGED_SINCE_SUBJECT_CHARS)))
+                .collect();
+            return (!subjects.is_empty()).then(|| subjects.join("\n"));
+        }
+    }
+    None
+}
+
 /// Build the stage-1 scoping prompt. Prior failures go in (#803) so the
 /// scoper re-plans around the dead end instead of reproducing the spec that
-/// already failed.
-pub(crate) fn build_scope_prompt(issue: &Issue, prior: Option<&str>) -> String {
+/// already failed; what merged since the issue was filed goes in (#1515) so
+/// an aged or re-admitted issue is not scoped as if nothing had landed.
+///
+/// Pure: the caller collects the history (see [`merged_since`]).
+pub(crate) fn build_scope_prompt(
+    issue: &Issue,
+    prior: Option<&str>,
+    merged_since: Option<&str>,
+) -> String {
     format!(
-        "GitHub issue #{}: {}\n\n{}{}\n\nProduce the verdict header and (if \
+        "GitHub issue #{}: {}\n\n{}{}{}\n\nProduce the verdict header and (if \
          fixable) the implementation spec now.",
         issue.number,
         issue.title,
         issue.body,
-        prior_attempts_section(prior)
+        prior_attempts_section(prior),
+        merged_since_section(merged_since)
     )
+}
+
+fn merged_since_section(merged: Option<&str>) -> String {
+    match merged.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(m) => format!(
+            "\n\n## Merged since this issue was filed (newest first — judge \
+             whether these overtake the issue)\n{m}"
+        ),
+        None => String::new(),
+    }
 }
 
 fn prior_attempts_section(prior: Option<&str>) -> String {
@@ -4776,6 +4884,7 @@ async fn red_main_plan(repo_root: &Path, red: &RedMain) -> RedMainPlan {
         author,
         author_trusted,
         research_filed: false,
+        created_at: s("created_at"),
     })
 }
 
@@ -6101,6 +6210,7 @@ async fn resume_draft_pr(
         research_filed: is_research_filed(
             iv.get("body").and_then(|v| v.as_str()).unwrap_or(""),
         ),
+        created_at: iv.get("created_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
     };
     // #803 — the resume path revises against fresh findings; every revision
     // prompt also carries what earlier attempts on this issue failed on.
@@ -7325,7 +7435,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         }
     }
 
-    let scope_prompt = build_scope_prompt(&issue, prior_attempts.as_deref());
+    // #1515 — what landed since the issue was written. An aged or re-admitted
+    // issue scoped against today's main with no view of this either gets
+    // re-implemented or gets a spec written against a stale description.
+    let merged = merged_since(repo_root, &issue.created_at).await;
+    let scope_prompt =
+        build_scope_prompt(&issue, prior_attempts.as_deref(), merged.as_deref());
     let scope = match reasoner
         .call(&scope_opts(worktree.clone()), &scope_prompt)
         .await
@@ -7343,6 +7458,38 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             None
         }
     };
+    // #1515 — a commit that merged since the issue was filed already delivers
+    // it. Building anyway spends the daily cap on a no-op PR, so hold it for
+    // the owner to close or re-scope. `partial` is not held: the spec says
+    // what remains, which is ordinary work. #932 — a red-main issue is never
+    // labelled out, not even here: the scoper over-labels (#955), and a
+    // mis-scoped "overtaken" verdict would hold the self-heal loop until a
+    // human notices while main stays red.
+    if let Some(sc) = &scope {
+        if sc.relevance == Relevance::Overtaken && !is_red_main_issue(&issue.body) {
+            cleanup(worktree, branch, repo_root.to_path_buf()).await;
+            backoff_comment(
+                repo_root,
+                issue.number,
+                &format!(
+                    "Auto-fix triage: work merged since this issue was filed \
+                     appears to already deliver it, so the pipeline is \
+                     leaving it for a human to close or re-scope. Remove the \
+                     `{GAVE_UP_LABEL}` label to re-triage.\n\n\
+                     Scoper's reading:\n\n{}",
+                    truncate(&sc.body, 1200)
+                ),
+            )
+            .await
+            .ok();
+            label_gave_up(repo_root, issue.number, GIVE_UP_OVERTAKEN).await.ok();
+            return Ok(RunReport::triage(format!(
+                "issue #{}: overtaken by work merged since it was filed — \
+                 labeled out",
+                issue.number
+            )));
+        }
+    }
     if let Some(s) = &scope {
         // #932 — a red-main issue is never labelled out: that would hold the
         // loop until a human notices, which is the outage this exists to end.
@@ -9514,7 +9661,7 @@ async fn pick_issue_for_repo(
             "--state",
             "open",
             "--json",
-            "number,title,body,labels,author",
+            "number,title,body,labels,author,createdAt",
             "--limit",
             "50",
         ],
@@ -9587,6 +9734,11 @@ async fn pick_issue_for_repo(
             body,
             author,
             author_trusted: false,
+            created_at: iss
+                .get("createdAt")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
         }));
     }
     Ok(None)
@@ -11172,7 +11324,8 @@ for tool, arguments in [
         let diff = String::from_utf8(diff.stdout).unwrap();
         let issue = Issue { number: 42, title: "Correct synthetic addition".into(),
             body: "The add function must return the sum of its two arguments; preserve the supplied regression test.".into(),
-            author: "synthetic-author".into(), author_trusted: true, research_filed: false };
+            author: "synthetic-author".into(), author_trusted: true, research_filed: false,
+            created_at: String::new() };
         let criteria = vec!["The add function returns 5 for (2,3) and 3 for (-4,7).".into()];
         let unavailable = independent_review(&resumed, &issue, &summary, &diff, repo.into(), None, &criteria).await;
         assert!(!unavailable.available && !unavailable.approved(), "latched independent reviewer must block merge");
@@ -11245,6 +11398,7 @@ for tool, arguments in [
         let issue = Issue {
             number: 42, title: "Synthetic change".into(), body: String::new(),
             author: "synthetic-author".into(), author_trusted: true, research_filed: false,
+            created_at: String::new(),
         };
         let review = independent_review(&builder, &issue, "synthetic summary", "synthetic diff",
             dir.path().join("nonexistent-worktree"), None, &[]).await;
@@ -11677,6 +11831,7 @@ for tool, arguments in [
             author: "a".into(),
             author_trusted: true,
             research_filed: false,
+            created_at: String::new(),
         };
         let with = build_fix_prompt(&issue, Some("the spec"), None);
         assert!(with.contains("the spec"));
@@ -12623,6 +12778,7 @@ CODEX-REVIEW: lgtm").0);
             author: "a".into(),
             author_trusted: true,
             research_filed: false,
+            created_at: String::new(),
         };
         let p = build_revise_prompt(&issue, "rfind(',') splits quoted display names", 373, None);
         assert!(p.contains("rfind"), "the reviewer's findings must reach the builder");
@@ -14896,6 +15052,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             author: "nolanmak".into(),
             author_trusted: true,
             research_filed: false,
+            created_at: String::new(),
         };
         let cs = crit(&["C1: every lane is enumerated", "C2: unknown evidence fails closed"]);
         let p = build_fix_prompt_with_criteria(&issue, Some("spec"), None, &cs);
@@ -14919,6 +15076,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             author: "nolanmak".into(),
             author_trusted: true,
             research_filed: false,
+            created_at: String::new(),
         };
         assert_eq!(
             build_fix_prompt_with_criteria(&issue, Some("spec"), None, &[]),
@@ -15008,6 +15166,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             author: "nolanmak".into(),
             author_trusted: true,
             research_filed: false,
+            created_at: String::new(),
         };
         let p = build_fix_prompt(&issue, None, None);
         assert!(p.contains("source::tests::apply_writes_indexes_and_is_idempotent"));
@@ -15125,6 +15284,14 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(
             line.contains("!is_red_main_issue(&issue.body)"),
             "fixability refusal must exempt red-main issues: {line}"
+        );
+        // #1515 — same invariant for the "overtaken" label-out, which returns
+        // before the fixability branch is reached.
+        let at = body.find("if sc.relevance == Relevance::Overtaken").expect("overtaken branch");
+        let line = &body[at..at + 100];
+        assert!(
+            line.contains("!is_red_main_issue(&issue.body)"),
+            "the overtaken refusal must exempt red-main issues: {line}"
         );
     }
 
@@ -15265,6 +15432,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             author: "nolanmak".into(),
             author_trusted: true,
             research_filed: false,
+            created_at: String::new(),
         };
         let files = vec![
             "crates/a/src/lib.rs".to_string(),
@@ -16047,6 +16215,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             author: "a".into(),
             author_trusted: true,
             research_filed: false,
+            created_at: String::new(),
         }
     }
 
@@ -16119,15 +16288,131 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(fix.contains("the spec"));
         assert!(fix.contains("Prior attempts"));
         assert!(fix.contains("FAILED"));
-        assert!(build_scope_prompt(&issue, Some(digest.as_str())).contains("Prior attempts"));
+        assert!(
+            build_scope_prompt(&issue, Some(digest.as_str()), None).contains("Prior attempts")
+        );
 
         assert!(!build_fix_prompt(&issue, None, None).contains("Prior attempts"));
-        assert!(!build_scope_prompt(&issue, None).contains("Prior attempts"));
+        assert!(!build_scope_prompt(&issue, None, None).contains("Prior attempts"));
         // The section sits after the issue body and before the closing ask.
         let body_at = fix.find("\n\nb").unwrap();
         let prior_at = fix.find("Prior attempts").unwrap();
         let ask_at = fix.find("Implement the fix now.").unwrap();
         assert!(body_at < prior_at && prior_at < ask_at);
+    }
+
+    // --- #1515: what merged since the issue was filed reaches the scoper ---
+
+    #[tokio::test]
+    async fn merged_since_shows_only_what_landed_after_the_issue_was_filed() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str], when: &str| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_AUTHOR_DATE", when)
+                .env("GIT_COMMITTER_DATE", when)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q", "-b", "main", "."], "2026-09-01T00:00:00Z");
+        git(
+            &["commit", "-q", "--allow-empty", "-m", "work that predates the issue"],
+            "2026-09-01T00:00:00Z",
+        );
+        git(
+            &["commit", "-q", "--allow-empty", "-m", "autopr: paginate the issue pool"],
+            "2026-10-05T00:00:00Z",
+        );
+
+        // The reported case: the issue was filed between the two commits, so
+        // only the newer one can have overtaken it.
+        let merged = merged_since(repo, "2026-10-01T00:00:00Z").await.expect("history");
+        assert!(merged.contains("- autopr: paginate the issue pool"), "{merged}");
+        assert!(!merged.contains("predates the issue"), "{merged}");
+
+        // Nothing landed since, and no filing date at all: no section, so a
+        // freshly-filed issue's prompt is what it was before #1515.
+        assert!(merged_since(repo, "2026-11-01T00:00:00Z").await.is_none());
+        assert!(merged_since(repo, "  ").await.is_none());
+
+        let issue = test_issue_803();
+        let prompt = build_scope_prompt(&issue, None, Some(merged.as_str()));
+        assert!(prompt.contains("Merged since this issue was filed"), "{prompt}");
+        assert!(prompt.contains("autopr: paginate the issue pool"));
+        assert_eq!(
+            build_scope_prompt(&issue, None, None),
+            build_scope_prompt(&issue, None, Some("   ")),
+            "a blank history must not add an empty section"
+        );
+    }
+
+    #[test]
+    fn an_overtaken_issue_is_held_instead_of_being_re_implemented() {
+        let header = "VERDICT: fixable\nCOMPLEXITY: simple\nEST-DIFF-LINES: 20\n\
+                      GUARDED-PATHS: no";
+        let overtaken = parse_scope_output(&format!(
+            "{header}\nRELEVANCE: overtaken\n\n'autopr: paginate the issue pool' \
+             already delivers this."
+        ));
+        assert_eq!(overtaken.relevance, Relevance::Overtaken);
+        assert!(!overtaken.body.to_ascii_lowercase().contains("relevance:"));
+
+        for (line, want) in [
+            ("RELEVANCE: **overtaken** — 'autopr: paginate' did it", Relevance::Overtaken),
+            ("RELEVANCE: partial", Relevance::Partial),
+            ("RELEVANCE: current", Relevance::Current),
+            // Values that merely CONTAIN a keyword are not that keyword: a
+            // scoper writing the negation must not hold the issue.
+            ("RELEVANCE: not-overtaken", Relevance::Current),
+            ("RELEVANCE: not overtaken", Relevance::Current),
+            // A formatting glitch must never hold work either.
+            ("RELEVANCE: ¿", Relevance::Current),
+        ] {
+            let got = parse_scope_output(&format!("{header}\n{line}\n\nspec")).relevance;
+            assert_eq!(got, want, "{line}");
+        }
+        // Scopers that never learned the header keep flowing as before.
+        assert_eq!(parse_scope_output(header).relevance, Relevance::Current);
+
+        // The hold is triage-class, so it costs no daily build slot.
+        assert!(!RunReport::triage(String::new()).billed);
+
+        let src = include_str!("self_improve.rs");
+        let start = src.find("pub async fn run_once(").expect("run_once");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+        let at = body.find("Relevance::Overtaken").expect("the overtaken branch");
+        let branch = &body[at..];
+        let ret = branch
+            .find("return Ok(RunReport::triage(")
+            .expect("the hold ends the tick unbilled");
+        let before_return = &branch[..ret];
+        assert!(
+            before_return.contains("GIVE_UP_OVERTAKEN"),
+            "held under its own reason code"
+        );
+        let label = before_return.find("label_gave_up").expect("the issue is labelled out");
+        assert!(
+            before_return[..label].contains("backoff_comment"),
+            "and the hold explains itself on the issue first"
+        );
+        // The comment names why the issue is held, how to undo it, and quotes
+        // the scoper's reading — the owner needs all three to close or re-scope.
+        for phrase in ["merged since this issue was filed", "GAVE_UP_LABEL", "sc.body"] {
+            assert!(before_return.contains(phrase), "comment must carry {phrase}");
+        }
+        // The issue is HELD, not resolved: nothing closes it and the attempt
+        // is not recorded, so clearing the label re-triages it from scratch.
+        assert!(!before_return.contains("record_attempt"), "no attempt is recorded");
+        assert!(
+            !before_return.contains("issue\",\n") && !before_return.contains("\"close\""),
+            "the issue stays open"
+        );
     }
 
     #[test]
@@ -16875,7 +17160,10 @@ else:
             !body.contains("record_attempt(repo_root, issue.number, None)"),
             "no anonymous attempt in run_once"
         );
-        assert!(body.contains("build_scope_prompt(&issue, prior_attempts.as_deref())"));
+        // #1515 added the merged-since argument.
+        assert!(body.contains(
+            "build_scope_prompt(&issue, prior_attempts.as_deref(), merged.as_deref())"
+        ));
         // #1012 added the criteria argument. Same intent as before: the fix
         // prompt gets the issue, the scoped plan and the prior attempts.
         assert!(body.contains(
@@ -18227,6 +18515,7 @@ mod iterate_not_delete_tests {
             author: "o".into(),
             author_trusted: true,
             research_filed: false,
+            created_at: String::new(),
         };
         let first = qa_review_prompt(&issue, "summary", None);
         assert!(first.contains("GitHub issue #7"));
@@ -18552,6 +18841,7 @@ mod iterate_not_delete_tests {
             author: "o".into(),
             author_trusted: true,
             research_filed: false,
+            created_at: String::new(),
         };
         let p = build_no_change_prompt(&issue);
         assert!(p.contains("ALREADY_FIXED:") && p.contains("UNDERSPECIFIED:"));

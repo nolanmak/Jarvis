@@ -793,6 +793,10 @@ pub async fn run(
                 author: c.author.clone(),
                 author_trusted: true,
                 research_filed: false,
+                // Fixtures carry no filing date, so the harness shows the
+                // scoper no merged-since history (#1515) — the tree is
+                // already pinned to `c.base` below, which is the same intent.
+                created_at: String::new(),
             };
             // `None` for prior attempts: tier one measures the FIRST scoping
             // judgment on an issue. Retry judgment — how the scoper reacts to
@@ -800,7 +804,7 @@ pub async fn run(
             // different fixture shape (an issue plus a specific attempt
             // history) and belongs to its own tier rather than being faked
             // here with a digest no real run produced.
-            let prompt = crate::self_improve::build_scope_prompt(&issue, None);
+            let prompt = crate::self_improve::build_scope_prompt(&issue, None, None);
 
             // Place the tree at the commit the decision was actually made at.
             // Without this the scoper reads today's `main`, finds the fix
