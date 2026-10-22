@@ -242,6 +242,40 @@ pub fn attach_tools(
 #[cfg(test)]
 mod routing_tests {
     #[tokio::test]
+    async fn phone_native_routing_survives_fallback_dispatch() {
+        use crate::{Reasoner, reasoner::ReasonerOpts, fallback::FallbackReasoner};
+        use super::*;
+        const NAME: &str = "phone_agent::routing_tests::phone_native_routing_survives_fallback_dispatch";
+        if std::env::var_os("JARVIS_PHONE_ROUTING_CHILD").is_some() {
+            struct Native;
+            #[async_trait]
+            impl Reasoner for Native {
+                async fn call(&self, _: &ReasonerOpts, _: &str) -> anyhow::Result<String> {
+                    assert!(crate::model_router::current()?.is_none(), "dispatch must preserve direct phone routing");
+                    Ok("native answer".into())
+                }
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let chain = FallbackReasoner::for_tests(vec![(ProviderKind::Claude, Arc::new(Native))], crate::cooldown::CooldownLatch::at(dir.path().join("cooldown")));
+            let opts = crate::reasoner::triage_opts(None);
+            assert!(crate::model_router::current().unwrap().is_some());
+            let result = crate::model_selection::SELECTED_PROFILE.scope(Some(ProviderKind::Claude),
+                super::native_phone_turn(chain.call(&opts, "hello"))).await.unwrap();
+            assert_eq!(result, "native answer");
+            assert!(crate::model_router::current().unwrap().is_some());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("router.json");
+        std::fs::write(&path, crate::model_router::tests::fixture().to_string()).unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env("JARVIS_PHONE_ROUTING_CHILD", "1")
+            .env("AUGMENTAGENT_MODEL_ROUTER_CONFIG", path)
+            .output().unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stdout));
+    }
+    #[tokio::test]
     async fn phone_routing_bypasses_gateway_without_changing_chat_selection() {
         use crate::model_router::{current, SNAPSHOT};
         let config = crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
