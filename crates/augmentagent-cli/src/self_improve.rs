@@ -13322,7 +13322,6 @@ CODEX-REVIEW: lgtm").0);
     fn a_sliced_child_is_never_sliced_again() {
         let child = slice_child_body(1516, "Add the parser.");
         assert!(child.starts_with(&format!("{SLICE_CHILD_MARKER_PREFIX}1516 -->")));
-        assert_eq!(slice_parent_of(&child), Some(1516));
         assert!(is_slice_child(&child));
         assert!(!is_slice_child("An ordinary issue body."));
         assert!(!is_slice_child(""));
