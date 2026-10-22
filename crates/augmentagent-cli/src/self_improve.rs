@@ -1046,8 +1046,10 @@ Relevance guide: judge the issue against the 'Merged since this issue was \
 filed' section, when one is present. 'overtaken' means a listed commit \
 already delivers what the issue asks — NAME that commit subject in your \
 reason; the pipeline then holds the issue for the owner instead of \
-re-implementing landed work. 'partial' means some of it landed: your spec \
-MUST state exactly what remains. 'current' means nothing listed affects it; \
+re-implementing landed work. 'partial' means some of it landed: NAME that \
+commit too, and your spec MUST state exactly what remains. A 'partial' or \
+'overtaken' reason that names no listed commit is ignored and the issue is \
+built as usual. 'current' means nothing listed affects it; \
 say 'current' whenever there is no section, and when in doubt.\n\
 \n\
 For fixable issues, emit an acceptance-criteria block before the spec, as \
@@ -1153,8 +1155,8 @@ pub(crate) enum Relevance {
     /// the header is missing or unrecognised. Absence must never hold work.
     #[default]
     Current,
-    /// Part of the ask landed; the spec states what remains. Flows exactly
-    /// like [`Relevance::Current`].
+    /// Part of the ask landed and the spec states what remains; the rest is
+    /// ordinary work, so this flows exactly like [`Relevance::Current`].
     Partial,
     /// A named commit already delivers the ask. Held for owner triage.
     Overtaken,
@@ -3805,6 +3807,39 @@ async fn merged_since(repo_root: &Path, created_at: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Shortest commit subject that counts as "named": a two-word subject can
+/// appear in a spec by coincidence, a sentence-length one cannot.
+const MERGED_SINCE_NAMED_CHARS: usize = 12;
+
+/// #1515 — a relevance claim is worth exactly as much as its evidence. The
+/// scoper is told to NAME the commit it is ruling on; a `partial` or
+/// `overtaken` verdict whose reason names none of the subjects it was shown
+/// is an assertion, not a finding, and acting on it would hold or reshape an
+/// open issue on a model's say-so. Unsupported claims degrade to
+/// [`Relevance::Current`] — the pre-#1515 behaviour, which only ever builds.
+///
+/// Whether a `partial` spec usefully DESCRIBES what remains is the model's
+/// to get right; what is checkable here is that it says anything at all.
+fn supported_relevance(sc: &ScopeOutcome, merged: Option<&str>) -> Relevance {
+    if sc.relevance == Relevance::Current {
+        return Relevance::Current;
+    }
+    if sc.relevance == Relevance::Partial && sc.body.trim().is_empty() {
+        return Relevance::Current;
+    }
+    let reason = sc.body.to_ascii_lowercase();
+    let named = merged.unwrap_or_default().lines().any(|l| {
+        let subject = l.trim().trim_start_matches("- ").trim_end_matches('…').trim();
+        subject.len() >= MERGED_SINCE_NAMED_CHARS
+            && reason.contains(&subject.to_ascii_lowercase())
+    });
+    if named {
+        sc.relevance
+    } else {
+        Relevance::Current
+    }
 }
 
 /// Build the stage-1 scoping prompt. Prior failures go in (#803) so the
@@ -7466,9 +7501,20 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // mis-scoped "overtaken" verdict would hold the self-heal loop until a
     // human notices while main stays red.
     if let Some(sc) = &scope {
-        if sc.relevance == Relevance::Overtaken && !is_red_main_issue(&issue.body) {
-            cleanup(worktree, branch, repo_root.to_path_buf()).await;
-            backoff_comment(
+        let relevance = supported_relevance(sc, merged.as_deref());
+        if sc.relevance != relevance {
+            info!(
+                issue = issue.number,
+                "scoper claimed relevance {:?} without naming a merged commit \
+                 — treating the issue as current",
+                sc.relevance
+            );
+        }
+        if relevance == Relevance::Overtaken && !is_red_main_issue(&issue.body) {
+            // The evidence goes up BEFORE the label: a held issue with no
+            // comment is indistinguishable from an unexplained refusal, so a
+            // comment failure cancels the hold and the run builds as usual.
+            let evidence = backoff_comment(
                 repo_root,
                 issue.number,
                 &format!(
@@ -7480,14 +7526,23 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     truncate(&sc.body, 1200)
                 ),
             )
-            .await
-            .ok();
-            label_gave_up(repo_root, issue.number, GIVE_UP_OVERTAKEN).await.ok();
-            return Ok(RunReport::triage(format!(
-                "issue #{}: overtaken by work merged since it was filed — \
-                 labeled out",
-                issue.number
-            )));
+            .await;
+            match evidence {
+                Ok(()) => {
+                    cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                    label_gave_up(repo_root, issue.number, GIVE_UP_OVERTAKEN).await.ok();
+                    return Ok(RunReport::triage(format!(
+                        "issue #{}: overtaken by work merged since it was \
+                         filed — labeled out",
+                        issue.number
+                    )));
+                }
+                Err(e) => warn!(
+                    issue = issue.number,
+                    "overtaken hold could not leave its evidence on the \
+                     issue; building instead of holding silently: {e:#}"
+                ),
+            }
         }
     }
     if let Some(s) = &scope {
@@ -15287,7 +15342,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         );
         // #1515 — same invariant for the "overtaken" label-out, which returns
         // before the fixability branch is reached.
-        let at = body.find("if sc.relevance == Relevance::Overtaken").expect("overtaken branch");
+        let at = body.find("if relevance == Relevance::Overtaken").expect("overtaken branch");
         let line = &body[at..at + 100];
         assert!(
             line.contains("!is_red_main_issue(&issue.body)"),
@@ -16401,6 +16456,13 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             before_return[..label].contains("backoff_comment"),
             "and the hold explains itself on the issue first"
         );
+        // A hold with no comment is an unexplained refusal, so the label is
+        // reached only on the comment's success arm — never after a dropped
+        // error from an inbox or API outage.
+        assert!(
+            before_return[..label].contains("Ok(()) =>"),
+            "labelling out must be gated on the evidence comment succeeding"
+        );
         // The comment names why the issue is held, how to undo it, and quotes
         // the scoper's reading — the owner needs all three to close or re-scope.
         for phrase in ["merged since this issue was filed", "GAVE_UP_LABEL", "sc.body"] {
@@ -16413,6 +16475,50 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             !before_return.contains("issue\",\n") && !before_return.contains("\"close\""),
             "the issue stays open"
         );
+    }
+
+    #[test]
+    fn a_relevance_claim_that_names_no_merged_commit_is_not_acted_on() {
+        let merged = "- autopr: paginate the issue pool\n- wiki: fix front-matter parse";
+        let scoped = |rel: &str, reason: &str| {
+            parse_scope_output(&format!(
+                "VERDICT: fixable\nCOMPLEXITY: simple\nEST-DIFF-LINES: 20\n\
+                 GUARDED-PATHS: no\nRELEVANCE: {rel}\n\n{reason}"
+            ))
+        };
+
+        // The reviewer's case: a bare "already handled" names nothing, so the
+        // issue is scoped as current and built rather than held.
+        let bare = scoped("overtaken", "already handled");
+        assert_eq!(bare.relevance, Relevance::Overtaken);
+        assert_eq!(supported_relevance(&bare, Some(merged)), Relevance::Current);
+
+        let named = scoped("overtaken", "'autopr: paginate the issue pool' already did this.");
+        assert_eq!(supported_relevance(&named, Some(merged)), Relevance::Overtaken);
+        // Evidence is checked against what the scoper was SHOWN, so a commit
+        // it invented, and a verdict reached with no history at all, degrade.
+        assert_eq!(supported_relevance(&named, None), Relevance::Current);
+        assert_eq!(
+            supported_relevance(&scoped("overtaken", "'autopr: rewrite everything' did it"), Some(merged)),
+            Relevance::Current
+        );
+
+        // `partial` must both name the commit and say what remains; an empty
+        // spec states nothing, whatever the header claims.
+        let partial = scoped("partial", "'wiki: fix front-matter parse' landed half of it; \
+                                         the pagination half remains.");
+        assert_eq!(supported_relevance(&partial, Some(merged)), Relevance::Partial);
+        assert_eq!(
+            supported_relevance(&scoped("partial", ""), Some(merged)),
+            Relevance::Current
+        );
+        assert_eq!(
+            supported_relevance(&scoped("partial", "some of it landed"), Some(merged)),
+            Relevance::Current
+        );
+
+        // `current` never needs evidence: the default must stay free.
+        assert_eq!(supported_relevance(&scoped("current", ""), None), Relevance::Current);
     }
 
     #[test]
