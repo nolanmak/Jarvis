@@ -73,6 +73,22 @@ const GIVE_UP_BLAST_RADIUS_NAMED: &str = "guard:blast-radius-named";
 const GIVE_UP_UNTRUSTED_AUTHOR: &str = "held:untrusted-author";
 /// #1491 — the builder says the issue is already fixed or under-specified.
 const GIVE_UP_OWNER_TRIAGE: &str = "held:owner-triage";
+/// #1515 — the scoping pass found that main already delivered the issue
+/// since it was filed. Held with the evidence, never billed.
+const GIVE_UP_OVERTAKEN: &str = "held:overtaken";
+/// #1516 — a parent issue the pipeline split into child issues. The picker
+/// skips it; the children are ordinary candidates.
+const SLICED_LABEL: &str = "agent-sliced";
+/// #787 — the research pipeline's label, inherited by a research parent's slices.
+const RESEARCH_LABEL: &str = "research";
+/// #1516 — stamped into every child issue body so a slice is never sliced
+/// again and the parent is findable from the child.
+const SLICE_MARKER_PREFIX: &str = "<!-- self-improve-slice parent=";
+const MIN_SLICES: usize = 2;
+const MAX_SLICES: usize = 6;
+const MAX_SLICE_BODY_CHARS: usize = 4000;
+/// #1515 — commit subjects shown to the scoper as "merged since filed".
+const MAX_MERGED_SINCE: usize = 60;
 /// What [`run_once`] returns when no labeled issue is waiting. The #630
 /// auto-PR loop matches on this to tell an idle tick (one cheap `gh issue
 /// list`, no reasoner spend) from an engaged run (counts against the daily
@@ -304,7 +320,7 @@ fn rest_issue_candidates(v: &serde_json::Value) -> Vec<RestIssue> {
         .filter(|iss| iss.get("pull_request").is_none())
         .filter_map(|iss| {
             let number = iss.get("number").and_then(serde_json::Value::as_u64)?;
-            if has_gave_up_label(iss) {
+            if has_gave_up_label(iss) || has_label(iss, SLICED_LABEL) {
                 return None;
             }
             let s = |k: &str| {
@@ -332,11 +348,16 @@ fn rest_issue_candidates(v: &serde_json::Value) -> Vec<RestIssue> {
 
 /// Does this REST issue row carry [`GAVE_UP_LABEL`]?
 fn has_gave_up_label(iss: &serde_json::Value) -> bool {
+    has_label(iss, GAVE_UP_LABEL)
+}
+
+/// Does this REST issue row carry `label`?
+fn has_label(iss: &serde_json::Value, label: &str) -> bool {
     iss.get("labels")
         .and_then(serde_json::Value::as_array)
         .is_some_and(|ls| {
             ls.iter()
-                .any(|l| l.get("name").and_then(|n| n.as_str()) == Some(GAVE_UP_LABEL))
+                .any(|l| l.get("name").and_then(|n| n.as_str()) == Some(label))
         })
 }
 
@@ -1013,18 +1034,33 @@ vague, under-specified, or not actually fixable by a coding agent at all \
 relevant code first, then judge it and — when fixable — produce an \
 implementation spec for a second, separate agent that will write the code.\n\
 \n\
-Your output MUST start with these four lines EXACTLY (then a blank line):\n\
+Your output MUST start with these five lines EXACTLY (then a blank line):\n\
 VERDICT: fixable | not-fixable\n\
 COMPLEXITY: simple | medium | hard\n\
 EST-DIFF-LINES: <your honest estimate of added+removed lines>\n\
 GUARDED-PATHS: yes | no\n\
+RELEVANCE: current | partial | overtaken\n\
 \n\
 Verdict guide: 'fixable' means a competent engineer could ship it from the \
 issue text plus the code, as a focused diff under 600 changed lines, \
-verifiable by the test suite. Research questions, multi-week epics, \
-decisions needing the owner, and changes to deploy/auth/secret/CI paths are \
-'not-fixable' — for those, follow the header with a 2-4 sentence reason and \
-stop.\n\
+verifiable by the test suite. 'not-fixable' is for work no diff can do: a \
+decision only the owner can make, a purchase, or a change that cannot avoid \
+deploy/auth/secret/CI paths. It is an OBJECTION, not a stop: on an issue's \
+first pass the pipeline builds anyway and hands your reason to the builder \
+as the objection its diff must answer, so state the reason in 2-4 sentences \
+and make it concrete. A research spike or a multi-week epic is NOT \
+not-fixable by itself: scope the first shippable increment (the smallest \
+change that moves the issue and can be verified by tests) as 'fixable', and \
+say in the Interpretation what you left for later. If the whole issue \
+honestly cannot fit under 600 lines even as a first increment, give the \
+full estimate: the pipeline splits oversized issues into child issues \
+rather than refusing them.\n\
+Relevance guide: when the prompt carries a 'Merged on main since this issue \
+was filed' section, read it against the issue before anything else. \
+'overtaken' means main already delivers what the issue asks — name the \
+commit and the code that does it, and stop: nothing is built. 'partial' \
+means some of it landed — the spec must say exactly what remains. \
+'current' otherwise, or when no such section is present.\n\
 Complexity guide: 'simple' = localized change, obvious approach, low regression \
 risk. 'medium' = a few files or a subtle interaction, still well-understood. \
 'hard' = cross-cutting, ambiguous, migration-shaped, or high blast radius if \
@@ -1147,6 +1183,21 @@ pub(crate) struct ScopeOutcome {
     /// are the one independent target in the pipeline. Empty is always valid
     /// and changes nothing (see [`criteria_pr_section`]).
     pub(crate) criteria: Vec<String>,
+    /// #1515 — the scoper's answer to "is this issue still what main needs,
+    /// given what merged since it was filed?". Missing header ⇒ `Current`:
+    /// absence must never hold work.
+    pub(crate) relevance: Relevance,
+}
+
+/// #1515 — whether main has moved past an issue since it was filed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Relevance {
+    /// Still what the code needs.
+    Current,
+    /// Part of it landed; the spec must say what remains.
+    Partial,
+    /// Main already delivers it; nothing to build.
+    Overtaken,
 }
 
 /// #1012 — caps applied at the parser so nothing downstream has to remember.
@@ -2157,10 +2208,22 @@ pub(crate) fn parse_scope_output(raw: &str) -> ScopeOutcome {
     let mut complexity = Complexity::Hard;
     let mut est_diff_lines: Option<usize> = None;
     let mut guarded_paths = false;
+    let mut relevance = Relevance::Current;
     let mut body_lines: Vec<&str> = Vec::new();
     for (i, line) in raw.lines().enumerate() {
         let l = line.trim().to_ascii_lowercase();
         let is_header_zone = i < 10;
+        if is_header_zone && l.starts_with("relevance:") {
+            let v = l["relevance:".len()..].trim();
+            relevance = if v.starts_with("overtaken") {
+                Relevance::Overtaken
+            } else if v.starts_with("partial") {
+                Relevance::Partial
+            } else {
+                Relevance::Current
+            };
+            continue;
+        }
         if is_header_zone && l.starts_with("verdict:") {
             fixable = !l.contains("not-fixable") && !l.contains("not fixable");
             continue;
@@ -2197,6 +2260,7 @@ pub(crate) fn parse_scope_output(raw: &str) -> ScopeOutcome {
         guarded_paths,
         body: body_lines.join("\n").trim().to_string(),
         criteria,
+        relevance,
     }
 }
 
@@ -2221,8 +2285,13 @@ fn spec_from_scope(scope: Option<&ScopeOutcome>) -> Option<String> {
 ///
 /// - a review-reject or a red gate means the issue WAS built — an agent
 ///   produced a reviewable diff for it, so it is never labelled out;
-/// - no charged failure at all is the first-pass triage the label exists for
-///   (research ask, epic, owner decision) — label it out;
+/// - no charged failure at all is a FIRST-PASS verdict, and (#1514) a
+///   first-pass verdict never labels out: the scoper has been wrong about
+///   "not agent-fixable" often enough (#955; 77 issues left the pool that
+///   way without a build) that the issue gets one real build attempt with
+///   the objection as context. A research ask or owner decision that truly
+///   has no diff comes back as a no-change run, which #1491 holds for the
+///   owner unbilled;
 /// - otherwise the verdict needs a repeated cause: two failures of the same
 ///   kind, not one. An epic that failed once before being scoped therefore
 ///   costs one further attempt, and the second failure closes it out.
@@ -2238,10 +2307,9 @@ fn may_label_out(kinds: &[FailureKind]) -> bool {
     if was_built(&charged) {
         return false;
     }
-    charged.is_empty()
-        || charged
-            .iter()
-            .any(|k| charged.iter().filter(|other| *other == k).count() >= 2)
+    charged
+        .iter()
+        .any(|k| charged.iter().filter(|other| *other == k).count() >= 2)
 }
 
 /// #955 — do these failure kinds prove the issue WAS built? Only a build can
@@ -2297,6 +2365,280 @@ fn scope_predicts_refusal(s: &ScopeOutcome) -> Option<String> {
         )),
         _ => None,
     }
+}
+
+// =====================================================================
+// #1515 — relevance: what merged on main since the issue was filed
+// =====================================================================
+
+/// `gh issue view <n> --json createdAt` → the ISO timestamp, or `None` when
+/// gh cannot say (the section is then simply absent).
+async fn issue_created_at(repo_root: &Path, number: u64) -> Option<String> {
+    let gh = gh_bin();
+    let (ok, out, _) = run(
+        &gh,
+        &["issue", "view", &number.to_string(), "--json", "createdAt", "--jq", ".createdAt"],
+        repo_root,
+    )
+    .await
+    .ok()?;
+    let v = out.trim();
+    (ok && !v.is_empty()).then(|| v.to_string())
+}
+
+/// The commit subjects on the worktree's branch (fresh off main) since the
+/// issue was filed, newest first, capped at [`MAX_MERGED_SINCE`]. Empty when
+/// the filing date is unknown or nothing landed.
+async fn merged_since_filed(repo_root: &Path, worktree: &Path, number: u64) -> Vec<String> {
+    let Some(since) = issue_created_at(repo_root, number).await else {
+        return Vec::new();
+    };
+    let since_arg = format!("--since={since}");
+    let max = format!("--max-count={MAX_MERGED_SINCE}");
+    match run("git", &["log", "--no-merges", "--format=%s", &since_arg, &max, "HEAD"], worktree).await {
+        Ok((true, out, _)) => out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The prompt section the scoper reads for its `RELEVANCE:` header. Empty
+/// when there is nothing to show, so an issue filed against today's main
+/// gets exactly the prompt it got before.
+fn merged_since_section(subjects: &[String]) -> String {
+    if subjects.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n\n## Merged on main since this issue was filed (newest first)\n\
+         Judge the issue against the code as it is NOW: some or all of it may \
+         already be delivered by these commits. Answer in the RELEVANCE header.\n",
+    );
+    for s in subjects.iter().take(MAX_MERGED_SINCE) {
+        out.push_str("- ");
+        out.push_str(&truncate(s, 160));
+        out.push('\n');
+    }
+    out
+}
+
+// =====================================================================
+// #1516 — slicing: an oversized issue becomes child issues, not a refusal
+// =====================================================================
+
+/// One child issue the slice planner proposed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Slice {
+    pub(crate) title: String,
+    pub(crate) body: String,
+}
+
+/// Was this body written by [`file_slices`]? A slice is never sliced again.
+fn is_slice_body(body: &str) -> bool {
+    body.contains(SLICE_MARKER_PREFIX)
+}
+
+const SLICE_SYSTEM: &str = "PUBLIC OUTPUT RULE: This response becomes public GitHub issues. Use only technical behavior and invented examples. Never copy private messages, personal names, account or invoice details, live traces, local paths, or generated programs with private inputs.\n\
+You are the slicing pass of a staged autonomous fix pipeline for this \
+codebase. The scoping pass judged the given issue too large for one \
+unattended change (the pipeline refuses any diff over 600 changed lines). \
+READ the relevant code, then split the issue into 2-6 ORDERED child issues \
+that together deliver it. Each child must be: a focused diff well under 600 \
+changed lines including tests; shippable and verifiable on its own (the \
+suite is green after it merges, even if later children never land); \
+self-contained — a reader with the child alone, not the parent, can build \
+it. Earlier children never depend on later ones. Do NOT plan changes to \
+deploy/auth/secret/CI paths (systemd, scripts/check-for-updates, \
+.github/workflows, credentials/keyring/.env).\n\
+\n\
+Output format, nothing else:\n\
+### Slice 1: <title under 100 characters>\n\
+<markdown body: what to change, files to touch, which existing functions to \
+reuse, the test to write first, and 2-4 checkable acceptance criteria. \
+Mention `Depends on: slice N` if it builds on an earlier child.>\n\
+### Slice 2: <title>\n\
+...\n\
+If the issue cannot be split into independently shippable pieces, output \
+exactly one line: CANNOT-SLICE: <reason>.";
+
+/// Read-only, scoping-tier call with the slicing instructions.
+fn slice_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
+    let mut o = scope_opts(worktree);
+    o.system_prompt = SLICE_SYSTEM.to_string();
+    o
+}
+
+pub(crate) fn build_slice_prompt(issue: &Issue, scope: &ScopeOutcome) -> String {
+    format!(
+        "GitHub issue #{}: {}\n\n{}\n\n## Scoping pass (estimated ~{} changed \
+         lines against a {MAX_DIFF_LINES}-line cap)\n{}\n\nProduce the ordered \
+         slices now.",
+        issue.number,
+        issue.title,
+        issue.body,
+        scope.est_diff_lines.unwrap_or(0),
+        truncate(&scope.body, 3000)
+    )
+}
+
+/// `### Slice N: title` blocks → children, in order. Anything degraded —
+/// a `CANNOT-SLICE` line, fewer than [`MIN_SLICES`], a header with no body,
+/// an empty title, more than [`MAX_SLICES`] (a plan that long is a tree,
+/// not a sequence, and truncating it would lose the last steps unseen) —
+/// yields an empty plan, and the caller falls back to the refusal it would
+/// have made anyway. Bodies are clipped to [`MAX_SLICE_BODY_CHARS`].
+pub(crate) fn parse_slice_plan(raw: &str) -> Vec<Slice> {
+    if raw.trim_start().starts_with("CANNOT-SLICE") {
+        return Vec::new();
+    }
+    let mut out: Vec<Slice> = Vec::new();
+    let mut cur: Option<(String, Vec<&str>)> = None;
+    let finish = |cur: Option<(String, Vec<&str>)>, out: &mut Vec<Slice>| {
+        if let Some((title, lines)) = cur {
+            let body = lines.join("\n").trim().to_string();
+            if !title.is_empty() && !body.is_empty() {
+                out.push(Slice { title, body: truncate(&body, MAX_SLICE_BODY_CHARS) });
+            }
+        }
+    };
+    for line in raw.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("### Slice ").or_else(|| t.strip_prefix("### slice ")) {
+            if let Some((_, title)) = rest.split_once(':') {
+                finish(cur.take(), &mut out);
+                cur = Some((truncate(title.trim(), 120), Vec::new()));
+                continue;
+            }
+        }
+        if let Some((_, lines)) = cur.as_mut() {
+            lines.push(line);
+        }
+    }
+    finish(cur, &mut out);
+    if out.len() < MIN_SLICES || out.len() > MAX_SLICES {
+        return Vec::new();
+    }
+    out
+}
+
+/// The body a child issue is filed with: the planner's text, then the
+/// marker and a human-readable pointer to the parent.
+pub(crate) fn slice_issue_body(
+    parent: u64,
+    index: usize,
+    total: usize,
+    body: &str,
+    research_filed: bool,
+) -> String {
+    // #787 — a research-filed parent's children stay research-filed: picked
+    // last, never auto-merged. The stamp is the phrase `is_research_filed`
+    // keys on.
+    let stamp = if research_filed {
+        "\nThe parent was auto-filed by the daily `augmentagent research` \
+         pipeline, and this part inherits that status."
+    } else {
+        ""
+    };
+    format!(
+        "{body}\n\n---\n{SLICE_MARKER_PREFIX}#{parent} index={index}/{total} -->\n\
+         Part {index} of {total} of #{parent}, split by the auto-PR pipeline \
+         because the parent does not fit one unattended change. Ship this \
+         part on its own; the parent closes when every part has.{stamp}"
+    )
+}
+
+/// Best-effort `gh label create --force`: the repo may never have had it.
+async fn ensure_label(repo_root: &Path, name: &str, color: &str, description: &str) {
+    let gh = gh_bin();
+    let _ = run(
+        &gh,
+        &["label", "create", name, "--force", "--color", color, "--description", description],
+        repo_root,
+    )
+    .await;
+}
+
+/// File the children, comment the list on the parent, label the parent
+/// [`SLICED_LABEL`]. Returns the child numbers filed. A child that fails to
+/// file is skipped; the parent is labelled only if at least one was filed,
+/// so a run that filed nothing leaves no trace and the refusal proceeds.
+async fn file_slices(repo_root: &Path, issue: &Issue, plan: &[Slice]) -> Result<Vec<u64>> {
+    let gh = gh_bin();
+    let total = plan.len();
+    // Labels first: `gh issue create --label` fails outright on a label the
+    // repo never had, and a fresh deployment has neither.
+    ensure_label(repo_root, FIXABLE_LABEL, "0E8A16", "Eligible for the auto-PR pipeline").await;
+    ensure_label(
+        repo_root,
+        SLICED_LABEL,
+        "BFD4F2",
+        "Parent issue split into child issues by the auto-PR pipeline; the picker skips it",
+    )
+    .await;
+    let mut labels = vec![FIXABLE_LABEL.to_string()];
+    if issue.research_filed {
+        ensure_label(repo_root, RESEARCH_LABEL, "D4C5F9", "Filed by the daily research pipeline").await;
+        labels.push(RESEARCH_LABEL.to_string());
+    }
+    let labels = labels.join(",");
+    let mut children: Vec<(u64, String)> = Vec::new();
+    for (i, slice) in plan.iter().enumerate() {
+        let body = slice_issue_body(issue.number, i + 1, total, &slice.body, issue.research_filed);
+        if let Err(e) = augmentagent_channel_core::public_report::validate(&slice.title, &body) {
+            warn!(issue = issue.number, slice = i + 1, "slice failed the public-output check: {e:#}");
+            continue;
+        }
+        let (ok, out, err) = run(
+            &gh,
+            &["issue", "create", "--title", &slice.title, "--body", &body, "--label", &labels],
+            repo_root,
+        )
+        .await?;
+        if !ok {
+            warn!(issue = issue.number, slice = i + 1, "gh issue create failed: {}", truncate(&err, 300));
+            continue;
+        }
+        match out.trim().rsplit('/').find_map(|s| s.parse::<u64>().ok()) {
+            Some(n) => children.push((n, slice.title.clone())),
+            None => warn!(issue = issue.number, "gh stdout has no issue number: {}", truncate(&out, 200)),
+        }
+    }
+    if children.is_empty() {
+        return Ok(Vec::new());
+    }
+    let list = children
+        .iter()
+        .map(|(n, t)| format!("- #{n} — {t}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    backoff_comment(
+        repo_root,
+        issue.number,
+        &format!(
+            "Auto-fix triage: the scoping pass estimates this issue is larger than \
+             one unattended change (the pipeline caps a diff at {MAX_DIFF_LINES} \
+             lines), so it was split into child issues the pipeline will pick up \
+             in order:\n\n{list}\n\nThis parent is labelled `{SLICED_LABEL}` and \
+             will not be built as a whole. Close it once the parts have landed, or \
+             remove the label to have it re-scoped."
+        ),
+    )
+    .await
+    .ok();
+    let (ok, _o, err) = run(
+        &gh,
+        &["issue", "edit", &issue.number.to_string(), "--add-label", SLICED_LABEL],
+        repo_root,
+    )
+    .await?;
+    if !ok {
+        bail!("labelling #{} `{SLICED_LABEL}` failed: {}", issue.number, truncate(&err, 300));
+    }
+    Ok(children.into_iter().map(|(n, _)| n).collect())
 }
 
 /// Stage 3 (#653): read-only QA review of the builder's diff, on the same
@@ -7325,7 +7667,13 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         }
     }
 
-    let scope_prompt = build_scope_prompt(&issue, prior_attempts.as_deref());
+    let mut scope_prompt = build_scope_prompt(&issue, prior_attempts.as_deref());
+    // #1515 — what landed on main since the issue was written, so the scoper
+    // judges the issue against today's code rather than the code it
+    // described. Empty when nothing merged or the date is unknown.
+    scope_prompt.push_str(&merged_since_section(
+        &merged_since_filed(repo_root, &worktree, issue.number).await,
+    ));
     let scope = match reasoner
         .call(&scope_opts(worktree.clone()), &scope_prompt)
         .await
@@ -7344,6 +7692,32 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         }
     };
     if let Some(s) = &scope {
+        // #1515 — main already delivers this. Hold it with the evidence for
+        // the owner to confirm and close; nothing is built, nothing billed,
+        // and the ledger mark keeps the picker off it for the day.
+        if s.relevance == Relevance::Overtaken && !is_red_main_issue(&issue.body) {
+            cleanup(worktree, branch, repo_root.to_path_buf()).await;
+            AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue.number);
+            backoff_comment(
+                repo_root,
+                issue.number,
+                &format!(
+                    "Auto-fix triage: the scoping pass found that main already \
+                     delivers this since the issue was filed, so nothing was \
+                     built.\n\n{}\n\nHeld for the owner to confirm and close — \
+                     it is not closed. Remove the `{GAVE_UP_LABEL}` label to \
+                     put it back in the pool.",
+                    truncate(&s.body, 1500)
+                ),
+            )
+            .await
+            .ok();
+            label_gave_up(repo_root, issue.number, GIVE_UP_OVERTAKEN).await.ok();
+            return Ok(RunReport::triage(format!(
+                "issue #{}: overtaken by main since filing — held for owner triage",
+                issue.number
+            )));
+        }
         // #932 — a red-main issue is never labelled out: that would hold the
         // loop until a human notices, which is the outage this exists to end.
         if !s.fixable && !is_red_main_issue(&issue.body) {
@@ -7374,9 +7748,10 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     issue.number
                 )));
             }
-            // #955 — the evidence does not carry the verdict (see
-            // `may_label_out`): the run falls through to the builder with the
-            // objection as context rather than spending the terminal label.
+            // #955/#1514 — the evidence does not carry the verdict (see
+            // `may_label_out`; a first pass never does): the run falls
+            // through to the builder with the objection as context rather
+            // than spending the terminal label.
             info!(
                 issue = issue.number,
                 "scoped as not agent-fixable on evidence that does not support \
@@ -7391,6 +7766,37 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // the expensive version of this exact conclusion.
     if let Some(sc) = &scope {
         if let Some(reason) = scope_predicts_refusal(sc) {
+            // #1516 — an honest over-cap estimate on a fixable issue that is
+            // not itself a slice is an epic, not a refusal: split it into
+            // child issues each inside the pipeline's bounds. One
+            // scoping-tier call, unbilled. Guarded paths are never sliced
+            // around, and a not-fixable verdict is not: its objection would
+            // reach none of the children.
+            if sc.fixable && !sc.guarded_paths && !is_slice_body(&issue.body) {
+                let plan = reasoner
+                    .call(&slice_opts(worktree.clone()), &build_slice_prompt(&issue, sc))
+                    .await
+                    .map(|raw| parse_slice_plan(&raw))
+                    .unwrap_or_else(|e| {
+                        warn!(issue = issue.number, "slice planning failed: {e:#}");
+                        Vec::new()
+                    });
+                if plan.len() >= MIN_SLICES {
+                    match file_slices(repo_root, &issue, &plan).await {
+                        Ok(children) if !children.is_empty() => {
+                            cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                            return Ok(RunReport::triage(format!(
+                                "issue #{}: oversized — sliced into {} child issues ({})",
+                                issue.number,
+                                children.len(),
+                                children.iter().map(|n| format!("#{n}")).collect::<Vec<_>>().join(", ")
+                            )));
+                        }
+                        Ok(_) => {}
+                        Err(e) => warn!(issue = issue.number, "filing slices failed: {e:#}"),
+                    }
+                }
+            }
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
             backoff_comment(
                 repo_root,
@@ -9250,7 +9656,7 @@ async fn label_out_evidence(repo_root: &Path, issue: u64) -> Option<Vec<FailureK
     )
     .await
     {
-        Ok((true, comments, _)) => Some(marker_kinds(&comments)),
+        Ok((true, comments, _)) => Some(marker_kinds(after_last_reset(&comments))),
         _ => None,
     }
 }
@@ -9269,6 +9675,7 @@ async fn label_out_evidence(repo_root: &Path, issue: u64) -> Option<Vec<FailureK
 /// and later built to exhaustion would be revived on every tick forever — and
 /// any label-out with no scoping verdict behind it.
 fn gave_up_is_stale(comments: &str) -> bool {
+    let comments = after_last_reset(comments);
     if !comments.contains(SCOPE_GAVE_UP_MARKER) {
         return false;
     }
@@ -9282,6 +9689,12 @@ fn gave_up_is_stale(comments: &str) -> bool {
 
 /// The open issues in a REST issues array that carry [`GAVE_UP_LABEL`] —
 /// exactly the rows [`rest_issue_candidates`] drops.
+/// #1517 — gave-up issues whose comments the idle-tick sweep reads per tick.
+/// The old newest-50 listing bounded this implicitly.
+const MAX_RETRIAGE_READS: usize = 50;
+/// #1517 — the UTC day the sweep last ran in this process; 0 = never.
+static LAST_RETRIAGE_DAY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn gave_up_numbers(v: &serde_json::Value) -> Vec<u64> {
     v.as_array()
         .map(|arr| {
@@ -9309,9 +9722,19 @@ fn stale_gave_up(fetched: &[(u64, String)]) -> Vec<u64> {
 /// is the whole re-triage: the next tick sees them as ordinary candidates
 /// again.
 async fn retriage_gave_up(repo_root: &Path, issues: &serde_json::Value) {
+    // #1517 — once per UTC day per process: the comment sets it reads do
+    // not change between idle ticks, and with the whole open set listed a
+    // per-tick sweep would be fifty GitHub reads every few minutes.
+    let today = utc_day_now();
+    if LAST_RETRIAGE_DAY.swap(today, std::sync::atomic::Ordering::SeqCst) == today {
+        return;
+    }
     let gh = gh_bin();
     let mut fetched = Vec::new();
-    for number in gave_up_numbers(issues) {
+    // #1517 — the listing is now the whole open set, so bound the reads to
+    // the newest `MAX_RETRIAGE_READS` gave-up issues: one `gh issue view`
+    // each, on the idle path only.
+    for number in gave_up_numbers(issues).into_iter().take(MAX_RETRIAGE_READS) {
         let n = number.to_string();
         if let Ok((true, comments, _)) =
             run(&gh, &["issue", "view", &n, "--json", "comments"], repo_root).await
@@ -16232,8 +16655,9 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     #[test]
     fn may_label_out_needs_a_repeated_cause_and_never_a_built_issue() {
         use FailureKind::*;
-        // The label exists for the first-pass triage verdict: no attempt.
-        assert!(may_label_out(&[]));
+        // #1514 — a first-pass verdict (no attempt yet) never labels out:
+        // the issue gets a real build with the objection as context.
+        assert!(!may_label_out(&[]), "first-pass not-fixable builds anyway");
         // #926 verbatim: ONE review-reject, then a not-fixable verdict. Built
         // once is built — a later same-kind pile-up changes nothing.
         assert!(!may_label_out(&[ReviewReject]));
@@ -16246,9 +16670,134 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             assert!(may_label_out(&[kind, kind]), "{kind:?}: repeated cause");
         }
         assert!(!may_label_out(&[NoChanges, GuardRefusal]), "different causes");
-        // Harness failures are not the issue's fault and never count (#803).
-        assert!(may_label_out(&[ReasonerError, Infra, ReasonerError]));
+        // Harness failures are not the issue's fault and never count (#803):
+        // an issue that only ever hit outages is still on its first pass.
+        assert!(!may_label_out(&[ReasonerError, Infra, ReasonerError]));
         assert!(!may_label_out(&[ReasonerError, NoChanges]));
+        assert!(may_label_out(&[ReasonerError, NoChanges, Infra, NoChanges]));
+    }
+
+    // #1515 — the relevance header parses, and its absence never holds work.
+    #[test]
+    fn scope_output_parses_the_relevance_header_and_defaults_to_current() {
+        let none = parse_scope_output("VERDICT: fixable\nCOMPLEXITY: simple\n\nspec");
+        assert_eq!(none.relevance, Relevance::Current);
+        for (raw, want) in [
+            ("RELEVANCE: current", Relevance::Current),
+            ("RELEVANCE: Partial — the guard landed in #12", Relevance::Partial),
+            ("RELEVANCE: overtaken (commit abc)", Relevance::Overtaken),
+            ("relevance: OVERTAKEN", Relevance::Overtaken),
+            ("RELEVANCE: something else", Relevance::Current),
+        ] {
+            let out = parse_scope_output(&format!(
+                "VERDICT: fixable\nCOMPLEXITY: simple\nEST-DIFF-LINES: 40\nGUARDED-PATHS: no\n{raw}\n\nspec body"
+            ));
+            assert_eq!(out.relevance, want, "{raw}");
+            assert_eq!(out.body, "spec body", "the header never leaks into the spec: {raw}");
+        }
+        // Only the header zone counts: a mention deep in the body is prose.
+        let deep = format!("VERDICT: fixable\n\n{}\nRELEVANCE: overtaken", "line\n".repeat(12));
+        assert_eq!(parse_scope_output(&deep).relevance, Relevance::Current);
+    }
+
+    #[test]
+    fn merged_since_section_is_absent_without_history_and_capped_with_it() {
+        assert_eq!(merged_since_section(&[]), "");
+        let subjects: Vec<String> = (0..(MAX_MERGED_SINCE + 10)).map(|i| format!("commit {i}")).collect();
+        let section = merged_since_section(&subjects);
+        assert!(section.contains("Merged on main since this issue was filed"));
+        assert!(section.contains("- commit 0\n"));
+        assert!(section.contains(&format!("- commit {}\n", MAX_MERGED_SINCE - 1)));
+        assert!(!section.contains(&format!("- commit {}\n", MAX_MERGED_SINCE)), "capped");
+        assert!(SCOPE_SYSTEM.contains("RELEVANCE: current | partial | overtaken"));
+        assert!(SCOPE_SYSTEM.contains("these five lines"));
+    }
+
+    // Structural: the overtaken hold runs before the not-fixable branch and
+    // bills nothing; the slicing branch never touches guarded work or a slice.
+    #[test]
+    fn run_once_holds_overtaken_issues_before_scoping_and_slices_only_unguarded_parents() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("pub async fn run_once(").expect("run_once");
+        let end = start + src[start..].find("\n}\n").expect("end");
+        let body = &src[start..end];
+        let overtaken = body.find("s.relevance == Relevance::Overtaken").expect("overtaken hold");
+        let not_fixable = body.find("if !s.fixable && !is_red_main_issue(&issue.body)").expect("not-fixable branch");
+        assert!(overtaken < not_fixable, "relevance is judged before fixability");
+        let hold = &body[overtaken..not_fixable];
+        assert!(hold.contains("GIVE_UP_OVERTAKEN") && hold.contains("RunReport::triage("), "held, unbilled");
+        assert!(hold.contains("AttemptLedger::mark_persist("), "off the picker for the day");
+        assert!(!hold.contains("record_attempt("), "an overtaken issue is not an attempt");
+        let slice = body.find("sc.fixable && !sc.guarded_paths && !is_slice_body(&issue.body)").expect("slice guard");
+        let refusal = body.find("GIVE_UP_SCOPER_PREDICTS_REFUSAL").expect("size refusal");
+        assert!(slice < refusal, "slicing is tried before the refusal");
+        assert!(body[slice..refusal].contains("slice_opts(") && body[slice..refusal].contains("file_slices("));
+    }
+
+    #[test]
+    fn slice_plan_parses_ordered_children_and_rejects_degraded_shapes() {
+        let raw = "### Slice 1: Add the parser\nBody one.\nMore.\n\n### Slice 2: Wire it in\nBody two.\n### slice 3: Tests\nBody three.";
+        let plan = parse_slice_plan(raw);
+        assert_eq!(plan.len(), 3);
+        assert_eq!(plan[0].title, "Add the parser");
+        assert_eq!(plan[0].body, "Body one.\nMore.");
+        assert_eq!(plan[2].title, "Tests");
+        assert!(parse_slice_plan("CANNOT-SLICE: one atomic migration").is_empty());
+        assert!(parse_slice_plan("### Slice 1: Only one\nbody").is_empty(), "fewer than MIN_SLICES");
+        assert!(parse_slice_plan("### Slice 1: No body\n### Slice 2: Has body\nx").is_empty(), "a bodiless slice is dropped, leaving one");
+        assert!(parse_slice_plan("prose with no headers at all").is_empty());
+        let many: String = (1..=9).map(|i| format!("### Slice {i}: T{i}\nb{i}\n")).collect();
+        assert!(parse_slice_plan(&many).is_empty(), "more than MAX_SLICES is degraded, never truncated");
+        let six: String = (1..=6).map(|i| format!("### Slice {i}: T{i}\nb{i}\n")).collect();
+        assert_eq!(parse_slice_plan(&six).len(), MAX_SLICES);
+        let long = format!("### Slice 1: a\n{}\n### Slice 2: b\nx", "y".repeat(MAX_SLICE_BODY_CHARS + 500));
+        assert!(parse_slice_plan(&long)[0].body.len() <= MAX_SLICE_BODY_CHARS + 4);
+    }
+
+    #[test]
+    fn slice_bodies_carry_the_marker_and_are_never_sliced_again() {
+        let body = slice_issue_body(1500, 2, 4, "do the thing", false);
+        assert!(body.starts_with("do the thing"));
+        assert!(body.contains("<!-- self-improve-slice parent=#1500 index=2/4 -->"));
+        assert!(body.contains("Part 2 of 4 of #1500"));
+        assert!(is_slice_body(&body));
+        assert!(!is_research_filed(&body), "a human parent's children are human-filed");
+        let research = slice_issue_body(1500, 1, 2, "x", true);
+        assert!(is_research_filed(&research), "a research parent's children stay research-filed (#787)");
+        assert!(!is_slice_body("an ordinary issue that mentions #1500"));
+        let issue = Issue {
+            number: 7,
+            title: "Big".into(),
+            body: "big body".into(),
+            author: "o".into(),
+            author_trusted: true,
+            research_filed: false,
+        };
+        let scope = parse_scope_output("VERDICT: fixable\nCOMPLEXITY: hard\nEST-DIFF-LINES: 2400\nGUARDED-PATHS: no\n\nthe plan");
+        let prompt = build_slice_prompt(&issue, &scope);
+        assert!(prompt.contains("#7: Big") && prompt.contains("~2400 changed") && prompt.contains("the plan"));
+        assert!(SLICE_SYSTEM.contains("### Slice 1:") && SLICE_SYSTEM.contains("CANNOT-SLICE"));
+    }
+
+    // #1516 — the picker skips sliced parents the same way it skips
+    // gave-up issues, over the paginated listing from #1517/#1519.
+    #[test]
+    fn picker_skips_sliced_parents_and_paginates_the_open_set() {
+        let rows = serde_json::json!([
+            {"number": 3, "title": "parent", "body": "", "user": {"login": "o"}, "author_association": "OWNER",
+             "labels": [{"name": SLICED_LABEL}]},
+            {"number": 2, "title": "gave up", "body": "", "user": {"login": "o"}, "author_association": "OWNER",
+             "labels": [{"name": GAVE_UP_LABEL}]},
+            {"number": 1, "title": "child", "body": "x", "user": {"login": "o"}, "author_association": "OWNER",
+             "labels": []}
+        ]);
+        let picked: Vec<u64> = rest_issue_candidates(&rows).into_iter().map(|i| i.number).collect();
+        assert_eq!(picked, vec![1]);
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn pick_issue(repo_root: &Path").expect("pick_issue");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+        assert!(body.contains("fetch_issue_pages("), "paginated (#1519)");
+        assert!(!body.contains("per_page=50"), "the newest-50 window is gone");
     }
 
     #[test]
@@ -16533,11 +17082,13 @@ else:
         gh
     }
 
-    /// C4 — a scoper verdict on a never-built issue still labels out at
-    /// once, and says so with a reason code.
+    /// C4 / #1514 — a scoper verdict on a never-built issue labels out only
+    /// once the issue has failed the same way twice, and says so with a
+    /// reason code; the first pass builds.
     #[test]
-    fn scoper_not_fixable_labels_on_first_occurrence_with_its_reason() {
-        assert!(may_label_out(&[]), "first-pass triage labels out immediately");
+    fn scoper_not_fixable_labels_only_after_a_repeated_charged_failure() {
+        assert!(!may_label_out(&[]), "first-pass triage builds instead of labelling out (#1514)");
+        assert!(may_label_out(&[FailureKind::NoChanges, FailureKind::NoChanges]));
         assert_eq!(GIVE_UP_SCOPER_NOT_FIXABLE, "scoper:not-fixable");
         let src = include_str!("self_improve.rs");
         let at = src.find("Auto-fix triage: {SCOPE_GAVE_UP_MARKER}").expect("the scoper refusal");
@@ -16731,7 +17282,21 @@ else:
     fn the_gave_up_label_is_never_applied_without_a_reason() {
         let src = include_str!("self_improve.rs");
         let prod = &src[..src.find("\n#[cfg(test)]\n#[path = \"self_improve_lifecycle_tests.rs\"]").expect("tests")];
-        assert_eq!(prod.matches("\"--add-label\"").count(), 1, "one labelling site");
+        // Every `--add-label` site: exactly one applies GAVE_UP_LABEL (inside
+        // `label_gave_up`); any other applies only SLICED_LABEL (#1516).
+        let sites: Vec<usize> = prod.match_indices("\"--add-label\"").map(|(i, _)| i).collect();
+        let gave_up_sites = sites
+            .iter()
+            .filter(|&&i| prod[i..(i + 160).min(prod.len())].contains("GAVE_UP_LABEL"))
+            .count();
+        assert_eq!(gave_up_sites, 1, "one gave-up labelling site");
+        for &i in &sites {
+            let window = &prod[i..(i + 160).min(prod.len())];
+            assert!(
+                window.contains("GAVE_UP_LABEL") || window.contains("SLICED_LABEL"),
+                "unexpected label site: {window}"
+            );
+        }
         let start = prod.find("async fn label_gave_up(").expect("label_gave_up");
         let body = &prod[start..start + prod[start..].find("\n}\n").unwrap()];
         assert!(body.starts_with("async fn label_gave_up(repo_root: &Path, issue: u64, reason: &str)"), "{}", &body[..80]);
