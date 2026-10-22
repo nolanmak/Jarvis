@@ -97,7 +97,8 @@ elif a[:2]==['pr','diff']: print('src/synthetic.rs')
 elif a[:2]==['pr','checks']:
     print(json.dumps([dict(state=s['checks'])])); sys.exit(0 if s['checks']=='SUCCESS' else 8)
 elif a[0]=='api': print('[]')
-elif a[:2]==['pr','ready']: pass
+elif a[:2]==['pr','ready']:
+    assert s['draft'], 'already-ready PR must retain its original state'
 elif a[:2]==['pr','merge']:
     assert a[a.index('--match-head-commit')+1]==s['head']
     if s['fail_merge']: sys.exit(1)
@@ -115,6 +116,7 @@ else: raise Exception('unexpected call '+repr(a))
             .env_remove("DISCORD_WEBHOOK_URL")
             .output().unwrap();
         assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(root.join("merged").exists(), "child scenario must actually execute");
         return;
     }
     let root = PathBuf::from(std::env::var_os(CHILD).unwrap());
@@ -138,6 +140,11 @@ else: raise Exception('unexpected call '+repr(a))
     assert_eq!(merge_sweep(&root, false).await, 0);
     scenario("SUCCESS", false, true, &head);
     assert_eq!(merge_sweep(&root, false).await, 0);
+    scenario("SUCCESS", true, true, &head);
+    assert_eq!(merge_sweep(&root, false).await, 0);
+    let calls = std::fs::read_to_string(root.join("calls")).unwrap();
+    assert!(calls.lines().any(|line| line.contains("--undo")), "failed draft merge restores draft state");
+    assert_eq!(ready_for_merge(&root, 20, None).await, None);
     scenario("SUCCESS", false, false, &"b".repeat(40));
     assert_eq!(merge_sweep(&root, false).await, 0);
     scenario("SUCCESS", false, false, &head);

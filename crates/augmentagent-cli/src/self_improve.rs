@@ -1629,16 +1629,11 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
                     );
                     continue;
                 }
-                // Marking ready is a state change, and the merge right after
-                // it can still fail — a check that went red between the read
-                // and now, mergeability that changed, branch protection. The
-                // contract is "merge, or leave it alone", so a failure here
-                // must put the draft back: the sweep only ever considers
-                // drafts, and a PR stranded as ready would drop out of every
-                // future sweep as well as not having merged.
-                let (readied, ..) = run(&gh, &["pr", "ready", &pr.to_string()], repo_root)
-                    .await
-                    .unwrap_or((false, String::new(), String::new()));
+                // Preserve the original state when a merge must be retried.
+                let Some(readied) = ready_for_merge(repo_root, pr,
+                    row.get("isDraft").and_then(serde_json::Value::as_bool)).await else {
+                    continue;
+                };
                 // Codex: a check can go green-to-red without a new commit —
                 // a CI re-run, a flaky job retried, a required check added.
                 // `--match-head-commit` catches a moved HEAD, not a changed
@@ -1702,6 +1697,18 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
         }
     }
     merged
+}
+
+/// Return whether this attempt changed a draft to ready. Unknown state or a
+/// failed transition defers merging; an already-ready PR needs no mutation.
+async fn ready_for_merge(repo_root: &Path, pr: u64, draft: Option<bool>) -> Option<bool> {
+    match draft? {
+        false => Some(false),
+        true => match run(&gh_bin(), &["pr", "ready", &pr.to_string()], repo_root).await {
+            Ok((true, ..)) => Some(true),
+            _ => None,
+        },
+    }
 }
 
 /// Are every one of this PR's checks green? `None` when that cannot be
@@ -6984,7 +6991,7 @@ async fn resume_draft_pr(
         } else {
             IndependentReview::not_run("QA requested changes".into())
         };
-        if qa_ok && !independent.notes.is_empty() {
+        if qa_ok && independent.available && !independent.notes.is_empty() {
             prior_notes = Some(independent.notes.clone());
             if !dry_run {
                 let _ = run(&gh, &["pr", "comment", &pr.to_string(), "--body",
@@ -7143,7 +7150,17 @@ async fn resume_draft_pr(
                     "PR #{pr}: LGTM recorded; awaiting CI, merge sweep will retry"
                 )));
             }
-            let _ = run(&gh, &["pr", "ready", &pr.to_string()], repo_root).await;
+            let draft = match run(&gh, &["pr", "view", &pr.to_string(), "--json", "isDraft"], repo_root).await {
+                Ok((true, out, _)) => serde_json::from_str::<serde_json::Value>(&out).ok()
+                    .and_then(|v| v.get("isDraft").and_then(serde_json::Value::as_bool)),
+                _ => None,
+            };
+            let Some(readied) = ready_for_merge(repo_root, pr, draft).await else {
+                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                return Ok(RunReport::built(format!(
+                    "PR #{pr}: LGTM recorded; ready state unavailable, merge sweep will retry"
+                )));
+            };
             // #893 — release the worktree BEFORE merging: gh's --delete-branch
             // also deletes the local branch, which fails while a worktree
             // holds it and turns a successful merge into a reported failure.
@@ -7154,8 +7171,11 @@ async fn resume_draft_pr(
                 &["pr", "merge", &pr.to_string(), "--squash", "--delete-branch", "--match-head-commit", reviewed_head],
                 repo_root,
             )
-            .await?;
+            .await.unwrap_or((false, String::new(), "spawn failed".into()));
             if !ok && !pr_is_merged(repo_root, pr).await {
+                if readied {
+                    let _ = run(&gh, &["pr", "ready", &pr.to_string(), "--undo"], repo_root).await;
+                }
                 warn!(pr, "resume auto-merge failed; approval retained for the next sweep: {e}");
                 return Ok(RunReport::built(format!(
                     "PR #{pr}: double LGTM but merge FAILED (left open)"
@@ -9022,7 +9042,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         };
         record_opened_pr(&opened_prs_path(), issue.number, n, published_head, verdict);
     }
-    if !independent.notes.is_empty() {
+    if independent.available && !independent.notes.is_empty() {
         let _ = run(&gh, &["pr", "comment", &pr_url, "--body",
             &independent_findings_comment(&independent.notes)], repo_root).await;
     }
@@ -13885,7 +13905,7 @@ CODEX-REVIEW: lgtm").0);
         let src = include_str!("self_improve.rs");
         let resume_start = src.find("async fn resume_draft_pr(").expect("resume fn");
         let body = &src[resume_start..];
-        let ready_at = body.find(r#"["pr", "ready", &pr.to_string()]"#).expect("gh pr ready call");
+        let ready_at = body.find("ready_for_merge(repo_root, pr,").expect("ready transition");
         let merge_at = body
             .find(r#""pr", "merge", &pr.to_string(), "--squash", "--delete-branch""#)
             .expect("merge call");
@@ -14903,7 +14923,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let start = src.find("async fn merge_sweep(").expect("the sweep");
         let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
 
-        let ready = body.find(r#""pr", "ready""#).expect("the sweep marks ready");
+        let ready = body.find("ready_for_merge(repo_root, pr,").expect("the sweep marks ready");
         let merge = body.find(r#""pr", "merge""#).expect("then merges");
         assert!(ready < merge, "ready comes first");
         // Codex: everything the sweep checked came from a snapshot. A commit
@@ -16188,8 +16208,8 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             .find("if resume_may_merge(qa_ok, independent.approved(), rabbit.approved()) {")
             .expect("every approval guards the merge (QA joined in #1488)");
         let ready = body
-            .find(r#"["pr", "ready", &pr.to_string()]"#)
-            .expect("gh pr ready");
+            .find("ready_for_merge(repo_root, pr,")
+            .expect("ready transition");
         assert!(gate < ready);
         assert!(!body[gate..ready].contains("if independent.approved() {"));
         // Advisory: a missing CodeRabbit verdict never parks the draft.
