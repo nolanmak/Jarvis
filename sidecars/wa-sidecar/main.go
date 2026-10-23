@@ -153,9 +153,9 @@ type rpcResponse struct {
 // ---------------------------------------------------------------------------
 
 type sidecar struct {
-	client  *whatsmeow.Client
-	pairMu  sync.Mutex
-	pairing bool
+	client   *whatsmeow.Client
+	pairMu   sync.Mutex
+	pairing  bool
 	outbound *outboundLedger
 	// writeMu protects clients/lastQR and serializes writes to each socket.
 	writeMu sync.Mutex
