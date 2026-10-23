@@ -3459,23 +3459,37 @@ async fn find_resumable_draft(
     }
 
     let ledger = AttemptLedger::load(&attempt_ledger_path());
-    let fair = FairSched::load(&fair_sched_path());
-    let chosen = resumable_from(
-        &prs,
-        &ledger,
-        utc_day_now(),
-        &gave_up,
-        only,
-        owner.as_deref(),
-        fair.resume_cursor,
-    )?;
-    // #1532 — the rotation advances at SELECTION time, not on success: a
-    // resume that later wedges must not pin the cursor to itself forever. The
-    // pinned red-main path neither consults nor moves it.
-    if only.is_none() && !dry_run {
-        FairSched::update_persist(&fair_sched_path(), |f| f.advance(chosen.0));
+    let select = |cursor| {
+        resumable_from(&prs, &ledger, utc_day_now(), &gave_up, only, owner.as_deref(), cursor)
+    };
+    // #1532 — a pinned red-main fix neither consults nor moves the rotation,
+    // and a dry run reserves nothing.
+    if only.is_some() || dry_run {
+        return select(FairSched::load(&fair_sched_path()).resume_cursor);
     }
-    Some(chosen)
+    reserve_next_draft(&fair_sched_path(), select)
+}
+
+/// #1532 — hand out the next draft and reserve it in ONE locked
+/// read-modify-write, so the cursor the choice is made from is the same inode
+/// the choice advances. A plain load-then-select-then-advance let the resume
+/// and combined lanes (separate processes, separate flocks — see [`Lane`])
+/// both read the same stale cursor and resume the same draft twice.
+///
+/// The reservation lands at SELECTION time, not on success: a resume that
+/// later wedges must not pin the cursor to itself forever.
+fn reserve_next_draft(
+    path: &Path,
+    select: impl FnOnce(u64) -> Option<(u64, u64, String)>,
+) -> Option<(u64, u64, String)> {
+    let mut chosen = None;
+    FairSched::update_persist(path, |f| {
+        chosen = select(f.resume_cursor);
+        if let Some((pr, _, _)) = &chosen {
+            f.advance(*pr);
+        }
+    });
+    chosen
 }
 
 /// Is this PR's head branch in THIS repository, rather than a fork?
@@ -7386,6 +7400,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // non-converging drafts than the daily cap starved every new issue
     // forever, because review rejections stay retryable and both day-keyed
     // files reset at midnight.
+    // An unlocked read is enough HERE, unlike the cursor reservation above:
+    // only the combined lane acts on the debt, and it holds the #816 run lock
+    // that the build lane shares, so the sole concurrent writer is the resume
+    // lane. Reading its increment a tick late costs one extra resume, never a
+    // starved build — the debt only grows until a build clears it, and every
+    // tick re-reads it from disk.
     let fair = FairSched::load(&fair_sched_path());
     let prefer_build = prefer_build_now(
         lane,
@@ -13324,27 +13344,47 @@ CODEX-REVIEW: lgtm").0);
         assert!(prefer_build_now(Lane::Combined, true, &tomorrow, 1),
             "yesterday's resume still owes today's build");
 
-        // #871's hazard: the lanes are separate processes on one file.
-        let (p1, p2) = (path.clone(), path.clone());
-        let t1 = std::thread::spawn(move || {
-            for i in 0..50u64 {
-                FairSched::update_persist(&p1, |f| f.advance(200 + i));
-            }
-        });
-        let t2 = std::thread::spawn(move || {
-            for _ in 0..50 {
-                FairSched::update_persist(&p2, |f| f.record_billed(true));
-            }
-        });
-        t1.join().unwrap();
-        t2.join().unwrap();
-        let after = FairSched::load(&path);
-        assert_eq!(after.resumes_since_build, 51, "a locked read-modify-write loses no update");
-        assert_eq!(after.resume_cursor, 249);
-
+        // #871's hazard — two lane processes on one file — is covered by
+        // `concurrent_reservations_never_hand_the_same_draft_out_twice`.
         // An in-place rewrite must leave no tail of the longer old record.
         FairSched::update_persist(&path, |f| *f = FairSched::default());
         assert_eq!(std::fs::read(&path).unwrap(), serde_json::to_vec(&FairSched::default()).unwrap());
+    }
+
+    /// #1532 — the resume and combined lanes are separate processes with
+    /// separate flocks, so reading the cursor, selecting, and advancing must
+    /// be ONE locked step: done separately, both lanes read the same cursor
+    /// and resume the same draft twice. Ten reservations over the issue's
+    /// five-draft backlog rotate through it exactly twice, with no draft
+    /// handed out a third time and none skipped.
+    #[test]
+    fn concurrent_reservations_never_hand_the_same_draft_out_twice() {
+        const POOL: [u64; 5] = [100, 101, 102, 103, 104];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autopr-fair.json");
+        let lanes: Vec<_> = (0..2)
+            .map(|_| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    (0..5)
+                        .map(|_| {
+                            reserve_next_draft(&p, |cursor| {
+                                let pr = *POOL.iter().find(|n| **n > cursor).unwrap_or(&POOL[0]);
+                                Some((pr, pr - 90, format!("agent-fix/issue-{}", pr - 90)))
+                            })
+                            .expect("a draft is always eligible")
+                            .0
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut handed_out: Vec<u64> =
+            lanes.into_iter().flat_map(|l| l.join().unwrap()).collect();
+        handed_out.sort_unstable();
+        assert_eq!(handed_out, vec![100, 100, 101, 101, 102, 102, 103, 103, 104, 104],
+            "{handed_out:?}");
+        assert_eq!(FairSched::load(&path).resume_cursor, 104);
     }
 
     #[test]
@@ -15792,11 +15832,15 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let start = src.find("async fn find_resumable_draft(").expect("finder");
         let end = start + src[start..].find("\n}\n").expect("finder end");
         let body = &src[start..end];
-        let choose = body.find("resumable_from(").expect("choice");
-        let advance = body.find("f.advance(chosen.0)").expect("cursor advance");
-        assert!(choose < advance, "choose, then advance");
-        let guard = body[..advance].rfind("only.is_none() && !dry_run").expect("guarded");
-        assert!(advance - guard < 160, "the advance is inside that guard: {guard} {advance}");
+        let bypass = body.find("if only.is_some() || dry_run {").expect("pinned bypass");
+        let reserve = body.find("reserve_next_draft(&fair_sched_path(), select)").expect("reservation");
+        assert!(bypass < reserve, "a pinned or dry run returns before reserving");
+        let r = src.find("fn reserve_next_draft(").expect("reserve_next_draft");
+        let reserver = &src[r..r + src[r..].find("\n}\n").expect("reserver end")];
+        let lock = reserver.find("FairSched::update_persist(").expect("locked");
+        let choose = reserver.find("select(f.resume_cursor)").expect("choice");
+        let advance = reserver.find("f.advance(*pr)").expect("cursor advance");
+        assert!(lock < choose && choose < advance, "read, choose and advance under one lock");
     }
 
     // --- #933 auto-rebase: the builder resolves a draft's merge conflict ---
