@@ -35,8 +35,7 @@ pub struct PeopleReport {
     pub aliases: usize,
     /// `household:` links kept, counting each direction once (#1539).
     pub links: usize,
-    /// `household:` entries naming the page itself, a redirect or a slug with
-    /// no page: skipped, not an error.
+    /// `household:` entries naming the page itself or a slug with no page.
     pub dangling_links: usize,
     #[serde(skip)]
     pub conflict_handles: Vec<(String, Vec<String>)>,
@@ -237,6 +236,11 @@ pub fn snapshot(wiki_root: &Path) -> anyhow::Result<PeopleSnapshot> {
 
 /// Replace the cache atomically: readers see the old or the new mapping,
 /// never an empty table.
+///
+/// Every row is rewritten from the wiki, so a cache built before a front-
+/// matter feature existed (#1539) needs no migration step: the daemon's
+/// `people_loop` refresh (immediate at startup, then every 15 minutes) fills
+/// in the new aliases and household links on its own.
 pub fn write_snapshot(store: &Store, snap: &PeopleSnapshot) -> anyhow::Result<()> {
     store.with_conn(|c| {
         c.execute_batch("BEGIN IMMEDIATE")?;
@@ -306,9 +310,8 @@ pub struct PersonMatch {
     pub kind: MatchKind,
     /// `false` when the query was a handle no person page claims.
     pub resolved: bool,
-    /// Newest message exchanged with this person, RFC 3339 (#1539). Filled in
-    /// for ambiguity candidates so the caller can see who is actually current;
-    /// the resolver itself never picks by recency.
+    /// Newest message exchanged with this person, RFC 3339 (#1539): set on
+    /// ambiguity candidates only, and the resolver never picks by recency.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<String>,
 }
@@ -684,50 +687,30 @@ mod tests {
     }
 
     #[test]
-    fn aliases_are_searchable_but_never_reach_the_send_path() {
+    fn aliases_stay_off_the_send_path_and_household_links_go_both_ways() {
         let with = snapshot(pair_wiki(true).path()).unwrap();
-        let without = snapshot(pair_wiki(false).path()).unwrap();
+        let plain = snapshot(pair_wiki(false).path()).unwrap();
         assert_eq!(
             joined(&with.alias_names),
             ["alex-rivera/al", "alex-rivera/lex"]
         );
-        assert_eq!(with.report.aliases, 2);
+        assert!(plain.alias_names.is_empty());
         assert_eq!(
-            with.names, without.names,
+            with.names, plain.names,
             "`names` drives Slack recipient resolution: aliases must stay out"
         );
-        assert!(without.alias_names.is_empty());
+        assert_eq!(
+            joined(&with.links),
+            ["alex-rivera/sam-doe", "sam-doe/alex-rivera"],
+            "one documented direction links both ways"
+        );
+        assert_eq!((with.report.aliases, with.report.links), (2, 1));
+        assert_eq!(with.report.dangling_links, 2, "self-link and ghost slug");
 
         let (_d, s) = store();
         write_snapshot(&s, &with).unwrap();
         s.with_conn(|c| {
-            let m = resolve_person(c, "Lex")?;
-            assert_eq!(m.len(), 1);
-            assert_eq!(
-                (m[0].key.as_str(), m[0].kind),
-                ("alex-rivera", MatchKind::Exact)
-            );
-            Ok(())
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn household_links_are_bidirectional_and_drop_self_and_dangling_entries() {
-        let snap = snapshot(pair_wiki(false).path()).unwrap();
-        assert_eq!(
-            joined(&snap.links),
-            ["alex-rivera/sam-doe", "sam-doe/alex-rivera"],
-            "one documented direction links both ways"
-        );
-        assert_eq!(snap.report.links, 1);
-        assert_eq!(snap.report.dangling_links, 2, "self-link and ghost slug");
-
-        let (_d, s) = store();
-        write_snapshot(&s, &snap).unwrap();
-        s.with_conn(|c| {
-            assert!(linked(c, "sam-doe", "alex-rivera")?);
-            assert!(linked(c, "alex-rivera", "sam-doe")?);
+            assert!(linked(c, "sam-doe", "alex-rivera")? && linked(c, "alex-rivera", "sam-doe")?);
             assert!(!linked(c, "alex-rivera", "sam-park")?);
             Ok(())
         })

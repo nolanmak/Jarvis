@@ -486,10 +486,7 @@ mod tests {
     #[test]
     fn aliases_and_household_accept_list_and_scalar_and_default_empty() {
         let (_d, layout) = layout_with_pages(&[
-            (
-                "alex-rivera",
-                "kind: person\naliases: [Alex, \"Lex\"]\nhousehold:\n  - \"[[sam-doe]]\"\n  - people/kai-doe.md",
-            ),
+            ("alex-rivera", "kind: person\naliases: [Alex, \"Lex\"]\nhousehold:\n  - \"[[sam-doe]]\"\n  - people/kai-doe.md"),
             ("sam-doe", "kind: person\naliases: Sam\nhousehold: alex-rivera"),
             ("pat-lee", "kind: person\nkey: pat-lee"),
         ]);

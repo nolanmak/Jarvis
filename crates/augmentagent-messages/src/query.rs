@@ -7,11 +7,10 @@
 //!
 //! Person references resolve through [`crate::people`]. An ambiguous
 //! reference returns no rows plus the candidates, newest contact first: the
-//! tool never guesses. The one exception is documented pairs (#1539) — when
-//! several names in one query each have a candidate and exactly one pair of
-//! those candidates is linked by `household:` front matter, both references
-//! bind to that pair. Narrowing only ever shrinks a candidate set the owner
-//! already wrote down, so it cannot invent a merge.
+//! tool never guesses. The exception is documented pairs (#1539) — when
+//! exactly one pair of candidates across the query's references is linked by
+//! `household:` front matter, both references bind to that pair. Narrowing
+//! only shrinks a candidate set, so it cannot invent a merge.
 
 use std::collections::BTreeSet;
 
@@ -404,8 +403,7 @@ fn candidates_by_recency(
             .map(|t| t.to_rfc3339());
         dated.push((ts, m));
     }
-    // Stable, so same-recency candidates keep the resolver's own order; a
-    // candidate with no messages at all sorts last.
+    // Stable: ties keep the resolver's order, no-messages candidates sort last.
     dated.sort_by_key(|(ts, _)| std::cmp::Reverse(ts.unwrap_or(i64::MIN)));
     Ok(dated.into_iter().map(|(_, m)| m).collect())
 }
@@ -1245,6 +1243,28 @@ mod tests {
         let r = resp(&s, "with:lex");
         assert!(r.hits.is_empty());
         assert_eq!(r.ambiguous.len(), 1);
+    }
+
+    /// Upgrade path: a deployment whose cache predates #1539 has no links
+    /// table and no alias rows. Opening the store creates the table, and the
+    /// daemon's periodic `resolve_people` refresh rewrites every row — so the
+    /// first refresh after the owner edits front matter is enough.
+    #[test]
+    fn a_pre_existing_cache_picks_up_aliases_and_households_on_refresh() {
+        let (dir, w, old) = housemates("");
+        old.with_conn(|c| c.execute_batch("DROP TABLE message_person_links"))
+            .unwrap();
+        drop(old);
+        let s = Store::open(dir.path().join("t.db")).unwrap();
+        std::fs::write(
+            w.path().join("people/alex-rivera.md"),
+            "---\nkind: person\naliases: Lex\nhousehold: [sam-doe]\n\
+             identities:\n  discord: \"510\"\n---\n",
+        )
+        .unwrap();
+        crate::people::resolve_people(&s, w.path()).unwrap();
+        assert!(resp(&s, "with:alex with:sam").ambiguous.is_empty());
+        assert!(resp(&s, "with:lex").ambiguous.is_empty());
     }
 
     #[test]
