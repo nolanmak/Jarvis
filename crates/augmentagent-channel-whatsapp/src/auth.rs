@@ -20,9 +20,10 @@
 //! daemon boot can confirm a pairing without re-reading the sidecar store.
 //!
 //! For headless / CI loops where the Secret Service backend is unavailable,
-//! `AUGMENTAGENT_WHATSAPP_AUTH` may point at a JSON file with the same shape
-//! — consulted only on `Keychain(NotFound)` (parity with telegram-bot).
+//! `AUGMENTAGENT_WHATSAPP_AUTH` may explicitly select a private JSON file
+//! with the same shape when an OS keyring is unavailable.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -100,26 +101,86 @@ impl WhatsappAuth {
         Ok(())
     }
 
-    /// Keychain first; fall back to the `AUGMENTAGENT_WHATSAPP_AUTH` file
-    /// only when the keychain entry is missing (a corrupt-but-present entry
-    /// surfaces loudly instead of being papered over).
-    pub fn load_with_file_fallback(phone: &str) -> Result<Self, AuthError> {
-        match Self::load_from_keychain(phone) {
-            Ok(a) => Ok(a),
-            Err(AuthError::Keychain(KeychainError::NotFound { .. })) => {
-                if let Some(path) = file_fallback_path() {
-                    let raw = std::fs::read_to_string(&path)?;
-                    let parsed: WhatsappAuth = serde_json::from_str(&raw)?;
-                    parsed.validate()?;
-                    Ok(parsed)
-                } else {
-                    Err(AuthError::Invalid(format!(
-                        "no whatsapp keychain entry for {phone} and \
-                         {ENV_AUTH_OVERRIDE} not set"
-                    )))
-                }
+    /// Atomically write the non-secret device index bundle with private file
+    /// permissions. The actual linked-device keys remain in the Go store.
+    pub fn save_to_file(&self, path: impl AsRef<Path>) -> Result<(), AuthError> {
+        self.validate()?;
+        let path = path.as_ref();
+        if path.exists() {
+            let existing = Self::load_from_file(path)?;
+            if existing.phone != self.phone {
+                return Err(AuthError::Invalid(
+                    "auth file belongs to another phone".into(),
+                ));
             }
-            Err(e) => Err(e),
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| AuthError::Invalid("auth path has no parent".into()))?;
+        std::fs::create_dir_all(parent)?;
+        let temporary = parent.join(format!(".whatsapp-auth-{}.tmp", uuid::Uuid::new_v4()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let result = (|| {
+            let mut file = options.open(&temporary)?;
+            file.write_all(&serde_json::to_vec(self)?)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, path)?;
+            #[cfg(unix)]
+            std::fs::File::open(parent)?.sync_all()?;
+            Ok::<(), AuthError>(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    pub fn save_configured(&self) -> Result<(), AuthError> {
+        match file_fallback_path() {
+            Some(path) => self.save_to_file(path),
+            None => self.save_to_keychain(),
+        }
+    }
+
+    pub fn delete_configured(phone: &str) -> Result<(), AuthError> {
+        if let Some(path) = file_fallback_path() {
+            if path.exists() && Self::load_from_file(&path)?.phone != phone {
+                return Err(AuthError::Invalid(
+                    "auth file belongs to another phone".into(),
+                ));
+            }
+            match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            }
+        } else {
+            match Self::delete_from_keychain(phone) {
+                Err(AuthError::Keychain(KeychainError::NotFound { .. })) => Ok(()),
+                other => other,
+            }
+        }
+    }
+
+    /// An explicit auth-file override takes precedence; otherwise use the
+    /// per-phone keychain slot.
+    pub fn load_with_file_fallback(phone: &str) -> Result<Self, AuthError> {
+        if let Some(path) = file_fallback_path() {
+            let auth = Self::load_from_file(path)?;
+            if auth.phone != phone {
+                return Err(AuthError::Invalid(
+                    "auth file belongs to another phone".into(),
+                ));
+            }
+            Ok(auth)
+        } else {
+            Self::load_from_keychain(phone)
         }
     }
 
@@ -145,6 +206,31 @@ mod tests {
             device_jid: "15559998888:5@s.whatsapp.net".into(),
             user_jid: "15559998888@s.whatsapp.net".into(),
             paired_at_ms: 1776600000000,
+        }
+    }
+
+    #[test]
+    fn auth_file_save_is_private_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        sample().save_to_file(&path).unwrap();
+        let loaded = WhatsappAuth::load_from_file(&path).unwrap();
+        assert_eq!(loaded.phone, sample().phone);
+        assert_eq!(loaded.device_jid, sample().device_jid);
+        let mut another = sample();
+        another.phone = "15550001111".into();
+        assert!(another.save_to_file(&path).is_err());
+        assert_eq!(
+            WhatsappAuth::load_from_file(&path).unwrap().phone,
+            sample().phone
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
     }
 

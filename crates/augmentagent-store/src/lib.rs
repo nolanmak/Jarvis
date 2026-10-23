@@ -51,7 +51,7 @@ pub use models::{
 };
 pub use store::{
     ActionCodeModeFields, ActionWithEmail, BodyCompaction, DiscordConversation, InterruptedDiscordTurn,
-    JournalSyncCursor,
+    JournalSyncCursor, WhatsappOwnerConfig,
     NativeConversation, PendingActionRow, PendingNudge, RetryableReply, RevisionRecord, Store,
     StoreError, StoreResult, SurfaceTurnResolution, SurfaceTurnState, SurfaceTurnStatus,
     NUDGE_INTERVAL_MS,
