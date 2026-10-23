@@ -3792,8 +3792,8 @@ mod tests {
         second.url = format!("{}/second", server.url());
         second.size = second_bytes.len() as u32;
         let id = (uuid::Uuid::new_v4().as_u128() >> 64) as u64;
-        let old = extract_doc_attachments(std::slice::from_ref(&first), id).await;
-        let new = extract_doc_attachments(&[second], id.wrapping_add(1)).await;
+        let old = extract_doc_attachments(std::slice::from_ref(&first), id, None).await;
+        let new = extract_doc_attachments(&[second], id.wrapping_add(1), None).await;
         assert_eq!(old.originals.len(), 1);
         assert_eq!(new.originals.len(), 1);
         assert_ne!(
@@ -3854,7 +3854,7 @@ mod tests {
             .await;
         let mut attachment = att("agreement.pdf", Some("application/pdf"));
         attachment.url = format!("{}/missing", server.url());
-        let result = extract_doc_attachments(&[attachment], 14570001).await;
+        let result = extract_doc_attachments(&[attachment], 14570001, None).await;
         assert!(result.originals.is_empty());
         assert!(result.text.is_empty());
         assert!(result.notices[0].contains("unavailable"));
@@ -3883,7 +3883,7 @@ mod tests {
         attachment.url = format!("{}/doc", server.url());
         attachment.size = bytes.len() as u32;
         let id = (uuid::Uuid::new_v4().as_u128() >> 64) as u64;
-        let result = extract_doc_attachments(&[attachment], id).await;
+        let result = extract_doc_attachments(&[attachment], id, None).await;
         assert_eq!(result.text.len(), 1);
         assert!(result.originals[0].ends_with(format!("aa-doc-{id}-1.pdf")));
         assert_eq!(std::fs::read(&*result.originals[0]).unwrap(), bytes);
