@@ -31,6 +31,13 @@ pub struct PeopleReport {
     /// `16105551234.md` created before the person was named): mapped to the
     /// named page, the same resolution the identity-merge flow proposes.
     pub stub_duplicates_resolved: usize,
+    /// `aliases:` names collected across pages (#1539).
+    pub aliases: usize,
+    /// `household:` links kept, counting each direction once (#1539).
+    pub links: usize,
+    /// `household:` entries naming the page itself, a redirect or a slug with
+    /// no page: skipped, not an error.
+    pub dangling_links: usize,
     #[serde(skip)]
     pub conflict_handles: Vec<(String, Vec<String>)>,
 }
@@ -39,7 +46,15 @@ pub struct PeopleReport {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PeopleSnapshot {
     pub handles: BTreeMap<String, String>,
+    /// `(person_key, normalized name)` from the page slug and its title.
+    /// Deliberately alias-free: the Slack send path resolves recipients from
+    /// this set and must keep naming exactly the people it named before.
     pub names: BTreeSet<(String, String)>,
+    /// `(person_key, normalized alias)` from `aliases:` front matter (#1539).
+    /// Searchable like a name, but only through the message-search cache.
+    pub alias_names: BTreeSet<(String, String)>,
+    /// `(person_key, other_key)` household pairs (#1539), both directions.
+    pub links: BTreeSet<(String, String)>,
     pub report: PeopleReport,
 }
 
@@ -130,11 +145,24 @@ pub fn snapshot(wiki_root: &Path) -> anyhow::Result<PeopleSnapshot> {
     let index = IdentityIndex::build(&WikiLayout::new(wiki_root))?;
     let mut claims: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut names = BTreeSet::new();
+    let mut alias_names = BTreeSet::new();
+    let mut household: Vec<(String, Vec<String>)> = Vec::new();
+    let mut live_slugs: BTreeSet<&str> = BTreeSet::new();
     let mut with_handles = 0usize;
     for page in index.pages() {
         let (redirect, title) = page_meta(&page.path);
         if redirect {
             continue;
+        }
+        live_slugs.insert(page.slug.as_str());
+        for alias in &page.aliases {
+            let n = normalize_name(alias);
+            if !n.is_empty() {
+                alias_names.insert((page.slug.clone(), n));
+            }
+        }
+        if !page.household.is_empty() {
+            household.push((page.slug.clone(), page.household.clone()));
         }
         let hs = identity_handles(&page.identities);
         if !hs.is_empty() {
@@ -172,6 +200,20 @@ pub fn snapshot(wiki_root: &Path) -> anyhow::Result<PeopleSnapshot> {
             conflicts.push((handle, owners.into_iter().collect()));
         }
     }
+    // A link to the page itself, to a redirect, or to a slug with no page is
+    // owner typo territory: drop it rather than fail the whole snapshot.
+    let mut links = BTreeSet::new();
+    let mut dangling = 0usize;
+    for (slug, others) in &household {
+        for other in others {
+            if other == slug || !live_slugs.contains(other.as_str()) {
+                dangling += 1;
+                continue;
+            }
+            links.insert((slug.clone(), other.clone()));
+            links.insert((other.clone(), slug.clone()));
+        }
+    }
     let report = PeopleReport {
         pages: index.len(),
         people_with_handles: with_handles,
@@ -179,11 +221,16 @@ pub fn snapshot(wiki_root: &Path) -> anyhow::Result<PeopleSnapshot> {
         names: names.len(),
         conflicts: conflicts.len(),
         stub_duplicates_resolved: stub_resolved,
+        aliases: alias_names.len(),
+        links: links.len() / 2,
+        dangling_links: dangling,
         conflict_handles: conflicts,
     };
     Ok(PeopleSnapshot {
         handles: map,
         names,
+        alias_names,
+        links,
         report,
     })
 }
@@ -196,6 +243,7 @@ pub fn write_snapshot(store: &Store, snap: &PeopleSnapshot) -> anyhow::Result<()
         let r = (|| {
             c.execute("DELETE FROM message_people", [])?;
             c.execute("DELETE FROM message_person_names", [])?;
+            c.execute("DELETE FROM message_person_links", [])?;
             {
                 let mut ins =
                     c.prepare("INSERT INTO message_people (handle, person_key) VALUES (?1, ?2)")?;
@@ -205,8 +253,14 @@ pub fn write_snapshot(store: &Store, snap: &PeopleSnapshot) -> anyhow::Result<()
                 let mut ins = c.prepare(
                     "INSERT OR IGNORE INTO message_person_names (person_key, name) VALUES (?1, ?2)",
                 )?;
-                for (k, n) in &snap.names {
+                for (k, n) in snap.names.iter().chain(snap.alias_names.iter()) {
                     ins.execute(params![k, n])?;
+                }
+                let mut ins = c.prepare(
+                    "INSERT OR IGNORE INTO message_person_links (person_key, other_key) VALUES (?1, ?2)",
+                )?;
+                for (a, b) in &snap.links {
+                    ins.execute(params![a, b])?;
                 }
             }
             c.execute(
@@ -252,6 +306,11 @@ pub struct PersonMatch {
     pub kind: MatchKind,
     /// `false` when the query was a handle no person page claims.
     pub resolved: bool,
+    /// Newest message exchanged with this person, RFC 3339 (#1539). Filled in
+    /// for ambiguity candidates so the caller can see who is actually current;
+    /// the resolver itself never picks by recency.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<String>,
 }
 
 fn looks_like_handle(q: &str) -> bool {
@@ -317,12 +376,14 @@ pub fn resolve_person(
                 key: k,
                 kind: MatchKind::Handle,
                 resolved: true,
+                last_seen: None,
             },
             None => PersonMatch {
                 key: h,
                 name: None,
                 kind: MatchKind::Handle,
                 resolved: false,
+                last_seen: None,
             },
         }]);
     }
@@ -350,6 +411,7 @@ pub fn resolve_person(
                 name: Some(name),
                 kind: MatchKind::Exact,
                 resolved: true,
+                last_seen: None,
             })
             .collect());
     }
@@ -371,6 +433,7 @@ pub fn resolve_person(
             name: Some(name),
             kind: MatchKind::Partial,
             resolved: true,
+            last_seen: None,
         })
         .collect())
 }
@@ -400,6 +463,42 @@ pub fn handles_for(c: &Connection, key: &str) -> augmentagent_store::rusqlite::R
     } else {
         hs
     })
+}
+
+/// Whether two person keys are documented as sharing a household (#1539).
+pub fn linked(c: &Connection, a: &str, b: &str) -> augmentagent_store::rusqlite::Result<bool> {
+    c.query_row(
+        "SELECT 1 FROM message_person_links WHERE person_key = ?1 AND other_key = ?2",
+        [a, b],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|found| found.is_some())
+}
+
+/// Timestamp of the newest message exchanged with a person, for ordering
+/// ambiguity candidates. `None` when nothing in the index mentions them.
+pub fn last_seen_ms(
+    c: &Connection,
+    key: &str,
+) -> augmentagent_store::rusqlite::Result<Option<i64>> {
+    let hs = handles_for(c, key)?;
+    let marks = (1..=hs.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let bound: Vec<&dyn augmentagent_store::rusqlite::ToSql> = hs
+        .iter()
+        .map(|h| h as &dyn augmentagent_store::rusqlite::ToSql)
+        .collect();
+    c.query_row(
+        &format!(
+            "SELECT MAX(ts_ms) FROM message_index \
+             WHERE sender_handle IN ({marks}) OR counterpart_handle IN ({marks})"
+        ),
+        bound.as_slice(),
+        |r| r.get(0),
+    )
 }
 
 #[cfg(test)]
@@ -566,6 +665,75 @@ mod tests {
         );
     }
 
+    /// Three pages, one documented pair, plus the two household entries that
+    /// must be dropped: a self-link and a slug with no page.
+    fn pair_wiki(aliases: bool) -> tempfile::TempDir {
+        let w = tempfile::tempdir().unwrap();
+        let front = format!(
+            "{}household: [\"[[sam-doe]]\", alex-rivera, ghost-doe]\nidentities:\n  discord: \"510\"\n",
+            if aliases { "aliases: [Lex, \"Al\"]\n" } else { "" }
+        );
+        page(w.path(), "alex-rivera", &front, "");
+        page(w.path(), "sam-doe", "identities:\n  discord: \"610\"\n", "");
+        page(w.path(), "sam-park", "identities:\n  discord: \"620\"\n", "");
+        w
+    }
+
+    fn joined(pairs: &BTreeSet<(String, String)>) -> Vec<String> {
+        pairs.iter().map(|(a, b)| format!("{a}/{b}")).collect()
+    }
+
+    #[test]
+    fn aliases_are_searchable_but_never_reach_the_send_path() {
+        let with = snapshot(pair_wiki(true).path()).unwrap();
+        let without = snapshot(pair_wiki(false).path()).unwrap();
+        assert_eq!(
+            joined(&with.alias_names),
+            ["alex-rivera/al", "alex-rivera/lex"]
+        );
+        assert_eq!(with.report.aliases, 2);
+        assert_eq!(
+            with.names, without.names,
+            "`names` drives Slack recipient resolution: aliases must stay out"
+        );
+        assert!(without.alias_names.is_empty());
+
+        let (_d, s) = store();
+        write_snapshot(&s, &with).unwrap();
+        s.with_conn(|c| {
+            let m = resolve_person(c, "Lex")?;
+            assert_eq!(m.len(), 1);
+            assert_eq!(
+                (m[0].key.as_str(), m[0].kind),
+                ("alex-rivera", MatchKind::Exact)
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn household_links_are_bidirectional_and_drop_self_and_dangling_entries() {
+        let snap = snapshot(pair_wiki(false).path()).unwrap();
+        assert_eq!(
+            joined(&snap.links),
+            ["alex-rivera/sam-doe", "sam-doe/alex-rivera"],
+            "one documented direction links both ways"
+        );
+        assert_eq!(snap.report.links, 1);
+        assert_eq!(snap.report.dangling_links, 2, "self-link and ghost slug");
+
+        let (_d, s) = store();
+        write_snapshot(&s, &snap).unwrap();
+        s.with_conn(|c| {
+            assert!(linked(c, "sam-doe", "alex-rivera")?);
+            assert!(linked(c, "alex-rivera", "sam-doe")?);
+            assert!(!linked(c, "alex-rivera", "sam-park")?);
+            Ok(())
+        })
+        .unwrap();
+    }
+
     #[test]
     fn write_replaces_atomically_and_rebuild_is_identical() {
         let (_d, s) = store();
@@ -578,7 +746,10 @@ mod tests {
         let n1 = count(&s);
         assert_eq!(n1 as usize, first.handles);
         s.with_conn(|c| {
-            c.execute_batch("DELETE FROM message_people; DELETE FROM message_person_names;")
+            c.execute_batch(
+                "DELETE FROM message_people; DELETE FROM message_person_names; \
+                 DELETE FROM message_person_links;",
+            )
         })
         .unwrap();
         resolve_people(&s, w.path()).unwrap();
@@ -587,7 +758,7 @@ mod tests {
         let bad = PeopleSnapshot {
             handles: [("email:x@example.com".to_string(), "x".to_string())].into(),
             names: [("k".to_string(), "dup".to_string())].into(),
-            report: PeopleReport::default(),
+            ..PeopleSnapshot::default()
         };
         s.with_conn(|c| c.execute_batch("DROP TABLE message_person_names"))
             .unwrap();

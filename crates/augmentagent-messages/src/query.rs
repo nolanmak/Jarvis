@@ -6,7 +6,14 @@
 //! typed can change the shape of the SQL or of the FTS expression.
 //!
 //! Person references resolve through [`crate::people`]. An ambiguous
-//! reference returns no rows plus the candidates: the tool never guesses.
+//! reference returns no rows plus the candidates, newest contact first: the
+//! tool never guesses. The one exception is documented pairs (#1539) — when
+//! several names in one query each have a candidate and exactly one pair of
+//! those candidates is linked by `household:` front matter, both references
+//! bind to that pair. Narrowing only ever shrinks a candidate set the owner
+//! already wrote down, so it cannot invent a merge.
+
+use std::collections::BTreeSet;
 
 use augmentagent_store::rusqlite::types::Value as SqlValue;
 use augmentagent_store::rusqlite::{Connection, Row};
@@ -340,27 +347,124 @@ type ResolvedRef = (Vec<String>, bool);
 /// references, references used as raw handles.
 type PlannedQuery = (String, String, Vec<SqlValue>, Vec<Ambiguity>, Vec<String>);
 
-/// Resolve one person reference to its handles. Returns `Err(candidates)`
-/// when the reference is ambiguous.
-fn person_handles(
-    c: &Connection,
-    reference: &str,
-) -> augmentagent_store::rusqlite::Result<Result<ResolvedRef, Vec<PersonMatch>>> {
-    let matches = people::resolve_person(c, reference)?;
-    match matches.len() {
-        0 => Ok(Ok((vec![crate::handles::canonical(reference)], false))),
-        1 => {
-            let m = &matches[0];
-            let resolved = m.resolved;
-            let handles = if m.kind == MatchKind::Handle && !resolved {
-                vec![m.key.clone()]
-            } else {
-                people::handles_for(c, &m.key)?
-            };
-            Ok(Ok((handles, resolved)))
+/// Which filter a resolved reference turns into.
+#[derive(PartialEq, Eq)]
+enum Slot {
+    /// `with:`/`to:` — conversations this person takes part in.
+    Conversation,
+    /// `from:` — messages this person sent.
+    Sender,
+}
+
+/// One person reference with its candidate matches, before narrowing.
+struct PersonRef {
+    reference: String,
+    slot: Slot,
+    matches: Vec<PersonMatch>,
+}
+
+impl PersonRef {
+    /// Handles to filter on. `Err(candidates)` when the reference is still
+    /// ambiguous after narrowing.
+    fn resolve(
+        &self,
+        c: &Connection,
+    ) -> augmentagent_store::rusqlite::Result<Result<ResolvedRef, Vec<PersonMatch>>> {
+        match self.matches.len() {
+            0 => Ok(Ok((
+                vec![crate::handles::canonical(&self.reference)],
+                false,
+            ))),
+            1 => {
+                let m = &self.matches[0];
+                let handles = if m.kind == MatchKind::Handle && !m.resolved {
+                    vec![m.key.clone()]
+                } else {
+                    people::handles_for(c, &m.key)?
+                };
+                Ok(Ok((handles, m.resolved)))
+            }
+            _ => Ok(Err(candidates_by_recency(c, &self.matches)?)),
         }
-        _ => Ok(Err(matches)),
     }
+}
+
+/// Candidates newest-contact-first, each carrying its last-contact timestamp.
+/// Presentation only — nothing downstream picks the head of this list.
+fn candidates_by_recency(
+    c: &Connection,
+    matches: &[PersonMatch],
+) -> augmentagent_store::rusqlite::Result<Vec<PersonMatch>> {
+    let mut dated = Vec::with_capacity(matches.len());
+    for m in matches {
+        let ts = people::last_seen_ms(c, &m.key)?;
+        let mut m = m.clone();
+        m.last_seen = ts
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .map(|t| t.to_rfc3339());
+        dated.push((ts, m));
+    }
+    // Stable, so same-recency candidates keep the resolver's own order; a
+    // candidate with no messages at all sorts last.
+    dated.sort_by_key(|(ts, _)| std::cmp::Reverse(ts.unwrap_or(i64::MIN)));
+    Ok(dated.into_iter().map(|(_, m)| m).collect())
+}
+
+/// Narrow ambiguous references against the household links the owner wrote
+/// down (#1539). A reference binds only when exactly one of its candidates
+/// is linked to a candidate of another reference in the same query; two
+/// competing pairs, or one candidate linked to two partners, leave the
+/// reference ambiguous. Unambiguous references are evidence, never rebound.
+fn narrow_to_households(
+    c: &Connection,
+    refs: &mut [PersonRef],
+) -> augmentagent_store::rusqlite::Result<()> {
+    let mut paired: Vec<BTreeSet<String>> = vec![BTreeSet::new(); refs.len()];
+    for i in 0..refs.len() {
+        for j in (i + 1)..refs.len() {
+            for a in &refs[i].matches {
+                for b in &refs[j].matches {
+                    if a.key != b.key && people::linked(c, &a.key, &b.key)? {
+                        paired[i].insert(a.key.clone());
+                        paired[j].insert(b.key.clone());
+                    }
+                }
+            }
+        }
+    }
+    for (r, keys) in refs.iter_mut().zip(paired) {
+        if r.matches.len() < 2 || keys.len() != 1 {
+            continue;
+        }
+        r.matches.retain(|m| keys.contains(&m.key));
+    }
+    Ok(())
+}
+
+/// Resolve every person reference in the query, then narrow by household.
+fn person_refs(c: &Connection, q: &Query) -> augmentagent_store::rusqlite::Result<Vec<PersonRef>> {
+    let mut refs = Vec::new();
+    let listed = q
+        .with
+        .iter()
+        .chain(q.to.iter())
+        .map(|r| (r, Slot::Conversation))
+        .chain(
+            q.from
+                .iter()
+                // `from:me` is the owner, not a person page.
+                .filter(|r| !r.eq_ignore_ascii_case("me"))
+                .map(|r| (r, Slot::Sender)),
+        );
+    for (reference, slot) in listed {
+        refs.push(PersonRef {
+            matches: people::resolve_person(c, reference)?,
+            reference: reference.clone(),
+            slot,
+        });
+    }
+    narrow_to_households(c, &mut refs)?;
+    Ok(refs)
 }
 
 /// Build the SQL for a parsed query. Every value is bound.
@@ -392,41 +496,27 @@ pub fn plan(
         ));
     };
 
-    for reference in q.with.iter().chain(q.to.iter()) {
-        match person_handles(c, reference)? {
+    for r in person_refs(c, q)? {
+        match r.resolve(c)? {
             Ok((handles, resolved)) => {
                 if !resolved {
-                    unresolved.push(reference.clone());
+                    unresolved.push(r.reference.clone());
                 }
-                conversation_clause(&mut sql, &handles);
+                if r.slot == Slot::Conversation {
+                    conversation_clause(&mut sql, &handles);
+                } else {
+                    let list = sql.in_list(&handles);
+                    sql.filters.push(format!("mi.sender_handle IN ({list})"));
+                }
             }
             Err(candidates) => ambiguous.push(Ambiguity {
-                query: reference.clone(),
+                query: r.reference.clone(),
                 candidates,
             }),
         }
     }
-    if !q.to.is_empty() {
+    if !q.to.is_empty() || q.from.iter().any(|r| r.eq_ignore_ascii_case("me")) {
         sql.filters.push("mi.from_me = 1".into());
-    }
-    for reference in &q.from {
-        if reference.eq_ignore_ascii_case("me") {
-            sql.filters.push("mi.from_me = 1".into());
-            continue;
-        }
-        match person_handles(c, reference)? {
-            Ok((handles, resolved)) => {
-                if !resolved {
-                    unresolved.push(reference.clone());
-                }
-                let list = sql.in_list(&handles);
-                sql.filters.push(format!("mi.sender_handle IN ({list})"));
-            }
-            Err(candidates) => ambiguous.push(Ambiguity {
-                query: reference.clone(),
-                candidates,
-            }),
-        }
     }
     if !q.platforms.is_empty() {
         let list = sql.in_list(&q.platforms);
@@ -1030,6 +1120,155 @@ mod tests {
         let scoped = resp(&s, "in:discord after:2026-01-01");
         assert!(scoped.archive_newest_entry.is_empty());
         assert!(scoped.stale_platforms.is_empty());
+    }
+
+    /// Two Alexes, two Sams, and a group chat with one of each. `front` is
+    /// spliced into `alex-rivera`'s front matter, so the same fixture serves
+    /// as the documented-pair case and as its no-link control.
+    fn housemates(front: &str) -> (tempfile::TempDir, tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        let wiki = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(wiki.path().join("people")).unwrap();
+        let page = |slug: &str, front: &str| {
+            std::fs::write(
+                wiki.path().join(format!("people/{slug}.md")),
+                format!("---\nkind: person\n{front}---\n"),
+            )
+            .unwrap()
+        };
+        page(
+            "alex-rivera",
+            &format!("{front}identities:\n  discord: \"510\"\n"),
+        );
+        page("alex-stone", "identities:\n  discord: \"520\"\n");
+        page("sam-doe", "identities:\n  discord: \"610\"\n");
+        page("sam-park", "identities:\n  discord: \"620\"\n");
+
+        let put = |id: &str, handle: &str, thread: &str, date: &str| {
+            store
+                .upsert_email(&Email {
+                    message_id: id.into(),
+                    thread_id: Some(thread.into()),
+                    from: format!("<discord:{handle}>"),
+                    to: String::new(),
+                    cc: String::new(),
+                    attachments: vec![],
+                    subject: format!("Discord group DM: {thread}"),
+                    body: "who is picking up the keys".into(),
+                    date: date.into(),
+                    account_entity_id: Some("discord:900".into()),
+                    platform: "discord".into(),
+                    kind: "group".into(),
+                })
+                .unwrap();
+        };
+        put("h1", "510", "house-1", "2025-12-10T10:00:00Z");
+        put("h2", "610", "house-1", "2025-12-10T11:00:00Z");
+        // The other Alex and the other Sam talk in a different chat, more
+        // recently — so recency alone would pick the wrong pair.
+        put("o1", "520", "other-1", "2025-12-30T10:00:00Z");
+        put("o2", "620", "other-2", "2025-12-31T10:00:00Z");
+        drain(&store, 100, Duration::ZERO).unwrap();
+        crate::people::resolve_people(&store, wiki.path()).unwrap();
+        (dir, wiki, store)
+    }
+
+    #[test]
+    fn household_pair_narrows_ambiguous_first_names() {
+        let (_d, _w, s) = housemates("household: [sam-doe]\n");
+        let r = resp(&s, "with:alex with:sam");
+        assert!(
+            r.ambiguous.is_empty(),
+            "documented pair must not be ambiguous: {:?}",
+            r.ambiguous
+        );
+        let mut got: Vec<&str> = r.hits.iter().map(|h| h.message_id.as_str()).collect();
+        got.sort();
+        assert_eq!(got, ["h1", "h2"]);
+    }
+
+    #[test]
+    fn without_a_documented_pair_two_first_names_stay_ambiguous() {
+        let (_d, _w, s) = housemates("");
+        let r = resp(&s, "with:alex with:sam");
+        assert!(r.hits.is_empty());
+        assert_eq!(
+            r.ambiguous
+                .iter()
+                .map(|a| a.query.as_str())
+                .collect::<Vec<_>>(),
+            ["alex", "sam"]
+        );
+    }
+
+    #[test]
+    fn narrowing_refuses_when_two_household_pairs_compete() {
+        let (_d, w, s) = housemates("household: [sam-doe]\n");
+        // A second documented pair spanning the same two candidate sets.
+        std::fs::write(
+            w.path().join("people/alex-stone.md"),
+            "---\nkind: person\nhousehold: [sam-park]\nidentities:\n  discord: \"520\"\n---\n",
+        )
+        .unwrap();
+        crate::people::resolve_people(&s, w.path()).unwrap();
+        let r = resp(&s, "with:alex with:sam");
+        assert!(r.hits.is_empty());
+        assert_eq!(r.ambiguous.len(), 2, "two pairs: the owner must choose");
+    }
+
+    #[test]
+    fn a_handle_reference_narrows_its_partner_but_is_never_rebound() {
+        let (_d, _w, s) = housemates("household: [sam-doe]\n");
+        let r = resp(&s, "with:discord:510 with:sam");
+        assert!(r.ambiguous.is_empty());
+        let mut got: Vec<&str> = r.hits.iter().map(|h| h.message_id.as_str()).collect();
+        got.sort();
+        assert_eq!(got, ["h1", "h2"]);
+    }
+
+    #[test]
+    fn an_alias_on_one_page_resolves_exactly() {
+        let (_d, w, s) = housemates("aliases: Lex\n");
+        let r = resp(&s, "with:lex");
+        assert!(r.ambiguous.is_empty());
+        let mut got: Vec<&str> = r.hits.iter().map(|h| h.message_id.as_str()).collect();
+        got.sort();
+        assert_eq!(got, ["h1", "h2"], "both sides of Lex's group chat");
+        // The same alias claimed by a second page is ambiguous, not a merge.
+        std::fs::write(
+            w.path().join("people/alex-stone.md"),
+            "---\nkind: person\naliases: [Lex]\nidentities:\n  discord: \"520\"\n---\n",
+        )
+        .unwrap();
+        crate::people::resolve_people(&s, w.path()).unwrap();
+        let r = resp(&s, "with:lex");
+        assert!(r.hits.is_empty());
+        assert_eq!(r.ambiguous.len(), 1);
+    }
+
+    #[test]
+    fn ambiguity_candidates_are_ordered_by_last_contact() {
+        let (_d, w, s) = housemates("");
+        // A third Alex nobody has messaged: no `last_seen`, so sorts last.
+        std::fs::write(
+            w.path().join("people/alex-nguyen.md"),
+            "---\nkind: person\nidentities:\n  discord: \"530\"\n---\n",
+        )
+        .unwrap();
+        crate::people::resolve_people(&s, w.path()).unwrap();
+        let c = &resp(&s, "with:alex").ambiguous[0].candidates;
+        assert_eq!(
+            c.iter().map(|m| m.key.as_str()).collect::<Vec<_>>(),
+            ["alex-stone", "alex-rivera", "alex-nguyen"]
+        );
+        let seen: Vec<&str> = c
+            .iter()
+            .map(|m| m.last_seen.as_deref().unwrap_or("-"))
+            .collect();
+        assert!(seen[0].starts_with("2025-12-30"), "{seen:?}");
+        assert!(seen[1].starts_with("2025-12-10"), "{seen:?}");
+        assert_eq!(seen[2], "-");
     }
 
     #[test]

@@ -204,6 +204,8 @@ pub fn resolve_recipient(
              instead",
         );
     };
+    // Only `handles` and `names` are read here: the snapshot's `alias_names`
+    // and `links` (#1539) widen message search, never a send recipient.
     let snap = match people::snapshot(wiki) {
         Ok(s) => s,
         Err(e) => return unknown(q, format!("could not read the wiki's people pages: {e}")),
