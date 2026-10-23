@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Remove one optional macOS sidecar job while keeping its state and session.
 set -euo pipefail
-[ "$#" -eq 1 ] || { echo 'usage: uninstall-sidecar.sh renderer|fetch|wa-sidecar' >&2; exit 2; }
+[ "$#" -eq 1 ] || { echo 'usage: uninstall-sidecar.sh renderer|fetch|wa-sidecar|discord-voice|telegram-capture' >&2; exit 2; }
 case "$1" in
-  renderer|fetch|wa-sidecar) ;;
+  renderer|fetch|wa-sidecar|discord-voice|telegram-capture) ;;
   *) echo 'unknown sidecar' >&2; exit 2 ;;
 esac
 [ "$(uname -s)" = Darwin ] || { echo 'sidecar LaunchAgent removal requires macOS' >&2; exit 1; }

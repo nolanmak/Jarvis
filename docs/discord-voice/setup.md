@@ -10,7 +10,7 @@ From the deployment checkout (`~/AugmentAgent` in the supplied user unit):
 
 ```sh
 cd ~/AugmentAgent/sidecars/discord-voice
-npm ci
+bash setup.sh
 npm run typecheck
 npm test
 npm run build
