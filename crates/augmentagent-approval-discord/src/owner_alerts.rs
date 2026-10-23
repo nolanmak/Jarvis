@@ -417,12 +417,9 @@ mod tests {
             ..notice
         };
         let json = serde_json::to_value(message(&notice, UserId::new(123), 4, None)).unwrap();
-        let description = json["embeds"][0]["description"].as_str().unwrap();
-        assert!(description.contains("still open"), "{description}");
-        assert!(
-            description.contains("Mark done / stop reminders"),
-            "{description}"
-        );
+        let heading = json["content"].as_str().unwrap();
+        assert!(heading.contains("still open") && heading.contains("preparation reminders remain"), "{heading}");
+        assert_eq!(json["components"][0]["components"][2]["label"], "Mark done / stop reminders");
     }
     #[test]
     fn persisted_state_strings_are_stable() {
