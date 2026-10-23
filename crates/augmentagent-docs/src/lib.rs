@@ -21,7 +21,9 @@
 //! depends on approval-discord — the pipeline can't live in core without a
 //! dependency cycle.
 
-use std::path::Path;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
@@ -100,15 +102,241 @@ pub fn doc_command_for(kind: DocKind, in_path: &Path) -> (&'static str, Vec<Stri
     }
 }
 
+/// Upper bound for one converter run. A stuck pdftotext/pandoc is killed
+/// and the turn gets an error instead of hanging.
+pub const CONVERT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Directories searched after `PATH`. A launchd job gets
+/// `/usr/bin:/bin:/usr/sbin:/sbin` unless its plist sets `PATH`
+/// (`scripts/lib/launchd-install.sh` does, systemd units do too); these
+/// cover Homebrew on Apple Silicon and Intel and the distro locations when a
+/// service was installed without them.
+pub const SERVICE_TOOL_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
+
+/// How stage 1 finds and bounds its converter.
+#[derive(Debug, Clone)]
+pub struct ConvertOptions {
+    /// `PATH` to search; `None` = only `fallback_dirs`.
+    pub search_path: Option<OsString>,
+    /// Searched after `search_path`, in order.
+    pub fallback_dirs: Vec<PathBuf>,
+    /// `PATH` used to find the DOCX fallback interpreter (#1385). Kept
+    /// separate from `search_path` so a test can prove pandoc is absent
+    /// without also hiding `python3`.
+    pub fallback_search_path: Option<OsString>,
+    /// Searched after `fallback_search_path` for the fallback interpreter.
+    pub fallback_tool_dirs: Vec<PathBuf>,
+    pub timeout: Duration,
+}
+
+impl Default for ConvertOptions {
+    /// The process `PATH`, then [`SERVICE_TOOL_DIRS`], bounded by
+    /// [`CONVERT_TIMEOUT`]. The fallback interpreter is looked up the same
+    /// way.
+    fn default() -> Self {
+        let service_dirs: Vec<PathBuf> = SERVICE_TOOL_DIRS.iter().map(PathBuf::from).collect();
+        Self {
+            search_path: std::env::var_os("PATH"),
+            fallback_dirs: service_dirs.clone(),
+            fallback_search_path: std::env::var_os("PATH"),
+            fallback_tool_dirs: service_dirs,
+            timeout: CONVERT_TIMEOUT,
+        }
+    }
+}
+
+/// First executable regular file named `program` on the search path, then in
+/// the fallback directories.
+pub fn resolve_tool(program: &str, opts: &ConvertOptions) -> Option<PathBuf> {
+    resolve_in(program, opts.search_path.as_deref(), &opts.fallback_dirs)
+}
+
+/// [`resolve_tool`] for the DOCX fallback interpreter, which has its own
+/// search path so it stays independent of the converter lookup (#1385).
+fn resolve_fallback_tool(program: &str, opts: &ConvertOptions) -> Option<PathBuf> {
+    resolve_in(
+        program,
+        opts.fallback_search_path.as_deref(),
+        &opts.fallback_tool_dirs,
+    )
+}
+
+fn resolve_in(program: &str, path: Option<&std::ffi::OsStr>, dirs: &[PathBuf]) -> Option<PathBuf> {
+    let on_path = path
+        .map(|p| std::env::split_paths(p).collect::<Vec<_>>())
+        .unwrap_or_default();
+    on_path
+        .into_iter()
+        .chain(dirs.iter().cloned())
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(program))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_file()
+    }
+}
+
+/// The pandoc/python3 binaries are host packages the agent's own session
+/// cannot install, so their hints name the operator as the actor instead of
+/// handing the caller a `brew`/`apt` line it can never run (#1385).
+/// `pdftotext` keeps its original wording verbatim: the PDF path (and the OCR
+/// stage that reads its error) must stay byte-identical.
+fn install_hint(program: &str) -> &'static str {
+    match program {
+        "pdftotext" => "install poppler (`brew install poppler` on macOS, `apt install poppler-utils` on Linux)",
+        "pandoc" => {
+            "an operator must install pandoc on the host (package: pandoc); \
+             the agent cannot install packages"
+        }
+        "python3" => {
+            "an operator must install python3 on the host (package: python3); \
+             the agent cannot install packages"
+        }
+        _ => "install it",
+    }
+}
+
+fn missing_tool_error(program: &str, dirs: &[PathBuf]) -> anyhow::Error {
+    let dirs: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+    anyhow::anyhow!(
+        "{program} is not installed or not on the service PATH (also looked in {}); {}",
+        if dirs.is_empty() {
+            "no other directories".to_string()
+        } else {
+            dirs.join(", ")
+        },
+        install_hint(program)
+    )
+}
+
+/// Pure-stdlib DOCX text extractor run by `python3` (#1385). A `.docx` is a
+/// zip whose `word/document.xml` holds `<w:p>` paragraphs and `<w:t>` runs, so
+/// a pre-order walk emitting a newline per paragraph recovers readable text
+/// with its paragraph breaks. The script is a constant with nothing
+/// interpolated into it; the document path arrives as a separate argv element.
+pub const DOCX_FALLBACK_SCRIPT: &str = r#"
+import sys, zipfile, xml.etree.ElementTree as ET
+NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+try:
+    with zipfile.ZipFile(sys.argv[1]) as z:
+        xml = z.read('word/document.xml')
+except (zipfile.BadZipFile, KeyError, OSError, ValueError):
+    sys.stderr.write('not a readable .docx: no word/document.xml inside\n')
+    sys.exit(2)
+try:
+    root = ET.fromstring(xml)
+except ET.ParseError:
+    sys.stderr.write('not a readable .docx: word/document.xml is not valid XML\n')
+    sys.exit(2)
+out = []
+for el in root.iter():
+    if el.tag == NS + 'p':
+        out.append('\n')
+    elif el.tag == NS + 't' and el.text:
+        out.append(el.text)
+sys.stdout.write(''.join(out))
+"#;
+
+/// Extract `.docx` text without pandoc, via `python3`'s `zipfile` + `xml`.
+pub async fn docx_fallback_to_text(in_path: &Path, opts: &ConvertOptions) -> anyhow::Result<String> {
+    let Some(binary) = resolve_fallback_tool("python3", opts) else {
+        return Err(missing_tool_error("python3", &opts.fallback_tool_dirs));
+    };
+    let run = tokio::process::Command::new(&binary)
+        .arg("-c")
+        .arg(DOCX_FALLBACK_SCRIPT)
+        .arg(in_path)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let output = match tokio::time::timeout(opts.timeout, run).await {
+        Err(_elapsed) => anyhow::bail!(
+            "the docx fallback timed out after {}s and was stopped",
+            opts.timeout.as_secs_f32()
+        ),
+        Ok(result) => result.map_err(|e| anyhow::anyhow!("spawn python3: {e}"))?,
+    };
+    if !output.status.success() {
+        anyhow::bail!(
+            "the docx fallback could not read word/document.xml: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// Stage 1: shell out to the converter and return the extracted text. Errors
 /// include: binary missing, non-zero exit, unreadable input.
 pub async fn convert_doc_to_text(kind: DocKind, in_path: &Path) -> anyhow::Result<String> {
+    convert_doc_to_text_with(kind, in_path, &ConvertOptions::default()).await
+}
+
+/// [`convert_doc_to_text`] with explicit tool lookup and timeout.
+pub async fn convert_doc_to_text_with(
+    kind: DocKind,
+    in_path: &Path,
+    opts: &ConvertOptions,
+) -> anyhow::Result<String> {
+    let converted = run_converter(kind, in_path, opts).await;
+    // Only DOCX has a pandoc-free path: it is a zip we can read ourselves.
+    // Legacy .doc is a binary OLE2 container with no such shortcut, and the
+    // PDF path must stay byte-identical (OCR hangs off its exact behaviour).
+    let Err(converter_err) = converted else {
+        return converted;
+    };
+    if kind != DocKind::Docx {
+        return Err(converter_err);
+    }
+    match docx_fallback_to_text(in_path, opts).await {
+        Ok(text) => {
+            info!(
+                path = %in_path.display(),
+                "pandoc unavailable; extracted docx text via the zip/XML fallback"
+            );
+            Ok(text)
+        }
+        // One flat message: callers log `{err}`, and both causes matter.
+        Err(fallback_err) => Err(anyhow::anyhow!(
+            "docx extraction failed: {converter_err:#}; and {fallback_err:#}"
+        )),
+    }
+}
+
+async fn run_converter(
+    kind: DocKind,
+    in_path: &Path,
+    opts: &ConvertOptions,
+) -> anyhow::Result<String> {
     let (program, args) = doc_command_for(kind, in_path);
-    let output = tokio::process::Command::new(program)
+    let Some(binary) = resolve_tool(program, opts) else {
+        return Err(missing_tool_error(program, &opts.fallback_dirs));
+    };
+    // kill_on_drop: when the timeout (or a cancelled turn) drops the future,
+    // the converter is killed instead of running on in the background.
+    let run = tokio::process::Command::new(&binary)
         .args(&args)
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("spawn {program}: {e}"))?;
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let output = match tokio::time::timeout(opts.timeout, run).await {
+        Err(_elapsed) => anyhow::bail!(
+            "{program} timed out after {}s and was stopped",
+            opts.timeout.as_secs_f32()
+        ),
+        Ok(result) => result.map_err(|e| anyhow::anyhow!("spawn {program}: {e}"))?,
+    };
     if !output.status.success() {
         anyhow::bail!(
             "{program} exited with {}: {}",
@@ -206,13 +434,23 @@ pub async fn extract_text(
     in_path: &Path,
     ocr: Option<&OcrClient>,
 ) -> anyhow::Result<Extracted> {
+    extract_text_with(kind, in_path, ocr, &ConvertOptions::default()).await
+}
+
+/// [`extract_text`] with explicit converter lookup and timeout (#1293).
+pub async fn extract_text_with(
+    kind: DocKind,
+    in_path: &Path,
+    ocr: Option<&OcrClient>,
+    opts: &ConvertOptions,
+) -> anyhow::Result<Extracted> {
     // A missing input is a caller bug regardless of kind; surface it before
     // the converter produces a confusing "no such file" of its own.
     if !tokio::fs::try_exists(in_path).await.unwrap_or(false) {
         anyhow::bail!("document not found: {}", in_path.display());
     }
 
-    let stage1 = convert_doc_to_text(kind, in_path).await;
+    let stage1 = convert_doc_to_text_with(kind, in_path, opts).await;
 
     if !kind.ocr_eligible() {
         return Ok(Extracted {
@@ -280,3 +518,6 @@ pub fn resolve_api_key(keyring: Option<String>, env: Option<String>) -> Option<S
 }
 
 pub mod delivery;
+pub mod inbound;
+
+pub mod signing;

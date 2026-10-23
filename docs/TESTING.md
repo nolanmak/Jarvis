@@ -12,7 +12,7 @@ daemon state. The Codex fallback contract they verify is in
 | Python bridge, sandbox, VM-snapshot and dependency-proxy suites (`scripts/tests/*_test.py`) | CI, every PR and push to `main` | Nothing. Locally, sandbox tests skip without Landlock ABI 6; in CI they fail |
 | PR gate receipt rules (`scripts/tests/agent-pr-verify-gate.test.sh`) | CI, same job | `jq`, `git` |
 | Privacy scripts, Node build and tests | CI (`privacy.yml`) | Nothing |
-| Rust unit tests | Locally and in the auto-PR gate, per crate. Not in GitHub CI | `cargo` |
+| Rust unit tests | Selected suites in CI, including Code Mode; remaining suites locally and in the auto-PR gate | `cargo`; Code Mode also needs Deno |
 | Real-VM tests (Python and Rust) | Owner-run only | `JARVIS_TEST_VM_CONFIG` and a provisioned runtime |
 | Live provider tests (Rust `#[ignore]`, `live_handoff_discovery_test.py`) | Owner-run only | Claude and/or Codex login. Uses provider quota |
 | Nightly | Nothing is scheduled today | |
@@ -22,14 +22,16 @@ daemon state. The Codex fallback contract they verify is in
 `.github/workflows/bridge-suites.yml` has one job, `bridge-suites`. It runs on
 `ubuntu-latest` for every pull request and every push to `main`:
 
-1. Installs `poppler-utils`, `libseccomp2` and `ripgrep` (apt retries 3 times).
+1. Installs `poppler-utils`, `libseccomp2`, `ripgrep` and `python3-packaging` (apt retries 3 times).
 2. Prints `python3 scripts/tests/host_capabilities.py`, which shows the kernel's
    Landlock ABI and whether the command sandbox and the PDF renderer are usable.
    The job sets `REQUIRE_ENFORCEABLE_SANDBOX=1`, so this step fails when either
    is not.
-3. Fails if any of the four enforcement suites is missing:
-   `codex_tool_bridge_test`, `codex_command_sandbox_test`, `codex_build_vm_test`
-   and `build_dependency_proxy_test`.
+3. Fails if an enforcement or compute suite is missing:
+   `codex_tool_bridge_test`, `codex_command_sandbox_test`, `codex_build_vm_test`,
+   `build_dependency_proxy_test`, `code_mode_compute_test`,
+   `compute_initialization_test`, `qa_code_mode_compute_test`, `compute_ci_test` or
+   `compute_receipt_test`.
 4. From `scripts/`, runs `python3 -m unittest discover -s tests -p '*_test.py' -v`.
 5. Runs `bash scripts/tests/agent-pr-verify-gate.test.sh`.
 
@@ -49,12 +51,46 @@ the sandbox, so a sandbox bug still fails on a host that supports it.
 `scripts/tests/host_capabilities_test.py` pins the switch with a faked report:
 skip when it is off, failure when it is on.
 
-The only tests that skip in CI are the opt-in ones below: 5 `BuildVmTests`, 7
-bridge `test_vm_*` tests and the live discovery test.
+Opt-in real-VM, public-registry and live-provider tests skip in CI. This
+includes compute VM and wheel-preparation fixtures; their acceptance evidence
+must come from the provisioned host. Record actual skip counts and reasons
+from each run instead of treating a CI pass as real-VM coverage.
 
 A failing test fails the job. `main` has no branch protection today, so the job
 blocks a merge only after the owner marks the **`bridge-suites`** check as
 required in the repository's branch protection or ruleset settings.
+
+## CI: `Code Mode`
+
+`.github/workflows/code-mode.yml` runs on every PR and push to `main`. It pins
+Deno 2.7.14 and Rust 1.94.1, installs the trusted host `packaging` parser, and
+runs the same deterministic entrypoint available locally:
+
+```sh
+bash scripts/ci-code-mode.sh
+python3 -m unittest scripts.tests.compute_ci_test -v
+bash scripts/tests/updater-rebuild-trigger.test.sh
+```
+
+The entrypoint requires the Rust/CLI/Deno suite files, propagates command
+failures through log capture, and rejects a successful command that reports
+zero passing tests. It runs compute policy and storage tests, Deno capability
+checks, owner-control and repair tests, CLI contracts, legacy Code Mode and
+CLI dry-run regressions, and the TypeScript sidecar suite. Ignored real-VM
+cases remain separate from this deterministic gate.
+
+The updater regression uses throwaway repositories and stubbed build/service
+commands. It verifies that changes to all three embedded compute Python
+helpers or `sidecars/code-mode-runner/runner.ts` rebuild the binary. Changes
+to the XLSX test fixtures or `runner_test.ts` do not trigger a deployment.
+
+CI does not satisfy AC01–AC18 by itself. Before delivery, run
+`scripts/qa-code-mode-compute.py --require-vm --public-packages --cases all`
+with explicit binary, runtime, scratch and report paths from the isolated
+implementation worktree. Missing prerequisites, failed cases, dirty source,
+changed binaries or incomplete acceptance coverage must remain failures.
+Preserve its report with the final-HEAD receipt; never label skipped VM tests
+as passing acceptance evidence.
 
 ## Owner-run suites
 
@@ -180,6 +216,26 @@ logs and latches there. The synthetic-`HOME` pin test above is the reliable
 check.
 
 ## Receipts
+
+Compute runtime, helper, runner and acceptance-fixture changes require both
+`.claude/agent-test-receipts/<HEAD>.txt` and
+`.claude/agent-test-receipts/<HEAD>.compute.json` before `gh pr create`.
+Copy the **unchanged** `report.json` from a successful
+`qa-code-mode-compute.py --require-vm --public-packages --cases all` run to the
+JSON receipt path after final verification. Keep the human-readable commands,
+counts and observations in the text receipt. Do not commit either private
+receipt or its logs.
+
+`scripts/verify-code-mode-receipt.py <receipt> --head <HEAD>` checks the report
+schema, exact commit, clean source, unchanged binary, runtime fingerprints,
+version evidence, all required command records and the complete AC01–AC18
+map against the current harness. Missing or skipped cases, a partial mode,
+a stale commit, missing VM/public-package requirements, or a forged green
+summary with incomplete case evidence fail. Rebase/amend requires a fresh
+run. A generic text receipt or a refactor note cannot bypass this compute gate.
+These checks detect incomplete evidence; they do not cryptographically attest
+that a manually edited report is authentic. Preserve original harness output.
+
 
 `scripts/agent-pr-verify-gate.sh` blocks `gh pr create` until
 `.claude/agent-test-receipts/<HEAD-sha>.txt` exists when a PR changes one of

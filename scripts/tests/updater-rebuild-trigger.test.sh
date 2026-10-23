@@ -27,6 +27,8 @@ TEST_ONLY_EMBEDS=(
   eval/autopr-cases.json
   eval/last-run.json
   scripts/tests/fixtures/scoped-document.pdf
+  scripts/tests/fixtures/code-mode-compute/numbers.xlsx
+  scripts/tests/fixtures/code-mode-compute/sum-xlsx.ts
   skills/email-triage/SKILL.md
 )
 
@@ -39,13 +41,14 @@ make_case() {
   git clone -q "$TMP/origin.git" "$TMP/work" 2>/dev/null
   mkdir -p "$TMP/work/scripts/lib" "$(dirname "$TMP/work/$path")"
   cp "$REPO_ROOT/scripts/check-for-updates.sh" "$TMP/work/scripts/"
+  printf 'import os, sys; sys.exit(int(os.environ.get("PDF_INSTALL_FAIL", "0")))\n' > "$TMP/work/scripts/pdf-runtime.py"
   cp "$REPO_ROOT/scripts/lib/service-restart.sh" "$TMP/work/scripts/lib/"
-  echo base > "$TMP/work/$path"
+  echo "# base" > "$TMP/work/$path"
   git -C "$TMP/work" add -A
   git -C "$TMP/work" -c user.email=t@e -c user.name=t commit -qm base
   git -C "$TMP/work" push -q origin HEAD:main
   git -C "$TMP/work" branch -q -M main 2>/dev/null || true
-  echo newer > "$TMP/work/$path"
+  echo "# newer" > "$TMP/work/$path"
   git -C "$TMP/work" -c user.email=t@e -c user.name=t commit -qam newer
   git -C "$TMP/work" push -q origin main
   git -C "$TMP/work" reset -q --hard HEAD~1
@@ -120,6 +123,12 @@ expect_rebuild scripts/codex-command-sandbox.py
 expect_rebuild scripts/codex-build-vm.py
 expect_rebuild scripts/build-dependency-proxy.py
 expect_rebuild scripts/provider-supervisor.py
+expect_rebuild scripts/code-mode-compute.py
+expect_rebuild scripts/code-mode-compute-guest.py
+expect_rebuild scripts/code-mode-compute-prepare.py
+expect_rebuild sidecars/code-mode-runner/runner.ts
+expect_rebuild scripts/pdf-runtime.py
+expect_rebuild scripts/run-rs.sh
 expect_rebuild schema/wiki-ask.md
 expect_rebuild .env.example
 
@@ -127,6 +136,9 @@ expect_rebuild .env.example
 expect_no_rebuild docs/BUILD-VM.md
 expect_no_rebuild scripts/check-no-personal-data.sh
 expect_no_rebuild eval/last-run.json
+expect_no_rebuild scripts/tests/fixtures/code-mode-compute/numbers.xlsx
+expect_no_rebuild scripts/tests/fixtures/code-mode-compute/sum-xlsx.ts
+expect_no_rebuild sidecars/code-mode-runner/runner_test.ts
 
 # Drift guard: every include_str!/include_bytes! target outside crates/ in the
 # real tree is either classified test-only above or triggers a rebuild.
@@ -136,6 +148,135 @@ if grep -q 'sidecars/computer-use ci' "$TMP/npm-calls" 2>/dev/null && grep -q 'r
   ok "deploys dependencies and restarts browser worker on sidecar changes"
 else
   bad "deploys dependencies and restarts browser worker on sidecar changes" "sidecar would keep stale code/dependencies"
+fi
+rm -rf "$TMP"
+for sidecar in browser renderer fetch wa-sidecar; do
+  make_case "sidecars/$sidecar/source.fixture"
+  printf '#!/usr/bin/env bash\necho Darwin\n' > "$TMP/bin/uname"
+  chmod +x "$TMP/bin/uname"
+  cat > "$TMP/work/sidecars/$sidecar/setup.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "$PWD" >> "$STUB_DIR/sidecar-build-calls"
+exit 0
+STUB
+  chmod +x "$TMP/work/sidecars/$sidecar/setup.sh"
+  mkdir -p "$TMP/Library/LaunchAgents"
+  label="$sidecar"
+  [ "$sidecar" = browser ] && label=browser-sidecar
+  touch "$TMP/Library/LaunchAgents/com.nolanmak.augmentagent.$label.plist"
+  cat > "$TMP/bin/launchctl" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+  print)
+    pid=100
+    [ -f "$STUB_DIR/sidecar-kicked" ] && pid=101
+    printf '\tstate = running\n\tpid = %s\n' "$pid"
+    ;;
+  kickstart)
+    printf '%s\n' "$*" >> "$STUB_DIR/sidecar-launchctl-calls"
+    touch "$STUB_DIR/sidecar-kicked"
+    ;;
+esac
+STUB
+  chmod +x "$TMP/bin/launchctl"
+  updater_rebuilt || true
+  if grep -q "sidecars/$sidecar" "$TMP/sidecar-build-calls" 2>/dev/null &&
+      grep -q "kickstart -k gui/.*/com.nolanmak.augmentagent.$label" "$TMP/sidecar-launchctl-calls" 2>/dev/null; then
+    ok "rebuilds and restarts installed macOS $sidecar after source update"
+  else
+    bad "rebuilds and restarts installed macOS $sidecar after source update" "missing setup or launchctl kickstart"
+  fi
+  rm -rf "$TMP"
+done
+make_case sidecars/fetch/src/index.ts
+cat > "$TMP/bin/systemctl" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_DIR/service-calls"
+case "$*" in
+  *list-unit-files*) echo 'augmentagent-fetch.service enabled enabled' ;;
+  *show*) [ -s "$STUB_DIR/fetch-pid" ] || echo 100 > "$STUB_DIR/fetch-pid"; cat "$STUB_DIR/fetch-pid" ;;
+  *restart*) echo 101 > "$STUB_DIR/fetch-pid" ;;
+  *is-active*|*cat*) exit 0 ;;
+esac
+STUB
+chmod +x "$TMP/bin/systemctl"
+cat > "$TMP/work/sidecars/fetch/setup.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "$PWD" >> "$STUB_DIR/sidecar-build-calls"
+exit 0
+STUB
+chmod +x "$TMP/work/sidecars/fetch/setup.sh"
+updater_rebuilt || true
+if grep -q 'sidecars/fetch' "$TMP/sidecar-build-calls" 2>/dev/null &&
+    grep -q 'restart augmentagent-fetch.service' "$TMP/service-calls" 2>/dev/null; then
+  ok "rebuilds and restarts an installed Linux fetch sidecar"
+else
+  bad "rebuilds and restarts an installed Linux fetch sidecar" "build=$(cat "$TMP/sidecar-build-calls" 2>/dev/null); services=$(cat "$TMP/service-calls" 2>/dev/null | tail -n 4); update=$(tail -n 3 "$TMP/state/augmentagent/update.log" 2>/dev/null)"
+fi
+rm -rf "$TMP"
+make_case crates/augmentagent-cli/src/installers.rs
+printf '#!/usr/bin/env bash\necho Darwin\n' > "$TMP/bin/uname"
+chmod +x "$TMP/bin/uname"
+mkdir -p "$TMP/Library/LaunchAgents" "$TMP/work/sidecars/browser" "$TMP/work/target/release"
+touch "$TMP/Library/LaunchAgents/com.nolanmak.augmentagent.browser-sidecar.plist"
+cat > "$TMP/work/sidecars/browser/setup.sh" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+cat > "$TMP/work/target/release/augmentagent" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_DIR/browser-install-calls"
+exit 0
+STUB
+cat > "$TMP/bin/launchctl" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+  print)
+    pid=100
+    [ -f "$STUB_DIR/browser-kicked" ] && pid=101
+    printf '\tstate = running\n\tpid = %s\n' "$pid"
+    ;;
+  kickstart) touch "$STUB_DIR/browser-kicked" ;;
+esac
+STUB
+chmod +x "$TMP/work/sidecars/browser/setup.sh" "$TMP/work/target/release/augmentagent" "$TMP/bin/launchctl"
+updater_rebuilt || true
+if grep -q '^install browser-sidecar$' "$TMP/browser-install-calls" 2>/dev/null; then
+  ok "refreshes installed macOS browser plists when the installer changes"
+else
+  bad "refreshes installed macOS browser plists when the installer changes" "old socket path would remain loaded"
+fi
+rm -rf "$TMP"
+make_case sidecars/fetch/src/index.ts
+printf '#!/usr/bin/env bash\necho Darwin\n' > "$TMP/bin/uname"
+chmod +x "$TMP/bin/uname"
+cat > "$TMP/work/sidecars/fetch/setup.sh" <<'STUB'
+#!/usr/bin/env bash
+echo called >> "$STUB_DIR/sidecar-build-calls"
+STUB
+chmod +x "$TMP/work/sidecars/fetch/setup.sh"
+updater_rebuilt || true
+if [ ! -e "$TMP/sidecar-build-calls" ]; then
+  ok "does not rebuild an uninstalled macOS fetch sidecar"
+else
+  bad "does not rebuild an uninstalled macOS fetch sidecar" "optional setup ran without an installed plist"
+fi
+rm -rf "$TMP"
+make_case sidecars/fetch/src/index.ts
+printf '#!/usr/bin/env bash\necho Darwin\n' > "$TMP/bin/uname"
+chmod +x "$TMP/bin/uname"
+mkdir -p "$TMP/Library/LaunchAgents"
+touch "$TMP/Library/LaunchAgents/com.nolanmak.augmentagent.fetch.plist"
+cat > "$TMP/work/sidecars/fetch/setup.sh" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+chmod +x "$TMP/work/sidecars/fetch/setup.sh"
+updater_rebuilt || true
+if [ ! -e "$TMP/state/augmentagent/built-commit" ]; then
+  ok "withholds build stamp when an installed sidecar dependency fails"
+else
+  bad "withholds build stamp when an installed sidecar dependency fails" "a failed setup was marked deployed"
 fi
 rm -rf "$TMP"
 make_case sidecars/computer-use/server.mjs
@@ -177,11 +318,12 @@ else
 fi
 rm -rf "$TMP"
 echo "include drift guard:"
-mapfile -t EMBEDS < <(
+EMBEDS=()
+while IFS= read -r embedded; do EMBEDS+=("$embedded"); done < <(
   cd "$REPO_ROOT" && grep -rnoE 'include_(str|bytes)!\("[^"]*"\)' crates/ \
     | while IFS=: read -r file _line match; do
         rel=$(printf '%s' "$match" | sed -E 's/^include_(str|bytes)!\("//; s/"\)$//')
-        realpath -m --relative-to=. "$(dirname "$file")/$rel"
+        python3 -c 'import os,sys; print(os.path.relpath(os.path.join(os.path.dirname(sys.argv[1]), sys.argv[2])))' "$file" "$rel"
       done | grep -v '^crates/' | sort -u
 )
 [ "${#EMBEDS[@]}" -gt 0 ] && ok "found ${#EMBEDS[@]} embedded files outside crates/" \

@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+augmentagent-phone = { path = "../augmentagent-phone" }
+sha2 = "0.10.9"
 augmentagent-store = { path = "../augmentagent-store" }
 # #176 — `!loops` Discord command reuses the shared /proc walker + signal
 # primitive that backs `augmentagent loops` (#175).
@@ -23,6 +25,9 @@ chrono = { workspace = true }
 # #231 — cron-style /loop scheduling (timezone-aware via IANA db).
 cron = { workspace = true }
 chrono-tz = { workspace = true }
+# #1291 — the host zone's IANA *name* (CoreFoundation on macOS, /etc/localtime
+# on Linux); its rules come from chrono-tz, never from host zoneinfo files.
+iana-time-zone = "0.1"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 dashmap = { workspace = true }
@@ -36,3 +41,5 @@ uuid = { workspace = true }
 tempfile = "3"
 
 [dev-dependencies]
+mockito = "1"
+tracing-subscriber = { workspace = true }

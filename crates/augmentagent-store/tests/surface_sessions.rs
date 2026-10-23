@@ -1,6 +1,6 @@
 use augmentagent_store::{
     DiscordConversation, NativeConversation, Store, SurfaceAccountRef, SurfaceConversationRef,
-    SurfacePlatform, SurfaceTurnRef,
+    SurfacePlatform, SurfaceTurnRef, SurfaceTurnResolution, SurfaceTurnState, SurfaceTurnStatus,
 };
 
 fn chat(platform: &str, account: &str, conversation: &str) -> SurfaceConversationRef {
@@ -163,5 +163,106 @@ fn whatsapp_accounts_and_discord_with_similar_ids_remain_isolated() {
             )
             .unwrap()
         )
+        .is_err());
+}
+
+fn slack_thread(thread: &str) -> SurfaceConversationRef {
+    SurfaceConversationRef::new(
+        SurfaceAccountRef::new(SurfacePlatform::new("slack").unwrap(), "team:T00000001").unwrap(),
+        "C00000001",
+        Some(thread.into()),
+    )
+    .unwrap()
+}
+
+// #1288 — an interrupted or cancelled turn is resolved: the owner was told,
+// so the claim stays (never re-run) but the conversation may take its next
+// turn, which the old `status != complete` gate would refuse forever.
+#[test]
+fn a_resolved_turn_is_never_rerun_but_unblocks_the_next_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state dir \u{fc}").join("data.db");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let store = Store::open(&path).unwrap();
+    let chat = slack_thread("1700000000.000100");
+    let first = SurfaceTurnRef::new(chat.clone(), "turn-1").unwrap();
+    assert_eq!(store.surface_turn_state(&first).unwrap(), None);
+    store.claim_surface_turn(&first).unwrap();
+    assert_eq!(
+        store.surface_turn_state(&first).unwrap(),
+        Some(SurfaceTurnState {
+            status: SurfaceTurnStatus::Pending,
+            resolution: None
+        })
+    );
+    // The daemon died mid-turn: the next turn is refused until resolved.
+    let second = SurfaceTurnRef::new(chat.clone(), "turn-2").unwrap();
+    assert!(store.claim_surface_turn(&second).is_err());
+    drop(store);
+
+    let store = Store::open(&path).unwrap();
+    store
+        .resolve_surface_turn(&first, SurfaceTurnResolution::Interrupted)
+        .unwrap();
+    assert_eq!(
+        store.surface_turn_state(&first).unwrap(),
+        Some(SurfaceTurnState {
+            status: SurfaceTurnStatus::Uncertain,
+            resolution: Some(SurfaceTurnResolution::Interrupted)
+        })
+    );
+    // Resolving twice keeps the first resolution; the turn is still never re-run.
+    store
+        .resolve_surface_turn(&first, SurfaceTurnResolution::Cancelled)
+        .unwrap();
+    assert_eq!(
+        store
+            .surface_turn_state(&first)
+            .unwrap()
+            .unwrap()
+            .resolution,
+        Some(SurfaceTurnResolution::Interrupted)
+    );
+    assert!(store.claim_surface_turn(&first).is_err(), "never re-run");
+    store.claim_surface_turn(&second).unwrap();
+
+    // A cancelled pending turn is resolved the same way.
+    store
+        .resolve_surface_turn(&second, SurfaceTurnResolution::Cancelled)
+        .unwrap();
+    let third = SurfaceTurnRef::new(chat.clone(), "turn-3").unwrap();
+    store.claim_surface_turn(&third).unwrap();
+    store.finish_surface_turn(&third, true).unwrap();
+    assert_eq!(
+        store.surface_turn_state(&third).unwrap().unwrap().status,
+        SurfaceTurnStatus::Complete
+    );
+    // A completed turn has nothing to resolve; an unknown one neither.
+    assert!(store
+        .resolve_surface_turn(&third, SurfaceTurnResolution::Cancelled)
+        .is_err());
+    assert!(store
+        .resolve_surface_turn(
+            &SurfaceTurnRef::new(chat, "never-claimed").unwrap(),
+            SurfaceTurnResolution::Cancelled
+        )
+        .is_err());
+}
+
+// Discord keeps its own uncertain-turn semantics (#1220): its turns cannot
+// be resolved through the surface API, so a Discord conversation with an
+// uncertain turn stays blocked until inspected.
+#[test]
+fn discord_turns_cannot_be_resolved_through_the_surface_api() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("data.db")).unwrap();
+    let discord = chat("discord", "1", "2");
+    let turn = SurfaceTurnRef::new(discord.clone(), "2:1").unwrap();
+    store.claim_surface_turn(&turn).unwrap();
+    assert!(store
+        .resolve_surface_turn(&turn, SurfaceTurnResolution::Interrupted)
+        .is_err());
+    assert!(store
+        .claim_surface_turn(&SurfaceTurnRef::new(discord, "2:2").unwrap())
         .is_err());
 }

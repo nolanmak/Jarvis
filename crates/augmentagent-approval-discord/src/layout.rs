@@ -387,10 +387,10 @@ fn approval_embed_and_rows(
 
     // #927 — a merge card carries evidence, not a draft: nothing to redraft,
     // so Approve (which runs the merge) and Skip are the only verbs offered.
-    if email.kind == "identity_merge" {
+    if email.kind == "identity_merge" || email.platform == "document-signing" {
         let row = CreateActionRow::Buttons(vec![
-            CreateButton::new(CustomId::new(action_id, Verb::Approve).to_string())
-                .label("Approve & Merge")
+            CreateButton::new(CustomId::new(action_id, Verb::Approve).with_revision(draft).to_string())
+                .label(if email.platform == "document-signing" { "Approve & Sign" } else { "Approve & Merge" })
                 .style(ButtonStyle::Success),
             CreateButton::new(CustomId::new(action_id, Verb::Skip).to_string())
                 .label("Skip")
@@ -400,7 +400,7 @@ fn approval_embed_and_rows(
     }
 
     let button_row = CreateActionRow::Buttons(vec![
-        CreateButton::new(CustomId::new(action_id, Verb::Approve).to_string())
+        CreateButton::new(CustomId::new(action_id, Verb::Approve).with_revision(draft).to_string())
             .label("Approve & Send")
             .style(ButtonStyle::Success),
         CreateButton::new(CustomId::new(action_id, Verb::Revise).to_string())
@@ -867,7 +867,7 @@ fn render_marker_line(name: &str, values: &str, hidden: usize) -> String {
 /// and lifts consecutive [`is_envelope_marker_line`] lines, stopping at the
 /// first line that is not one — so a `[to: …]` sitting inside the body stays
 /// body. No trailing markers ⇒ `(draft, "")`, the byte-identical path.
-fn split_trailing_envelope_markers(draft: &str) -> (String, String) {
+pub(crate) fn split_trailing_envelope_markers(draft: &str) -> (String, String) {
     let mut end = draft.trim_end().len();
     let scanned_from = end;
     while end > 0 {
@@ -1327,6 +1327,13 @@ mod tests {
         e.account_entity_id = Some("linkedin:urn123".into());
         let v = json(&approval_message("act-s6", &e, "d", 0));
         assert!(!v.contains("schedule_pick"), "linkedin-entity card gated");
+        // #1375 — an operator-composed LinkedIn card has no entity id at all;
+        // the platform column is the only tell, and it must gate too.
+        let mut e = email();
+        e.platform = "linkedin".into();
+        e.account_entity_id = None;
+        let v = json(&approval_message("act-s6", &e, "d", 0));
+        assert!(!v.contains("schedule_pick"), "linkedin-platform card gated");
     }
 
     #[test]

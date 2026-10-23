@@ -11,7 +11,8 @@ Environment=PYTHONUNBUFFERED=1
 Environment=AUGMENTAGENT_BROWSER_CDP=http://127.0.0.1:9223
 Environment=AUGMENTAGENT_BROWSER_SOCK=%t/augmentagent/browser.sock
 ExecStartPre=/usr/bin/mkdir -p %t/augmentagent
-ExecStart=%h/AugmentAgent/sidecars/browser/.venv/bin/python %h/AugmentAgent/sidecars/browser/sidecar.py
+ExecStartPre=/usr/bin/chmod 700 %t/augmentagent
+ExecStart=%h/AugmentAgent/sidecars/browser/.venv/bin/python %h/AugmentAgent/scripts/start-sidecar.py browser %t/augmentagent/browser.sock %h/AugmentAgent/sidecars/browser/.venv/bin/python %h/AugmentAgent/sidecars/browser/sidecar.py
 Restart=on-failure
 RestartSec=5
 StandardOutput=append:%S/augmentagent/browser-sidecar.log

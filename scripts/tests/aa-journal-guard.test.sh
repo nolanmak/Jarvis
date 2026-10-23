@@ -100,5 +100,27 @@ expect_block "Write a wiki-relative CLAUDE.md from the wiki cwd is blocked" \
 expect_block "Write ../CLAUDE.md escaping the wiki is blocked" \
   Write file_path "../CLAUDE.md"
 
+# macOS readlink lacks GNU -m. Exercise that branch on every host.
+REAL_READLINK=$(command -v readlink)
+export REAL_READLINK
+mkdir "$TMP/portable-bin"
+cat > "$TMP/portable-bin/readlink" <<'SHIM'
+#!/usr/bin/env bash
+if [[ "${1:-}" == -m ]]; then exit 1; fi
+exec "$REAL_READLINK" "$@"
+SHIM
+chmod +x "$TMP/portable-bin/readlink"
+PORTABLE_PATH="$TMP/portable-bin:$PATH"
+ln -s "$REPO" "$WIKI/outside-link"
+ln -s journal "$WIKI/journal-link"
+expect_allow "Without readlink -m ordinary new pages remain writable" \
+  Write file_path "$WIKI/people/new-page.md" PATH="$PORTABLE_PATH"
+expect_block "Without readlink -m an outside symlink remains blocked" \
+  Write file_path "$WIKI/outside-link/notes.md" PATH="$PORTABLE_PATH"
+expect_block "Without readlink -m a journal symlink remains blocked" \
+  Write file_path "$WIKI/journal-link/new-page.md" PATH="$PORTABLE_PATH"
+expect_block "Without readlink -m a protected symlink name remains blocked" \
+  Write file_path "$WIKI/sub/CLAUDE.md" PATH="$PORTABLE_PATH"
+
 printf '\n%d ok, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

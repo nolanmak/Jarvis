@@ -274,6 +274,15 @@ pub fn trusted_request_id(value: &str) -> bool {
             return true;
         }
     }
+    // #1288 — a Slack owner turn: `slack:<team>:<channel>:<ts>` (Slack IDs
+    // are alphanumeric, a ts is digits and one dot).
+    if let Some(rest) = value.strip_prefix("slack:") {
+        return !rest.is_empty()
+            && !rest.contains("..")
+            && rest
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '-' | '_'));
+    }
     value.starts_with("loop:")
         && value.len() > 5
         && value[5..]
@@ -1114,6 +1123,24 @@ mod tests {
         assert!(!trusted_request_id("123:456; evil"));
         assert!(!trusted_request_id("loop:"));
         assert!(!trusted_request_id("person:123"));
+    }
+
+    // #1288 — a Slack owner turn's audit ID (`slack:<team>:<event>`) is a
+    // trusted request ID like a Discord `channel:message`; anything with
+    // characters outside the Slack ID/ts alphabet is not.
+    #[test]
+    fn trusted_request_id_accepts_slack_owner_turns() {
+        assert!(trusted_request_id(
+            "slack:T00000001:D00000001:1700000000.000100"
+        ));
+        assert!(trusted_request_id(
+            "slack:T00000001:mention:C00000001:1700000000.000100"
+        ));
+        assert!(!trusted_request_id("slack:"));
+        assert!(!trusted_request_id("slack:T00000001:D0 1:1"));
+        assert!(!trusted_request_id("slack:T00000001:D01:1;rm"));
+        assert!(!trusted_request_id("slack:T00000001/../x"));
+        assert!(!trusted_request_id(&format!("slack:{}", "A".repeat(100))));
     }
 
     #[test]

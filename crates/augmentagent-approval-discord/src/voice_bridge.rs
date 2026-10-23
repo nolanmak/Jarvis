@@ -665,7 +665,8 @@ impl VoiceBridge {
             channel_id: Some(channel),
             owner_authorized: true,
         };
-        let answer = handler.query.answer_turn(&audit, "", &transcript).await;
+        let answer = crate::interaction::owner_history(true,
+            handler.query.answer_turn(&audit, "", &transcript)).await;
         match answer {
             Ok(answer) => {
                 let final_spoken = handler.query.take_final_spoken(&turn_id);

@@ -299,6 +299,14 @@ pub struct SearchResponse {
     pub ambiguous: Vec<Ambiguity>,
     /// Person references that matched no page and were used as raw handles.
     pub unresolved: Vec<String>,
+    /// Newest message each bundle-backed platform in scope actually holds
+    /// (#1429). Absent for platforms with no archive reader.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub archive_newest_entry: std::collections::BTreeMap<String, Option<String>>,
+    /// Platforms whose archive ends before this query's lower date bound, so
+    /// no hits means "the archive stopped here", not "nothing matched".
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stale_platforms: Vec<String>,
 }
 
 struct Sql {
@@ -535,6 +543,8 @@ pub fn search(
     let q = parse(query)?;
     let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let (rows_sql, count_sql, params, ambiguous, unresolved) = plan(c, &q, limit, offset)?;
+    let archive_newest_entry = crate::archive::newest_entries(c, &q.platforms)?;
+    let stale_platforms = crate::archive::stale_platforms(&archive_newest_entry, q.after);
     if !ambiguous.is_empty() {
         return Ok(SearchResponse {
             hits: Vec::new(),
@@ -543,6 +553,8 @@ pub fn search(
             interpreted_as: q,
             ambiguous,
             unresolved,
+            archive_newest_entry,
+            stale_platforms,
         });
     }
     let bound: Vec<&dyn augmentagent_store::rusqlite::ToSql> = params
@@ -581,6 +593,8 @@ pub fn search(
         interpreted_as: q,
         ambiguous,
         unresolved,
+        archive_newest_entry,
+        stale_platforms,
     })
 }
 
@@ -960,6 +974,62 @@ mod tests {
         seen.dedup();
         assert_eq!(seen.len(), before.len(), "no duplicates across pages");
         assert_eq!(page1.total_estimate, all.len() as i64);
+    }
+
+    /// A WhatsApp archive that stopped on 2025-11-01, the date of `x1`.
+    fn with_stale_whatsapp_archive(s: &Store) {
+        s.set_archive_newest_entry("whatsapp", Some("2025-11-01T08:00:00+00:00"))
+            .unwrap();
+    }
+
+    #[test]
+    fn query_past_the_archive_end_reports_the_cursor_instead_of_a_bare_zero() {
+        let (_d, _w, s) = fixture();
+        with_stale_whatsapp_archive(&s);
+        let r = resp(&s, "in:whatsapp after:2025-12-01");
+        assert_eq!(r.total_estimate, 0);
+        assert_eq!(
+            r.archive_newest_entry.get("whatsapp").cloned().flatten(),
+            Some("2025-11-01T08:00:00+00:00".to_string())
+        );
+        assert_eq!(r.stale_platforms, ["whatsapp"]);
+    }
+
+    #[test]
+    fn in_range_and_unbounded_queries_never_flag_staleness() {
+        let (_d, _w, s) = fixture();
+        with_stale_whatsapp_archive(&s);
+        let in_range = resp(&s, "in:whatsapp after:2025-10-01");
+        assert!(!in_range.hits.is_empty());
+        assert!(in_range.stale_platforms.is_empty());
+        assert!(in_range.archive_newest_entry.contains_key("whatsapp"));
+
+        let unbounded = resp(&s, "in:whatsapp budget");
+        assert!(unbounded.stale_platforms.is_empty());
+        let before_only = resp(&s, "in:whatsapp before:2026-01-01");
+        assert!(before_only.stale_platforms.is_empty());
+    }
+
+    #[test]
+    fn bundle_platform_without_a_poll_yet_reports_a_null_cursor() {
+        let (_d, _w, s) = fixture();
+        let r = resp(&s, "in:whatsapp after:2025-12-01");
+        assert_eq!(r.archive_newest_entry.get("whatsapp"), Some(&None));
+        assert!(r.stale_platforms.is_empty());
+    }
+
+    #[test]
+    fn only_the_stale_platform_in_scope_is_flagged() {
+        let (_d, _w, s) = fixture();
+        with_stale_whatsapp_archive(&s);
+        s.set_archive_newest_entry("imessage", Some("2026-06-01T00:00:00+00:00"))
+            .unwrap();
+        let r = resp(&s, "in:whatsapp,imessage after:2025-12-01");
+        assert_eq!(r.stale_platforms, ["whatsapp"]);
+        // A platform with no bundle reader is absent, not reported stale.
+        let scoped = resp(&s, "in:discord after:2026-01-01");
+        assert!(scoped.archive_newest_entry.is_empty());
+        assert!(scoped.stale_platforms.is_empty());
     }
 
     #[test]

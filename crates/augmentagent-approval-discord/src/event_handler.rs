@@ -7,7 +7,7 @@
 //! Also routes qualifying messages in the query channel (or DMs) to the
 //! `QueryHandler` for wiki-ask answers.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,6 +24,7 @@ use tracing::{debug, info, warn};
 
 // #939 — shared PDF/DOCX → text pipeline (pdftotext, then Mistral OCR for
 // scanned PDFs). Lives in a leaf crate so this crate stays below channel-core.
+use augmentagent_docs::inbound::{self, InboundKind};
 use augmentagent_docs::{extract_text, DocKind, OcrClient};
 
 use crate::broker::BrokerState;
@@ -34,6 +35,10 @@ use crate::layout::{
     split_needs_input, SCHEDULE_CUSTOM_VALUE,
 };
 use crate::ApprovalActionOutcome;
+// #1289 — outcome copy shared with the Slack approval surface.
+use crate::outcome::{describe, offers_recompose, redraft_produced_no_card};
+#[cfg(test)]
+use crate::outcome::resolved_message;
 use crate::voice_bridge::VoiceBinding;
 
 const DISCORD_MSG_LIMIT: usize = 1900;
@@ -292,6 +297,29 @@ impl Handler {
     }
 }
 
+/// #1396 — posted for a turn a daemon restart interrupted. It is not re-run,
+/// because its tools may already have acted.
+pub const INTERRUPTED_TURN_NOTICE: &str = "Jarvis restarted while working on this, so it stopped \
+     part-way and was not run again (it may already have done some of the work). Send it again \
+     if you still need it.";
+
+/// Where to post the notice for an interrupted turn: its channel, and the
+/// message to reply to when the turn is a text turn (`<channel>:<message>`).
+/// Any other turn ID (speech) gets a channel-level notice. `None` only when
+/// the channel itself is not a Discord ID.
+pub fn interrupted_turn_target(
+    turn: &augmentagent_store::InterruptedDiscordTurn,
+) -> Option<(ChannelId, Option<MessageId>)> {
+    let channel = turn.channel_id.parse::<u64>().ok().filter(|id| *id != 0)?;
+    let message = turn
+        .turn_id
+        .strip_prefix(&format!("{}:", turn.channel_id))
+        .and_then(|rest| rest.parse::<u64>().ok())
+        .filter(|id| *id != 0)
+        .map(MessageId::new);
+    Some((ChannelId::new(channel), message))
+}
+
 #[serenity::async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
@@ -320,6 +348,31 @@ impl EventHandler for Handler {
                     }
                 });
             }
+        }
+
+        // #1396 — tell the owner about turns the previous process died on.
+        // They are already closed in the store; drained so a re-identify
+        // does not repeat the notice.
+        let interrupted = std::mem::take(
+            &mut *self.state.interrupted_turns.lock().expect("interrupted turns poisoned"),
+        );
+        if !interrupted.is_empty() {
+            let http = Arc::clone(&ctx.http);
+            tokio::spawn(async move {
+                for turn in interrupted {
+                    let Some((channel, message)) = interrupted_turn_target(&turn) else {
+                        warn!(turn_id = %turn.turn_id, "interrupted Discord turn has no channel to notify");
+                        continue;
+                    };
+                    let mut builder = CreateMessage::new().content(INTERRUPTED_TURN_NOTICE);
+                    if let Some(message) = message {
+                        builder = builder.reference_message(MessageReference::from((channel, message)));
+                    }
+                    if let Err(error) = channel.send_message(&*http, builder).await {
+                        warn!(turn_id = %turn.turn_id, "could not post interrupted-turn notice: {error}");
+                    }
+                }
+            });
         }
 
         // One-shot scrollback sweep: delete approval cards whose actions are
@@ -394,12 +447,27 @@ impl EventHandler for Handler {
         }
 
         let user_text = msg.content.trim().to_string();
+        // #1496: consume phone setup before attachments, history, native turn
+        // claims or model inference, even if the phone adapter is unavailable.
+        let phone_context = crate::phone::PhoneCommandContext {
+            guild_id: msg.guild_id.map(|id| id.get()),
+            bot_user_id: self.state.bot_user_id.get().map(|id| id.get()).unwrap_or(0),
+            channel_id: msg.channel_id.get(),
+            author_id: msg.author.id.get(),
+            message_id: msg.id.get(),
+        };
+        if let Some(reply) = crate::phone::dispatch(handler.as_ref(), &phone_context, &user_text).await {
+            let builder = CreateMessage::new().content(reply)
+                .reference_message(MessageReference::from((msg.channel_id, msg.id)));
+            if msg.channel_id.send_message(&ctx.http, builder).await.is_err() {
+                warn!("failed to post phone command reply");
+            }
+            return;
+        }
         // Model selection is an owner control, never part of the model prompt.
         // This runs after the existing fail-closed allowlist and before any
         // attachment download or history collection.
-        if let Some(reply) = handler.model_command_in_guild(
-            msg.guild_id.map(|guild| guild.get()), msg.channel_id.get(), &user_text
-        ).await {
+        if let Some(reply) = crate::phone::model_command(handler.as_ref(), &phone_context, &user_text).await {
             let builder = CreateMessage::new().content(reply)
                 .reference_message(MessageReference::from((msg.channel_id, msg.id)));
             if let Err(error) = msg.channel_id.send_message(&ctx.http, builder).await {
@@ -411,12 +479,20 @@ impl EventHandler for Handler {
             images,
             text_files,
             docs,
-            rejected,
+            mut rejected,
         } = partition_attachments(&msg.attachments);
+        let compute_enabled = self.state.allowed_user_id.is_some() && msg.guild_id.is_none()
+            && matches!(std::env::var("AUGMENTAGENT_COMPUTE_ENABLED").as_deref(), Ok("true" | "1"));
+        let compute_files: Vec<_> = if compute_enabled {
+            msg.attachments.iter().filter(|a| crate::compute_inputs::eligible(
+                &a.filename, a.content_type.as_deref(), u64::from(a.size))).cloned().collect()
+        } else { Vec::new() };
+        rejected.retain(|rejection| !compute_files.iter().any(|a| a.filename == rejection.filename));
         if user_text.is_empty()
             && images.is_empty()
             && text_files.is_empty()
             && docs.is_empty()
+            && compute_files.is_empty()
         {
             // Rejected-only path: tell the user what was dropped, don't ping
             // the reasoner. Otherwise the message is truly empty — return.
@@ -585,10 +661,22 @@ impl EventHandler for Handler {
             // path treats them uniformly.
             let downloaded_imgs = download_images(&images, msg_id.get()).await;
             let mut downloaded_txts = download_text_files(&text_files, msg_id.get()).await;
-            let extracted_docs = extract_doc_attachments(&docs, msg_id.get()).await;
+            let signable_root = signable_root(wiki_root.as_deref(), allowed_user_id);
+            let extracted_docs = extract_doc_attachments(&docs, msg_id.get(), signable_root).await;
             downloaded_txts.extend(extracted_docs);
 
-            let current = build_prompt(&user_text, &downloaded_imgs, &downloaded_txts);
+            let mut current = build_prompt(&user_text, &downloaded_imgs, &downloaded_txts);
+            let compute_inputs = match crate::compute_inputs::download(&compute_files).await {
+                Ok(inputs) => inputs,
+                Err(_) => {
+                    current.push_str("\nRaw compute attachments could not be imported. Do not claim to have computed results from unavailable inputs.");
+                    None
+                }
+            };
+            let selected = compute_inputs.as_ref().map(|inputs| inputs.files.clone()).unwrap_or_default();
+            if !selected.is_empty() {
+                current.push_str(&format!("\nRaw files selected for computeInputs (alias to original attachment name): {}", serde_json::to_string(&compute_inputs.as_ref().expect("nonempty selection").labels).unwrap_or_default()));
+            }
 
             // #125: Liveness signal. Discord's typing indicator auto-expires
             // after ~10s, so we kick one off immediately and re-broadcast on a
@@ -610,7 +698,9 @@ impl EventHandler for Handler {
             let result = run_with_typing(
                 &http,
                 channel_id,
-                handler.answer_turn(&audit_ctx, &history, &current),
+                crate::interaction::owner_history(
+                    allowed_user_id.is_some() && (is_dm || in_query_channel),
+                    crate::compute_inputs::SELECTED.scope(selected, crate::phone::answer_turn(handler.as_ref(), &phone_context, &audit_ctx, &history, &current))),
             ).await;
             info!(%channel_id, %msg_id, success = result.is_ok(), "discord query completed");
 
@@ -698,10 +788,34 @@ impl EventHandler for Handler {
                 }
             }
             Interaction::Component(comp) => {
+                if comp.data.custom_id.starts_with("oa:") {
+                    if !is_authorized(self.state.allowed_user_id, comp.user.id) {
+                        ack_ephemeral(&ctx,&comp,"Only the configured owner can change this alert.").await;
+                        return;
+                    }
+                    let response=match self.state.store.as_ref() {
+                        Some(store)=>crate::interaction::local_decision(store,
+                            &crate::interaction::DecisionContext { surface:"discord".into(),actor:comp.user.id.to_string(),conversation:comp.channel_id.to_string(),interaction_id:comp.id.to_string(),revision:None },
+                            comp.data.custom_id.rsplit(':').next().unwrap_or(&comp.data.custom_id),
+                            comp.data.custom_id.split(':').nth(1).unwrap_or("unknown"),"owner_alert","Owner alert control",
+                            || crate::owner_alerts::control(store,&comp.data.custom_id,chrono::Utc::now().timestamp_millis()))
+                            .unwrap_or_else(|e|format!("Alert outcome unconfirmed: {e}; check its state before repeating")),
+                        None=>"Alert store unavailable".into(),
+                    };
+                    ack_ephemeral(&ctx,&comp,&response).await;
+                    return;
+                }
                 let Some(cid) = CustomId::parse(&comp.data.custom_id) else {
                     debug!("unrecognized custom_id: {}", comp.data.custom_id);
                     return;
                 };
+                // #1507 — without this line the log cannot say which card a
+                // click landed on; only its side effects were visible.
+                info!(
+                    action_id = %cid.action_id,
+                    verb = cid.verb.as_str(),
+                    "discord card control clicked"
+                );
                 // Enforce user allowlist on clicks.
                 if !is_authorized(self.state.allowed_user_id, comp.user.id) {
                     ack_ephemeral(
@@ -723,26 +837,19 @@ impl EventHandler for Handler {
                             return;
                         }
                         let handler = self.state.action_handler.clone();
+                        let allowed = self.state.allowed_user_id;
                         let action_id = cid.action_id.clone();
                         let ctx_clone = ctx.clone();
                         let comp_clone = comp.clone();
                         tokio::spawn(async move {
-                            let outcome = match handler {
-                                Some(h) => h.approve(&action_id).await,
-                                None => ApprovalActionOutcome::Failed {
-                                    message: "no action handler configured".into(),
-                                },
-                            };
-                            followup_with_recovery(&ctx_clone, &comp_clone, &outcome, &action_id)
-                                .await;
-                            if should_delete_source(&outcome) {
-                                delete_source_message(
-                                    &ctx_clone,
-                                    comp_clone.channel_id,
-                                    comp_clone.message.id,
-                                    &action_id,
-                                )
-                                .await;
+                            let outcome = dispatch_component_approval(&comp_clone, allowed, handler).await;
+                            if let Err(e) = deliver_approval_outcome(
+                                &ctx_clone.http,
+                                &comp_clone,
+                                &outcome,
+                                &action_id,
+                            ).await {
+                                warn!(%action_id, "failed to deliver approval outcome: {e}");
                             }
                         });
                     }
@@ -751,7 +858,11 @@ impl EventHandler for Handler {
                             warn!("failed to defer Skip: {e}");
                             return;
                         }
-                        let handler = self.state.action_handler.clone();
+                        let handler = crate::interaction::contextual(self.state.action_handler.clone(), crate::interaction::DecisionContext {
+                            surface: "discord".into(), actor: comp.user.id.to_string(),
+                            conversation: comp.channel_id.to_string(), interaction_id: comp.id.to_string(),
+                            revision: cid.revision.clone(),
+                        });
                         let action_id = cid.action_id.clone();
                         let ctx_clone = ctx.clone();
                         let comp_clone = comp.clone();
@@ -841,7 +952,11 @@ impl EventHandler for Handler {
                             warn!("failed to defer QuickRefine: {e}");
                             return;
                         }
-                        let handler = self.state.action_handler.clone();
+                        let handler = crate::interaction::contextual(self.state.action_handler.clone(), crate::interaction::DecisionContext {
+                            surface: "discord".into(), actor: comp.user.id.to_string(),
+                            conversation: comp.channel_id.to_string(), interaction_id: comp.id.to_string(),
+                            revision: cid.revision.clone(),
+                        });
                         let action_id = cid.action_id.clone();
                         let approval_channel = self.state.approval_channel_id;
                         let store_for_capture = self.state.store.clone();
@@ -1044,7 +1159,11 @@ impl EventHandler for Handler {
                             warn!("failed to defer SchedulePick: {e}");
                             return;
                         }
-                        let handler = self.state.action_handler.clone();
+                        let handler = crate::interaction::contextual(self.state.action_handler.clone(), crate::interaction::DecisionContext {
+                            surface: "discord".into(), actor: comp.user.id.to_string(),
+                            conversation: comp.channel_id.to_string(), interaction_id: comp.id.to_string(),
+                            revision: cid.revision.clone(),
+                        });
                         let action_id = cid.action_id.clone();
                         let ctx_clone = ctx.clone();
                         let comp_clone = comp.clone();
@@ -1081,7 +1200,11 @@ impl EventHandler for Handler {
                             return;
                         }
                         let verb = cid.verb;
-                        let handler = self.state.action_handler.clone();
+                        let handler = crate::interaction::contextual(self.state.action_handler.clone(), crate::interaction::DecisionContext {
+                            surface: "discord".into(), actor: comp.user.id.to_string(),
+                            conversation: comp.channel_id.to_string(), interaction_id: comp.id.to_string(),
+                            revision: cid.revision.clone(),
+                        });
                         let action_id = cid.action_id.clone();
                         let ctx_clone = ctx.clone();
                         let comp_clone = comp.clone();
@@ -1128,7 +1251,11 @@ impl EventHandler for Handler {
                             warn!("failed to defer Recompose: {e}");
                             return;
                         }
-                        let handler = self.state.action_handler.clone();
+                        let handler = crate::interaction::contextual(self.state.action_handler.clone(), crate::interaction::DecisionContext {
+                            surface: "discord".into(), actor: comp.user.id.to_string(),
+                            conversation: comp.channel_id.to_string(), interaction_id: comp.id.to_string(),
+                            revision: cid.revision.clone(),
+                        });
                         let action_id = cid.action_id.clone();
                         let ctx_clone = ctx.clone();
                         let comp_clone = comp.clone();
@@ -1157,7 +1284,16 @@ impl EventHandler for Handler {
                         let dismissed = matches!(cid.verb, Verb::LoopDismiss);
                         let rows = match self.state.store.as_ref() {
                             Some(store) => {
-                                store.acknowledge_nag_cycle(loop_id, cycle_ms).unwrap_or(0)
+                                match crate::interaction::local_decision(store,
+                                    &crate::interaction::DecisionContext { surface:"discord".into(),actor:comp.user.id.to_string(),conversation:comp.channel_id.to_string(),interaction_id:comp.id.to_string(),revision:None },
+                                    &cid.action_id,cid.verb.as_str(),"loop_reminder","Reminder cycle control",
+                                    || Ok(store.acknowledge_nag_cycle(loop_id,cycle_ms)?)) {
+                                    Ok(rows) => rows,
+                                    Err(_) => {
+                                        ack_ephemeral(&ctx,&comp,"Reminder outcome could not be recorded. Check its state before repeating.").await;
+                                        return;
+                                    }
+                                }
                             }
                             None => 0,
                         };
@@ -1241,7 +1377,11 @@ impl EventHandler for Handler {
                 // Parse failure is an ephemeral followup and the card stays.
                 if matches!(cid.verb, Verb::ScheduleModal) {
                     let input = extract_feedback(&modal.data.components).unwrap_or_default();
-                    let handler = self.state.action_handler.clone();
+                    let handler = crate::interaction::contextual(self.state.action_handler.clone(), crate::interaction::DecisionContext {
+                            surface: "discord".into(), actor: modal.user.id.to_string(),
+                            conversation: modal.channel_id.to_string(), interaction_id: modal.id.to_string(),
+                            revision: cid.revision.clone(),
+                        });
                     let action_id = cid.action_id.clone();
                     let ctx_clone = ctx.clone();
                     let modal_clone = modal.clone();
@@ -1323,7 +1463,11 @@ impl EventHandler for Handler {
                     }
                     _ => extract_feedback(&modal.data.components).unwrap_or_default(),
                 };
-                let handler = self.state.action_handler.clone();
+                let handler = crate::interaction::contextual(self.state.action_handler.clone(), crate::interaction::DecisionContext {
+                            surface: "discord".into(), actor: modal.user.id.to_string(),
+                            conversation: modal.channel_id.to_string(), interaction_id: modal.id.to_string(),
+                            revision: cid.revision.clone(),
+                        });
                 let action_id = cid.action_id.clone();
                 let approval_channel = self.state.approval_channel_id;
                 let store_for_capture = self.state.store.clone();
@@ -1569,17 +1713,122 @@ async fn followup_with_recovery(
     outcome: &ApprovalActionOutcome,
     action_id: &str,
 ) {
+    log_resolved(comp, outcome, action_id);
+    if let Err(e) = comp
+        .create_followup(&ctx.http, approval_followup(outcome, action_id))
+        .await
+    {
+        warn!("failed to send followup: {e}");
+    }
+}
+
+fn approval_followup(
+    outcome: &ApprovalActionOutcome,
+    action_id: &str,
+) -> CreateInteractionResponseFollowup {
     let mut fu = CreateInteractionResponseFollowup::new()
         .content(describe(outcome))
-        .ephemeral(true);
+        .ephemeral(true)
+        .allowed_mentions(serenity::all::CreateAllowedMentions::new());
     if let ApprovalActionOutcome::AlreadyResolved { status, detail } = outcome {
         if offers_recompose(status, detail.as_deref()) {
             fu = fu.components(vec![recompose_button_row(action_id)]);
         }
     }
-    if let Err(e) = comp.create_followup(&ctx.http, fu).await {
-        warn!("failed to send followup: {e}");
+    fu
+}
+
+/// Shared with the local Serenity interaction repro. Authorization and metadata
+/// capture occur before the approver, independently of receipt delivery.
+async fn dispatch_component_approval(
+    comp: &serenity::all::ComponentInteraction,
+    allowed: Option<UserId>,
+    handler: Option<Arc<dyn crate::ApprovalActionHandler>>,
+) -> ApprovalActionOutcome {
+    if !is_authorized(allowed,comp.user.id) {
+        return ApprovalActionOutcome::Failed {message:"Not authorized to approve this action".into()};
     }
+    let Some(cid)=CustomId::parse(&comp.data.custom_id).filter(|c|c.verb==Verb::Approve) else {
+        return ApprovalActionOutcome::Failed {message:"Invalid approval control".into()};
+    };
+    let handler=crate::interaction::contextual(handler,crate::interaction::DecisionContext {
+        surface:"discord".into(),actor:comp.user.id.to_string(),conversation:comp.channel_id.to_string(),
+        interaction_id:comp.id.to_string(),revision:cid.revision,
+    });
+    match handler {
+        Some(handler)=>handler.approve(&cid.action_id).await,
+        None=>ApprovalActionOutcome::Failed {message:"no action handler configured".into()},
+    }
+}
+
+/// The real Approve button's HTTP tail, also exercised with Serenity against
+/// a local Discord API. A failed acknowledgment must not silently consume a card.
+async fn deliver_approval_outcome(
+    http: &Http,
+    comp: &serenity::all::ComponentInteraction,
+    outcome: &ApprovalActionOutcome,
+    action_id: &str,
+) -> Result<(), serenity::Error> {
+    log_resolved(comp, outcome, action_id);
+    let mut followup = approval_followup(outcome, action_id);
+    // #1507 — name the card the click acted on, so a reply can't be mistaken
+    // for another card's (the owner approved a DM thinking it was a signature).
+    if let Some(title) = card_title(&comp.message) {
+        // Embed titles are capped at 256 by Discord; keep well inside the
+        // 2000-char message limit so naming the card can't fail the reply.
+        let title: String = title.chars().take(200).collect();
+        let body: String = describe(outcome).chars().take(1700).collect();
+        followup = followup.content(format!("**{title}** — {body}"));
+    }
+    if let ApprovalActionOutcome::DocumentSigned { output: Some((path, hash)), .. } = outcome {
+        let bytes = augmentagent_docs::signing::verified_output(path, hash)
+            .map_err(|_| serenity::Error::Other("Signed PDF is missing or changed; approval card retained"))?;
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("signed-document.pdf")
+            .to_string();
+        followup = followup.add_file(serenity::all::CreateAttachment::bytes(bytes, name));
+    }
+    comp.create_followup(http, followup).await?;
+    if should_delete_source(outcome) {
+        comp.channel_id.delete_message(http, comp.message.id).await?;
+    }
+    Ok(())
+}
+
+/// The card's embed title (its subject line), if it has one.
+fn card_title(message: &Message) -> Option<&str> {
+    message
+        .embeds
+        .first()
+        .and_then(|e| e.title.as_deref())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+}
+
+/// The outcome variant's name, for logs — never its payload (drafts, PII).
+fn outcome_kind(outcome: &ApprovalActionOutcome) -> String {
+    format!("{outcome:?}")
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// #1507 — one line per resolved card control, pairing with "clicked".
+fn log_resolved(
+    comp: &serenity::all::ComponentInteraction,
+    outcome: &ApprovalActionOutcome,
+    action_id: &str,
+) {
+    let verb = CustomId::parse(&comp.data.custom_id).map(|c| c.verb.as_str());
+    info!(
+        %action_id,
+        verb = verb.unwrap_or("-"),
+        outcome = %outcome_kind(outcome),
+        "discord card control resolved"
+    );
 }
 
 /// Non-deferred immediate ephemeral ack — used only for the authorization
@@ -1604,23 +1853,6 @@ async fn ack_ephemeral(
     }
 }
 
-/// #1190 — did a redraft entry point (Revise/FillAsk modal submit, or the
-/// QuickRefine select) fail to repost a new approval card, leaving the owner
-/// with no durable signal? True for `Failed`/`NotFound`: `revise` returned no
-/// draft, `repost` is `None`, the old card stays, and the ONLY trace is an
-/// ephemeral followup a coincidental 🚩 triage notice can visually displace —
-/// so those two warrant a durable in-channel notice. False for `Revised` (a
-/// fresh card is reposted) and `AlreadyResolved` (the stale card is deleted and
-/// the ephemeral explains why), and false for every other outcome, none of
-/// which a redraft path can produce. Pure so the decision is exhaustively
-/// unit-testable — a new `ApprovalActionOutcome` variant forces a choice here.
-fn redraft_produced_no_card(outcome: &ApprovalActionOutcome) -> bool {
-    matches!(
-        outcome,
-        ApprovalActionOutcome::Failed { .. } | ApprovalActionOutcome::NotFound
-    )
-}
-
 /// #1190 — build the durable no-card notice for a redraft outcome, if one is
 /// warranted. Returns `Some` for exactly the outcomes [`redraft_produced_no_card`]
 /// flags (`Failed`/`NotFound`), and — critically — does so REGARDLESS of whether
@@ -1637,103 +1869,6 @@ fn redraft_no_card_notice(
 ) -> Option<CreateMessage> {
     redraft_produced_no_card(outcome)
         .then(|| revise_failure_notice(snapshot_email, &describe(outcome)))
-}
-
-fn describe(outcome: &ApprovalActionOutcome) -> String {
-    match outcome {
-        ApprovalActionOutcome::NotFound => {
-            "No record of that approval — it may have been cleared.".into()
-        }
-        ApprovalActionOutcome::AlreadyResolved { status, detail } => {
-            resolved_message(status, detail.as_deref())
-        }
-        ApprovalActionOutcome::Approved => "Approved — sending.".into(),
-        ApprovalActionOutcome::Skipped => "Skipped — draft discarded.".into(),
-        ApprovalActionOutcome::Revised { .. } => "Revising — new draft posted below.".into(),
-        ApprovalActionOutcome::Scheduled { local, .. } => {
-            format!("Scheduled — sends {local}.")
-        }
-        ApprovalActionOutcome::Unscheduled => {
-            "Back in the queue — approval card reposted.".into()
-        }
-        ApprovalActionOutcome::CancelledSchedule => {
-            "Schedule cancelled — draft discarded.".into()
-        }
-        ApprovalActionOutcome::Recomposed => {
-            "Recomposed — a fresh approval card is posted below. It won't be \
-             auto-retired again."
-                .into()
-        }
-        ApprovalActionOutcome::Failed { message } => format!("Failed: {message}"),
-    }
-}
-
-/// #1203 — should the #1199 recovery ephemeral carry a one-click **Recompose**
-/// button for this terminal outcome? Pure so it is exhaustively testable; the
-/// serenity button construction stays a thin wrapper over it.
-///
-/// True only for a `superseded` row whose reason is NOT the empty-draft case
-/// (#484: there is literally nothing to recompose — the button would post an
-/// empty card). Every other supersede reason (already replied, bulk sender,
-/// newer version, `stale`, unknown) is a legitimate owner override: they may
-/// still want the drafted reply, so offer the button. The CLI handler defends
-/// the empty-draft edge again (a `stale`-reasoned row could in theory carry an
-/// empty draft), returning `Failed` rather than carding a blank.
-///
-/// False for every non-superseded terminal status and for a `None` detail
-/// (reason unknown → don't guess a draft exists; the owner can act on the
-/// newest card, per the #1199 pointer).
-fn offers_recompose(status: &str, detail: Option<&str>) -> bool {
-    status == "superseded"
-        && detail.is_some_and(|reason| !reason.contains("empty draft body"))
-}
-
-/// #1199 — render a terminal `AlreadyResolved { status, detail }` as
-/// owner-actionable copy. `detail` is the raw `actions.errorMessage` the store
-/// persisted (the specific supersede reason for a `superseded` row; unused for
-/// the other terminal statuses).
-///
-/// Before #1199 every terminal state collapsed to `Already resolved
-/// (superseded).`, which never said *why* the card was gone and offered no
-/// recovery path. Now the reason is surfaced and each class points at the
-/// owner's real next step:
-///   - already replied (reconcile Rule 1 / replied-after-scheduling) → the
-///     thread is handled, nothing to send;
-///   - bulk/automated sender (Rule 2) → no reply was needed;
-///   - empty draft body (Rule 3 / #484) → recompose;
-///   - newer manual reply / follow-up compose / `stale` / unknown reason →
-///     act on the newest card for this thread.
-///
-/// `detail == None` (row gone, or no stored message) falls through to the
-/// "newest card" pointer, which is the safe default for a `superseded` row and
-/// never panics.
-fn resolved_message(status: &str, detail: Option<&str>) -> String {
-    match status {
-        "superseded" => {
-            let reason = detail.unwrap_or_default();
-            if reason.contains("already replied")
-                || reason.contains("replied on this thread after scheduling")
-            {
-                "You already handled this thread, so the draft was retired — nothing left to send."
-                    .into()
-            } else if reason.contains("bulk/automated") {
-                "Retired — bulk/automated sender, no reply needed.".into()
-            } else if reason.contains("empty draft body") {
-                "The draft was empty, so it was cleared — recompose if you meant to reply.".into()
-            } else {
-                // "superseded by manual reply", "superseded by follow-up
-                // compose", "superseded: stale", or any unrecognized reason.
-                "A newer version replaced this draft. Act on the newest card for this thread."
-                    .into()
-            }
-        }
-        "sent" => "Already sent.".into(),
-        "scheduled" => "Already scheduled — see the scheduled notice.".into(),
-        "sending" => "Already sending — a send is in flight.".into(),
-        "skipped" | "rejected" => "Already skipped — draft discarded.".into(),
-        "cancelled" => "Schedule already cancelled.".into(),
-        other => format!("Already resolved ({other})."),
-    }
 }
 
 /// Ephemeral followup on a deferred MODAL interaction (#501). Mirror of
@@ -1879,6 +2014,8 @@ fn should_delete_source(outcome: &ApprovalActionOutcome) -> bool {
     matches!(
         outcome,
         ApprovalActionOutcome::Approved
+            | ApprovalActionOutcome::CalendarCreated { .. }
+            | ApprovalActionOutcome::DocumentSigned { .. }
             | ApprovalActionOutcome::Skipped
             | ApprovalActionOutcome::Revised { .. }
             | ApprovalActionOutcome::AlreadyResolved { .. }
@@ -2068,35 +2205,25 @@ pub async fn edit_card_for_action(
 /// than this are downloaded up to `MAX_DOWNLOAD_BYTES` and truncated to the
 /// first `MAX_TEXT_BYTES` bytes — the prompt annotation marks the file as
 /// `TRUNCATED — first X of Y` so the reasoner knows it has the head only.
-const MAX_TEXT_BYTES: u32 = 1_048_576; // 1 MB (matches serenity's Attachment.size u32)
+/// The policy itself lives in `augmentagent_docs::inbound` (#1293) so every
+/// surface shares it; Discord keeps `u32` because serenity's sizes are `u32`.
+#[cfg(test)]
+const MAX_TEXT_BYTES: u32 = inbound::MAX_TEXT_BYTES as u32; // 1 MB
 
 /// Hard cap on text-file attachment size. Files larger than this are dropped
 /// at filter time so we never spend bandwidth downloading them. Sized to leave
 /// headroom above `MAX_TEXT_BYTES` — files in `MAX_TEXT_BYTES..MAX_DOWNLOAD_BYTES`
 /// are accepted and truncated at write time.
-const MAX_DOWNLOAD_BYTES: u32 = 8 * 1_048_576; // 8 MB
+const MAX_DOWNLOAD_BYTES: u32 = inbound::MAX_DOWNLOAD_BYTES as u32; // 8 MB
 
 /// Extensions we accept as text even when Discord omits `content_type`.
 /// Discord populates `content_type` from the upload, which is unreliable for
 /// code/config files, so we fall back to extension here.
-const TEXT_EXT_ALLOWLIST: &[&str] = &[
-    // plain text & docs
-    "txt", "md", "markdown", "rst", "log",
-    // structured data
-    "json", "yaml", "yml", "toml", "csv", "tsv", "xml",
-    // source code
-    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs",
-    "py", "go", "java", "c", "cc", "cpp", "h", "hpp",
-    "cs", "rb", "php", "swift", "kt", "scala",
-    "sh", "bash", "zsh", "sql",
-    "html", "css", "scss", "less",
-    // config
-    "ini", "conf", "cfg", "properties",
-];
+const TEXT_EXT_ALLOWLIST: &[&str] = inbound::TEXT_EXT_ALLOWLIST;
 
 /// Extensions we refuse to ingest as text even if the MIME type matches.
 /// These are formats that commonly contain credentials.
-const TEXT_EXT_DENYLIST: &[&str] = &["env", "pem", "key", "p12", "pfx"];
+const TEXT_EXT_DENYLIST: &[&str] = inbound::TEXT_EXT_DENYLIST;
 
 /// Identify the doc kind from an attachment's content_type and/or filename
 /// extension. Delegates to the shared pipeline crate (#939) so Discord drops,
@@ -2186,107 +2313,63 @@ struct AttachmentPartition {
 /// dropped by each filter.
 ///
 /// Images are unconditionally accepted (no size/extension gate; matches the
-/// pre-existing image-attachment behavior). The text-file gating logic
-/// mirrors `filter_text_attachments` — kept in sync deliberately rather than
-/// delegated, because the rejection reasons need to be produced inline.
+/// pre-existing image-attachment behavior). The rules are the shared
+/// `augmentagent_docs::inbound::classify` (#1293), which Slack uses too.
 fn partition_attachments(attachments: &[Attachment]) -> AttachmentPartition {
     let mut out = AttachmentPartition::default();
     for a in attachments {
-        if a
-            .content_type
-            .as_deref()
-            .is_some_and(|ct| ct.starts_with("image/"))
-        {
-            out.images.push(a.clone());
-            continue;
-        }
-        let ext = std::path::Path::new(&a.filename)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|s| s.to_lowercase());
-        if let Some(e) = ext.as_deref() {
-            if TEXT_EXT_DENYLIST.contains(&e) {
-                out.rejected.push(RejectedAttachment {
-                    filename: a.filename.clone(),
-                    reason: RejectReason::SecurityDenylist,
-                });
+        let reason = match inbound::classify(&a.filename, a.content_type.as_deref(), u64::from(a.size)) {
+            Ok(InboundKind::Image) => {
+                out.images.push(a.clone());
                 continue;
             }
-        }
-        if a.size > MAX_DOWNLOAD_BYTES {
-            out.rejected.push(RejectedAttachment {
-                filename: a.filename.clone(),
-                reason: RejectReason::Oversize { size: a.size },
-            });
-            continue;
-        }
-        // Doc formats (PDF / DOCX / DOC) get routed through the converter
-        // pipeline before joining text_files for the prompt.
-        if doc_kind_for(a).is_some() {
-            out.docs.push(a.clone());
-            continue;
-        }
-        let is_text_mime = a
-            .content_type
-            .as_deref()
-            .is_some_and(|ct| ct.starts_with("text/"));
-        let is_allowlisted_ext = ext
-            .as_deref()
-            .is_some_and(|e| TEXT_EXT_ALLOWLIST.contains(&e));
-        if is_text_mime || is_allowlisted_ext {
-            out.text_files.push(a.clone());
-        } else {
-            out.rejected.push(RejectedAttachment {
-                filename: a.filename.clone(),
-                reason: RejectReason::UnsupportedType {
-                    content_type: a.content_type.as_deref().map(|s| s.to_string()),
-                    ext,
-                },
-            });
-        }
+            Ok(InboundKind::Doc(_)) => {
+                out.docs.push(a.clone());
+                continue;
+            }
+            Ok(InboundKind::Text) => {
+                out.text_files.push(a.clone());
+                continue;
+            }
+            Err(inbound::RejectReason::SecurityDenylist) => RejectReason::SecurityDenylist,
+            Err(inbound::RejectReason::Oversize { .. }) => RejectReason::Oversize { size: a.size },
+            Err(inbound::RejectReason::UnsupportedType { content_type, ext }) => {
+                RejectReason::UnsupportedType { content_type, ext }
+            }
+            // Only produced by surfaces that download inside the pipeline.
+            Err(inbound::RejectReason::Unavailable(_)) => continue,
+        };
+        out.rejected.push(RejectedAttachment {
+            filename: a.filename.clone(),
+            reason,
+        });
     }
     out
-}
-
-fn format_size(bytes: u32) -> String {
-    const MB: f64 = 1_048_576.0;
-    const KB: f64 = 1024.0;
-    let b = bytes as f64;
-    if b >= MB {
-        format!("{:.1} MB", b / MB)
-    } else if b >= KB {
-        format!("{:.0} KB", b / KB)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 /// Render the rejection footer. Returns `None` if there's nothing to surface,
 /// so callers can use `if let Some(footer) = format_rejection_footer(...)`.
 fn format_rejection_footer(rejected: &[RejectedAttachment]) -> Option<String> {
-    if rejected.is_empty() {
-        return None;
-    }
-    let parts: Vec<String> = rejected
+    let shared: Vec<inbound::Rejected> = rejected
         .iter()
-        .map(|r| match &r.reason {
-            RejectReason::Oversize { size } => format!(
-                "{} ({} > {})",
-                r.filename,
-                format_size(*size),
-                format_size(MAX_DOWNLOAD_BYTES),
-            ),
-            RejectReason::SecurityDenylist => format!("{} (security)", r.filename),
-            RejectReason::UnsupportedType { content_type, ext } => {
-                let detail = content_type
-                    .clone()
-                    .or_else(|| ext.clone())
-                    .unwrap_or_else(|| "unknown".to_string());
-                format!("{} (unsupported: {})", r.filename, detail)
-            }
+        .map(|r| inbound::Rejected {
+            filename: r.filename.clone(),
+            reason: match &r.reason {
+                RejectReason::Oversize { size } => inbound::RejectReason::Oversize {
+                    size: u64::from(*size),
+                    limit: u64::from(MAX_DOWNLOAD_BYTES),
+                },
+                RejectReason::SecurityDenylist => inbound::RejectReason::SecurityDenylist,
+                RejectReason::UnsupportedType { content_type, ext } => {
+                    inbound::RejectReason::UnsupportedType {
+                        content_type: content_type.clone(),
+                        ext: ext.clone(),
+                    }
+                }
+            },
         })
         .collect();
-    Some(format!("\u{26A0}\u{FE0F} skipped: {}", parts.join(", ")))
+    inbound::format_rejection_footer(&shared)
 }
 
 /// Label used to annotate prior turns in conversation history when the user
@@ -2311,33 +2394,7 @@ fn attachment_kind_label(attachments: &[Attachment]) -> &'static str {
 /// extension, otherwise derive from the MIME subtype, otherwise fall back to
 /// `bin`.
 fn extension_for(att: &Attachment) -> String {
-    if let Some(ext) = std::path::Path::new(&att.filename)
-        .extension()
-        .and_then(|e| e.to_str())
-    {
-        if !ext.is_empty() {
-            return ext.to_lowercase();
-        }
-    }
-    if let Some(ct) = att.content_type.as_deref() {
-        if let Some(rest) = ct.strip_prefix("image/") {
-            // image/jpeg → jpg; everything else passes through.
-            let ext = match rest {
-                "jpeg" => "jpg",
-                other => other,
-            };
-            return ext.to_string();
-        }
-        // text/* fallback for the common cases. Only kicks in when the
-        // filename has no extension — otherwise the early-return above wins.
-        match ct {
-            "text/plain" => return "txt".into(),
-            "text/markdown" => return "md".into(),
-            "text/csv" => return "csv".into(),
-            _ => {}
-        }
-    }
-    "bin".into()
+    inbound::extension_for(&att.filename, att.content_type.as_deref())
 }
 
 /// Download each attachment to `/tmp/aa-img-<msg_id>-<idx>.<ext>`. Returns the
@@ -2349,7 +2406,7 @@ async fn download_images(attachments: &[Attachment], msg_id: u64) -> Vec<PathBuf
         let path = PathBuf::from(format!("/tmp/aa-img-{msg_id}-{idx}.{ext}"));
         match reqwest::get(&att.url).await {
             Ok(resp) => match resp.bytes().await {
-                Ok(bytes) => match tokio::fs::write(&path, &bytes).await {
+                Ok(bytes) => match augmentagent_docs::inbound::write_private_attachment(&path, &bytes).await {
                     Ok(()) => out.push(path),
                     Err(e) => warn!("write image tempfile {} failed: {e}", path.display()),
                 },
@@ -2361,32 +2418,15 @@ async fn download_images(attachments: &[Attachment], msg_id: u64) -> Vec<PathBuf
     out
 }
 
-/// A text-file attachment that was downloaded to disk for the reasoner.
-/// `truncated` is true when the file was larger than `MAX_TEXT_BYTES` and we
-/// wrote only the first MB; `original_size` is what Discord reported on the
-/// uploaded attachment.
-#[derive(Debug, Clone)]
-struct DownloadedTextFile {
-    path: PathBuf,
-    truncated: bool,
-    original_size: u32,
-    /// #939 — what the OCR stage did for a converted doc (recovered text /
-    /// unavailable because MISTRAL_API_KEY is unset / failed). Surfaced in
-    /// the prompt so the reasoner never mistakes a scanned PDF's empty
-    /// extraction for an empty document. `None` for plain text files and
-    /// docs whose text layer was fine.
-    note: Option<String>,
-}
+/// A text-file attachment that was downloaded to disk for the reasoner:
+/// the shared representation (#1293). `truncated` is true when the file was
+/// larger than `MAX_TEXT_BYTES`; `original_size` is what Discord reported;
+/// `note` carries the #939 OCR outcome for converted docs.
+type DownloadedTextFile = inbound::TextAttachment;
 
-/// Pure slicing helper for the truncation logic. Extracted so the cap behavior
-/// is unit-testable without standing up a fake HTTP server.
+/// Pure slicing helper for the truncation logic (shared, #1293).
 fn truncate_text_bytes(bytes: &[u8]) -> (&[u8], bool) {
-    let cap = MAX_TEXT_BYTES as usize;
-    if bytes.len() > cap {
-        (&bytes[..cap], true)
-    } else {
-        (bytes, false)
-    }
+    inbound::truncate_text_bytes(bytes)
 }
 
 /// Mirror of `download_images` for text-file attachments. Writes to
@@ -2409,11 +2449,11 @@ async fn download_text_files(
             Ok(resp) => match resp.bytes().await {
                 Ok(bytes) => {
                     let (to_write, truncated) = truncate_text_bytes(&bytes);
-                    match tokio::fs::write(&path, to_write).await {
+                    match augmentagent_docs::inbound::write_private_attachment(&path, to_write).await {
                         Ok(()) => out.push(DownloadedTextFile {
                             path,
                             truncated,
-                            original_size: att.size,
+                            original_size: u64::from(att.size),
                             note: None,
                         }),
                         Err(e) => warn!("write text tempfile {} failed: {e}", path.display()),
@@ -2446,6 +2486,7 @@ async fn download_text_files(
 async fn extract_doc_attachments(
     attachments: &[Attachment],
     msg_id: u64,
+    signable_root: Option<&Path>,
 ) -> Vec<DownloadedTextFile> {
     let mut out = Vec::with_capacity(attachments.len());
     // One key lookup per message, not per attachment. `None` ⇒ OCR skipped.
@@ -2463,10 +2504,16 @@ async fn extract_doc_attachments(
         let out_path = PathBuf::from(format!("/tmp/aa-doc-{msg_id}-{idx}.txt"));
 
         // Download binary.
+        let mut staged: Option<String> = None;
         let download_ok = match reqwest::get(&att.url).await {
             Ok(resp) => match resp.bytes().await {
-                Ok(bytes) => match tokio::fs::write(&in_path, &bytes).await {
-                    Ok(()) => true,
+                Ok(bytes) => match augmentagent_docs::inbound::write_private_attachment(&in_path, &bytes).await {
+                    Ok(()) => {
+                        if let Some(root) = signable_root.filter(|_| matches!(kind, DocKind::Pdf)) {
+                            staged = stage_signable_upload(root, &att.filename, &bytes);
+                        }
+                        true
+                    }
                     Err(e) => {
                         warn!("write doc tempfile {} failed: {e}", in_path.display());
                         false
@@ -2487,13 +2534,16 @@ async fn extract_doc_attachments(
             match extract_text(kind, &in_path, ocr.as_ref()).await {
                 Ok(extracted) => {
                     let text = extracted.text;
-                    let note = extracted.ocr.note();
+                    let note = match (extracted.ocr.note(), staged) {
+                        (Some(ocr), Some(saved)) => Some(format!("{ocr}; {saved}")),
+                        (ocr, saved) => ocr.or(saved),
+                    };
                     if let Some(n) = &note {
                         info!(file = %att.filename, "{n}");
                     }
                     let (to_write, truncated) = truncate_text_bytes(text.as_bytes());
-                    let extracted_len = text.len().min(u32::MAX as usize) as u32;
-                    match tokio::fs::write(&out_path, to_write).await {
+                    let extracted_len = text.len() as u64;
+                    match augmentagent_docs::inbound::write_private_attachment(&out_path, to_write).await {
                         Ok(()) => out.push(DownloadedTextFile {
                             path: out_path,
                             truncated,
@@ -2524,6 +2574,37 @@ async fn extract_doc_attachments(
     out
 }
 
+/// #1507 — only the allowlisted owner's PDFs become signable; with no
+/// allowlist anyone who can message the bot could plant a document for an
+/// Approve & Sign card.
+fn signable_root(wiki_root: Option<&Path>, allowed_user_id: Option<UserId>) -> Option<&Path> {
+    wiki_root.filter(|_| allowed_user_id.is_some())
+}
+
+/// #1507 — keep the owner's original PDF byte-for-byte so it can be signed
+/// as-is. Returns the prompt note naming the staged path, or `None` (logged)
+/// when staging fails; the text extraction still proceeds either way.
+fn stage_signable_upload(root: &Path, filename: &str, bytes: &[u8]) -> Option<String> {
+    let staged = augmentagent_docs::signing::state_root().and_then(|state| {
+        augmentagent_docs::signing::stage_owner_upload(root, &state, filename, bytes)
+    });
+    match staged {
+        Ok(path) => {
+            info!(file = %filename, path = %path.display(), "owner PDF staged for signing");
+            Some(format!(
+                "original PDF saved unchanged at {}; to sign this exact file run `augmentagent doc sign-lines {}` then `augmentagent doc sign {} --out <new-signed.pdf> --page <n> --anchor-text \"<text under the line>\"`",
+                path.display(),
+                path.display(),
+                path.display()
+            ))
+        }
+        Err(e) => {
+            warn!(file = %filename, "stage owner PDF for signing failed: {e:#}");
+            None
+        }
+    }
+}
+
 /// Combine the user's text (possibly empty) with lists of locally-downloaded
 /// image and text-file paths, instructing Claude to use the Read tool to
 /// inspect them. Truncated text files get a marker so the reasoner knows it
@@ -2533,49 +2614,7 @@ fn build_prompt(
     images: &[PathBuf],
     text_files: &[DownloadedTextFile],
 ) -> String {
-    if images.is_empty() && text_files.is_empty() {
-        return user_text.to_string();
-    }
-    let mut s = String::new();
-    if !user_text.is_empty() {
-        s.push_str(user_text);
-        s.push_str("\n\n");
-    }
-    if !images.is_empty() {
-        // `IMAGE:` marker lines are the cross-provider convention defined in
-        // `augmentagent_channel_core::images`: claude Reads the path directly
-        // (scope-guard carve-out for /tmp/aa-img-*), a codex failover turns
-        // each marker into a native `-i` attachment, and text-only providers
-        // replace them with an honest note. The prefix is MIRRORED here as a
-        // literal — this crate must stay free of a channel-core dependency
-        // (channel-core depends on us), same pattern as SOCIALAPI_API_KEY_ENV.
-        s.push_str("[attached images to analyze — open each IMAGE path]\n");
-        for path in images {
-            s.push_str(&format!("IMAGE: {}\n", path.display()));
-        }
-    }
-    if !text_files.is_empty() {
-        s.push_str("[attached text files to read]\n");
-        for f in text_files {
-            s.push_str("- ");
-            s.push_str(&f.path.display().to_string());
-            if f.truncated {
-                s.push_str(&format!(
-                    "  (TRUNCATED — first {} of {})",
-                    format_size(MAX_TEXT_BYTES),
-                    format_size(f.original_size),
-                ));
-            }
-            // #939 — OCR outcome for converted docs (recovered / unavailable /
-            // failed). Nothing is appended when the text layer was fine.
-            if let Some(note) = &f.note {
-                s.push_str(&format!("  ({note})"));
-            }
-            s.push('\n');
-        }
-    }
-    s.push_str("\nUse the Read tool to view each attachment and answer based on them.");
-    s
+    inbound::build_prompt(user_text, images, text_files)
 }
 
 /// Layer a pre-formatted `<conversation_history>` block in front of the
@@ -2613,7 +2652,7 @@ fn is_model_control_text(text: &str) -> bool {
 
 fn history_without_model_controls(turns: &[HistoryTurn]) -> Vec<(&'static str, String)> {
     let control_ids: std::collections::HashSet<u64> = turns.iter()
-        .filter(|turn| turn.role == "user" && is_model_control_text(&turn.body))
+        .filter(|turn| turn.role == "user" && (is_model_control_text(&turn.body) || crate::phone::is_private_control(&turn.body)))
         .map(|turn| turn.id)
         .collect();
     turns.iter()
@@ -2634,14 +2673,25 @@ async fn fetch_conversation_context(
     bot_user_id: Option<UserId>,
     allowed_user_id: Option<UserId>,
 ) -> String {
-    let builder = GetMessages::new().before(before).limit(HISTORY_LIMIT);
-    let messages = match channel_id.messages(&ctx.http, builder).await {
-        Ok(m) => m,
-        Err(e) => {
-            warn!("fetch conversation history failed: {e}");
-            return String::new();
-        }
-    };
+    match fetch_owner_history(&ctx.http, channel_id, Some(before), bot_user_id, allowed_user_id).await {
+        Ok(history) => history,
+        Err(_) => { warn!("fetch conversation history failed"); String::new() }
+    }
+}
+
+/// Shared bounded owner-only history for text and phone session bootstrap.
+/// Private setup controls and their replies use the same filter on both paths.
+pub async fn fetch_owner_history(
+    http: &serenity::http::Http,
+    channel_id: ChannelId,
+    before: Option<MessageId>,
+    bot_user_id: Option<UserId>,
+    allowed_user_id: Option<UserId>,
+) -> anyhow::Result<String> {
+    let mut builder = GetMessages::new().limit(HISTORY_LIMIT);
+    if let Some(before) = before { builder = builder.before(before); }
+    let messages = channel_id.messages(http, builder).await
+        .map_err(|_| anyhow::anyhow!("Discord history unavailable"))?;
 
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2687,7 +2737,7 @@ async fn fetch_conversation_context(
     }
     // `messages` was newest-first; the Vec we built is therefore newest-first too.
     turns.reverse();
-    format_transcript(&history_without_model_controls(&turns), HISTORY_CHAR_CAP)
+    Ok(format_transcript(&history_without_model_controls(&turns), HISTORY_CHAR_CAP))
 }
 
 /// Pure renderer so unit tests don't need a live Discord connection.
@@ -2887,6 +2937,35 @@ fn hard_split(s: &str, max: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #1396 — where the owner is told about a turn a restart interrupted.
+    fn interrupted(channel: &str, turn_id: &str) -> augmentagent_store::InterruptedDiscordTurn {
+        augmentagent_store::InterruptedDiscordTurn {
+            guild_id: "1".into(),
+            channel_id: channel.into(),
+            turn_id: turn_id.into(),
+        }
+    }
+
+    #[test]
+    fn interrupted_text_turn_is_answered_on_its_own_message() {
+        assert_eq!(
+            interrupted_turn_target(&interrupted("42", "42:77")),
+            Some((ChannelId::new(42), Some(MessageId::new(77))))
+        );
+    }
+
+    #[test]
+    fn interrupted_turn_of_any_other_shape_still_gets_a_channel_notice() {
+        for turn_id in ["42:voice-start-77", "speech-9", "43:77", "42:0", ""] {
+            assert_eq!(
+                interrupted_turn_target(&interrupted("42", turn_id)),
+                Some((ChannelId::new(42), None)),
+                "{turn_id}"
+            );
+        }
+        assert_eq!(interrupted_turn_target(&interrupted("not-a-channel", "x")), None);
+    }
     use augmentagent_docs::doc_command_for;
 
     #[test]
@@ -3587,6 +3666,19 @@ mod tests {
     }
 
     #[test]
+    fn private_phone_setup_and_its_replies_never_enter_later_history() {
+        let turns = vec![
+            HistoryTurn { role: "user", body: "phone number set +12025550123".into(), id: 1, reply_to: None },
+            HistoryTurn { role: "assistant", body: "Verification requested".into(), id: 2, reply_to: Some(1) },
+            HistoryTurn { role: "user", body: " /PHONE NUMBER verify 123456 ".into(), id: 3, reply_to: None },
+            HistoryTurn { role: "assistant", body: "Number verified".into(), id: 4, reply_to: Some(3) },
+            HistoryTurn { role: "user", body: "What were we discussing?".into(), id: 5, reply_to: None },
+        ];
+        let history = history_without_model_controls(&turns);
+        assert_eq!(history, vec![("user", "What were we discussing?".into())]);
+    }
+
+    #[test]
     fn transcript_drops_oldest_when_over_cap() {
         let turns = vec![
             ("user", "A".repeat(200)),
@@ -3604,6 +3696,14 @@ mod tests {
     fn transcript_returns_empty_when_nothing_fits() {
         let turns = vec![("user", "x".repeat(10_000))];
         assert_eq!(format_transcript(&turns, 100), "");
+    }
+
+    #[test]
+    fn owner_uploads_are_signable_only_with_an_owner_allowlist() {
+        let wiki = std::path::Path::new("/wiki");
+        assert_eq!(signable_root(Some(wiki), Some(UserId::new(7))), Some(wiki));
+        assert_eq!(signable_root(Some(wiki), None), None, "no allowlist: nothing registered");
+        assert_eq!(signable_root(None, Some(UserId::new(7))), None);
     }
 
     #[test]
@@ -4098,3 +4198,7 @@ mod tests {
         assert_eq!(p.rejected[0].filename, "archive.zip");
     }
 }
+
+#[cfg(test)]
+#[path = "approval_delivery_tests.rs"]
+mod approval_delivery_tests;

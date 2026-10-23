@@ -3,4 +3,3 @@ node_modules/
 .remotion/
 out/
 *.mp4
-package-lock.json

@@ -1,11 +1,11 @@
 import path from "path";
 import fs from "fs";
-import os from "os";
 
 export function fetchRuntimeDir(): string {
+  if (process.platform === "darwin") return path.join("/tmp", `augmentagent-${process.getuid?.() ?? 0}`);
   const xdg = process.env.XDG_RUNTIME_DIR;
   if (xdg && fs.existsSync(xdg)) return path.join(xdg, "augmentagent");
-  return path.join(os.tmpdir(), "augmentagent");
+  return path.join("/tmp", `augmentagent-${process.getuid?.() ?? 0}`);
 }
 
 export function fetchSocketPath(): string {

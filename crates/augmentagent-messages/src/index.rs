@@ -13,7 +13,7 @@ use augmentagent_store::rusqlite::{params, Connection, OptionalExtension};
 use augmentagent_store::Store;
 use serde::Serialize;
 
-use crate::extract::{extract, EmailRowView, OwnerHandles, EXTRACTOR_VERSION};
+use crate::extract::{extract, EmailRowView, IndexFields, OwnerHandles, EXTRACTOR_VERSION};
 use crate::handles;
 
 #[derive(Debug, Default, Serialize, Clone, PartialEq, Eq)]
@@ -232,7 +232,10 @@ fn drain_in_tx(c: &Connection, batch: usize) -> augmentagent_store::rusqlite::Re
             }
             Some(row) => {
                 body_bytes += row.body.len();
-                let f = extract(&row, &owner);
+                let mut f = extract(&row, &owner);
+                if row.platform == "slack" && row.kind != "compose" {
+                    slack_directory(c, &row, &mut f);
+                }
                 upsert.execute(params![
                     row.message_id,
                     f.platform,
@@ -269,6 +272,53 @@ fn drain_in_tx(c: &Connection, batch: usize) -> augmentagent_store::rusqlite::Re
     }
     report.remaining = c.query_row("SELECT COUNT(*) FROM message_index_queue", [], |r| r.get(0))?;
     Ok(report)
+}
+
+/// #1296 — name a Slack conversation from the local directory: the
+/// subscription's display name (kept current on rename) as the title, a
+/// group DM as `group`, and the workspace's name as the container. Tables
+/// that do not exist (a store without Slack) leave the fields as they are.
+fn slack_directory(c: &Connection, row: &EmailRowView, f: &mut IndexFields) {
+    let Some(channel) = row.thread_id.as_deref() else {
+        return;
+    };
+    let team = row
+        .account_entity_id
+        .as_deref()
+        .and_then(|a| a.strip_prefix("slack:team:"));
+    let title: Option<String> = c
+        .query_row(
+            "SELECT display_name FROM channel_subscriptions \
+              WHERE platform = 'slack' AND channel_id = ?1 \
+              ORDER BY (account_id IS ?2) DESC, active DESC, updated_at_ms DESC LIMIT 1",
+            params![channel, team],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .filter(|t: &String| !t.trim().is_empty());
+    if let Some(title) = title {
+        if f.conv_kind != "dm" && (title.starts_with("group DM") || title.starts_with("mpdm-")) {
+            f.conv_kind = "group".into();
+        }
+        f.conversation_title = Some(title);
+    }
+    if let Some(team) = team {
+        let name: Option<String> = c
+            .query_row(
+                "SELECT team_name FROM slack_workspaces WHERE team_id = ?1",
+                params![team],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .filter(|n: &String| !n.trim().is_empty());
+        if let Some(name) = name {
+            f.container = Some(name);
+        }
+    }
 }
 
 pub fn check(store: &Store) -> anyhow::Result<IndexHealth> {

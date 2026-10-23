@@ -20,7 +20,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from apple_notes_sync import sync
+from apple_notes_sync import source_staleness, sync
 from scrub import check_bundle
 
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
@@ -115,6 +115,11 @@ def run(args):
                       s3=uploader(args.s3_bucket, args.aws_profile) if args.s3_bucket else None,
                       media_root=args.media_root)
         print("synced: " + ", ".join(f"{counts[k]} {k}" for k in ("new", "updated", "renamed", "deleted", "unchanged", "skipped")))
+        stale = source_staleness(args.db)
+        if stale:
+            print(f"WARNING: Notes store has not been written for "
+                  f"{stale / 3600:.0f}h — open Notes so it can sync from "
+                  f"iCloud, or this export stays frozen", file=sys.stderr)
         if args.commit:
             commit(args.out, counts, touched)
 

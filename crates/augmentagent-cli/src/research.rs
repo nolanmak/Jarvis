@@ -125,6 +125,48 @@ struct Gap {
     confidence: f64,
     #[serde(default)]
     source: String,
+    /// #1513 — the open research issue this gap already belongs to, when the
+    /// driver recognised one. Such a gap is never filed: its source is added
+    /// to the existing issue instead.
+    #[serde(default)]
+    duplicate_of: Option<u64>,
+}
+
+/// #1513 — an open issue the driver is shown so it does not re-propose it.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub(crate) struct OpenIssue {
+    pub(crate) number: u64,
+    pub(crate) title: String,
+}
+
+/// #1513 — what the filing loop does with one ranked gap.
+#[derive(Debug, PartialEq, Eq)]
+enum Filing {
+    /// New: file it.
+    File,
+    /// The driver says an open issue already covers it: note the source there.
+    Extends(u64),
+    /// The driver claimed a duplicate of an issue that is not open: file it,
+    /// the claim is stale or invented.
+    FileDespiteClaim(u64),
+    /// #366 — a near-identical title is already open.
+    DuplicateTitle,
+}
+
+/// The decision for one gap, pure so it is testable: the driver's
+/// `duplicate_of` wins when it names an OPEN research issue; a claim naming
+/// anything else is ignored rather than trusted, since the driver can only
+/// know the numbers it was shown; then the lexical title check.
+fn filing_decision(gap: &Gap, open_research: &[OpenIssue], open_titles: &[String]) -> Filing {
+    if let Some(n) = gap.duplicate_of {
+        if open_research.iter().any(|o| o.number == n) {
+            return Filing::Extends(n);
+        }
+    }
+    if title_is_duplicate(&gap.title, open_titles) {
+        return Filing::DuplicateTitle;
+    }
+    gap.duplicate_of.map_or(Filing::File, Filing::FileDespiteClaim)
 }
 
 #[derive(Debug, Deserialize)]
@@ -224,14 +266,21 @@ pub(crate) async fn run_research(
         let msg = "🔬 **Daily research** — nothing new on arXiv or leapmodel in the window.";
         println!("{msg}");
         if post_discord {
-            crate::post_digest_to_discord(msg).await?;
+            crate::notify::notify_owner(crate::notify::Notice::new("research_digest", msg))
+                .await
+                .into_result()?;
         }
         return Ok(());
     }
 
     // --- D. Reason via the swappable LLM driver. ----------------------------
+    // #1513 — the driver sees what is already open, so a paper that
+    // strengthens an existing ask extends that issue instead of becoming
+    // the fourth issue for one mechanism. Fetched in dry runs too: a dry run
+    // is how the dedup is previewed.
+    let open_research = fetch_open_research_issues(&cfg).await;
     let our_process = load_our_process();
-    let prompt = build_prompt(&fresh, &commits, &our_process);
+    let prompt = build_prompt(&fresh, &commits, &our_process, &open_research);
     let gaps = match run_llm_driver(&cfg.llm_cmd, &prompt).await {
         Ok(g) => g,
         Err(e) => {
@@ -255,29 +304,49 @@ pub(crate) async fn run_research(
     // a near-duplicate of something already open. The daily pipeline had been
     // filing ~identical issues (e.g. the code-mode postmortems). Best-effort: a
     // gh failure yields an empty list and filing proceeds exactly as before.
-    let open_titles = if dry_run {
-        Vec::new()
-    } else {
-        fetch_open_issue_titles(&cfg).await
-    };
+    // Read-only, so a dry run fetches too (#1513): the preview must show the
+    // same dedup decisions a live run would make.
+    let open_titles = fetch_open_issue_titles(&cfg).await;
     let mut created: Vec<(u64, String)> = Vec::new();
     let mut also_noted: Vec<String> = Vec::new();
     for (i, gap) in ranked.iter().enumerate() {
         if i < cap {
             if dry_run {
+                let what = match filing_decision(gap, &open_research, &open_titles) {
+                    Filing::File => "would file".to_string(),
+                    Filing::FileDespiteClaim(n) => format!("would file; driver's duplicate_of #{n} is not open"),
+                    Filing::Extends(n) => format!("would extend #{n}, not file"),
+                    Filing::DuplicateTitle => "would skip: near-duplicate title already open".to_string(),
+                };
                 info!(
                     title = %gap.title,
                     confidence = gap.confidence,
-                    "research: [dry-run] would file issue"
+                    "research: [dry-run] {what}"
                 );
-                also_noted.push(format!("(dry-run) {}", gap.title));
-            } else if title_is_duplicate(&gap.title, &open_titles) {
-                info!(
-                    title = %gap.title,
-                    "research: skipped filing — near-duplicate of an already-open issue (#366)"
-                );
-                also_noted.push(format!("(duplicate of an open issue, not filed) {}", gap.title));
+                also_noted.push(format!("(dry-run: {what}) {}", gap.title));
             } else {
+                match filing_decision(gap, &open_research, &open_titles) {
+                    Filing::DuplicateTitle => {
+                        info!(
+                            title = %gap.title,
+                            "research: skipped filing — near-duplicate of an already-open issue (#366)"
+                        );
+                        also_noted.push(format!("(duplicate of an open issue, not filed) {}", gap.title));
+                        continue;
+                    }
+                    Filing::Extends(n) => {
+                        info!(title = %gap.title, issue = n, "research: extends an open issue (#1513)");
+                        if let Err(e) = comment_extends(&cfg, n, gap).await {
+                            warn!("research: could not note the new source on #{n}: {e:#}");
+                        }
+                        also_noted.push(format!("(extends #{n}, not filed) {}", gap.title));
+                        continue;
+                    }
+                    Filing::FileDespiteClaim(n) => {
+                        warn!(title = %gap.title, claimed = n, "research: driver named a non-open issue as duplicate; filing");
+                    }
+                    Filing::File => {}
+                }
                 match create_issue(&cfg, gap).await {
                     Ok(num) => {
                         info!(issue = num, title = %gap.title, "research: filed issue");
@@ -298,10 +367,15 @@ pub(crate) async fn run_research(
     let digest = build_digest(&cfg, &fresh, &commits, &created, &also_noted, dry_run);
     println!("{digest}");
     if post_discord {
-        crate::post_digest_to_discord(&digest)
-            .await
-            .context("posting research digest to Discord")?;
-        info!("research: digest posted to Discord");
+        // #1295 — to Discord and/or Slack per AUGMENTAGENT_NOTIFY_SURFACES.
+        crate::notify::notify_owner(crate::notify::Notice::new(
+            "research_digest",
+            digest.clone(),
+        ))
+        .await
+        .into_result()
+        .context("posting research digest")?;
+        info!("research: digest delivered");
     }
 
     Ok(())
@@ -495,7 +569,12 @@ fn read_truncated(path: &str, max: usize) -> Option<String> {
     }
 }
 
-fn build_prompt(papers: &[Paper], commits: &[CommitEnvelope], our_process: &str) -> String {
+fn build_prompt(
+    papers: &[Paper],
+    commits: &[CommitEnvelope],
+    our_process: &str,
+    open_research: &[OpenIssue],
+) -> String {
     let mut p = String::new();
     p.push_str(
         "You are a research analyst for an autonomous personal-assistant agent \
@@ -513,9 +592,25 @@ fn build_prompt(papers: &[Paper], commits: &[CommitEnvelope], our_process: &str)
          Respond with ONLY a JSON object, no prose, no markdown fences:\n\
          {\"gaps\":[{\"title\":\"...\",\"body\":\"markdown issue body with a \
          'Source:' line and a 'Why it matters for our agent:' section\",\
-         \"confidence\":0.0-1.0,\"source\":\"arxiv:<id> or leapmodel:<sha>\"}]}\n\n",
+         \"confidence\":0.0-1.0,\"source\":\"arxiv:<id> or leapmodel:<sha>\",\
+         \"duplicate_of\":<issue number, ONLY when an already-open issue below \
+         asks for the same mechanism; omit otherwise>}]}\n\n\
+         DEDUP RULE: the section 'ALREADY-OPEN RESEARCH ISSUES' lists what has \
+         been proposed and is still open. Do NOT propose a gap that one of them \
+         already covers under a new title or framing — the same mechanism with \
+         a different paper is the same ask. If a paper strengthens or refines \
+         an open issue, return that gap WITH duplicate_of set to its number and \
+         keep the body to the new evidence; it will be added to that issue \
+         rather than filed. Only a mechanism none of them asks for is new.\n\n",
     );
-    p.push_str("=== OUR AGENT PROCESS ===\n");
+    p.push_str("=== ALREADY-OPEN RESEARCH ISSUES (do not re-propose) ===\n");
+    if open_research.is_empty() {
+        p.push_str("(none)\n");
+    }
+    for o in open_research {
+        p.push_str(&format!("- #{} {}\n", o.number, truncate(&o.title, 160)));
+    }
+    p.push_str("\n=== OUR AGENT PROCESS ===\n");
     p.push_str(our_process);
     p.push_str("\n\n=== RECENT ARXIV PAPERS ===\n");
     if papers.is_empty() {
@@ -671,6 +766,64 @@ async fn fetch_open_issue_titles(cfg: &ResearchConfig) -> Vec<String> {
     }
 }
 
+/// #1513 — the open `research`-labelled issues (number + title), for the
+/// driver's dedup section. Best-effort like the title fetch: a gh failure
+/// yields an empty list and the prompt says "(none)".
+async fn fetch_open_research_issues(cfg: &ResearchConfig) -> Vec<OpenIssue> {
+    let out = tokio::process::Command::new(&cfg.gh_bin)
+        .args(["issue", "list", "--repo"])
+        .arg(&cfg.gh_repo)
+        .args([
+            "--label", RESEARCH_LABEL, "--state", "open", "--limit", "200", "--json", "number,title",
+        ])
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {
+            serde_json::from_slice::<Vec<OpenIssue>>(&o.stdout).unwrap_or_else(|e| {
+                warn!("research: open research-issue list unparseable: {e:#}");
+                Vec::new()
+            })
+        }
+        Ok(o) => {
+            warn!(
+                "research: open research-issue fetch failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            Vec::new()
+        }
+        Err(e) => {
+            warn!("research: open research-issue fetch could not spawn gh: {e:#}");
+            Vec::new()
+        }
+    }
+}
+
+/// #1513 — record a new supporting source on the open issue the gap extends.
+async fn comment_extends(cfg: &ResearchConfig, issue: u64, gap: &Gap) -> Result<()> {
+    let body = format!(
+        "New supporting source from the daily `augmentagent research` pipeline \
+         (not filed separately: this issue already asks for the mechanism):\n\n\
+         **{}**\n\n{}\n\n_Source: {}_",
+        gap.title,
+        truncate(&gap.body, 2500),
+        gap.source
+    );
+    debug_assert!(!body.contains("  ("), "no source indentation leaks into the comment");
+    augmentagent_channel_core::public_report::validate(&gap.title, &body)?;
+    let out = tokio::process::Command::new(&cfg.gh_bin)
+        .args(["issue", "comment", &issue.to_string(), "--repo"])
+        .arg(&cfg.gh_repo)
+        .args(["--body", &body])
+        .output()
+        .await
+        .context("spawning gh issue comment")?;
+    if !out.status.success() {
+        anyhow::bail!("gh issue comment failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
 /// #366: normalized token set of a title — lowercased alphanumeric words of
 /// length ≥ 3 — for similarity comparison.
 fn title_tokens(title: &str) -> std::collections::BTreeSet<String> {
@@ -704,7 +857,58 @@ fn title_is_duplicate(candidate: &str, existing: &[String]) -> bool {
 
 #[cfg(test)]
 mod dedup_tests {
-    use super::title_is_duplicate;
+    use super::{title_is_duplicate, filing_decision, parse_llm_gaps, build_prompt, Filing, Gap, OpenIssue};
+
+    fn gap(title: &str, dup: Option<u64>) -> Gap {
+        Gap { title: title.into(), body: "b".into(), confidence: 0.5, source: "arxiv:1".into(), duplicate_of: dup }
+    }
+
+    // #1513 — the driver's duplicate_of is honoured only for an open research
+    // issue it was shown; anything else falls back to the lexical check.
+    #[test]
+    fn filing_decision_honours_duplicate_of_only_for_open_research_issues() {
+        let open = vec![OpenIssue { number: 808, title: "Close the draft-feedback loop".into() }];
+        let titles = vec!["Close the draft-feedback loop".to_string()];
+        assert_eq!(filing_decision(&gap("Revise feedback as rules", Some(808)), &open, &titles), Filing::Extends(808));
+        assert_eq!(filing_decision(&gap("Revise feedback as rules", Some(999)), &open, &titles), Filing::FileDespiteClaim(999));
+        assert_eq!(filing_decision(&gap("Close the draft feedback loop", Some(999)), &open, &titles), Filing::DuplicateTitle);
+        assert_eq!(filing_decision(&gap("Close the draft feedback loop", None), &open, &titles), Filing::DuplicateTitle);
+        assert_eq!(filing_decision(&gap("Something new entirely", None), &open, &titles), Filing::File);
+        assert_eq!(filing_decision(&gap("Something new entirely", Some(808)), &[], &[]), Filing::FileDespiteClaim(808));
+    }
+
+    #[test]
+    fn extends_comment_has_no_source_indentation() {
+        let g = gap("A title", Some(1));
+        let body = format!(
+            "New supporting source from the daily `augmentagent research` pipeline \
+             (not filed separately: this issue already asks for the mechanism):\n\n\
+             **{}**\n\n{}\n\n_Source: {}_",
+            g.title, g.body, g.source
+        );
+        assert!(body.contains("pipeline (not filed"), "{body}");
+        assert!(body.contains("\n\n**A title**\n\n"), "{body}");
+    }
+
+    #[test]
+    fn driver_output_with_and_without_duplicate_of_parses() {
+        let gaps = parse_llm_gaps(r#"{"gaps":[{"title":"a","body":"x","duplicate_of":808},{"title":"b","body":"y"}]}"#).unwrap();
+        assert_eq!(gaps[0].duplicate_of, Some(808));
+        assert_eq!(gaps[1].duplicate_of, None);
+        let enveloped = parse_llm_gaps(r#"{"result":"{\"gaps\":[{\"title\":\"c\",\"body\":\"z\",\"duplicate_of\":null}]}"}"#).unwrap();
+        assert_eq!(enveloped[0].duplicate_of, None);
+    }
+
+    #[test]
+    fn prompt_lists_open_research_issues_and_states_the_dedup_rule() {
+        let open = vec![OpenIssue { number: 665, title: "offline triage eval harness".into() }];
+        let p = build_prompt(&[], &[], "process", &open);
+        assert!(p.contains("ALREADY-OPEN RESEARCH ISSUES"));
+        assert!(p.contains("- #665 offline triage eval harness"));
+        assert!(p.contains("duplicate_of"));
+        let none = build_prompt(&[], &[], "process", &[]);
+        assert!(none.contains("(none)"));
+    }
 
     #[test]
     fn near_identical_titles_are_duplicates() {

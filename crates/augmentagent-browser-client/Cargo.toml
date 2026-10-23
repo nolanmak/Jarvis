@@ -21,6 +21,7 @@ reqwest = { workspace = true }
 uuid = { workspace = true }
 base64 = "0.22"
 dashmap = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

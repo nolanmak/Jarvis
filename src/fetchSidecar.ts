@@ -6,7 +6,6 @@
 import net from "net";
 import path from "path";
 import fs from "fs";
-import os from "os";
 import { randomUUID } from "crypto";
 
 export type LayerId = "http" | "render" | "firecrawl" | "brightdata";
@@ -38,9 +37,10 @@ export interface FetchSidecarError {
 
 function defaultSocketPath(): string {
   if (process.env.FETCH_SOCKET) return process.env.FETCH_SOCKET;
+  if (process.platform === "darwin") return path.join("/tmp", `augmentagent-${process.getuid?.() ?? 0}`, "fetch.sock");
   const xdg = process.env.XDG_RUNTIME_DIR;
   if (xdg && fs.existsSync(xdg)) return path.join(xdg, "augmentagent", "fetch.sock");
-  return path.join(os.tmpdir(), "augmentagent", "fetch.sock");
+  return path.join("/tmp", `augmentagent-${process.getuid?.() ?? 0}`, "fetch.sock");
 }
 
 interface Pending {

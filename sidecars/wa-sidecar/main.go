@@ -156,6 +156,7 @@ type sidecar struct {
 	client  *whatsmeow.Client
 	pairMu  sync.Mutex
 	pairing bool
+	outbound *outboundLedger
 	// writeMu protects clients/lastQR and serializes writes to each socket.
 	writeMu sync.Mutex
 	clients map[net.Conn]struct{}
@@ -274,6 +275,10 @@ func (s *sidecar) handleWAEvent(rawEvt interface{}) {
 		if isRevoke {
 			quotedID = protocol.GetKey().GetID()
 		}
+		var agentOutbound *bool
+		if s.client != nil && s.client.Store.ID != nil && s.outbound != nil && evt.Info.Timestamp.Unix() > s.outbound.since {
+			agentOutbound = s.agentOutbound(s.client.Store.ID.ToNonAD().String(), evt.Info.Chat.ToNonAD().String(), string(evt.Info.ID))
+		}
 		s.emitEvent(map[string]interface{}{
 			"event":             "received-message",
 			"id":                evt.Info.ID,
@@ -283,6 +288,7 @@ func (s *sidecar) handleWAEvent(rawEvt interface{}) {
 			"text":              text,
 			"timestamp":         evt.Info.Timestamp.Unix(),
 			"from_me":           evt.Info.IsFromMe,
+			"agent_outbound":    agentOutbound,
 			"quoted_message_id": quotedID,
 			"mentioned_jids":    mentions,
 			"media":             mediaDescriptor(evt.Message),
@@ -435,6 +441,8 @@ func (s *sidecar) dispatch(conn net.Conn, req rpcRequest) {
 		s.opFetchHistory(conn, req)
 	case "send_text":
 		s.opSendText(conn, req)
+	case "lookup_delivery":
+		s.opLookupDelivery(conn, req)
 	default:
 		s.fail(conn, req.RequestID, "BadRequest", "unknown op: "+req.Op)
 	}
@@ -594,6 +602,8 @@ func (s *sidecar) opSendText(conn net.Conn, req rpcRequest) {
 	var p struct {
 		ChatJID string `json:"chat_jid"`
 		Text    string `json:"text"`
+		Key     string `json:"delivery_key"`
+		Account string `json:"account"`
 	}
 	if err := json.Unmarshal(req.Params, &p); err != nil || p.ChatJID == "" || p.Text == "" {
 		s.fail(conn, req.RequestID, "BadRequest", "chat_jid and text required")
@@ -601,6 +611,10 @@ func (s *sidecar) opSendText(conn net.Conn, req rpcRequest) {
 	}
 	if s.client == nil || s.client.Store.ID == nil {
 		s.fail(conn, req.RequestID, "NotPaired", "no linked device")
+		return
+	}
+	if p.Key != "" && (len(p.Key) > 256 || p.Account != s.client.Store.ID.ToNonAD().String()) {
+		s.fail(conn, req.RequestID, "BadRequest", "invalid delivery identity")
 		return
 	}
 	if !s.client.IsConnected() {
@@ -612,13 +626,44 @@ func (s *sidecar) opSendText(conn net.Conn, req rpcRequest) {
 		s.fail(conn, req.RequestID, "BadRequest", "bad jid: "+err.Error())
 		return
 	}
+	if s.outbound == nil {
+		s.fail(conn, req.RequestID, "Internal", "outbound identity store unavailable")
+		return
+	}
+	messageID := s.client.GenerateMessageID()
+	account := s.client.Store.ID.ToNonAD().String()
+	chat := jid.ToNonAD().String()
+	if p.Key != "" {
+		rec, fresh, err := s.outbound.reserveDelivery(account, chat, p.Key, p.Text, string(messageID))
+		if err != nil {
+			s.fail(conn, req.RequestID, "Internal", "delivery reservation failed")
+			return
+		}
+		if !fresh {
+			if rec.Sent {
+				s.ok(conn, req.RequestID, map[string]interface{}{"message_id": rec.ID})
+			} else {
+				s.fail(conn, req.RequestID, "Uncertain", "delivery outcome unknown")
+			}
+			return
+		}
+	} else if err := s.outbound.reserve(account, chat, string(messageID)); err != nil {
+		s.fail(conn, req.RequestID, "Internal", "outbound identity reservation failed")
+		return
+	}
 	msg := &waE2E.Message{Conversation: &p.Text}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	resp, err := s.client.SendMessage(ctx, jid, msg)
+	resp, err := s.client.SendMessage(ctx, jid, msg, whatsmeow.SendRequestExtra{ID: messageID})
 	if err != nil {
 		s.fail(conn, req.RequestID, "SendFailed", err.Error())
 		return
+	}
+	if p.Key != "" {
+		if resp.ID != messageID || s.outbound.confirmDelivery(account, chat, p.Key, string(resp.ID)) != nil {
+			s.fail(conn, req.RequestID, "Uncertain", "delivery confirmation unavailable")
+			return
+		}
 	}
 	s.ok(conn, req.RequestID, map[string]interface{}{"message_id": resp.ID})
 }
@@ -676,7 +721,13 @@ func main() {
 	}
 
 	client := whatsmeow.NewClient(deviceStore, logger)
-	s := &sidecar{client: client, logger: logger}
+	outbound, err := openOutboundLedger(storePath() + ".outbound.db")
+	if err != nil {
+		logger.Errorf("outbound identity store unavailable")
+		os.Exit(1)
+	}
+	defer outbound.Close()
+	s := &sidecar{client: client, logger: logger, outbound: outbound}
 	client.AddEventHandler(s.handleWAEvent)
 
 	// Pairing vs. reconnect.

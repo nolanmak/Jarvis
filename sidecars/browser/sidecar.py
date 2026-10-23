@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import signal
+import stat
 import sys
 import time
 import traceback
@@ -68,17 +69,16 @@ except ImportError:  # pragma: no cover — surfaced at startup, not at import-t
 
 CDP_URL = os.environ.get("AUGMENTAGENT_BROWSER_CDP", "http://127.0.0.1:9223")
 
-# #1079 — macOS has no /run/user; match augmentagent-browser-client's fallback.
-_DEFAULT_RUNTIME = (
-    f"/run/user/{os.getuid()}"
-    if sys.platform.startswith("linux")
-    else str(Path.home() / "Library" / "Caches")
-)
-_RUNTIME = os.environ.get("XDG_RUNTIME_DIR", _DEFAULT_RUNTIME)
-SOCK_PATH = os.environ.get(
-    "AUGMENTAGENT_BROWSER_SOCK",
-    str(Path(_RUNTIME) / "augmentagent" / "browser.sock"),
-)
+if "AUGMENTAGENT_BROWSER_SOCK" in os.environ:
+    SOCK_PATH = os.environ["AUGMENTAGENT_BROWSER_SOCK"]
+elif sys.platform == "darwin":
+    SOCK_PATH = f"/tmp/augmentagent-{os.getuid()}/browser.sock"
+elif "XDG_RUNTIME_DIR" in os.environ:
+    SOCK_PATH = str(Path(os.environ["XDG_RUNTIME_DIR"]) / "augmentagent" / "browser.sock")
+elif sys.platform.startswith("linux"):
+    SOCK_PATH = f"/run/user/{os.getuid()}/augmentagent/browser.sock"
+else:
+    SOCK_PATH = f"/tmp/augmentagent-{os.getuid()}/browser.sock"
 
 # Heuristics for AuthRequired / CaptchaDetected — see #75 §9.
 _LOGIN_URL_FRAGMENTS = ("/login", "/signin", "/sign_in", "/accounts/login")
@@ -605,12 +605,14 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
 
 async def _serve() -> None:
     sock_path = Path(SOCK_PATH)
-    sock_path.parent.mkdir(parents=True, exist_ok=True)
-    if sock_path.exists():
-        sock_path.unlink()
+    sock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    parent = sock_path.parent.lstat()
+    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid() or parent.st_mode & 0o077:
+        raise RuntimeError("browser socket directory must be owner-private")
 
     server = await asyncio.start_unix_server(_handle_client, path=str(sock_path))
     os.chmod(sock_path, 0o600)
+    owned = sock_path.lstat()
     log.info("listening on %s (CDP=%s)", sock_path, CDP_URL)
 
     stop = asyncio.Event()
@@ -640,7 +642,9 @@ async def _serve() -> None:
     except Exception:  # noqa: BLE001
         pass
     try:
-        sock_path.unlink()
+        current = sock_path.lstat()
+        if stat.S_ISSOCK(current.st_mode) and (current.st_dev, current.st_ino) == (owned.st_dev, owned.st_ino):
+            sock_path.unlink()
     except FileNotFoundError:
         pass
 

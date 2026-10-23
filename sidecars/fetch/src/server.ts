@@ -1,6 +1,7 @@
 import net from "net";
 import fs from "fs";
-import { fetchRuntimeDir, fetchSocketPath } from "./socketPath.js";
+import path from "path";
+import { fetchSocketPath } from "./socketPath.js";
 import { FetchError, classify } from "./errors.js";
 import type { LayeredFetcher } from "./fetcher.js";
 
@@ -8,6 +9,7 @@ type Handler = (params: any) => Promise<any>;
 
 export class FetchSocketServer {
   private server: net.Server | null = null;
+  private ownedSocket: { dev: number; ino: number } | null = null;
   private ops: Map<string, Handler> = new Map();
 
   constructor(private fetcher: LayeredFetcher) {
@@ -29,16 +31,27 @@ export class FetchSocketServer {
   }
 
   async listen(): Promise<string> {
-    fs.mkdirSync(fetchRuntimeDir(), { recursive: true });
     const sock = fetchSocketPath();
-    if (fs.existsSync(sock)) fs.unlinkSync(sock);
-
+    const directory = path.dirname(sock);
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const runtime = fs.lstatSync(directory);
+    if (!runtime.isDirectory() || runtime.isSymbolicLink() ||
+        runtime.uid !== process.getuid?.() || (runtime.mode & 0o077) !== 0) {
+      throw new Error('fetch socket directory must be owner-private');
+    }
     this.server = net.createServer((conn) => this.onConnection(conn));
-    await new Promise<void>((resolve, reject) => {
-      this.server!.once("error", reject);
-      this.server!.listen(sock, () => resolve());
-    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        this.server!.once("error", reject);
+        this.server!.listen(sock, () => resolve());
+      });
+    } catch (error) {
+      this.server = null;
+      throw error;
+    }
     fs.chmodSync(sock, 0o600);
+    const owned = fs.lstatSync(sock);
+    this.ownedSocket = { dev: owned.dev, ino: owned.ino };
     console.error(`[fetch] listening on ${sock}`);
     return sock;
   }
@@ -49,7 +62,16 @@ export class FetchSocketServer {
       this.server = null;
     }
     const sock = fetchSocketPath();
-    if (fs.existsSync(sock)) fs.unlinkSync(sock);
+    if (this.ownedSocket) {
+      try {
+        const current = fs.lstatSync(sock);
+        if (current.isSocket() && current.dev === this.ownedSocket.dev &&
+            current.ino === this.ownedSocket.ino) fs.unlinkSync(sock);
+      } catch (error: any) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+      this.ownedSocket = null;
+    }
   }
 
   private onConnection(conn: net.Socket) {

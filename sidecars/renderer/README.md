@@ -3,7 +3,8 @@
 Node sidecar that owns a long-running [Remotion](https://www.remotion.dev/)
 bundle and renders a parametrized vertical (1080×1920) video from JSON props.
 The Rust daemon talks to it via NDJSON over
-`${XDG_RUNTIME_DIR}/augmentagent/renderer.sock` — the **same wire envelope** as
+`${XDG_RUNTIME_DIR}/augmentagent/renderer.sock` when set, otherwise
+`/tmp/augmentagent-<uid>/renderer.sock` on macOS — the **same wire envelope** as
 the browser sidecar (`sidecars/browser/sidecar.py`).
 
 Phase 0 of the content-rendering roadmap (see `docs/REMOTION.md`). Foundation
@@ -19,7 +20,7 @@ sidecars/renderer/
   src/ShortCard.tsx # the 1080x1920 branded title/body card
   package.json      # pinned Remotion 4.0.462 deps
   tsconfig.json
-  setup.sh          # npm install + `remotion browser ensure`
+  setup.sh          # npm ci + Chrome Headless Shell
 ```
 
 One systemd unit in `systemd/`:
@@ -28,6 +29,11 @@ One systemd unit in `systemd/`:
   dependency (Remotion manages its own headless Chrome Headless Shell).
 
 ## Setup (one-time per host)
+
+On macOS, run `./sidecars/renderer/setup.sh`, then
+`python3 scripts/install-sidecar.py renderer` from the repo root. See
+[`docs/MACOS-SIDECARS.md`](../../docs/MACOS-SIDECARS.md) for status, logs,
+removal, and updater behavior. On Linux:
 
 ```bash
 # 1. node_modules + Chrome Headless Shell for Remotion (~150 MB)
@@ -89,7 +95,7 @@ Typed error kinds: `BadProps`, `RenderFailed`, `BundleFailed`, `Timeout`,
 
 | Symptom | Fix |
 |---------|-----|
-| `BundleFailed` on every render | check `~/.local/state/augmentagent/renderer.stderr.log`; usually a TS/JSX error in `src/` |
+| `BundleFailed` on every render | check `augmentagent logs --unit augmentagent-renderer.service` on macOS or `~/.local/state/augmentagent/renderer.stderr.log` on Linux; usually a TS/JSX error in `src/` |
 | `RenderFailed: ... Headless Shell` | re-run `sidecars/renderer/setup.sh` (Chrome Headless Shell missing) |
-| `socket not present` | `systemctl --user status augmentagent-renderer` — sidecar didn't start; check logs at `~/.local/state/augmentagent/renderer.stderr.log` |
+| `socket not present` | check the managed service status and logs; on Linux use `systemctl --user status augmentagent-renderer` |
 | `npx: command not found` after pulling | re-run `sidecars/renderer/setup.sh` |

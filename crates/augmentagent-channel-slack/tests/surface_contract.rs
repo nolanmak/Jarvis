@@ -5,7 +5,8 @@
 use augmentagent_channel_slack::surface::{
     missing_rows, parity_blockers, slack_capabilities, slack_message, slack_reply_target,
     CapabilityRow, SlackInteraction, SlackMessageId, SlackWorkspace, SupportStatus,
-    SLACK_INTERACTIONS, SLACK_SHARED_CAPABILITIES, SLACK_SURFACE_PLATFORM,
+    LIVE_VOICE_FEASIBILITY_RECORD, SLACK_INTERACTIONS, SLACK_SHARED_CAPABILITIES,
+    SLACK_SURFACE_PLATFORM,
 };
 use augmentagent_store::{
     NativeConversation, Store, SurfaceAccountRef, SurfaceCapability, SurfaceConversationRef,
@@ -376,19 +377,59 @@ fn an_undeclared_capability_returns_the_typed_unsupported_error() {
             ),
         }
     }
-    // Nothing interactive is wired on Slack yet, so nothing may be claimed.
+    // #1298 — live voice is not proven possible on Slack.
     assert_eq!(
-        declared.require(SurfaceCapability::Query),
-        Err(SurfaceRefError::UnsupportedCapability("query"))
+        declared.require(SurfaceCapability::Voice),
+        Err(SurfaceRefError::UnsupportedCapability("voice"))
     );
     assert_eq!(
         SlackInteraction::LiveVoice.require(),
         Err(SurfaceRefError::UnsupportedCapability("live_voice"))
     );
-    assert_eq!(
-        SlackInteraction::Buttons.require(),
-        Err(SurfaceRefError::UnsupportedCapability("buttons"))
-    );
+}
+
+// #1292 — `/jarvis` and the owner commands (model, process control) run on
+// Slack; live voice stays a named blocker.
+#[test]
+fn owner_commands_model_and_process_control_are_supported_on_slack() {
+    let declared = slack_capabilities();
+    assert!(SlackInteraction::SlashCommands.require().is_ok());
+    assert!(declared.require(SurfaceCapability::ModelControl).is_ok());
+    assert!(declared.require(SurfaceCapability::ProcessControl).is_ok());
+    for key in [
+        SurfaceCapability::ModelControl,
+        SurfaceCapability::ProcessControl,
+    ] {
+        let row = SLACK_SHARED_CAPABILITIES
+            .iter()
+            .find(|row| row.key == key)
+            .unwrap();
+        assert_eq!(row.tracking_issue, 1292);
+        assert!(row.basis.contains("owner_commands"), "{}", row.basis);
+    }
+    assert!(parity_blockers().iter().all(|b| !matches!(
+        b.name,
+        "slash_commands" | "model_control" | "process_control"
+    )));
+    assert!(parity_blockers().iter().any(|b| b.name == "live_voice"));
+}
+
+// #1289 — approvals run on Slack: cards with buttons, modals for revise and
+// missing info, decisions through the shared handler.
+#[test]
+fn approvals_buttons_and_modals_are_supported_now_that_slack_has_approval_cards() {
+    assert!(slack_capabilities()
+        .require(SurfaceCapability::Approve)
+        .is_ok());
+    assert_eq!(SlackInteraction::Buttons.status(), SupportStatus::Supported);
+    assert_eq!(SlackInteraction::Modals.status(), SupportStatus::Supported);
+    let blockers = parity_blockers();
+    for name in ["approve", "buttons", "modals"] {
+        assert!(
+            !blockers.iter().any(|b| b.name == name),
+            "{name} still a blocker"
+        );
+    }
 }
 
 #[test]
@@ -409,6 +450,79 @@ fn every_row_that_is_not_supported_is_listed_as_a_parity_blocker() {
         .expect("live voice is a blocker");
     assert_eq!(live_voice.status, SupportStatus::Unproven);
     assert_eq!(live_voice.tracking_issue, 1298);
+}
+
+/// #1298 — live voice is an open parity blocker backed by a dated record.
+///
+/// The record found no Slack API that lets an app join a huddle or carry
+/// call audio. Flipping either voice row needs a real owner session that
+/// exchanged audio both ways, a named behavior test, and an updated record;
+/// this test fails until all three move together.
+#[test]
+fn live_voice_stays_an_open_blocker_backed_by_the_dated_feasibility_record() {
+    let shared = SLACK_SHARED_CAPABILITIES
+        .iter()
+        .find(|row| row.key == SurfaceCapability::Voice)
+        .unwrap();
+    let live = SLACK_INTERACTIONS
+        .iter()
+        .find(|row| row.key == SlackInteraction::LiveVoice)
+        .unwrap();
+    for (name, status, issue, basis) in [
+        ("voice", shared.status, shared.tracking_issue, shared.basis),
+        ("live_voice", live.status, live.tracking_issue, live.basis),
+    ] {
+        assert_eq!(
+            status,
+            SupportStatus::Unproven,
+            "{name}: live voice may leave Unproven only with a real owner audio \
+             session, a named behavior test and an updated {LIVE_VOICE_FEASIBILITY_RECORD}"
+        );
+        assert_eq!(issue, 1298, "{name}");
+        assert!(
+            basis.contains(LIVE_VOICE_FEASIBILITY_RECORD),
+            "{name} basis must cite the feasibility record: {basis}"
+        );
+        // Voice clips (#1297) never stand in for live voice.
+        assert!(basis.contains("#1297"), "{name}: {basis}");
+    }
+
+    let blockers = parity_blockers();
+    for name in ["voice", "live_voice"] {
+        let blocker = blockers
+            .iter()
+            .find(|blocker| blocker.name == name)
+            .unwrap_or_else(|| panic!("{name} is not listed as a parity blocker"));
+        assert_eq!(blocker.status, SupportStatus::Unproven);
+        assert_eq!(blocker.tracking_issue, 1298);
+    }
+
+    // The checked-in record states the same status as the code, with the
+    // date it was checked, so neither can change without the other.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(LIVE_VOICE_FEASIBILITY_RECORD);
+    let record = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    let recorded = record
+        .lines()
+        .find_map(|line| line.strip_prefix("Recorded status: "))
+        .expect("record has a `Recorded status:` line");
+    assert_eq!(recorded.trim(), format!("`{:?}`", live.status));
+    let checked = record
+        .lines()
+        .find_map(|line| line.strip_prefix("Checked: "))
+        .expect("record has a `Checked:` line");
+    let date = checked.trim();
+    assert!(
+        date.len() == 10
+            && date.bytes().enumerate().all(|(index, byte)| match index {
+                4 | 7 => byte == b'-',
+                _ => byte.is_ascii_digit(),
+            }),
+        "Checked: must be an ISO date, got {date:?}"
+    );
+    assert!(record.contains("Part of #1298"));
 }
 
 #[test]
@@ -448,5 +562,87 @@ fn adding_slack_leaves_existing_discord_and_whatsapp_rows_unchanged() {
     // The WhatsApp turn claimed before Slack existed is still pending.
     assert!(store
         .claim_surface_turn(&SurfaceTurnRef::new(whatsapp, "message-2").unwrap())
+        .is_err());
+}
+
+// #1288 — threads are persistent conversations on the interactive surface.
+#[test]
+fn threads_are_supported_now_that_each_thread_is_a_persistent_conversation() {
+    assert_eq!(SlackInteraction::Threads.status(), SupportStatus::Supported);
+    assert!(SlackInteraction::Threads.require().is_ok());
+    assert!(!parity_blockers().iter().any(|b| b.name == "threads"));
+}
+
+// #1290 — approved replies and owner-composed messages reach Slack contacts,
+// as the owner, through the contact-send path.
+#[test]
+fn send_is_supported_now_that_approved_contact_messages_are_delivered() {
+    assert!(slack_capabilities()
+        .require(SurfaceCapability::Send)
+        .is_ok());
+    let row = SLACK_SHARED_CAPABILITIES
+        .iter()
+        .find(|row| row.key == SurfaceCapability::Send)
+        .unwrap();
+    assert_eq!(row.tracking_issue, 1290);
+    assert!(row.basis.contains("contact_send"), "{}", row.basis);
+    assert!(!parity_blockers().iter().any(|b| b.name == "send"));
+}
+
+// #1300 — the parity gate reconciles the column with what landed: serve
+// (#1287), scheduling (#1291), files in (#1293), answers, uploads and
+// progress edits (#1294) and history (#1296) run on Slack with named tests
+// in docs/slack-parity-matrix.json, and so are notifications (#1295), routed
+// per class through the Slack outbox. Voice clips and spoken replies run in
+// serve (#1297); live voice (#1298) stays the only blocker.
+#[test]
+fn capabilities_that_landed_with_named_tests_are_supported_and_only_real_gaps_block() {
+    let declared = slack_capabilities();
+    for capability in [
+        SurfaceCapability::Query,
+        SurfaceCapability::Schedule,
+        SurfaceCapability::MediaRead,
+        SurfaceCapability::MediaWrite,
+        SurfaceCapability::History,
+        SurfaceCapability::Notifications,
+    ] {
+        assert!(declared.require(capability).is_ok(), "{capability:?}");
+    }
+    for interaction in [
+        SlackInteraction::FileUpload,
+        SlackInteraction::MessageEdit,
+        SlackInteraction::EphemeralReplies,
+        SlackInteraction::VoiceClip,
+    ] {
+        assert!(interaction.require().is_ok(), "{interaction:?}");
+    }
+    let blockers: Vec<(&str, SupportStatus, u32)> = parity_blockers()
+        .iter()
+        .map(|b| (b.name, b.status, b.tracking_issue))
+        .collect();
+    assert_eq!(
+        blockers,
+        [
+            ("voice", SupportStatus::Unproven, 1298),
+            ("live_voice", SupportStatus::Unproven, 1298),
+        ]
+    );
+}
+
+// #1297 — voice clips become turns in serve and `voice on` answers with audio
+// plus text; the row cites the serve-path tests. Live voice is untouched.
+#[test]
+fn voice_clips_are_supported_in_serve_and_live_voice_stays_blocked() {
+    let row = SLACK_INTERACTIONS
+        .iter()
+        .find(|row| row.key == SlackInteraction::VoiceClip)
+        .unwrap();
+    assert_eq!(row.status, SupportStatus::Supported);
+    assert_eq!(row.tracking_issue, 1297);
+    assert!(row.basis.contains("voice_surface"), "{}", row.basis);
+    assert!(SlackInteraction::VoiceClip.require().is_ok());
+    assert!(SlackInteraction::LiveVoice.require().is_err());
+    assert!(slack_capabilities()
+        .require(SurfaceCapability::Voice)
         .is_err());
 }

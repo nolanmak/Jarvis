@@ -19,8 +19,10 @@ personal wiki, and social/posting integrations.
 - **Many channels.** Email (Gmail), Discord, Slack, Telegram, LinkedIn,
   WhatsApp, Twitter/X, Instagram, Reddit, GitHub, Linear, Notion, Calendly,
   Google Calendar, Google Drive, Meetup, and a voice-capture channel.
-- **iMessage history.** A bundled Mac exporter and scheduler import texting
-  history locally or over SSH, without a second repository. See
+- **iMessage history and replies.** A bundled Mac exporter and scheduler import
+  texting history locally or over SSH, without a second repository. Opted-in
+  conversations get reply cards; approved replies are sent by a sender job on
+  the Mac and confirmed in the Messages database. See
   [iMessage setup](docs/IMESSAGE.md).
 - **WhatsApp history.** Export WhatsApp Desktop conversations into searchable
   history and incremental wiki capture, with local or SSH setup and support for
@@ -40,6 +42,9 @@ personal wiki, and social/posting integrations.
 - **Proactive CRM.** A scheduled engine surfaces stale contacts, unmet
   commitments, and upcoming events as nudges, backed by a markdown
   person-wiki with an identity index (email/phone/handles → person).
+- **Heartbeat.** An opt-in periodic check-in reads your `HEARTBEAT.md`
+  checklist plus recent activity and stays silent unless something needs you,
+  with a liveness probe for external monitoring. See [Heartbeat](docs/HEARTBEAT.md).
 - **Self-improvement & scheduling.** A `self-improve` mode can pick up
   `agent-fixable` issues and open draft PRs; a user-facing `/loop` command
   registers cron-style recurring agent tasks.

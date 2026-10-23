@@ -31,9 +31,9 @@
 //! The capability tables at the bottom are the Slack column of the feature
 //! matrix. Each row states whether the capability is implemented on the Slack
 //! surface in this repo (`Supported`), not implemented (`Unsupported`) or not
-//! yet shown to be possible at all (`Unproven`), and which issue owns it. The
-//! shared matrix and command registry from #1226 have not landed; when they
-//! do, these tables are the input for the Slack column, not a second layer.
+//! yet shown to be possible at all (`Unproven`), and which issue owns it.
+//! `docs/slack-parity-matrix.json` (#1300, [`crate::parity`]) maps every epic
+//! row onto these entries, and its check fails when the two disagree.
 
 use augmentagent_store::{
     SurfaceAccountRef, SurfaceCapabilities, SurfaceCapability, SurfaceConversationRef,
@@ -313,41 +313,106 @@ impl SlackInteraction {
     }
 }
 
-const NOT_WIRED: &str = "no Slack interactive surface exists; the crate only polls subscribed \
-     conversations through Composio and posts plain text (channel.rs, api.rs)";
+/// The dated live-voice feasibility record (#1298), relative to the repo
+/// root. Both voice rows cite it; `surface_contract` checks that the record's
+/// `Recorded status:` line matches the `LiveVoice` row.
+pub const LIVE_VOICE_FEASIBILITY_RECORD: &str = "docs/SLACK-LIVE-VOICE.md";
 
 /// The Slack column for the shared capability set.
 pub const SLACK_SHARED_CAPABILITIES: [CapabilityRow<SurfaceCapability>; 11] = [
-    row(SurfaceCapability::Query, SupportStatus::Unsupported, 1287, NOT_WIRED),
+    row(
+        SurfaceCapability::Query,
+        SupportStatus::Supported,
+        1287,
+        "`serve` runs Slack as an immediate interactive surface: owner DMs and control-channel \
+         messages start a turn within a second through the durable inbox, beside or without \
+         Discord and WhatsApp (interactive.rs, tests/interactive_surface.rs, \
+         augmentagent-cli tests/slack_serve_cli.rs)",
+    ),
     row(
         SurfaceCapability::Approve,
-        SupportStatus::Unsupported,
+        SupportStatus::Supported,
         1289,
-        "Slack contact-reply approvals are posted through the Discord ApprovalBroker (channel.rs)",
+        "approval cards post to the owner DM or control channel and every decision (approve, \
+         skip, revise, presets, missing info, recompose) runs the shared ApprovalActionHandler \
+         with cross-surface redraw (approvals/, tests/approval_surface.rs); scheduling \
+         controls are #1291",
     ),
     row(
         SurfaceCapability::Send,
-        SupportStatus::Unsupported,
+        SupportStatus::Supported,
         1290,
-        "SlackClient::send_message exists but no owner-driven send path uses the shared refs",
+        "approved contact replies (DM, group DM, channel, in thread) and owner-composed messages \
+         are sent once, as the owner's own account through the Composio user connection, with \
+         a per-action send ledger for retries (contact/, tests/contact_send.rs, \
+         tests/contact_surface.rs); live-workspace identity is unverified",
     ),
-    row(SurfaceCapability::Schedule, SupportStatus::Unsupported, 1291, NOT_WIRED),
-    row(SurfaceCapability::ModelControl, SupportStatus::Unsupported, 1292, NOT_WIRED),
-    row(SurfaceCapability::ProcessControl, SupportStatus::Unsupported, 1292, NOT_WIRED),
-    row(SurfaceCapability::MediaRead, SupportStatus::Unsupported, 1293, NOT_WIRED),
-    row(SurfaceCapability::MediaWrite, SupportStatus::Unsupported, 1294, NOT_WIRED),
+    row(
+        SurfaceCapability::Schedule,
+        SupportStatus::Supported,
+        1291,
+        "schedule, reschedule, send now, cancel and back to queue on cards and as text \
+         commands, with the resolved time and zone, fired once by the shared scheduler \
+         through the contact send ledger (approvals/, tests/approval_scheduling.rs)",
+    ),
+    row(
+        SurfaceCapability::ModelControl,
+        SupportStatus::Supported,
+        1292,
+        "`model` (and `/jarvis model`) shows and sets the model per conversation on the \
+         transport-neutral key, persisted across restarts and used by the next turn; `reset` \
+         starts a new native session (commands/, tests/owner_commands.rs, \
+         tests/owner_commands_surface.rs)",
+    ),
+    row(
+        SurfaceCapability::ProcessControl,
+        SupportStatus::Supported,
+        1292,
+        "`processes` lists and stops `claude` CLI processes through the cross-platform walker \
+         and says so when it cannot run on the host; `cancel all` stops the running turn and \
+         drops the queue (commands/, tests/owner_commands.rs, tests/owner_commands_surface.rs)",
+    ),
+    row(
+        SurfaceCapability::MediaRead,
+        SupportStatus::Supported,
+        1293,
+        "owner-sent images, text, PDF/DOCX and attachment-only messages reach the turn through \
+         the shared inbound pipeline, downloaded only from Slack file hosts (inbound.rs, \
+         tests/inbound_files.rs, tests/transport_download.rs)",
+    ),
+    row(
+        SurfaceCapability::MediaWrite,
+        SupportStatus::Supported,
+        1294,
+        "answers are split losslessly and generated files uploaded into the thread through the \
+         outbox, once across restarts (delivery/, tests/delivery_outbox.rs, \
+         tests/transport_upload.rs)",
+    ),
     row(
         SurfaceCapability::History,
-        SupportStatus::Unsupported,
+        SupportStatus::Supported,
         1296,
-        "SlackClient::fetch_messages ingests contacts; no owner conversation history is keyed by the shared refs",
+        "history-in-prompt providers read the turn's thread or DM, bounded and owner-only, and \
+         subscribed conversations are searchable by person and channel (history.rs, \
+         tests/conversation_history.rs, tests/search_identity.rs)",
     ),
-    row(SurfaceCapability::Notifications, SupportStatus::Unsupported, 1295, NOT_WIRED),
+    row(
+        SurfaceCapability::Notifications,
+        SupportStatus::Supported,
+        1295,
+        "digests, research, reminders, audit, health and review notices are routed per class \
+         to the owner's DM or control channel through the durable Slack outbox (deduplicated, \
+         paced, marked late after a suspension), Slack-only without Discord credentials; \
+         broker notices reach Slack through the approval surfaces and loop output through \
+         its destination (notify.rs, tests/notifications.rs); one-shot broker commands stay \
+         Discord-only",
+    ),
     row(
         SurfaceCapability::Voice,
         SupportStatus::Unproven,
         1298,
-        "live two-way audio through a Slack app is unverified; voice clips (#1297) do not satisfy it",
+        "no documented Slack API lets an app join a huddle or carry call audio (checked \
+         2026-09-29, docs/SLACK-LIVE-VOICE.md); voice clips (#1297) do not satisfy it",
     ),
 ];
 
@@ -355,57 +420,73 @@ pub const SLACK_SHARED_CAPABILITIES: [CapabilityRow<SurfaceCapability>; 11] = [
 pub const SLACK_INTERACTIONS: [CapabilityRow<SlackInteraction>; 9] = [
     row(
         SlackInteraction::Buttons,
-        SupportStatus::Unsupported,
+        SupportStatus::Supported,
         1289,
-        NOT_WIRED,
+        "approval card buttons and the quick-refine select (block_actions), owner-gated and \
+         resolved exactly once (approvals/, tests/approval_surface.rs)",
     ),
     row(
         SlackInteraction::Modals,
-        SupportStatus::Unsupported,
+        SupportStatus::Supported,
         1289,
-        NOT_WIRED,
+        "revise and missing-info modals (views.open + view_submission), with a fresh-message \
+         fallback when the trigger expired (approvals/, tests/approval_surface.rs)",
     ),
     row(
         SlackInteraction::Threads,
-        SupportStatus::Unsupported,
+        SupportStatus::Supported,
         1288,
-        "thread identity is mapped here (thread_ts) but no runtime reads or posts in threads",
+        "each Slack thread (and a top-level control-channel message, which starts one) is a \
+         persistent conversation with its own native session; answers, progress and \
+         follow-ups stay in the thread (interactive.rs, harness.rs)",
     ),
     row(
         SlackInteraction::SlashCommands,
-        SupportStatus::Unsupported,
+        SupportStatus::Supported,
         1292,
-        NOT_WIRED,
+        "`/jarvis <command>` runs every owner command in the shared registry (help generated \
+         from it), in a private lane that never queues behind a turn; other text still talks \
+         to Jarvis (commands/, tests/owner_commands.rs, tests/owner_commands_surface.rs)",
     ),
     row(
         SlackInteraction::FileUpload,
-        SupportStatus::Unsupported,
+        SupportStatus::Supported,
         1294,
-        NOT_WIRED,
+        "files.getUploadURLExternal + completeUploadExternal, streamed from disk into the \
+         thread (transport/web.rs, tests/transport_upload.rs, tests/delivery_outbox.rs)",
     ),
     row(
         SlackInteraction::MessageEdit,
-        SupportStatus::Unsupported,
+        SupportStatus::Supported,
         1294,
-        NOT_WIRED,
+        "chat.update for throttled turn progress and approval cards redrawn in place \
+         (delivery/progress.rs, tests/delivery_progress.rs, tests/approval_surface.rs)",
     ),
     row(
         SlackInteraction::EphemeralReplies,
-        SupportStatus::Unsupported,
+        SupportStatus::Supported,
         1287,
-        NOT_WIRED,
+        "a non-owner gets one bounded chat.postEphemeral rejection and never reaches the \
+         handler (interactive.rs, tests/interactive_surface.rs)",
     ),
     row(
         SlackInteraction::VoiceClip,
-        SupportStatus::Unsupported,
+        SupportStatus::Supported,
         1297,
-        NOT_WIRED,
+        "owner clips are transcribed into a turn in the same conversation with the \
+         transcript shown first, and `voice on` answers with an uploaded audio file plus the \
+         text through the Rust Deepgram/ElevenLabs adapter (voice/, interactive.rs, \
+         tests/voice_surface.rs, tests/voice_tts_http.rs, tests/voice_clips.rs); live voice \
+         is separate (#1298)",
     ),
     row(
         SlackInteraction::LiveVoice,
         SupportStatus::Unproven,
         1298,
-        "whether a Slack app can exchange live audio with the owner is unverified",
+        "no documented Slack API lets an app join a huddle or carry call audio; the Calls API \
+         only registers a third-party call, so any route puts the audio outside Slack and \
+         needs an owner decision (checked 2026-09-29, docs/SLACK-LIVE-VOICE.md); voice \
+         clips (#1297) do not satisfy it",
     ),
 ];
 

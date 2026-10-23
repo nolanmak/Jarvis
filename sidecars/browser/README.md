@@ -27,6 +27,17 @@ Three systemd units in `systemd/`:
 
 ## Setup (one-time per host)
 
+On macOS, run `./sidecars/browser/setup.sh` and
+`augmentagent install browser-sidecar`. The installer manages headed Chrome
+and the Python sidecar as user LaunchAgents; Xvfb and the Linux units below
+are not used. Check `augmentagent browser status` and
+`augmentagent logs --unit augmentagent-browser-sidecar.service`. The browser
+profile survives service restart and `augmentagent uninstall browser-sidecar`.
+See [`docs/MACOS-SIDECARS.md`](../../docs/MACOS-SIDECARS.md). Signed-in account
+consent still needs a controlled owner-Mac acceptance run.
+
+On Linux:
+
 ```bash
 # 1. python venv + playwright + bundled chromium (~500 MB)
 ./sidecars/browser/setup.sh

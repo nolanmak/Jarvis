@@ -51,6 +51,30 @@ pub fn history_wiki_capture_enabled() -> bool {
     parse_flag(std::env::var(ENV_HISTORY_WIKI_CAPTURE).ok().as_deref())
 }
 
+/// Global kill-switch for iMessage sends (#1301). Off unless set; approve
+/// refuses and the outbox hands nothing to the sender while it is off.
+pub const ENV_SEND_ENABLED: &str = "AUGMENTAGENT_IMESSAGE_SEND_ENABLED";
+
+pub fn send_enabled() -> bool {
+    parse_flag(std::env::var(ENV_SEND_ENABLED).ok().as_deref())
+}
+
+/// How often the daemon polls the bundle and drafts reply cards (#1306).
+pub const ENV_POLL_SECS: &str = "AUGMENTAGENT_IMESSAGE_POLL_SECS";
+pub const DEFAULT_POLL_SECS: u64 = 30 * 60;
+
+pub fn poll_interval() -> std::time::Duration {
+    poll_interval_from(std::env::var(ENV_POLL_SECS).ok().as_deref())
+}
+
+fn poll_interval_from(raw: Option<&str>) -> std::time::Duration {
+    let secs = raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_POLL_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
 fn parse_flag(raw: Option<&str>) -> bool {
     matches!(
         raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
@@ -70,5 +94,42 @@ mod tests {
         assert!(!parse_flag(Some("false")));
         assert!(parse_flag(Some("1")));
         assert!(parse_flag(Some(" TRUE ")));
+    }
+
+    #[test]
+    fn send_kill_switch_is_off_unless_explicitly_enabled() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let cases: [(Option<&str>, bool); 10] = [
+            (None, false),
+            (Some(""), false),
+            (Some("0"), false),
+            (Some("false"), false),
+            (Some("no"), false),
+            (Some("1"), true),
+            (Some("true"), true),
+            (Some(" Yes "), true),
+            (Some("ON"), true),
+            (Some("enabled"), false),
+        ];
+        for (raw, want) in cases {
+            match raw {
+                Some(v) => std::env::set_var(ENV_SEND_ENABLED, v),
+                None => std::env::remove_var(ENV_SEND_ENABLED),
+            }
+            assert_eq!(send_enabled(), want, "{raw:?}");
+        }
+        std::env::remove_var(ENV_SEND_ENABLED);
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn poll_interval_is_configurable_with_a_safe_default() {
+        use std::time::Duration;
+        assert_eq!(poll_interval_from(Some("60")), Duration::from_secs(60));
+        assert_eq!(poll_interval_from(Some(" 120 ")), Duration::from_secs(120));
+        for bad in [None, Some(""), Some("0"), Some("-5"), Some("soon")] {
+            assert_eq!(poll_interval_from(bad), Duration::from_secs(1800), "{bad:?}");
+        }
     }
 }

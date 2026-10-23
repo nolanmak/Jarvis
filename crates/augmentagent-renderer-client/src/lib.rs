@@ -44,13 +44,15 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 /// Default socket path resolution. Honors `AUGMENTAGENT_RENDERER_SOCK`,
-/// then `${XDG_RUNTIME_DIR}/augmentagent/renderer.sock`, finally
-/// `/run/user/<uid>/augmentagent/renderer.sock` on Linux and
-/// `~/Library/Caches/augmentagent/renderer.sock` elsewhere (#1079; mirrored in
-/// `sidecars/renderer/server.mjs`).
+/// then uses `/tmp/augmentagent-<uid>/renderer.sock` on macOS. Linux uses
+/// `${XDG_RUNTIME_DIR}/augmentagent/renderer.sock` or falls back to
+/// `/run/user/<uid>/augmentagent/renderer.sock`. The renderer mirrors this.
 pub fn default_socket_path() -> PathBuf {
     if let Ok(p) = std::env::var("AUGMENTAGENT_RENDERER_SOCK") {
         return PathBuf::from(p);
+    }
+    if cfg!(target_os = "macos") {
+        return PathBuf::from(format!("/tmp/augmentagent-{}/renderer.sock", fallback_uid()));
     }
     let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
         if cfg!(target_os = "linux") {
@@ -69,11 +71,7 @@ pub fn default_socket_path() -> PathBuf {
 }
 
 fn fallback_uid() -> u32 {
-    // Avoid pulling in libc just for getuid(); fall back to env or 1000.
-    std::env::var("UID")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1000)
+    unsafe { libc::getuid() }
 }
 
 /// Errors returned by [`RendererClient`]. The `Sidecar` variant carries the
@@ -363,19 +361,30 @@ mod tests {
         assert!(!e2.is_bundle_failed());
     }
 
+    // `std::env::set_var` is process-global, so these two tests cannot run
+    // concurrently: one clears AUGMENTAGENT_RENDERER_SOCK while the other sets
+    // it, and `cargo test` runs them on parallel threads in one binary.
+    // Whichever interleaving loses, fails — reddening PRs that touch no Rust.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
-    fn default_socket_path_uses_runtime() {
+    fn default_socket_path_matches_platform() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("XDG_RUNTIME_DIR", "/tmp/xdgtest-renderer");
         std::env::remove_var("AUGMENTAGENT_RENDERER_SOCK");
         let p = default_socket_path();
+        #[cfg(target_os = "macos")]
         assert_eq!(
             p,
-            std::path::PathBuf::from("/tmp/xdgtest-renderer/augmentagent/renderer.sock")
+            std::path::PathBuf::from(format!("/tmp/augmentagent-{}/renderer.sock", fallback_uid()))
         );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(p, std::path::PathBuf::from("/tmp/xdgtest-renderer/augmentagent/renderer.sock"));
     }
 
     #[test]
     fn explicit_socket_env_overrides() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("AUGMENTAGENT_RENDERER_SOCK", "/tmp/custom.sock");
         let p = default_socket_path();
         assert_eq!(p, std::path::PathBuf::from("/tmp/custom.sock"));

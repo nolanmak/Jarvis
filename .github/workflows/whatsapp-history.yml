@@ -14,7 +14,8 @@ permissions:
   contents: read
 jobs:
   history:
-    runs-on: ubuntu-latest
+    # Python 3.9 compatibility coverage requires an available runner build.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       CARGO_BUILD_JOBS: 2

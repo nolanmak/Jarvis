@@ -26,6 +26,27 @@ _NORMAL_ASSOC_TYPES = (0, None)
 
 HEADER_PREFIX = "### ["
 
+# A source app that stops running freezes its database, and an exporter with
+# nothing to export looks identical to a healthy one. Report the age so a cold
+# source is visible in the job's own log instead of being silent for weeks.
+SOURCE_STALE_AFTER_S = 6 * 3600
+
+
+def source_staleness(db_path, now=None, threshold=SOURCE_STALE_AFTER_S):
+    """Seconds since `db_path` was written when that exceeds `threshold`.
+
+    None when the source is fresh or unreadable — the caller reports staleness,
+    it does not diagnose a missing file.
+    """
+    import os
+    import time
+    try:
+        age = (now if now is not None else time.time()) - os.path.getmtime(db_path)
+    except OSError:
+        return None
+    return age if age > threshold else None
+
+
 # Link previews (rich URL cards) arrive as attachments but hold no media worth
 # storing: uploading them cost more than half of every queue drain.
 SKIP_ATTACHMENT_SUFFIXES = (".pluginpayloadattachment",)
@@ -90,6 +111,24 @@ def apple_time_to_iso(raw):
     seconds = raw / 1_000_000_000 if abs(raw) > 1e12 else raw
     dt = datetime.fromtimestamp(seconds + APPLE_EPOCH, tz=timezone.utc)
     return dt.astimezone().isoformat(timespec="seconds")
+
+
+def newer_iso(current, candidate):
+    """The later of two ISO-8601 timestamps, compared as instants so differing
+    UTC offsets order correctly. Unparseable values ('unknown-time') never win,
+    so an incremental run cannot regress a conversation's freshness cursor."""
+    def instant(value):
+        try:
+            return datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            return None
+
+    a, b = instant(current), instant(candidate)
+    if b is None:
+        return current
+    if a is None:
+        return candidate
+    return candidate if b > a else current
 
 
 def decode_attributed_body(blob):
@@ -439,6 +478,16 @@ def sync(db_path, out_dir, state_path, contacts=None, s3=None):
 
     con = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
     cur = con.cursor()
+    # The chat guid is the only way to address a group when sending (#1308).
+    # Copied verbatim from chat.db, never built: macOS 26 uses `any;…`.
+    guids = {}
+    for identifier, guid in cur.execute("SELECT chat_identifier, guid FROM chat"):
+        if identifier and guid:
+            guids.setdefault(slugify(identifier), guid)
+    for ident, entry in index.items():
+        if not entry.get("chat_guid") and guids.get(ident):
+            entry["chat_guid"] = guids[ident]
+            renamed = True  # the index must be rewritten
     rows = cur.execute(
         "SELECT m.ROWID, m.text, m.attributedBody, m.date, m.is_from_me,"
         " h.id, c.ROWID, c.chat_identifier, c.display_name, c.service_name,"
@@ -476,6 +525,8 @@ def sync(db_path, out_dir, state_path, contacts=None, s3=None):
                 "service": service or "iMessage",
                 "participants": participants,
             }
+            if guids.get(ident):
+                entry["chat_guid"] = guids[ident]
             entry.update(_naming(
                 ident, display_name, service, participants, contacts, index,
             ))
@@ -510,6 +561,11 @@ def sync(db_path, out_dir, state_path, contacts=None, s3=None):
         entry = f"\n{HEADER_PREFIX}{when}] {sender}\n" + "\n".join(parts) + "\n"
         with md_path.open("a") as f:
             f.write(entry)
+        # #1429 — recall reads this to tell "no match" from "the archive
+        # stopped here"; it must come from a message, never from synced_at.
+        cursor = newer_iso(index[ident].get("newest_entry"), when)
+        if cursor is not None:
+            index[ident]["newest_entry"] = cursor
         written += 1
         touched.add(ident)
 

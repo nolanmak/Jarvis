@@ -20,7 +20,9 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use augmentagent_auth::{Auth as KeychainAuth, AuthError as KeychainError, DEFAULT_ACCOUNT};
+use augmentagent_auth::{
+    Auth as KeychainAuth, AuthError as KeychainError, CredentialStore, DEFAULT_ACCOUNT,
+};
 
 pub const KEYCHAIN_PLATFORM: &str = "slack";
 
@@ -119,6 +121,34 @@ impl SlackAuth {
 
     pub fn delete_from_keychain(team_id: &str) -> Result<(), AuthError> {
         KeychainAuth::delete(KEYCHAIN_PLATFORM, team_id)?;
+        Ok(())
+    }
+
+    /// [`save_to_keychain`](Self::save_to_keychain) against an explicit
+    /// store (tests, and callers that inject one).
+    pub fn save_to(&self, store: &dyn CredentialStore) -> Result<(), AuthError> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self)?;
+        store.put(KEYCHAIN_PLATFORM, &self.team_id, &bytes)?;
+        Ok(())
+    }
+
+    /// [`load_for_team`](Self::load_for_team) against an explicit store.
+    pub fn load_for_team_from(
+        store: &dyn CredentialStore,
+        team_id: &str,
+    ) -> Result<Self, AuthError> {
+        let bytes = store.get(KEYCHAIN_PLATFORM, team_id)?;
+        let parsed: SlackAuth = serde_json::from_slice(&bytes)?;
+        parsed.validate()?;
+        Ok(parsed)
+    }
+
+    /// [`delete_from_keychain`](Self::delete_from_keychain) against an
+    /// explicit store. Only touches the Composio slot, never the
+    /// interactive app's `slack-app` slot.
+    pub fn delete_from(store: &dyn CredentialStore, team_id: &str) -> Result<(), AuthError> {
+        store.delete(KEYCHAIN_PLATFORM, team_id)?;
         Ok(())
     }
 }

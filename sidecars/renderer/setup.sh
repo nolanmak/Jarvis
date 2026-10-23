@@ -14,13 +14,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-# npm ci needs a lockfile; on a fresh checkout there isn't one (it's
-# gitignored), so fall back to `npm install` which generates it.
-if [[ -f package-lock.json ]]; then
-    npm ci
-else
-    npm install
-fi
+npm ci
 
 # Chrome Headless Shell for Remotion's renderer. Skip with SKIP_CHROMIUM=1
 # in dev (renders will fail until it's present). We call `ensureBrowser()`
@@ -34,4 +28,8 @@ fi
 
 echo
 echo "renderer sidecar ready at: $(pwd)"
-echo "next step: install systemd unit (systemd/augmentagent-renderer.service)"
+if [[ "$(uname -s)" == Darwin ]]; then
+    echo "next step: python3 scripts/install-sidecar.py renderer (from repo root)"
+else
+    echo "next step: install systemd unit (systemd/augmentagent-renderer.service)"
+fi

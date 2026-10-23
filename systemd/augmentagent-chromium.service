@@ -2,6 +2,8 @@
 Description=AugmentAgent dedicated Chromium (headed, on Xvfb :99)
 After=augmentagent-xvfb.service
 Requires=augmentagent-xvfb.service
+StartLimitBurst=3
+StartLimitIntervalSec=300
 
 [Service]
 Type=simple
@@ -18,8 +20,6 @@ ExecStart=/usr/bin/chromium \
     --start-maximized
 Restart=on-failure
 RestartSec=10
-StartLimitBurst=3
-StartLimitIntervalSec=300
 StandardOutput=append:%S/augmentagent/chromium.log
 StandardError=append:%S/augmentagent/chromium.log
 
