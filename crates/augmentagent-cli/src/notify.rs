@@ -229,6 +229,8 @@ pub static PRODUCERS: &[Producer] = &[
     p("discord_channel_sink", "crates/augmentagent-cli/src/notify.rs", "send_message(&", 1, TRANSPORT, "Discord leg: bot channel / request channel"),
     p("discord_channel_sink", "crates/augmentagent-cli/src/notify.rs", "CreateMessage::new(", 1, TRANSPORT, "Discord leg: bot channel / request channel"),
     p("discord_webhook_sink", "crates/augmentagent-cli/src/notify.rs", "DISCORD_WEBHOOK_URL", 3, TRANSPORT, "Discord leg: webhook"),
+    act(p("calendar_rsvp", "crates/augmentagent-cli/src/calendar_rsvp.rs", "send_message(&", 1, BROKER, "calendar RSVP approval card")),
+    p("calendar_rsvp_layout", "crates/augmentagent-cli/src/calendar_rsvp.rs", "CreateMessage::new(", 1, TRANSPORT, "calendar RSVP receipt fallback"),
     // -- Approval surfaces (#1289) -------------------------------------------
     act(p("approval_broker", "crates/augmentagent-approval-discord/src/broker.rs", "send_message(&", 4, BROKER, "Discord approval broker: cards, flag notices, digests")),
     act(p("owner_alert_discord", "crates/augmentagent-approval-discord/src/broker.rs", "send_message(&", 1, BROKER, "critical owner alerts with acknowledgment controls")),
@@ -239,7 +241,7 @@ pub static PRODUCERS: &[Producer] = &[
     p("broker_fan_out", "crates/augmentagent-approval-discord/src/sync.rs", ".post_digest(", 1, BROKER, "MultiSurfaceBroker fan-out"),
     p("broker_fan_out", "crates/augmentagent-approval-discord/src/sync.rs", ".post_flag_notice(", 1, BROKER, "MultiSurfaceBroker fan-out"),
     p("broker_default_notice", "crates/augmentagent-approval-discord/src/lib.rs", ".post_flag_notice(", 1, BROKER, "ApprovalBroker default notice"),
-    p("card_layout", "crates/augmentagent-approval-discord/src/layout.rs", "CreateMessage::new(", 4, TRANSPORT, "Discord card builders"),
+    p("card_layout", "crates/augmentagent-approval-discord/src/layout.rs", "CreateMessage::new(", 5, TRANSPORT, "Discord card builders"),
     p("code_mode_failure", "crates/augmentagent-channel-core/src/code_mode/failure.rs", ".post_flag_notice(", 1, BROKER, "code-mode failure notice"),
     p("engagement", "crates/augmentagent-channel-core/src/engagement.rs", ".post_digest(", 1, BROKER, "engagement digest"),
     p("engagement", "crates/augmentagent-channel-core/src/engagement.rs", ".post_flag_notice(", 2, BROKER, "engagement notices"),

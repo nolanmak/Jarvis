@@ -6,6 +6,7 @@ mod document_signing;
 mod provider_migration_tests;
 mod model_tool;
 mod composio_auth_tool;
+mod calendar_rsvp;
 mod voice_tool;
 mod phone_runtime;
 mod local_phone_transport;
@@ -1389,6 +1390,38 @@ enum CalendarOp {
         /// Window length in days when --to is absent (clamped to 1-60)
         #[arg(long, default_value_t = 7)]
         days: i64,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// #1224 — answer a calendar invite. accepted/tentative run at once;
+    /// declined (visible to the organizer) only previews unless --post true
+    /// raises a Discord approval card. --post true cards any response.
+    Rsvp {
+        /// Event id from `calendar list-events --json true`
+        #[arg(long)]
+        event_id: String,
+        /// accepted | declined | tentative
+        #[arg(long)]
+        response: String,
+        /// Account the invite is on (default: whichever account has it)
+        #[arg(long)]
+        account: Option<String>,
+        /// Answer the whole recurring series, not just this occurrence
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        series: bool,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        post: bool,
+    },
+    /// #1224 — turn invite auto-accept on/off for one account, or for every
+    /// account without its own setting when --account is absent.
+    SetAutoAccept {
+        #[arg(long, action = clap::ArgAction::Set)]
+        on: bool,
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// #1224 — per-account calendar settings (auto-accept and its source).
+    Status {
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         json: bool,
     },
@@ -4874,6 +4907,17 @@ async fn main() -> Result<()> {
                 .await?;
                 Ok(())
             }
+            CalendarOp::Rsvp {
+                event_id,
+                response,
+                account,
+                series,
+                post,
+            } => calendar_rsvp::run_rsvp(store, event_id, response, account, series, post).await,
+            CalendarOp::SetAutoAccept { on, account } => {
+                calendar_rsvp::run_set_auto_accept(store, on, account)
+            }
+            CalendarOp::Status { json } => calendar_rsvp::run_status(store, json),
         },
         Cmd::Voice { ref op } => match op {
             VoiceOp::Login { token } => run_voice_login(token.clone()),
@@ -13878,6 +13922,11 @@ impl ApprovalActionHandler for ReplyApprover {
         self.audited(action_id, "recompose", self.run_recompose(action_id)).await
     }
 
+    async fn calendar_decline(&self, action_id: &str) -> ApprovalActionOutcome {
+        self.audited(action_id, "calendar_decline", self.run_calendar_decline(action_id))
+            .await
+    }
+
     async fn is_schedule_live(&self, action_id: &str) -> bool {
         match self.handle_load(action_id) {
             Some(a) => matches!(a.action.status.as_str(), "scheduled" | "sending"),
@@ -13977,6 +14026,9 @@ impl ReplyApprover {
         }
         if action.email.platform == augmentagent_channel_socialapi::PLATFORM {
             return self.approve_socialapi(action_id, action).await;
+        }
+        if action.email.platform == "gcal" && action.email.kind == calendar_rsvp::RSVP_CARD_KIND {
+            return self.approve_gcal_rsvp(action_id, action).await;
         }
         if action.email.platform == "gcal" {
             return self.approve_gcal(action_id, action).await;
@@ -14218,10 +14270,8 @@ impl ReplyApprover {
                 let html_link =
                     Self::calendar_account_link(created.html_link.as_deref(), &action.email.from);
                 let link = html_link.clone().unwrap_or_else(|| event_id.clone());
-                let final_body = format!(
-                    "{}\ncreated: {link}\nevent ID: {event_id}",
-                    action.action.draft_body.clone().unwrap_or_default()
-                );
+                let base_body = action.action.draft_body.clone().unwrap_or_default();
+                let final_body = format!("{base_body}\ncreated: {link}\nevent ID: {event_id}");
                 if let Err(e) = self.store.update_action_status(
                     action_id,
                     ActionStatus::Sent,
@@ -14231,6 +14281,34 @@ impl ReplyApprover {
                     return ApprovalActionOutcome::Failed {
                         message: format!("calendar event {event_id} was created, but recording its receipt failed: {e}; check the calendar before retrying"),
                     };
+                }
+                // #1456 — creating is an implicit accept; never leave the
+                // organizer's own entry at needsAction. Runs only after the
+                // receipt is saved (the event exists either way), and its
+                // note goes BEFORE the terminal `created:`/`event ID:` lines
+                // recover_calendar_receipt parses.
+                let organizer_check = if draft.attendees.is_empty() {
+                    Ok(false) // no guest list ⇒ no attendee entry to answer
+                } else {
+                    augmentagent_channel_calendar::ensure_organizer_accepted(
+                        self.calendar.as_ref(),
+                        entity_id,
+                        "primary",
+                        &created,
+                    )
+                    .await
+                };
+                let organizer_note = match organizer_check {
+                    Ok(true) => "\norganizer RSVP: set to accepted",
+                    Ok(false) => "",
+                    Err(e) => {
+                        tracing::warn!(action_id, event_id, "organizer self-accept failed: {e}");
+                        "\norganizer RSVP: still needs action (self-accept failed)"
+                    }
+                };
+                if !organizer_note.is_empty() {
+                    let noted = format!("{base_body}{organizer_note}\ncreated: {link}\nevent ID: {event_id}");
+                    let _ = self.store.update_action_status(action_id, ActionStatus::Sent, Some(&noted), None);
                 }
                 let _ = self
                     .store
@@ -19810,6 +19888,8 @@ async fn run_calendar_poll_once(
     let api_key =
         std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gcal = Arc::new(ComposioCalendarClient::new(api_key));
+    let rsvp_api = Arc::clone(&gcal);
+    let rsvp_store = Arc::clone(&store);
     let reasoner = build_reasoner();
 
     // Wiki schema path defaults next to wiki_dir, mirroring gmail's wiring.
@@ -19849,8 +19929,18 @@ async fn run_calendar_poll_once(
         Some(sink) => channel = channel.with_alert_sink(sink),
         None => info!("calendar alerts: no notification surface is configured (Discord bot channel or Slack app); alert delivery disabled"),
     }
-    let outcome = channel.poll_once().await?;
-    println!("{:#?}", outcome);
+    let ingest = channel.poll_once().await;
+    if let Ok(outcome) = &ingest {
+        println!("{:#?}", outcome);
+    }
+    // #1224 — answer pending invites on auto-accept accounts. Isolated from
+    // the ingest result: a failure here is logged, never fails the poll.
+    let surface = calendar_rsvp::NoticeSurface::from_env();
+    match calendar_rsvp::auto_accept_pass(&rsvp_store, rsvp_api.as_ref(), &surface, dry_run).await {
+        Ok(report) => println!("{report:#?}"),
+        Err(e) => warn!("calendar auto-accept pass failed: {e:#}"),
+    }
+    ingest?;
     Ok(())
 }
 
@@ -19972,6 +20062,14 @@ async fn run_calendar_list_events(
         }
     }
 
+    // The owner's response, unless they organize it (organizers don't RSVP).
+    let my_response = |p: &MeetingPayload| -> Option<String> {
+        let me = p.attendees.iter().find(|a| a.is_self)?;
+        if me.is_organizer {
+            return None;
+        }
+        Some(me.response_status.clone().unwrap_or_else(|| "needsAction".into()))
+    };
     let attendee_line = |p: &MeetingPayload| -> String {
         let others: Vec<String> = p
             .attendees
@@ -20011,6 +20109,9 @@ async fn run_calendar_list_events(
                             "is_self": at.is_self,
                         })).collect::<Vec<_>>(),
                         "organizer_email": p.organizer_email,
+                        // #1224 — the owner's own answer; "needsAction" =
+                        // unanswered invite (`calendar rsvp` answers it).
+                        "my_response": my_response(p),
                         "conference_kind": p.conference_kind,
                         "virtual_meeting": p.virtual_meeting,
                         "recurring_event_id": p.recurring_event_id,
@@ -20067,14 +20168,21 @@ async fn run_calendar_list_events(
                         .as_deref()
                         .map(|k| format!(" [{k}]"))
                         .unwrap_or_default();
+                    let reply = match my_response(p).as_deref() {
+                        Some("needsAction") => " [invite: not answered]",
+                        Some("tentative") => " [you: maybe]",
+                        Some("declined") => " [you: declined]",
+                        _ => "",
+                    };
                     println!(
-                        "  - {} {}–{}  {}{}{}",
+                        "  - {} {}–{}  {}{}{}{}",
                         local_start.format("%a %Y-%m-%d"),
                         local_start.format("%H:%M"),
                         p.end.with_timezone(&Local).format("%H:%M"),
                         p.summary,
                         attendee_line(p),
-                        conf
+                        conf,
+                        reply
                     );
                 }
             }

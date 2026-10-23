@@ -187,10 +187,17 @@ async fn list_and_get_do_not_swallow_unsuccessful_envelopes() {
         .expect(1)
         .create_async()
         .await;
-    let get = server
-        .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_EVENTS_GET")
+    server
+        .mock("GET", "/api/v3/connected_accounts")
+        .match_query(mockito::Matcher::Any)
         .with_status(200)
-        .with_body(r#"{"successful":false,"error":"read rejected","data":{"id":"misleading"}}"#)
+        .with_body(r#"{"items":[{"id":"ca_test"}]}"#)
+        .create_async()
+        .await;
+    let get = server
+        .mock("POST", "/api/v3/tools/execute/proxy")
+        .with_status(200)
+        .with_body(r#"{"status":404,"data":{"error":{"message":"Not Found"},"id":"misleading"}}"#)
         .expect(1)
         .create_async()
         .await;

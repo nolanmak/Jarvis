@@ -95,7 +95,14 @@ impl ReplyApprover {
             )
         );
         let kind = format!("{}:{}", action.email.platform, action.email.kind);
-        let summary = if action.email.platform == "gcal" {
+        let summary = if action.email.platform == "gcal" && action.email.kind.starts_with("rsvp") {
+            let payload: serde_json::Value =
+                serde_json::from_str(&action.email.body).unwrap_or_default();
+            format!(
+                "{} | event={} | response={}",
+                action.email.subject, payload["event_id"], payload["response"]
+            )
+        } else if action.email.platform == "gcal" {
             let payload: serde_json::Value =
                 serde_json::from_str(&action.email.body).unwrap_or_default();
             format!(
@@ -125,6 +132,9 @@ impl ReplyApprover {
             Ok(None)=>return ApprovalActionOutcome::Failed{message:"This interaction was already recorded, or this action has an in-progress/unconfirmed operation. Check approval history and the provider before retrying; nothing was repeated.".into()},
             Err(_)=>return ApprovalActionOutcome::Failed{message:"Approval history could not be saved; nothing executed.".into()},
         };
+        // An own-response RSVP is idempotent: a failure is safe to retry, so
+        // never fence it as "unconfirmed" (that blocks every later click).
+        let idempotent = action.email.platform == "gcal" && action.email.kind.starts_with("rsvp");
         let outcome = f.await;
         let (state, detail) = match &outcome {
             ApprovalActionOutcome::DocumentSigned { receipt, .. } => ("completed", receipt.clone()),
@@ -140,6 +150,9 @@ impl ReplyApprover {
                     html_link.as_deref().unwrap_or("")
                 ),
             ),
+            ApprovalActionOutcome::CalendarResponded { response, .. } => {
+                ("completed", format!("rsvp={response}"))
+            }
             ApprovalActionOutcome::Skipped => ("skipped", String::new()),
             ApprovalActionOutcome::Revised { .. } => ("revised", String::new()),
             ApprovalActionOutcome::Scheduled { at_ms, .. } => {
@@ -173,7 +186,8 @@ impl ReplyApprover {
                     "no message id",
                 ]
                 .iter()
-                .any(|v| lower.contains(v));
+                .any(|v| lower.contains(v))
+                    && !idempotent;
                 (
                     if unknown { "unconfirmed" } else { "failed" },
                     bounded(message, 800),

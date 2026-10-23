@@ -54,6 +54,9 @@ impl ApprovalActionHandler for Contextual {
     async fn recompose(&self, id: &str) -> ApprovalActionOutcome {
         deciding(self.ctx.clone(), self.inner.recompose(id)).await
     }
+    async fn calendar_decline(&self, id: &str) -> ApprovalActionOutcome {
+        deciding(self.ctx.clone(), self.inner.calendar_decline(id)).await
+    }
     async fn is_resolved(&self, id: &str) -> bool {
         self.inner.is_resolved(id).await
     }
