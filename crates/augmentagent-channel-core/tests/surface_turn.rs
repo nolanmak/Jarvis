@@ -401,3 +401,118 @@ async fn turn_env_reaches_the_agent_inside_the_turn_only() {
     assert_eq!(seen.load(Ordering::SeqCst), 1);
     assert!(turn_env().is_empty());
 }
+
+#[tokio::test]
+async fn phone_and_text_turns_share_one_queue_and_native_session() {
+    for kind in [ProviderKind::Claude, ProviderKind::Codex] {
+        let (_dir, store) = store();
+        let provider = RecordingNativeProvider::new(kind);
+        let chat = slack("D-phone-owner", None);
+        let text = SurfaceTurnRef::new(chat.clone(), "slack:text-1").unwrap();
+        let phone = SurfaceTurnRef::new(chat, "phone:call-1:1").unwrap();
+        let active = AtomicUsize::new(0);
+        let maximum = AtomicUsize::new(0);
+        let answer = |turn: &SurfaceTurnRef, prompt: String| {
+            let provider = &provider;
+            let active = &active;
+            let maximum = &maximum;
+            let opts = opts(turn);
+            async move {
+                let n = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(n, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                let result = provider.call(&opts, &prompt).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                result
+            }
+        };
+        let (first, second) = tokio::join!(
+            run_surface_turn(
+                &store,
+                SurfaceTurnRequest {
+                    turn: &text,
+                    history: "earlier text",
+                    current: "text question",
+                    cwd: "/fixture"
+                },
+                || Ok(Some(kind)),
+                None,
+                |p| answer(&text, p)
+            ),
+            run_surface_turn(
+                &store,
+                SurfaceTurnRequest {
+                    turn: &phone,
+                    history: "earlier text",
+                    current: "phone question",
+                    cwd: "/fixture"
+                },
+                || Ok(Some(kind)),
+                None,
+                |p| answer(&phone, p)
+            ),
+        );
+        assert!(first.is_ok(), "text: {first:?}");
+        assert!(second.is_ok(), "phone: {second:?}");
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].native_session_id, calls[1].native_session_id);
+    }
+}
+
+#[tokio::test]
+async fn queued_phone_loads_history_only_if_no_native_session_exists_when_it_runs() {
+    use augmentagent_channel_core::surface_turn::run_surface_turn_with_history;
+    for kind in [ProviderKind::Claude, ProviderKind::Codex] {
+        let (_dir, store) = store();
+        let provider = RecordingNativeProvider::new(kind);
+        let chat = slack("D-history", None);
+        let text = SurfaceTurnRef::new(chat.clone(), "text:first").unwrap();
+        let phone = SurfaceTurnRef::new(chat, "phone:first").unwrap();
+        let entered = tokio::sync::Notify::new();
+        let loads = AtomicUsize::new(0);
+        let (text_result, phone_result) = tokio::join!(
+            run_surface_turn(&store, SurfaceTurnRequest { turn: &text, history: "initial history", current: "text", cwd: "/fixture" },
+                || Ok(Some(kind)), None, |prompt| {
+                    let (entered, provider, text) = (&entered, &provider, &text);
+                    async move {
+                        entered.notify_one();
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        provider.call(&opts(text), &prompt).await
+                    }
+                }),
+            async {
+                entered.notified().await;
+                run_surface_turn_with_history(&store, SurfaceTurnRequest { turn: &phone, history: "", current: "phone", cwd: "/fixture" },
+                    || Ok(Some(kind)), None, |prompt| {
+                        let (provider, phone) = (&provider, &phone);
+                        async move { provider.call(&opts(phone), &prompt).await }
+                    },
+                    || async { loads.fetch_add(1, Ordering::SeqCst); anyhow::bail!("history is unavailable but native resume must work") }).await
+            }
+        );
+        assert!(text_result.is_ok());
+        assert!(phone_result.is_ok(), "{phone_result:?}");
+        assert_eq!(loads.load(Ordering::SeqCst), 0);
+        let calls = provider.calls();
+        assert_eq!(calls[0].native_session_id, calls[1].native_session_id);
+    }
+}
+
+#[tokio::test]
+async fn cancellation_during_initial_history_load_never_dispatches_or_claims_a_turn() {
+    use augmentagent_channel_core::surface_turn::run_surface_turn_with_history;
+    let (_dir, store) = store();
+    let turn = SurfaceTurnRef::new(slack("D-history-cancel", None), "phone:cancel-history").unwrap();
+    let cancel = CancellationToken::new();
+    let result = tokio::time::timeout(Duration::from_secs(1), run_surface_turn_with_history(&store,
+        SurfaceTurnRequest { turn: &turn, history: "", current: "phone", cwd: "/fixture" },
+        || Ok(Some(ProviderKind::Claude)), Some(&cancel),
+        |_| async { panic!("cancelled history must not reach the model") },
+        || async { cancel.cancel(); std::future::pending::<anyhow::Result<String>>().await })).await
+        .expect("history cancellation must return promptly").unwrap();
+    assert_eq!(result, SurfaceTurnOutcome::Cancelled);
+    // A retry can claim the same ID: cancellation happened before submission.
+    store.claim_surface_turn(&turn).unwrap();
+}

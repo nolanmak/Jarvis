@@ -245,6 +245,8 @@ rm -rf "$DEFER_DIR"
 unset AUGMENTAGENT_SELFIMPROVE_LOCK AUGMENTAGENT_RESTART_DEFER_STAMP
 
 echo "trim_gate_cache_if_idle (#891):"
+# Capacity cases must not inherit the CI runner's changing free-space floor.
+_gate_free_mb() { echo 65536; }
 GATE_PRUNE_BIN=/nonexistent  # hermetic: never the checkout's real binary
 CACHE_DIR=$(mktemp -d)
 export AUGMENTAGENT_GATE_TARGET_DIR="$CACHE_DIR/gate"

@@ -171,6 +171,53 @@ grep -qi slack "$PLIST" && bad "plist carries no Slack setting or token" "$(grep
   || ok "plist carries no Slack setting or token"
 rm -rf "$TMP"
 
+# --- phone settings survive service reinstallation (#1496) -------------------
+# Phone runs inside serve. Service installation must neither copy private phone
+# settings into the public unit/plist nor replace the checkout's durable state.
+for platform in Linux Darwin; do
+  make_case
+  printf '#!/usr/bin/env bash\necho %s\n' "$platform" > "$TMP/bin/uname"
+  printf '#!/usr/bin/env bash\n[ "$1" = print ] && exit 113\nexit 0\n' > "$TMP/bin/launchctl"
+  chmod +x "$TMP/bin/launchctl"
+  cat > "$TMP/repo/.env" <<'PHONE_ENV'
+AUGMENTAGENT_PHONE_ENABLED=1
+TWILIO_AUTH_TOKEN=synthetic-installer-secret
+AUGMENTAGENT_PHONE_PUBLIC_URL=https://phone.example.test
+PHONE_ENV
+  chmod 600 "$TMP/repo/.env"
+  cp "$TMP/repo/.env" "$TMP/expected.env"
+  mkdir -p "$TMP/repo/data"
+  printf 'synthetic durable state sentinel\n' > "$TMP/repo/data/augmentagent.db"
+  cp "$TMP/repo/data/augmentagent.db" "$TMP/expected.db"
+  for phase in fresh reinstall; do
+    if run_installer install-autostart.sh; then
+      ok "$platform phone $phase installer succeeds"
+    else
+      bad "$platform phone $phase installer succeeds" "$(tail -3 "$TMP/install.out")"
+    fi
+    cmp -s "$TMP/expected.env" "$TMP/repo/.env" \
+      && ok "$platform $phase preserves private phone configuration" \
+      || bad "$platform $phase preserves private phone configuration"
+    cmp -s "$TMP/expected.db" "$TMP/repo/data/augmentagent.db" \
+      && ok "$platform $phase leaves durable state untouched" \
+      || bad "$platform $phase leaves durable state untouched"
+    service_file="$UNIT"
+    [ "$platform" = Darwin ] && service_file="$TMP/home/Library/LaunchAgents/com.nolanmak.augmentagent.plist"
+    if grep -qiE 'synthetic-installer-secret|TWILIO_|AUGMENTAGENT_PHONE_' "$service_file"; then
+      bad "$platform $phase keeps phone settings out of service definition"
+    else
+      ok "$platform $phase keeps phone settings out of service definition"
+    fi
+    python3 - "$TMP/repo/.env" <<'MODE_CHECK'
+import os, stat, sys
+assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o600
+MODE_CHECK
+    [ "$?" -eq 0 ] && ok "$platform $phase retains private config permissions" \
+      || bad "$platform $phase retains private config permissions"
+  done
+  rm -rf "$TMP"
+done
+
 # --- tenant unit ------------------------------------------------------------
 echo "install-tenant.sh unit resource limits (#902):"
 make_case

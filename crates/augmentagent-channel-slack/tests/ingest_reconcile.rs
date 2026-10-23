@@ -489,3 +489,24 @@ async fn a_deleted_digest_message_leaves_no_row() {
     ));
     assert_eq!(w.rows(), 0, "nothing refers to it, so the row is dropped");
 }
+
+#[tokio::test]
+async fn phone_number_commands_are_excluded_from_polled_messages_and_edits() {
+    let w = world(SubscriptionMode::Priority);
+    w.poll(vec![polled(T0, "phone number set +12025550973")])
+        .await;
+    assert_eq!(w.rows(), 0);
+    assert_eq!(w.triages(), 0);
+    w.poll(vec![polled("1800000001.000100", "ordinary message")])
+        .await;
+    let mut edit = polled("1800000001.000100", "phone number verify 654321");
+    edit.edited = Some(SlackEdited {
+        user: None,
+        ts: "1800000002.000100".into(),
+    });
+    w.poll(vec![edit]).await;
+    assert_eq!(
+        w.body(&format!("{CHAN}:1800000001.000100")).as_deref(),
+        Some("ordinary message")
+    );
+}

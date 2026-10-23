@@ -7,7 +7,7 @@
 //! Also routes qualifying messages in the query channel (or DMs) to the
 //! `QueryHandler` for wiki-ask answers.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -447,12 +447,27 @@ impl EventHandler for Handler {
         }
 
         let user_text = msg.content.trim().to_string();
+        // #1496: consume phone setup before attachments, history, native turn
+        // claims or model inference, even if the phone adapter is unavailable.
+        let phone_context = crate::phone::PhoneCommandContext {
+            guild_id: msg.guild_id.map(|id| id.get()),
+            bot_user_id: self.state.bot_user_id.get().map(|id| id.get()).unwrap_or(0),
+            channel_id: msg.channel_id.get(),
+            author_id: msg.author.id.get(),
+            message_id: msg.id.get(),
+        };
+        if let Some(reply) = crate::phone::dispatch(handler.as_ref(), &phone_context, &user_text).await {
+            let builder = CreateMessage::new().content(reply)
+                .reference_message(MessageReference::from((msg.channel_id, msg.id)));
+            if msg.channel_id.send_message(&ctx.http, builder).await.is_err() {
+                warn!("failed to post phone command reply");
+            }
+            return;
+        }
         // Model selection is an owner control, never part of the model prompt.
         // This runs after the existing fail-closed allowlist and before any
         // attachment download or history collection.
-        if let Some(reply) = handler.model_command_in_guild(
-            msg.guild_id.map(|guild| guild.get()), msg.channel_id.get(), &user_text
-        ).await {
+        if let Some(reply) = crate::phone::model_command(handler.as_ref(), &phone_context, &user_text).await {
             let builder = CreateMessage::new().content(reply)
                 .reference_message(MessageReference::from((msg.channel_id, msg.id)));
             if let Err(error) = msg.channel_id.send_message(&ctx.http, builder).await {
@@ -646,7 +661,8 @@ impl EventHandler for Handler {
             // path treats them uniformly.
             let downloaded_imgs = download_images(&images, msg_id.get()).await;
             let mut downloaded_txts = download_text_files(&text_files, msg_id.get()).await;
-            let extracted_docs = extract_doc_attachments(&docs, msg_id.get()).await;
+            let signable_root = signable_root(wiki_root.as_deref(), allowed_user_id);
+            let extracted_docs = extract_doc_attachments(&docs, msg_id.get(), signable_root).await;
             downloaded_txts.extend(extracted_docs);
 
             let mut current = build_prompt(&user_text, &downloaded_imgs, &downloaded_txts);
@@ -684,7 +700,7 @@ impl EventHandler for Handler {
                 channel_id,
                 crate::interaction::owner_history(
                     allowed_user_id.is_some() && (is_dm || in_query_channel),
-                    crate::compute_inputs::SELECTED.scope(selected, handler.answer_turn(&audit_ctx, &history, &current))),
+                    crate::compute_inputs::SELECTED.scope(selected, crate::phone::answer_turn(handler.as_ref(), &phone_context, &audit_ctx, &history, &current))),
             ).await;
             info!(%channel_id, %msg_id, success = result.is_ok(), "discord query completed");
 
@@ -793,6 +809,13 @@ impl EventHandler for Handler {
                     debug!("unrecognized custom_id: {}", comp.data.custom_id);
                     return;
                 };
+                // #1507 — without this line the log cannot say which card a
+                // click landed on; only its side effects were visible.
+                info!(
+                    action_id = %cid.action_id,
+                    verb = cid.verb.as_str(),
+                    "discord card control clicked"
+                );
                 // Enforce user allowlist on clicks.
                 if !is_authorized(self.state.allowed_user_id, comp.user.id) {
                     ack_ephemeral(
@@ -1690,6 +1713,7 @@ async fn followup_with_recovery(
     outcome: &ApprovalActionOutcome,
     action_id: &str,
 ) {
+    log_resolved(comp, outcome, action_id);
     if let Err(e) = comp
         .create_followup(&ctx.http, approval_followup(outcome, action_id))
         .await
@@ -1745,17 +1769,66 @@ async fn deliver_approval_outcome(
     outcome: &ApprovalActionOutcome,
     action_id: &str,
 ) -> Result<(), serenity::Error> {
+    log_resolved(comp, outcome, action_id);
     let mut followup = approval_followup(outcome, action_id);
+    // #1507 — name the card the click acted on, so a reply can't be mistaken
+    // for another card's (the owner approved a DM thinking it was a signature).
+    if let Some(title) = card_title(&comp.message) {
+        // Embed titles are capped at 256 by Discord; keep well inside the
+        // 2000-char message limit so naming the card can't fail the reply.
+        let title: String = title.chars().take(200).collect();
+        let body: String = describe(outcome).chars().take(1700).collect();
+        followup = followup.content(format!("**{title}** — {body}"));
+    }
     if let ApprovalActionOutcome::DocumentSigned { output: Some((path, hash)), .. } = outcome {
         let bytes = augmentagent_docs::signing::verified_output(path, hash)
             .map_err(|_| serenity::Error::Other("Signed PDF is missing or changed; approval card retained"))?;
-        followup = followup.add_file(serenity::all::CreateAttachment::bytes(bytes, "signed-document.pdf"));
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("signed-document.pdf")
+            .to_string();
+        followup = followup.add_file(serenity::all::CreateAttachment::bytes(bytes, name));
     }
     comp.create_followup(http, followup).await?;
     if should_delete_source(outcome) {
         comp.channel_id.delete_message(http, comp.message.id).await?;
     }
     Ok(())
+}
+
+/// The card's embed title (its subject line), if it has one.
+fn card_title(message: &Message) -> Option<&str> {
+    message
+        .embeds
+        .first()
+        .and_then(|e| e.title.as_deref())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+}
+
+/// The outcome variant's name, for logs — never its payload (drafts, PII).
+fn outcome_kind(outcome: &ApprovalActionOutcome) -> String {
+    format!("{outcome:?}")
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// #1507 — one line per resolved card control, pairing with "clicked".
+fn log_resolved(
+    comp: &serenity::all::ComponentInteraction,
+    outcome: &ApprovalActionOutcome,
+    action_id: &str,
+) {
+    let verb = CustomId::parse(&comp.data.custom_id).map(|c| c.verb.as_str());
+    info!(
+        %action_id,
+        verb = verb.unwrap_or("-"),
+        outcome = %outcome_kind(outcome),
+        "discord card control resolved"
+    );
 }
 
 /// Non-deferred immediate ephemeral ack — used only for the authorization
@@ -2333,7 +2406,7 @@ async fn download_images(attachments: &[Attachment], msg_id: u64) -> Vec<PathBuf
         let path = PathBuf::from(format!("/tmp/aa-img-{msg_id}-{idx}.{ext}"));
         match reqwest::get(&att.url).await {
             Ok(resp) => match resp.bytes().await {
-                Ok(bytes) => match tokio::fs::write(&path, &bytes).await {
+                Ok(bytes) => match augmentagent_docs::inbound::write_private_attachment(&path, &bytes).await {
                     Ok(()) => out.push(path),
                     Err(e) => warn!("write image tempfile {} failed: {e}", path.display()),
                 },
@@ -2376,7 +2449,7 @@ async fn download_text_files(
             Ok(resp) => match resp.bytes().await {
                 Ok(bytes) => {
                     let (to_write, truncated) = truncate_text_bytes(&bytes);
-                    match tokio::fs::write(&path, to_write).await {
+                    match augmentagent_docs::inbound::write_private_attachment(&path, to_write).await {
                         Ok(()) => out.push(DownloadedTextFile {
                             path,
                             truncated,
@@ -2413,6 +2486,7 @@ async fn download_text_files(
 async fn extract_doc_attachments(
     attachments: &[Attachment],
     msg_id: u64,
+    signable_root: Option<&Path>,
 ) -> Vec<DownloadedTextFile> {
     let mut out = Vec::with_capacity(attachments.len());
     // One key lookup per message, not per attachment. `None` ⇒ OCR skipped.
@@ -2430,10 +2504,16 @@ async fn extract_doc_attachments(
         let out_path = PathBuf::from(format!("/tmp/aa-doc-{msg_id}-{idx}.txt"));
 
         // Download binary.
+        let mut staged: Option<String> = None;
         let download_ok = match reqwest::get(&att.url).await {
             Ok(resp) => match resp.bytes().await {
-                Ok(bytes) => match tokio::fs::write(&in_path, &bytes).await {
-                    Ok(()) => true,
+                Ok(bytes) => match augmentagent_docs::inbound::write_private_attachment(&in_path, &bytes).await {
+                    Ok(()) => {
+                        if let Some(root) = signable_root.filter(|_| matches!(kind, DocKind::Pdf)) {
+                            staged = stage_signable_upload(root, &att.filename, &bytes);
+                        }
+                        true
+                    }
                     Err(e) => {
                         warn!("write doc tempfile {} failed: {e}", in_path.display());
                         false
@@ -2454,13 +2534,16 @@ async fn extract_doc_attachments(
             match extract_text(kind, &in_path, ocr.as_ref()).await {
                 Ok(extracted) => {
                     let text = extracted.text;
-                    let note = extracted.ocr.note();
+                    let note = match (extracted.ocr.note(), staged) {
+                        (Some(ocr), Some(saved)) => Some(format!("{ocr}; {saved}")),
+                        (ocr, saved) => ocr.or(saved),
+                    };
                     if let Some(n) = &note {
                         info!(file = %att.filename, "{n}");
                     }
                     let (to_write, truncated) = truncate_text_bytes(text.as_bytes());
                     let extracted_len = text.len() as u64;
-                    match tokio::fs::write(&out_path, to_write).await {
+                    match augmentagent_docs::inbound::write_private_attachment(&out_path, to_write).await {
                         Ok(()) => out.push(DownloadedTextFile {
                             path: out_path,
                             truncated,
@@ -2489,6 +2572,37 @@ async fn extract_doc_attachments(
         }
     }
     out
+}
+
+/// #1507 — only the allowlisted owner's PDFs become signable; with no
+/// allowlist anyone who can message the bot could plant a document for an
+/// Approve & Sign card.
+fn signable_root(wiki_root: Option<&Path>, allowed_user_id: Option<UserId>) -> Option<&Path> {
+    wiki_root.filter(|_| allowed_user_id.is_some())
+}
+
+/// #1507 — keep the owner's original PDF byte-for-byte so it can be signed
+/// as-is. Returns the prompt note naming the staged path, or `None` (logged)
+/// when staging fails; the text extraction still proceeds either way.
+fn stage_signable_upload(root: &Path, filename: &str, bytes: &[u8]) -> Option<String> {
+    let staged = augmentagent_docs::signing::state_root().and_then(|state| {
+        augmentagent_docs::signing::stage_owner_upload(root, &state, filename, bytes)
+    });
+    match staged {
+        Ok(path) => {
+            info!(file = %filename, path = %path.display(), "owner PDF staged for signing");
+            Some(format!(
+                "original PDF saved unchanged at {}; to sign this exact file run `augmentagent doc sign-lines {}` then `augmentagent doc sign {} --out <new-signed.pdf> --page <n> --anchor-text \"<text under the line>\"`",
+                path.display(),
+                path.display(),
+                path.display()
+            ))
+        }
+        Err(e) => {
+            warn!(file = %filename, "stage owner PDF for signing failed: {e:#}");
+            None
+        }
+    }
 }
 
 /// Combine the user's text (possibly empty) with lists of locally-downloaded
@@ -2538,7 +2652,7 @@ fn is_model_control_text(text: &str) -> bool {
 
 fn history_without_model_controls(turns: &[HistoryTurn]) -> Vec<(&'static str, String)> {
     let control_ids: std::collections::HashSet<u64> = turns.iter()
-        .filter(|turn| turn.role == "user" && is_model_control_text(&turn.body))
+        .filter(|turn| turn.role == "user" && (is_model_control_text(&turn.body) || crate::phone::is_private_control(&turn.body)))
         .map(|turn| turn.id)
         .collect();
     turns.iter()
@@ -2559,14 +2673,25 @@ async fn fetch_conversation_context(
     bot_user_id: Option<UserId>,
     allowed_user_id: Option<UserId>,
 ) -> String {
-    let builder = GetMessages::new().before(before).limit(HISTORY_LIMIT);
-    let messages = match channel_id.messages(&ctx.http, builder).await {
-        Ok(m) => m,
-        Err(e) => {
-            warn!("fetch conversation history failed: {e}");
-            return String::new();
-        }
-    };
+    match fetch_owner_history(&ctx.http, channel_id, Some(before), bot_user_id, allowed_user_id).await {
+        Ok(history) => history,
+        Err(_) => { warn!("fetch conversation history failed"); String::new() }
+    }
+}
+
+/// Shared bounded owner-only history for text and phone session bootstrap.
+/// Private setup controls and their replies use the same filter on both paths.
+pub async fn fetch_owner_history(
+    http: &serenity::http::Http,
+    channel_id: ChannelId,
+    before: Option<MessageId>,
+    bot_user_id: Option<UserId>,
+    allowed_user_id: Option<UserId>,
+) -> anyhow::Result<String> {
+    let mut builder = GetMessages::new().limit(HISTORY_LIMIT);
+    if let Some(before) = before { builder = builder.before(before); }
+    let messages = channel_id.messages(http, builder).await
+        .map_err(|_| anyhow::anyhow!("Discord history unavailable"))?;
 
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2612,7 +2737,7 @@ async fn fetch_conversation_context(
     }
     // `messages` was newest-first; the Vec we built is therefore newest-first too.
     turns.reverse();
-    format_transcript(&history_without_model_controls(&turns), HISTORY_CHAR_CAP)
+    Ok(format_transcript(&history_without_model_controls(&turns), HISTORY_CHAR_CAP))
 }
 
 /// Pure renderer so unit tests don't need a live Discord connection.
@@ -3541,6 +3666,19 @@ mod tests {
     }
 
     #[test]
+    fn private_phone_setup_and_its_replies_never_enter_later_history() {
+        let turns = vec![
+            HistoryTurn { role: "user", body: "phone number set +12025550123".into(), id: 1, reply_to: None },
+            HistoryTurn { role: "assistant", body: "Verification requested".into(), id: 2, reply_to: Some(1) },
+            HistoryTurn { role: "user", body: " /PHONE NUMBER verify 123456 ".into(), id: 3, reply_to: None },
+            HistoryTurn { role: "assistant", body: "Number verified".into(), id: 4, reply_to: Some(3) },
+            HistoryTurn { role: "user", body: "What were we discussing?".into(), id: 5, reply_to: None },
+        ];
+        let history = history_without_model_controls(&turns);
+        assert_eq!(history, vec![("user", "What were we discussing?".into())]);
+    }
+
+    #[test]
     fn transcript_drops_oldest_when_over_cap() {
         let turns = vec![
             ("user", "A".repeat(200)),
@@ -3558,6 +3696,14 @@ mod tests {
     fn transcript_returns_empty_when_nothing_fits() {
         let turns = vec![("user", "x".repeat(10_000))];
         assert_eq!(format_transcript(&turns, 100), "");
+    }
+
+    #[test]
+    fn owner_uploads_are_signable_only_with_an_owner_allowlist() {
+        let wiki = std::path::Path::new("/wiki");
+        assert_eq!(signable_root(Some(wiki), Some(UserId::new(7))), Some(wiki));
+        assert_eq!(signable_root(Some(wiki), None), None, "no allowlist: nothing registered");
+        assert_eq!(signable_root(None, Some(UserId::new(7))), None);
     }
 
     #[test]

@@ -543,7 +543,9 @@ impl FallbackReasoner {
         transcript: bool,
         revision_authors: Option<&[ProviderKind]>,
     ) -> anyhow::Result<String> {
-        let config = crate::model_router::load().map_err(|_| ReasonerError::Local {
+        // Respect a caller-pinned routing snapshot (including native phone turns).
+        // Unscoped dispatch still reloads configuration for the next request.
+        let config = crate::model_router::current().map_err(|_| ReasonerError::Local {
             message: "Invalid model router configuration; refusing dispatch".into(),
         })?;
         // Bind the selected profile and router mode together for this logical
