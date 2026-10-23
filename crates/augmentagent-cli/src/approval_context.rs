@@ -47,6 +47,9 @@ impl ReplyApprover {
                 }
             }
         };
+        if action.email.platform == "document-signing" && !matches!(verb, "approve" | "skip") {
+            return ApprovalActionOutcome::Failed { message: "Signing supports Approve or Skip only; changes require a new document proposal.".into() };
+        }
         // Already completed approvals retain their existing recovery/receipt behavior.
         if verb == "approve" && !matches!(action.action.status.as_str(), "pending" | "error") {
             return f.await;
@@ -124,6 +127,7 @@ impl ReplyApprover {
         };
         let outcome = f.await;
         let (state, detail) = match &outcome {
+            ApprovalActionOutcome::DocumentSigned { receipt, .. } => ("completed", receipt.clone()),
             ApprovalActionOutcome::Approved => ("completed", "Handler confirmed completion".into()),
             ApprovalActionOutcome::CalendarCreated {
                 event_id,

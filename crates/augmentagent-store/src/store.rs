@@ -995,11 +995,14 @@ impl Store {
         crate::delivery::migrate(conn)?;
         // #1286 / #1230 — owner binding, control conversations, rejection audit.
         crate::owner::migrate(conn)?;
+        crate::phone::migrate(conn)?;
+        crate::local_chat::migrate(conn)?;
         // #1287 — live listener health reported by interactive surfaces.
         crate::surface_health::migrate(conn)?;
         // #1289 — approval-card pointers per surface.
         crate::approval_cards::migrate(conn)?;
         crate::approval_history::migrate(conn)?;
+        crate::document_signatures::migrate(conn)?;
         // #1299 — the daemon's own start report (credential backend, notices).
         crate::daemon_report::migrate(conn)?;
         // #1297 — per-conversation reply mode (`voice on|off` on Slack).
@@ -4363,6 +4366,11 @@ impl Store {
     /// inbound *email*, and a merge card has no thread and a display name, not a
     /// mailbox, in `fromEmail` — which the bulk-sender rule retires on sight.
     ///
+    /// #1503 — `sign_pdf` cards are excluded for the same reason: an owner
+    /// signing decision on a local file (`fromEmail` = `Owner signature`) is
+    /// not an inbound draft, and the bulk-sender rule retired every one on the
+    /// first tick, so Approve & Sign always failed "superseded".
+    ///
     /// #1191 — pending `--send-at` proposals (`scheduledAtMs IS NOT NULL`) are
     /// excluded too. They are live cards awaiting the owner's Approve and must
     /// not be fed into the empty-draft / bulk-sender / answered-thread rules,
@@ -4382,7 +4390,7 @@ impl Store {
                LEFT JOIN emails e ON a.messageId = e.messageId \
               WHERE a.status = 'pending' \
                 AND a.scheduledAtMs IS NULL \
-                AND COALESCE(e.kind, '') <> 'identity_merge' \
+                AND COALESCE(e.kind, '') NOT IN ('identity_merge', 'sign_pdf') \
               ORDER BY a.createdAt ASC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -12104,6 +12112,44 @@ mod tests {
         s.record_outbound_thread_event("ent-1", "msg-noth", None, 20_000)
             .unwrap();
         assert!(!s.thread_has_user_reply_after("T-other", 0).unwrap());
+    }
+
+    /// #1503 — a pending PDF-signing card is an owner decision, not an inbound
+    /// draft, so the reconcile sweep must never see it (its `Owner signature`
+    /// sender failed the bulk-sender rule on every tick). Ordinary drafts are
+    /// still enumerated.
+    #[test]
+    fn pending_actions_for_reconcile_excludes_signing_cards() {
+        let (s, _f) = fresh_store();
+        let plain = pending_action(&s, "m-rec-plain");
+        let mut email = sample_email("doc-sign:1");
+        email.from = "Owner signature".into();
+        email.platform = "document-signing".into();
+        email.kind = "sign_pdf".into();
+        s.upsert_email(&email).unwrap();
+        let signing = s
+            .log_action(
+                "doc-sign:1",
+                None,
+                "Owner signature",
+                "Sign PDF: deliverables/x.pdf",
+                Some("{}"),
+                Some("Apply signature 'default' to deliverables/x.pdf"),
+                ActionStatus::Pending,
+            )
+            .unwrap();
+
+        let ids: Vec<String> = s
+            .pending_actions_for_reconcile()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert!(ids.contains(&plain), "plain pending draft is reconcilable");
+        assert!(
+            !ids.contains(&signing),
+            "a sign_pdf card must be excluded from reconcile"
+        );
     }
 
     /// #1196 — the reconcile sweep needs each pending card's inbound arrival to

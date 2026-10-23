@@ -57,9 +57,13 @@ pub(crate) enum Op {
         #[arg(long, default_value_t = 3600)]
         useful_seconds: u32,
     },
+    /// Record that the alert was seen; preparation reminders continue.
+    #[command(visible_alias = "seen")]
     Acknowledge {
         id: String,
     },
+    /// Mark the alert done and stop all further reminders.
+    #[command(visible_alias = "done")]
     Resolve {
         id: String,
     },

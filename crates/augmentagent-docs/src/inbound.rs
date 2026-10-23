@@ -21,6 +21,22 @@ use std::path::{Path, PathBuf};
 
 use crate::{doc_kind_for, DocKind};
 
+/// Atomically publish an owner-only attachment without following a preexisting
+/// destination symlink or modifying another hard link's inode. The temporary
+/// file is removed if writing fails or the future is cancelled before publish.
+pub async fn write_private_attachment(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let parent = path.parent().ok_or_else(|| std::io::Error::new(
+        std::io::ErrorKind::InvalidInput, "attachment requires a parent directory"))?;
+    let temporary = tempfile::Builder::new().prefix(".aa-inbound-").tempfile_in(parent)?;
+    let mut output = tokio::fs::File::from_std(temporary.as_file().try_clone()?);
+    output.write_all(bytes).await?;
+    output.flush().await?;
+    drop(output);
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
 /// Soft cap on how much of a text file goes into the prompt. Larger files are
 /// truncated to this many bytes and annotated `TRUNCATED`.
 pub const MAX_TEXT_BYTES: u64 = 1_048_576; // 1 MiB

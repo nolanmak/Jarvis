@@ -7,6 +7,7 @@
 // #1289 — durable approval-card pointers per surface.
 pub mod approval_cards;
 pub mod approval_history;
+pub mod document_signatures;
 pub mod alert_schedule;
 pub mod daemon_report;
 pub mod delivery;
@@ -14,6 +15,8 @@ pub mod imessage;
 pub mod models;
 pub mod notes;
 pub mod owner;
+pub mod phone;
+mod local_chat;
 pub mod owner_alerts;
 pub mod redact;
 // #1290 — Slack contact send targets and the per-action send ledger.

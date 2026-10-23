@@ -5,7 +5,8 @@ on:
       - 'crates/augmentagent-docs/**'
       - 'crates/augmentagent-cli/**'
       - 'crates/augmentagent-channel-core/src/reasoner.rs'
-      - 'crates/augmentagent-approval-discord/src/attachments.rs'
+      - 'crates/augmentagent-approval-discord/**'
+      - 'crates/augmentagent-store/src/document_signatures.rs'
       - 'schema/wiki-ask.md'
       - 'Cargo.*'
       - '.github/workflows/pdf-generation.yml'
@@ -45,6 +46,8 @@ jobs:
       - run: bash scripts/tests/updater-rebuild-trigger.test.sh
       - run: ~/.local/share/augmentagent/pdf-runtime/bin/python3 -m unittest discover -s crates/augmentagent-docs/python -v
       - run: cargo test --locked -p augmentagent-docs
+      - run: cargo test --locked -p augmentagent-cli --bin augmentagent document_signing::tests
+      - run: cargo test --locked -p augmentagent-approval-discord --lib signing_receipt
       - run: cargo test --locked -p augmentagent-cli --test pdf_generation
       - run: cargo test --locked -p augmentagent-channel-core ask_opts_pdf_generation --lib
       - run: "cargo test --locked -p augmentagent-approval-discord attachments:: --lib"

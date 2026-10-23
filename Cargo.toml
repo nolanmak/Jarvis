@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/augmentagent-finance",
     "crates/augmentagent-store",
+    "crates/augmentagent-phone",
     "crates/augmentagent-messages",
     "crates/augmentagent-embeddings",
     "crates/augmentagent-channel-core",

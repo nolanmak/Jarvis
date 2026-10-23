@@ -57,6 +57,12 @@ pub(crate) fn migrate(conn: &Connection) -> StoreResult<()> {
             PRIMARY KEY(platform, account_id, conversation_id),
             UNIQUE(platform, account_id, kind)
         );
+        CREATE TABLE IF NOT EXISTS surface_private_command_receipts (
+            platform TEXT NOT NULL, account_id TEXT NOT NULL,
+            conversation_id TEXT NOT NULL, event_id TEXT NOT NULL,
+            consumed_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(platform,account_id,conversation_id,event_id)
+        );
         CREATE TABLE IF NOT EXISTS surface_auth_rejections (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             platform TEXT NOT NULL,
@@ -71,6 +77,30 @@ pub(crate) fn migrate(conn: &Connection) -> StoreResult<()> {
         CREATE INDEX IF NOT EXISTS idx_surface_auth_rejections_account
         ON surface_auth_rejections(platform, account_id, id);"#,
     )?;
+    // Retain revisions across unbinding. Wall-clock timestamps can repeat or
+    // move backwards and cannot identify an authorization generation.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS surface_authority_revisions (
+            platform TEXT NOT NULL, account_id TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            PRIMARY KEY(platform, account_id)
+        );
+        INSERT OR IGNORE INTO surface_authority_revisions(platform,account_id,revision)
+            SELECT platform,account_id,1 FROM surface_owner_bindings;",
+    )?;
+    for table in ["surface_owner_bindings", "surface_control_conversations"] {
+        for event in ["INSERT", "UPDATE", "DELETE"] {
+            let row = if event == "DELETE" { "OLD" } else { "NEW" };
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER IF NOT EXISTS {table}_authority_{event}
+                 AFTER {event} ON {table} BEGIN
+                 INSERT INTO surface_authority_revisions(platform,account_id,revision)
+                 VALUES({row}.platform,{row}.account_id,1)
+                 ON CONFLICT(platform,account_id) DO UPDATE SET revision=revision+1;
+                 END;"
+            ))?;
+        }
+    }
     Ok(())
 }
 
@@ -114,6 +144,8 @@ pub struct ControlConversation {
 pub struct SurfaceOwnerBinding {
     pub owner: SurfaceOwnerRef,
     pub confirmed_at_ms: i64,
+    /// Durable authorization generation, retained across unbinding.
+    pub revision: i64,
     /// Ordered `direct` first, then `channel`.
     pub control: Vec<ControlConversation>,
 }
@@ -245,14 +277,81 @@ fn load_binding(
             added_at_ms,
         });
     }
+    let revision = conn.query_row(
+        "SELECT revision FROM surface_authority_revisions WHERE platform=?1 AND account_id=?2",
+        params![platform, account_id],
+        |r| r.get(0),
+    )?;
     Ok(Some(SurfaceOwnerBinding {
         owner,
         confirmed_at_ms,
+        revision,
         control,
     }))
 }
 
 impl Store {
+    /// Consume an already-authorized private command before executing it.
+    /// Only provider IDs are retained, never command bodies or verification
+    /// codes. A crash leaves the receipt consumed: retry requires a new message.
+    pub fn consume_private_surface_command(
+        &self,
+        conversation: &SurfaceConversationRef,
+        event_id: &str,
+        now_ms: i64,
+    ) -> StoreResult<bool> {
+        bounded(event_id, "private command event ID")?;
+        if event_id.trim().is_empty() || conversation.thread_id().is_some() {
+            return Err(StoreError::InvalidInput(
+                "invalid private command identity".into(),
+            ));
+        }
+        write_tx(self, |tx| {
+            Ok(tx.execute(
+                "INSERT INTO surface_private_command_receipts(platform,account_id,conversation_id,event_id,consumed_at_ms) VALUES(?1,?2,?3,?4,?5) ON CONFLICT DO NOTHING",
+                params![conversation.account().platform().as_str(), conversation.account().account_id(), conversation.conversation_id(), event_id, now_ms],
+            )? == 1)
+        })
+    }
+
+    /// Initialize a never-bound account and its authenticated private chat in one
+    /// transaction. The caller must verify transport identity and explicit owner
+    /// configuration. Returns false for any previous binding, including revoked
+    /// bindings; this operation never replaces or restores authority.
+    pub fn initialize_private_surface_owner(
+        &self,
+        owner: &SurfaceOwnerRef,
+        conversation: &SurfaceConversationRef,
+        now_ms: i64,
+    ) -> StoreResult<bool> {
+        if owner.account() != conversation.account() || conversation.thread_id().is_some() {
+            return Err(StoreError::InvalidInput(
+                "private owner conversation mismatch".into(),
+            ));
+        }
+        let account = owner.account();
+        let platform = account.platform().as_str();
+        let account_id = account.account_id();
+        write_tx(self, |tx| {
+            let seen: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM surface_authority_revisions WHERE platform=?1 AND account_id=?2)",
+                params![platform, account_id], |r| r.get(0),
+            )?;
+            if seen {
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT INTO surface_owner_bindings(platform,account_id,owner_sender_id,confirmed_at_ms) VALUES(?1,?2,?3,?4)",
+                params![platform, account_id, owner.sender_id(), now_ms],
+            )?;
+            tx.execute(
+                "INSERT INTO surface_control_conversations(platform,account_id,conversation_id,kind,added_at_ms) VALUES(?1,?2,?3,?4,?5)",
+                params![platform, account_id, conversation.conversation_id(), ControlConversationKind::Direct.as_str(), now_ms],
+            )?;
+            Ok(true)
+        })
+    }
+
     /// Bind `owner` as the only identity with owner authority on its account.
     /// A different owner than the stored one replaces it and clears the
     /// control conversations; the same owner only refreshes the timestamp.

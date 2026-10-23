@@ -43,13 +43,21 @@ elif args[:2]==['pr','create']:
     (root/'created-pr.json').write_text(json.dumps(args))
     print('https://example.invalid/synthetic/project/pull/1')
 elif args[:2]==['pr','view']:
-    original=json.loads((root/'created-pr.json').read_text())
-    print(json.dumps({'body':original[original.index('--body')+1]}))
+    if args[args.index('--json')+1]=='headRefOid':
+        import subprocess
+        print(subprocess.check_output(['git','--git-dir='+str(root/'remote.git'),
+            'rev-parse','agent-fix/issue-700001'],text=True).strip())
+    else:
+        original=json.loads((root/'created-pr.json').read_text())
+        print(json.dumps({'body':original[original.index('--body')+1]}))
+elif args[:2]==['pr','checks']:
+    print(json.dumps([{'state':'SUCCESS','bucket':'pass','name':'synthetic CI','link':''}]))
 elif args[:2]==['pr','merge']:
     remote=root/'remote.git'
     def git(*argv,**kw):
         return subprocess.check_output(['git','--git-dir='+str(remote),*argv],text=True,**kw).strip()
     before=git('rev-parse','main')
+    assert args[args.index('--match-head-commit')+1]==git('rev-parse','agent-fix/issue-700001')
     tree=git('rev-parse','agent-fix/issue-700001^{tree}')
     identity=dict(os.environ,GIT_AUTHOR_NAME='Synthetic',GIT_AUTHOR_EMAIL='fixture@example.com',
         GIT_COMMITTER_NAME='Synthetic',GIT_COMMITTER_EMAIL='fixture@example.com')

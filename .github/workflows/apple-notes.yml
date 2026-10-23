@@ -13,7 +13,8 @@ permissions:
   contents: read
 jobs:
   exporter:
-    runs-on: ubuntu-latest
+    # Python 3.9 compatibility coverage requires an available runner build.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,7 +22,8 @@ jobs:
           python-version: '3.9'
       - run: python3 -m unittest discover -s scripts/apple-notes/tests -v
   notes:
-    runs-on: ubuntu-latest
+    # Python 3.9 compatibility coverage requires an available runner build.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       CARGO_BUILD_JOBS: 2

@@ -265,6 +265,69 @@ class ToolPolicyTests(unittest.TestCase):
             p.write('bad.txt', 'bad')
         self.assertFalse((self.root / 'bad.txt').exists())
 
+    def test_scope_guard_resolves_paths_without_gnu_readlink_m(self):
+        import os
+        import shutil
+        guard = Path(SPEC.origin).with_name('aa-wiki-scope-guard.sh')
+        shim = Path(self.temp.name) / 'bin'
+        shim.mkdir()
+        executable = shim / 'readlink'
+        executable.write_text('#!/bin/sh\nif [ "$1" = "-m" ]; then exit 1; fi\nexec ' + shutil.which('readlink') + ' "$@"\n')
+        executable.chmod(0o700)
+        alias = Path(self.temp.name) / 'alias'
+        alias.symlink_to(self.root, target_is_directory=True)
+        (self.root / 'note.txt').write_text('SYNTHETIC')
+        env = dict(os.environ, WIKI_ROOT=str(self.root), PATH=str(shim)+os.pathsep+os.environ['PATH'])
+        for tool, key in [('Read','file_path'), ('Write','file_path'), ('Grep','path'), ('Glob','path')]:
+            path = alias / 'note.txt' if key == 'file_path' else alias
+            run = subprocess.run(['bash', str(guard)], input=json.dumps({'tool_name':tool, 'tool_input':{key:str(path)}}),
+                env=env, text=True, capture_output=True, timeout=10)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertFalse(run.stdout.strip(), f'{tool}: {run.stdout}')
+
+    def test_system_alias_discovery_rejects_untrusted_links_and_parent_directories(self):
+        import stat
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        def metadata(path):
+            return SimpleNamespace(st_uid=0, st_mode=(stat.S_IFDIR | 0o755) if path in ('/', '/private') else (stat.S_IFLNK | 0o777))
+        with patch.object(bridge.sys, 'platform', 'darwin'), patch.object(bridge.os, 'lstat', side_effect=metadata), patch.object(bridge.os, 'readlink', side_effect=lambda p: 'private' + p):
+            self.assertEqual(bridge.system_path_aliases(), {'/tmp':'/private/tmp', '/var':'/private/var', '/etc':'/private/etc'})
+            with patch.object(bridge.os, 'readlink', return_value='/untrusted'):
+                self.assertEqual(bridge.system_path_aliases(), {})
+            with patch.object(bridge.os, 'lstat', return_value=SimpleNamespace(st_uid=1000, st_mode=stat.S_IFDIR | 0o777)):
+                self.assertEqual(bridge.system_path_aliases(), {})
+        with patch.object(bridge.sys, 'platform', 'linux'):
+            self.assertEqual(bridge.system_path_aliases(), {})
+
+    def test_trusted_system_aliases_allow_scoped_files_but_not_user_symlinks(self):
+        from unittest.mock import patch
+        alias = Path(self.temp.name) / 'alias'
+        alias.symlink_to(self.root, target_is_directory=True)
+        with patch.object(bridge, 'system_path_aliases', return_value={str(alias): str(self.root)}):
+            policy = bridge.Policy({'cwd': str(self.root), 'read_roots': [str(self.root)],
+                'write_roots': [str(self.root)], 'allowed_tools': ['Read', 'Write', 'Glob', 'Grep']})
+        (self.root / 'allowed.txt').write_text('SYNTHETIC_ALLOWED')
+        self.assertEqual(policy.read(str(alias / 'allowed.txt')), 'SYNTHETIC_ALLOWED')
+        self.root.chmod(0o700)
+        with patch.object(bridge, 'system_path_aliases', return_value={str(alias): str(self.root)}):
+            attachments = bridge.Policy({'cwd': str(self.root), 'read_roots': [], 'write_roots': [],
+                'allowed_tools': ['Read', 'Glob'], 'read_allowances': [{'tools':['Read'],
+                'directory':str(alias), 'name_pattern':r'allowed\.txt'}]})
+        self.assertEqual(attachments.read(str(alias / 'allowed.txt')), 'SYNTHETIC_ALLOWED')
+        self.assertEqual(attachments.read(str(self.root / 'allowed.txt')), 'SYNTHETIC_ALLOWED')
+        with self.assertRaises(bridge.Denied):
+            attachments.glob('*', str(alias))
+
+        policy.write(str(alias / 'new.txt'), 'SYNTHETIC_NEW')
+        self.assertEqual((self.root / 'new.txt').read_text(), 'SYNTHETIC_NEW')
+        self.assertIn('allowed.txt', str(policy.glob('*.txt', str(alias))))
+        (self.root / 'escape').symlink_to(self.outside)
+        with self.assertRaises(bridge.Denied):
+            policy.read(str(alias / 'escape'))
+        with self.assertRaises(bridge.Denied):
+            policy.read(str(alias.parent / 'outside.txt'))
+
     def test_traversal_absolute_and_symlink_escape_are_denied(self):
         (self.root / 'link').symlink_to(self.outside)
         for name in ['../outside.txt', str(self.outside), 'link']:
@@ -962,6 +1025,20 @@ console.log('DEPENDENCY_FIXTURE_OK');
 
 
 class HandoffTests(unittest.TestCase):
+    def test_composio_status_remains_live_but_start_and_complete_are_mutations(self):
+        args = {'attempt_id': 'synthetic-attempt'}
+        self.assertTrue(bridge.read_only_operation('mcp__composio_auth__auth_status', args))
+        for name in ('start_auth', 'complete_auth', 'unknown'):
+            self.assertFalse(bridge.read_only_operation('mcp__composio_auth__' + name, args))
+        self.assertFalse(bridge.read_only_operation('mcp__composio_auth__auth_status', {**args, 'extra': True}))
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            for identifier in ('poll-1', 'poll-2'):
+                event = {'tool_name': 'mcp__composio_auth__auth_status', 'tool_input': args, 'tool_use_id': identifier}
+                journal.observe_hook({**event, 'hook_event_name': 'PreToolUse'})
+                journal.observe_hook({**event, 'hook_event_name': 'PostToolUse', 'tool_response': 'INITIATED'})
+            self.assertEqual(journal.inspect(), [])
+
     def test_computer_status_polls_remain_live_while_mutations_keep_replay_protection(self):
         name = 'mcp__computer__computer_task'
         arguments = {'operation': 'status', 'taskId': 'synthetic-task'}
@@ -1982,6 +2059,142 @@ GREP_PARITY_TABLE = [
 ]
 
 
+class PortableGrepTests(unittest.TestCase):
+    def test_matcher_starts_and_reports_valid_result(self):
+        import os
+        data = b'SYNTHETIC_MATCH\n'
+        header = json.dumps({'pattern': 'SYNTHETIC_MATCH', 'ignore_case': False, 'limit': 10}).encode() + b'\n'
+        result = subprocess.run([sys.executable, '-I', '-S', '-c', bridge.GREP_MATCHER, str(os.getpid())],
+            input=header + str(len(data)).encode() + b'\n' + data,
+            capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+        self.assertEqual(json.loads(result.stdout)['matches'], [[0, 1, 'SYNTHETIC_MATCH']])
+
+    def test_matcher_respects_lower_inherited_resource_limits(self):
+        import os
+        launcher = """import os,resource,sys
+if sys.platform!='darwin':
+    kind=resource.RLIMIT_AS
+    soft,hard=resource.getrlimit(kind)
+    limit=min([256*1024*1024]+[n for n in (soft,hard) if n!=resource.RLIM_INFINITY])
+    resource.setrlimit(kind,(limit,limit))
+resource.setrlimit(resource.RLIMIT_CPU,(2,2))
+os.execv(sys.executable,[sys.executable,'-I','-S','-c',sys.argv[1],sys.argv[2]])
+"""
+        data = b'SYNTHETIC_MATCH\n'
+        header = json.dumps({'pattern': 'SYNTHETIC_MATCH', 'ignore_case': False, 'limit': 10}).encode() + b'\n'
+        result = subprocess.run([sys.executable, '-I', '-S', '-c', launcher, bridge.GREP_MATCHER, str(os.getpid())],
+            input=header + str(len(data)).encode() + b'\n' + data,
+            capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+        self.assertEqual(json.loads(result.stdout)['matches'], [[0, 1, 'SYNTHETIC_MATCH']])
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Darwin resident-memory monitor; Linux uses RLIMIT_AS')
+    def test_darwin_memory_monitor_refuses_over_budget_matcher(self):
+        import os
+        code = bridge.GREP_MATCHER.replace('MAX_MATCHER_RESIDENT = 1 << 30', 'MAX_MATCHER_RESIDENT = 1')
+        result = subprocess.run([sys.executable, '-I', '-S', '-c', code, str(os.getpid())],
+            input=b'', capture_output=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b'check resident memory: MemoryError', result.stderr)
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Darwin resident-memory monitor')
+    def test_darwin_memory_monitor_failure_after_startup_stops_matcher(self):
+        import os
+        for error in ('MemoryError', 'OSError'):
+            with self.subTest(error=error):
+                code = bridge.GREP_MATCHER.replace('    def check_memory():',
+                    '    memory_checks = 0\n'
+                    '    def check_memory():\n'
+                    '        global memory_checks\n'
+                    '        memory_checks += 1\n'
+                    '        if memory_checks == 2: raise ' + error + "('synthetic monitor failure')")
+                child = subprocess.Popen([sys.executable, '-I', '-S', '-c', code, str(os.getpid())],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                    # Keep stdin open: after arming the guardian, the matcher
+                    # blocks awaiting input. Only the monitor should stop it.
+                    child.wait(timeout=2)
+                    self.assertNotEqual(child.returncode, 0)
+                    self.assertIn(('check resident memory: ' + error).encode(), child.stderr.read())
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                    child.communicate(timeout=5)
+
+    def test_matcher_dies_with_parent_during_pathological_regex(self):
+        import os
+        import select
+        import time
+        program = r"""import json,os,subprocess,sys
+child=subprocess.Popen([sys.executable,'-I','-S','-c',sys.argv[1],str(os.getpid())],
+    stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+header=json.dumps({'pattern':'(a+)+$','ignore_case':False,'limit':1000}).encode()+b'\n'
+data=b'a'*40+b'b\n'
+child.stdin.write(header+str(len(data)).encode()+b'\n'+data);child.stdin.flush()
+assert child.stdout.readline()==b'MATCHING\n'
+print(child.pid,flush=True)
+sys.stdin.readline()
+"""
+        matcher = bridge.GREP_MATCHER.replace('    for number, line in enumerate(text.splitlines(), 1):',
+            "    print('MATCHING', flush=True)\n    for number, line in enumerate(text.splitlines(), 1):")
+        parent = subprocess.Popen([sys.executable, '-c', program, matcher],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        pidfd = None
+        watcher = None
+        try:
+            pid = int(parent.stdout.readline())
+            if hasattr(os, 'pidfd_open'):
+                pidfd = os.pidfd_open(pid)
+                watcher = select.poll()
+                watcher.register(pidfd, select.POLLIN)
+            else:
+                watcher = select.kqueue()
+                watcher.control([select.kevent(pid, filter=select.KQ_FILTER_PROC,
+                    flags=select.KQ_EV_ADD, fflags=select.KQ_NOTE_EXIT)], 0, 0)
+            time.sleep(0.2)
+            # It must still be matching, otherwise startup failure would falsely
+            # appear to satisfy the parent-death guarantee.
+            events = watcher.poll(0) if pidfd is not None else watcher.control([], 1, 0)
+            self.assertFalse(events, 'matcher exited before parent-death test')
+            parent.communicate('exit\n', timeout=5)
+            events = watcher.poll(1000) if pidfd is not None else watcher.control([], 1, 1)
+            self.assertTrue(events, 'matcher outlived its parent during regex execution')
+        finally:
+            if pidfd is not None:
+                import signal
+                try:
+                    signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                os.close(pidfd)
+            elif watcher is not None:
+                watcher.close()
+            if parent.poll() is None:
+                parent.kill()
+                parent.communicate(timeout=5)
+
+    def test_grep_without_linux_memfd_preserves_results_and_matching_limit(self):
+        import os
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / 'note.txt').write_text('SYNTHETIC_MATCH\n')
+            policy = bridge.Policy({'cwd': str(root), 'read_roots': [str(root)],
+                'write_roots': [], 'allowed_tools': ['Grep']})
+            self.addCleanup(policy.close)
+            saved = os.__dict__.pop('memfd_create', None)
+            try:
+                result = policy.grep('SYNTHETIC_MATCH')
+                self.assertEqual(len(result), 1)
+                self.assertEqual(result[0]['text'], 'SYNTHETIC_MATCH')
+                (root / 'bait.txt').write_text('a' * 40 + 'b\n')
+                with self.assertRaises(bridge.SearchLimit):
+                    policy.grep('(a+)+$')
+            finally:
+                if saved is not None:
+                    os.memfd_create = saved
+
+
 class BoundedGrepTests(unittest.TestCase):
     """#1038: a model-supplied pattern cannot stall the bridge or its CLI slot."""
     PATHOLOGICAL = '(a+)+$'
@@ -2847,6 +3060,12 @@ class TransportTests(unittest.TestCase):
                 child.terminate();child.communicate(timeout=5)
 
     def test_bridge_stops_when_parent_process_exits_even_if_stdin_stays_open(self):
+        self.check_parent_lifetime(False)
+
+    def test_bridge_without_pidfd_stops_when_parent_exits_with_stdin_open(self):
+        self.check_parent_lifetime(True)
+
+    def check_parent_lifetime(self, without_pidfd):
         import os
         import select
         with tempfile.TemporaryDirectory() as temporary:
@@ -2857,23 +3076,41 @@ class TransportTests(unittest.TestCase):
             # EOF alone cannot provide the lifecycle guarantee being tested.
             read_fd,write_fd=os.pipe()
             program="""import json,os,subprocess,sys
-child=subprocess.Popen([sys.executable,sys.argv[1],sys.argv[2]],stdin=int(sys.argv[3]),stdout=subprocess.PIPE)
+command=[sys.executable,sys.argv[1],sys.argv[2]]
+if sys.argv[4]=='True':
+    command=[sys.executable,'-c',"import os,runpy,sys; os.__dict__.pop('pidfd_open',None); sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')",sys.argv[1],sys.argv[2]]
+child=subprocess.Popen(command,stdin=int(sys.argv[3]),stdout=subprocess.PIPE)
 ready=child.stdout.readline()
 assert 'result' in json.loads(ready)
 print(child.pid,flush=True)
 sys.stdin.readline()
 """
-            parent=subprocess.Popen([sys.executable,'-c',program,str(SPEC.origin),str(config),str(read_fd)],
+            parent=subprocess.Popen([sys.executable,'-c',program,str(SPEC.origin),str(config),str(read_fd),str(without_pidfd)],
                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,pass_fds=(read_fd,),text=True)
             pidfd=None
+            exit_queue=None
             try:
                 os.write(write_fd,(json.dumps({'jsonrpc':'2.0','id':1,'method':'initialize'})+'\n').encode())
-                pid=int(parent.stdout.readline());pidfd=os.pidfd_open(pid)
+                line=parent.stdout.readline()
+                self.assertTrue(line, 'bridge failed to initialize')
+                pid=int(line)
+                if hasattr(os, 'pidfd_open'):
+                    pidfd=os.pidfd_open(pid)
+                else:
+                    exit_queue=select.kqueue()
+                    exit_queue.control([select.kevent(pid, filter=select.KQ_FILTER_PROC,
+                        flags=select.KQ_EV_ADD, fflags=select.KQ_NOTE_EXIT)], 0, 0)
                 parent.communicate('exit\n',timeout=5)
-                watcher=select.poll();watcher.register(pidfd,select.POLLIN)
-                self.assertTrue(watcher.poll(5000),'bridge outlived its parent process')
+                if pidfd is not None:
+                    watcher=select.poll();watcher.register(pidfd,select.POLLIN)
+                    ended=watcher.poll(5000)
+                else:
+                    ended=exit_queue.control([], 1, 5)
+                self.assertTrue(ended,'bridge outlived its parent process')
             finally:
                 os.close(read_fd);os.close(write_fd)
+                if exit_queue is not None:
+                    exit_queue.close()
                 if pidfd is not None:
                     import signal
                     try: signal.pidfd_send_signal(pidfd,signal.SIGKILL)

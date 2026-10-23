@@ -99,6 +99,7 @@ pub struct WhatsappControlSurface {
     /// Most-recently-posted card per control chat. WhatsApp has no per-message
     /// buttons, so a bare `approve` applies to the chat's active card.
     active_card: Arc<Mutex<HashMap<String, String>>>,
+    phone: Option<Arc<crate::phone::PhoneControl>>,
 }
 
 impl WhatsappControlSurface {
@@ -116,7 +117,16 @@ impl WhatsappControlSurface {
             action_handler,
             query_handler,
             active_card: Arc::new(Mutex::new(HashMap::new())),
+            phone: None,
         }
+    }
+
+    /// Install phone commands using the authenticated linked-device identity.
+    /// Explicit phone links are required. First-time number setup initializes
+    /// the private binding; previously revoked bindings are never restored.
+    pub fn with_phone_tools(mut self, linked_owner: crate::Jid, tools: Arc<augmentagent_phone::tools::ToolServer>) -> anyhow::Result<Self> {
+        self.phone = Some(Arc::new(crate::phone::PhoneControl::new(self.store.clone(), tools, linked_owner, &self.config.control_chat_jid)?));
+        Ok(self)
     }
 
     /// True iff `chat_jid` is the designated control chat.
@@ -170,9 +180,35 @@ impl WhatsappControlSurface {
         msg: &WaMessage,
     ) -> Result<bool, ApprovalError> {
         let chat_jid = msg.chat.bare();
-        if !self.is_control_chat(&chat_jid) || msg.is_outbound() {
+        if !self.is_control_chat(&chat_jid) {
             return Ok(false);
         }
+        // Reserve phone controls before generic queries, even while no phone
+        // adapter is installed. Numbers and verification codes must never
+        // become model input through a fallback path.
+        if augmentagent_phone::commands::recognizes(&msg.text) {
+            if let Some(phone) = &self.phone {
+                if self.check_send_gate(&chat_jid).is_err() { return Ok(true); }
+                if let Some(reply) = phone.execute(msg).await.map_err(|_| ApprovalError::Discord("private phone command failed; check phone status before retrying".into()))? {
+                    self.send_to_control(&reply).await?;
+                }
+                return Ok(true);
+            }
+            if msg.is_outbound() { return Ok(false); }
+
+            self.send_to_control("Phone commands are unavailable in this WhatsApp connection.")
+                .await.ok();
+            return Ok(true);
+        }
+        let trusted = match &self.phone {
+            Some(phone) => {
+                if self.check_send_gate(&chat_jid).is_err() { return Ok(true); }
+                let Some(origin) = phone.authorized_origin(msg) else { return Ok(true); };
+                Some(origin)
+            }
+            None => None,
+        };
+        if msg.is_outbound() && trusted.is_none() { return Ok(false); }
         let cmd = parse_control_command(&msg.text);
         match cmd {
             ControlCommand::Approve | ControlCommand::Decline | ControlCommand::Revise(_) => {
@@ -229,9 +265,21 @@ impl WhatsappControlSurface {
                     // WhatsApp sender must not inherit that authority.
                     owner_authorized: false,
                 };
-                match augmentagent_approval_discord::interaction::owner_history(!chat_jid.ends_with("@g.us"), qh.answer(&audit_ctx, &q)).await {
+                let answer = match &trusted {
+                    Some((origin, _)) => augmentagent_phone::context::scope(origin.clone(), None,
+                        augmentagent_approval_discord::interaction::owner_history(true, qh.answer_turn(&audit_ctx, "", &q))).await,
+                    None => augmentagent_approval_discord::interaction::owner_history(!chat_jid.ends_with("@g.us"), qh.answer(&audit_ctx, &q)).await,
+                };
+                // A queued or long-running native turn may outlive its binding.
+                if let Some((_, revision)) = &trusted {
+                    if self.phone.as_ref().and_then(|phone| phone.authorized_origin(msg)).is_none_or(|(_, current)| current != *revision) { return Ok(true); }
+                }
+                match answer {
                     Ok(answer) => {
                         for chunk in chunk_for_whatsapp(&answer) {
+                            if let Some((_, revision)) = &trusted {
+                                if self.phone.as_ref().and_then(|phone| phone.authorized_origin(msg)).is_none_or(|(_, current)| current != *revision) { break; }
+                            }
                             if let Err(e) = self.send_to_control(&chunk).await {
                                 warn!("control: query answer send failed: {e}");
                                 break;
@@ -260,7 +308,7 @@ impl WhatsappControlSurface {
                 self.active_card.lock().await.remove(chat_jid);
                 self.send_to_control("Sent.").await.ok();
             }
-            receipt @ ApprovalActionOutcome::CalendarCreated { .. } => {
+            receipt @ (ApprovalActionOutcome::CalendarCreated { .. } | ApprovalActionOutcome::DocumentSigned { .. }) => {
                 self.active_card.lock().await.remove(chat_jid);
                 self.send_to_control(&augmentagent_approval_discord::outcome::describe(&receipt))
                     .await

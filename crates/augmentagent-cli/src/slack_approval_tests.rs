@@ -125,11 +125,35 @@ async fn skip_racing_an_approval_of_a_slack_reply_cannot_undo_the_send() {
     let (a, s) = tokio::join!(approver.approve(&id), approver.skip(&id));
     sends.assert_async().await;
     assert!(matches!(a, ApprovalActionOutcome::Approved), "{a:?}");
+    // The guarantee is that the loser CHANGED NOTHING, not which refusal it
+    // reports. `approval_history_inflight` is a partial unique index on
+    // action_id WHERE finished_at IS NULL — a single-flight fence — so a skip
+    // that arrives while the send is in progress is turned away by
+    // `begin_approval` before the handler runs and reports Failed. A skip that
+    // arrives after the send completes reaches the store's compare-and-swap and
+    // reports AlreadyResolved. Both are correct refusals; which one happens
+    // depends on scheduling, so pinning a single variant made this test fail
+    // deterministically once the fence landed (#1447).
     assert!(
-        matches!(&s, ApprovalActionOutcome::AlreadyResolved { .. }),
-        "the skip lost the race and changed nothing: {s:?}"
+        matches!(
+            &s,
+            ApprovalActionOutcome::AlreadyResolved { status, .. }
+                if status == "sending" || status == "sent"
+        ) || matches!(&s, ApprovalActionOutcome::Failed { .. }),
+        "the skip must change nothing and say so: {s:?}"
     );
+    // What actually matters, asserted directly: the reply was sent exactly once
+    // (the mock is armed for 1 and verified above) and the skip did not move
+    // the action out of `sent`.
     assert_eq!(status(&store, &id), "sent");
+
+    // And the skip is still refused once the send has settled.
+    match approver.skip(&id).await {
+        ApprovalActionOutcome::AlreadyResolved { status, .. } => assert_eq!(status, "sent"),
+        other => panic!("a settled action must report AlreadyResolved: {other:?}"),
+    }
+    assert_eq!(status(&store, &id), "sent");
+    sends.assert_async().await;
 }
 
 #[tokio::test]

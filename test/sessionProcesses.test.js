@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const { createMacBackend, createSessionManager, parseMacPsRows } = require("../dist/sessionProcesses");
 
 function row(overrides = {}) {
@@ -69,16 +69,46 @@ test("macOS ps timeout is distinct from an empty process list", () => {
   assert.deepEqual(empty.list(), []);
 });
 
-test("native host discovers and stops only a disposable claude-named process", async () => {
+// A fixture must be a REAL executable whose kernel-owned `comm` is "claude":
+// both backends identify a session by `comm`, not by argv0, so a shell script
+// wrapping sleep is reported as "sleep" and correctly ignored.
+//
+// Copying a system binary no longer works on macOS. /bin/sleep is an arm64e
+// platform binary, and a copy loses the signature that entitles it, so the
+// kernel SIGKILLs it on exec (exit 137) — the fixture died before `ps` ever saw
+// it, which is why this test failed on every Mac. Hardlinking is refused too
+// ("Operation not permitted"). Compiling a two-line binary is the only approach
+// that yields a genuine executable under a chosen name.
+function buildClaudeFixture(scratch) {
+  const executable = path.join(scratch, "claude");
+  const compiler = ["cc", "clang", "gcc"].find((candidate) => {
+    const probe = spawnSync(candidate, ["--version"], { stdio: "ignore" });
+    return !probe.error && probe.status === 0;
+  });
+  if (!compiler) return null;
+  const source = path.join(scratch, "claude.c");
+  fs.writeFileSync(source, "#include <unistd.h>\nint main(void){ for(;;) pause(); return 0; }\n");
+  const built = spawnSync(compiler, ["-O0", "-o", executable, source], { stdio: "ignore" });
+  if (built.status !== 0) return null;
+  fs.chmodSync(executable, 0o700);
+  return executable;
+}
+
+test("native host discovers and stops only a disposable claude-named process", async (t) => {
   if (!(["linux", "darwin"].includes(process.platform))) return;
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-session-process-"));
-  const executable = path.join(scratch, "claude");
-  fs.copyFileSync("/bin/sleep", executable);
-  fs.chmodSync(executable, 0o700);
+  const executable = buildClaudeFixture(scratch);
+  if (!executable) {
+    fs.rmSync(scratch, { recursive: true, force: true });
+    // Skipped rather than silently passing: without a compiler there is no way
+    // to produce a real executable named "claude" to discover.
+    t.skip("no C compiler available to build the claude-named fixture");
+    return;
+  }
   const manager = createSessionManager();
   try {
     for (const force of [false, true]) {
-      const child = spawn(executable, ["30"], { stdio: "ignore" });
+      const child = spawn(executable, { stdio: "ignore" });
       try {
         await new Promise((resolve, reject) => {
           child.once("spawn", resolve);

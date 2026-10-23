@@ -94,3 +94,26 @@ installer, tests missing-dependency detection and repair, and exercises the CLI
 against the managed runtime from a separate wiki directory. OS removal of
 `python3-markdown` no longer affects the renderer. Host Python and Liberation
 fonts remain system prerequisites; the preflight detects their loss.
+
+## Owner signature image (#1444)
+
+The operator installs a supplied PNG once with `augmentagent doc signature-install /path/to/signature.png --name default`.
+The image lives under the OS state directory's `augmentagent/signatures`, outside wiki/git, with a private directory and file permissions.
+Names are immutable: use another name to rotate an asset. The query agent may list names with `doc signatures`; installation and image reads are not allowed agent tools.
+
+Render the document with `doc render-pdf` first. New exports are registered by SHA-256 outside the wiki. Older/unregistered PDFs must be regenerated from the reviewed source.
+`doc sign-lines draft.pdf --page 1` lists the signature lines on a page (#1510), measured from the page as Poppler renders it, so stroked rules, thin filled rectangles and underscore runs are found wherever the CTM puts them. Each entry has its 1-based `line` number, `y`/`top`/`bottom`, `x0`/`x1` and the text directly `below` it.
+`doc sign draft.pdf --out draft-signed.pdf --signature default --page 1 --anchor-text "Jane Signer" --date 2026-10-12`
+posts an **Approve & Sign** card with a PNG of the signed page and the unsigned PDF. The signature's *visible ink*, measured from the asset's alpha, not its bitmap with any padding, is placed 1.5 pt above the line's top edge, 12 pt in from its start, at min(180 pt, line length − 12) wide. `--line <n>` picks a line by number, and `--width` overrides the width. `--x/--y [--width]` remain for pages with no line and address the ink's bottom-left corner. Placement is refused, before any card is posted, when the anchor matches zero or several lines, or when the ink, or the date beside it, would overlap text or cross a line. Pages are one-based; positions are PDF points from the bottom-left.
+
+The overlap check uses both the text layer and the rendered pixels, so images, scans and outlined text count too. Pages larger than 20 in, and cropped pages, cannot be measured. Note that the preview posts a rendering of the owner's signature into the approval channel. That is the point of the preview; the asset file itself is never sent.
+
+The card records the detected line, the ink box, the preview's SHA-256, the signed output's SHA-256 and a fingerprint of the signer code and pinned runtime. Signing is deterministic, so approval re-signs and publishes only if the bytes match that hash. What the owner saw is what is published. If Jarvis's signer changed between proposal and approval, the card fails with a request to propose again, and nothing is published. Proposals made before #1510 have no ink box and keep their image-box meaning.
+
+Approval is bound to both document and asset hashes. Changing either requires a new proposal. Signing never overwrites files and never sends email. Sending requires its own approval. The Discord confirmation attaches the completed PDF directly. The next owner query also receives its ATTACH marker and SHA-256 through approval history. Attachment delivery checks the saved hash and retains the card if the file is missing or changed.
+
+The immutable `document_signatures` table stores the approval ID, full proposal (paths, hashes, placement), output hash and completion timestamp. Approval history records the actor/decision separately. Repeated approvals recover a verified output receipt; concurrent approvals share the durable action fence. If publication succeeded but receipt persistence failed, the outcome is unconfirmed and cannot replay automatically. Inspect the output before recovery.
+
+The first release accepts generated, text-readable, unencrypted PDFs of up to 100 pages/8 MiB and PNG assets up to 1 MiB/4096 pixels per side. Rotated/offset pages, interactive forms and the issue's affidavit/sworn-statement/perjury/government-filing keyword cases require manual handling. This applies a signature image; it does not implement counterparty signing, cryptographic sealing or certificate validation.
+
+Tests use synthetic signatures. Run the Python renderer/signing suite, `cargo test -p augmentagent-docs --test signing`, `cargo test -p augmentagent-cli --bin augmentagent document_signing::tests`, and the Discord approval-delivery tests. Provision the updated pinned runtime with `python3 scripts/pdf-runtime.py`.

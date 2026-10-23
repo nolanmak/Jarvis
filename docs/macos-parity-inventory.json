@@ -994,6 +994,36 @@
     "evidence": null
   },
   {
+    "id": "cli:phone-reconcile",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Local operator recovery reads the stored Twilio call ID and reconciles confirmed terminal usage without dialing, hanging up, or clearing uncertain calls.",
+    "macos_target": "The same bounded provider read and atomic reconciliation work on macOS, including when phone dialing is disabled.",
+    "prerequisites": [
+      "Rust CLI",
+      "Existing local call record with a provider ID",
+      "Twilio credentials for operator use; synthetic provider for offline tests"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1496",
+    "test_plan": "Run cargo test --locked -p augmentagent-phone --test recovery on Linux and macOS. Verify confirmed completion, unknown provider ID, nonterminal and contradictory evidence, and concurrent signed usage. Exercise the installed CLI with redacted provider evidence before marking host parity verified.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:phone-tool",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Private MCP facade delegates owner phone tools through the local authenticated phone broker; offline contracts run on Linux.",
+    "macos_target": "The same private broker, revocable owner grants and native-session phone tools work on macOS without platform voice dependencies.",
+    "prerequisites": [
+      "Rust CLI",
+      "Configured owner phone service and native agent provider",
+      "Synthetic provider for offline tests; Twilio and public TLS for live qualification"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1496",
+    "test_plan": "Run scripts/phone-offline-tests.py on Linux and macOS, including MCP authorization and Claude/Codex session continuity; attach live host receipts required by AC10 before marking verified.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
     "id": "cli:poll-once",
     "source": "crates/augmentagent-cli/src/main.rs",
     "linux_baseline": "Linux exposes augmentagent poll-once; record its command-specific effects and authorization.",
@@ -3579,6 +3609,61 @@
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1406",
     "test_plan": "Verify 04:37 daily schedule and catch-up behavior, synthetic cleanup, active-build protection and service install/uninstall on each platform.",
     "status": "gap",
+    "evidence": null
+  },
+  {
+    "id": "installer:install-sync-watchdog.sh",
+    "source": "scripts/install-sync-watchdog.sh",
+    "macos_target": "Mac install-sync-watchdog.sh manages only the source-app watchdog LaunchAgent idempotently, relaunching Notes/WhatsApp/Messages when their local store stops being written.",
+    "linux_baseline": "No Linux equivalent: the exporters' source apps are macOS-only, so there is no store for a Linux host to watch.",
+    "prerequisites": [
+      "signed-in launchd user session",
+      "the source apps installed and signed in"
+    ],
+    "status": "in_progress",
+    "evidence": null,
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1463",
+    "test_plan": "Run sync_source_watchdog_test in a disposable home, then verify on a real Mac that a cold store relaunches its app and a fresh one does not."
+  },
+  {
+    "id": "installer:uninstall-sync-watchdog.sh",
+    "source": "scripts/uninstall-sync-watchdog.sh",
+    "macos_target": "Mac uninstall-sync-watchdog.sh removes the watchdog LaunchAgent and leaves every source database and exported bundle untouched.",
+    "linux_baseline": "No Linux equivalent: nothing to uninstall where the watchdog never installs.",
+    "prerequisites": [
+      "signed-in launchd user session"
+    ],
+    "status": "in_progress",
+    "evidence": null,
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1463",
+    "test_plan": "Covered by sync_source_watchdog_test's uninstall case; confirm on a real Mac that the job is gone and the stores remain."
+  },
+  {
+    "id": "cli:composio-auth-tool",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Owner-gated MCP start, live status, and verified completion of Composio consent; selected DB credentials and port reach the child.",
+    "macos_target": "Owner-gated MCP start, live status, and verified completion of Composio consent; selected DB credentials and port reach the child.",
+    "prerequisites": [
+      "Rust CLI",
+      "synthetic dashboard and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1474",
+    "test_plan": "Run cargo test -p augmentagent-cli --bin augmentagent composio_auth_tool on native Linux and macOS; record OS, architecture and result.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:composioAuthRoutes:POST:/:operation",
+    "source": "src/composioAuthRoutes.ts",
+    "linux_baseline": "Authenticated POST /api/composio/auth/{start,status,complete}; isolated attempts, strict identity/status validation, expiry and idempotent persistence.",
+    "macos_target": "Authenticated POST /api/composio/auth/{start,status,complete}; isolated attempts, strict identity/status validation, expiry and idempotent persistence.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic Composio and persistence fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1474",
+    "test_plan": "Run npm test on native Linux and macOS; record OS, architecture and result.",
+    "status": "unverified",
     "evidence": null
   }
 ]
