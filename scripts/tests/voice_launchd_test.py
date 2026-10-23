@@ -36,7 +36,9 @@ class VoiceLaunchdTests(unittest.TestCase):
                 artifact = repo / relative
                 artifact.parent.mkdir(parents=True, exist_ok=True)
                 artifact.write_text('synthetic')
-            home = root / 'owner home'
+            verifier = repo / 'scripts/build-whisper.sh'
+            verifier.write_text('#!/bin/sh\ntest "$1" = --verify-only\n')
+            home = root / 'owner home' 
             config = home / '.config/augmentagent'
             config.mkdir(parents=True, mode=0o700)
             credential = config / 'discord-voice.env'
@@ -75,6 +77,10 @@ class VoiceLaunchdTests(unittest.TestCase):
                         installer.main()
                 self.assertEqual(voice_plist.read_bytes(), installed)
                 self.assertTrue(capture_plist.is_file())
+                verifier.write_text('#!/bin/sh\nexit 1\n')
+                with mock.patch.object(sys, 'argv', ['install-sidecar.py', 'telegram-capture']):
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        installer.main()
             session = home / '.local/state/augmentagent/voice-session.json'
             session.write_text('synthetic session')
             result = subprocess.run(

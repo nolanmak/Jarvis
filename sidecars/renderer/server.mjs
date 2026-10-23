@@ -31,11 +31,13 @@
  */
 
 import { createServer } from 'node:net';
-import { chmod, lstat, mkdir, stat, unlink } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readdir, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
+import { BUNDLE_PREFIX, OWNER_FILE, staleBundles } from './bundle_gc.mjs';
 import { bundle } from '@remotion/bundler';
 import { ensureBrowser, renderMedia, selectComposition } from '@remotion/renderer';
 
@@ -84,6 +86,45 @@ const bundleFailed = (m) => new SidecarError(m, 'BundleFailed');
 // ---------------------------------------------------------------------------
 
 let _bundlePromise = null;
+// #1411 — the bundle is a fresh `remotion-webpack-bundle-*` dir in the system
+// temp dir on every start; nothing removed it, so each restart left one behind.
+let _bundleDir = null;
+
+/** Only ever a dir Remotion created for this process, inside the temp dir. */
+function ownBundleDir() {
+  if (typeof _bundleDir !== 'string') return null;
+  const dir = path.resolve(_bundleDir);
+  const inTmp = path.dirname(dir) === path.resolve(os.tmpdir());
+  return inTmp && path.basename(dir).startsWith(BUNDLE_PREFIX) ? dir : null;
+}
+
+/** Remove bundle dirs left by renderers that were killed. Best effort. */
+async function sweepStaleBundles() {
+  const tmp = os.tmpdir();
+  const names = (await readdir(tmp).catch(() => [])).filter((n) => n.startsWith(BUNDLE_PREFIX));
+  const now = Date.now();
+  const dirs = [];
+  for (const name of names) {
+    const info = await lstat(path.join(tmp, name)).catch(() => null);
+    if (!info?.isDirectory()) continue;
+    const marker = await readFile(path.join(tmp, name, OWNER_FILE), 'utf8').catch(() => null);
+    const pid = marker === null ? NaN : Number.parseInt(marker.trim(), 10);
+    dirs.push({ name, ownerPid: Number.isInteger(pid) ? pid : null, ageMs: now - info.mtimeMs });
+  }
+  const isAlive = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (e) {
+      // EPERM: it exists and belongs to someone else.
+      return e?.code === 'EPERM';
+    }
+  };
+  for (const name of staleBundles(dirs, isAlive, process.pid)) {
+    await rm(path.join(tmp, name), { recursive: true, force: true }).catch(() => {});
+    log('INFO', `removed stale bundle ${name}`);
+  }
+}
 
 function ensureBundle() {
   if (_bundlePromise === null) {
@@ -93,8 +134,13 @@ function ensureBundle() {
       // No webpack overrides — keep the React deterministic and offline.
       onProgress: () => {},
     })
-      .then((serveUrl) => {
+      .then(async (serveUrl) => {
         log('INFO', `bundle ready: ${serveUrl}`);
+        _bundleDir = serveUrl;
+        const own = ownBundleDir();
+        if (own) {
+          await writeFile(path.join(own, OWNER_FILE), String(process.pid)).catch(() => {});
+        }
         return serveUrl;
       })
       .catch((e) => {
@@ -330,6 +376,7 @@ async function serve() {
   const owned = await lstat(SOCK_PATH);
   log('INFO', `listening on ${SOCK_PATH} (composition=${COMPOSITION_ID})`);
 
+  sweepStaleBundles().catch(() => {});
   // Warm the bundle so the first real render isn't also paying bundle cost.
   ensureBundle().catch((e) =>
     log('WARN', `eager bundle failed (will retry on first render): ${e?.message ?? e}`),
@@ -341,6 +388,10 @@ async function serve() {
     const current = await lstat(SOCK_PATH).catch(() => null);
     if (current?.isSocket() && current.dev === owned.dev && current.ino === owned.ino) {
       await unlink(SOCK_PATH).catch(() => {});
+    }
+    const bundleDir = ownBundleDir();
+    if (bundleDir) {
+      await rm(bundleDir, { recursive: true, force: true }).catch(() => {});
     }
     process.exit(0);
   };

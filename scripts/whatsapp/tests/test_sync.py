@@ -220,6 +220,42 @@ class TestSync(unittest.TestCase):
         conv = (self.out / "conversations" / "index.md").read_text()
         self.assertIn("John_Smith/messages.md", conv)
 
+    def _index(self):
+        return json.loads(
+            (self.out / "conversations" / "index.json").read_text()
+        )["14155550123@s.whatsapp.net"]
+
+    def test_newest_entry_tracks_the_last_appended_message(self):
+        add_message(self.con, 1, 1, "hey", cd(1787745600), 0)
+        sync(self.db, self.out, self.state)
+        first = core_data_time_to_iso(cd(1787745600))
+        self.assertEqual(self._index()["newest_entry"], first)
+        # An incremental run advances the cursor to the newer message...
+        add_message(self.con, 2, 1, "yo", cd(1787745660), 1)
+        sync(self.db, self.out, self.state)
+        self.assertEqual(
+            self._index()["newest_entry"], core_data_time_to_iso(cd(1787745660))
+        )
+        # ...and a run that appends nothing never regresses it.
+        sync(self.db, self.out, self.state)
+        self.assertEqual(
+            self._index()["newest_entry"], core_data_time_to_iso(cd(1787745660))
+        )
+
+    def test_unknown_time_never_becomes_the_cursor(self):
+        add_message(self.con, 1, 1, "hey", cd(1787745600), 0)
+        sync(self.db, self.out, self.state)
+        known = self._index()["newest_entry"]
+        add_message(self.con, 2, 1, "when?", None, 0)
+        sync(self.db, self.out, self.state)
+        self.assertIn("unknown-time", self.read_md("John_Smith"))
+        self.assertEqual(self._index()["newest_entry"], known)
+
+    def test_newest_entry_absent_until_a_message_with_a_timestamp(self):
+        add_message(self.con, 1, 1, "when?", None, 0)
+        sync(self.db, self.out, self.state)
+        self.assertIsNone(self._index().get("newest_entry"))
+
 
 if __name__ == "__main__":
     unittest.main()

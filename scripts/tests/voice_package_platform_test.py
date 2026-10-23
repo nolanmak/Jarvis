@@ -9,7 +9,18 @@ ROOT = Path(__file__).resolve().parents[2]
 VOICE = ROOT / 'sidecars/discord-voice'
 
 
+def supports(restrictions, value):
+    allowed = [v for v in restrictions if not v.startswith('!')]
+    return f'!{value}' not in restrictions and (not allowed or value in allowed or 'any' in allowed)
+
+
 class VoicePackagePlatformTests(unittest.TestCase):
+    def test_exclusion_only_constraints(self):
+        self.assertTrue(supports(['!win32'], 'linux'))
+        self.assertFalse(supports(['!win32'], 'win32'))
+        self.assertFalse(supports(['darwin'], 'linux'))
+        self.assertFalse(supports(['any', '!arm64'], 'arm64'))
+
     def test_locked_install_includes_native_codec_bindings(self):
         self.assertIn('omit=optional', (VOICE / '.npmrc').read_text().splitlines())
         setup = (VOICE / 'setup.sh').read_text()
@@ -32,9 +43,9 @@ class VoicePackagePlatformTests(unittest.TestCase):
                 with self.subTest(package=name, os=os_name, cpu=cpu):
                     supported_os = package.get('os', [])
                     supported_cpu = package.get('cpu', [])
-                    self.assertTrue(not supported_os or os_name in supported_os,
+                    self.assertTrue(supports(supported_os, os_name),
                                     f'{name} is required but cannot install on {os_name}/{cpu}')
-                    self.assertTrue(not supported_cpu or cpu in supported_cpu,
+                    self.assertTrue(supports(supported_cpu, cpu),
                                     f'{name} is required but cannot install on {os_name}/{cpu}')
 
 

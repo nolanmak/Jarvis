@@ -123,6 +123,27 @@ pub(crate) fn migrate(conn: &Connection) -> StoreResult<()> {
             PRIMARY KEY(platform, account_id, conversation_id, thread_id)
         );"#,
     )?;
+    // #1294: when the last attempt was claimed (lower bound for a provider
+    // history lookup) and how many reconcile lookups failed. Additive.
+    for (column, ddl) in [
+        (
+            "last_claimed_at_ms",
+            "ALTER TABLE surface_outbox ADD COLUMN last_claimed_at_ms INTEGER",
+        ),
+        (
+            "reconcile_lookups",
+            "ALTER TABLE surface_outbox ADD COLUMN reconcile_lookups INTEGER NOT NULL DEFAULT 0",
+        ),
+    ] {
+        let exists: bool = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('surface_outbox') WHERE name = ?1",
+            params![column],
+            |r| r.get::<_, i64>(0).map(|n| n > 0),
+        )?;
+        if !exists {
+            conn.execute(ddl, [])?;
+        }
+    }
     Ok(())
 }
 
@@ -349,6 +370,27 @@ impl Store {
         now_ms: i64,
         max_attempts: u32,
     ) -> StoreResult<Option<ClaimedInbound>> {
+        self.claim_inbound(None, now_ms, max_attempts)
+    }
+
+    /// [`claim_next_inbound_event`](Self::claim_next_inbound_event) limited
+    /// to one surface platform, so each surface's dispatcher only ever takes
+    /// its own events when several surfaces run in one daemon (#1287).
+    pub fn claim_next_inbound_event_for(
+        &self,
+        platform: &SurfacePlatform,
+        now_ms: i64,
+        max_attempts: u32,
+    ) -> StoreResult<Option<ClaimedInbound>> {
+        self.claim_inbound(Some(platform.as_str()), now_ms, max_attempts)
+    }
+
+    fn claim_inbound(
+        &self,
+        platform: Option<&str>,
+        now_ms: i64,
+        max_attempts: u32,
+    ) -> StoreResult<Option<ClaimedInbound>> {
         write_tx(self, |tx| loop {
             let candidate = tx
                 .query_row(
@@ -356,6 +398,7 @@ impl Store {
                             e.event_id, e.kind, e.occurred_at_ms, e.payload, e.attempts
                      FROM surface_inbound_events e
                      WHERE e.status = 'received'
+                       AND (?1 IS NULL OR e.platform = ?1)
                        AND NOT EXISTS (
                          SELECT 1 FROM surface_inbound_events p
                          WHERE p.platform = e.platform AND p.account_id = e.account_id
@@ -367,7 +410,7 @@ impl Store {
                                          OR (p.occurred_at_ms = e.occurred_at_ms AND p.seq < e.seq)))))
                      ORDER BY e.occurred_at_ms, e.seq
                      LIMIT 1",
-                    [],
+                    params![platform],
                     |r| {
                         Ok((
                             r.get::<_, i64>(0)?,
@@ -439,17 +482,37 @@ impl Store {
     /// database, so claims and in-flight sends left behind belong to a
     /// process that died.
     pub fn recover_surface_delivery(&self, now_ms: i64) -> StoreResult<RecoveryReport> {
+        self.recover_delivery(None, now_ms)
+    }
+
+    /// Recover one account before starting its worker, without resetting other
+    /// surfaces that may already be running in this daemon.
+    pub fn recover_surface_delivery_for(
+        &self,
+        account: &SurfaceAccountRef,
+        now_ms: i64,
+    ) -> StoreResult<RecoveryReport> {
+        self.recover_delivery(Some(account), now_ms)
+    }
+
+    fn recover_delivery(
+        &self,
+        account: Option<&SurfaceAccountRef>,
+        now_ms: i64,
+    ) -> StoreResult<RecoveryReport> {
+        let platform = account.map(|a| a.platform().as_str());
+        let account_id = account.map(|a| a.account_id());
         write_tx(self, |tx| {
             let inbound_requeued = tx.execute(
                 "UPDATE surface_inbound_events SET status = 'received',
                      last_error = COALESCE(last_error, 'interrupted by restart')
-                 WHERE status = 'claimed'",
-                [],
+                 WHERE status = 'claimed' AND (?1 IS NULL OR (platform=?1 AND account_id=?2))",
+                params![platform, account_id],
             )?;
             let sends_to_reconcile = tx.execute(
                 "UPDATE surface_outbox SET status = 'reconcile', updated_at_ms = ?1
-                 WHERE status = 'sending'",
-                params![now_ms],
+                 WHERE status = 'sending' AND (?2 IS NULL OR (platform=?2 AND account_id=?3))",
+                params![now_ms, platform, account_id],
             )?;
             Ok(RecoveryReport {
                 inbound_requeued,
@@ -645,6 +708,11 @@ pub struct OutboundSend {
     pub fell_back: bool,
     pub provider_message_id: Option<String>,
     pub last_error: Option<String>,
+    /// When the latest attempt was claimed; a provider lookup for a lost
+    /// outcome never needs to look earlier than this.
+    pub last_claimed_at_ms: Option<i64>,
+    /// Failed reconcile lookups since the send last went to `reconcile`.
+    pub reconcile_lookups: u32,
 }
 
 /// Exponential backoff: `base * 2^(attempt - 1)`, capped at `max_delay_ms`.
@@ -690,7 +758,8 @@ pub struct ReconcileReport {
 
 const SEND_COLUMNS: &str = "id, platform, account_id, conversation_id, thread_id, idempotency_key,
     operation, target_message_id, payload, status, attempts, max_attempts, next_attempt_at_ms,
-    interaction_expires_at_ms, fell_back, provider_message_id, last_error";
+    interaction_expires_at_ms, fell_back, provider_message_id, last_error, last_claimed_at_ms,
+    reconcile_lookups";
 
 fn send_from_row(r: &Row<'_>) -> rusqlite::Result<StoreResult<OutboundSend>> {
     let conversation = conversation_at(r, 1)?;
@@ -707,6 +776,8 @@ fn send_from_row(r: &Row<'_>) -> rusqlite::Result<StoreResult<OutboundSend>> {
     let fell_back: bool = r.get::<_, i64>(14)? != 0;
     let provider_message_id: Option<String> = r.get(15)?;
     let last_error: Option<String> = r.get(16)?;
+    let last_claimed_at_ms: Option<i64> = r.get(17)?;
+    let reconcile_lookups: u32 = r.get(18)?;
     Ok((|| {
         Ok(OutboundSend {
             id,
@@ -723,6 +794,8 @@ fn send_from_row(r: &Row<'_>) -> rusqlite::Result<StoreResult<OutboundSend>> {
             fell_back,
             provider_message_id,
             last_error,
+            last_claimed_at_ms,
+            reconcile_lookups,
         })
     })())
 }
@@ -743,61 +816,84 @@ impl Store {
         send: &NewOutboundSend,
         now_ms: i64,
     ) -> StoreResult<EnqueueOutcome> {
-        required(&send.idempotency_key, "idempotency key")?;
-        if send.max_attempts == 0 {
-            return Err(invalid("max_attempts must be at least 1"));
-        }
-        if send.operation == OutboundOperation::Update && send.target_message_id.is_none() {
-            return Err(invalid("an update needs target_message_id"));
-        }
-        let c = cols(&send.conversation);
+        self.enqueue_outbound_send_at(send, now_ms, now_ms)
+    }
+
+    /// [`enqueue_outbound_send`](Self::enqueue_outbound_send), first due at
+    /// `due_at_ms` instead of now (#1295: paced notifications). A duplicate
+    /// key keeps its existing schedule.
+    pub fn enqueue_outbound_send_at(
+        &self,
+        send: &NewOutboundSend,
+        now_ms: i64,
+        due_at_ms: i64,
+    ) -> StoreResult<EnqueueOutcome> {
         write_tx(self, |tx| {
-            let inserted = tx.execute(
-                "INSERT INTO surface_outbox
-                 (platform, account_id, conversation_id, thread_id, idempotency_key, operation,
-                  target_message_id, payload, max_attempts, next_attempt_at_ms,
-                  interaction_expires_at_ms, created_at_ms, updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?10, ?10)
-                 ON CONFLICT(platform, account_id, idempotency_key) DO NOTHING",
-                params![
-                    c.platform,
-                    c.account_id,
-                    c.conversation_id,
-                    c.thread_id,
-                    send.idempotency_key,
-                    send.operation.as_str(),
-                    send.target_message_id,
-                    send.payload,
-                    send.max_attempts,
-                    now_ms,
-                    send.interaction_expires_at_ms
-                ],
-            )?;
-            let (id, status): (i64, String) = tx.query_row(
-                "SELECT id, status FROM surface_outbox
-                 WHERE platform = ?1 AND account_id = ?2 AND idempotency_key = ?3",
-                params![c.platform, c.account_id, send.idempotency_key],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            Ok(if inserted == 1 {
-                EnqueueOutcome::Queued { id }
-            } else {
-                EnqueueOutcome::Duplicate {
-                    id,
-                    status: SendStatus::parse(&status)?,
-                }
-            })
+            enqueue_outbound_tx(tx, send, now_ms, due_at_ms, false)
+        })
+    }
+
+    /// Atomically queue one logical message's parts. Unlike the legacy single
+    /// send API, duplicate keys must describe exactly the same immutable send.
+    pub fn enqueue_outbound_batch(
+        &self,
+        sends: &[NewOutboundSend],
+        now_ms: i64,
+    ) -> StoreResult<Vec<EnqueueOutcome>> {
+        if sends.is_empty() || sends.len() > 256 {
+            return Err(invalid("outbound batch size must be 1..256"));
+        }
+        write_tx(self, |tx| {
+            sends
+                .iter()
+                .map(|send| enqueue_outbound_tx(tx, send, now_ms, now_ms, true))
+                .collect()
         })
     }
 
     /// Claim the next due send whose conversation has nothing earlier still
     /// open. Expired interaction responses are rewritten to a normal post.
     pub fn claim_next_outbound_send(&self, now_ms: i64) -> StoreResult<Option<OutboundSend>> {
+        self.claim_outbound(None, None, now_ms)
+    }
+
+    /// [`claim_next_outbound_send`](Self::claim_next_outbound_send) limited
+    /// to one platform account, so a transport never claims a send that
+    /// belongs to another surface or workspace.
+    pub fn claim_next_outbound_send_for(
+        &self,
+        account: &SurfaceAccountRef,
+        now_ms: i64,
+    ) -> StoreResult<Option<OutboundSend>> {
+        self.claim_outbound(Some(account), None, now_ms)
+    }
+
+    /// Claim only this transport's namespace while preserving conversation order.
+    pub fn claim_next_outbound_send_for_prefix(
+        &self,
+        account: &SurfaceAccountRef,
+        prefix: &str,
+        now_ms: i64,
+    ) -> StoreResult<Option<OutboundSend>> {
+        required(prefix, "outbound key prefix")?;
+        self.claim_outbound(Some(account), Some(prefix), now_ms)
+    }
+
+    fn claim_outbound(
+        &self,
+        account: Option<&SurfaceAccountRef>,
+        prefix: Option<&str>,
+        now_ms: i64,
+    ) -> StoreResult<Option<OutboundSend>> {
+        let platform = account.map(|a| a.platform().as_str());
+        let account_id = account.map(|a| a.account_id());
         write_tx(self, |tx| {
             let id: Option<i64> = tx
                 .query_row(
                     "SELECT o.id FROM surface_outbox o
                      WHERE o.status IN ('queued', 'failed') AND o.next_attempt_at_ms <= ?1
+                       AND (?2 IS NULL OR (o.platform = ?2 AND o.account_id = ?3))
+                       AND (?4 IS NULL OR substr(o.idempotency_key,1,length(?4)) = ?4)
                        AND NOT EXISTS (
                          SELECT 1 FROM surface_outbox p
                          WHERE p.platform = o.platform AND p.account_id = o.account_id
@@ -805,7 +901,7 @@ impl Store {
                            AND p.id < o.id
                            AND p.status IN ('queued', 'sending', 'failed', 'reconcile'))
                      ORDER BY o.id LIMIT 1",
-                    params![now_ms],
+                    params![now_ms, platform, account_id, prefix],
                     |r| r.get(0),
                 )
                 .optional()?;
@@ -821,7 +917,8 @@ impl Store {
             )?;
             tx.execute(
                 "UPDATE surface_outbox
-                 SET status = 'sending', attempts = attempts + 1, updated_at_ms = ?2
+                 SET status = 'sending', attempts = attempts + 1, updated_at_ms = ?2,
+                     last_claimed_at_ms = ?2
                  WHERE id = ?1",
                 params![id, now_ms],
             )?;
@@ -882,6 +979,22 @@ impl Store {
         })
     }
 
+    /// The attempt may or may not have reached the provider (a timeout or a
+    /// dropped connection after the request left). Park the send in
+    /// `reconcile` so it is never resent blindly; it keeps holding later
+    /// sends in its conversation until [`reconcile_outbound_sends`] or the
+    /// owner resolves it.
+    pub fn mark_outbound_uncertain(&self, id: i64, error: &str, now_ms: i64) -> StoreResult<()> {
+        write_tx(self, |tx| {
+            let changed = tx.execute(
+                "UPDATE surface_outbox SET status = 'reconcile', last_error = ?2, updated_at_ms = ?3
+                 WHERE id = ?1 AND status = 'sending'",
+                params![id, error, now_ms],
+            )?;
+            changed_one(changed, "outbound send is not in flight")
+        })
+    }
+
     /// Cancel a send that has not gone out. Not allowed while in flight.
     pub fn abandon_outbound_send(&self, id: i64, reason: &str, now_ms: i64) -> StoreResult<()> {
         write_tx(self, |tx| {
@@ -897,6 +1010,29 @@ impl Store {
         })
     }
 
+    /// Move a send that has not gone out (`queued` or `failed`) to
+    /// `next_attempt_at_ms`, optionally replacing its payload. Not an
+    /// attempt. `false` when the send is in flight, settled or unknown.
+    /// #1295: a notification held through a suspension is re-paced and
+    /// marked late before it is sent.
+    pub fn reschedule_outbound_send(
+        &self,
+        id: i64,
+        payload: Option<&str>,
+        next_attempt_at_ms: i64,
+        now_ms: i64,
+    ) -> StoreResult<bool> {
+        write_tx(self, |tx| {
+            let changed = tx.execute(
+                "UPDATE surface_outbox
+                 SET next_attempt_at_ms = ?2, payload = COALESCE(?3, payload), updated_at_ms = ?4
+                 WHERE id = ?1 AND status IN ('queued', 'failed')",
+                params![id, next_attempt_at_ms, payload, now_ms],
+            )?;
+            Ok(changed == 1)
+        })
+    }
+
     pub fn outbound_send(&self, id: i64) -> StoreResult<Option<OutboundSend>> {
         read(self, |conn| load_send(conn, id))
     }
@@ -909,6 +1045,111 @@ impl Store {
             ))?;
             let rows = stmt
                 .query_map([], send_from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.into_iter().collect()
+        })
+    }
+
+    /// Sends of one account awaiting reconcile whose next lookup is due
+    /// (`next_attempt_at_ms <= now_ms`), oldest first.
+    pub fn outbound_sends_awaiting_reconcile_for(
+        &self,
+        account: &SurfaceAccountRef,
+        now_ms: i64,
+    ) -> StoreResult<Vec<OutboundSend>> {
+        read(self, |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {SEND_COLUMNS} FROM surface_outbox
+                 WHERE status = 'reconcile' AND platform = ?1 AND account_id = ?2
+                   AND next_attempt_at_ms <= ?3
+                 ORDER BY id"
+            ))?;
+            let rows = stmt
+                .query_map(
+                    params![account.platform().as_str(), account.account_id(), now_ms],
+                    send_from_row,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.into_iter().collect()
+        })
+    }
+
+    /// A reconcile lookup could not settle the send. It stays in
+    /// `reconcile` until `next_lookup_at_ms`. With `count_lookup` the
+    /// failure is counted, and once `max_lookups` failures have accrued the
+    /// send is dead-lettered so its conversation is no longer held.
+    pub fn defer_outbound_reconcile(
+        &self,
+        id: i64,
+        error: &str,
+        next_lookup_at_ms: i64,
+        count_lookup: bool,
+        max_lookups: u32,
+        now_ms: i64,
+    ) -> StoreResult<SendStatus> {
+        write_tx(self, |tx| {
+            let Some(send) = load_send(tx, id)? else {
+                return Err(invalid("unknown outbound send"));
+            };
+            if send.status != SendStatus::Reconcile {
+                return Err(invalid("outbound send is not awaiting reconcile"));
+            }
+            let lookups = send.reconcile_lookups + u32::from(count_lookup);
+            let status = if count_lookup && lookups >= max_lookups.max(1) {
+                SendStatus::DeadLetter
+            } else {
+                SendStatus::Reconcile
+            };
+            tx.execute(
+                "UPDATE surface_outbox
+                 SET status = ?2, last_error = ?3, next_attempt_at_ms = ?4,
+                     reconcile_lookups = ?5, updated_at_ms = ?6
+                 WHERE id = ?1",
+                params![
+                    id,
+                    status.as_str(),
+                    error,
+                    next_lookup_at_ms,
+                    lookups,
+                    now_ms
+                ],
+            )?;
+            Ok(status)
+        })
+    }
+
+    /// Every send of one account whose idempotency key starts with
+    /// `prefix` (compared literally), in enqueue order. An empty `statuses`
+    /// means any status.
+    pub fn outbound_sends_with_key_prefix(
+        &self,
+        account: &SurfaceAccountRef,
+        prefix: &str,
+        statuses: &[SendStatus],
+    ) -> StoreResult<Vec<OutboundSend>> {
+        // Status names are fixed identifiers from `SendStatus::as_str`.
+        let status_filter = if statuses.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<String> = statuses
+                .iter()
+                .map(|s| format!("'{}'", s.as_str()))
+                .collect();
+            format!("AND status IN ({})", names.join(", "))
+        };
+        read(self, |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {SEND_COLUMNS} FROM surface_outbox
+                 WHERE platform = ?1 AND account_id = ?2
+                   AND substr(idempotency_key, 1, length(?3)) = ?3
+                   {status_filter}
+                 ORDER BY id"
+            ))?;
+            let rows = stmt
+                .query_map(
+                    params![account.platform().as_str(), account.account_id(), prefix],
+                    send_from_row,
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             rows.into_iter().collect()
         })
@@ -951,7 +1192,7 @@ impl Store {
                     tx.execute(
                         "UPDATE surface_outbox
                          SET status = ?2, next_attempt_at_ms = ?3, updated_at_ms = ?3,
-                             last_error = 'not delivered before restart'
+                             last_error = 'not delivered before restart', reconcile_lookups = 0
                          WHERE id = ?1",
                         params![id, status.as_str(), now_ms],
                     )?;
@@ -1212,4 +1453,70 @@ impl Store {
             Ok(())
         })
     }
+}
+
+fn enqueue_outbound_tx(
+    tx: &Transaction<'_>,
+    send: &NewOutboundSend,
+    now_ms: i64,
+    due_at_ms: i64,
+    strict: bool,
+) -> StoreResult<EnqueueOutcome> {
+    required(&send.idempotency_key, "idempotency key")?;
+    if send.max_attempts == 0 {
+        return Err(invalid("max_attempts must be at least 1"));
+    }
+    if send.operation == OutboundOperation::Update && send.target_message_id.is_none() {
+        return Err(invalid("an update needs target_message_id"));
+    }
+    let c = cols(&send.conversation);
+
+    let inserted = tx.execute(
+        "INSERT INTO surface_outbox
+                 (platform, account_id, conversation_id, thread_id, idempotency_key, operation,
+                  target_message_id, payload, max_attempts, next_attempt_at_ms,
+                  interaction_expires_at_ms, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?12, ?11, ?10, ?10)
+                 ON CONFLICT(platform, account_id, idempotency_key) DO NOTHING",
+        params![
+            c.platform,
+            c.account_id,
+            c.conversation_id,
+            c.thread_id,
+            send.idempotency_key,
+            send.operation.as_str(),
+            send.target_message_id,
+            send.payload,
+            send.max_attempts,
+            now_ms,
+            send.interaction_expires_at_ms,
+            due_at_ms
+        ],
+    )?;
+    let (id, status): (i64, String) = tx.query_row(
+        "SELECT id, status FROM surface_outbox
+                 WHERE platform = ?1 AND account_id = ?2 AND idempotency_key = ?3",
+        params![c.platform, c.account_id, send.idempotency_key],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if inserted == 0 && strict {
+        let existing = load_send(tx, id)?.ok_or_else(|| invalid("missing duplicate send"))?;
+        if existing.conversation != send.conversation
+            || existing.payload != send.payload
+            || existing.operation != send.operation
+            || existing.target_message_id != send.target_message_id
+            || existing.max_attempts != send.max_attempts
+            || existing.interaction_expires_at_ms != send.interaction_expires_at_ms
+        {
+            return Err(invalid("outbound batch conflicts with existing send"));
+        }
+    }
+    Ok(if inserted == 1 {
+        EnqueueOutcome::Queued { id }
+    } else {
+        EnqueueOutcome::Duplicate {
+            id,
+            status: SendStatus::parse(&status)?,
+        }
+    })
 }

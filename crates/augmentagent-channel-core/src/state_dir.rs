@@ -415,9 +415,13 @@ mod tests {
     fn no_state_path_bypasses_the_shared_resolver() {
         // augmentagent-tools cannot link this crate (it stays out of the
         // daemon's dependency graph); tone-eval mirrors `resolve` inline.
-        const EXEMPT: [&str; 2] = [
+        // augmentagent-auth is a dependency of this crate, so its Linux
+        // credential directory (#1325) mirrors `resolve` inline too; its
+        // test pins the same XDG_STATE_HOME/HOME rule.
+        const EXEMPT: [&str; 3] = [
             "augmentagent-channel-core/src/state_dir.rs",
             "augmentagent-tools/src/bin/tone-eval.rs",
+            "augmentagent-auth/src/lib.rs",
         ];
         let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let mut offenders = Vec::new();

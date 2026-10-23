@@ -142,5 +142,46 @@ else
   ok "reasoner.rs block omits the bridge-suite section"
 fi
 
+# Compute changes require a complete machine-readable final-HEAD VM report;
+# a generic text receipt must not turn missing acceptance evidence green.
+for file in scripts/code-mode-compute.py scripts/code-mode-compute-guest.py \
+            scripts/code-mode-compute-prepare.py sidecars/code-mode-runner/runner.ts \
+            crates/augmentagent-channel-core/src/code_mode/compute/service.rs \
+            crates/augmentagent-cli/src/compute_cli.rs; do
+  new_repo "$file"
+  receipt="$repo/.claude/agent-test-receipts/$(git -C "$repo" rev-parse HEAD).txt"
+  mkdir -p "$(dirname "$receipt")"
+  printf 'command: synthetic unit tests\n' > "$receipt"
+  out=$(run_gate "$repo" "$PR")
+  if is_block "$out" && reason "$out" | grep -qF -- '--require-vm --public-packages --cases all'; then
+    ok "$file requires complete compute acceptance despite a text receipt"
+  else
+    bad "$file requires complete compute acceptance despite a text receipt" "$out"
+  fi
+done
+
+# This is a throwaway repository and an explicitly synthetic report, never
+# acceptance evidence for the implementation branch.
+compute_receipt="$repo/.claude/agent-test-receipts/$(git -C "$repo" rev-parse HEAD).compute.json"
+python3 - "$REPO_ROOT" "$compute_receipt" "$(git -C "$repo" rev-parse HEAD)" <<'PYFIXTURE'
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from scripts.tests.compute_receipt_test import fixture
+with open(sys.argv[2], 'w') as stream:
+    json.dump(fixture(sys.argv[3]), stream)
+PYFIXTURE
+out=$(run_gate "$repo" "$PR")
+if [ -z "$out" ]; then ok "complete current-HEAD compute report plus text receipt unlocks gate"
+else bad "complete current-HEAD compute report plus text receipt unlocks gate" "$out"; fi
+python3 - "$compute_receipt" <<'PYFIXTURE'
+import json, sys
+with open(sys.argv[1]) as stream: report = json.load(stream)
+report['git']['head'] = '0' * 40
+with open(sys.argv[1], 'w') as stream: json.dump(report, stream)
+PYFIXTURE
+out=$(run_gate "$repo" "$PR")
+if is_block "$out"; then ok "stale compute JSON cannot unlock current-HEAD gate"
+else bad "stale compute JSON cannot unlock current-HEAD gate" "$out"; fi
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

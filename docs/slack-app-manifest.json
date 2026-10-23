@@ -56,7 +56,9 @@
         "message.channels",
         "message.groups",
         "message.im",
-        "message.mpim"
+        "message.mpim",
+        "channel_rename",
+        "group_rename"
       ]
     },
     "interactivity": {

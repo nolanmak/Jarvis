@@ -66,7 +66,7 @@ if [ ! -d "$SRC/.git" ]; then
   git clone --depth 1 --branch "$WHISPER_TAG" "$WHISPER_REPO" "$SRC"
 fi
 [ "$(git -C "$SRC" rev-parse HEAD)" = "$WHISPER_COMMIT" ] \
-  || fail "whisper.cpp checkout is not pinned $WHISPER_TAG ($WHISPER_COMMIT)"
+  || fail "whisper.cpp checkout is not pinned $WHISPER_TAG ($WHISPER_COMMIT); move $SRC aside and rerun this script to rebuild the pinned source"
 
 if [ ! -f "$MODEL" ]; then
   partial="$(mktemp "$MODEL_DIR/.ggml-medium.en.bin.XXXXXX")"

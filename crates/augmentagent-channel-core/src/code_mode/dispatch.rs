@@ -38,15 +38,16 @@ use thiserror::Error;
 use augmentagent_store::{ActionStatus, Email, Store};
 
 use super::trace::{now_ms, summarize_value, ToolCallRecord};
-use crate::governor::{
-    ActionKind, ActionRequest, Platform, RateGovernor, Risk, TargetAttrs,
-};
+use crate::governor::{ActionKind, ActionRequest, Platform, RateGovernor, Risk, TargetAttrs};
 
 /// Errors a dispatcher can hand back to the sandbox. The runner reflects
 /// these as `{"id": <n>, "error": "<message>"}` frames; the program sees
 /// them as a thrown `Error` it can catch.
 #[derive(Debug, Error)]
 pub enum DispatchError {
+    /// Sanitized compute policy/deadline refusal.
+    #[error(transparent)]
+    Compute(#[from] super::compute::RequestError),
     /// Tool name was not in the v1 allowlist. The runner will not crash —
     /// the program receives a structured `Error` and may decide how to
     /// recover (typically it logs and falls through to a safe default).
@@ -134,7 +135,12 @@ impl StubDispatcher {
 
     /// Convenience: stub that always returns `null` for the listed names.
     pub fn always_null(names: &[&str]) -> Self {
-        Self::new(names.iter().map(|n| ((*n).to_string(), Value::Null)).collect())
+        Self::new(
+            names
+                .iter()
+                .map(|n| ((*n).to_string(), Value::Null))
+                .collect(),
+        )
     }
 }
 
@@ -357,8 +363,7 @@ impl<'a> DefaultDispatcher<'a> {
     /// conservative defaults (`Risk::Medium`, treat target as a stranger so
     /// the approval-required matrix kicks in for unknown senders).
     fn build_action_request(&self, reason: &str) -> ActionRequest {
-        let platform =
-            Platform::parse(&self.message_ctx.channel).unwrap_or(Platform::Twitter);
+        let platform = Platform::parse(&self.message_ctx.channel).unwrap_or(Platform::Twitter);
         ActionRequest {
             platform,
             action: ActionKind::Reply,
@@ -392,8 +397,7 @@ impl<'a> DefaultDispatcher<'a> {
                 Ok(v)
             }
             "db.recentEmailsFrom" => {
-                let (sender, days) =
-                    parse_recent_args(args).map_err(DispatchError::BadArgs)?;
+                let (sender, days) = parse_recent_args(args).map_err(DispatchError::BadArgs)?;
                 let since_ms = now_ms() - days * 86_400_000;
                 // `recent_emails_since` returns `(from, subject, triage)`.
                 // We filter by sender on the Rust side — for a typical
@@ -418,8 +422,8 @@ impl<'a> DefaultDispatcher<'a> {
                 Ok(v)
             }
             "db.threadHistory" => {
-                let thread_id = parse_string_arg(args, "threadId")
-                    .map_err(DispatchError::BadArgs)?;
+                let thread_id =
+                    parse_string_arg(args, "threadId").map_err(DispatchError::BadArgs)?;
                 // `since_ms = 0` means "no lower bound" — the SQL returns the
                 // whole thread, oldest first.
                 let rows = self
@@ -445,8 +449,7 @@ impl<'a> DefaultDispatcher<'a> {
                 Ok(v)
             }
             "db.isProcessed" => {
-                let msg_id = parse_string_arg(args, "messageId")
-                    .map_err(DispatchError::BadArgs)?;
+                let msg_id = parse_string_arg(args, "messageId").map_err(DispatchError::BadArgs)?;
                 let ok = self
                     .store
                     .is_message_processed(&msg_id)
@@ -456,8 +459,7 @@ impl<'a> DefaultDispatcher<'a> {
                 Ok(v)
             }
             "calendar.busy" => {
-                let (start_iso, end_iso) =
-                    parse_busy_args(args).map_err(DispatchError::BadArgs)?;
+                let (start_iso, end_iso) = parse_busy_args(args).map_err(DispatchError::BadArgs)?;
                 let Some(cal) = self.calendar else {
                     // No calendar adapter wired — return an empty list rather
                     // than erroring so a defensively-coded program still
@@ -508,9 +510,8 @@ impl<'a> DefaultDispatcher<'a> {
                 self.record_success(name, args, &success_value);
 
                 let trace_buf = self.snapshot();
-                let trace_json = serde_json::to_string(&trace_buf).map_err(|e| {
-                    DispatchError::Internal(format!("serialize trace: {e}"))
-                })?;
+                let trace_json = serde_json::to_string(&trace_buf)
+                    .map_err(|e| DispatchError::Internal(format!("serialize trace: {e}")))?;
 
                 let email = &self.message_ctx.email;
                 let action_id = self
@@ -598,7 +599,10 @@ fn parse_busy_args(args: &Value) -> Result<(String, String), String> {
         .as_array()
         .ok_or_else(|| "expected positional arg array".to_string())?;
     if arr.len() < 2 {
-        return Err(format!("expected 2 args (startIso, endIso); got {}", arr.len()));
+        return Err(format!(
+            "expected 2 args (startIso, endIso); got {}",
+            arr.len()
+        ));
     }
     let s = arr[0]
         .as_str()
@@ -644,7 +648,10 @@ mod tests {
     #[tokio::test]
     async fn stub_records_success_in_trace() {
         let d = StubDispatcher::new(vec![("wiki.draftHint".into(), json!("hint"))]);
-        let v = d.call("wiki.draftHint", json!([{"from": "a"}])).await.unwrap();
+        let v = d
+            .call("wiki.draftHint", json!([{"from": "a"}]))
+            .await
+            .unwrap();
         assert_eq!(v, json!("hint"));
         let trace = d.drain_trace();
         assert_eq!(trace.len(), 1);
@@ -691,8 +698,7 @@ mod tests {
 
     #[test]
     fn parse_draft_args_three_strings() {
-        let (c, b, r) =
-            parse_draft_args(&json!(["gmail", "body", "reason"])).unwrap();
+        let (c, b, r) = parse_draft_args(&json!(["gmail", "body", "reason"])).unwrap();
         assert_eq!(c, "gmail");
         assert_eq!(b, "body");
         assert_eq!(r, "reason");
@@ -776,7 +782,10 @@ mod tests {
         let d = DefaultDispatcher::new(&store, ctx, "// source").with_governor(&gov);
 
         let v = d
-            .call("draft", json!(["gmail", "Thanks — I'll take a look.", "ack"]))
+            .call(
+                "draft",
+                json!(["gmail", "Thanks — I'll take a look.", "ack"]),
+            )
             .await
             .expect("draft must land despite the model's channel guess");
         assert_eq!(v, Value::Null);

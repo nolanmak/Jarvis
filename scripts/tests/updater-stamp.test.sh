@@ -22,6 +22,7 @@ make_case() {
   git clone -q "$TMP/origin.git" "$TMP/work" 2>/dev/null
   mkdir -p "$TMP/work/scripts/lib" "$TMP/work/crates"
   cp "$REPO_ROOT/scripts/check-for-updates.sh" "$TMP/work/scripts/"
+  printf 'import os, sys; sys.exit(int(os.environ.get("PDF_INSTALL_FAIL", "0")))\n' > "$TMP/work/scripts/pdf-runtime.py"
   cp "$REPO_ROOT/scripts/lib/service-restart.sh" "$TMP/work/scripts/lib/"
   echo base > "$TMP/work/crates/x.rs"
   git -C "$TMP/work" add -A
@@ -65,6 +66,13 @@ esac
 exit 0
 STUB
   chmod +x "$TMP/bin/cargo" "$TMP/bin/systemctl"
+  # The built daemon: records what the updater asks it to do.
+  mkdir -p "$TMP/work/target/release"
+  cat > "$TMP/work/target/release/augmentagent" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$SYSTEMCTL_STUB_DIR/daemon-calls"
+STUB
+  chmod +x "$TMP/work/target/release/augmentagent"
   # Exercise the Linux (systemd) branch on any host (#1079: CI runs macOS too).
   printf '#!/usr/bin/env bash\necho Linux\n' > "$TMP/bin/uname" && chmod +x "$TMP/bin/uname"
   SYSTEMCTL_STUB_DIR="$TMP"; export SYSTEMCTL_STUB_DIR
@@ -79,6 +87,21 @@ run_updater() {
 
 echo "check-for-updates.sh stamp policy:"
 
+# A renderer install failure must stop deployment before restart/stamping.
+make_case
+export PDF_INSTALL_FAIL=1
+run_updater 1; rc=$?
+unset PDF_INSTALL_FAIL
+[ "$rc" -ne 0 ] && ok "PDF provisioning failure stops deployment" \
+                || bad "PDF provisioning failure stops deployment"
+[ ! -s "$STAMP_FILE" ] && ok "PDF failure withholds build stamp" \
+                       || bad "PDF failure withholds build stamp"
+[ ! -f "$TMP/mainpid" ] && ok "PDF failure does not restart daemon" \
+                       || bad "PDF failure does not restart daemon"
+grep -q "PDF RUNTIME INSTALL FAILED" "$TMP/state/augmentagent/update.log" \
+  && ok "PDF failure is actionable in update log" || bad "PDF failure is actionable in update log"
+rm -rf "$TMP"
+
 # --- the 2026-08-27 failure: restart runs but the process never bounces ---
 make_case
 run_updater 0; rc=$?
@@ -92,6 +115,9 @@ else
 fi
 grep -q "NOT writing the build stamp" "$TMP/state/augmentagent/update.log" \
   && ok "says why in the log" || bad "says why in the log" "no explanation logged"
+grep -qx "deploy prune" "$TMP/daemon-calls" 2>/dev/null \
+  && bad "keeps rollback material after an unverified restart (#1410)" "deploy prune ran" \
+  || ok "keeps rollback material after an unverified restart (#1410)"
 
 # The retry path: with the stamp absent, the next tick must try again rather
 # than reporting `up to date`. This is the property the old code destroyed.
@@ -102,6 +128,9 @@ else
   bad "a later tick recovers and writes the stamp once the restart works" \
     "stamp still absent; retry exit $retry_rc; $(tail -n 8 "$TMP/state/augmentagent/update.log")"
 fi
+grep -qx "deploy prune" "$TMP/daemon-calls" 2>/dev/null \
+  && ok "prunes old rollback material once the deploy is verified (#1410)" \
+  || bad "prunes old rollback material once the deploy is verified (#1410)" "deploy prune never ran"
 rm -rf "$TMP"
 
 # --- healthy deploy is unchanged ---

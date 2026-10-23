@@ -357,6 +357,38 @@ fn quota_refusal_fails_over_to_codex_and_latches() {
     assert_eq!(rig.spawns("codex"), 2);
 }
 
+/// #1499 — an expired claude login arrives as a successful completion whose
+/// text is the CLI's auth error. It must fail over and latch claude instead of
+/// being returned as the answer.
+#[test]
+fn expired_claude_login_fails_over_to_codex_and_latches() {
+    let rig = Rig::new();
+    let fakes = [
+        ("CLAUDE_CLI", "fake-claude-auth-expired.sh"),
+        ("CODEX_CLI", "fake-codex-ok.sh"),
+    ];
+
+    let out = rig.run("run 1 — claude login expired", rig.cmd("claude,codex", &fakes));
+    assert!(out.status.success(), "selftest should be served by codex");
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("response: PONG-FROM-FAKE-CODEX"), "{stdout}");
+    assert!(
+        !stdout.contains("response: Failed to authenticate"),
+        "the auth error must not be the answer: {stdout}"
+    );
+
+    let (until, reason) = rig.latch("claude").expect("claude must be latched");
+    assert!(until > Utc::now(), "latch must be in the future: {until}");
+    assert!(reason.contains("Failed to authenticate"), "{reason}");
+    assert_eq!(rig.spawns("claude"), 1);
+    assert_eq!(rig.spawns("codex"), 1);
+
+    let out2 = rig.run("run 2 — claude latched", rig.cmd("claude,codex", &fakes));
+    assert!(out2.status.success(), "{}", stderr_of(&out2));
+    assert_eq!(rig.spawns("claude"), 1, "a latched provider must not be spawned again");
+    assert_eq!(rig.spawns("codex"), 2);
+}
+
 /// A primary that never answers is a typed `Timeout`, not a stuck pipeline:
 /// the watchdog kills it, the fallback serves, and the primary is latched.
 #[test]

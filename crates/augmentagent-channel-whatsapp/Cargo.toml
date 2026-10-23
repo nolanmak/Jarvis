@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+augmentagent-phone = { path = "../augmentagent-phone" }
 augmentagent-store = { path = "../augmentagent-store" }
 augmentagent-auth = { path = "../augmentagent-auth" }
 augmentagent-channel-core = { path = "../augmentagent-channel-core" }
@@ -21,6 +22,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 reqwest = { workspace = true }
 uuid = { workspace = true }
 time = { workspace = true }

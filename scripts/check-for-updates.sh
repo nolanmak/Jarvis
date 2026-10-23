@@ -82,6 +82,10 @@ apply_update() {
       return 1
     fi
     log "rebuilding rust (changed files touched crates/ or Cargo)"
+    if ! python3 "$REPO_ROOT/scripts/pdf-runtime.py" >> "$LOG" 2>&1; then
+      log "PDF RUNTIME INSTALL FAILED — not restarting; build stamp withheld"
+      return 1
+    fi
     # Build BOTH production binaries. `augmentagent-mcp-memory` is a separate
     # package that the daemon spawns as a stdio MCP server — ask_opts points
     # at `target/release/augmentagent-mcp-memory` (see reasoner.rs). It was
@@ -293,6 +297,12 @@ will retry via the build-stamp mismatch path."
   fi
   printf '%s\n' "$TARGET" > "$STAMP"
   log "update complete: now at $TARGET (build stamp written)"
+  # #1410 — a verified deploy is the moment older rollback material stops
+  # mattering: keep the newest snapshots and rollback binaries, drop the rest.
+  # Housekeeping only; it can never fail the update.
+  if [ -x "$REPO_ROOT/target/release/augmentagent" ]; then
+    "$REPO_ROOT/target/release/augmentagent" deploy prune >> "$LOG" 2>&1 || true
+  fi
 }
 
 log "checking for updates"
@@ -429,11 +439,12 @@ fi
 # Rust rebuild: crates/ and Cargo files, plus every file outside crates/ that
 # production code compiles in with include_str!/include_bytes! — agent prompts
 # under schema/, the embedded .env.example key list, and the Codex tool bridge,
-# command sandbox, build VM runner, dependency gateway and provider supervisor.
+# command sandbox, build VM runner, dependency gateway, provider supervisor,
+# Python compute helpers and the embedded Deno Code Mode runner.
 # Missing one means the PR merges but the daemon keeps the stale embedded copy.
 # scripts/tests/updater-rebuild-trigger.test.sh fails when a new include target
 # outside crates/ is added without being classified here.
-RUST_REBUILD_PATHS='^(crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|schema/|\.env\.example$|docs/slack-app-manifest\.json$|scripts/(codex-tool-bridge|codex-command-sandbox|codex-build-vm|build-dependency-proxy|provider-supervisor)\.py$)'
+RUST_REBUILD_PATHS='^(crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|schema/|\.env\.example$|docs/slack-app-manifest\.json$|scripts/(codex-tool-bridge|codex-command-sandbox|codex-build-vm|build-dependency-proxy|provider-supervisor|pdf-runtime|code-mode-compute(-guest|-prepare)?)\.py$|scripts/run-rs\.sh$|sidecars/code-mode-runner/runner\.ts$)'
 if printf '%s\n' "$CHANGED_FILES" | grep -qE "$RUST_REBUILD_PATHS"; then
   NEEDS_REBUILD=1
 fi
@@ -442,6 +453,15 @@ fi
 if printf '%s\n' "$CHANGED_FILES" | grep -qE '^(src/|views/|package(-lock)?\.json|tsconfig\.json|tailwind\.config\.js)'; then
   NEEDS_DASHBOARD_REBUILD=1
 fi
+# The data-sync cron jobs execute their Python straight out of this checkout, so
+# the pull alone deploys them — there is nothing to rebuild and no daemon to
+# bounce. Report it instead: these jobs are scheduled outside the service this
+# script restarts, so a silent pull leaves the operator unable to tell whether a
+# merged fix is live. Gated on the paths the jobs actually run, because most
+# pushes to main touch none of them and a notice on every push gets ignored.
+# scripts/tests/updater-sync-scripts.test.sh pins both directions.
+SYNC_SCRIPT_PATHS='^scripts/(apple-notes|imessage)/[^/]+\.py$'
+CHANGED_SYNC_SCRIPTS=$(printf '%s\n' "$CHANGED_FILES" | grep -E "$SYNC_SCRIPT_PATHS" || true)
 
 log "pulling"
 if ! git pull --ff-only origin main >> "$LOG" 2>&1; then
@@ -450,6 +470,12 @@ if ! git pull --ff-only origin main >> "$LOG" 2>&1; then
 fi
 
 apply_update "$REMOTE"
+
+if [ -n "$CHANGED_SYNC_SCRIPTS" ]; then
+  SYNC_SCRIPT_LIST=$(printf '%s' "$CHANGED_SYNC_SCRIPTS" | tr '\n' ' ')
+  log "data sync script changed in this pull; live for the next scheduled run: $SYNC_SCRIPT_LIST"
+  notify_owner "data sync script updated: $SYNC_SCRIPT_LIST — live on the next scheduled run"
+fi
 
 # --- Auto-register optional scheduled jobs once ----------------------------
 # When a new install-*.sh ships with the pull, check whether its

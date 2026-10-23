@@ -102,6 +102,12 @@ pub struct WaMessage {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct WaMessageMetadata {
+    /// Classification from the sidecar's durable outbound-ID ledger. Missing or
+    /// null (old sidecar, pre-ledger event, storage error) is unknown, never an
+    /// owner-command capability. True marks an agent-generated echo.
+    #[serde(default)]
+    pub agent_outbound: Option<bool>,
+
     /// Message being quoted, or the target of a revoke event.
     #[serde(default)]
     pub quoted_message_id: String,
@@ -138,6 +144,23 @@ impl WaMessage {
     /// Stable across redelivery and linked devices, distinct for every turn.
     pub fn stable_id(&self) -> String {
         format!("wa:{}:{}", self.chat.bare(), self.id)
+    }
+
+    /// Transport-level self-chat check only. Callers must additionally check
+    /// the explicit configured owner link, stored control binding and feature
+    /// gates. `linked_owner` comes from the authenticated sidecar identity.
+    pub fn is_verified_self_command(&self, linked_owner: &Jid) -> bool {
+        linked_owner.is_personal()
+            && !linked_owner.user().is_empty()
+            && linked_owner.user().bytes().all(|c| c.is_ascii_digit())
+            && self.from_me
+            && self.metadata.agent_outbound == Some(false)
+            && self.chat.bare() == linked_owner.bare()
+            && self.sender.bare() == linked_owner.bare()
+            && !self.id.trim().is_empty()
+            && !self.text.trim().is_empty()
+            && !self.metadata.is_edit
+            && !self.metadata.is_revoke
     }
 
     /// True if this is our own outbound message — never triaged.

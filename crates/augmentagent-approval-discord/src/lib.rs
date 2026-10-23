@@ -9,7 +9,9 @@
 //! still `pending`, across daemon restarts, unlimited timeouts.
 
 pub mod attachments;
+pub mod compute_inputs;
 pub mod conversation;
+pub mod interaction;
 pub mod voice_bridge;
 pub mod voice_tool;
 mod broker;
@@ -19,6 +21,11 @@ mod journal_cmd;
 mod layout;
 mod loops;
 mod nudge;
+pub mod owner_alerts;
+// #1292 — the shared owner-command registry (Discord triggers, Slack mapping).
+pub mod owner_commands;
+pub mod phone;
+pub mod phone_delivery;
 mod process_loops;
 // #994 — register (casing) audit for outbound drafts. Public: the delivery
 // layer checks receipts here and `gmail compose` gates its body on them.
@@ -26,6 +33,9 @@ pub mod register;
 mod status_bus;
 mod surface;
 mod presets;
+// #1289 — outcome copy and cross-surface card sync shared with Slack.
+pub mod outcome;
+pub mod sync;
 // #501 — deterministic send-time parsing. Public module: the event handler's
 // select/modal arms resolve here, and `augmentagent-channel-core` re-exports
 // it for the query-mode `--send-at` flag (#502) — channel-core depends on
@@ -36,6 +46,7 @@ pub use broker::{DiscordApprovalBroker, DiscordConfig};
 // #501 — `append_envelope_markers` is shared with the CLI's Back-to-queue
 // repost so it renders the same To/cc/bcc decoration as the Revise repost.
 pub use event_handler::{append_envelope_markers, chunk_for_discord, edit_card_for_action};
+pub use event_handler::{fetch_owner_history, interrupted_turn_target, INTERRUPTED_TURN_NOTICE};
 pub use journal_cmd::{parse_journal_command, JournalCmd, JOURNAL_NOT_CONFIGURED, JOURNAL_USAGE};
 // #35 Phase 5: the email channel appends the needs-input marker to the
 // persisted draft via this; the card decodes it on render. `NeedsInput` is
@@ -55,10 +66,19 @@ pub use loops::{
     next_cron_firing_ms, normalize_and_validate_cron, parse_interval, pause_after_failures,
     validate_tz, LoopCommandParser, LoopPoster, LoopRunner, LoopScheduler, ParsedLoop,
 };
+// #1292 — Slack's loop command reuses the deterministic grammar and checks.
+pub use loops::{parse_create_args, validate_parsed};
 pub use nudge::NudgeScheduler;
 pub use status_bus::{StatusBus, StatusChanged};
 pub use surface::{ApprovalSurface, ComposedSurface};
 pub use presets::{Preset, MAX_REDRAFT_ITERATIONS, PRESETS};
+// #1289 — what the Slack approval surface reuses unchanged from the Discord
+// card: the needs-input feedback shape and the Revise-result header.
+pub use layout::{fill_feedback, revise_result_prefix};
+pub use sync::{
+    deciding, deciding_surface, ApprovalCardSurface, CardSurfaces, MultiSurfaceBroker,
+    SyncingActionHandler,
+};
 
 use async_trait::async_trait;
 use augmentagent_store::Email;
@@ -88,6 +108,17 @@ pub enum ApprovalActionOutcome {
     },
     /// Approve succeeded — email sent, action marked Sent.
     Approved,
+    /// Calendar creation confirmed by the provider; carry a verifiable receipt.
+    CalendarCreated {
+        /// Selected account; calendar creation currently targets its primary calendar.
+        organizer_account: String,
+        event_id: String,
+        html_link: Option<String>,
+        /// A repeated Approve recovered the saved receipt; no new write/nudge.
+        already_existed: bool,
+    },
+    /// A signed PDF was published, or its immutable receipt recovered.
+    DocumentSigned { receipt: String, already_existed: bool, output: Option<(std::path::PathBuf, String)> },
     /// Skip succeeded — draft deleted, action marked Rejected.
     Skipped,
     /// Revise succeeded — a new draft was created and should be re-posted as
@@ -130,6 +161,10 @@ pub enum ApprovalError {
 /// Discord API round-trip finishes, not when the user clicks a button.
 #[async_trait]
 pub trait ApprovalBroker: Send + Sync {
+    async fn post_owner_alert(&self, _notice: &augmentagent_store::alert_schedule::AlertNotice)
+        -> Result<String,ApprovalError> {
+        Err(ApprovalError::Discord("owner alerts are not supported by this broker".into()))
+    }
     async fn post_approval(
         &self,
         action_id: &str,
@@ -332,6 +367,17 @@ pub trait ApprovalActionHandler: Send + Sync {
         }
     }
 
+    /// #1291 — "Reschedule": move an armed schedule to `at_ms`
+    /// (`scheduled → scheduled`, CAS-gated on the row still being armed).
+    /// The impl owns the central time guard and replaces the scheduled
+    /// notices. Default: unsupported.
+    async fn reschedule(&self, action_id: &str, at_ms: i64) -> ApprovalActionOutcome {
+        let _ = (action_id, at_ms);
+        ApprovalActionOutcome::Failed {
+            message: "rescheduling is not supported by this handler".into(),
+        }
+    }
+
     /// #1203 — "Recompose" on the recovery ephemeral: restore a superseded
     /// draft (`superseded → pending`, card reposted, row exempted from the
     /// reconcile sweep). Default `Failed`: handlers without a store/broker
@@ -394,6 +440,14 @@ pub trait QueryHandler: Send + Sync {
         };
         self.answer(ctx, &prompt).await
     }
+
+    /// Return a phone origin only after checking the stored owner/control-chat
+    /// authority. Disabled or unlinked transports keep ordinary text behavior.
+    fn phone_origin(&self, _context: &phone::PhoneCommandContext) -> Option<augmentagent_store::phone::PhoneOrigin> { None }
+
+    /// Deterministic phone command after Discord owner admission. Implementations
+    /// must validate stored owner links before executing a phone operation.
+    async fn phone_command(&self, _context: &phone::PhoneCommandContext, _text: &str) -> Option<String> { None }
 
     /// Owner-only deterministic control command, intercepted before history,
     /// attachments or model inference. `None` means an ordinary message.

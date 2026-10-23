@@ -279,7 +279,7 @@ impl AttachmentSource {
         }
         // Unlink `dest` as a path entry, then O_EXCL: a link is never written through.
         let _ = tokio::fs::remove_file(dest).await;
-        let mut file = tokio::fs::OpenOptions::new().write(true).create_new(true).open(dest).await?;
+        let mut file = tokio::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(dest).await?;
         let mut written: u64 = 0;
         let streamed: Result<(), S3FetchError> = async {
             while let Some(chunk) = resp.chunk().await? {
@@ -366,6 +366,8 @@ mod tests {
         mock.assert_async().await;
         assert_eq!(n, 9);
         assert_eq!(std::fs::read(&dest).unwrap(), b"jpegbytes");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     /// #1061 — the Apple Notes channel reads its own env prefix and defaults to `notes/`;

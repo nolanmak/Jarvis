@@ -5,14 +5,16 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serenity::all::{ChannelId, GatewayIntents, MessageId, UserId};
+use serenity::all::{ChannelId, EditMessage, GatewayIntents, MessageId, UserId};
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
 use augmentagent_store::{Email, Store};
 
 use crate::event_handler::Handler;
-use crate::layout::{approval_message, flag_notice_message, scheduled_notice_message};
+use crate::layout::{
+    approval_edit_message, approval_message, flag_notice_message, scheduled_notice_message,
+};
 use crate::loops::LoopCommandParser;
 use crate::voice_bridge::VoiceBridge;
 use crate::{ApprovalActionHandler, ApprovalBroker, ApprovalError, JournalOps, QueryHandler};
@@ -47,6 +49,10 @@ pub struct DiscordConfig {
     /// Bridge into the cli's ShadowNote journaling flow (#428). `None`
     /// leaves `!journal` answering with a not-configured notice.
     pub journal_ops: Option<Arc<dyn JournalOps>>,
+    /// #1396 — turns the previous daemon process died on, already closed in
+    /// the store (`Store::interrupt_pending_discord_turns`). The owner is told
+    /// about each once the gateway is ready. One-shot commands pass none.
+    pub interrupted_turns: Vec<augmentagent_store::InterruptedDiscordTurn>,
     /// Private Unix socket for the Discord voice sidecar. Voice remains off
     /// when this is unset.
     pub voice_socket_path: Option<std::path::PathBuf>,
@@ -73,6 +79,9 @@ pub(crate) struct BrokerState {
     /// Populated once, from the first `Ready` event. Used to distinguish the
     /// bot's own messages from the user's when building conversation context.
     pub(crate) bot_user_id: std::sync::OnceLock<UserId>,
+    /// #1396 — interrupted turns the owner has not been told about yet;
+    /// drained by the first `Ready`.
+    pub(crate) interrupted_turns: std::sync::Mutex<Vec<augmentagent_store::InterruptedDiscordTurn>>,
 }
 
 impl BrokerState {
@@ -105,6 +114,7 @@ impl BrokerState {
             voice_bridge,
             voice_enabled,
             bot_user_id: std::sync::OnceLock::new(),
+            interrupted_turns: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -124,10 +134,25 @@ impl BrokerState {
 
 pub struct DiscordApprovalBroker {
     http: Arc<serenity::http::Http>,
+    bot_user_id: Option<UserId>,
     channel_id: ChannelId,
+    owner_id: Option<UserId>,
+    /// #1289 — read when another surface decided an action, to redraw the
+    /// Discord card from the action's current state. `None`: no redraw.
+    store: Option<Arc<Store>>,
 }
 
 impl DiscordApprovalBroker {
+    /// HTTP-only operator dispatch; the running daemon handles controls.
+    pub fn post_only(token:&str,channel_id:u64,owner_id:u64,store:Arc<Store>)->Self {
+        Self {http:Arc::new(serenity::http::Http::new(token)),bot_user_id:None,channel_id:ChannelId::new(channel_id),
+            owner_id:Some(UserId::new(owner_id)),store:Some(store)}
+    }
+    /// Available only after authenticated gateway READY, never in post-only mode.
+    pub fn phone_connection(&self) -> Option<(Arc<serenity::http::Http>, u64)> {
+        Some((self.http.clone(), self.bot_user_id?.get()))
+    }
+
     /// Start the serenity client in a background task. Blocks the current task
     /// until the gateway is `Ready`, after which `post_approval` calls may be
     /// issued.
@@ -155,6 +180,9 @@ impl DiscordApprovalBroker {
             voice_bridge,
             config.voice_socket_path.is_some(),
         ));
+
+        *state.interrupted_turns.lock().expect("interrupted turns poisoned") =
+            config.interrupted_turns.clone();
 
         if state.allowed_user_id.is_none() {
             warn!(
@@ -204,17 +232,32 @@ impl DiscordApprovalBroker {
 
         // `state` is moved into the Handler and dropped from the broker
         // after client.start. That's intentional: the broker is post-only.
+        let bot_user_id = state.bot_user_id.get().copied();
         drop(state);
 
         Ok(Self {
             http,
+            bot_user_id,
             channel_id: approval_channel,
+            owner_id: config.allowed_user_id.map(UserId::new),
+            store: config.store.clone(),
         })
     }
 }
 
 #[async_trait]
 impl ApprovalBroker for DiscordApprovalBroker {
+    async fn post_owner_alert(&self, notice:&augmentagent_store::alert_schedule::AlertNotice)
+        -> Result<String,ApprovalError> {
+        let owner=self.owner_id.ok_or_else(||ApprovalError::Discord("DISCORD_ALLOWED_USER_ID is required for owner alerts".into()))?;
+        let channel=self.channel_id.to_channel(&*self.http).await.map_err(|e|ApprovalError::Discord(e.to_string()))?;
+        let guild=match channel {serenity::all::Channel::Guild(c)=>c.guild_id.to_string(),_=>"@me".into()};
+        let status=self.store.as_ref().and_then(|s|s.owner_alert_text_status(&notice.alert.id).ok().flatten());
+        let message=crate::owner_alerts::message(notice,owner,chrono::Utc::now().timestamp_millis(),status.as_deref());
+        let posted=self.channel_id.send_message(&*self.http,message).await
+            .map_err(|e|ApprovalError::Discord(e.to_string()))?;
+        Ok(format!("https://discord.com/channels/{}/{}/{}",guild,self.channel_id,posted.id))
+    }
     async fn post_approval(
         &self,
         action_id: &str,
@@ -299,5 +342,56 @@ impl ApprovalBroker for DiscordApprovalBroker {
             .delete_message(&*self.http, MessageId::new(message_id))
             .await
             .map_err(|e| ApprovalError::Discord(e.to_string()))
+    }
+}
+
+/// #1289 — a decision taken on another surface (Slack) redraws the Discord
+/// card in place: a still-pending action (a revise elsewhere) gets the
+/// current draft; a decided one loses its buttons and says what happened,
+/// with the #1199 recovery pointer for a superseded draft. The card is found
+/// the same way the startup sweep finds it (its button IDs in the last 100
+/// channel messages), so no Discord message ID has to be stored. A card
+/// Discord itself resolved is already gone and is simply not found.
+#[async_trait]
+impl crate::sync::ApprovalCardSurface for DiscordApprovalBroker {
+    fn surface_name(&self) -> &'static str {
+        "discord"
+    }
+
+    async fn redraw_cards(&self, action_id: &str, origin: &str) {
+        let Some(store) = self.store.as_deref() else {
+            return;
+        };
+        let row = match store.get_action_with_email(action_id) {
+            Ok(Some(row)) => row,
+            Ok(None) => return,
+            Err(e) => {
+                warn!(action_id, "discord redraw: could not load the action: {e}");
+                return;
+            }
+        };
+        let status = row.action.status.as_str();
+        let edit =
+            match crate::outcome::card_status_line(status, row.action.error_message.as_deref()) {
+                None => {
+                    let count = store.redraft_count(action_id).unwrap_or(0);
+                    let draft = crate::append_envelope_markers(
+                        row.action.draft_body.clone().unwrap_or_default(),
+                        Some(store),
+                        action_id,
+                        &row.email.from,
+                        None,
+                    );
+                    approval_edit_message(action_id, &row.email, &draft, count)
+                }
+                Some(line) => EditMessage::new()
+                    .content(format!("{line} _(decided on {origin})_"))
+                    .components(vec![]),
+            };
+        match crate::edit_card_for_action(&self.http, self.channel_id, action_id, edit).await {
+            Ok(true) => info!(action_id, origin, "discord card redrawn"),
+            Ok(false) => {}
+            Err(e) => warn!(action_id, "discord redraw failed: {e:#}"),
+        }
     }
 }

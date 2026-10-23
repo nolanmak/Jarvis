@@ -15,7 +15,8 @@ pub mod sync;
 pub mod target;
 
 pub use bundle::{
-    entry_date, parse_entries, synthetic_imessage_email, Bundle, Conversation, MessageEntry,
+    entry_date, newest_entry_of, parse_entries, synthetic_imessage_email, Bundle, Conversation,
+    MessageEntry,
 };
 pub use config::{
     history_wiki_capture_enabled, poll_interval, send_enabled, ImessageConfig, ENV_POLL_SECS,

@@ -286,22 +286,27 @@ dependencies = [
  "async-trait",
  "augmentagent-docs",
  "augmentagent-loops",
+ "augmentagent-phone",
  "augmentagent-store",
  "chrono",
  "chrono-tz",
  "cron",
  "dashmap 6.1.0",
+ "iana-time-zone",
  "libc",
+ "mockito",
  "reqwest",
  "serde",
  "serde_json",
  "serenity",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "tokio-tungstenite",
+ "tokio-tungstenite 0.21.0",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -443,6 +448,7 @@ dependencies = [
  "augmentagent-approval-discord",
  "augmentagent-auth",
  "augmentagent-messages",
+ "augmentagent-phone",
  "augmentagent-store",
  "augmentagent-wiki",
  "chrono",
@@ -521,6 +527,7 @@ dependencies = [
  "augmentagent-wiki",
  "chrono",
  "md-5",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",
@@ -553,6 +560,7 @@ dependencies = [
  "async-trait",
  "augmentagent-approval-discord",
  "augmentagent-store",
+ "md-5",
  "mockito",
  "reqwest",
  "rusqlite",
@@ -802,9 +810,17 @@ dependencies = [
  "augmentagent-auth",
  "augmentagent-channel-core",
  "augmentagent-channel-discord-dm",
+ "augmentagent-channel-voice",
+ "augmentagent-docs",
+ "augmentagent-loops",
+ "augmentagent-messages",
+ "augmentagent-phone",
  "augmentagent-store",
  "augmentagent-wiki",
+ "chrono",
+ "chrono-tz",
  "futures",
+ "libc",
  "mockito",
  "reqwest",
  "rusqlite",
@@ -813,7 +829,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "tokio-tungstenite",
+ "tokio-tungstenite 0.21.0",
  "tokio-util",
  "tracing",
  "uuid",
@@ -924,6 +940,7 @@ dependencies = [
  "augmentagent-approval-discord",
  "augmentagent-auth",
  "augmentagent-channel-core",
+ "augmentagent-phone",
  "augmentagent-store",
  "augmentagent-wiki",
  "futures",
@@ -933,6 +950,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "time",
@@ -950,6 +968,7 @@ dependencies = [
  "augmentagent-channel-core",
  "augmentagent-channel-imessage",
  "augmentagent-mcp-memory",
+ "augmentagent-phone",
  "augmentagent-store",
  "augmentagent-wiki",
  "chrono",
@@ -991,6 +1010,7 @@ dependencies = [
  "augmentagent-channel-telegram-bot",
  "augmentagent-channel-twitter",
  "augmentagent-channel-voice",
+ "augmentagent-channel-whatsapp",
  "augmentagent-channel-whatsapp-history",
  "augmentagent-content-adapter",
  "augmentagent-docs",
@@ -999,16 +1019,21 @@ dependencies = [
  "augmentagent-heartbeat",
  "augmentagent-loops",
  "augmentagent-messages",
+ "augmentagent-phone",
  "augmentagent-proactive",
  "augmentagent-renderer-client",
  "augmentagent-store",
  "augmentagent-wiki",
+ "base64 0.22.1",
  "chrono",
  "chrono-tz",
  "clap",
  "cron",
  "dashmap 6.1.0",
  "dotenvy",
+ "flate2",
+ "futures",
+ "hmac 0.12.1",
  "insta",
  "libc",
  "mockito",
@@ -1018,9 +1043,11 @@ dependencies = [
  "serde",
  "serde_json",
  "serenity",
+ "sha1",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tokio-tungstenite 0.21.0",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
@@ -1056,6 +1083,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tracing",
@@ -1167,6 +1195,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "augmentagent-phone"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "augmentagent-store",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "futures",
+ "hmac 0.12.1",
+ "mockito",
+ "rand 0.8.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sha1",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "augmentagent-proactive"
 version = "0.1.0"
 dependencies = [
@@ -1208,6 +1264,8 @@ dependencies = [
 name = "augmentagent-store"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "chrono-tz",
  "once_cell",
  "regex",
  "rusqlite",
@@ -1682,6 +1740,61 @@ dependencies = [
  "aws-smithy-schema",
  "aws-smithy-types",
  "rustc_version",
+ "tracing",
+]
+
+[[package]]
+name = "axum"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
+dependencies = [
+ "axum-core",
+ "base64 0.22.1",
+ "bytes",
+ "form_urlencoded",
+ "futures-util",
+ "http 1.4.0",
+ "http-body 1.0.1",
+ "http-body-util",
+ "hyper 1.9.0",
+ "hyper-util",
+ "itoa",
+ "matchit",
+ "memchr",
+ "mime",
+ "percent-encoding",
+ "pin-project-lite",
+ "serde_core",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_urlencoded",
+ "sha1",
+ "sync_wrapper",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
+ "tower",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
+name = "axum-core"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08c78f31d7b1291f7ee735c1c6780ccde7785daae9a9206026862dab7d8792d1"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "http 1.4.0",
+ "http-body 1.0.1",
+ "http-body-util",
+ "mime",
+ "pin-project-lite",
+ "sync_wrapper",
+ "tower-layer",
+ "tower-service",
  "tracing",
 ]
 
@@ -3410,6 +3523,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "matchit"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
+
+[[package]]
 name = "matrixmultiply"
 version = "0.3.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4741,6 +4860,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_repr"
 version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4801,7 +4931,7 @@ dependencies = [
  "serde_json",
  "time",
  "tokio",
- "tokio-tungstenite",
+ "tokio-tungstenite 0.21.0",
  "tracing",
  "typemap_rev",
  "url",
@@ -5279,8 +5409,20 @@ dependencies = [
  "rustls-pki-types",
  "tokio",
  "tokio-rustls 0.25.0",
- "tungstenite",
+ "tungstenite 0.21.0",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "tokio-tungstenite"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
+dependencies = [
+ "futures-util",
+ "log",
+ "tokio",
+ "tungstenite 0.29.0",
 ]
 
 [[package]]
@@ -5340,6 +5482,7 @@ dependencies = [
  "tokio",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -5459,6 +5602,22 @@ dependencies = [
  "thiserror 1.0.69",
  "url",
  "utf-8",
+]
+
+[[package]]
+name = "tungstenite"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c01152af293afb9c7c2a57e4b559c5620b421f6d133261c60dd2d0cdb38e6b8"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http 1.4.0",
+ "httparse",
+ "log",
+ "rand 0.9.4",
+ "sha1",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

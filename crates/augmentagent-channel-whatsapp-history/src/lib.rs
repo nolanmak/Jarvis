@@ -126,6 +126,13 @@ pub fn poll_once(root: &Path, store: &Store) -> Result<Report> {
         );",
         )
     })?;
+    store.set_archive_newest_entry(
+        "whatsapp",
+        augmentagent_channel_imessage::newest_entry_of(
+            index.values().filter_map(|c| c.newest_entry.as_deref()),
+        )
+        .as_deref(),
+    )?;
     let mut report = Report::default();
     for (key, conv) in index {
         if key != conv.identifier || conv.service != "WhatsApp" {
@@ -160,6 +167,12 @@ pub fn poll_once(root: &Path, store: &Store) -> Result<Report> {
             first_run: seen.is_none(),
         };
         for (idx, entry) in entries.iter().enumerate().skip(start) {
+            // Consume the archive position without storing private phone setup
+            // or passing it into incremental wiki capture. Keep original indices
+            // so skipping controls cannot renumber ordinary message identities.
+            if augmentagent_phone::commands::sensitive(&entry.body) {
+                continue;
+            }
             // Don't silently rewrite an unknown timestamp as today's history.
             let ts = match DateTime::parse_from_rfc3339(&entry.timestamp) {
                 Ok(ts) => ts.timestamp_millis(),

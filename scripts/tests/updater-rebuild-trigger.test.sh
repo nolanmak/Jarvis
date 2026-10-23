@@ -27,6 +27,8 @@ TEST_ONLY_EMBEDS=(
   eval/autopr-cases.json
   eval/last-run.json
   scripts/tests/fixtures/scoped-document.pdf
+  scripts/tests/fixtures/code-mode-compute/numbers.xlsx
+  scripts/tests/fixtures/code-mode-compute/sum-xlsx.ts
   skills/email-triage/SKILL.md
 )
 
@@ -39,13 +41,14 @@ make_case() {
   git clone -q "$TMP/origin.git" "$TMP/work" 2>/dev/null
   mkdir -p "$TMP/work/scripts/lib" "$(dirname "$TMP/work/$path")"
   cp "$REPO_ROOT/scripts/check-for-updates.sh" "$TMP/work/scripts/"
+  printf 'import os, sys; sys.exit(int(os.environ.get("PDF_INSTALL_FAIL", "0")))\n' > "$TMP/work/scripts/pdf-runtime.py"
   cp "$REPO_ROOT/scripts/lib/service-restart.sh" "$TMP/work/scripts/lib/"
-  echo base > "$TMP/work/$path"
+  echo "# base" > "$TMP/work/$path"
   git -C "$TMP/work" add -A
   git -C "$TMP/work" -c user.email=t@e -c user.name=t commit -qm base
   git -C "$TMP/work" push -q origin HEAD:main
   git -C "$TMP/work" branch -q -M main 2>/dev/null || true
-  echo newer > "$TMP/work/$path"
+  echo "# newer" > "$TMP/work/$path"
   git -C "$TMP/work" -c user.email=t@e -c user.name=t commit -qam newer
   git -C "$TMP/work" push -q origin main
   git -C "$TMP/work" reset -q --hard HEAD~1
@@ -120,6 +123,12 @@ expect_rebuild scripts/codex-command-sandbox.py
 expect_rebuild scripts/codex-build-vm.py
 expect_rebuild scripts/build-dependency-proxy.py
 expect_rebuild scripts/provider-supervisor.py
+expect_rebuild scripts/code-mode-compute.py
+expect_rebuild scripts/code-mode-compute-guest.py
+expect_rebuild scripts/code-mode-compute-prepare.py
+expect_rebuild sidecars/code-mode-runner/runner.ts
+expect_rebuild scripts/pdf-runtime.py
+expect_rebuild scripts/run-rs.sh
 expect_rebuild schema/wiki-ask.md
 expect_rebuild .env.example
 
@@ -127,6 +136,9 @@ expect_rebuild .env.example
 expect_no_rebuild docs/BUILD-VM.md
 expect_no_rebuild scripts/check-no-personal-data.sh
 expect_no_rebuild eval/last-run.json
+expect_no_rebuild scripts/tests/fixtures/code-mode-compute/numbers.xlsx
+expect_no_rebuild scripts/tests/fixtures/code-mode-compute/sum-xlsx.ts
+expect_no_rebuild sidecars/code-mode-runner/runner_test.ts
 
 # Drift guard: every include_str!/include_bytes! target outside crates/ in the
 # real tree is either classified test-only above or triggers a rebuild.

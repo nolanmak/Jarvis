@@ -50,6 +50,8 @@ class LaunchdInstallerTests(unittest.TestCase):
                      "daily-digest.sh", "daily-research.sh", "wix-events-sync.mjs"):
             (self.repo / "scripts" / name).write_text("#!/bin/sh\nexit 0\n")
             (self.repo / "scripts" / name).chmod(0o755)
+        # Provisioning belongs to pdf_runtime_test; this fixture tests launchd.
+        (self.repo / "scripts/pdf-runtime.py").write_text("raise SystemExit(0)\n")
         (self.repo / "target/release/augmentagent").write_text("#!/bin/sh\nexit 0\n")
         (self.repo / "target/release/augmentagent").chmod(0o755)
         (self.repo / "dist/dashboard-server.js").write_text("")

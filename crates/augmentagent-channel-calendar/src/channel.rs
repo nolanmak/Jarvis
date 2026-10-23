@@ -191,7 +191,19 @@ impl<C: CalendarApi, R: Reasoner + 'static> CalendarChannel<C, R> {
                 )
                 .await
             {
-                Ok(events) => {
+                Ok(mut events) => {
+                    // A tracked meeting moved outside the hot window must
+                    // still update preparation deadlines. Fetch missing tracked
+                    // IDs rather than interpreting absence as cancellation.
+                    let prefix=format!("{}:{}:",account.entity_id,self.config.calendar_id);
+                    for key in self.store.tracked_owner_alert_meetings(&account.entity_id)? {
+                        let Some(id)=key.strip_prefix(&prefix) else{continue};
+                        if events.iter().any(|ev|ev.id==id){continue;}
+                        match self.gcal.get_event(&account.entity_id,&self.config.calendar_id,id).await {
+                            Ok(event)=>events.push(event),
+                            Err(error)=>warn!("tracked preparation meeting refresh failed: {error}"),
+                        }
+                    }
                     outcome.events_seen += events.len();
                     outcome.alerts_sent += self
                         .run_alert_pass(&events, &account.entity_id, now)
@@ -259,6 +271,42 @@ impl<C: CalendarApi, R: Reasoner + 'static> CalendarChannel<C, R> {
         now: DateTime<Utc>,
     ) -> usize {
         use chrono::Timelike;
+
+        // Keep the shared preparation-alert cache current even when the
+        // ordinary upcoming-event sink is disabled. Only privacy-allowlisted
+        // meeting fields leave this channel.
+        if !self.config.dry_run {
+            for ev in events {
+                let key=format!("{}:{}:{}",entity_id,self.config.calendar_id,ev.id);
+                if ev.visibility.as_deref().is_some_and(|v|
+                    v.eq_ignore_ascii_case("private") || v.eq_ignore_ascii_case("confidential")) {
+                    if let Err(error) = self.store.forget_owner_alert_meeting(&key, now.timestamp_millis()) {
+                        warn!("preparation meeting privacy revocation failed: {error}");
+                    }
+                    continue;
+                }
+                let candidate=AlertCandidate::from_event(ev,entity_id,&self.config.calendar_id);
+                match candidate.filter(|c|!c.all_day && !c.declined_by_self) {
+                    Some(c)=>{
+                        let mut participants:Vec<String>=c.payload.attendees.iter().map(|a|a.email.clone()).collect();
+                        participants.extend(c.payload.organizer_email.iter().cloned());
+                        participants.sort();participants.dedup();
+                        let value=serde_json::json!({"id":key,"account_id":entity_id,"summary":c.payload.summary,
+                            "start_ms":c.payload.start.timestamp_millis(),"participants":participants,
+                            "url":ev.html_link.as_deref().filter(|url|url.starts_with("https://calendar.google.com/"))});
+                        if let Err(e)=self.store.cache_owner_alert_meeting(&key,entity_id,c.payload.start.timestamp_millis(),&value.to_string(),now.timestamp_millis()) {
+                            warn!("preparation meeting cache failed: {e}");
+                        }
+                    }
+                    None if ev.status.as_deref()==Some("cancelled") || ev.attendees.as_ref().is_some_and(|list|
+                        list.iter().any(|a|a.self_==Some(true) && a.response_status.as_deref()==Some("declined")))=>{
+                        if let Err(e)=self.store.cancel_owner_alert_meeting(&key,now.timestamp_millis()) {
+                        warn!("preparation meeting cancellation failed: {e}");
+                    }},
+                    None=>{},
+                }
+            }
+        }
 
         if self.alert_sink.is_none() && !self.config.dry_run {
             return 0;
@@ -929,4 +977,62 @@ mod tests {
             .unwrap()
             .is_none());
     }
+    #[tokio::test]
+    async fn preparation_cache_excludes_private_events_and_revokes_changed_visibility() {
+        let (store, _file) = tmp_store();
+        let now = Utc::now();
+        let ch = CalendarChannel::new(store.clone(), Arc::new(StubApi { events: vec![] }),
+            Arc::new(StubReasoner), alert_config());
+        let mut event = event_at("private-prep", now + chrono::Duration::hours(2), now + chrono::Duration::hours(3));
+        event.summary = Some("Ordinary meeting title".into());
+        for visibility in ["private", "CONFIDENTIAL"] {
+            event.visibility = Some(visibility.into());
+            ch.run_alert_pass(&[event.clone()], "acc1", now).await;
+            assert!(store.owner_alert_meetings("acc1", now.timestamp_millis()).unwrap().is_empty());
+        }
+        event.visibility = Some("default".into());
+        ch.run_alert_pass(&[event.clone()], "acc1", now).await;
+        assert_eq!(store.owner_alert_meetings("acc1", now.timestamp_millis()).unwrap().len(), 1);
+        let key = format!("acc1:{}:private-prep", ch.config.calendar_id);
+        store.insert_owner_alert(&augmentagent_store::owner_alerts::NewOwnerAlert {
+            id: "privacy-prep", source_url: "https://example.test/email", sender: "Test Colleague",
+            action: "Prepare a recommendation", reason: "Preparation requested", urgency: augmentagent_store::owner_alerts::Urgency::High,
+            due_at_ms: Some((now + chrono::Duration::hours(2)).timestamp_millis()), timezone: "UTC",
+            meeting_id: Some(&key), expires_at_ms: (now + chrono::Duration::hours(2)).timestamp_millis(),
+            text_after_ms: now.timestamp_millis() + 600_000,
+        }, now.timestamp_millis()).unwrap();
+        store.attach_owner_alert_details("privacy-prep", &augmentagent_store::alert_schedule::AlertDetails {
+            message_id: "mail1".into(), thread_id: None, account_id: Some("acc1".into()), subject: "Prepare".into(),
+            evidence: "Please prepare a recommendation".into(), deadline_kind: "inferred_preparation".into(),
+            meeting_start_ms: Some((now + chrono::Duration::hours(2)).timestamp_millis()), meeting_url: None, reply_resolves: false,
+        }, now.timestamp_millis()).unwrap();
+        event.visibility = Some("private".into());
+        // Privacy revocation must work even if the same response lacks timing fields.
+        event.start = None;
+        ch.run_alert_pass(&[event], "acc1", now).await;
+        assert!(store.owner_alert_meetings("acc1", now.timestamp_millis()).unwrap().is_empty());
+        let conn = rusqlite::Connection::open(_file.path()).unwrap();
+        let retained: i64 = conn.query_row("SELECT COUNT(*) FROM owner_alert_meetings", [], |r| r.get(0)).unwrap();
+        assert_eq!(retained, 0, "privacy revocation removes cached metadata");
+        assert_eq!(store.owner_alert("privacy-prep").unwrap().unwrap().state,
+            augmentagent_store::owner_alerts::AlertState::Resolved);
+        assert!(store.claim_owner_alert_notice(now.timestamp_millis()).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn preparation_cache_is_privacy_filtered_and_cancellation_is_explicit() {
+        let (store,_file)=tmp_store();let now=Utc::now();
+        let ch=CalendarChannel::new(store.clone(),Arc::new(StubApi{events:vec![]}),Arc::new(StubReasoner),alert_config());
+        let mut event=event_at("prep",now+chrono::Duration::hours(2),now+chrono::Duration::hours(3));
+        event.html_link=Some("https://calendar.google.com/calendar/event?eid=synthetic".into());
+        ch.run_alert_pass(&[event.clone()],"acc1",now).await;
+        let cache=store.owner_alert_meetings("acc1",now.timestamp_millis()).unwrap();assert_eq!(cache.len(),1);
+        assert!(!cache[0].contains("private NDA notes"));assert!(!cache[0].contains("221B"));
+        assert!(cache[0].contains("calendar.google.com"));
+        event.start=None;ch.run_alert_pass(&[event.clone()],"acc1",now).await;
+        assert_eq!(store.owner_alert_meetings("acc1",now.timestamp_millis()).unwrap().len(),1,"malformed event is not cancellation");
+        event.status=Some("cancelled".into());ch.run_alert_pass(&[event],"acc1",now).await;
+        assert!(store.owner_alert_meetings("acc1",now.timestamp_millis()).unwrap().is_empty());
+    }
+
 }

@@ -65,6 +65,39 @@ fn backfill_is_searchable_historical_and_repeat_safe() {
     assert_eq!(capture.platform, "whatsapp");
 }
 
+/// #1429 — the poll records how far the archive actually reaches, so a recall
+/// query past that date can say "stale since" instead of "no results".
+#[test]
+fn poll_records_the_archive_freshness_cursor() {
+    let tmp = tempfile::tempdir().unwrap();
+    bundle(tmp.path());
+    let store = Store::open(tmp.path().join("data.db")).unwrap();
+
+    // A bundle written before the field existed: freshness unknown, not an error.
+    poll_once(tmp.path(), &store).unwrap();
+    assert_eq!(
+        store.archive_newest_entries().unwrap().get("whatsapp"),
+        Some(&None)
+    );
+
+    let path = tmp.path().join("conversations/index.json");
+    let mut index: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    index["15550000001@s.whatsapp.net"]["newest_entry"] = json!("2026-09-29T21:10:00-04:00");
+    fs::write(&path, index.to_string()).unwrap();
+    poll_once(tmp.path(), &store).unwrap();
+    assert_eq!(
+        store
+            .archive_newest_entries()
+            .unwrap()
+            .get("whatsapp")
+            .cloned()
+            .flatten()
+            .as_deref(),
+        Some("2026-09-29T21:10:00-04:00")
+    );
+}
+
 #[test]
 fn invalid_paths_and_missing_conversations_do_not_block_good_ones() {
     let tmp = tempfile::tempdir().unwrap();
@@ -98,6 +131,7 @@ from test_sync import make_fixture_db, add_message, cd
 from whatsapp_sync import sync
 con = make_fixture_db(dest/'source.sqlite')
 add_message(con, 1, 2, 'cabin compatibility test', cd(1787745600), 0, group_member=7)
+add_message(con, 2, 2, 'no timestamp here', None, 0, group_member=7)
 sync(dest/'source.sqlite', dest, dest/'.sync_state.json')
 con.close()
 "#;
@@ -114,6 +148,25 @@ con.close()
     let email = capture_email(&report.deltas[0]);
     assert_eq!(email.kind, "group");
     assert!(email.body.contains("+14155550999"));
+    // #1429 — the exporter's freshness cursor is the newest *message*
+    // timestamp, never `synced_at`, and an undated message cannot claim it.
+    let newest = store
+        .archive_newest_entries()
+        .unwrap()
+        .get("whatsapp")
+        .cloned()
+        .flatten()
+        .expect("exporter wrote newest_entry");
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(&newest)
+            .unwrap()
+            .timestamp_millis(),
+        1_787_745_600_000
+    );
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(tmp.path().join(".sync_state.json")).unwrap())
+            .unwrap();
+    assert_ne!(state["synced_at"].as_str(), Some(newest.as_str()));
 }
 
 #[test]
@@ -235,4 +288,30 @@ fn symlink_cannot_read_conversation_outside_bundle() {
     let report = poll_once(tmp.path(), &Store::open(tmp.path().join("db")).unwrap()).unwrap();
     assert_eq!(report.inserted, 0);
     assert_eq!(report.skipped, 1);
+}
+
+#[test]
+fn private_phone_setup_is_excluded_from_search_and_wiki_capture_across_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    bundle(tmp.path());
+    let path = tmp.path().join("conversations/Friend/messages.md");
+    let original = fs::read_to_string(&path).unwrap();
+    fs::write(&path, format!("{original}\n### [2026-08-26T12:02:00+00:00] me\nphone number set +12025550123\n\n### [2026-08-26T12:03:00+00:00] me\n/phone number verify 123456\n")).unwrap();
+    let db = tmp.path().join("data.db");
+    let store = Store::open(&db).unwrap();
+    let first = poll_once(tmp.path(), &store).unwrap();
+    assert_eq!(first.inserted, 2);
+    let capture = capture_email(&first.deltas[0]);
+    assert!(!capture.body.contains("12025550123"));
+    assert!(!capture.body.contains("123456"));
+    let memory = Server::open(&db).unwrap();
+    assert!(memory.search_conversation_history(Some("123456"), None, None, Some("whatsapp"), None).unwrap().is_empty());
+    drop(store);
+    let reopened = Store::open(&db).unwrap();
+    assert_eq!(poll_once(tmp.path(), &reopened).unwrap().inserted, 0);
+    let content = fs::read_to_string(&path).unwrap();
+    fs::write(&path, format!("{content}\n### [2026-08-26T12:04:00+00:00] me\nNew ordinary message\n")).unwrap();
+    let next = poll_once(tmp.path(), &reopened).unwrap();
+    assert_eq!(next.inserted, 1);
+    assert!(capture_email(&next.deltas[0]).body.contains("New ordinary message"));
 }

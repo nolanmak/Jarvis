@@ -162,10 +162,436 @@ Source: https://docs.slack.dev/apis/events-api/using-socket-mode (checked
   `PostedMessage { channel, ts }` is the message reference used everywhere.
 - Every call is bounded by `request_timeout` (15 s) and by the
   `CancellationToken` bound with `HttpSlackWebApi::scoped`.
-- `upload_file` / `download_file` are declared on `SlackWebApi` and return
-  `WebApiError::Unsupported` in `HttpSlackWebApi`; #1293 and #1294 implement
-  them (Slack's `files.getUploadURLExternal` /
-  `files.completeUploadExternal` flow, **unverified**).
+- `upload_file` is implemented (#1294, see "Outbound delivery" below).
+  `download_file` is implemented (#1293, see "Inbound files" below).
+
+## Outbound delivery (#1294)
+
+Code: `crates/augmentagent-channel-slack/src/delivery/` (`mrkdwn.rs`,
+`split.rs`, `plan.rs`, `progress.rs`) and `HttpSlackWebApi::upload_file` in
+`transport/web.rs`. The interactive surface in `serve` (#1287) delivers its
+answers through it; the operator path is `augmentagent slack deliver`.
+
+### Formatting and mentions
+
+Source: https://docs.slack.dev/messaging/formatting-message-text (read
+2026-09-29).
+
+- **[docs]** `&`, `<`, `>` must be sent as `&amp;`, `&lt;`, `&gt;`. The
+  converter escapes them everywhere, code included, so model text can never
+  form a `<…>` control sequence: `<!channel>`, `<!here>`, `<!everyone>`,
+  `<@U…>`, `<#C…>` and `<!subteam^…>` render as text.
+- **[docs]** "Plain text `@channel` does not trigger notifications; the
+  special syntax `<!channel>` is required." Defence in depth anyway: a word
+  joiner (U+2060) is inserted after the `@` of `@channel`/`@here`/`@everyone`,
+  and every post sends `link_names: false`. The `chat.postMessage` page
+  describes `link_names` as "Find and link user groups"; its default is
+  **unverified**, hence the explicit `false`.
+- **[docs]** mrkdwn has `*bold*`, `_italic_`, `~strike~`, `` `code` ``,
+  ```` ``` ```` blocks, `<url|text>` links, `>` quotes and no headings. The
+  converter maps Markdown onto these (table in `mrkdwn.rs`); headings become a
+  bold line and pipe tables a code block. Links are only built for
+  `http(s)`/`mailto` URLs without `<`, `>`, `|` or whitespace.
+- Code is verbatim apart from the entity escaping (which Slack renders back).
+  Known limitation: a literal ```` ``` ```` inside a `~~~`-fenced block ends
+  Slack's code block early.
+
+### Message size and splitting
+
+- **[docs]** `chat.postMessage`: keep `text` to 4,000 characters; Slack
+  truncates above 40,000. `chat.update`: `text` "cannot exceed 4,000
+  characters". Sources: https://docs.slack.dev/reference/methods/chat.postMessage,
+  https://docs.slack.dev/reference/methods/chat.update (2026-09-29).
+- Whether "characters" means Unicode scalars, UTF-16 units or bytes is
+  **unverified**. Parts default to 3,500 scalars (`DEFAULT_PART_CHARS`), so
+  even a part of only 4-byte characters (14,000 bytes) stays far below the
+  40,000 truncation point.
+- Splits prefer blank lines, then lines, then spaces, never inside an
+  entity, a `<…>` link or an inline code span. A cut inside a code block
+  closes the fence and reopens it in the next part. The parts' ranges tile
+  the input exactly (property test over 400 generated inputs).
+- Blocks are not used for answers (text only), so the 50-block limit does
+  not apply.
+
+### Multi-part delivery on the outbox
+
+- One outbox entry per part, keyed `turn:<turn_id>:text:<n>` /
+  `turn:<turn_id>:file:<n>`, all in the turn's conversation (thread
+  included). Re-planning the same turn enqueues nothing new; the outbox's
+  per-conversation ordering sends what is left, in order.
+- Every post carries message metadata `{"event_type":
+  "augmentagent_delivery", "event_payload": {"idempotency_key": …}}` so a
+  send whose outcome was lost can be found in history. **[docs]** the
+  `metadata` argument is "JSON object with event_type and event_payload
+  fields"; sending it as a JSON object in a JSON body is **unverified**.
+- Failure classes (dispatcher in `plan.rs`): rate limit / transient Slack
+  error / HTTP 5xx → retried after `max(backoff, Retry-After)`; upload failed
+  before completion → retried whole; timeout or lost connection on a post or
+  completion → `reconcile` (never resent blindly); other Slack errors, HTTP
+  4xx, bad file → `dead_letter`.
+- **A turn with a hole is closed.** When a text or file part of a turn is
+  dead-lettered or abandoned, every part of that turn not yet sent is
+  abandoned and one notice (`turn:<id>:notice`, sent once, same
+  conversation/thread) says ":warning: This answer could not be delivered in
+  full. N of M parts arrived; the rest was not sent." It runs right after a
+  part dead-letters and again at the start of every drain, so a restart in
+  between still sends the notice exactly once.
+- **[docs]** `chat.postMessage` allows "1 message per second to a specific
+  channel" with bursts; the dispatcher does not pace itself and relies on
+  429/`Retry-After`. Effective behaviour for a 10-part answer is
+  **unverified** live.
+
+### Reconciling a send whose outcome was lost
+
+`delivery/reconcile.rs` (`SlackSendReconciler`, also usable as the store's
+`SendReconciler`); the dispatcher runs it before every claim.
+
+- Sources: https://docs.slack.dev/reference/methods/conversations.history,
+  https://docs.slack.dev/reference/methods/conversations.replies (read
+  2026-09-29). **[docs]** both take `channel`, `cursor`,
+  `include_all_metadata` ("Return all metadata associated with this
+  message", default false), `inclusive`, `latest`, `limit` and `oldest`
+  ("Only messages after this Unix timestamp"); `conversations.replies` also
+  takes `ts` (the thread's parent). Form-encoded and JSON are accepted; sent
+  form-encoded. History returns "the most recent messages … first"; replies
+  returns the parent first, then replies in order. Paging via
+  `has_more` + `response_metadata.next_cursor`. Scopes: the `*:history`
+  scopes already in the manifest. Rate limit: Tier 3 ("50+ per minute") for
+  Marketplace and internal apps; non-Marketplace commercially distributed
+  apps get 1 request per minute with `limit` ≤ 15 (not our case: Jarvis is a
+  single-workspace internal app).
+- That history messages carry the `metadata` object
+  (`{event_type, event_payload}`) we set when `include_all_metadata=true`
+  is **unverified** live; the fetched pages do not show the field in the
+  response example.
+- Query: `conversations.replies` for a part in a thread, otherwise
+  `conversations.history`; `oldest` = the send's last claim time minus 60 s
+  (host clock skew); `include_all_metadata=true`; 200 messages per page, at
+  most 5 pages.
+- Found (event type `augmentagent_delivery` and the part's key) → `sent`
+  with that `ts`. All pages read, key absent, and the claim is at least 30 s
+  old (settle window) → requeued for exactly one resend. Key absent inside
+  the settle window → looked up again when it ends (not counted as a
+  failure). Lookup error or page budget exhausted → failed lookup, retried
+  after 5 s, 10 s, 20 s … (cap 5 min); after 5 failed lookups the part is
+  dead-lettered, which closes the turn with the notice above, so a
+  conversation is never held forever.
+- Uploads: the `files.completeUploadExternal` result is not recorded when
+  its reply is lost, and the file-share message carries none of our
+  metadata, so an uncertain upload is treated as not delivered once the
+  settle window has passed and uploaded again. Worst case: one duplicate
+  file, never a missing one. `chat.update` parts are idempotent and simply
+  redone.
+
+### File upload
+
+Sources: https://docs.slack.dev/reference/methods/files.getUploadURLExternal,
+https://docs.slack.dev/reference/methods/files.completeUploadExternal,
+https://docs.slack.dev/messaging/working-with-files (all read 2026-09-29).
+
+1. `files.getUploadURLExternal` **[docs]**: `filename` and `length` (bytes)
+   required, `alt_txt` (max 1,000 characters) and `snippet_type` optional;
+   form-encoded or JSON; returns `upload_url` and `file_id`; scope
+   `files:write`; Tier 4 ("100+ per minute"). Sent form-encoded.
+2. POST the bytes to `upload_url` **[docs]**: "Files can be sent as raw
+   bytes or can be multipart form encoded"; the example sends
+   `Content-Type: application/octet-stream`. Sent raw, streamed from disk,
+   with `Content-Length`, **without** the bot token (the docs do not say the
+   URL needs one; **unverified**). The URL must be https (plain http only on
+   loopback, for tests) and is never logged or echoed in errors. Any 2xx is
+   success; the example body is `OK - <bytes>`.
+3. `files.completeUploadExternal` **[docs]**: `files` = `[{id, title}]`
+   required; `channel_id`, `thread_ts`, `initial_comment` optional; JSON
+   accepted; Tier 4. "If not called, the uploaded file and associated
+   metadata will be discarded", and it "may only be invoked once per
+   upload". A failure in steps 1–2 is therefore reported as
+   `WebApiError::UploadIncomplete` and retried from step 1 without risk of a
+   duplicate.
+
+- Size limit: the fetched method pages state none. `UploadLimits::max_bytes`
+  defaults to 1 GiB (Slack's commonly cited per-file limit, **unverified**);
+  larger files are refused before any request. Transfer timeout 300 s
+  (`UploadLimits::transfer_timeout`), cancellable with the client's token.
+- Slack derives the file type from `filename`; no content type is sent
+  beyond `application/octet-stream` (**unverified** for every type).
+- How long `upload_url` stays valid is not documented (**unverified**).
+
+### Progress
+
+`ProgressMessage` posts (or adopts) a status message and edits it with
+`chat.update` at most once per `min_interval` (default 3 s) per message,
+newest text wins, identical text is not re-sent, a rate-limited edit waits
+`max(interval, Retry-After)`. **[docs]** `chat.update` is Tier 3 ("50+ per
+minute"), per method per workspace. Progress edits are best effort and not
+written to the outbox.
+
+## Inbound files (#1293)
+
+Code: `HttpSlackWebApi::download_file` in `transport/web.rs`, the pipeline
+in `crates/augmentagent-channel-slack/src/inbound.rs`, the shared policy in
+`crates/augmentagent-docs/src/inbound.rs` (Discord's rules, moved there
+unchanged and used by both surfaces) and the bounded converter lookup in
+`crates/augmentagent-docs/src/lib.rs`. Not wired into `serve` yet
+(#1287/#1288); the operator path is `augmentagent slack files fetch
+--channel C… --ts TS [--json]`.
+
+### Download
+
+Sources: https://docs.slack.dev/reference/objects/file-object and
+https://docs.slack.dev/messaging/working-with-files (read 2026-09-29).
+
+- **[docs]** `url_private` and `url_private_download` "require an
+  authorization header of the form: Authorization: Bearer A_VALID_TOKEN"
+  with at least `files:read` (already in the manifest). Both example URLs
+  are `https://files.slack.com/files-pri/…`. `url_private_download` is
+  preferred, `url_private` is the fallback.
+- **Host allow-list:** `SLACK_FILE_HOSTS = ["files.slack.com"]`, https on
+  the default port only. Any other host (GovSlack, Enterprise Grid, a CDN
+  Slack might redirect to) is **unverified** and refused until observed
+  live; the list is one constant. Subdomain and suffix tricks, credentials
+  in the URL and other ports are refused
+  (`only_documented_slack_file_hosts_are_allowed_by_default`).
+- **Redirects** are followed by hand (reqwest's automatic redirects are
+  off for downloads), at most 3 hops. Every hop must be on the allow-list,
+  otherwise the download fails with `FileHostRefused` before anything is
+  sent there. The bot token is sent only to the host the caller named; a
+  hop to a different allow-listed host is fetched without it. Whether Slack
+  redirects file downloads at all is **unverified**.
+- **Size cap while streaming:** a `Content-Length` over the cap is refused
+  before the body; otherwise bytes are counted as they arrive and the
+  transfer stops just past the cap. The destination is created exclusively
+  with mode 0600 and removed on every error, timeout and cancellation.
+- **Sign-in page:** an HTML answer for a file whose Slack `mimetype` is not
+  HTML is refused (`DownloadRejected`, hint: `files:read`). That Slack
+  answers a bad or under-scoped token this way is commonly reported and
+  **unverified** here.
+- Bounded by `DownloadLimits::transfer_timeout` (120 s, whole transfer
+  including redirects) and the client's cancel token; 429 is retried after
+  `Retry-After` like other calls. The rate-limit tier for file downloads is
+  not documented on the fetched pages (**unverified**).
+- Test hosts: `AUGMENTAGENT_SLACK_TEST_FILE_HOSTS` adds loopback
+  `host:port` entries (plain http allowed for exactly those); anything else
+  in it is an error. It exists only for the local mock in tests and QA.
+
+### Pipeline
+
+`inbound::prepare_inbound(api, text, files, &InboundOptions, &cancel)`
+returns an `InboundMessage` with the same pieces Discord feeds the
+reasoner: `prompt` from the shared `build_prompt` (`IMAGE:` markers, text
+path list with `TRUNCATED`/OCR notes), `images`, `text_files`, plus
+`accepted`, `rejected` and `rejection_notice()` (the shared "⚠️ skipped: …"
+line) and `starts_turn()`.
+
+- Types and limits are Discord's: images (any `image/*`), text/code by MIME
+  or extension allow-list, PDF/DOCX/DOC through pdftotext/pandoc (+ OCR for
+  scanned PDFs when `MISTRAL_API_KEY` is set), credential formats
+  (`.env`, `.pem`, …) refused, 8 MiB cap for text/documents, text truncated
+  to 1 MiB. Slack also caps images at 20 MiB (`MAX_IMAGE_BYTES`) because the
+  download is streamed on our side; Discord does not apply that cap.
+- Refused before any download: unsupported/credential types, a declared
+  size over the cap, deleted (`mode: tombstone`), plan-hidden
+  (`hidden_by_limit`), external files, Slack Connect files that need
+  `files.info` (`file_access: check_file_info`), a missing download link,
+  and more than 10 files per message. Download and conversion failures are
+  reported per file ("couldn't download: timed out", "couldn't read the
+  document: pdftotext is not installed …"); the other files still arrive.
+- An attachment-only message (`subtype: file_share`, empty text) starts a
+  turn; a message whose files were all refused and that has no text only
+  gets the notice (`starts_turn() == false`).
+- **Storage:** `<state dir>/slack-inbound/msg-XXXX/` (the shared
+  `state_dir()`: `$XDG_STATE_HOME/augmentagent` or
+  `~/.local/state/augmentagent`, same rule on Linux and macOS, never
+  `/tmp`). The root is created 0700 and refused if it is a symlink or owned
+  by another user; each message gets its own 0700 directory; files are
+  0600. The directory is removed when the `InboundMessage` is dropped or
+  `cleanup()` is called, on failure, and on cancellation. Retention beyond
+  the turn is #995 and must change every surface together.
+- **File names** come from `sanitize_filename`, a pure function (same
+  result on both hosts): last path component only, `[A-Za-z0-9._-]` kept,
+  everything else `_`, no leading dots, bounded length, and a two-digit
+  per-message index prefix so names that differ only by case or Unicode
+  normalisation never collide on a case-insensitive APFS volume. The
+  original name is kept for the owner-facing summary.
+- **Converters** are resolved by `augmentagent_docs::resolve_tool`, the
+  same path Discord's pipeline now uses: the process `PATH` (set by
+  `scripts/lib/launchd-install.sh` and the systemd units), then
+  `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin` for a launchd
+  job whose plist has no `PATH`. A missing tool is an immediate error with
+  an install hint; a converter is killed after 120 s (`kill_on_drop`, also
+  on cancellation).
+
+### In serve (#1288)
+
+- The dispatcher calls `prepare_inbound` for owner `message`/`file_share`
+  events after the owner check (#1286), appends `rejection_notice()` to the
+  answer (or posts it alone and skips the agent when `!starts_turn()`), and
+  removes the message directory when the turn ends.
+- The turn names its directory in `AUGMENTAGENT_SLACK_INBOUND_DIR`. The
+  wiki-ask scope guard (`scripts/aa-wiki-scope-guard.sh`) and its Codex
+  mirror (`SLACK_INBOUND_DIR_PATTERN` / `SLACK_INBOUND_FILE_NAME` in
+  `codex_tools.rs`) allow `Read`, and only `Read`, of `NN-<name>` files
+  directly inside that one canonical `…/slack-inbound/msg-*` directory:
+  siblings, `..`, a symlinked directory and other state files stay denied.
+
+## Voice clips and spoken replies (#1297)
+
+Asynchronous voice only: a recorded clip in, an uploaded audio reply out,
+in the same conversation and thread as typed turns. This is **not** live
+voice; that stays an open blocker ([`SLACK-LIVE-VOICE.md`](SLACK-LIVE-VOICE.md),
+#1298). Code: `crates/augmentagent-channel-slack/src/voice/`. Wired into
+`serve` (see [In serve](#in-serve-1297) below).
+
+### What Slack sends (file object, read 2026-09-29)
+
+- Clips recorded in Slack carry `subtype: slack_audio` / `slack_video`,
+  `media_display_type` and `duration_ms` **[docs]**; they arrive as
+  `files[]` on a `file_share` message like any upload. The documented audio
+  filetypes are `m4a`, `mp3`, `mp4`, `wav`, `ogg`, `webm` **[docs]**. Which
+  MIME each client uses for a clip (`audio/webm` on desktop, `audio/mp4` on
+  mobile are the expectation) is **unverified** against a live workspace;
+  detection therefore uses the MIME type, then the clip subtype, then the
+  Slack `filetype`/extension.
+- Slack's own `transcription` field is not used: it depends on the
+  workspace's plan and region and is not the shared speech stack.
+
+### Inbound
+
+`inbound::prepare_inbound_with_voice(api, text, files, opts, Some(&VoiceInbound), cancel)`:
+
+- decodes `audio/webm|ogg|opus|mp4|m4a|x-m4a|aac|mpeg|mp3|wav|x-wav|wave|flac`
+  and `video/mp4|webm|quicktime`; any other `audio/*`/`video/*` is skipped
+  before download with "unsupported audio format (…); send m4a, mp3, wav,
+  ogg, webm, flac or mp4";
+- limits: 25 MiB (declared and enforced while streaming), 10 minutes
+  (declared `duration_ms`, then the decoded length), 3 clips per message,
+  `ffmpeg` 60 s, transcription 120 s; each limit is an owner-facing reason;
+- downloads into the same private per-message directory as #1293, decodes
+  to 16 kHz mono 16-bit WAV (the format the Discord sidecar streams to both
+  vendors) and deletes the clip and the WAV as soon as the transcript is in;
+- the transcript joins the typed text in `turn_text()` (and the prompt), and
+  `transcript_notice()` is the line shown back to the owner
+  ("🎙️ Transcript of clip.webm (0:04): …"). An empty transcript, a decode
+  failure or a provider failure is a "skipped" reason telling the owner to
+  resend or type; the turn starts only if something else is left.
+- `prepare_inbound` (no speech stack) keeps #1293's behaviour: clips are
+  "unsupported". Owner-only: call it only for input `owner::admit`
+  dispatched (`tests/voice_clips.rs::non_owner_audio_never_reaches_the_speech_provider`).
+
+### Speech providers: the seam, not a second stack
+
+The Deepgram/ElevenLabs clients, provider selection
+(`AUGMENTAGENT_DISCORD_STT_PROVIDER` / `_TTS_PROVIDER`, `DEEPGRAM_API_KEY`,
+`ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`) and the credit fallback live
+only in the TypeScript sidecar (`sidecars/discord-voice`), bound to a live
+Discord voice session over private IPC; nothing in Rust calls them and they
+have no request/response mode for a recorded file. The Rust seam is
+`voice::speech`:
+
+- `SpeechToText` / `TextToSpeech` traits over a finished file or text;
+- `SttStack` / `TtsStack` with the sidecar's rule: switch to the alternate
+  vendor only on confirmed credit exhaustion (`402` or `quota_exceeded`,
+  `ProviderError.exhausted`); any other failure is reported as is;
+- `TranscriberStt` plugs in the existing Rust transcriber
+  (`augmentagent_channel_voice::Transcriber`, whisper.cpp under
+  `vendor/whisper`, used for Telegram voice memos). This is what `slack voice
+  transcribe` uses in a release build.
+- `voice::providers::HttpTts` is the Rust text-to-speech adapter: the
+  request/response form of the sidecar's two vendors with the same choices
+  (Deepgram `POST /v1/speak?model=aura-2-thalia-en&encoding=linear16&sample_rate=24000&container=none`,
+  text in the sidecar's 1800-character chunks; ElevenLabs
+  `POST /v1/text-to-speech/<voice>/stream?output_format=pcm_24000`, model
+  `eleven_flash_v2_5`), 24 kHz PCM out, 30 s per request. HTTP status is the
+  error code (`402`, or ElevenLabs `quota_exceeded` in the JSON body, is
+  credit exhaustion); messages never carry a key or URL. Tested against a
+  local mock (`tests/voice_tts_http.rs`: success, chunking, 402 and
+  `quota_exceeded` fallback, 5xx without fallback, timeout, empty audio).
+
+`voice::fake::{ScriptedStt, ScriptedTts}` are offline fakes for tests; the
+CLI selects them only in a debug build through
+`AUGMENTAGENT_TEST_SLACK_SPEECH` (`ok:TEXT`, `fail:CODE`, `exhausted:TEXT`,
+`exhausted-all`); release builds ignore it.
+
+### Spoken replies
+
+`voice::reply::enqueue_spoken_answer(store, conversation, &SpokenAnswer { turn_id, markdown, files, mode }, Some(&tts), &opts, now_ms)`:
+
+- `ReplyMode` is per turn and defaults to `Text` (`"spoken"`/`"voice"`
+  parse to `Spoken`); the harness sets it when the owner asks for a spoken
+  answer;
+- the text mirror is always the full answer (`turn:<id>:text:<n>`); the
+  audio is the turn's first file (`turn:<id>:file:0`, WAV named
+  `spoken-reply.wav`, raw PCM from a provider gets a WAV header), then any
+  generated files;
+- the speech text drops Markdown markers, code blocks and URLs and is cut
+  at 12 000 characters (the sidecar's limit) with "The rest is in the text
+  reply.";
+- a restart of the same turn finds `turn:<id>:file:0` in the outbox and
+  neither synthesises nor sends again;
+- a TTS failure, timeout (30 s) or missing provider still delivers the text,
+  with "_Spoken reply unavailable: <provider> failed (…)._";
+- the audio is stored under `<state dir>/slack-voice-replies/<turn>-<hash>/`
+  (0700/0600) until uploaded; `release_spoken_audio` removes it once the
+  upload is sent, dead-lettered or abandoned. Whether Slack plays an
+  uploaded WAV inline on every client is **unverified**.
+
+### Host dependencies
+
+| host | install | resolved under the service manager |
+| --- | --- | --- |
+| macOS Apple Silicon | `brew install ffmpeg` → `/opt/homebrew/bin/ffmpeg` | launchd `PATH` from `scripts/lib/launchd-install.sh`, else the `/opt/homebrew/bin` fallback |
+| macOS Intel | `brew install ffmpeg` → `/usr/local/bin/ffmpeg` | same, `/usr/local/bin` fallback |
+| Debian/Ubuntu | `apt install ffmpeg` → `/usr/bin/ffmpeg` | systemd `PATH`, else `/usr/bin` |
+| Fedora | `dnf install ffmpeg-free` (or `ffmpeg` from RPM Fusion) → `/usr/bin/ffmpeg`; **unverified** here | same |
+
+`ffmpeg` is resolved with `augmentagent_docs::resolve_tool`, like the
+#1293 converters, and killed at its timeout or on cancellation. A missing
+binary is the owner-facing reason "ffmpeg is not installed or not on the
+service PATH (…); install it (`brew install ffmpeg` on macOS, `apt install
+ffmpeg` or `dnf install ffmpeg` on Linux)". The local speech-to-text path
+additionally needs whisper.cpp and its model (`scripts/build-whisper.sh`,
+`vendor/whisper/`), resolved from the working directory as for Telegram
+voice memos. CI uses a fake `ffmpeg` and scripted providers on both hosts.
+Real launchd/systemd qualification of the audio dependencies is #1255.
+
+### In serve (#1297)
+
+`SlackSurfaceConfig::voice` (`serve` always sets it):
+
+- an owner message with clips runs `prepare_inbound_with_voice` after
+  `owner::admit` dispatched it; the transcript notice is queued first
+  (`turn:transcript:<event>:…`, so a replay never posts it twice), then the
+  transcript runs as a normal turn in the same conversation and native
+  session. Non-owner audio is rejected by the gate and never downloaded or
+  transcribed (`tests/voice_surface.rs`);
+- when speech-to-text is not set up, a clip is refused **before download**
+  with "voice clips can't be transcribed on this host: <why>; type the message
+  instead", and no turn runs;
+- `voice on` / `voice off` (also `!voice …`, `/jarvis voice …`) store the
+  conversation's reply mode in the store (`surface_reply_modes`, keyed by the
+  conversation storage key); a thread without its own choice inherits its
+  channel's or DM's. Every answer reads it: spoken answers go through
+  `enqueue_spoken_answer` (full text mirror plus `spoken-reply.wav`, once),
+  a TTS failure or missing provider still delivers the text with a note, and
+  the stored audio is released once its upload is settled. `voice status`
+  shows the mode, both providers and the live-voice blocker (#1298).
+  Failed and cancelled turns are always text.
+
+Daemon-level provider selection (read once at start; restart the daemon
+after a change):
+
+| setting | values | default |
+| --- | --- | --- |
+| `AUGMENTAGENT_SLACK_STT_PROVIDER` | `whisper-cpp`, `off` | `whisper-cpp` |
+| `AUGMENTAGENT_WHISPER_BIN` / `AUGMENTAGENT_WHISPER_MODEL` | paths | `<working dir>/vendor/whisper/main`, `…/models/ggml-medium.en.bin` (`scripts/build-whisper.sh`) |
+| `AUGMENTAGENT_SLACK_TTS_PROVIDER` | `deepgram`, `elevenlabs`, `off` | `AUGMENTAGENT_DISCORD_TTS_PROVIDER`, else `deepgram` |
+| `DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` | the sidecar's credential names | unset: spoken replies are text with a note |
+
+The other TTS vendor is the credit fallback when its key (and, for
+ElevenLabs, the voice ID) is set, exactly as in the sidecar. Deepgram and
+ElevenLabs speech-to-text for clips is not ported: clips use whisper.cpp.
+Debug builds only: `AUGMENTAGENT_TEST_SLACK_SPEECH` swaps in the scripted
+fakes and `AUGMENTAGENT_TEST_SLACK_TTS_ENDPOINT` (loopback `http://` only)
+points the real TTS adapter at a local mock; release builds ignore both.
 
 ## Install-time checks (#1284)
 
@@ -212,7 +638,46 @@ Source: https://docs.slack.dev/apis/events-api/using-socket-mode (checked
 - `tests/transport_web_api.rs`: bearer + JSON bodies, form-encoded lookups,
   `ok:false` errors, 429/`Retry-After` retry and caps, timeout, cancellation
   (including during a rate-limit wait), token never in Debug/errors,
-  deferred file transfer, recording fake.
+  a non-Slack download host refused without a request, recording fake.
+- `tests/transport_upload.rs` (#1294): each upload step against a mock
+  Slack; step 1 fails, transfer cut off midway, upload host 5xx, completion
+  fails, size/empty/missing file, stalled transfer timeout and cancel, rate
+  limits, insecure upload URL, no token on the upload host.
+- `tests/delivery_format.rs`, `tests/delivery_outbox.rs`,
+  `tests/delivery_progress.rs` (#1294): conversion table and mention
+  neutralisation, splitting invariants, restart between parts, crash
+  mid-send reconciled (found / not found / lookup errors / budget
+  exhausted / uploads), dead-lettered or abandoned part closing the turn
+  with one notice (also across a restart), rate limit mid-answer, upload
+  failing midway,
+  paused-clock progress throttling. `augmentagent-cli/tests/slack_deliver_cli.rs`
+  runs `slack deliver` end to end.
+- `tests/transport_download.rs` (#1293): bearer token only to allow-listed
+  hosts, same-host / other-allowed-host / foreign-host redirects, redirect
+  loops, `Content-Length` and streaming size caps, sign-in page, 429 retry
+  and cap, HTTP errors redacted, stalled transfer timeout, cancellation,
+  existing destination never overwritten, no partial file left behind.
+- `tests/inbound_files.rs` (#1293): image + text + PDF + DOCX in one
+  message reaching the Discord-shaped prompt, attachment-only message,
+  rejections before download (oversize, unsupported, credential formats,
+  deleted/external/Slack Connect/no link), a file larger than declared,
+  truncation, missing and stuck converters, case-colliding and hostile
+  names, too many files, download timeout and cancellation cleanup,
+  private permissions, symlinked root refused.
+  `augmentagent-cli/tests/slack_files_cli.rs` runs `slack files fetch` end
+  to end; `augmentagent-docs/tests/converter_bounds.rs` pins converter
+  lookup under a launchd-style PATH and the timeout.
+- `tests/voice_clips.rs` and `tests/voice_replies.rs` (#1297): clip
+  detection, Slack clip fields, transcript into turn text and the owner
+  line, typed text plus images plus a clip, unsupported codec before
+  download, undecodable audio, missing and stuck `ffmpeg`, size/duration/
+  count limits, empty transcript, credit-exhaustion fallback and
+  non-exhaustion failure, STT timeout and cancellation cleanup, non-owner
+  audio never reaching the provider through `admit`; spoken reply as audio
+  plus text mirror delivered once across a restart, text mode, TTS failure
+  and missing provider notes, PCM to WAV, speakable text, audio retention.
+  `augmentagent-cli/tests/slack_voice_cli.rs` runs `slack voice transcribe`
+  and `slack voice speak` end to end.
 - `tests/transport_socket.rs`: ack only after hand-off, rejected and slow
   hand-offs not acked, redelivery with stable id, unknown/malformed frames
   keep the link, response payloads, refresh drain then reconnect, forced
@@ -250,11 +715,321 @@ with identifiers and a reason code only, never message text.
 - Every rejected user sees the same short text; no reply is offered for an
   unbound workspace, an enterprise mismatch or a payload without an actor.
 
-`admit()` is the gate `serve` (#1287) puts in front of the harness: owner
+`admit()` is the gate `serve` (#1287) puts in front of the turn handler: owner
 input goes to an `OwnerInputSink`, rejections are audited before it returns.
 Field names used for team and sharing checks come from the Events API,
 interactivity and slash-command reference pages; like the rest of this file
 they are unconfirmed against a live workspace (item 11 below).
+
+## Interactive surface in `serve` (#1287)
+
+Code: `crates/augmentagent-channel-slack/src/interactive.rs`, wired by
+`crates/augmentagent-cli/src/slack_serve.rs`. Operator view:
+[`SLACK-APP.md`](SLACK-APP.md) section 5.
+
+- **Ack after persist.** The Socket Mode sink records every envelope with
+  `record_inbound_event` (messages keyed `<channel>:<ts>`, mentions
+  `mention:<channel>:<ts>`, everything else by `stable_id()`) and only then
+  lets the client acknowledge it. A store failure leaves it unacknowledged.
+  Duplicates are acknowledged and dropped.
+- **Dispatcher.** Woken by each new row (fallback poll 5 s), it claims
+  Slack's events only (`claim_next_inbound_event_for`) and runs up to four
+  at once: the store never hands out a second event of a conversation or
+  thread that has one claimed, so a slow turn in the DM does not hold up
+  the control channel or a rejection, and one conversation stays in order.
+  Each event: re-parse the
+  stored frame, reloads the owner bindings and runs `owner::admit`. Owner
+  input goes to a `SlackTurnHandler`; rejections are replied to (DM through
+  the outbox, channel via `chat.postEphemeral`, which history cannot
+  reconcile) and never reach the handler; ignored events are settled.
+- **Replies.** `delivery::enqueue_answer` with the event ID as the turn ID,
+  then `SlackOutboxDispatcher::drain` per workspace (dry run: sends are
+  claimed and marked sent with `dry-run:<id>`). A failed turn posts one
+  generic notice; the error stays in the log.
+- **Restart and shutdown.** `recover_surface_delivery` runs at start.
+  Shutdown during a turn drops the handler future and releases the event.
+  A replayed event (`attempt > 1`) whose answer parts already exist is
+  settled without calling the handler.
+- **Health.** Listener states, last event and last send are written to
+  `surface_listener_health` on every change and every 15 s. `status` treats
+  a live state older than 60 s as `disconnected`.
+- **Turn handler seam.** `SlackTurnHandler::handle_turn(&SlackTurn) ->
+  Option<SlackTurnReply>`: the turn carries its conversation (`session`),
+  global turn ID, prompt (text plus files), inbound directory and cancel
+  token; the reply is Markdown plus generated files. `serve` plugs in the
+  shared harness (#1288, below).
+
+Tests: `tests/interactive_surface.rs` (the real client, sink, dispatcher and
+outbox over an in-memory WebSocket with `RecordingSlackWebApi`, a fake turn
+handler and an hour-long fallback poll) and
+`augmentagent-cli/tests/slack_serve_cli.rs` (the built binary, Slack only,
+against a mock Web API and a local WebSocket).
+
+## Conversations, sessions and turn lifecycle (#1288)
+
+Code: `crates/augmentagent-channel-slack/src/harness.rs` (the handler
+`serve` runs), `interactive.rs` (lanes, cancel, files, progress) and
+`crates/augmentagent-channel-core/src/surface_turn.rs` (the native-session
+turn Discord's conversation path runs too).
+
+- **Conversations.** The DM with the app is one conversation; a thread in
+  the DM is another; a top-level control-channel message starts a thread
+  under itself and that thread is its conversation; a reply in any thread
+  continues that thread's conversation. The key is the transport-neutral
+  `SurfaceConversationRef` (account, channel, `thread_ts`), stable across
+  restarts. Each conversation is bound (`surface_conversations`) to one
+  native Claude or Codex session, created on its first turn and resumed on
+  every follow-up; two threads never share one.
+- **Same agent as Discord.** The harness calls the `QueryHandler` Discord
+  answers with (`WikiQuerier`: wiki-ask prompt and owner rules, tool
+  allowlist and scope guards, wiki and memory MCP, skills, tool audit keyed
+  by the turn ID, provider fallback) inside `run_surface_turn`. The turn ID
+  is `slack:<team>:<channel>:<ts>`. Owner authority: a turn reaches the
+  harness only after `owner::admit` returned `Owner` for the bound
+  `(workspace, user)`, the Slack counterpart of Discord's explicit owner
+  allowlist, so it runs with `owner_authorized: true`. Tools that need a
+  Discord channel (model switch, computer use, voice) are not offered on
+  Slack yet (#1292, #1297).
+- **Claim before execution.** `run_surface_turn` persists the turn claim
+  (`surface_native_turns`) before the agent runs. A redelivered event or a
+  replay after restart finds the claim and never submits the turn again.
+- **Queueing.** Inbound events are recorded under their conversation's
+  lane, and the store hands out one event per lane at a time: a message
+  sent while its conversation has a turn running waits, then continues the
+  same session; other conversations run concurrently (up to four turns).
+- **Cancel.** `cancel` or `stop` (optionally `!`/`/`-prefixed), alone in a
+  message, stops the running turn in that conversation: it is recorded in a
+  lane of its own so it never waits behind the turn it stops. The agent
+  future is dropped (the provider supervisor reaps the process tree), the
+  claim is resolved as cancelled, the owner gets "Stopped. …", and the next
+  message resumes the same session. With nothing running, the owner is
+  told how cancel works. The status line during a turn says
+  "reply `cancel` … to stop".
+- **Restart.** A turn interrupted by a restart or crash is replayed once:
+  its claim is still pending, so it is resolved as interrupted and not
+  re-run (its tools may already have acted), and the owner is told; the
+  next message resumes the same session. A provider that failed mid-turn
+  leaves the session uncertain (#1220 semantics): that conversation is not
+  continued automatically and the owner is told to start a new thread.
+- **Clarification and handoffs.** A clarifying question is an ordinary
+  answer in the thread; the owner's reply resumes the same native session.
+  Durable handoff journals are keyed by the turn ID exactly as on Discord.
+- **Progress and answers.** A throttled status line per turn (live only),
+  finished as Done / Stopped / Failed; the answer and any `ATTACH:` files
+  (validated against the wiki root with Discord's rules) go through
+  `enqueue_answer`. Dry run: the turn runs, nothing is posted.
+
+Tests: `tests/conversation_harness.rs` (the real dispatch path with the
+recording native provider), `augmentagent-channel-core/tests/surface_turn.rs`,
+the shared scenario in `surface_conformance.rs` run against Discord and
+Slack (`augmentagent-cli` `surface_conformance_tests`), and the built
+`serve` in `augmentagent-cli/tests/slack_serve_cli.rs`.
+
+## Approvals (#1289)
+
+Code: `crates/augmentagent-channel-slack/src/approvals/` (cards, clicks,
+modals, text commands), `crates/augmentagent-approval-discord/src/sync.rs`
+(cross-surface redraw, multi-surface posting) and `outcome.rs` (the owner
+copy both surfaces render), `crates/augmentagent-store/src/approval_cards.rs`
+(card pointers), wired in `serve` by `crates/augmentagent-cli/src/slack_serve.rs`
+and `approval_routing.rs`. Operator view: [`SLACK-APP.md`](SLACK-APP.md)
+section 6.
+
+- **Same decisions as Discord.** Card clicks, modal submissions and text
+  commands call the daemon's one `ApprovalActionHandler` (`ReplyApprover`),
+  the object the Discord bot calls: send, skip, revise, quick-refine preset
+  (capped at `MAX_REDRAFT_ITERATIONS`), missing info (`fill_feedback`),
+  recompose. Revise records the #37 triple and the #34 counter; a redraft
+  that changes nothing leaves the #1190 durable notice. Replies use
+  `outcome::describe` / `resolved_message`, so a stale or superseded card
+  explains itself with the #1199 recovery pointer and offers Recompose
+  (#1203) exactly where Discord does.
+- **Card.** Block Kit: subject, sender, their message, the draft, needs-input
+  and assumed-facts sections, then Approve & Send / Revise / Skip, Provide
+  missing info (when asked), the Quick refine select (until the cap), and a
+  context line with the short reference and the text commands
+  (`approve 3f2a9c1b`, `skip …`, `revise … <what to change>`,
+  `refine … shorter`, `recompose …`, `approvals` for the queue). Every
+  control's `block_id` is `aa|<action_id>|<draft digest>`.
+- **In place.** Every card posted is recorded in `surface_approval_cards`
+  (channel, `ts`, action, draft digest, last status). A decision anywhere
+  edits every Slack card of that action with `chat.update`; a newer card for
+  the same action (a reminder, a recompose) turns the older one into a
+  pointer to it, so one card is actionable.
+- **Exactly once.** The handler's store transitions are compare-and-swap
+  (`claim_action_for_send`, `try_resolve_action`, `refresh_pending_draft`,
+  `recompose_action`); Slack contact replies claim before sending since
+  #1289. A second click on any surface gets the already-resolved reply with
+  its reason. Each interaction is recorded in a dispatch lane of its own, so
+  two clicks race only in that compare-and-swap and a click never waits
+  behind an agent turn.
+- **Right draft.** A click on a card whose digest no longer matches the
+  action's draft (it was revised elsewhere, or repointed) is refused and the
+  card redrawn; nothing is decided on a draft the owner did not see.
+- **Cross-surface.** `CardSurfaces` holds the running card surfaces. A Slack
+  decision asks Discord to redraw (`DiscordApprovalBroker` edits the card it
+  finds by button ID in the last 100 channel messages: current draft while
+  pending, buttons removed and the state line once decided); the Discord bot
+  is given `SyncingActionHandler("discord", …)`, so a Discord decision
+  redraws the Slack cards. WhatsApp has no card surface in `serve` yet; it
+  joins by implementing `ApprovalCardSurface` and registering.
+- **Sweep.** At start and every 60 s the surface redraws live cards whose
+  action moved on while nothing watched (reconcile supersede, dashboard,
+  expiry, a crash between decision and redraw).
+- **Acknowledgement deadline.** The Socket Mode ack goes out as soon as the
+  envelope is persisted, before any decision runs (test
+  `simultaneous_clicks_on_slack_and_discord_send_once_and_the_ack_does_not_wait`
+  acks while a send is held). Opening a modal needs the `trigger_id`, which
+  Slack documents as valid for three seconds. If the click is handled
+  later than that by the Slack `action_ts` (the Mac slept between ack and
+  dispatch, or the daemon restarted), no modal is attempted: the owner gets a
+  fresh message with the text command; a decision still runs once and is
+  answered with a fresh message instead of an ephemeral one. A `views.open`
+  error falls back the same way.
+- **Routing.** `AUGMENTAGENT_APPROVAL_SURFACES` = `discord`, `slack`, or
+  both (unset: every configured surface). Slack cards go to the owner DM
+  (`AUGMENTAGENT_SLACK_APPROVAL_CHANNEL=dm`, default) or the bound control
+  channel (`control`). Slack-only needs no Discord credential. Scheduled
+  sends (#1291) and their notices stay on Discord; the Slack card draws no
+  schedule control.
+
+Verified here (offline): everything above against `RecordingSlackWebApi`
+and the built `serve` against a mock Web API. **Unverified until a real
+workspace:** the three-second `trigger_id` window and the exact
+`expired_trigger_id` error, Block Kit rendering and limits as Slack
+enforces them (section 3000 characters, 75-character option text, 100
+options), `chat.update` on a message in the app DM, ephemeral delivery in
+the app DM, and whether Slack delivers a click made while the socket was
+down after it reconnects.
+
+Tests: `tests/approval_surface.rs` (the real dispatch path; a store-backed
+handler with the daemon's compare-and-swap semantics and a fake reasoner;
+Discord as a recording card surface plus `SyncingActionHandler`),
+`augmentagent-store/tests/surface_approval_cards.rs`,
+`augmentagent-approval-discord` `sync::`/`outcome::`, `augmentagent-cli`
+`slack_approval_tests::` (the real `ReplyApprover` against a mock Composio)
+and `slack_serve_cli.rs`
+`slack_only_serve_posts_an_approval_card_and_an_approve_click_sends_once`.
+
+## Contact sends (#1290)
+
+Code: `crates/augmentagent-channel-slack/src/contact/` (the send path and
+compose), `crates/augmentagent-store/src/slack_contact.rs` (send targets and
+the send ledger), `SlackClient`'s `ContactSendApi` in `api.rs`, and
+`ReplyApprover::approve_slack` / `slack_compose.rs` in the CLI.
+
+### Who sends a contact message
+
+Decision: **the owner's own Slack account, through the Composio user
+connection, with `as_user: true`. Never the interactive app's bot.**
+
+| Connection | Token | Used for |
+| --- | --- | --- |
+| Composio Slack connection (`augmentagent slack persist-auth`, one per workspace, `SlackAuth`) | the owner's OAuth user connection, held by Composio | ingesting subscribed conversations and every contact send |
+| Interactive Slack app (`augmentagent slack app install`) | `<bot-token>` and `<app-token>` | the owner's DM and control channel only: cards, answers, files |
+
+Evidence (read 2026-09-29):
+
+- Composio, Slack toolkit (docs.composio.dev/toolkits/slack): "Composio
+  supports two toolkits: **Slack** (authenticate as a user for
+  workspace-level actions) and **Slackbot** (authenticate as a bot…)";
+  "Slack can post as the app; Slackbot posts as the bot user"; and for
+  `SLACK_SEND_MESSAGE`: "For the Slack toolkit, set `as_user=True` to post as
+  the authenticated user." Before #1290 the reply path did not pass
+  `as_user`, so by Composio's own description it could have posted as the
+  Composio app. It now always passes `as_user: true` and
+  `link_names: false`, and `thread_ts` for a threaded reply ("Use `ts` of
+  the parent message, not another reply").
+- Slack, `chat.postMessage` (docs.slack.dev/reference/methods/chat.postMessage):
+  `as_user` is "(Legacy) Pass true to post the message as the authed user
+  instead of as a bot"; posting with a user ID as `channel` opens a direct
+  message conversation "if it isn't open already"; and "bot users cannot
+  post to a direct message conversation between two users" — so the app bot
+  could not reply in a contact's DM even if it were used.
+- The Composio connection's Slack user id (`SlackAuth.user_id`, from
+  `auth.test` at `persist-auth`) is the identity the card shows and the send
+  ledger records (`identity = owner_user`, `sender_user_id`). With no user
+  id the send is refused before anything is claimed; with no Composio
+  connection for the workspace it is refused too. There is no fallback to the
+  bot.
+- After a send, the posted message's `user` / `bot_id` from the response are
+  recorded. If Slack attributes it to another user, or marks it with a
+  `bot_id`, the action is still `sent` (it went out) but carries the warning
+  in its error message and the daemon logs an error, so it is never silent.
+
+**Unverified until a real workspace:** how Slack attributes an `as_user`
+post made through Composio's Slack app (user, app badge, `bot_id` on the
+message), whether `SLACK_SEND_MESSAGE` to a user id opens the owner's DM with
+that person, and the exact response shape Composio relays. The code handles
+both answers conservatively (warning, not silence).
+
+### Destination and thread
+
+- Replies: at ingest, each priority message records a send target
+  (`slack_send_targets`): its conversation, and `thread_ts` = the thread it
+  is in, or for a top-level message in a channel the message itself (a
+  reply to one person does not land in the whole channel). A DM or group DM
+  is answered top level. Rows drafted before #1290 have no target: the reply
+  goes to their conversation top level, as before.
+- New messages: `compose <person or #channel>: <message>` in the owner's
+  Slack conversation, or `augmentagent slack compose --to … --text …` (the
+  agent's tool path; the daemon's queue posts its card). A person is
+  resolved through the wiki identity layer (`people/*.md` `identities:
+  slack:`, via `augmentagent_messages::people`): full name, first or last
+  name, page, or Slack user id. Two or more matches are asked about; no match
+  or a person without a Slack identity is refused; nothing is stored in
+  either case. A channel must be one this workspace is subscribed to.
+  `--dry-run` resolves and stores nothing.
+- The card shows **Goes to** (`#general · in thread …`, `DM with Alice
+  Example`) and **Sends as** (the owner's Slack user id through the Composio
+  user connection) before anything is sent; a composed card says **To**.
+
+### Exactly once, and retries
+
+- Approve claims the action (`pending → sending`) and then the send ledger
+  (`slack_contact_sends`, one row per action) records the attempt before the
+  post. A second approval on any surface loses the claim.
+- A refused send (Composio 4xx, `successful: false`, connection refused)
+  records `failed`; nothing was posted. A timeout, a lost or unreadable
+  response or a 5xx records `unknown`. Either leaves the action `error` and
+  the Slack card shows **Retry send** (and `approve <ref>`).
+- A retry claims `error → sending`. If the previous attempt is `unknown` (or
+  a crash left it `sending`), the conversation (or the thread) is read first
+  (`SLACK_FETCH_CONVERSATION_HISTORY` / `SLACK_FETCH_MESSAGE_THREAD_FROM_A_CONVERSATION`)
+  for a message by the owner with exactly the text sent; if found, it is
+  recorded as sent and nothing is posted. If the conversation cannot be read
+  (or it is a new DM whose id Slack never returned), nothing is posted, the
+  row becomes `unverified` and the owner is asked to look; the next approval
+  sends. A `sent` row is never posted again.
+- Documented limitation: the lookup matches exact text. If Slack stored the
+  text differently from what was sent, an `unknown` attempt that did land is
+  not found and the retry posts a second copy.
+
+### Formatting and separation
+
+- The draft is converted with `delivery::markdown_to_mrkdwn`: bold, italics,
+  links (`<url|text>`), lists; `&`, `<`, `>` are escaped, so `<!here>`,
+  `<!channel>` and `<@U…>` in model text notify nobody, and `@channel` /
+  `@here` get a word joiner. `link_names` is false.
+- `approve_contact_message` is the only function that posts to a contact,
+  and it posts only the stored draft of an action it has just claimed, to
+  the recorded destination. The owner's conversation is answered by the
+  app bot through the outbox, to the owner's DM or control channel only.
+  Tests (`contact_surface.rs`
+  `control_conversation_text_is_never_a_contact_send`) feed agent-answer and
+  tool-output text into the approval surface and show it never reaches the
+  contact path; only the approved card's draft does.
+- `status_source` now names the surface that decided (`slack` or
+  `discord`, via `augmentagent_approval_discord::deciding`), and a delivered
+  message is recorded in `self_sent_messages` with `platform = slack`
+  (`slack:<channel>:<ts>`), not as a Gmail send.
+
+Tests: `augmentagent-store/tests/slack_contact_sends.rs`,
+`augmentagent-channel-slack/tests/contact_send.rs` (dispatch against a
+recording fake of the Composio connection), `tests/contact_surface.rs` (the
+approval surface with the real contact path), `api::` (the Composio request
+and error classification against a mock), and `augmentagent-cli`
+`slack_approval_tests::` (the real `ReplyApprover` against a mock Composio).
 
 ## Remaining live verification (owner, test workspace)
 
@@ -281,3 +1056,12 @@ they are unconfirmed against a live workspace (item 11 below).
     interactions, `is_ext_shared_channel` on Events API callbacks, and whether
     the app receives both `message` and `app_mention` for one post in a
     control channel.
+12. #1294: whether history/replies return our `metadata` with
+    `include_all_metadata=true`, and how quickly a just-posted message is
+    visible there (the 30 s settle window assumes well under that); the
+    unit of the 4,000-character text limit; `link_names` default;
+    `metadata` accepted as a JSON object; the upload URL working without
+    an `Authorization` header; the per-file size limit; a real 10-part
+    answer and a PDF/PNG upload landing in a thread in order; a launchd-run
+    daemon reading generated files from the shared state/temp location
+    (#1256).

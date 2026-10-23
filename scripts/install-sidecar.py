@@ -190,6 +190,7 @@ def main():
         model = ROOT / 'vendor/whisper/models/ggml-medium.en.bin'
         if not whisper.is_file() or not os.access(whisper, os.X_OK) or not model.is_file():
             raise SystemExit('run scripts/build-whisper.sh before installing voice capture')
+        subprocess.run(['bash', str(ROOT / 'scripts/build-whisper.sh'), '--verify-only'], check=True)
     elif args.sidecar == 'discord-voice':
         if not voice_node.is_file() or not os.access(voice_node, os.X_OK) or not entry.is_file():
             raise SystemExit('run npm ci and npm run build in sidecars/discord-voice before installing')

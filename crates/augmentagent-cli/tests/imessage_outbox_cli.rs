@@ -8,6 +8,37 @@ use augmentagent_store::{ActionStatus, Email, ImessageTargetKind, NewImessageOut
 
 const PHONE: &str = "+15555550100"; // pii-ok synthetic
 
+#[test]
+fn repeated_committed_report_finishes_action_after_process_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, ids) = seed_queued(&dir.path().join("agent.db"), 1);
+    let item = store.claim_imessage_outbox().unwrap().unwrap();
+    store.complete_imessage_outbox(item.id, &augmentagent_store::ImessageSendOutcome::Sent { message_guid: None }).unwrap();
+    stdout(&run(dir.path(), true, &["outbox", "complete", &item.id.to_string(), "--status", "sent"]));
+    assert_eq!(action_status(&store, &ids[0]).0, "sent");
+}
+
+#[test]
+fn owner_alert_can_queue_without_an_inbound_message_or_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    stdout(&run(dir.path(), true, &["alerts", "configure", "--destination", PHONE, "--enabled"]));
+    stdout(&run(dir.path(), true, &["alerts", "create", "synthetic-critical", "--sender", "Test Sender",
+        "--action", "Prepare for meeting", "--reason", "Meeting starts soon", "--source-url",
+        "https://example.test/email/1", "--urgency", "critical"]));
+    let off: serde_json::Value = serde_json::from_str(&stdout(&run(dir.path(), false, &["outbox", "claim"]))).unwrap();
+    assert!(off["item"].is_null());
+    let on: serde_json::Value = serde_json::from_str(&stdout(&run(dir.path(), true, &["outbox", "claim"]))).unwrap();
+    assert_eq!(on["item"]["target"], PHONE);
+    assert!(on["item"]["send_by_ms"].as_i64().is_some());
+    assert!(on["item"]["body"].as_str().unwrap().contains("Prepare for meeting"));
+    let id = on["item"]["id"].as_i64().unwrap().to_string();
+    stdout(&run(dir.path(), true, &["outbox", "complete", &id, "--status", "unknown", "--reason", "ambiguous send"]));
+    // A lost SSH response must not trap the sender's journal on a successful retry.
+    stdout(&run(dir.path(), true, &["outbox", "complete", &id, "--status", "unknown", "--reason", "ambiguous send"]));
+    let next: serde_json::Value = serde_json::from_str(&stdout(&run(dir.path(), true, &["outbox", "claim"]))).unwrap();
+    assert!(next["item"].is_null());
+}
+
 fn run(dir: &Path, enabled: bool, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_augmentagent"))
         .current_dir(dir)

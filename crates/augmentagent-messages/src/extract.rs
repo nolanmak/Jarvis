@@ -160,6 +160,9 @@ pub fn extract(row: &EmailRowView, owner: &OwnerHandles) -> IndexFields {
             f.conversation_title = non_empty(title);
             f.container = folder.and_then(non_empty);
         }
+        // #1296 — ingested Slack messages (`<channel>:<ts>` rows); composed
+        // drafts keep the generic shape below.
+        "slack" if row.kind != "compose" => slack(row, &mut f),
         "linkedin" | "socialapi" | "instagram" | "twitter" | "slack" | "telegram" => {
             f.conv_kind = if row.kind == "group" { "group" } else { "dm" }.into();
             // "[LinkedIn DM from Pat]" / "[Instagram DM from pat]"
@@ -191,6 +194,45 @@ pub fn extract(row: &EmailRowView, owner: &OwnerHandles) -> IndexFields {
         }
     }
     f
+}
+
+/// Slack `ts` (`"1800000000.000100"`, what `receivedAt` holds for Slack
+/// rows) → milliseconds.
+fn slack_ts_ms(raw: &str) -> Option<i64> {
+    let (secs, frac) = raw.trim().split_once('.')?;
+    if secs.len() < 9 || !secs.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let secs: i64 = secs.parse().ok()?;
+    let millis: i64 = format!("{:0<3}", frac.get(..frac.len().min(3))?)
+        .parse()
+        .ok()?;
+    Some(secs * 1000 + millis)
+}
+
+/// #1296 — a Slack message's conversation is its channel (`threadId`): a
+/// `D…` channel is a DM (the sender is the counterpart), anything else a
+/// channel until the index names it (a group DM, see
+/// `index::slack_directory`). The time is Slack's own `ts`, and the
+/// workspace (`accountEntityId` = `slack:team:<id>`) is the container.
+fn slack(row: &EmailRowView, f: &mut IndexFields) {
+    if f.ts_fallback {
+        if let Some(ms) = row.received_at.as_deref().and_then(slack_ts_ms) {
+            f.ts_ms = ms;
+            f.ts_fallback = false;
+        }
+    }
+    let channel = row.thread_id.as_deref().unwrap_or("");
+    let dm = channel.starts_with('D');
+    f.conv_kind = if dm { "dm" } else { "channel" }.into();
+    if dm && !f.from_me {
+        f.counterpart_handle = Some(f.sender_handle.clone());
+    }
+    f.container = row
+        .account_entity_id
+        .as_deref()
+        .and_then(|a| a.strip_prefix("slack:team:"))
+        .and_then(non_empty);
 }
 
 fn imessage(row: &EmailRowView, f: &mut IndexFields) {
@@ -307,6 +349,34 @@ mod tests {
         OwnerHandles {
             handles: vec!["email:owner@example.com".into()],
         }
+    }
+
+    /// #1296 — Slack rows: channel vs DM by channel ID, the counterpart of
+    /// a DM, the workspace, and Slack's own `ts` as the time.
+    #[test]
+    fn slack_channel_and_dm_rows() {
+        let mut r = row(
+            "slack",
+            "alice <slack:U0000000B>",
+            "C0000001",
+            "",
+            "digest_item",
+        );
+        r.received_at = Some("1800000000.000100".into());
+        r.account_entity_id = Some("slack:team:T0000001".into());
+        let f = extract(&r, &owner());
+        assert_eq!(f.conv_kind, "channel");
+        assert_eq!(f.sender_handle, "slack:U0000000B");
+        assert_eq!(f.counterpart_handle, None);
+        assert_eq!(f.container.as_deref(), Some("T0000001"));
+        assert_eq!((f.ts_ms, f.ts_fallback), (1_800_000_000_000, false));
+        r.thread_id = Some("D0000002".into());
+        let f = extract(&r, &owner());
+        assert_eq!(f.conv_kind, "dm");
+        assert_eq!(f.counterpart_handle.as_deref(), Some("slack:U0000000B"));
+        // An unparseable ts still falls back to the ingest time.
+        r.received_at = Some("not a ts".into());
+        assert!(extract(&r, &owner()).ts_fallback);
     }
 
     #[test]

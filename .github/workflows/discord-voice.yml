@@ -6,6 +6,7 @@ on:
       - 'sidecars/discord-voice/**'
       - 'crates/augmentagent-approval-discord/**'
       - 'crates/augmentagent-channel-core/**'
+      - 'crates/augmentagent-channel-voice/**'
       - 'crates/augmentagent-cli/**'
       - 'crates/augmentagent-store/**'
       - 'docs/discord-voice/**'
@@ -25,6 +26,7 @@ on:
       - 'sidecars/discord-voice/**'
       - 'crates/augmentagent-approval-discord/**'
       - 'crates/augmentagent-channel-core/**'
+      - 'crates/augmentagent-channel-voice/**'
       - 'crates/augmentagent-cli/**'
       - 'crates/augmentagent-store/**'
       - 'docs/discord-voice/**'
@@ -55,7 +57,7 @@ jobs:
       run:
         working-directory: sidecars/discord-voice
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Record native target
         run: uname -srm
         working-directory: .
@@ -88,7 +90,7 @@ jobs:
         os: [ubuntu-latest, macos-15]
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.1
@@ -103,7 +105,7 @@ jobs:
         run: |
           cargo test -p augmentagent-approval-discord -p augmentagent-channel-voice -p augmentagent-store --locked
           cargo test -p augmentagent-channel-core --lib voice_bridge::tests --locked
-          cargo test -p augmentagent-channel-core --test conversation_scheduler --locked
+          cargo test -p augmentagent-approval-discord --test conversation_scheduler --locked
           cargo test -p augmentagent-channel-core --test voice_tool_contract --locked
       - name: Linux CLI regression suite
         if: runner.os == 'Linux'
@@ -123,7 +125,7 @@ jobs:
         os: [ubuntu-latest, macos-15]
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Record native target
         run: |
           uname -srm

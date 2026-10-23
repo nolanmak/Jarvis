@@ -42,8 +42,21 @@ wants Drive on.
 4. After consent, re-run `augmentagent status --json` and check
    `channels.gdrive.configured` and `channels.gdrive.accounts`.
 
-This channel has no `augmentagent gdrive login` subcommand. The dashboard
-URL is the only entry point today.
+For CLI-managed sign-in, run:
+
+```sh
+node scripts/connect-google.mjs start --toolkit googledrive --email owner@example.com
+# Or generate separate links for several accounts:
+node scripts/connect-google.mjs start --toolkit googledrive --count 4
+node scripts/connect-google.mjs finish
+node scripts/connect-google.mjs status
+```
+
+Open each printed link and consent with the intended Google account, then run
+`finish`. The CLI verifies the ACTIVE connection and provider email before
+saving it. `--email` rejects accidental sign-in to a different address. Each
+attempt has separate persisted state; no dashboard callback is required.
+The same CLI supports `--toolkit gmail` for a new mailbox.
 
 ## Validate
 
@@ -58,12 +71,11 @@ empty, the callback wrote no row; consult Common errors.
 
 ## Common errors and fixes
 
-- "Discovery failed" on the callback page. The dashboard's gdrive
-  callback waits up to a fixed number of retries for Composio to surface
-  the connected-account record (see the retry loop in `src/dashboard.ts`
-  around `/oauth/googledrive/callback`). If discovery fails, re-running
-  the start URL usually clears it; if not, pull dashboard logs via
-  `augmentagent logs --unit augmentagent-dashboard.service`.
+- Callback redirects with `googledrive=error`. Only ACTIVE connections matching
+  the pending user and Drive toolkit are persisted. The callback also checks
+  the Drive profile through Composio. Retry the connect URL; inspect dashboard
+  logs if the connection or profile cannot be verified. Project-wide account
+  discovery is intentionally not used.
 - "redirect_uri_mismatch" at Google. The redirect must match
   `http://localhost:<DASHBOARD_PORT>/oauth/googledrive/callback` exactly.
   Fix in Google Cloud Console.
@@ -86,3 +98,41 @@ augmentagent gdrive accounts --json
 Find the account id, revoke at
 `https://myaccount.google.com/permissions`, and remove the row via the
 dashboard's UI. No CLI delete verb today.
+
+## On-demand agent tools
+
+The interactive agent can use `gdrive accounts`, `gdrive search`, `gdrive get`,
+and `gdrive read` without enabling change-feed notifications. Example:
+
+```sh
+augmentagent gdrive search --query "trashed = false and name contains 'plan'"
+augmentagent gdrive read --file-id FILE_ID
+```
+
+Use `--account` for multiple accounts. Search accepts Google Drive v3 query
+syntax and returns JSON with pagination. Read supports UTF-8 text files and
+Docs/Slides text exports; Sheets CSV exports cover the first sheet only.
+Binary files are discoverable but not text-readable. The tool reports content
+truncation; `--max-chars` can raise the output limit up to 200000.
+
+API contracts: https://docs.composio.dev/toolkits/googledrive and
+https://docs.composio.dev/docs/tools-direct/executing-tools.
+
+## Permissions and uploads
+
+On Google's consent screen, select the Drive access permission; granting only
+sign-in/email leaves the connection ACTIVE but Drive calls fail with HTTP 403
+`ACCESS_TOKEN_SCOPE_INSUFFICIENT`. Inspect granted `state.val.scope`, not just
+`requested_scopes`. Full `https://www.googleapis.com/auth/drive` permits reading
+and writing subject to file-level permissions. Reconnect only accounts missing
+the required grant, using `--email` to verify the same identity.
+
+The agent can upload owner-requested files with:
+
+```sh
+augmentagent gdrive upload --account owner@example.com --file ./wiki/deliverables/report.pdf
+```
+
+Optional `--folder-id`, `--name`, and `--mime-type` select the destination and
+metadata. Uploads create new files up to 5 MB and do not modify sharing. Agent
+sessions restrict uploads to non-hidden files under WIKI_ROOT.
