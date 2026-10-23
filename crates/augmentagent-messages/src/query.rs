@@ -1176,11 +1176,7 @@ mod tests {
     fn household_pair_narrows_ambiguous_first_names() {
         let (_d, _w, s) = housemates("household: [sam-doe]\n");
         let r = resp(&s, "with:alex with:sam");
-        assert!(
-            r.ambiguous.is_empty(),
-            "documented pair must not be ambiguous: {:?}",
-            r.ambiguous
-        );
+        assert!(r.ambiguous.is_empty(), "{:?}", r.ambiguous);
         let mut got: Vec<&str> = r.hits.iter().map(|h| h.message_id.as_str()).collect();
         got.sort();
         assert_eq!(got, ["h1", "h2"]);
@@ -1191,13 +1187,8 @@ mod tests {
         let (_d, _w, s) = housemates("");
         let r = resp(&s, "with:alex with:sam");
         assert!(r.hits.is_empty());
-        assert_eq!(
-            r.ambiguous
-                .iter()
-                .map(|a| a.query.as_str())
-                .collect::<Vec<_>>(),
-            ["alex", "sam"]
-        );
+        let qs: Vec<&str> = r.ambiguous.iter().map(|a| a.query.as_str()).collect();
+        assert_eq!(qs, ["alex", "sam"]);
     }
 
     #[test]
