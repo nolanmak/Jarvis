@@ -803,6 +803,24 @@ impl EventHandler for Handler {
                         None=>"Alert store unavailable".into(),
                     };
                     ack_ephemeral(&ctx,&comp,&response).await;
+                    // Render persisted state, including for stale buttons or an audit error.
+                    if let Some(store) = self.state.store.as_ref() {
+                        if let Some((_, id)) = comp.data.custom_id.strip_prefix("oa:").and_then(|rest| rest.split_once(':')) {
+                            match store.owner_alert(id) {
+                                Ok(Some(alert)) => {
+                                    let update = crate::owner_alerts::status_update(&alert, chrono::Utc::now().timestamp_millis(), &comp.message.embeds);
+                                    if let Err(error) = comp.channel_id.edit_message(&ctx.http, comp.message.id, update).await {
+                                        warn!(alert_id=%id, "owner alert card refresh failed: {error}");
+                                        let _ = comp.create_followup(&ctx.http, CreateInteractionResponseFollowup::new()
+                                            .ephemeral(true)
+                                            .content("The alert card could not be refreshed. The control outcome above still applies; the card may show an older status.")).await;
+                                    }
+                                }
+                                Ok(None) => {},
+                                Err(error) => warn!(alert_id=%id, "could not read owner alert for card refresh: {error}"),
+                            }
+                        }
+                    }
                     return;
                 }
                 let Some(cid) = CustomId::parse(&comp.data.custom_id) else {
