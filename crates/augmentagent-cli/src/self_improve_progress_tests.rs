@@ -59,10 +59,125 @@ fn ready_managed_prs_are_resumable_but_forks_and_unmanaged_prs_are_not() {
     ]);
     let mut ledger = AttemptLedger::default();
     let gave_up = std::collections::HashSet::new();
-    assert_eq!(resumable_from(&prs, &ledger, 1, &gave_up, None, None),
+    assert_eq!(resumable_from(&prs, &ledger, 1, &gave_up, None, None, 0),
         Some((3, 3, "agent-fix/issue-3".into())));
     ledger.mark(1, 3);
-    assert_eq!(resumable_from(&prs, &ledger, 1, &gave_up, None, None), None);
+    assert_eq!(resumable_from(&prs, &ledger, 1, &gave_up, None, None, 0), None);
+}
+
+/// #1532 — the starvation axis: with more eligible drafts than the daily cap,
+/// a persisted cursor that is NOT reset by the UTC-day rollover must give
+/// every draft a turn before any draft gets a second one. On `main` the
+/// lowest-numbered drafts were re-served every single day and 102-104 never
+/// ran at all.
+#[test]
+fn fair_rotation_covers_backlog_larger_than_daily_cap_across_days() {
+    let prs = serde_json::Value::Array(
+        (100..105u64)
+            .map(|pr| serde_json::json!({
+                "number": pr,
+                "headRefName": format!("agent-fix/issue-{}", pr - 90),
+                "isDraft": true,
+                "isCrossRepository": false,
+            }))
+            .collect(),
+    );
+    let gave_up = std::collections::HashSet::new();
+    let mut fair = FairSched::default();
+    let mut order = Vec::new();
+    for day in 1..=3u64 {
+        // A fresh ledger per simulated day: the within-day exclusion resets,
+        // the rotation does not.
+        let mut ledger = AttemptLedger::default();
+        for _ in 0..2 {
+            let (pr, issue, _) =
+                resumable_from(&prs, &ledger, day, &gave_up, None, None, fair.resume_cursor)
+                    .expect("a draft is always eligible");
+            fair.advance(pr);
+            ledger.mark(day, issue);
+            order.push(pr);
+        }
+    }
+    assert_eq!(order, vec![100, 101, 102, 103, 104, 100],
+        "every draft gets a turn before any draft gets a second one");
+}
+
+/// #1532 — the other starvation axis, and the fallbacks. Three simulated days
+/// of three billed slots each against five non-converging drafts and two new
+/// issues: every draft is resumed and BOTH new issues are built, none of
+/// which happens when sitting drafts outrank new work absolutely.
+#[test]
+fn a_combined_lane_day_spends_slots_on_both_drafts_and_new_issues() {
+    let prs = serde_json::Value::Array(
+        (100..105u64)
+            .map(|pr| serde_json::json!({
+                "number": pr,
+                "headRefName": format!("agent-fix/issue-{}", pr - 90),
+                "isDraft": true,
+                "isCrossRepository": false,
+            }))
+            .collect(),
+    );
+    let gave_up = std::collections::HashSet::new();
+    const CAP: u32 = 3;
+    const PER_BUILD: u32 = 2;
+    let mut fair = FairSched::default();
+    let mut pickable = vec![20u64, 21];
+    let (mut resumed, mut built) = (Vec::new(), Vec::new());
+    for day in 1..=3u64 {
+        let mut ledger = AttemptLedger::default();
+        let mut billed = 0;
+        while billed < CAP {
+            // `run_once`'s order of operations: the preference decides which
+            // kind is tried first, the other kind is the fallback.
+            let prefer_build = prefer_build_now(Lane::Combined, true, &fair, PER_BUILD);
+            let draft = resumable_from(&prs, &ledger, day, &gave_up, None, None, fair.resume_cursor);
+            let pick = pickable.iter().copied().find(|i| !ledger.attempted_today(day, *i));
+            let slot = if prefer_build {
+                pick.map(Err).or_else(|| draft.clone().map(Ok))
+            } else {
+                draft.clone().map(Ok).or_else(|| pick.map(Err))
+            };
+            match slot {
+                Some(Ok((pr, issue, _))) => {
+                    fair.advance(pr);
+                    ledger.mark(day, issue);
+                    resumed.push(pr);
+                    fair.record_billed(true);
+                }
+                Some(Err(issue)) => {
+                    ledger.mark(day, issue);
+                    built.push(issue);
+                    pickable.retain(|i| *i != issue);
+                    fair.record_billed(false);
+                }
+                None => break,
+            }
+            billed += 1;
+        }
+        assert!(billed <= CAP, "day {day} must not exceed the shared daily budget");
+    }
+    assert_eq!(built, vec![20, 21], "new issues are not starved by the draft backlog");
+    let mut distinct = resumed.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct, vec![100, 101, 102, 103, 104], "{resumed:?}");
+
+    // Fallback, the other direction: a slot that prefers a resume but has no
+    // eligible draft left buys a build, which settles the debt.
+    let mut spent = AttemptLedger::default();
+    for issue in 10..15u64 {
+        spent.mark(4, issue);
+    }
+    let mut fresh = FairSched::default();
+    assert!(!prefer_build_now(Lane::Combined, true, &fresh, PER_BUILD), "a resume is preferred");
+    assert_eq!(
+        resumable_from(&prs, &spent, 4, &gave_up, None, None, fresh.resume_cursor),
+        None,
+        "but no draft is eligible, so the slot buys a build"
+    );
+    fresh.record_billed(false);
+    assert_eq!(fresh.resumes_since_build, 0);
 }
 
 #[test]
