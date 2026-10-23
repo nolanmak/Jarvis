@@ -17,19 +17,30 @@ pub(crate) struct ProcessGroup {
     _directory: tempfile::TempDir,
 }
 
+/// The supervisor creates the receipt and only then writes it, so its mere
+/// existence is no acknowledgement: a reader that stops at `exists()` can read
+/// the empty file in between and call a clean reap unverified. Wait for the
+/// body, which is the acknowledgement, until `deadline`.
+fn reaped_by(receipt: &std::path::Path, deadline: std::time::Instant) -> bool {
+    loop {
+        if std::fs::read_to_string(receipt).is_ok_and(|value| value == "all-descendants-reaped\n") {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline { return false; }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        if !self.receipt.exists() {
+        let mut processes_reaped = reaped_by(&self.receipt, std::time::Instant::now());
+        if !processes_reaped {
             // Signal the supervisor, which retains ownership of detached
             // grandchildren and acknowledges only after reaping every child.
             unsafe { libc::kill(self.id, libc::SIGTERM); }
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-            while !self.receipt.exists() && std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
+            processes_reaped = reaped_by(&self.receipt,
+                std::time::Instant::now() + std::time::Duration::from_secs(3));
         }
-        let processes_reaped = std::fs::read_to_string(&self.receipt)
-            .is_ok_and(|value| value == "all-descendants-reaped\n");
         let mut clean = processes_reaped;
         if clean {
             if let Some(marker) = &self.active_request {
@@ -564,6 +575,27 @@ mod tests {
     /// Write an owner-private file, as the daemon's own writes are.
     fn write_private(path: &std::path::Path, body: &[u8]) {
         std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(path).unwrap().write_all(body).unwrap();
+    }
+
+    /// The supervisor publishes its receipt in two steps — `O_CREAT|O_EXCL`,
+    /// then the body — so a verified reap is briefly visible as an empty file.
+    /// Reading that as "cleanup unverified" blocks failover on a tree that was
+    /// in fact reaped, which is the race that made the hung-primary failover
+    /// test fail under load.
+    #[test]
+    fn a_receipt_caught_between_its_creation_and_its_body_is_waited_out() {
+        let (directory, _) = request();
+        let receipt = directory.path().join("cleanup-complete");
+        write_private(&receipt, b"");
+        assert!(!reaped_by(&receipt, std::time::Instant::now()), "an empty receipt proves nothing");
+
+        let publishing = receipt.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::fs::write(&publishing, b"all-descendants-reaped\n").unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        assert!(reaped_by(&receipt, deadline), "the body arrived within the deadline");
     }
 
     /// #1071 — a marker is cleared only on a proof that no descendant of the call can still be
