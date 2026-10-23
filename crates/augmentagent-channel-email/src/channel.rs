@@ -426,7 +426,8 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         // still go through triage so agreement stays measured. The verdict
         // type cannot express anything but Skip.
         let mut spot_check: Option<crate::prefilter::PrefilterDecision> = None;
-        if let Some(pf) = self.prefilter.as_ref().filter(|pf| pf.enabled()) {
+        let priority_sender=self.store.owner_alert_priority(&extract_bare_email(&email.from))?.is_some();
+        if let Some(pf) = self.prefilter.as_ref().filter(|pf| pf.enabled() && !priority_sender) {
             if let Some(decision) = pf.assess(&email).await {
                 if pf.is_spot_check(&email.message_id) {
                     spot_check = Some(decision);
@@ -466,7 +467,8 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             })
             .unwrap_or_default();
         let wiki_hint = with_notes_hint(&self.store, &email, &wiki_hint);
-        let triage_prompt = triage_user_message(&email, learned, &wiki_hint);
+        let mut triage_prompt = triage_user_message(&email, learned, &wiki_hint);
+        triage_prompt.push_str(&crate::owner_alerts::prompt_context(&self.store,&email,chrono::Utc::now().timestamp_millis())?);
         let raw = self.reasoner.call(&triage_opts, &triage_prompt).await?;
         let decision = match parse_decision(&raw) {
             Ok(d) => d,
@@ -493,6 +495,12 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 return Err(e.into());
             }
         };
+
+        if !self.config.dry_run {
+            if let Err(error)=crate::owner_alerts::persist_assessment(&self.store,&email,&raw,chrono::Utc::now().timestamp_millis()) {
+                warn!(message_id=%email.message_id,"owner alert assessment failed; background reevaluation will retry: {error}");
+            }
+        }
 
         if let (Some(pf), Some(pre)) = (self.prefilter.as_ref(), spot_check.as_ref()) {
             pf.record(&email.message_id, pre, Some(decision.decision))
@@ -2095,6 +2103,8 @@ mod tests {
     /// `--model` with the quality-tier model, and no spawn in the poll may
     /// omit `--model` (which would inherit the owner's interactive model,
     /// #448). The stub runs no model, so draft quality is not exercised.
+    // The real provider supervisor requires Linux PR_SET_CHILD_SUBREAPER.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn reply_poll_pins_the_model_on_every_claude_spawn() {
         use crate::argv_stub::{flag, summarize, ArgvStub};

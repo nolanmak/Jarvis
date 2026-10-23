@@ -11,7 +11,7 @@ use crate::surface::{SurfaceConversationRef, SurfaceTurnRef};
 
 use crate::models::{
     Account, ActionRecord, ActionStatus, AgentPrRun, AgentRepo, ChannelSubscription,
-    ConnectionRequestRow, DriveAccount, Email, FriendWatch, LearnedPattern,
+    ConnectionRequestRow, DriveAccount, Email, FriendWatch, GmailRateRefusal, LearnedPattern,
     LinkedInConnectionSync, OwnPost, PhoneIdentity, RateAuditRow, RateHalt,
     RateWarmup, ScheduledPost, ScheduledPostStatus, SlackWorkspace, SocialapiAccount,
     SocialapiWebhookEvent, SubscriptionMode, TelegramBot,
@@ -94,6 +94,15 @@ impl SurfaceTurnResolution {
     }
 }
 
+/// #1396 — a Discord turn the previous daemon process died on, closed by
+/// [`Store::interrupt_pending_discord_turns`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterruptedDiscordTurn {
+    pub guild_id: String,
+    pub channel_id: String,
+    pub turn_id: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SurfaceTurnState {
     pub status: SurfaceTurnStatus,
@@ -140,6 +149,23 @@ fn lost_migration_race(e: &StoreError) -> bool {
         .as_deref()
         .is_some_and(|m| m.contains("duplicate column name") || m.contains("already exists"))
 }
+
+/// #1412 — what a body-compaction pass found or dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BodyCompaction {
+    pub rows: u64,
+    pub bytes: u64,
+}
+
+/// The rows [`Store::compact_action_bodies`] may touch; `?1` is the cutoff.
+/// `e.body = a.originalBody` is the whole safety argument: only an exact
+/// duplicate is ever dropped, so the reader fallback returns the same text.
+const COMPACTABLE_BODY_FROM: &str = "FROM actions a \
+     JOIN emails e ON e.messageId = a.messageId \
+    WHERE a.status IN ('skipped', 'permanent_error') \
+      AND a.originalBody IS NOT NULL \
+      AND a.createdAt < ?1 \
+      AND e.body = a.originalBody";
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -417,9 +443,15 @@ impl Store {
         }
         let mut guard = self.conn.lock().expect("store mutex poisoned");
         let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // #1396 — a turn the startup pass closed as interrupted stays
+        // consumed but no longer blocks the channel.
         let unfinished: Option<String> = tx.query_row(
-            "SELECT turn_id FROM discord_native_turns \
-             WHERE guild_id = ?1 AND channel_id = ?2 AND status != 'complete' LIMIT 1",
+            "SELECT t.turn_id FROM discord_native_turns t \
+             WHERE t.guild_id = ?1 AND t.channel_id = ?2 AND t.status != 'complete' \
+             AND NOT EXISTS (SELECT 1 FROM surface_turn_resolutions r \
+                 WHERE r.platform = 'discord' AND r.account_id = t.guild_id \
+                 AND r.conversation_id = t.channel_id AND r.thread_id = '' \
+                 AND r.turn_id = t.turn_id) LIMIT 1",
             params![guild_id, channel_id],
             |row| row.get(0),
         ).optional()?;
@@ -440,6 +472,49 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// #1396 — close every Discord turn still `pending` as interrupted and
+    /// return them, so the owner can be told. Only the daemon may call this,
+    /// once, before it accepts Discord messages: at that point a pending
+    /// claim can only belong to a process that died mid-turn. The turn is
+    /// never re-run (its tools may have acted) but no longer blocks its
+    /// channel. Turns a live process finished as `uncertain` are left alone.
+    pub fn interrupt_pending_discord_turns(&self) -> StoreResult<Vec<InterruptedDiscordTurn>> {
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let turns: Vec<InterruptedDiscordTurn> = {
+            let mut stmt = tx.prepare(
+                "SELECT guild_id, channel_id, turn_id FROM discord_native_turns \
+                 WHERE status = 'pending' ORDER BY created_at_ms, turn_id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(InterruptedDiscordTurn {
+                    guild_id: row.get(0)?,
+                    channel_id: row.get(1)?,
+                    turn_id: row.get(2)?,
+                })
+            })?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let now = now_millis();
+        for turn in &turns {
+            tx.execute(
+                "UPDATE discord_native_turns SET status = 'uncertain', finished_at_ms = ?4 \
+                 WHERE guild_id = ?1 AND channel_id = ?2 AND turn_id = ?3 AND status = 'pending'",
+                params![turn.guild_id, turn.channel_id, turn.turn_id, now],
+            )?;
+            tx.execute(
+                "INSERT INTO surface_turn_resolutions \
+                 (platform, account_id, conversation_id, thread_id, turn_id, resolution, resolved_at_ms) \
+                 VALUES ('discord', ?1, ?2, '', ?3, ?4, ?5) \
+                 ON CONFLICT(platform, account_id, conversation_id, thread_id, turn_id) DO NOTHING",
+                params![turn.guild_id, turn.channel_id, turn.turn_id,
+                    SurfaceTurnResolution::Interrupted.as_str(), now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(turns)
     }
 
     /// Only the native runner that claimed a pending turn can resolve it.
@@ -593,6 +668,59 @@ impl Store {
     /// constructor.
     pub fn db_path(&self) -> &Path {
         &self.path
+    }
+
+    /// #1412 — rows whose `originalBody` [`compact_action_bodies`] would
+    /// drop, and how many bytes that is.
+    ///
+    /// [`compact_action_bodies`]: Self::compact_action_bodies
+    pub fn action_body_compaction_candidates(&self, older_than_ms: i64) -> StoreResult<BodyCompaction> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let (rows, bytes): (i64, i64) = guard.query_row(
+            &format!("SELECT count(*), COALESCE(sum(length(a.originalBody)), 0) {COMPACTABLE_BODY_FROM}"),
+            params![older_than_ms],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(BodyCompaction { rows: rows as u64, bytes: bytes as u64 })
+    }
+
+    /// #1412 — drop `actions.originalBody` where it only repeats the email.
+    ///
+    /// A row qualifies when all of these hold: it is in a terminal status
+    /// that never produces a reply, it was created before `older_than_ms`,
+    /// and `emails.body` for the same message is byte-for-byte the same
+    /// text. Readers fall back to `emails.body`, so what they see does not
+    /// change. No row is removed and no status is touched: triage decisions
+    /// are evaluation data (#448).
+    ///
+    /// At most `batch` rows per call, in one short transaction, so the
+    /// daemon's own writes are never held up for long. Returns what this
+    /// call dropped; zero rows means there is nothing left.
+    pub fn compact_action_bodies(&self, older_than_ms: i64, batch: usize) -> StoreResult<BodyCompaction> {
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        // IMMEDIATE, not the default deferred: the batch reads then writes,
+        // and a read transaction cannot be upgraded once another connection
+        // (the dashboard, a CLI run) has committed — SQLite fails that at
+        // once with "database is locked" instead of waiting. Taking the
+        // write lock up front waits out the other writer instead.
+        let tx = guard.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let picked: Vec<(String, i64)> = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT a.id, length(a.originalBody) {COMPACTABLE_BODY_FROM} LIMIT ?2"
+            ))?;
+            let rows = stmt.query_map(params![older_than_ms, batch as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut done = BodyCompaction::default();
+        {
+            let mut clear = tx.prepare("UPDATE actions SET originalBody = NULL WHERE id = ?1")?;
+            for (id, len) in &picked {
+                done.rows += clear.execute(params![id])? as u64;
+                done.bytes += *len as u64;
+            }
+        }
+        tx.commit()?;
+        Ok(done)
     }
 
     /// Run a closure with the locked connection. Used by extension traits in
@@ -867,10 +995,14 @@ impl Store {
         crate::delivery::migrate(conn)?;
         // #1286 / #1230 — owner binding, control conversations, rejection audit.
         crate::owner::migrate(conn)?;
+        crate::phone::migrate(conn)?;
+        crate::local_chat::migrate(conn)?;
         // #1287 — live listener health reported by interactive surfaces.
         crate::surface_health::migrate(conn)?;
         // #1289 — approval-card pointers per surface.
         crate::approval_cards::migrate(conn)?;
+        crate::approval_history::migrate(conn)?;
+        crate::document_signatures::migrate(conn)?;
         // #1299 — the daemon's own start report (credential backend, notices).
         crate::daemon_report::migrate(conn)?;
         // #1297 — per-conversation reply mode (`voice on|off` on Slack).
@@ -1521,6 +1653,31 @@ impl Store {
              );",
         )?;
 
+        // #1384 — append-only ledger of provider rate-limit refusals. Unlike
+        // `gmail_fetch_cooldowns` (one latched row per entity, MAX() upsert)
+        // this keeps every observation so frequency and shape are measurable.
+        // Growth is bounded by how rarely the provider refuses, so a retention
+        // sweep is deferred until it is needed.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS gmail_rate_refusals (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                 observedAtMs INTEGER NOT NULL,\
+                 entityId TEXT NOT NULL,\
+                 mailbox TEXT,\
+                 action TEXT NOT NULL,\
+                 class TEXT NOT NULL,\
+                 origin TEXT NOT NULL,\
+                 retryAfterMs INTEGER,\
+                 retryAfterRaw TEXT,\
+                 providerMessage TEXT NOT NULL,\
+                 headersJson TEXT,\
+                 logId TEXT,\
+                 attempt INTEGER NOT NULL\
+             );\
+             CREATE INDEX IF NOT EXISTS idx_gmail_rate_refusals_observed \
+                 ON gmail_rate_refusals(observedAtMs);",
+        )?;
+
         // #81 — Proactive CRM signals + per-scan run cursor.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS proactive_signals (\
@@ -1863,6 +2020,19 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS imessage_sync_state (\
                  conversation  TEXT PRIMARY KEY,\
                  entries_seen  INTEGER NOT NULL,\
+                 updated_at_ms INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+
+        // #1429 — per-platform archive freshness cursor. One row per
+        // bundle-backed platform; stores the newest *message* timestamp the
+        // bundle holds (not when the exporter last ran), so recall can say
+        // "the archive ends here" instead of returning a bare zero.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS platform_archive_state (\
+                 platform      TEXT PRIMARY KEY,\
+                 newest_entry  TEXT,\
                  updated_at_ms INTEGER NOT NULL\
              )",
             [],
@@ -2451,6 +2621,8 @@ impl Store {
         )?;
 
         crate::imessage::migrate(conn)?;
+        crate::owner_alerts::migrate(conn)?;
+        crate::alert_schedule::migrate(conn)?;
         crate::slack_contact::migrate(conn)?;
         // #1296 — one record per Slack message across live/poll/catch-up.
         crate::slack_ingest::migrate(conn)?;
@@ -3226,6 +3398,74 @@ impl Store {
         Ok(())
     }
 
+    /// #1384 — append one refusal observation. Callers must not fail a Gmail
+    /// call when this errors; the ledger is diagnostics, not control flow.
+    pub fn record_gmail_rate_refusal(&self, r: &GmailRateRefusal) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        // The mailbox is snapshotted here rather than joined at read time: the
+        // Gmail client only knows the entity id, and an account that is later
+        // disconnected would otherwise lose the address its refusals belong to.
+        guard.execute(
+            "INSERT INTO gmail_rate_refusals \
+                (observedAtMs, entityId, mailbox, action, class, origin, retryAfterMs, \
+                 retryAfterRaw, providerMessage, headersJson, logId, attempt) \
+             VALUES (?1, ?2, \
+                 COALESCE(?3, (SELECT NULLIF(TRIM(email), '') FROM gmail_accounts \
+                               WHERE entityId = ?2 ORDER BY active DESC LIMIT 1)), \
+                 ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                r.observed_at_ms,
+                r.entity_id,
+                r.mailbox,
+                r.action,
+                r.class,
+                r.origin,
+                r.retry_after_ms,
+                r.retry_after_raw,
+                r.provider_message,
+                r.headers_json,
+                r.log_id,
+                r.attempt,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Refusals observed in `[from_ms, to_ms]`, oldest first. Grouping happens
+    /// in the reporting layer so the shape stays easy to test.
+    pub fn gmail_rate_refusals_between(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> StoreResult<Vec<GmailRateRefusal>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT observedAtMs, entityId, mailbox, action, class, origin, retryAfterMs, \
+                    retryAfterRaw, providerMessage, headersJson, logId, attempt \
+             FROM gmail_rate_refusals \
+             WHERE observedAtMs BETWEEN ?1 AND ?2 ORDER BY observedAtMs",
+        )?;
+        let rows = stmt
+            .query_map(params![from_ms, to_ms], |row| {
+                Ok(GmailRateRefusal {
+                    observed_at_ms: row.get(0)?,
+                    entity_id: row.get(1)?,
+                    mailbox: row.get(2)?,
+                    action: row.get(3)?,
+                    class: row.get(4)?,
+                    origin: row.get(5)?,
+                    retry_after_ms: row.get(6)?,
+                    retry_after_raw: row.get(7)?,
+                    provider_message: row.get(8)?,
+                    headers_json: row.get(9)?,
+                    log_id: row.get(10)?,
+                    attempt: row.get(11)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn get_active_gmail_accounts(&self) -> StoreResult<Vec<Account>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = guard.prepare(
@@ -3470,6 +3710,45 @@ impl Store {
             params![conversation, entries_seen, now_millis()],
         )?;
         Ok(())
+    }
+
+    /// Record how fresh a bundle-backed platform's archive is (#1429):
+    /// the newest message timestamp present, verbatim. `None` when the
+    /// bundle carries no parseable timestamp — the row still lands, so
+    /// "ingest ran, freshness unknown" stays distinguishable from
+    /// "this platform has no archive".
+    pub fn set_archive_newest_entry(
+        &self,
+        platform: &str,
+        newest_entry: Option<&str>,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO platform_archive_state (platform, newest_entry, updated_at_ms) \
+                 VALUES (?1, ?2, ?3) \
+             ON CONFLICT(platform) DO UPDATE SET \
+                 newest_entry = excluded.newest_entry, updated_at_ms = excluded.updated_at_ms",
+            params![platform, newest_entry, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// Archive freshness cursors, keyed by platform. A platform with no
+    /// bundle reader is absent rather than reported stale.
+    pub fn archive_newest_entries(
+        &self,
+    ) -> StoreResult<std::collections::BTreeMap<String, Option<String>>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare("SELECT platform, newest_entry FROM platform_archive_state")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        let mut out = std::collections::BTreeMap::new();
+        for row in rows {
+            let (platform, newest) = row?;
+            out.insert(platform, newest);
+        }
+        Ok(out)
     }
 
     // ---------------------------------------------------------------
@@ -4087,6 +4366,11 @@ impl Store {
     /// inbound *email*, and a merge card has no thread and a display name, not a
     /// mailbox, in `fromEmail` — which the bulk-sender rule retires on sight.
     ///
+    /// #1503 — `sign_pdf` cards are excluded for the same reason: an owner
+    /// signing decision on a local file (`fromEmail` = `Owner signature`) is
+    /// not an inbound draft, and the bulk-sender rule retired every one on the
+    /// first tick, so Approve & Sign always failed "superseded".
+    ///
     /// #1191 — pending `--send-at` proposals (`scheduledAtMs IS NOT NULL`) are
     /// excluded too. They are live cards awaiting the owner's Approve and must
     /// not be fed into the empty-draft / bulk-sender / answered-thread rules,
@@ -4106,7 +4390,7 @@ impl Store {
                LEFT JOIN emails e ON a.messageId = e.messageId \
               WHERE a.status = 'pending' \
                 AND a.scheduledAtMs IS NULL \
-                AND COALESCE(e.kind, '') <> 'identity_merge' \
+                AND COALESCE(e.kind, '') NOT IN ('identity_merge', 'sign_pdf') \
               ORDER BY a.createdAt ASC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -4311,9 +4595,13 @@ impl Store {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let row: Option<ActionWithEmail> = guard
             .query_row(
+                // #1412 — a compacted row's body lives only in `emails`.
                 "SELECT \
                    a.id, a.messageId, a.threadId, a.fromEmail, a.subject, \
-                   a.originalBody, a.draftBody, a.status, a.errorMessage, \
+                   CASE WHEN a.originalBody IS NULL \
+                             AND a.status IN ('skipped', 'permanent_error') \
+                        THEN e.body ELSE a.originalBody END, \
+                   a.draftBody, a.status, a.errorMessage, \
                    a.createdAt, a.updatedAt, COALESCE(a.retryCount, 0), a.draftId, \
                    e.body, e.receivedAt, e.accountEntityId, e.platform, e.kind \
                  FROM actions a \
@@ -8647,6 +8935,36 @@ mod tests {
     }
 
     #[test]
+    fn archive_newest_entry_roundtrip_keeps_platforms_without_a_reader_absent() {
+        let (store, _d) = fresh_store();
+        assert!(store.archive_newest_entries().unwrap().is_empty());
+        store
+            .set_archive_newest_entry("whatsapp", Some("2026-09-29T21:10:00-04:00"))
+            .unwrap();
+        store.set_archive_newest_entry("imessage", None).unwrap();
+        let map = store.archive_newest_entries().unwrap();
+        assert_eq!(
+            map.get("whatsapp").cloned().flatten().as_deref(),
+            Some("2026-09-29T21:10:00-04:00")
+        );
+        assert_eq!(map.get("imessage"), Some(&None));
+        assert!(!map.contains_key("discord"));
+        store
+            .set_archive_newest_entry("whatsapp", Some("2026-10-02T08:00:00-04:00"))
+            .unwrap();
+        assert_eq!(
+            store
+                .archive_newest_entries()
+                .unwrap()
+                .get("whatsapp")
+                .cloned()
+                .flatten()
+                .as_deref(),
+            Some("2026-10-02T08:00:00-04:00")
+        );
+    }
+
+    #[test]
     fn imessage_entries_seen_roundtrip() {
         let (store, _d) = fresh_store();
         // never-synced conversation reads as 0, not an error
@@ -8797,6 +9115,50 @@ mod tests {
             None,
             "expired cooldowns must stop blocking requests"
         );
+    }
+
+    /// Round-trip plus the two things the read path depends on: rows outside
+    /// the window are excluded, and the mailbox is snapshotted at write time
+    /// so disconnecting the account later does not erase whose refusal it was.
+    #[test]
+    fn gmail_rate_refusals_round_trip_and_keep_their_mailbox_after_a_disconnect() {
+        let (store, _file) = fresh_store();
+        let sql = |q: &str| store.conn.lock().unwrap().execute(q, []).unwrap();
+        sql("INSERT INTO gmail_accounts (id, connectionId, email, entityId, active, createdAt) \
+             VALUES ('g1', 'c1', 'owner@example.com', 'acct-a', 1, 0)");
+
+        let row = |observed_at_ms, class: &str, retry: Option<(i64, &str)>| GmailRateRefusal {
+            observed_at_ms,
+            entity_id: "acct-a".into(),
+            mailbox: None,
+            action: "GMAIL_FETCH_EMAILS".into(),
+            class: class.into(),
+            origin: "interactive".into(),
+            retry_after_ms: retry.map(|(ms, _)| ms),
+            // Kept even when it did not parse into a boundary above.
+            retry_after_raw: Some(retry.map_or("Mon, 32 Foo 2026", |(_, raw)| raw).into()),
+            provider_message: "rate limit".into(),
+            headers_json: Some(r#"{"retry-after":"30"}"#.into()),
+            log_id: Some("log-1".into()),
+            attempt: 1,
+        };
+        for r in [
+            row(1_000, "http_429", Some((31_000, "30"))),
+            row(2_000, "envelope", None),
+            row(9_000, "http_429", Some((39_000, "30"))),
+        ] {
+            store.record_gmail_rate_refusal(&r).unwrap();
+        }
+        sql("UPDATE gmail_accounts SET active = 0 WHERE id = 'g1'");
+
+        let found = store.gmail_rate_refusals_between(1_000, 2_000).unwrap();
+        assert_eq!(found.len(), 2, "out-of-window rows must be excluded");
+        assert_eq!((&*found[0].class, &*found[0].origin), ("http_429", "interactive"));
+        assert_eq!(found[0].mailbox.as_deref(), Some("owner@example.com"));
+        assert_eq!(found[0].retry_after_ms, Some(31_000));
+        assert_eq!(found[0].headers_json.as_deref(), Some(r#"{"retry-after":"30"}"#));
+        assert_eq!((&*found[1].class, found[1].retry_after_ms), ("envelope", None));
+        assert_eq!(found[1].retry_after_raw.as_deref(), Some("Mon, 32 Foo 2026"));
     }
 
     #[test]
@@ -11750,6 +12112,44 @@ mod tests {
         s.record_outbound_thread_event("ent-1", "msg-noth", None, 20_000)
             .unwrap();
         assert!(!s.thread_has_user_reply_after("T-other", 0).unwrap());
+    }
+
+    /// #1503 — a pending PDF-signing card is an owner decision, not an inbound
+    /// draft, so the reconcile sweep must never see it (its `Owner signature`
+    /// sender failed the bulk-sender rule on every tick). Ordinary drafts are
+    /// still enumerated.
+    #[test]
+    fn pending_actions_for_reconcile_excludes_signing_cards() {
+        let (s, _f) = fresh_store();
+        let plain = pending_action(&s, "m-rec-plain");
+        let mut email = sample_email("doc-sign:1");
+        email.from = "Owner signature".into();
+        email.platform = "document-signing".into();
+        email.kind = "sign_pdf".into();
+        s.upsert_email(&email).unwrap();
+        let signing = s
+            .log_action(
+                "doc-sign:1",
+                None,
+                "Owner signature",
+                "Sign PDF: deliverables/x.pdf",
+                Some("{}"),
+                Some("Apply signature 'default' to deliverables/x.pdf"),
+                ActionStatus::Pending,
+            )
+            .unwrap();
+
+        let ids: Vec<String> = s
+            .pending_actions_for_reconcile()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert!(ids.contains(&plain), "plain pending draft is reconcilable");
+        assert!(
+            !ids.contains(&signing),
+            "a sign_pdf card must be excluded from reconcile"
+        );
     }
 
     /// #1196 — the reconcile sweep needs each pending card's inbound arrival to

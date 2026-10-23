@@ -1,9 +1,16 @@
 //! `augmentagent` binary.
 
+mod approval_context;
+mod document_signing;
 #[cfg(test)]
 mod provider_migration_tests;
 mod model_tool;
+mod composio_auth_tool;
 mod voice_tool;
+mod phone_runtime;
+mod local_phone_transport;
+mod local_phone;
+mod discord_phone;
 mod computer_tool;
 #[cfg(test)]
 mod provider_channel_tests;
@@ -12,7 +19,15 @@ mod model_switch_sequence_tests;
 #[cfg(test)]
 mod discord_voice_session_tests;
 #[cfg(test)]
+mod discord_phone_session_tests;
+#[cfg(test)]
+mod whatsapp_phone_session_tests;
+#[cfg(test)]
 mod surface_conformance_tests;
+#[cfg(test)]
+mod calendar_approval_tests;
+#[cfg(test)]
+mod calendar_live_tests;
 #[cfg(test)]
 mod slack_approval_tests;
 #[cfg(test)]
@@ -67,29 +82,39 @@ use augmentagent_channel_linkedin::connections::{
 use augmentagent_channel_contacts::{
     CardDavSource, ContactsSource, ContactsSyncer, GooglePeopleSource,
 };
-use augmentagent_store::{ActionStatus, Store, TriageResult};
+use augmentagent_store::{ActionStatus, GmailRateRefusal, Store, TriageResult};
 use async_trait::async_trait;
 
 mod whatsapp_history;
+mod whatsapp_phone;
 mod messages_cmd;
 mod embeddings_cmd;
 mod triage_prefilter_cmd;
 mod apple_notes;
 mod imessage_send;
+mod owner_alerts;
 mod autopr_eval;
 mod autopr_health;
 mod channel_router;
 mod code_mode;
+mod compute_cli;
+mod compute_tool;
 mod doc_cmd;
+mod db_compact;
+mod deploy_snapshot;
+mod disk;
 mod doctor;
 mod env_cfg;
 mod gmail_attach;
+mod gdrive_query;
 mod repo_docs;
 mod finance;
 mod handoff_prune;
 mod heartbeat_cmd;
 mod installers;
+mod log_rotate;
 mod logs;
+mod ops_archive;
 mod newsletter;
 mod notify;
 mod loop_cmd;
@@ -621,6 +646,46 @@ enum Cmd {
         #[command(subcommand)]
         op: AutoprOp,
     },
+    /// Rotate and compress the state dir's logs and append-only sinks
+    /// (#1413): anything at `AUGMENTAGENT_LOG_ROTATE_MB` (default 50) or
+    /// not rotated since last month. Rotated files are kept for
+    /// `AUGMENTAGENT_LOG_KEEP_MONTHS` (default 3).
+    LogRotate {
+        /// Report what would happen; change nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Machine-readable output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Rotate this dir instead of the state dir.
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
+    /// Private archive of rotated logs and audit sinks (#1414). Off unless
+    /// `AUGMENTAGENT_OPS_ARCHIVE_REMOTE` names a GitHub repo, which must be
+    /// PRIVATE.
+    OpsArchive {
+        #[command(subcommand)]
+        op: OpsArchiveOp,
+    },
+    /// Database housekeeping (#1412).
+    Db {
+        #[command(subcommand)]
+        op: DbOp,
+    },
+    /// Pre-deploy snapshots and their retention (#1410): the one supported
+    /// way to back up the database and binary before a manual deploy.
+    Deploy {
+        #[command(subcommand)]
+        op: DeployOp,
+    },
+    /// Disk hygiene for build output (#1406). Cargo never deletes an
+    /// artifact; this bounds every target dir the project writes without
+    /// touching anything a warm build still uses.
+    Disk {
+        #[command(subcommand)]
+        op: DiskOp,
+    },
     Doctor {
         /// Force JSON (`--json`) or human table. Default: auto — JSON when
         /// stdout is piped, table on a tty.
@@ -644,9 +709,26 @@ enum Cmd {
         #[arg(long)]
         readiness: String,
     },
+    /// Internal owner-authorized MCP server for Composio hosted consent links.
+    #[command(hide = true)]
+    ComposioAuthTool,
     /// Internal conversation-bound MCP server for Discord speech.
     #[command(hide = true)]
     VoiceTool,
+    /// Internal owner-bound phone MCP facade.
+    #[command(hide = true)]
+    PhoneTool,
+    /// Reconcile one known phone call from provider evidence; never dials.
+    PhoneReconcile {
+        #[arg(long)]
+        call_id: String,
+        /// Candidate Twilio SID; bind only after exact provider-origin evidence.
+        #[arg(long)]
+        provider_id: Option<String>,
+    },
+    /// Internal owner-DM-bound computation MCP facade.
+    #[command(hide = true)]
+    ComputeTool,
     /// #655/#667 — one live round-trip through the provider fallback chain.
     /// Builds the production reasoner (AUGMENTAGENT_REASONER_CHAIN +
     /// eligibility checks), sends a trivial text-only prompt, and prints the
@@ -803,6 +885,118 @@ enum Cmd {
     // === end setup+maintenance subcommands ===
 }
 
+
+#[derive(Subcommand, Debug)]
+enum OpsArchiveOp {
+    /// Commit every rotated log not yet archived and push. Refuses a remote
+    /// that is not PRIVATE; skips a file that holds a secret; deletes local
+    /// rotations past `AUGMENTAGENT_LOG_KEEP_MONTHS` once the push succeeds.
+    Sync {
+        /// Report what would be archived; copy and push nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Machine-readable output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DbOp {
+    /// Drop `actions.originalBody` where it only repeats `emails.body`:
+    /// terminal no-reply actions older than
+    /// `AUGMENTAGENT_ACTION_BODY_RETENTION_DAYS` (default 30) whose email
+    /// row holds the identical text. No row or decision is removed, and
+    /// readers fall back to the email's body. The daemon does this hourly;
+    /// this is the on-demand pass.
+    Compact {
+        /// Report what would be dropped; change nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Also `VACUUM`, which is what actually shrinks the file. It
+        /// rewrites the whole database: run it when the daemon is quiet.
+        #[arg(long, default_value_t = false)]
+        vacuum: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DeployOp {
+    /// Snapshot the database (consistent while the daemon runs, compressed)
+    /// and the release binary into one dated dir. Prints the dir.
+    Snapshot {
+        /// Short name for the snapshot, e.g. the PR number.
+        #[arg(long, default_value = "manual")]
+        label: String,
+    },
+    /// Snapshots, newest first.
+    List,
+    /// Keep the newest `AUGMENTAGENT_DEPLOY_KEEP` snapshots (default 2) and
+    /// anything younger than 48 h; the same for `augmentagent.*` rollback
+    /// binaries beside the release build. The newest is never removed.
+    Prune {
+        /// Report what would go; remove nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Also list backups made by hand before this command existed
+        /// (older than 7 days, newest kept).
+        #[arg(long, default_value_t = false)]
+        strays: bool,
+        /// Actually remove the listed hand-made backups.
+        #[arg(long, default_value_t = false, requires = "strays")]
+        yes: bool,
+        /// Machine-readable output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Decompress a snapshot's database to a path. Stop the daemon first.
+    RestoreDb {
+        /// Snapshot name, as `deploy list` prints it.
+        name: String,
+        /// Where to write the database.
+        #[arg(long)]
+        to: std::path::PathBuf,
+        /// Replace an existing file.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DiskOp {
+    /// Remove cold build output: `incremental/` sessions idle 2 days,
+    /// artifacts whose cargo unit has not been used for 7 (14 where the
+    /// filesystem records no access times), and the whole `target/` of a
+    /// worktree whose branch is merged or gone. Skips any target dir a
+    /// running build is using. Tunable via `AUGMENTAGENT_PRUNE_*`; extra
+    /// dirs via `AUGMENTAGENT_PRUNE_TARGET_DIRS` (colon-separated).
+    Prune {
+        /// Report what would go and how many bytes; remove nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Machine-readable output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Prune exactly this target dir (repeatable) instead of
+        /// discovering the repo's own.
+        #[arg(long)]
+        root: Vec<std::path::PathBuf>,
+        /// With `--root`: trim down to this size in tiers (incremental,
+        /// then stale artifacts, then a full drop) instead of by age.
+        #[arg(long, requires = "root")]
+        cap_mb: Option<u64>,
+        /// Idle days an artifact needs before a `--cap-mb` trim takes it.
+        #[arg(long, requires = "cap_mb")]
+        stale_days: Option<f64>,
+    },
+    /// Free space on every filesystem that holds build output or state
+    /// (#1409), one line per mount, with what lives there.
+    Status {
+        /// Machine-readable output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
 #[derive(Subcommand)]
 enum AutoprOp {
     /// Put `agent-gave-up` issues back in the pool by recorded reason code
@@ -814,6 +1008,10 @@ enum AutoprOp {
         /// List the matching issue numbers, one per line; change nothing.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        /// Also clear each re-admitted issue's recorded attempts, so its next
+        /// failure is charged as attempt 1 instead of giving up immediately.
+        #[arg(long, default_value_t = false)]
+        reset_history: bool,
     },
 }
 
@@ -979,6 +1177,12 @@ enum DraftsOp {
 
 #[derive(Subcommand)]
 enum ApprovalsOp {
+    /// Read-only decision and execution history. Cursor pagination, newest first.
+    History {
+        #[arg(long)] before: Option<i64>,
+        #[arg(long, default_value_t=20)] limit: usize,
+        #[arg(long)] action: Option<String>,
+    },
     /// List the oldest pending drafts (action id, sender, subject, age).
     /// Read-only; safe to run anytime.
     List {
@@ -1258,6 +1462,11 @@ enum PersonOp {
 
 #[derive(Subcommand)]
 enum ImessageOp {
+    /// Proactive owner alerts, separate from approved replies to contacts.
+    Alerts {
+        #[command(subcommand)]
+        op: owner_alerts::Op,
+    },
     /// Backfill conversation history into person pages (#885). Dry-run
     /// JSON report by default; pass `--apply` to write fill-blanks pages,
     /// stamp `updated:` with last-message dates, and index phones.
@@ -1542,6 +1751,46 @@ enum MeetupOp {
 
 #[derive(Subcommand)]
 enum GdriveOp {
+    /// Upload a local file (up to 5 MB) as a new Drive file.
+    Upload {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        account: String,
+        #[arg(long)]
+        folder_id: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        mime_type: Option<String>,
+    },
+    /// Search live Drive files/folders. Query uses Google Drive v3 syntax.
+    Search {
+        #[arg(long, default_value = "trashed = false")]
+        query: String,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=100))]
+        limit: u32,
+        #[arg(long)]
+        page_token: Option<String>,
+    },
+    /// Get live metadata for a Drive file id.
+    Get {
+        #[arg(long)]
+        file_id: String,
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Read text/JSON files or export Docs/Slides as text and Sheets as CSV.
+    Read {
+        #[arg(long)]
+        file_id: String,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long, default_value_t = 30000, value_parser = clap::value_parser!(u32).range(1..=200000))]
+        max_chars: u32,
+    },
     /// List connected Drive accounts (entity → email) in this db.
     Accounts {
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
@@ -1846,6 +2095,36 @@ enum DiscordOp {
 
 #[derive(Subcommand)]
 enum DocOp {
+    /// Propose a signature on a generated PDF. Only approval publishes the signed output.
+    Sign {
+        file: PathBuf,
+        #[arg(long)] out: PathBuf,
+        #[arg(long, default_value = "default")] signature: String,
+        #[arg(long)] page: u32,
+        /// Text directly under the signature line, e.g. the signer's printed
+        /// name. The signature's ink is placed on that line.
+        #[arg(long, conflicts_with_all = ["line", "x", "y"])] anchor_text: Option<String>,
+        /// Line number from `doc sign-lines` (1-based, top to bottom).
+        #[arg(long, conflicts_with_all = ["x", "y"])] line: Option<u32>,
+        /// Bottom-left of the visible ink, PDF points from bottom-left. Only
+        /// for pages with no signature line.
+        #[arg(long, requires = "y")] x: Option<f64>,
+        #[arg(long, requires = "x")] y: Option<f64>,
+        /// Ink width in points (on a line: min(180, line length − 12); else 144).
+        #[arg(long)] width: Option<f64>,
+        /// Optional ISO date printed beside the signature.
+        #[arg(long)] date: Option<String>,
+    },
+    /// List the signature lines on a PDF's pages (JSON), with the text under each.
+    SignLines {
+        file: PathBuf,
+        #[arg(long)] page: Option<u32>,
+    },
+    /// Operator-only: install a PNG under a logical signature name. Never overwrites a name.
+    SignatureInstall { file: PathBuf, #[arg(long, default_value = "default")] name: String },
+    /// List logical signature names, without paths or image data.
+    Signatures,
+
     /// Render Markdown to a real PDF under WIKI_ROOT, ready for Discord attachment.
     RenderPdf {
         /// Wiki-relative Markdown or text file (absolute paths must also be inside WIKI_ROOT).
@@ -1944,6 +2223,20 @@ enum GmailOp {
         /// Extract text for document kinds (default true).
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         extract: bool,
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// Report provider rate-limit refusals over a window (#1384), grouped by
+    /// mailbox, action and call origin, with the observed retry-after spread
+    /// and the platform-budget (429) vs provider user-rate (envelope) split.
+    /// Counts refusals, not commands: each refused retry attempt is a row.
+    RateReport {
+        /// Window start, YYYY-MM-DD (default: 7 days ago).
+        #[arg(long)]
+        since: Option<String>,
+        /// Window end, YYYY-MM-DD inclusive (default: today).
+        #[arg(long)]
+        until: Option<String>,
         #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         json: bool,
     },
@@ -2437,7 +2730,7 @@ enum WikiOp {
     ///
     /// - Conversation and memory recall through the memory MCP server (search and read only, no memory writes).
     ///
-    /// - Bash limited to an allowlist: `augmentagent gmail` (every subcommand, including send), `finance` status/transactions/summary, `calendar` list-events/create-event, `loop`, `loops`, `meetup events`, `socialapi` and `linkedin` dm/comment, `linkedin recent-dms`, `repo-docs`, `doc render-pdf`, `imessage fetch-attachment`, and `aa-gh issue` create/list/view/comment.
+    /// - Bash limited to an allowlist: `augmentagent gmail` (every subcommand, including send), `finance` status/transactions/summary, `calendar` list-events/create-event, `loop`, `loops`, `meetup events`, `socialapi` and `linkedin` dm/comment, `linkedin recent-dms`, `repo-docs`, `doc render-pdf/sign/signatures`, `imessage fetch-attachment`, and `aa-gh issue` create/list/view/comment.
     ///
     /// Some of these act outside the wiki: sending email, filing or commenting on GitHub issues, and changing or stopping loops. Calendar events and social DMs and comments are raised as Discord approval cards and happen only when approved.
     Ask {
@@ -2452,6 +2745,10 @@ enum WikiOp {
         /// Needs DISCORD_BOT_TOKEN + DISCORD_CHANNEL_ID in the env.
         #[arg(long, default_value_t = false)]
         post: bool,
+        /// Continue the persistent local conversation in the running phone-enabled daemon.
+        /// Uses AUGMENTAGENT_PHONE_LOCAL_SOCKET and the daemon's configured wiki.
+        #[arg(long, conflicts_with = "post")]
+        daemon: bool,
     },
     /// Backfill v2 schema fields onto cold person pages via Haiku. See #78.
     ///
@@ -2540,6 +2837,7 @@ enum RatelimitOp {
 /// #1071 — how long a stop waits for cancelled runners to unwind. Kept well under
 /// systemd's `TimeoutStopSec` so the drain always ends before SIGKILL does.
 const DRAIN_BUDGET: Duration = Duration::from_secs(20);
+const _: () = assert!(augmentagent_phone::runtime::SHUTDOWN_BUDGET.as_secs() < DRAIN_BUDGET.as_secs());
 
 /// Join the daemon's tasks, bounding only the stop (#1071). Until `shutdown` fires the join is
 /// unbounded — the runners are the daemon's lifetime, and a runner error still ends it. Once
@@ -2571,6 +2869,12 @@ async fn drain_daemon_tasks(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    // Compute QA is explicitly isolated from live configuration and storage.
+    if let Cmd::CodeMode { op: code_mode::CodeModeOp::ComputeRun(ref args) } = cli.cmd {
+        std::process::exit(compute_cli::run(args).await);
+    }
+    if let Cmd::ComputeTool = cli.cmd { return compute_tool::serve(); }
     let _ = dotenvy::dotenv();
     // Send tracing to stderr so JSON-mode subcommands (consumed by the
     // dashboard via shell-out) don't get their stdout polluted with log
@@ -2584,9 +2888,14 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let cli = Cli::parse();
     if let Cmd::ModelTool { channel, ref readiness } = cli.cmd {
         return model_tool::serve(channel, readiness);
+    }
+    if let Cmd::ComposioAuthTool = cli.cmd {
+        return composio_auth_tool::serve().await;
+    }
+    if let Cmd::PhoneTool = cli.cmd {
+        return Ok(augmentagent_phone::mcp::serve()?);
     }
     if let Cmd::VoiceTool = cli.cmd {
         return voice_tool::serve();
@@ -2596,6 +2905,90 @@ async fn main() -> Result<()> {
     }
     if let Cmd::Newsletter { ref op } = cli.cmd {
         return newsletter::run(op).await;
+    }
+    // Log rotation needs no database.
+    if let Cmd::LogRotate { dry_run, json, ref dir } = cli.cmd {
+        let dir = dir
+            .clone()
+            .or_else(augmentagent_channel_core::state_dir::state_dir)
+            .context("no --dir and no HOME to locate the state dir")?;
+        // With the archive on, it takes expired rotations before they go.
+        let archive_on = ops_archive::remote_from_env().is_some();
+        return log_rotate::run_cli(&dir, dry_run, json, archive_on, &mut std::io::stdout().lock());
+    }
+    if let Cmd::OpsArchive { op: OpsArchiveOp::Sync { dry_run, json } } = cli.cmd {
+        return ops_archive::run_cli(dry_run, json, &mut std::io::stdout().lock());
+    }
+    // Snapshots read the database file directly; they must not open (and
+    // migrate) it through the store.
+    if let Cmd::Deploy { ref op } = cli.cmd {
+        let root = deploy_snapshot::snapshot_root()
+            .context("no AUGMENTAGENT_DEPLOY_SNAPSHOT_DIR and no HOME to locate the snapshot dir")?;
+        let repo_root = std::env::current_dir().context("current_dir")?;
+        let release = repo_root.join("target/release");
+        let mut out = std::io::stdout().lock();
+        return match op {
+            DeployOp::Snapshot { label } => {
+                let db = cli
+                    .db
+                    .clone()
+                    .or_else(|| std::env::var("AUGMENTAGENT_DB").ok().map(PathBuf::from))
+                    .unwrap_or_else(|| PathBuf::from("data.db"));
+                let sha = std::process::Command::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+                let dir = deploy_snapshot::snapshot(
+                    &db,
+                    Some(&release.join("augmentagent")),
+                    &root,
+                    label,
+                    sha.as_deref(),
+                    chrono::Utc::now(),
+                )?;
+                use std::io::Write as _;
+                writeln!(out, "{}", dir.display())?;
+                Ok(())
+            }
+            DeployOp::List => deploy_snapshot::run_list(&root, &mut out),
+            DeployOp::Prune { dry_run, strays, yes, json } => deploy_snapshot::run_prune(
+                &root,
+                Some(&release),
+                &deploy_snapshot::PruneOptions {
+                    dry_run: *dry_run,
+                    strays: *strays,
+                    yes: *yes,
+                    keep: deploy_snapshot::keep_from_env(),
+                },
+                *json,
+                &mut out,
+            ),
+            DeployOp::RestoreDb { name, to, force } => {
+                deploy_snapshot::restore_db(&root.join(name), to, *force)
+            }
+        };
+    }
+    // Build-output housekeeping needs no database either.
+    if let Cmd::Disk { ref op } = cli.cmd {
+        let repo_root = std::env::current_dir().context("current_dir")?;
+        return match op {
+            DiskOp::Prune { dry_run, json, root, cap_mb, stale_days } => disk::run_prune(
+                &repo_root,
+                &disk::Options {
+                    dry_run: *dry_run,
+                    json: *json,
+                    roots: root.clone(),
+                    cap_mb: *cap_mb,
+                    stale_days: *stale_days,
+                },
+                &mut std::io::stdout().lock(),
+            ),
+            DiskOp::Status { json } => {
+                disk::run_status(&repo_root, *json, &mut std::io::stdout().lock())
+            }
+        };
     }
     // Journal housekeeping needs no database.
     if let Cmd::HandoffPrune {
@@ -2638,6 +3031,14 @@ async fn main() -> Result<()> {
     }
     // PDF exports need no database or network credentials. In particular, do
     // not try to create data.db when invoked from a fresh wiki directory.
+    if let Cmd::Doc { op: DocOp::SignLines { ref file, page } } = cli.cmd {
+        let root = std::env::var_os("WIKI_ROOT")
+            .map(PathBuf::from)
+            .context("WIKI_ROOT must be set to the wiki directory")?;
+        let lines = augmentagent_docs::signing::sign_lines(&root, file, page).await?;
+        println!("{}", serde_json::to_string(&lines)?);
+        return Ok(());
+    }
     if let Cmd::Doc {
         op:
             DocOp::RenderPdf {
@@ -2889,6 +3290,13 @@ async fn main() -> Result<()> {
                 _ => None,
             };
             let mut broker_error = None;
+            // A dry run starts no Discord bot, so it must not touch the claims.
+            let interrupted_discord_turns = if dry_run {
+                Vec::new()
+            } else {
+                interrupt_dead_discord_turns(&store)
+            };
+            let discord_phone_pending: discord_phone::PendingSlot = Arc::new(std::sync::Mutex::new(None));
             let (broker, approver) = match build_approval_surfaces(
                 &cli,
                 Arc::clone(&store),
@@ -2896,6 +3304,8 @@ async fn main() -> Result<()> {
                 routing,
                 slack_approvals.clone(),
                 card_surfaces.clone(),
+                interrupted_discord_turns,
+                Some(discord_phone_pending.clone()),
             )
             .await
             {
@@ -3130,6 +3540,73 @@ async fn main() -> Result<()> {
             });
             // Collect the enabled channels' runners + optional digest scheduler.
             let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
+            let phone = if cli.wiki_dir.is_some() {
+                match phone_runtime::start(Arc::clone(&store), dry_run).await {
+                    Ok(Some((endpoint, runtime))) => {
+                        tasks.push(tokio::spawn(phone_runtime::supervise(runtime, shutdown.clone())));
+                        Some(endpoint)
+                    }
+                    Ok(None) => None,
+                    Err(_) => { warn!("phone runtime unavailable: check private phone configuration and loopback listener"); None }
+                }
+            } else { None };
+
+
+            if phone.is_none() {
+                if let Some(cleanup) = phone_runtime::cleanup_when_unavailable(store.clone(), dry_run) {
+                    tasks.push(cleanup);
+                }
+            }
+
+            if let (Some(endpoint), Some(wiki), Some(socket)) = (
+                phone.as_ref(), cli.wiki_dir.as_ref(), std::env::var_os("AUGMENTAGENT_PHONE_LOCAL_SOCKET"),
+            ) {
+                let query = wiki_querier(build_reasoner(), wiki.clone(),
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")), store.clone(), false);
+                let _ = query.phone_tools.set(endpoint.tools.clone());
+                match local_phone::spawn(endpoint.clone(), store.clone(), Arc::new(query), wiki.clone(), socket.into(), shutdown.clone()) {
+                    Ok(worker) => tasks.push(worker),
+                    Err(_) => warn!("local phone conversation unavailable: check private socket directory and explicit OS-owner link"),
+                }
+            }
+
+            let pending_discord = discord_phone_pending.lock().ok().and_then(|mut pending| pending.take());
+            let _discord_phone_registration = match (phone.as_ref(), pending_discord) {
+                (Some(endpoint), Some(connection)) => match discord_phone::install(endpoint, connection, store.clone(), shutdown.clone()) {
+                    Ok((registration, worker)) => { tasks.push(worker); Some(registration) }
+                    Err(_) => { warn!("Discord phone unavailable: check explicit owner link and control-chat binding"); None }
+                },
+                _ => None,
+            };
+
+            if let (Some(endpoint), Some(wiki)) = (phone.as_ref(), cli.wiki_dir.as_ref()) {
+                if augmentagent_channel_whatsapp::control_enabled()
+                    && endpoint.service.linked_surface_owners().iter().any(|owner| {
+                        owner.account().platform().as_str() == "whatsapp"
+                    })
+                {
+                    let query = wiki_querier(
+                        build_reasoner(), wiki.clone(),
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                        store.clone(), false,
+                    );
+                    let _ = query.phone_tools.set(endpoint.tools.clone());
+                    tasks.push(whatsapp_phone::spawn(
+                        endpoint.clone(), store.clone(), Arc::new(query),
+                        approver.clone().map(|handler| handler as Arc<dyn ApprovalActionHandler>),
+                        wiki.clone(), augmentagent_channel_whatsapp::default_socket_path(),
+                        shutdown.clone(),
+                    ));
+                }
+            }
+
+            // #1412 — drop action bodies that only repeat the stored email,
+            // shortly after start and hourly, in small batches.
+            tasks.push(tokio::spawn(db_compact::run_loop(Arc::clone(&store), shutdown.clone())));
+
+            // #1434 — task leases recover at startup and at most 30 seconds
+            // apart; retained compute artifacts expire after 24 hours.
+            tasks.push(tokio::spawn(augmentagent_channel_core::code_mode::compute::retention::run_sweep_loop(shutdown.clone())));
 
             // #1035 — reasoner handoff journals: remove finished ones idle past
             // the grace period, at start and hourly, on the blocking pool.
@@ -3404,33 +3881,36 @@ async fn main() -> Result<()> {
             {
                 let store_q = Arc::clone(&store);
                 let wiki_root = cli.wiki_dir.clone();
+                let phone_q = phone.clone();
+                let phone_service = phone.as_ref().map(|endpoint| endpoint.service.clone());
                 // Only a surface that got the approval handler takes clicks.
                 let slack_approvals = slack_approvals.filter(|_| approver.is_some());
                 tasks.push(slack_serve::spawn(
                     Arc::clone(&store),
                     slack_plan,
-                    move |history| -> Arc<dyn augmentagent_channel_slack::interactive::SlackTurnHandler> {
-                        match wiki_root {
-                            // #1288 — the shared conversation harness over
-                            // the same WikiQuerier Discord answers with.
-                            Some(root) => slack_serve::conversation_handler(
-                                Arc::clone(&store_q),
-                                Arc::new(wiki_querier(
-                                    build_reasoner(),
-                                    root.clone(),
-                                    std::env::current_dir()
-                                        .unwrap_or_else(|_| PathBuf::from(".")),
-                                    store_q,
-                                    false,
-                                )),
-                                root,
-                                history,
-                            ),
-                            None => Arc::new(slack_serve::NoQueryHandler),
+                    move |history, wake| -> Result<Arc<dyn augmentagent_channel_slack::interactive::SlackTurnHandler>> {
+                        let Some(root) = wiki_root else { return Ok(Arc::new(slack_serve::NoQueryHandler)); };
+                        let query = wiki_querier(
+                            build_reasoner(), root.clone(),
+                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                            store_q.clone(), false,
+                        );
+                        if let Some(endpoint) = &phone_q {
+                            let _ = query.phone_tools.set(endpoint.tools.clone());
+                        }
+                        let query: Arc<dyn QueryHandler> = Arc::new(query);
+                        let handler = slack_serve::conversation_handler(
+                            store_q.clone(), query.clone(), root.clone(),
+                            history.clone().map(|h| h as Arc<dyn augmentagent_channel_slack::history::TurnHistory>),
+                        );
+                        match phone_q {
+                            Some(endpoint) => phone_runtime::attach_slack(&endpoint, store_q, query, root, history, wake, handler),
+                            None => Ok(handler),
                         }
                     },
                     slack_approvals,
                     slack_commands,
+                    phone_service,
                     slack_live,
                     dry_run,
                     shutdown.clone(),
@@ -3587,6 +4067,24 @@ async fn main() -> Result<()> {
             // next tick. Skipped under dry-run (NoopBroker) — bumping
             // counters with no visible card is pointless.
             if !dry_run {
+                if !no_email {
+                    let assessment_store=Arc::clone(&store);
+                    let assessment_reasoner=build_reasoner();
+                    let assessment_wiki=cli.wiki_dir.clone();
+                    let assessment_shutdown=shutdown.clone();
+                    tasks.push(tokio::spawn(async move {
+                        augmentagent_channel_email::owner_alerts::run_backfill(assessment_store,assessment_reasoner,
+                            assessment_wiki,assessment_shutdown).await;
+                        Ok(())
+                    }));
+                }
+                let alert_store=Arc::clone(&store);
+                let alert_broker=Arc::clone(&broker);
+                let alert_shutdown=shutdown.clone();
+                tasks.push(tokio::spawn(async move {
+                    augmentagent_approval_discord::owner_alerts::run(alert_store,alert_broker,alert_shutdown).await;
+                    Ok(())
+                }));
                 let nudge = Arc::new(augmentagent_approval_discord::NudgeScheduler::new(
                     Arc::clone(&store),
                     Arc::clone(&broker),
@@ -3772,10 +4270,13 @@ async fn main() -> Result<()> {
         },
         Cmd::Wiki { ref op } => match op {
             WikiOp::Lint { out } => run_wiki_lint(&cli, Arc::clone(&store), out.clone()).await,
-            WikiOp::Ask { question, stdin, post } => {
+            WikiOp::Ask { question, stdin, post, daemon } => {
                 let question = if *stdin { read_wiki_question(std::io::stdin().lock())? }
                     else { question.clone().context("question or --stdin is required")? };
-                run_wiki_ask(&cli, question, *post).await
+                if *daemon {
+                    println!("{}", local_phone::ask(question).await?);
+                    Ok(())
+                } else { run_wiki_ask(&cli, question, *post).await }
             },
             WikiOp::Migrate {
                 to,
@@ -3811,9 +4312,16 @@ async fn main() -> Result<()> {
         } => research::run_research(store, since_hours, post_discord, dry_run, max_issues).await,
         Cmd::RepoDocs { .. } => unreachable!("handled before database initialization"),
         Cmd::HandoffPrune { .. } => unreachable!("handled before database initialization"),
+        Cmd::Disk { .. } => unreachable!("handled before database initialization"),
+        Cmd::Deploy { .. } => unreachable!("handled before database initialization"),
+        Cmd::LogRotate { .. } => unreachable!("handled before database initialization"),
+        Cmd::OpsArchive { .. } => unreachable!("handled before database initialization"),
         Cmd::Gmail { ref op } => match op {
             GmailOp::Search { query, limit, full, account } => {
                 run_gmail_search(store, query.clone(), *limit, *full, account.clone()).await
+            }
+            GmailOp::RateReport { since, until, json } => {
+                run_gmail_rate_report(store, since.clone(), until.clone(), *json)
             }
             GmailOp::Accounts { json } => run_gmail_accounts(store, *json).await,
             GmailOp::ListAttachments { account, message_id, json } => {
@@ -3919,6 +4427,26 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Doc { ref op } => match op {
+            DocOp::SignatureInstall { ref file, ref name } => {
+                let hash = augmentagent_docs::signing::install(&augmentagent_docs::signing::state_root()?, name, file)?;
+                println!("Installed signature {name}; SHA-256 {hash}"); Ok(())
+            }
+            DocOp::Signatures => {
+                println!("{}", serde_json::to_string(&augmentagent_docs::signing::list(&augmentagent_docs::signing::state_root()?)?)?); Ok(())
+            }
+            DocOp::Sign { ref file, ref out, ref signature, page, ref anchor_text, line, x, y, width, ref date } => {
+                use augmentagent_docs::signing::{PlacementRequest, Target};
+                let target = match (anchor_text, line, x, y) {
+                    (Some(text), ..) => Target::AnchorText(text.clone()),
+                    (_, Some(line), ..) => Target::Line(*line),
+                    (_, _, Some(x), Some(y)) => Target::Ink { x: *x, y: *y, width: width.unwrap_or(144.) },
+                    _ => anyhow::bail!("give --anchor-text (preferred), --line, or --x/--y; run doc sign-lines to see the page's lines"),
+                };
+                let width = if matches!(target, Target::Ink { .. }) { None } else { *width };
+                document_signing::propose(store.clone(), file, out, signature,
+                    PlacementRequest { page: *page, target, width, date: date.clone() }).await
+            }
+            DocOp::SignLines { .. } => unreachable!("sign-lines dispatched before store initialization"),
             DocOp::RenderPdf { .. } => unreachable!("PDF rendering dispatched before store initialization"),
             DocOp::Extract { file, out, kind, no_ocr, json } => {
                 doc_cmd::run_doc_extract(file.clone(), out.clone(), kind.clone(), *no_ocr, *json)
@@ -4269,6 +4797,7 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Imessage { ref op } => match op {
+            ImessageOp::Alerts { op } => owner_alerts::run(&store, op).await,
             ImessageOp::Sync { apply } => {
                 run_imessage_sync(&cli, store, *apply)?;
                 Ok(())
@@ -4564,6 +5093,14 @@ async fn main() -> Result<()> {
         },
         Cmd::Gdrive { ref op } => match op {
             GdriveOp::Accounts { json } => run_gdrive_accounts(store, *json),
+            GdriveOp::Upload { file, account, folder_id, name, mime_type } =>
+                gdrive_query::upload(&store, account, file, folder_id.as_deref(), name.as_deref(), mime_type.as_deref()).await,
+            GdriveOp::Search { query, account, limit, page_token } =>
+                gdrive_query::search(&store, account.as_deref(), query, *limit, page_token.as_deref()).await,
+            GdriveOp::Get { file_id, account } =>
+                gdrive_query::get(&store, account.as_deref(), file_id).await,
+            GdriveOp::Read { file_id, account, max_chars } =>
+                gdrive_query::read(&store, account.as_deref(), file_id, *max_chars).await,
             GdriveOp::PollOnce { dry_run } => {
                 let (broker, _) = build_broker(&cli, Arc::clone(&store), *dry_run).await?;
                 let ch = build_gdrive_channel(store, broker, *dry_run)?;
@@ -4668,6 +5205,10 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Approvals { op } => match op {
+            ApprovalsOp::History { before, limit, action } => {
+                println!("{}",serde_json::to_string_pretty(&store.approval_history(before,limit,action.as_deref())?)?);
+                Ok(())
+            },
             ApprovalsOp::List { limit } => run_approvals_list(store, limit),
             ApprovalsOp::ApproveAll { yes } => run_approvals_approve_all(store, yes),
             ApprovalsOp::DiscardOlder { days, yes } => {
@@ -4750,7 +5291,8 @@ async fn main() -> Result<()> {
         Cmd::TokenUsage { days, json } => {
             use augmentagent_channel_core::token_usage as tu;
             let path = tu::default_usage_log_path();
-            let raw = std::fs::read_to_string(&path).unwrap_or_default();
+            // #1413 — a report window can straddle a rotation.
+            let raw = log_rotate::read_with_rotated(&path);
             let mut rolled = tu::rollup(&raw);
             if rolled.len() > days as usize {
                 rolled.drain(..rolled.len() - days as usize);
@@ -4790,9 +5332,9 @@ async fn main() -> Result<()> {
             .await?;
             std::process::exit(code);
         }
-        Cmd::Autopr { op: AutoprOp::Readmit { reason, dry_run } } => {
+        Cmd::Autopr { op: AutoprOp::Readmit { reason, dry_run, reset_history } } => {
             let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            for n in self_improve::readmit(&root, &reason, dry_run).await? {
+            for n in self_improve::readmit(&root, &reason, dry_run, reset_history).await? {
                 if dry_run {
                     println!("{n}");
                 } else {
@@ -4812,7 +5354,11 @@ async fn main() -> Result<()> {
         }
         Cmd::Env { ref op, json } => env_cfg::run_env(op, json),
         Cmd::ModelTool { channel, ref readiness } => model_tool::serve(channel, readiness),
+        Cmd::ComposioAuthTool => composio_auth_tool::serve().await,
         Cmd::VoiceTool => voice_tool::serve(),
+        Cmd::PhoneTool => Ok(augmentagent_phone::mcp::serve()?),
+        Cmd::PhoneReconcile { ref call_id, ref provider_id } => phone_runtime::reconcile_local(&store, call_id, provider_id.as_deref()).await,
+        Cmd::ComputeTool => compute_tool::serve(),
         Cmd::ReasonerSelftest { ref prompt, ref profile, tool_probe } =>
             run_reasoner_selftest(prompt, profile.as_deref(), tool_probe).await,
         Cmd::Install { component } => installers::run_install(component).await,
@@ -4828,6 +5374,9 @@ async fn main() -> Result<()> {
         Cmd::Loops { op } => loops::run(op).await,
         Cmd::Service { op, ref unit, json } => service::run_service(op, unit, json).await,
         Cmd::Setup { ref op } => setup::run_setup(op).await,
+        Cmd::Db { op: DbOp::Compact { dry_run, vacuum } } => {
+            db_compact::run_cli(&store, &db_path, dry_run, vacuum, &mut std::io::stdout().lock())
+        }
         Cmd::Status {
             json,
             channel,
@@ -5137,7 +5686,9 @@ async fn run_gmail_search(
     account_filter: Option<String>,
 ) -> Result<()> {
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
-    let gmail = ComposioClient::new(api_key).with_rate_limit_store(Arc::clone(&store));
+    let gmail = ComposioClient::new(api_key)
+        .with_rate_limit_store(Arc::clone(&store))
+        .with_call_origin("interactive");
     let mut accounts = store.get_active_gmail_accounts()?;
     if accounts.is_empty() {
         println!("(no active gmail accounts)");
@@ -5631,6 +6182,136 @@ fn unescape_body(s: &str) -> String {
         }
     }
     out
+}
+
+/// One group of refusals (by mailbox, or by action) with the retry-after
+/// spread the issue asks for (#1384).
+#[derive(serde::Serialize)]
+struct RefusalGroup {
+    key: String,
+    count: usize,
+    platform: usize,
+    provider: usize,
+    retry_after_min_ms: Option<i64>,
+    retry_after_median_ms: Option<i64>,
+    retry_after_max_ms: Option<i64>,
+}
+
+fn group_refusals<'a>(
+    rows: &'a [GmailRateRefusal],
+    key_of: impl Fn(&'a GmailRateRefusal) -> String,
+) -> Vec<RefusalGroup> {
+    use std::collections::BTreeMap;
+    let mut by_key: BTreeMap<String, Vec<&GmailRateRefusal>> = BTreeMap::new();
+    for row in rows {
+        by_key.entry(key_of(row)).or_default().push(row);
+    }
+    let mut groups: Vec<_> = by_key
+        .into_iter()
+        .map(|(key, rows)| {
+            // The wait the provider asked for, relative to when it refused.
+            let mut waits: Vec<i64> = rows
+                .iter()
+                .filter_map(|r| r.retry_after_ms.map(|ms| ms - r.observed_at_ms))
+                .collect();
+            waits.sort_unstable();
+            RefusalGroup {
+                key,
+                count: rows.len(),
+                platform: rows.iter().filter(|r| r.class == "http_429").count(),
+                provider: rows.iter().filter(|r| r.class == "envelope").count(),
+                retry_after_min_ms: waits.first().copied(),
+                retry_after_median_ms: waits.get(waits.len() / 2).copied(),
+                retry_after_max_ms: waits.last().copied(),
+            }
+        })
+        .collect();
+    groups.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.key.cmp(&b.key)));
+    groups
+}
+
+fn render_refusal_groups(title: &str, groups: &[RefusalGroup]) {
+    let wait = |ms: Option<i64>| match ms {
+        Some(ms) if ms >= 3_600_000 => format!("{:.1}h", ms as f64 / 3_600_000.0),
+        Some(ms) if ms >= 60_000 => format!("{:.1}m", ms as f64 / 60_000.0),
+        Some(ms) => format!("{}s", ms / 1_000),
+        None => "-".into(),
+    };
+    println!("\n{title}  (count  platform/provider  retry-after min/median/max)");
+    for g in groups {
+        let (min, med, max) =
+            (wait(g.retry_after_min_ms), wait(g.retry_after_median_ms), wait(g.retry_after_max_ms));
+        println!(
+            "  {:<40} {:>5}  {}/{}  {min}/{med}/{max}",
+            g.key, g.count, g.platform, g.provider,
+        );
+    }
+}
+
+fn day_bound_ms(raw: &Option<String>, flag: &str, default_ms: i64, end_of_day: bool) -> Result<i64> {
+    let Some(raw) = raw else { return Ok(default_ms) };
+    let day = chrono::NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d")
+        .with_context(|| format!("{flag} must be YYYY-MM-DD"))?;
+    // The query bound is inclusive, so the last millisecond of the named day
+    // has to be inside it — `23:59:59.000` would drop a refusal observed in
+    // that final second.
+    let (h, m, s, milli) = if end_of_day { (23, 59, 59, 999) } else { (0, 0, 0, 0) };
+    Ok(day.and_hms_milli_opt(h, m, s, milli).unwrap().and_utc().timestamp_millis())
+}
+
+fn run_gmail_rate_report(
+    store: Arc<Store>,
+    since: Option<String>,
+    until: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let now = chrono::Utc::now();
+    let week_ago = (now - chrono::Duration::days(7)).timestamp_millis();
+    let from_ms = day_bound_ms(&since, "--since", week_ago, false)?;
+    let to_ms = day_bound_ms(&until, "--until", now.timestamp_millis(), true)?;
+    let rows = store.gmail_rate_refusals_between(from_ms, to_ms)?;
+
+    // The mailbox is the one snapshotted when the provider refused, so a
+    // since-disconnected account still reports under its own address.
+    let by_account =
+        group_refusals(&rows, |r| r.mailbox.clone().unwrap_or_else(|| r.entity_id.clone()));
+    let by_action = group_refusals(&rows, |r| r.action.clone());
+    let by_origin = group_refusals(&rows, |r| r.origin.clone());
+    let platform = rows.iter().filter(|r| r.class == "http_429").count();
+    let provider = rows.iter().filter(|r| r.class == "envelope").count();
+
+    let window = |ms: i64| {
+        chrono::DateTime::from_timestamp_millis(ms)
+            .map_or_else(|| ms.to_string(), |d| d.format("%Y-%m-%d").to_string())
+    };
+    let (from, to) = (window(from_ms), window(to_ms));
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "since": from,
+                "until": to,
+                "total": rows.len(),
+                "platform_429": platform,
+                "provider_user_rate": provider,
+                "by_account": by_account,
+                "by_action": by_action,
+                "by_origin": by_origin,
+            }))?
+        );
+    } else if rows.is_empty() {
+        println!("(no rate-limit refusals between {from} and {to})");
+    } else {
+        println!(
+            "{} rate-limit refusals {from} → {to}: {platform} platform-budget (HTTP 429), \
+             {provider} provider user-rate",
+            rows.len(),
+        );
+        render_refusal_groups("by mailbox", &by_account);
+        render_refusal_groups("by action", &by_action);
+        render_refusal_groups("by origin", &by_origin);
+    }
+    Ok(())
 }
 
 async fn run_gmail_accounts(store: Arc<Store>, json: bool) -> Result<()> {
@@ -7605,7 +8286,11 @@ async fn run_outbound_observer(
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n >= 30)
         .unwrap_or(300);
-    let gmail = Arc::new(ComposioClient::new(api_key).with_rate_limit_store(Arc::clone(&store)));
+    let gmail = Arc::new(
+        ComposioClient::new(api_key)
+            .with_rate_limit_store(Arc::clone(&store))
+            .with_call_origin("background"),
+    );
     let observer = OutboundObserver::new(store, gmail, 200);
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
     info!(interval_secs, "outbound observer started");
@@ -7808,12 +8493,16 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
             continue;
         }
         // Rule 2 — bulk/marketing sender. Cheap, purely local, so check first.
-        // #1289 — not for Slack contact replies: their `from` is a name and
-        // a Slack user ID (`Name <slack:U…>`), never an address, so the rule
-        // would retire every one of them. (Other chat platforms share the
-        // shape; they are outside #1289 and keep the old behaviour.)
-        let addressless = row.platform == augmentagent_channel_slack::PLATFORM;
-        if !addressless && !is_human_sender(&row.from_email, &row.body) {
+        // `is_human_sender` reads a mailbox address, which only email cards
+        // have: every chat platform's `from` is a name plus a platform id
+        // (`Name <slack:U…>`, `Name <twitter:…>`, `user-{id}`, …) and always
+        // fails the check, so the rule retired all of them (#1289 Slack, #1503
+        // signing, #1505 the rest). Gate on the email platform instead of
+        // exempting platforms one at a time. A card with no joined email row
+        // surfaces platform '' — unknown provenance, so skip Rule 2 there too;
+        // Rule 3, Rule 1 and the 7-day expiry still apply.
+        let email_platform = row.platform == augmentagent_channel_email::inbound::PLATFORM;
+        if email_platform && !is_human_sender(&row.from_email, &row.body) {
             info!(
                 action_id = %row.id,
                 from = %row.from_email,
@@ -8256,6 +8945,8 @@ mod wiki_question_stdin_tests {
         assert!(matches!(cli.cmd, Cmd::Wiki { op: WikiOp::Ask { question: None, stdin: true, .. } }));
         assert!(Cli::try_parse_from(["augmentagent", "wiki", "ask"]).is_err());
         assert!(Cli::try_parse_from(["augmentagent", "wiki", "ask", "private", "--stdin"]).is_err());
+        assert!(Cli::try_parse_from(["augmentagent", "wiki", "ask", "--stdin", "--daemon"]).is_ok());
+        assert!(Cli::try_parse_from(["augmentagent", "wiki", "ask", "--stdin", "--daemon", "--post"]).is_err());
     }
 }
 
@@ -9981,6 +10672,7 @@ struct WikiQuerier {
     conversation_scheduler: Arc<augmentagent_approval_discord::conversation::ConversationScheduler>,
     voice_enabled: bool,
     voice_tools: std::sync::OnceLock<Arc<augmentagent_approval_discord::voice_tool::VoiceToolService>>,
+    phone_tools: std::sync::OnceLock<Arc<augmentagent_phone::tools::ToolServer>>,
     final_spoken_turns: dashmap::DashMap<String, ()>,
 }
 
@@ -10003,6 +10695,7 @@ fn wiki_querier(
             augmentagent_approval_discord::conversation::ConversationScheduler::new(),
         ),
         voice_enabled,
+        phone_tools: std::sync::OnceLock::new(),
         voice_tools: std::sync::OnceLock::new(),
         final_spoken_turns: dashmap::DashMap::new(),
     }
@@ -10173,7 +10866,26 @@ impl QueryHandler for WikiQuerier {
         ctx: &augmentagent_approval_discord::AuditCtx,
         question: &str,
     ) -> anyhow::Result<String> {
+        let discord_history = ctx.owner_authorized && ctx.channel_id.is_some_and(|channel| {
+            std::env::var("DISCORD_QUERY_CHANNEL_ID").or_else(|_|std::env::var("DISCORD_CHANNEL_ID"))
+                .ok().and_then(|v|v.parse::<u64>().ok()) == Some(channel.get())
+        });
+        let history_allowed = discord_history || augmentagent_approval_discord::interaction::history_allowed();
+        let question = approval_context::inject(self.conversation_store.as_deref(), history_allowed, question)?;
+        let question = question.as_str();
         let mut opts = ask_opts(self.wiki_root.clone(), self.repo_root.clone());
+        if history_allowed {
+            if let Some(store)=self.conversation_store.as_ref() {
+                let db=store.db_path();
+                let db=if db.is_absolute() {db.to_path_buf()} else {std::env::current_dir()?.join(db)};
+                opts.env.push(("AUGMENTAGENT_DB".into(),db.display().to_string()));
+            }
+            let bin=self.repo_root.join("target/release/augmentagent");
+            for prefix in ["augmentagent".to_string(),bin.display().to_string()] {
+                opts.allowed_tools.push(format!("Bash({prefix} approvals history*)"));
+            }
+        }
+
         // #1288 — per-turn environment from the surface running this turn
         // (Slack's inbound file directory, which the scope guard and the
         // Codex bridge grant read-only). Empty for Discord turns.
@@ -10182,6 +10894,35 @@ impl QueryHandler for WikiQuerier {
         enable_newsletter_tools(&mut opts, ctx);
         computer_tool::configure(&mut opts, ctx, &self.repo_root);
         model_tool::configure(&mut opts, ctx, &self.reasoner, &self.repo_root.join("target/release/augmentagent"));
+        // Unit-test query fixtures launch synthetic MCP servers: the test
+        // executable has libtest's entry point, not the CLI subcommands.
+        #[cfg(test)]
+        let auth_bin = self.repo_root.join("target/release/augmentagent");
+        #[cfg(not(test))]
+        let auth_bin = std::env::current_exe()?;
+        composio_auth_tool::configure(
+            &mut opts,
+            ctx,
+            &auth_bin,
+            self.conversation_store.as_ref().map(|store| store.db_path()),
+        )?;
+        let compute_turn = match compute_tool::attach(&mut opts, ctx, &std::env::current_exe()?).await {
+            Ok(turn) => turn,
+            Err(_) => {
+                warn!("owner compute unavailable: host policy or runtime setup failed");
+                None
+            }
+        };
+        // The scoped origin comes only from an authenticated interactive transport.
+        // Keep this capability alive through the native provider call below.
+        // Phone authority is the scoped transport origin plus the server grant,
+        // independently of Discord's owner_authorized flag. attach_tools returns
+        // no capability without a scope and revalidates explicit owner bindings.
+        let _phone_grant = self.phone_tools
+            .get()
+            .map(|server| augmentagent_channel_core::phone_agent::attach_tools(&mut opts, server, &auth_bin))
+            .transpose()?
+            .flatten();
         let voice_grant = self.voice_tools.get().and_then(|service| {
             let guild = ctx.guild_id?;
             let channel = ctx.channel_id?;
@@ -10252,6 +10993,9 @@ impl QueryHandler for WikiQuerier {
             voice_grant.as_ref().is_some_and(|(_, grant)| grant.final_spoken()) {
             self.final_spoken_turns.insert(ctx.session_id.clone(), ());
         }
+        if let Some(turn) = compute_turn {
+            turn.finish().await.context("compute task cleanup could not be verified")?;
+        }
         sweep_imessage_attachments(&opts.env);
         answer
     }
@@ -10266,6 +11010,20 @@ impl QueryHandler for WikiQuerier {
             if history.is_empty() { current.to_string() }
             else { format!("{history}\n\nuser's current message:\n{current}") }
         };
+        if let Some(turn) = augmentagent_phone::context::current() {
+            if turn.origin.conversation.account().platform().as_str() == "whatsapp" {
+                let store = self.conversation_store.as_ref().context("WhatsApp conversation store unavailable")?;
+                let tools = self.phone_tools.get().context("WhatsApp phone tools unavailable")?;
+                return phone_runtime::whatsapp_text_turn(store, tools, self, ctx, &turn.origin,
+                    &self.wiki_root, history, current).await;
+            }
+            if turn.origin.conversation.account().platform().as_str() == "discord" {
+                let store = self.conversation_store.as_ref().context("Discord conversation store unavailable")?;
+                let tools = self.phone_tools.get().context("Discord phone tools unavailable")?;
+                return phone_runtime::discord_text_turn(store, tools, self, ctx, &turn.origin,
+                    &self.wiki_root, history, current).await;
+            }
+        }
         let (Some(guild_id), Some(channel_id), Some(store)) =
             (ctx.guild_id, ctx.channel_id, self.conversation_store.as_ref())
         else {
@@ -10323,6 +11081,23 @@ impl QueryHandler for WikiQuerier {
             .map_err(anyhow::Error::msg)
     }
 
+    async fn phone_command(&self, context: &augmentagent_approval_discord::phone::PhoneCommandContext, text: &str) -> Option<String> {
+        let tools = self.phone_tools.get()?;
+        let origin = match context.origin() { Ok(origin) => origin, Err(_) => return Some("Discord phone identity unavailable".into()) };
+        let event_id = format!("discord:{}:{}", context.channel_id, context.message_id);
+        if context.guild_id.is_none() {
+            tools.discord_private_command(&origin.owner, &origin.conversation, &event_id, text).await
+        } else {
+            tools.command(&origin.owner, &origin.conversation, &event_id, text).await
+        }
+    }
+
+    fn phone_origin(&self, context: &augmentagent_approval_discord::phone::PhoneCommandContext) -> Option<augmentagent_store::phone::PhoneOrigin> {
+        let origin = context.origin().ok()?;
+        let _grant = self.phone_tools.get()?.grant(&origin.owner, &origin.conversation, None).ok()?;
+        Some(origin)
+    }
+
     async fn model_command(&self, channel_id: u64, text: &str) -> Option<String> {
         use augmentagent_channel_core::model_selection::{config_path, run_command, SelectionStore};
         let store = SelectionStore::new(config_path());
@@ -10337,22 +11112,22 @@ impl QueryHandler for WikiQuerier {
         channel_id: u64,
         text: &str,
     ) -> Option<String> {
+        if let (Some(turn), Some(store)) = (augmentagent_phone::context::current(), self.conversation_store.as_ref()) {
+            if turn.origin.conversation.account().platform().as_str() == "discord" {
+                match store.surface_conversation(&turn.origin.conversation) {
+                    Ok(Some(binding)) => {
+                        if let Some(reply) = native_model_switch_refusal(&binding.provider, &binding.native_session_id, text) { return Some(reply); }
+                    }
+                    Ok(None) => {}
+                    Err(_) => return Some("Model selection unavailable: conversation storage failed".into()),
+                }
+            }
+        }
         if self.voice_enabled {
             if let (Some(guild), Some(store)) = (guild_id, self.conversation_store.as_ref()) {
                 match store.discord_conversation(&guild.to_string(), &channel_id.to_string()) {
                     Ok(Some(binding)) => {
-                        let mut words = text.split_whitespace();
-                        if matches!(words.next(), Some("/model" | "model")) {
-                            let args: Vec<_> = words.collect();
-                            let same = matches!(args.as_slice(), ["set", name] | [name]
-                                if *name == binding.provider);
-                            if !same && !matches!(args.as_slice(), [] | ["help"] | ["list"] | ["status"]) {
-                                return Some(format!(
-                                    "This conversation is bound to native {} session {}. Switching models would start a different session; the current binding stays unchanged.",
-                                    binding.provider, binding.native_session_id
-                                ));
-                            }
-                        }
+                        if let Some(reply) = native_model_switch_refusal(&binding.provider, &binding.native_session_id, text) { return Some(reply); }
                     }
                     Ok(None) => {}
                     Err(error) => return Some(format!("Model selection unavailable: {error}")),
@@ -10361,6 +11136,15 @@ impl QueryHandler for WikiQuerier {
         }
         self.model_command(channel_id, text).await
     }
+}
+
+fn native_model_switch_refusal(provider: &str, session: &str, text: &str) -> Option<String> {
+    let mut words = text.split_whitespace();
+    if !matches!(words.next(), Some("/model" | "model")) { return None; }
+    let args: Vec<_> = words.collect();
+    let same = matches!(args.as_slice(), ["set", name] | [name] if *name == provider);
+    if same || matches!(args.as_slice(), [] | ["help"] | ["list"] | ["status"]) { return None; }
+    Some(format!("This conversation is bound to native {provider} session {session}. Switching models would start a different session; the current binding stays unchanged."))
 }
 
 fn model_profile_ready(reasoner: &FallbackReasoner, profile: augmentagent_channel_core::providers::ProviderKind) -> Result<(), String> {
@@ -10541,6 +11325,7 @@ mod query_delivery_contract_tests {
         ], CooldownLatch::at(repo.join("cooldowns.json"))));
         let handler = WikiQuerier { reasoner: reasoner.clone(), wiki_root: wiki.clone(), repo_root: repo.into(),
             conversation_store: None, conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()), voice_enabled: false,
+            phone_tools: std::sync::OnceLock::new(),
             voice_tools: std::sync::OnceLock::new(), final_spoken_turns: dashmap::DashMap::new() };
         for turn in 0..2 {
             let mut ctx = augmentagent_approval_discord::AuditCtx::empty();
@@ -10603,6 +11388,7 @@ mod query_delivery_contract_tests {
         let handler = WikiQuerier { reasoner: reasoner.clone(), wiki_root: wiki.clone(),
             repo_root: fixture.path().to_path_buf(), conversation_store: None,
             conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()), voice_enabled: false,
+            phone_tools: std::sync::OnceLock::new(),
             voice_tools: std::sync::OnceLock::new(), final_spoken_turns: dashmap::DashMap::new() };
         let mut context = augmentagent_approval_discord::AuditCtx::empty();
         context.session_id = "synthetic-channel:synthetic-turn".into();
@@ -13023,12 +13809,15 @@ impl ReplyApprover {
 #[async_trait]
 impl ApprovalActionHandler for ReplyApprover {
     async fn approve(&self, action_id: &str) -> ApprovalActionOutcome {
-        let outcome = self.run_approve(action_id).await;
+        let outcome = self.audited(action_id, "approve", self.run_approve(action_id)).await;
         // Scheduled: Approve on a --send-at proposal armed the timer (#502)
         // — the card leaves the queue either way, so advance the carousel.
         if matches!(
             outcome,
-            ApprovalActionOutcome::Approved | ApprovalActionOutcome::Scheduled { .. }
+            ApprovalActionOutcome::Approved
+                | ApprovalActionOutcome::CalendarCreated { already_existed: false, .. }
+                | ApprovalActionOutcome::DocumentSigned { already_existed: false, .. }
+                | ApprovalActionOutcome::Scheduled { .. }
         ) {
             self.trigger_next_nudge().await;
         }
@@ -13036,7 +13825,7 @@ impl ApprovalActionHandler for ReplyApprover {
     }
 
     async fn skip(&self, action_id: &str) -> ApprovalActionOutcome {
-        let outcome = self.run_skip(action_id).await;
+        let outcome = self.audited(action_id, "skip", self.run_skip(action_id)).await;
         if matches!(outcome, ApprovalActionOutcome::Skipped) {
             self.trigger_next_nudge().await;
         }
@@ -13047,7 +13836,7 @@ impl ApprovalActionHandler for ReplyApprover {
         // Revise does NOT advance the queue — the card stays active until the
         // user finally approves or skips. The instant-new-draft response is
         // handled by the broker's event handler from the Revised outcome.
-        self.run_revise(action_id, feedback).await
+        self.audited(action_id, "revise", self.run_revise(action_id, feedback)).await
     }
 
     async fn is_resolved(&self, action_id: &str) -> bool {
@@ -13058,7 +13847,7 @@ impl ApprovalActionHandler for ReplyApprover {
     }
 
     async fn schedule(&self, action_id: &str, at_ms: i64) -> ApprovalActionOutcome {
-        let outcome = self.run_schedule(action_id, at_ms).await;
+        let outcome = self.audited(action_id, "schedule", self.run_schedule(action_id, at_ms)).await;
         if matches!(outcome, ApprovalActionOutcome::Scheduled { .. }) {
             // The scheduled card left the queue — surface the next one, the
             // same instant-advance approve/skip get.
@@ -13069,25 +13858,25 @@ impl ApprovalActionHandler for ReplyApprover {
 
     async fn send_now(&self, action_id: &str) -> ApprovalActionOutcome {
         // No nudge trigger: the row left the carousel at schedule time.
-        self.run_send_now(action_id).await
+        self.audited(action_id, "send_now", self.run_send_now(action_id)).await
     }
 
     async fn reschedule(&self, action_id: &str, at_ms: i64) -> ApprovalActionOutcome {
-        self.run_reschedule(action_id, at_ms).await
+        self.audited(action_id, "reschedule", self.run_reschedule(action_id, at_ms)).await
     }
 
     async fn cancel_schedule(&self, action_id: &str) -> ApprovalActionOutcome {
-        self.run_cancel_schedule(action_id).await
+        self.audited(action_id, "cancel_schedule", self.run_cancel_schedule(action_id)).await
     }
 
     async fn back_to_queue(&self, action_id: &str) -> ApprovalActionOutcome {
         // No nudge trigger: the repost + record_nudge inside makes this row
         // the active card again.
-        self.run_back_to_queue(action_id).await
+        self.audited(action_id, "back_to_queue", self.run_back_to_queue(action_id)).await
     }
 
     async fn recompose(&self, action_id: &str) -> ApprovalActionOutcome {
-        self.run_recompose(action_id).await
+        self.audited(action_id, "recompose", self.run_recompose(action_id)).await
     }
 
     async fn is_schedule_live(&self, action_id: &str) -> bool {
@@ -13153,6 +13942,16 @@ impl ReplyApprover {
         // retryable and never sends a delivered message twice.
         if action.email.platform == "slack" && action.action.status == "error" {
             return self.approve_slack(action_id, action).await;
+        }
+        if action.email.platform == "document-signing" {
+            return self.approve_document_signature(action_id, action).await;
+        }
+        // A card is retained when Discord fails to deliver the first receipt.
+        // Recover that receipt on a repeated click without creating/nudging again.
+        if action.email.platform == "gcal" && action.email.kind == "create_event"
+            && action.action.status == "sent"
+        {
+            return Self::recover_calendar_receipt(&action);
         }
         if action.action.status != "pending" {
             return ApprovalActionOutcome::AlreadyResolved {
@@ -13338,6 +14137,52 @@ impl ReplyApprover {
         ApprovalActionOutcome::Approved
     }
 
+    /// Keep the provider's event destination but select the approved account.
+    /// This is a browser account hint, not an access grant or a creation request.
+    fn calendar_account_link(link: Option<&str>, account: &str) -> Option<String> {
+        let mut url = reqwest::Url::parse(link?).ok()?;
+        if account.trim().is_empty()
+            || url.scheme() != "https"
+            || !matches!(url.host_str(), Some("www.google.com" | "calendar.google.com"))
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return None;
+        }
+        let pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(key, _)| key != "authuser")
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        url.query_pairs_mut()
+            .clear()
+            .extend_pairs(pairs)
+            .append_pair("authuser", account);
+        Some(url.into())
+    }
+
+    fn recover_calendar_receipt(action: &augmentagent_store::ActionWithEmail) -> ApprovalActionOutcome {
+        // #1436 appends these two terminal lines only after confirmed creation.
+        // Use the last suffix so proposal text cannot shadow the saved receipt.
+        let receipt = action.action.draft_body.as_deref()
+            .and_then(|body| body.rsplit_once("\ncreated: "))
+            .and_then(|(_, suffix)| suffix.split_once("\nevent ID: "))
+            .filter(|(_, id)| !id.is_empty() && !id.chars().any(char::is_whitespace));
+        let Some((link, event_id)) = receipt else {
+            // Historical false-success rows have no ID. Never create on a sent
+            // row or rewrite history based on the old empty-link placeholder.
+            return ApprovalActionOutcome::Failed {
+                message: "This calendar action is marked sent, but no event ID was saved; check the calendar before retrying".into(),
+            };
+        };
+        ApprovalActionOutcome::CalendarCreated {
+            event_id: event_id.into(),
+            html_link: Self::calendar_account_link(Some(link), &action.email.from),
+            organizer_account: action.email.from.clone(),
+            already_existed: true,
+        }
+    }
+
     /// #398 — Approve on a calendar-event card: parse the machine payload
     /// (EventDraft JSON) from the emails row and execute the create. The
     /// event exists — and invites go out — only after this succeeds.
@@ -13368,20 +14213,26 @@ impl ReplyApprover {
         };
         match self.calendar.create_event(entity_id, "primary", &draft).await {
             Ok(created) => {
-                let link = created
-                    .html_link
-                    .clone()
-                    .unwrap_or_else(|| "(no link returned)".into());
+                // The concrete calendar client returns success only with a
+                // nonempty ID. Keep that receipt in both storage and the ack.
+                let event_id = created.id.clone().expect("validated calendar event ID");
+                let html_link =
+                    Self::calendar_account_link(created.html_link.as_deref(), &action.email.from);
+                let link = html_link.clone().unwrap_or_else(|| event_id.clone());
                 let final_body = format!(
-                    "{}\ncreated: {link}",
+                    "{}\ncreated: {link}\nevent ID: {event_id}",
                     action.action.draft_body.clone().unwrap_or_default()
                 );
-                let _ = self.store.update_action_status(
+                if let Err(e) = self.store.update_action_status(
                     action_id,
                     ActionStatus::Sent,
                     Some(&final_body),
                     None,
-                );
+                ) {
+                    return ApprovalActionOutcome::Failed {
+                        message: format!("calendar event {event_id} was created, but recording its receipt failed: {e}; check the calendar before retrying"),
+                    };
+                }
                 let _ = self
                     .store
                     .mark_email_processed(&action.email.message_id, TriageResult::Reply);
@@ -13391,7 +14242,12 @@ impl ReplyApprover {
                     link,
                     "gcal event created"
                 );
-                ApprovalActionOutcome::Approved
+                ApprovalActionOutcome::CalendarCreated {
+                    event_id,
+                    html_link,
+                    organizer_account: action.email.from.clone(),
+                    already_existed: false,
+                }
             }
             Err(CalendarError::Forbidden { message }) => {
                 let msg = format!(
@@ -14401,6 +15257,10 @@ async fn build_broker(
         },
         None,
         augmentagent_approval_discord::CardSurfaces::new(),
+        // A one-shot command may run beside the daemon, whose pending turn
+        // is then live: only `serve` closes interrupted turns (#1396).
+        Vec::new(),
+        None,
     )
     .await
 }
@@ -14418,6 +15278,8 @@ async fn build_approval_surfaces(
     routing: approval_routing::Routing,
     slack: Option<Arc<augmentagent_channel_slack::approvals::SlackApprovals>>,
     surfaces: augmentagent_approval_discord::CardSurfaces,
+    interrupted_discord_turns: Vec<augmentagent_store::InterruptedDiscordTurn>,
+    phone_pending: Option<discord_phone::PendingSlot>,
 ) -> Result<(Arc<dyn ApprovalBroker>, Option<Arc<ReplyApprover>>)> {
     if dry_run {
         return Ok((Arc::new(NoopBroker), None));
@@ -14505,8 +15367,17 @@ async fn build_approval_surfaces(
             )),
             None => Arc::clone(&approver) as Arc<dyn ApprovalActionHandler>,
         };
-        match start_discord_broker(cli, store_for_broker, token, handler, &reasoner, &repo_root)
-            .await
+        match start_discord_broker(
+            cli,
+            store_for_broker,
+            token,
+            handler,
+            &reasoner,
+            &repo_root,
+            interrupted_discord_turns,
+            phone_pending,
+        )
+        .await
         {
             Ok(discord) => {
                 let discord = Arc::new(discord);
@@ -14548,6 +15419,27 @@ async fn build_approval_surfaces(
     Ok((broker, Some(approver)))
 }
 
+/// #1396 — `serve` start, before the Discord gateway connects: a Discord turn
+/// still `pending` was claimed by a daemon process that died mid-turn (a
+/// message landing in the shutdown drain, a crash). Close each as
+/// interrupted so it stops refusing every later message in its channel; the
+/// broker tells the owner. A store failure leaves the turns as they were.
+fn interrupt_dead_discord_turns(store: &Store) -> Vec<augmentagent_store::InterruptedDiscordTurn> {
+    match store.interrupt_pending_discord_turns() {
+        Ok(turns) => {
+            for turn in &turns {
+                warn!(turn_id = %turn.turn_id, guild = %turn.guild_id, channel = %turn.channel_id,
+                    "Discord native turn interrupted by a restart: closed, not re-run");
+            }
+            turns
+        }
+        Err(error) => {
+            tracing::error!("could not close interrupted Discord turns: {error}");
+            Vec::new()
+        }
+    }
+}
+
 /// #1299 — why the Discord approval broker did not start while Slack
 /// approvals carried on (that error is logged, not returned), so serve can
 /// record it in the daemon start report.
@@ -14561,6 +15453,8 @@ async fn start_discord_broker(
     handler: Arc<dyn ApprovalActionHandler>,
     reasoner: &Arc<FallbackReasoner>,
     repo_root: &Path,
+    interrupted_turns: Vec<augmentagent_store::InterruptedDiscordTurn>,
+    phone_pending: Option<discord_phone::PendingSlot>,
 ) -> Result<DiscordApprovalBroker> {
     let channel_id: u64 = std::env::var("DISCORD_CHANNEL_ID")
         .context("DISCORD_CHANNEL_ID env var required")?
@@ -14581,14 +15475,14 @@ async fn start_discord_broker(
     let voice_socket_path = resolve_discord_voice_socket(voice_enabled,
         std::env::var_os("AUGMENTAGENT_DISCORD_VOICE_SOCKET"), std::env::var_os("XDG_RUNTIME_DIR"))?;
 
-    let query_handler: Option<Arc<dyn QueryHandler>> = cli.wiki_dir.as_ref().map(|root| {
+    let query_handler: Option<Arc<WikiQuerier>> = cli.wiki_dir.as_ref().map(|root| {
         Arc::new(wiki_querier(
             Arc::clone(reasoner),
             root.clone(),
             repo_root.to_path_buf(),
             Arc::clone(&store),
             voice_enabled,
-        )) as Arc<dyn QueryHandler>
+        ))
     });
     // #428 — `!journal` write-back bridge. Present iff SHADOWNOTE_* config
     // exists (keyring/env); without it the command replies with the
@@ -14599,21 +15493,28 @@ async fn start_discord_broker(
             reasoner: Arc::clone(reasoner),
         }),
     );
-    DiscordApprovalBroker::start(DiscordConfig {
+    let broker = DiscordApprovalBroker::start(DiscordConfig {
         bot_token: token,
         channel_id,
         query_channel_id,
         allowed_user_id,
-        query_handler,
+        query_handler: query_handler.clone().map(|query| query as Arc<dyn QueryHandler>),
         action_handler: Some(handler),
         store: Some(store),
         loop_parser,
         wiki_root: cli.wiki_dir.clone(),
         journal_ops,
         voice_socket_path,
+        interrupted_turns,
     })
     .await
-    .context("start discord broker")
+    .context("start discord broker")?;
+    if let (Some(slot), Some(query), Some(owner_user_id), Some((http, bot_user_id))) =
+        (phone_pending, query_handler, allowed_user_id, broker.phone_connection()) {
+        *slot.lock().map_err(|_| anyhow::anyhow!("Discord phone startup state unavailable"))? =
+            Some(discord_phone::PendingConnection { query, http, bot_user_id, owner_user_id });
+    }
+    Ok(broker)
 }
 
 /// #428 — the `!journal` write-back bridge, present iff SHADOWNOTE_* config
@@ -14675,7 +15576,11 @@ fn build_channel(
     interval_secs: u64,
 ) -> Result<GmailChannel<ComposioClient, FallbackReasoner>> {
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
-    let gmail = Arc::new(ComposioClient::new(api_key).with_rate_limit_store(Arc::clone(&store)));
+    let gmail = Arc::new(
+        ComposioClient::new(api_key)
+            .with_rate_limit_store(Arc::clone(&store))
+            .with_call_origin("background"),
+    );
     let reasoner = build_reasoner();
 
     // Resolve wiki enable/disable and schema path.
@@ -15723,7 +16628,7 @@ async fn run_merge_scan(
         if scan.merged.len() > MAX_AUTO_MERGE_DIGEST_LINES {
             body.push(format!("…and {} more", scan.merged.len() - MAX_AUTO_MERGE_DIGEST_LINES));
         }
-        body.push("Undo: revert the merge commit in the wiki repo.".into());
+        body.push("Undo requires restoring the original wiki pages and the affected identity_phone database mappings from a pre-merge backup. There is no built-in auto-merge undo; restoring wiki files alone is insufficient.".into());
         let title = format!("Contacts auto-merged ({})", scan.merged.len());
         if let Err(e) = broker.post_digest(&title, &body.join("\n")).await {
             warn!("post identity auto-merge digest: {e}");
@@ -19537,7 +20442,9 @@ async fn run_tone_backfill(
 
     let api_key = std::env::var("COMPOSIO_API_KEY")
         .context("COMPOSIO_API_KEY env var required for tone backfill")?;
-    let gmail = ComposioClient::new(api_key).with_rate_limit_store(Arc::clone(&store));
+    let gmail = ComposioClient::new(api_key)
+        .with_rate_limit_store(Arc::clone(&store))
+        .with_call_origin("interactive");
 
     let accounts = match account {
         Some(a) => vec![a],
@@ -20555,6 +21462,20 @@ mod stale_reconcile_tests {
         from: &str,
         draft: Option<&str>,
     ) -> String {
+        seed_pending_draft_on(store, msg, thread, from, draft, "gmail")
+    }
+
+    /// #1505 — same as `seed_pending_draft` but the inbound is recorded on an
+    /// explicit platform, so a test can assert what the sweep does to a
+    /// non-email reply card.
+    fn seed_pending_draft_on(
+        store: &Store,
+        msg: &str,
+        thread: Option<&str>,
+        from: &str,
+        draft: Option<&str>,
+        platform: &str,
+    ) -> String {
         store
             .upsert_email(&Email {
                 attachments: Vec::new(),
@@ -20567,7 +21488,7 @@ mod stale_reconcile_tests {
                 body: "body".into(),
                 date: "2026-07-13T12:00:00Z".into(),
                 account_entity_id: Some("acc".into()),
-                platform: "gmail".into(),
+                platform: platform.into(),
                 kind: "dm".into(),
             })
             .unwrap();
@@ -20925,6 +21846,121 @@ mod stale_reconcile_tests {
             status_of(&store, &human),
             "pending",
             "a real person's card must never be swept as bulk"
+        );
+    }
+
+    /// #1505 — Rule 2 reads a mailbox address, which only email cards have.
+    /// Every chat platform's reply-card `from` is a name plus a platform id, so
+    /// the rule used to retire all of them on the first tick — #1289 exempted
+    /// Slack, and everyone else inherited the bug. None of these cards may move.
+    #[test]
+    fn reconcile_never_retires_a_non_email_platform_card() {
+        let cases: &[(&str, &str)] = &[
+            (augmentagent_channel_slack::PLATFORM, "Jade Quinn <slack:U0123ABC>"), // pii-ok: synthetic
+            ("twitter", "Jade Quinn <twitter:12345>"),                             // pii-ok: synthetic
+            (
+                augmentagent_channel_linkedin::inbound::PLATFORM,
+                "Jade Quinn <linkedin:urn:li:fsd_profile:ABC>", // pii-ok: synthetic
+            ),
+            ("whatsapp", "Jade Quinn <whatsapp:15550001111@s.whatsapp.net>"), // pii-ok: synthetic
+            (augmentagent_channel_deft::PLATFORM, "Deft form <deft:3f2a9c>"),
+            (augmentagent_channel_discord_dm::PLATFORM, "user-123456789012345678"),
+            (augmentagent_channel_voice::PLATFORM, "voice:chat-1"),
+        ];
+
+        for (i, (platform, from)) in cases.iter().enumerate() {
+            let (store, _t) = fresh_store();
+            let card = seed_pending_draft_on(
+                &store,
+                &format!("m-{i}"),
+                Some(&format!("T-{i}")),
+                from,
+                Some("a draft"),
+                platform,
+            );
+
+            let n = reconcile_stale_approvals_tick(&store).unwrap();
+            assert_eq!(n, 0, "{platform}: nothing to retire");
+            assert_eq!(
+                status_of(&store, &card),
+                "pending",
+                "{platform}: a reply card must survive the sweep"
+            );
+        }
+    }
+
+    /// #1505 — a pending card whose inbound row is gone surfaces platform `''`.
+    /// Provenance is unknown, so Rule 2 stays out of it; Rules 1 and 3 and the
+    /// 7-day expiry still cover the row.
+    #[test]
+    fn reconcile_skips_rule_two_when_the_platform_is_unknown() {
+        let (store, _t) = fresh_store();
+        let card = store
+            .log_action(
+                "orphan-1",
+                Some("T-orphan"),
+                "Jade Quinn <twitter:12345>", // pii-ok: synthetic
+                "subj",
+                Some("body"),
+                Some("a draft"),
+                ActionStatus::Pending,
+            )
+            .unwrap();
+
+        assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 0);
+        assert_eq!(status_of(&store, &card), "pending");
+    }
+
+    /// #1503 — a PDF-signing card is an owner decision on a local file, filed
+    /// exactly as `document_signing::propose` files it (`Owner signature`, no
+    /// thread). Its sender has no `@`, so Rule 2 used to retire it on the first
+    /// tick and Approve & Sign always failed "superseded". It must survive
+    /// repeated sweeps while a bulk-mail card beside it is still retired.
+    #[test]
+    fn reconcile_never_retires_a_pdf_signing_card() {
+        let (store, _t) = fresh_store();
+        store
+            .upsert_email(&Email {
+                attachments: Vec::new(),
+                to: String::new(),
+                cc: String::new(),
+                message_id: "doc-sign:1".into(),
+                thread_id: None,
+                from: "Owner signature".into(),
+                subject: "Sign PDF: deliverables/x.pdf".into(),
+                body: "{}".into(),
+                date: "2026-10-19T15:32:58Z".into(),
+                account_entity_id: None,
+                platform: "document-signing".into(),
+                kind: "sign_pdf".into(),
+            })
+            .unwrap();
+        let signing = store
+            .log_action(
+                "doc-sign:1",
+                None,
+                "Owner signature",
+                "Sign PDF: deliverables/x.pdf",
+                Some("{}"),
+                Some("Apply signature 'default' to deliverables/x.pdf (1 pages)."),
+                ActionStatus::Pending,
+            )
+            .unwrap();
+        let blast =
+            seed_pending(&store, "m-blast", Some("T-b"), "Brand <marketing@engage.brand.example.com>"); // pii-ok: synthetic
+
+        assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 1);
+        assert_eq!(
+            status_of(&store, &blast),
+            "superseded",
+            "Rule 2 still retires bulk mail"
+        );
+        assert_eq!(status_of(&store, &signing), "pending");
+        assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 0);
+        assert_eq!(
+            status_of(&store, &signing),
+            "pending",
+            "durable across ticks"
         );
     }
 
@@ -21706,17 +22742,20 @@ mod identity_merge_tests {
     }
 
     /// The card names the stub, per the contract — and must survive the daemon:
-    /// the sweep's bulk-sender rule fails any `from` without an `@`.
+    /// the sweep's bulk-sender rule fails any `from` without an `@`, and the
+    /// merge kind is off the sweep's list besides.
     #[test]
     fn a_proposed_merge_card_survives_the_stale_approval_sweep() {
         let (store, _t, wiki) = seeded_env();
         let (email, payload, draft) = build_identity_merge_card(&dry_run(&store, &wiki));
         assert_eq!(email.from, "Landlord Philly", "the sender field IS the stub");
         let proposed = record_identity_merge_proposal(&store, &email, &payload, &draft).unwrap();
-        // Control — the identical row under any other kind IS retired, so this
-        // cannot pass on a sweep that does nothing at all.
+        // Control — the same row as an ordinary email card IS retired, so this
+        // cannot pass on a sweep that does nothing at all. (#1505 gates Rule 2
+        // on the email platform, so the control has to be on it.)
         let mut other = email.clone();
         (other.message_id, other.kind) = ("merge:control".into(), "dm".into());
+        other.platform = augmentagent_channel_email::inbound::PLATFORM.into();
         let control = record_identity_merge_proposal(&store, &other, &payload, &draft).unwrap();
         assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 1);
         assert_eq!(status_of(&store, &proposed), "pending", "must stay clickable");
@@ -21825,6 +22864,7 @@ mod identity_merge_tests {
         let digests = discord.digests.lock().unwrap().clone();
         assert_eq!(digests.len(), 1);
         assert_eq!(digests[0].0, "Contacts auto-merged (1)");
+        assert!(digests[0].1.contains("no built-in auto-merge undo"));
         assert!(digests[0].1.contains("• Landlord Philly → Centra Associates"), "{digests:?}");
         let row = store.get_action_with_email(&card_id).unwrap().unwrap();
         assert_eq!(row.action.status, "sent", "the pending card was claimed");
@@ -22006,6 +23046,63 @@ async fn the_drain_budget_does_not_bound_a_running_daemon() {
     shutdown.cancel();
     drain.await.unwrap().unwrap();
     assert!(stop.elapsed() >= DRAIN_BUDGET, "the wedged runner still gets the full drain budget");
+}
+
+/// #1384 — the report must separate the two refusal classes on the stored
+/// `class` field and count per mailbox and per action, so the owner can see
+/// whether throttling concentrates in one account or one call.
+#[cfg(test)]
+#[test]
+fn the_rate_report_groups_refusals_by_class_account_action_and_origin() {
+    let row = |entity_id: &str, action: &str, class: &str, wait_ms: i64| GmailRateRefusal {
+        observed_at_ms: 1_000,
+        entity_id: entity_id.into(),
+        // A disconnected mailbox still reports under its snapshotted address.
+        mailbox: (entity_id == "acct-a").then(|| "owner@example.com".to_string()),
+        action: action.into(),
+        class: class.into(),
+        origin: if class == "envelope" { "interactive".into() } else { "background".into() },
+        retry_after_ms: Some(1_000 + wait_ms),
+        retry_after_raw: None,
+        provider_message: "rate limit".into(),
+        headers_json: None,
+        log_id: None,
+        attempt: 1,
+    };
+    let rows = vec![
+        row("acct-a", "GMAIL_FETCH_EMAILS", "http_429", 30_000),
+        row("acct-a", "GMAIL_FETCH_EMAILS", "envelope", 7_200_000),
+        row("acct-a", "GMAIL_SEARCH_EMAILS", "http_429", 60_000),
+        row("acct-b", "GMAIL_FETCH_EMAILS", "http_429", 45_000),
+    ];
+
+    let by_account =
+        group_refusals(&rows, |r| r.mailbox.clone().unwrap_or_else(|| r.entity_id.clone()));
+    assert_eq!(by_account[0].key, "owner@example.com", "the worst mailbox sorts first");
+    assert_eq!((by_account[0].count, by_account[0].platform, by_account[0].provider), (3, 2, 1));
+    // A short platform window and a multi-hour provider block stay distinguishable.
+    let (min, max) = (by_account[0].retry_after_min_ms, by_account[0].retry_after_max_ms);
+    assert_eq!((min, max), (Some(30_000), Some(7_200_000)));
+    assert_eq!((&*by_account[1].key, by_account[1].provider), ("acct-b", 0));
+
+    let by_action = group_refusals(&rows, |r| r.action.clone());
+    assert_eq!((&*by_action[0].key, by_action[0].count), ("GMAIL_FETCH_EMAILS", 3));
+    assert_eq!((&*by_action[1].key, by_action[1].count), ("GMAIL_SEARCH_EMAILS", 1));
+
+    // Interactive-vs-background degradation has to be readable too.
+    let by_origin = group_refusals(&rows, |r| r.origin.clone());
+    assert_eq!((&*by_origin[0].key, by_origin[0].count), ("background", 3));
+    assert_eq!((&*by_origin[1].key, by_origin[1].count), ("interactive", 1));
+}
+
+/// A refusal in the last millisecond of `--until`'s day is inside the window:
+/// the SQL bound is inclusive, so the bound itself must be `23:59:59.999`.
+#[cfg(test)]
+#[test]
+fn the_until_bound_covers_the_whole_final_day() {
+    let to_ms = day_bound_ms(&Some("2026-10-05".into()), "--until", 0, true).unwrap();
+    let late = chrono::DateTime::parse_from_rfc3339("2026-10-05T23:59:59.500Z").unwrap();
+    assert_eq!(to_ms, late.timestamp_millis() + 499, "23:59:59.500Z must be inside --until");
 }
 
 /// Test builders shared by sibling modules (`imessage_send`).

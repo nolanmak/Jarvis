@@ -228,6 +228,13 @@ fn any_ok<T>(
 
 #[async_trait]
 impl ApprovalBroker for MultiSurfaceBroker {
+    async fn post_owner_alert(&self,notice:&augmentagent_store::alert_schedule::AlertNotice)
+        ->Result<String,ApprovalError> {
+        let Some((_,discord))=self.surfaces.iter().find(|(name,_)|*name=="discord") else {
+            return Err(ApprovalError::Discord("Discord owner-alert surface is unavailable".into()));
+        };
+        discord.post_owner_alert(notice).await
+    }
     async fn post_approval(
         &self,
         action_id: &str,

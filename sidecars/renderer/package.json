@@ -6,6 +6,7 @@
   "description": "Remotion render sidecar for the AugmentAgent Rust daemon. NDJSON over a Unix socket; vertical 1080x1920 branded short-card composition.",
   "scripts": {
     "server": "node server.mjs",
+    "test": "node --test",
     "studio": "remotion studio src/index.ts",
     "ensure-browser": "remotion browser ensure"
   },

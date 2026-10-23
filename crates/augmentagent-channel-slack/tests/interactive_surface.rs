@@ -1222,3 +1222,311 @@ fn surface_state_words_are_stable() {
         assert_eq!(SurfaceState::parse(w).map(|s| s.as_str()), Some(w));
     }
 }
+
+#[derive(Default)]
+struct PhoneProvider {
+    calls: Mutex<Vec<augmentagent_phone::DialRequest>>,
+    stops: Mutex<Vec<String>>,
+    hold_first: AtomicBool,
+    release: Notify,
+}
+#[async_trait]
+impl augmentagent_phone::Telephony for PhoneProvider {
+    async fn create(
+        &self,
+        request: augmentagent_phone::DialRequest,
+    ) -> Result<String, augmentagent_phone::ProviderError> {
+        let n = {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(request);
+            calls.len()
+        };
+        if n == 1 && self.hold_first.load(Ordering::SeqCst) {
+            self.release.notified().await;
+        }
+        Ok(format!("CA-fixture-{n}"))
+    }
+    async fn hangup(&self, sid: &str) -> Result<(), augmentagent_phone::ProviderError> {
+        self.stops.lock().unwrap().push(sid.into());
+        Ok(())
+    }
+}
+#[tokio::test]
+async fn phone_private_setup_is_intercepted_before_inbox_and_agent_and_calls_share_service() {
+    let h = Harness::new();
+    let provider = Arc::new(PhoneProvider::default());
+    let service = Arc::new(augmentagent_phone::PhoneService::new(
+        h.store.clone(),
+        provider.clone(),
+        Arc::new(augmentagent_phone::SystemClock),
+        augmentagent_phone::PhoneConfig::new(
+            true,
+            "https://phone.example.test",
+            "slack-fixture-verification-secret-32",
+            vec![augmentagent_phone::OwnerLink {
+                surface_owner: workspace().owner(OWNER).unwrap(),
+                owner_id: "owner-main".into(),
+            }],
+        )
+        .unwrap(),
+    ));
+    let (connector, mut servers) = DuplexConnector::new();
+    let handler = Arc::new(FakeHandler::default());
+    let running = start(
+        h.surface(h.store.clone(), connector, handler.clone(), false)
+            .with_phone(service.clone()),
+    );
+    let mut server = Server::accept(&mut servers).await;
+    let number = "+12025550973";
+    provider.hold_first.store(true, Ordering::SeqCst);
+    let setup = owner_dm(
+        "phone-set",
+        &format!("phone number set {number}"),
+        "1700000100.000001",
+    );
+    server.send(&setup).await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), server.ack())
+            .await
+            .expect("ack must not await provider"),
+        "phone-set"
+    );
+    provider.release.notify_one();
+    eventually("verification call", || {
+        provider.calls.lock().unwrap().len() == 1
+    })
+    .await;
+    eventually("setup reply", || {
+        h.posts()
+            .iter()
+            .any(|p| p.text.contains("Verification call"))
+    })
+    .await;
+    server.send(&setup).await;
+    assert_eq!(server.ack().await, "phone-set");
+    let code = provider.calls.lock().unwrap()[0]
+        .twiml
+        .split(" is ")
+        .nth(1)
+        .unwrap()
+        .split('.')
+        .next()
+        .unwrap()
+        .replace(' ', "");
+    server
+        .send(&owner_dm(
+            "phone-verify",
+            &format!("phone number verify {code}"),
+            "1700000101.000001",
+        ))
+        .await;
+    server.ack().await;
+    eventually("verified reply", || {
+        h.posts()
+            .iter()
+            .any(|p| p.text.contains("Phone number verified"))
+    })
+    .await;
+    let grant = service
+        .authorize(
+            &workspace().owner(OWNER).unwrap(),
+            &workspace().conversation(DM, None).unwrap(),
+        )
+        .unwrap();
+    let verification = service.latest_call(&grant).unwrap().unwrap();
+    h.store
+        .phone_provider_event(
+            &verification.id,
+            "CA-fixture-1",
+            augmentagent_store::phone::CallState::Completed,
+            T0 + 102_000,
+        )
+        .unwrap();
+    server
+        .send(&owner_dm("phone-call", "phone call", "1700000102.000001"))
+        .await;
+    server.ack().await;
+    eventually("normal call", || provider.calls.lock().unwrap().len() == 2).await;
+    server
+        .send(&owner_dm("phone-stop", "phone stop", "1700000103.000001"))
+        .await;
+    server.ack().await;
+    eventually("normal hangup", || {
+        !provider.stops.lock().unwrap().is_empty()
+    })
+    .await;
+    server
+        .send(&message(
+            "phone-public",
+            CONTROL,
+            "channel",
+            OWNER,
+            &format!("phone number set {number}"),
+            "1700000104.000001",
+        ))
+        .await;
+    server.ack().await;
+    server
+        .send(&message(
+            "phone-outsider",
+            DM,
+            "im",
+            STRANGER,
+            &format!("phone number verify {code}"),
+            "1700000105.000001",
+        ))
+        .await;
+    server.ack().await;
+    eventually("public setup reply", || {
+        h.posts().iter().any(|p| p.text.contains("private"))
+    })
+    .await;
+    let mut edit = owner_dm("phone-edit", "edited", "1700000106.000001");
+    edit["payload"]["event"] = json!({"type":"message","subtype":"message_changed","channel":DM,"message":{"ts":"1700000106.000001","user":OWNER,"text":format!("phone number set {number}")}});
+    server.send(&edit).await;
+    server.ack().await;
+    assert_eq!(provider.calls.lock().unwrap().len(), 2);
+    assert_eq!(handler.calls(), 0);
+    let conn = rusqlite::Connection::open(&h.path).unwrap();
+    for table in ["surface_inbound_events", "surface_outbox"] {
+        let mut stmt = conn
+            .prepare(&format!("SELECT payload FROM {table}"))
+            .unwrap();
+        for payload in stmt.query_map([], |r| r.get::<_, String>(0)).unwrap() {
+            let payload = payload.unwrap();
+            assert!(!payload.contains(number));
+            assert!(!payload.contains(&code));
+        }
+    }
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn interrupted_private_phone_command_after_restart_requests_resend_without_replay() {
+    let h = Harness::new();
+    let provider = Arc::new(PhoneProvider::default());
+    let service = Arc::new(augmentagent_phone::PhoneService::new(
+        h.store.clone(),
+        provider.clone(),
+        Arc::new(augmentagent_phone::SystemClock),
+        augmentagent_phone::PhoneConfig::new(
+            true,
+            "https://phone.example.test",
+            "slack-fixture-verification-secret-32",
+            vec![augmentagent_phone::OwnerLink {
+                surface_owner: workspace().owner(OWNER).unwrap(),
+                owner_id: "owner-main".into(),
+            }],
+        )
+        .unwrap(),
+    ));
+    let origin = augmentagent_store::phone::PhoneOrigin {
+        owner: workspace().owner(OWNER).unwrap(),
+        conversation: workspace().conversation(DM, None).unwrap(),
+    };
+    h.store
+        .record_inbound_event(
+            &NewInboundEvent {
+                conversation: origin.conversation.clone(),
+                event_id: "Ev-private-restart".into(),
+                kind: "phone_private".into(),
+                occurred_at_ms: T0,
+                payload: serde_json::to_string(&origin).unwrap(),
+            },
+            T0,
+        )
+        .unwrap();
+    let (connector, mut servers) = DuplexConnector::new();
+    let handler = Arc::new(FakeHandler::default());
+    let running = start(
+        h.surface(h.reopen(), connector, handler.clone(), false)
+            .with_phone(service),
+    );
+    let _server = Server::accept(&mut servers).await;
+    eventually("interrupted private command reply", || {
+        h.posts().iter().any(|p| p.text.contains("Resend it"))
+    })
+    .await;
+    assert_eq!(handler.calls(), 0);
+    assert!(provider.calls.lock().unwrap().is_empty());
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn phone_stop_and_private_removal_do_not_wait_for_a_running_agent_turn() {
+    let h = Harness::new();
+    let provider = Arc::new(PhoneProvider::default());
+    h.store
+        .phone_import_destination("owner-main", "+12025550973", T0)
+        .unwrap();
+    let service = Arc::new(augmentagent_phone::PhoneService::new(
+        h.store.clone(),
+        provider.clone(),
+        Arc::new(augmentagent_phone::SystemClock),
+        augmentagent_phone::PhoneConfig::new(
+            true,
+            "https://phone.example.test",
+            "slack-fixture-verification-secret-32",
+            vec![augmentagent_phone::OwnerLink {
+                surface_owner: workspace().owner(OWNER).unwrap(),
+                owner_id: "owner-main".into(),
+            }],
+        )
+        .unwrap(),
+    ));
+    let grant = service
+        .authorize(
+            &workspace().owner(OWNER).unwrap(),
+            &workspace().conversation(DM, None).unwrap(),
+        )
+        .unwrap();
+    service
+        .tool(
+            &grant,
+            "call_owner",
+            json!({"request_id":"already-running"}),
+        )
+        .await
+        .unwrap();
+    let (connector, mut servers) = DuplexConnector::new();
+    let handler = FakeHandler::holding();
+    let running = start(
+        h.surface(h.store.clone(), connector, handler.clone(), false)
+            .with_phone(service.clone()),
+    );
+    let mut server = Server::accept(&mut servers).await;
+    server
+        .send(&owner_dm(
+            "long-agent",
+            "slow owner question",
+            "1700000200.000001",
+        ))
+        .await;
+    server.ack().await;
+    eventually("long agent started", || handler.calls() == 1).await;
+    server
+        .send(&owner_dm("urgent-stop", "phone stop", "1700000201.000001"))
+        .await;
+    server.ack().await;
+    eventually("phone hangup while agent is blocked", || {
+        !provider.stops.lock().unwrap().is_empty()
+    })
+    .await;
+    server
+        .send(&owner_dm(
+            "urgent-remove",
+            "phone number remove",
+            "1700000202.000001",
+        ))
+        .await;
+    server.ack().await;
+    eventually("phone removal while agent is blocked", || {
+        h.posts()
+            .iter()
+            .any(|p| p.text.contains("Phone number removed"))
+    })
+    .await;
+    assert_eq!(handler.calls(), 1);
+    handler.release.notify_waiters();
+    running.stop().await;
+}

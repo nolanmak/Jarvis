@@ -9,7 +9,7 @@
 // `--allow-read` (so Deno can load `runner.ts` from disk).
 
 // deno-lint-ignore-file no-import-prefix
-// The runner itself forbids imports (deno.json has empty `imports`). This
+// The runner explicitly disables remote/npm imports. This
 // test file is loaded only by `deno test`, never by the production runner,
 // so we pull std/assert inline via a JSR specifier.
 import { assert, assertEquals, assertStringIncludes } from "jsr:@std/assert@1";
@@ -35,7 +35,7 @@ async function driveRunner(opts: {
   status: Deno.CommandStatus;
 }> {
   const cmd = new Deno.Command(Deno.execPath(), {
-    args: ["run", RUNNER],
+    args: ["run", "--no-config", "--no-npm", "--no-remote", "--deny-import", "--no-prompt", RUNNER],
     stdin: "piped",
     stdout: "piped",
     stderr: "piped",
@@ -68,7 +68,7 @@ async function driveRunner(opts: {
     }
     const { value, done } = await reader.read();
     if (done) break;
-    buf += decoder.decode(value);
+    buf += decoder.decode(value, { stream: true });
     let idx;
     while ((idx = buf.indexOf("\n")) >= 0) {
       const line = buf.slice(0, idx);
@@ -349,7 +349,7 @@ Deno.test({
     };
     // We spawn manually so we can write both lines in a single chunk.
     const cmd = new Deno.Command(Deno.execPath(), {
-      args: ["run", RUNNER],
+      args: ["run", "--no-config", "--no-npm", "--no-remote", "--deny-import", "--no-prompt", RUNNER],
       stdin: "piped",
       stdout: "piped",
       stderr: "piped",
@@ -384,7 +384,7 @@ Deno.test({
       }
       const { value, done } = await reader.read();
       if (done) break;
-      buf += decoder.decode(value);
+      buf += decoder.decode(value, { stream: true });
       let idx;
       while ((idx = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, idx);
@@ -567,7 +567,7 @@ Deno.test("#989: console.log goes to stderr, never corrupts stdout frames", asyn
     await main();
   `;
   const cmd = new Deno.Command(Deno.execPath(), {
-    args: ["run", RUNNER],
+    args: ["run", "--no-config", "--no-npm", "--no-remote", "--deny-import", "--no-prompt", RUNNER],
     stdin: "piped",
     stdout: "piped",
     stderr: "piped",
@@ -597,7 +597,7 @@ Deno.test("#989: console.log goes to stderr, never corrupts stdout frames", asyn
     }
     const { value, done } = await reader.read();
     if (done) break;
-    buf += decoder.decode(value);
+    buf += decoder.decode(value, { stream: true });
     let idx;
     while ((idx = buf.indexOf("\n")) >= 0) {
       const line = buf.slice(0, idx);
@@ -673,4 +673,26 @@ Deno.test("wrapProgramForModule strips trailing main() invocation", () => {
   // Programs that don't end with main() are left intact in the user body.
   const c = wrap("const x = 1;");
   assertStringIncludes(c, "const x = 1;");
+});
+
+Deno.test("UTF-8: split header code points survive input chunks", async () => {
+  const expected = "€🧪".repeat(5000);
+  const result = await driveRunner({
+    header: { program: `async function main(){return ${JSON.stringify(expected)};} main();`, manifest: [] },
+    onFrame: () => undefined,
+    testTimeoutMs: 10_000,
+  });
+  assertEquals(result.status.code, 0, result.stderr);
+  assertEquals(result.stdoutFrames.find((frame) => "final" in frame)?.final, expected);
+});
+
+Deno.test("UTF-8: split tool response code points survive input chunks", async () => {
+  const expected = "€🧪".repeat(5000);
+  const result = await driveRunner({
+    header: { program: 'async function main(){return await tools.draft("gmail","fixture","fixture");} main();', manifest: ["draft"] },
+    onFrame: (frame) => "call" in frame ? { id: frame.id, result: expected } : undefined,
+    testTimeoutMs: 10_000,
+  });
+  assertEquals(result.status.code, 0, result.stderr);
+  assertEquals(result.stdoutFrames.find((frame) => "final" in frame)?.final, expected);
 });

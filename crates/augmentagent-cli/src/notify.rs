@@ -173,6 +173,7 @@ pub const MARKERS: &[&str] = &[
     "CreateMessage::new(",
     ".post_digest(",
     ".post_flag_notice(",
+    ".post_owner_alert(",
     "DISCORD_WEBHOOK_URL",
     "impl LoopPoster for",
     "notify_owner(",
@@ -230,6 +231,11 @@ pub static PRODUCERS: &[Producer] = &[
     p("discord_webhook_sink", "crates/augmentagent-cli/src/notify.rs", "DISCORD_WEBHOOK_URL", 3, TRANSPORT, "Discord leg: webhook"),
     // -- Approval surfaces (#1289) -------------------------------------------
     act(p("approval_broker", "crates/augmentagent-approval-discord/src/broker.rs", "send_message(&", 4, BROKER, "Discord approval broker: cards, flag notices, digests")),
+    act(p("owner_alert_discord", "crates/augmentagent-approval-discord/src/broker.rs", "send_message(&", 1, BROKER, "critical owner alerts with acknowledgment controls")),
+    act(p("signing_approval", "crates/augmentagent-cli/src/document_signing.rs", "send_message(&", 1, BROKER, "`sign`: the document signing approval card with the unsigned review PDF")),
+    act(p("owner_alert_scheduler", "crates/augmentagent-approval-discord/src/owner_alerts.rs", ".post_owner_alert(", 1, BROKER, "persistent owner alert escalation")),
+    act(p("owner_alert_route", "crates/augmentagent-approval-discord/src/sync.rs", ".post_owner_alert(", 1, BROKER, "Discord-only route for owner alert controls")),
+    p("owner_alert_layout", "crates/augmentagent-approval-discord/src/owner_alerts.rs", "CreateMessage::new(", 1, TRANSPORT, "owner alert presentation"),
     p("broker_fan_out", "crates/augmentagent-approval-discord/src/sync.rs", ".post_digest(", 1, BROKER, "MultiSurfaceBroker fan-out"),
     p("broker_fan_out", "crates/augmentagent-approval-discord/src/sync.rs", ".post_flag_notice(", 1, BROKER, "MultiSurfaceBroker fan-out"),
     p("broker_default_notice", "crates/augmentagent-approval-discord/src/lib.rs", ".post_flag_notice(", 1, BROKER, "ApprovalBroker default notice"),
@@ -253,6 +259,7 @@ pub static PRODUCERS: &[Producer] = &[
     p("twitter_flags", "crates/augmentagent-channel-twitter/src/channel.rs", ".post_flag_notice(", 1, BROKER, "Twitter flags"),
     p("whatsapp_flags", "crates/augmentagent-channel-whatsapp/src/channel.rs", ".post_flag_notice(", 1, BROKER, "WhatsApp flags"),
     p("imessage_outbox_failures", "crates/augmentagent-cli/src/imessage_send.rs", ".post_flag_notice(", 1, BROKER, "iMessage send failures"),
+    p("owner_text_health", "crates/augmentagent-cli/src/imessage_send.rs", ".post_digest(", 2, BROKER, "owner text sender health and failed escalation notices"),
     p("cli_broker_digests", CLI, ".post_digest(", 4, BROKER, "contacts sync, signature backfill, pending-review and contact auto-merge digests"),
     p("cli_broker_notices", CLI, ".post_flag_notice(", 2, BROKER, "compose fan-out / family cards"),
     act(p("pr_awaiting_approval", "crates/augmentagent-cli/src/self_improve.rs", ".post_flag_notice(", 1, BROKER, "agent-coding PR awaiting approval")),
@@ -262,8 +269,12 @@ pub static PRODUCERS: &[Producer] = &[
     act(p("loop_output_slack", "crates/augmentagent-channel-slack/src/commands/loops.rs", "impl LoopPoster for", 2, LOOP, "loop results and reminders on Slack")),
     act(p("loop_output_discord", CLI, "impl LoopPoster for", 1, LOOP, "loop results and reminders on Discord")),
     // -- Replies, interaction responses and Discord-only posts ---------------
-    p("discord_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "send_message(&", 8, REPLY, "query answers, command replies, redraft notices"),
-    p("discord_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "CreateMessage::new(", 6, REPLY, "query answers, command replies"),
+    // #1396's interrupted-turn notice stays `REPLY`: it posts in the owner
+    // channel the dead turn came from, referencing the owner's own message.
+    p("discord_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "send_message(&", 10, REPLY, "query answers, command replies, redraft and interrupted-turn notices"),
+    p("discord_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "CreateMessage::new(", 8, REPLY, "query answers, command replies, interrupted-turn notices"),
+    p("phone_transcripts", "crates/augmentagent-approval-discord/src/phone_delivery.rs", "send_message(&", 1, REPLY, "phone transcripts restricted to the originating owner conversation"),
+    p("phone_transcripts", "crates/augmentagent-approval-discord/src/phone_delivery.rs", "CreateMessage::new(", 1, REPLY, "phone transcripts restricted to the originating owner conversation"),
     p("voice_bridge", "crates/augmentagent-approval-discord/src/voice_bridge.rs", "send_message(&", 6, REPLY, "Discord voice transcripts in the voice channel"),
     p("voice_bridge", "crates/augmentagent-approval-discord/src/voice_bridge.rs", "CreateMessage::new(", 7, REPLY, "Discord voice transcripts in the voice channel"),
     p("cli_discord_posts", CLI, "send_message(&", 7, Route::DiscordOnly("explicit `--post` Discord commands (compose/propose cards, wiki ask --post) and Discord loop output"), "one-shot Discord posts"),

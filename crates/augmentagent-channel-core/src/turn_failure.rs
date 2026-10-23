@@ -160,6 +160,9 @@ const RULES: &[(FailureClass, &[&str])] = &[
         "unauthorized",
         "forbidden",
         "not logged in",
+        "failed to authenticate",
+        "could not be refreshed",
+        "run /login",
         "invalid api key",
         "incorrect api key",
         "invalid_api_key",
@@ -330,6 +333,18 @@ mod tests {
 
     /// The table, pinned row by row with the real wording each row exists
     /// for. A new failure shape gets a line here before a needle.
+    /// #1499 — the claude CLI's wording for an expired login.
+    #[test]
+    fn claude_cli_oauth_expiry_wording_is_auth() {
+        for detail in [
+            "Failed to authenticate: OAuth session expired and could not be refreshed",
+            "Invalid API key · Please run /login",
+            "Not logged in · Please run /login",
+        ] {
+            assert_eq!(classify(detail, true), Auth, "{detail}");
+        }
+    }
+
     #[test]
     fn classifier_table_pins_real_failure_wording() {
         let cases: &[(&str, FailureClass)] = &[

@@ -36,7 +36,8 @@ fn discord_model_switch_sequence_uses_one_audited_harness() {
 import json, sys
 names = ('search_conversation_history', 'read_conversation_thread',
          'search_messages', 'conversation_stats', 'search_notes',
-         'memory_search', 'memory_recent', 'switch_model')
+         'memory_search', 'memory_recent', 'switch_model',
+         'start_auth', 'auth_status', 'complete_auth')
 for line in sys.stdin:
     request = json.loads(line)
     method = request.get('method')
@@ -61,7 +62,7 @@ for line in sys.stdin:
     let finance = release.join("augmentagent");
     std::fs::write(
         &finance,
-        "#!/bin/sh\nif [ \"$1\" = model-tool ]; then exec \"$(dirname \"$0\")/augmentagent-mcp-memory\"; fi\n[ \"$#\" -eq 2 ] && [ \"$1\" = finance ] && [ \"$2\" = status ] || exit 64\nprintf 'SHELL_FIXTURE_OK\\n'\n",
+        "#!/bin/sh\nif [ \"$1\" = model-tool ] || [ \"$1\" = composio-auth-tool ]; then exec \"$(dirname \"$0\")/augmentagent-mcp-memory\"; fi\n[ \"$#\" -eq 2 ] && [ \"$1\" = finance ] && [ \"$2\" = status ] || exit 64\nprintf 'SHELL_FIXTURE_OK\\n'\n",
     )
     .unwrap();
     std::fs::set_permissions(&finance, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -219,7 +220,7 @@ async fn discord_model_switch_sequence_child() {
         conversation_store: None,
         conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()),
         voice_enabled: false,
-        voice_tools: std::sync::OnceLock::new(),
+        phone_tools: std::sync::OnceLock::new(), voice_tools: std::sync::OnceLock::new(),
         final_spoken_turns: dashmap::DashMap::new(),
     };
     let file = root.join("wiki/probe.txt");

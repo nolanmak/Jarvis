@@ -6,12 +6,18 @@
 
 // #1289 — durable approval-card pointers per surface.
 pub mod approval_cards;
+pub mod approval_history;
+pub mod document_signatures;
+pub mod alert_schedule;
 pub mod daemon_report;
 pub mod delivery;
 pub mod imessage;
 pub mod models;
 pub mod notes;
 pub mod owner;
+pub mod phone;
+mod local_chat;
+pub mod owner_alerts;
 pub mod redact;
 // #1290 — Slack contact send targets and the per-action send ledger.
 pub mod slack_contact;
@@ -37,13 +43,15 @@ pub use surface::{
 
 pub use models::{
     Account, ActionRecord, ActionStatus, AgentPrRun, AgentRepo, ChannelSubscription,
-    ConnectionRequestRow, DriveAccount, Email, FriendWatch, LearnedPattern, LinkedInConnectionSync,
+    ConnectionRequestRow, DriveAccount, Email, FriendWatch, GmailRateRefusal, LearnedPattern,
+    LinkedInConnectionSync,
     OwnPost, PhoneIdentity, RateAuditRow, RateEvent, RateHalt, RateWarmup, ScheduledPost,
     ScheduledPostStatus, SlackWorkspace, SocialapiAccount, SocialapiWebhookEvent, SubscriptionMode,
     TelegramBot, ToneExample, ToneProfile, TriageResult, UserLoop, WhatsappDevice,
 };
 pub use store::{
-    ActionCodeModeFields, ActionWithEmail, DiscordConversation, JournalSyncCursor,
+    ActionCodeModeFields, ActionWithEmail, BodyCompaction, DiscordConversation, InterruptedDiscordTurn,
+    JournalSyncCursor,
     NativeConversation, PendingActionRow, PendingNudge, RetryableReply, RevisionRecord, Store,
     StoreError, StoreResult, SurfaceTurnResolution, SurfaceTurnState, SurfaceTurnStatus,
     NUDGE_INTERVAL_MS,

@@ -104,6 +104,32 @@
       "operations": [
         "mcp__computer__computer_task"
       ]
+    },
+    "compute-task-mcp": {
+      "scope": "Owner-authorized turn only: dependency-enabled computation through a grant-scoped socket; reads explicitly selected files under /inputs and writes declared files under /outputs, no host paths exposed",
+      "operations": [
+        "mcp__compute__run"
+      ]
+    },
+    "composio-auth-mcp": {
+      "scope": "Owner-authorized hosted consent attempts; credentials stay in the MCP child and dashboard; existing preset permissions and model preserved.",
+      "operations": [
+        "mcp__composio_auth__start_auth",
+        "mcp__composio_auth__auth_status",
+        "mcp__composio_auth__complete_auth"
+      ]
+    },
+    "owner-phone-mcp": {
+      "scope": "Transport-authenticated owner and conversation only; revocable private broker grants. Preserve existing tool permissions and approval policy. Number/code entry bypasses the model; speech is present only during an accepted phone turn.",
+      "operations": [
+        "mcp__phone__call_owner",
+        "mcp__phone__phone_status",
+        "mcp__phone__phone_hangup",
+        "mcp__phone__phone_number_setup",
+        "mcp__phone__phone_number_status",
+        "mcp__phone__phone_number_remove",
+        "mcp__phone__speak (accepted phone turn only)"
+      ]
     }
   },
   "presets": [
@@ -465,6 +491,53 @@
       "provider_conformance": "verified"
     },
     {
+      "callsite": "crates/augmentagent-cli/src/compute_tool.rs::configure",
+      "permission_profile": "compute-task-mcp",
+      "output_contract": "Preserve the wrapped preset output contract",
+      "model_tier": "preserved",
+      "tier_rationale": "Builds nothing itself: adds the grant-scoped compute MCP tool to the wrapped preset and keeps its model.",
+      "conformance": [
+        "compute_tool::tests::configured_facade_exposes_no_runtime_paths_and_preserves_other_tools",
+        "compute_tool::tests::capability_denial_and_program_repair_share_original_task_budget",
+        "compute_tool::tests::repair_deadline_exhaustion_returns_typed_refusal_without_dispatch"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/computer_tool.rs::configure",
+      "permission_profile": "computer-task-mcp",
+      "output_contract": "Preserve the wrapped preset output contract",
+      "model_tier": "preserved",
+      "tier_rationale": "Preserves the parent model; the delegated browser worker selects its own validated Astra model.",
+      "conformance": [
+        "computer_tool::tests::computer_tools_require_trusted_owner_and_bind_identity_outside_model_arguments"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/main.rs::answer",
+      "permission_profile": "wiki-agentic",
+      "output_contract": "Complete assistant transcript with original ATTACH markers and image context",
+      "model_tier": "preserved",
+      "tier_rationale": "Delegates to ask_opts and keeps its pinned model; adds only owner-gated conversation context and the AUGMENTAGENT_DB env when history is authorized.",
+      "conformance": [
+        "approval_context::tests::real_query_harness_refreshes_approval_context_in_resumed_session",
+        "approval_context::tests::simultaneous_surfaces_only_execute_once_and_context_is_fresh_each_turn"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/main.rs::configure_newsletter_tools",
+      "permission_profile": "newsletter-cli",
+      "output_contract": "Preserve the wrapped preset output contract",
+      "model_tier": "preserved",
+      "tier_rationale": "Builds nothing itself: adds the owner-gated NewsletterBuddy CLI allowlist and environment to the wrapped Discord preset and keeps its model.",
+      "conformance": [
+        "newsletter_agent_tests::newsletter_commands_require_explicit_owner_allowlist_and_configured_url"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
       "callsite": "crates/augmentagent-cli/src/main.rs::run_reasoner_selftest",
       "permission_profile": "text",
       "output_contract": "Selftest response used for text-only failover diagnosis",
@@ -473,6 +546,19 @@
       "conformance": [
         "reasoner_failover_e2e::quota_refusal_fails_over_to_codex_and_latches",
         "reasoner_failover_e2e::healthy_primary_never_spawns_fallback"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/model_tool.rs::configure",
+      "permission_profile": "model-switch-mcp",
+      "output_contract": "Preserve the wrapped preset output contract",
+      "model_tier": "preserved",
+      "tier_rationale": "Builds nothing itself: adds the owner-gated model-switch MCP tool to the wrapped Discord preset and keeps its model.",
+      "conformance": [
+        "model_tool::tests::model_tool_requires_an_owner_and_channel",
+        "model_tool::tests::model_tool_scopes_changes_refuses_paused_profiles_and_resets",
+        "model_switch_sequence_tests::discord_model_switch_sequence_uses_one_audited_harness"
       ],
       "provider_conformance": "verified"
     },
@@ -526,28 +612,15 @@
       "provider_conformance": "verified"
     },
     {
-      "callsite": "crates/augmentagent-cli/src/main.rs::configure_newsletter_tools",
-      "permission_profile": "newsletter-cli",
-      "output_contract": "Preserve the wrapped preset output contract",
+      "callsite": "crates/augmentagent-cli/src/self_improve.rs::slice_opts",
+      "permission_profile": "source-inspect",
+      "output_contract": "Ordered child-issue plan or a cannot-slice explanation; no repository writes",
       "model_tier": "preserved",
-      "tier_rationale": "Builds nothing itself: adds the owner-gated NewsletterBuddy CLI allowlist and environment to the wrapped Discord preset and keeps its model.",
+      "tier_rationale": "Wraps scope_opts, preserving its pinned scope model and read-only tool policy while replacing the system prompt.",
       "conformance": [
-        "newsletter_agent_tests::newsletter_commands_require_explicit_owner_allowlist_and_configured_url"
+        "self_improve::tests::source_inspection_presets_enforce_read_only_bridge_access"
       ],
-      "provider_conformance": "verified"
-    },
-    {
-      "callsite": "crates/augmentagent-cli/src/model_tool.rs::configure",
-      "permission_profile": "model-switch-mcp",
-      "output_contract": "Preserve the wrapped preset output contract",
-      "model_tier": "preserved",
-      "tier_rationale": "Builds nothing itself: adds the owner-gated model-switch MCP tool to the wrapped Discord preset and keeps its model.",
-      "conformance": [
-        "model_tool::tests::model_tool_requires_an_owner_and_channel",
-        "model_tool::tests::model_tool_scopes_changes_refuses_paused_profiles_and_resets",
-        "model_switch_sequence_tests::discord_model_switch_sequence_uses_one_audited_harness"
-      ],
-      "provider_conformance": "verified"
+      "provider_conformance": "inherited from scope_opts; slicing prompt not live-provider verified"
     },
     {
       "callsite": "crates/augmentagent-cli/src/voice_tool.rs::configure",
@@ -565,17 +638,6 @@
       "provider_conformance": "verified"
     },
     {
-      "callsite": "crates/augmentagent-cli/src/computer_tool.rs::configure",
-      "permission_profile": "computer-task-mcp",
-      "output_contract": "Preserve the wrapped preset output contract",
-      "model_tier": "preserved",
-      "tier_rationale": "Preserves the parent model; the delegated browser worker selects its own validated Astra model.",
-      "conformance": [
-        "computer_tool::tests::computer_tools_require_trusted_owner_and_bind_identity_outside_model_arguments"
-      ],
-      "provider_conformance": "verified"
-    },
-    {
       "callsite": "crates/augmentagent-heartbeat/src/runner.rs::heartbeat_opts",
       "permission_profile": "wiki-read",
       "output_contract": "One JSON decision object: {\"notify\": false} or {\"notify\": true, \"message\": ...}; anything else is recorded as an error and never delivered",
@@ -584,6 +646,34 @@
       "conformance": [
         "runner::tests::heartbeat_opts_are_read_only_fast_and_scoped_to_the_wiki"
       ]
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/composio_auth_tool.rs::configure",
+      "permission_profile": "composio-auth-mcp",
+      "output_contract": "Preserve the wrapped preset output contract; only report connected after verified persistence.",
+      "model_tier": "preserved",
+      "tier_rationale": "Adds owner-gated authentication tools without changing the wrapped model.",
+      "conformance": [
+        "composio_auth_tool::tests::owner_gate_and_database_do_not_depend_on_discord_channel_or_history",
+        "composio_auth_tool::tests::malformed_arguments_fail_before_credentials_or_network_access",
+        "scripts/tests/composio_auth_smoke.py"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/phone_agent.rs::attach_tools",
+      "permission_profile": "owner-phone-mcp",
+      "output_contract": "Preserve the originating query contract; phone speech and durable transcript delivery use separate receipts.",
+      "model_tier": "preserved",
+      "tier_rationale": "Adds scoped MCP tools to the existing native session without replacing its model or approval configuration.",
+      "conformance": [
+        "phone_agent::phone_tool_configuration_requires_authenticated_context_and_preserves_other_tools",
+        "phone_agent::ac06_text_three_phone_turns_text_resume_the_same_native_session",
+        "phone_agent::late_reply_is_not_mirrored_or_returned_after_authority_changes",
+        "discord_phone_session_tests::discord_phone_dm_text_reuses_native_session_without_legacy_voice",
+        "whatsapp_phone_session_tests::whatsapp_text_phone_text_preserves_native_session_and_tools"
+      ],
+      "provider_conformance": "unverified"
     }
   ]
 }

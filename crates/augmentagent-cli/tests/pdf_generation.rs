@@ -97,6 +97,49 @@ fn pdf_cli_requires_root_and_bounds_input() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("WIKI_ROOT must be set"));
 }
 
+#[test]
+fn pdf_cli_managed_runtime_does_not_depend_on_path_or_wiki_python_modules() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("source.md"), "# Managed runtime").unwrap();
+    std::fs::write(
+        root.path().join("markdown.py"),
+        "raise RuntimeError('wiki import')",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_augmentagent"))
+        .env("WIKI_ROOT", root.path())
+        .env("PATH", root.path())
+        .env("PYTHONPATH", root.path())
+        .env_remove("AUGMENTAGENT_PDF_PYTHON")
+        .current_dir(root.path())
+        .args(["doc", "render-pdf", "source.md"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(root.path().join("source.pdf").is_file());
+}
+
+#[test]
+fn pdf_cli_missing_managed_runtime_reports_repair_without_publishing() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("source.md"), "# Document").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_augmentagent"))
+        .env("WIKI_ROOT", root.path())
+        .env("XDG_DATA_HOME", root.path().join("missing-runtime"))
+        .env_remove("AUGMENTAGENT_PDF_PYTHON")
+        .current_dir(root.path())
+        .args(["doc", "render-pdf", "source.md"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("scripts/pdf-runtime.py"));
+    assert!(!root.path().join("source.pdf").exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn pdf_cli_never_publishes_failed_invalid_or_oversized_renderer_output() {
@@ -115,6 +158,7 @@ fn pdf_cli_never_publishes_failed_invalid_or_oversized_renderer_output() {
         let out = Command::new(env!("CARGO_BIN_EXE_augmentagent"))
             .env("WIKI_ROOT", root.path())
             .env("PATH", bin.path())
+            .env("AUGMENTAGENT_PDF_PYTHON", &worker)
             .current_dir(root.path())
             .args(["doc", "render-pdf", "source.md"])
             .output()
@@ -142,6 +186,7 @@ fn pdf_cli_preserves_dependency_error_when_worker_exits_before_reading_input() {
     let out = Command::new(env!("CARGO_BIN_EXE_augmentagent"))
         .env("WIKI_ROOT", root.path())
         .env("PATH", bin.path())
+        .env("AUGMENTAGENT_PDF_PYTHON", &worker)
         .current_dir(root.path())
         .args(["doc", "render-pdf", "source.md"])
         .output()

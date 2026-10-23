@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 tempfile = "3"
 augmentagent-finance = { path = "../augmentagent-finance" }
+augmentagent-phone = { path = "../augmentagent-phone" }
 augmentagent-store = { path = "../augmentagent-store" }
 augmentagent-channel-core = { path = "../augmentagent-channel-core" }
 augmentagent-channel-reddit = { path = "../augmentagent-channel-reddit" }
@@ -23,6 +24,7 @@ augmentagent-channel-twitter = { path = "../augmentagent-channel-twitter" }
 augmentagent-channel-socialapi = { path = "../augmentagent-channel-socialapi" }
 augmentagent-channel-discord-dm = { path = "../augmentagent-channel-discord-dm" }
 augmentagent-channel-slack = { path = "../augmentagent-channel-slack" }
+augmentagent-channel-whatsapp = { path = "../augmentagent-channel-whatsapp" }
 augmentagent-channel-github = { path = "../augmentagent-channel-github" }
 augmentagent-channel-meetup = { path = "../augmentagent-channel-meetup" }
 augmentagent-channel-gdrive = { path = "../augmentagent-channel-gdrive" }
@@ -90,6 +92,10 @@ quick-xml = "0.38"
 # fake `Signaler` that returns ESRCH; the real walker + kill live in the
 # `augmentagent-loops` shared crate so the Discord channel can call them.
 libc = "0.2"
+# #1410 — deploy snapshots store the database gzip-compressed.
+flate2 = "1"
+# …and are taken with `VACUUM INTO` on the raw file, outside the store.
+rusqlite = { workspace = true }
 
 # #14 — snapshot test for the `augmentagent status --json` schema. `insta`
 # is the idiomatic Rust snapshot crate; `tempfile` gives the test an isolated
@@ -110,3 +116,7 @@ mockito = "1"
 # Same version the workspace already resolves (serenity, the Slack crate).
 tokio-tungstenite = "0.21"
 futures = { workspace = true }
+# Phone callback signatures in the offline daemon adapter test.
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"

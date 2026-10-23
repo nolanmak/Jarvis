@@ -104,6 +104,13 @@ fi
 # Write to new files.
 if RESOLVED=$(readlink -m -- "$ABS" 2>/dev/null); then
   ABS="$RESOLVED"
+elif RESOLVED=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$ABS" 2>/dev/null); then
+  # macOS readlink has no GNU -m. Python resolves existing parents while
+  # preserving nonexistent leaf names, including new Write destinations.
+  ABS="$RESOLVED"
+else
+  echo "aa-wiki-scope-guard: cannot canonicalize candidate" >&2
+  exit 2
 fi
 
 # #1078 — the protected-name check below also runs against the REQUESTED path,
@@ -113,9 +120,21 @@ fi
 # that laundering. Relative candidates are already wiki-relative; absolute ones
 # are made relative only when they land under the wiki root.
 REQUESTED_REL=""
+REQUESTED_ABS="$CANDIDATE"
+if [[ "$(uname -s)" == Darwin && "$CANDIDATE" = /* ]]; then
+  # Preserve all model-controlled components (including protected symlink
+  # names), normalizing only the fixed OS prefix used by the canonical root.
+  for SYSTEM_ALIAS in /var /tmp /etc; do
+    if [[ "$REQUESTED_ABS" == "$SYSTEM_ALIAS"/* ]] \
+       && [[ "$(readlink -f -- "$SYSTEM_ALIAS" 2>/dev/null)" == "/private$SYSTEM_ALIAS" ]]; then
+      REQUESTED_ABS="/private$REQUESTED_ABS"
+      break
+    fi
+  done
+fi
 if [[ "$CANDIDATE" = /* ]]; then
-  if [[ "$CANDIDATE" == "$WIKI_ROOT_ABS"/* ]]; then
-    REQUESTED_REL="${CANDIDATE#"$WIKI_ROOT_ABS"/}"
+  if [[ "$REQUESTED_ABS" == "$WIKI_ROOT_ABS"/* ]]; then
+    REQUESTED_REL="${REQUESTED_ABS#"$WIKI_ROOT_ABS"/}"
   fi
 else
   REQUESTED_REL="$CANDIDATE"
@@ -167,6 +186,15 @@ fi
 # Codex bridge policy is built. `scope_guard_carve_outs_mirror_the_read_allowance_definition`
 # fails if a regex here drifts from it; change both together.
 #
+# Carve-outs are specified with the daemon's /tmp spelling. Canonical paths
+# on macOS use /private/tmp; only map the fixed OS alias back for these two
+# single-file checks. Wiki/transcript and Slack comparisons stay canonical.
+ATTACHMENT_ABS="$ABS"
+if [[ "$(uname -s)" == Darwin && "$ABS" == /private/tmp/* ]] \
+   && [[ "$(readlink -f -- /tmp 2>/dev/null)" == /private/tmp ]]; then
+  ATTACHMENT_ABS="/tmp/${ABS#/private/tmp/}"
+fi
+
 # Allow Read on Discord-attachment tempfiles. The discord crate
 # (augmentagent-approval-discord) downloads inbound attachments to
 # /tmp/aa-{img,txt,doc}-<msg_id>-<idx>.<ext> and instructs the model to
@@ -176,7 +204,7 @@ fi
 # wiki. The regex pins the canonical filename shape (digits-only ids,
 # alphanumeric extension) so a literal name like `aa-txt-..` cannot
 # slip past as a `/tmp/aa-txt-*` glob would.
-if [[ "$TOOL" == "Read" && "$ABS" =~ ^/tmp/aa-(txt|img|doc)-[0-9]+-[0-9]+\.[a-zA-Z0-9]+$ ]]; then
+if [[ "$TOOL" == "Read" && "$ATTACHMENT_ABS" =~ ^/tmp/aa-(txt|img|doc)-[0-9]+-[0-9]+\.[a-zA-Z0-9]+$ ]]; then
   exit 0
 fi
 
@@ -184,7 +212,7 @@ fi
 # $AUGMENTAGENT_IMESSAGE_TMP_DIR/<name>: a /tmp/aa-imsg/<session> dir minted per ask session,
 # <name> CLI-sanitized. Read-only like the carve-out above; ABS is `..`-resolved, the quoted var matches literally.
 if [[ "$TOOL" == "Read" && "${AUGMENTAGENT_IMESSAGE_TMP_DIR:-}" =~ ^/tmp/aa-imsg/[A-Za-z0-9._-]+$ \
-      && "$ABS" =~ ^"$AUGMENTAGENT_IMESSAGE_TMP_DIR"/[A-Za-z0-9._-]+$ ]]; then
+      && "$ATTACHMENT_ABS" =~ ^"$AUGMENTAGENT_IMESSAGE_TMP_DIR"/[A-Za-z0-9._-]+$ ]]; then
   exit 0
 fi
 

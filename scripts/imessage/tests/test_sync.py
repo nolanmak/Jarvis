@@ -14,6 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from imessage_sync import (
+    source_staleness,
     apple_time_to_iso,
     drain_uploads,
     is_uploadable,
@@ -405,6 +406,43 @@ class TestSync(unittest.TestCase):
         state = json.loads(self.state.read_text())
         self.assertEqual(state["last_rowid"], 1)
 
+    def test_newest_entry_tracks_the_last_appended_message(self):
+        add_message(self.con, 1, 1, "first", ns(1782475200), 0)
+        sync(self.db_path, self.out, self.state)
+        self.assertEqual(
+            self._index()["+15551234567"]["newest_entry"],
+            apple_time_to_iso(ns(1782475200)),
+        )
+        add_message(self.con, 2, 1, "second", ns(1782475300), 1)
+        sync(self.db_path, self.out, self.state)
+        newest = apple_time_to_iso(ns(1782475300))
+        self.assertEqual(self._index()["+15551234567"]["newest_entry"], newest)
+        # A run that appends nothing never regresses the cursor.
+        sync(self.db_path, self.out, self.state)
+        self.assertEqual(self._index()["+15551234567"]["newest_entry"], newest)
+
+    def test_newest_entry_is_not_the_synced_at_value(self):
+        add_message(self.con, 1, 1, "first", ns(1782475200), 0)
+        sync(self.db_path, self.out, self.state)
+        self.assertNotEqual(
+            self._index()["+15551234567"]["newest_entry"],
+            json.loads(self.state.read_text())["synced_at"],
+        )
+
+    def test_unknown_time_never_becomes_the_cursor(self):
+        add_message(self.con, 1, 1, "dated", ns(1782475200), 0)
+        sync(self.db_path, self.out, self.state)
+        known = self._index()["+15551234567"]["newest_entry"]
+        add_message(self.con, 2, 1, "undated", 0, 0)
+        sync(self.db_path, self.out, self.state)
+        self.assertIn("unknown-time", self.read_md("+15551234567"))
+        self.assertEqual(self._index()["+15551234567"]["newest_entry"], known)
+
+    def test_newest_entry_absent_until_a_message_with_a_timestamp(self):
+        add_message(self.con, 1, 1, "undated", 0, 0)
+        sync(self.db_path, self.out, self.state)
+        self.assertIsNone(self._index()["+15551234567"].get("newest_entry"))
+
     def test_index_json_written(self):
         add_message(self.con, 1, 2, "yo", ns(1782475200), 0, handle_id=2)
         sync(self.db_path, self.out, self.state)
@@ -585,6 +623,44 @@ class TestUploadableFilter(unittest.TestCase):
     def test_real_media_is_uploadable(self):
         for name in ("a.jpeg", "b.HEIC", "c.mov", "d.pdf", "e.png"):
             self.assertTrue(is_uploadable("/x/" + name), name)
+
+
+class TestSourceStaleness(unittest.TestCase):
+    """A frozen source database must be visible in the job's own output.
+
+    Notes.app went unopened for ~8 weeks and WhatsApp for ~2; both stores
+    stopped advancing and the exporters reported "0 changed" every two minutes
+    with no error, so nobody could tell a healthy sync from a dead source.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Path(self.tmp.name) / "source.sqlite"
+        self.db.write_text("x")
+
+    def test_a_fresh_source_reports_no_staleness(self):
+        self.assertIsNone(source_staleness(str(self.db)))
+
+    def test_a_cold_source_reports_its_age(self):
+        import os
+        when = time.time() - 9 * 86400
+        os.utime(self.db, (when, when))
+        age = source_staleness(str(self.db))
+        self.assertIsNotNone(age)
+        self.assertGreater(age, 8 * 86400)
+
+    def test_the_threshold_is_respected(self):
+        import os
+        when = time.time() - 2 * 3600
+        os.utime(self.db, (when, when))
+        self.assertIsNone(source_staleness(str(self.db), threshold=6 * 3600))
+        self.assertIsNotNone(source_staleness(str(self.db), threshold=3600))
+
+    def test_a_missing_source_is_not_reported_as_stale(self):
+        # Absence is a different failure with a different message; this helper
+        # must not claim a missing file is merely old.
+        self.assertIsNone(source_staleness(str(self.db) + ".nope"))
 
 if __name__ == "__main__":
     unittest.main()

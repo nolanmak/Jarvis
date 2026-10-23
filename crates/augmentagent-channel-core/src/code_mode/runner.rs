@@ -13,9 +13,8 @@
 //!
 //! 1. `AUGMENTAGENT_CODE_MODE_SIDECAR` env var (absolute path to
 //!    `runner.ts`) wins.
-//! 2. Otherwise walk up from `CARGO_MANIFEST_DIR` (or `cwd` when not
-//!    built via cargo) looking for `sidecars/code-mode-runner/runner.ts`.
-//! 3. Fall back to `./sidecars/code-mode-runner/runner.ts`.
+//! 2. Otherwise materialize the compiled-in sidecar into a private temporary
+//!    file, retained until the runner exits. Task directories never select code.
 //!
 //! The Deno binary location resolves in the following order:
 //!
@@ -37,7 +36,7 @@
 //! `sidecars/code-mode-runner/runner.ts`'s `TIMEOUT_MS`). We additionally
 //! enforce the same budget on the Rust side as defence-in-depth — if the
 //! child process is still alive after [`RUST_WALL_CLOCK_MS`] from when we
-//! finished writing the header, we kill it and return
+//! began delivering the header, we kill it and return
 //! [`RunnerError::Timeout`]. This guards against a malfunctioning
 //! sandbox that fails to enforce its own timeout (e.g. a JIT bug) or
 //! against the spawn step itself hanging on a stuck child.
@@ -49,19 +48,16 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::time::timeout;
 
 use super::dispatch::Dispatcher;
 use super::manifest::ToolManifest;
 use super::trace::ToolCallRecord;
 
-/// Defence-in-depth wall clock for the *whole* program (header write →
-/// `{"final"}` or `{"error"}` frame). Generous over the sandbox's own
-/// 60s so the in-sandbox timeout frame can be observed before we kill
-/// the child.
-pub const RUST_WALL_CLOCK_MS: u64 = 65_000;
+/// Default host wall clock for the whole program, including header delivery
+/// and process exit. The host deadline also stops a blocked JS event loop.
+pub const RUST_WALL_CLOCK_MS: u64 = 60_000;
 
 /// Outcome of a successful program run.
 ///
@@ -77,6 +73,8 @@ pub struct CodeModeOutcome {
     /// One entry per `tools.*` call in the order they happened. Pulled
     /// from the dispatcher's internal buffer after the program finished.
     pub trace: Vec<ToolCallRecord>,
+    /// Host refusals remain observable even when the program catches errors.
+    pub dispatch_failures: usize,
 }
 
 /// Where [`resolve_deno_bin`] sourced the returned path from. Carried
@@ -120,6 +118,8 @@ pub struct DenoResolution {
 /// Errors `run_program` can return.
 #[derive(Debug, Error)]
 pub enum RunnerError {
+    #[error("resource_limit: {0}")]
+    ResourceLimit(&'static str),
     /// Failed to spawn `deno` — non-ENOENT cause (permission denied,
     /// EMFILE, etc.). ENOENT is surfaced as [`RunnerError::DenoNotFound`]
     /// with a richer diagnostic.
@@ -180,6 +180,52 @@ pub enum RunnerError {
     UnexpectedExit(String),
 }
 
+impl RunnerError {
+    /// Stable failure category for reports; never serialize program messages.
+    pub fn public_code(&self) -> &'static str {
+        match self {
+            Self::Timeout { .. } => "timeout",
+            Self::ResourceLimit(_) => "resource_limit",
+            Self::DenoNotFound { .. } | Self::Spawn(_) => "sandbox_unavailable",
+            Self::RuntimeError {
+                kind: Some(kind), ..
+            } if kind == "timeout" => "timeout",
+            Self::RuntimeError {
+                kind: Some(kind), ..
+            } if kind == "call_budget_exceeded" => "resource_limit",
+            _ => "execution_failed",
+        }
+    }
+}
+
+/// Host-selected program policy. Never deserialize this from model arguments.
+#[derive(Debug, Clone)]
+pub struct RunOptions {
+    pub timeout: Duration,
+    pub compute_inputs: std::collections::BTreeMap<String, String>,
+    /// Private host-owned task storage for recoverable orchestration files.
+    pub orchestration_root: Option<PathBuf>,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(60),
+            compute_inputs: Default::default(),
+            orchestration_root: None,
+        }
+    }
+}
+
+pub async fn run_program_with_options(
+    source: &str,
+    manifest: &ToolManifest,
+    dispatcher: &dyn Dispatcher,
+    options: &RunOptions,
+) -> Result<CodeModeOutcome, RunnerError> {
+    run_program_inner(source, manifest, dispatcher, options).await
+}
+
 /// Run `source` inside the Deno sandbox with the given `manifest` as the
 /// allowlist; dispatch every `tools.*` call to `dispatcher`.
 ///
@@ -195,26 +241,79 @@ pub async fn run_program(
     manifest: &ToolManifest,
     dispatcher: &dyn Dispatcher,
 ) -> Result<CodeModeOutcome, RunnerError> {
+    run_program_inner(source, manifest, dispatcher, &RunOptions::default()).await
+}
+
+async fn run_program_inner(
+    source: &str,
+    manifest: &ToolManifest,
+    dispatcher: &dyn Dispatcher,
+    options: &RunOptions,
+) -> Result<CodeModeOutcome, RunnerError> {
+    let millis = options.timeout.as_millis();
+    if !(1..=3_600_000).contains(&millis) || options.timeout.subsec_nanos() % 1_000_000 != 0 {
+        return Err(RunnerError::Protocol("invalid host program timeout".into()));
+    }
+    let started = tokio::time::Instant::now();
     let resolution = resolve_deno_bin();
-    let sidecar = resolve_sidecar_path();
+    let runtime_storage = options.orchestration_root.as_deref().map(RunStorage::new).transpose()?;
+    let sidecar = resolve_sidecar(runtime_storage.as_ref().map(|storage| storage.path.as_path()))?;
 
     tracing::debug!(
         deno = %resolution.path.display(),
         deno_source = %resolution.source,
-        sidecar = %sidecar.display(),
+        sidecar = %sidecar.path.display(),
         "spawning code-mode sandbox"
     );
 
-    let mut child = Command::new(&resolution.path)
+    let mut command = Command::new(&resolution.path);
+    if let Some(storage) = &runtime_storage {
+        command.env_clear().env("PATH", std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
+            .env("DENO_NO_UPDATE_CHECK", "1")
+            .env("HOME", storage.path.join("home"))
+            .env("DENO_DIR", storage.path.join("cache"))
+            .env("TMPDIR", storage.path.join("tmp"))
+            .env("XDG_CACHE_HOME", storage.path.join("cache"))
+            .env("XDG_CONFIG_HOME", storage.path.join("config"))
+            .env("XDG_DATA_HOME", storage.path.join("data"));
+    }
+    command
         .arg("run")
-        // No --allow-* flags: default-deny on every capability. See
-        // sidecars/code-mode-runner/README.md — `--allow-none` is NOT a
-        // real Deno flag.
-        .arg(&sidecar)
+        // Configuration and import resolution are independent of ordinary
+        // capability permissions. Do not inherit a task's deno.json or npm.
+        .args([
+            "--no-config",
+            "--no-lock",
+            "--no-code-cache",
+            "--no-npm",
+            "--no-remote",
+            "--deny-import",
+            "--no-prompt",
+        ])
+        .arg(&sidecar.path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    #[cfg(target_os = "linux")]
+    {
+        let owner = unsafe { libc::getpid() };
+        // kill_on_drop cannot run when the daemon/CLI receives SIGKILL.
+        // Only async-signal-safe syscalls are used between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                super::process::isolate_descriptors()?;
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != owner {
+                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+                }
+                Ok(())
+            });
+        }
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| map_spawn_error(e, &resolution))?;
 
@@ -232,31 +331,35 @@ pub async fn run_program(
         .take()
         .ok_or_else(|| RunnerError::Protocol("missing child stderr".into()))?;
 
-    // Drain stderr in the background so a chatty `deno run` warning can't
-    // wedge the pipe. We log it at debug level (it's almost always boilerplate
-    // about "Warning: ..."), but keep the join handle so the future is owned.
-    // Since #989 the sidecar also routes the program's `console.*` output
-    // here with synchronous writes, so this must be running before the
-    // header goes out and for the whole RPC loop — a full pipe would block
-    // the sidecar mid-program.
-    let stderr_task = tokio::spawn(drain_stderr(stderr));
-
     // First NDJSON frame: header. Serialise the manifest the runner.ts
     // schema expects (flat array of dotted names — see
     // sidecars/code-mode-runner/README.md).
     let header = HeaderFrame {
         program: source,
         manifest: manifest.to_runner_manifest(),
+        timeout_ms: millis as u64,
+        compute_inputs: &options.compute_inputs,
     };
     let mut header_line = serde_json::to_vec(&header)
         .map_err(|e| RunnerError::Protocol(format!("header encode: {e}")))?;
     header_line.push(b'\n');
-    stdin.write_all(&header_line).await?;
-    stdin.flush().await?;
-
-    // Drive the RPC loop with a Rust-side wall clock as defence-in-depth.
-    let loop_fut = rpc_loop(stdout, &mut stdin, dispatcher);
-    let outcome = match timeout(Duration::from_millis(RUST_WALL_CLOCK_MS), loop_fut).await {
+    // Header delivery is inside the watchdog too: a child that stops reading
+    // must not hang the host before the RPC loop even begins.
+    let loop_fut = async move {
+        stdin.write_all(&header_line).await?;
+        stdin.flush().await?;
+        let result = rpc_loop(stdout, &mut stdin, dispatcher, manifest).await;
+        drop(stdin);
+        result
+    };
+    // Both streams are owned by this future. A log overflow cancels an active
+    // RPC immediately, and dropping the caller cannot detach a drain task.
+    let drive = async {
+        let (outcome, ()) = tokio::try_join!(loop_fut, drain_stderr(stderr))?;
+        Ok(outcome)
+    };
+    let wall = options.timeout;
+    let outcome = match tokio::time::timeout_at(started + wall, drive).await {
         Ok(result) => result,
         Err(_) => {
             // Wall clock fired. Kill the child explicitly (kill_on_drop
@@ -264,9 +367,8 @@ pub async fn run_program(
             // the error).
             let _ = child.start_kill();
             let _ = child.wait().await;
-            stderr_task.abort();
             return Err(RunnerError::Timeout {
-                ms: RUST_WALL_CLOCK_MS,
+                ms: wall.as_millis() as u64,
             });
         }
     };
@@ -274,10 +376,28 @@ pub async fn run_program(
     // Close our stdin so the sandbox knows there are no more responses
     // coming, then reap the process. We don't care about the exit code
     // beyond logging — the protocol layer already told us success / failure.
-    drop(stdin);
-    let _ = child.wait().await;
-    // Stop draining stderr (the child is gone).
-    let _ = stderr_task.await;
+    if outcome.is_err() {
+        let _ = child.start_kill();
+    }
+    let exit = tokio::time::timeout_at(started + wall, child.wait()).await;
+    match exit {
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(RunnerError::Timeout {
+                ms: wall.as_millis() as u64,
+            });
+        }
+        Ok(Err(error)) => {
+            return Err(error.into());
+        }
+        Ok(Ok(status)) if !status.success() && outcome.is_ok() => {
+            return Err(RunnerError::UnexpectedExit(
+                "sandbox exited unsuccessfully after final frame".into(),
+            ));
+        }
+        _ => (),
+    }
 
     outcome
 }
@@ -286,6 +406,10 @@ pub async fn run_program(
 struct HeaderFrame<'a> {
     program: &'a str,
     manifest: Vec<String>,
+    #[serde(rename = "timeoutMs")]
+    timeout_ms: u64,
+    #[serde(rename = "computeInputs")]
+    compute_inputs: &'a std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -302,6 +426,8 @@ enum SandboxFrame {
     Final {
         #[serde(rename = "final")]
         value: Value,
+        #[serde(default, rename = "localRefusal")]
+        local_refusal: bool,
     },
     /// `{ "error": { ... } }` — terminal failure.
     Error { error: ErrorPayload },
@@ -321,29 +447,55 @@ async fn rpc_loop(
     stdout: tokio::process::ChildStdout,
     stdin: &mut tokio::process::ChildStdin,
     dispatcher: &dyn Dispatcher,
+    manifest: &ToolManifest,
 ) -> Result<CodeModeOutcome, RunnerError> {
+    let allowed = manifest.to_runner_manifest();
+    let mut calls = 0;
+    let mut dispatch_failures = 0;
     let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
+    let mut line = Vec::new();
 
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).await?;
+        let n = (&mut reader)
+            .take(2 * 1024 * 1024 + 1)
+            .read_until(b'\n', &mut line)
+            .await?;
+        if n > 2 * 1024 * 1024 {
+            return Err(RunnerError::ResourceLimit("sandbox frame exceeds 2 MiB"));
+        }
         if n == 0 {
             // EOF before terminal frame.
             return Err(RunnerError::UnexpectedExit(
                 "sandbox stdout closed with no {final} or {error} frame".into(),
             ));
         }
+        if line.last() != Some(&b'\n') {
+            return Err(RunnerError::Protocol("incomplete sandbox frame".into()));
+        }
+        let line = std::str::from_utf8(&line)
+            .map_err(|_| RunnerError::Protocol("sandbox frame is not UTF-8".into()))?;
         let trimmed = line.trim_end_matches(['\n', '\r']);
         if trimmed.is_empty() {
             continue;
         }
         let frame: SandboxFrame = serde_json::from_str(trimmed)
-            .map_err(|e| RunnerError::Protocol(format!("decode {trimmed:?}: {e}")))?;
+            .map_err(|_| RunnerError::Protocol("invalid sandbox frame".into()))?;
         match frame {
             SandboxFrame::Call { id, call, args } => {
-                let args_for_dispatch = args.clone();
-                let result = dispatcher.call(&call, args_for_dispatch).await;
+                calls += 1;
+                let result = if !allowed.contains(&call) {
+                    Err(super::dispatch::DispatchError::UnknownTool(call.clone()))
+                } else if calls > 25 {
+                    Err(super::dispatch::DispatchError::PermitDenied(
+                        "tool call budget exceeded".into(),
+                    ))
+                } else {
+                    dispatcher.call(&call, args).await
+                };
+                if result.is_err() {
+                    dispatch_failures += 1;
+                }
                 let response_line = match result {
                     Ok(value) => serde_json::json!({ "id": id, "result": value }),
                     Err(err) => serde_json::json!({ "id": id, "error": err.wire_message() }),
@@ -354,10 +506,14 @@ async fn rpc_loop(
                 stdin.write_all(&buf).await?;
                 stdin.flush().await?;
             }
-            SandboxFrame::Final { value } => {
+            SandboxFrame::Final {
+                value,
+                local_refusal,
+            } => {
                 return Ok(CodeModeOutcome {
                     final_value: value,
                     trace: dispatcher.drain_trace(),
+                    dispatch_failures: dispatch_failures + usize::from(local_refusal),
                 });
             }
             SandboxFrame::Error { error } => {
@@ -371,23 +527,21 @@ async fn rpc_loop(
     }
 }
 
-async fn drain_stderr(stderr: tokio::process::ChildStderr) {
-    let mut reader = BufReader::new(stderr);
-    let mut line = String::new();
+async fn drain_stderr(mut stderr: tokio::process::ChildStderr) -> Result<(), RunnerError> {
+    // Program console output is untrusted, including newline-free streams.
+    // Do not copy its contents into public diagnostics or unbounded buffers.
+    let mut buffer = [0u8; 8192];
+    let mut total = 0usize;
     loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => {
-                let trimmed = line.trim_end_matches(['\n', '\r']);
-                if !trimmed.is_empty() {
-                    tracing::debug!(target: "code_mode_runner", "sandbox stderr: {trimmed}");
-                }
-            }
-            Err(e) => {
-                tracing::debug!("sandbox stderr read error: {e}");
-                break;
-            }
+        let count = stderr.read(&mut buffer).await?;
+        if count == 0 {
+            return Ok(());
+        }
+        total += count;
+        if total > 8 * 1024 * 1024 {
+            return Err(RunnerError::ResourceLimit(
+                "orchestration logs exceed 8 MiB",
+            ));
         }
     }
 }
@@ -570,37 +724,76 @@ pub async fn check_deno_available() -> Result<DenoResolution, RunnerError> {
     Ok(resolution)
 }
 
-fn resolve_sidecar_path() -> PathBuf {
-    if let Ok(p) = std::env::var("AUGMENTAGENT_CODE_MODE_SIDECAR") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    // Walk up from this crate's manifest dir looking for the sidecar.
-    // CARGO_MANIFEST_DIR is set at compile time when this crate is built
-    // by cargo; falls back to CWD otherwise.
-    let start: PathBuf = std::env::var_os("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."));
-    if let Some(p) = walk_up_for_sidecar(&start) {
-        return p;
-    }
-    PathBuf::from("./sidecars/code-mode-runner/runner.ts")
+struct RunStorage {
+    _temporary: tempfile::TempDir,
+    path: PathBuf,
+    // Keep the parent descriptor alive until descriptor-relative TempDir cleanup.
+    _parent: super::compute::artifacts::Directory,
 }
 
-fn walk_up_for_sidecar(start: &Path) -> Option<PathBuf> {
-    let mut cur = start.to_path_buf();
-    for _ in 0..8 {
-        let candidate = cur.join("sidecars/code-mode-runner/runner.ts");
-        if candidate.exists() {
-            return Some(candidate);
-        }
-        if !cur.pop() {
-            break;
-        }
+impl RunStorage {
+    #[cfg(not(unix))]
+    fn new(_root: &std::path::Path) -> Result<Self, RunnerError> {
+        Err(RunnerError::Protocol("private compute storage requires Unix".into()))
     }
-    None
+
+    #[cfg(unix)]
+    fn new(root: &std::path::Path) -> Result<Self, RunnerError> {
+        let create = || -> anyhow::Result<Self> {
+            use std::os::unix::fs::MetadataExt;
+            let parent = super::compute::artifacts::Directory::open(root, false)?;
+            let metadata = std::fs::metadata(parent.path())?;
+            anyhow::ensure!(metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o777 == 0o700,
+                "orchestration storage must be owner-private");
+            let (temporary, _) = parent.private_tempdir("compute-orchestration-")?;
+            let path = std::fs::canonicalize(temporary.path())?;
+            for name in ["home", "cache", "tmp", "config", "data"] {
+                std::fs::create_dir(path.join(name))?;
+            }
+            Ok(Self { _temporary: temporary, path, _parent: parent })
+        };
+        create().map_err(|_| RunnerError::Protocol("private orchestration storage unavailable".into()))
+    }
+}
+
+struct Sidecar {
+    path: PathBuf,
+    _file: Option<tempfile::NamedTempFile>,
+}
+
+fn resolve_sidecar(root: Option<&std::path::Path>) -> Result<Sidecar, RunnerError> {
+    materialize_sidecar_in(std::env::var_os("AUGMENTAGENT_CODE_MODE_SIDECAR"), root)
+}
+
+#[cfg(test)]
+fn materialize_sidecar(override_path: Option<std::ffi::OsString>) -> Result<Sidecar, RunnerError> {
+    materialize_sidecar_in(override_path, None)
+}
+
+fn materialize_sidecar_in(override_path: Option<std::ffi::OsString>, root: Option<&std::path::Path>) -> Result<Sidecar, RunnerError> {
+    if let Some(path) = override_path.filter(|path| !path.is_empty()) {
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(RunnerError::Protocol(
+                "sidecar override must be an absolute operator path".into(),
+            ));
+        }
+        return Ok(Sidecar { path, _file: None });
+    }
+    use std::io::Write;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("jarvis-code-mode-").suffix(".ts");
+    let mut file = match root {
+        Some(root) => builder.tempfile_in(root)?,
+        None => builder.tempfile()?,
+    };
+    file.write_all(include_bytes!(
+        "../../../../sidecars/code-mode-runner/runner.ts"
+    ))?;
+    Ok(Sidecar {
+        path: file.path().to_owned(),
+        _file: Some(file),
+    })
 }
 
 #[cfg(test)]
@@ -766,18 +959,28 @@ mod tests {
 
     #[test]
     fn resolve_sidecar_env_overrides() {
-        std::env::set_var("AUGMENTAGENT_CODE_MODE_SIDECAR", "/custom/runner.ts");
-        assert_eq!(resolve_sidecar_path(), PathBuf::from("/custom/runner.ts"));
-        std::env::remove_var("AUGMENTAGENT_CODE_MODE_SIDECAR");
+        let sidecar = materialize_sidecar(Some("/custom/runner.ts".into())).unwrap();
+        assert_eq!(sidecar.path, PathBuf::from("/custom/runner.ts"));
+        assert!(materialize_sidecar(Some("relative/runner.ts".into())).is_err());
     }
 
     #[test]
-    fn walk_up_finds_workspace_sidecar() {
-        // CARGO_MANIFEST_DIR at compile time points into the crate dir, so
-        // the walk-up should land on the real workspace sidecar.
-        let p = walk_up_for_sidecar(Path::new(env!("CARGO_MANIFEST_DIR")));
-        assert!(p.is_some(), "expected to find sidecar from crate dir");
-        let p = p.unwrap();
-        assert!(p.ends_with("sidecars/code-mode-runner/runner.ts"));
+    fn embedded_sidecar_is_private_and_removed_after_use() {
+        let sidecar = materialize_sidecar(None).unwrap();
+        let path = sidecar.path.clone();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            include_bytes!("../../../../sidecars/code-mode-runner/runner.ts")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(sidecar);
+        assert!(!path.exists());
     }
 }

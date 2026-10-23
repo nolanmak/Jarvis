@@ -228,6 +228,9 @@ impl RouterConfig {
         cmd.env("ANTHROPIC_BASE_URL", self.base_url.trim_end_matches("/v1"))
             .env("ANTHROPIC_AUTH_TOKEN", &self.api_key)
             .env("ANTHROPIC_CUSTOM_HEADERS", "X-9Router-Token-Saver: off")
+            // #1404 — a dead route should fail in seconds, not sit in the
+            // CLI's own retry loop; the caller has the direct CLI to fall to.
+            .env("CLAUDE_CODE_MAX_RETRIES", "2")
             .env_remove("ANTHROPIC_API_KEY")
             .env_remove("CLAUDE_CODE_OAUTH_TOKEN");
     }

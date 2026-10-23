@@ -222,6 +222,8 @@ pub struct BridgeLaunch {
     /// Per-turn voice capability, forwarded to Codex and then only to its
     /// configured stdio MCP child. Values never appear in CLI argv.
     pub voice_env: Vec<(String, String)>,
+    /// Per-turn compute capability, carried only in the MCP child environment.
+    pub compute_env: Vec<(String, String)>,
     /// The bridge policy, which carries integration secrets (#1044). It lives
     /// in its own randomly named 0700 directory, never in the launch directory
     /// that contains `native_cwd`, so no path walked up from Codex's cwd names it.
@@ -250,7 +252,7 @@ impl BridgeLaunch {
         use std::os::unix::fs::OpenOptionsExt;
         use serde_json::json;
 
-        let settings: serde_json::Value = match &opts.settings_json {
+        let mut settings: serde_json::Value = match &opts.settings_json {
             Some(raw) => serde_json::from_str(raw)?,
             None => json!({}),
         };
@@ -279,6 +281,31 @@ impl BridgeLaunch {
             }
             voice_launch = Some((command.to_string(), entries));
         }
+        let mut compute_launch: Option<(String, Vec<(String, String)>)> = None;
+        if let Some(server) = settings.pointer("/mcpServers/compute") {
+            anyhow::ensure!(opts.allowed_tools.iter().any(|tool| tool == "mcp__compute__run") &&
+                !opts.allowed_tools.iter().any(|tool| tool.starts_with("mcp__compute__") && tool != "mcp__compute__run"),
+                "compute MCP requires the exact run allowance");
+            let command = server.get("command").and_then(|value| value.as_str())
+                .ok_or_else(|| anyhow::anyhow!("compute MCP command missing"))?;
+            anyhow::ensure!(Path::new(command).is_absolute() && server.get("args") == Some(&json!(["compute-tool"])),
+                "invalid compute MCP launch");
+            let env = server.get("env").and_then(|value| value.as_object())
+                .ok_or_else(|| anyhow::anyhow!("compute MCP environment missing"))?;
+            anyhow::ensure!(env.len() == 2, "unexpected compute MCP environment");
+            let mut entries = Vec::new();
+            for key in ["AUGMENTAGENT_COMPUTE_TOOL_SOCKET", "AUGMENTAGENT_COMPUTE_TOOL_GRANT"] {
+                let value = env.get(key).and_then(|value| value.as_str()).filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("compute MCP capability missing"))?;
+                entries.push((key.to_string(), value.to_string()));
+            }
+            compute_launch = Some((command.to_string(), entries));
+        }
+        if compute_launch.is_some() {
+            settings["mcpServers"].as_object_mut().expect("validated MCP server map").remove("compute");
+        }
+        let bridge_tools: Vec<_> = opts.allowed_tools.iter().filter(|tool|
+            compute_launch.is_none() || !tool.starts_with("mcp__compute__")).collect();
         let web_search = opts.allowed_tools.iter().any(|tool| tool == "WebSearch");
         let web_fetch = opts.allowed_tools.iter().any(|tool| tool == "WebFetch");
         if web_search || web_fetch {
@@ -324,7 +351,7 @@ impl BridgeLaunch {
             // Pattern-scoped single files, never directories to walk (#1045).
             "read_allowances": read_allowances(opts).iter().map(ReadAllowance::policy).collect::<Vec<_>>(),
             "write_roots": write_roots,
-            "allowed_tools": opts.allowed_tools,
+            "allowed_tools": bridge_tools,
             "environment": environment,
             "settings": settings,
             "session_id": opts.session_id,
@@ -390,7 +417,14 @@ impl BridgeLaunch {
             ));
             env
         } else { Vec::new() };
-        Ok(Self { native_cwd, config_overrides, voice_env, policy_path, _policy_dir: policy_dir })
+        let compute_env = if let Some((command, env)) = compute_launch {
+            config_overrides.push(format!(
+                "mcp_servers.compute={{command={},args=[\"compute-tool\"],required=true,tool_timeout_sec=3605,env_vars=[\"AUGMENTAGENT_COMPUTE_TOOL_SOCKET\",\"AUGMENTAGENT_COMPUTE_TOOL_GRANT\"],default_tools_approval_mode=\"approve\"}}",
+                serde_json::to_string(&command)?
+            ));
+            env
+        } else { Vec::new() };
+        Ok(Self { native_cwd, config_overrides, voice_env, compute_env, policy_path, _policy_dir: policy_dir })
     }
 }
 
@@ -398,6 +432,27 @@ impl BridgeLaunch {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn compute_mcp_uses_native_transport_with_full_budget_and_private_grant() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut opts = crate::reasoner::resume_opts(fixture.path().into());
+        opts.allowed_tools.push("mcp__compute__run".into());
+        let mut settings: serde_json::Value = serde_json::from_str(opts.settings_json.as_deref().unwrap_or("{}")).unwrap();
+        settings["mcpServers"]["compute"] = serde_json::json!({
+            "command":"/fixture/augmentagent", "args":["compute-tool"],
+            "env":{"AUGMENTAGENT_COMPUTE_TOOL_SOCKET":"/fixture/socket", "AUGMENTAGENT_COMPUTE_TOOL_GRANT":"fixture-grant"}
+        });
+        opts.settings_json = Some(settings.to_string());
+        let launch = BridgeLaunch::prepare(&opts, fixture.path()).unwrap();
+        let native = launch.config_overrides.iter().find(|line| line.starts_with("mcp_servers.compute="));
+        assert!(native.is_some(), "compute is limited by the generic bridge's short MCP timeout");
+        assert!(native.unwrap().contains("tool_timeout_sec=3605"));
+        assert!(!native.unwrap().contains("fixture-grant"));
+        let policy: serde_json::Value = serde_json::from_slice(&std::fs::read(&launch.policy_path).unwrap()).unwrap();
+        assert!(policy.pointer("/settings/mcpServers/compute").is_none());
+        assert!(!policy["allowed_tools"].as_array().unwrap().contains(&serde_json::json!("mcp__compute__run")));
+    }
 
     #[test]
     fn native_web_cannot_expand_a_fetch_only_profile_or_bypass_matching_hooks() {

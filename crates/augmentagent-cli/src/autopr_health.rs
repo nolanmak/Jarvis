@@ -61,6 +61,10 @@ pub struct Finding {
 /// than the tick interval, so one pause covers the gap it causes.
 const PROVIDER_HOLD_FRESH_MINS: i64 = 90;
 
+/// #1409 — a previous disk reading older than this is no baseline for the
+/// growth rule (the timer runs every 2 h; three missed runs is a gap).
+const DISK_DROP_WINDOW_HOURS: f64 = 6.0;
+
 /// Everything the rules judge. Absent evidence is `None`, which never fires a
 /// rule: a missing log is a reason to stay quiet, not to cry wolf.
 #[derive(Debug, Clone, Default)]
@@ -83,6 +87,11 @@ pub struct HealthInputs {
     pub deploy_lag_mins: Option<i64>,
     pub free_gb_root: Option<f64>,
     pub free_gb_gate: Option<f64>,
+    /// #1409 — every OTHER filesystem that holds build output or state
+    /// (a symlinked `target/debug`, the temp dir, …), one entry per mount.
+    pub free_gb_elsewhere: Vec<(String, f64)>,
+    /// #1409 — filesystems that lost space fast since the previous check.
+    pub disk_drops: Vec<crate::disk::FsDrop>,
     /// When the cached red-`main` verdict was written, if `main` is currently
     /// recorded red.
     pub red_main_since: Option<DateTime<Utc>>,
@@ -123,6 +132,8 @@ pub struct Thresholds {
     pub reasoner_silent_mins: i64,
     pub loop_silent_mins: i64,
     pub free_gb_floor: f64,
+    /// GB a filesystem may lose between two checks before it is a finding.
+    pub disk_drop_gb: f64,
     pub no_merge_days: i64,
     pub deploy_lag_mins: i64,
     pub red_main_hours: i64,
@@ -139,6 +150,8 @@ impl Default for Thresholds {
             loop_silent_mins: 95,
             // A workspace test build needs well over this.
             free_gb_floor: 15.0,
+            // One heavy day of builds is 30-40 GB; a check runs every 2 h.
+            disk_drop_gb: 20.0,
             no_merge_days: 3,
             // The updater ticks every 5 min and a full rebuild is minutes;
             // an hour behind means it is not deploying, not merely slow.
@@ -241,7 +254,10 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         }
     }
 
-    for (label, free) in [("/", i.free_gb_root), ("the gate target", i.free_gb_gate)] {
+    let disks = [("/", i.free_gb_root), ("the gate target", i.free_gb_gate)]
+        .into_iter()
+        .chain(i.free_gb_elsewhere.iter().map(|(l, gb)| (l.as_str(), Some(*gb))));
+    for (label, free) in disks {
         if let Some(gb) = free {
             if gb < t.free_gb_floor {
                 out.push(Finding {
@@ -257,6 +273,24 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
                         .into(),
                 });
             }
+        }
+    }
+
+    // #1409 — a runaway writer, caught before the floor: a build cache that
+    // adds tens of GB between two checks fills the volume within the day.
+    for d in &i.disk_drops {
+        if d.lost_gb >= t.disk_drop_gb {
+            out.push(Finding {
+                severity: Severity::Warn,
+                code: "disk-shrinking",
+                detail: format!(
+                    "{} lost {:.0} GB in {:.1} h ({:.1} GB left)",
+                    d.label, d.lost_gb, d.hours, d.free_gb
+                ),
+                fix: "`augmentagent disk prune --dry-run` shows what is cold; \
+                      `augmentagent disk status` shows what lives on each filesystem."
+                    .into(),
+            });
         }
     }
 
@@ -340,10 +374,10 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         .filter(|(pr, ..)| i.open_prs.as_ref().is_none_or(|open| open.contains(pr)))
         .collect();
     if !held.is_empty() {
-        let budget = crate::self_improve::REVIEW_UNAVAILABLE_BUDGET_DAYS;
+        let budget = crate::self_improve::REVIEW_UNAVAILABLE_ALERT_DAYS;
         let which = held
             .iter()
-            .map(|(pr, _, reason, days)| format!("#{pr} {reason} (day {days} of {budget})"))
+            .map(|(pr, _, reason, days)| format!("#{pr} {reason} (waiting {days} days)"))
             .collect::<Vec<_>>()
             .join("; ");
         let mut fixes: Vec<&str> = Vec::new();
@@ -364,12 +398,16 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
             }
         }
         out.push(Finding {
-            severity: Severity::Warn,
+            severity: if held.iter().any(|(_, _, _, days)| *days >= budget) {
+                Severity::Alert
+            } else {
+                Severity::Warn
+            },
             code: "review-held",
             detail: format!(
                 "the loop is not wedged: these drafts are held, unbilled, because no \
-                 independent review is possible: {which}. After {budget} days it gives up on \
-                 each and says why."
+                 independent review is possible: {which}. Drafts remain queued for recovery; \
+                 waits of {budget} days or more are escalated."
             ),
             fix: fixes.join(". "),
         });
@@ -445,20 +483,6 @@ pub fn report(findings: &[Finding]) -> Option<String> {
 // ---------------------------------------------------------------------------
 // Collection
 // ---------------------------------------------------------------------------
-
-/// The last `max` bytes of a file — the daemon log is hundreds of MB and only
-/// its tail is ever relevant.
-fn tail_bytes(path: &Path, max: u64) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    if len > max {
-        f.seek(SeekFrom::Start(len - max)).ok()?;
-    }
-    let mut buf = Vec::new();
-    f.take(max).read_to_end(&mut buf).ok()?;
-    Some(String::from_utf8_lossy(&buf).into_owned())
-}
 
 /// Drop ANSI SGR sequences. The daemon writes coloured tracing output, so a
 /// raw log line carries escapes in the middle of the text — they broke both
@@ -752,7 +776,10 @@ fn last_merge(repo_root: &Path) -> Option<DateTime<Utc>> {
 pub fn collect(repo_root: &Path) -> HealthInputs {
     let now = Utc::now();
     let dir = state_dir();
-    let log = tail_bytes(&dir.join("stderr.log"), 4 * 1024 * 1024).unwrap_or_default();
+    // #1413 — right after a rotation the live log is nearly empty; the tail
+    // of the rotated one keeps the last hours in view.
+    let log = crate::log_rotate::tail_with_rotated(&dir.join("stderr.log"), 4 * 1024 * 1024)
+        .unwrap_or_default();
     let gate_dir = std::env::var("AUGMENTAGENT_GATE_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -762,6 +789,23 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
         });
 
     let deploy = deploy_state(repo_root, &dir);
+    // #1409 — everything beyond `/` and the gate cache, de-duplicated by
+    // mount, plus how fast each is shrinking since the last check.
+    let filesystems = crate::disk::read_filesystems(repo_root);
+    let already = [Path::new("/"), gate_dir.as_path()].map(crate::disk::device_id);
+    let free_gb_elsewhere = filesystems
+        .iter()
+        .filter(|r| !already.contains(&Some(r.dev)))
+        .map(|r| (r.label(), r.free_gb))
+        .collect();
+    let disk_drops = crate::disk::fs_drops(
+        &crate::disk::load_readings(),
+        &filesystems,
+        now,
+        0.0,
+        DISK_DROP_WINDOW_HOURS,
+    );
+    crate::disk::save_readings(&filesystems, now);
     HealthInputs {
         now_or_epoch: Some(now),
         daemon_active: daemon_active(),
@@ -774,6 +818,8 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
         deployed_is_current: deploy.0,
         deploy_lag_mins: deploy.1,
         free_gb_root: free_gb(Path::new("/")),
+        free_gb_elsewhere,
+        disk_drops,
         free_gb_gate: gate_dir
             .exists()
             .then(|| free_gb(&gate_dir))
@@ -912,6 +958,8 @@ mod tests {
             deploy_lag_mins: Some(0),
             free_gb_root: Some(70.0),
             free_gb_gate: Some(53.0),
+            free_gb_elsewhere: vec![("the debug target".into(), 51.0)],
+            disk_drops: Vec::new(),
             red_main_since: None,
             repeated_refusals: vec![],
             open_prs: None,
@@ -972,6 +1020,38 @@ mod tests {
             ..healthy()
         };
         assert_eq!(codes(&analyze(&g, &Thresholds::default())), vec!["disk-low"]);
+    }
+
+    /// 2026-10-06 (#1409): `target/debug` had been symlinked onto a third
+    /// volume, which filled to 73% with nothing watching it.
+    #[test]
+    fn catches_a_low_filesystem_that_is_neither_root_nor_the_gate() {
+        let i = HealthInputs {
+            free_gb_elsewhere: vec![("the debug target".into(), 3.0), ("the temp dir".into(), 80.0)],
+            ..healthy()
+        };
+        let f = analyze(&i, &Thresholds::default());
+        assert_eq!(codes(&f), vec!["disk-low"]);
+        assert!(f[0].detail.starts_with("the debug target has 3.0 GB free"), "{:?}", f[0]);
+    }
+
+    /// #1409: 41 GB written to the gate cache in a day is visible two hours
+    /// in, long before the floor.
+    #[test]
+    fn warns_when_a_filesystem_is_shrinking_fast() {
+        let drop = |lost: f64| crate::disk::FsDrop {
+            label: "the gate target".into(),
+            lost_gb: lost,
+            hours: 2.0,
+            free_gb: 50.0,
+        };
+        let i = HealthInputs { disk_drops: vec![drop(28.0)], ..healthy() };
+        let f = analyze(&i, &Thresholds::default());
+        assert_eq!(codes(&f), vec!["disk-shrinking"]);
+        assert_eq!(f[0].severity, Severity::Warn);
+        assert!(f[0].detail.contains("lost 28 GB in 2.0 h"), "{:?}", f[0]);
+        let quiet = HealthInputs { disk_drops: vec![drop(6.0)], ..healthy() };
+        assert!(analyze(&quiet, &Thresholds::default()).is_empty(), "ordinary growth is silent");
     }
 
     /// 2026-09-07: a red verdict held behind a gave-up issue, forever.
@@ -1297,7 +1377,7 @@ mod tests {
         ] {
             assert!(held.detail.contains(pr) && held.detail.contains(reason), "{}", held.detail);
         }
-        assert!(held.detail.contains("day 2 of 3"), "the budget is visible: {}", held.detail);
+        assert!(held.detail.contains("waiting 2 days"), "the wait is visible: {}", held.detail);
         assert!(
             held.detail.contains("not wedged") && held.detail.contains("unbilled"),
             "say plainly that nothing is broken or spent: {}",
@@ -1313,6 +1393,13 @@ mod tests {
         // A draft that has since closed or merged is history, not a hold.
         let closed = HealthInputs { open_prs: Some(vec![987]), ..i.clone() };
         assert!(!analyze(&closed, &Thresholds::default()).iter().any(|x| x.code == "review-held"));
+        let mut prolonged = i.clone();
+        prolonged.unreviewable_drafts[1].3 = 3;
+        let alerts = analyze(&prolonged, &Thresholds::default());
+        let alert = alerts.iter().find(|x| x.code == "review-held").unwrap();
+        assert_eq!(alert.severity, Severity::Alert);
+        assert!(alert.detail.contains("remain queued for recovery"));
+        assert!(!alert.detail.contains("gives up"));
         // And with nothing held, nothing is said.
         assert!(analyze(&healthy(), &Thresholds::default()).is_empty());
     }
