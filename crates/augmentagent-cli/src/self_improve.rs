@@ -10601,7 +10601,7 @@ impl FairSched {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let file = match std::fs::OpenOptions::new()
+        let mut file = match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -10619,26 +10619,34 @@ impl FairSched {
         if rc != 0 {
             warn!("fair-scheduling state flock failed; updating without it");
         }
-        let mut state = Self::load(path);
+        // Read AND write the very inode this flock covers, never re-opening
+        // by path: two lanes must not end up locking different inodes while
+        // both believe they hold the state.
+        let mut state = Self::read_from(&mut file).unwrap_or_default();
         edit(&mut state);
-        state.save(path);
+        if let Err(e) = state.write_into(&mut file) {
+            warn!(path = %path.display(), "could not persist fair-scheduling state: {e}");
+        }
         // Lock released when `file` drops.
     }
 
-    /// Best-effort persist, like [`DailyCounter::save`]: losing this file
+    /// Defaults on anything unreadable or corrupt, exactly like [`Self::load`].
+    fn read_from(file: &mut std::fs::File) -> Option<Self> {
+        use std::io::{Read, Seek};
+        let mut buf = Vec::new();
+        file.rewind().ok()?;
+        file.read_to_end(&mut buf).ok()?;
+        serde_json::from_slice(&buf).ok()
+    }
+
+    /// Best-effort persist, like [`DailyCounter::save`]: losing this state
     /// costs the rotation its memory, not the run.
-    fn save(&self, path: &Path) {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        match serde_json::to_vec(self) {
-            Ok(bytes) => {
-                if let Err(e) = std::fs::write(path, bytes) {
-                    warn!(path = %path.display(), "could not persist fair-scheduling state: {e}");
-                }
-            }
-            Err(e) => warn!("could not serialize fair-scheduling state: {e}"),
-        }
+    fn write_into(&self, file: &mut std::fs::File) -> std::io::Result<()> {
+        use std::io::{Seek, Write};
+        let bytes = serde_json::to_vec(self)?;
+        file.rewind()?;
+        file.set_len(0)?;
+        file.write_all(&bytes)
     }
 }
 
@@ -13307,9 +13315,10 @@ CODEX-REVIEW: lgtm").0);
 
         // Persisted across the rollover: at one resume per build the lane
         // alternates ACROSS days, which a day-keyed quota cannot do.
-        fair.advance(104);
-        fair.record_billed(true);
-        fair.save(&path);
+        FairSched::update_persist(&path, |f| {
+            f.advance(104);
+            f.record_billed(true);
+        });
         let tomorrow = FairSched::load(&path);
         assert_eq!((tomorrow.resume_cursor, tomorrow.resumes_since_build), (104, 1));
         assert!(prefer_build_now(Lane::Combined, true, &tomorrow, 1),
@@ -13332,6 +13341,10 @@ CODEX-REVIEW: lgtm").0);
         let after = FairSched::load(&path);
         assert_eq!(after.resumes_since_build, 51, "a locked read-modify-write loses no update");
         assert_eq!(after.resume_cursor, 249);
+
+        // An in-place rewrite must leave no tail of the longer old record.
+        FairSched::update_persist(&path, |f| *f = FairSched::default());
+        assert_eq!(std::fs::read(&path).unwrap(), serde_json::to_vec(&FairSched::default()).unwrap());
     }
 
     #[test]

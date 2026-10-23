@@ -124,26 +124,34 @@ fn a_combined_lane_day_spends_slots_on_both_drafts_and_new_issues() {
     let mut fair = FairSched::default();
     let mut pickable = vec![20u64, 21];
     let (mut resumed, mut built) = (Vec::new(), Vec::new());
+    // `run_once`'s order of operations, as one selection both the day loop and
+    // the fallback cases below drive: the preference decides which kind is
+    // tried first, the other kind is the fallback.
+    type Slot = Option<Result<(u64, u64, String), u64>>;
+    let select = |fair: &FairSched, draft: Option<(u64, u64, String)>, pick: Option<u64>| {
+        let prefer_build = prefer_build_now(Lane::Combined, true, fair, PER_BUILD);
+        let slot: Slot = if prefer_build {
+            pick.map(Err).or_else(|| draft.map(Ok))
+        } else {
+            draft.map(Ok).or_else(|| pick.map(Err))
+        };
+        (prefer_build, slot)
+    };
+    let mut reserved_slots_spent_on_drafts = 0;
     for day in 1..=3u64 {
         let mut ledger = AttemptLedger::default();
         let mut billed = 0;
         while billed < CAP {
-            // `run_once`'s order of operations: the preference decides which
-            // kind is tried first, the other kind is the fallback.
-            let prefer_build = prefer_build_now(Lane::Combined, true, &fair, PER_BUILD);
             let draft = resumable_from(&prs, &ledger, day, &gave_up, None, None, fair.resume_cursor);
             let pick = pickable.iter().copied().find(|i| !ledger.attempted_today(day, *i));
-            let slot = if prefer_build {
-                pick.map(Err).or_else(|| draft.clone().map(Ok))
-            } else {
-                draft.clone().map(Ok).or_else(|| pick.map(Err))
-            };
+            let (prefer_build, slot) = select(&fair, draft, pick);
             match slot {
                 Some(Ok((pr, issue, _))) => {
                     fair.advance(pr);
                     ledger.mark(day, issue);
                     resumed.push(pr);
                     fair.record_billed(true);
+                    reserved_slots_spent_on_drafts += u32::from(prefer_build);
                 }
                 Some(Err(issue)) => {
                     ledger.mark(day, issue);
@@ -162,22 +170,26 @@ fn a_combined_lane_day_spends_slots_on_both_drafts_and_new_issues() {
     distinct.sort_unstable();
     distinct.dedup();
     assert_eq!(distinct, vec![100, 101, 102, 103, 104], "{resumed:?}");
+    assert!(reserved_slots_spent_on_drafts > 0, "a reserved slot with no issue left resumed");
 
-    // Fallback, the other direction: a slot that prefers a resume but has no
-    // eligible draft left buys a build, which settles the debt.
+    // Fallback, explicitly, through that same selection. A slot that prefers a
+    // resume but has no eligible draft left buys a build...
     let mut spent = AttemptLedger::default();
     for issue in 10..15u64 {
         spent.mark(4, issue);
     }
-    let mut fresh = FairSched::default();
-    assert!(!prefer_build_now(Lane::Combined, true, &fresh, PER_BUILD), "a resume is preferred");
-    assert_eq!(
-        resumable_from(&prs, &spent, 4, &gave_up, None, None, fresh.resume_cursor),
-        None,
-        "but no draft is eligible, so the slot buys a build"
-    );
-    fresh.record_billed(false);
-    assert_eq!(fresh.resumes_since_build, 0);
+    let fresh = FairSched::default();
+    let draft = resumable_from(&prs, &spent, 4, &gave_up, None, None, fresh.resume_cursor);
+    assert_eq!(draft, None, "every draft was already attempted today");
+    assert_eq!(select(&fresh, draft, Some(22)), (false, Some(Err(22))));
+
+    // ...and a slot reserved for a build with nothing to build resumes,
+    // rather than idling the tick away.
+    let owing = FairSched { resume_cursor: 0, resumes_since_build: PER_BUILD };
+    let draft = resumable_from(&prs, &AttemptLedger::default(), 5, &gave_up, None, None, 0);
+    let (prefer_build, slot) = select(&owing, draft, None);
+    assert!(prefer_build);
+    assert_eq!(slot.map(|s| s.map(|(pr, _, _)| pr)), Some(Ok(100)));
 }
 
 #[test]
