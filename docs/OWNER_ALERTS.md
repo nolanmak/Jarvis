@@ -56,8 +56,12 @@ active. Sent, failed, unknown, expired, and cancelled text outcomes remain disti
 
 ## Controls and recovery
 
+Seen is not done: **Mark as seen** only records that you read the alert, while
+**Mark done / stop reminders** is the only control that ends preparation reminders.
+
 - **Mark as seen:** seen, not complete. Cancels queued text escalation and ordinary
-  follow-up. Preparation reminders remain until resolution. Never sends a reply.
+  follow-up. Preparation reminders remain until the item is marked done. Never
+  sends a reply.
 - **Snooze 10 min:** postpones evaluation without resolving. The button rejects a
   snooze past the useful cutoff. An intentional override is available through
   `augmentagent imessage alerts snooze ALERT_ID --seconds 600 --override-deadline`;

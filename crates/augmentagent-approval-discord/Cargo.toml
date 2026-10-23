@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+augmentagent-phone = { path = "../augmentagent-phone" }
 sha2 = "0.10.9"
 augmentagent-store = { path = "../augmentagent-store" }
 # #176 — `!loops` Discord command reuses the shared /proc walker + signal
@@ -41,3 +42,4 @@ tempfile = "3"
 
 [dev-dependencies]
 mockito = "1"
+tracing-subscriber = { workspace = true }

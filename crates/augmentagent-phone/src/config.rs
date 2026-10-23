@@ -1,0 +1,112 @@
+//! Explicit operator configuration. Destination numbers belong to the verified
+//! owner settings store, never this environment configuration.
+use crate::{
+    twilio::TwilioClient, webhook::WebhookAuth, Error, OwnerLink, PhoneConfig, PhoneService,
+    SystemClock,
+};
+use augmentagent_store::{Store, SurfaceAccountRef, SurfaceOwnerRef, SurfacePlatform};
+use serde::Deserialize;
+use std::{net::SocketAddr, sync::Arc};
+
+// Intentionally no Debug/Serialize: provider credentials and verification key.
+pub struct Settings {
+    bind: SocketAddr,
+    phone: PhoneConfig,
+    provider: Arc<TwilioClient>,
+    auth: Arc<WebhookAuth>,
+}
+pub struct ConfiguredPhone {
+    pub bind: SocketAddr,
+    pub service: Arc<PhoneService>,
+    pub auth: Arc<WebhookAuth>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Link {
+    platform: String,
+    account: String,
+    surface_owner: String,
+    owner: String,
+}
+impl Settings {
+    pub fn from_env() -> Result<Option<Self>, Error> {
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+    /// Injectable lookup avoids changing process environment in tests. No value
+    /// is copied into errors or logs; malformed enabled configuration fails closed.
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Option<Self>, Error> {
+        match get("AUGMENTAGENT_PHONE_ENABLED").as_deref() {
+            None | Some("0") => return Ok(None),
+            Some("1") => {}
+            _ => return Err(Error::NotConfigured),
+        }
+        let required = |key| {
+            get(key)
+                .filter(|s| !s.trim().is_empty())
+                .ok_or(Error::NotConfigured)
+        };
+        let bind: SocketAddr = get("AUGMENTAGENT_PHONE_BIND")
+            .unwrap_or_else(|| "127.0.0.1:8878".into())
+            .parse()
+            .map_err(|_| Error::NotConfigured)?;
+        if !bind.ip().is_loopback() || bind.port() == 0 {
+            return Err(Error::NotConfigured);
+        }
+        let raw_links = required("AUGMENTAGENT_PHONE_OWNER_LINKS")?;
+        if raw_links.len() > 32_768 {
+            return Err(Error::NotConfigured);
+        }
+        let specs: Vec<Link> =
+            serde_json::from_str(&raw_links).map_err(|_| Error::NotConfigured)?;
+        if specs.is_empty() || specs.len() > 64 {
+            return Err(Error::NotConfigured);
+        }
+        let links = specs
+            .into_iter()
+            .map(|l| {
+                let platform =
+                    SurfacePlatform::new(l.platform).map_err(|_| Error::NotConfigured)?;
+                let account = SurfaceAccountRef::new(platform, l.account)
+                    .map_err(|_| Error::NotConfigured)?;
+                let surface_owner = SurfaceOwnerRef::new(account, l.surface_owner)
+                    .map_err(|_| Error::NotConfigured)?;
+                Ok(OwnerLink {
+                    surface_owner,
+                    owner_id: l.owner,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let phone = PhoneConfig::new(
+            true,
+            &required("AUGMENTAGENT_PHONE_PUBLIC_URL")?,
+            &required("AUGMENTAGENT_PHONE_VERIFICATION_KEY")?,
+            links,
+        )?;
+        let account = required("TWILIO_ACCOUNT_SID")?;
+        let token = required("TWILIO_AUTH_TOKEN")?;
+        let provider = Arc::new(TwilioClient::new(
+            &account,
+            &token,
+            &required("TWILIO_PHONE_NUMBER")?,
+        )?);
+        let auth = Arc::new(WebhookAuth::new(&account, &token));
+        Ok(Some(Self {
+            bind,
+            phone,
+            provider,
+            auth,
+        }))
+    }
+    pub fn build(self, store: Arc<Store>) -> Result<ConfiguredPhone, Error> {
+        Ok(ConfiguredPhone {
+            bind: self.bind,
+            service: Arc::new(PhoneService::new(
+                store,
+                self.provider,
+                Arc::new(SystemClock),
+                self.phone,
+            )),
+            auth: self.auth,
+        })
+    }
+}

@@ -148,7 +148,8 @@ pub fn status_update(alert: &OwnerAlert, now: i64, embeds: &[Embed]) -> EditMess
             if let Some(description) = embed.description.as_mut() {
                 *description = description
                     .lines()
-                    .filter(|line| *line != "Seen, still unresolved — preparation reminder.")
+                    .filter(|line| *line != "Seen, still unresolved — preparation reminder."
+                        && *line != "Marked seen — still open. Preparation reminders continue until you choose *Mark done / stop reminders*.")
                     .map(|line| {
                         if line.starts_with("**Text delivery:") {
                             line.trim_end_matches(" Discord reminders remain active.")
@@ -197,7 +198,7 @@ pub fn control(store: &Store, custom_id: &str, now: i64) -> anyhow::Result<Strin
         "resolve" => {
             store.set_owner_alert_state(id, AlertState::Resolved, now)?;
             store.reconcile_owner_alert_texts(now)?;
-            Ok("Resolved. Future reminders and queued text escalation are cancelled.".into())
+            Ok("Marked done. Future reminders and queued text escalation are cancelled.".into())
         }
         "snooze" => {
             store.snooze_owner_alert(id, now + 600_000, false, now)?;
@@ -344,7 +345,7 @@ mod tests {
             .description
             .as_mut()
             .unwrap()
-            .push_str("\nSeen, still unresolved — preparation reminder.");
+            .push_str("\nSeen, still unresolved — preparation reminder.\nMarked seen — still open. Preparation reminders continue until you choose *Mark done / stop reminders*.");
         let done = serde_json::to_value(status_update(
             &store.owner_alert("sample").unwrap().unwrap(),
             5,
@@ -361,9 +362,146 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("reminders remain active"));
+        assert!(!done["embeds"][0]["description"].as_str().unwrap().contains("Preparation reminders continue"));
         assert!(control(&store, "oa:ack:sample", 6)
             .unwrap()
             .contains("Already resolved"));
+    }
+    #[test]
+    fn controls_name_outcomes_and_keep_their_custom_ids() {
+        let d = tempfile::tempdir().unwrap();
+        let store = Store::open(d.path().join("test.db")).unwrap();
+        store
+            .insert_owner_alert(
+                &augmentagent_store::owner_alerts::NewOwnerAlert {
+                    id: "sample",
+                    sender: "Colleague",
+                    action: "Review briefing",
+                    reason: "Meeting starts soon",
+                    urgency: Urgency::High,
+                    source_url: "https://example.test/1",
+                    due_at_ms: None,
+                    timezone: "UTC",
+                    meeting_id: None,
+                    expires_at_ms: 10000,
+                    text_after_ms: 1,
+                },
+                1,
+            )
+            .unwrap();
+        let notice = store.claim_owner_alert_notice(2).unwrap().unwrap();
+        let json = serde_json::to_value(message(&notice, UserId::new(123), 2, None)).unwrap();
+        let buttons = json["components"][0]["components"].as_array().unwrap();
+        let rendered: Vec<(&str, &str)> = buttons
+            .iter()
+            .map(|b| {
+                (
+                    b["label"].as_str().unwrap(),
+                    b["custom_id"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                ("Mark as seen", "oa:ack:sample"),
+                ("Snooze 10 min", "oa:snooze:sample"),
+                ("Mark done / stop reminders", "oa:resolve:sample"),
+            ]
+        );
+        store
+            .set_owner_alert_state("sample", AlertState::Acknowledged, 3)
+            .unwrap();
+        let notice = AlertNotice {
+            alert: store.owner_alert("sample").unwrap().unwrap(),
+            ..notice
+        };
+        let json = serde_json::to_value(message(&notice, UserId::new(123), 4, None)).unwrap();
+        let description = json["embeds"][0]["description"].as_str().unwrap();
+        assert!(description.contains("still open"), "{description}");
+        assert!(
+            description.contains("Mark done / stop reminders"),
+            "{description}"
+        );
+    }
+    #[test]
+    fn persisted_state_strings_are_stable() {
+        assert_eq!(AlertState::Acknowledged.as_str(), "acknowledged");
+        assert_eq!(AlertState::Resolved.as_str(), "resolved");
+        assert_eq!(AlertState::Open.as_str(), "open");
+    }
+    #[tokio::test]
+    async fn seen_keeps_preparation_reminders_but_done_stops_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("test.db")).unwrap();
+        let now = 10_000_000;
+        store
+            .insert_owner_alert(
+                &augmentagent_store::owner_alerts::NewOwnerAlert {
+                    id: "prep",
+                    sender: "Colleague",
+                    action: "Prepare recommendation",
+                    reason: "Meeting soon",
+                    source_url: "https://example.test/1",
+                    urgency: Urgency::High,
+                    due_at_ms: Some(now + 3_600_000),
+                    timezone: "UTC",
+                    meeting_id: None,
+                    expires_at_ms: now + 3_600_000,
+                    text_after_ms: now + 600_000,
+                },
+                now,
+            )
+            .unwrap();
+        store
+            .attach_owner_alert_details(
+                "prep",
+                &augmentagent_store::alert_schedule::AlertDetails {
+                    message_id: "prep-mail".into(),
+                    thread_id: None,
+                    account_id: None,
+                    subject: "Quarterly review".into(),
+                    evidence: "Agenda attached".into(),
+                    deadline_kind: "inferred_preparation".into(),
+                    meeting_start_ms: Some(now + 3_600_000),
+                    meeting_url: None,
+                    reply_resolves: false,
+                },
+                now,
+            )
+            .unwrap();
+        let broker = AlertBroker {
+            fail: false,
+            posts: 0.into(),
+        };
+        assert_eq!(tick(&store, &broker, now).await.unwrap(), 1);
+        let seen = control(&store, "oa:ack:prep", now + 1000).unwrap();
+        assert!(seen.contains("still open"), "{seen}");
+        assert!(seen.contains("Mark done / stop reminders"), "{seen}");
+        assert_eq!(
+            store.owner_alert("prep").unwrap().unwrap().state,
+            AlertState::Acknowledged
+        );
+        assert!(store
+            .owner_alerts_due_for_text(now + 2000)
+            .unwrap()
+            .is_empty());
+        // Preparation reminders survive "Mark as seen".
+        assert_eq!(
+            tick(&store, &broker, now + 2_700_000).await.unwrap(),
+            1,
+            "preparation reminder must still fire after the alert is marked seen"
+        );
+        let done = control(&store, "oa:resolve:prep", now + 2_700_001).unwrap();
+        assert!(done.starts_with("Marked done"), "{done}");
+        assert_eq!(tick(&store, &broker, now + 3_300_000).await.unwrap(), 0);
+        assert!(control(&store, "oa:ack:prep", now + 3_300_001)
+            .unwrap()
+            .contains("Already resolved"));
+        assert_eq!(
+            store.owner_alert("prep").unwrap().unwrap().state,
+            AlertState::Resolved
+        );
     }
     struct AlertBroker {
         fail: bool,

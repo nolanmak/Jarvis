@@ -23,9 +23,11 @@ aa_path_has_protected_injection_name() {
   local IFS='/'
   for component in $path; do
     [[ -z "$component" ]] && continue
-    local lower="${component,,}"
+    # Bash 3.2 (the macOS system shell) has no ${value,,} expansion.
+    local lower
+    lower=$(printf '%s' "$component" | tr '[:upper:]' '[:lower:]')
     for reserved in "${AA_PROTECTED_INJECTION_NAMES[@]}"; do
-      [[ "$lower" == "${reserved,,}" ]] && return 0
+      [[ "$lower" == "$(printf '%s' "$reserved" | tr '[:upper:]' '[:lower:]')" ]] && return 0
     done
   done
   return 1
