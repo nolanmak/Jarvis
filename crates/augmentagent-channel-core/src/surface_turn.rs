@@ -91,6 +91,33 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
+fn conversation_queue(
+    store: &Store,
+    conversation: &augmentagent_store::SurfaceConversationRef,
+) -> Arc<tokio::sync::Mutex<()>> {
+    use std::sync::{Mutex, OnceLock, Weak};
+    type Queues =
+        std::collections::HashMap<(std::path::PathBuf, String), Weak<tokio::sync::Mutex<()>>>;
+    static QUEUES: OnceLock<Mutex<Queues>> = OnceLock::new();
+    let db = store
+        .db_path()
+        .canonicalize()
+        .unwrap_or_else(|_| store.db_path().to_path_buf());
+    let key = (db, conversation.storage_key());
+    let mut queues = QUEUES
+        .get_or_init(Mutex::default)
+        .lock()
+        .expect("conversation queues poisoned");
+    // Weak entries do not retain idle conversations or cross-test databases.
+    queues.retain(|_, queue| queue.strong_count() > 0);
+    if let Some(queue) = queues.get(&key).and_then(Weak::upgrade) {
+        return queue;
+    }
+    let queue = Arc::new(tokio::sync::Mutex::new(()));
+    queues.insert(key, Arc::downgrade(&queue));
+    queue
+}
+
 /// Run one turn. `select` is read after the binding (the conversation's
 /// model selection); `answer` gets the prompt to send and runs the shared
 /// agent (tools, wiki, skills, audit, fallback). See the module docs.
@@ -106,14 +133,61 @@ where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = anyhow::Result<String>>,
 {
+    run_surface_turn_with_history(store, request, select, cancel, answer,
+        || async { Ok(request.history.to_string()) }).await
+}
+
+/// Resolve initial history only after entering the shared conversation queue.
+/// Bound native sessions never fetch history. Cancellation while loading does
+/// not claim a turn or dispatch model work. `request.history` is overridden.
+pub async fn run_surface_turn_with_history<S, F, Fut, H, History>(
+    store: &Store,
+    request: SurfaceTurnRequest<'_>,
+    select: S,
+    cancel: Option<&CancellationToken>,
+    answer: F,
+    load_history: H,
+) -> anyhow::Result<SurfaceTurnOutcome>
+where
+    S: FnOnce() -> anyhow::Result<Option<ProviderKind>>,
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = anyhow::Result<String>>,
+    H: FnOnce() -> History,
+    History: Future<Output = anyhow::Result<String>>,
+{
     let turn = request.turn;
     let chat = turn.conversation();
+    // Text and phone enter through different transport queues. Serialize at
+    // their common native-session boundary before reading the binding or
+    // claiming a turn, so a second input resumes the first input's session.
+    let queue = conversation_queue(store, chat);
+    let _queue_guard = match cancel {
+        Some(token) => tokio::select! {
+            biased;
+            _ = token.cancelled() => return Ok(SurfaceTurnOutcome::Cancelled),
+            guard = queue.lock() => guard,
+        },
+        None => queue.lock().await,
+    };
     let discord = chat.account().platform().as_str() == "discord";
     let binding = store.surface_conversation(chat)?;
     if binding.as_ref().is_some_and(|item| item.uncertain) {
         anyhow::bail!("Native conversation has an uncertain turn; inspect it before continuing");
     }
     let selection = select()?;
+    let history = if binding.is_none() {
+        match cancel {
+            Some(token) => tokio::select! {
+                biased;
+                _ = token.cancelled() => return Ok(SurfaceTurnOutcome::Cancelled),
+                history = load_history() => history?,
+            },
+            None => load_history().await?,
+        }
+    } else {
+        String::new()
+    };
+
     let provider = if let Some(item) = &binding {
         let bound = match item.provider.as_str() {
             "claude" => ProviderKind::Claude,
@@ -130,7 +204,7 @@ where
             // Profiles without a native session keep their existing text
             // route until the owner explicitly selects Claude or Codex.
             return Ok(SurfaceTurnOutcome::Answered(
-                answer(legacy_prompt(request.history, request.current)).await?,
+                answer(legacy_prompt(&history, request.current)).await?,
             ));
         }
         selected
@@ -142,7 +216,7 @@ where
     let prompt = if binding.is_some() {
         request.current.to_string()
     } else {
-        legacy_prompt(request.history, request.current)
+        legacy_prompt(&history, request.current)
     };
     // Persist the claim before the CLI can run tools. If the daemon dies
     // before recording a result or native ID, restart must not silently

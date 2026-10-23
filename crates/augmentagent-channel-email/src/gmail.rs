@@ -2102,6 +2102,59 @@ mod tests {
         assert_eq!(att.s3key, "317291/gmail/GMAIL_CREATE_EMAIL_DRAFT/request/abc");
     }
 
+    /// #1507 AC8 — a signed PDF is binary; `compose --attach` must upload
+    /// exactly its bytes (no text decoding), and the md5 Composio checks must
+    /// be the md5 of the file on disk.
+    #[tokio::test]
+    async fn upload_attachment_sends_the_exact_file_bytes_and_md5() {
+        use md5::{Digest, Md5};
+        async fn capture_raw(body: String) -> (SocketAddr, tokio::sync::oneshot::Receiver<Vec<u8>>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 { break; }
+                    raw.extend_from_slice(&buf[..n]);
+                    if let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+                        let len = head.lines().find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0);
+                        if raw.len() >= end + 4 + len {
+                            let _ = tx.send(raw[end + 4..end + 4 + len].to_vec());
+                            break;
+                        }
+                    }
+                }
+                let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+            (addr, rx)
+        }
+        let (put_addr, put_body) = capture_raw(String::new()).await;
+        let (req_addr, req_body) = capture_raw(format!(
+            r#"{{"id":"up_9","key":"k/signed","new_presigned_url":"http://{put_addr}/put"}}"#
+        )).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{req_addr}"));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("letter-signed.pdf");
+        let mut pdf = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        pdf.extend((0..=255u8).cycle().take(4096));
+        pdf.extend_from_slice(b"\n%%EOF\n");
+        std::fs::write(&file, &pdf).unwrap();
+
+        client.upload_attachment("GMAIL_CREATE_EMAIL_DRAFT", &file).await.unwrap();
+        let request: serde_json::Value = serde_json::from_slice(&req_body.await.unwrap()).unwrap();
+        assert_eq!(request["md5"], format!("{:x}", Md5::digest(&pdf)));
+        assert_eq!(request["filename"], "letter-signed.pdf");
+        assert_eq!(put_body.await.unwrap(), pdf, "uploaded bytes must equal the file");
+    }
+
     // Re-upload of an already-known file: response carries the key but no
     // presigned URL — must succeed without attempting a PUT.
     #[tokio::test]

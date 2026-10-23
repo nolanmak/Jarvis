@@ -160,6 +160,14 @@ impl FakeAgent {
 #[async_trait]
 impl QueryHandler for FakeAgent {
     async fn answer(&self, ctx: &AuditCtx, question: &str) -> anyhow::Result<String> {
+        let phone = augmentagent_phone::context::current()
+            .expect("authenticated Slack turn carries phone origin");
+        assert_eq!(phone.origin.owner.sender_id(), OWNER);
+        assert_eq!(
+            phone.origin.conversation.account().platform().as_str(),
+            "slack"
+        );
+        assert!(phone.speech.is_none());
         let env = turn_env();
         let file_access = env
             .iter()

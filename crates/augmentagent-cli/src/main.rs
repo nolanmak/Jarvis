@@ -8,6 +8,10 @@ mod model_tool;
 mod composio_auth_tool;
 mod calendar_rsvp;
 mod voice_tool;
+mod phone_runtime;
+mod local_phone_transport;
+mod local_phone;
+mod discord_phone;
 mod computer_tool;
 #[cfg(test)]
 mod provider_channel_tests;
@@ -15,6 +19,10 @@ mod provider_channel_tests;
 mod model_switch_sequence_tests;
 #[cfg(test)]
 mod discord_voice_session_tests;
+#[cfg(test)]
+mod discord_phone_session_tests;
+#[cfg(test)]
+mod whatsapp_phone_session_tests;
 #[cfg(test)]
 mod surface_conformance_tests;
 #[cfg(test)]
@@ -79,6 +87,7 @@ use augmentagent_store::{ActionStatus, GmailRateRefusal, Store, TriageResult};
 use async_trait::async_trait;
 
 mod whatsapp_history;
+mod whatsapp_phone;
 mod messages_cmd;
 mod embeddings_cmd;
 mod triage_prefilter_cmd;
@@ -707,6 +716,17 @@ enum Cmd {
     /// Internal conversation-bound MCP server for Discord speech.
     #[command(hide = true)]
     VoiceTool,
+    /// Internal owner-bound phone MCP facade.
+    #[command(hide = true)]
+    PhoneTool,
+    /// Reconcile one known phone call from provider evidence; never dials.
+    PhoneReconcile {
+        #[arg(long)]
+        call_id: String,
+        /// Candidate Twilio SID; bind only after exact provider-origin evidence.
+        #[arg(long)]
+        provider_id: Option<String>,
+    },
     /// Internal owner-DM-bound computation MCP facade.
     #[command(hide = true)]
     ComputeTool,
@@ -989,6 +1009,10 @@ enum AutoprOp {
         /// List the matching issue numbers, one per line; change nothing.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        /// Also clear each re-admitted issue's recorded attempts, so its next
+        /// failure is charged as attempt 1 instead of giving up immediately.
+        #[arg(long, default_value_t = false)]
+        reset_history: bool,
     },
 }
 
@@ -2110,12 +2134,24 @@ enum DocOp {
         #[arg(long)] out: PathBuf,
         #[arg(long, default_value = "default")] signature: String,
         #[arg(long)] page: u32,
-        /// PDF points from bottom-left.
-        #[arg(long)] x: f64,
-        #[arg(long)] y: f64,
-        #[arg(long, default_value = "144")] width: f64,
-        /// Optional ISO date printed below the signature.
+        /// Text directly under the signature line, e.g. the signer's printed
+        /// name. The signature's ink is placed on that line.
+        #[arg(long, conflicts_with_all = ["line", "x", "y"])] anchor_text: Option<String>,
+        /// Line number from `doc sign-lines` (1-based, top to bottom).
+        #[arg(long, conflicts_with_all = ["x", "y"])] line: Option<u32>,
+        /// Bottom-left of the visible ink, PDF points from bottom-left. Only
+        /// for pages with no signature line.
+        #[arg(long, requires = "y")] x: Option<f64>,
+        #[arg(long, requires = "x")] y: Option<f64>,
+        /// Ink width in points (on a line: min(180, line length − 12); else 144).
+        #[arg(long)] width: Option<f64>,
+        /// Optional ISO date printed beside the signature.
         #[arg(long)] date: Option<String>,
+    },
+    /// List the signature lines on a PDF's pages (JSON), with the text under each.
+    SignLines {
+        file: PathBuf,
+        #[arg(long)] page: Option<u32>,
     },
     /// Operator-only: install a PNG under a logical signature name. Never overwrites a name.
     SignatureInstall { file: PathBuf, #[arg(long, default_value = "default")] name: String },
@@ -2742,6 +2778,10 @@ enum WikiOp {
         /// Needs DISCORD_BOT_TOKEN + DISCORD_CHANNEL_ID in the env.
         #[arg(long, default_value_t = false)]
         post: bool,
+        /// Continue the persistent local conversation in the running phone-enabled daemon.
+        /// Uses AUGMENTAGENT_PHONE_LOCAL_SOCKET and the daemon's configured wiki.
+        #[arg(long, conflicts_with = "post")]
+        daemon: bool,
     },
     /// Backfill v2 schema fields onto cold person pages via Haiku. See #78.
     ///
@@ -2830,6 +2870,7 @@ enum RatelimitOp {
 /// #1071 — how long a stop waits for cancelled runners to unwind. Kept well under
 /// systemd's `TimeoutStopSec` so the drain always ends before SIGKILL does.
 const DRAIN_BUDGET: Duration = Duration::from_secs(20);
+const _: () = assert!(augmentagent_phone::runtime::SHUTDOWN_BUDGET.as_secs() < DRAIN_BUDGET.as_secs());
 
 /// Join the daemon's tasks, bounding only the stop (#1071). Until `shutdown` fires the join is
 /// unbounded — the runners are the daemon's lifetime, and a runner error still ends it. Once
@@ -2885,6 +2926,9 @@ async fn main() -> Result<()> {
     }
     if let Cmd::ComposioAuthTool = cli.cmd {
         return composio_auth_tool::serve().await;
+    }
+    if let Cmd::PhoneTool = cli.cmd {
+        return Ok(augmentagent_phone::mcp::serve()?);
     }
     if let Cmd::VoiceTool = cli.cmd {
         return voice_tool::serve();
@@ -3020,6 +3064,14 @@ async fn main() -> Result<()> {
     }
     // PDF exports need no database or network credentials. In particular, do
     // not try to create data.db when invoked from a fresh wiki directory.
+    if let Cmd::Doc { op: DocOp::SignLines { ref file, page } } = cli.cmd {
+        let root = std::env::var_os("WIKI_ROOT")
+            .map(PathBuf::from)
+            .context("WIKI_ROOT must be set to the wiki directory")?;
+        let lines = augmentagent_docs::signing::sign_lines(&root, file, page).await?;
+        println!("{}", serde_json::to_string(&lines)?);
+        return Ok(());
+    }
     if let Cmd::Doc {
         op:
             DocOp::RenderPdf {
@@ -3277,6 +3329,7 @@ async fn main() -> Result<()> {
             } else {
                 interrupt_dead_discord_turns(&store)
             };
+            let discord_phone_pending: discord_phone::PendingSlot = Arc::new(std::sync::Mutex::new(None));
             let (broker, approver) = match build_approval_surfaces(
                 &cli,
                 Arc::clone(&store),
@@ -3285,6 +3338,7 @@ async fn main() -> Result<()> {
                 slack_approvals.clone(),
                 card_surfaces.clone(),
                 interrupted_discord_turns,
+                Some(discord_phone_pending.clone()),
             )
             .await
             {
@@ -3519,6 +3573,65 @@ async fn main() -> Result<()> {
             });
             // Collect the enabled channels' runners + optional digest scheduler.
             let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
+            let phone = if cli.wiki_dir.is_some() {
+                match phone_runtime::start(Arc::clone(&store), dry_run).await {
+                    Ok(Some((endpoint, runtime))) => {
+                        tasks.push(tokio::spawn(phone_runtime::supervise(runtime, shutdown.clone())));
+                        Some(endpoint)
+                    }
+                    Ok(None) => None,
+                    Err(_) => { warn!("phone runtime unavailable: check private phone configuration and loopback listener"); None }
+                }
+            } else { None };
+
+
+            if phone.is_none() {
+                if let Some(cleanup) = phone_runtime::cleanup_when_unavailable(store.clone(), dry_run) {
+                    tasks.push(cleanup);
+                }
+            }
+
+            if let (Some(endpoint), Some(wiki), Some(socket)) = (
+                phone.as_ref(), cli.wiki_dir.as_ref(), std::env::var_os("AUGMENTAGENT_PHONE_LOCAL_SOCKET"),
+            ) {
+                let query = wiki_querier(build_reasoner(), wiki.clone(),
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")), store.clone(), false);
+                let _ = query.phone_tools.set(endpoint.tools.clone());
+                match local_phone::spawn(endpoint.clone(), store.clone(), Arc::new(query), wiki.clone(), socket.into(), shutdown.clone()) {
+                    Ok(worker) => tasks.push(worker),
+                    Err(_) => warn!("local phone conversation unavailable: check private socket directory and explicit OS-owner link"),
+                }
+            }
+
+            let pending_discord = discord_phone_pending.lock().ok().and_then(|mut pending| pending.take());
+            let _discord_phone_registration = match (phone.as_ref(), pending_discord) {
+                (Some(endpoint), Some(connection)) => match discord_phone::install(endpoint, connection, store.clone(), shutdown.clone()) {
+                    Ok((registration, worker)) => { tasks.push(worker); Some(registration) }
+                    Err(_) => { warn!("Discord phone unavailable: check explicit owner link and control-chat binding"); None }
+                },
+                _ => None,
+            };
+
+            if let (Some(endpoint), Some(wiki)) = (phone.as_ref(), cli.wiki_dir.as_ref()) {
+                if augmentagent_channel_whatsapp::control_enabled()
+                    && endpoint.service.linked_surface_owners().iter().any(|owner| {
+                        owner.account().platform().as_str() == "whatsapp"
+                    })
+                {
+                    let query = wiki_querier(
+                        build_reasoner(), wiki.clone(),
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                        store.clone(), false,
+                    );
+                    let _ = query.phone_tools.set(endpoint.tools.clone());
+                    tasks.push(whatsapp_phone::spawn(
+                        endpoint.clone(), store.clone(), Arc::new(query),
+                        approver.clone().map(|handler| handler as Arc<dyn ApprovalActionHandler>),
+                        wiki.clone(), augmentagent_channel_whatsapp::default_socket_path(),
+                        shutdown.clone(),
+                    ));
+                }
+            }
 
             // #1412 — drop action bodies that only repeat the stored email,
             // shortly after start and hourly, in small batches.
@@ -3801,33 +3914,36 @@ async fn main() -> Result<()> {
             {
                 let store_q = Arc::clone(&store);
                 let wiki_root = cli.wiki_dir.clone();
+                let phone_q = phone.clone();
+                let phone_service = phone.as_ref().map(|endpoint| endpoint.service.clone());
                 // Only a surface that got the approval handler takes clicks.
                 let slack_approvals = slack_approvals.filter(|_| approver.is_some());
                 tasks.push(slack_serve::spawn(
                     Arc::clone(&store),
                     slack_plan,
-                    move |history| -> Arc<dyn augmentagent_channel_slack::interactive::SlackTurnHandler> {
-                        match wiki_root {
-                            // #1288 — the shared conversation harness over
-                            // the same WikiQuerier Discord answers with.
-                            Some(root) => slack_serve::conversation_handler(
-                                Arc::clone(&store_q),
-                                Arc::new(wiki_querier(
-                                    build_reasoner(),
-                                    root.clone(),
-                                    std::env::current_dir()
-                                        .unwrap_or_else(|_| PathBuf::from(".")),
-                                    store_q,
-                                    false,
-                                )),
-                                root,
-                                history,
-                            ),
-                            None => Arc::new(slack_serve::NoQueryHandler),
+                    move |history, wake| -> Result<Arc<dyn augmentagent_channel_slack::interactive::SlackTurnHandler>> {
+                        let Some(root) = wiki_root else { return Ok(Arc::new(slack_serve::NoQueryHandler)); };
+                        let query = wiki_querier(
+                            build_reasoner(), root.clone(),
+                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                            store_q.clone(), false,
+                        );
+                        if let Some(endpoint) = &phone_q {
+                            let _ = query.phone_tools.set(endpoint.tools.clone());
+                        }
+                        let query: Arc<dyn QueryHandler> = Arc::new(query);
+                        let handler = slack_serve::conversation_handler(
+                            store_q.clone(), query.clone(), root.clone(),
+                            history.clone().map(|h| h as Arc<dyn augmentagent_channel_slack::history::TurnHistory>),
+                        );
+                        match phone_q {
+                            Some(endpoint) => phone_runtime::attach_slack(&endpoint, store_q, query, root, history, wake, handler),
+                            None => Ok(handler),
                         }
                     },
                     slack_approvals,
                     slack_commands,
+                    phone_service,
                     slack_live,
                     dry_run,
                     shutdown.clone(),
@@ -4187,10 +4303,13 @@ async fn main() -> Result<()> {
         },
         Cmd::Wiki { ref op } => match op {
             WikiOp::Lint { out } => run_wiki_lint(&cli, Arc::clone(&store), out.clone()).await,
-            WikiOp::Ask { question, stdin, post } => {
+            WikiOp::Ask { question, stdin, post, daemon } => {
                 let question = if *stdin { read_wiki_question(std::io::stdin().lock())? }
                     else { question.clone().context("question or --stdin is required")? };
-                run_wiki_ask(&cli, question, *post).await
+                if *daemon {
+                    println!("{}", local_phone::ask(question).await?);
+                    Ok(())
+                } else { run_wiki_ask(&cli, question, *post).await }
             },
             WikiOp::Migrate {
                 to,
@@ -4348,10 +4467,19 @@ async fn main() -> Result<()> {
             DocOp::Signatures => {
                 println!("{}", serde_json::to_string(&augmentagent_docs::signing::list(&augmentagent_docs::signing::state_root()?)?)?); Ok(())
             }
-            DocOp::Sign { ref file, ref out, ref signature, page, x, y, width, ref date } => {
+            DocOp::Sign { ref file, ref out, ref signature, page, ref anchor_text, line, x, y, width, ref date } => {
+                use augmentagent_docs::signing::{PlacementRequest, Target};
+                let target = match (anchor_text, line, x, y) {
+                    (Some(text), ..) => Target::AnchorText(text.clone()),
+                    (_, Some(line), ..) => Target::Line(*line),
+                    (_, _, Some(x), Some(y)) => Target::Ink { x: *x, y: *y, width: width.unwrap_or(144.) },
+                    _ => anyhow::bail!("give --anchor-text (preferred), --line, or --x/--y; run doc sign-lines to see the page's lines"),
+                };
+                let width = if matches!(target, Target::Ink { .. }) { None } else { *width };
                 document_signing::propose(store.clone(), file, out, signature,
-                    augmentagent_docs::signing::Placement { page: *page, x: *x, y: *y, width: *width, date: date.clone() }).await
+                    PlacementRequest { page: *page, target, width, date: date.clone() }).await
             }
+            DocOp::SignLines { .. } => unreachable!("sign-lines dispatched before store initialization"),
             DocOp::RenderPdf { .. } => unreachable!("PDF rendering dispatched before store initialization"),
             DocOp::Extract { file, out, kind, no_ocr, json } => {
                 doc_cmd::run_doc_extract(file.clone(), out.clone(), kind.clone(), *no_ocr, *json)
@@ -5247,9 +5375,9 @@ async fn main() -> Result<()> {
             .await?;
             std::process::exit(code);
         }
-        Cmd::Autopr { op: AutoprOp::Readmit { reason, dry_run } } => {
+        Cmd::Autopr { op: AutoprOp::Readmit { reason, dry_run, reset_history } } => {
             let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            for n in self_improve::readmit(&root, &reason, dry_run).await? {
+            for n in self_improve::readmit(&root, &reason, dry_run, reset_history).await? {
                 if dry_run {
                     println!("{n}");
                 } else {
@@ -5271,6 +5399,8 @@ async fn main() -> Result<()> {
         Cmd::ModelTool { channel, ref readiness } => model_tool::serve(channel, readiness),
         Cmd::ComposioAuthTool => composio_auth_tool::serve().await,
         Cmd::VoiceTool => voice_tool::serve(),
+        Cmd::PhoneTool => Ok(augmentagent_phone::mcp::serve()?),
+        Cmd::PhoneReconcile { ref call_id, ref provider_id } => phone_runtime::reconcile_local(&store, call_id, provider_id.as_deref()).await,
         Cmd::ComputeTool => compute_tool::serve(),
         Cmd::ReasonerSelftest { ref prompt, ref profile, tool_probe } =>
             run_reasoner_selftest(prompt, profile.as_deref(), tool_probe).await,
@@ -8406,12 +8536,16 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
             continue;
         }
         // Rule 2 — bulk/marketing sender. Cheap, purely local, so check first.
-        // #1289 — not for Slack contact replies: their `from` is a name and
-        // a Slack user ID (`Name <slack:U…>`), never an address, so the rule
-        // would retire every one of them. (Other chat platforms share the
-        // shape; they are outside #1289 and keep the old behaviour.)
-        let addressless = row.platform == augmentagent_channel_slack::PLATFORM;
-        if !addressless && !is_human_sender(&row.from_email, &row.body) {
+        // `is_human_sender` reads a mailbox address, which only email cards
+        // have: every chat platform's `from` is a name plus a platform id
+        // (`Name <slack:U…>`, `Name <twitter:…>`, `user-{id}`, …) and always
+        // fails the check, so the rule retired all of them (#1289 Slack, #1503
+        // signing, #1505 the rest). Gate on the email platform instead of
+        // exempting platforms one at a time. A card with no joined email row
+        // surfaces platform '' — unknown provenance, so skip Rule 2 there too;
+        // Rule 3, Rule 1 and the 7-day expiry still apply.
+        let email_platform = row.platform == augmentagent_channel_email::inbound::PLATFORM;
+        if email_platform && !is_human_sender(&row.from_email, &row.body) {
             info!(
                 action_id = %row.id,
                 from = %row.from_email,
@@ -8854,6 +8988,8 @@ mod wiki_question_stdin_tests {
         assert!(matches!(cli.cmd, Cmd::Wiki { op: WikiOp::Ask { question: None, stdin: true, .. } }));
         assert!(Cli::try_parse_from(["augmentagent", "wiki", "ask"]).is_err());
         assert!(Cli::try_parse_from(["augmentagent", "wiki", "ask", "private", "--stdin"]).is_err());
+        assert!(Cli::try_parse_from(["augmentagent", "wiki", "ask", "--stdin", "--daemon"]).is_ok());
+        assert!(Cli::try_parse_from(["augmentagent", "wiki", "ask", "--stdin", "--daemon", "--post"]).is_err());
     }
 }
 
@@ -10579,6 +10715,7 @@ struct WikiQuerier {
     conversation_scheduler: Arc<augmentagent_approval_discord::conversation::ConversationScheduler>,
     voice_enabled: bool,
     voice_tools: std::sync::OnceLock<Arc<augmentagent_approval_discord::voice_tool::VoiceToolService>>,
+    phone_tools: std::sync::OnceLock<Arc<augmentagent_phone::tools::ToolServer>>,
     final_spoken_turns: dashmap::DashMap<String, ()>,
 }
 
@@ -10601,6 +10738,7 @@ fn wiki_querier(
             augmentagent_approval_discord::conversation::ConversationScheduler::new(),
         ),
         voice_enabled,
+        phone_tools: std::sync::OnceLock::new(),
         voice_tools: std::sync::OnceLock::new(),
         final_spoken_turns: dashmap::DashMap::new(),
     }
@@ -10818,6 +10956,16 @@ impl QueryHandler for WikiQuerier {
                 None
             }
         };
+        // The scoped origin comes only from an authenticated interactive transport.
+        // Keep this capability alive through the native provider call below.
+        // Phone authority is the scoped transport origin plus the server grant,
+        // independently of Discord's owner_authorized flag. attach_tools returns
+        // no capability without a scope and revalidates explicit owner bindings.
+        let _phone_grant = self.phone_tools
+            .get()
+            .map(|server| augmentagent_channel_core::phone_agent::attach_tools(&mut opts, server, &auth_bin))
+            .transpose()?
+            .flatten();
         let voice_grant = self.voice_tools.get().and_then(|service| {
             let guild = ctx.guild_id?;
             let channel = ctx.channel_id?;
@@ -10905,6 +11053,20 @@ impl QueryHandler for WikiQuerier {
             if history.is_empty() { current.to_string() }
             else { format!("{history}\n\nuser's current message:\n{current}") }
         };
+        if let Some(turn) = augmentagent_phone::context::current() {
+            if turn.origin.conversation.account().platform().as_str() == "whatsapp" {
+                let store = self.conversation_store.as_ref().context("WhatsApp conversation store unavailable")?;
+                let tools = self.phone_tools.get().context("WhatsApp phone tools unavailable")?;
+                return phone_runtime::whatsapp_text_turn(store, tools, self, ctx, &turn.origin,
+                    &self.wiki_root, history, current).await;
+            }
+            if turn.origin.conversation.account().platform().as_str() == "discord" {
+                let store = self.conversation_store.as_ref().context("Discord conversation store unavailable")?;
+                let tools = self.phone_tools.get().context("Discord phone tools unavailable")?;
+                return phone_runtime::discord_text_turn(store, tools, self, ctx, &turn.origin,
+                    &self.wiki_root, history, current).await;
+            }
+        }
         let (Some(guild_id), Some(channel_id), Some(store)) =
             (ctx.guild_id, ctx.channel_id, self.conversation_store.as_ref())
         else {
@@ -10962,6 +11124,23 @@ impl QueryHandler for WikiQuerier {
             .map_err(anyhow::Error::msg)
     }
 
+    async fn phone_command(&self, context: &augmentagent_approval_discord::phone::PhoneCommandContext, text: &str) -> Option<String> {
+        let tools = self.phone_tools.get()?;
+        let origin = match context.origin() { Ok(origin) => origin, Err(_) => return Some("Discord phone identity unavailable".into()) };
+        let event_id = format!("discord:{}:{}", context.channel_id, context.message_id);
+        if context.guild_id.is_none() {
+            tools.discord_private_command(&origin.owner, &origin.conversation, &event_id, text).await
+        } else {
+            tools.command(&origin.owner, &origin.conversation, &event_id, text).await
+        }
+    }
+
+    fn phone_origin(&self, context: &augmentagent_approval_discord::phone::PhoneCommandContext) -> Option<augmentagent_store::phone::PhoneOrigin> {
+        let origin = context.origin().ok()?;
+        let _grant = self.phone_tools.get()?.grant(&origin.owner, &origin.conversation, None).ok()?;
+        Some(origin)
+    }
+
     async fn model_command(&self, channel_id: u64, text: &str) -> Option<String> {
         use augmentagent_channel_core::model_selection::{config_path, run_command, SelectionStore};
         let store = SelectionStore::new(config_path());
@@ -10976,22 +11155,22 @@ impl QueryHandler for WikiQuerier {
         channel_id: u64,
         text: &str,
     ) -> Option<String> {
+        if let (Some(turn), Some(store)) = (augmentagent_phone::context::current(), self.conversation_store.as_ref()) {
+            if turn.origin.conversation.account().platform().as_str() == "discord" {
+                match store.surface_conversation(&turn.origin.conversation) {
+                    Ok(Some(binding)) => {
+                        if let Some(reply) = native_model_switch_refusal(&binding.provider, &binding.native_session_id, text) { return Some(reply); }
+                    }
+                    Ok(None) => {}
+                    Err(_) => return Some("Model selection unavailable: conversation storage failed".into()),
+                }
+            }
+        }
         if self.voice_enabled {
             if let (Some(guild), Some(store)) = (guild_id, self.conversation_store.as_ref()) {
                 match store.discord_conversation(&guild.to_string(), &channel_id.to_string()) {
                     Ok(Some(binding)) => {
-                        let mut words = text.split_whitespace();
-                        if matches!(words.next(), Some("/model" | "model")) {
-                            let args: Vec<_> = words.collect();
-                            let same = matches!(args.as_slice(), ["set", name] | [name]
-                                if *name == binding.provider);
-                            if !same && !matches!(args.as_slice(), [] | ["help"] | ["list"] | ["status"]) {
-                                return Some(format!(
-                                    "This conversation is bound to native {} session {}. Switching models would start a different session; the current binding stays unchanged.",
-                                    binding.provider, binding.native_session_id
-                                ));
-                            }
-                        }
+                        if let Some(reply) = native_model_switch_refusal(&binding.provider, &binding.native_session_id, text) { return Some(reply); }
                     }
                     Ok(None) => {}
                     Err(error) => return Some(format!("Model selection unavailable: {error}")),
@@ -11000,6 +11179,15 @@ impl QueryHandler for WikiQuerier {
         }
         self.model_command(channel_id, text).await
     }
+}
+
+fn native_model_switch_refusal(provider: &str, session: &str, text: &str) -> Option<String> {
+    let mut words = text.split_whitespace();
+    if !matches!(words.next(), Some("/model" | "model")) { return None; }
+    let args: Vec<_> = words.collect();
+    let same = matches!(args.as_slice(), ["set", name] | [name] if *name == provider);
+    if same || matches!(args.as_slice(), [] | ["help"] | ["list"] | ["status"]) { return None; }
+    Some(format!("This conversation is bound to native {provider} session {session}. Switching models would start a different session; the current binding stays unchanged."))
 }
 
 fn model_profile_ready(reasoner: &FallbackReasoner, profile: augmentagent_channel_core::providers::ProviderKind) -> Result<(), String> {
@@ -11180,6 +11368,7 @@ mod query_delivery_contract_tests {
         ], CooldownLatch::at(repo.join("cooldowns.json"))));
         let handler = WikiQuerier { reasoner: reasoner.clone(), wiki_root: wiki.clone(), repo_root: repo.into(),
             conversation_store: None, conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()), voice_enabled: false,
+            phone_tools: std::sync::OnceLock::new(),
             voice_tools: std::sync::OnceLock::new(), final_spoken_turns: dashmap::DashMap::new() };
         for turn in 0..2 {
             let mut ctx = augmentagent_approval_discord::AuditCtx::empty();
@@ -11242,6 +11431,7 @@ mod query_delivery_contract_tests {
         let handler = WikiQuerier { reasoner: reasoner.clone(), wiki_root: wiki.clone(),
             repo_root: fixture.path().to_path_buf(), conversation_store: None,
             conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()), voice_enabled: false,
+            phone_tools: std::sync::OnceLock::new(),
             voice_tools: std::sync::OnceLock::new(), final_spoken_turns: dashmap::DashMap::new() };
         let mut context = augmentagent_approval_discord::AuditCtx::empty();
         context.session_id = "synthetic-channel:synthetic-turn".into();
@@ -15147,6 +15337,7 @@ async fn build_broker(
         // A one-shot command may run beside the daemon, whose pending turn
         // is then live: only `serve` closes interrupted turns (#1396).
         Vec::new(),
+        None,
     )
     .await
 }
@@ -15165,6 +15356,7 @@ async fn build_approval_surfaces(
     slack: Option<Arc<augmentagent_channel_slack::approvals::SlackApprovals>>,
     surfaces: augmentagent_approval_discord::CardSurfaces,
     interrupted_discord_turns: Vec<augmentagent_store::InterruptedDiscordTurn>,
+    phone_pending: Option<discord_phone::PendingSlot>,
 ) -> Result<(Arc<dyn ApprovalBroker>, Option<Arc<ReplyApprover>>)> {
     if dry_run {
         return Ok((Arc::new(NoopBroker), None));
@@ -15260,6 +15452,7 @@ async fn build_approval_surfaces(
             &reasoner,
             &repo_root,
             interrupted_discord_turns,
+            phone_pending,
         )
         .await
         {
@@ -15338,6 +15531,7 @@ async fn start_discord_broker(
     reasoner: &Arc<FallbackReasoner>,
     repo_root: &Path,
     interrupted_turns: Vec<augmentagent_store::InterruptedDiscordTurn>,
+    phone_pending: Option<discord_phone::PendingSlot>,
 ) -> Result<DiscordApprovalBroker> {
     let channel_id: u64 = std::env::var("DISCORD_CHANNEL_ID")
         .context("DISCORD_CHANNEL_ID env var required")?
@@ -15358,14 +15552,14 @@ async fn start_discord_broker(
     let voice_socket_path = resolve_discord_voice_socket(voice_enabled,
         std::env::var_os("AUGMENTAGENT_DISCORD_VOICE_SOCKET"), std::env::var_os("XDG_RUNTIME_DIR"))?;
 
-    let query_handler: Option<Arc<dyn QueryHandler>> = cli.wiki_dir.as_ref().map(|root| {
+    let query_handler: Option<Arc<WikiQuerier>> = cli.wiki_dir.as_ref().map(|root| {
         Arc::new(wiki_querier(
             Arc::clone(reasoner),
             root.clone(),
             repo_root.to_path_buf(),
             Arc::clone(&store),
             voice_enabled,
-        )) as Arc<dyn QueryHandler>
+        ))
     });
     // #428 — `!journal` write-back bridge. Present iff SHADOWNOTE_* config
     // exists (keyring/env); without it the command replies with the
@@ -15376,12 +15570,12 @@ async fn start_discord_broker(
             reasoner: Arc::clone(reasoner),
         }),
     );
-    DiscordApprovalBroker::start(DiscordConfig {
+    let broker = DiscordApprovalBroker::start(DiscordConfig {
         bot_token: token,
         channel_id,
         query_channel_id,
         allowed_user_id,
-        query_handler,
+        query_handler: query_handler.clone().map(|query| query as Arc<dyn QueryHandler>),
         action_handler: Some(handler),
         store: Some(store),
         loop_parser,
@@ -15391,7 +15585,13 @@ async fn start_discord_broker(
         interrupted_turns,
     })
     .await
-    .context("start discord broker")
+    .context("start discord broker")?;
+    if let (Some(slot), Some(query), Some(owner_user_id), Some((http, bot_user_id))) =
+        (phone_pending, query_handler, allowed_user_id, broker.phone_connection()) {
+        *slot.lock().map_err(|_| anyhow::anyhow!("Discord phone startup state unavailable"))? =
+            Some(discord_phone::PendingConnection { query, http, bot_user_id, owner_user_id });
+    }
+    Ok(broker)
 }
 
 /// #428 — the `!journal` write-back bridge, present iff SHADOWNOTE_* config
@@ -21264,6 +21464,20 @@ mod stale_reconcile_tests {
         from: &str,
         draft: Option<&str>,
     ) -> String {
+        seed_pending_draft_on(store, msg, thread, from, draft, "gmail")
+    }
+
+    /// #1505 — same as `seed_pending_draft` but the inbound is recorded on an
+    /// explicit platform, so a test can assert what the sweep does to a
+    /// non-email reply card.
+    fn seed_pending_draft_on(
+        store: &Store,
+        msg: &str,
+        thread: Option<&str>,
+        from: &str,
+        draft: Option<&str>,
+        platform: &str,
+    ) -> String {
         store
             .upsert_email(&Email {
                 attachments: Vec::new(),
@@ -21276,7 +21490,7 @@ mod stale_reconcile_tests {
                 body: "body".into(),
                 date: "2026-07-13T12:00:00Z".into(),
                 account_entity_id: Some("acc".into()),
-                platform: "gmail".into(),
+                platform: platform.into(),
                 kind: "dm".into(),
             })
             .unwrap();
@@ -21634,6 +21848,121 @@ mod stale_reconcile_tests {
             status_of(&store, &human),
             "pending",
             "a real person's card must never be swept as bulk"
+        );
+    }
+
+    /// #1505 — Rule 2 reads a mailbox address, which only email cards have.
+    /// Every chat platform's reply-card `from` is a name plus a platform id, so
+    /// the rule used to retire all of them on the first tick — #1289 exempted
+    /// Slack, and everyone else inherited the bug. None of these cards may move.
+    #[test]
+    fn reconcile_never_retires_a_non_email_platform_card() {
+        let cases: &[(&str, &str)] = &[
+            (augmentagent_channel_slack::PLATFORM, "Jade Quinn <slack:U0123ABC>"), // pii-ok: synthetic
+            ("twitter", "Jade Quinn <twitter:12345>"),                             // pii-ok: synthetic
+            (
+                augmentagent_channel_linkedin::inbound::PLATFORM,
+                "Jade Quinn <linkedin:urn:li:fsd_profile:ABC>", // pii-ok: synthetic
+            ),
+            ("whatsapp", "Jade Quinn <whatsapp:15550001111@s.whatsapp.net>"), // pii-ok: synthetic
+            (augmentagent_channel_deft::PLATFORM, "Deft form <deft:3f2a9c>"),
+            (augmentagent_channel_discord_dm::PLATFORM, "user-123456789012345678"),
+            (augmentagent_channel_voice::PLATFORM, "voice:chat-1"),
+        ];
+
+        for (i, (platform, from)) in cases.iter().enumerate() {
+            let (store, _t) = fresh_store();
+            let card = seed_pending_draft_on(
+                &store,
+                &format!("m-{i}"),
+                Some(&format!("T-{i}")),
+                from,
+                Some("a draft"),
+                platform,
+            );
+
+            let n = reconcile_stale_approvals_tick(&store).unwrap();
+            assert_eq!(n, 0, "{platform}: nothing to retire");
+            assert_eq!(
+                status_of(&store, &card),
+                "pending",
+                "{platform}: a reply card must survive the sweep"
+            );
+        }
+    }
+
+    /// #1505 — a pending card whose inbound row is gone surfaces platform `''`.
+    /// Provenance is unknown, so Rule 2 stays out of it; Rules 1 and 3 and the
+    /// 7-day expiry still cover the row.
+    #[test]
+    fn reconcile_skips_rule_two_when_the_platform_is_unknown() {
+        let (store, _t) = fresh_store();
+        let card = store
+            .log_action(
+                "orphan-1",
+                Some("T-orphan"),
+                "Jade Quinn <twitter:12345>", // pii-ok: synthetic
+                "subj",
+                Some("body"),
+                Some("a draft"),
+                ActionStatus::Pending,
+            )
+            .unwrap();
+
+        assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 0);
+        assert_eq!(status_of(&store, &card), "pending");
+    }
+
+    /// #1503 — a PDF-signing card is an owner decision on a local file, filed
+    /// exactly as `document_signing::propose` files it (`Owner signature`, no
+    /// thread). Its sender has no `@`, so Rule 2 used to retire it on the first
+    /// tick and Approve & Sign always failed "superseded". It must survive
+    /// repeated sweeps while a bulk-mail card beside it is still retired.
+    #[test]
+    fn reconcile_never_retires_a_pdf_signing_card() {
+        let (store, _t) = fresh_store();
+        store
+            .upsert_email(&Email {
+                attachments: Vec::new(),
+                to: String::new(),
+                cc: String::new(),
+                message_id: "doc-sign:1".into(),
+                thread_id: None,
+                from: "Owner signature".into(),
+                subject: "Sign PDF: deliverables/x.pdf".into(),
+                body: "{}".into(),
+                date: "2026-10-19T15:32:58Z".into(),
+                account_entity_id: None,
+                platform: "document-signing".into(),
+                kind: "sign_pdf".into(),
+            })
+            .unwrap();
+        let signing = store
+            .log_action(
+                "doc-sign:1",
+                None,
+                "Owner signature",
+                "Sign PDF: deliverables/x.pdf",
+                Some("{}"),
+                Some("Apply signature 'default' to deliverables/x.pdf (1 pages)."),
+                ActionStatus::Pending,
+            )
+            .unwrap();
+        let blast =
+            seed_pending(&store, "m-blast", Some("T-b"), "Brand <marketing@engage.brand.example.com>"); // pii-ok: synthetic
+
+        assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 1);
+        assert_eq!(
+            status_of(&store, &blast),
+            "superseded",
+            "Rule 2 still retires bulk mail"
+        );
+        assert_eq!(status_of(&store, &signing), "pending");
+        assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 0);
+        assert_eq!(
+            status_of(&store, &signing),
+            "pending",
+            "durable across ticks"
         );
     }
 
@@ -22409,17 +22738,20 @@ mod identity_merge_tests {
     }
 
     /// The card names the stub, per the contract — and must survive the daemon:
-    /// the sweep's bulk-sender rule fails any `from` without an `@`.
+    /// the sweep's bulk-sender rule fails any `from` without an `@`, and the
+    /// merge kind is off the sweep's list besides.
     #[test]
     fn a_proposed_merge_card_survives_the_stale_approval_sweep() {
         let (store, _t, wiki) = seeded_env();
         let (email, payload, draft) = build_identity_merge_card(&dry_run(&store, &wiki));
         assert_eq!(email.from, "Landlord Philly", "the sender field IS the stub");
         let proposed = record_identity_merge_proposal(&store, &email, &payload, &draft).unwrap();
-        // Control — the identical row under any other kind IS retired, so this
-        // cannot pass on a sweep that does nothing at all.
+        // Control — the same row as an ordinary email card IS retired, so this
+        // cannot pass on a sweep that does nothing at all. (#1505 gates Rule 2
+        // on the email platform, so the control has to be on it.)
         let mut other = email.clone();
         (other.message_id, other.kind) = ("merge:control".into(), "dm".into());
+        other.platform = augmentagent_channel_email::inbound::PLATFORM.into();
         let control = record_identity_merge_proposal(&store, &other, &payload, &draft).unwrap();
         assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 1);
         assert_eq!(status_of(&store, &proposed), "pending", "must stay clickable");

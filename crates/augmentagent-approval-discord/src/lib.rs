@@ -24,6 +24,8 @@ mod nudge;
 pub mod owner_alerts;
 // #1292 — the shared owner-command registry (Discord triggers, Slack mapping).
 pub mod owner_commands;
+pub mod phone;
+pub mod phone_delivery;
 mod process_loops;
 // #994 — register (casing) audit for outbound drafts. Public: the delivery
 // layer checks receipts here and `gmail compose` gates its body on them.
@@ -44,7 +46,7 @@ pub use broker::{DiscordApprovalBroker, DiscordConfig};
 // #501 — `append_envelope_markers` is shared with the CLI's Back-to-queue
 // repost so it renders the same To/cc/bcc decoration as the Revise repost.
 pub use event_handler::{append_envelope_markers, chunk_for_discord, edit_card_for_action};
-pub use event_handler::{interrupted_turn_target, INTERRUPTED_TURN_NOTICE};
+pub use event_handler::{fetch_owner_history, interrupted_turn_target, INTERRUPTED_TURN_NOTICE};
 pub use journal_cmd::{parse_journal_command, JournalCmd, JOURNAL_NOT_CONFIGURED, JOURNAL_USAGE};
 // #35 Phase 5: the email channel appends the needs-input marker to the
 // persisted draft via this; the card decodes it on render. `NeedsInput` is
@@ -455,6 +457,14 @@ pub trait QueryHandler: Send + Sync {
         };
         self.answer(ctx, &prompt).await
     }
+
+    /// Return a phone origin only after checking the stored owner/control-chat
+    /// authority. Disabled or unlinked transports keep ordinary text behavior.
+    fn phone_origin(&self, _context: &phone::PhoneCommandContext) -> Option<augmentagent_store::phone::PhoneOrigin> { None }
+
+    /// Deterministic phone command after Discord owner admission. Implementations
+    /// must validate stored owner links before executing a phone operation.
+    async fn phone_command(&self, _context: &phone::PhoneCommandContext, _text: &str) -> Option<String> { None }
 
     /// Owner-only deterministic control command, intercepted before history,
     /// attachments or model inference. `None` means an ordinary message.

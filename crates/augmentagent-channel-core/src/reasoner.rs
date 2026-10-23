@@ -1413,9 +1413,34 @@ impl ClaudeCliReasoner {
                     "claude exited non-zero: {status:?}: {stderr_buf}"
                 )));
             }
+            // #1499 — a failed exit is never an answer, whatever its result
+            // text says. Quota and auth refusals fall through to their typed
+            // errors below.
+            if !is_rate_limited(&final_text) && !is_auth_refusal(&final_text) {
+                let first_line: String =
+                    final_text.trim().lines().next().unwrap_or_default().chars().take(200).collect();
+                return Err(CallError::Other(anyhow::anyhow!(
+                    "claude exited non-zero: {status:?}: {first_line}"
+                )));
+            }
         }
         if final_text.is_empty() {
             return Err(CallError::EmptyOutput);
+        }
+        // #1499 — an expired login, like the quota refusal, is a completion
+        // whose text is the CLI's error. Typed per the #1040 table (Auth →
+        // Unavailable) so the chain latches claude and fails over.
+        if is_auth_refusal(&final_text) {
+            warn!("claude REFUSED ON AUTH (login expired or missing): {}", final_text.trim());
+            if let Some(lease) = native_lease {
+                let _ = lease.finish();
+            }
+            return Err(CallError::Other(crate::turn_failure::turn_error(
+                "claude",
+                crate::turn_failure::FailureClass::Auth,
+                crate::providers::CapabilityClass::TextOnly,
+                final_text.trim().to_string(),
+            )));
         }
         // #448 — the quota refusal is a *successful* completion. Catch it here,
         // before it reaches a JSON parser that would mislabel it a parse error
@@ -1580,6 +1605,33 @@ pub(crate) fn is_rate_limited(text: &str) -> bool {
     anchored
         && (t.contains("session limit") || t.contains("usage limit") || t.contains("rate limit"))
         && (t.contains("hit your") || t.contains("reached your") || t.contains("resets"))
+}
+
+/// #1499 — whether a turn's result text is the CLI refusing on its own login
+/// ("Failed to authenticate: OAuth session expired and could not be
+/// refreshed"). Like the quota refusal, it arrives as a successful completion,
+/// so without this check it was returned as the model's answer: no failover,
+/// and the raw error posted to Discord. A positive latches claude for every
+/// caller, so the same gates as [`is_rate_limited`] apply: one short line that
+/// starts with the refusal, confirmed by the #1040 classifier's Auth row.
+pub(crate) fn is_auth_refusal(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() || t.len() > 300 {
+        return false;
+    }
+    let lower = t.to_ascii_lowercase();
+    let anchored = [
+        "failed to authenticate",
+        "invalid api key",
+        "not logged in",
+        "oauth token",
+        "authentication error",
+        "authentication_error",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix));
+    anchored
+        && crate::turn_failure::classify(t, true) == crate::turn_failure::FailureClass::Auth
 }
 
 /// Locate the most recent `.claude.json.backup.*` file under
@@ -2151,6 +2203,8 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             format!("Bash({} finance summary *)", bin.display()),
             "Bash(augmentagent doc sign *)".into(),
             format!("Bash({} doc sign *)", bin.display()),
+            "Bash(augmentagent doc sign-lines *)".into(),
+            format!("Bash({} doc sign-lines *)", bin.display()),
             "Bash(augmentagent doc signatures)".into(),
             format!("Bash({} doc signatures)", bin.display()),
             "Bash(augmentagent doc render-pdf *)".into(),
@@ -3507,6 +3561,9 @@ mod tests {
             .iter()
             .any(|(k, v)| k == "WIKI_ROOT" && v == wiki.path().to_str().unwrap()));
         assert!(opts.allowed_tools.contains(&"Bash(augmentagent doc sign *)".into()));
+        assert!(opts.allowed_tools.contains(&"Bash(augmentagent doc sign-lines *)".into()));
+        assert!(opts.system_prompt.contains("doc sign-lines"));
+        assert!(opts.system_prompt.contains("--anchor-text"));
         assert!(opts.allowed_tools.contains(&"Bash(augmentagent doc signatures)".into()));
         assert!(!opts.allowed_tools.iter().any(|tool| tool.contains("signature-install")));
         assert!(opts.system_prompt.contains("augmentagent doc sign"));
@@ -4236,6 +4293,40 @@ mod rate_limit_tests {
         assert!(is_rate_limited(
             "You've hit your session limit · resets 9:30am (America/New_York)"
         ));
+    }
+
+    /// #1499 — the CLI returns an expired login as the turn's result text.
+    /// The first case is the exact string the daemon received.
+    #[test]
+    fn detects_cli_auth_refusals() {
+        for refusal in [
+            "Failed to authenticate: OAuth session expired and could not be refreshed",
+            "Invalid API key · Please run /login",
+            "OAuth token has expired. Please obtain a new token or refresh your existing token.",
+            "Not logged in · Please run /login",
+        ] {
+            assert!(is_auth_refusal(refusal), "missed auth refusal: {refusal}");
+        }
+    }
+
+    /// #1499 — a positive latches claude for every caller, so the refusal must
+    /// be the whole message, never quoted inside an answer.
+    #[test]
+    fn auth_refusal_needs_the_whole_short_message() {
+        let quoted = "The owner forwarded: \"Failed to authenticate: OAuth session expired and could not be refreshed\"";
+        let padded = format!(
+            "Failed to authenticate: OAuth session expired and could not be refreshed {}",
+            "context ".repeat(50)
+        );
+        for ok in [
+            r#"{"action":"ignore"}"#,
+            quoted,
+            &padded,
+            "",
+            "You've hit your session limit · resets 9:30am",
+        ] {
+            assert!(!is_auth_refusal(ok), "false positive on: {ok}");
+        }
     }
 }
 
@@ -5115,12 +5206,84 @@ echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30
         }
     }
 
+    /// #1499 — a fake `claude` that reports `result` and exits `code`.
+    fn stub_cli_result(dir: &tempfile::TempDir, name: &str, result: &str, code: i32) -> String {
+        let event = serde_json::json!({"type": "result", "result": result}).to_string();
+        stub_cli(dir, name, &format!("cat >/dev/null\ncat <<'EOF'\n{event}\nEOF\nexit {code}\n"))
+    }
+
+    async fn expect_claude_unavailable(bin: String) {
+        let reasoner = ClaudeCliReasoner { bin, gate: CliGate::global() };
+        let err = reasoner
+            .call(&dummy_opts(), "triage this")
+            .await
+            .expect_err("a failed CLI turn must never be an answer");
+        match ReasonerError::find_in(&err) {
+            Some(ReasonerError::Unavailable { provider, .. }) => assert_eq!(provider, "claude"),
+            other => panic!("expected Unavailable, got {other:?} (err: {err:#})"),
+        }
+    }
+
+    /// #1499 — an expired login arrives as a successful completion.
+    #[tokio::test]
+    async fn auth_refusal_on_exit_zero_is_typed_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_cli_result(&dir, "fake-claude-auth-0",
+            "Failed to authenticate: OAuth session expired and could not be refreshed", 0);
+        expect_claude_unavailable(bin).await;
+    }
+
+    /// #1499 — and the same refusal on a failed exit.
+    #[tokio::test]
+    async fn auth_refusal_on_exit_one_is_typed_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_cli_result(&dir, "fake-claude-auth-1",
+            "Failed to authenticate: OAuth session expired and could not be refreshed", 1);
+        expect_claude_unavailable(bin).await;
+    }
+
+    /// #1499 — a non-zero exit is never an answer, whatever its result says.
+    #[tokio::test]
+    async fn failed_exit_with_result_text_is_not_an_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_cli_result(&dir, "fake-claude-fail", "something went sideways", 1);
+        expect_claude_unavailable(bin).await;
+    }
+
+    /// #1499 — the chain fails over from an expired login and latches claude.
+    #[tokio::test]
+    async fn auth_refusal_fails_over_and_latches_claude() {
+        struct Served;
+        #[async_trait]
+        impl Reasoner for Served {
+            async fn call(&self, _: &ReasonerOpts, _: &str) -> anyhow::Result<String> {
+                Ok("served".into())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_cli_result(&dir, "fake-claude-auth-chain",
+            "Failed to authenticate: OAuth session expired and could not be refreshed", 0);
+        let latch = crate::cooldown::CooldownLatch::at(dir.path().join("cooldowns.json"));
+        let chain = crate::fallback::FallbackReasoner::for_tests(
+            vec![
+                (crate::providers::ProviderKind::Claude,
+                    Arc::new(ClaudeCliReasoner { bin, gate: CliGate::global() }) as Arc<dyn Reasoner>),
+                (crate::providers::ProviderKind::Codex, Arc::new(Served) as Arc<dyn Reasoner>),
+            ],
+            latch.clone(),
+        );
+        assert_eq!(chain.call(&dummy_opts(), "triage this").await.unwrap(), "served");
+        assert!(latch.latched_until("claude").is_some(), "an expired login must latch claude");
+    }
+
     /// #656 — a hung CLI becomes a typed Timeout instead of blocking the
     /// pipeline forever. kill_on_drop reaps the child.
     #[tokio::test]
     async fn hung_cli_times_out_with_typed_error() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = stub_cli(&dir, "fake-claude-hang", "cat >/dev/null\nsleep 600\n");
+        // Keep the watchdog fixture to one process; orphaned shell children can
+        // legitimately produce CleanupUnverified on busy CI hosts.
+        let bin = stub_cli(&dir, "fake-claude-hang", "cat >/dev/null\nexec sleep 600\n");
         let _env = TIMEOUT_ENV_LOCK.lock().await;
         std::env::set_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS", "1");
         let reasoner = ClaudeCliReasoner {

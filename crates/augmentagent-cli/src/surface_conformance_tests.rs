@@ -73,7 +73,7 @@ fn querier(root: &Path, provider: &Arc<RecordingNativeProvider>) -> WikiQuerier 
         conversation_store: Some(Arc::new(Store::open(root.join("data.db")).unwrap())),
         conversation_scheduler: Arc::new(ConversationScheduler::new()),
         voice_enabled: true,
-        voice_tools: std::sync::OnceLock::new(),
+        phone_tools: std::sync::OnceLock::new(), voice_tools: std::sync::OnceLock::new(),
         final_spoken_turns: dashmap::DashMap::new(),
     }
 }

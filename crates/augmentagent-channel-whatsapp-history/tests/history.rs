@@ -289,3 +289,29 @@ fn symlink_cannot_read_conversation_outside_bundle() {
     assert_eq!(report.inserted, 0);
     assert_eq!(report.skipped, 1);
 }
+
+#[test]
+fn private_phone_setup_is_excluded_from_search_and_wiki_capture_across_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    bundle(tmp.path());
+    let path = tmp.path().join("conversations/Friend/messages.md");
+    let original = fs::read_to_string(&path).unwrap();
+    fs::write(&path, format!("{original}\n### [2026-08-26T12:02:00+00:00] me\nphone number set +12025550123\n\n### [2026-08-26T12:03:00+00:00] me\n/phone number verify 123456\n")).unwrap();
+    let db = tmp.path().join("data.db");
+    let store = Store::open(&db).unwrap();
+    let first = poll_once(tmp.path(), &store).unwrap();
+    assert_eq!(first.inserted, 2);
+    let capture = capture_email(&first.deltas[0]);
+    assert!(!capture.body.contains("12025550123"));
+    assert!(!capture.body.contains("123456"));
+    let memory = Server::open(&db).unwrap();
+    assert!(memory.search_conversation_history(Some("123456"), None, None, Some("whatsapp"), None).unwrap().is_empty());
+    drop(store);
+    let reopened = Store::open(&db).unwrap();
+    assert_eq!(poll_once(tmp.path(), &reopened).unwrap().inserted, 0);
+    let content = fs::read_to_string(&path).unwrap();
+    fs::write(&path, format!("{content}\n### [2026-08-26T12:04:00+00:00] me\nNew ordinary message\n")).unwrap();
+    let next = poll_once(tmp.path(), &reopened).unwrap();
+    assert_eq!(next.inserted, 1);
+    assert!(capture_email(&next.deltas[0]).body.contains("New ordinary message"));
+}
