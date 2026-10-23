@@ -1198,6 +1198,11 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retry_after_overflow_is_ignored() {
+        assert!(parse_rate_limit_retry_after("retry after 9223372036854775807").is_none());
+    }
+
     // The draft-creation path is exactly what #1486 is about: Composio returns
     // the upstream throttle in an HTTP 200 `successful:false` envelope, which
     // never reached the HTTP-429 backoff. A transient throttle must now be
@@ -2566,7 +2571,7 @@ fn parse_rate_limit_retry_after(error: &str) -> Option<(i64, String)> {
     }
     // A bare non-negative integer is delta-seconds from now.
     match token.parse::<i64>() {
-        Ok(secs) if secs >= 0 => Some((wallclock_ms() + secs * 1_000, token.to_string())),
+        Ok(secs) if secs >= 0 => Some((wallclock_ms().checked_add(secs.checked_mul(1_000)?)?, token.to_string())),
         _ => None,
     }
 }
