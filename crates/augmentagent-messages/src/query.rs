@@ -1246,9 +1246,11 @@ mod tests {
     }
 
     /// Upgrade path: a deployment whose cache predates #1539 has no links
-    /// table and no alias rows. Opening the store creates the table, and the
-    /// daemon's periodic `resolve_people` refresh rewrites every row — so the
-    /// first refresh after the owner edits front matter is enough.
+    /// table and no alias rows. Opening the store creates the table, and
+    /// every `resolve_people` rewrites all of its rows, so the unattended
+    /// daemon repairs the cache on its own: `messages_cmd::people_loop`
+    /// resolves on its immediate first tick at startup and every 15 minutes
+    /// after, which covers both an upgrade and a later front-matter edit.
     #[test]
     fn a_pre_existing_cache_picks_up_aliases_and_households_on_refresh() {
         let (dir, w, old) = housemates("");
@@ -1282,13 +1284,8 @@ mod tests {
             c.iter().map(|m| m.key.as_str()).collect::<Vec<_>>(),
             ["alex-stone", "alex-rivera", "alex-nguyen"]
         );
-        let seen: Vec<&str> = c
-            .iter()
-            .map(|m| m.last_seen.as_deref().unwrap_or("-"))
-            .collect();
-        assert!(seen[0].starts_with("2025-12-30"), "{seen:?}");
-        assert!(seen[1].starts_with("2025-12-10"), "{seen:?}");
-        assert_eq!(seen[2], "-");
+        assert!(c[0].last_seen.as_deref().unwrap().starts_with("2025-12-30"));
+        assert!(c[2].last_seen.is_none());
     }
 
     #[test]
