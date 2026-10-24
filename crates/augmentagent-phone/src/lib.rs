@@ -134,6 +134,7 @@ pub struct PhoneConfig {
     owner_first_name: Option<String>,
     debug_events: bool,
     barge_in: relay::BargeIn,
+    fast: Option<fast::FastLayerConfig>,
 }
 impl PhoneConfig {
     pub fn new(
@@ -174,6 +175,7 @@ impl PhoneConfig {
             owner_first_name: None,
             debug_events: false,
             barge_in: relay::BargeIn::default(),
+            fast: None,
         })
     }
     /// Operator-validated speech providers. Only startup configuration may call this.
@@ -196,6 +198,11 @@ impl PhoneConfig {
     /// Backchannel filter and false-interruption handling (#1550).
     pub fn with_barge_in(mut self, barge_in: relay::BargeIn) -> Self {
         self.barge_in = barge_in;
+        self
+    }
+    /// Answer utterances with the fast conversational layer (#1546).
+    pub fn with_fast_layer(mut self, fast: Option<fast::FastLayerConfig>) -> Self {
+        self.fast = fast;
         self
     }
 }
@@ -239,6 +246,10 @@ impl PhoneService {
     }
     pub fn debug_events(&self) -> bool {
         self.config.debug_events
+    }
+    /// Fast-layer settings when `AUGMENTAGENT_PHONE_FAST_LAYER=1` (#1546).
+    pub fn fast_layer(&self) -> Option<&fast::FastLayerConfig> {
+        self.config.fast.as_ref()
     }
     pub fn linked_surface_owners(&self) -> Vec<SurfaceOwnerRef> {
         self.config
@@ -682,7 +693,9 @@ impl PhoneService {
         self.authorize_call_origin(&call)
     }
 
-    pub(crate) fn authorize_call_origin(&self, call: &PhoneCall) -> Result<Grant, Error> {
+    /// Owner authority for the call's origin, without requiring the call to
+    /// still be connected. Dispatched work (#1546) outlives its call.
+    pub fn authorize_call_origin(&self, call: &PhoneCall) -> Result<Grant, Error> {
         let origin = self.store.phone_origin(&call.id)?;
         let grant = self.authorize(&origin.owner, &origin.conversation)?;
         if grant.owner_id != call.owner
@@ -733,3 +746,5 @@ pub mod router;
 pub mod recovery;
 
 pub mod metrics;
+
+pub mod fast;

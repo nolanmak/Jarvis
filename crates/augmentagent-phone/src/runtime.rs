@@ -144,6 +144,7 @@ pub async fn cleanup_without_runtime(
             owner_first_name: None,
             debug_events: false,
             barge_in: crate::relay::BargeIn::default(),
+            fast: None,
         },
     ));
     let initial = service.cleanup_due(true)?;

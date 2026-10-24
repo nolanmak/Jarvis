@@ -510,3 +510,467 @@ async fn phone_turn_streams_the_sanitized_answer_then_finishes() {
         ]
     );
 }
+
+// ---------- #1546 fast conversational layer ----------
+
+mod fast {
+    use super::*;
+    use augmentagent_channel_core::phone_agent::PhoneAgent;
+    use augmentagent_phone::{
+        fast::{
+            FastEvent, FastLayerConfig, FastMessage, FastModel, FastModelError, FastRequest,
+            FastStream, ToolCall,
+        },
+        ingress::{ConversationAgent, SpeechEvent, SpeechSender},
+        relay::{RelayInput, RelaySession},
+    };
+    use augmentagent_store::{
+        delivery::{NewOutboundSend, OutboundOperation},
+        phone::PhoneCall,
+    };
+    use std::time::{Duration, Instant};
+    use tokio::sync::Notify;
+
+    /// Scripted fast model: one round of events per request.
+    pub struct Scripted {
+        rounds: Mutex<std::collections::VecDeque<Vec<FastEvent>>>,
+        pub requests: Mutex<Vec<(Instant, Vec<FastMessage>)>>,
+    }
+    impl Scripted {
+        pub fn new(rounds: Vec<Vec<FastEvent>>) -> Arc<Self> {
+            Arc::new(Self {
+                rounds: Mutex::new(rounds.into()),
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+    }
+    #[async_trait]
+    impl FastModel for Scripted {
+        async fn stream(&self, request: FastRequest) -> Result<FastStream, FastModelError> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push((Instant::now(), request.messages));
+            let round = self.rounds.lock().unwrap().pop_front().unwrap_or_default();
+            Ok(Box::pin(futures::stream::iter(round.into_iter().map(Ok))))
+        }
+    }
+    pub fn tool(name: &str, input: serde_json::Value) -> FastEvent {
+        FastEvent::ToolCall(ToolCall {
+            id: format!("call-{name}"),
+            name: name.into(),
+            input,
+        })
+    }
+    pub fn token(text: &str) -> FastEvent {
+        FastEvent::Token(text.into())
+    }
+
+    /// Durable chat outbox: the store's idempotent surface outbox.
+    pub struct OutboxIo {
+        pub store: Arc<Store>,
+    }
+    #[async_trait]
+    impl ConversationIo for OutboxIo {
+        async fn history(&self, _: &PhoneOrigin) -> anyhow::Result<String> {
+            Ok("owner: earlier chat line".into())
+        }
+        async fn mirror(&self, origin: &PhoneOrigin, key: &str, text: &str) -> anyhow::Result<()> {
+            self.store.enqueue_outbound_send(
+                &NewOutboundSend {
+                    conversation: origin.conversation.clone(),
+                    idempotency_key: key.into(),
+                    operation: OutboundOperation::Post,
+                    target_message_id: None,
+                    payload: text.into(),
+                    max_attempts: 3,
+                    interaction_expires_at_ms: None,
+                },
+                0,
+            )?;
+            Ok(())
+        }
+        fn audit_context(&self, _: &PhoneOrigin, turn_id: &str) -> AuditCtx {
+            let mut ctx = AuditCtx::empty();
+            ctx.session_id = turn_id.into();
+            ctx.owner_authorized = true;
+            ctx
+        }
+    }
+    pub fn sends(store: &Store, origin: &PhoneOrigin, key: &str) -> Vec<String> {
+        store
+            .outbound_sends_with_key_prefix(origin.conversation.account(), key, &[])
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.idempotency_key == key)
+            .map(|s| s.payload)
+            .collect()
+    }
+
+    /// Heavy native agent that blocks until released, recording what the
+    /// existing surface-turn path handed it.
+    pub struct BlockedHeavy {
+        pub provider: Arc<RecordingNativeProvider>,
+        pub entered: Arc<Notify>,
+        pub release: Arc<Notify>,
+        /// (owner_authorized, phone origin attached, speech attached)
+        pub seen: Mutex<Vec<(bool, bool, bool)>>,
+    }
+    #[async_trait]
+    impl QueryHandler for BlockedHeavy {
+        async fn answer(&self, ctx: &AuditCtx, question: &str) -> anyhow::Result<String> {
+            let context = augmentagent_phone::context::current();
+            self.seen.lock().unwrap().push((
+                ctx.owner_authorized,
+                context.is_some(),
+                context.as_ref().is_some_and(|c| c.speech.is_some()),
+            ));
+            self.entered.notify_one();
+            self.release.notified().await;
+            let mut opts = augmentagent_channel_core::reasoner::triage_opts(None);
+            opts.session_id = Some(ctx.session_id.clone());
+            self.provider.call(&opts, question).await
+        }
+    }
+
+    pub struct Connected {
+        pub dir: tempfile::TempDir,
+        pub store: Arc<Store>,
+        pub service: Arc<PhoneService>,
+        pub origin: PhoneOrigin,
+        pub call: PhoneCall,
+    }
+    pub async fn connected() -> Connected {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("db")).unwrap());
+        let account =
+            SurfaceAccountRef::new(SurfacePlatform::new("slack").unwrap(), "team").unwrap();
+        let owner = SurfaceOwnerRef::new(account.clone(), "owner").unwrap();
+        let chat = SurfaceConversationRef::new(account, "dm", None).unwrap();
+        store.bind_surface_owner(&owner, 0).unwrap();
+        store
+            .set_surface_control_conversation(&chat, ControlConversationKind::Direct, 0)
+            .unwrap();
+        store
+            .phone_import_destination("owner", "+12025550123", 0)
+            .unwrap();
+        let service = Arc::new(PhoneService::new(
+            store.clone(),
+            Arc::new(TestPhone),
+            Arc::new(TestClock),
+            PhoneConfig::new(
+                true,
+                "https://phone.example.test",
+                "test-verification-key-separate-32bytes",
+                vec![OwnerLink {
+                    surface_owner: owner.clone(),
+                    owner_id: "owner".into(),
+                }],
+            )
+            .unwrap(),
+        ));
+        let grant = service.authorize(&owner, &chat).unwrap();
+        let receipt = service
+            .tool(&grant, "call_owner", serde_json::json!({"request_id":"start"}))
+            .await
+            .unwrap();
+        let id = receipt["id"].as_str().unwrap();
+        store
+            .phone_provider_event(id, "CA-test", CallState::AwaitingAcceptance, 100)
+            .unwrap();
+        store.phone_accept(id, "CA-test", 100).unwrap();
+        let call = store.phone_provider_call(id).unwrap();
+        Connected {
+            dir,
+            store,
+            service,
+            origin: PhoneOrigin {
+                owner,
+                conversation: chat,
+            },
+            call,
+        }
+    }
+    pub fn speech_for(call_id: &str, text: &str) -> (String, SpeechSender, tokio::sync::mpsc::Receiver<SpeechEvent>) {
+        let mut session = RelaySession::new(call_id, "AC-test", "CA-test");
+        session
+            .receive(r#"{"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX"}"#)
+            .unwrap();
+        let frame = serde_json::json!({"type":"prompt","voicePrompt":text,"last":true}).to_string();
+        let RelayInput::Turn(turn) = session.receive(&frame).unwrap() else {
+            panic!()
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        (turn.id.clone(), SpeechSender::new(tx, Arc::new(turn)), rx)
+    }
+    pub fn bridge(
+        f: &Connected,
+        heavy: Arc<dyn QueryHandler>,
+        model: Arc<Scripted>,
+    ) -> PhoneAgent {
+        PhoneAgent::new(
+            f.store.clone(),
+            f.service.clone(),
+            heavy,
+            Arc::new(OutboxIo {
+                store: f.store.clone(),
+            }),
+            "/fixture".into(),
+            Arc::new(|_| Ok(Some(ProviderKind::Claude))),
+        )
+        .with_fast_layer(model, FastLayerConfig::default())
+    }
+    pub async fn wait_for(mut done: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("condition not reached");
+    }
+
+    // Step 2 / AC2 / AC3: dispatch returns at once while the heavy turn runs on
+    // the existing surface-turn path; its result is queued exactly once under
+    // `{turn_id}:dispatch`, also after a restart replays delivery.
+    #[tokio::test]
+    async fn step2_dispatch_returns_immediately_and_delivers_once_across_restart() {
+        let f = connected().await;
+        let provider = Arc::new(RecordingNativeProvider::new(ProviderKind::Claude));
+        let heavy = Arc::new(BlockedHeavy {
+            provider: provider.clone(),
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            seen: Mutex::new(Vec::new()),
+        });
+        let model = Scripted::new(vec![
+            vec![tool(
+                "dispatch_task",
+                serde_json::json!({"description":"Draft a reply to the last Linear comment"}),
+            )],
+            vec![token("On it. "), token("The draft will land in chat.")],
+        ]);
+        let bridge = bridge(&f, heavy.clone(), model.clone());
+        let (turn_id, speech, _rx) = speech_for(&f.call.id, "draft a reply");
+        let answer = bridge
+            .answer(&f.call, &turn_id, "draft a reply", speech, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(answer, "On it. The draft will land in chat.");
+        {
+            let requests = model.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let waited = requests[1].0.duration_since(requests[0].0);
+            assert!(waited < Duration::from_millis(50), "dispatch_task took {waited:?}");
+            let task_id = format!("{turn_id}:dispatch");
+            assert!(requests[1].1.iter().any(|m| matches!(m,
+                FastMessage::ToolResult { content, is_error: false, .. } if content.contains(&task_id))));
+        }
+        let key = format!("{turn_id}:dispatch");
+        tokio::time::timeout(Duration::from_secs(5), heavy.entered.notified())
+            .await
+            .expect("heavy turn started on the surface-turn path");
+        assert!(sends(&f.store, &f.origin, &key).is_empty(), "nothing before completion");
+        heavy.release.notify_one();
+        wait_for(|| !sends(&f.store, &f.origin, &key).is_empty()).await;
+        let delivered = sends(&f.store, &f.origin, &key);
+        assert_eq!(delivered.len(), 1);
+        // Spy: one native call through the session runner, with the existing
+        // owner authorization and phone context (no call speech) attached.
+        assert_eq!(provider.calls().len(), 1);
+        assert!(provider.calls()[0].prompt.contains("Draft a reply to the last Linear comment"));
+        assert_eq!(*heavy.seen.lock().unwrap(), vec![(true, true, false)]);
+        let dispatch_turn =
+            SurfaceTurnRef::new(f.origin.conversation.clone(), key.as_str()).unwrap();
+        assert!(f.store.claim_surface_turn(&dispatch_turn).is_err(), "durable claim recorded");
+
+        // Simulated restart: a fresh store handle and bridge replay the same
+        // dispatch. The durable claim refuses a second heavy run and the
+        // outbox key admits no duplicate.
+        drop(bridge);
+        let reopened = Arc::new(Store::open(f.dir.path().join("db")).unwrap());
+        let restarted = Connected {
+            dir: tempfile::tempdir().unwrap(),
+            store: reopened.clone(),
+            service: f.service.clone(),
+            origin: f.origin.clone(),
+            call: f.call.clone(),
+        };
+        let replay = Scripted::new(vec![
+            vec![tool(
+                "dispatch_task",
+                serde_json::json!({"description":"Draft a reply to the last Linear comment"}),
+            )],
+            vec![token("Okay.")],
+        ]);
+        let bridge = super::fast::bridge(&restarted, heavy.clone(), replay);
+        let (_, speech, _rx) = speech_for(&f.call.id, "draft a reply");
+        bridge
+            .answer(&f.call, &turn_id, "draft a reply", speech, CancellationToken::new())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(sends(&reopened, &f.origin, &key).len(), 1);
+        assert_eq!(provider.calls().len(), 1, "dispatched work never re-runs");
+    }
+
+    /// Revokes the owner's authority while the model is answering, then asks
+    /// for dispatch: the tool must be refused.
+    struct RevokingModel {
+        store: Arc<Store>,
+        owner: SurfaceOwnerRef,
+        inner: Arc<Scripted>,
+    }
+    #[async_trait]
+    impl FastModel for RevokingModel {
+        async fn stream(&self, request: FastRequest) -> Result<FastStream, FastModelError> {
+            if self.inner.requests.lock().unwrap().is_empty() {
+                self.store.unbind_surface_owner(self.owner.account()).unwrap();
+            }
+            self.inner.stream(request).await
+        }
+    }
+    // Step 3 / AC5: a revoked call cannot dispatch; no surface turn is queued.
+    #[tokio::test]
+    async fn step3_dispatch_on_revoked_call_is_refused_and_enqueues_nothing() {
+        let f = connected().await;
+        let provider = Arc::new(RecordingNativeProvider::new(ProviderKind::Claude));
+        let heavy = Arc::new(BlockedHeavy {
+            provider: provider.clone(),
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            seen: Mutex::new(Vec::new()),
+        });
+        let inner = Scripted::new(vec![
+            vec![tool("dispatch_task", serde_json::json!({"description":"send the report"}))],
+            vec![token("I can't do that right now.")],
+        ]);
+        let model = Arc::new(RevokingModel {
+            store: f.store.clone(),
+            owner: f.origin.owner.clone(),
+            inner: inner.clone(),
+        });
+        let bridge = PhoneAgent::new(
+            f.store.clone(),
+            f.service.clone(),
+            heavy.clone(),
+            Arc::new(OutboxIo { store: f.store.clone() }),
+            "/fixture".into(),
+            Arc::new(|_| Ok(Some(ProviderKind::Claude))),
+        )
+        .with_fast_layer(model, FastLayerConfig::default());
+        let (turn_id, speech, _rx) = speech_for(&f.call.id, "send the report");
+        let _ = bridge
+            .answer(&f.call, &turn_id, "send the report", speech, CancellationToken::new())
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        {
+            let requests = inner.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2, "the model hears the refusal");
+            assert!(requests[1].1.iter().any(|m| matches!(m,
+                FastMessage::ToolResult { content, is_error: true, .. } if content.contains("unauthorized"))));
+        }
+        let key = format!("{turn_id}:dispatch");
+        assert!(heavy.seen.lock().unwrap().is_empty(), "no heavy turn ran");
+        assert!(provider.calls().is_empty());
+        assert!(sends(&f.store, &f.origin, &key).is_empty());
+        let dispatch_turn =
+            SurfaceTurnRef::new(f.origin.conversation.clone(), key.as_str()).unwrap();
+        assert!(
+            f.store.claim_surface_turn(&dispatch_turn).is_ok(),
+            "no surface turn was claimed for the refused dispatch"
+        );
+    }
+
+    // AC6 wiring: the operator flag alone decides; without it the bridge is
+    // the unchanged native PhoneAgent.
+    #[tokio::test]
+    async fn fast_layer_is_enabled_only_by_operator_configuration() {
+        let f = connected().await;
+        let plain = PhoneAgent::new(
+            f.store.clone(),
+            f.service.clone(),
+            Arc::new(MarkdownAgent),
+            Arc::new(OutboxIo { store: f.store.clone() }),
+            "/fixture".into(),
+            Arc::new(|_| Ok(Some(ProviderKind::Claude))),
+        );
+        assert!(!plain.uses_fast_layer());
+        let configured = Arc::new(PhoneService::new(
+            f.store.clone(),
+            Arc::new(TestPhone),
+            Arc::new(TestClock),
+            PhoneConfig::new(
+                true,
+                "https://phone.example.test",
+                "test-verification-key-separate-32bytes",
+                vec![OwnerLink {
+                    surface_owner: f.origin.owner.clone(),
+                    owner_id: "owner".into(),
+                }],
+            )
+            .unwrap()
+            .with_fast_layer(Some(FastLayerConfig::default())),
+        ));
+        // Construction reads no credentials and makes no request.
+        let fast = PhoneAgent::new(
+            f.store.clone(),
+            configured,
+            Arc::new(MarkdownAgent),
+            Arc::new(OutboxIo { store: f.store.clone() }),
+            "/fixture".into(),
+            Arc::new(|_| Ok(Some(ProviderKind::Claude))),
+        );
+        assert!(fast.uses_fast_layer());
+    }
+
+    /// Heavy agent that reports progress from inside the dispatched turn.
+    struct ProgressHeavy {
+        accepted: Mutex<Vec<bool>>,
+    }
+    #[async_trait]
+    impl QueryHandler for ProgressHeavy {
+        async fn answer(&self, _: &AuditCtx, _: &str) -> anyhow::Result<String> {
+            let first = augmentagent_phone::fast::report_progress("Found the Linear thread.");
+            // Within 5 s of the first: rate-limited at the source.
+            let second = augmentagent_phone::fast::report_progress("Drafting now.");
+            self.accepted.lock().unwrap().extend([first, second]);
+            Ok("Draft: Thanks, shipping Friday.".into())
+        }
+    }
+    // Step 8 (native path): a dispatched turn can report progress; progress is
+    // never mirrored to chat and the final result is mirrored once.
+    #[tokio::test]
+    async fn step8_dispatched_turn_progress_reaches_the_call_but_not_the_chat() {
+        let f = connected().await;
+        let heavy = Arc::new(ProgressHeavy { accepted: Mutex::new(Vec::new()) });
+        let model = Scripted::new(vec![
+            vec![tool("dispatch_task", serde_json::json!({"description":"draft the reply"}))],
+            vec![token("Started.")],
+        ]);
+        let bridge = bridge(&f, heavy.clone(), model);
+        let (turn_id, speech, mut rx) = speech_for(&f.call.id, "draft it");
+        // The relay loop keeps its speech queue open for the whole call.
+        let _call_open = speech.clone();
+        bridge
+            .answer(&f.call, &turn_id, "draft it", speech, CancellationToken::new())
+            .await
+            .unwrap();
+        let key = format!("{turn_id}:dispatch");
+        wait_for(|| !sends(&f.store, &f.origin, &key).is_empty()).await;
+        assert_eq!(*heavy.accepted.lock().unwrap(), [true, false]);
+        let all = f
+            .store
+            .outbound_sends_with_key_prefix(f.origin.conversation.account(), "", &[])
+            .unwrap();
+        assert!(all.iter().all(|s| !s.payload.contains("Linear thread")));
+        assert_eq!(all.iter().filter(|s| s.idempotency_key == key).count(), 1);
+        let mut announced = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let SpeechEvent::System { text } = event {
+                announced.push(text);
+            }
+        }
+        assert!(announced.iter().any(|t| t.contains("Found the Linear thread.")), "{announced:?}");
+    }
+}
