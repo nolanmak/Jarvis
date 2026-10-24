@@ -597,3 +597,36 @@ async fn ac7_resume_off_discards_the_remainder_after_the_timeout() {
     assert_eq!(session.take_interrupted_prefix().as_deref(), Some("Nothing"));
     assert!(session.finish_stream(&next, "").unwrap().is_none());
 }
+
+// #1557 interplay: a goodbye phrase is never a backchannel, even if an operator
+// lists it, so after an interrupt it becomes a turn and the goodbye shortcut
+// can end the call.
+#[tokio::test(start_paused = true)]
+async fn goodbye_phrase_after_interrupt_is_never_a_backchannel() {
+    let phrases = vec!["ok".to_owned(), "bye".to_owned(), "that's all".to_owned()];
+    for speech in ["bye", "Bye!", "That's all."] {
+        let mut session = ready(BargeIn::new(3, phrases.clone(), 2_000, true).unwrap());
+        answered(&mut session, ANSWER);
+        session.receive(&interrupt("Tomorrow you have", 900)).unwrap();
+        let RelayInput::Turn(turn) = session.receive(&prompt(speech)).unwrap() else {
+            panic!("{speech}: a goodbye must become a turn")
+        };
+        assert_eq!(turn.text, speech);
+    }
+}
+
+// #1557 interplay: once the goodbye is out nothing resumes. An interrupt over
+// the goodbye is not held for a backchannel decision.
+#[tokio::test(start_paused = true)]
+async fn interrupt_during_the_goodbye_never_resumes_the_answer() {
+    let mut session = ready(BargeIn::default());
+    let turn = turn(&mut session, "that's it");
+    session.speak_partial(&turn, "Here is the summary. ").unwrap().unwrap();
+    session.goodbye(&turn, "Okay, talk soon. Bye!").unwrap();
+    assert!(matches!(
+        session.receive(&interrupt("Okay", 300)).unwrap(),
+        RelayInput::Interrupted
+    ));
+    assert!(session.false_interrupt_deadline().is_none());
+    assert!(!matches!(session.receive(&prompt("ok")).unwrap(), RelayInput::Resumed(_)));
+}

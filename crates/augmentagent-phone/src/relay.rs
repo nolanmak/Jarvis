@@ -149,10 +149,13 @@ impl BargeIn {
         self.resume
     }
     /// Speech shorter than `min_words` that matches a backchannel phrase is
-    /// not an interruption.
+    /// not an interruption. A goodbye phrase (#1557) never is, so the owner
+    /// can always end the call over Jarvis.
     fn is_backchannel(&self, text: &str) -> bool {
-        let text = normalize(text);
-        text.split(' ').count() < self.min_words && self.backchannels.contains(&text)
+        let normalized = normalize(text);
+        normalized.split(' ').count() < self.min_words
+            && self.backchannels.contains(&normalized)
+            && !crate::end_call::is_goodbye_phrase(text)
     }
 }
 /// Lowercase, hyphens and punctuation to spaces, whitespace collapsed:
@@ -268,7 +271,10 @@ enum Incoming {
     /// Relay debug/event traffic (`debug`/`events` TwiML attributes). Only the
     /// event name is read; values are never logged or stored.
     #[serde(rename = "info")]
-    Info { name: Option<String> },
+    Info {
+        name: Option<String>,
+        last: Option<bool>,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -322,6 +328,9 @@ pub struct RelaySession {
     /// Turn that most recently wrote speech: what an `interrupt` cut off.
     speaking: Option<String>,
     pending: Option<PendingInterrupt>,
+    /// A tokens-played event marked `last:true` arrived (#1557).
+    played_final: bool,
+    ended: bool,
 }
 impl RelaySession {
     pub fn new(call_id: &str, account_sid: &str, call_sid: &str) -> Self {
@@ -341,6 +350,8 @@ impl RelaySession {
             barge: BargeIn::default(),
             speaking: None,
             pending: None,
+            played_final: false,
+            ended: false,
         }
     }
     /// With Relay debug events requested in TwiML, unknown frame types are
@@ -392,6 +403,11 @@ impl RelaySession {
     /// Receipt time of the latest tokens-played debug event, consumed once.
     pub fn take_played_event(&mut self) -> Option<tokio::time::Instant> {
         self.played_event.take()
+    }
+    /// Whether a tokens-played event closing a talk cycle (`last:true`)
+    /// arrived since the last call. Consumed once.
+    pub fn take_played_final(&mut self) -> bool {
+        std::mem::take(&mut self.played_final)
     }
     pub fn receive(&mut self, frame: &str) -> Result<RelayInput, Error> {
         let result = self.receive_frame(frame);
@@ -486,10 +502,11 @@ impl RelaySession {
             Incoming::Error {
                 code: Some(code), ..
             } => Ok(RelayInput::ProviderError(code)),
-            Incoming::Info { name } => {
+            Incoming::Info { name, last } => {
                 // Without debug events requested, nothing is attributed.
                 if self.debug_events && name.as_deref() == Some("tokensPlayed") {
                     self.played_event = Some(tokio::time::Instant::now());
+                    self.played_final |= last == Some(true);
                 }
                 Ok(RelayInput::Ignore)
             }
@@ -637,6 +654,40 @@ impl RelaySession {
         Ok(Some(
             json!({"type":"play","source":source,"loop":1,"preemptible":true}),
         ))
+    }
+    /// The agent's goodbye (#1557): one complete `text` frame with
+    /// `last:true` that closes the turn's talk cycle, sent even after an
+    /// interruption so the owner hears why the line closes.
+    pub fn goodbye(&mut self, turn: &RelayTurn, text: &str) -> Result<Value, Error> {
+        if text.len() > 12_000 {
+            return Err(Error::InvalidArguments);
+        }
+        if let Some(output) = self.outputs.get_mut(&turn.id) {
+            output.final_spoken = true;
+            output.streamed.push_str(text);
+        }
+        // After the goodbye nothing resumes (#1550): an interrupt over it is
+        // not held for a backchannel decision.
+        self.speaking = None;
+        self.pending = None;
+        let spoken = crate::speech::SpeechTextTransform::apply(text);
+        let spoken = if spoken.trim().is_empty() {
+            crate::end_call::DEFAULT_GOODBYE.to_owned()
+        } else {
+            spoken
+        };
+        Ok(text_frame(&spoken, true))
+    }
+    /// The single `end` message (#1557). `handoffData` is a JSON string the
+    /// relay-ended callback returns; `None` once `end` was already produced.
+    pub fn end(&mut self, reason: crate::end_call::EndCallReason) -> Option<Value> {
+        if std::mem::replace(&mut self.ended, true) {
+            return None;
+        }
+        Some(json!({
+            "type": "end",
+            "handoffData": crate::end_call::handoff_data(reason, &self.call_id),
+        }))
     }
     pub fn finish(&mut self, turn: &RelayTurn, text: &str) -> Result<Option<Value>, Error> {
         if text.is_empty() || self.outputs.get(&turn.id).is_some_and(|o| o.final_spoken) {
