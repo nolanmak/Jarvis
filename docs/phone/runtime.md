@@ -62,6 +62,9 @@ limits and duplicate-call protections still apply. Private DM entry is optional.
 | `AUGMENTAGENT_PHONE_BACKCHANNEL_PHRASES` | Comma-separated backchannel phrases, compared case-insensitively with punctuation and hyphens ignored (`Mm-hmm.` matches `mm hmm`). Default `ok, okay, yeah, yes, mm, mhm, mm hm, mm hmm, uh huh, right, sure, got it`; 1–64 phrases. |
 | `AUGMENTAGENT_PHONE_FALSE_INTERRUPT_MS` | How long after an `interrupt` with no following prompt the interruption is treated as false. Default `2000`; values outside 500–5000 fail configuration with `InvalidSetting`. |
 | `AUGMENTAGENT_PHONE_RESUME_FALSE_INTERRUPT` | `1` (default) resumes a falsely interrupted answer from its unspoken remainder; `0` drops the remainder and waits for the next prompt. Other values fail configuration. |
+| `AUGMENTAGENT_PHONE_SILENCE_CHECKIN_1_S` | Silence policy (#1556): seconds of quiet before "Still there?" is spoken. Default `12`. |
+| `AUGMENTAGENT_PHONE_SILENCE_CHECKIN_2_S` | Seconds of quiet before the second check-in. Default `25`. |
+| `AUGMENTAGENT_PHONE_SILENCE_HANGUP_S` | Seconds of quiet before the fixed goodbye and automatic end. Default `45`. All three must be 5–300 and strictly increasing, or configuration fails with `InvalidSetting` naming the variable. |
 | `TWILIO_ACCOUNT_SID` | Twilio account SID. |
 | `TWILIO_AUTH_TOKEN` | Twilio API authentication and callback-signature secret. |
 | `TWILIO_PHONE_NUMBER` | Operator's voice-capable Twilio caller number, in E.164 format. This is **not** the owner's destination. |
@@ -562,6 +565,26 @@ reason, extra fields, another call's ID, a duplicated field) is stored as
 `relay_ended_unknown` and logged only as `category=handoff_data_invalid`,
 never with its content. A call that ended without `handoffData` gets no row.
 A replayed callback never changes the stored reason.
+
+## Silence and idle policy (#1556)
+
+A quiet line no longer runs to the provider duration limit: two check-ins
+("Still there?", then "I'll hang up in a bit if you're done.") are followed by
+a fixed goodbye, the #1557 `end` message with reason `silence`, and one note in
+the originating chat under the idempotency key `<call_id>:silence_end`.
+
+The clock starts over on any accepted `prompt` (partial or final) or
+`interrupt`, on every speech frame Jarvis writes (answers, announcements,
+resumes, goodbyes) and on every `tokensPlayed` event. Check-in frames do not
+restart it, so the stages keep their spacing; they are `interruptible` and
+`preemptible`, so speaking over one is a normal barge-in (#1550) and restarts
+the sequence. Nothing is checked in while an owner turn is still being
+answered, after a goodbye, or while a dispatched task is in flight and spoke a
+progress line in the last 15 s — the owner is waiting on Jarvis, not absent. A
+task quiet for longer does not hold the line open; its result reaches chat.
+
+`silence` is runtime-only: the fast model's `end_call` still offers and accepts
+exactly `owner_goodbye`, `task_complete` and `owner_request`.
 
 ## Shared conversation queue (#1548)
 

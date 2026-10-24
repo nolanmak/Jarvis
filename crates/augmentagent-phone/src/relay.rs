@@ -334,6 +334,9 @@ pub struct RelaySession {
     pending: Option<PendingInterrupt>,
     /// A tokens-played event marked `last:true` arrived (#1557).
     played_final: bool,
+    /// An accepted `prompt` or `interrupt` arrived: the line is not quiet
+    /// (#1556).
+    owner_activity: bool,
     ended: bool,
 }
 impl RelaySession {
@@ -356,6 +359,7 @@ impl RelaySession {
             speaking: None,
             pending: None,
             played_final: false,
+            owner_activity: false,
             ended: false,
         }
     }
@@ -414,6 +418,11 @@ impl RelaySession {
     pub fn take_played_final(&mut self) -> bool {
         std::mem::take(&mut self.played_final)
     }
+    /// Whether the owner spoke since the last call: any accepted `prompt`
+    /// carrying speech, partial or final, or any `interrupt` (#1556).
+    pub fn take_owner_activity(&mut self) -> bool {
+        std::mem::take(&mut self.owner_activity)
+    }
     /// Any accepted frame resets the consecutive invalid run; a rejected
     /// frame extends it. Control frames are not messages and change nothing.
     pub fn receive(&mut self, frame: &str) -> Result<RelayInput, Error> {
@@ -468,6 +477,7 @@ impl RelaySession {
                 if text.len() > 12_000 {
                     return Err(Error::InvalidArguments);
                 }
+                self.owner_activity |= !text.trim().is_empty();
                 // TwiML pins partialPrompts=false. Defensive handling never
                 // submits interim recognition to the agent.
                 if !last || text.trim().is_empty() {
@@ -506,6 +516,7 @@ impl RelaySession {
                 if heard.len() > 12_000 || duration > 900_000 {
                     return Err(Error::InvalidArguments);
                 }
+                self.owner_activity = true;
                 // Min words 1 leaves no speech short enough to be a backchannel.
                 if let Some(turn_id) = self.speaking.clone().filter(|_| self.barge.min_words > 1) {
                     self.pending = Some(PendingInterrupt {
@@ -723,4 +734,10 @@ impl RelaySession {
 }
 fn text_frame(token: &str, last: bool) -> Value {
     json!({"type":"text","token":token,"last":last,"interruptible":true,"preemptible":false})
+}
+/// A silence check-in line (#1556): one complete talk cycle, interruptible and
+/// preemptible. It touches no turn or speaking state, so an interrupt over it
+/// is confirmed at once instead of being held as a possible backchannel.
+pub fn check_in_frame(line: &str) -> Value {
+    json!({"type":"text","token":line,"last":true,"interruptible":true,"preemptible":true})
 }

@@ -483,6 +483,22 @@ impl ConversationAgent for PhoneAgent {
             wiki_root: self.cwd.clone(),
         })
     }
+    fn silence_suspended(&self, call: &PhoneCall) -> bool {
+        self.fast.as_ref().is_some_and(|fast| fast.silence_suspended(call))
+    }
+    /// Report a call that ended on a quiet line (#1556), once, in its chat.
+    async fn silence_ended(&self, call: &PhoneCall) -> Result<(), AgentError> {
+        use augmentagent_phone::silence::{CHAT_NOTICE, CHAT_NOTICE_KEY};
+        if let Some(fast) = &self.fast {
+            return fast.silence_ended(call).await;
+        }
+        let origin = self.store.phone_origin(&call.id).map_err(|_| AgentError)?;
+        let key = format!("{}:{CHAT_NOTICE_KEY}", call.id);
+        self.io
+            .mirror(&origin, &key, CHAT_NOTICE)
+            .await
+            .map_err(|_| AgentError)
+    }
     async fn interrupted(&self, call: &PhoneCall, heard: &str) -> Result<(), AgentError> {
         if let Some(fast) = &self.fast {
             return fast.interrupted(call, heard).await;

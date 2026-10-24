@@ -308,6 +308,14 @@ fn barge_in_settings_load_with_defaults_and_bounded_timeout() {
         ("AUGMENTAGENT_PHONE_BARGE_MIN_WORDS", "three"),
         ("AUGMENTAGENT_PHONE_BACKCHANNEL_PHRASES", " , "),
         ("AUGMENTAGENT_PHONE_RESUME_FALSE_INTERRUPT", "yes"),
+        // AC4 (#1556): out of range, unparsable, or not strictly increasing
+        // past the other two defaults (12/25/45 s).
+        ("AUGMENTAGENT_PHONE_SILENCE_CHECKIN_1_S", "4"),
+        ("AUGMENTAGENT_PHONE_SILENCE_CHECKIN_1_S", "twelve"),
+        ("AUGMENTAGENT_PHONE_SILENCE_CHECKIN_2_S", "301"),
+        ("AUGMENTAGENT_PHONE_SILENCE_CHECKIN_2_S", "12"),
+        ("AUGMENTAGENT_PHONE_SILENCE_HANGUP_S", "0"),
+        ("AUGMENTAGENT_PHONE_SILENCE_HANGUP_S", "25"),
     ] {
         let mut env = values();
         env.insert(key, bad.into());
@@ -316,6 +324,26 @@ fn barge_in_settings_load_with_defaults_and_bounded_timeout() {
             "{key}={bad}"
         );
     }
+}
+
+// TDD 4 / AC4 (#1556): silence thresholds load with the documented defaults
+// and from the environment. Rejected values are in the typed-error table of
+// the barge-in settings test above.
+#[test]
+fn silence_settings_load_with_defaults_and_from_the_environment() {
+    use augmentagent_phone::silence::SilencePolicy;
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        std::sync::Arc::new(augmentagent_store::Store::open(dir.path().join("db")).unwrap());
+    let silence = |env: &_| {
+        load(env).unwrap().unwrap().build(store.clone()).unwrap().service.silence()
+    };
+    assert_eq!(silence(&values()), SilencePolicy::new(12, 25, 45).unwrap());
+    let mut env = values();
+    env.insert("AUGMENTAGENT_PHONE_SILENCE_CHECKIN_1_S", "5".into());
+    env.insert("AUGMENTAGENT_PHONE_SILENCE_CHECKIN_2_S", "10".into());
+    env.insert("AUGMENTAGENT_PHONE_SILENCE_HANGUP_S", "300".into());
+    assert_eq!(silence(&env), SilencePolicy::new(5, 10, 300).unwrap());
 }
 
 // #1546: the fast layer is off unless explicitly enabled; its settings are

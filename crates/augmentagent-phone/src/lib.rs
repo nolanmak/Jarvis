@@ -134,6 +134,7 @@ pub struct PhoneConfig {
     owner_first_name: Option<String>,
     debug_events: bool,
     barge_in: relay::BargeIn,
+    silence: silence::SilencePolicy,
     fast: Option<fast::FastLayerConfig>,
 }
 impl PhoneConfig {
@@ -175,6 +176,7 @@ impl PhoneConfig {
             owner_first_name: None,
             debug_events: false,
             barge_in: relay::BargeIn::default(),
+            silence: silence::SilencePolicy::default(),
             fast: None,
         })
     }
@@ -198,6 +200,11 @@ impl PhoneConfig {
     /// Backchannel filter and false-interruption handling (#1550).
     pub fn with_barge_in(mut self, barge_in: relay::BargeIn) -> Self {
         self.barge_in = barge_in;
+        self
+    }
+    /// Check-in and automatic-end thresholds for a quiet line (#1556).
+    pub fn with_silence(mut self, silence: silence::SilencePolicy) -> Self {
+        self.silence = silence;
         self
     }
     /// Answer utterances with the fast conversational layer (#1546).
@@ -246,6 +253,9 @@ impl PhoneService {
     }
     pub fn debug_events(&self) -> bool {
         self.config.debug_events
+    }
+    pub fn silence(&self) -> silence::SilencePolicy {
+        self.config.silence
     }
     /// Fast-layer settings when `AUGMENTAGENT_PHONE_FAST_LAYER=1` (#1546).
     pub fn fast_layer(&self) -> Option<&fast::FastLayerConfig> {
@@ -568,6 +578,7 @@ pub mod twilio;
 pub mod webhook;
 
 pub mod relay;
+pub mod silence;
 pub mod speech;
 pub mod voice;
 

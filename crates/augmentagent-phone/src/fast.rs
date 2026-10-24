@@ -361,6 +361,11 @@ impl VoiceConversationAgent {
             calls: Mutex::new(HashMap::new()),
         }
     }
+    /// The call's state only if a turn already created it; never inserts, so
+    /// polling from the relay loop cannot grow the map.
+    fn existing_log(&self, call_id: &str) -> Option<Arc<CallLog>> {
+        self.calls.lock().unwrap_or_else(|p| p.into_inner()).get(call_id).cloned()
+    }
     fn log(&self, call_id: &str) -> Arc<CallLog> {
         let mut calls = self.calls.lock().unwrap_or_else(|p| p.into_inner());
         if calls.len() >= 64 && !calls.contains_key(call_id) {
@@ -608,7 +613,7 @@ fn remember(log: &CallLog, text: &str, spoken: &str) {
 }
 /// `end_call` arguments: a known reason (required) and the goodbye text.
 fn end_call_args(input: &Value) -> Option<(EndCallReason, String)> {
-    let reason = EndCallReason::parse(input["reason"].as_str()?)?;
+    let reason = EndCallReason::parse_model(input["reason"].as_str()?)?;
     let goodbye = input["goodbye"].as_str().unwrap_or_default();
     if goodbye.len() > 4_000 {
         return None;
@@ -776,6 +781,22 @@ impl ConversationAgent for VoiceConversationAgent {
         cancel: CancellationToken,
     ) -> Result<String, AgentError> {
         self.turn(call, turn_id, text, &speech, &cancel).await
+    }
+    /// A dispatched task the owner is waiting on, with a progress line spoken
+    /// recently: the quiet line is attention, not absence (#1556).
+    fn silence_suspended(&self, call: &PhoneCall) -> bool {
+        let Some(log) = self.existing_log(&call.id) else {return false};
+        if log.in_flight.load(Ordering::SeqCst) == 0 {
+            return false;
+        }
+        let spoken = *log.progress_spoken.lock().unwrap_or_else(|p| p.into_inner());
+        spoken.is_some_and(|at| at.elapsed() < crate::silence::PROGRESS_SUSPENDS)
+    }
+    async fn silence_ended(&self, call: &PhoneCall) -> Result<(), AgentError> {
+        let key = format!("{}:{}", call.id, crate::silence::CHAT_NOTICE_KEY);
+        self.backend
+            .mirror(call, &key, crate::silence::CHAT_NOTICE)
+            .await
     }
     async fn interrupted(&self, call: &PhoneCall, heard: &str) -> Result<(), AgentError> {
         self.backend.authorize_call(call)?;

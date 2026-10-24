@@ -8,6 +8,27 @@ use thiserror::Error;
 
 pub(crate) fn migrate(conn: &Connection) -> StoreResult<()> {
     conn.execute_batch(include_str!("phone.sql"))?;
+    drop_end_reason_check(conn)?;
+    Ok(())
+}
+
+/// End reasons were a SQL CHECK constraint before #1556 added `silence`.
+/// SQLite cannot alter one, so a table created earlier is rebuilt with its
+/// rows; [`PHONE_END_REASONS`] is the whitelist from here on.
+fn drop_end_reason_check(conn: &Connection) -> StoreResult<()> {
+    let table = "SELECT sql FROM sqlite_master WHERE type='table' AND name='phone_call_end_reasons'";
+    let existing: Option<String> = conn.query_row(table, [], |r| r.get(0)).optional()?;
+    if !existing.is_some_and(|sql| sql.contains("CHECK")) {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "BEGIN;
+         CREATE TABLE phone_call_end_reasons_rebuilt (call_id TEXT PRIMARY KEY REFERENCES phone_calls(id), reason TEXT NOT NULL, recorded_ms INTEGER NOT NULL);
+         INSERT INTO phone_call_end_reasons_rebuilt SELECT call_id,reason,recorded_ms FROM phone_call_end_reasons;
+         DROP TABLE phone_call_end_reasons;
+         ALTER TABLE phone_call_end_reasons_rebuilt RENAME TO phone_call_end_reasons;
+         COMMIT;",
+    )?;
     Ok(())
 }
 
@@ -1326,10 +1347,12 @@ impl Store {
 }
 
 /// Why a relayed call ended, as recorded from the relay-ended callback (#1557).
-pub const PHONE_END_REASONS: [&str; 4] = [
+pub const PHONE_END_REASONS: [&str; 5] = [
     "owner_goodbye",
     "task_complete",
     "owner_request",
+    // The line went quiet and the runtime ended the call (#1556).
+    "silence",
     "relay_ended_unknown",
 ];
 impl Store {

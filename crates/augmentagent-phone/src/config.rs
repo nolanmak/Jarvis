@@ -2,6 +2,7 @@
 //! owner settings store, never this environment configuration.
 use crate::{
     relay::{BargeIn, DEFAULT_BACKCHANNELS},
+    silence::SilencePolicy,
     twilio::TwilioClient,
     voice::VoiceConfig,
     webhook::WebhookAuth,
@@ -17,14 +18,32 @@ pub const BACKCHANNEL_PHRASES: &str = "AUGMENTAGENT_PHONE_BACKCHANNEL_PHRASES";
 pub const FALSE_INTERRUPT_MS: &str = "AUGMENTAGENT_PHONE_FALSE_INTERRUPT_MS";
 pub const RESUME_FALSE_INTERRUPT: &str = "AUGMENTAGENT_PHONE_RESUME_FALSE_INTERRUPT";
 
-fn barge_in(get: &impl Fn(&str) -> Option<String>) -> Result<BargeIn, Error> {
-    let number = |key: &'static str, default: u64| match get(key) {
+/// Silence and idle policy (#1556); see `docs/phone/runtime.md`.
+pub const SILENCE_CHECKIN_1_S: &str = "AUGMENTAGENT_PHONE_SILENCE_CHECKIN_1_S";
+pub const SILENCE_CHECKIN_2_S: &str = "AUGMENTAGENT_PHONE_SILENCE_CHECKIN_2_S";
+pub const SILENCE_HANGUP_S: &str = "AUGMENTAGENT_PHONE_SILENCE_HANGUP_S";
+
+/// A whole number, or the default when the variable is absent.
+fn seconds(get: &impl Fn(&str) -> Option<String>, key: &'static str, default: u64) -> Result<u64, Error> {
+    match get(key) {
         None => Ok(default),
         Some(v) => v
             .trim()
             .parse::<u64>()
             .map_err(|_| Error::InvalidSetting(key)),
-    };
+    }
+}
+
+fn silence(get: &impl Fn(&str) -> Option<String>) -> Result<SilencePolicy, Error> {
+    SilencePolicy::new(
+        seconds(get, SILENCE_CHECKIN_1_S, 12)?,
+        seconds(get, SILENCE_CHECKIN_2_S, 25)?,
+        seconds(get, SILENCE_HANGUP_S, 45)?,
+    )
+}
+
+fn barge_in(get: &impl Fn(&str) -> Option<String>) -> Result<BargeIn, Error> {
+    let number = |key: &'static str, default: u64| seconds(get, key, default);
     let min_words = usize::try_from(number(BARGE_MIN_WORDS, 3)?)
         .map_err(|_| Error::InvalidSetting(BARGE_MIN_WORDS))?;
     let phrases = match get(BACKCHANNEL_PHRASES) {
@@ -134,6 +153,7 @@ impl Settings {
         .with_voice(voice.clone())
         .with_debug_events(debug_events)
         .with_barge_in(barge_in(&get)?)
+        .with_silence(silence(&get)?)
         .with_fast_layer(fast);
         let account = required("TWILIO_ACCOUNT_SID")?;
         let token = required("TWILIO_AUTH_TOKEN")?;

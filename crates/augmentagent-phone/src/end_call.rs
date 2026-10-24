@@ -8,28 +8,36 @@
 use serde::Deserialize;
 use std::time::Duration;
 
-/// Why the agent ended the call. The model may pick exactly these.
+/// Why the call ended. All but `Silence`, which the runtime raises on a quiet
+/// line (#1556), are reasons the model may pick.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EndCallReason {
     OwnerGoodbye,
     TaskComplete,
     OwnerRequest,
+    Silence,
 }
 impl EndCallReason {
-    pub const ALL: [EndCallReason; 3] = [
+    pub const ALL: [EndCallReason; 4] = [
         EndCallReason::OwnerGoodbye,
         EndCallReason::TaskComplete,
         EndCallReason::OwnerRequest,
+        EndCallReason::Silence,
     ];
     pub fn as_str(self) -> &'static str {
         match self {
             Self::OwnerGoodbye => "owner_goodbye",
             Self::TaskComplete => "task_complete",
             Self::OwnerRequest => "owner_request",
+            Self::Silence => "silence",
         }
     }
     pub fn parse(value: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|r| r.as_str() == value)
+    }
+    /// A reason the model is allowed to choose; `Silence` never is.
+    pub fn parse_model(value: &str) -> Option<Self> {
+        Self::parse(value).filter(|r| *r != Self::Silence)
     }
 }
 
@@ -148,6 +156,12 @@ mod tests {
         );
         for junk in ["", "null", "{}", "[1]", "{\"reason\":1,\"call_id\":\"c1\"}"] {
             assert_eq!(end_reason_from_handoff(junk, "c1"), UNKNOWN_END_REASON);
+        }
+        // AC6 (#1556): `silence` round-trips above, but the model may never
+        // name it; every other reason stays model-selectable.
+        assert_eq!(EndCallReason::parse_model("silence"), None);
+        for reason in EndCallReason::ALL.into_iter().filter(|r| *r != EndCallReason::Silence) {
+            assert_eq!(EndCallReason::parse_model(reason.as_str()), Some(reason));
         }
     }
     #[test]

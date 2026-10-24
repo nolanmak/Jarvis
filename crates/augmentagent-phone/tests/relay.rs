@@ -671,3 +671,25 @@ async fn interrupt_during_the_goodbye_never_resumes_the_answer() {
     assert!(session.false_interrupt_deadline().is_none());
     assert!(!matches!(session.receive(&prompt("ok")).unwrap(), RelayInput::Resumed(_)));
 }
+
+// AC2 (#1556): owner activity is reported for any prompt carrying speech,
+// partial or final, and for an interrupt; nothing else counts, and the flag
+// is consumed once.
+#[test]
+fn owner_activity_is_reported_once_for_speech_and_interrupts_only() {
+    let mut session = ready(BargeIn::default());
+    assert!(!session.take_owner_activity(), "setup is not owner speech");
+    let partial = json!({"type":"prompt","voicePrompt":"still ","last":false}).to_string();
+    for frame in [partial, prompt("are you there"), interrupt("Tomorrow you", 300)] {
+        session.receive(&frame).unwrap();
+        assert!(session.take_owner_activity(), "{frame}");
+        assert!(!session.take_owner_activity(), "consumed once: {frame}");
+    }
+    for quiet in [
+        json!({"type":"prompt","voicePrompt":"  ","last":true}),
+        json!({"type":"info","name":"tokensPlayed","last":true}),
+    ] {
+        session.receive(&quiet.to_string()).unwrap();
+        assert!(!session.take_owner_activity(), "{quiet}");
+    }
+}

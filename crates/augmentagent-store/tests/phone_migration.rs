@@ -142,3 +142,43 @@ fn adding_phone_tables_preserves_sessions_history_and_pending_approvals() {
         }
     }
 }
+
+/// #1556: an end-reason table created with the pre-`silence` CHECK constraint
+/// is rebuilt on open, keeping its rows and accepting the new reason.
+#[test]
+fn legacy_end_reason_check_is_rebuilt_and_accepts_silence() {
+    use augmentagent_store::phone::ReserveCall;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("end-reasons.db");
+    let store = Store::open(&path).unwrap();
+    store.phone_import_destination("owner", "+12025550123", 0).unwrap();
+    let reserve = ReserveCall { owner: "owner", request_id: "r1", conversation: "chat", now_ms: 0 };
+    let old = store.phone_reserve_call(reserve).unwrap().call.id;
+    drop(store);
+    // The table exactly as #1557 shipped it, with one recorded reason.
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(&format!(
+        "DROP TABLE phone_call_end_reasons;
+         CREATE TABLE phone_call_end_reasons (call_id TEXT PRIMARY KEY REFERENCES phone_calls(id), reason TEXT NOT NULL CHECK(reason IN ('owner_goodbye','task_complete','owner_request','relay_ended_unknown')), recorded_ms INTEGER NOT NULL);
+         INSERT INTO phone_call_end_reasons(call_id,reason,recorded_ms) VALUES('{old}','owner_goodbye',7);"
+    ))
+    .unwrap();
+    drop(conn);
+    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        store.phone_end_reason(&old).unwrap().as_deref(),
+        Some("owner_goodbye"),
+        "the rebuilt table keeps recorded reasons"
+    );
+    // The CHECK is gone, so the runtime-only `silence` reason is storable;
+    // PHONE_END_REASONS is the whitelist from here on.
+    let conn = Connection::open(&path).unwrap();
+    conn.execute("UPDATE phone_call_end_reasons SET reason='silence'", [])
+        .unwrap();
+    drop(conn);
+    assert_eq!(
+        store.phone_end_reason(&old).unwrap().as_deref(),
+        Some("silence")
+    );
+    assert!(store.phone_record_end_reason(&old, "made_up", 9).is_err());
+}

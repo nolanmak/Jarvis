@@ -8,6 +8,7 @@ use augmentagent_phone::{
     },
     ingress::{AgentError, ConversationAgent, SpeechEvent, SpeechSender},
     relay::{RelayInput, RelaySession},
+    silence::SilencePolicy,
 };
 use augmentagent_store::phone::{CallState, PhoneCall};
 use serde_json::{json, Value};
@@ -127,8 +128,12 @@ impl FastBackend for FakeBackend {
             chat_summary: self.chat_summary.clone(),
         })
     }
+    /// Keyed like the durable outbox: a repeated key delivers nothing new.
     async fn mirror(&self, _: &PhoneCall, key: &str, text: &str) -> Result<(), AgentError> {
-        self.mirrors.lock().unwrap().push((key.into(), text.into()));
+        let mut mirrors = self.mirrors.lock().unwrap();
+        if !mirrors.iter().any(|(existing, _)| existing == key) {
+            mirrors.push((key.into(), text.into()));
+        }
         Ok(())
     }
     async fn dispatch(
@@ -481,13 +486,15 @@ impl augmentagent_phone::Clock for Clock100 {
 }
 /// A connected call with an accepted relay socket answered by `agent`.
 async fn live(agent: Arc<dyn ConversationAgent>, fast: Option<FastLayerConfig>) -> Live {
-    live_with(agent, fast, false).await
+    live_with(agent, fast, false, SilencePolicy::default()).await
 }
-/// [`live`] with Relay debug events (tokens-played) optionally requested.
+/// [`live`] with Relay debug events (tokens-played) optionally requested, and
+/// explicit silence thresholds (#1556).
 async fn live_with(
     agent: Arc<dyn ConversationAgent>,
     fast: Option<FastLayerConfig>,
     debug_events: bool,
+    silence: SilencePolicy,
 ) -> Live {
     use augmentagent_store::{
         owner::ControlConversationKind, Store, SurfaceAccountRef, SurfaceConversationRef,
@@ -522,7 +529,8 @@ async fn live_with(
         )
         .unwrap()
         .with_fast_layer(fast)
-        .with_debug_events(debug_events),
+        .with_debug_events(debug_events)
+        .with_silence(silence),
     ));
     let grant = service.authorize(&owner, &chat).unwrap();
     let receipt = service
@@ -1307,7 +1315,7 @@ async fn end_call_step1_goodbye_then_one_end_frame_and_reason_is_persisted() {
     let model = end_script("task_complete", "All set. Talk soon!");
     let backend = Arc::new(FakeBackend::default());
     let fast = agent(model.clone(), backend.clone(), FastLayerConfig::default());
-    let mut live = live_with(fast, Some(FastLayerConfig::default()), true).await;
+    let mut live = live_with(fast, Some(FastLayerConfig::default()), true, SilencePolicy::default()).await;
     live.prompt("great, that covers everything").await;
     let goodbye = live.talk_cycle().await;
     assert_eq!(goodbye.len(), 1, "exactly one goodbye frame: {goodbye:?}");
@@ -1356,7 +1364,8 @@ async fn end_call_step2_end_waits_for_tokens_played_or_four_seconds() {
             Arc::new(FakeBackend::default()),
             FastLayerConfig::default(),
         );
-        let mut live = live_with(fast, Some(FastLayerConfig::default()), true).await;
+        let mut live =
+            live_with(fast, Some(FastLayerConfig::default()), true, SilencePolicy::default()).await;
         live.prompt("please hang up on me now").await;
         let goodbye = live.talk_cycle().await;
         assert_eq!(goodbye.len(), 1);
@@ -1474,7 +1483,8 @@ async fn end_call_step4_in_flight_task_gets_the_handoff_line_and_one_chat_result
         )],
     ]);
     let fast = agent(model.clone(), backend.clone(), FastLayerConfig::default());
-    let mut live = live_with(fast, Some(FastLayerConfig::default()), true).await;
+    let mut live =
+        live_with(fast, Some(FastLayerConfig::default()), true, SilencePolicy::default()).await;
     live.prompt("draft a reply to the last Linear comment").await;
     assert_eq!(spoken(&live.talk_cycle().await), "On it.");
     live.prompt("bye").await;
@@ -1621,5 +1631,114 @@ async fn queue_wait_notice_is_spoken_on_the_socket_and_wait_is_recorded() {
         record.t_first_speech_ms.is_some_and(|ms| ms >= 60),
         "the notice is not the answer's first speech: {record:?}"
     );
+    live.server.abort();
+}
+
+// ---- #1556: silence check-ins and automatic end over a real relay socket ----
+
+/// A live call with short silence thresholds, 5/7/9 s. The default arithmetic
+/// (12/25/45 s) is pinned on a paused clock in `silence.rs`: a paused clock
+/// auto-advances while a loopback read is pending.
+async fn quiet_live(fast: Arc<dyn ConversationAgent>) -> Live {
+    let silence = SilencePolicy::new(5, 7, 9).unwrap();
+    live_with(fast, Some(FastLayerConfig::default()), true, silence).await
+}
+fn near(elapsed: Duration, expected: u64) -> bool {
+    let expected = Duration::from_secs(expected);
+    elapsed + Duration::from_millis(300) >= expected && elapsed <= expected + Duration::from_secs(1)
+}
+
+// TDD 2 / AC1 + AC5: after a final answer the quiet line gets two check-in
+// frames, then a goodbye and one `end` carrying reason `silence`; the
+// relay-ended callback persists it and the chat gets exactly one note.
+#[tokio::test]
+async fn silence_step1_two_check_ins_then_goodbye_end_and_one_chat_note() {
+    use augmentagent_phone::silence::{
+        CHAT_NOTICE, CHAT_NOTICE_KEY, CHECK_IN_1_LINE, CHECK_IN_2_LINE, GOODBYE_LINE,
+    };
+    let model = ScriptedModel::new(vec![vec![Step::Token("It's sunny today.")]]);
+    let backend = Arc::new(FakeBackend::default());
+    let fast = agent(model, backend.clone(), FastLayerConfig::default());
+    let mut live = quiet_live(fast.clone()).await;
+    live.prompt("how's the weather").await;
+    assert_eq!(spoken(&live.talk_cycle().await), "It's sunny today.");
+    let answered = tokio::time::Instant::now();
+    for (expected, line) in [(5, CHECK_IN_1_LINE), (7, CHECK_IN_2_LINE), (9, GOODBYE_LINE)] {
+        let frame = live.frame(Duration::from_secs(12)).await.expect(line);
+        let elapsed = answered.elapsed();
+        assert!(near(elapsed, expected), "{line} after {elapsed:?}");
+        // A check-in, unlike the goodbye, may be cut by later speech too.
+        let preemptible = line != GOODBYE_LINE;
+        assert_eq!(
+            frame,
+            json!({"type":"text","token":line,"last":true,"interruptible":true,"preemptible":preemptible})
+        );
+    }
+    live.played().await;
+    let end = live.frame(Duration::from_secs(6)).await.expect("end frame");
+    assert_eq!(handoff(&end), json!({"reason":"silence","call_id": live.call_id}));
+    assert!(live.frame(Duration::from_millis(300)).await.is_none(), "nothing after end");
+    let data = end["handoffData"].as_str().unwrap().to_owned();
+    assert!(live.relay_ended(Some(&data)).contains("<Hangup/>"));
+    assert_eq!(
+        live.store.phone_end_reason(&live.call_id).unwrap().as_deref(),
+        Some("silence")
+    );
+    // A restart re-runs delivery under the same idempotency key: still one note.
+    let mut restarted = call();
+    restarted.id = live.call_id.clone();
+    ConversationAgent::silence_ended(&*fast, &restarted).await.unwrap();
+    let key = format!("{}:{CHAT_NOTICE_KEY}", live.call_id);
+    let notes = backend.mirrors.lock().unwrap();
+    assert_eq!(notes.iter().filter(|(k, _)| *k == key).count(), 1, "{notes:?}");
+    assert!(notes.contains(&(key, CHAT_NOTICE.to_owned())));
+    live.server.abort();
+}
+
+// TDD 3+5 / AC2 + AC3: while dispatched work is in flight and a progress line
+// was spoken recently, no check-in is written; the clock restarts once the
+// result is announced, and again whenever the owner speaks.
+#[tokio::test]
+async fn silence_step2_dispatched_work_suspends_check_ins_and_owner_speech_restarts_them() {
+    use augmentagent_phone::silence::CHECK_IN_1_LINE;
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let release = Arc::new(Notify::new());
+    let backend = Arc::new(FakeBackend::default());
+    let gate = release.clone();
+    *backend.on_dispatch.lock().unwrap() = Some(Box::new(move |events: TaskEvents| {
+        let gate = gate.clone();
+        tokio::spawn(async move {
+            events.progress("Still drafting.");
+            gate.notified().await;
+            events.completed("The draft is in your chat.");
+        });
+    }));
+    let mut live = quiet_live(agent(dispatch_script(), backend, FastLayerConfig::default())).await;
+    live.prompt("draft the reply please").await;
+    live.talk_cycle().await;
+    assert_eq!(spoken(&live.talk_cycle().await), "Still drafting.");
+    // Long enough for all three stages, so the call would already have ended.
+    assert!(
+        live.frame(Duration::from_secs(10)).await.is_none(),
+        "the owner is waiting on dispatched work, not absent"
+    );
+    release.notify_one();
+    assert!(spoken(&live.talk_cycle().await).contains("The draft is in your chat."));
+    let announced = tokio::time::Instant::now();
+    let check_in = live.frame(Duration::from_secs(8)).await.expect("check-in");
+    assert_eq!(check_in["token"], CHECK_IN_1_LINE);
+    let elapsed = announced.elapsed();
+    assert!(near(elapsed, 5), "check-in {elapsed:?} after the result was spoken");
+    // Even a partial prompt is the owner being there: the second check-in due
+    // at 7 s never comes and the sequence restarts from the first.
+    let partial = json!({"type":"prompt","voicePrompt":"uh","last":false}).to_string();
+    live.socket.send(Message::Text(partial.into())).await.unwrap();
+    let spoke = tokio::time::Instant::now();
+    assert!(live.frame(Duration::from_millis(2_500)).await.is_none());
+    let again = live.frame(Duration::from_secs(4)).await.expect("check-in");
+    assert_eq!(again["token"], CHECK_IN_1_LINE, "the sequence restarts");
+    let elapsed = spoke.elapsed();
+    assert!(near(elapsed, 5), "check-in {elapsed:?} after the owner spoke");
     live.server.abort();
 }

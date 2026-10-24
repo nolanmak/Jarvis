@@ -47,6 +47,16 @@ pub trait ConversationAgent: Send + Sync {
     /// Persist a distinct interrupted-playback marker; do not claim generated
     /// text was fully heard, and do not undo completed tools.
     async fn interrupted(&self, call: &PhoneCall, heard: &str) -> Result<(), AgentError>;
+    /// Whether silence handling is suspended (#1556): the owner is waiting on
+    /// work Jarvis already started, so a quiet line is not an absent owner.
+    fn silence_suspended(&self, _call: &PhoneCall) -> bool {
+        false
+    }
+    /// The call ended because the line went quiet: report it once in the
+    /// originating chat.
+    async fn silence_ended(&self, _call: &PhoneCall) -> Result<(), AgentError> {
+        Ok(())
+    }
     /// Post-call memory (#1552): run the heavy agent once, with exactly the
     /// request's tools (none), over the transcript mirrored into the call's
     /// originating chat. Adapters without a heavy agent leave the default.
@@ -881,6 +891,8 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
     };
     let mut metrics = TurnMetricsLedger::new(&state.service, &call);
     let mut tick = tokio::time::interval(Duration::from_millis(100));
+    // #1556: the quiet stretch starts with the claimed socket.
+    let mut silence = crate::silence::SilenceClock::new(state.service.silence());
     // #1557: after the agent's goodbye, `end` waits for its tokens-played
     // event or PLAYBACK_WAIT, whichever is first.
     let mut ending: Option<(tokio::time::Instant, serde_json::Value)> = None;
@@ -893,6 +905,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
             incoming=socket.recv()=>{
                 if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
                 let classified = classify(&mut session, incoming);
+                if session.take_owner_activity() { silence.reset(); }
                 settle_interruption(&mut session, &mut feedback, &mut metrics, &interrupt_tx);
                 match classified {
                     // The goodbye is out: later owner speech is not answered.
@@ -909,6 +922,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                             // recorded as a failed turn, not an answered one.
                             if let Ok(Some(frame))=session.finish(&dropped, QUEUE_FULL_RECOVERY_LINE) {
                                 if !write_frame(&mut socket, frame).await {break EndReason::TransportError;}
+                                silence.reset();
                                 metrics.spoken(&dropped.id, true, true);
                             }
                         }
@@ -919,10 +933,11 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                         tracing::info!(call_id = %call.id, "phone barge-in pending");
                     },
                     Classified::Resumed(resume)=>{
+                        silence.reset();
                         if !write_resume(&mut socket, &mut metrics, resume).await {break EndReason::TransportError;}
                     },
                     Classified::Ignore=>{
-                        if let Some(at) = session.take_played_event() { metrics.played(at); }
+                        if let Some(at) = session.take_played_event() { metrics.played(at); silence.reset(); }
                         if session.take_played_final() {
                             if let Some((_, frame)) = ending.take() { break send_end(&mut socket, frame).await; }
                         }
@@ -952,6 +967,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                 let decided = session.poll_false_interrupt();
                 settle_interruption(&mut session, &mut feedback, &mut metrics, &interrupt_tx);
                 if let Some(RelayInput::Resumed(resume)) = decided {
+                    silence.reset();
                     if !write_resume(&mut socket, &mut metrics, resume).await {break EndReason::TransportError;}
                 }
             },
@@ -969,6 +985,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                         if announcements.len() < 8 { announcements.push_back(text.clone()); }
                         if feedback.is_empty() {
                             if let Err(reason) = flush_announcements(&state.service, &call, &mut session, &mut socket, &mut announcements, &mut diagnostics).await {break reason;}
+                            silence.reset();
                         }
                         continue;
                     }
@@ -1005,6 +1022,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                             Err(_) => { log_recoverable(&call, diagnostics.note("invalid_speech_output", None, session.consecutive_invalid_frames())); continue }
                         };
                         if !write_frame(&mut socket, frame).await {break EndReason::TransportError;}
+                        silence.reset();
                         metrics.spoken(&turn.id, true, false);
                         // Only a tokens-played event after the goodbye counts.
                         let _ = session.take_played_final();
@@ -1026,6 +1044,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                 match result {
                     Ok(Some(frame))=>{
                         if !write_frame(&mut socket, frame).await {break EndReason::TransportError;}
+                        silence.reset();
                         metrics.spoken(&turn.id, closes, failed);
                     },
                     Ok(None)=>{},
@@ -1034,6 +1053,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                 }
                 if feedback.is_empty() && !announcements.is_empty() {
                     if let Err(reason) = flush_announcements(&state.service, &call, &mut session, &mut socket, &mut announcements, &mut diagnostics).await {break reason;}
+                    silence.reset();
                 }
             },
             _=tokio::time::sleep_until(end_at.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3_600))), if end_at.is_some() => {
@@ -1055,6 +1075,35 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                 if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
                 if feedback.is_empty() && !announcements.is_empty() {
                     if let Err(reason) = flush_announcements(&state.service, &call, &mut session, &mut socket, &mut announcements, &mut diagnostics).await {break reason;}
+                    silence.reset();
+                }
+                // #1556: a quiet line gets two check-ins and then hangs up.
+                // Nothing is due after the goodbye, while an owner turn is
+                // still being answered, or while the owner is waiting on
+                // dispatched work that is still reporting progress.
+                if ending.is_some() {continue;}
+                if !feedback.is_empty() || state.agent.silence_suspended(&call) {silence.reset(); continue;}
+                let Some(action) = silence.poll() else {continue};
+                tracing::info!(call_id = %call.id, stage = ?action, "phone silence stage due");
+                if action != crate::silence::SilenceAction::Goodbye {
+                    // A check-in never resets the clock: it must not postpone
+                    // the stage after it.
+                    if !write_frame(&mut socket, crate::relay::check_in_frame(action.line())).await {break EndReason::TransportError;}
+                    continue;
+                }
+                announcements.clear();
+                // A fixed line, so `system_speech` always yields a frame.
+                if let Ok(Some(frame)) = session.system_speech(crate::silence::GOODBYE_LINE) {
+                    if !write_frame(&mut socket, frame).await {break EndReason::TransportError;}
+                }
+                // Only a tokens-played event after the goodbye counts.
+                let _ = session.take_played_final();
+                let Some(end) = session.end(crate::end_call::EndCallReason::Silence) else {continue};
+                ending = Some((tokio::time::Instant::now() + crate::end_call::PLAYBACK_WAIT, end));
+                // The chat note is best effort: the end reason is recorded by
+                // the relay-ended callback either way.
+                if state.agent.silence_ended(&call).await.is_err() {
+                    tracing::warn!(call_id = %call.id, "phone silence end not reported in chat");
                 }
             }
         }
