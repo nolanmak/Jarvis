@@ -1223,3 +1223,70 @@ async fn ac11_thinking_sound_frame_is_preemptible_and_sent_once() {
     assert_eq!(spoken(&frames), "Dentist at nine.");
     live.server.abort();
 }
+
+// ---------- #1548 shared conversation queue ----------
+
+/// Native-path stand-in that waited 700 ms for the shared conversation queue:
+/// it reports the wait, speaks the fixed notice, then answers.
+struct QueuedNativeAgent;
+#[async_trait]
+impl ConversationAgent for QueuedNativeAgent {
+    async fn answer(
+        &self,
+        _: &PhoneCall,
+        _: &str,
+        _: &str,
+        speech: SpeechSender,
+        _: CancellationToken,
+    ) -> Result<String, AgentError> {
+        assert!(speech.notice("queue_wait_1", "I'm still finishing something, one moment."));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        speech.note_queue_wait(Duration::from_millis(700));
+        speech.speak_partial("All done.").await?;
+        speech.finish().await?;
+        Ok("All done.".into())
+    }
+    async fn interrupted(&self, _: &PhoneCall, _: &str) -> Result<(), AgentError> {
+        Ok(())
+    }
+}
+
+// AC3 / AC4 on the wire: the wait notice is its own spoken frame ahead of the
+// answer, the socket stays open, the notice is not counted as the answer's
+// first speech, and the queue wait lands in `queue_wait_ms`.
+#[tokio::test]
+async fn queue_wait_notice_is_spoken_on_the_socket_and_wait_is_recorded() {
+    let mut live = live(Arc::new(QueuedNativeAgent), None).await;
+    live.prompt("status?").await;
+    let notice = live.talk_cycle().await;
+    assert_eq!(
+        spoken(&notice),
+        "I'm still finishing something, one moment."
+    );
+    assert_eq!(spoken(&live.talk_cycle().await), "All done.");
+    let call = live.store.phone_provider_call(&live.call_id).unwrap();
+    assert!(!call.stop_requested, "socket and call stay up");
+    live.socket.close(None).await.unwrap();
+    let records = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let records = live.store.phone_turn_metrics(&live.call_id).unwrap();
+            if !records.is_empty() {
+                return records;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert!(
+        record.queue_wait_ms.is_some_and(|ms| ms >= 700),
+        "{record:?}"
+    );
+    assert!(
+        record.t_first_speech_ms.is_some_and(|ms| ms >= 60),
+        "the notice is not the answer's first speech: {record:?}"
+    );
+    live.server.abort();
+}

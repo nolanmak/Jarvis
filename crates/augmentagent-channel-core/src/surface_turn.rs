@@ -37,7 +37,9 @@
 //! handlers append [`turn_env`] to their spawn environment.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use augmentagent_store::{NativeConversation, Store, SurfaceTurnRef, SurfaceTurnResolution};
 use tokio_util::sync::CancellationToken;
@@ -91,13 +93,31 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
-fn conversation_queue(
+/// The per-conversation queue that text turns and native phone turns share
+/// (#1548 exposes it so callers can see who is waiting on it).
+#[derive(Default)]
+pub struct ConversationQueue {
+    lock: tokio::sync::Mutex<()>,
+    entries: AtomicU64,
+}
+impl ConversationQueue {
+    /// Turns that have asked for this queue so far.
+    pub fn entries(&self) -> u64 {
+        self.entries.load(Ordering::SeqCst)
+    }
+    /// Whether a turn holds the queue right now.
+    pub fn is_locked(&self) -> bool {
+        self.lock.try_lock().is_err()
+    }
+}
+
+/// The shared queue for `conversation` in `store`'s database.
+pub fn conversation_queue(
     store: &Store,
     conversation: &augmentagent_store::SurfaceConversationRef,
-) -> Arc<tokio::sync::Mutex<()>> {
+) -> Arc<ConversationQueue> {
     use std::sync::{Mutex, OnceLock, Weak};
-    type Queues =
-        std::collections::HashMap<(std::path::PathBuf, String), Weak<tokio::sync::Mutex<()>>>;
+    type Queues = std::collections::HashMap<(std::path::PathBuf, String), Weak<ConversationQueue>>;
     static QUEUES: OnceLock<Mutex<Queues>> = OnceLock::new();
     let db = store
         .db_path()
@@ -113,7 +133,7 @@ fn conversation_queue(
     if let Some(queue) = queues.get(&key).and_then(Weak::upgrade) {
         return queue;
     }
-    let queue = Arc::new(tokio::sync::Mutex::new(()));
+    let queue = Arc::new(ConversationQueue::default());
     queues.insert(key, Arc::downgrade(&queue));
     queue
 }
@@ -155,19 +175,88 @@ where
     H: FnOnce() -> History,
     History: Future<Output = anyhow::Result<String>>,
 {
+    run_surface_turn_waiting(store, request, select, cancel, answer, load_history, None).await
+}
+
+/// How a caller hears about a long wait for the shared conversation queue
+/// (#1548): `notice` runs once `notice_after` passes without the queue, then
+/// every `repeat` while the turn keeps waiting; `entered` gets the total wait
+/// once the turn holds the queue. The wait itself is never cut short.
+pub struct QueueWait<'a> {
+    pub notice_after: Duration,
+    /// Must be non-zero.
+    pub repeat: Duration,
+    pub notice: &'a (dyn Fn() + Send + Sync),
+    pub entered: &'a (dyn Fn(Duration) + Send + Sync),
+}
+
+/// Wait for the queue; `None` when cancelled first.
+async fn enter_queue<'q>(
+    queue: &'q ConversationQueue,
+    cancel: Option<&CancellationToken>,
+    wait: Option<&QueueWait<'_>>,
+) -> Option<tokio::sync::MutexGuard<'q, ()>> {
+    queue.entries.fetch_add(1, Ordering::SeqCst);
+    let started = tokio::time::Instant::now();
+    let cancelled = async {
+        match cancel {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(cancelled);
+    let lock = queue.lock.lock();
+    tokio::pin!(lock);
+    let mut next = wait.map(|w| started + w.notice_after);
+    let guard = loop {
+        let notice_due = async {
+            match next {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = &mut cancelled => return None,
+            guard = &mut lock => break guard,
+            _ = notice_due => if let Some(wait) = wait {
+                (wait.notice)();
+                next = next.map(|at| at + wait.repeat);
+            },
+        }
+    };
+    if let Some(wait) = wait {
+        (wait.entered)(started.elapsed());
+    }
+    Some(guard)
+}
+
+/// [`run_surface_turn_with_history`] that reports a long wait for the shared
+/// conversation queue through `wait` (#1548).
+pub async fn run_surface_turn_waiting<S, F, Fut, H, History>(
+    store: &Store,
+    request: SurfaceTurnRequest<'_>,
+    select: S,
+    cancel: Option<&CancellationToken>,
+    answer: F,
+    load_history: H,
+    wait: Option<QueueWait<'_>>,
+) -> anyhow::Result<SurfaceTurnOutcome>
+where
+    S: FnOnce() -> anyhow::Result<Option<ProviderKind>>,
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = anyhow::Result<String>>,
+    H: FnOnce() -> History,
+    History: Future<Output = anyhow::Result<String>>,
+{
     let turn = request.turn;
     let chat = turn.conversation();
     // Text and phone enter through different transport queues. Serialize at
     // their common native-session boundary before reading the binding or
     // claiming a turn, so a second input resumes the first input's session.
     let queue = conversation_queue(store, chat);
-    let _queue_guard = match cancel {
-        Some(token) => tokio::select! {
-            biased;
-            _ = token.cancelled() => return Ok(SurfaceTurnOutcome::Cancelled),
-            guard = queue.lock() => guard,
-        },
-        None => queue.lock().await,
+    let Some(_queue_guard) = enter_queue(&queue, cancel, wait.as_ref()).await else {
+        return Ok(SurfaceTurnOutcome::Cancelled);
     };
     let discord = chat.account().platform().as_str() == "discord";
     let binding = store.surface_conversation(chat)?;

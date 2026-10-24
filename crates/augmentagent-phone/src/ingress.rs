@@ -79,6 +79,14 @@ pub enum SpeechEvent {
     System { text: String },
     /// Thinking sound for a slow tool (#1546); preempted by the next text.
     Play { turn: Arc<RelayTurn>, source: String },
+    /// Fixed runtime notice spoken mid-turn, such as the wait for the shared
+    /// conversation queue (#1548). Not part of the answer: it never counts as
+    /// agent speech in the turn's metrics.
+    Notice {
+        turn: Arc<RelayTurn>,
+        utterance_id: String,
+        text: String,
+    },
 }
 /// Weak handle to a live call's speech queue. It never keeps the relay loop
 /// alive; once the socket ends, announcements are dropped.
@@ -121,7 +129,9 @@ impl SpeechSender {
     pub fn new(sender: mpsc::Sender<SpeechEvent>, turn: Arc<RelayTurn>) -> Self {
         Self::with_timer(sender, turn, Arc::new(TurnTimer::start()))
     }
-    fn with_timer(
+    /// A sender reporting into `timer`: the ingress worker's per-turn record,
+    /// or a harness that inspects it.
+    pub fn with_timer(
         sender: mpsc::Sender<SpeechEvent>,
         turn: Arc<RelayTurn>,
         timer: Arc<TurnTimer>,
@@ -165,6 +175,22 @@ impl SpeechSender {
     /// duration is kept; tool names, arguments and results are never recorded.
     pub fn note_tool_time(&self, duration: Duration) {
         self.timer.add_tool_time(duration);
+    }
+    /// Add time spent waiting for the shared conversation queue (#1548) to
+    /// this turn's `queue_wait_ms`.
+    pub fn note_queue_wait(&self, duration: Duration) {
+        self.timer.add_queue_wait(duration);
+    }
+    /// Queue a fixed runtime notice for this turn without waiting (#1548).
+    /// `false` when the call's speech queue is full or closed.
+    pub fn notice(&self, utterance_id: &str, text: &str) -> bool {
+        self.sender
+            .try_send(SpeechEvent::Notice {
+                turn: self.turn.clone(),
+                utterance_id: utterance_id.into(),
+                text: text.into(),
+            })
+            .is_ok()
     }
     /// A successful return means queued, not audibly played. Only send intended
     /// user-facing text. Receipts are deduplicated by turn plus utterance ID.
@@ -673,6 +699,17 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                         }
                         continue;
                     }
+                    SpeechEvent::Notice { turn, utterance_id, text } => {
+                        // Speaks now, mid-turn, but is not the answer: no
+                        // speech metrics, and a refused frame is just skipped.
+                        if let Some(pending) = feedback.get_mut(&turn.id) { pending.acked = true; }
+                        if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
+                        if let Ok(Some(frame)) = session.speech(turn, utterance_id, text, false) {
+                            if !matches!(tokio::time::timeout(Duration::from_secs(2),socket.send(Message::Text(frame.to_string().into()))).await,Ok(Ok(()))) {break "speech_write_failed";}
+                            tracing::info!(call_id = %call.id, kind = "queue_wait", "phone feedback queued");
+                        }
+                        continue;
+                    }
                     SpeechEvent::Play { turn, source } => {
                         if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
                         match session.play(turn, source) {
@@ -691,7 +728,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                     SpeechEvent::Utterance { turn, utterance_id, text, final_output } => session.speech(turn, utterance_id, text, *final_output),
                     SpeechEvent::Token { turn, text, last: false, .. } => session.speak_partial(turn, text),
                     SpeechEvent::Token { turn, text, last: true, .. } => session.finish_stream(turn, text),
-                    SpeechEvent::System { .. } | SpeechEvent::Play { .. } => continue,
+                    SpeechEvent::System { .. } | SpeechEvent::Play { .. } | SpeechEvent::Notice { .. } => continue,
                 };
                 match result {
                     Ok(Some(frame))=>{
