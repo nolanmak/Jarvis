@@ -410,3 +410,103 @@ async fn late_reply_is_not_mirrored_or_returned_after_authority_changes() {
         assert!(mirrors[0].0.ends_with(":owner"));
     }
 }
+
+struct MarkdownAgent;
+#[async_trait]
+impl QueryHandler for MarkdownAgent {
+    async fn answer(&self, _: &AuditCtx, _: &str) -> anyhow::Result<String> {
+        Ok("**Done.** See [the board](https://example.com/b) 🎉 for details.".into())
+    }
+}
+// #1547: the native harness yields one complete answer; the phone adapter
+// streams it as sanitized chunks and closes the talk cycle, so the ingress
+// fallback never speaks the raw Markdown.
+#[tokio::test]
+async fn phone_turn_streams_the_sanitized_answer_then_finishes() {
+    use augmentagent_phone::{
+        ingress::{SpeechEvent, SpeechSender},
+        relay::{RelayInput, RelaySession},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(dir.path().join("db")).unwrap());
+    let account = SurfaceAccountRef::new(SurfacePlatform::new("slack").unwrap(), "team").unwrap();
+    let owner = SurfaceOwnerRef::new(account.clone(), "owner").unwrap();
+    let chat = SurfaceConversationRef::new(account, "dm", None).unwrap();
+    store.bind_surface_owner(&owner, 0).unwrap();
+    store
+        .set_surface_control_conversation(&chat, ControlConversationKind::Direct, 0)
+        .unwrap();
+    store
+        .phone_import_destination("owner", "+12025550123", 0)
+        .unwrap();
+    let service = Arc::new(PhoneService::new(
+        store.clone(),
+        Arc::new(TestPhone),
+        Arc::new(TestClock),
+        PhoneConfig::new(
+            true,
+            "https://phone.example.test",
+            "test-verification-key-separate-32bytes",
+            vec![OwnerLink {
+                surface_owner: owner.clone(),
+                owner_id: "owner".into(),
+            }],
+        )
+        .unwrap(),
+    ));
+    let grant = service.authorize(&owner, &chat).unwrap();
+    let receipt = service
+        .tool(&grant, "call_owner", serde_json::json!({"request_id":"start"}))
+        .await
+        .unwrap();
+    let id = receipt["id"].as_str().unwrap();
+    store
+        .phone_provider_event(id, "CA-test", CallState::AwaitingAcceptance, 100)
+        .unwrap();
+    store.phone_accept(id, "CA-test", 100).unwrap();
+    let call = store.phone_provider_call(id).unwrap();
+    let io = Arc::new(Io::default());
+    let bridge = PhoneAgent::new(
+        store.clone(),
+        service.clone(),
+        Arc::new(MarkdownAgent),
+        io.clone(),
+        "/fixture".into(),
+        Arc::new(move |_| Ok(Some(ProviderKind::Claude))),
+    );
+    let mut session = RelaySession::new(id, "AC-test", "CA-test");
+    session
+        .receive(r#"{"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX"}"#)
+        .unwrap();
+    let RelayInput::Turn(turn) = session
+        .receive(r#"{"type":"prompt","voicePrompt":"status?","last":true}"#)
+        .unwrap()
+    else {
+        panic!()
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let speech = SpeechSender::new(tx, Arc::new(turn));
+    let answer = bridge
+        .run(&call, "phone-stream", "status?", Some(speech.clone()), CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(answer.contains("**Done.**"), "chat mirror keeps the raw answer");
+    // What the ingress fallback would add afterwards is a no-op.
+    assert!(speech.speak_partial(&answer).await.is_err());
+    speech.finish().await.unwrap();
+    drop(speech);
+    let mut tokens = Vec::new();
+    while let Some(event) = rx.recv().await {
+        match event {
+            SpeechEvent::Token { text, last, .. } => tokens.push((text, last)),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(
+        tokens,
+        [
+            ("Done. ".to_string(), false),
+            ("See the board for details.".to_string(), true)
+        ]
+    );
+}

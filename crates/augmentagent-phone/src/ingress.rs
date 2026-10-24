@@ -3,6 +3,7 @@
 use crate::{
     metrics::TurnTimer,
     relay::{RelayInput, RelaySession, RelayTurn},
+    speech::SpeechStream,
     webhook::WebhookAuth,
     Error, PhoneService,
 };
@@ -20,7 +21,10 @@ use axum::{
     Router,
 };
 use futures::SinkExt;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -43,21 +47,57 @@ pub trait ConversationAgent: Send + Sync {
     /// text was fully heard, and do not undo completed tools.
     async fn interrupted(&self, call: &PhoneCall, heard: &str) -> Result<(), AgentError>;
 }
-struct SpeechOutput {
-    turn: Arc<RelayTurn>,
-    utterance_id: String,
-    text: String,
-    final_output: bool,
-    automatic: bool,
-    failed: bool,
+/// One queued speech item for the relay loop. `Utterance` carries an
+/// agent-identified receipt (MCP `speak`); `Token` is one streamed chunk,
+/// `failed` marking a fallback answer for the turn's metrics record.
+#[derive(Debug)]
+pub enum SpeechEvent {
+    Utterance {
+        turn: Arc<RelayTurn>,
+        utterance_id: String,
+        text: String,
+        final_output: bool,
+    },
+    Token {
+        turn: Arc<RelayTurn>,
+        text: String,
+        last: bool,
+        failed: bool,
+    },
 }
+struct StreamState {
+    pipeline: SpeechStream,
+    finished: bool,
+}
+/// Clones share one sanitize-and-chunk pipeline per turn, so the agent, the
+/// MCP facade and the ingress fallback never interleave half-finished state.
 #[derive(Clone)]
 pub struct SpeechSender {
-    sender: mpsc::Sender<SpeechOutput>,
+    sender: mpsc::Sender<SpeechEvent>,
     turn: Arc<RelayTurn>,
     timer: Arc<TurnTimer>,
+    stream: Arc<Mutex<StreamState>>,
 }
 impl SpeechSender {
+    /// A sender with its own latency timer, for harnesses and tests.
+    pub fn new(sender: mpsc::Sender<SpeechEvent>, turn: Arc<RelayTurn>) -> Self {
+        Self::with_timer(sender, turn, Arc::new(TurnTimer::start()))
+    }
+    fn with_timer(
+        sender: mpsc::Sender<SpeechEvent>,
+        turn: Arc<RelayTurn>,
+        timer: Arc<TurnTimer>,
+    ) -> Self {
+        Self {
+            sender,
+            turn,
+            timer,
+            stream: Arc::new(Mutex::new(StreamState {
+                pipeline: SpeechStream::new(),
+                finished: false,
+            })),
+        }
+    }
     /// Add tool execution time to this turn's latency record (#1551). Only the
     /// duration is kept; tool names, arguments and results are never recorded.
     pub fn note_tool_time(&self, duration: Duration) {
@@ -76,13 +116,67 @@ impl SpeechSender {
         }
         self.timer.first_token();
         self.sender
-            .send(SpeechOutput {
+            .send(SpeechEvent::Utterance {
                 turn: self.turn.clone(),
                 utterance_id: utterance_id.into(),
                 text: text.into(),
                 final_output,
-                automatic: false,
-                failed: false,
+            })
+            .await
+            .map_err(|_| AgentError)
+    }
+    /// Stream part of the answer as it is generated. Text is sanitized for
+    /// TTS and sent at sentence boundaries; call [`finish`](Self::finish) once
+    /// the answer is complete. Fails after `finish`.
+    pub async fn speak_partial(&self, text: &str) -> Result<(), AgentError> {
+        if text.len() > 12_000 {
+            return Err(AgentError);
+        }
+        let chunks = {
+            let mut state = self.stream.lock().map_err(|_| AgentError)?;
+            if state.finished {
+                return Err(AgentError);
+            }
+            state.pipeline.push(text)
+        };
+        if !text.is_empty() {
+            self.timer.first_token();
+        }
+        for chunk in chunks {
+            self.token(chunk, false, false).await?;
+        }
+        Ok(())
+    }
+    /// Flush the pipeline and close the talk cycle with `last:true`. Idempotent.
+    pub async fn finish(&self) -> Result<(), AgentError> {
+        self.finish_outcome(false).await
+    }
+    async fn finish_outcome(&self, failed: bool) -> Result<(), AgentError> {
+        let chunks = {
+            let mut state = self.stream.lock().map_err(|_| AgentError)?;
+            if state.finished {
+                return Ok(());
+            }
+            state.finished = true;
+            state.pipeline.flush()
+        };
+        self.timer.first_token();
+        if chunks.is_empty() {
+            return self.token(String::new(), true, failed).await;
+        }
+        let last = chunks.len() - 1;
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            self.token(chunk, index == last, failed).await?;
+        }
+        Ok(())
+    }
+    async fn token(&self, text: String, last: bool, failed: bool) -> Result<(), AgentError> {
+        self.sender
+            .send(SpeechEvent::Token {
+                turn: self.turn.clone(),
+                text,
+                last,
+                failed,
             })
             .await
             .map_err(|_| AgentError)
@@ -393,7 +487,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
         return;
     }
     let (turn_tx, mut turn_rx) = mpsc::channel::<(Arc<RelayTurn>, Arc<TurnTimer>)>(4);
-    let (speech_tx, mut speech_rx) = mpsc::channel::<SpeechOutput>(32);
+    let (speech_tx, mut speech_rx) = mpsc::channel::<SpeechEvent>(32);
     let cancel = CancellationToken::new();
     let worker_cancel = cancel.clone();
     let agent = state.agent.clone();
@@ -421,18 +515,14 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                 break;
             }
             timer.dequeued();
-            let speech = SpeechSender {
-                sender: speech_tx.clone(),
-                turn: turn.clone(),
-                timer: timer.clone(),
-            };
+            let speech = SpeechSender::with_timer(speech_tx.clone(), turn.clone(), timer.clone());
             let turn_cancel = worker_cancel.child_token();
             let result = bounded_answer(
                 agent.answer(
                     &worker_call,
                     &turn.id,
                     &turn.text,
-                    speech,
+                    speech.clone(),
                     turn_cancel.clone(),
                 ),
                 &turn_cancel,
@@ -441,23 +531,14 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
             if worker_cancel.is_cancelled() {
                 break;
             }
-            timer.first_token();
             let failed = result.is_err();
             let text = result.unwrap_or_else(|_| {
                 "Sorry, I couldn’t complete that request. You can try another question or continue in chat.".into()
             });
-            if speech_tx
-                .send(SpeechOutput {
-                    turn,
-                    utterance_id: "final".into(),
-                    text,
-                    final_output: true,
-                    automatic: true,
-                    failed,
-                })
-                .await
-                .is_err()
-            {
+            // Agents that already streamed and finished make this a no-op; an
+            // agent-spoken `final` utterance suppresses it in the relay.
+            let _ = speech.speak_partial(&text).await;
+            if speech.finish_outcome(failed).await.is_err() {
                 break;
             }
         }
@@ -510,14 +591,22 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
             },
             output=speech_rx.recv()=>{
                 let Some(output)=output else {break "speech_worker_closed"};
-                if output.final_output { feedback.remove(&output.turn.id); }
-                else if let Some(pending) = feedback.get_mut(&output.turn.id) { pending.acked = true; }
+                let (turn, closes, failed) = match &output {
+                    SpeechEvent::Utterance { turn, final_output, .. } => (turn, *final_output, false),
+                    SpeechEvent::Token { turn, last, failed, .. } => (turn, *last, *failed),
+                };
+                if closes { feedback.remove(&turn.id); }
+                else if let Some(pending) = feedback.get_mut(&turn.id) { pending.acked = true; }
                 if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
-                let result=if output.automatic {session.finish(&output.turn,&output.text)} else {session.speech(&output.turn,&output.utterance_id,&output.text,output.final_output)};
+                let result = match &output {
+                    SpeechEvent::Utterance { turn, utterance_id, text, final_output } => session.speech(turn, utterance_id, text, *final_output),
+                    SpeechEvent::Token { turn, text, last: false, .. } => session.speak_partial(turn, text),
+                    SpeechEvent::Token { turn, text, last: true, .. } => session.finish_stream(turn, text),
+                };
                 match result {
                     Ok(Some(frame))=>{
                         if !matches!(tokio::time::timeout(Duration::from_secs(2),socket.send(Message::Text(frame.to_string().into()))).await,Ok(Ok(()))) {break "speech_write_failed";}
-                        metrics.spoken(&output.turn.id, output.final_output, output.failed);
+                        metrics.spoken(&turn.id, closes, failed);
                     },
                     Ok(None)=>{},Err(_)=>break "invalid_speech_output",
                 }

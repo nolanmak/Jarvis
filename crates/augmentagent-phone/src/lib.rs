@@ -543,6 +543,7 @@ pub mod twilio;
 pub mod webhook;
 
 pub mod relay;
+pub mod speech;
 pub mod voice;
 
 impl PhoneService {
