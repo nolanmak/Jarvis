@@ -586,6 +586,7 @@ mod tests {
         drop(a);
         assert!(Lease::try_at(t.path()).unwrap().is_some());
     }
+    #[cfg(target_os = "linux")]
     #[test]
     fn cleanup_precedes_fresh_floor_check_and_insufficient_space_still_refuses() {
         use std::cell::Cell;
@@ -690,6 +691,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn cancellation_stops_background_children_before_releasing_the_build_lease() {
         let t = tempfile::tempdir().unwrap();
