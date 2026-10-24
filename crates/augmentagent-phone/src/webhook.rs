@@ -58,6 +58,8 @@ impl PhoneService {
         signature: &str,
     ) -> Result<String, Error> {
         self.callback_call(auth, "relay-ended", id, fields, signature)?;
+        // #1557: first, so a summary-queue failure cannot drop the reason.
+        self.record_end_reason(id, fields);
         // #1552: the conversation is over; queue its summary exactly once.
         self.store.phone_enqueue_call_summary(id, self.clock.now_ms())?;
         let failed = field(fields, "SessionStatus")? == "failed";
@@ -71,6 +73,35 @@ impl PhoneService {
             return Ok("<Response><Say voice=\"Polly.Joanna\" language=\"en-US\">Sorry, Jarvis could not connect the voice conversation. The connection error has been recorded.</Say><Hangup/></Response>".into());
         }
         Ok(HANGUP.into())
+    }
+    /// #1557: an agent-initiated `end` carries `handoffData`; record why the
+    /// call ended. Absent means the agent did not end it. Malformed data is
+    /// categorized, never logged.
+    fn record_end_reason(&self, id: &str, fields: &[(String, String)]) {
+        let mut handoff = fields.iter().filter(|(k, _)| k == "HandoffData");
+        let Some((_, data)) = handoff.next() else {
+            return;
+        };
+        let reason = if handoff.next().is_some() {
+            crate::end_call::UNKNOWN_END_REASON
+        } else {
+            crate::end_call::end_reason_from_handoff(data, id)
+        };
+        if reason == crate::end_call::UNKNOWN_END_REASON {
+            tracing::warn!(call_id = id, category = "handoff_data_invalid", "phone relay-ended handoff data not recognized");
+        }
+        match self
+            .store
+            .phone_record_end_reason(id, reason, self.clock.now_ms())
+        {
+            Ok(true) => {
+                tracing::info!(call_id = id, end_reason = reason, "phone call end reason recorded")
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(call_id = id, error = %error, "phone call end reason not persisted")
+            }
+        }
     }
     fn callback_call(
         &self,

@@ -445,7 +445,7 @@ pub fn wiki_lookup(root: &Path, query: &str, budget: std::time::Duration) -> Str
 #[cfg(test)]
 mod phone_fast_tests {
     use super::*;
-    use augmentagent_phone::fast::tool_specs;
+    use augmentagent_phone::fast::{tool_specs, TOOL_NAMES};
 
     fn request() -> FastRequest {
         FastRequest {
@@ -481,7 +481,7 @@ mod phone_fast_tests {
     }
 
     #[test]
-    fn phone_fast_anthropic_body_streams_haiku_with_exactly_two_tools() {
+    fn phone_fast_anthropic_body_streams_haiku_with_exactly_three_tools() {
         let body = anthropic_body(&request());
         assert_eq!(body["model"], "claude-haiku-5-5");
         assert_eq!(body["stream"], true);
@@ -492,7 +492,7 @@ mod phone_fast_tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(tools, ["dispatch_task", "lookup_fast"]);
+        assert_eq!(tools, ["dispatch_task", "lookup_fast", "end_call"]);
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[1]["content"][1]["type"], "tool_use");
@@ -513,10 +513,10 @@ mod phone_fast_tests {
         };
         let anthropic = anthropic_body(&speculative);
         assert_eq!(anthropic["tool_choice"], json!({"type":"none"}));
-        assert_eq!(anthropic["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(anthropic["tools"].as_array().unwrap().len(), TOOL_NAMES.len());
         let cerebras = cerebras_body(&speculative, "m");
         assert_eq!(cerebras["tool_choice"], "none");
-        assert_eq!(cerebras["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(cerebras["tools"].as_array().unwrap().len(), TOOL_NAMES.len());
     }
 
     #[test]
@@ -531,7 +531,7 @@ mod phone_fast_tests {
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
             .collect();
-        assert_eq!(tools, ["dispatch_task", "lookup_fast"]);
+        assert_eq!(tools, ["dispatch_task", "lookup_fast", "end_call"]);
         assert_eq!(
             body["messages"][2]["tool_calls"][0]["function"]["name"],
             "dispatch_task"

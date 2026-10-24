@@ -749,5 +749,6 @@ pub mod metrics;
 pub mod fast;
 
 pub mod memory;
+pub mod end_call;
 /// Preemptive generation on interim transcripts (#1555).
 pub mod speculation;
