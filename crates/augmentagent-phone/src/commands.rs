@@ -54,16 +54,67 @@ fn words(text: &str) -> Option<Vec<&str>> {
         .is_some_and(|w| w.eq_ignore_ascii_case("phone"))
         .then_some(words)
 }
+/// Owner profile controls (#1552): exactly `profile`, `profile show` or
+/// `profile forget <key>`. Other prose starting with "profile" is not a command.
+enum ProfileCommand {
+    Show,
+    Forget(String),
+}
+fn profile_command(text: &str) -> Option<ProfileCommand> {
+    let body = text.trim().trim_start_matches(['!', '/']);
+    let words: Vec<_> = body.split_whitespace().collect();
+    if !words.first()?.eq_ignore_ascii_case("profile") {
+        return None;
+    }
+    match words.as_slice() {
+        [_] => Some(ProfileCommand::Show),
+        [_, show] if show.eq_ignore_ascii_case("show") => Some(ProfileCommand::Show),
+        [_, forget, key] if forget.eq_ignore_ascii_case("forget") => {
+            Some(ProfileCommand::Forget(key.to_ascii_lowercase()))
+        }
+        _ => None,
+    }
+}
+/// Same authority as `phone number …`: the stored owner, in the stored
+/// private control conversation only.
+fn profile_reply(
+    service: &PhoneService,
+    grant: &crate::Grant,
+    command: ProfileCommand,
+) -> Result<String, crate::Error> {
+    service.check(grant, true)?;
+    match command {
+        ProfileCommand::Show => {
+            let facts = service.store.phone_owner_profile(&grant.owner_id)?;
+            if facts.is_empty() {
+                return Ok("No profile facts yet. Jarvis learns them from your phone calls.".into());
+            }
+            let lines = facts
+                .iter()
+                .map(|f| format!("- {}: {}", f.key, f.value))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(format!("Profile facts from your calls, most recent first:\n{lines}\nRemove one with `profile forget <key>`."))
+        }
+        ProfileCommand::Forget(key) => {
+            if service.store.phone_forget_profile_fact(&grant.owner_id, &key)? {
+                Ok(format!("Forgot profile fact `{key}`. It will not be used on future calls."))
+            } else {
+                Ok(format!("No profile fact named `{key}`. Send `profile` to list them."))
+            }
+        }
+    }
+}
 pub fn sets_number(text: &str) -> bool {
     number_statement(text).is_some() || words(text).is_some_and(|w| matches!(w.as_slice(), [_, "number", "set", _]))
 }
 pub fn recognizes(text: &str) -> bool {
-    number_statement(text).is_some() || words(text).is_some()
+    profile_command(text).is_some() || number_statement(text).is_some() || words(text).is_some()
 }
 pub fn sensitive(text: &str) -> bool {
     number_statement(text).is_some() || words(text).is_some_and(|w| w.get(1).is_some_and(|w| w.eq_ignore_ascii_case("number")))
 }
-pub const HELP:&str="Phone: `phone call`, `phone status`, `phone stop`. In your private chat: `phone number set +<country code><number>`, `phone number verify <six-digit code>`, `phone number status`, `phone number remove`.";
+pub const HELP:&str="Phone: `phone call`, `phone status`, `phone stop`. In your private chat: `phone number set +<country code><number>`, `phone number verify <six-digit code>`, `phone number status`, `phone number remove`, `profile`, `profile forget <key>`.";
 const SETUP_HELP: &str = "In your private DM with the agent, reply ‘my number is …’ to set up calling. I assume US (+1) unless you include another country code. Server channels must also be linked to your owner identity.";
 
 pub async fn execute(
@@ -73,13 +124,17 @@ pub async fn execute(
     event_id: &str,
     text: &str,
 ) -> Option<String> {
-    let statement = number_statement(text);
-    let w = if statement.is_some() { vec![] } else { words(text)? };
+    let profile = profile_command(text);
+    let statement = if profile.is_some() { None } else { number_statement(text) };
+    let w = if statement.is_some() || profile.is_some() { vec![] } else { words(text)? };
     let grant = match service.authorize(owner, conversation) {
         Ok(g) => g,
         Err(crate::Error::Unauthorized) => return Some(format!("Phone owner authorization is required in this chat. {SETUP_HELP}")),
         Err(e) => return Some(e.to_string()),
     };
+    if let Some(command) = profile {
+        return Some(profile_reply(service, &grant, command).unwrap_or_else(|e| e.to_string()));
+    }
     if let Some((raw, call)) = statement {
         let number = match normalize_number(&raw) {
             Ok(number) => number,

@@ -1114,3 +1114,213 @@ impl Store {
         })
     }
 }
+
+/// #1552 bounds, enforced again here so no caller can exceed them.
+pub const PHONE_SUMMARY_MAX_CHARS: usize = 800;
+pub const PHONE_PROFILE_MAX_FACTS: usize = 10;
+pub const PHONE_PROFILE_KEY_MAX: usize = 64;
+pub const PHONE_PROFILE_VALUE_MAX: usize = 200;
+/// The profile key whose value is the owner's first name.
+pub const PHONE_PROFILE_FIRST_NAME: &str = "first_name";
+/// A claimed summary job is not due again for this long (doubling per attempt),
+/// longer than one bounded summarization run.
+const SUMMARY_LEASE_MS: i64 = 600_000;
+
+/// A profile fact as produced by one summarization run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewProfileFact {
+    pub key: String,
+    pub value: String,
+    pub confidence: f64,
+}
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ProfileFact {
+    pub key: String,
+    pub value: String,
+    pub confidence: f64,
+    pub source_call_id: String,
+    pub updated_ms: i64,
+}
+/// Lowercase ASCII letters, digits, `_`, `.` and `-`; at most 64 bytes.
+pub fn valid_profile_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= PHONE_PROFILE_KEY_MAX
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-'))
+}
+fn valid_fact(fact: &NewProfileFact) -> bool {
+    valid_profile_key(&fact.key)
+        && !fact.value.trim().is_empty()
+        && fact.value.chars().count() <= PHONE_PROFILE_VALUE_MAX
+        && fact.confidence.is_finite()
+        && (0.0..=1.0).contains(&fact.confidence)
+}
+
+impl Store {
+    /// Enqueue the post-call summary job. Only calls that reached a relay
+    /// session have a transcript; verification calls never do. Returns whether
+    /// a new job was created; duplicate callbacks and replays return false.
+    pub fn phone_enqueue_call_summary(&self, call_id: &str, now_ms: i64) -> PhoneResult<bool> {
+        transaction(self, |tx| {
+            let call = call_by_id(tx, call_id)?;
+            let relayed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM phone_relay_claims WHERE call_id=?1)",
+                [call_id],
+                |r| r.get(0),
+            )?;
+            if call.verification || !relayed {
+                return Ok(false);
+            }
+            Ok(tx.execute(
+                "INSERT OR IGNORE INTO phone_call_summary_jobs(call_id,created_ms) VALUES(?1,?2)",
+                params![call_id, now_ms],
+            )? == 1)
+        })
+    }
+    /// Pending jobs whose lease has expired. The relay session has ended, so
+    /// the transcript is complete even before the final status callback.
+    pub fn phone_call_summaries_due(&self, now_ms: i64) -> PhoneResult<Vec<PhoneCall>> {
+        Ok(self.with_conn(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {CALL_COLUMNS} FROM phone_calls WHERE id IN (
+                    SELECT call_id FROM phone_call_summary_jobs
+                    WHERE state='pending' AND attempts<3 AND next_ms<=?1)
+                 ORDER BY created_ms, id LIMIT 4"
+            ))?;
+            let calls = stmt
+                .query_map([now_ms], read_call)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(calls)
+        })?)
+    }
+    /// Take a durable lease on one job attempt. False when the job is done,
+    /// out of attempts, or still leased by an earlier attempt.
+    pub fn phone_claim_call_summary(&self, call_id: &str, now_ms: i64) -> PhoneResult<bool> {
+        transaction(self, |tx| {
+            let job: Option<(String, i64, i64)> = tx
+                .query_row(
+                    "SELECT state,attempts,next_ms FROM phone_call_summary_jobs WHERE call_id=?1",
+                    [call_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            let Some((state, attempts, next)) = job else {
+                return Ok(false);
+            };
+            if state != "pending" || attempts >= 3 || now_ms < next {
+                return Ok(false);
+            }
+            tx.execute(
+                "UPDATE phone_call_summary_jobs SET attempts=attempts+1,next_ms=?2 WHERE call_id=?1",
+                params![call_id, now_ms.saturating_add(SUMMARY_LEASE_MS << attempts)],
+            )?;
+            Ok(true)
+        })
+    }
+    /// Persist one run's result and mark the job done, atomically. A job that
+    /// is already done is left untouched (returns false), so a replayed run
+    /// never changes stored rows.
+    pub fn phone_complete_call_summary(
+        &self,
+        call_id: &str,
+        summary: &str,
+        wiki_path: &str,
+        facts: &[NewProfileFact],
+        now_ms: i64,
+    ) -> PhoneResult<bool> {
+        if summary.chars().count() > PHONE_SUMMARY_MAX_CHARS
+            || facts.len() > PHONE_PROFILE_MAX_FACTS
+            || wiki_path.is_empty()
+            || wiki_path.len() > 256
+            || !facts.iter().all(valid_fact)
+            || facts
+                .iter()
+                .enumerate()
+                .any(|(i, f)| facts[..i].iter().any(|old| old.key == f.key))
+        {
+            return Err(PhoneError::InvalidInput);
+        }
+        transaction(self, |tx| {
+            let call = call_by_id(tx, call_id)?;
+            let pending: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM phone_call_summary_jobs WHERE call_id=?1 AND state='pending')",
+                [call_id],
+                |r| r.get(0),
+            )?;
+            if !pending {
+                return Ok(false);
+            }
+            for (seq, fact) in facts.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO owner_profile(owner,key,value,confidence,source_call_id,updated_ms,seq)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7)
+                     ON CONFLICT(owner,key) DO UPDATE SET value=excluded.value,
+                        confidence=excluded.confidence,source_call_id=excluded.source_call_id,
+                        updated_ms=excluded.updated_ms,seq=excluded.seq",
+                    params![call.owner, fact.key, fact.value.trim(), fact.confidence, call_id, now_ms, seq as i64],
+                )?;
+            }
+            tx.execute(
+                "UPDATE phone_call_summary_jobs SET state='done',done_ms=?2,summary=?3,wiki_path=?4 WHERE call_id=?1",
+                params![call_id, now_ms, summary, wiki_path],
+            )?;
+            Ok(true)
+        })
+    }
+    /// The owner's facts, most recently learned first; within one call, in
+    /// the order the summarizer produced them.
+    pub fn phone_owner_profile(&self, owner: &str) -> PhoneResult<Vec<ProfileFact>> {
+        Ok(self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT key,value,confidence,source_call_id,updated_ms FROM owner_profile
+                 WHERE owner=?1 ORDER BY updated_ms DESC, seq ASC, key ASC",
+            )?;
+            let facts = stmt
+                .query_map([owner], |r| {
+                    Ok(ProfileFact {
+                        key: r.get(0)?,
+                        value: r.get(1)?,
+                        confidence: r.get(2)?,
+                        source_call_id: r.get(3)?,
+                        updated_ms: r.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(facts)
+        })?)
+    }
+    pub fn phone_owner_first_name(&self, owner: &str) -> PhoneResult<Option<String>> {
+        Ok(self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT value FROM owner_profile WHERE owner=?1 AND key=?2",
+                params![owner, PHONE_PROFILE_FIRST_NAME],
+                |r| r.get(0),
+            )
+            .optional()
+        })?)
+    }
+    /// Returns whether a fact was removed.
+    pub fn phone_forget_profile_fact(&self, owner: &str, key: &str) -> PhoneResult<bool> {
+        Ok(self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM owner_profile WHERE owner=?1 AND key=?2",
+                params![owner, key],
+            )
+        })? > 0)
+    }
+    /// Stored summaries of the owner's most recent summarized calls, newest first.
+    pub fn phone_recent_call_summaries(&self, owner: &str, limit: usize) -> PhoneResult<Vec<String>> {
+        Ok(self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT j.summary FROM phone_call_summary_jobs j JOIN phone_calls c ON c.id=j.call_id
+                 WHERE c.owner=?1 AND j.state='done' AND j.summary IS NOT NULL AND j.summary<>''
+                 ORDER BY c.created_ms DESC, c.id DESC LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(params![owner, i64::try_from(limit).unwrap_or(i64::MAX)], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })?)
+    }
+}
