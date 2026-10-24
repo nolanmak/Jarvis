@@ -296,8 +296,18 @@ fn decode_setup(session: &mut RelaySession, text: &str) -> Result<(), SetupFailu
         serde_json::from_str(text).map_err(|_| failure("invalid_json"))?;
     if value["type"] == "error" {
         let provider_code = value["code"].as_u64().and_then(|n| u32::try_from(n).ok());
+        // Classify without retaining the description: it can carry URLs,
+        // numbers and the rejected voice string.
+        let reason = if value["description"]
+            .as_str()
+            .is_some_and(crate::relay::names_voice_setup)
+        {
+            "setup_provider_rejected"
+        } else {
+            "provider_error"
+        };
         return Err(SetupFailure {
-            reason: "provider_error",
+            reason,
             provider_code,
         });
     }
@@ -450,6 +460,9 @@ enum Classified {
     },
     /// The provider reported a session-terminating error code.
     ProviderTerminated(u32),
+    /// The provider refused the configured speech providers before any
+    /// speech and closes after this frame.
+    ProviderRejectedSetup,
     Terminal(EndReason),
 }
 fn classify(
@@ -461,6 +474,7 @@ fn classify(
             Ok(RelayInput::Turn(turn)) => Classified::Turn(turn),
             Ok(RelayInput::Interrupted) => Classified::Interrupted,
             Ok(RelayInput::Ignore | RelayInput::Ready) => Classified::Ignore,
+            Ok(RelayInput::SetupProviderRejected) => Classified::ProviderRejectedSetup,
             Ok(RelayInput::ProviderError(code)) if TERMINAL_PROVIDER_CODES.contains(&code) => {
                 Classified::ProviderTerminated(code)
             }
@@ -687,6 +701,11 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                         tracing::warn!(call_id = %call.id, provider_code = code, "phone provider ended the relay session");
                         break EndReason::PeerClosed;
                     },
+                    Classified::ProviderRejectedSetup=>{
+                        // No turn was created, so the agent is never invoked.
+                        tracing::warn!(call_id = %call.id, category = "setup_provider_rejected", "phone provider rejected the configured speech providers");
+                        break EndReason::PeerClosed;
+                    },
                     Classified::Terminal(reason)=>break reason,
                 }
             },
@@ -830,6 +849,21 @@ mod setup_diagnostic_tests {
         // Provider errors reset the invalid run; only frame failures count.
         assert_eq!(session.consecutive_invalid_frames(), 0);
         assert_eq!(diagnostics.note("invalid_protocol_frame", None, 1).count, 3);
+    }
+    #[test]
+    fn provider_rejection_of_voice_setup_is_categorized_without_the_description() {
+        let mut session = RelaySession::new("call", "expected-account", "expected-call");
+        let raw = r#"{"type":"error","description":"Invalid voice secret-marker for ttsProvider ElevenLabs"}"#;
+        let error = decode_setup(&mut session, raw).unwrap_err();
+        assert_eq!(error.reason, "setup_provider_rejected");
+        assert_eq!(error.provider_code, None);
+        assert!(!format!("{error:?}").contains("secret-marker"));
+        let error = decode_setup(
+            &mut session,
+            r#"{"type":"error","code":64101,"description":"Invalid message received"}"#,
+        )
+        .unwrap_err();
+        assert_eq!(error.reason, "provider_error");
     }
 }
 

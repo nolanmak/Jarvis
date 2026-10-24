@@ -63,6 +63,23 @@ struct Fixture {
     conversation: SurfaceConversationRef,
 }
 fn fixture(platform: &str, enabled: bool, private: bool, uncertain: bool) -> Fixture {
+    fixture_with_voice(
+        platform,
+        enabled,
+        private,
+        uncertain,
+        augmentagent_phone::voice::VoiceConfig::default(),
+        None,
+    )
+}
+fn fixture_with_voice(
+    platform: &str,
+    enabled: bool,
+    private: bool,
+    uncertain: bool,
+    voice: augmentagent_phone::voice::VoiceConfig,
+    owner_first_name: Option<&str>,
+) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open(dir.path().join("test.db")).unwrap());
     let account =
@@ -98,7 +115,9 @@ fn fixture(platform: &str, enabled: bool, private: bool, uncertain: bool) -> Fix
             owner_id: "canonical-owner".into(),
         }],
     )
-    .unwrap();
+    .unwrap()
+    .with_voice(voice)
+    .with_owner_first_name(owner_first_name.map(str::to_owned));
     let service = PhoneService::new(store.clone(), provider.clone(), clock.clone(), config);
     Fixture {
         _dir: dir,
@@ -1769,15 +1788,48 @@ async fn relay_startup_bounds_control_frames_and_keeps_one_deadline() {
 
 #[tokio::test]
 async fn owner_requested_call_connects_directly_with_female_voice() {
-    use augmentagent_phone::webhook::WebhookAuth;
     let f = fixture("discord", true, true, false);
+    let (id, reply) = start_owner_call(&f).await;
+    assert!(reply.contains("ConversationRelay"));
+    assert!(!reply.contains("Gather"));
+    let relay = relay_attributes(&reply);
+    assert_eq!(relay["language"], "en-US");
+    assert_eq!(
+        f.store
+            .phone_call("canonical-owner", &id)
+            .unwrap()
+            .state
+            .as_str(),
+        "connected"
+    );
+    let fields = vec![
+        ("AccountSid".into(), "AC-test".into()),
+        ("CallSid".into(), "CA-test".into()),
+    ];
+    let auth = augmentagent_phone::webhook::WebhookAuth::new("AC-test", "secret");
+    let sig = signed(
+        "secret",
+        &format!("https://phone.example.test/phone/start/{id}"),
+        &fields,
+    );
+    assert!(f
+        .service
+        .start_callback(&auth, &id, &fields, &sig)
+        .unwrap()
+        .contains("Hangup"));
+    assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
+}
+
+/// Signed owner start callback; returns the call ID and the TwiML reply.
+async fn start_owner_call(f: &Fixture) -> (String, String) {
+    use augmentagent_phone::webhook::WebhookAuth;
     let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
     let call = f
         .service
         .tool(&grant, "call_owner", json!({"request_id":"direct-answer"}))
         .await
         .unwrap();
-    let id = call["id"].as_str().unwrap();
+    let id = call["id"].as_str().unwrap().to_owned();
     let fields = vec![
         ("AccountSid".into(), "AC-test".into()),
         ("CallSid".into(), "CA-test".into()),
@@ -1788,30 +1840,238 @@ async fn owner_requested_call_connects_directly_with_female_voice() {
         &format!("https://phone.example.test/phone/start/{id}"),
         &fields,
     );
-    let reply = f.service.start_callback(&auth, id, &fields, &sig).unwrap();
-    assert!(reply.contains("ConversationRelay"));
-    assert!(!reply.contains("Gather"));
-    for attr in [
-        "ttsProvider=\"Amazon\"",
-        "voice=\"Joanna\"",
-        "language=\"en-US\"",
-    ] {
-        assert!(reply.contains(attr), "{reply}");
-    }
+    let reply = f.service.start_callback(&auth, &id, &fields, &sig).unwrap();
+    (id, reply)
+}
+/// Parses the TwiML as XML (not substring matching) and returns the decoded
+/// attributes of the single ConversationRelay element.
+fn relay_attributes(twiml: &str) -> std::collections::BTreeMap<String, String> {
+    let doc = roxmltree::Document::parse(twiml).expect("TwiML must be well-formed XML");
+    let mut relays = doc
+        .descendants()
+        .filter(|n| n.has_tag_name("ConversationRelay"));
+    let relay = relays.next().expect("one ConversationRelay element");
+    assert!(relays.next().is_none(), "exactly one ConversationRelay");
+    relay
+        .attributes()
+        .map(|a| (a.name().to_owned(), a.value().to_owned()))
+        .collect()
+}
+fn voice_from(pairs: &[(&str, &str)]) -> augmentagent_phone::voice::VoiceConfig {
+    let env: std::collections::HashMap<&str, String> = pairs
+        .iter()
+        .map(|(k, v)| (*k, (*v).to_owned()))
+        .collect();
+    augmentagent_phone::voice::VoiceConfig::from_lookup(|k| env.get(k).cloned()).unwrap()
+}
+const DEFAULT_HINTS: &str = "Jarvis, Discord, WhatsApp, Slack, Linear, Notion";
+
+#[tokio::test]
+async fn ac01_default_twiml_pins_deepgram_nova3_and_elevenlabs_flash() {
+    let f = fixture("discord", true, true, false);
+    let (_, reply) = start_owner_call(&f).await;
+    let relay = relay_attributes(&reply);
+    assert_eq!(relay["transcriptionProvider"], "Deepgram");
+    assert_eq!(relay["speechModel"], "nova-3-general");
+    assert_eq!(relay["ttsProvider"], "ElevenLabs");
+    assert_eq!(relay["voice"], "UgBBYS2sOqTuMpoF3BR0-flash_v2_5");
+    assert_eq!(relay["language"], "en-US");
+    assert_eq!(relay["elevenlabsTextNormalization"], "on");
+    assert_eq!(relay["hints"], DEFAULT_HINTS);
+    // Still an owner-authorized direct connect with the existing turn contract.
+    assert_eq!(relay["interruptible"], "any");
+    assert_eq!(relay["partialPrompts"], "false");
     assert_eq!(
-        f.store
-            .phone_call("canonical-owner", id)
-            .unwrap()
-            .state
-            .as_str(),
-        "connected"
+        relay["url"],
+        format!(
+            "wss://phone.example.test/phone/relay/{}",
+            f.store.phone_active_calls().unwrap()[0].id
+        )
     );
-    assert!(f
-        .service
-        .start_callback(&auth, id, &fields, &sig)
-        .unwrap()
-        .contains("Hangup"));
-    assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn ac02_each_provider_variable_changes_only_its_own_attribute() {
+    let defaults = fixture("discord", true, true, false);
+    let (_, reply) = start_owner_call(&defaults).await;
+    let baseline = relay_attributes(&reply);
+    // (env overrides, expected attribute differences from the baseline; None = absent)
+    type Overrides<'a> = Vec<(&'a str, &'a str)>;
+    type Expected<'a> = Vec<(&'a str, Option<&'a str>)>;
+    let matrix: Vec<(Overrides, Expected)> = vec![
+        (
+            vec![("AUGMENTAGENT_PHONE_STT_MODEL", "nova-2-phonecall")],
+            vec![("speechModel", Some("nova-2-phonecall"))],
+        ),
+        (
+            vec![("AUGMENTAGENT_PHONE_STT_PROVIDER", "Google")],
+            vec![
+                ("transcriptionProvider", Some("Google")),
+                ("speechModel", Some("telephony")),
+            ],
+        ),
+        (
+            vec![
+                ("AUGMENTAGENT_PHONE_STT_PROVIDER", "Google"),
+                ("AUGMENTAGENT_PHONE_STT_MODEL", "long"),
+            ],
+            vec![
+                ("transcriptionProvider", Some("Google")),
+                ("speechModel", Some("long")),
+            ],
+        ),
+        (
+            vec![("AUGMENTAGENT_PHONE_TTS_VOICE", "UgBBYS2sOqTuMpoF3BR0-flash_v2_5-1.0_0.5_0.75")],
+            vec![("voice", Some("UgBBYS2sOqTuMpoF3BR0-flash_v2_5-1.0_0.5_0.75"))],
+        ),
+        (
+            vec![("AUGMENTAGENT_PHONE_TTS_PROVIDER", "Amazon")],
+            vec![
+                ("ttsProvider", Some("Amazon")),
+                ("voice", Some("Joanna")),
+                ("elevenlabsTextNormalization", None),
+            ],
+        ),
+        (
+            vec![
+                ("AUGMENTAGENT_PHONE_TTS_PROVIDER", "Amazon"),
+                ("AUGMENTAGENT_PHONE_TTS_VOICE", "Matthew-Generative"),
+            ],
+            vec![
+                ("ttsProvider", Some("Amazon")),
+                ("voice", Some("Matthew-Generative")),
+                ("elevenlabsTextNormalization", None),
+            ],
+        ),
+    ];
+    assert_eq!(matrix.len(), 6);
+    for (env, expected) in matrix {
+        let f = fixture_with_voice("discord", true, true, false, voice_from(&env), None);
+        let (_, reply) = start_owner_call(&f).await;
+        let relay = relay_attributes(&reply);
+        let mut want = baseline.clone();
+        for (name, value) in &expected {
+            match value {
+                Some(v) => {
+                    want.insert((*name).to_owned(), (*v).to_owned());
+                }
+                None => {
+                    want.remove(*name);
+                }
+            }
+        }
+        // Call IDs differ per fixture; everything else must match exactly.
+        want.remove("url");
+        let mut got = relay.clone();
+        got.remove("url");
+        assert_eq!(got, want, "overrides {env:?}");
+    }
+}
+
+#[test]
+fn ac04_relay_twiml_reads_only_startup_configuration() {
+    // Source-level guard: the TwiML builder may read `self.config` and the
+    // call ID only. Chat text, provider fields, tool arguments and model output
+    // never reach it, so no attribute can be influenced by them.
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/webhook.rs"
+    ))
+    .unwrap();
+    let start = source
+        .find("fn relay_twiml(&self, id: &str) -> String {")
+        .expect("relay_twiml signature unchanged");
+    let body = &source[start..];
+    let end = body.find("\n    }\n").expect("end of relay_twiml") + 7;
+    let body = &body[..end];
+    assert!(body.contains("ConversationRelay"), "{body}");
+    for forbidden in [
+        "fields",
+        "args",
+        "call.",
+        "store",
+        "Value",
+        "serde_json",
+        "std::env",
+        "env::var",
+        "prompt",
+        "text",
+    ] {
+        assert!(!body.contains(forbidden), "relay_twiml must not read {forbidden}: {body}");
+    }
+    let mut cursor = body;
+    let mut reads = 0;
+    while let Some(i) = cursor.find("self.") {
+        assert!(
+            cursor[i..].starts_with("self.config."),
+            "relay_twiml reads something other than self.config: {body}"
+        );
+        reads += 1;
+        cursor = &cursor[i + 5..];
+    }
+    assert!(reads >= 4, "expected provider reads through self.config");
+    // The only other binding read is the call identifier parameter.
+    let other_user = source.contains("fn relay_twiml(&self, id: &str)");
+    assert!(other_user);
+}
+
+#[tokio::test]
+async fn ac05_hints_include_stored_first_name_only_when_present_and_are_escaped_and_capped() {
+    let plain = fixture_with_voice(
+        "discord",
+        true,
+        true,
+        false,
+        augmentagent_phone::voice::VoiceConfig::default(),
+        None,
+    );
+    let (_, reply) = start_owner_call(&plain).await;
+    assert_eq!(relay_attributes(&reply)["hints"], DEFAULT_HINTS);
+
+    let named = fixture_with_voice(
+        "discord",
+        true,
+        true,
+        false,
+        augmentagent_phone::voice::VoiceConfig::default(),
+        Some("Nolan"),
+    );
+    let (_, reply) = start_owner_call(&named).await;
+    assert_eq!(
+        relay_attributes(&reply)["hints"],
+        format!("Nolan, {DEFAULT_HINTS}")
+    );
+
+    // Markup in a stored name is removed before emission, apostrophes survive
+    // through XML escaping, and the raw characters never appear in the TwiML.
+    let hostile = fixture_with_voice(
+        "discord",
+        true,
+        true,
+        false,
+        augmentagent_phone::voice::VoiceConfig::default(),
+        Some("D'Arcy <b>&amp;\" x=\"y"),
+    );
+    let (_, reply) = start_owner_call(&hostile).await;
+    assert!(!reply.contains("<b>"));
+    assert!(!reply.contains("x=\"y"));
+    assert_eq!(
+        relay_attributes(&reply)["hints"],
+        format!("D'Arcy bamp xy, {DEFAULT_HINTS}")
+    );
+    assert_eq!(
+        augmentagent_phone::voice::hints(Some("O'Brien")),
+        format!("O'Brien, {DEFAULT_HINTS}")
+    );
+    assert_eq!(augmentagent_phone::voice::hints(Some("   ")), DEFAULT_HINTS);
+    // Oversized names are dropped rather than truncated mid-word, and the
+    // whole attribute is capped at 500 characters.
+    assert_eq!(
+        augmentagent_phone::voice::hints(Some(&"N".repeat(65))),
+        DEFAULT_HINTS
+    );
+    assert!(augmentagent_phone::voice::hints(Some(&"N".repeat(64))).chars().count() <= 500);
+    const { assert!(augmentagent_phone::voice::HINTS_MAX_CHARS == 500) };
 }
 
 struct SlowPhoneAgent {
