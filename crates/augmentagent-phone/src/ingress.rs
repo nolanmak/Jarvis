@@ -8,7 +8,7 @@ use crate::{
     Error, PhoneService,
 };
 use async_trait::async_trait;
-use augmentagent_store::phone::{CallState, PhoneCall, TurnOutcome, TurnProvider};
+use augmentagent_store::phone::{CallState, PhoneCall, TurnOutcome};
 use axum::{
     body::Bytes,
     extract::{
@@ -64,6 +64,34 @@ pub enum SpeechEvent {
         last: bool,
         failed: bool,
     },
+    /// Fast-layer announcement outside an owner turn (#1546): one complete
+    /// spoken `text` frame, sent only while the call is live and idle.
+    System { text: String },
+    /// Thinking sound for a slow tool (#1546); preempted by the next text.
+    Play { turn: Arc<RelayTurn>, source: String },
+}
+/// Weak handle to a live call's speech queue. It never keeps the relay loop
+/// alive; once the socket ends, announcements are dropped.
+#[derive(Clone)]
+pub struct CallLine {
+    sender: mpsc::WeakSender<SpeechEvent>,
+}
+impl CallLine {
+    /// Queue one system announcement. `false` means the call is gone or the
+    /// queue is full; nothing was or will be spoken.
+    pub fn announce(&self, text: &str) -> bool {
+        if text.trim().is_empty() || text.len() > 12_000 {
+            return false;
+        }
+        self.sender.upgrade().is_some_and(|sender| {
+            sender
+                .try_send(SpeechEvent::System { text: text.into() })
+                .is_ok()
+        })
+    }
+    pub fn is_live(&self) -> bool {
+        self.sender.upgrade().is_some_and(|s| !s.is_closed())
+    }
 }
 struct StreamState {
     pipeline: SpeechStream,
@@ -97,6 +125,31 @@ impl SpeechSender {
                 finished: false,
             })),
         }
+    }
+    /// Handle for speaking outside this turn while the call stays live.
+    pub fn line(&self) -> CallLine {
+        CallLine {
+            sender: self.sender.downgrade(),
+        }
+    }
+    /// Mark this turn as answered by the fast layer (#1546) for metrics.
+    pub fn mark_fast(&self) {
+        self.timer.mark_fast();
+    }
+    /// Mark this turn as having handed work off (#1546) for metrics.
+    pub fn mark_dispatched(&self) {
+        self.timer.mark_dispatched();
+    }
+    /// Request a preemptible thinking sound for this turn. Never counts as
+    /// speech for latency metrics.
+    pub async fn play(&self, source: &str) -> Result<(), AgentError> {
+        self.sender
+            .send(SpeechEvent::Play {
+                turn: self.turn.clone(),
+                source: source.into(),
+            })
+            .await
+            .map_err(|_| AgentError)
     }
     /// Add tool execution time to this turn's latency record (#1551). Only the
     /// duration is kept; tool names, arguments and results are never recorded.
@@ -534,6 +587,14 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
         }
     });
     let mut feedback = std::collections::HashMap::<String, TurnFeedback>::new();
+    let mut announcements = std::collections::VecDeque::<String>::new();
+    // With the fast layer the runtime acknowledgment is only a fallback for a
+    // slow first token (#1546); otherwise it keeps #1526's 250 ms.
+    let ack_after = if state.service.fast_layer().is_some() {
+        Duration::from_millis(1_500)
+    } else {
+        Duration::from_millis(250)
+    };
     let mut metrics = TurnMetricsLedger::new(&state.service, &call);
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let end_reason = 'connection: loop {
@@ -544,7 +605,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                     Some(Ok(Message::Text(frame)))=>match session.receive(&frame) {
                         Ok(RelayInput::Turn(turn))=>{
                             let turn=Arc::new(turn);
-                            feedback.insert(turn.id.clone(), TurnFeedback::new(turn.clone()));
+                            feedback.insert(turn.id.clone(), TurnFeedback::new(turn.clone()).with_ack_after(ack_after));
                             let timer = metrics.begin(&turn.id);
                             if turn_tx.try_send((turn, timer)).is_err() {break "turn_queue_full";}
                         },
@@ -577,6 +638,24 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                 let (turn, closes, failed) = match &output {
                     SpeechEvent::Utterance { turn, final_output, .. } => (turn, *final_output, false),
                     SpeechEvent::Token { turn, last, failed, .. } => (turn, *last, *failed),
+                    SpeechEvent::System { text } => {
+                        // Bounded; overflow is dropped rather than blocking.
+                        if announcements.len() < 8 { announcements.push_back(text.clone()); }
+                        if feedback.is_empty() {
+                            if let Err(reason) = flush_announcements(&state.service, &call, &mut session, &mut socket, &mut announcements).await {break reason;}
+                        }
+                        continue;
+                    }
+                    SpeechEvent::Play { turn, source } => {
+                        if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
+                        match session.play(turn, source) {
+                            Ok(Some(frame))=>{
+                                if !matches!(tokio::time::timeout(Duration::from_secs(2),socket.send(Message::Text(frame.to_string().into()))).await,Ok(Ok(()))) {break "speech_write_failed";}
+                            },
+                            Ok(None)=>{},Err(_)=>break "invalid_speech_output",
+                        }
+                        continue;
+                    }
                 };
                 if closes { feedback.remove(&turn.id); }
                 else if let Some(pending) = feedback.get_mut(&turn.id) { pending.acked = true; }
@@ -585,6 +664,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                     SpeechEvent::Utterance { turn, utterance_id, text, final_output } => session.speech(turn, utterance_id, text, *final_output),
                     SpeechEvent::Token { turn, text, last: false, .. } => session.speak_partial(turn, text),
                     SpeechEvent::Token { turn, text, last: true, .. } => session.finish_stream(turn, text),
+                    SpeechEvent::System { .. } | SpeechEvent::Play { .. } => continue,
                 };
                 match result {
                     Ok(Some(frame))=>{
@@ -592,6 +672,9 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                         metrics.spoken(&turn.id, closes, failed);
                     },
                     Ok(None)=>{},Err(_)=>break "invalid_speech_output",
+                }
+                if feedback.is_empty() && !announcements.is_empty() {
+                    if let Err(reason) = flush_announcements(&state.service, &call, &mut session, &mut socket, &mut announcements).await {break reason;}
                 }
             },
             _=tick.tick()=>{
@@ -607,7 +690,9 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                     }
                 }
                 if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
-
+                if feedback.is_empty() && !announcements.is_empty() {
+                    if let Err(reason) = flush_announcements(&state.service, &call, &mut session, &mut socket, &mut announcements).await {break reason;}
+                }
             }
         }
     };
@@ -806,8 +891,8 @@ impl<'a> TurnMetricsLedger<'a> {
         let record = turn.timer.record(
             &self.call.id,
             &turn.id,
-            TurnProvider::Native,
-            outcome,
+            turn.timer.provider(),
+            turn.timer.outcome(outcome),
             self.service.clock.now_ms(),
             crate::metrics::build_commit(),
         );
@@ -839,6 +924,7 @@ struct TurnFeedback {
     started: tokio::time::Instant,
     acked: bool,
     progressed: bool,
+    ack_after: Duration,
 }
 impl TurnFeedback {
     fn new(turn: Arc<RelayTurn>) -> Self {
@@ -847,11 +933,16 @@ impl TurnFeedback {
             started: tokio::time::Instant::now(),
             acked: false,
             progressed: false,
+            ack_after: Duration::from_millis(250),
         }
+    }
+    fn with_ack_after(mut self, ack_after: Duration) -> Self {
+        self.ack_after = ack_after;
+        self
     }
     fn notice(&mut self) -> Option<(&'static str, &'static str)> {
         let elapsed = self.started.elapsed();
-        if !self.acked && elapsed >= Duration::from_millis(250) {
+        if !self.acked && elapsed >= self.ack_after {
             self.acked = true;
             Some(("runtime_ack", "Got it. Give me a moment."))
         } else if !self.progressed && elapsed >= Duration::from_secs(10) {
@@ -861,6 +952,39 @@ impl TurnFeedback {
             None
         }
     }
+}
+
+/// Speak queued fast-layer announcements as complete system turns. Only
+/// called while no owner turn is mid-answer, so talk cycles never interleave.
+async fn flush_announcements(
+    service: &PhoneService,
+    call: &PhoneCall,
+    session: &mut RelaySession,
+    socket: &mut WebSocket,
+    announcements: &mut std::collections::VecDeque<String>,
+) -> Result<(), &'static str> {
+    while let Some(text) = announcements.pop_front() {
+        if let Some(reason) = call_end_reason(service, call) {
+            return Err(reason);
+        }
+        match session.system_speech(&text) {
+            Ok(Some(frame)) => {
+                if !matches!(
+                    tokio::time::timeout(
+                        Duration::from_secs(2),
+                        socket.send(Message::Text(frame.to_string().into()))
+                    )
+                    .await,
+                    Ok(Ok(()))
+                ) {
+                    return Err("speech_write_failed");
+                }
+            }
+            Ok(None) => {}
+            Err(_) => return Err("invalid_speech_output"),
+        }
+    }
+    Ok(())
 }
 
 fn call_end_reason(service: &PhoneService, original: &PhoneCall) -> Option<&'static str> {

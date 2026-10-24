@@ -66,6 +66,10 @@ limits and duplicate-call protections still apply. Private DM entry is optional.
 | `AUGMENTAGENT_PHONE_VERIFICATION_KEY` | Separate secret of at least 32 bytes, used for keyed verification-code hashes. Keep stable across restarts; rotation invalidates outstanding challenges. |
 | `AUGMENTAGENT_PHONE_OWNER_LINKS` | JSON array mapping authenticated surface identities to a canonical owner; 1–64 explicit links, at most 32 KiB. |
 | `AUGMENTAGENT_PHONE_DEBUG_EVENTS` | `1` adds `debug="debugging tokens-played speaker-events"` to the ConversationRelay TwiML so #1551 can record when tokens were actually played; `0` disables it. Absent defaults to on for debug (non-production) builds and off for release builds. Other values fail configuration. |
+| `AUGMENTAGENT_PHONE_FAST_LAYER` | `1` answers call utterances with the fast conversational layer (#1546); absent or `0` (default) keeps the native agent answering every utterance unchanged. Other values fail configuration. |
+| `AUGMENTAGENT_PHONE_FAST_PROVIDER` | Fast model provider when the layer is on: `anthropic` (default, `claude-haiku-5-5`, key `ANTHROPIC_API_KEY`) or `cerebras` (fast-tier Cerebras model, key `CEREBRAS_API_KEY`). Keys load per request from the service keyring, then the service environment. Other values fail configuration. |
+| `AUGMENTAGENT_PHONE_MAX_TOOL_STEPS` | Tool calls the fast model may make per owner utterance, `1`–`8`, default `3`. Further calls get a typed refusal. Other values fail configuration. |
+| `AUGMENTAGENT_PHONE_THINKING_SOUND_URL` | Optional audio played while a fast-layer tool runs longer than 700 ms with nothing spoken. Must be `https` on the same origin as `AUGMENTAGENT_PHONE_PUBLIC_URL`, without credentials; anything else fails configuration, even while the layer is off. Unset (default) never plays a sound. |
 
 Synthetic link example (replace identifiers with actual authenticated bindings):
 
@@ -430,6 +434,38 @@ slow interruption persistence, stale audio suppression, bounded cancellation,
 recoverable provider errors and scoped native routing. Live audible greeting,
 lookup completion and interruption behavior must be recorded separately; passing
 these tests does not establish those live results.
+
+## Fast conversational layer (#1546)
+
+With `AUGMENTAGENT_PHONE_FAST_LAYER=1`, each final `prompt` is answered by a
+small streaming model instead of a full native turn. It receives a fixed
+persona prompt, the last 20 phone turns of this call, the last 10 lines of the
+originating chat (bounded) and task updates from this call. Tokens are spoken
+at sentence boundaries as they stream. The runtime acknowledgment (#1526)
+becomes a fallback after 1.5 s without speech instead of 250 ms.
+
+The model has exactly two tools, `dispatch_task(description)` and
+`lookup_fast(query)`. Call authority (`authorize_call`) is re-checked before
+every tool; any other tool name, a revoked call or a fourth call in one
+utterance gets a typed refusal and the turn still ends with `last:true`.
+
+- `dispatch_task` returns at once with a `task_id` (`{turn_id}:dispatch`). The
+  work runs as a native surface turn on the originating conversation, with the
+  same session, approvals and phone MCP grant (without call speech) as a text
+  turn. Its result is queued once to the chat outbox under the task key; a
+  replay after restart is refused by the durable turn claim and the outbox
+  key. If the call is still live and idle, a short summary is also spoken as a
+  system turn; after hangup nothing is spoken.
+- A dispatched turn may report progress (`augmentagent_phone::fast::report_progress`):
+  at most one event per 5 s and 6 per task, 140 characters each. The call
+  speaks at most one progress line per 15 s. Progress is never posted to chat.
+- `lookup_fast` scans the wiki's Markdown files read-only and is cut off at
+  1.5 s.
+
+Fast-layer turns are recorded with `provider = fast`; a turn that dispatched
+work records outcome `dispatched`; tool time is added to `tool_ms`. Logs carry
+only fixed category codes (for example `http_4xx`, `scripted_failure`), never
+model text, tool arguments, chat text or keys.
 
 ## Per-turn latency metrics (#1551)
 
