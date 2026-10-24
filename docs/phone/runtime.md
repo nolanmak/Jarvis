@@ -79,6 +79,9 @@ limits and duplicate-call protections still apply. Private DM entry is optional.
 | `AUGMENTAGENT_PHONE_MAX_TOOL_STEPS` | Tool calls the fast model may make per owner utterance, `1`–`8`, default `3`. Further calls get a typed refusal. Other values fail configuration. |
 | `AUGMENTAGENT_PHONE_THINKING_SOUND_URL` | Optional audio played while a fast-layer tool runs longer than 700 ms with nothing spoken. Must be `https` on the same origin as `AUGMENTAGENT_PHONE_PUBLIC_URL`, without credentials; anything else fails configuration, even while the layer is off. Unset (default) never plays a sound. |
 | `AUGMENTAGENT_PHONE_PREEMPTIVE` | `1` starts fast-layer answers on interim transcripts and commits them when the final transcript matches (#1555); TwiML then requests `partialPrompts="true"`. Absent or `0` (default) keeps `partialPrompts="false"` and every turn unchanged. Without `AUGMENTAGENT_PHONE_FAST_LAYER=1` it has no effect: native turns never speculate. Other values fail configuration. |
+| `AUGMENTAGENT_PHONE_QUIET_HOURS` | Owner-local window, `HH:MM-HH:MM` (24-hour, may wrap midnight), during which agent-proposed calls (#1553) are deferred to the window's end, never dropped. Default `22:00-08:00`; `off` disables it. Equal start and end or any other value fails configuration. |
+| `AUGMENTAGENT_TIMEZONE` | IANA zone for the quiet hours (shared with other owner-local schedules). Unset uses the host's local time; an unknown zone fails configuration. |
+| `AUGMENTAGENT_PHONE_PROPOSE_CALLS` | `1` lets the proactive runner turn each pass's dispatched follow-ups into one call proposal (#1553). Needs phone calling running with links that name a single owner. Absent (default) or anything else: no proposals. Read by the daemon, not the phone configuration. |
 | `AUGMENTAGENT_PHONE_SILENCE_CHECKIN_1_SECS` | Seconds of silence before the first check-in ("Still there?"), default `12` (#1556). |
 | `AUGMENTAGENT_PHONE_SILENCE_CHECKIN_2_SECS` | Seconds of silence before the second check-in ("I'll hang up in a bit if you're done."), default `25`. |
 | `AUGMENTAGENT_PHONE_SILENCE_END_SECS` | Seconds of silence before the goodbye line and `end`, default `45`. Each of the three silence values must be a whole number in 5–300 and they must be strictly increasing; otherwise configuration fails with a typed `Silence` error naming the variable (never its value). |
@@ -744,6 +747,64 @@ Offline regressions cover each recoverable condition followed by an answered
 prompt, oldest-turn eviction, the ten-frame limit and its reset, the exact
 terminal set and diagnostic redaction. A live owner call that ends only on
 hangup with Twilio status `completed` must still be recorded separately.
+
+## Agent-proposed calls (#1553)
+
+A proactive loop can **ask** for a call; it cannot place one. With
+`AUGMENTAGENT_PHONE_PROPOSE_CALLS=1`, each proactive pass that dispatches
+follow-ups hands one proposal (a reason and at most 5 one-line agenda items,
+the dispatched headlines) to `PhoneService::propose_call`. The
+`augmentagent-proactive` crate sees only its own `CallProposer` trait; it has
+no dependency on `augmentagent-phone` and no crate it depends on re-exports
+the `Telephony` trait (`crates/augmentagent-proactive/tests/no_dial_path.rs`
+checks both with `cargo metadata`).
+
+`propose_call` never dials and never posts by itself. It records the proposal
+in the additive table `phone_call_proposals` after the limits:
+
+- at most one proposal per owner within 4 hours of another, and at most 3 in
+  any rolling 24 hours (declined and expired ones count; refused ones are not
+  recorded);
+- inside the quiet hours (`AUGMENTAGENT_PHONE_QUIET_HOURS`, owner-local) its
+  delivery time moves to the quiet-hours end. Deferred, never dropped.
+
+The phone runtime checks due proposals every 5 s in its own worker,
+independent of post-call summaries (so a deferred one arrives
+within seconds of the quiet hours ending) and posts each once through the
+owner's **private control chat** outbox (idempotency key
+`call-proposal:<id>`):
+
+> I have N things to go over, call now? (yes/no, expires in 15 min)
+> Reason: …
+> - item
+
+The owner's answer is a bare `yes` (`y`, `yes please`, `call now`) or `no`
+(`n`, `no thanks`, `not now`). While a question is open, and for 15 minutes
+after it closes, adapters route these replies to the phone service like other
+phone commands; once the owner has answered, routing stops 15 minutes after
+that answer. The rest of the time a bare `yes` is ordinary chat text.
+Only an authenticated owner reply in the chat the question was posted in
+counts:
+
+- `yes` within 15 minutes of posting accepts the proposal once and dials
+  through the existing `call_owner` path (same grant checks, budget and rate
+  limits as `call me`; request ID `proposal:<id>`). Duplicate `yes` replies
+  get "already requested" with the call's current state and never dial
+  again (they retry the same request ID, so a reservation refused before it
+  was created gets its first attempt).
+- `yes` from another conversation (even another control channel) gets a fixed
+  reply and is ignored; from an unauthorized sender or chat, the usual
+  authorization reply.
+- `yes` after expiry gets a fixed "expired" reply. `no`, or no answer within
+  15 minutes, records a decline.
+- A proposal that could not be posted within an hour of its delivery time
+  expires instead of arriving late.
+
+The accepted proposal's reason and agenda go into the **first phone turn's
+prompt** (fast layer: its system prompt, which every turn of that call keeps;
+native path: the first turn of the call only), with an instruction to open
+with them. They never appear in TwiML,
+the provider dial request or the welcome greeting.
 
 ## Silence and idle policy (#1556)
 

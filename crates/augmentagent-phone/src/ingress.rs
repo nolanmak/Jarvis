@@ -79,6 +79,17 @@ pub trait ConversationAgent: Send + Sync {
     ) -> Result<crate::memory::SummaryDraft, AgentError> {
         Err(AgentError)
     }
+    /// Post an owner notice (#1553: a call proposal) to `origin`'s chat
+    /// through the adapter's durable, idempotent outbox under `key`. Adapters
+    /// without an outbox leave the default and nothing is posted.
+    async fn notify_owner(
+        &self,
+        _origin: &augmentagent_store::phone::PhoneOrigin,
+        _key: &str,
+        _text: &str,
+    ) -> Result<(), AgentError> {
+        Err(AgentError)
+    }
     /// The runtime ended the call itself (#1556): enqueue `text` once to the
     /// originating chat's durable outbox under the idempotency key `key`.
     /// Retried after failure or restart with the same key. Adapters without

@@ -143,7 +143,8 @@ impl Settings {
         .with_silence(silence)
         .with_barge_in(barge_in(&get)?)
         .with_fast_layer(fast)
-        .with_preemptive(preemptive);
+        .with_preemptive(preemptive)
+        .with_proposals(crate::proposals::ProposalPolicy::from_lookup(&get)?);
         let account = required("TWILIO_ACCOUNT_SID")?;
         let token = required("TWILIO_AUTH_TOKEN")?;
         let provider = Arc::new(TwilioClient::new(
