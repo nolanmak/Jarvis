@@ -611,20 +611,21 @@ fn gate_env() -> Vec<(String, String)> {
 /// Shared cargo target dir for gate + builder runs (#692).
 /// `AUGMENTAGENT_GATE_TARGET_DIR` overrides; defaults under `~/.cache`.
 fn gate_target_dir() -> String {
-    std::env::var("AUGMENTAGENT_GATE_TARGET_DIR").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        format!("{home}/.cache/augmentagent-gate-target")
-    })
+    crate::disk::gate_target_dir().to_string_lossy().into_owned()
 }
 
-/// #1407 — refuse a gate that would start on a nearly full disk. The text is
-/// classified `Infra` by [`infra_failure_reason`], so the run is neither
-/// charged to the builder nor cached as a red `main`.
+/// Validate the build filesystem before setting up a gate. Admission then
+/// reclaims storage and checks the floor under its lease; infrastructure
+/// refusals are never charged to a builder or cached as red main.
 fn gate_disk_guard() -> Result<()> {
-    match crate::disk::gate_floor_refusal(Path::new(&gate_target_dir())) {
-        Some(why) => bail!("{why}"),
-        None => Ok(()),
+    // Admission performs cleanup before the final floor check. This early
+    // probe only rejects an unmeasurable filesystem; no stale low-space
+    // refusal may bypass recovery.
+    let target = crate::build_storage::effective_target(&std::env::current_dir()?);
+    if crate::disk::available_bytes(&target).is_none() {
+        bail!("{}: cannot inspect build filesystem", crate::disk::LOW_DISK_REFUSAL);
     }
+    Ok(())
 }
 
 /// True if an env-var name looks like a provider secret (case-insensitive
@@ -664,15 +665,34 @@ async fn run_sandboxed(
     cwd: &Path,
     env: &[(String, String)],
 ) -> Result<(bool, String, String)> {
-    let out = Command::new(cmd)
+    let child = Command::new(cmd)
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .env_clear()
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .output()
-        .await
+        .kill_on_drop(true)
+        .process_group(0)
+        .spawn()
         .with_context(|| format!("spawn (sandboxed) {cmd} {args:?}"))?;
+    // Kill the whole process group on cancellation/pressure, including cargo
+    // underneath the shell pipeline. A dropped output future alone only kills
+    // the shell and can leave a writer alive after its storage lease drops.
+    struct Group(u32);
+    impl Drop for Group {
+        fn drop(&mut self) { unsafe { libc::kill(-(self.0 as i32), libc::SIGKILL) }; }
+    }
+    let _group = Group(child.id().context("spawned gate has no pid")?);
+    let target = env.iter().find(|(k, _)| k == "CARGO_TARGET_DIR")
+        .map(|(_, p)| { let p = PathBuf::from(p); if p.is_absolute() { p } else { cwd.join(p) } });
+    let output = async { Ok::<_, anyhow::Error>(child.wait_with_output().await?) };
+    let out = if let Some(target) = target {
+        crate::build_storage::watch_reserve(&target, output).await?
+    } else {
+        output.await?
+    };
     Ok((
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -4221,6 +4241,26 @@ fn automerge_eligible(author: &str, owner: Option<&str>, authors_csv: Option<&st
     }
 }
 
+#[async_trait::async_trait]
+trait StorageCalls {
+    async fn call_with_storage(&self, opts: &augmentagent_channel_core::ReasonerOpts, prompt: &str) -> Result<String>;
+    async fn call_revision_with_storage(&self, opts: &augmentagent_channel_core::ReasonerOpts, prompt: &str) -> Result<String>;
+}
+
+#[async_trait::async_trait]
+impl StorageCalls for augmentagent_channel_core::FallbackReasoner {
+    async fn call_with_storage(&self, opts: &augmentagent_channel_core::ReasonerOpts, prompt: &str) -> Result<String> {
+        let cwd = opts.cwd.as_deref().context("builder has no working directory")?;
+        let _storage = crate::build_storage::admit(cwd, Path::new(&gate_target_dir())).await?;
+        crate::build_storage::watch_reserve(Path::new(&gate_target_dir()), self.call(opts, prompt)).await
+    }
+    async fn call_revision_with_storage(&self, opts: &augmentagent_channel_core::ReasonerOpts, prompt: &str) -> Result<String> {
+        let cwd = opts.cwd.as_deref().context("builder has no working directory")?;
+        let _storage = crate::build_storage::admit(cwd, Path::new(&gate_target_dir())).await?;
+        crate::build_storage::watch_reserve(Path::new(&gate_target_dir()), self.call_revision(opts, prompt)).await
+    }
+}
+
 fn fix_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
     augmentagent_channel_core::ReasonerOpts {
         system_prompt: SELF_IMPROVE_SYSTEM.to_string(),
@@ -4232,6 +4272,8 @@ fn fix_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
         // test runs re-leaked 4 GB / 4,500 files within two hours.
         env: vec![
             ("CARGO_TARGET_DIR".into(), gate_target_dir()),
+            ("CARGO_PROFILE_DEV_DEBUG".into(), "0".into()),
+            ("CARGO_PROFILE_TEST_DEBUG".into(), "0".into()),
             ("TMPDIR".into(), format!("{}/tmp", gate_target_dir())),
         ],
         allowed_tools: vec![
@@ -4374,6 +4416,7 @@ fn changed_crates(paths: &str) -> Option<Vec<String>> {
 /// pushed or merged; this trims the redundancy, not the bar.
 async fn verification_gate_targeted(worktree: &Path, crates: &[String]) -> Result<()> {
     gate_disk_guard()?;
+    let _storage = crate::build_storage::admit(worktree, &crate::build_storage::effective_target(worktree)).await?;
     let env = gate_env();
     let pkgs: String = crates
         .iter()
@@ -4418,6 +4461,7 @@ async fn gate_for_round(worktree: &Path, changed_paths: &str) -> Result<()> {
 
 async fn verification_gate(worktree: &Path) -> Result<()> {
     gate_disk_guard()?;
+    let _storage = crate::build_storage::admit(worktree, &crate::build_storage::effective_target(worktree)).await?;
     // #300 — Strip provider secrets from the gate's child env. `cargo
     // build`/`npm run build` execute `build.rs`/proc-macros/`npm
     // postinstall`, which the issue body could influence; none need
@@ -4770,6 +4814,7 @@ async fn baseline_failures(
     // Names were validated to Rust-path characters by `failing_tests`.
     let filters = tests.join(" ");
     info!(%pkg_args, %filters, "baseline check: cargo test on origin/main (sandboxed env)");
+    let _storage = crate::build_storage::admit(&worktree, &crate::build_storage::effective_target(&worktree)).await?;
     let env = gate_env();
     let result = run_sandboxed(
         "bash",
@@ -6400,7 +6445,7 @@ async fn resume_draft_pr(
                 let (_ok, hunks, _) = run("git", &["diff"], &worktree).await?;
                 builder_ran = true;
                 match reasoner
-                    .call_revision(
+                    .call_revision_with_storage(
                         &fix_opts(worktree.clone()),
                         &build_conflict_prompt(&issue, &pr_body, &files, &hunks),
                     )
@@ -6603,7 +6648,7 @@ async fn resume_draft_pr(
             rounds_done += 1;
             info!(pr, issue = issue.number, round = rounds_done, lines_now, "resume: shrink round");
             match reasoner
-                .call_revision(
+                .call_revision_with_storage(
                     &fix_opts(worktree.clone()),
                     &build_revise_prompt(&issue, &shrink_findings(lines_now), lines_now, prior_attempts.as_deref()),
                 )
@@ -6683,7 +6728,7 @@ async fn resume_draft_pr(
                     "resume: gate-repair round"
                 );
                 match reasoner
-                    .call_revision(
+                    .call_revision_with_storage(
                         &fix_opts(worktree.clone()),
                         &build_revise_prompt(&issue, &gate_findings(&gate_text), lines_now, prior_attempts.as_deref()),
                     )
@@ -6739,7 +6784,7 @@ async fn resume_draft_pr(
         if rounds_done < revise_rounds() {
             if let Some(findings) = ci_findings.take() {
                 rounds_done += 1;
-                let revised = reasoner.call_revision(&fix_opts(worktree.clone()),
+                let revised = reasoner.call_revision_with_storage(&fix_opts(worktree.clone()),
                     &build_revise_prompt(&issue, &findings, lines_now, prior_attempts.as_deref())).await;
                 match revised {
                     Ok(rs) => {
@@ -7031,7 +7076,7 @@ async fn resume_draft_pr(
             "resume: revising against findings"
         );
         let rev_summary = match reasoner
-            .call_revision(
+            .call_revision_with_storage(
                 &fix_opts(worktree.clone()),
                 &build_revise_prompt(&issue, &findings, lines_now, prior_attempts.as_deref()),
             )
@@ -7766,7 +7811,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     let opts = fix_opts(worktree.clone());
     let prompt =
         build_fix_prompt_with_criteria(&issue, plan.as_deref(), prior_attempts.as_deref(), &criteria);
-    let mut summary = match reasoner.call(&opts, &prompt).await {
+    let mut summary = match reasoner.call_with_storage(&opts, &prompt).await {
         Ok(s) => s,
         Err(err) => {
             // #1030 — classify BEFORE recording anything. A provider can
@@ -7826,7 +7871,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             spent += 1;
             info!(issue = issue.number, "builder made no changes; one follow-up");
             match reasoner
-                .call_revision(&fix_opts(worktree.clone()), &build_no_change_prompt(&issue))
+                .call_revision_with_storage(&fix_opts(worktree.clone()), &build_no_change_prompt(&issue))
                 .await
             {
                 Ok(text) => {
@@ -7978,7 +8023,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         spent += 1;
         let snapshot = snapshot_tree(&worktree).await?;
         match reasoner
-            .call_revision(
+            .call_revision_with_storage(
                 &fix_opts(worktree.clone()),
                 &build_revise_prompt(&issue, &shrink_findings(lines), lines, prior_attempts.as_deref()),
             )
@@ -8092,7 +8137,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             info!(issue = issue.number, round, max_rounds, "initial gate red; repair round");
             let snapshot = snapshot_tree(&worktree).await?;
             match reasoner
-                .call_revision(
+                .call_revision_with_storage(
                     &fix_opts(worktree.clone()),
                     &build_revise_prompt(&issue, &gate_findings(&gate_text), lines, prior_attempts.as_deref()),
                 )
@@ -8262,7 +8307,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             info!(issue = issue.number, round, max_rounds, ?source, "revising against the findings");
             let snapshot = snapshot_tree(&worktree).await?;
             match reasoner
-                .call_revision(
+                .call_revision_with_storage(
                     &fix_opts(worktree.clone()),
                     &build_revise_prompt(&issue, &findings, lines, prior_attempts.as_deref()),
                 )
@@ -8622,7 +8667,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 "commit refused by the personal-data guard; one repair round"
             );
             match reasoner
-                .call_revision(&fix_opts(worktree.clone()), &build_pii_fix_prompt(&hits))
+                .call_revision_with_storage(&fix_opts(worktree.clone()), &build_pii_fix_prompt(&hits))
                 .await
             {
                 Ok(summary_of_fix) => {
@@ -9967,6 +10012,7 @@ async fn verification_gate_for_repo(workspace: &Path, repo: &AgentRepo) -> Resul
     // #300 — same secret-stripping as the single-repo gate: the per-repo
     // `build_cmd` runs attacker-influenceable build scripts and must not
     // inherit provider keys.
+    let _storage = crate::build_storage::admit(workspace, &crate::build_storage::effective_target(workspace)).await?;
     let env = gate_env();
     let (ok, _o, e) = run_sandboxed("bash", &["-lc", &wrapped], workspace, &env).await?;
     if !ok {
@@ -10124,7 +10170,7 @@ async fn process_one_repo(
         "GitHub issue #{} in repo {}: {}\n\n{}\n\nImplement the fix now.",
         issue.number, repo.full_name, issue.title, issue.body
     );
-    let summary = match reasoner.call(&opts, &prompt).await {
+    let summary = match reasoner.call_with_storage(&opts, &prompt).await {
         Ok(s) => s,
         Err(err) => {
             do_cleanup().await;
@@ -14117,7 +14163,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             .expect("gate-repair loop");
         let repair = &body[repair_at..];
         let pre_repair = repair.find("preexisting_on_main(").expect("baseline check before repair");
-        let call = repair.find("call_revision(").expect("repair round");
+        let call = repair.find("call_revision_with_storage(").expect("repair round");
         assert!(pre_repair < call, "baseline check must precede the repair round");
         let gate_at = body
             .find("if let Err(gate_err) = gate_result {")
@@ -18192,7 +18238,7 @@ else:
         let bind = body.find("track_review_history(").expect("history is bound");
         let ask = body.find("select_reviewer(").expect("the lane must ask before spending");
         assert!(bind < ask, "provenance is read after it is bound");
-        for spend in [r#""worktree", "add""#, r#""merge", "--no-edit""#, "verification_gate(", "call_revision("] {
+        for spend in [r#""worktree", "add""#, r#""merge", "--no-edit""#, "verification_gate(", "call_revision_with_storage("] {
             let at = body.find(spend).unwrap_or_else(|| panic!("{spend} is in the lane"));
             assert!(ask < at, "ask before {spend}");
         }
@@ -18698,7 +18744,7 @@ mod iterate_not_delete_tests {
             .find("match after_review(")
             .expect("the decision drives the loop");
         let rest = &body[lp..];
-        let rev = rest.find(".call_revision(").expect("a revision round");
+        let rev = rest.find(".call_revision_with_storage(").expect("a revision round");
         let qa = rest[rev..]
             .find("review_opts(")
             .expect("QA after the revision");

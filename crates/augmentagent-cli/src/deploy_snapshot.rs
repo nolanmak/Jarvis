@@ -32,6 +32,15 @@ const DB_NAME: &str = "data.db.gz";
 const BINARY_NAME: &str = "augmentagent";
 const MANIFEST_NAME: &str = "manifest.json";
 
+fn retention_lease(root: &Path) -> Result<Option<crate::build_storage::Lease>> {
+    use sha2::{Digest, Sha256};
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| {
+        if root.is_absolute() { root.to_path_buf() } else { std::env::current_dir().unwrap_or_default().join(root) }
+    });
+    let key = format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes()));
+    crate::build_storage::Lease::try_at(&crate::build_storage::state_dir()?.join("snapshot-locks").join(key))
+}
+
 pub fn keep_from_env() -> usize {
     std::env::var("AUGMENTAGENT_DEPLOY_KEEP")
         .ok()
@@ -150,10 +159,25 @@ pub fn snapshot(
     git_sha: Option<&str>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<PathBuf> {
+    snapshot_budgeted(db, binary, root, label, git_sha, now, budget_bytes())
+}
+
+fn snapshot_budgeted(db: &Path, binary: Option<&Path>, root: &Path, label: &str,
+    git_sha: Option<&str>, now: chrono::DateTime<chrono::Utc>, budget: u64) -> Result<PathBuf> {
     if !db.is_file() {
         bail!("no database at {}", db.display());
     }
-    let db_bytes = std::fs::metadata(db)?.len();
+    let wal = PathBuf::from(format!("{}-wal", db.to_string_lossy()));
+    let db_bytes = std::fs::metadata(db)?.len().saturating_add(std::fs::metadata(wal).map_or(0, |m| m.len()));
+    std::fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
+    let _lease = retention_lease(root)?.context("snapshot retention/creation busy; retry")?;
+    let refs = crate::snapshot_refs::collect();
+    prune_locked(root, None, &[], &PruneOptions { keep: keep_from_env(), ..Default::default() }, SystemTime::now(), &refs);
+    let binary_bytes = binary.and_then(|b| std::fs::metadata(b).ok()).map_or(0, |m| m.len());
+    let retained = snapshot_items(root, SystemTime::now()).iter().map(|i| i.bytes).sum::<u64>();
+    if retained.saturating_add(db_bytes).saturating_add(binary_bytes) > budget {
+        bail!("snapshot storage budget exhausted (including protected snapshots); prune, unpin obsolete rollbacks, or increase AUGMENTAGENT_DEPLOY_MAX_GB");
+    }
     std::fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
     // `VACUUM INTO` writes a full copy before it is compressed.
     if let Some(free) = crate::disk::available_bytes(root) {
@@ -203,7 +227,11 @@ pub fn snapshot(
                 .with_context(|| format!("copy {}", bin.display()))?;
         }
         let gz_bytes = std::fs::metadata(&gz_path)?.len();
+        if retained.saturating_add(gz_bytes).saturating_add(binary_bytes) > budget {
+            bail!("compressed snapshot exceeds storage budget; incomplete snapshot removed");
+        }
         let manifest = serde_json::json!({
+            "owner": "augmentagent-snapshot-v1",
             "created_at": now.to_rfc3339(),
             "label": sanitize_label(label),
             "git_sha": git_sha,
@@ -219,6 +247,7 @@ pub fn snapshot(
         let _ = std::fs::remove_dir_all(&dir);
         return Err(e);
     }
+    prune_locked(root, None, &[], &PruneOptions { keep: keep_from_env(), ..Default::default() }, SystemTime::now(), &refs);
     Ok(dir)
 }
 
@@ -272,6 +301,7 @@ pub struct Removal {
     pub path: String,
     pub bytes: u64,
     pub removed: bool,
+    pub reason: String,
 }
 
 /// Hand-made backup locations: each child is one backup.
@@ -296,34 +326,129 @@ pub fn prune(
     opts: &PruneOptions,
     now: SystemTime,
 ) -> Vec<Removal> {
+    if !root.exists() && !opts.dry_run {
+        if let Err(error) = std::fs::create_dir_all(root) {
+            return vec![Removal { kind: "retention", path: root.display().to_string(), bytes: 0,
+                removed: false, reason: format!("deferred: cannot prepare snapshot root: {error}") }];
+        }
+    }
+    let lock = retention_lease(root);
+    let Ok(Some(_lease)) = lock else {
+        return vec![Removal { kind: "retention", path: root.display().to_string(), bytes: 0,
+            removed: false, reason: "deferred: retention/creation busy or lock unavailable".into() }];
+    };
+    prune_locked(root, release_dir, strays, opts, now, &crate::snapshot_refs::collect())
+}
+
+fn budget_bytes() -> u64 {
+    let gb = std::env::var("AUGMENTAGENT_DEPLOY_MAX_GB").ok()
+        .and_then(|s| s.parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0).unwrap_or(8.0);
+    (gb * GIB) as u64
+}
+
+fn manifest(path: &Path) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path.join(MANIFEST_NAME)).ok()?).ok()?;
+    // The original helper's manifest is also recognized; arbitrary dirs are not.
+    (value.get("created_at").and_then(|v| v.as_str()).is_some()
+        && value.get("db_bytes").and_then(|v| v.as_u64()).is_some()
+        && (path.join(DB_NAME).is_file() || value.get("external_path").is_some())).then_some(value)
+}
+
+fn external_path(path: &Path) -> Option<PathBuf> {
+    let v = manifest(path)?;
+    let external = PathBuf::from(v.get("external_path")?.as_str()?);
+    if std::fs::canonicalize(&external).ok().as_ref() != Some(&external) { return None; }
+    let marker = external.join(".augmentagent-rollout.json");
+    if std::fs::symlink_metadata(&marker).ok()?.file_type().is_symlink() { return None; }
+    let actual: serde_json::Value = serde_json::from_slice(&std::fs::read(marker).ok()?).ok()?;
+    (actual == v).then_some(external)
+}
+
+fn snapshot_items(root: &Path, now: SystemTime) -> Vec<Item> {
+    items_in(root, now, &|_, is_dir| is_dir).into_iter().filter_map(|mut i| {
+        let p = root.join(&i.name);
+        let m = manifest(&p)?;
+        if m.get("external_path").is_some() {
+            i.bytes += crate::disk::disk_bytes(&external_path(&p)?);
+        }
+        Some(i)
+    }).collect()
+}
+
+fn prune_locked(root: &Path, release_dir: Option<&Path>, strays: &[PathBuf], opts: &PruneOptions,
+    now: SystemTime, refs: &crate::snapshot_refs::References) -> Vec<Removal> {
     let mut out = Vec::new();
     let mut expire = |kind: &'static str, dir: &Path, items: Vec<Item>, min_age: f64, act: bool| {
-        let sizes: std::collections::HashMap<String, u64> =
-            items.iter().map(|i| (i.name.clone(), i.bytes)).collect();
         for name in select_expired(&items, opts.keep, min_age) {
             let path = dir.join(&name);
-            let removed = act && !opts.dry_run && remove(&path);
-            out.push(Removal {
-                kind,
-                path: path.display().to_string(),
-                bytes: sizes.get(&name).copied().unwrap_or(0),
-                removed,
-            });
+            let external = external_path(&path);
+            let bytes = items.iter().find(|i| i.name == name).map_or(0, |i| i.bytes);
+            let blocked = refs.protects(&path) || external.as_deref().is_some_and(|p| refs.protects(p));
+            let removed = !blocked && act && !opts.dry_run
+                && external.as_deref().is_none_or(remove) && remove(&path);
+            let reason = if blocked { "kept: pinned, referenced, or reference probe unavailable" }
+                else if !act || opts.dry_run { "would remove: past count and minimum age" }
+                else if removed { "removed: past count and minimum age" }
+                else { "failed to remove; no recovery claimed" };
+            out.push(Removal { kind, path: path.display().to_string(), bytes, removed, reason: reason.into() });
         }
     };
-    expire("snapshot", root, items_in(root, now, &|_, is_dir| is_dir), MIN_AGE_HOURS, true);
+    expire("snapshot", root, snapshot_items(root, now), MIN_AGE_HOURS, true);
     if let Some(dir) = release_dir {
-        let bins = items_in(dir, now, &|name, is_dir| !is_dir && is_rollback_binary(name));
-        expire("rollback binary", dir, bins, MIN_AGE_HOURS, true);
+        expire("rollback binary", dir, items_in(dir, now, &|name, is_dir| !is_dir && is_rollback_binary(name)), MIN_AGE_HOURS, true);
     }
     if opts.strays {
         for dir in strays {
-            // Manifests and pointers are tiny and say what the binaries were.
-            let items = items_in(dir, now, &|name, _| !name.ends_with(".json"));
-            expire("hand-made backup", dir, items, STRAY_DAYS * 24.0, opts.yes);
+            expire("hand-made backup", dir, items_in(dir, now, &|name, _| !name.ends_with(".json")), STRAY_DAYS * 24.0, opts.yes);
         }
     }
+    let total: u64 = snapshot_items(root, now).iter().map(|i| i.bytes).sum();
+    if total > budget_bytes() {
+        out.push(Removal { kind: "budget", path: root.display().to_string(), bytes: total, removed: false,
+            reason: "over budget: protected/newest snapshots retained; new snapshots refused until headroom restored".into() });
+    }
     out
+}
+
+pub fn set_pin(root: &Path, name: &str, reason: Option<&str>) -> Result<()> {
+    if name.is_empty() || Path::new(name).components().count() != 1 || name == "." || name == ".." {
+        bail!("snapshot name must be a single directory name");
+    }
+    let _lease = retention_lease(root)?.context("retention busy; retry")?;
+    let dir = root.join(name);
+    if std::fs::symlink_metadata(&dir)?.file_type().is_symlink() || manifest(&dir).is_none() { bail!("not an owned snapshot"); }
+    if let Some(reason) = reason {
+        if reason.trim().is_empty() { bail!("pin needs a reason"); }
+        std::fs::write(dir.join(".pin"), reason)?;
+    } else if dir.join(".pin").exists() { std::fs::remove_file(dir.join(".pin"))?; }
+    Ok(())
+}
+
+/// Explicit adoption records ownership, but starts pinned. This neither
+/// copies private backups to a public repo nor assumes an old rollout is safe
+/// to discard. Unpinning later enables the same scheduled retention.
+pub fn adopt_rollout(root: &Path, path: &Path, label: &str) -> Result<PathBuf> {
+    adopt_rollout_at(root, path, label, &crate::build_storage::state_dir()?)
+}
+
+fn adopt_rollout_at(root: &Path, path: &Path, label: &str, state: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(root)?;
+    let _lease = retention_lease(root)?.context("retention busy; retry")?;
+    let path = std::fs::canonicalize(path)?;
+    let state = std::fs::canonicalize(state)?;
+    if path.parent() != Some(&state) || path.join(".git").exists() || path.join("Cargo.toml").exists()
+        || path.join(".augmentagent-rollout.json").exists() {
+        bail!("rollout adoption requires an unregistered direct child of the private state directory");
+    }
+    let name = format!("{}-adopted-{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"), sanitize_label(label));
+    let dir = root.join(name);
+    std::fs::create_dir(&dir)?; restrict(&dir);
+    let value = serde_json::json!({"owner": "augmentagent-snapshot-v1", "created_at": chrono::Utc::now(),
+        "db_bytes": 0, "external_path": path, "label": sanitize_label(label)});
+    std::fs::write(dir.join(".pin"), "Historical rollout: verify rollback dependencies before unpinning")?;
+    std::fs::write(path.join(".augmentagent-rollout.json"), serde_json::to_vec_pretty(&value)?)?;
+    std::fs::write(dir.join(MANIFEST_NAME), serde_json::to_vec_pretty(&value)?)?;
+    Ok(dir)
 }
 
 fn fmt_size(bytes: u64) -> String {
@@ -351,8 +476,7 @@ pub fn run_prune(
         return Ok(());
     }
     for r in &removals {
-        let verb = if r.removed { "removed" } else { "would remove" };
-        writeln!(out, "{verb} {} {} ({})", r.kind, r.path, fmt_size(r.bytes))?;
+        writeln!(out, "{}: {} {} ({})", r.reason, r.kind, r.path, fmt_size(r.bytes))?;
     }
     let (done, pending): (Vec<_>, Vec<_>) = removals.iter().partition(|r| r.removed);
     let sum = |v: &[&Removal]| v.iter().map(|r| r.bytes).sum::<u64>();
@@ -365,13 +489,13 @@ pub fn run_prune(
 
 pub fn run_list(root: &Path, out: &mut dyn Write) -> Result<()> {
     let now = SystemTime::now();
-    let mut items = items_in(root, now, &|_, is_dir| is_dir);
+    let mut items = snapshot_items(root, now);
     items.sort_by(|a, b| a.age_hours.total_cmp(&b.age_hours));
     if items.is_empty() {
         writeln!(out, "no snapshots under {}", root.display())?;
     }
     for i in items {
-        writeln!(out, "{:>9}  {:>6.1} h old  {}", fmt_size(i.bytes), i.age_hours, i.name)?;
+        writeln!(out, "{:>9}  {:>6.1} h old  {}{}", fmt_size(i.bytes), i.age_hours, i.name, if root.join(&i.name).join(".pin").exists() { " [pinned]" } else { "" })?;
     }
     Ok(())
 }
@@ -503,6 +627,8 @@ mod tests {
         for (name, hours) in [("s-old", 200.0), ("s-mid", 100.0), ("s-new", 1.0)] {
             std::fs::create_dir_all(root.join(name)).unwrap();
             std::fs::write(root.join(name).join(DB_NAME), b"x").unwrap();
+            std::fs::write(root.join(name).join(MANIFEST_NAME), br#"{"created_at":"2026-01-01T00:00:00Z","db_bytes":1}"#).unwrap();
+            std::fs::write(root.join(name).join(DB_NAME), b"x").unwrap();
             aged(&root.join(name), hours);
         }
         let release = tmp.path().join("release");
@@ -524,7 +650,8 @@ mod tests {
         }
 
         let opts = PruneOptions { keep: 2, strays: true, ..Default::default() };
-        let done = prune(&root, Some(&release), &[stray.clone()], &opts, SystemTime::now());
+        let refs = crate::snapshot_refs::References { reliable: true, ..Default::default() };
+        let done = prune_locked(&root, Some(&release), &[stray.clone()], &opts, SystemTime::now(), &refs);
         assert!(!root.join("s-old").exists());
         assert!(root.join("s-mid").exists() && root.join("s-new").exists());
         assert!(!release.join("augmentagent.pre-1").exists());
@@ -536,13 +663,13 @@ mod tests {
         assert!(listed.is_empty(), "keep=2 covers both stray binaries: {listed:?}");
 
         let keep1 = PruneOptions { keep: 1, strays: true, ..Default::default() };
-        let listed = prune(&root, Some(&release), &[stray.clone()], &keep1, SystemTime::now());
+        let listed = prune_locked(&root, Some(&release), &[stray.clone()], &keep1, SystemTime::now(), &refs);
         let hand: Vec<_> = listed.iter().filter(|r| r.kind == "hand-made backup").collect();
         assert_eq!(hand.len(), 1);
         assert!(!hand[0].removed && stray.join("2026-old").exists(), "needs --yes");
 
         let yes = PruneOptions { yes: true, ..keep1 };
-        prune(&root, Some(&release), &[stray.clone()], &yes, SystemTime::now());
+        prune_locked(&root, Some(&release), &[stray.clone()], &yes, SystemTime::now(), &refs);
         assert!(!stray.join("2026-old").exists());
         assert!(stray.join("2026-newer").exists() && stray.join("live.json").exists());
     }
@@ -553,11 +680,99 @@ mod tests {
         let root = tmp.path().join("snaps");
         for (name, hours) in [("s-old", 200.0), ("s-new", 1.0)] {
             std::fs::create_dir_all(root.join(name)).unwrap();
+            std::fs::write(root.join(name).join(MANIFEST_NAME), br#"{"created_at":"2026-01-01T00:00:00Z","db_bytes":1}"#).unwrap();
+            std::fs::write(root.join(name).join(DB_NAME), b"x").unwrap();
             aged(&root.join(name), hours);
         }
         let opts = PruneOptions { keep: 1, dry_run: true, ..Default::default() };
-        let out = prune(&root, None, &[], &opts, SystemTime::now());
+        let out = prune_locked(&root, None, &[], &opts, SystemTime::now(), &crate::snapshot_refs::References { reliable: true, ..Default::default() });
         assert_eq!(out.len(), 1);
         assert!(!out[0].removed && root.join("s-old").exists());
     }
+    #[test]
+    fn retention_preserves_pins_references_unknown_dirs_and_unavailable_probes() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        for (name, hours) in [("old-pin", 200.0), ("old-ref", 190.0), ("old-free", 180.0), ("new", 1.0)] {
+            let p = root.join(name); std::fs::create_dir(&p).unwrap();
+            std::fs::write(p.join(DB_NAME), b"data").unwrap();
+            std::fs::write(p.join(MANIFEST_NAME), br#"{"created_at":"2026-01-01T00:00:00Z","db_bytes":4}"#).unwrap();
+            aged(&p, hours);
+        }
+        std::fs::write(root.join("old-pin/.pin"), "rollback in use").unwrap(); aged(&root.join("old-pin"), 200.0);
+        std::fs::create_dir(root.join("unowned")).unwrap(); aged(&root.join("unowned"), 1000.0);
+        let refs = crate::snapshot_refs::References { reliable: true, paths: vec![root.join("old-ref/augmentagent")], ..Default::default() };
+        let opts = PruneOptions { keep: 1, ..Default::default() };
+        let dry = prune_locked(root, None, &[], &PruneOptions { dry_run: true, ..opts.clone() }, SystemTime::now(), &refs);
+        assert!(dry.iter().any(|r| r.path.ends_with("old-free") && r.reason.starts_with("would remove")));
+        assert!(root.join("old-free").exists());
+        let unknown = prune_locked(root, None, &[], &opts, SystemTime::now(), &crate::snapshot_refs::References::default());
+        assert!(unknown.iter().all(|r| !r.removed));
+        let done = prune_locked(root, None, &[], &opts, SystemTime::now(), &refs);
+        assert!(done.iter().any(|r| r.path.ends_with("old-free") && r.removed));
+        assert!(!root.join("old-free").exists());
+        assert!(root.join("old-pin").exists()); assert!(root.join("old-ref").exists());
+        assert!(root.join("unowned").exists()); assert!(root.join("new").exists());
+        assert!(prune_locked(root, None, &[], &opts, SystemTime::now(), &refs).iter().all(|r| !r.removed));
+    }
+
+    #[test]
+    fn service_references_and_pin_name_validation_protect_rollbacks() {
+        let t = tempfile::tempdir().unwrap();
+        let old = t.path().join("rollback");
+        let refs = crate::snapshot_refs::References { reliable: true,
+            config: format!("ExecStart={}/augmentagent", old.display()), ..Default::default() };
+        assert!(refs.protects(&old));
+        assert!(set_pin(t.path(), "../outside", Some("test")).is_err());
+        assert!(set_pin(t.path(), ".", None).is_err());
+    }
+
+    #[test]
+    fn snapshot_budget_refuses_before_growing_protected_storage() {
+        let t = tempfile::tempdir().unwrap(); let db = t.path().join("data.db"); seeded_db(&db, 3);
+        let root = t.path().join("snaps");
+        let err = snapshot_budgeted(&db, None, &root, "budget", None, now(), 1).unwrap_err();
+        assert!(err.to_string().contains("budget"));
+        assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn adopted_rollouts_start_pinned_and_join_accounting_and_retention() {
+        let t = tempfile::tempdir().unwrap(); let state = t.path().join("state");
+        let old = state.join("rollout-old"); std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("data.db"), vec![0; 16384]).unwrap();
+        let root = t.path().join("snaps");
+        let adopted = adopt_rollout_at(&root, &old, "test", &state).unwrap();
+        assert!(adopted.join(".pin").exists()); assert!(old.exists());
+        assert!(snapshot_items(&root, SystemTime::now())[0].bytes >= 16384);
+        let new = root.join("new"); std::fs::create_dir(&new).unwrap();
+        std::fs::write(new.join(DB_NAME), b"db").unwrap();
+        std::fs::write(new.join(MANIFEST_NAME), br#"{"created_at":"2026-01-01T00:00:00Z","db_bytes":2}"#).unwrap();
+        aged(&adopted, 200.0);
+        let refs = crate::snapshot_refs::References { reliable: true, ..Default::default() };
+        let opts = PruneOptions { keep: 1, ..Default::default() };
+        assert!(prune_locked(&root, None, &[], &opts, SystemTime::now(), &refs).iter().all(|r| !r.removed));
+        let name = adopted.file_name().unwrap().to_str().unwrap(); set_pin(&root, name, None).unwrap(); aged(&adopted, 200.0);
+        let pinned_by_service = crate::snapshot_refs::References { reliable: true,
+            config: format!("ExecStart={}/augmentagent", old.display()), ..Default::default() };
+        prune_locked(&root, None, &[], &opts, SystemTime::now(), &pinned_by_service);
+        assert!(old.exists());
+        assert!(prune_locked(&root, None, &[], &opts, SystemTime::now(), &refs).iter().any(|r| r.removed));
+        assert!(!old.exists()); assert!(!adopted.exists()); assert!(new.exists());
+        assert!(adopt_rollout_at(&root, t.path(), "bad", &state).is_err());
+    }
+
+    #[test]
+    fn dry_run_still_lists_rollback_retention_before_the_first_snapshot_exists() {
+        let t = tempfile::tempdir().unwrap(); let root = t.path().join("absent-snapshots");
+        let release = t.path().join("release"); std::fs::create_dir(&release).unwrap();
+        for (name, hours) in [("augmentagent.old", 200.0), ("augmentagent.new", 1.0)] {
+            std::fs::write(release.join(name), b"binary").unwrap(); aged(&release.join(name), hours);
+        }
+        let records = prune(&root, Some(&release), &[], &PruneOptions { keep: 1, dry_run: true, ..Default::default() }, SystemTime::now());
+        assert!(records.iter().any(|r| r.kind == "rollback binary" && r.path.ends_with("augmentagent.old")));
+        assert!(!root.exists(), "dry-run must not create the snapshot root");
+        assert!(release.join("augmentagent.old").exists());
+    }
+
 }

@@ -445,9 +445,8 @@ _gate_min_free_mb() {
 #
 # #1407 — in tiers, cheapest loss first: `incremental/`, then artifacts no
 # compile has needed for GATE_CACHE_STALE_DAYS, and only then the whole
-# `debug/`. The wipe used to be the only step, and it costs the next gate a
-# cold rebuild; it is now the backstop for a binary that predates
-# `disk prune`, fails, or cannot get under the cap.
+# `debug/`, under the pruner's storage lease. An old, failed, or busy pruner
+# defers cleanup; the updater never bypasses exclusion with its own wipe.
 #
 # Every tier keeps the idle-only rule. Cargo takes its build lock per
 # profile dir, but nothing stops a compile from reading an `incremental/`
@@ -481,7 +480,8 @@ trim_gate_cache_if_idle() {
     fi
     sz=$after
   fi
-  _sr_log "gate cache ${sz}MB over ${cap}MB cap and lanes idle; dropping debug/ (next gate cold-rebuilds once)"
-  rm -rf "$GATE_CACHE_DIR/debug"
-  return 0
+  # An old/missing/failed pruner cannot participate in the storage lease.
+  # Never fall back to an uncoordinated rm beneath a newly admitted build.
+  _sr_log "gate cache cleanup deferred: pruner unavailable, busy, or unable to reach ${cap}MB; retrying next tick"
+  return 1
 }

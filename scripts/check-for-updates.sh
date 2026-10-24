@@ -142,7 +142,13 @@ apply_update() {
     #
     # If a new binary is ever referenced from production code, add it here.
     # `grep -rn "target/release/" crates/*/src/*.rs` lists what is expected.
-    if ! cargo build --release -p augmentagent-cli -p augmentagent-mcp-memory >> "$LOG" 2>&1; then
+    # Once available, the deployed binary coordinates release builds with
+    # gates/pruning too. Bootstrap installs still build directly.
+    local build_driver=()
+    if "$DAEMON_BINARY" disk build --help >/dev/null 2>&1; then
+      build_driver=("$DAEMON_BINARY" disk build --target-dir "$REPO_ROOT/target" --)
+    fi
+    if ! "${build_driver[@]}" cargo build --release -p augmentagent-cli -p augmentagent-mcp-memory >> "$LOG" 2>&1; then
       log "RUST BUILD FAILED — not restarting; daemon stays on previous binary"
       exit 1
     fi

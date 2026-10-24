@@ -114,6 +114,27 @@ expect_no_rebuild() {
 
 echo "check-for-updates.sh rebuild trigger:"
 
+# A deployed binary supporting storage admission must wrap the release build.
+make_case crates/augmentagent-cli/src/main.rs
+mkdir -p "$TMP/work/target/release"
+cat > "$TMP/work/target/release/augmentagent" <<'STUB'
+#!/usr/bin/env bash
+if [ "$*" = "disk build --help" ]; then exit 0; fi
+if [ "$1 $2 $3" = "disk build --target-dir" ]; then
+  printf '%s\n' "$*" >> "$STUB_DIR/storage-calls"
+  shift 5
+  exec "$@"
+fi
+exit 1
+STUB
+chmod +x "$TMP/work/target/release/augmentagent"
+if updater_rebuilt && grep -q 'disk build --target-dir .*target -- cargo build --release' "$TMP/storage-calls"; then
+  ok "release build participates in storage admission when supported"
+else
+  bad "release build participates in storage admission when supported" "missing storage wrapper or cargo build"
+fi
+rm -rf "$TMP"
+
 # Control: the pre-existing trigger still fires.
 expect_rebuild crates/augmentagent-channel-core/src/lib.rs
 
