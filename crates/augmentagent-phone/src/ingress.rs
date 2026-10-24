@@ -2,7 +2,7 @@
 //! listener; this router has no agent-tool, credential or arbitrary-proxy route.
 use crate::{
     metrics::TurnTimer,
-    relay::{RelayInput, RelaySession, RelayTurn},
+    relay::{RelayInput, RelaySession, RelayTurn, INVALID_FRAME_LIMIT},
     speech::SpeechStream,
     webhook::WebhookAuth,
     Error, PhoneService,
@@ -22,10 +22,11 @@ use axum::{
 };
 use futures::SinkExt;
 use std::{
+    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, thiserror::Error)]
@@ -588,6 +589,196 @@ async fn receive_setup(
     .map_err(|_| failure("setup_timeout"))?
 }
 
+/// The only conditions that end an authenticated relay (#1549, #1557). Every other
+/// in-call condition is recoverable: it is counted, logged by category and
+/// the loop continues. Adding a variant here is a contract change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndReason {
+    /// The provider closed the WebSocket, or reported a session-terminating
+    /// error code (64104, 64105, 64108) after which the socket is gone.
+    PeerClosed,
+    /// A read or write on the socket failed.
+    TransportError,
+    /// The call left the connected state or a stop was requested, including
+    /// an `end` we sent ourselves.
+    OwnerHangup,
+    /// Call authority can no longer be verified.
+    Revoked,
+    /// The configured maximum call duration elapsed.
+    DurationLimit,
+    /// The agent worker stopped before the connection did.
+    WorkerFailed,
+    /// Ten consecutive invalid incoming frames; `end` was sent first.
+    InvalidFrameLimit,
+    /// Jarvis said goodbye and sent `end` itself (#1557).
+    AgentEnd,
+}
+impl EndReason {
+    pub const ALL: [EndReason; 8] = [
+        EndReason::PeerClosed,
+        EndReason::TransportError,
+        EndReason::OwnerHangup,
+        EndReason::Revoked,
+        EndReason::DurationLimit,
+        EndReason::WorkerFailed,
+        EndReason::InvalidFrameLimit,
+        EndReason::AgentEnd,
+    ];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EndReason::PeerClosed => "peer_closed",
+            EndReason::TransportError => "transport_error",
+            EndReason::OwnerHangup => "owner_hangup",
+            EndReason::Revoked => "revoked",
+            EndReason::DurationLimit => "duration_limit",
+            EndReason::WorkerFailed => "worker_failed",
+            EndReason::InvalidFrameLimit => "invalid_frame_limit",
+            EndReason::AgentEnd => "agent_end",
+        }
+    }
+}
+/// Error codes Twilio documents as ending the ConversationRelay session.
+const TERMINAL_PROVIDER_CODES: [u32; 3] = [64104, 64105, 64108];
+const QUEUE_FULL_RECOVERY_LINE: &str = "Sorry, say that again?";
+const TURN_QUEUE_CAPACITY: usize = 4;
+
+/// Structured record of one recoverable condition: a fixed category plus
+/// counters. It never carries frame content, numbers, speech or signatures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Recoverable {
+    category: &'static str,
+    /// Occurrences of this category during the session.
+    count: u32,
+    /// Current run of consecutive invalid incoming frames.
+    consecutive_invalid: u32,
+    provider_code: Option<u32>,
+}
+#[derive(Default)]
+struct Diagnostics {
+    counts: HashMap<&'static str, u32>,
+}
+impl Diagnostics {
+    fn note(
+        &mut self,
+        category: &'static str,
+        provider_code: Option<u32>,
+        consecutive_invalid: u32,
+    ) -> Recoverable {
+        let count = self.counts.entry(category).or_default();
+        *count = count.saturating_add(1);
+        Recoverable {
+            category,
+            count: *count,
+            consecutive_invalid,
+            provider_code,
+        }
+    }
+}
+fn log_recoverable(call: &PhoneCall, diagnostic: Recoverable) {
+    tracing::warn!(
+        call_id = %call.id,
+        category = diagnostic.category,
+        count = diagnostic.count,
+        consecutive_invalid = diagnostic.consecutive_invalid,
+        provider_code = ?diagnostic.provider_code,
+        "phone relay recoverable condition"
+    );
+}
+enum Classified {
+    Turn(RelayTurn),
+    Interrupted,
+    /// A possible barge-in awaiting the next prompt or the timeout (#1550).
+    InterruptPending,
+    /// A false interruption resolved; the remainder may be resumed.
+    Resumed(Option<crate::relay::Resume>),
+    Ignore,
+    Recoverable {
+        category: &'static str,
+        provider_code: Option<u32>,
+    },
+    /// The provider reported a session-terminating error code.
+    ProviderTerminated(u32),
+    /// The provider refused the configured speech providers before any
+    /// speech and closes after this frame.
+    ProviderRejectedSetup,
+    Terminal(EndReason),
+}
+fn classify(
+    session: &mut RelaySession,
+    incoming: Option<Result<Message, axum::Error>>,
+) -> Classified {
+    match incoming {
+        Some(Ok(Message::Text(frame))) => match session.receive(&frame) {
+            Ok(RelayInput::Turn(turn)) => Classified::Turn(turn),
+            Ok(RelayInput::Interrupted) => Classified::Interrupted,
+            Ok(RelayInput::InterruptPending) => Classified::InterruptPending,
+            Ok(RelayInput::Resumed(resume)) => Classified::Resumed(resume),
+            Ok(RelayInput::Ignore | RelayInput::Ready) => Classified::Ignore,
+            Ok(RelayInput::SetupProviderRejected) => Classified::ProviderRejectedSetup,
+            Ok(RelayInput::ProviderError(code)) if TERMINAL_PROVIDER_CODES.contains(&code) => {
+                Classified::ProviderTerminated(code)
+            }
+            Ok(RelayInput::ProviderError(code)) => Classified::Recoverable {
+                category: "provider_error",
+                provider_code: Some(code),
+            },
+            Err(_) => Classified::Recoverable {
+                category: "invalid_protocol_frame",
+                provider_code: None,
+            },
+        },
+        Some(Ok(Message::Ping(_) | Message::Pong(_))) => Classified::Ignore,
+        Some(Ok(Message::Close(_))) | None => Classified::Terminal(EndReason::PeerClosed),
+        Some(Err(_)) => Classified::Terminal(EndReason::TransportError),
+        Some(Ok(Message::Binary(_))) => {
+            session.note_unsupported_frame();
+            Classified::Recoverable {
+                category: "unsupported_frame",
+                provider_code: None,
+            }
+        }
+    }
+}
+/// Bounded FIFO between the connection loop and the agent worker. Overflow
+/// evicts the oldest waiting turn instead of ending the call.
+#[derive(Default)]
+struct TurnQueue {
+    turns: Mutex<VecDeque<QueuedTurn>>,
+    ready: Notify,
+}
+type QueuedTurn = (Arc<RelayTurn>, Arc<TurnTimer>);
+impl TurnQueue {
+    fn push(&self, turn: QueuedTurn) -> Option<QueuedTurn> {
+        let mut turns = self.turns.lock().unwrap_or_else(|e| e.into_inner());
+        turns.push_back(turn);
+        let dropped = if turns.len() > TURN_QUEUE_CAPACITY {
+            turns.pop_front()
+        } else {
+            None
+        };
+        drop(turns);
+        self.ready.notify_one();
+        dropped
+    }
+    fn pop(&self) -> Option<QueuedTurn> {
+        self.turns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
+    }
+}
+/// Bounded write; `false` means the transport failed.
+async fn write_frame(socket: &mut WebSocket, frame: serde_json::Value) -> bool {
+    matches!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            socket.send(Message::Text(frame.to_string().into()))
+        )
+        .await,
+        Ok(Ok(()))
+    )
+}
+
 async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
     tracing::info!(call_id = %call.id, "phone relay websocket upgraded");
     let Some(sid) = call.provider_sid.as_deref() else {
@@ -626,7 +817,8 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
         let _ = tokio::time::timeout(Duration::from_secs(2), socket.close()).await;
         return;
     }
-    let (turn_tx, mut turn_rx) = mpsc::channel::<(Arc<RelayTurn>, Arc<TurnTimer>)>(4);
+    let queue = Arc::new(TurnQueue::default());
+    let worker_queue = queue.clone();
     let (speech_tx, mut speech_rx) = mpsc::channel::<SpeechEvent>(32);
     let cancel = CancellationToken::new();
     let worker_cancel = cancel.clone();
@@ -650,7 +842,12 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
     });
     let mut worker = tokio::spawn(async move {
         loop {
-            let (turn, timer) = tokio::select! { _=worker_cancel.cancelled()=>break, t=turn_rx.recv()=>match t {Some(t)=>t,None=>break} };
+            let (turn, timer) = loop {
+                if let Some(entry) = worker_queue.pop() {
+                    break entry;
+                }
+                tokio::select! { _=worker_cancel.cancelled()=>return, _=worker_queue.ready.notified()=>{} }
+            };
             if worker_service.authorize_call(&worker_call.id).is_err() {
                 break;
             }
@@ -683,8 +880,9 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
             }
         }
     });
-    let mut feedback = std::collections::HashMap::<String, TurnFeedback>::new();
-    let mut announcements = std::collections::VecDeque::<String>::new();
+    let mut feedback = HashMap::<String, TurnFeedback>::new();
+    let mut diagnostics = Diagnostics::default();
+    let mut announcements = VecDeque::<String>::new();
     // With the fast layer the runtime acknowledgment is only a fallback for a
     // slow first token (#1546); otherwise it keeps #1526's 250 ms.
     let ack_after = if state.service.fast_layer().is_some() {
@@ -705,50 +903,59 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
         tokio::select! {
             incoming=socket.recv()=>{
                 if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
-                match incoming {
-                    Some(Ok(Message::Text(frame)))=>{
-                        let received = session.receive(&frame);
-                        settle_interruption(&mut session, &mut feedback, &mut metrics, &interrupt_tx);
-                        match received {
-                        // The goodbye is out: later owner speech is not answered.
-                        Ok(RelayInput::Turn(_)) if ending.is_some() => {},
-                        Ok(RelayInput::Turn(turn))=>{
-                            let turn=Arc::new(turn);
-                            feedback.insert(turn.id.clone(), TurnFeedback::new(turn.clone()).with_ack_after(ack_after));
-                            let timer = metrics.begin(&turn.id);
-                            if turn_tx.try_send((turn, timer)).is_err() {break "turn_queue_full";}
-                        },
-                        Ok(RelayInput::Interrupted)=>{},
-                        Ok(RelayInput::InterruptPending)=>{
-                            tracing::info!(call_id = %call.id, "phone barge-in pending");
-                        },
-                        Ok(RelayInput::Resumed(resume))=>{
-                            if !write_resume(&mut socket, &mut metrics, resume).await {break "speech_write_failed";}
-                        },
-                        Ok(RelayInput::Ignore)=>{
-                            if let Some(at) = session.take_played_event() { metrics.played(at); }
-                            if session.take_played_final() {
-                                if let Some((_, frame)) = ending.take() { break send_end(&mut socket, frame).await; }
+                let classified = classify(&mut session, incoming);
+                settle_interruption(&mut session, &mut feedback, &mut metrics, &interrupt_tx);
+                match classified {
+                    // The goodbye is out: later owner speech is not answered.
+                    Classified::Turn(_) if ending.is_some() => {},
+                    Classified::Turn(turn)=>{
+                        let turn=Arc::new(turn);
+                        feedback.insert(turn.id.clone(), TurnFeedback::new(turn.clone()).with_ack_after(ack_after));
+                        let timer = metrics.begin(&turn.id);
+                        if let Some((dropped, _))=queue.push((turn, timer)) {
+                            feedback.remove(&dropped.id);
+                            log_recoverable(&call, diagnostics.note("turn_queue_full", None, session.consecutive_invalid_frames()));
+                            // The evicted turn gets one fixed final line; dedup and
+                            // interruption rules apply like any other speech. It is
+                            // recorded as a failed turn, not an answered one.
+                            if let Ok(Some(frame))=session.finish(&dropped, QUEUE_FULL_RECOVERY_LINE) {
+                                if !write_frame(&mut socket, frame).await {break EndReason::TransportError;}
+                                metrics.spoken(&dropped.id, true, true);
                             }
-                        },
-                        Ok(RelayInput::ProviderError(code))=>{
-                            tracing::warn!(call_id = %call.id, provider_code = code, "phone provider error");
-                            if code != 64107 { break "provider_error"; }
-                        },
-                        Ok(RelayInput::SetupProviderRejected)=>{
-                            // The configured STT/TTS selection was refused before
-                            // any speech; Twilio closes after this frame. No turn
-                            // was created, so the agent is never invoked.
-                            tracing::warn!(call_id = %call.id, category = "setup_provider_rejected", "phone provider rejected the configured speech providers");
-                            break "setup_provider_rejected";
-                        },
-                        _=>break "invalid_protocol_frame",
                         }
                     },
-                    Some(Ok(Message::Ping(_)|Message::Pong(_)))=>{},
-                    Some(Ok(Message::Close(_))) | None => break "peer_closed",
-                    Some(Err(_)) => break "transport_error",
-                    _ => break "unsupported_frame",
+                    // Settled above: stale audio is already invalidated.
+                    Classified::Interrupted=>{},
+                    Classified::InterruptPending=>{
+                        tracing::info!(call_id = %call.id, "phone barge-in pending");
+                    },
+                    Classified::Resumed(resume)=>{
+                        if !write_resume(&mut socket, &mut metrics, resume).await {break EndReason::TransportError;}
+                    },
+                    Classified::Ignore=>{
+                        if let Some(at) = session.take_played_event() { metrics.played(at); }
+                        if session.take_played_final() {
+                            if let Some((_, frame)) = ending.take() { break send_end(&mut socket, frame).await; }
+                        }
+                    },
+                    Classified::Recoverable{category,provider_code}=>{
+                        let consecutive=session.consecutive_invalid_frames();
+                        log_recoverable(&call, diagnostics.note(category, provider_code, consecutive));
+                        if consecutive >= INVALID_FRAME_LIMIT {
+                            let _ = write_frame(&mut socket, session.end_frame()).await;
+                            break EndReason::InvalidFrameLimit;
+                        }
+                    },
+                    Classified::ProviderTerminated(code)=>{
+                        tracing::warn!(call_id = %call.id, provider_code = code, "phone provider ended the relay session");
+                        break EndReason::PeerClosed;
+                    },
+                    Classified::ProviderRejectedSetup=>{
+                        // No turn was created, so the agent is never invoked.
+                        tracing::warn!(call_id = %call.id, category = "setup_provider_rejected", "phone provider rejected the configured speech providers");
+                        break EndReason::PeerClosed;
+                    },
+                    Classified::Terminal(reason)=>break reason,
                 }
             },
             _=tokio::time::sleep_until(undecided.unwrap_or_else(tokio::time::Instant::now)), if undecided.is_some()=>{
@@ -756,11 +963,13 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                 let decided = session.poll_false_interrupt();
                 settle_interruption(&mut session, &mut feedback, &mut metrics, &interrupt_tx);
                 if let Some(RelayInput::Resumed(resume)) = decided {
-                    if !write_resume(&mut socket, &mut metrics, resume).await {break "speech_write_failed";}
+                    if !write_resume(&mut socket, &mut metrics, resume).await {break EndReason::TransportError;}
                 }
             },
             output=speech_rx.recv(), if undecided.is_none()=>{
-                let Some(output)=output else {break "speech_worker_closed"};
+                let Some(output)=output else {
+                    break call_end_reason(&state.service, &call).unwrap_or(EndReason::WorkerFailed);
+                };
                 // Nothing is spoken after the goodbye.
                 if ending.is_some() { continue; }
                 let (turn, closes, failed) = match &output {
@@ -770,7 +979,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                         // Bounded; overflow is dropped rather than blocking.
                         if announcements.len() < 8 { announcements.push_back(text.clone()); }
                         if feedback.is_empty() {
-                            if let Err(reason) = flush_announcements(&state.service, &call, &mut session, &mut socket, &mut announcements).await {break reason;}
+                            if let Err(reason) = flush_announcements(&state.service, &call, &mut session, &mut socket, &mut announcements, &mut diagnostics).await {break reason;}
                         }
                         continue;
                     }
@@ -780,7 +989,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                         if let Some(pending) = feedback.get_mut(&turn.id) { pending.acked = true; }
                         if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
                         if let Ok(Some(frame)) = session.speech(turn, utterance_id, text, false) {
-                            if !matches!(tokio::time::timeout(Duration::from_secs(2),socket.send(Message::Text(frame.to_string().into()))).await,Ok(Ok(()))) {break "speech_write_failed";}
+                            if !write_frame(&mut socket, frame).await {break EndReason::TransportError;}
                             tracing::info!(call_id = %call.id, kind = "queue_wait", "phone feedback queued");
                         }
                         continue;
@@ -789,9 +998,10 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                         if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
                         match session.play(turn, source) {
                             Ok(Some(frame))=>{
-                                if !matches!(tokio::time::timeout(Duration::from_secs(2),socket.send(Message::Text(frame.to_string().into()))).await,Ok(Ok(()))) {break "speech_write_failed";}
+                                if !write_frame(&mut socket, frame).await {break EndReason::TransportError;}
                             },
-                            Ok(None)=>{},Err(_)=>break "invalid_speech_output",
+                            Ok(None)=>{},
+                            Err(_)=>log_recoverable(&call, diagnostics.note("invalid_speech_output", None, session.consecutive_invalid_frames())),
                         }
                         continue;
                     }
@@ -799,8 +1009,13 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                         if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
                         feedback.clear();
                         announcements.clear();
-                        let frame = match session.goodbye(turn, goodbye) { Ok(frame) => frame, Err(_) => break "invalid_speech_output" };
-                        if !matches!(tokio::time::timeout(Duration::from_secs(2),socket.send(Message::Text(frame.to_string().into()))).await,Ok(Ok(()))) {break "speech_write_failed";}
+                        // A goodbye that violates the speech contract is dropped like
+                        // any other invalid utterance; the call continues.
+                        let frame = match session.goodbye(turn, goodbye) {
+                            Ok(frame) => frame,
+                            Err(_) => { log_recoverable(&call, diagnostics.note("invalid_speech_output", None, session.consecutive_invalid_frames())); continue }
+                        };
+                        if !write_frame(&mut socket, frame).await {break EndReason::TransportError;}
                         metrics.spoken(&turn.id, true, false);
                         // Only a tokens-played event after the goodbye counts.
                         let _ = session.take_played_final();
@@ -821,13 +1036,15 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                 };
                 match result {
                     Ok(Some(frame))=>{
-                        if !matches!(tokio::time::timeout(Duration::from_secs(2),socket.send(Message::Text(frame.to_string().into()))).await,Ok(Ok(()))) {break "speech_write_failed";}
+                        if !write_frame(&mut socket, frame).await {break EndReason::TransportError;}
                         metrics.spoken(&turn.id, closes, failed);
                     },
-                    Ok(None)=>{},Err(_)=>break "invalid_speech_output",
+                    Ok(None)=>{},
+                    // An agent-side utterance violation drops that output only.
+                    Err(_)=>log_recoverable(&call, diagnostics.note("invalid_speech_output", None, session.consecutive_invalid_frames())),
                 }
                 if feedback.is_empty() && !announcements.is_empty() {
-                    if let Err(reason) = flush_announcements(&state.service, &call, &mut session, &mut socket, &mut announcements).await {break reason;}
+                    if let Err(reason) = flush_announcements(&state.service, &call, &mut session, &mut socket, &mut announcements, &mut diagnostics).await {break reason;}
                 }
             },
             _=tokio::time::sleep_until(end_at.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3_600))), if end_at.is_some() => {
@@ -841,26 +1058,25 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                     let notice = pending.notice();
                     if let Some((utterance,text))=notice {
                         if let Ok(Some(frame))=session.speech(&pending.turn,utterance,text,false) {
-                            if !matches!(tokio::time::timeout(Duration::from_secs(2),socket.send(Message::Text(frame.to_string().into()))).await,Ok(Ok(()))) {break 'connection "feedback_write_failed";}
+                            if !write_frame(&mut socket, frame).await {break 'connection EndReason::TransportError;}
                             tracing::info!(call_id = %call.id, elapsed_ms = elapsed.as_millis() as u64, kind = utterance, "phone feedback queued");
                         }
                     }
                 }
                 if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
                 if feedback.is_empty() && !announcements.is_empty() {
-                    if let Err(reason) = flush_announcements(&state.service, &call, &mut session, &mut socket, &mut announcements).await {break reason;}
+                    if let Err(reason) = flush_announcements(&state.service, &call, &mut session, &mut socket, &mut announcements, &mut diagnostics).await {break reason;}
                 }
             }
         }
     };
-    tracing::info!(call_id = %call.id, reason = end_reason, "phone relay ending");
+    tracing::info!(call_id = %call.id, reason = end_reason.as_str(), "phone relay ending");
     // Nothing more can be spoken: late announcements fail immediately.
     speech_rx.close();
     metrics.finish();
     cancel.cancel();
     drop(interrupt_tx);
     let _ = interrupt_worker.await;
-    drop(turn_tx);
     let _ = state
         .service
         .store
@@ -942,6 +1158,67 @@ mod setup_diagnostic_tests {
         let error = decode_setup(&mut session, r#"{"type":"setup","accountSid":"secret-marker","callSid":"wrong","sessionId":"secret-marker"}"#).unwrap_err();
         assert_eq!(error.reason, "setup_identity_rejected");
         assert!(!format!("{error:?}").contains("secret-marker"));
+    }
+    /// AC5 (#1549): every recoverable in-call condition yields a diagnostic
+    /// carrying only a fixed category and counters, never frame content.
+    #[test]
+    fn recoverable_condition_diagnostics_exclude_raw_frames() {
+        let private = [
+            "secret-marker",
+            "2025550123",
+            "private.example",
+            "description",
+            "mystery",
+            "say that again",
+        ];
+        let mut session = RelaySession::new("call", "AC", "CA");
+        session
+            .receive(r#"{"type":"setup","accountSid":"AC","callSid":"CA","sessionId":"VX"}"#)
+            .unwrap();
+        let mut diagnostics = Diagnostics::default();
+        let frames: [(&str, Option<u32>, Message); 5] = [
+            ("unsupported_frame", None, Message::Binary(b"secret-marker +12025550123".to_vec().into())),
+            ("invalid_protocol_frame", None, Message::Text("{secret-marker +12025550123".into())),
+            ("invalid_protocol_frame", None, Message::Text(r#"{"type":"mystery","voicePrompt":"secret-marker"}"#.into())),
+            ("provider_error", Some(64107), Message::Text(r#"{"type":"error","code":64107,"description":"secret-marker https://private.example/?sig=secret-marker"}"#.into())),
+            ("provider_error", Some(64199), Message::Text(r#"{"type":"error","code":64199,"description":"secret-marker +12025550123"}"#.into())),
+        ];
+        let mut rendered = Vec::new();
+        for (expected, code, frame) in frames {
+            let Classified::Recoverable {
+                category,
+                provider_code,
+            } = classify(&mut session, Some(Ok(frame)))
+            else {
+                panic!("{expected} must be recoverable");
+            };
+            assert_eq!(category, expected);
+            assert_eq!(provider_code, code);
+            rendered.push(format!(
+                "{:?}",
+                diagnostics.note(
+                    category,
+                    provider_code,
+                    session.consecutive_invalid_frames()
+                )
+            ));
+        }
+        let turn_queue_full = diagnostics.note("turn_queue_full", None, 0);
+        assert_eq!(turn_queue_full.count, 1);
+        rendered.push(format!("{turn_queue_full:?}"));
+        rendered.push(format!(
+            "{:?}",
+            diagnostics.note("invalid_speech_output", None, 0)
+        ));
+        assert_eq!(rendered.len(), 7);
+        for diagnostic in &rendered {
+            for marker in private {
+                assert!(!diagnostic.contains(marker), "{diagnostic} leaks {marker}");
+            }
+        }
+        // Provider errors reset the invalid run; only frame failures count.
+        assert_eq!(session.consecutive_invalid_frames(), 0);
+        assert_eq!(diagnostics.note("invalid_protocol_frame", None, 1).count, 3);
     }
     #[test]
     fn provider_rejection_of_voice_setup_is_categorized_without_the_description() {
@@ -1172,69 +1449,67 @@ impl TurnFeedback {
 
 /// Send the agent's `end` message (#1557); the session then closes as
 /// `agent_end`, distinct from an owner hang-up or a transport failure.
-async fn send_end(socket: &mut WebSocket, frame: serde_json::Value) -> &'static str {
-    match tokio::time::timeout(
-        Duration::from_secs(2),
-        socket.send(Message::Text(frame.to_string().into())),
-    )
-    .await
-    {
-        Ok(Ok(())) => "agent_end",
-        _ => "speech_write_failed",
+async fn send_end(socket: &mut WebSocket, frame: serde_json::Value) -> EndReason {
+    if write_frame(socket, frame).await {
+        EndReason::AgentEnd
+    } else {
+        EndReason::TransportError
     }
 }
 
 /// Speak queued fast-layer announcements as complete system turns. Only
 /// called while no owner turn is mid-answer, so talk cycles never interleave.
+/// A rejected announcement is dropped as a recoverable condition.
 async fn flush_announcements(
     service: &PhoneService,
     call: &PhoneCall,
     session: &mut RelaySession,
     socket: &mut WebSocket,
-    announcements: &mut std::collections::VecDeque<String>,
-) -> Result<(), &'static str> {
+    announcements: &mut VecDeque<String>,
+    diagnostics: &mut Diagnostics,
+) -> Result<(), EndReason> {
     while let Some(text) = announcements.pop_front() {
         if let Some(reason) = call_end_reason(service, call) {
             return Err(reason);
         }
         match session.system_speech(&text) {
             Ok(Some(frame)) => {
-                if !matches!(
-                    tokio::time::timeout(
-                        Duration::from_secs(2),
-                        socket.send(Message::Text(frame.to_string().into()))
-                    )
-                    .await,
-                    Ok(Ok(()))
-                ) {
-                    return Err("speech_write_failed");
+                if !write_frame(socket, frame).await {
+                    return Err(EndReason::TransportError);
                 }
             }
             Ok(None) => {}
-            Err(_) => return Err("invalid_speech_output"),
+            Err(_) => log_recoverable(
+                call,
+                diagnostics.note(
+                    "invalid_speech_output",
+                    None,
+                    session.consecutive_invalid_frames(),
+                ),
+            ),
         }
     }
     Ok(())
 }
 
-fn call_end_reason(service: &PhoneService, original: &PhoneCall) -> Option<&'static str> {
+/// Terminal conditions observed outside the socket itself. A store that cannot
+/// confirm call state fails closed as unverifiable authority.
+fn call_end_reason(service: &PhoneService, original: &PhoneCall) -> Option<EndReason> {
     if original
         .answered_ms
         .is_some_and(|at| service.clock.now_ms() - at >= original.max_duration_seconds * 1000)
     {
-        return Some("duration_limit");
+        return Some(EndReason::DurationLimit);
     }
     let Ok(current) = service.store.phone_provider_call(&original.id) else {
-        return Some("call_state_unavailable");
+        tracing::warn!(call_id = %original.id, detail = "call_state_unavailable", "phone relay cannot verify call state");
+        return Some(EndReason::Revoked);
     };
-    if current.stop_requested {
-        return Some("stop_requested");
-    }
-    if current.state != CallState::Connected {
-        return Some("call_ended");
+    if current.stop_requested || current.state != CallState::Connected {
+        return Some(EndReason::OwnerHangup);
     }
     service
         .authorize_call(&original.id)
         .err()
-        .map(|_| "authorization_revoked")
+        .map(|_| EndReason::Revoked)
 }
