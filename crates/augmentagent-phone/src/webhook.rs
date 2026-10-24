@@ -1,6 +1,10 @@
 //! Signed provider callbacks. HTTP adapters must pass every decoded form field,
 //! with no trimming, and reject non-form content types and oversized requests.
-use crate::{twilio::validate_signature, xml, Error, PhoneService};
+use crate::{
+    twilio::validate_signature,
+    voice::{hints, TtsProvider},
+    xml, Error, PhoneService,
+};
 use augmentagent_store::phone::{CallState, PhoneCall, PhoneError, ProviderUsage};
 
 pub struct WebhookAuth {
@@ -206,7 +210,24 @@ impl PhoneService {
         Ok(self.relay_twiml(id))
     }
     fn relay_twiml(&self, id: &str) -> String {
+        // Every attribute value here is startup configuration validated to an
+        // attribute-safe alphabet, or a constant. Nothing from the call, the
+        // provider callback or the agent is read.
         let ws = self.config.public_base.replacen("https://", "wss://", 1);
-        format!("<Response><Connect action=\"{}/phone/relay-ended/{id}\" method=\"POST\"><ConversationRelay url=\"{}/phone/relay/{id}\" ttsProvider=\"Amazon\" voice=\"Joanna\" language=\"en-US\" interruptible=\"any\" reportInputDuringAgentSpeech=\"any\" partialPrompts=\"false\" welcomeGreeting=\"Hi, I'm here. What can I help you with?\" /></Connect><Hangup/></Response>",xml(&self.config.public_base),xml(&ws))
+        let voice = &self.config.voice;
+        let normalization = match voice.tts_provider() {
+            TtsProvider::ElevenLabs => " elevenlabsTextNormalization=\"on\"",
+            TtsProvider::Amazon | TtsProvider::Google => "",
+        };
+        format!(
+            "<Response><Connect action=\"{}/phone/relay-ended/{id}\" method=\"POST\"><ConversationRelay url=\"{}/phone/relay/{id}\" transcriptionProvider=\"{}\" speechModel=\"{}\" ttsProvider=\"{}\" voice=\"{}\" language=\"en-US\"{normalization} hints=\"{}\" interruptible=\"any\" reportInputDuringAgentSpeech=\"any\" partialPrompts=\"false\" welcomeGreeting=\"Hi, I'm here. What can I help you with?\" /></Connect><Hangup/></Response>",
+            xml(&self.config.public_base),
+            xml(&ws),
+            voice.stt_provider().as_str(),
+            xml(voice.stt_model()),
+            voice.tts_provider().as_str(),
+            xml(voice.tts_voice()),
+            xml(&hints(self.config.owner_first_name.as_deref())),
+        )
     }
 }
