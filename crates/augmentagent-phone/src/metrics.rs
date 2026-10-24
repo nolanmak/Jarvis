@@ -18,6 +18,8 @@ struct Marks {
     first_played: Option<Instant>,
     last_played: Option<Instant>,
     tool: Duration,
+    /// Time spent waiting for the shared conversation queue (#1548).
+    queue: Duration,
     fast: bool,
     dispatched: bool,
 }
@@ -93,6 +95,11 @@ impl TurnTimer {
             other => other,
         }
     }
+    /// Time the turn waited for the shared conversation queue (#1548); added
+    /// to the worker pickup wait in `queue_wait_ms`.
+    pub fn add_queue_wait(&self, duration: Duration) {
+        self.update(|m| m.queue = m.queue.saturating_add(duration));
+    }
     pub fn add_tool_time(&self, duration: Duration) {
         self.update(|m| m.tool = m.tool.saturating_add(duration));
     }
@@ -121,7 +128,10 @@ impl TurnTimer {
             recorded_ms,
             provider,
             outcome,
-            queue_wait_ms: offset(self.started, marks.dequeued),
+            // Worker pickup plus any wait for the shared conversation queue.
+            queue_wait_ms: offset(self.started, marks.dequeued).map(|pickup| {
+                pickup.saturating_add(i64::try_from(marks.queue.as_millis()).unwrap_or(i64::MAX))
+            }),
             t_first_token_ms: offset(self.started, marks.first_token),
             t_first_speech_ms,
             t_last_speech_ms: offset(self.started, marks.last_speech),
