@@ -93,6 +93,8 @@ pub enum Error {
     Provider(#[from] ProviderError),
     #[error("phone voice configuration is invalid: {0}")]
     Voice(#[from] voice::VoiceConfigError),
+    #[error("phone silence policy is invalid: {0}")]
+    Silence(#[from] silence::SilenceConfigError),
 }
 impl Error {
     pub fn code(&self) -> &'static str {
@@ -114,7 +116,7 @@ impl Error {
             Self::Store(_) => "storage_error",
             Self::Provider(ProviderError::Rejected) => "provider_rejected",
             Self::Provider(ProviderError::Uncertain) => "provider_uncertain",
-            Self::Voice(_) => "not_configured",
+            Self::Voice(_) | Self::Silence(_) => "not_configured",
         }
     }
 }
@@ -136,6 +138,7 @@ pub struct PhoneConfig {
     barge_in: relay::BargeIn,
     fast: Option<fast::FastLayerConfig>,
     preemptive: bool,
+    silence: silence::SilencePolicy,
 }
 impl PhoneConfig {
     pub fn new(
@@ -178,6 +181,7 @@ impl PhoneConfig {
             barge_in: relay::BargeIn::default(),
             fast: None,
             preemptive: false,
+            silence: silence::SilencePolicy::default(),
         })
     }
     /// Operator-validated speech providers. Only startup configuration may call this.
@@ -195,6 +199,11 @@ impl PhoneConfig {
     /// so #1551 can measure audible latency. Off unless explicitly enabled.
     pub fn with_debug_events(mut self, enabled: bool) -> Self {
         self.debug_events = enabled;
+        self
+    }
+    /// Silence check-in and automatic-end thresholds (#1556).
+    pub fn with_silence(mut self, silence: silence::SilencePolicy) -> Self {
+        self.silence = silence;
         self
     }
     /// Backchannel filter and false-interruption handling (#1550).
@@ -263,6 +272,10 @@ impl PhoneService {
     /// requests interim prompts and the relay may speculate on them.
     pub fn preemptive(&self) -> bool {
         self.config.preemptive && self.config.fast.is_some()
+    }
+    /// Silence check-in and automatic-end thresholds (#1556).
+    pub fn silence_policy(&self) -> silence::SilencePolicy {
+        self.config.silence
     }
     pub fn linked_surface_owners(&self) -> Vec<SurfaceOwnerRef> {
         self.config
@@ -766,3 +779,4 @@ pub mod memory;
 pub mod end_call;
 /// Preemptive generation on interim transcripts (#1555).
 pub mod speculation;
+pub mod silence;

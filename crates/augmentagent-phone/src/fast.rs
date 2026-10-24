@@ -8,7 +8,7 @@
 //! Diagnostics carry only fixed category codes: model output, tool arguments,
 //! chat text, phone numbers and credentials are never logged.
 use crate::end_call::{self, EndCallReason};
-use crate::ingress::{AgentError, CallLine, ConversationAgent, SpeechSender};
+use crate::ingress::{AgentError, CallLine, ConversationAgent, SpeechSender, TaskSpeech};
 use crate::speculation::Speculative;
 use async_trait::async_trait;
 use augmentagent_store::phone::PhoneCall;
@@ -260,7 +260,9 @@ impl TaskEvents {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         if spoken.is_none_or(|at| now.duration_since(at) >= PROGRESS_SPEAK_INTERVAL)
-            && self.log.announce(&text)
+            && self
+                .log
+                .announce(&text, TaskSpeech::Progress(self.task_id.clone()))
         {
             *spoken = Some(now);
         }
@@ -281,15 +283,20 @@ impl TaskEvents {
         let brief = brief(result);
         self.log
             .note(format!("Task {} finished: {brief}", self.task_id));
-        self.log.announce(&format!("Update on your task: {brief}"))
+        self.log.announce(
+            &format!("Update on your task: {brief}"),
+            TaskSpeech::Result(self.task_id.clone()),
+        )
     }
     /// The task failed or its result could not be delivered.
     pub fn failed(&self) -> bool {
         self.settle();
         self.log
             .note(format!("Task {} did not complete.", self.task_id));
-        self.log
-            .announce("That task didn't finish. I left a note in chat.")
+        self.log.announce(
+            "That task didn't finish. I left a note in chat.",
+            TaskSpeech::Result(self.task_id.clone()),
+        )
     }
 }
 
@@ -336,13 +343,14 @@ impl CallLog {
             notes.pop_front();
         }
     }
-    /// Speak outside a turn, only while the call's socket is still open.
-    fn announce(&self, text: &str) -> bool {
+    /// Speak a task update outside a turn, only while the call's socket is
+    /// still open. The tag lets the relay hold its silence clock (#1556).
+    fn announce(&self, text: &str, task: TaskSpeech) -> bool {
         self.line
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
-            .is_some_and(|line| line.announce(text))
+            .is_some_and(|line| line.announce_task(text, task))
     }
 }
 /// First sentences of a result, short enough to speak.

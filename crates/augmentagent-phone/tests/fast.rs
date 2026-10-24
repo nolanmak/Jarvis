@@ -924,7 +924,7 @@ fn system_events(events: &[SpeechEvent]) -> Vec<String> {
     events
         .iter()
         .filter_map(|e| match e {
-            SpeechEvent::System { text } => Some(text.clone()),
+            SpeechEvent::System { text, .. } => Some(text.clone()),
             _ => None,
         })
         .collect()
@@ -2116,4 +2116,43 @@ mod preemptive {
         advance(5_000).await;
         assert!(relay.relay.drain().is_empty());
     }
+}
+
+// #1556: spoken task updates carry their task so the relay can hold its
+// silence clock on progress and release it on the result.
+#[tokio::test(start_paused = true)]
+async fn spoken_task_updates_are_tagged_with_their_task_for_the_silence_clock() {
+    use augmentagent_phone::ingress::TaskSpeech;
+    let done = Arc::new(Notify::new());
+    let backend = progressing_backend(1, Duration::from_secs(1), done.clone());
+    let model = ScriptedModel::new(vec![
+        vec![Step::Tool(
+            "dispatch_task",
+            json!({"description":"draft the reply"}),
+        )],
+        vec![Step::Token("Started.")],
+    ]);
+    let fast = agent(model, backend, FastLayerConfig::default());
+    let mut relay = Relay::new();
+    let (turn_id, speech) = relay.turn("draft it");
+    fast.answer(&call(), &turn_id, "draft it", speech, CancellationToken::new())
+        .await
+        .unwrap();
+    done.notified().await;
+    let task = format!("{turn_id}:dispatch");
+    let tags: Vec<_> = relay
+        .drain()
+        .into_iter()
+        .filter_map(|e| match e {
+            SpeechEvent::System { task, .. } => Some(task),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tags,
+        [
+            Some(TaskSpeech::Progress(task.clone())),
+            Some(TaskSpeech::Result(task))
+        ]
+    );
 }

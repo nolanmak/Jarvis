@@ -147,6 +147,7 @@ pub async fn cleanup_without_runtime(
             barge_in: crate::relay::BargeIn::default(),
             fast: None,
             preemptive: false,
+            silence: crate::silence::SilencePolicy::default(),
         },
     ));
     let initial = service.cleanup_due(true)?;
@@ -177,6 +178,15 @@ async fn memory_worker(
             result = service.run_call_summaries(agent.as_ref()) => {
                 if result.is_err() {
                     tracing::warn!(target: "phone.memory", "phone call summary queue could not be read; retrying");
+                }
+            }
+        }
+        // #1556: end notices whose first delivery failed or was cut short.
+        tokio::select! {
+            _ = stop.cancelled() => return Ok(()),
+            result = service.run_end_notices(agent.as_ref()) => {
+                if result.is_err() {
+                    tracing::warn!(target: "phone.memory", "phone end notice queue could not be read; retrying");
                 }
             }
         }

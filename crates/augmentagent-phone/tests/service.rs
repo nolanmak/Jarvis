@@ -3524,8 +3524,9 @@ fn ac04_terminal_end_reasons_are_exactly_the_documented_set() {
         EndReason::WorkerFailed => "worker_failed",
         EndReason::InvalidFrameLimit => "invalid_frame_limit",
         EndReason::AgentEnd => "agent_end",
+        EndReason::Silence => "silence",
     };
-    assert_eq!(EndReason::ALL.len(), 8);
+    assert_eq!(EndReason::ALL.len(), 9);
     let mut names: Vec<&str> = EndReason::ALL.iter().map(|r| r.as_str()).collect();
     names.sort_unstable();
     let mut expected = vec![
@@ -3537,6 +3538,7 @@ fn ac04_terminal_end_reasons_are_exactly_the_documented_set() {
         "worker_failed",
         "invalid_frame_limit",
         "agent_end",
+        "silence",
     ];
     expected.sort_unstable();
     assert_eq!(names, expected);

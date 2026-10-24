@@ -79,6 +79,9 @@ limits and duplicate-call protections still apply. Private DM entry is optional.
 | `AUGMENTAGENT_PHONE_MAX_TOOL_STEPS` | Tool calls the fast model may make per owner utterance, `1`–`8`, default `3`. Further calls get a typed refusal. Other values fail configuration. |
 | `AUGMENTAGENT_PHONE_THINKING_SOUND_URL` | Optional audio played while a fast-layer tool runs longer than 700 ms with nothing spoken. Must be `https` on the same origin as `AUGMENTAGENT_PHONE_PUBLIC_URL`, without credentials; anything else fails configuration, even while the layer is off. Unset (default) never plays a sound. |
 | `AUGMENTAGENT_PHONE_PREEMPTIVE` | `1` starts fast-layer answers on interim transcripts and commits them when the final transcript matches (#1555); TwiML then requests `partialPrompts="true"`. Absent or `0` (default) keeps `partialPrompts="false"` and every turn unchanged. Without `AUGMENTAGENT_PHONE_FAST_LAYER=1` it has no effect: native turns never speculate. Other values fail configuration. |
+| `AUGMENTAGENT_PHONE_SILENCE_CHECKIN_1_SECS` | Seconds of silence before the first check-in ("Still there?"), default `12` (#1556). |
+| `AUGMENTAGENT_PHONE_SILENCE_CHECKIN_2_SECS` | Seconds of silence before the second check-in ("I'll hang up in a bit if you're done."), default `25`. |
+| `AUGMENTAGENT_PHONE_SILENCE_END_SECS` | Seconds of silence before the goodbye line and `end`, default `45`. Each of the three silence values must be a whole number in 5–300 and they must be strictly increasing; otherwise configuration fails with a typed `Silence` error naming the variable (never its value). |
 
 Synthetic link example (replace identifiers with actual authenticated bindings):
 
@@ -703,7 +706,7 @@ the text never reaches history or the model):
 
 ## Terminal and recoverable relay conditions (#1549)
 
-Once a relay socket is authenticated and claimed, only eight conditions end it.
+Once a relay socket is authenticated and claimed, only nine conditions end it.
 `ingress::EndReason` enumerates them and a wildcard-free test keeps the set
 exact: `peer_closed` (the provider closed the WebSocket, or sent an error code
 Twilio documents as session-terminating: 64104, 64105, 64108), `transport_error`
@@ -711,8 +714,9 @@ Twilio documents as session-terminating: 64104, 64105, 64108), `transport_error`
 state or a stop was requested, including an `end` we sent), `revoked` (call
 authority can no longer be verified; an unreadable call record fails closed the
 same way), `duration_limit`, `worker_failed` (the agent worker stopped before
-the connection did), `invalid_frame_limit` and `agent_end` (Jarvis said goodbye and
-sent `end` itself, #1557). The TwiML is `<Connect>` followed
+the connection did), `invalid_frame_limit`, `agent_end` (Jarvis said goodbye and
+sent `end` itself, #1557) and `silence` (nobody spoke through both check-ins,
+#1556). The TwiML is `<Connect>` followed
 by `<Hangup/>`, so any other exit would hang up on the owner.
 
 Everything else is recoverable and the loop continues:
@@ -740,4 +744,41 @@ Offline regressions cover each recoverable condition followed by an answered
 prompt, oldest-turn eviction, the ten-frame limit and its reset, the exact
 terminal set and diagnostic redaction. A live owner call that ends only on
 hangup with Twilio status `completed` must still be recorded separately.
+
+## Silence and idle policy (#1556)
+
+A connected call with nobody talking no longer runs to the provider time
+limit. The relay keeps a silence clock that starts at the latest of: any owner
+`prompt` (partial or final) or `interrupt`, a closing `text` frame
+(`last:true`) written by Jarvis, and a tokens-played event for that speech
+(with debug events on). With the defaults:
+
+| Silence | Frame |
+| --- | --- |
+| 12 s | `text` "Still there?" (`interruptible:true`, `preemptible:true`) |
+| 25 s | `text` "I'll hang up in a bit if you're done." (same flags) |
+| 45 s | fixed goodbye `text` (not interruptible), then `end` with `handoffData` `{"reason":"silence","call_id":"…"}` |
+
+As for an agent-initiated end (#1557), `end` is sent once the goodbye's
+tokens-played event arrives, or after `PLAYBACK_WAIT` (4 s) without one, so
+the goodbye is not cut off. The relay-ended callback recognizes the `silence`
+handoff.
+
+Check-ins and the goodbye never restart the clock, and neither does a
+tokens-played event for a check-in. While an owner turn is still being
+answered the clock is held. A spoken progress line of a dispatched task (#1546)
+suspends silence handling for 15 s; the task's spoken result (or failure
+notice) releases it and restarts the clock, and an expired hold restarts the
+clock where it lapsed. Owner speech over a check-in is handled by the normal
+interruption rules and restarts the clock.
+
+When the relay ends for silence it persists `end_reason = silence` in
+#1557's `phone_call_end_reasons` (first write wins; a database created before
+`silence` was allowed is rebuilt once on open, keeping its rows), requests the
+stop, then enqueues one message in the originating chat ("Phone call ended
+after 45 seconds of silence.") under the idempotency key
+`{call_id}:silence_end`. Delivery is a leased job (`phone_call_end_notices`:
+three attempts, 60 s doubling lease) that the runtime's memory worker retries
+after a failure or restart; the outbox rejects a replayed key, so the message
+is never duplicated.
 

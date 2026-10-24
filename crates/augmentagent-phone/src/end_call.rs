@@ -119,6 +119,8 @@ pub fn end_reason_from_handoff(data: &str, call_id: &str) -> &'static str {
     match serde_json::from_str::<Handoff>(data) {
         Ok(handoff) if handoff.call_id == call_id => EndCallReason::parse(&handoff.reason)
             .map(EndCallReason::as_str)
+            // #1556: the relay's own silence hangup uses the same handoff.
+            .or((handoff.reason == crate::silence::END_REASON).then_some(crate::silence::END_REASON))
             .unwrap_or(UNKNOWN_END_REASON),
         _ => UNKNOWN_END_REASON,
     }
