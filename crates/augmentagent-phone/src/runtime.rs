@@ -140,6 +140,7 @@ pub async fn cleanup_without_runtime(
             public_base: String::new(),
             verification_key: Vec::new(),
             links: Vec::new(),
+            debug_events: false,
         },
     ));
     let initial = service.cleanup_due(true)?;
