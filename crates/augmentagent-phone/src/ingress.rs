@@ -2,7 +2,9 @@
 //! listener; this router has no agent-tool, credential or arbitrary-proxy route.
 use crate::{
     metrics::TurnTimer,
+    silence::{SilenceAction, SilenceMonitor},
     relay::{RelayInput, RelaySession, RelayTurn, INVALID_FRAME_LIMIT},
+    speculation::{Speculative, Speculator},
     speech::SpeechStream,
     webhook::WebhookAuth,
     Error, PhoneService,
@@ -47,15 +49,25 @@ pub trait ConversationAgent: Send + Sync {
     /// Persist a distinct interrupted-playback marker; do not claim generated
     /// text was fully heard, and do not undo completed tools.
     async fn interrupted(&self, call: &PhoneCall, heard: &str) -> Result<(), AgentError>;
-    /// Whether silence handling is suspended (#1556): the owner is waiting on
-    /// work Jarvis already started, so a quiet line is not an absent owner.
-    fn silence_suspended(&self, _call: &PhoneCall) -> bool {
-        false
+    /// Start a speculative answer for an interim transcript (#1555). Its
+    /// output stays buffered until committed. Only the fast layer speculates;
+    /// by default nothing is started.
+    fn speculate(&self, _call: &PhoneCall, _text: &str) -> Option<Speculative> {
+        None
     }
-    /// The call ended because the line went quiet: report it once in the
-    /// originating chat.
-    async fn silence_ended(&self, _call: &PhoneCall) -> Result<(), AgentError> {
-        Ok(())
+    /// Answer a final prompt whose speculation was committed. By default the
+    /// speculation is dropped and the prompt answered normally.
+    async fn answer_speculated(
+        &self,
+        call: &PhoneCall,
+        turn_id: &str,
+        text: &str,
+        speech: SpeechSender,
+        cancel: CancellationToken,
+        speculation: Speculative,
+    ) -> Result<String, AgentError> {
+        drop(speculation);
+        self.answer(call, turn_id, text, speech, cancel).await
     }
     /// Post-call memory (#1552): run the heavy agent once, with exactly the
     /// request's tools (none), over the transcript mirrored into the call's
@@ -67,6 +79,31 @@ pub trait ConversationAgent: Send + Sync {
     ) -> Result<crate::memory::SummaryDraft, AgentError> {
         Err(AgentError)
     }
+    /// Post an owner notice (#1553: a call proposal) to `origin`'s chat
+    /// through the adapter's durable, idempotent outbox under `key`. Adapters
+    /// without an outbox leave the default and nothing is posted.
+    async fn notify_owner(
+        &self,
+        _origin: &augmentagent_store::phone::PhoneOrigin,
+        _key: &str,
+        _text: &str,
+    ) -> Result<(), AgentError> {
+        Err(AgentError)
+    }
+    /// The runtime ended the call itself (#1556): enqueue `text` once to the
+    /// originating chat's durable outbox under the idempotency key `key`.
+    /// Retried after failure or restart with the same key. Adapters without
+    /// an outbox leave the default, and the notice is never marked delivered.
+    async fn call_ended(&self, _call: &PhoneCall, _key: &str, _text: &str) -> Result<(), AgentError> {
+        Err(AgentError)
+    }
+}
+/// What a spoken system announcement says about a dispatched task (#1556):
+/// progress holds the silence clock, a result releases it. Carries task IDs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskSpeech {
+    Progress(String),
+    Result(String),
 }
 /// One queued speech item for the relay loop. `Utterance` carries an
 /// agent-identified receipt (MCP `speak`); `Token` is one streamed chunk,
@@ -87,7 +124,10 @@ pub enum SpeechEvent {
     },
     /// Fast-layer announcement outside an owner turn (#1546): one complete
     /// spoken `text` frame, sent only while the call is live and idle.
-    System { text: String },
+    System {
+        text: String,
+        task: Option<TaskSpeech>,
+    },
     /// Thinking sound for a slow tool (#1546); preempted by the next text.
     Play { turn: Arc<RelayTurn>, source: String },
     /// Agent-initiated end (#1557): speak `goodbye` as the turn's final
@@ -116,12 +156,22 @@ impl CallLine {
     /// Queue one system announcement. `false` means the call is gone or the
     /// queue is full; nothing was or will be spoken.
     pub fn announce(&self, text: &str) -> bool {
+        self.queue(text, None)
+    }
+    /// Announce a dispatched task's progress or result (#1556).
+    pub fn announce_task(&self, text: &str, task: TaskSpeech) -> bool {
+        self.queue(text, Some(task))
+    }
+    fn queue(&self, text: &str, task: Option<TaskSpeech>) -> bool {
         if text.trim().is_empty() || text.len() > 12_000 {
             return false;
         }
         self.sender.upgrade().is_some_and(|sender| {
             sender
-                .try_send(SpeechEvent::System { text: text.into() })
+                .try_send(SpeechEvent::System {
+                    text: text.into(),
+                    task,
+                })
                 .is_ok()
         })
     }
@@ -173,6 +223,10 @@ impl SpeechSender {
     /// Mark this turn as answered by the fast layer (#1546) for metrics.
     pub fn mark_fast(&self) {
         self.timer.mark_fast();
+    }
+    /// The committed speculation was discarded and the turn re-planned (#1555).
+    pub fn speculation_discarded(&self) {
+        self.timer.speculation_discarded();
     }
     /// Mark this turn as having handed work off (#1546) for metrics.
     pub fn mark_dispatched(&self) {
@@ -611,9 +665,12 @@ pub enum EndReason {
     InvalidFrameLimit,
     /// Jarvis said goodbye and sent `end` itself (#1557).
     AgentEnd,
+    /// Nobody spoke through both check-ins; the fixed goodbye and `end` were
+    /// sent (#1556).
+    Silence,
 }
 impl EndReason {
-    pub const ALL: [EndReason; 8] = [
+    pub const ALL: [EndReason; 9] = [
         EndReason::PeerClosed,
         EndReason::TransportError,
         EndReason::OwnerHangup,
@@ -622,6 +679,7 @@ impl EndReason {
         EndReason::WorkerFailed,
         EndReason::InvalidFrameLimit,
         EndReason::AgentEnd,
+        EndReason::Silence,
     ];
     pub fn as_str(self) -> &'static str {
         match self {
@@ -633,6 +691,7 @@ impl EndReason {
             EndReason::WorkerFailed => "worker_failed",
             EndReason::InvalidFrameLimit => "invalid_frame_limit",
             EndReason::AgentEnd => "agent_end",
+            EndReason::Silence => "silence",
         }
     }
 }
@@ -685,6 +744,8 @@ fn log_recoverable(call: &PhoneCall, diagnostic: Recoverable) {
 }
 enum Classified {
     Turn(RelayTurn),
+    /// Interim recognition for preemptive generation (#1555).
+    Partial(String),
     Interrupted,
     /// A possible barge-in awaiting the next prompt or the timeout (#1550).
     InterruptPending,
@@ -709,6 +770,7 @@ fn classify(
     match incoming {
         Some(Ok(Message::Text(frame))) => match session.receive(&frame) {
             Ok(RelayInput::Turn(turn)) => Classified::Turn(turn),
+            Ok(RelayInput::Partial(text)) => Classified::Partial(text),
             Ok(RelayInput::Interrupted) => Classified::Interrupted,
             Ok(RelayInput::InterruptPending) => Classified::InterruptPending,
             Ok(RelayInput::Resumed(resume)) => Classified::Resumed(resume),
@@ -745,7 +807,8 @@ struct TurnQueue {
     turns: Mutex<VecDeque<QueuedTurn>>,
     ready: Notify,
 }
-type QueuedTurn = (Arc<RelayTurn>, Arc<TurnTimer>);
+/// A turn, its latency record and, when committed (#1555), its speculation.
+type QueuedTurn = (Arc<RelayTurn>, Arc<TurnTimer>, Option<Speculative>);
 impl TurnQueue {
     fn push(&self, turn: QueuedTurn) -> Option<QueuedTurn> {
         let mut turns = self.turns.lock().unwrap_or_else(|e| e.into_inner());
@@ -785,7 +848,8 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
     };
     let mut session = RelaySession::new(&call.id, state.auth.account(), sid)
         .with_debug_events(state.service.config.debug_events)
-        .with_barge_in(state.service.config.barge_in.clone());
+        .with_barge_in(state.service.config.barge_in.clone())
+        .with_partial_prompts(state.service.preemptive());
     let setup_ok = match receive_setup(&mut socket, &mut session).await {
         Ok(control_frames) => {
             tracing::info!(call_id = %call.id, control_frames, "phone relay setup accepted");
@@ -818,6 +882,10 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
     }
     let queue = Arc::new(TurnQueue::default());
     let worker_queue = queue.clone();
+    // Turns queued or being answered. Speculation (#1555) runs only while
+    // this is zero, so it always sees the call's complete history.
+    let busy = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let worker_busy = busy.clone();
     let (speech_tx, mut speech_rx) = mpsc::channel::<SpeechEvent>(32);
     let cancel = CancellationToken::new();
     let worker_cancel = cancel.clone();
@@ -841,7 +909,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
     });
     let mut worker = tokio::spawn(async move {
         loop {
-            let (turn, timer) = loop {
+            let (turn, timer, speculation) = loop {
                 if let Some(entry) = worker_queue.pop() {
                     break entry;
                 }
@@ -853,17 +921,34 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
             timer.dequeued();
             let speech = SpeechSender::with_timer(speech_tx.clone(), turn.clone(), timer.clone());
             let turn_cancel = worker_cancel.child_token();
-            let result = bounded_answer(
-                agent.answer(
-                    &worker_call,
-                    &turn.id,
-                    &turn.text,
-                    speech.clone(),
-                    turn_cancel.clone(),
-                ),
-                &turn_cancel,
-            )
-            .await;
+            let answer = async {
+                match speculation {
+                    Some(speculation) => {
+                        agent
+                            .answer_speculated(
+                                &worker_call,
+                                &turn.id,
+                                &turn.text,
+                                speech.clone(),
+                                turn_cancel.clone(),
+                                speculation,
+                            )
+                            .await
+                    }
+                    None => {
+                        agent
+                            .answer(
+                                &worker_call,
+                                &turn.id,
+                                &turn.text,
+                                speech.clone(),
+                                turn_cancel.clone(),
+                            )
+                            .await
+                    }
+                }
+            };
+            let result = bounded_answer(answer, &turn_cancel).await;
             if worker_cancel.is_cancelled() {
                 break;
             }
@@ -877,11 +962,13 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
             if speech.finish_outcome(failed).await.is_err() {
                 break;
             }
+            worker_busy.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
     });
     let mut feedback = HashMap::<String, TurnFeedback>::new();
     let mut diagnostics = Diagnostics::default();
-    let mut announcements = VecDeque::<String>::new();
+    let mut announcements = VecDeque::<(String, Option<TaskSpeech>)>::new();
+    let mut silence = SilenceMonitor::new(state.service.silence_policy(), tokio::time::Instant::now());
     // With the fast layer the runtime acknowledgment is only a fallback for a
     // slow first token (#1546); otherwise it keeps #1526's 250 ms.
     let ack_after = if state.service.fast_layer().is_some() {
@@ -890,13 +977,18 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
         Duration::from_millis(250)
     };
     let mut metrics = TurnMetricsLedger::new(&state.service, &call);
+    let mut speculator = Speculator::default();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
-    // #1556: the quiet stretch starts with the claimed socket.
-    let mut silence = crate::silence::SilenceClock::new(state.service.silence());
     // #1557: after the agent's goodbye, `end` waits for its tokens-played
     // event or PLAYBACK_WAIT, whichever is first.
     let mut ending: Option<(tokio::time::Instant, serde_json::Value)> = None;
+    // #1556: the pending `end` is a silence hangup, not an agent end.
+    let mut silence_ending = false;
     let end_reason = 'connection: loop {
+        // Owner speech in the frame handled last restarts the silence clock.
+        if session.take_owner_activity() {
+            silence.activity(tokio::time::Instant::now());
+        }
         // While an interruption is undecided (#1550) nothing new is spoken:
         // speech stays queued until the next prompt or the timeout decides.
         let undecided = session.false_interrupt_deadline();
@@ -905,7 +997,6 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
             incoming=socket.recv()=>{
                 if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
                 let classified = classify(&mut session, incoming);
-                if session.take_owner_activity() { silence.reset(); }
                 settle_interruption(&mut session, &mut feedback, &mut metrics, &interrupt_tx);
                 match classified {
                     // The goodbye is out: later owner speech is not answered.
@@ -913,8 +1004,13 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                     Classified::Turn(turn)=>{
                         let turn=Arc::new(turn);
                         feedback.insert(turn.id.clone(), TurnFeedback::new(turn.clone()).with_ack_after(ack_after));
+                        let finalized = speculator.finalize(&turn.text);
                         let timer = metrics.begin(&turn.id);
-                        if let Some((dropped, _))=queue.push((turn, timer)) {
+                        timer.speculation(finalized.speculated, finalized.saved);
+                        busy.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if let Some((dropped, _, _))=queue.push((turn, timer, finalized.speculation)) {
+                            // The evicted turn never runs; its speculation is dropped.
+                            busy.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                             feedback.remove(&dropped.id);
                             log_recoverable(&call, diagnostics.note("turn_queue_full", None, session.consecutive_invalid_frames()));
                             // The evicted turn gets one fixed final line; dedup and
@@ -922,22 +1018,36 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                             // recorded as a failed turn, not an answered one.
                             if let Ok(Some(frame))=session.finish(&dropped, QUEUE_FULL_RECOVERY_LINE) {
                                 if !write_frame(&mut socket, frame).await {break EndReason::TransportError;}
-                                silence.reset();
                                 metrics.spoken(&dropped.id, true, true);
                             }
                         }
                     },
                     // Settled above: stale audio is already invalidated.
-                    Classified::Interrupted=>{},
+                    // After the goodbye nothing new starts (#1557).
+                    Classified::Partial(_) if ending.is_some() => {},
+                    Classified::Partial(text)=>{
+                        // Only while idle: a turn still answering would leave
+                        // the speculation without that turn's history. Also not
+                        // while a barge-in is undecided (#1550): the interruption
+                        // marker is not yet in the history.
+                        if busy.load(std::sync::atomic::Ordering::SeqCst) == 0
+                            && session.false_interrupt_deadline().is_none()
+                        {
+                            speculator.partial(&text, |text| state.agent.speculate(&call, text));
+                        } else {
+                            speculator.reset();
+                        }
+                    },
+                    Classified::Interrupted=>{ speculator.reset(); },
                     Classified::InterruptPending=>{
                         tracing::info!(call_id = %call.id, "phone barge-in pending");
+                        speculator.reset();
                     },
                     Classified::Resumed(resume)=>{
-                        silence.reset();
                         if !write_resume(&mut socket, &mut metrics, resume).await {break EndReason::TransportError;}
                     },
                     Classified::Ignore=>{
-                        if let Some(at) = session.take_played_event() { metrics.played(at); silence.reset(); }
+                        if let Some(at) = session.take_played_event() { metrics.played(at); silence.played(at); }
                         if session.take_played_final() {
                             if let Some((_, frame)) = ending.take() { break send_end(&mut socket, frame).await; }
                         }
@@ -967,7 +1077,6 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                 let decided = session.poll_false_interrupt();
                 settle_interruption(&mut session, &mut feedback, &mut metrics, &interrupt_tx);
                 if let Some(RelayInput::Resumed(resume)) = decided {
-                    silence.reset();
                     if !write_resume(&mut socket, &mut metrics, resume).await {break EndReason::TransportError;}
                 }
             },
@@ -980,12 +1089,11 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                 let (turn, closes, failed) = match &output {
                     SpeechEvent::Utterance { turn, final_output, .. } => (turn, *final_output, false),
                     SpeechEvent::Token { turn, last, failed, .. } => (turn, *last, *failed),
-                    SpeechEvent::System { text } => {
+                    SpeechEvent::System { text, task } => {
                         // Bounded; overflow is dropped rather than blocking.
-                        if announcements.len() < 8 { announcements.push_back(text.clone()); }
+                        if announcements.len() < 8 { announcements.push_back((text.clone(), task.clone())); }
                         if feedback.is_empty() {
-                            if let Err(reason) = flush_announcements(&state.service, &call, &mut session, &mut socket, &mut announcements, &mut diagnostics).await {break reason;}
-                            silence.reset();
+                            if let Err(reason) = flush_announcements(&state.service, &call, &mut session, &mut socket, &mut announcements, &mut diagnostics, &mut silence).await {break reason;}
                         }
                         continue;
                     }
@@ -1022,7 +1130,6 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                             Err(_) => { log_recoverable(&call, diagnostics.note("invalid_speech_output", None, session.consecutive_invalid_frames())); continue }
                         };
                         if !write_frame(&mut socket, frame).await {break EndReason::TransportError;}
-                        silence.reset();
                         metrics.spoken(&turn.id, true, false);
                         // Only a tokens-played event after the goodbye counts.
                         let _ = session.take_played_final();
@@ -1044,16 +1151,15 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                 match result {
                     Ok(Some(frame))=>{
                         if !write_frame(&mut socket, frame).await {break EndReason::TransportError;}
-                        silence.reset();
                         metrics.spoken(&turn.id, closes, failed);
+                        if closes { silence.activity(tokio::time::Instant::now()); }
                     },
                     Ok(None)=>{},
                     // An agent-side utterance violation drops that output only.
                     Err(_)=>log_recoverable(&call, diagnostics.note("invalid_speech_output", None, session.consecutive_invalid_frames())),
                 }
                 if feedback.is_empty() && !announcements.is_empty() {
-                    if let Err(reason) = flush_announcements(&state.service, &call, &mut session, &mut socket, &mut announcements, &mut diagnostics).await {break reason;}
-                    silence.reset();
+                    if let Err(reason) = flush_announcements(&state.service, &call, &mut session, &mut socket, &mut announcements, &mut diagnostics, &mut silence).await {break reason;}
                 }
             },
             _=tokio::time::sleep_until(end_at.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3_600))), if end_at.is_some() => {
@@ -1074,41 +1180,39 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                 }
                 if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
                 if feedback.is_empty() && !announcements.is_empty() {
-                    if let Err(reason) = flush_announcements(&state.service, &call, &mut session, &mut socket, &mut announcements, &mut diagnostics).await {break reason;}
-                    silence.reset();
+                    if let Err(reason) = flush_announcements(&state.service, &call, &mut session, &mut socket, &mut announcements, &mut diagnostics, &mut silence).await {break reason;}
                 }
-                // #1556: a quiet line gets two check-ins and then hangs up.
-                // Nothing is due after the goodbye, while an owner turn is
-                // still being answered, or while the owner is waiting on
-                // dispatched work that is still reporting progress.
+                // #1556: nothing is due after the goodbye is out (#1557).
                 if ending.is_some() {continue;}
-                if !feedback.is_empty() || state.agent.silence_suspended(&call) {silence.reset(); continue;}
-                let Some(action) = silence.poll() else {continue};
-                tracing::info!(call_id = %call.id, stage = ?action, "phone silence stage due");
-                if action != crate::silence::SilenceAction::Goodbye {
-                    // A check-in never resets the clock: it must not postpone
-                    // the stage after it.
-                    if !write_frame(&mut socket, crate::relay::check_in_frame(action.line())).await {break EndReason::TransportError;}
-                    continue;
-                }
-                announcements.clear();
-                // A fixed line, so `system_speech` always yields a frame.
-                if let Ok(Some(frame)) = session.system_speech(crate::silence::GOODBYE_LINE) {
-                    if !write_frame(&mut socket, frame).await {break EndReason::TransportError;}
-                }
-                // Only a tokens-played event after the goodbye counts.
-                let _ = session.take_played_final();
-                let Some(end) = session.end(crate::end_call::EndCallReason::Silence) else {continue};
-                ending = Some((tokio::time::Instant::now() + crate::end_call::PLAYBACK_WAIT, end));
-                // The chat note is best effort: the end reason is recorded by
-                // the relay-ended callback either way.
-                if state.agent.silence_ended(&call).await.is_err() {
-                    tracing::warn!(call_id = %call.id, "phone silence end not reported in chat");
+                // An owner turn still being answered is not silence.
+                let now = tokio::time::Instant::now();
+                if !feedback.is_empty() || !announcements.is_empty() {
+                    silence.activity(now);
+                } else if let Some(action) = silence.poll(now) {
+                    if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
+                    match speak_silence_action(&call, &mut session, &mut socket, action).await {
+                        Ok(Some(end)) => {
+                            // Like an agent end (#1557): `end` follows once the
+                            // goodbye has played, or after PLAYBACK_WAIT.
+                            silence_ending = true;
+                            ending = Some((now + crate::end_call::PLAYBACK_WAIT, end));
+                        }
+                        Ok(None) => {}
+                        Err(reason) => break reason,
+                    }
                 }
             }
         }
     };
+    let end_reason = if silence_ending && end_reason == EndReason::AgentEnd { EndReason::Silence } else { end_reason };
     tracing::info!(call_id = %call.id, reason = end_reason.as_str(), "phone relay ending");
+    // #1556: persist a runtime-chosen end before anything else can fail.
+    let ended_by_silence = end_reason == EndReason::Silence
+        && state
+            .service
+            .store
+            .phone_record_end_with_notice(&call.id, SILENCE_END, state.service.clock.now_ms())
+            .is_ok();
     // Nothing more can be spoken: late announcements fail immediately.
     speech_rx.close();
     metrics.finish();
@@ -1120,6 +1224,13 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
         .store
         .phone_request_stop(&call.owner, &call.id);
     let _ = tokio::time::timeout(Duration::from_secs(2), socket.close()).await;
+    if ended_by_silence {
+        // One chat notice; the memory worker retries a failed attempt.
+        let _ = state
+            .service
+            .deliver_end_notice(state.agent.as_ref(), &call, SILENCE_END)
+            .await;
+    }
     // The bridge receives cancellation first so native session claims can be
     // resolved and provider children reaped before a bounded forced abort.
     if tokio::time::timeout(Duration::from_secs(5), &mut worker)
@@ -1442,6 +1553,9 @@ impl<'a> TurnMetricsLedger<'a> {
             t_last_played_ms = record.t_last_played_ms,
             audible_delta_ms = record.audible_delta_ms,
             commit_sha = record.commit_sha.as_deref(),
+            speculated = record.speculated,
+            speculation_committed = record.speculation_committed,
+            speculation_saved_ms = record.speculation_saved_ms,
             "phone turn metrics"
         );
         if let Err(error) = self.service.store.phone_record_turn_metrics(&record) {
@@ -1503,10 +1617,11 @@ async fn flush_announcements(
     call: &PhoneCall,
     session: &mut RelaySession,
     socket: &mut WebSocket,
-    announcements: &mut VecDeque<String>,
+    announcements: &mut VecDeque<(String, Option<TaskSpeech>)>,
     diagnostics: &mut Diagnostics,
+    silence: &mut SilenceMonitor,
 ) -> Result<(), EndReason> {
-    while let Some(text) = announcements.pop_front() {
+    while let Some((text, task)) = announcements.pop_front() {
         if let Some(reason) = call_end_reason(service, call) {
             return Err(reason);
         }
@@ -1514,6 +1629,11 @@ async fn flush_announcements(
             Ok(Some(frame)) => {
                 if !write_frame(socket, frame).await {
                     return Err(EndReason::TransportError);
+                }
+                let now = tokio::time::Instant::now();
+                match &task {
+                    Some(task) => silence.task_spoken(task, now),
+                    None => silence.activity(now),
                 }
             }
             Ok(None) => {}
@@ -1528,6 +1648,38 @@ async fn flush_announcements(
         }
     }
     Ok(())
+}
+
+/// Relay end reason for a silence hangup (#1556).
+const SILENCE_END: &str = crate::silence::END_REASON;
+
+/// Write a check-in, or the fixed goodbye. For the goodbye, returns the
+/// `end` frame (`handoffData` reason `silence`) to send once it has played.
+async fn speak_silence_action(
+    call: &PhoneCall,
+    session: &mut RelaySession,
+    socket: &mut WebSocket,
+    action: SilenceAction,
+) -> Result<Option<serde_json::Value>, EndReason> {
+    let frame = match action {
+        SilenceAction::CheckIn(line) => session.check_in(line),
+        SilenceAction::Goodbye(line) => session.silence_goodbye(line),
+    };
+    if !write_frame(socket, frame).await {
+        return Err(EndReason::TransportError);
+    }
+    match action {
+        SilenceAction::CheckIn(_) => {
+            tracing::info!(call_id = %call.id, kind = "silence_check_in", "phone silence check-in");
+            Ok(None)
+        }
+        SilenceAction::Goodbye(_) => {
+            tracing::info!(call_id = %call.id, reason = SILENCE_END, "phone relay ending call for silence");
+            // Only a tokens-played event after the goodbye counts.
+            let _ = session.take_played_final();
+            Ok(session.end_for_silence())
+        }
+    }
 }
 
 /// Terminal conditions observed outside the socket itself. A store that cannot

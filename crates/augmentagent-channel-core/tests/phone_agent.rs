@@ -929,6 +929,36 @@ mod fast {
         assert!(fast.uses_fast_layer());
     }
 
+    // #1555: only the fast layer speculates. The native bridge never starts
+    // one; a committed speculation is answered through the fast layer without
+    // a second model request.
+    #[tokio::test]
+    async fn preemptive_speculation_runs_only_on_the_fast_layer() {
+        let f = connected().await;
+        let plain = PhoneAgent::new(
+            f.store.clone(),
+            f.service.clone(),
+            Arc::new(MarkdownAgent),
+            Arc::new(OutboxIo { store: f.store.clone() }),
+            "/fixture".into(),
+            Arc::new(|_| Ok(Some(ProviderKind::Claude))),
+        );
+        assert!(plain.speculate(&f.call, "what's on my calendar tomorrow").is_none());
+        let model = Scripted::new(vec![vec![token("You're free tomorrow.")]]);
+        let bridge = bridge(&f, Arc::new(MarkdownAgent), model.clone());
+        let speculation = bridge
+            .speculate(&f.call, "what's on my calendar tomorrow")
+            .expect("the fast layer speculates");
+        let final_text = "what's on my calendar tomorrow?";
+        let (turn_id, speech, _rx) = speech_for(&f.call.id, final_text);
+        let answer = bridge
+            .answer_speculated(&f.call, &turn_id, final_text, speech, CancellationToken::new(), speculation)
+            .await
+            .unwrap();
+        assert_eq!(answer, "You're free tomorrow.");
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+    }
+
     /// Heavy agent that reports progress from inside the dispatched turn.
     struct ProgressHeavy {
         accepted: Mutex<Vec<bool>>,
@@ -972,7 +1002,7 @@ mod fast {
         assert_eq!(all.iter().filter(|s| s.idempotency_key == key).count(), 1);
         let mut announced = Vec::new();
         while let Ok(event) = rx.try_recv() {
-            if let SpeechEvent::System { text } = event {
+            if let SpeechEvent::System { text, .. } = event {
                 announced.push(text);
             }
         }
@@ -1415,5 +1445,164 @@ mod queue {
             .await
             .unwrap();
         assert_eq!(gate.acquire_calls(), before + 1, "the spy sees the native path");
+    }
+}
+
+/// #1553: agent-proposed calls through the native bridge.
+mod proposals {
+    use super::fast::{sends, speech_for, token, OutboxIo, Scripted};
+    use super::*;
+    use augmentagent_phone::{
+        fast::FastLayerConfig,
+        ingress::ConversationAgent,
+        proposals::{ProposalPolicy, AGENDA_INSTRUCTION},
+    };
+    use augmentagent_store::phone::PhoneCall;
+
+    struct Questions(Mutex<Vec<String>>);
+    #[async_trait]
+    impl QueryHandler for Questions {
+        async fn answer(&self, _: &AuditCtx, question: &str) -> anyhow::Result<String> {
+            self.0.lock().unwrap().push(question.into());
+            Ok("Noted.".into())
+        }
+    }
+
+    struct Proposed {
+        _dir: tempfile::TempDir,
+        store: Arc<Store>,
+        service: Arc<PhoneService>,
+        origin: PhoneOrigin,
+        proposal_id: String,
+    }
+    fn proposed() -> Proposed {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("db")).unwrap());
+        let account =
+            SurfaceAccountRef::new(SurfacePlatform::new("slack").unwrap(), "team").unwrap();
+        let owner = SurfaceOwnerRef::new(account.clone(), "owner").unwrap();
+        let chat = SurfaceConversationRef::new(account, "dm", None).unwrap();
+        store.bind_surface_owner(&owner, 0).unwrap();
+        store
+            .set_surface_control_conversation(&chat, ControlConversationKind::Direct, 0)
+            .unwrap();
+        store
+            .phone_import_destination("owner", "+12025550123", 0)
+            .unwrap();
+        let service = Arc::new(PhoneService::new(
+            store.clone(),
+            Arc::new(TestPhone),
+            Arc::new(TestClock),
+            PhoneConfig::new(
+                true,
+                "https://phone.example.test",
+                "test-verification-key-separate-32bytes",
+                vec![OwnerLink {
+                    surface_owner: owner.clone(),
+                    owner_id: "owner".into(),
+                }],
+            )
+            .unwrap()
+            // The fixed test clock sits at midnight UTC: no quiet hours here.
+            .with_proposals(ProposalPolicy::new(None, None)),
+        ));
+        let receipt = service
+            .propose_call(
+                "owner",
+                "Two follow-ups are due",
+                &["Reply to the venue".into(), "Confirm Friday dinner".into()],
+            )
+            .unwrap();
+        Proposed {
+            _dir: dir,
+            store,
+            service,
+            origin: PhoneOrigin {
+                owner,
+                conversation: chat,
+            },
+            proposal_id: receipt.id,
+        }
+    }
+    fn agent(p: &Proposed, heavy: Arc<dyn QueryHandler>) -> PhoneAgent {
+        PhoneAgent::new(
+            p.store.clone(),
+            p.service.clone(),
+            heavy,
+            Arc::new(OutboxIo {
+                store: p.store.clone(),
+            }),
+            "/fixture".into(),
+            Arc::new(|_| Ok(Some(ProviderKind::Claude))),
+        )
+    }
+    /// Post the question through `agent`, answer `yes` in the private chat and
+    /// connect the resulting call.
+    async fn accepted_call(p: &Proposed, agent: &PhoneAgent) -> PhoneCall {
+        assert_eq!(p.service.deliver_call_proposals(agent).await.unwrap(), 1);
+        let reply = augmentagent_phone::commands::execute(
+            &p.service,
+            &p.origin.owner,
+            &p.origin.conversation,
+            "evt-yes",
+            "yes",
+        )
+        .await
+        .unwrap();
+        assert!(reply.starts_with("Calling you now."), "{reply}");
+        let call = p.store.phone_latest_call("owner").unwrap().unwrap();
+        p.store
+            .phone_provider_event(&call.id, "CA-test", CallState::AwaitingAcceptance, 100)
+            .unwrap();
+        p.store.phone_accept(&call.id, "CA-test", 100).unwrap();
+        p.store.phone_provider_call(&call.id).unwrap()
+    }
+
+    // AC1: the question goes through the chat's durable outbox exactly once.
+    #[tokio::test]
+    async fn proposal_question_is_posted_once_through_the_chat_outbox() {
+        let p = proposed();
+        let agent = agent(&p, Arc::new(Questions(Mutex::new(Vec::new()))));
+        assert_eq!(p.service.deliver_call_proposals(&agent).await.unwrap(), 1);
+        assert_eq!(p.service.deliver_call_proposals(&agent).await.unwrap(), 0);
+        let key = format!("call-proposal:{}", p.proposal_id);
+        let posted = sends(&p.store, &p.origin, &key);
+        assert_eq!(posted.len(), 1, "{posted:?}");
+        assert!(posted[0].starts_with("I have 2 things to go over, call now?"));
+        assert!(p.store.phone_latest_call("owner").unwrap().is_none(), "no call yet");
+    }
+
+    // AC5, native path: the first turn of the accepted call opens with the agenda.
+    #[tokio::test]
+    async fn native_first_turn_carries_the_proposal_agenda() {
+        let p = proposed();
+        let questions = Arc::new(Questions(Mutex::new(Vec::new())));
+        let agent = agent(&p, questions.clone());
+        let call = accepted_call(&p, &agent).await;
+        for (turn, text) in [("phone:turn-1", "hello"), ("phone:turn-2", "next")] {
+            agent.run(&call, turn, text, None, CancellationToken::new()).await.unwrap();
+        }
+        let questions = questions.0.lock().unwrap();
+        assert!(questions[0].contains(AGENDA_INSTRUCTION), "{}", questions[0]);
+        assert!(questions[0].contains("- Reply to the venue\n- Confirm Friday dinner"));
+        assert!(!questions[1].contains("Reply to the venue"), "{}", questions[1]);
+    }
+
+    // AC5, fast path: the fast layer's first prompt carries the agenda.
+    #[tokio::test]
+    async fn fast_first_turn_carries_the_proposal_agenda() {
+        let p = proposed();
+        let model = Scripted::new(vec![vec![token("I called about the venue.")]]);
+        let agent = agent(&p, Arc::new(Questions(Mutex::new(Vec::new()))))
+            .with_fast_layer(model.clone(), FastLayerConfig::default());
+        let call = accepted_call(&p, &agent).await;
+        let (turn_id, speech, _rx) = speech_for(&call.id, "hey");
+        agent
+            .answer(&call, &turn_id, "hey", speech, CancellationToken::new())
+            .await
+            .unwrap();
+        let systems = model.systems.lock().unwrap();
+        assert!(systems[0].contains(AGENDA_INSTRUCTION), "{}", systems[0]);
+        assert!(systems[0].contains("- Reply to the venue\n- Confirm Friday dinner"));
     }
 }

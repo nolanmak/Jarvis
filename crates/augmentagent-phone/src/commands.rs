@@ -133,7 +133,11 @@ pub fn sets_number(text: &str) -> bool {
     number_statement(text).is_some() || words(text).is_some_and(|w| matches!(w.as_slice(), [_, "number", "set", _]))
 }
 pub fn recognizes(text: &str) -> bool {
-    profile_command(text).is_some() || number_statement(text).is_some() || words(text).is_some()
+    profile_command(text).is_some()
+        || number_statement(text).is_some()
+        || words(text).is_some()
+        // #1553: a bare yes/no only while a call proposal awaits an answer.
+        || (crate::proposals::window_open() && crate::proposals::consent(text).is_some())
 }
 pub fn sensitive(text: &str) -> bool {
     number_statement(text).is_some() || words(text).is_some_and(|w| w.get(1).is_some_and(|w| w.eq_ignore_ascii_case("number")))
@@ -150,12 +154,20 @@ pub async fn execute(
 ) -> Option<String> {
     let profile = profile_command(text);
     let statement = if profile.is_some() { None } else { number_statement(text) };
-    let w = if statement.is_some() || profile.is_some() { vec![] } else { words(text)? };
+    let consent = if profile.is_none() && statement.is_none() && service.consent_window_open() {
+        crate::proposals::consent(text)
+    } else {
+        None
+    };
+    let w = if statement.is_some() || profile.is_some() || consent.is_some() { vec![] } else { words(text)? };
     let grant = match service.authorize(owner, conversation) {
         Ok(g) => g,
         Err(crate::Error::Unauthorized) => return Some(format!("Phone owner authorization is required in this chat. {SETUP_HELP}")),
         Err(e) => return Some(e.to_string()),
     };
+    if let Some(accept) = consent {
+        return Some(service.answer_proposal(&grant, accept).await.unwrap_or_else(|e| e.to_string()));
+    }
     if let Some(command) = profile {
         return Some(profile_reply(service, &grant, command).unwrap_or_else(|e| e.to_string()));
     }

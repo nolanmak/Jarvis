@@ -93,6 +93,8 @@ pub enum Error {
     Provider(#[from] ProviderError),
     #[error("phone voice configuration is invalid: {0}")]
     Voice(#[from] voice::VoiceConfigError),
+    #[error("phone silence policy is invalid: {0}")]
+    Silence(#[from] silence::SilenceConfigError),
 }
 impl Error {
     pub fn code(&self) -> &'static str {
@@ -114,7 +116,7 @@ impl Error {
             Self::Store(_) => "storage_error",
             Self::Provider(ProviderError::Rejected) => "provider_rejected",
             Self::Provider(ProviderError::Uncertain) => "provider_uncertain",
-            Self::Voice(_) => "not_configured",
+            Self::Voice(_) | Self::Silence(_) => "not_configured",
         }
     }
 }
@@ -134,8 +136,10 @@ pub struct PhoneConfig {
     owner_first_name: Option<String>,
     debug_events: bool,
     barge_in: relay::BargeIn,
-    silence: silence::SilencePolicy,
     fast: Option<fast::FastLayerConfig>,
+    preemptive: bool,
+    proposals: proposals::ProposalPolicy,
+    silence: silence::SilencePolicy,
 }
 impl PhoneConfig {
     pub fn new(
@@ -176,9 +180,16 @@ impl PhoneConfig {
             owner_first_name: None,
             debug_events: false,
             barge_in: relay::BargeIn::default(),
-            silence: silence::SilencePolicy::default(),
             fast: None,
+            preemptive: false,
+            proposals: proposals::ProposalPolicy::default(),
+            silence: silence::SilencePolicy::default(),
         })
+    }
+    /// Quiet hours and owner time zone for agent-proposed calls (#1553).
+    pub fn with_proposals(mut self, proposals: proposals::ProposalPolicy) -> Self {
+        self.proposals = proposals;
+        self
     }
     /// Operator-validated speech providers. Only startup configuration may call this.
     pub fn with_voice(mut self, voice: voice::VoiceConfig) -> Self {
@@ -197,19 +208,25 @@ impl PhoneConfig {
         self.debug_events = enabled;
         self
     }
-    /// Backchannel filter and false-interruption handling (#1550).
-    pub fn with_barge_in(mut self, barge_in: relay::BargeIn) -> Self {
-        self.barge_in = barge_in;
-        self
-    }
     /// Check-in and automatic-end thresholds for a quiet line (#1556).
     pub fn with_silence(mut self, silence: silence::SilencePolicy) -> Self {
         self.silence = silence;
         self
     }
+    /// Backchannel filter and false-interruption handling (#1550).
+    pub fn with_barge_in(mut self, barge_in: relay::BargeIn) -> Self {
+        self.barge_in = barge_in;
+        self
+    }
     /// Answer utterances with the fast conversational layer (#1546).
     pub fn with_fast_layer(mut self, fast: Option<fast::FastLayerConfig>) -> Self {
         self.fast = fast;
+        self
+    }
+    /// Preemptive generation on interim transcripts (#1555). Takes effect only
+    /// together with the fast layer.
+    pub fn with_preemptive(mut self, enabled: bool) -> Self {
+        self.preemptive = enabled;
         self
     }
 }
@@ -229,6 +246,13 @@ pub struct PhoneService {
     config: PhoneConfig,
     stopping: std::sync::atomic::AtomicBool,
     cleanup_inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Whether this service holds an open call-proposal answer window (#1553).
+    consent_window: std::sync::atomic::AtomicBool,
+}
+impl Drop for PhoneService {
+    fn drop(&mut self) {
+        self.set_consent_window(false);
+    }
 }
 impl PhoneService {
     pub fn new(
@@ -244,6 +268,7 @@ impl PhoneService {
             config,
             stopping: std::sync::atomic::AtomicBool::new(false),
             cleanup_inflight: Arc::new(std::sync::Mutex::new(Default::default())),
+            consent_window: std::sync::atomic::AtomicBool::new(false),
         }
     }
     /// Explicit operator-configured identities, for installing transport adapters
@@ -254,12 +279,18 @@ impl PhoneService {
     pub fn debug_events(&self) -> bool {
         self.config.debug_events
     }
-    pub fn silence(&self) -> silence::SilencePolicy {
-        self.config.silence
-    }
     /// Fast-layer settings when `AUGMENTAGENT_PHONE_FAST_LAYER=1` (#1546).
     pub fn fast_layer(&self) -> Option<&fast::FastLayerConfig> {
         self.config.fast.as_ref()
+    }
+    /// `AUGMENTAGENT_PHONE_PREEMPTIVE=1` on the fast layer (#1555): TwiML
+    /// requests interim prompts and the relay may speculate on them.
+    pub fn preemptive(&self) -> bool {
+        self.config.preemptive && self.config.fast.is_some()
+    }
+    /// Silence check-in and automatic-end thresholds (#1556).
+    pub fn silence_policy(&self) -> silence::SilencePolicy {
+        self.config.silence
     }
     pub fn linked_surface_owners(&self) -> Vec<SurfaceOwnerRef> {
         self.config
@@ -578,7 +609,6 @@ pub mod twilio;
 pub mod webhook;
 
 pub mod relay;
-pub mod silence;
 pub mod speech;
 pub mod voice;
 
@@ -762,3 +792,8 @@ pub mod fast;
 
 pub mod memory;
 pub mod end_call;
+/// Preemptive generation on interim transcripts (#1555).
+pub mod speculation;
+
+pub mod proposals;
+pub mod silence;

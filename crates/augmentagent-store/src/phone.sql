@@ -122,12 +122,45 @@ CREATE TABLE IF NOT EXISTS owner_profile (
 );
 CREATE INDEX IF NOT EXISTS owner_profile_recent ON owner_profile(owner, updated_ms);
 
--- #1557 why a relayed call ended, from the relay-ended callback's handoffData.
--- Written once; a replayed callback cannot change it. PHONE_END_REASONS in
--- Rust is the whitelist, so adding one (#1556 added 'silence') needs no
--- schema change.
+-- #1553 agent-proposed calls. A proposal is only a question posted to the
+-- owner's private control chat; it never dials. `scheduled` waits for its
+-- delivery time (quiet hours defer, never drop), `pending` awaits the owner's
+-- yes/no until `expires_ms`. Every row counts toward the rate limits.
+CREATE TABLE IF NOT EXISTS phone_call_proposals (
+    id TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    conversation TEXT NOT NULL,
+    origin_json TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK(length(reason) BETWEEN 1 AND 300),
+    agenda_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('scheduled','pending','accepted','declined','expired')),
+    created_ms INTEGER NOT NULL,
+    deliver_ms INTEGER NOT NULL,
+    delivered_ms INTEGER,
+    expires_ms INTEGER,
+    decided_ms INTEGER,
+    call_request TEXT
+);
+CREATE INDEX IF NOT EXISTS phone_call_proposals_owner ON phone_call_proposals(owner, deliver_ms);
+CREATE INDEX IF NOT EXISTS phone_call_proposals_state ON phone_call_proposals(state, deliver_ms);
+-- #1557 why a relayed call ended, from the relay-ended callback's handoffData,
+-- or (#1556 'silence') from the relay itself. Written once; a replayed
+-- callback cannot change it. `migrate` rebuilds a table created before
+-- 'silence' was allowed.
 CREATE TABLE IF NOT EXISTS phone_call_end_reasons (
     call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
-    reason TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK(reason IN ('owner_goodbye','task_complete','owner_request','relay_ended_unknown','silence')),
     recorded_ms INTEGER NOT NULL
+);
+
+-- #1556 the one chat notice for a call the relay ended itself. A lease
+-- (attempts + next_ms) so a restart replays an unfinished delivery once,
+-- under the same outbox idempotency key.
+CREATE TABLE IF NOT EXISTS phone_call_end_notices (
+    call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
+    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','done')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 3),
+    next_ms INTEGER NOT NULL DEFAULT 0,
+    created_ms INTEGER NOT NULL,
+    done_ms INTEGER
 );

@@ -2,6 +2,7 @@
 //! Registration is an in-process transport capability, never a model argument.
 use crate::{
     ingress::{AgentError, ConversationAgent, SpeechSender},
+    speculation::Speculative,
     Error,
 };
 use async_trait::async_trait;
@@ -84,11 +85,45 @@ impl ConversationAgent for AgentRouter {
     async fn interrupted(&self, call: &PhoneCall, heard: &str) -> Result<(), AgentError> {
         self.adapter(call)?.interrupted(call, heard).await
     }
+    fn speculate(&self, call: &PhoneCall, text: &str) -> Option<Speculative> {
+        self.adapter(call).ok()?.speculate(call, text)
+    }
+    async fn answer_speculated(
+        &self,
+        call: &PhoneCall,
+        turn_id: &str,
+        text: &str,
+        speech: SpeechSender,
+        cancel: CancellationToken,
+        speculation: Speculative,
+    ) -> Result<String, AgentError> {
+        self.adapter(call)?
+            .answer_speculated(call, turn_id, text, speech, cancel, speculation)
+            .await
+    }
     async fn summarize_call(
         &self,
         call: &PhoneCall,
         request: &crate::memory::SummaryRequest,
     ) -> Result<crate::memory::SummaryDraft, AgentError> {
         self.adapter(call)?.summarize_call(call, request).await
+    }
+    async fn notify_owner(
+        &self,
+        origin: &augmentagent_store::phone::PhoneOrigin,
+        key: &str,
+        text: &str,
+    ) -> Result<(), AgentError> {
+        if origin.owner.account() != origin.conversation.account() {
+            return Err(AgentError);
+        }
+        let adapter = self
+            .adapters
+            .read()
+            .map_err(|_| AgentError)?
+            .get(origin.owner.account().platform().as_str())
+            .cloned()
+            .ok_or(AgentError)?;
+        adapter.notify_owner(origin, key, text).await
     }
 }

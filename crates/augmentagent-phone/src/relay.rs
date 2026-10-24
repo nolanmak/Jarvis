@@ -30,6 +30,9 @@ pub enum RelayInput {
     /// prompt whose description names the provider, model or voice: the
     /// configured STT/TTS selection was rejected. The description is dropped.
     SetupProviderRejected,
+    /// Interim recognition (`prompt` with `last:false`), surfaced only when
+    /// preemptive generation (#1555) requested `partialPrompts="true"`.
+    Partial(String),
     Turn(RelayTurn),
 }
 /// Manual Debug: caller speech and provider descriptions never appear.
@@ -47,6 +50,7 @@ impl std::fmt::Debug for RelayInput {
             ),
             Self::ProviderError(code) => write!(f, "ProviderError({code})"),
             Self::SetupProviderRejected => f.write_str("SetupProviderRejected"),
+            Self::Partial(_) => f.write_str("Partial"),
             Self::Turn(turn) => write!(f, "Turn({})", turn.id),
         }
     }
@@ -328,15 +332,16 @@ pub struct RelaySession {
     debug_events: bool,
     invalid_frames: u64,
     played_event: Option<tokio::time::Instant>,
+    partial_prompts: bool,
+    /// An accepted `prompt` carrying speech, or an `interrupt`, arrived: the
+    /// line is not quiet (#1556).
+    owner_activity: bool,
     barge: BargeIn,
     /// Turn that most recently wrote speech: what an `interrupt` cut off.
     speaking: Option<String>,
     pending: Option<PendingInterrupt>,
     /// A tokens-played event marked `last:true` arrived (#1557).
     played_final: bool,
-    /// An accepted `prompt` or `interrupt` arrived: the line is not quiet
-    /// (#1556).
-    owner_activity: bool,
     ended: bool,
 }
 impl RelaySession {
@@ -355,13 +360,20 @@ impl RelaySession {
             debug_events: false,
             invalid_frames: 0,
             played_event: None,
+            partial_prompts: false,
+            owner_activity: false,
             barge: BargeIn::default(),
             speaking: None,
             pending: None,
             played_final: false,
-            owner_activity: false,
             ended: false,
         }
+    }
+    /// Surface interim recognition as [`RelayInput::Partial`] (#1555). Only
+    /// set when the TwiML requested `partialPrompts="true"`.
+    pub fn with_partial_prompts(mut self, enabled: bool) -> Self {
+        self.partial_prompts = enabled;
+        self
     }
     /// With Relay debug events requested in TwiML, unknown frame types are
     /// categorized and ignored instead of ending the session.
@@ -409,6 +421,11 @@ impl RelaySession {
     pub fn invalid_frames(&self) -> u64 {
         self.invalid_frames
     }
+    /// Whether the owner spoke (any `prompt`, partial or final, or an
+    /// `interrupt`) since the last call. Restarts the silence clock (#1556).
+    pub fn take_owner_activity(&mut self) -> bool {
+        std::mem::take(&mut self.owner_activity)
+    }
     /// Receipt time of the latest tokens-played debug event, consumed once.
     pub fn take_played_event(&mut self) -> Option<tokio::time::Instant> {
         self.played_event.take()
@@ -417,11 +434,6 @@ impl RelaySession {
     /// arrived since the last call. Consumed once.
     pub fn take_played_final(&mut self) -> bool {
         std::mem::take(&mut self.played_final)
-    }
-    /// Whether the owner spoke since the last call: any accepted `prompt`
-    /// carrying speech, partial or final, or any `interrupt` (#1556).
-    pub fn take_owner_activity(&mut self) -> bool {
-        std::mem::take(&mut self.owner_activity)
     }
     /// Any accepted frame resets the consecutive invalid run; a rejected
     /// frame extends it. Control frames are not messages and change nothing.
@@ -477,11 +489,21 @@ impl RelaySession {
                 if text.len() > 12_000 {
                     return Err(Error::InvalidArguments);
                 }
+                // Only a prompt carrying speech is the owner being there
+                // (#1556): an empty recognition result is not activity.
                 self.owner_activity |= !text.trim().is_empty();
-                // TwiML pins partialPrompts=false. Defensive handling never
-                // submits interim recognition to the agent.
-                if !last || text.trim().is_empty() {
+                if text.trim().is_empty() {
                     return Ok(RelayInput::Ignore);
+                }
+                // Interim recognition never opens a turn. Without preemptive
+                // generation the TwiML pins partialPrompts=false and any
+                // stray interim prompt is ignored.
+                if !last {
+                    return Ok(if self.partial_prompts {
+                        RelayInput::Partial(text)
+                    } else {
+                        RelayInput::Ignore
+                    });
                 }
                 if self.pending.is_some() && self.barge.is_backchannel(&text) {
                     return Ok(self.false_interruption());
@@ -672,6 +694,9 @@ impl RelaySession {
         if spoken.trim().is_empty() {
             return Ok(None);
         }
+        // An announcement is not an answer: an interrupt over it has nothing
+        // to resume (#1550).
+        self.speaking = None;
         Ok(Some(text_frame(&spoken, true)))
     }
     /// Preemptible thinking sound for a turn still waiting on a tool. Nothing
@@ -732,12 +757,32 @@ impl RelaySession {
         self.speech(turn, "final", text, true)
     }
 }
+impl RelaySession {
+    /// Silence check-in (#1556): its own talk cycle; the owner may talk over
+    /// it and any later speech replaces it.
+    pub fn check_in(&mut self, text: &str) -> Value {
+        // What plays now is not an answer: an interrupt over it has nothing
+        // to resume (#1550).
+        self.speaking = None;
+        json!({"type":"text","token":text,"last":true,"interruptible":true,"preemptible":true})
+    }
+    /// Fixed silence goodbye spoken just before `end`; nothing may cut it short.
+    pub fn silence_goodbye(&mut self, text: &str) -> Value {
+        self.speaking = None;
+        json!({"type":"text","token":text,"last":true,"interruptible":false,"preemptible":false})
+    }
+    /// `end` for a silence hangup (#1556), at most once per session, with the
+    /// same `{reason, call_id}` handoff as an agent-initiated end (#1557).
+    pub fn end_for_silence(&mut self) -> Option<Value> {
+        if std::mem::replace(&mut self.ended, true) {
+            return None;
+        }
+        Some(json!({
+            "type": "end",
+            "handoffData": json!({"reason": crate::silence::END_REASON, "call_id": self.call_id}).to_string(),
+        }))
+    }
+}
 fn text_frame(token: &str, last: bool) -> Value {
     json!({"type":"text","token":token,"last":last,"interruptible":true,"preemptible":false})
-}
-/// A silence check-in line (#1556): one complete talk cycle, interruptible and
-/// preemptible. It touches no turn or speaking state, so an interrupt over it
-/// is confirmed at once instead of being held as a possible backchannel.
-pub fn check_in_frame(line: &str) -> Value {
-    json!({"type":"text","token":line,"last":true,"interruptible":true,"preemptible":true})
 }

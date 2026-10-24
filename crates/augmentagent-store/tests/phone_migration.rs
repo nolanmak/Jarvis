@@ -143,42 +143,49 @@ fn adding_phone_tables_preserves_sessions_history_and_pending_approvals() {
     }
 }
 
-/// #1556: an end-reason table created with the pre-`silence` CHECK constraint
-/// is rebuilt on open, keeping its rows and accepting the new reason.
+// #1556: a database whose end-reason table was created by #1557 (before
+// 'silence' was allowed) is rebuilt on open, keeping its rows.
 #[test]
-fn legacy_end_reason_check_is_rebuilt_and_accepts_silence() {
-    use augmentagent_store::phone::ReserveCall;
+fn end_reason_table_from_1557_is_rebuilt_to_allow_silence_and_keeps_rows() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("end-reasons.db");
-    let store = Store::open(&path).unwrap();
-    store.phone_import_destination("owner", "+12025550123", 0).unwrap();
-    let reserve = ReserveCall { owner: "owner", request_id: "r1", conversation: "chat", now_ms: 0 };
-    let old = store.phone_reserve_call(reserve).unwrap().call.id;
-    drop(store);
-    // The table exactly as #1557 shipped it, with one recorded reason.
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch(&format!(
-        "DROP TABLE phone_call_end_reasons;
-         CREATE TABLE phone_call_end_reasons (call_id TEXT PRIMARY KEY REFERENCES phone_calls(id), reason TEXT NOT NULL CHECK(reason IN ('owner_goodbye','task_complete','owner_request','relay_ended_unknown')), recorded_ms INTEGER NOT NULL);
-         INSERT INTO phone_call_end_reasons(call_id,reason,recorded_ms) VALUES('{old}','owner_goodbye',7);"
-    ))
-    .unwrap();
-    drop(conn);
-    let store = Store::open(&path).unwrap();
-    assert_eq!(
-        store.phone_end_reason(&old).unwrap().as_deref(),
-        Some("owner_goodbye"),
-        "the rebuilt table keeps recorded reasons"
-    );
-    // The CHECK is gone, so the runtime-only `silence` reason is storable;
-    // PHONE_END_REASONS is the whitelist from here on.
-    let conn = Connection::open(&path).unwrap();
-    conn.execute("UPDATE phone_call_end_reasons SET reason='silence'", [])
+    let path = dir.path().join("upgrade.db");
+    drop(Store::open(&path).unwrap());
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE phone_call_end_notices;
+             DROP TABLE phone_call_end_reasons;
+             CREATE TABLE phone_call_end_reasons (
+                 call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
+                 reason TEXT NOT NULL CHECK(reason IN ('owner_goodbye','task_complete','owner_request','relay_ended_unknown')),
+                 recorded_ms INTEGER NOT NULL
+             );
+             INSERT INTO phone_calls(id,owner,request_id,conversation,destination,state,created_ms,ended_ms,max_duration_seconds)
+                 VALUES('call-old','owner','r1','chat','synthetic','completed',1,4,60),
+                       ('call-new','owner','r2','chat','synthetic','connected',2,NULL,60);
+             INSERT INTO phone_call_end_reasons VALUES('call-old','owner_goodbye',5);",
+        )
         .unwrap();
-    drop(conn);
+        assert!(conn
+            .execute("INSERT INTO phone_call_end_reasons VALUES('call-new','silence',6)", [])
+            .is_err());
+    }
+    let store = Store::open(&path).unwrap();
     assert_eq!(
-        store.phone_end_reason(&old).unwrap().as_deref(),
+        store.phone_end_reason("call-old").unwrap().as_deref(),
+        Some("owner_goodbye")
+    );
+    assert!(store
+        .phone_record_end_with_notice("call-new", "silence", 7)
+        .unwrap());
+    assert_eq!(
+        store.phone_end_reason("call-new").unwrap().as_deref(),
         Some("silence")
     );
-    assert!(store.phone_record_end_reason(&old, "made_up", 9).is_err());
+    // The rebuild runs once; reopening keeps everything.
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.phone_end_notices_due(10).unwrap().len(), 1);
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(rows(&conn, "phone_call_end_reasons").len(), 2);
 }

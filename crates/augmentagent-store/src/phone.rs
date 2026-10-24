@@ -8,27 +8,59 @@ use thiserror::Error;
 
 pub(crate) fn migrate(conn: &Connection) -> StoreResult<()> {
     conn.execute_batch(include_str!("phone.sql"))?;
-    drop_end_reason_check(conn)?;
+    // #1555 speculation fields, added in place to existing metrics tables.
+    for (column, definition) in [
+        ("speculated", "INTEGER NOT NULL DEFAULT 0 CHECK(speculated IN (0,1))"),
+        (
+            "speculation_committed",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(speculation_committed IN (0,1))",
+        ),
+        (
+            "speculation_saved_ms",
+            "INTEGER CHECK(speculation_saved_ms IS NULL OR speculation_saved_ms >= 0)",
+        ),
+    ] {
+        let present: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('phone_turn_metrics') WHERE name = ?1",
+            [column],
+            |row| row.get(0),
+        )?;
+        if !present {
+            conn.execute(
+                &format!("ALTER TABLE phone_turn_metrics ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+    allow_silence_end_reason(conn)?;
     Ok(())
 }
-
-/// End reasons were a SQL CHECK constraint before #1556 added `silence`.
-/// SQLite cannot alter one, so a table created earlier is rebuilt with its
-/// rows; [`PHONE_END_REASONS`] is the whitelist from here on.
-fn drop_end_reason_check(conn: &Connection) -> StoreResult<()> {
-    let table = "SELECT sql FROM sqlite_master WHERE type='table' AND name='phone_call_end_reasons'";
-    let existing: Option<String> = conn.query_row(table, [], |r| r.get(0)).optional()?;
-    if !existing.is_some_and(|sql| sql.contains("CHECK")) {
+/// #1556: a `phone_call_end_reasons` table created by #1557 rejects
+/// 'silence' in its CHECK. SQLite cannot alter a CHECK, so the table is
+/// rebuilt once with its rows kept. A no-op on any later open.
+fn allow_silence_end_reason(conn: &Connection) -> StoreResult<()> {
+    let sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='phone_call_end_reasons'",
+        [],
+        |r| r.get(0),
+    )?;
+    if sql.contains("'silence'") {
         return Ok(());
     }
-    conn.execute_batch(
-        "BEGIN;
-         CREATE TABLE phone_call_end_reasons_rebuilt (call_id TEXT PRIMARY KEY REFERENCES phone_calls(id), reason TEXT NOT NULL, recorded_ms INTEGER NOT NULL);
-         INSERT INTO phone_call_end_reasons_rebuilt SELECT call_id,reason,recorded_ms FROM phone_call_end_reasons;
-         DROP TABLE phone_call_end_reasons;
-         ALTER TABLE phone_call_end_reasons_rebuilt RENAME TO phone_call_end_reasons;
-         COMMIT;",
+    // Rolled back on any error, so a failed rebuild leaves the old table.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE phone_call_end_reasons RENAME TO phone_call_end_reasons_1557;
+         CREATE TABLE phone_call_end_reasons (
+             call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
+             reason TEXT NOT NULL CHECK(reason IN ('owner_goodbye','task_complete','owner_request','relay_ended_unknown','silence')),
+             recorded_ms INTEGER NOT NULL
+         );
+         INSERT INTO phone_call_end_reasons(call_id,reason,recorded_ms)
+             SELECT call_id,reason,recorded_ms FROM phone_call_end_reasons_1557;
+         DROP TABLE phone_call_end_reasons_1557;",
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -988,9 +1020,15 @@ pub struct PhoneTurnMetrics {
     pub t_last_played_ms: Option<i64>,
     pub audible_delta_ms: Option<i64>,
     pub commit_sha: Option<String>,
+    /// #1555: a speculation was started on an interim transcript.
+    pub speculated: bool,
+    /// #1555: the final transcript committed that speculation's answer.
+    pub speculation_committed: bool,
+    /// #1555: final-prompt time minus speculation start, when committed.
+    pub speculation_saved_ms: Option<i64>,
 }
 /// Percentile columns, in CLI display order.
-pub const PHONE_TURN_METRIC_FIELDS: [&str; 8] = [
+pub const PHONE_TURN_METRIC_FIELDS: [&str; 9] = [
     "queue_wait_ms",
     "t_first_token_ms",
     "t_first_speech_ms",
@@ -999,6 +1037,7 @@ pub const PHONE_TURN_METRIC_FIELDS: [&str; 8] = [
     "t_first_played_ms",
     "t_last_played_ms",
     "audible_delta_ms",
+    "speculation_saved_ms",
 ];
 impl PhoneTurnMetrics {
     pub fn field(&self, name: &str) -> Option<Option<i64>> {
@@ -1011,6 +1050,7 @@ impl PhoneTurnMetrics {
             "t_first_played_ms" => self.t_first_played_ms,
             "t_last_played_ms" => self.t_last_played_ms,
             "audible_delta_ms" => self.audible_delta_ms,
+            "speculation_saved_ms" => self.speculation_saved_ms,
             _ => return None,
         })
     }
@@ -1036,7 +1076,7 @@ pub fn nearest_rank_percentile(sorted: &[i64], percent: u32) -> Option<i64> {
     let rank = (sorted.len() as u64 * u64::from(percent)).div_ceil(100).max(1) as usize;
     sorted.get(rank.min(sorted.len()) - 1).copied()
 }
-const METRIC_COLUMNS: &str = "call_id,turn_id,recorded_ms,provider,outcome,queue_wait_ms,t_first_token_ms,t_first_speech_ms,t_last_speech_ms,tool_ms,t_first_played_ms,t_last_played_ms,audible_delta_ms,commit_sha";
+const METRIC_COLUMNS: &str = "call_id,turn_id,recorded_ms,provider,outcome,queue_wait_ms,t_first_token_ms,t_first_speech_ms,t_last_speech_ms,tool_ms,t_first_played_ms,t_last_played_ms,audible_delta_ms,commit_sha,speculated,speculation_committed,speculation_saved_ms";
 fn read_metrics(row: &rusqlite::Row<'_>) -> rusqlite::Result<PhoneTurnMetrics> {
     Ok(PhoneTurnMetrics {
         call_id: row.get(0)?,
@@ -1053,6 +1093,9 @@ fn read_metrics(row: &rusqlite::Row<'_>) -> rusqlite::Result<PhoneTurnMetrics> {
         t_last_played_ms: row.get(11)?,
         audible_delta_ms: row.get(12)?,
         commit_sha: row.get(13)?,
+        speculated: row.get(14)?,
+        speculation_committed: row.get(15)?,
+        speculation_saved_ms: row.get(16)?,
     })
 }
 impl Store {
@@ -1072,14 +1115,20 @@ impl Store {
                 return Err(PhoneError::InvalidInput);
             }
         }
+        // A committed speculation was started; only a committed one saved time.
+        if (m.speculation_committed && !m.speculated)
+            || m.speculation_saved_ms.is_some() != m.speculation_committed
+        {
+            return Err(PhoneError::InvalidInput);
+        }
         if let Some(sha) = &m.commit_sha {
             if !(7..=40).contains(&sha.len()) || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err(PhoneError::InvalidInput);
             }
         }
         Ok(self.with_conn(|c| c.execute(
-            &format!("INSERT INTO phone_turn_metrics({METRIC_COLUMNS}) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) ON CONFLICT(call_id,turn_id) DO NOTHING"),
-            params![m.call_id, m.turn_id, m.recorded_ms, m.provider.as_str(), m.outcome.as_str(), m.queue_wait_ms, m.t_first_token_ms, m.t_first_speech_ms, m.t_last_speech_ms, m.tool_ms, m.t_first_played_ms, m.t_last_played_ms, m.audible_delta_ms, m.commit_sha]))? == 1)
+            &format!("INSERT INTO phone_turn_metrics({METRIC_COLUMNS}) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17) ON CONFLICT(call_id,turn_id) DO NOTHING"),
+            params![m.call_id, m.turn_id, m.recorded_ms, m.provider.as_str(), m.outcome.as_str(), m.queue_wait_ms, m.t_first_token_ms, m.t_first_speech_ms, m.t_last_speech_ms, m.tool_ms, m.t_first_played_ms, m.t_last_played_ms, m.audible_delta_ms, m.commit_sha, m.speculated, m.speculation_committed, m.speculation_saved_ms]))? == 1)
     }
     pub fn phone_turn_metrics(&self, call_id: &str) -> PhoneResult<Vec<PhoneTurnMetrics>> {
         Ok(self.with_conn(|conn| {
@@ -1351,9 +1400,9 @@ pub const PHONE_END_REASONS: [&str; 5] = [
     "owner_goodbye",
     "task_complete",
     "owner_request",
-    // The line went quiet and the runtime ended the call (#1556).
-    "silence",
     "relay_ended_unknown",
+    // #1556: recorded by the relay itself, with a chat notice.
+    "silence",
 ];
 impl Store {
     /// Record a call's end reason. First write wins, so a replayed callback
@@ -1385,5 +1434,381 @@ impl Store {
             )
             .optional()
         })?)
+    }
+}
+
+// ---- #1553 agent-proposed calls -------------------------------------------
+
+/// A proposal waits this long for the owner's answer after it is posted.
+pub const PHONE_PROPOSAL_TTL_MS: i64 = 15 * 60_000;
+/// At most one proposal per owner within this distance of another.
+pub const PHONE_PROPOSAL_SPACING_MS: i64 = 4 * 60 * 60_000;
+/// At most this many proposals per owner in any rolling 24 hours.
+pub const PHONE_PROPOSALS_PER_DAY: i64 = 3;
+/// Bullets carried into the first phone turn.
+pub const PHONE_PROPOSAL_AGENDA_MAX: usize = 5;
+pub const PHONE_PROPOSAL_REASON_MAX: usize = 300;
+pub const PHONE_PROPOSAL_ITEM_MAX: usize = 200;
+/// A scheduled proposal not posted within this long after its delivery time
+/// (no chat adapter, repeated delivery failure) expires instead of arriving late.
+pub const PHONE_PROPOSAL_STALE_MS: i64 = 60 * 60_000;
+const DAY_MS: i64 = 24 * 60 * 60_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProposalState {
+    Scheduled,
+    Pending,
+    Accepted,
+    Declined,
+    Expired,
+}
+impl ProposalState {
+    fn parse(s: &str) -> rusqlite::Result<Self> {
+        Ok(match s {
+            "scheduled" => Self::Scheduled,
+            "pending" => Self::Pending,
+            "accepted" => Self::Accepted,
+            "declined" => Self::Declined,
+            "expired" => Self::Expired,
+            _ => return Err(rusqlite::Error::InvalidQuery),
+        })
+    }
+}
+#[derive(Clone, Debug)]
+pub struct CallProposal {
+    pub id: String,
+    pub owner: String,
+    pub origin: PhoneOrigin,
+    pub reason: String,
+    pub agenda: Vec<String>,
+    pub state: ProposalState,
+    pub created_ms: i64,
+    pub deliver_ms: i64,
+    pub delivered_ms: Option<i64>,
+    pub expires_ms: Option<i64>,
+    /// `call_owner` request ID used by the accepted proposal's call.
+    pub call_request: Option<String>,
+}
+pub struct NewCallProposal<'a> {
+    pub owner: &'a str,
+    pub origin: &'a PhoneOrigin,
+    pub reason: &'a str,
+    pub agenda: &'a [String],
+    pub now_ms: i64,
+    /// `now_ms`, or the end of the owner's quiet hours.
+    pub deliver_ms: i64,
+}
+/// Result of an owner's yes/no in a control conversation.
+#[derive(Debug)]
+pub enum ProposalAnswer {
+    /// Newly accepted: the caller dials once with `call_request`.
+    Accepted(CallProposal),
+    /// A duplicate yes: the call was already requested.
+    AlreadyAccepted(CallProposal),
+    Declined,
+    AlreadyDeclined,
+    Expired,
+    /// The open proposal was posted in a different conversation.
+    OtherConversation,
+    NoProposal,
+}
+const PROPOSAL_COLUMNS: &str = "id,owner,origin_json,reason,agenda_json,state,created_ms,deliver_ms,delivered_ms,expires_ms,call_request";
+fn read_proposal(r: &rusqlite::Row<'_>) -> rusqlite::Result<CallProposal> {
+    let bad = |_| rusqlite::Error::InvalidQuery;
+    Ok(CallProposal {
+        id: r.get(0)?,
+        owner: r.get(1)?,
+        origin: serde_json::from_str(&r.get::<_, String>(2)?).map_err(bad)?,
+        reason: r.get(3)?,
+        agenda: serde_json::from_str(&r.get::<_, String>(4)?).map_err(bad)?,
+        state: ProposalState::parse(&r.get::<_, String>(5)?)?,
+        created_ms: r.get(6)?,
+        deliver_ms: r.get(7)?,
+        delivered_ms: r.get(8)?,
+        expires_ms: r.get(9)?,
+        call_request: r.get(10)?,
+    })
+}
+fn bounded_line(s: &str, max: usize) -> bool {
+    !s.trim().is_empty() && s.chars().count() <= max && !s.chars().any(char::is_control)
+}
+
+impl Store {
+    /// Record a proposal after the rate limits: no other proposal for the
+    /// owner within [`PHONE_PROPOSAL_SPACING_MS`] of its delivery time and
+    /// fewer than [`PHONE_PROPOSALS_PER_DAY`] delivered in the 24 hours before
+    /// it. A rejected proposal is not recorded.
+    pub fn phone_schedule_call_proposal(&self, p: NewCallProposal<'_>) -> PhoneResult<CallProposal> {
+        identifier(p.owner)?;
+        if !bounded_line(p.reason, PHONE_PROPOSAL_REASON_MAX)
+            || p.agenda.len() > PHONE_PROPOSAL_AGENDA_MAX
+            || !p.agenda.iter().all(|item| bounded_line(item, PHONE_PROPOSAL_ITEM_MAX))
+            || p.deliver_ms < p.now_ms
+            || p.origin.owner.account() != p.origin.conversation.account()
+        {
+            return Err(PhoneError::InvalidInput);
+        }
+        let origin = serde_json::to_string(p.origin).map_err(|_| PhoneError::InvalidInput)?;
+        let agenda = serde_json::to_string(p.agenda).map_err(|_| PhoneError::InvalidInput)?;
+        let id = uuid::Uuid::new_v4().to_string();
+        transaction(self, |tx| {
+            let near: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM phone_call_proposals
+                 WHERE owner=?1 AND deliver_ms>?2 AND deliver_ms<?3)",
+                params![p.owner, p.deliver_ms - PHONE_PROPOSAL_SPACING_MS, p.deliver_ms + PHONE_PROPOSAL_SPACING_MS],
+                |r| r.get(0),
+            )?;
+            let today: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM phone_call_proposals
+                 WHERE owner=?1 AND deliver_ms>?2 AND deliver_ms<=?3",
+                params![p.owner, p.deliver_ms - DAY_MS, p.deliver_ms],
+                |r| r.get(0),
+            )?;
+            if near || today >= PHONE_PROPOSALS_PER_DAY {
+                return Err(PhoneError::RateLimited);
+            }
+            tx.execute(
+                "INSERT INTO phone_call_proposals(id,owner,conversation,origin_json,reason,agenda_json,state,created_ms,deliver_ms)
+                 VALUES(?1,?2,?3,?4,?5,?6,'scheduled',?7,?8)",
+                params![id, p.owner, p.origin.conversation.storage_key(), origin, p.reason.trim(), agenda, p.now_ms, p.deliver_ms],
+            )?;
+            Ok(tx.query_row(
+                &format!("SELECT {PROPOSAL_COLUMNS} FROM phone_call_proposals WHERE id=?1"),
+                [&id],
+                read_proposal,
+            )?)
+        })
+    }
+    /// Scheduled proposals whose delivery time has come. Ones left unposted
+    /// for longer than [`PHONE_PROPOSAL_STALE_MS`] expire here instead.
+    pub fn phone_call_proposals_due(&self, now_ms: i64) -> PhoneResult<Vec<CallProposal>> {
+        transaction(self, |tx| {
+            tx.execute(
+                "UPDATE phone_call_proposals SET state='expired',decided_ms=?1
+                 WHERE state='scheduled' AND deliver_ms<=?2",
+                params![now_ms, now_ms - PHONE_PROPOSAL_STALE_MS],
+            )?;
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {PROPOSAL_COLUMNS} FROM phone_call_proposals
+                 WHERE state='scheduled' AND deliver_ms<=?1 ORDER BY deliver_ms, id LIMIT 8"
+            ))?;
+            let due = stmt
+                .query_map([now_ms], read_proposal)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(due)
+        })
+    }
+    /// The question is in the owner's chat: start its answer window. False
+    /// when it was already delivered or is no longer scheduled.
+    pub fn phone_mark_call_proposal_delivered(&self, id: &str, now_ms: i64) -> PhoneResult<bool> {
+        Ok(self.with_conn(|c| {
+            c.execute(
+                "UPDATE phone_call_proposals SET state='pending',delivered_ms=?2,expires_ms=?3
+                 WHERE id=?1 AND state='scheduled'",
+                params![id, now_ms, now_ms + PHONE_PROPOSAL_TTL_MS],
+            )
+        })? == 1)
+    }
+    /// Unanswered proposals past their window are recorded as expired
+    /// (a decline). Returns how many expired.
+    pub fn phone_expire_call_proposals(&self, now_ms: i64) -> PhoneResult<usize> {
+        Ok(self.with_conn(|c| {
+            c.execute(
+                "UPDATE phone_call_proposals SET state='expired',decided_ms=?1
+                 WHERE state='pending' AND expires_ms<=?1",
+                [now_ms],
+            )
+        })?)
+    }
+    /// Whether any posted proposal's window (plus `grace_ms` for late replies)
+    /// is still open, so bare yes/no replies are routed to the phone service.
+    /// An answered proposal's window ends at its decision time plus grace.
+    pub fn phone_call_proposal_window_open(&self, now_ms: i64, grace_ms: i64) -> PhoneResult<bool> {
+        Ok(self.with_conn(|c| {
+            c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM phone_call_proposals
+                 WHERE delivered_ms IS NOT NULL AND (CASE WHEN state IN ('accepted','declined') THEN decided_ms ELSE expires_ms END)+?2>?1)",
+                params![now_ms, grace_ms],
+                |r| r.get(0),
+            )
+        })?)
+    }
+    /// Apply an authenticated owner's yes/no. Only the most recently posted
+    /// proposal whose window (plus `grace_ms`) is open is considered; it must
+    /// have been posted in `conversation` (a storage key). Acceptance is a
+    /// single transition, so duplicate replies cannot accept twice.
+    pub fn phone_answer_call_proposal(
+        &self,
+        owner: &str,
+        conversation: &str,
+        accept: bool,
+        now_ms: i64,
+        grace_ms: i64,
+    ) -> PhoneResult<ProposalAnswer> {
+        transaction(self, |tx| {
+            let latest = tx
+                .query_row(
+                    &format!(
+                        "SELECT {PROPOSAL_COLUMNS},conversation FROM phone_call_proposals
+                         WHERE owner=?1 AND delivered_ms IS NOT NULL AND (CASE WHEN state IN ('accepted','declined') THEN decided_ms ELSE expires_ms END)+?3>?2
+                         ORDER BY delivered_ms DESC, id DESC LIMIT 1"
+                    ),
+                    params![owner, now_ms, grace_ms],
+                    |r| Ok((read_proposal(r)?, r.get::<_, String>(11)?)),
+                )
+                .optional()?;
+            let Some((mut proposal, posted_in)) = latest else {
+                return Ok(ProposalAnswer::NoProposal);
+            };
+            if posted_in != conversation {
+                return Ok(ProposalAnswer::OtherConversation);
+            }
+            if proposal.state == ProposalState::Pending
+                && proposal.expires_ms.is_some_and(|at| now_ms >= at)
+            {
+                tx.execute(
+                    "UPDATE phone_call_proposals SET state='expired',decided_ms=?2 WHERE id=?1",
+                    params![proposal.id, now_ms],
+                )?;
+                return Ok(ProposalAnswer::Expired);
+            }
+            Ok(match (proposal.state, accept) {
+                (ProposalState::Pending, true) => {
+                    let request = format!("proposal:{}", proposal.id);
+                    tx.execute(
+                        "UPDATE phone_call_proposals SET state='accepted',decided_ms=?2,call_request=?3 WHERE id=?1",
+                        params![proposal.id, now_ms, request],
+                    )?;
+                    proposal.state = ProposalState::Accepted;
+                    proposal.call_request = Some(request);
+                    ProposalAnswer::Accepted(proposal)
+                }
+                (ProposalState::Pending, false) => {
+                    tx.execute(
+                        "UPDATE phone_call_proposals SET state='declined',decided_ms=?2 WHERE id=?1",
+                        params![proposal.id, now_ms],
+                    )?;
+                    ProposalAnswer::Declined
+                }
+                (ProposalState::Accepted, _) => ProposalAnswer::AlreadyAccepted(proposal),
+                (ProposalState::Declined, _) => ProposalAnswer::AlreadyDeclined,
+                _ => ProposalAnswer::Expired,
+            })
+        })
+    }
+    /// The accepted proposal that requested this call, if any.
+    pub fn phone_call_proposal_for_call(&self, call_id: &str) -> PhoneResult<Option<CallProposal>> {
+        Ok(self.with_conn(|c| {
+            c.query_row(
+                &format!(
+                    "SELECT {} FROM phone_call_proposals p JOIN phone_calls c
+                     ON c.owner=p.owner AND c.request_id=p.call_request
+                     WHERE c.id=?1 AND p.state='accepted'",
+                    PROPOSAL_COLUMNS.split(',').map(|col| format!("p.{col}")).collect::<Vec<_>>().join(",")
+                ),
+                [call_id],
+                read_proposal,
+            )
+            .optional()
+        })?)
+    }
+    /// Every proposal for an owner, oldest first. For status and tests.
+    pub fn phone_call_proposals(&self, owner: &str) -> PhoneResult<Vec<CallProposal>> {
+        Ok(self.with_conn(|c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {PROPOSAL_COLUMNS} FROM phone_call_proposals WHERE owner=?1 ORDER BY created_ms, id"
+            ))?;
+            let rows = stmt
+                .query_map([owner], read_proposal)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })?)
+    }
+}
+/// First retry delay for an end notice (#1556); doubles per attempt.
+const END_NOTICE_LEASE_MS: i64 = 60_000;
+impl Store {
+    /// Record an end the runtime chose itself (#1556) and queue its one chat
+    /// notice in the same transaction. First write wins: returns false, and
+    /// queues nothing, when the call already has an end reason.
+    pub fn phone_record_end_with_notice(
+        &self,
+        call_id: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> PhoneResult<bool> {
+        if !PHONE_END_REASONS.contains(&reason) {
+            return Err(PhoneError::InvalidInput);
+        }
+        transaction(self, |tx| {
+            call_by_id(tx, call_id)?;
+            if tx.execute(
+                "INSERT OR IGNORE INTO phone_call_end_reasons(call_id,reason,recorded_ms) VALUES(?1,?2,?3)",
+                params![call_id, reason, now_ms],
+            )? == 0
+            {
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO phone_call_end_notices(call_id,created_ms) VALUES(?1,?2)",
+                params![call_id, now_ms],
+            )?;
+            Ok(true)
+        })
+    }
+    /// Calls with a pending end notice not leased by an earlier attempt,
+    /// with their end reason.
+    pub fn phone_end_notices_due(&self, now_ms: i64) -> PhoneResult<Vec<(PhoneCall, String)>> {
+        let columns = CALL_COLUMNS
+            .split(',')
+            .map(|c| format!("c.{c}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        Ok(self.with_conn(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {columns}, r.reason FROM phone_call_end_notices n
+                 JOIN phone_call_end_reasons r ON r.call_id=n.call_id
+                 JOIN phone_calls c ON c.id=n.call_id
+                 WHERE n.state='pending' AND n.attempts<3 AND n.next_ms<=?1
+                 ORDER BY n.created_ms, c.id LIMIT 8"
+            ))?;
+            let due = stmt
+                .query_map([now_ms], |row| Ok((read_call(row)?, row.get(12)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(due)
+        })?)
+    }
+    /// Lease one delivery attempt. False when the notice was delivered, is
+    /// out of attempts, or is still leased by an earlier attempt.
+    pub fn phone_claim_end_notice(&self, call_id: &str, now_ms: i64) -> PhoneResult<bool> {
+        transaction(self, |tx| {
+            let notice: Option<(String, i64, i64)> = tx
+                .query_row(
+                    "SELECT state,attempts,next_ms FROM phone_call_end_notices WHERE call_id=?1",
+                    [call_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            let Some((state, attempts, next)) = notice else {
+                return Ok(false);
+            };
+            if state != "pending" || attempts >= 3 || now_ms < next {
+                return Ok(false);
+            }
+            tx.execute(
+                "UPDATE phone_call_end_notices SET attempts=attempts+1,next_ms=?2 WHERE call_id=?1",
+                params![call_id, now_ms.saturating_add(END_NOTICE_LEASE_MS << attempts)],
+            )?;
+            Ok(true)
+        })
+    }
+    /// The notice reached the durable outbox. False if it was already done.
+    pub fn phone_complete_end_notice(&self, call_id: &str, now_ms: i64) -> PhoneResult<bool> {
+        transaction(self, |tx| {
+            Ok(tx.execute(
+                "UPDATE phone_call_end_notices SET state='done',done_ms=?2 WHERE call_id=?1 AND state='pending'",
+                params![call_id, now_ms],
+            )? == 1)
+        })
     }
 }

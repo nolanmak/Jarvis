@@ -308,14 +308,6 @@ fn barge_in_settings_load_with_defaults_and_bounded_timeout() {
         ("AUGMENTAGENT_PHONE_BARGE_MIN_WORDS", "three"),
         ("AUGMENTAGENT_PHONE_BACKCHANNEL_PHRASES", " , "),
         ("AUGMENTAGENT_PHONE_RESUME_FALSE_INTERRUPT", "yes"),
-        // AC4 (#1556): out of range, unparsable, or not strictly increasing
-        // past the other two defaults (12/25/45 s).
-        ("AUGMENTAGENT_PHONE_SILENCE_CHECKIN_1_S", "4"),
-        ("AUGMENTAGENT_PHONE_SILENCE_CHECKIN_1_S", "twelve"),
-        ("AUGMENTAGENT_PHONE_SILENCE_CHECKIN_2_S", "301"),
-        ("AUGMENTAGENT_PHONE_SILENCE_CHECKIN_2_S", "12"),
-        ("AUGMENTAGENT_PHONE_SILENCE_HANGUP_S", "0"),
-        ("AUGMENTAGENT_PHONE_SILENCE_HANGUP_S", "25"),
     ] {
         let mut env = values();
         env.insert(key, bad.into());
@@ -324,26 +316,6 @@ fn barge_in_settings_load_with_defaults_and_bounded_timeout() {
             "{key}={bad}"
         );
     }
-}
-
-// TDD 4 / AC4 (#1556): silence thresholds load with the documented defaults
-// and from the environment. Rejected values are in the typed-error table of
-// the barge-in settings test above.
-#[test]
-fn silence_settings_load_with_defaults_and_from_the_environment() {
-    use augmentagent_phone::silence::SilencePolicy;
-    let dir = tempfile::tempdir().unwrap();
-    let store =
-        std::sync::Arc::new(augmentagent_store::Store::open(dir.path().join("db")).unwrap());
-    let silence = |env: &_| {
-        load(env).unwrap().unwrap().build(store.clone()).unwrap().service.silence()
-    };
-    assert_eq!(silence(&values()), SilencePolicy::new(12, 25, 45).unwrap());
-    let mut env = values();
-    env.insert("AUGMENTAGENT_PHONE_SILENCE_CHECKIN_1_S", "5".into());
-    env.insert("AUGMENTAGENT_PHONE_SILENCE_CHECKIN_2_S", "10".into());
-    env.insert("AUGMENTAGENT_PHONE_SILENCE_HANGUP_S", "300".into());
-    assert_eq!(silence(&env), SilencePolicy::new(5, 10, 300).unwrap());
 }
 
 // #1546: the fast layer is off unless explicitly enabled; its settings are
@@ -435,5 +407,73 @@ fn thinking_sound_url_must_be_on_the_operator_origin() {
         "not a url",
     ] {
         assert!(load(bad).is_err(), "{bad}");
+    }
+}
+
+// #1555: preemptive generation is off unless explicitly enabled, applies only
+// on the fast layer, and junk fails closed.
+#[test]
+fn preemptive_flag_defaults_off_needs_the_fast_layer_and_fails_closed_on_junk() {
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        std::sync::Arc::new(augmentagent_store::Store::open(dir.path().join("db")).unwrap());
+    let load = |pairs: &[(&'static str, &str)]| {
+        let mut env = values();
+        for (k, v) in pairs {
+            env.insert(k, (*v).into());
+        }
+        Settings::from_lookup(|k| env.get(k).cloned())
+    };
+    let preemptive = |pairs: &[(&'static str, &str)]| {
+        load(pairs)
+            .unwrap()
+            .unwrap()
+            .build(store.clone())
+            .unwrap()
+            .service
+            .preemptive()
+    };
+    assert!(!preemptive(&[]));
+    assert!(!preemptive(&[("AUGMENTAGENT_PHONE_FAST_LAYER", "1")]));
+    assert!(!preemptive(&[("AUGMENTAGENT_PHONE_PREEMPTIVE", "1")]), "native turns never speculate");
+    assert!(!preemptive(&[
+        ("AUGMENTAGENT_PHONE_FAST_LAYER", "1"),
+        ("AUGMENTAGENT_PHONE_PREEMPTIVE", "0"),
+    ]));
+    assert!(preemptive(&[
+        ("AUGMENTAGENT_PHONE_FAST_LAYER", "1"),
+        ("AUGMENTAGENT_PHONE_PREEMPTIVE", "1"),
+    ]));
+    for bad in ["yes", "true", "", "2"] {
+        assert!(load(&[("AUGMENTAGENT_PHONE_PREEMPTIVE", bad)]).is_err(), "{bad:?}");
+        assert!(
+            load(&[("AUGMENTAGENT_PHONE_FAST_LAYER", "1"), ("AUGMENTAGENT_PHONE_PREEMPTIVE", bad)]).is_err(),
+            "{bad:?}"
+        );
+    }
+}
+
+// #1553: quiet hours for agent-proposed calls are explicit and fail closed.
+#[test]
+fn proposal_quiet_hours_and_time_zone_fail_closed_on_junk() {
+    for (key, value) in [
+        ("AUGMENTAGENT_PHONE_QUIET_HOURS", "22:00-08:00"),
+        ("AUGMENTAGENT_PHONE_QUIET_HOURS", "off"),
+        ("AUGMENTAGENT_PHONE_QUIET_HOURS", "21:30-07:15"),
+        ("AUGMENTAGENT_TIMEZONE", "America/New_York"),
+    ] {
+        let mut env = values();
+        env.insert(key, value.into());
+        assert!(Settings::from_lookup(|k| env.get(k).cloned()).is_ok(), "{key}={value}");
+    }
+    for (key, value) in [
+        ("AUGMENTAGENT_PHONE_QUIET_HOURS", "nightly"),
+        ("AUGMENTAGENT_PHONE_QUIET_HOURS", "22:00-22:00"),
+        ("AUGMENTAGENT_PHONE_QUIET_HOURS", "24:00-08:00"),
+        ("AUGMENTAGENT_TIMEZONE", "Mars/Base"),
+    ] {
+        let mut env = values();
+        env.insert(key, value.into());
+        assert!(Settings::from_lookup(|k| env.get(k).cloned()).is_err(), "{key}={value}");
     }
 }

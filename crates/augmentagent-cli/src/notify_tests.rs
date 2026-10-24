@@ -256,12 +256,16 @@ fn every_routed_class_defaults_to_every_configured_surface() {
 fn actionable_producers_are_never_fanned_out_blindly() {
     // The owner acts on approval cards (kept in step across surfaces by
     // CardSurfaces, #1289) and loop reminders (posted only to the loop's
-    // own surface, #1292). Nothing routed here asks for an action, so a
-    // fan-out never makes the owner act twice.
+    // own surface, #1292) and call proposals (only the private control chat
+    // they were posted in, #1553). Nothing routed here asks for an action,
+    // so a fan-out never makes the owner act twice.
     for p in PRODUCERS {
         if p.actionable {
             assert!(
-                matches!(p.route, Route::ApprovalSurfaces | Route::LoopDestination),
+                matches!(
+                    p.route,
+                    Route::ApprovalSurfaces | Route::LoopDestination | Route::PhoneControlChat
+                ),
                 "{} ({}) is actionable but routed {:?}",
                 p.id,
                 p.what,

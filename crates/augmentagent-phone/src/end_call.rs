@@ -8,36 +8,28 @@
 use serde::Deserialize;
 use std::time::Duration;
 
-/// Why the call ended. All but `Silence`, which the runtime raises on a quiet
-/// line (#1556), are reasons the model may pick.
+/// Why the agent ended the call. The model may pick exactly these.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EndCallReason {
     OwnerGoodbye,
     TaskComplete,
     OwnerRequest,
-    Silence,
 }
 impl EndCallReason {
-    pub const ALL: [EndCallReason; 4] = [
+    pub const ALL: [EndCallReason; 3] = [
         EndCallReason::OwnerGoodbye,
         EndCallReason::TaskComplete,
         EndCallReason::OwnerRequest,
-        EndCallReason::Silence,
     ];
     pub fn as_str(self) -> &'static str {
         match self {
             Self::OwnerGoodbye => "owner_goodbye",
             Self::TaskComplete => "task_complete",
             Self::OwnerRequest => "owner_request",
-            Self::Silence => "silence",
         }
     }
     pub fn parse(value: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|r| r.as_str() == value)
-    }
-    /// A reason the model is allowed to choose; `Silence` never is.
-    pub fn parse_model(value: &str) -> Option<Self> {
-        Self::parse(value).filter(|r| *r != Self::Silence)
     }
 }
 
@@ -127,6 +119,8 @@ pub fn end_reason_from_handoff(data: &str, call_id: &str) -> &'static str {
     match serde_json::from_str::<Handoff>(data) {
         Ok(handoff) if handoff.call_id == call_id => EndCallReason::parse(&handoff.reason)
             .map(EndCallReason::as_str)
+            // #1556: the relay's own silence hangup uses the same handoff.
+            .or((handoff.reason == crate::silence::END_REASON).then_some(crate::silence::END_REASON))
             .unwrap_or(UNKNOWN_END_REASON),
         _ => UNKNOWN_END_REASON,
     }
@@ -157,12 +151,17 @@ mod tests {
         for junk in ["", "null", "{}", "[1]", "{\"reason\":1,\"call_id\":\"c1\"}"] {
             assert_eq!(end_reason_from_handoff(junk, "c1"), UNKNOWN_END_REASON);
         }
-        // AC6 (#1556): `silence` round-trips above, but the model may never
-        // name it; every other reason stays model-selectable.
-        assert_eq!(EndCallReason::parse_model("silence"), None);
-        for reason in EndCallReason::ALL.into_iter().filter(|r| *r != EndCallReason::Silence) {
-            assert_eq!(EndCallReason::parse_model(reason.as_str()), Some(reason));
-        }
+        // AC6 (#1556): the relay's own silence handoff is recognized, but
+        // `silence` is runtime-only and the model may never name it.
+        assert_eq!(
+            end_reason_from_handoff(
+                &serde_json::json!({"reason": crate::silence::END_REASON, "call_id": "c1"})
+                    .to_string(),
+                "c1"
+            ),
+            crate::silence::END_REASON
+        );
+        assert_eq!(EndCallReason::parse(crate::silence::END_REASON), None);
     }
     #[test]
     fn goodbye_is_bounded_on_a_sentence_or_word() {
