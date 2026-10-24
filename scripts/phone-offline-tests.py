@@ -17,14 +17,14 @@ ROOT = Path(__file__).resolve().parents[1]
 # counts prevent silent deletion of the current required coverage.
 SUITES = [
     ("augmentagent-docs", "--test", "private_attachments", 2),
-    ("augmentagent-phone", "--lib", None, 11),
-    ("augmentagent-phone", "--test", "relay", 10),
-    ("augmentagent-phone", "--test", "service", 39),
+    ("augmentagent-phone", "--lib", None, 15),
+    ("augmentagent-phone", "--test", "relay", 12),
+    ("augmentagent-phone", "--test", "service", 43),
     ("augmentagent-phone", "--test", "speech", 14),
     ("augmentagent-phone", "--test", "metrics", 3),
     ("augmentagent-phone", "--test", "recovery", 7),
     ("augmentagent-phone", "--test", "mcp", 2),
-    ("augmentagent-phone", "--test", "config", 2),
+    ("augmentagent-phone", "--test", "config", 3),
     ("augmentagent-phone", "--test", "runtime", 3),
     ("augmentagent-store", "--test", "phone_calls", 17),
     ("augmentagent-store", "--test", "phone_migration", 1),
