@@ -472,7 +472,7 @@ mod phone_fast_tests {
     }
 
     #[test]
-    fn phone_fast_anthropic_body_streams_haiku_with_exactly_two_tools() {
+    fn phone_fast_anthropic_body_streams_haiku_with_exactly_three_tools() {
         let body = anthropic_body(&request());
         assert_eq!(body["model"], "claude-haiku-5-5");
         assert_eq!(body["stream"], true);
@@ -483,7 +483,7 @@ mod phone_fast_tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(tools, ["dispatch_task", "lookup_fast"]);
+        assert_eq!(tools, ["dispatch_task", "lookup_fast", "end_call"]);
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[1]["content"][1]["type"], "tool_use");
@@ -504,7 +504,7 @@ mod phone_fast_tests {
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
             .collect();
-        assert_eq!(tools, ["dispatch_task", "lookup_fast"]);
+        assert_eq!(tools, ["dispatch_task", "lookup_fast", "end_call"]);
         assert_eq!(
             body["messages"][2]["tool_calls"][0]["function"]["name"],
             "dispatch_task"

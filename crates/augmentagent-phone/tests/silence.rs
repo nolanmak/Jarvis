@@ -268,13 +268,53 @@ struct Live {
     _dir: tempfile::TempDir,
 }
 
-fn signed(token: &str, url: &str) -> String {
+/// Twilio request signature: URL followed by the sorted form fields.
+fn signed(token: &str, url: &str, fields: &[(String, String)]) -> String {
     use base64::{engine::general_purpose::STANDARD, Engine};
     use hmac::{Hmac, Mac};
     use sha1::Sha1;
+    let mut payload = url.to_string();
+    let mut fields = fields.to_vec();
+    fields.sort();
+    for (k, v) in fields {
+        payload.push_str(&k);
+        payload.push_str(&v);
+    }
     let mut h = Hmac::<Sha1>::new_from_slice(token.as_bytes()).unwrap();
-    h.update(url.as_bytes());
+    h.update(payload.as_bytes());
     STANDARD.encode(h.finalize().into_bytes())
+}
+impl Live {
+    /// A tokens-played event for the latest speech.
+    async fn played(&mut self) {
+        send(
+            &mut self.socket,
+            json!({"type":"info","name":"tokensPlayed","value":"x","last":true}),
+        )
+        .await;
+    }
+    /// The signed relay-ended (`<Connect action>`) callback after `end`.
+    fn relay_ended(&self, handoff: &str) -> String {
+        let fields = vec![
+            ("AccountSid".to_string(), "AC-test".to_string()),
+            ("CallSid".into(), "CA-test".into()),
+            ("SessionStatus".into(), "completed".into()),
+            ("HandoffData".into(), handoff.into()),
+        ];
+        let url = format!(
+            "https://phone.example.test/phone/relay-ended/{}",
+            self.call_id
+        );
+        let auth = augmentagent_phone::webhook::WebhookAuth::new("AC-test", "callback-secret");
+        self.service
+            .relay_ended_callback(
+                &auth,
+                &self.call_id,
+                &fields,
+                &signed("callback-secret", &url, &fields),
+            )
+            .unwrap()
+    }
 }
 
 fn service(store: Arc<Store>, clock: Arc<FakeClock>, owner: &SurfaceOwnerRef) -> PhoneService {
@@ -287,7 +327,9 @@ fn service(store: Arc<Store>, clock: Arc<FakeClock>, owner: &SurfaceOwnerRef) ->
             owner_id: "canonical-owner".into(),
         }],
     )
-    .unwrap();
+    .unwrap()
+    // Tokens-played events (#1551) confirm the goodbye before `end`.
+    .with_debug_events(true);
     PhoneService::new(store, Arc::new(FakeProvider), clock, config)
 }
 
@@ -351,6 +393,7 @@ async fn live(agent: Arc<Owner>) -> Live {
     let signature = signed(
         "callback-secret",
         &format!("wss://phone.example.test/phone/relay/{call_id}"),
+        &[],
     );
     request
         .headers_mut()
@@ -448,7 +491,10 @@ async fn step1_silence_checks_in_twice_then_says_goodbye_and_ends() {
     let agent = Arc::new(Owner::default());
     let mut live = live(agent.clone()).await;
     let answered = ask(&mut live.socket, "what's next").await;
-    let frames = frames_until(&mut live.socket, answered, SECS(50)).await;
+    let mut frames = frames_until(&mut live.socket, answered, MS(45_020)).await;
+    // The provider reports the goodbye played; `end` follows at once (#1557).
+    live.played().await;
+    frames.extend(frames_until(&mut live.socket, answered, SECS(50)).await);
     let summary: Vec<_> = frames
         .iter()
         .map(|(at, f)| (at.as_millis(), f.clone()))
@@ -484,8 +530,13 @@ async fn step1_silence_checks_in_twice_then_says_goodbye_and_ends() {
     let (at, end) = &frames[3];
     assert!(near(*at, 45_000), "{summary:?}");
     assert_eq!(end["type"], "end");
-    let handoff: Value = serde_json::from_str(end["handoffData"].as_str().unwrap()).unwrap();
-    assert_eq!(handoff, json!({"reason":"silence"}));
+    let data = end["handoffData"].as_str().unwrap();
+    let handoff: Value = serde_json::from_str(data).unwrap();
+    assert_eq!(handoff, json!({"reason":"silence","call_id":live.call_id}));
+    assert_eq!(
+        augmentagent_phone::end_call::end_reason_from_handoff(data, &live.call_id),
+        "silence"
+    );
 
     // AC5: persisted reason and exactly one chat notice.
     wait_for(|| !agent.notices.lock().unwrap().is_empty()).await;
@@ -521,6 +572,39 @@ async fn step1_silence_checks_in_twice_then_says_goodbye_and_ends() {
     live.clock.0.fetch_add(3_600_000, Ordering::SeqCst);
     assert_eq!(restarted.run_end_notices(agent.as_ref()).await.unwrap(), 0);
     assert_eq!(agent.notices.lock().unwrap().len(), 1);
+    // Twilio's relay-ended callback carries the handoff; the reason stays.
+    assert!(live.relay_ended(data).contains("<Hangup/>"));
+    assert_eq!(
+        live.store
+            .phone_end_reason(&live.call_id)
+            .unwrap()
+            .as_deref(),
+        Some("silence")
+    );
+    live.server.abort();
+}
+
+// Without a playback report the goodbye still gets the bounded wait before
+// `end`, so it is not cut off.
+#[tokio::test(start_paused = true)]
+async fn step1_goodbye_without_playback_report_ends_after_the_bounded_wait() {
+    let mut live = live(Arc::new(Owner::default())).await;
+    let answered = ask(&mut live.socket, "what's next").await;
+    let frames = frames_until(&mut live.socket, answered, SECS(55)).await;
+    let summary: Vec<_> = frames
+        .iter()
+        .map(|(at, f)| (at.as_millis(), f["type"].clone(), token(f).to_owned()))
+        .collect();
+    assert_eq!(frames.len(), 4, "{summary:?}");
+    assert!(
+        near(frames[2].0, 45_000) && token(&frames[2].1) == GOODBYE_LINE,
+        "{summary:?}"
+    );
+    let wait = augmentagent_phone::end_call::PLAYBACK_WAIT.as_millis() as u64;
+    assert!(
+        near(frames[3].0, 45_000 + wait) && frames[3].1["type"] == "end",
+        "{summary:?}"
+    );
     live.server.abort();
 }
 
@@ -642,11 +726,11 @@ async fn ac5_end_notice_survives_a_crash_and_is_never_duplicated() {
     // Crash between persisting the reason and delivering the notice.
     assert!(live
         .store
-        .phone_record_end_reason(&id, "silence", 200)
+        .phone_record_end_with_notice(&id, "silence", 200)
         .unwrap());
     assert!(!live
         .store
-        .phone_record_end_reason(&id, "silence", 300)
+        .phone_record_end_with_notice(&id, "silence", 300)
         .unwrap());
     agent.fail_notice.store(true, Ordering::SeqCst);
     assert_eq!(
@@ -686,6 +770,6 @@ async fn ac5_end_notice_survives_a_crash_and_is_never_duplicated() {
     // Reasons are fixed category codes, never free text.
     assert!(live
         .store
-        .phone_record_end_reason(&id, "Owner said bye!", 400)
+        .phone_record_end_with_notice(&id, "Owner said bye!", 400)
         .is_err());
 }

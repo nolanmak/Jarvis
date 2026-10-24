@@ -753,6 +753,14 @@ async function getOrCreateAuthConfig(
   client: Composio,
   toolkit: string
 ): Promise<string> {
+  // Owner override first: COMPOSIO_AUTH_CONFIG_<TOOLKIT> pins a specific
+  // Composio auth config (e.g. one backed by the owner's own Google OAuth
+  // app) so new connections stop counting against the Composio-managed-app
+  // quota. Env wins over the DB cache so a stale cached id can't shadow it.
+  const envOverride =
+    process.env[`COMPOSIO_AUTH_CONFIG_${toolkit.toUpperCase()}`]?.trim();
+  if (envOverride) return envOverride;
+
   // Check DB cache first
   const cached = getConfig(`auth_config_${toolkit}`);
   if (cached) return cached;

@@ -97,6 +97,21 @@ pub enum SpeechEvent {
     },
     /// Thinking sound for a slow tool (#1546); preempted by the next text.
     Play { turn: Arc<RelayTurn>, source: String },
+    /// Agent-initiated end (#1557): speak `goodbye` as the turn's final
+    /// frame, then send `end` once it has played (or after a bound).
+    End {
+        turn: Arc<RelayTurn>,
+        goodbye: String,
+        reason: crate::end_call::EndCallReason,
+    },
+    /// Fixed runtime notice spoken mid-turn, such as the wait for the shared
+    /// conversation queue (#1548). Not part of the answer: it never counts as
+    /// agent speech in the turn's metrics.
+    Notice {
+        turn: Arc<RelayTurn>,
+        utterance_id: String,
+        text: String,
+    },
 }
 /// Weak handle to a live call's speech queue. It never keeps the relay loop
 /// alive; once the socket ends, announcements are dropped.
@@ -149,7 +164,9 @@ impl SpeechSender {
     pub fn new(sender: mpsc::Sender<SpeechEvent>, turn: Arc<RelayTurn>) -> Self {
         Self::with_timer(sender, turn, Arc::new(TurnTimer::start()))
     }
-    fn with_timer(
+    /// A sender reporting into `timer`: the ingress worker's per-turn record,
+    /// or a harness that inspects it.
+    pub fn with_timer(
         sender: mpsc::Sender<SpeechEvent>,
         turn: Arc<RelayTurn>,
         timer: Arc<TurnTimer>,
@@ -193,6 +210,22 @@ impl SpeechSender {
     /// duration is kept; tool names, arguments and results are never recorded.
     pub fn note_tool_time(&self, duration: Duration) {
         self.timer.add_tool_time(duration);
+    }
+    /// Add time spent waiting for the shared conversation queue (#1548) to
+    /// this turn's `queue_wait_ms`.
+    pub fn note_queue_wait(&self, duration: Duration) {
+        self.timer.add_queue_wait(duration);
+    }
+    /// Queue a fixed runtime notice for this turn without waiting (#1548).
+    /// `false` when the call's speech queue is full or closed.
+    pub fn notice(&self, utterance_id: &str, text: &str) -> bool {
+        self.sender
+            .try_send(SpeechEvent::Notice {
+                turn: self.turn.clone(),
+                utterance_id: utterance_id.into(),
+                text: text.into(),
+            })
+            .is_ok()
     }
     /// A successful return means queued, not audibly played. Only send intended
     /// user-facing text. Receipts are deduplicated by turn plus utterance ID.
@@ -260,6 +293,38 @@ impl SpeechSender {
             self.token(chunk, index == last, failed).await?;
         }
         Ok(())
+    }
+    /// End the call (#1557): flush anything still buffered as partial text,
+    /// close this turn's stream, and ask the relay loop to speak `goodbye` as
+    /// the final frame and then send `end`. Fails if the turn already finished.
+    pub async fn end_call(
+        &self,
+        goodbye: &str,
+        reason: crate::end_call::EndCallReason,
+    ) -> Result<(), AgentError> {
+        if goodbye.len() > 12_000 {
+            return Err(AgentError);
+        }
+        let chunks = {
+            let mut state = self.stream.lock().map_err(|_| AgentError)?;
+            if state.finished {
+                return Err(AgentError);
+            }
+            state.finished = true;
+            state.pipeline.flush()
+        };
+        for chunk in chunks {
+            self.token(chunk, false, false).await?;
+        }
+        self.timer.first_token();
+        self.sender
+            .send(SpeechEvent::End {
+                turn: self.turn.clone(),
+                goodbye: goodbye.into(),
+                reason,
+            })
+            .await
+            .map_err(|_| AgentError)
     }
     async fn token(&self, text: String, last: bool, failed: bool) -> Result<(), AgentError> {
         self.sender
@@ -646,16 +711,24 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
     };
     let mut metrics = TurnMetricsLedger::new(&state.service, &call);
     let mut tick = tokio::time::interval(Duration::from_millis(100));
+    // #1557: after the agent's goodbye, `end` waits for its tokens-played
+    // event or PLAYBACK_WAIT, whichever is first.
+    let mut ending: Option<(tokio::time::Instant, serde_json::Value)> = None;
+    // #1556: the pending `end` is a silence hangup, not an agent end.
+    let mut silence_ending = false;
     let end_reason = 'connection: loop {
         // Owner speech in the frame handled last restarts the silence clock.
         if session.take_owner_activity() {
             silence.activity(tokio::time::Instant::now());
         }
+        let end_at = ending.as_ref().map(|(at, _)| *at);
         tokio::select! {
             incoming=socket.recv()=>{
                 if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
                 match incoming {
                     Some(Ok(Message::Text(frame)))=>match session.receive(&frame) {
+                        // The goodbye is out: later owner speech is not answered.
+                        Ok(RelayInput::Turn(_)) if ending.is_some() => {},
                         Ok(RelayInput::Turn(turn))=>{
                             let turn=Arc::new(turn);
                             feedback.insert(turn.id.clone(), TurnFeedback::new(turn.clone()).with_ack_after(ack_after));
@@ -673,6 +746,9 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                         },
                         Ok(RelayInput::Ignore)=>{
                             if let Some(at) = session.take_played_event() { metrics.played(at); silence.played(at); }
+                            if session.take_played_final() {
+                                if let Some((_, frame)) = ending.take() { break send_end(&mut socket, frame).await; }
+                            }
                         },
                         Ok(RelayInput::ProviderError(code))=>{
                             tracing::warn!(call_id = %call.id, provider_code = code, "phone provider error");
@@ -695,6 +771,8 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
             },
             output=speech_rx.recv()=>{
                 let Some(output)=output else {break "speech_worker_closed"};
+                // Nothing is spoken after the goodbye.
+                if ending.is_some() { continue; }
                 let (turn, closes, failed) = match &output {
                     SpeechEvent::Utterance { turn, final_output, .. } => (turn, *final_output, false),
                     SpeechEvent::Token { turn, last, failed, .. } => (turn, *last, *failed),
@@ -703,6 +781,17 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                         if announcements.len() < 8 { announcements.push_back((text.clone(), task.clone())); }
                         if feedback.is_empty() {
                             if let Err(reason) = flush_announcements(&state.service, &call, &mut session, &mut socket, &mut announcements, &mut silence).await {break reason;}
+                        }
+                        continue;
+                    }
+                    SpeechEvent::Notice { turn, utterance_id, text } => {
+                        // Speaks now, mid-turn, but is not the answer: no
+                        // speech metrics, and a refused frame is just skipped.
+                        if let Some(pending) = feedback.get_mut(&turn.id) { pending.acked = true; }
+                        if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
+                        if let Ok(Some(frame)) = session.speech(turn, utterance_id, text, false) {
+                            if !matches!(tokio::time::timeout(Duration::from_secs(2),socket.send(Message::Text(frame.to_string().into()))).await,Ok(Ok(()))) {break "speech_write_failed";}
+                            tracing::info!(call_id = %call.id, kind = "queue_wait", "phone feedback queued");
                         }
                         continue;
                     }
@@ -716,6 +805,20 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                         }
                         continue;
                     }
+                    SpeechEvent::End { turn, goodbye, reason } => {
+                        if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
+                        feedback.clear();
+                        announcements.clear();
+                        let frame = match session.goodbye(turn, goodbye) { Ok(frame) => frame, Err(_) => break "invalid_speech_output" };
+                        if !matches!(tokio::time::timeout(Duration::from_secs(2),socket.send(Message::Text(frame.to_string().into()))).await,Ok(Ok(()))) {break "speech_write_failed";}
+                        metrics.spoken(&turn.id, true, false);
+                        // Only a tokens-played event after the goodbye counts.
+                        let _ = session.take_played_final();
+                        let Some(end) = session.end(*reason) else { continue };
+                        tracing::info!(call_id = %call.id, reason = reason.as_str(), "phone agent ending call");
+                        ending = Some((tokio::time::Instant::now() + crate::end_call::PLAYBACK_WAIT, end));
+                        continue;
+                    }
                 };
                 if closes { feedback.remove(&turn.id); }
                 else if let Some(pending) = feedback.get_mut(&turn.id) { pending.acked = true; }
@@ -724,7 +827,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                     SpeechEvent::Utterance { turn, utterance_id, text, final_output } => session.speech(turn, utterance_id, text, *final_output),
                     SpeechEvent::Token { turn, text, last: false, .. } => session.speak_partial(turn, text),
                     SpeechEvent::Token { turn, text, last: true, .. } => session.finish_stream(turn, text),
-                    SpeechEvent::System { .. } | SpeechEvent::Play { .. } => continue,
+                    SpeechEvent::System { .. } | SpeechEvent::Play { .. } | SpeechEvent::Notice { .. } | SpeechEvent::End { .. } => continue,
                 };
                 match result {
                     Ok(Some(frame))=>{
@@ -737,6 +840,9 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                 if feedback.is_empty() && !announcements.is_empty() {
                     if let Err(reason) = flush_announcements(&state.service, &call, &mut session, &mut socket, &mut announcements, &mut silence).await {break reason;}
                 }
+            },
+            _=tokio::time::sleep_until(end_at.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3_600))), if end_at.is_some() => {
+                if let Some((_, frame)) = ending.take() { break send_end(&mut socket, frame).await; }
             },
             _=tick.tick()=>{
                 if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
@@ -759,18 +865,29 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                 if !feedback.is_empty() || !announcements.is_empty() {
                     silence.activity(now);
                 } else if let Some(action) = silence.poll(now) {
-                    if let Some(reason) = speak_silence_action(&call, &session, &mut socket, action).await {break reason;}
+                    if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
+                    match speak_silence_action(&call, &mut session, &mut socket, action).await {
+                        Ok(Some(end)) => {
+                            // Like an agent end (#1557): `end` follows once the
+                            // goodbye has played, or after PLAYBACK_WAIT.
+                            silence_ending = true;
+                            ending = Some((now + crate::end_call::PLAYBACK_WAIT, end));
+                        }
+                        Ok(None) => {}
+                        Err(reason) => break reason,
+                    }
                 }
             }
         }
     };
+    let end_reason = if silence_ending && end_reason == "agent_end" { SILENCE_END } else { end_reason };
     tracing::info!(call_id = %call.id, reason = end_reason, "phone relay ending");
     // #1556: persist a runtime-chosen end before anything else can fail.
     let ended_by_silence = end_reason == SILENCE_END
         && state
             .service
             .store
-            .phone_record_end_reason(&call.id, SILENCE_END, state.service.clock.now_ms())
+            .phone_record_end_with_notice(&call.id, SILENCE_END, state.service.clock.now_ms())
             .is_ok();
     // Nothing more can be spoken: late announcements fail immediately.
     speech_rx.close();
@@ -1053,6 +1170,20 @@ impl TurnFeedback {
     }
 }
 
+/// Send the agent's `end` message (#1557); the session then closes as
+/// `agent_end`, distinct from an owner hang-up or a transport failure.
+async fn send_end(socket: &mut WebSocket, frame: serde_json::Value) -> &'static str {
+    match tokio::time::timeout(
+        Duration::from_secs(2),
+        socket.send(Message::Text(frame.to_string().into())),
+    )
+    .await
+    {
+        Ok(Ok(())) => "agent_end",
+        _ => "speech_write_failed",
+    }
+}
+
 /// Speak queued fast-layer announcements as complete system turns. Only
 /// called while no owner turn is mid-answer, so talk cycles never interleave.
 async fn flush_announcements(
@@ -1095,40 +1226,39 @@ async fn flush_announcements(
 /// Relay end reason for a silence hangup (#1556).
 const SILENCE_END: &str = crate::silence::END_REASON;
 
-/// Write a check-in, or the goodbye followed by `end` with
-/// `handoffData={"reason":"silence"}`. Returns the end reason when the
-/// connection must stop.
+/// Write a check-in, or the fixed goodbye. For the goodbye, returns the
+/// `end` frame (`handoffData` reason `silence`) to send once it has played.
 async fn speak_silence_action(
     call: &PhoneCall,
-    session: &RelaySession,
+    session: &mut RelaySession,
     socket: &mut WebSocket,
     action: SilenceAction,
-) -> Option<&'static str> {
-    let frames = match action {
-        SilenceAction::CheckIn(line) => vec![session.check_in(line)],
-        SilenceAction::Goodbye(line) => vec![
-            session.goodbye(line),
-            session.end_with_handoff(&serde_json::json!({ "reason": SILENCE_END })),
-        ],
+) -> Result<Option<serde_json::Value>, &'static str> {
+    let frame = match action {
+        SilenceAction::CheckIn(line) => session.check_in(line),
+        SilenceAction::Goodbye(line) => session.silence_goodbye(line),
     };
-    for frame in frames {
-        if !matches!(
-            tokio::time::timeout(
-                Duration::from_secs(2),
-                socket.send(Message::Text(frame.to_string().into()))
-            )
-            .await,
-            Ok(Ok(()))
-        ) {
-            return Some("speech_write_failed");
-        }
+    if !matches!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            socket.send(Message::Text(frame.to_string().into()))
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        return Err("speech_write_failed");
     }
     match action {
         SilenceAction::CheckIn(_) => {
             tracing::info!(call_id = %call.id, kind = "silence_check_in", "phone silence check-in");
-            None
+            Ok(None)
         }
-        SilenceAction::Goodbye(_) => Some(SILENCE_END),
+        SilenceAction::Goodbye(_) => {
+            tracing::info!(call_id = %call.id, reason = SILENCE_END, "phone relay ending call for silence");
+            // Only a tokens-played event after the goodbye counts.
+            let _ = session.take_played_final();
+            Ok(session.end_for_silence())
+        }
     }
 }
 

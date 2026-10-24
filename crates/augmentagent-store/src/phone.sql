@@ -122,16 +122,24 @@ CREATE TABLE IF NOT EXISTS owner_profile (
 );
 CREATE INDEX IF NOT EXISTS owner_profile_recent ON owner_profile(owner, updated_ms);
 
--- #1556 why the runtime ended a relayed call itself (a short category code),
--- plus the durable one-shot chat notice for it. The notice is a lease
--- (attempts + next_ms) so a restart replays an unfinished delivery once,
--- under the same outbox idempotency key.
+-- #1557 why a relayed call ended, from the relay-ended callback's handoffData,
+-- or (#1556 'silence') from the relay itself. Written once; a replayed
+-- callback cannot change it. `migrate` rebuilds a table created before
+-- 'silence' was allowed.
 CREATE TABLE IF NOT EXISTS phone_call_end_reasons (
     call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
-    reason TEXT NOT NULL CHECK(length(reason) BETWEEN 1 AND 32),
-    recorded_ms INTEGER NOT NULL,
-    notice TEXT NOT NULL DEFAULT 'pending' CHECK(notice IN ('pending','done')),
+    reason TEXT NOT NULL CHECK(reason IN ('owner_goodbye','task_complete','owner_request','relay_ended_unknown','silence')),
+    recorded_ms INTEGER NOT NULL
+);
+
+-- #1556 the one chat notice for a call the relay ended itself. A lease
+-- (attempts + next_ms) so a restart replays an unfinished delivery once,
+-- under the same outbox idempotency key.
+CREATE TABLE IF NOT EXISTS phone_call_end_notices (
+    call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
+    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','done')),
     attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 3),
     next_ms INTEGER NOT NULL DEFAULT 0,
-    notified_ms INTEGER
+    created_ms INTEGER NOT NULL,
+    done_ms INTEGER
 );
