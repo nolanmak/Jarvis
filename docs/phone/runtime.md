@@ -602,7 +602,8 @@ in the additive table `phone_call_proposals` after the limits:
 - inside the quiet hours (`AUGMENTAGENT_PHONE_QUIET_HOURS`, owner-local) its
   delivery time moves to the quiet-hours end. Deferred, never dropped.
 
-The phone runtime checks due proposals every 5 s (so a deferred one arrives
+The phone runtime checks due proposals every 5 s in its own worker,
+independent of post-call summaries (so a deferred one arrives
 within seconds of the quiet hours ending) and posts each once through the
 owner's **private control chat** outbox (idempotency key
 `call-proposal:<id>`):
@@ -614,14 +615,17 @@ owner's **private control chat** outbox (idempotency key
 The owner's answer is a bare `yes` (`y`, `yes please`, `call now`) or `no`
 (`n`, `no thanks`, `not now`). While a question is open, and for 15 minutes
 after it closes, adapters route these replies to the phone service like other
-phone commands; the rest of the time a bare `yes` is ordinary chat text.
+phone commands; once the owner has answered, routing stops 15 minutes after
+that answer. The rest of the time a bare `yes` is ordinary chat text.
 Only an authenticated owner reply in the chat the question was posted in
 counts:
 
 - `yes` within 15 minutes of posting accepts the proposal once and dials
   through the existing `call_owner` path (same grant checks, budget and rate
   limits as `call me`; request ID `proposal:<id>`). Duplicate `yes` replies
-  get "already requested" and never dial again.
+  get "already requested" with the call's current state and never dial
+  again (they retry the same request ID, so a reservation refused before it
+  was created gets its first attempt).
 - `yes` from another conversation (even another control channel) gets a fixed
   reply and is ignored; from an unauthorized sender or chat, the usual
   authorization reply.

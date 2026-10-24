@@ -19,6 +19,11 @@ pub struct CallProposal {
 impl CallProposal {
     /// One proposal covering up to five headlines; `None` when there are none.
     pub fn from_headlines(headlines: &[String]) -> Option<Self> {
+        let headlines: Vec<String> = headlines
+            .iter()
+            .map(|h| bounded(h, ITEM_MAX))
+            .filter(|h| !h.is_empty())
+            .collect();
         if headlines.is_empty() {
             return None;
         }
@@ -30,12 +35,7 @@ impl CallProposal {
         };
         Some(Self {
             reason: bounded(&reason, REASON_MAX),
-            agenda: headlines
-                .iter()
-                .map(|h| bounded(h, ITEM_MAX))
-                .filter(|h| !h.is_empty())
-                .take(AGENDA_MAX)
-                .collect(),
+            agenda: headlines.into_iter().take(AGENDA_MAX).collect(),
         })
     }
 }

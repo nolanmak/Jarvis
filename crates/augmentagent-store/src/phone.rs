@@ -1510,11 +1510,12 @@ impl Store {
     }
     /// Whether any posted proposal's window (plus `grace_ms` for late replies)
     /// is still open, so bare yes/no replies are routed to the phone service.
+    /// An answered proposal's window ends at its decision time plus grace.
     pub fn phone_call_proposal_window_open(&self, now_ms: i64, grace_ms: i64) -> PhoneResult<bool> {
         Ok(self.with_conn(|c| {
             c.query_row(
                 "SELECT EXISTS(SELECT 1 FROM phone_call_proposals
-                 WHERE delivered_ms IS NOT NULL AND expires_ms+?2>?1)",
+                 WHERE delivered_ms IS NOT NULL AND (CASE WHEN state IN ('accepted','declined') THEN decided_ms ELSE expires_ms END)+?2>?1)",
                 params![now_ms, grace_ms],
                 |r| r.get(0),
             )
@@ -1537,7 +1538,7 @@ impl Store {
                 .query_row(
                     &format!(
                         "SELECT {PROPOSAL_COLUMNS},conversation FROM phone_call_proposals
-                         WHERE owner=?1 AND delivered_ms IS NOT NULL AND expires_ms+?3>?2
+                         WHERE owner=?1 AND delivered_ms IS NOT NULL AND (CASE WHEN state IN ('accepted','declined') THEN decided_ms ELSE expires_ms END)+?3>?2
                          ORDER BY delivered_ms DESC, id DESC LIMIT 1"
                     ),
                     params![owner, now_ms, grace_ms],

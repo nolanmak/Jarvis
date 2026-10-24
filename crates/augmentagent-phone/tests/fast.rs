@@ -1244,6 +1244,20 @@ async fn proposal_agenda_is_in_the_first_turn_prompt() {
     let system = model.requests()[0].system.clone();
     assert!(system.contains(augmentagent_phone::proposals::AGENDA_INSTRUCTION), "{system}");
     assert!(system.contains("- Reply to the venue\n- Confirm Friday dinner"), "{system}");
+    // A long multi-byte agenda keeps its head: the reason and first item.
+    let long = format!("Reason: Ünïcödé reason\n- first item\n{}", "- ✓✓✓✓✓✓✓✓✓✓\n".repeat(200));
+    let wide = ScriptedModel::new(vec![vec![Step::Token("Ok.")]]);
+    let fast = agent(
+        wide.clone(),
+        Arc::new(FakeBackend { agenda: Some(long), ..Default::default() }),
+        FastLayerConfig::default(),
+    );
+    let (turn_id, speech) = relay.turn("hey");
+    fast.answer(&call(), &turn_id, "hey", speech, CancellationToken::new())
+        .await
+        .unwrap();
+    let system = wide.requests()[0].system.clone();
+    assert!(system.contains("Reason: Ünïcödé reason\n- first item"), "{system}");
     // Without a proposal there is no agenda section.
     let plain = ScriptedModel::new(vec![vec![Step::Token("Hi.")]]);
     let fast = agent(plain.clone(), Arc::new(FakeBackend::default()), FastLayerConfig::default());

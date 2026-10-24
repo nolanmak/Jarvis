@@ -550,3 +550,28 @@ async fn agenda_is_absent_from_twiml_and_provider_requests() {
     let section = f.service.call_agenda(&call).unwrap().unwrap().prompt_section();
     assert!(section.contains("Zephyrine venue deposit") && section.contains("Marmalade"));
 }
+
+#[tokio::test]
+async fn answered_proposal_closes_its_window_after_the_decision_grace() {
+    let _serial = SERIAL.lock().await;
+    let f = fixture(at(5, 12, 0));
+    f.propose("A follow-up is due", &[]).unwrap();
+    f.deliver().await;
+    f.set(at(5, 12, 1));
+    say(&f, &f.conversation, "evt-yes", "yes").await;
+    // Duplicates right after the decision are still handled, without a dial.
+    f.set(at(5, 12, 15));
+    f.deliver().await;
+    let reply = say(&f, &f.conversation, "evt-dup", "yes").await;
+    assert!(reply.contains("already requested"), "{reply}");
+    assert_eq!(f.dials(), 1);
+    // 15 minutes after the decision, a bare yes is ordinary text again,
+    // even though the unanswered window would have run until 12:30.
+    f.set(at(5, 12, 16));
+    f.deliver().await;
+    assert!(!augmentagent_phone::commands::recognizes("yes"));
+    assert_eq!(
+        augmentagent_phone::commands::execute(&f.service, &f.owner, &f.conversation, "e", "yes").await,
+        None
+    );
+}

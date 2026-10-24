@@ -350,8 +350,18 @@ impl PhoneService {
                     call["state"].as_str().unwrap_or("unknown")
                 )
             }
-            ProposalAnswer::AlreadyAccepted(_) => {
-                "That call was already requested. Say `phone status` to check it or `phone stop` to end it.".into()
+            ProposalAnswer::AlreadyAccepted(proposal) => {
+                // Same request ID: an existing reservation never dials again,
+                // and one refused before it was created gets its first try.
+                let request = proposal.call_request.ok_or(Error::Store(PhoneError::Conflict))?;
+                let call = self
+                    .tool(grant, "call_owner", serde_json::json!({ "request_id": request }))
+                    .await?;
+                format!(
+                    "That call was already requested. Phone call {}: {}. Say `phone stop` to end it.",
+                    call["id"].as_str().unwrap_or("unknown"),
+                    call["state"].as_str().unwrap_or("unknown")
+                )
             }
             ProposalAnswer::Declined | ProposalAnswer::AlreadyDeclined => DECLINED_REPLY.into(),
             ProposalAnswer::Expired => EXPIRED_REPLY.into(),

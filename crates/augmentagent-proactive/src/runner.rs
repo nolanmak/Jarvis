@@ -426,5 +426,11 @@ mod tests {
         assert_eq!(proposal.agenda[0], "Item 1 second line");
         assert_eq!(proposal.reason, "8 follow-ups need your attention");
         assert!(crate::call_proposal::CallProposal::from_headlines(&[]).is_none());
+        let blank = vec!["  ".to_string(), "\n\t".to_string()];
+        assert!(crate::call_proposal::CallProposal::from_headlines(&blank).is_none());
+        let mixed = vec![" ".to_string(), "Real item".to_string()];
+        let proposal = crate::call_proposal::CallProposal::from_headlines(&mixed).unwrap();
+        assert_eq!(proposal.agenda, vec!["Real item"]);
+        assert_eq!(proposal.reason, "A follow-up needs your attention");
     }
 }
