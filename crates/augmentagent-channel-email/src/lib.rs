@@ -18,6 +18,7 @@ mod channel;
 mod argv_stub;
 
 pub use channel::{
+    DEFAULT_POLL_SECS,
     DispatchOutcome, GmailChannel, GmailChannelConfig, GmailWorkHandler, PollOutcome,
 };
 pub use inbound::{email_to_work_item, GmailInbound};

@@ -18,8 +18,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SUITES = [
     ("augmentagent-docs", "--test", "private_attachments", 2),
     ("augmentagent-phone", "--lib", None, 18),
-    ("augmentagent-phone", "--test", "relay", 13),
-    ("augmentagent-phone", "--test", "service", 45),
+    ("augmentagent-phone", "--test", "relay", 23),
+    ("augmentagent-phone", "--test", "service", 48),
     ("augmentagent-phone", "--test", "speech", 14),
     ("augmentagent-phone", "--test", "fast", 30),
     ("augmentagent-phone", "--test", "metrics", 4),

@@ -4,7 +4,8 @@ use crate::Error;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
+use tokio::time::Instant;
 
 #[derive(Debug)]
 pub struct RelayTurn {
@@ -15,7 +16,15 @@ pub struct RelayTurn {
 pub enum RelayInput {
     Ready,
     Ignore,
+    /// A confirmed interruption with no new turn: the heard prefix is ready in
+    /// [`RelaySession::take_interrupted_prefix`].
     Interrupted,
+    /// Playback stopped; whether it was a real interruption is decided by the
+    /// next prompt or by the false-interruption timeout.
+    InterruptPending,
+    /// A false interruption: the interrupted answer resumes from the unspoken
+    /// remainder (`None` when nothing is left to say).
+    Resumed(Option<Resume>),
     ProviderError(u32),
     /// Provider `error` frame received after setup and before the first
     /// prompt whose description names the provider, model or voice: the
@@ -33,6 +42,12 @@ impl std::fmt::Debug for RelayInput {
             Self::Ready => f.write_str("Ready"),
             Self::Ignore => f.write_str("Ignore"),
             Self::Interrupted => f.write_str("Interrupted"),
+            Self::InterruptPending => f.write_str("InterruptPending"),
+            Self::Resumed(resume) => write!(
+                f,
+                "Resumed({})",
+                resume.as_ref().map_or("none", |r| r.turn_id.as_str())
+            ),
             Self::ProviderError(code) => write!(f, "ProviderError({code})"),
             Self::SetupProviderRejected => f.write_str("SetupProviderRejected"),
             Self::Partial(_) => f.write_str("Partial"),
@@ -59,6 +74,171 @@ pub fn names_voice_setup(description: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+/// The resumed remainder of an interrupted answer, ready to write.
+#[derive(Debug)]
+pub struct Resume {
+    pub turn_id: String,
+    pub frame: Value,
+}
+/// Barge-in handling (#1550). Short backchannel speech while Jarvis is talking
+/// does not cancel the answer.
+#[derive(Clone, Debug)]
+pub struct BargeIn {
+    min_words: usize,
+    backchannels: Vec<String>,
+    false_interrupt: Duration,
+    resume: bool,
+}
+/// Default backchannel phrases, already normalized (see [`normalize`]).
+pub const DEFAULT_BACKCHANNELS: &[&str] = &[
+    "ok", "okay", "yeah", "yes", "mm", "mhm", "mm hm", "mm hmm", "uh huh", "right", "sure",
+    "got it",
+];
+impl Default for BargeIn {
+    fn default() -> Self {
+        Self {
+            min_words: 3,
+            backchannels: DEFAULT_BACKCHANNELS.iter().map(|s| (*s).into()).collect(),
+            false_interrupt: Duration::from_millis(2_000),
+            resume: true,
+        }
+    }
+}
+impl BargeIn {
+    /// `min_words` 1–10 (1 disables the filter: every interrupt invalidates at
+    /// once); 1–64 phrases, normalized, each at most 64 bytes; timeout
+    /// 500–5,000 ms. Errors name the operator variable, never the value.
+    pub fn new(
+        min_words: usize,
+        backchannels: Vec<String>,
+        false_interrupt_ms: u64,
+        resume: bool,
+    ) -> Result<Self, Error> {
+        use crate::config::{BACKCHANNEL_PHRASES, BARGE_MIN_WORDS, FALSE_INTERRUPT_MS};
+        if !(1..=10).contains(&min_words) {
+            return Err(Error::InvalidSetting(BARGE_MIN_WORDS));
+        }
+        let backchannels: Vec<String> = backchannels
+            .iter()
+            .map(|b| normalize(b))
+            .filter(|b| !b.is_empty())
+            .collect();
+        if backchannels.is_empty()
+            || backchannels.len() > 64
+            || backchannels.iter().any(|b| b.len() > 64)
+        {
+            return Err(Error::InvalidSetting(BACKCHANNEL_PHRASES));
+        }
+        if !(500..=5_000).contains(&false_interrupt_ms) {
+            return Err(Error::InvalidSetting(FALSE_INTERRUPT_MS));
+        }
+        Ok(Self {
+            min_words,
+            backchannels,
+            false_interrupt: Duration::from_millis(false_interrupt_ms),
+            resume,
+        })
+    }
+    pub fn min_words(&self) -> usize {
+        self.min_words
+    }
+    pub fn backchannels(&self) -> &[String] {
+        &self.backchannels
+    }
+    pub fn false_interrupt(&self) -> Duration {
+        self.false_interrupt
+    }
+    pub fn resume(&self) -> bool {
+        self.resume
+    }
+    /// Speech shorter than `min_words` that matches a backchannel phrase is
+    /// not an interruption. A goodbye phrase (#1557) never is, so the owner
+    /// can always end the call over Jarvis.
+    fn is_backchannel(&self, text: &str) -> bool {
+        let normalized = normalize(text);
+        normalized.split(' ').count() < self.min_words
+            && self.backchannels.contains(&normalized)
+            && !crate::end_call::is_goodbye_phrase(text)
+    }
+}
+/// Lowercase, hyphens and punctuation to spaces, whitespace collapsed:
+/// "Mm-hmm." becomes "mm hmm".
+pub fn normalize(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '\'' {
+                c.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+/// The part of `spoken` the caller has not heard. `cycle_starts` are the byte
+/// offsets where each talk cycle began; the heard prefix is matched against the
+/// latest cycle first. A cut inside a word restarts that word. Without an
+/// exact prefix, the remainder starts at the next sentence boundary after the
+/// position the spoken duration implies within the latest cycle.
+fn remainder<'a>(
+    spoken: &'a str,
+    cycle_starts: &[usize],
+    heard: &str,
+    duration_ms: u64,
+) -> &'a str {
+    for &start in cycle_starts.iter().rev() {
+        if spoken[start..].starts_with(heard) {
+            let mut cut = start + heard.len();
+            let word = |i: usize| {
+                spoken[i..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_alphanumeric)
+            };
+            if cut < spoken.len() && cut > start && word(cut) {
+                while cut > start {
+                    let prev = spoken[..cut]
+                        .char_indices()
+                        .next_back()
+                        .map_or(start, |(i, _)| i);
+                    if !word(prev) {
+                        break;
+                    }
+                    cut = prev;
+                }
+            }
+            return spoken[cut..].trim_start();
+        }
+    }
+    let start = cycle_starts.last().copied().unwrap_or(0);
+    let estimate = usize::try_from(duration_ms.saturating_mul(SPOKEN_CHARS_PER_SECOND) / 1000)
+        .unwrap_or(usize::MAX);
+    let mut position = start.saturating_add(estimate).min(spoken.len());
+    while !spoken.is_char_boundary(position) {
+        position += 1;
+    }
+    let rest = &spoken[position..];
+    let mut chars = rest.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if matches!(c, '.' | '!' | '?')
+            && chars.peek().is_some_and(|(_, next)| next.is_whitespace())
+        {
+            return rest[i + 1..].trim_start();
+        }
+    }
+    ""
+}
+/// Nominal TTS speaking rate used to place a cut when the heard text does not
+/// match what was sent.
+const SPOKEN_CHARS_PER_SECOND: u64 = 15;
+struct PendingInterrupt {
+    turn_id: String,
+    heard: String,
+    duration_ms: u64,
+    deadline: Instant,
 }
 #[derive(Deserialize)]
 #[serde(tag = "type")]
@@ -108,6 +288,32 @@ struct TurnOutput {
     /// Concatenation of every streamed token so far. Deduplication covers the
     /// whole streamed answer, never an individual chunk.
     streamed: String,
+    /// Every token written for this turn, utterances included, in order.
+    spoken: String,
+    cycle_starts: Vec<usize>,
+    /// The latest frame had `last:false`.
+    cycle_open: bool,
+    generation: u64,
+}
+impl TurnOutput {
+    fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            sent: HashMap::new(),
+            final_spoken: false,
+            streamed: String::new(),
+            spoken: String::new(),
+            cycle_starts: Vec::new(),
+            cycle_open: false,
+        }
+    }
+    fn record(&mut self, token: &str, last: bool) {
+        if !self.cycle_open {
+            self.cycle_starts.push(self.spoken.len());
+        }
+        self.spoken.push_str(token);
+        self.cycle_open = !last;
+    }
 }
 pub struct RelaySession {
     call_id: String,
@@ -123,6 +329,10 @@ pub struct RelaySession {
     invalid_frames: u64,
     played_event: Option<tokio::time::Instant>,
     partial_prompts: bool,
+    barge: BargeIn,
+    /// Turn that most recently wrote speech: what an `interrupt` cut off.
+    speaking: Option<String>,
+    pending: Option<PendingInterrupt>,
     /// A tokens-played event marked `last:true` arrived (#1557).
     played_final: bool,
     ended: bool,
@@ -143,6 +353,9 @@ impl RelaySession {
             invalid_frames: 0,
             played_event: None,
             partial_prompts: false,
+            barge: BargeIn::default(),
+            speaking: None,
+            pending: None,
             played_final: false,
             ended: false,
         }
@@ -158,6 +371,42 @@ impl RelaySession {
     pub fn with_debug_events(mut self, enabled: bool) -> Self {
         self.debug_events = enabled;
         self
+    }
+    pub fn with_barge_in(mut self, barge: BargeIn) -> Self {
+        self.barge = barge;
+        self
+    }
+    /// Output epoch; speech for an older generation is never sent.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    /// When a pending interruption is treated as false if no prompt arrives.
+    pub fn false_interrupt_deadline(&self) -> Option<Instant> {
+        self.pending.as_ref().map(|p| p.deadline)
+    }
+    /// After the deadline, resolve the pending interruption as false.
+    pub fn poll_false_interrupt(&mut self) -> Option<RelayInput> {
+        if Instant::now() < self.false_interrupt_deadline()? {
+            return None;
+        }
+        Some(self.false_interruption())
+    }
+    /// Resume the cut answer, or with resume off drop its remainder: the turn
+    /// is closed without a new generation and reported as interrupted.
+    fn false_interruption(&mut self) -> RelayInput {
+        if self.barge.resume {
+            return RelayInput::Resumed(self.resume());
+        }
+        let Some(pending) = self.pending.take() else {
+            return RelayInput::Ignore;
+        };
+        if let Some(output) = self.outputs.get_mut(&pending.turn_id) {
+            output.final_spoken = true;
+            output.cycle_open = false;
+        }
+        self.speaking = None;
+        self.heard_until_interrupt = Some(pending.heard);
+        RelayInput::Interrupted
     }
     /// Frames rejected as malformed, unauthorized or unsupported.
     pub fn invalid_frames(&self) -> u64 {
@@ -219,20 +468,29 @@ impl RelaySession {
                         RelayInput::Ignore
                     });
                 }
+                if self.pending.is_some() && self.barge.is_backchannel(&text) {
+                    return Ok(self.false_interruption());
+                }
+                if let Some(pending) = self.pending.take() {
+                    self.confirm_interrupt(pending.heard);
+                } else if !self
+                    .outputs
+                    .values()
+                    .any(|o| o.generation == self.generation && !o.final_spoken)
+                {
+                    // Jarvis is silent with no answer in progress: the prompt
+                    // opens a new generation. An answer still being worked on
+                    // is not invalidated by a follow-up prompt.
+                    self.advance_generation();
+                }
                 if self.sequence >= 256 {
                     return Err(Error::InvalidArguments);
                 }
                 self.prompted = true;
                 self.sequence += 1;
                 let id = format!("phone:{}:{}", self.call_id, self.sequence);
-                self.outputs.insert(
-                    id.clone(),
-                    TurnOutput {
-                        sent: HashMap::new(),
-                        final_spoken: false,
-                        streamed: String::new(),
-                    },
-                );
+                self.outputs
+                    .insert(id.clone(), TurnOutput::new(self.generation));
                 Ok(RelayInput::Turn(RelayTurn {
                     id,
                     text,
@@ -243,8 +501,17 @@ impl RelaySession {
                 if heard.len() > 12_000 || duration > 900_000 {
                     return Err(Error::InvalidArguments);
                 }
-                self.generation += 1;
-                self.heard_until_interrupt = Some(heard);
+                // Min words 1 leaves no speech short enough to be a backchannel.
+                if let Some(turn_id) = self.speaking.clone().filter(|_| self.barge.min_words > 1) {
+                    self.pending = Some(PendingInterrupt {
+                        turn_id,
+                        heard,
+                        duration_ms: duration,
+                        deadline: Instant::now() + self.barge.false_interrupt,
+                    });
+                    return Ok(RelayInput::InterruptPending);
+                }
+                self.confirm_interrupt(heard);
                 Ok(RelayInput::Interrupted)
             }
             Incoming::Error { description, .. }
@@ -269,6 +536,38 @@ impl RelaySession {
             }
             _ => Err(Error::InvalidArguments),
         }
+    }
+    /// A real interruption: stale output is dropped from now on.
+    fn confirm_interrupt(&mut self, heard: String) {
+        self.advance_generation();
+        self.heard_until_interrupt = Some(heard);
+    }
+    fn advance_generation(&mut self) {
+        self.generation += 1;
+        self.speaking = None;
+    }
+    /// Resume the pending interrupted turn: one frame with the unspoken
+    /// remainder, which starts a new talk cycle.
+    fn resume(&mut self) -> Option<Resume> {
+        let pending = self.pending.take()?;
+        let output = self.outputs.get_mut(&pending.turn_id)?;
+        let rest = remainder(
+            &output.spoken,
+            &output.cycle_starts,
+            &pending.heard,
+            pending.duration_ms,
+        )
+        .to_owned();
+        if rest.is_empty() {
+            return None;
+        }
+        let last = !output.cycle_open;
+        output.cycle_open = false;
+        output.record(&rest, last);
+        Some(Resume {
+            turn_id: pending.turn_id,
+            frame: text_frame(&rest, last),
+        })
     }
     /// Provider-reported heard prefix, distinct from the full generated answer.
     pub fn take_interrupted_prefix(&mut self) -> Option<String> {
@@ -309,10 +608,10 @@ impl RelaySession {
         output.final_spoken = final_output;
         // Agent-authored utterances may carry Markdown; receipts are keyed on
         // the raw text, the provider hears the sanitized form.
-        Ok(Some(text_frame(
-            &crate::speech::SpeechTextTransform::apply(text),
-            true,
-        )))
+        let token = crate::speech::SpeechTextTransform::apply(text);
+        output.record(&token, true);
+        self.speaking = Some(turn.id.clone());
+        Ok(Some(text_frame(&token, true)))
     }
     /// One streamed token with `last:false`. Tokens are forwarded untrimmed
     /// so spacing survives concatenation on the provider side. Nothing is sent
@@ -343,6 +642,8 @@ impl RelaySession {
             output.sent.insert("final".into(), (hash, true));
             output.final_spoken = true;
         }
+        output.record(text, last);
+        self.speaking = Some(turn.id.clone());
         Ok(Some(text_frame(text, last)))
     }
     /// One complete fast-layer announcement outside any owner turn (#1546).
@@ -385,6 +686,10 @@ impl RelaySession {
             output.final_spoken = true;
             output.streamed.push_str(text);
         }
+        // After the goodbye nothing resumes (#1550): an interrupt over it is
+        // not held for a backchannel decision.
+        self.speaking = None;
+        self.pending = None;
         let spoken = crate::speech::SpeechTextTransform::apply(text);
         let spoken = if spoken.trim().is_empty() {
             crate::end_call::DEFAULT_GOODBYE.to_owned()
