@@ -104,11 +104,14 @@ pub fn collect() -> References {
 }
 
 fn read_config_tree(path: &Path, out: &mut References) {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        if path.exists() {
-            out.reliable = false;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                out.reliable = false;
+            }
+            return;
         }
-        return;
     };
     if meta.is_dir() {
         match std::fs::read_dir(path) {
@@ -122,7 +125,7 @@ fn read_config_tree(path: &Path, out: &mut References) {
             }
             Err(_) => out.reliable = false,
         }
-    } else if meta.is_file()
+    } else if (meta.is_file() || meta.file_type().is_symlink())
         && matches!(
             path.extension().and_then(|s| s.to_str()),
             Some("service" | "conf")
@@ -135,5 +138,50 @@ fn read_config_tree(path: &Path, out: &mut References) {
             }
             Err(_) => out.reliable = false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn symlinked_units_and_dropins_preserve_rollback_references_without_following_directory_loops()
+    {
+        use std::os::unix::fs::symlink;
+        let t = tempfile::tempdir().unwrap();
+        let units = t.path().join("units");
+        std::fs::create_dir(&units).unwrap();
+        let rollback = t.path().join("rollback");
+        let external = t.path().join("external-unit");
+        std::fs::write(
+            &external,
+            format!("ExecStart={}/augmentagent\n", rollback.display()),
+        )
+        .unwrap();
+        symlink(&external, units.join("agent.service")).unwrap();
+        symlink(&external, units.join("override.conf")).unwrap();
+        symlink(&units, units.join("loop")).unwrap();
+        let mut references = References {
+            reliable: true,
+            ..Default::default()
+        };
+        read_config_tree(&units, &mut references);
+        assert!(references.reliable);
+        assert!(references.protects(&rollback));
+    }
+
+    #[test]
+    fn unreadable_or_dangling_unit_links_cannot_authorize_retention() {
+        use std::os::unix::fs::symlink;
+        let t = tempfile::tempdir().unwrap();
+        symlink(t.path().join("missing"), t.path().join("agent.service")).unwrap();
+        let mut references = References {
+            reliable: true,
+            ..Default::default()
+        };
+        read_config_tree(t.path(), &mut references);
+        assert!(!references.reliable);
+        assert!(references.protects(&t.path().join("rollback")));
     }
 }

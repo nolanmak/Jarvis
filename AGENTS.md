@@ -12,5 +12,8 @@ available space, and do not delete a cache while any build uses it. Resume the
 managed wrapper once a supporting binary is available. Do not create another
 unregistered target directory to work around a busy cache.
 
+Take rollout backups through `augmentagent deploy snapshot`; do not create raw
+database copies or ad hoc rollback directories outside its retention policy.
+
 See `docs/disk-storage.md` for ownership, budgets, rollback protection, and rollout
 verification. Follow `CLAUDE.md` for other repository conventions when present.

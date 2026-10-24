@@ -41,7 +41,7 @@ jobs:
         env:
           AUGMENTAGENT_GH_DISABLE: '1'
         run: |
-          cargo test -p augmentagent-cli --bin augmentagent -- disk:: build_storage:: deploy_snapshot:: autopr_health::
+          cargo test -p augmentagent-cli --bin augmentagent -- disk:: build_storage:: deploy_snapshot:: snapshot_refs:: autopr_health::
           python3 scripts/tests/disk-storage-smoke.py target/debug/augmentagent
           bash scripts/tests/service-restart.test.sh
       # Every workflow here builds a per-crate SUBSET, so a crate that nothing
