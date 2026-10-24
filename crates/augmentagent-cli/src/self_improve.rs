@@ -1886,7 +1886,54 @@ fn recorded_approval(record: Option<&OpenedPr>, pr: u64, head: Option<&str>) -> 
     approval_of(reviewed_here.and_then(|r| r.verdict.as_ref()))
 }
 
+/// The mutex for the opened-PR map (#1533): a stable sibling of the data
+/// file, never the rename target. Flocking the data file itself would not
+/// exclude anything, because the rename below swaps the inode out from under
+/// whoever holds that lock.
+fn opened_prs_lock_path(path: &Path) -> PathBuf {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    path.with_file_name(format!("{name}.lock"))
+}
+
+/// Hold the opened-PR mutex, or `None` if it cannot be held at all. A signal
+/// interrupting `flock` is not a failure — it is retried, since giving up there
+/// would leave the caller writing unserialized.
+fn lock_opened_prs(lock_path: &Path) -> Option<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .map_err(|e| warn!(path = %lock_path.display(), "opened-PR lock open failed: {e}"))
+        .ok()?;
+    loop {
+        // SAFETY: `file` owns the fd; flock neither reads nor writes it.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Some(file);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        warn!(path = %lock_path.display(), "opened-PR lock flock failed: {e}");
+        return None;
+    }
+}
+
 /// Record that the loop opened `pr` for `issue`, at reviewed head `head`.
+///
+/// #1533 — the build and resume lanes hold *different* run locks, so they can
+/// both be here at once. Without the flock, two read-modify-write cycles drop
+/// one lane's record, and a missing head-bound verdict stalls the merge sweep
+/// for that PR forever.
+///
+/// The only writer of the map: the build lane (after publishing) and the resume
+/// lane (after recording a verdict) both come through here, and nothing else
+/// serializes it — `the_locking_recorder_is_the_codebases_only_writer_of_the_map`
+/// fails if a new one appears. Readers go through `read_opened_prs`, whose
+/// outcomes are unchanged (only its warnings are new); the approval predicates
+/// above and both call sites' arguments are untouched.
 fn record_opened_pr(
     path: &Path,
     issue: u64,
@@ -1894,24 +1941,78 @@ fn record_opened_pr(
     head: &str,
     verdict: Option<RecordedVerdict>,
 ) {
+    if let Some(dir) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            warn!(path = %path.display(), "opened-PR map dir create failed: {e}");
+        }
+    }
+    // Fail closed: an unlocked read-modify-write can rename a stale map over a
+    // sibling lane's record, which is the stall this guards against. Our own
+    // record is recoverable (the next pass re-records it); a clobbered sibling
+    // is not visible to anyone.
+    let _lock = match lock_opened_prs(&opened_prs_lock_path(path)) {
+        Some(f) => f,
+        None => return,
+    };
+
     let mut map = read_opened_prs(path);
     map.insert(issue.to_string(), OpenedPr { pr, head: head.to_string(), verdict });
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(json) = serde_json::to_vec_pretty(&map) {
-        let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, &json).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
+    let json = match serde_json::to_vec_pretty(&map) {
+        Ok(j) => j,
+        Err(e) => {
+            warn!(path = %path.display(), "opened-PR map serialize failed: {e}");
+            return;
         }
+    };
+    // Per-writer temp name: the fixed `.tmp` sibling let one lane rename the
+    // other's partial bytes into place.
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = path.with_file_name(format!("{name}.tmp.{}.{seq}", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, &json) {
+        warn!(path = %tmp.display(), "opened-PR map write failed: {e}");
+        remove_stale_tmp(&tmp);
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        warn!(path = %path.display(), "opened-PR map rename failed: {e}");
+        remove_stale_tmp(&tmp);
+    }
+    // Lock released when `_lock` drops.
+}
+
+/// Drop a staging file a failed write or rename left behind, reporting what
+/// stops us: an orphan `.tmp.<pid>.<seq>` sibling is never picked up again, so
+/// a silent failure here would accumulate junk beside the map.
+fn remove_stale_tmp(tmp: &Path) {
+    match std::fs::remove_file(tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!(path = %tmp.display(), "opened-PR map temp cleanup failed: {e}"),
     }
 }
 
 fn read_opened_prs(path: &Path) -> std::collections::BTreeMap<String, OpenedPr> {
-    std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        // Nothing recorded yet is the common case, not a fault.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Default::default(),
+        Err(e) => {
+            warn!(path = %path.display(), "opened-PR map read failed: {e}");
+            return Default::default();
+        }
+    };
+    // A damaged map reads as empty, exactly as it did before #1533: serde
+    // decodes the object as a whole, so there are no per-record survivors to
+    // salvage, and the next pass re-records what each lane still owns.
+    match serde_json::from_slice(&bytes) {
+        Ok(map) => map,
+        Err(e) => {
+            warn!(path = %path.display(), "opened-PR map parse failed: {e}");
+            Default::default()
+        }
+    }
 }
 
 /// What this box opened for `issue`, if anything.
@@ -14626,6 +14727,222 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // failure direction has to be "do not merge".
         std::fs::write(&path, b"not json").unwrap();
         assert_eq!(opened_pr_for(&path, 1007), None);
+    }
+
+    /// #1533 — the build and resume lanes hold different run locks, so they
+    /// write this map concurrently. Every record has to survive: a lost one
+    /// leaves the merge sweep with no head-bound verdict and stalls that PR.
+    #[test]
+    fn concurrent_writers_never_lose_each_others_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/opened.json");
+        const WRITERS: u64 = 16;
+        const ROUNDS: u64 = 4;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS as usize));
+
+        let mut handles = Vec::new();
+        for w in 0..WRITERS {
+            let path = path.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let issue = 70000 + w;
+                barrier.wait();
+                for round in 0..ROUNDS {
+                    record_opened_pr(&path, issue, 80000 + w, &format!("head{w}{round}"), None);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let map = read_opened_prs(&path);
+        for w in 0..WRITERS {
+            assert_eq!(
+                map.get(&(70000 + w).to_string()),
+                Some(&OpenedPr {
+                    pr: 80000 + w,
+                    head: format!("head{w}{}", ROUNDS - 1),
+                    verdict: None
+                }),
+                "issue {} lost its record among {WRITERS} concurrent writers",
+                70000 + w
+            );
+        }
+    }
+
+    /// A corrupt map cannot swallow the record that follows it: the prior
+    /// entries are already gone, and losing the new one too would stall the
+    /// sweep. Reads of the corrupt state still refuse to match (fail-closed).
+    #[test]
+    fn a_corrupt_map_still_takes_the_next_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opened.json");
+        std::fs::write(&path, b"not json").unwrap();
+        assert_eq!(opened_pr_for(&path, 1007), None, "corrupt state matches nothing");
+
+        record_opened_pr(&path, 1007, 1020, "aaaa111", None);
+        assert_eq!(
+            opened_pr_for(&path, 1007),
+            Some(OpenedPr { pr: 1020, head: "aaaa111".into(), verdict: None })
+        );
+    }
+
+    /// The staging file is cleaned up by the rename, and the mutex lives
+    /// beside the data file rather than being renamed over.
+    #[test]
+    fn recording_leaves_no_temporary_files_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opened.json");
+        record_opened_pr(&path, 1007, 1020, "aaaa111", None);
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left behind: {leftovers:?}");
+
+        let lock = opened_prs_lock_path(&path);
+        assert_ne!(lock, path, "the lock must not be the data file");
+        assert!(lock.exists(), "the lock sibling is created");
+        assert!(path.exists(), "and the data file is written");
+    }
+
+    /// Codex: an unlocked write is worse than no write. With the mutex
+    /// unobtainable (a directory sits where the lock file goes) the recorder
+    /// must leave the map alone rather than rename a stale copy over a sibling
+    /// lane's record — the very loss #1533 reports.
+    #[test]
+    fn an_unobtainable_lock_leaves_a_siblings_record_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opened.json");
+        record_opened_pr(&path, 994, 1000, "cccc333", None);
+        let lock = opened_prs_lock_path(&path);
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+
+        record_opened_pr(&path, 1007, 1020, "aaaa111", None);
+        assert_eq!(opened_pr_for(&path, 1007), None, "nothing written without the lock");
+        assert_eq!(
+            opened_pr_for(&path, 994),
+            Some(OpenedPr { pr: 1000, head: "cccc333".into(), verdict: None }),
+            "and the sibling's record survives"
+        );
+    }
+
+    /// #1533, verbatim: the resume lane records a verdict for one issue while
+    /// the build lane publishes another. The pre-existing record is unrelated
+    /// to the new one and must still be there afterwards — losing it is the
+    /// stall the issue reports.
+    #[test]
+    fn an_unrelated_record_survives_a_later_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opened.json");
+        let resumed = OpenedPr {
+            pr: 1000,
+            head: "cccc333".into(),
+            verdict: Some(RecordedVerdict {
+                provider: "codex".into(),
+                backend: String::new(),
+                model: String::new(),
+                diff_ok: true,
+                system_ok: true,
+            }),
+        };
+        record_opened_pr(&path, 994, resumed.pr, &resumed.head, resumed.verdict.clone());
+
+        record_opened_pr(&path, 1007, 1020, "aaaa111", None);
+
+        assert_eq!(opened_pr_for(&path, 994), Some(resumed), "the resume lane's record survives");
+        assert_eq!(
+            opened_pr_for(&path, 1007),
+            Some(OpenedPr { pr: 1020, head: "aaaa111".into(), verdict: None })
+        );
+    }
+
+    /// Codex asked how we know no writer bypasses the lock. Nothing can write
+    /// this map without naming either the record type or the path helper, so
+    /// the inventory is every source file mentioning one of those: all reads,
+    /// plus the single locking recorder here.
+    #[test]
+    fn the_locking_recorder_is_the_codebases_only_writer_of_the_map() {
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let mut pending = vec![crates.clone()];
+        let mut mentions = Vec::new();
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let p = entry.unwrap().path();
+                if p.is_dir() {
+                    pending.push(p);
+                } else if p.extension().is_some_and(|e| e == "rs") {
+                    let src = std::fs::read_to_string(&p).unwrap();
+                    if ["OpenedPr", "opened_prs_path", "AUGMENTAGENT_AUTOPR_OPENED_FILE"]
+                        .iter()
+                        .any(|needle| src.contains(needle))
+                    {
+                        let rel = p.strip_prefix(&crates).unwrap().to_string_lossy().into_owned();
+                        if rel != "augmentagent-cli/src/self_improve.rs" {
+                            assert!(
+                                !src.contains("to_vec_pretty"),
+                                "{rel} serializes a map beside the opened-PR map: check it is not \
+                                 writing that map outside record_opened_pr"
+                            );
+                        }
+                        mentions.push(rel);
+                    }
+                }
+            }
+        }
+        mentions.sort();
+        assert_eq!(
+            mentions,
+            vec![
+                "augmentagent-cli/src/autopr_eval.rs",
+                "augmentagent-cli/src/self_improve.rs",
+                "augmentagent-cli/src/self_improve_lifecycle_tests.rs",
+                "augmentagent-cli/src/self_improve_progress_tests.rs",
+            ],
+            "a new file touches the opened-PR map: check it writes via record_opened_pr"
+        );
+
+        // Of those, only this file serializes the map, and it locks first.
+        let src = include_str!("self_improve.rs");
+        let production = &src[..src.find("\nmod tests {").expect("the test module")];
+        assert_eq!(
+            production.matches("to_vec_pretty(&map)").count(),
+            1,
+            "a second serializer of the opened-PR map would write it unserialized"
+        );
+        let body_start = production.find("fn record_opened_pr(").expect("the recorder");
+        let body = &production[body_start..production[body_start..]
+            .find("to_vec_pretty(&map)")
+            .map(|i| body_start + i)
+            .expect("the serialize")];
+        assert!(body.contains("lock_opened_prs("), "the writer locks before it reads");
+
+        // And the call-site inventory Codex asked for: the build lane and the
+        // resume lane, nothing else, each still passing the arguments it passed
+        // before #1533 — the serialization is entirely inside the recorder, so
+        // neither lane's call changed.
+        assert!(
+            production.contains(
+                "record_opened_pr(&opened_prs_path(), issue.number, pr, reviewed_head, \
+                 independent.recorded_verdict());"
+            ),
+            "the resume lane's arguments changed"
+        );
+        assert!(
+            production.contains(
+                "record_opened_pr(&opened_prs_path(), issue.number, n, published_head, verdict);"
+            ),
+            "the build lane's arguments changed"
+        );
+        assert_eq!(
+            production.matches("record_opened_pr(").count(),
+            3,
+            "an extra reference to the recorder: declaration plus the two lanes"
+        );
     }
 
     /// Codex: an extraction that is supposed to change nothing has to change
