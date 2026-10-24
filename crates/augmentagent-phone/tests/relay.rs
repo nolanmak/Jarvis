@@ -86,7 +86,7 @@ fn ac07_wrong_setup_duplicate_setup_malformed_and_oversized_frames_fail_closed()
     assert!(session.receive("bad json").is_err());
     assert!(session.receive(&" ".repeat(32769)).is_err());
     assert!(session
-        .receive(r#"{"type":"error","description":"sensitive provider data"}"#)
+        .receive(r#"{"type":"error","description":"sensitive payload data"}"#)
         .is_err());
 }
 
@@ -94,8 +94,88 @@ fn ac07_wrong_setup_duplicate_setup_malformed_and_oversized_frames_fail_closed()
 fn provider_validation_error_does_not_end_an_authenticated_session() {
     let mut session = RelaySession::new("call-1", "AC-test", "CA-test");
     session.receive(&setup()).unwrap();
-    assert!(session.receive(r#"{"type":"error","code":64107,"description":"private"}"#).is_ok());
-    assert!(matches!(session.receive(r#"{"type":"prompt","voicePrompt":"try again","last":true}"#).unwrap(), RelayInput::Turn(_)));
+    assert!(session
+        .receive(r#"{"type":"error","code":64107,"description":"private"}"#)
+        .is_ok());
+    assert!(matches!(
+        session
+            .receive(r#"{"type":"prompt","voicePrompt":"try again","last":true}"#)
+            .unwrap(),
+        RelayInput::Turn(_)
+    ));
+}
+
+#[test]
+fn provider_error_naming_voice_setup_before_first_prompt_is_setup_provider_rejected() {
+    // Twilio's documented frame on an invalid provider/model/voice combination
+    // arrives after setup and before any prompt, then the socket closes.
+    for description in [
+        "Invalid voice: UgBBYS2sOqTuMpoF3BR0-flash_v2_5 is not valid for ttsProvider ElevenLabs",
+        "speechModel nova-9 is not supported by transcriptionProvider Deepgram",
+        "The configured TTS provider rejected the request",
+    ] {
+        let mut session = RelaySession::new("call-1", "AC-test", "CA-test");
+        session.receive(&setup()).unwrap();
+        let frame = json!({"type":"error","description":description}).to_string();
+        let input = session.receive(&frame).unwrap();
+        assert!(
+            matches!(input, RelayInput::SetupProviderRejected),
+            "{description}"
+        );
+        // The frame carries a code when Twilio sends one; the category stays.
+        let mut session = RelaySession::new("call-1", "AC-test", "CA-test");
+        session.receive(&setup()).unwrap();
+        let frame = json!({"type":"error","code":64104,"description":description}).to_string();
+        assert!(matches!(
+            session.receive(&frame).unwrap(),
+            RelayInput::SetupProviderRejected
+        ));
+    }
+    // The same text after the first prompt is an ordinary provider error: a
+    // live conversation is never reclassified as a setup failure.
+    let mut session = RelaySession::new("call-1", "AC-test", "CA-test");
+    session.receive(&setup()).unwrap();
+    assert!(matches!(
+        session
+            .receive(&json!({"type":"prompt","voicePrompt":"hello","last":true}).to_string())
+            .unwrap(),
+        RelayInput::Turn(_)
+    ));
+    assert!(matches!(
+        session
+            .receive(r#"{"type":"error","code":64104,"description":"voice rejected"}"#)
+            .unwrap(),
+        RelayInput::ProviderError(64104)
+    ));
+    // Code-less errors that do not name the voice setup still fail closed.
+    assert!(session
+        .receive(r#"{"type":"error","description":"voice rejected"}"#)
+        .is_err());
+    let mut session = RelaySession::new("call-1", "AC-test", "CA-test");
+    session.receive(&setup()).unwrap();
+    assert!(session
+        .receive(r#"{"type":"error","description":"Invalid message received"}"#)
+        .is_err());
+}
+
+#[test]
+fn setup_provider_rejection_category_never_carries_the_raw_description() {
+    use augmentagent_phone::relay::names_voice_setup;
+    assert!(names_voice_setup("Invalid voice for provider"));
+    assert!(names_voice_setup("unknown speechModel"));
+    assert!(names_voice_setup("TTS provider failure"));
+    assert!(names_voice_setup("transcriptionProvider is not available"));
+    assert!(!names_voice_setup(
+        "Invalid message received: {\"foo\":\"bar\"}"
+    ));
+    assert!(!names_voice_setup(""));
+    let mut session = RelaySession::new("call-1", "AC-test", "CA-test");
+    session.receive(&setup()).unwrap();
+    let input = session
+        .receive(r#"{"type":"error","description":"voice secret-marker +12025550123"}"#)
+        .unwrap();
+    assert!(!format!("{input:?}").contains("secret-marker"));
+    assert!(!format!("{input:?}").contains("2025550123"));
 }
 
 fn turn(session: &mut RelaySession, prompt: &str) -> augmentagent_phone::relay::RelayTurn {

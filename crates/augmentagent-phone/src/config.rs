@@ -3,6 +3,7 @@
 use crate::{
     relay::{BargeIn, DEFAULT_BACKCHANNELS},
     twilio::TwilioClient,
+    voice::VoiceConfig,
     webhook::WebhookAuth,
     Error, OwnerLink, PhoneConfig, PhoneService, SystemClock,
 };
@@ -50,6 +51,7 @@ pub struct Settings {
     phone: PhoneConfig,
     provider: Arc<TwilioClient>,
     auth: Arc<WebhookAuth>,
+    voice: VoiceConfig,
 }
 pub struct ConfiguredPhone {
     pub bind: SocketAddr,
@@ -112,6 +114,7 @@ impl Settings {
                 })
             })
             .collect::<Result<Vec<_>, Error>>()?;
+        let voice = VoiceConfig::from_lookup(&get)?;
         // Relay debug events (#1551): explicit on/off; absent defaults on for
         // non-production (debug) builds only.
         let debug_events = match get("AUGMENTAGENT_PHONE_DEBUG_EVENTS").as_deref() {
@@ -126,6 +129,7 @@ impl Settings {
             &required("AUGMENTAGENT_PHONE_VERIFICATION_KEY")?,
             links,
         )?
+        .with_voice(voice.clone())
         .with_debug_events(debug_events)
         .with_barge_in(barge_in(&get)?);
         let account = required("TWILIO_ACCOUNT_SID")?;
@@ -141,7 +145,12 @@ impl Settings {
             phone,
             provider,
             auth,
+            voice,
         }))
+    }
+    /// Validated speech providers as they will be emitted in TwiML.
+    pub fn voice(&self) -> &VoiceConfig {
+        &self.voice
     }
     pub fn build(self, store: Arc<Store>) -> Result<ConfiguredPhone, Error> {
         Ok(ConfiguredPhone {

@@ -91,6 +91,8 @@ pub enum Error {
     Store(#[from] PhoneError),
     #[error(transparent)]
     Provider(#[from] ProviderError),
+    #[error("phone voice configuration is invalid: {0}")]
+    Voice(#[from] voice::VoiceConfigError),
 }
 impl Error {
     pub fn code(&self) -> &'static str {
@@ -112,6 +114,7 @@ impl Error {
             Self::Store(_) => "storage_error",
             Self::Provider(ProviderError::Rejected) => "provider_rejected",
             Self::Provider(ProviderError::Uncertain) => "provider_uncertain",
+            Self::Voice(_) => "not_configured",
         }
     }
 }
@@ -127,6 +130,8 @@ pub struct PhoneConfig {
     public_base: String,
     verification_key: Vec<u8>,
     links: Vec<OwnerLink>,
+    voice: voice::VoiceConfig,
+    owner_first_name: Option<String>,
     debug_events: bool,
     barge_in: relay::BargeIn,
 }
@@ -165,9 +170,22 @@ impl PhoneConfig {
             public_base: url.origin().ascii_serialization(),
             verification_key: verification_key.as_bytes().into(),
             links,
+            voice: voice::VoiceConfig::default(),
+            owner_first_name: None,
             debug_events: false,
             barge_in: relay::BargeIn::default(),
         })
+    }
+    /// Operator-validated speech providers. Only startup configuration may call this.
+    pub fn with_voice(mut self, voice: voice::VoiceConfig) -> Self {
+        self.voice = voice;
+        self
+    }
+    /// Optional hook for a stored owner profile's first name, used only as a
+    /// recognition hint. No store exposes a profile yet, so runtime passes None.
+    pub fn with_owner_first_name(mut self, first_name: Option<String>) -> Self {
+        self.owner_first_name = first_name;
+        self
     }
     /// Request ConversationRelay debug events (tokens played, speaker events)
     /// so #1551 can measure audible latency. Off unless explicitly enabled.
@@ -540,6 +558,7 @@ pub mod webhook;
 
 pub mod relay;
 pub mod speech;
+pub mod voice;
 
 impl PhoneService {
     /// Snapshot and claim due cleanup without waiting for provider HTTP. The

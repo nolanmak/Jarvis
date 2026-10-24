@@ -26,7 +26,50 @@ pub enum RelayInput {
     /// remainder (`None` when nothing is left to say).
     Resumed(Option<Resume>),
     ProviderError(u32),
+    /// Provider `error` frame received after setup and before the first
+    /// prompt whose description names the provider, model or voice: the
+    /// configured STT/TTS selection was rejected. The description is dropped.
+    SetupProviderRejected,
     Turn(RelayTurn),
+}
+/// Manual Debug: caller speech and provider descriptions never appear.
+impl std::fmt::Debug for RelayInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ready => f.write_str("Ready"),
+            Self::Ignore => f.write_str("Ignore"),
+            Self::Interrupted => f.write_str("Interrupted"),
+            Self::InterruptPending => f.write_str("InterruptPending"),
+            Self::Resumed(resume) => write!(
+                f,
+                "Resumed({})",
+                resume.as_ref().map_or("none", |r| r.turn_id.as_str())
+            ),
+            Self::ProviderError(code) => write!(f, "ProviderError({code})"),
+            Self::SetupProviderRejected => f.write_str("SetupProviderRejected"),
+            Self::Turn(turn) => write!(f, "Turn({})", turn.id),
+        }
+    }
+}
+/// Whether a provider error description points at the configured speech
+/// providers rather than at a malformed message. Case-insensitive keyword
+/// match; the description itself is never retained.
+pub fn names_voice_setup(description: &str) -> bool {
+    let lower = description.to_ascii_lowercase();
+    [
+        "voice",
+        "ttsprovider",
+        "transcriptionprovider",
+        "speechmodel",
+        "provider",
+        "model",
+        "tts",
+        "transcription",
+        "elevenlabs",
+        "deepgram",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 /// The resumed remainder of an interrupted answer, ready to write.
 #[derive(Debug)]
@@ -218,7 +261,10 @@ enum Incoming {
     #[serde(rename = "dtmf")]
     Dtmf { digit: String },
     #[serde(rename = "error")]
-    Error { code: Option<u32> },
+    Error {
+        code: Option<u32>,
+        description: Option<String>,
+    },
     /// Relay debug/event traffic (`debug`/`events` TwiML attributes). Only the
     /// event name is read; values are never logged or stored.
     #[serde(rename = "info")]
@@ -264,6 +310,7 @@ pub struct RelaySession {
     account_sid: String,
     call_sid: String,
     ready: bool,
+    prompted: bool,
     sequence: u64,
     generation: u64,
     outputs: HashMap<String, TurnOutput>,
@@ -283,6 +330,7 @@ impl RelaySession {
             account_sid: account_sid.into(),
             call_sid: call_sid.into(),
             ready: false,
+            prompted: false,
             sequence: 0,
             generation: 0,
             outputs: HashMap::new(),
@@ -402,6 +450,7 @@ impl RelaySession {
                 if self.sequence >= 256 {
                     return Err(Error::InvalidArguments);
                 }
+                self.prompted = true;
                 self.sequence += 1;
                 let id = format!("phone:{}:{}", self.call_id, self.sequence);
                 self.outputs
@@ -429,7 +478,14 @@ impl RelaySession {
                 self.confirm_interrupt(heard);
                 Ok(RelayInput::Interrupted)
             }
-            Incoming::Error { code: Some(code) } => Ok(RelayInput::ProviderError(code)),
+            Incoming::Error { description, .. }
+                if !self.prompted && description.as_deref().is_some_and(names_voice_setup) =>
+            {
+                Ok(RelayInput::SetupProviderRejected)
+            }
+            Incoming::Error {
+                code: Some(code), ..
+            } => Ok(RelayInput::ProviderError(code)),
             Incoming::Info { name } => {
                 // Without debug events requested, nothing is attributed.
                 if self.debug_events && name.as_deref() == Some("tokensPlayed") {
