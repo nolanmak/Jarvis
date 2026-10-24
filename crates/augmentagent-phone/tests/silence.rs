@@ -498,8 +498,19 @@ async fn step1_silence_checks_in_twice_then_says_goodbye_and_ends() {
     let agent = Arc::new(Owner::default());
     let mut live = live(agent.clone()).await;
     let answered = ask(&mut live.socket, "what's next").await;
-    let mut frames = frames_until(&mut live.socket, answered, MS(45_020)).await;
-    // The provider reports the goodbye played; `end` follows at once (#1557).
+    // Read up to the goodbye, then report it played; `end` follows at once
+    // (#1557). Waiting for the frame itself keeps this independent of jitter.
+    let mut frames = Vec::new();
+    while frames
+        .last()
+        .is_none_or(|(_, f): &(Duration, Value)| token(f) != GOODBYE_LINE)
+    {
+        let left = (answered + SECS(50)).saturating_duration_since(Instant::now());
+        let frame = next_frame(&mut live.socket, left)
+            .await
+            .expect("goodbye frame");
+        frames.push((Instant::now() - answered, frame));
+    }
     live.played().await;
     frames.extend(frames_until(&mut live.socket, answered, SECS(50)).await);
     let summary: Vec<_> = frames
