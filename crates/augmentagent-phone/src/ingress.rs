@@ -47,6 +47,16 @@ pub trait ConversationAgent: Send + Sync {
     /// Persist a distinct interrupted-playback marker; do not claim generated
     /// text was fully heard, and do not undo completed tools.
     async fn interrupted(&self, call: &PhoneCall, heard: &str) -> Result<(), AgentError>;
+    /// Post-call memory (#1552): run the heavy agent once, with exactly the
+    /// request's tools (none), over the transcript mirrored into the call's
+    /// originating chat. Adapters without a heavy agent leave the default.
+    async fn summarize_call(
+        &self,
+        _call: &PhoneCall,
+        _request: &crate::memory::SummaryRequest,
+    ) -> Result<crate::memory::SummaryDraft, AgentError> {
+        Err(AgentError)
+    }
 }
 /// One queued speech item for the relay loop. `Utterance` carries an
 /// agent-identified receipt (MCP `speak`); `Token` is one streamed chunk,

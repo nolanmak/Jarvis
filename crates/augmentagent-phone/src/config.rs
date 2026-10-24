@@ -117,7 +117,19 @@ impl Settings {
     pub fn voice(&self) -> &VoiceConfig {
         &self.voice
     }
-    pub fn build(self, store: Arc<Store>) -> Result<ConfiguredPhone, Error> {
+    pub fn build(mut self, store: Arc<Store>) -> Result<ConfiguredPhone, Error> {
+        // #1552: the stored first-name fact (learned from earlier calls) is
+        // the recognition hint. One hint per deployment, so only when every
+        // link names the same owner; read once at startup.
+        let mut owners = self.phone.links.iter().map(|l| l.owner_id.as_str());
+        if let Some(owner) = owners.next().filter(|o| owners.all(|other| other == *o)) {
+            let name = store
+                .phone_owner_first_name(owner)
+                .map_err(|_| Error::NotConfigured)?;
+            if name.is_some() {
+                self.phone = self.phone.with_owner_first_name(name);
+            }
+        }
         Ok(ConfiguredPhone {
             bind: self.bind,
             service: Arc::new(PhoneService::new(

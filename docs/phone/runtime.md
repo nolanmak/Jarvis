@@ -431,8 +431,9 @@ validated to a conservative alphabet, so no value can break out of an attribute.
 Chat text, tool arguments and model output never reach these attributes; a
 source-level test holds `relay_twiml` to startup configuration only.
 
-`hints` biases recognition toward the owner's first name (only when a stored
-owner profile supplies one; no store does yet) and the fixed nouns `Jarvis,
+`hints` biases recognition toward the owner's first name (the stored
+`first_name` profile fact, read by `Settings::build` at daemon startup; see
+post-call memory below) and the fixed nouns `Jarvis,
 Discord, WhatsApp, Slack, Linear, Notion`, XML-escaped and capped at 500
 characters.
 
@@ -531,6 +532,52 @@ column's `samples` can be smaller than the turn count. The live acceptance
 criteria (AC5, AC8 and the epic gate) require pasting this output with the
 commit SHA after a real owner call; the offline suites only prove the record
 shape, the ±5 ms paused-clock fixture and the hand-computed percentiles.
+
+## Post-call memory (#1552)
+
+When a call that reached a ConversationRelay session ends (signed
+`relay-ended` callback, or a terminal status callback if that never arrives),
+one durable job is queued in the additive table `phone_call_summary_jobs`,
+keyed by call ID. Duplicate callbacks and restarts never add a second job;
+calls that never reached the relay and verification calls get none.
+
+The phone runtime checks the queue every 5 s. Each attempt takes a lease in
+the store first (10 min, doubling; at most 3 attempts), so a crash mid-run
+replays the job once after restart and a finished job is never rerun. One
+attempt runs the originating conversation's heavy agent once (Claude CLI,
+quality tier, 5 min limit) over that chat's bounded history, which already
+contains the call's mirrored `Phone — you:` / `Phone — Jarvis:` lines. The run
+has **no tools**: no allowed tools, a strict empty MCP configuration (host MCP
+servers are not loaded), built-in tools denied and no phone grant, so it
+cannot dial, message, dispatch or read files. It returns JSON; the phone crate
+validates it and then:
+
+- writes a summary note (at most 800 characters) to
+  `<wiki>/phone/calls/<YYYY-MM-DD>-<first 8 of call ID>.md` (write then rename);
+- upserts at most 10 facts (`key`, `value`, `confidence`, `source_call_id`)
+  into the additive `owner_profile` table, keeping the agent's order;
+- marks the job done in the same transaction as the facts.
+
+Output that does not parse leaves the job pending for its next bounded attempt.
+Logs carry only category codes, never summary or fact text.
+
+Phone prompts then carry the owner context (data, not instructions): the
+owner's first name, at most 1,200 characters of profile facts (most recently
+learned first, cut only between whole facts; absent when there are none) and
+the first line of each of the last 3 call summaries. The fast layer gets it in
+its system prompt every turn; the native path prepends it to the first turn of
+each call. A new first name reaches the recognition `hints` after the next
+daemon restart.
+
+Facts are owner-visible and deletable from the owner's **private control
+chat** (same authorization as `phone number …`; other chats are refused, and
+the text never reaches history or the model):
+
+- `profile` (or `profile show`) lists the stored facts, most recent first,
+  within 1,800 bytes (one message on every surface; the rest is counted);
+- `profile forget <key>` deletes one; the next assembled prompt omits it.
+  Forgetting `first_name` also removes it from prompts at once; only the
+  recognition `hints` keep the startup copy until the next restart.
 
 ## Terminal and recoverable relay conditions (#1549)
 
