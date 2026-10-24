@@ -535,18 +535,21 @@ mod fast {
     pub struct Scripted {
         rounds: Mutex<std::collections::VecDeque<Vec<FastEvent>>>,
         pub requests: Mutex<Vec<(Instant, Vec<FastMessage>)>>,
+        pub systems: Mutex<Vec<String>>,
     }
     impl Scripted {
         pub fn new(rounds: Vec<Vec<FastEvent>>) -> Arc<Self> {
             Arc::new(Self {
                 rounds: Mutex::new(rounds.into()),
                 requests: Mutex::new(Vec::new()),
+                systems: Mutex::new(Vec::new()),
             })
         }
     }
     #[async_trait]
     impl FastModel for Scripted {
         async fn stream(&self, request: FastRequest) -> Result<FastStream, FastModelError> {
+            self.systems.lock().unwrap().push(request.system);
             self.requests
                 .lock()
                 .unwrap()
@@ -973,4 +976,158 @@ mod fast {
         }
         assert!(announced.iter().any(|t| t.contains("Found the Linear thread.")), "{announced:?}");
     }
+
+    // ---------- #1552 post-call memory ----------
+
+    /// Seed the profile as a completed summary job of `f.call` would.
+    fn seed_profile(f: &Connected, facts: &[(&str, &str)]) {
+        use augmentagent_store::phone::NewProfileFact;
+        f.store.phone_claim_relay(&f.call.id, "CA-test").unwrap();
+        assert!(f.store.phone_enqueue_call_summary(&f.call.id, 100).unwrap());
+        assert!(f.store.phone_claim_call_summary(&f.call.id, 100).unwrap());
+        let facts: Vec<_> = facts
+            .iter()
+            .map(|(k, v)| NewProfileFact { key: (*k).into(), value: (*v).into(), confidence: 0.9 })
+            .collect();
+        assert!(f
+            .store
+            .phone_complete_call_summary(&f.call.id, "Planned the garden.\nDetails.", "phone/calls/x.md", &facts, 100)
+            .unwrap());
+    }
+
+    // TDD 3/4 (AC3/AC4) end to end: the fast layer's system prompt carries the
+    // owner context; after `profile forget` in the control chat, the next
+    // turn's prompt no longer contains the forgotten key.
+    #[tokio::test]
+    async fn fast_prompt_carries_profile_and_forgotten_key_is_gone_next_turn() {
+        let f = connected().await;
+        seed_profile(&f, &[("first_name", "Zorblat"), ("pet", "a cat named Bix"), ("city", "Springfield")]);
+        let model = Scripted::new(vec![vec![token("Hi Zorblat.")], vec![token("Sure.")]]);
+        let heavy = Arc::new(BlockedHeavy {
+            provider: Arc::new(RecordingNativeProvider::new(ProviderKind::Claude)),
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            seen: Mutex::new(Vec::new()),
+        });
+        let agent = bridge(&f, heavy, model.clone());
+        let (turn, speech, _rx) = speech_for(&f.call.id, "hello");
+        agent.answer(&f.call, &turn, "hello", speech, CancellationToken::new()).await.unwrap();
+        let reply = augmentagent_phone::commands::execute(
+            &f.service, &f.origin.owner, &f.origin.conversation, "forget-1", "profile forget pet",
+        )
+        .await
+        .unwrap();
+        assert!(reply.contains("Forgot"), "{reply}");
+        let (turn, speech, _rx) = speech_for(&f.call.id, "again");
+        agent.answer(&f.call, &turn, "again", speech, CancellationToken::new()).await.unwrap();
+        let systems = model.systems.lock().unwrap();
+        assert!(systems[0].contains("Owner first name: Zorblat"), "{}", systems[0]);
+        assert!(systems[0].contains("- pet: a cat named Bix"), "{}", systems[0]);
+        assert!(systems[0].contains("- Planned the garden."), "{}", systems[0]);
+        assert!(!systems[1].contains("pet"), "{}", systems[1]);
+        assert!(systems[1].contains("- city: Springfield"), "{}", systems[1]);
+    }
+
+    struct SummaryReasoner {
+        seen: Mutex<Vec<(augmentagent_channel_core::reasoner::ReasonerOpts, String, bool)>>,
+    }
+    #[async_trait]
+    impl Reasoner for SummaryReasoner {
+        async fn call(
+            &self,
+            opts: &augmentagent_channel_core::reasoner::ReasonerOpts,
+            message: &str,
+        ) -> anyhow::Result<String> {
+            let phone_context = augmentagent_phone::context::current().is_some();
+            self.seen.lock().unwrap().push((opts.clone(), message.into(), phone_context));
+            Ok(r#"{"summary":"Call.","facts":[]}"#.into())
+        }
+    }
+
+    // TDD 5 / AC5: the heavy summarization run has no tools at all, no MCP
+    // servers (not even the host's), and no phone grant in scope.
+    #[tokio::test]
+    async fn summarization_runs_the_heavy_agent_once_with_no_tools() {
+        use augmentagent_phone::memory::{SummaryRequest, FORBIDDEN_SUMMARY_TOOLS, SUMMARY_TOOLS};
+        let f = connected().await;
+        let reasoner = Arc::new(SummaryReasoner { seen: Mutex::new(Vec::new()) });
+        let wiki = tempfile::tempdir().unwrap();
+        let agent = PhoneAgent::new(
+            f.store.clone(),
+            f.service.clone(),
+            Arc::new(MarkdownAgent),
+            Arc::new(OutboxIo { store: f.store.clone() }),
+            wiki.path().to_path_buf(),
+            Arc::new(|_| Ok(Some(ProviderKind::Claude))),
+        )
+        .with_summary_reasoner(reasoner.clone());
+        let draft = agent.summarize_call(&f.call, &SummaryRequest::new()).await.unwrap();
+        assert_eq!(draft.wiki_root, wiki.path());
+        assert!(draft.output.contains("Call."));
+        let (opts, message, phone_context) = {
+            let seen = reasoner.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            seen[0].clone()
+        };
+        let names: std::collections::BTreeSet<&str> =
+            opts.allowed_tools.iter().map(String::as_str).collect();
+        assert_eq!(names, SUMMARY_TOOLS.iter().copied().collect());
+        for forbidden in FORBIDDEN_SUMMARY_TOOLS {
+            assert!(!names.iter().any(|n| n.contains(forbidden)), "{forbidden}");
+        }
+        let settings: serde_json::Value =
+            serde_json::from_str(opts.settings_json.as_deref().unwrap()).unwrap();
+        assert_eq!(settings["mcpServers"], serde_json::json!({}), "strict, empty MCP config");
+        let denied: Vec<&str> = settings["permissions"]["deny"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for tool in ["Bash", "Write", "Edit", "WebFetch", "Task"] {
+            assert!(denied.contains(&tool), "{tool} must be denied");
+        }
+        assert!(opts.add_dirs.is_empty());
+        assert!(!phone_context, "no phone grant is in scope");
+        assert!(message.contains("owner: earlier chat line"), "{message}");
+        // A revoked owner gets no summary run.
+        f.store.unbind_surface_owner(f.origin.owner.account()).unwrap();
+        assert!(agent.summarize_call(&f.call, &SummaryRequest::new()).await.is_err());
+        assert_eq!(reasoner.seen.lock().unwrap().len(), 1);
+    }
+
+    struct Questions(Mutex<Vec<String>>);
+    #[async_trait]
+    impl QueryHandler for Questions {
+        async fn answer(&self, _: &AuditCtx, question: &str) -> anyhow::Result<String> {
+            self.0.lock().unwrap().push(question.into());
+            Ok("Noted.".into())
+        }
+    }
+
+    // Native path: the first turn of a call carries the owner context once;
+    // later turns of the same call share the session and do not repeat it.
+    #[tokio::test]
+    async fn native_first_turn_of_a_call_carries_owner_context_once() {
+        let f = connected().await;
+        seed_profile(&f, &[("pet", "a cat named Bix")]);
+        let questions = Arc::new(Questions(Mutex::new(Vec::new())));
+        let agent = PhoneAgent::new(
+            f.store.clone(),
+            f.service.clone(),
+            questions.clone(),
+            Arc::new(OutboxIo { store: f.store.clone() }),
+            "/fixture".into(),
+            Arc::new(|_| Ok(Some(ProviderKind::Claude))),
+        );
+        for (turn, text) in [("phone:turn-1", "first question"), ("phone:turn-2", "second question")] {
+            agent.run(&f.call, turn, text, None, CancellationToken::new()).await.unwrap();
+        }
+        let questions = questions.0.lock().unwrap();
+        assert_eq!(questions.len(), 2);
+        assert!(questions[0].contains("- pet: a cat named Bix"), "{}", questions[0]);
+        assert!(questions[0].contains("first question"));
+        assert!(!questions[1].contains("pet"), "{}", questions[1]);
+    }
 }
+
