@@ -611,7 +611,8 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
         return;
     };
     let mut session = RelaySession::new(&call.id, state.auth.account(), sid)
-        .with_debug_events(state.service.config.debug_events);
+        .with_debug_events(state.service.config.debug_events)
+        .with_barge_in(state.service.config.barge_in.clone());
     let setup_ok = match receive_setup(&mut socket, &mut session).await {
         Ok(control_frames) => {
             tracing::info!(call_id = %call.id, control_frames, "phone relay setup accepted");
@@ -721,12 +722,18 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
         if session.take_owner_activity() {
             silence.activity(tokio::time::Instant::now());
         }
+        // While an interruption is undecided (#1550) nothing new is spoken:
+        // speech stays queued until the next prompt or the timeout decides.
+        let undecided = session.false_interrupt_deadline();
         let end_at = ending.as_ref().map(|(at, _)| *at);
         tokio::select! {
             incoming=socket.recv()=>{
                 if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
                 match incoming {
-                    Some(Ok(Message::Text(frame)))=>match session.receive(&frame) {
+                    Some(Ok(Message::Text(frame)))=>{
+                        let received = session.receive(&frame);
+                        settle_interruption(&mut session, &mut feedback, &mut metrics, &interrupt_tx);
+                        match received {
                         // The goodbye is out: later owner speech is not answered.
                         Ok(RelayInput::Turn(_)) if ending.is_some() => {},
                         Ok(RelayInput::Turn(turn))=>{
@@ -735,14 +742,12 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                             let timer = metrics.begin(&turn.id);
                             if turn_tx.try_send((turn, timer)).is_err() {break "turn_queue_full";}
                         },
-                        Ok(RelayInput::Interrupted)=>{
-                            feedback.clear();
-                            metrics.interrupted();
-                            if let Some(heard)=session.take_interrupted_prefix() {
-                                if interrupt_tx.try_send(heard).is_err() {
-                                    tracing::warn!("phone interruption persistence queue full; stale audio already invalidated");
-                                }
-                            }
+                        Ok(RelayInput::Interrupted)=>{},
+                        Ok(RelayInput::InterruptPending)=>{
+                            tracing::info!(call_id = %call.id, "phone barge-in pending");
+                        },
+                        Ok(RelayInput::Resumed(resume))=>{
+                            if !write_resume(&mut socket, &mut metrics, resume).await {break "speech_write_failed";}
                         },
                         Ok(RelayInput::Ignore)=>{
                             if let Some(at) = session.take_played_event() { metrics.played(at); silence.played(at); }
@@ -762,6 +767,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                             break "setup_provider_rejected";
                         },
                         _=>break "invalid_protocol_frame",
+                        }
                     },
                     Some(Ok(Message::Ping(_)|Message::Pong(_)))=>{},
                     Some(Ok(Message::Close(_))) | None => break "peer_closed",
@@ -769,7 +775,15 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                     _ => break "unsupported_frame",
                 }
             },
-            output=speech_rx.recv()=>{
+            _=tokio::time::sleep_until(undecided.unwrap_or_else(tokio::time::Instant::now)), if undecided.is_some()=>{
+                if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
+                let decided = session.poll_false_interrupt();
+                settle_interruption(&mut session, &mut feedback, &mut metrics, &interrupt_tx);
+                if let Some(RelayInput::Resumed(resume)) = decided {
+                    if !write_resume(&mut socket, &mut metrics, resume).await {break "speech_write_failed";}
+                }
+            },
+            output=speech_rx.recv(), if undecided.is_none()=>{
                 let Some(output)=output else {break "speech_worker_closed"};
                 // Nothing is spoken after the goodbye.
                 if ending.is_some() { continue; }
@@ -846,6 +860,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
             },
             _=tick.tick()=>{
                 if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
+                if undecided.is_some() {continue;}
                 for pending in feedback.values_mut() {
                     let elapsed = pending.started.elapsed();
                     let notice = pending.notice();
@@ -918,6 +933,48 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
         let _ = worker.await;
     }
     let _ = state.service.maintenance(false).await;
+}
+
+/// Bookkeeping for a confirmed interruption: pending notices are dropped, cut
+/// turns are recorded as interrupted and the heard prefix is persisted.
+fn settle_interruption(
+    session: &mut RelaySession,
+    feedback: &mut std::collections::HashMap<String, TurnFeedback>,
+    metrics: &mut TurnMetricsLedger<'_>,
+    interrupt_tx: &mpsc::Sender<String>,
+) {
+    let Some(heard) = session.take_interrupted_prefix() else {
+        return;
+    };
+    feedback.clear();
+    metrics.interrupted();
+    if interrupt_tx.try_send(heard).is_err() {
+        tracing::warn!("phone interruption persistence queue full; stale audio already invalidated");
+    }
+}
+
+/// Write a resumed remainder. A resume never changes the turn's outcome: it
+/// was not interrupted, and its final frame was already counted. Returns false
+/// when the socket write failed.
+async fn write_resume(
+    socket: &mut WebSocket,
+    metrics: &mut TurnMetricsLedger<'_>,
+    resume: Option<crate::relay::Resume>,
+) -> bool {
+    tracing::info!(remainder = resume.is_some(), "phone false interruption resumed");
+    let Some(resume) = resume else {
+        return true;
+    };
+    let sent = tokio::time::timeout(
+        Duration::from_secs(2),
+        socket.send(Message::Text(resume.frame.to_string().into())),
+    )
+    .await;
+    if !matches!(sent, Ok(Ok(()))) {
+        return false;
+    }
+    metrics.spoken(&resume.turn_id, false, false);
+    true
 }
 
 #[cfg(test)]

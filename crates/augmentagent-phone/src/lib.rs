@@ -75,6 +75,10 @@ pub enum Error {
     Disabled,
     #[error("phone configuration is incomplete or invalid")]
     NotConfigured,
+    /// A named operator setting is out of range or malformed. Carries only the
+    /// variable name, never its value.
+    #[error("phone setting {0} is invalid")]
+    InvalidSetting(&'static str),
     #[error("owner authorization required")]
     Unauthorized,
     #[error("phone capability has expired")]
@@ -96,7 +100,7 @@ impl Error {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
-            Self::NotConfigured => "not_configured",
+            Self::NotConfigured | Self::InvalidSetting(_) => "not_configured",
             Self::Unauthorized => "unauthorized",
             Self::Expired => "expired",
             Self::PrivateSetupRequired => "private_setup_required",
@@ -131,6 +135,7 @@ pub struct PhoneConfig {
     voice: voice::VoiceConfig,
     owner_first_name: Option<String>,
     debug_events: bool,
+    barge_in: relay::BargeIn,
     fast: Option<fast::FastLayerConfig>,
     silence: silence::SilencePolicy,
 }
@@ -172,6 +177,7 @@ impl PhoneConfig {
             voice: voice::VoiceConfig::default(),
             owner_first_name: None,
             debug_events: false,
+            barge_in: relay::BargeIn::default(),
             fast: None,
             silence: silence::SilencePolicy::default(),
         })
@@ -196,6 +202,11 @@ impl PhoneConfig {
     /// Silence check-in and automatic-end thresholds (#1556).
     pub fn with_silence(mut self, silence: silence::SilencePolicy) -> Self {
         self.silence = silence;
+        self
+    }
+    /// Backchannel filter and false-interruption handling (#1550).
+    pub fn with_barge_in(mut self, barge_in: relay::BargeIn) -> Self {
+        self.barge_in = barge_in;
         self
     }
     /// Answer utterances with the fast conversational layer (#1546).
@@ -239,6 +250,9 @@ impl PhoneService {
     }
     /// Explicit operator-configured identities, for installing transport adapters
     /// before the first private control conversation has been provisioned.
+    pub fn barge_in(&self) -> &relay::BargeIn {
+        &self.config.barge_in
+    }
     pub fn debug_events(&self) -> bool {
         self.config.debug_events
     }

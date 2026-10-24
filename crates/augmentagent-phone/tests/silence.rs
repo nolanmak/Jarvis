@@ -212,6 +212,8 @@ struct Owner {
     task: Option<Vec<(Duration, TaskSpeech, &'static str)>>,
     task_started: AtomicBool,
     fail_notice: AtomicBool,
+    /// Answer with several sentences, so a stale resume would be audible.
+    long_answer: bool,
 }
 #[async_trait]
 impl ConversationAgent for Owner {
@@ -223,7 +225,12 @@ impl ConversationAgent for Owner {
         speech: SpeechSender,
         _: CancellationToken,
     ) -> Result<String, AgentError> {
-        speech.speak_partial("Sure.").await?;
+        let answer = if self.long_answer {
+            "Sure. Here is the first part of a longer answer. It keeps going for a while. And it ends here."
+        } else {
+            "Sure."
+        };
+        speech.speak_partial(answer).await?;
         speech.finish().await?;
         if let Some(script) = self.task.clone() {
             if !self.task_started.swap(true, Ordering::SeqCst) {
@@ -710,6 +717,36 @@ async fn step5_interrupting_a_check_in_is_handled_and_resets_the_clock() {
     let frames = frames_until(&mut live.socket, answered, SECS(13)).await;
     assert_eq!(frames.len(), 1, "{frames:?}");
     assert!(near(frames[0].0, 12_000), "{frames:?}");
+    assert_eq!(token(&frames[0].1), CHECK_IN_1_LINE);
+    live.server.abort();
+}
+
+// With #1550's barge-in rules, an interrupt over a check-in must not be
+// treated as cutting off the previous answer: no stale remainder is resumed
+// when the false-interruption window lapses, and the clock restarts.
+#[tokio::test(start_paused = true)]
+async fn step5_interrupt_over_a_check_in_never_resumes_the_previous_answer() {
+    let agent = Arc::new(Owner {
+        long_answer: true,
+        ..Default::default()
+    });
+    let mut live = live(agent).await;
+    let answered = ask(&mut live.socket, "tell me more").await;
+    let frames = frames_until(&mut live.socket, answered, MS(12_500)).await;
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    assert_eq!(token(&frames[0].1), CHECK_IN_1_LINE);
+    send(
+        &mut live.socket,
+        json!({"type":"interrupt","utteranceUntilInterrupt":"Still","durationUntilInterruptMs":1500}),
+    )
+    .await;
+    let frames = frames_until(&mut live.socket, answered, SECS(25)).await;
+    let summary: Vec<_> = frames
+        .iter()
+        .map(|(at, f)| (at.as_millis(), token(f).to_owned()))
+        .collect();
+    assert_eq!(frames.len(), 1, "{summary:?}");
+    assert!(near(frames[0].0, 24_500), "{summary:?}");
     assert_eq!(token(&frames[0].1), CHECK_IN_1_LINE);
     live.server.abort();
 }
