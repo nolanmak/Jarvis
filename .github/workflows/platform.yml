@@ -303,7 +303,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for t in service-restart install-autostart install-autoupdate updater-stamp updater-restart-hygiene; do
+          for t in service-restart install-autostart install-autoupdate updater-stamp updater-restart-hygiene updater-pinned-binary; do
             echo "::group::$t"
             bash "scripts/tests/$t.test.sh"
             echo "::endgroup::"

@@ -15,6 +15,10 @@
 # - On build failure we DO NOT restart, so a broken push doesn't take the
 #   daemon down — it keeps running on the old binary until next pull fixes.
 # - All output goes to a per-platform log dir for post-mortem.
+# - #1571: a restart only counts when the unit comes back on
+#   target/release/augmentagent. A systemd drop-in that overrides ExecStart
+#   (never do that to pin a rollout) is reported as DEPLOY PINNED, alerted
+#   once, and the restart is skipped until the override is retired.
 #
 # Build stamp (idempotency fix):
 #   Idempotency used to be keyed purely on `HEAD == origin/main`. If the
@@ -62,6 +66,37 @@ notify_owner() {
 # library's diagnostics land in update.log like everything else.
 # shellcheck source=lib/service-restart.sh
 . "$REPO_ROOT/scripts/lib/service-restart.sh"
+
+# #1571 — the unit no longer runs what this script builds. A drop-in that
+# overrides ExecStart (2026-10-20: a rollout pinned a frozen copy of the
+# daemon) turns every tick into pull + rebuild + a verified bounce back onto
+# the OLD binary. Say exactly that, once per distinct cause (the tick is five
+# minutes), and count it as a restart failure so the stamp stays honest.
+# While ExecStart is pinned the restart itself is skipped: it only relaunches
+# the frozen binary and kills whatever the auto-PR loop was building.
+DAEMON_LAUNCHER="scripts/run-rs.sh"
+DAEMON_BINARY="$REPO_ROOT/target/release/augmentagent"
+PINNED_ALERT_STAMP="$LOG_DIR/deploy-pinned-alerted"
+report_pinned_deploy() {
+  local cause="$1" dropins msg
+  dropins=$(unit_dropins "$SYSTEMD_UNIT")
+  msg="DEPLOY PINNED: $SYSTEMD_UNIT $cause. Drop-ins: ${dropins:-none}. Merges \
+to main are built but never run until the override is retired: move the \
+drop-in out of ~/.config/systemd/user/$SYSTEMD_UNIT.d/, then \
+systemctl --user daemon-reload && systemctl --user restart $SYSTEMD_UNIT (#1571)."
+  log "$msg"
+  if [ "$(cat "$PINNED_ALERT_STAMP" 2>/dev/null)" != "$cause|$dropins" ]; then
+    printf '%s' "$cause|$dropins" > "$PINNED_ALERT_STAMP"
+    notify_owner "$msg"
+  fi
+}
+# 0 = ExecStart is overridden away from the repo launcher; reported, do not restart.
+deploy_pinned_elsewhere() {
+  unit_exec_pinned "$SYSTEMD_UNIT" "$DAEMON_LAUNCHER" || return 1
+  report_pinned_deploy "has ExecStart overridden away from $DAEMON_LAUNCHER \
+($(unit_exec_start "$SYSTEMD_UNIT")); not restarting"
+  return 0
+}
 
 # Rebuild the side(s) flagged by NEEDS_REBUILD / NEEDS_DASHBOARD_REBUILD, then
 # restart the corresponding services. On Rust build failure we exit non-zero
@@ -225,10 +260,20 @@ apply_update() {
           # #903 — same deferral semantics as #844: counts as a restart
           # failure so the stamp is withheld and the next tick retries.
           RESTART_FAILURES=$((RESTART_FAILURES + 1))
+        elif deploy_pinned_elsewhere; then
+          # #1571 — reported above; a restart would relaunch the frozen binary.
+          RESTART_FAILURES=$((RESTART_FAILURES + 1))
         else
           log "restarting daemon via systemctl --user restart $SYSTEMD_UNIT"
           if restart_unit "$SYSTEMD_UNIT"; then
             record_restart
+            # #1571 — a bounce proves the process came back, not that it is
+            # the binary we built.
+            if ! unit_runs_binary "$SYSTEMD_UNIT" "$DAEMON_BINARY"; then
+              report_pinned_deploy "came back running $(unit_exe_path "$SYSTEMD_UNIT") \
+instead of target/release/augmentagent"
+              RESTART_FAILURES=$((RESTART_FAILURES + 1))
+            fi
           else
             RESTART_FAILURES=$((RESTART_FAILURES + 1))
           fi
@@ -282,6 +327,9 @@ will retry via the build-stamp mismatch path."
   fi
   printf '%s\n' "$TARGET" > "$STAMP"
   log "update complete: now at $TARGET (build stamp written)"
+  # #1571 — a verified deploy on our own binary closes any pinned-deploy
+  # alert; the next pin is a new incident and gets a new Discord message.
+  rm -f "$PINNED_ALERT_STAMP"
   # #1410 — a verified deploy is the moment older rollback material stops
   # mattering: keep the newest snapshots and rollback binaries, drop the rest.
   # Housekeeping only; it can never fail the update.

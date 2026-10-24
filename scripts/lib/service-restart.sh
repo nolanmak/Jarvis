@@ -138,6 +138,71 @@ restart_agent() {
   return 0
 }
 
+# --- #1571: the unit must launch the binary the updater built ---------------
+#
+# 2026-10-20 → 10-24: a rollout session installed a systemd drop-in that
+# replaced ExecStart with a wrapper exec'ing a frozen COPY of the daemon.
+# Every tick the updater pulled, rebuilt and verifiably bounced the unit — and
+# the unit came back on the copy. The stamp was rightly withheld, but the only
+# signal was "restart could not be verified" every five minutes for four days,
+# while each forced restart killed whatever the auto-PR loop was building.
+#
+# Two checks, both fail-OPEN when the evidence cannot be read (launchd, no
+# /proc, systemd unreachable): a missing answer is not a pinned deploy.
+#   unit_exec_pinned  — BEFORE a restart: ExecStart no longer runs the repo's
+#                       launcher. Restarting is pointless (the same frozen
+#                       binary comes back) and costs the loop its build.
+#   unit_runs_binary  — AFTER a verified bounce: the new MainPID's executable
+#                       is not the binary we just built.
+
+# Effective ExecStart of `$1` as systemd prints it: `{ path=/x ; argv[]=… }`.
+unit_exec_start() {
+  systemctl --user show "$1" -p ExecStart --value 2>/dev/null | head -n1
+}
+
+# Drop-ins layered on `$1`, space-separated; empty when there are none.
+unit_dropins() {
+  systemctl --user show "$1" -p DropInPaths --value 2>/dev/null | head -n1
+}
+
+# 0 when `$1`'s ExecStart verifiably does not run `$2` (the repo launcher).
+unit_exec_pinned() {
+  local unit="$1" launcher="$2" exec_line
+  exec_line=$(unit_exec_start "$unit")
+  # Only a real `{ path=… ; argv[]=… }` answer is evidence; anything else
+  # (empty, an error, a stub) fails open.
+  case "$exec_line" in
+    *path=*) ;;
+    *) return 1 ;;
+  esac
+  case "$exec_line" in
+    *"$launcher"*) return 1 ;;
+  esac
+  return 0
+}
+
+# Resolved executable of `$1`'s MainPID, or empty when it cannot be read.
+# Linux only (/proc); AUGMENTAGENT_PROC_ROOT lets tests fake the tree. A
+# binary rebuilt under a running process reads as `/path (deleted)` — that is
+# a pending restart, not a different binary, so the suffix is dropped.
+unit_exe_path() {
+  local pid exe
+  pid=$(unit_main_pid "$1")
+  [ "$pid" != 0 ] || return 0
+  exe=$(readlink "${AUGMENTAGENT_PROC_ROOT:-/proc}/$pid/exe" 2>/dev/null) || return 0
+  printf '%s' "${exe% (deleted)}"
+}
+
+# 0 when `$1` is running `$2`, or when the answer cannot be read; 1 when it
+# is verifiably running something else.
+unit_runs_binary() {
+  local unit="$1" expected="$2" exe want
+  exe=$(unit_exe_path "$unit")
+  [ -n "$exe" ] || return 0
+  want=$(readlink -f "$expected" 2>/dev/null) || want="$expected"
+  [ "$exe" = "$want" ]
+}
+
 # May the build stamp be advanced? Only when no required restart failed.
 # Writing it regardless is what turned one skipped bounce into a permanently
 # stale daemon.
