@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use augmentagent_phone::{
+    relay::{BargeIn, DEFAULT_BACKCHANNELS},
     Clock, DialRequest, OwnerLink, PhoneConfig, PhoneService, ProviderError, Telephony,
 };
 use augmentagent_store::{
@@ -2359,6 +2360,21 @@ async fn streaming_socket(
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     tokio::task::JoinHandle<()>,
 ) {
+    let (socket, server, _, _) = streaming_socket_with(agent, BargeIn::default()).await;
+    (socket, server)
+}
+
+/// A connected relay socket whose service uses `barge`; also returns the store
+/// and call ID for metrics assertions.
+async fn streaming_socket_with(
+    agent: Arc<StreamingAgent>,
+    barge: BargeIn,
+) -> (
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    tokio::task::JoinHandle<()>,
+    Arc<Store>,
+    String,
+) {
     use augmentagent_store::phone::CallState;
     use futures::SinkExt;
     use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
@@ -2374,8 +2390,20 @@ async fn streaming_socket(
         .phone_provider_event(&id, "CA-test", CallState::AwaitingAcceptance, 100)
         .unwrap();
     f.store.phone_accept(&id, "CA-test", 101).unwrap();
+    let config = PhoneConfig::new(
+        true,
+        "https://phone.example.test",
+        "test-secret-for-verification-32bytes",
+        vec![OwnerLink {
+            surface_owner: f.owner.clone(),
+            owner_id: "canonical-owner".into(),
+        }],
+    )
+    .unwrap()
+    .with_barge_in(barge);
+    let service = PhoneService::new(f.store.clone(), f.provider.clone(), f.clock.clone(), config);
     let router = augmentagent_phone::ingress::router(
-        Arc::new(f.service),
+        Arc::new(service),
         Arc::new(augmentagent_phone::webhook::WebhookAuth::new(
             "AC-test",
             "callback-secret",
@@ -2384,6 +2412,7 @@ async fn streaming_socket(
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let store = f.store.clone();
     let server = tokio::spawn(async move {
         let _keep = f._dir;
         axum::serve(listener, router).await.unwrap()
@@ -2401,7 +2430,7 @@ async fn streaming_socket(
         .insert("x-twilio-signature", signature.parse().unwrap());
     let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
     socket.send(Message::Text(json!({"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX-test"}).to_string().into())).await.unwrap();
-    (socket, server)
+    (socket, server, store, id)
 }
 
 async fn next_frame<S>(socket: &mut S, within: std::time::Duration) -> Option<serde_json::Value>
@@ -2492,7 +2521,8 @@ async fn ac04_real_websocket_interrupt_silences_the_stale_stream_until_the_next_
         completed: std::sync::atomic::AtomicBool::new(false),
         interrupted: tokio::sync::Notify::new(),
     });
-    let (mut socket, server) = streaming_socket(agent.clone()).await;
+    // Immediate invalidation is the unfiltered (min words 1) contract.
+    let (mut socket, server, _, _) = streaming_socket_with(agent.clone(), unfiltered()).await;
     socket
         .send(Message::Text(
             json!({"type":"prompt","voicePrompt":"first question","last":true})
@@ -2542,5 +2572,151 @@ async fn ac04_real_websocket_interrupt_silences_the_stale_stream_until_the_next_
     }
     assert_eq!(tokens.concat(), "First sentence here. Second one with a link. Third and last");
     assert!(next_frame(&mut socket, std::time::Duration::from_millis(300)).await.is_none());
+    server.abort();
+}
+
+// ---- #1550 barge-in over a real WebSocket ----
+
+fn barge(min_words: usize, timeout_ms: u64, resume: bool) -> BargeIn {
+    let phrases = DEFAULT_BACKCHANNELS.iter().map(|s| (*s).into()).collect();
+    BargeIn::new(min_words, phrases, timeout_ms, resume).unwrap()
+}
+fn unfiltered() -> BargeIn {
+    barge(1, 2_000, true)
+}
+fn streaming_agent() -> Arc<StreamingAgent> {
+    Arc::new(StreamingAgent {
+        gate: tokio::sync::Semaphore::new(0),
+        first_after: std::time::Duration::from_millis(10),
+        finish_after: std::time::Duration::from_millis(20),
+        completed: std::sync::atomic::AtomicBool::new(false),
+        interrupted: tokio::sync::Notify::new(),
+    })
+}
+async fn rest_of_cycle<S>(socket: &mut S) -> String
+where
+    S: futures::Stream<
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + Unpin,
+{
+    let mut spoken = String::new();
+    loop {
+        let frame = next_frame(socket, std::time::Duration::from_secs(2)).await.expect("frame");
+        spoken.push_str(frame["token"].as_str().unwrap());
+        if frame["last"] == true {
+            return spoken;
+        }
+    }
+}
+async fn turn_outcomes(
+    store: &Store,
+    id: &str,
+) -> Vec<augmentagent_store::phone::TurnOutcome> {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if store.phone_call("canonical-owner", id).unwrap().state.terminal() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    store.phone_turn_metrics(id).unwrap().iter().map(|r| r.outcome).collect()
+}
+
+// AC1 + #1551 over the wire: "mm-hm" during an answer resumes it from the
+// unspoken remainder; the answer then finishes; the turn is recorded as
+// answered and no interrupted-playback marker is persisted.
+#[tokio::test]
+async fn ac1_real_websocket_backchannel_resumes_and_is_not_recorded_as_interrupted() {
+    use augmentagent_store::phone::TurnOutcome;
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let agent = streaming_agent();
+    let (mut socket, server, store, id) =
+        streaming_socket_with(agent.clone(), BargeIn::default()).await;
+    socket.send(Message::Text(json!({"type":"prompt","voicePrompt":"tell me","last":true}).to_string().into())).await.unwrap();
+    let first = next_frame(&mut socket, std::time::Duration::from_secs(2)).await.unwrap();
+    assert_eq!(first["token"], "First sentence here. ");
+    socket.send(Message::Text(json!({"type":"interrupt","utteranceUntilInterrupt":"First","durationUntilInterruptMs":300}).to_string().into())).await.unwrap();
+    socket.send(Message::Text(json!({"type":"prompt","voicePrompt":"Mm-hm.","last":true}).to_string().into())).await.unwrap();
+    let resumed = next_frame(&mut socket, std::time::Duration::from_secs(1)).await.expect("resume");
+    assert_eq!(resumed["token"], "sentence here. ");
+    assert_eq!(resumed["last"], false);
+    agent.gate.add_permits(1);
+    assert_eq!(rest_of_cycle(&mut socket).await, "Second one with a link. Third and last");
+    assert!(next_frame(&mut socket, std::time::Duration::from_millis(300)).await.is_none());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), agent.interrupted.notified())
+            .await
+            .is_err(),
+        "a backchannel must not persist an interruption"
+    );
+    socket.close(None).await.unwrap();
+    assert_eq!(turn_outcomes(&store, &id).await, [TurnOutcome::Answered]);
+    server.abort();
+}
+
+// AC3 over the wire: with no prompt after `interrupt`, the ingress resumes the
+// remainder on its own at the configured timeout (500 ms; real clock, so the
+// bounds are loose; the paused-clock relay test pins ±50 ms).
+#[tokio::test]
+async fn ac3_real_websocket_silence_resumes_at_the_configured_timeout() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let agent = streaming_agent();
+    let (mut socket, server, _, _) = streaming_socket_with(agent.clone(), barge(3, 500, true)).await;
+    socket.send(Message::Text(json!({"type":"prompt","voicePrompt":"tell me","last":true}).to_string().into())).await.unwrap();
+    next_frame(&mut socket, std::time::Duration::from_secs(2)).await.unwrap();
+    socket.send(Message::Text(json!({"type":"interrupt","utteranceUntilInterrupt":"First","durationUntilInterruptMs":300}).to_string().into())).await.unwrap();
+    let sent = tokio::time::Instant::now();
+    let resumed = next_frame(&mut socket, std::time::Duration::from_secs(2)).await.expect("resume");
+    let elapsed = sent.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(400) && elapsed < std::time::Duration::from_millis(1_500),
+        "resumed after {elapsed:?}"
+    );
+    assert_eq!(resumed["token"], "sentence here. ");
+    agent.gate.add_permits(1);
+    assert_eq!(rest_of_cycle(&mut socket).await, "Second one with a link. Third and last");
+    server.abort();
+}
+
+// AC7 over the wire: resume off, silence past the timeout discards the rest
+// of the answer (zero frames, recorded as interrupted) and the next prompt is
+// answered normally.
+#[tokio::test]
+async fn ac7_real_websocket_resume_off_discards_the_remainder_and_answers_the_next_prompt() {
+    use augmentagent_store::phone::TurnOutcome;
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let agent = streaming_agent();
+    let (mut socket, server, store, id) =
+        streaming_socket_with(agent.clone(), barge(3, 500, false)).await;
+    socket.send(Message::Text(json!({"type":"prompt","voicePrompt":"tell me","last":true}).to_string().into())).await.unwrap();
+    next_frame(&mut socket, std::time::Duration::from_secs(2)).await.unwrap();
+    socket.send(Message::Text(json!({"type":"interrupt","utteranceUntilInterrupt":"First","durationUntilInterruptMs":300}).to_string().into())).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), agent.interrupted.notified())
+        .await
+        .expect("discarded remainder is persisted as an interruption");
+    agent.gate.add_permits(1);
+    assert!(
+        next_frame(&mut socket, std::time::Duration::from_millis(500)).await.is_none(),
+        "discarded remainder was spoken"
+    );
+    socket.send(Message::Text(json!({"type":"prompt","voicePrompt":"what next","last":true}).to_string().into())).await.unwrap();
+    let fresh = next_frame(&mut socket, std::time::Duration::from_secs(2)).await.unwrap();
+    assert_eq!(fresh["token"], "First sentence here. ");
+    agent.gate.add_permits(1);
+    assert_eq!(rest_of_cycle(&mut socket).await, "Second one with a link. Third and last");
+    socket.close(None).await.unwrap();
+    assert_eq!(
+        turn_outcomes(&store, &id).await,
+        [TurnOutcome::Interrupted, TurnOutcome::Answered]
+    );
     server.abort();
 }

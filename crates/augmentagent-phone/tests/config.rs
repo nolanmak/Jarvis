@@ -98,3 +98,76 @@ fn debug_events_flag_is_explicit_and_fails_closed_on_junk() {
         .unwrap();
     assert_eq!(configured.service.debug_events(), cfg!(debug_assertions));
 }
+
+fn load(
+    env: &HashMap<&'static str, String>,
+) -> Result<Option<Settings>, augmentagent_phone::Error> {
+    Settings::from_lookup(|k| env.get(k).cloned())
+}
+
+// TDD step 8 / AC4 / AC8: barge-in settings are config-loaded with documented
+// defaults; a false-interruption timeout outside 500–5,000 ms fails with a
+// typed error naming the variable; other junk fails closed.
+#[test]
+fn barge_in_settings_load_with_defaults_and_bounded_timeout() {
+    use augmentagent_phone::{relay::DEFAULT_BACKCHANNELS, Error};
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        std::sync::Arc::new(augmentagent_store::Store::open(dir.path().join("db")).unwrap());
+    let build = |env: &HashMap<&'static str, String>| {
+        load(env).unwrap().unwrap().build(store.clone()).unwrap()
+    };
+    let defaults = build(&values());
+    let barge = defaults.service.barge_in();
+    assert_eq!(barge.min_words(), 3);
+    assert_eq!(barge.backchannels(), DEFAULT_BACKCHANNELS);
+    assert_eq!(barge.false_interrupt(), Duration::from_millis(2_000));
+    assert!(barge.resume());
+
+    let mut env = values();
+    env.insert("AUGMENTAGENT_PHONE_BARGE_MIN_WORDS", "1".into());
+    env.insert(
+        "AUGMENTAGENT_PHONE_BACKCHANNEL_PHRASES",
+        "OK, Mm-hmm ,sure thing".into(),
+    );
+    env.insert("AUGMENTAGENT_PHONE_FALSE_INTERRUPT_MS", "800".into());
+    env.insert("AUGMENTAGENT_PHONE_RESUME_FALSE_INTERRUPT", "0".into());
+    let configured = build(&env);
+    let barge = configured.service.barge_in();
+    assert_eq!(barge.min_words(), 1);
+    assert_eq!(barge.backchannels(), ["ok", "mm hmm", "sure thing"]);
+    assert_eq!(barge.false_interrupt(), Duration::from_millis(800));
+    assert!(!barge.resume());
+
+    for edge in ["500", "5000"] {
+        let mut env = values();
+        env.insert("AUGMENTAGENT_PHONE_FALSE_INTERRUPT_MS", edge.into());
+        assert!(load(&env).is_ok(), "{edge}");
+    }
+    for bad in ["499", "5001", "0", "-1", "2s", ""] {
+        let mut env = values();
+        env.insert("AUGMENTAGENT_PHONE_FALSE_INTERRUPT_MS", bad.into());
+        match load(&env) {
+            Err(Error::InvalidSetting(key)) => {
+                assert_eq!(key, "AUGMENTAGENT_PHONE_FALSE_INTERRUPT_MS", "{bad}")
+            }
+            Err(other) => panic!("{bad}: untyped {other:?}"),
+            Ok(_) => panic!("{bad}: accepted"),
+        }
+    }
+    for (key, bad) in [
+        ("AUGMENTAGENT_PHONE_BARGE_MIN_WORDS", "0"),
+        ("AUGMENTAGENT_PHONE_BARGE_MIN_WORDS", "11"),
+        ("AUGMENTAGENT_PHONE_BARGE_MIN_WORDS", "three"),
+        ("AUGMENTAGENT_PHONE_BACKCHANNEL_PHRASES", " , "),
+        ("AUGMENTAGENT_PHONE_RESUME_FALSE_INTERRUPT", "yes"),
+    ] {
+        let mut env = values();
+        env.insert(key, bad.into());
+        assert!(
+            matches!(load(&env), Err(Error::InvalidSetting(k)) if k == key),
+            "{key}={bad}"
+        );
+    }
+}

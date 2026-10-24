@@ -141,6 +141,7 @@ pub async fn cleanup_without_runtime(
             verification_key: Vec::new(),
             links: Vec::new(),
             debug_events: false,
+            barge_in: crate::relay::BargeIn::default(),
         },
     ));
     let initial = service.cleanup_due(true)?;
