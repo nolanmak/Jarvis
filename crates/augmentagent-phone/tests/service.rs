@@ -3219,3 +3219,328 @@ async fn ac7_real_websocket_resume_off_discards_the_remainder_and_answers_the_ne
     );
     server.abort();
 }
+
+// ---- #1549: recoverable conditions never close the relay socket ----
+
+/// Answers `Answer to: <text>` once a permit is available, so turns can be
+/// held in the queue deterministically.
+struct GatedAgent {
+    permits: tokio::sync::Semaphore,
+    entered: tokio::sync::Notify,
+}
+#[async_trait]
+impl augmentagent_phone::ingress::ConversationAgent for GatedAgent {
+    async fn answer(
+        &self,
+        _: &augmentagent_store::phone::PhoneCall,
+        _: &str,
+        text: &str,
+        _: augmentagent_phone::ingress::SpeechSender,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<String, augmentagent_phone::ingress::AgentError> {
+        self.entered.notify_one();
+        tokio::select! {
+            _ = cancel.cancelled() => Err(augmentagent_phone::ingress::AgentError),
+            permit = self.permits.acquire() => { permit.unwrap().forget(); Ok(format!("Answer to: {text}")) }
+        }
+    }
+    async fn interrupted(
+        &self,
+        _: &augmentagent_store::phone::PhoneCall,
+        _: &str,
+    ) -> Result<(), augmentagent_phone::ingress::AgentError> {
+        Ok(())
+    }
+}
+
+type RelaySocket = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
+struct RelayHarness {
+    _dir: tempfile::TempDir,
+    store: Arc<Store>,
+    provider: Arc<FakeProvider>,
+    id: String,
+    socket: RelaySocket,
+    server: tokio::task::JoinHandle<()>,
+}
+/// Signed upgrade plus accepted setup on a connected owner call.
+async fn connect_relay(
+    agent: Arc<dyn augmentagent_phone::ingress::ConversationAgent>,
+) -> RelayHarness {
+    use augmentagent_store::phone::CallState;
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+    let f = fixture("discord", true, true, false);
+    let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
+    let call = f
+        .service
+        .tool(&grant, "call_owner", json!({"request_id":"r1"}))
+        .await
+        .unwrap();
+    let id = call["id"].as_str().unwrap().to_string();
+    f.store
+        .phone_provider_event(&id, "CA-test", CallState::AwaitingAcceptance, 100)
+        .unwrap();
+    f.store.phone_accept(&id, "CA-test", 101).unwrap();
+    let router = augmentagent_phone::ingress::router(
+        Arc::new(f.service),
+        Arc::new(augmentagent_phone::webhook::WebhookAuth::new(
+            "AC-test",
+            "callback-secret",
+        )),
+        agent,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let mut request = format!("ws://{addr}/phone/relay/{id}")
+        .into_client_request()
+        .unwrap();
+    let signature = signed(
+        "callback-secret",
+        &format!("wss://phone.example.test/phone/relay/{id}"),
+        &[],
+    );
+    request
+        .headers_mut()
+        .insert("x-twilio-signature", signature.parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    socket
+        .send(Message::Text(
+            json!({"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX-test"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    RelayHarness {
+        _dir: f._dir,
+        store: f.store,
+        provider: f.provider,
+        id,
+        socket,
+        server,
+    }
+}
+fn prompt(text: &str) -> tokio_tungstenite::tungstenite::Message {
+    tokio_tungstenite::tungstenite::Message::Text(
+        json!({"type":"prompt","voicePrompt":text,"last":true})
+            .to_string()
+            .into(),
+    )
+}
+/// Reads text frames until one carries `token` with `last:true`, returning
+/// every token seen on the way. Panics on close or timeout.
+async fn read_until_answer(socket: &mut RelaySocket, token: &str, context: &str) -> Vec<String> {
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let mut seen = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if body["type"] == "end" {
+                        panic!("{context}: relay sent end before answering");
+                    }
+                    let spoken = body["token"].as_str().unwrap().to_string();
+                    let last = body["last"] == true;
+                    seen.push(spoken.clone());
+                    if spoken == token {
+                        assert!(last, "{context}: answer must be a final text frame");
+                        return;
+                    }
+                }
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                other => panic!("{context}: socket closed before answer: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{context}: no answer within deadline"));
+    seen
+}
+
+#[tokio::test]
+async fn ac01_recoverable_frames_keep_relay_open_and_next_prompt_is_answered() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let scenarios: [(&str, Message); 5] = [
+        ("binary", Message::Binary(vec![0xde, 0xad].into())),
+        ("malformed", Message::Text("{not json".into())),
+        (
+            "unknown_type",
+            Message::Text(json!({"type":"mystery","payload":"x"}).to_string().into()),
+        ),
+        (
+            "provider_64107",
+            Message::Text(
+                json!({"type":"error","code":64107,"description":"invalid message"})
+                    .to_string()
+                    .into(),
+            ),
+        ),
+        (
+            "provider_unknown",
+            Message::Text(
+                json!({"type":"error","code":64199,"description":"unknown"})
+                    .to_string()
+                    .into(),
+            ),
+        ),
+    ];
+    for (name, frame) in scenarios {
+        let mut relay = connect_relay(Arc::new(ScriptedAgent)).await;
+        relay.socket.send(prompt("before")).await.unwrap();
+        read_until_answer(&mut relay.socket, "Answer to: before", name).await;
+        relay.socket.send(frame).await.unwrap();
+        relay.socket.send(prompt("after")).await.unwrap();
+        read_until_answer(&mut relay.socket, "Answer to: after", name).await;
+        assert!(
+            !relay
+                .store
+                .phone_call("canonical-owner", &relay.id)
+                .unwrap()
+                .stop_requested,
+            "{name}: recoverable condition must not request a stop"
+        );
+        assert!(relay.provider.stops.lock().unwrap().is_empty(), "{name}");
+        relay.server.abort();
+    }
+}
+
+#[tokio::test]
+async fn ac02_queue_overflow_drops_oldest_turn_speaks_recovery_once_and_answers_newest() {
+    use futures::SinkExt;
+    let agent = Arc::new(GatedAgent {
+        permits: tokio::sync::Semaphore::new(0),
+        entered: tokio::sync::Notify::new(),
+    });
+    let mut relay = connect_relay(agent.clone()).await;
+    // Turn one is in progress; four queue; the sixth overflows the queue.
+    relay.socket.send(prompt("one")).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), agent.entered.notified())
+        .await
+        .unwrap();
+    for text in ["two", "three", "four", "five", "six"] {
+        relay.socket.send(prompt(text)).await.unwrap();
+    }
+    agent.permits.add_permits(6);
+    let seen = read_until_answer(&mut relay.socket, "Answer to: six", "overflow").await;
+    let recovery = seen
+        .iter()
+        .filter(|t| t.as_str() == "Sorry, say that again?")
+        .count();
+    assert_eq!(recovery, 1, "exactly one recovery line: {seen:?}");
+    for answered in ["one", "three", "four", "five", "six"] {
+        assert!(
+            seen.iter().any(|t| t == &format!("Answer to: {answered}")),
+            "{answered} must still be answered: {seen:?}"
+        );
+    }
+    assert!(
+        !seen.iter().any(|t| t == "Answer to: two"),
+        "the oldest queued turn is dropped: {seen:?}"
+    );
+    assert!(
+        !relay
+            .store
+            .phone_call("canonical-owner", &relay.id)
+            .unwrap()
+            .stop_requested
+    );
+    relay.server.abort();
+}
+
+#[tokio::test]
+async fn ac03_ten_consecutive_invalid_frames_send_end_then_close_and_a_valid_frame_resets() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let malformed = || Message::Text("{bad".into());
+    // Exactly ten in a row: one `end` frame, then the socket closes.
+    let mut relay = connect_relay(Arc::new(ScriptedAgent)).await;
+    for _ in 0..10 {
+        relay.socket.send(malformed()).await.unwrap();
+    }
+    let mut ends = 0;
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match relay.socket.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(body["type"], "end", "only an end frame may follow: {text}");
+                    ends += 1;
+                }
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("socket must close after the invalid frame limit");
+    assert_eq!(ends, 1, "exactly one end frame");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !relay.store.phone_provider_call(&relay.id).unwrap().state.terminal() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    relay.server.abort();
+    // Nine, one valid frame, nine more: the counter reset keeps the socket open.
+    let mut relay = connect_relay(Arc::new(ScriptedAgent)).await;
+    for _ in 0..9 {
+        relay.socket.send(malformed()).await.unwrap();
+    }
+    relay.socket.send(prompt("reset")).await.unwrap();
+    read_until_answer(&mut relay.socket, "Answer to: reset", "reset").await;
+    for _ in 0..9 {
+        relay.socket.send(malformed()).await.unwrap();
+    }
+    relay.socket.send(prompt("still open")).await.unwrap();
+    read_until_answer(&mut relay.socket, "Answer to: still open", "still open").await;
+    assert!(
+        !relay
+            .store
+            .phone_call("canonical-owner", &relay.id)
+            .unwrap()
+            .stop_requested
+    );
+    relay.server.abort();
+}
+
+#[test]
+fn ac04_terminal_end_reasons_are_exactly_the_documented_set() {
+    use augmentagent_phone::ingress::EndReason;
+    // A wildcard-free match fails to compile if a variant is added or removed.
+    let name = |reason: EndReason| match reason {
+        EndReason::PeerClosed => "peer_closed",
+        EndReason::TransportError => "transport_error",
+        EndReason::OwnerHangup => "owner_hangup",
+        EndReason::Revoked => "revoked",
+        EndReason::DurationLimit => "duration_limit",
+        EndReason::WorkerFailed => "worker_failed",
+        EndReason::InvalidFrameLimit => "invalid_frame_limit",
+        EndReason::AgentEnd => "agent_end",
+    };
+    assert_eq!(EndReason::ALL.len(), 8);
+    let mut names: Vec<&str> = EndReason::ALL.iter().map(|r| r.as_str()).collect();
+    names.sort_unstable();
+    let mut expected = vec![
+        "peer_closed",
+        "transport_error",
+        "owner_hangup",
+        "revoked",
+        "duration_limit",
+        "worker_failed",
+        "invalid_frame_limit",
+        "agent_end",
+    ];
+    expected.sort_unstable();
+    assert_eq!(names, expected);
+    for reason in EndReason::ALL {
+        assert_eq!(reason.as_str(), name(reason));
+    }
+}
