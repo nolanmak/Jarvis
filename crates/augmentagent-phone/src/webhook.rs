@@ -58,9 +58,10 @@ impl PhoneService {
         signature: &str,
     ) -> Result<String, Error> {
         self.callback_call(auth, "relay-ended", id, fields, signature)?;
+        // #1557: first, so a summary-queue failure cannot drop the reason.
+        self.record_end_reason(id, fields);
         // #1552: the conversation is over; queue its summary exactly once.
         self.store.phone_enqueue_call_summary(id, self.clock.now_ms())?;
-        self.record_end_reason(id, fields);
         let failed = field(fields, "SessionStatus")? == "failed";
         if failed {
             // Never log provider error text: it can include URLs and caller data.
