@@ -48,6 +48,7 @@ impl PhoneRuntime {
         let initial = service.cleanup_due(true)?;
         let stop = CancellationToken::new();
         let memory = tokio::spawn(memory_worker(service.clone(), agent.clone(), stop.clone()));
+        let proposals = tokio::spawn(proposal_worker(service.clone(), agent.clone(), stop.clone()));
         let router = crate::ingress::router(service.clone(), auth, agent);
         let listener_stop = stop.clone();
         let failed_stop = stop.clone();
@@ -70,7 +71,7 @@ impl PhoneRuntime {
             service,
             tools,
             stop,
-            tasks: vec![http, watchdog, memory],
+            tasks: vec![http, watchdog, memory, proposals],
         })
     }
     pub fn tools(&self) -> &Arc<ToolServer> {
@@ -146,6 +147,7 @@ pub async fn cleanup_without_runtime(
             debug_events: false,
             barge_in: crate::relay::BargeIn::default(),
             fast: None,
+            proposals: crate::proposals::ProposalPolicy::default(),
             silence: crate::silence::SilencePolicy::default(),
         },
     ));
@@ -157,6 +159,9 @@ pub async fn cleanup_without_runtime(
 
 /// How often the post-call summary queue (#1552) is checked.
 const MEMORY_INTERVAL: Duration = Duration::from_secs(5);
+/// How often due call proposals (#1553) are checked, so a deferred one
+/// arrives within seconds of quiet hours ending.
+const PROPOSAL_INTERVAL: Duration = Duration::from_secs(5);
 /// Drain durable post-call summary jobs. Failures are retried by the store's
 /// bounded lease and never stop the runtime; shutdown drops an in-flight run,
 /// whose lease then expires and replays it after restart.
@@ -186,6 +191,30 @@ async fn memory_worker(
             result = service.run_end_notices(agent.as_ref()) => {
                 if result.is_err() {
                     tracing::warn!(target: "phone.memory", "phone end notice queue could not be read; retrying");
+                }
+            }
+        }
+    }
+}
+
+/// Post due call proposals, independent of slow summary runs. Never dials.
+async fn proposal_worker(
+    service: Arc<PhoneService>,
+    agent: Arc<dyn ConversationAgent>,
+    stop: CancellationToken,
+) -> Result<(), RuntimeError> {
+    let mut tick = tokio::time::interval(PROPOSAL_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = stop.cancelled() => return Ok(()),
+            _ = tick.tick() => {}
+        }
+        tokio::select! {
+            _ = stop.cancelled() => return Ok(()),
+            result = service.deliver_call_proposals(agent.as_ref()) => {
+                if result.is_err() {
+                    tracing::warn!(target: "phone.proposals", "call proposals could not be read; retrying");
                 }
             }
         }

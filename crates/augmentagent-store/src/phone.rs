@@ -1396,6 +1396,294 @@ impl Store {
     }
 }
 
+// ---- #1553 agent-proposed calls -------------------------------------------
+
+/// A proposal waits this long for the owner's answer after it is posted.
+pub const PHONE_PROPOSAL_TTL_MS: i64 = 15 * 60_000;
+/// At most one proposal per owner within this distance of another.
+pub const PHONE_PROPOSAL_SPACING_MS: i64 = 4 * 60 * 60_000;
+/// At most this many proposals per owner in any rolling 24 hours.
+pub const PHONE_PROPOSALS_PER_DAY: i64 = 3;
+/// Bullets carried into the first phone turn.
+pub const PHONE_PROPOSAL_AGENDA_MAX: usize = 5;
+pub const PHONE_PROPOSAL_REASON_MAX: usize = 300;
+pub const PHONE_PROPOSAL_ITEM_MAX: usize = 200;
+/// A scheduled proposal not posted within this long after its delivery time
+/// (no chat adapter, repeated delivery failure) expires instead of arriving late.
+pub const PHONE_PROPOSAL_STALE_MS: i64 = 60 * 60_000;
+const DAY_MS: i64 = 24 * 60 * 60_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProposalState {
+    Scheduled,
+    Pending,
+    Accepted,
+    Declined,
+    Expired,
+}
+impl ProposalState {
+    fn parse(s: &str) -> rusqlite::Result<Self> {
+        Ok(match s {
+            "scheduled" => Self::Scheduled,
+            "pending" => Self::Pending,
+            "accepted" => Self::Accepted,
+            "declined" => Self::Declined,
+            "expired" => Self::Expired,
+            _ => return Err(rusqlite::Error::InvalidQuery),
+        })
+    }
+}
+#[derive(Clone, Debug)]
+pub struct CallProposal {
+    pub id: String,
+    pub owner: String,
+    pub origin: PhoneOrigin,
+    pub reason: String,
+    pub agenda: Vec<String>,
+    pub state: ProposalState,
+    pub created_ms: i64,
+    pub deliver_ms: i64,
+    pub delivered_ms: Option<i64>,
+    pub expires_ms: Option<i64>,
+    /// `call_owner` request ID used by the accepted proposal's call.
+    pub call_request: Option<String>,
+}
+pub struct NewCallProposal<'a> {
+    pub owner: &'a str,
+    pub origin: &'a PhoneOrigin,
+    pub reason: &'a str,
+    pub agenda: &'a [String],
+    pub now_ms: i64,
+    /// `now_ms`, or the end of the owner's quiet hours.
+    pub deliver_ms: i64,
+}
+/// Result of an owner's yes/no in a control conversation.
+#[derive(Debug)]
+pub enum ProposalAnswer {
+    /// Newly accepted: the caller dials once with `call_request`.
+    Accepted(CallProposal),
+    /// A duplicate yes: the call was already requested.
+    AlreadyAccepted(CallProposal),
+    Declined,
+    AlreadyDeclined,
+    Expired,
+    /// The open proposal was posted in a different conversation.
+    OtherConversation,
+    NoProposal,
+}
+const PROPOSAL_COLUMNS: &str = "id,owner,origin_json,reason,agenda_json,state,created_ms,deliver_ms,delivered_ms,expires_ms,call_request";
+fn read_proposal(r: &rusqlite::Row<'_>) -> rusqlite::Result<CallProposal> {
+    let bad = |_| rusqlite::Error::InvalidQuery;
+    Ok(CallProposal {
+        id: r.get(0)?,
+        owner: r.get(1)?,
+        origin: serde_json::from_str(&r.get::<_, String>(2)?).map_err(bad)?,
+        reason: r.get(3)?,
+        agenda: serde_json::from_str(&r.get::<_, String>(4)?).map_err(bad)?,
+        state: ProposalState::parse(&r.get::<_, String>(5)?)?,
+        created_ms: r.get(6)?,
+        deliver_ms: r.get(7)?,
+        delivered_ms: r.get(8)?,
+        expires_ms: r.get(9)?,
+        call_request: r.get(10)?,
+    })
+}
+fn bounded_line(s: &str, max: usize) -> bool {
+    !s.trim().is_empty() && s.chars().count() <= max && !s.chars().any(char::is_control)
+}
+
+impl Store {
+    /// Record a proposal after the rate limits: no other proposal for the
+    /// owner within [`PHONE_PROPOSAL_SPACING_MS`] of its delivery time and
+    /// fewer than [`PHONE_PROPOSALS_PER_DAY`] delivered in the 24 hours before
+    /// it. A rejected proposal is not recorded.
+    pub fn phone_schedule_call_proposal(&self, p: NewCallProposal<'_>) -> PhoneResult<CallProposal> {
+        identifier(p.owner)?;
+        if !bounded_line(p.reason, PHONE_PROPOSAL_REASON_MAX)
+            || p.agenda.len() > PHONE_PROPOSAL_AGENDA_MAX
+            || !p.agenda.iter().all(|item| bounded_line(item, PHONE_PROPOSAL_ITEM_MAX))
+            || p.deliver_ms < p.now_ms
+            || p.origin.owner.account() != p.origin.conversation.account()
+        {
+            return Err(PhoneError::InvalidInput);
+        }
+        let origin = serde_json::to_string(p.origin).map_err(|_| PhoneError::InvalidInput)?;
+        let agenda = serde_json::to_string(p.agenda).map_err(|_| PhoneError::InvalidInput)?;
+        let id = uuid::Uuid::new_v4().to_string();
+        transaction(self, |tx| {
+            let near: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM phone_call_proposals
+                 WHERE owner=?1 AND deliver_ms>?2 AND deliver_ms<?3)",
+                params![p.owner, p.deliver_ms - PHONE_PROPOSAL_SPACING_MS, p.deliver_ms + PHONE_PROPOSAL_SPACING_MS],
+                |r| r.get(0),
+            )?;
+            let today: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM phone_call_proposals
+                 WHERE owner=?1 AND deliver_ms>?2 AND deliver_ms<=?3",
+                params![p.owner, p.deliver_ms - DAY_MS, p.deliver_ms],
+                |r| r.get(0),
+            )?;
+            if near || today >= PHONE_PROPOSALS_PER_DAY {
+                return Err(PhoneError::RateLimited);
+            }
+            tx.execute(
+                "INSERT INTO phone_call_proposals(id,owner,conversation,origin_json,reason,agenda_json,state,created_ms,deliver_ms)
+                 VALUES(?1,?2,?3,?4,?5,?6,'scheduled',?7,?8)",
+                params![id, p.owner, p.origin.conversation.storage_key(), origin, p.reason.trim(), agenda, p.now_ms, p.deliver_ms],
+            )?;
+            Ok(tx.query_row(
+                &format!("SELECT {PROPOSAL_COLUMNS} FROM phone_call_proposals WHERE id=?1"),
+                [&id],
+                read_proposal,
+            )?)
+        })
+    }
+    /// Scheduled proposals whose delivery time has come. Ones left unposted
+    /// for longer than [`PHONE_PROPOSAL_STALE_MS`] expire here instead.
+    pub fn phone_call_proposals_due(&self, now_ms: i64) -> PhoneResult<Vec<CallProposal>> {
+        transaction(self, |tx| {
+            tx.execute(
+                "UPDATE phone_call_proposals SET state='expired',decided_ms=?1
+                 WHERE state='scheduled' AND deliver_ms<=?2",
+                params![now_ms, now_ms - PHONE_PROPOSAL_STALE_MS],
+            )?;
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {PROPOSAL_COLUMNS} FROM phone_call_proposals
+                 WHERE state='scheduled' AND deliver_ms<=?1 ORDER BY deliver_ms, id LIMIT 8"
+            ))?;
+            let due = stmt
+                .query_map([now_ms], read_proposal)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(due)
+        })
+    }
+    /// The question is in the owner's chat: start its answer window. False
+    /// when it was already delivered or is no longer scheduled.
+    pub fn phone_mark_call_proposal_delivered(&self, id: &str, now_ms: i64) -> PhoneResult<bool> {
+        Ok(self.with_conn(|c| {
+            c.execute(
+                "UPDATE phone_call_proposals SET state='pending',delivered_ms=?2,expires_ms=?3
+                 WHERE id=?1 AND state='scheduled'",
+                params![id, now_ms, now_ms + PHONE_PROPOSAL_TTL_MS],
+            )
+        })? == 1)
+    }
+    /// Unanswered proposals past their window are recorded as expired
+    /// (a decline). Returns how many expired.
+    pub fn phone_expire_call_proposals(&self, now_ms: i64) -> PhoneResult<usize> {
+        Ok(self.with_conn(|c| {
+            c.execute(
+                "UPDATE phone_call_proposals SET state='expired',decided_ms=?1
+                 WHERE state='pending' AND expires_ms<=?1",
+                [now_ms],
+            )
+        })?)
+    }
+    /// Whether any posted proposal's window (plus `grace_ms` for late replies)
+    /// is still open, so bare yes/no replies are routed to the phone service.
+    /// An answered proposal's window ends at its decision time plus grace.
+    pub fn phone_call_proposal_window_open(&self, now_ms: i64, grace_ms: i64) -> PhoneResult<bool> {
+        Ok(self.with_conn(|c| {
+            c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM phone_call_proposals
+                 WHERE delivered_ms IS NOT NULL AND (CASE WHEN state IN ('accepted','declined') THEN decided_ms ELSE expires_ms END)+?2>?1)",
+                params![now_ms, grace_ms],
+                |r| r.get(0),
+            )
+        })?)
+    }
+    /// Apply an authenticated owner's yes/no. Only the most recently posted
+    /// proposal whose window (plus `grace_ms`) is open is considered; it must
+    /// have been posted in `conversation` (a storage key). Acceptance is a
+    /// single transition, so duplicate replies cannot accept twice.
+    pub fn phone_answer_call_proposal(
+        &self,
+        owner: &str,
+        conversation: &str,
+        accept: bool,
+        now_ms: i64,
+        grace_ms: i64,
+    ) -> PhoneResult<ProposalAnswer> {
+        transaction(self, |tx| {
+            let latest = tx
+                .query_row(
+                    &format!(
+                        "SELECT {PROPOSAL_COLUMNS},conversation FROM phone_call_proposals
+                         WHERE owner=?1 AND delivered_ms IS NOT NULL AND (CASE WHEN state IN ('accepted','declined') THEN decided_ms ELSE expires_ms END)+?3>?2
+                         ORDER BY delivered_ms DESC, id DESC LIMIT 1"
+                    ),
+                    params![owner, now_ms, grace_ms],
+                    |r| Ok((read_proposal(r)?, r.get::<_, String>(11)?)),
+                )
+                .optional()?;
+            let Some((mut proposal, posted_in)) = latest else {
+                return Ok(ProposalAnswer::NoProposal);
+            };
+            if posted_in != conversation {
+                return Ok(ProposalAnswer::OtherConversation);
+            }
+            if proposal.state == ProposalState::Pending
+                && proposal.expires_ms.is_some_and(|at| now_ms >= at)
+            {
+                tx.execute(
+                    "UPDATE phone_call_proposals SET state='expired',decided_ms=?2 WHERE id=?1",
+                    params![proposal.id, now_ms],
+                )?;
+                return Ok(ProposalAnswer::Expired);
+            }
+            Ok(match (proposal.state, accept) {
+                (ProposalState::Pending, true) => {
+                    let request = format!("proposal:{}", proposal.id);
+                    tx.execute(
+                        "UPDATE phone_call_proposals SET state='accepted',decided_ms=?2,call_request=?3 WHERE id=?1",
+                        params![proposal.id, now_ms, request],
+                    )?;
+                    proposal.state = ProposalState::Accepted;
+                    proposal.call_request = Some(request);
+                    ProposalAnswer::Accepted(proposal)
+                }
+                (ProposalState::Pending, false) => {
+                    tx.execute(
+                        "UPDATE phone_call_proposals SET state='declined',decided_ms=?2 WHERE id=?1",
+                        params![proposal.id, now_ms],
+                    )?;
+                    ProposalAnswer::Declined
+                }
+                (ProposalState::Accepted, _) => ProposalAnswer::AlreadyAccepted(proposal),
+                (ProposalState::Declined, _) => ProposalAnswer::AlreadyDeclined,
+                _ => ProposalAnswer::Expired,
+            })
+        })
+    }
+    /// The accepted proposal that requested this call, if any.
+    pub fn phone_call_proposal_for_call(&self, call_id: &str) -> PhoneResult<Option<CallProposal>> {
+        Ok(self.with_conn(|c| {
+            c.query_row(
+                &format!(
+                    "SELECT {} FROM phone_call_proposals p JOIN phone_calls c
+                     ON c.owner=p.owner AND c.request_id=p.call_request
+                     WHERE c.id=?1 AND p.state='accepted'",
+                    PROPOSAL_COLUMNS.split(',').map(|col| format!("p.{col}")).collect::<Vec<_>>().join(",")
+                ),
+                [call_id],
+                read_proposal,
+            )
+            .optional()
+        })?)
+    }
+    /// Every proposal for an owner, oldest first. For status and tests.
+    pub fn phone_call_proposals(&self, owner: &str) -> PhoneResult<Vec<CallProposal>> {
+        Ok(self.with_conn(|c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {PROPOSAL_COLUMNS} FROM phone_call_proposals WHERE owner=?1 ORDER BY created_ms, id"
+            ))?;
+            let rows = stmt
+                .query_map([owner], read_proposal)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })?)
+    }
+}
 /// First retry delay for an end notice (#1556); doubles per attempt.
 const END_NOTICE_LEASE_MS: i64 = 60_000;
 impl Store {

@@ -88,6 +88,44 @@ fn cleanup_with_lookup(
     }))
 }
 
+/// #1553: proactive loops propose calls through this adapter. It can only
+/// ask; the owner's `yes` in the private control chat is what dials, inside
+/// `PhoneService`.
+pub struct PhoneCallProposer {
+    service: Arc<PhoneService>,
+    owner: String,
+}
+impl PhoneCallProposer {
+    /// `None` unless every phone link names the same owner.
+    pub fn new(service: Arc<PhoneService>) -> Option<Self> {
+        let owner = service.proposal_owner()?;
+        Some(Self { service, owner })
+    }
+}
+#[async_trait]
+impl augmentagent_proactive::call_proposal::CallProposer for PhoneCallProposer {
+    async fn propose_call(
+        &self,
+        proposal: augmentagent_proactive::call_proposal::CallProposal,
+    ) -> Result<
+        augmentagent_proactive::call_proposal::ProposalOutcome,
+        augmentagent_proactive::call_proposal::ProposalError,
+    > {
+        use augmentagent_proactive::call_proposal::{ProposalError, ProposalOutcome};
+        match self
+            .service
+            .propose_call(&self.owner, &proposal.reason, &proposal.agenda)
+        {
+            Ok(receipt) => Ok(ProposalOutcome {
+                deliver_at_ms: receipt.deliver_ms,
+                deferred: receipt.deferred,
+            }),
+            Err(e) if e.code() == "rate_limited" => Err(ProposalError::RateLimited),
+            Err(e) => Err(ProposalError::Unavailable(e.code().into())),
+        }
+    }
+}
+
 pub async fn supervise(runtime: PhoneRuntime, shutdown: CancellationToken) -> Result<()> {
     let unexpected = loop {
         tokio::select! {

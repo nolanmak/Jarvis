@@ -122,6 +122,27 @@ CREATE TABLE IF NOT EXISTS owner_profile (
 );
 CREATE INDEX IF NOT EXISTS owner_profile_recent ON owner_profile(owner, updated_ms);
 
+-- #1553 agent-proposed calls. A proposal is only a question posted to the
+-- owner's private control chat; it never dials. `scheduled` waits for its
+-- delivery time (quiet hours defer, never drop), `pending` awaits the owner's
+-- yes/no until `expires_ms`. Every row counts toward the rate limits.
+CREATE TABLE IF NOT EXISTS phone_call_proposals (
+    id TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    conversation TEXT NOT NULL,
+    origin_json TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK(length(reason) BETWEEN 1 AND 300),
+    agenda_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('scheduled','pending','accepted','declined','expired')),
+    created_ms INTEGER NOT NULL,
+    deliver_ms INTEGER NOT NULL,
+    delivered_ms INTEGER,
+    expires_ms INTEGER,
+    decided_ms INTEGER,
+    call_request TEXT
+);
+CREATE INDEX IF NOT EXISTS phone_call_proposals_owner ON phone_call_proposals(owner, deliver_ms);
+CREATE INDEX IF NOT EXISTS phone_call_proposals_state ON phone_call_proposals(state, deliver_ms);
 -- #1557 why a relayed call ended, from the relay-ended callback's handoffData,
 -- or (#1556 'silence') from the relay itself. Written once; a replayed
 -- callback cannot change it. `migrate` rebuilds a table created before
