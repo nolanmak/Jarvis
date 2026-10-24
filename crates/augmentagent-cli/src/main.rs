@@ -8,6 +8,7 @@ mod model_tool;
 mod composio_auth_tool;
 mod voice_tool;
 mod phone_runtime;
+mod phone_metrics;
 mod local_phone_transport;
 mod local_phone;
 mod discord_phone;
@@ -718,6 +719,11 @@ enum Cmd {
     /// Internal owner-bound phone MCP facade.
     #[command(hide = true)]
     PhoneTool,
+    /// Owner phone call diagnostics (#1551 latency metrics).
+    Phone {
+        #[command(subcommand)]
+        op: PhoneOp,
+    },
     /// Reconcile one known phone call from provider evidence; never dials.
     PhoneReconcile {
         #[arg(long)]
@@ -995,6 +1001,15 @@ enum DiskOp {
         /// Machine-readable output.
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+}
+#[derive(Subcommand)]
+enum PhoneOp {
+    /// Print nearest-rank p50/p95 per latency field for the last N calls.
+    /// Reads stored `phone_turn_metrics` only; no provider requests.
+    Metrics {
+        #[arg(long, default_value_t = 10)]
+        last: usize,
     },
 }
 #[derive(Subcommand)]
@@ -5356,6 +5371,7 @@ async fn main() -> Result<()> {
         Cmd::ComposioAuthTool => composio_auth_tool::serve().await,
         Cmd::VoiceTool => voice_tool::serve(),
         Cmd::PhoneTool => Ok(augmentagent_phone::mcp::serve()?),
+        Cmd::Phone { op: PhoneOp::Metrics { last } } => phone_metrics::run(&store, last),
         Cmd::PhoneReconcile { ref call_id, ref provider_id } => phone_runtime::reconcile_local(&store, call_id, provider_id.as_deref()).await,
         Cmd::ComputeTool => compute_tool::serve(),
         Cmd::ReasonerSelftest { ref prompt, ref profile, tool_probe } =>

@@ -47,6 +47,12 @@ enum Incoming {
     Dtmf { digit: String },
     #[serde(rename = "error")]
     Error { code: Option<u32> },
+    /// Relay debug/event traffic (`debug`/`events` TwiML attributes). Only the
+    /// event name is read; values are never logged or stored.
+    #[serde(rename = "info")]
+    Info { name: Option<String> },
+    #[serde(other)]
+    Unknown,
 }
 struct TurnOutput {
     sent: HashMap<String, ([u8; 32], bool)>,
@@ -61,6 +67,9 @@ pub struct RelaySession {
     generation: u64,
     outputs: HashMap<String, TurnOutput>,
     heard_until_interrupt: Option<String>,
+    debug_events: bool,
+    invalid_frames: u64,
+    played_event: Option<tokio::time::Instant>,
 }
 impl RelaySession {
     pub fn new(call_id: &str, account_sid: &str, call_sid: &str) -> Self {
@@ -73,9 +82,33 @@ impl RelaySession {
             generation: 0,
             outputs: HashMap::new(),
             heard_until_interrupt: None,
+            debug_events: false,
+            invalid_frames: 0,
+            played_event: None,
         }
     }
+    /// With Relay debug events requested in TwiML, unknown frame types are
+    /// categorized and ignored instead of ending the session.
+    pub fn with_debug_events(mut self, enabled: bool) -> Self {
+        self.debug_events = enabled;
+        self
+    }
+    /// Frames rejected as malformed, unauthorized or unsupported.
+    pub fn invalid_frames(&self) -> u64 {
+        self.invalid_frames
+    }
+    /// Receipt time of the latest tokens-played debug event, consumed once.
+    pub fn take_played_event(&mut self) -> Option<tokio::time::Instant> {
+        self.played_event.take()
+    }
     pub fn receive(&mut self, frame: &str) -> Result<RelayInput, Error> {
+        let result = self.receive_frame(frame);
+        if result.is_err() {
+            self.invalid_frames += 1;
+        }
+        result
+    }
+    fn receive_frame(&mut self, frame: &str) -> Result<RelayInput, Error> {
         if frame.len() > 32_768 {
             return Err(Error::InvalidArguments);
         }
@@ -134,6 +167,14 @@ impl RelaySession {
                 Ok(RelayInput::Interrupted)
             }
             Incoming::Error { code: Some(code) } => Ok(RelayInput::ProviderError(code)),
+            Incoming::Info { name } => {
+                // Without debug events requested, nothing is attributed.
+                if self.debug_events && name.as_deref() == Some("tokensPlayed") {
+                    self.played_event = Some(tokio::time::Instant::now());
+                }
+                Ok(RelayInput::Ignore)
+            }
+            Incoming::Unknown if self.debug_events => Ok(RelayInput::Ignore),
             Incoming::Dtmf { digit } if digit.len() == 1 && "0123456789*#".contains(&digit) => {
                 Ok(RelayInput::Ignore)
             }
