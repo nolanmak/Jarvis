@@ -121,3 +121,11 @@ CREATE TABLE IF NOT EXISTS owner_profile (
     PRIMARY KEY(owner, key)
 );
 CREATE INDEX IF NOT EXISTS owner_profile_recent ON owner_profile(owner, updated_ms);
+
+-- #1557 why a relayed call ended, from the relay-ended callback's handoffData.
+-- Written once; a replayed callback cannot change it.
+CREATE TABLE IF NOT EXISTS phone_call_end_reasons (
+    call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
+    reason TEXT NOT NULL CHECK(reason IN ('owner_goodbye','task_complete','owner_request','relay_ended_unknown')),
+    recorded_ms INTEGER NOT NULL
+);

@@ -290,6 +290,8 @@ async fn phone_tool_configuration_requires_authenticated_context_and_preserves_o
         .allowed_tools
         .contains(&"mcp__phone__call_owner".into()));
     assert!(!opts.allowed_tools.contains(&"mcp__phone__speak".into()));
+    // #1557 AC5: end_call belongs to the fast layer only, never the native path.
+    assert!(!opts.allowed_tools.iter().any(|tool| tool.contains("end_call")));
     let settings: serde_json::Value =
         serde_json::from_str(opts.settings_json.as_ref().unwrap()).unwrap();
     assert_eq!(settings["mcpServers"]["existing"]["command"], "kept");
