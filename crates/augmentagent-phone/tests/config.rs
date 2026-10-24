@@ -183,7 +183,10 @@ fn ac03_voice_providers_default_to_deepgram_and_elevenlabs_and_fail_closed_on_ba
         Settings::from_lookup(|k| env.get(k).cloned()),
         Err(Error::Voice(VoiceConfigError::VoiceRequired))
     ));
-    env.insert("AUGMENTAGENT_PHONE_TTS_VOICE", "en-US-Chirp3-HD-Aoede".into());
+    env.insert(
+        "AUGMENTAGENT_PHONE_TTS_VOICE",
+        "en-US-Chirp3-HD-Aoede".into(),
+    );
     let voice = Settings::from_lookup(|k| env.get(k).cloned())
         .unwrap()
         .unwrap()

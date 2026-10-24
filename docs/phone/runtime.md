@@ -65,6 +65,10 @@ limits and duplicate-call protections still apply. Private DM entry is optional.
 | `AUGMENTAGENT_PHONE_BIND` | Local proxy upstream, default `127.0.0.1:8878`; must be a loopback IP with a nonzero port. |
 | `AUGMENTAGENT_PHONE_VERIFICATION_KEY` | Separate secret of at least 32 bytes, used for keyed verification-code hashes. Keep stable across restarts; rotation invalidates outstanding challenges. |
 | `AUGMENTAGENT_PHONE_OWNER_LINKS` | JSON array mapping authenticated surface identities to a canonical owner; 1–64 explicit links, at most 32 KiB. |
+| `AUGMENTAGENT_PHONE_STT_PROVIDER` | ConversationRelay `transcriptionProvider`: `Deepgram` (default) or `Google`. Exact, case-sensitive; anything else fails configuration. |
+| `AUGMENTAGENT_PHONE_STT_MODEL` | ConversationRelay `speechModel`. Default `nova-3-general` for Deepgram, `telephony` for Google. Must match `^[A-Za-z0-9._-]{1,96}$`. |
+| `AUGMENTAGENT_PHONE_TTS_PROVIDER` | ConversationRelay `ttsProvider`: `ElevenLabs` (default), `Amazon` or `Google`. Exact, case-sensitive; anything else fails configuration. |
+| `AUGMENTAGENT_PHONE_TTS_VOICE` | ConversationRelay `voice`. Default `UgBBYS2sOqTuMpoF3BR0-flash_v2_5` for ElevenLabs (voice ID with model suffix; a `-<speed>_<stability>_<similarity>` suffix is allowed), `Joanna` for Amazon; required for Google. Must match `^[A-Za-z0-9._-]{1,96}$`. |
 
 Synthetic link example (replace identifiers with actual authenticated bindings):
 
@@ -406,8 +410,32 @@ It does not test installer/service rollback or authorize legacy voice removal.
 ## Conversational pickup and response recovery (#1526, #1527)
 
 An owner-requested call now connects on the signed answer callback without a
-keypress. ConversationRelay explicitly selects Amazon Joanna (`en-US`); failure
-announcements use Polly.Joanna. Optional number-verification calls remain separate.
+keypress. Failure announcements use Polly.Joanna via plain `<Say>`. Optional
+number-verification calls remain separate.
+
+### Speech providers (#1545)
+
+ConversationRelay TwiML pins the speech providers explicitly instead of relying
+on Twilio account defaults. With no overrides it emits
+`transcriptionProvider="Deepgram" speechModel="nova-3-general"
+ttsProvider="ElevenLabs" voice="UgBBYS2sOqTuMpoF3BR0-flash_v2_5"
+language="en-US" elevenlabsTextNormalization="on"`; the normalization attribute
+is only present for ElevenLabs. The four `AUGMENTAGENT_PHONE_STT_*` /
+`AUGMENTAGENT_PHONE_TTS_*` variables above are read once at startup and
+validated to a conservative alphabet, so no value can break out of an attribute.
+Chat text, tool arguments and model output never reach these attributes; a
+source-level test holds `relay_twiml` to startup configuration only.
+
+`hints` biases recognition toward the owner's first name (only when a stored
+owner profile supplies one; no store does yet) and the fixed nouns `Jarvis,
+Discord, WhatsApp, Slack, Linear, Notion`, XML-escaped and capped at 500
+characters.
+
+If Twilio rejects the provider, model or voice combination it sends an `error`
+frame before the first prompt and closes the socket. The relay records that as
+diagnostic category `setup_provider_rejected` (with the numeric code when one
+is present) without logging the description, which can include the rejected
+value, and no agent turn is created.
 
 For a final transcript whose agent answer is still pending, the relay queues a
 short acknowledgment after 250 ms (100 ms polling; tested within 500 ms) and one

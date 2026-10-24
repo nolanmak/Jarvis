@@ -1896,7 +1896,9 @@ async fn ac02_each_provider_variable_changes_only_its_own_attribute() {
     let (_, reply) = start_owner_call(&defaults).await;
     let baseline = relay_attributes(&reply);
     // (env overrides, expected attribute differences from the baseline; None = absent)
-    let matrix: Vec<(Vec<(&str, &str)>, Vec<(&str, Option<&str>)>)> = vec![
+    type Overrides<'a> = Vec<(&'a str, &'a str)>;
+    type Expected<'a> = Vec<(&'a str, Option<&'a str>)>;
+    let matrix: Vec<(Overrides, Expected)> = vec![
         (
             vec![("AUGMENTAGENT_PHONE_STT_MODEL", "nova-2-phonecall")],
             vec![("speechModel", Some("nova-2-phonecall"))],
@@ -2069,7 +2071,7 @@ async fn ac05_hints_include_stored_first_name_only_when_present_and_are_escaped_
         DEFAULT_HINTS
     );
     assert!(augmentagent_phone::voice::hints(Some(&"N".repeat(64))).chars().count() <= 500);
-    assert!(augmentagent_phone::voice::HINTS_MAX_CHARS == 500);
+    const { assert!(augmentagent_phone::voice::HINTS_MAX_CHARS == 500) };
 }
 
 struct SlowPhoneAgent {

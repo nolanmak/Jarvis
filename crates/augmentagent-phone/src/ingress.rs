@@ -282,8 +282,18 @@ fn decode_setup(session: &mut RelaySession, text: &str) -> Result<(), SetupFailu
         serde_json::from_str(text).map_err(|_| failure("invalid_json"))?;
     if value["type"] == "error" {
         let provider_code = value["code"].as_u64().and_then(|n| u32::try_from(n).ok());
+        // Classify without retaining the description: it can carry URLs,
+        // numbers and the rejected voice string.
+        let reason = if value["description"]
+            .as_str()
+            .is_some_and(crate::relay::names_voice_setup)
+        {
+            "setup_provider_rejected"
+        } else {
+            "provider_error"
+        };
         return Err(SetupFailure {
-            reason: "provider_error",
+            reason,
             provider_code,
         });
     }
@@ -462,6 +472,13 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                             tracing::warn!(call_id = %call.id, provider_code = code, "phone provider error");
                             if code != 64107 { break "provider_error"; }
                         },
+                        Ok(RelayInput::SetupProviderRejected)=>{
+                            // The configured STT/TTS selection was refused before
+                            // any speech; Twilio closes after this frame. No turn
+                            // was created, so the agent is never invoked.
+                            tracing::warn!(call_id = %call.id, category = "setup_provider_rejected", "phone provider rejected the configured speech providers");
+                            break "setup_provider_rejected";
+                        },
                         _=>break "invalid_protocol_frame",
                     },
                     Some(Ok(Message::Ping(_)|Message::Pong(_)))=>{},
@@ -542,6 +559,21 @@ mod setup_diagnostic_tests {
         let error = decode_setup(&mut session, r#"{"type":"setup","accountSid":"secret-marker","callSid":"wrong","sessionId":"secret-marker"}"#).unwrap_err();
         assert_eq!(error.reason, "setup_identity_rejected");
         assert!(!format!("{error:?}").contains("secret-marker"));
+    }
+    #[test]
+    fn provider_rejection_of_voice_setup_is_categorized_without_the_description() {
+        let mut session = RelaySession::new("call", "expected-account", "expected-call");
+        let raw = r#"{"type":"error","description":"Invalid voice secret-marker for ttsProvider ElevenLabs"}"#;
+        let error = decode_setup(&mut session, raw).unwrap_err();
+        assert_eq!(error.reason, "setup_provider_rejected");
+        assert_eq!(error.provider_code, None);
+        assert!(!format!("{error:?}").contains("secret-marker"));
+        let error = decode_setup(
+            &mut session,
+            r#"{"type":"error","code":64101,"description":"Invalid message received"}"#,
+        )
+        .unwrap_err();
+        assert_eq!(error.reason, "provider_error");
     }
 }
 
