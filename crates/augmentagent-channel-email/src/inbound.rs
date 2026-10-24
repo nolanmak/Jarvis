@@ -77,9 +77,19 @@ impl<G: GmailApi + 'static> InboundSource for GmailInbound<G> {
         }
         let mut items = Vec::new();
         for account in accounts {
+            // Bound the query to mail newer than the last successful tick.
+            // A cursor read failure degrades to the unbounded query rather
+            // than skipping the account — correctness over cost.
+            let since_ms = match self.store.gmail_inbound_cursor_ms(&account.entity_id) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(account = %account.entity_id, "gmail_inbound_cursor_ms failed; polling unbounded: {e}");
+                    None
+                }
+            };
             let fetch_result = self
                 .gmail
-                .fetch_unread(&account.entity_id, self.per_account_limit)
+                .fetch_unread_since(&account.entity_id, since_ms, self.per_account_limit)
                 .await;
             // #179 — record liveness so the dashboard can show *actually
             // connected* instead of trusting the static `active` flag.
@@ -245,6 +255,69 @@ mod tests {
             platform: "gmail".to_string(),
             kind: "dm".to_string(),
         }
+    }
+
+    /// Records the cursor each account was polled with.
+    struct CursorGmail {
+        seen: Mutex<Vec<(String, Option<i64>)>>,
+    }
+
+    #[async_trait]
+    impl GmailApi for CursorGmail {
+        async fn fetch_unread(&self, _e: &str, _l: u32) -> Result<Vec<Email>, GmailError> {
+            panic!("poller must go through fetch_unread_since");
+        }
+        async fn fetch_unread_since(
+            &self,
+            entity_id: &str,
+            since_ms: Option<i64>,
+            _limit: u32,
+        ) -> Result<Vec<Email>, GmailError> {
+            self.seen.lock().unwrap().push((entity_id.to_string(), since_ms));
+            Ok(Vec::new())
+        }
+        async fn fetch_with_query(&self, _e: &str, _q: &str, _l: u32) -> Result<Vec<Email>, GmailError> {
+            Ok(Vec::new())
+        }
+        async fn create_draft(&self, _e: &str, _t: &str, _s: &str, _b: &str, _th: Option<&str>) -> Result<String, GmailError> {
+            Ok("draft".into())
+        }
+        async fn send_draft(&self, _e: &str, _d: &str) -> Result<Option<String>, GmailError> {
+            Ok(None)
+        }
+        async fn delete_draft(&self, _e: &str, _d: &str) -> Result<(), GmailError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_new_bounds_each_account_by_its_last_successful_poll() {
+        let (store, _f) = mk_store(&["ent-1", "ent-2"]);
+        // ent-1 has completed a poll before; ent-2 never has (fresh connect).
+        store
+            .set_gmail_account_poll_outcome("ent-1", true, 1_792_850_400_000)
+            .unwrap();
+        // A *failed* poll must not move the cursor.
+        store
+            .set_gmail_account_poll_outcome("ent-1", false, 1_792_850_999_000)
+            .unwrap();
+
+        let gmail = Arc::new(CursorGmail { seen: Mutex::new(Vec::new()) });
+        let inbound = GmailInbound::new(Arc::clone(&store), Arc::clone(&gmail), 50);
+        inbound.fetch_new().await.unwrap();
+
+        let mut seen = gmail.seen.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                ("ent-1".to_string(), Some(1_792_850_400_000)),
+                ("ent-2".to_string(), None),
+            ]
+        );
+        // The successful tick just recorded becomes the next cursor for both.
+        assert!(store.gmail_inbound_cursor_ms("ent-2").unwrap().is_some());
+        assert!(store.gmail_inbound_cursor_ms("ent-1").unwrap().unwrap() > 1_792_850_400_000);
     }
 
     #[tokio::test]
