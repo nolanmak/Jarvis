@@ -529,13 +529,36 @@ work records outcome `dispatched`; tool time is added to `tool_ms`. Logs carry
 only fixed category codes (for example `http_4xx`, `scripted_failure`), never
 model text, tool arguments, chat text or keys.
 
+## Shared conversation queue (#1548)
+
+Text turns and native phone turns on one conversation take turns through a
+per-conversation queue (`surface_turn::conversation_queue`), so they continue
+one native session. The CLI gate (`AUGMENTAGENT_REASONER_MAX_INFLIGHT`) is a
+separate process-wide limit on CLI reasoner processes.
+
+- **Fast layer on** (`AUGMENTAGENT_PHONE_FAST_LAYER=1`): a phone utterance
+  never enters the conversation queue and never asks the CLI gate for a
+  permit. It is answered while a long text turn is still running. Only work
+  handed off with `dispatch_task` runs as a native turn and waits in the queue
+  like a text turn.
+- **Fast layer off** (legacy native path): the phone turn waits in the queue.
+  If it does not get the queue within 3 s, the call hears "I'm still finishing
+  something, one moment." It hears the line again every 15 s while it keeps
+  waiting. The socket stays open, and the answer is spoken once the earlier
+  turn releases the queue. The notice is a separate spoken frame, not part of
+  the answer. It is never mirrored to chat and never counts as the answer's
+  first speech.
+- `queue_wait_ms` adds the wait for the conversation queue to the agent
+  worker's pickup time. Fast-layer turns have no queue wait, so for them the
+  field is only the pickup time, normally 0.
+
 ## Per-turn latency metrics (#1551)
 
 Every accepted turn (answered, interrupted, failed or dispatched) produces one
 `tracing` event with target `phone.turn` and one row in the additive SQLite
 table `phone_turn_metrics`. Fields are millisecond offsets from receipt of the
 final `prompt` frame: `queue_wait_ms` (until the agent worker picked the turn
-up), `t_first_token_ms` (first agent output), `t_first_speech_ms` (first
+up, plus any wait for the shared conversation queue; see below), `t_first_token_ms` (first agent output), `t_first_speech_ms` (first
 agent speech frame written to the socket; automatic "Got it" acknowledgments are
 not counted), `t_last_speech_ms` (frame with `last:true` written), `tool_ms`
 (sum reported through `SpeechSender::note_tool_time`; null when nothing was

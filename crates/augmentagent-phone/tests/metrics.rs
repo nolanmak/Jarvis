@@ -77,6 +77,27 @@ async fn ac06_audible_delta_is_first_played_minus_first_speech() {
     assert_eq!(record.commit_sha, None);
 }
 
+// #1548: time spent waiting for the shared conversation queue is added to the
+// worker pickup wait; a turn that never queued (fast layer) records 0.
+#[tokio::test(start_paused = true)]
+async fn queue_wait_adds_the_shared_conversation_queue_wait_to_pickup() {
+    let timer = TurnTimer::start();
+    advance(40).await;
+    timer.dequeued();
+    advance(3_000).await;
+    timer.add_queue_wait(Duration::from_millis(3_000));
+    let record = timer.record("call-1", "phone:call-1:1", TurnProvider::Native, TurnOutcome::Answered, 0, None);
+    assert_eq!(record.queue_wait_ms, Some(3_040), "{record:?}");
+    let fast = TurnTimer::start();
+    fast.dequeued();
+    fast.mark_fast();
+    advance(500).await;
+    fast.first_token();
+    let record = fast.record("call-1", "phone:call-1:2", fast.provider(), TurnOutcome::Answered, 0, None);
+    assert_eq!(record.provider, TurnProvider::Fast);
+    assert_eq!(record.queue_wait_ms, Some(0), "{record:?}");
+}
+
 #[tokio::test(start_paused = true)]
 async fn ac04_record_from_a_turn_with_a_phone_number_contains_no_speech_or_long_digit_runs() {
     let mut session = RelaySession::new("call-redaction", "AC-test", "CA-test");

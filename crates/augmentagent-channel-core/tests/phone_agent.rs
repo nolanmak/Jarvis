@@ -1131,3 +1131,287 @@ mod fast {
     }
 }
 
+// ---------- #1548 phone turns and the shared conversation queue ----------
+
+mod queue {
+    use super::fast::{connected, token, Connected, Scripted};
+    use super::*;
+    use augmentagent_channel_core::surface_turn::{
+        conversation_queue, run_surface_turn, SurfaceTurnRequest,
+    };
+    use augmentagent_phone::{
+        ingress::{ConversationAgent, SpeechEvent, SpeechSender},
+        metrics::TurnTimer,
+    };
+    use augmentagent_store::phone::{TurnOutcome, TurnProvider};
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    /// A long text-chat turn on the call's originating conversation: it holds
+    /// the shared conversation queue for `hold`.
+    pub fn text_turn(f: &Connected, hold: Duration) -> tokio::task::JoinHandle<()> {
+        let store = f.store.clone();
+        let chat = f.origin.conversation.clone();
+        tokio::spawn(async move {
+            let turn = SurfaceTurnRef::new(chat, "slack:text-turn").unwrap();
+            run_surface_turn(
+                &store,
+                SurfaceTurnRequest {
+                    turn: &turn,
+                    history: "",
+                    current: "a long text request",
+                    cwd: "/fixture",
+                },
+                || Ok(Some(ProviderKind::Claude)),
+                None,
+                |_| async move {
+                    tokio::time::sleep(hold).await;
+                    Ok("text answer".to_string())
+                },
+            )
+            .await
+            .unwrap();
+        })
+    }
+
+    /// Speech for one turn whose latency timer saw the ingress worker pick
+    /// the turn up immediately.
+    pub fn timed_speech(
+        call_id: &str,
+        text: &str,
+    ) -> (
+        String,
+        SpeechSender,
+        Arc<TurnTimer>,
+        tokio::sync::mpsc::Receiver<SpeechEvent>,
+    ) {
+        use augmentagent_phone::relay::{RelayInput, RelaySession};
+        let mut session = RelaySession::new(call_id, "AC-test", "CA-test");
+        session
+            .receive(r#"{"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX"}"#)
+            .unwrap();
+        let frame = serde_json::json!({"type":"prompt","voicePrompt":text,"last":true}).to_string();
+        let RelayInput::Turn(turn) = session.receive(&frame).unwrap() else {
+            panic!()
+        };
+        let timer = Arc::new(TurnTimer::start());
+        timer.dequeued();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let turn_id = turn.id.clone();
+        let speech = SpeechSender::with_timer(tx, Arc::new(turn), timer.clone());
+        (turn_id, speech, timer, rx)
+    }
+
+    // Step 1 / AC1 / AC4: with the fast layer on, a phone utterance is answered
+    // while a text turn holds the conversation queue, without ever asking for
+    // it, and records zero queue wait.
+    #[tokio::test(start_paused = true)]
+    async fn ac1_fast_turn_completes_while_a_text_turn_holds_the_conversation_queue() {
+        let f = connected().await;
+        let queue = conversation_queue(&f.store, &f.origin.conversation);
+        let text = text_turn(&f, Duration::from_secs(10));
+        while queue.entries() < 1 {
+            tokio::task::yield_now().await;
+        }
+        assert!(queue.is_locked(), "the text turn holds the queue");
+        let model = Scripted::new(vec![vec![token("Sure. "), token("It's at noon.")]]);
+        let bridge = super::fast::bridge(&f, Arc::new(MarkdownAgent), model);
+        let (turn_id, speech, timer, _rx) = timed_speech(&f.call.id, "when is lunch");
+        let started = Instant::now();
+        let answer = tokio::time::timeout(
+            Duration::from_secs(1),
+            bridge.answer(&f.call, &turn_id, "when is lunch", speech, CancellationToken::new()),
+        )
+        .await
+        .expect("the fast turn must not wait for the text turn")
+        .unwrap();
+        assert_eq!(answer, "Sure. It's at noon.");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // Spy: still held by the text turn, and the phone turn never queued.
+        assert!(queue.is_locked(), "the mutex was held for the whole phone turn");
+        assert_eq!(queue.entries(), 1, "only the text turn entered the queue");
+        let record = timer.record(&f.call.id, &turn_id, timer.provider(), TurnOutcome::Answered, 0, None);
+        assert_eq!(record.provider, TurnProvider::Fast);
+        assert_eq!(record.queue_wait_ms, Some(0));
+        text.await.unwrap();
+    }
+
+    /// The legacy native bridge (fast layer off) answering one utterance in
+    /// the background, with every speech event stamped by the paused clock.
+    pub struct LegacyTurn {
+        pub turn_id: String,
+        pub timer: Arc<TurnTimer>,
+        /// The relay loop keeps the call's speech queue open.
+        pub line: SpeechSender,
+        pub events: Arc<Mutex<Vec<(Duration, SpeechEvent)>>>,
+        pub answer: tokio::task::JoinHandle<anyhow::Result<String>>,
+    }
+    pub fn legacy_turn(f: &Connected, started: Instant) -> LegacyTurn {
+        let bridge = Arc::new(PhoneAgent::new(
+            f.store.clone(),
+            f.service.clone(),
+            Arc::new(MarkdownAgent),
+            Arc::new(super::fast::OutboxIo { store: f.store.clone() }),
+            "/fixture".into(),
+            Arc::new(|_| Ok(Some(ProviderKind::Claude))),
+        ));
+        assert!(!bridge.uses_fast_layer());
+        let (turn_id, speech, timer, mut rx) = timed_speech(&f.call.id, "status?");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let seen = events.clone();
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                seen.lock().unwrap().push((started.elapsed(), event));
+            }
+        });
+        let (call, id, line) = (f.call.clone(), turn_id.clone(), speech.clone());
+        let answer = tokio::spawn(async move {
+            bridge
+                .run(&call, &id, "status?", Some(speech), CancellationToken::new())
+                .await
+        });
+        LegacyTurn { turn_id, timer, line, events, answer }
+    }
+    /// (at, utterance id) of every queue-wait notice.
+    pub fn notices(events: &[(Duration, SpeechEvent)]) -> Vec<(Duration, String)> {
+        events
+            .iter()
+            .filter_map(|(at, event)| match event {
+                SpeechEvent::Notice { utterance_id, text, .. } => {
+                    assert_eq!(text, augmentagent_channel_core::phone_agent::QUEUE_NOTICE);
+                    Some((*at, utterance_id.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+    fn near(actual: Duration, expected: Duration) -> bool {
+        actual.abs_diff(expected) <= Duration::from_millis(100)
+    }
+
+    // Step 2 / AC3 / AC4: on the legacy path a phone turn behind a 10 s text
+    // turn hears exactly one wait notice at 3 s, none before 18 s, keeps its
+    // call open, gets its answer after the lock is released, and records the
+    // wait as `queue_wait_ms`.
+    #[tokio::test(start_paused = true)]
+    async fn ac3_legacy_turn_behind_a_text_turn_hears_one_wait_notice_then_the_answer() {
+        let f = connected().await;
+        let queue = conversation_queue(&f.store, &f.origin.conversation);
+        let started = Instant::now();
+        let text = text_turn(&f, Duration::from_secs(10));
+        while queue.entries() < 1 {
+            tokio::task::yield_now().await;
+        }
+        let turn = legacy_turn(&f, started);
+        tokio::time::sleep(Duration::from_secs(18) - Duration::from_millis(1)).await;
+        assert!(turn.answer.is_finished(), "answered once the text turn released the queue");
+        let answer = turn.answer.await.unwrap().unwrap();
+        assert!(answer.contains("Done."));
+        text.await.unwrap();
+        let events = std::mem::take(&mut *turn.events.lock().unwrap());
+        let notices = notices(&events);
+        assert_eq!(notices.len(), 1, "exactly one notice before 18 s: {notices:?}");
+        assert!(near(notices[0].0, Duration::from_secs(3)), "{notices:?}");
+        // The answer follows the release; the notice is not part of it.
+        let tokens: Vec<_> = events
+            .iter()
+            .filter_map(|(at, e)| matches!(e, SpeechEvent::Token { .. }).then_some(*at))
+            .collect();
+        assert!(!tokens.is_empty());
+        assert!(tokens.iter().all(|at| *at >= Duration::from_secs(10)), "{tokens:?}");
+        // Nothing closed the call: its speech queue is still live.
+        assert!(turn.line.line().is_live());
+        let call = f.store.phone_provider_call(&f.call.id).unwrap();
+        assert!(!call.stop_requested);
+        let record = turn.timer.record(&f.call.id, &turn.turn_id, turn.timer.provider(), TurnOutcome::Answered, 0, None);
+        assert_eq!(record.provider, TurnProvider::Native);
+        let waited = record.queue_wait_ms.expect("queue wait recorded");
+        assert!((waited - 10_000).abs() <= 100, "{record:?}");
+        assert_eq!(queue.entries(), 2);
+    }
+
+    // AC3: the notice repeats once per 15 s while the turn still waits.
+    #[tokio::test(start_paused = true)]
+    async fn ac3_wait_notice_repeats_every_fifteen_seconds_while_still_queued() {
+        let f = connected().await;
+        let queue = conversation_queue(&f.store, &f.origin.conversation);
+        let started = Instant::now();
+        let text = text_turn(&f, Duration::from_secs(40));
+        while queue.entries() < 1 {
+            tokio::task::yield_now().await;
+        }
+        let turn = legacy_turn(&f, started);
+        let answer = turn.answer.await.unwrap().unwrap();
+        assert!(answer.contains("Done."));
+        text.await.unwrap();
+        let events = std::mem::take(&mut *turn.events.lock().unwrap());
+        let notices = notices(&events);
+        let at: Vec<_> = notices.iter().map(|(at, _)| *at).collect();
+        assert_eq!(at.len(), 3, "{notices:?}");
+        for (actual, expected) in at.iter().zip([3, 18, 33]) {
+            assert!(near(*actual, Duration::from_secs(expected)), "{notices:?}");
+        }
+        let ids: std::collections::HashSet<_> = notices.iter().map(|(_, id)| id).collect();
+        assert_eq!(ids.len(), 3, "each notice is a distinct utterance");
+        assert!(turn.line.line().is_live());
+    }
+
+    /// Native handler standing in for the CLI reasoner: it takes a permit from
+    /// `gate` (the process-wide CLI gate in production) before answering.
+    struct GatedAgent {
+        gate: Arc<augmentagent_channel_core::cli_gate::CliGate>,
+    }
+    #[async_trait]
+    impl QueryHandler for GatedAgent {
+        async fn answer(&self, _: &AuditCtx, _: &str) -> anyhow::Result<String> {
+            let _permit = self
+                .gate
+                .acquire_timed("claude", "phone_test", Duration::from_secs(60))
+                .await?;
+            Ok("Native answer.".into())
+        }
+    }
+
+    // Step 3 / AC2: a fast-layer phone turn takes no CLI gate permit, so it is
+    // answered even while unrelated channels hold every permit. The same
+    // handler on the legacy path does ask the gate (the spy sees it).
+    #[tokio::test(start_paused = true)]
+    async fn ac2_fast_turn_acquires_no_cli_gate_permit() {
+        use augmentagent_channel_core::cli_gate::CliGate;
+        let f = connected().await;
+        let gate = Arc::new(CliGate::new(1));
+        let busy = gate
+            .acquire_timed("claude", "other_channel", Duration::from_secs(600))
+            .await
+            .unwrap();
+        let before = gate.acquire_calls();
+        let model = Scripted::new(vec![vec![token("It's at noon.")]]);
+        let gated = Arc::new(GatedAgent { gate: gate.clone() });
+        let bridge = super::fast::bridge(&f, gated.clone(), model);
+        let (turn_id, speech, _timer, _rx) = timed_speech(&f.call.id, "when is lunch");
+        let answer = tokio::time::timeout(
+            Duration::from_secs(1),
+            bridge.answer(&f.call, &turn_id, "when is lunch", speech, CancellationToken::new()),
+        )
+        .await
+        .expect("the fast turn must not wait for a CLI permit")
+        .unwrap();
+        assert_eq!(answer, "It's at noon.");
+        assert_eq!(gate.acquire_calls(), before, "zero CLI gate requests");
+        drop(busy);
+        let legacy = PhoneAgent::new(
+            f.store.clone(),
+            f.service.clone(),
+            gated,
+            Arc::new(super::fast::OutboxIo { store: f.store.clone() }),
+            "/fixture".into(),
+            Arc::new(|_| Ok(Some(ProviderKind::Claude))),
+        );
+        let (turn_id, speech, _timer, _rx) = timed_speech(&f.call.id, "status?");
+        legacy
+            .run(&f.call, &turn_id, "status?", Some(speech), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(gate.acquire_calls(), before + 1, "the spy sees the native path");
+    }
+}
