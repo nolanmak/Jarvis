@@ -11,9 +11,13 @@
 # These drive the real updater against a throwaway repo with `cargo`,
 # `systemctl`, `curl` and /proc stubbed, and assert:
 #   - an ExecStart override is reported as DEPLOY PINNED, alerted ONCE, the
-#     restart is skipped and the stamp withheld;
-#   - a unit that bounces onto a different executable is reported the same
-#     way after the restart;
+#     restart is skipped and the stamp withheld — including a frozen copy of
+#     the whole checkout whose wrapper is also called scripts/run-rs.sh;
+#   - a unit that bounces onto a different executable is reported after the
+#     restart, and NOT restarted again on later ticks;
+#   - a launcher still mid-exec (MainPID is bash for a moment) is not a pin;
+#   - only drop-ins that override ExecStart are named; systemd's volatile
+#     pid/status fields do not re-trigger the alert;
 #   - retiring the override makes the next tick deploy normally and clears
 #     the alert memory.
 set -uo pipefail
@@ -32,6 +36,7 @@ make_case() {
   mkdir -p "$TMP/work/scripts/lib" "$TMP/work/crates" "$TMP/work/target/release"
   cp "$REPO_ROOT/scripts/check-for-updates.sh" "$TMP/work/scripts/"
   printf 'import sys; sys.exit(0)\n' > "$TMP/work/scripts/pdf-runtime.py"
+  printf '#!/bin/sh\nexec ./target/release/augmentagent "$@"\n' > "$TMP/work/scripts/run-rs.sh"
   cp "$REPO_ROOT/scripts/lib/service-restart.sh" "$TMP/work/scripts/lib/"
   echo base > "$TMP/work/crates/x.rs"
   git -C "$TMP/work" add -A
@@ -43,10 +48,18 @@ make_case() {
   git -C "$TMP/work" push -q origin main
   git -C "$TMP/work" reset -q --hard HEAD~1
 
-  # The binary the updater "builds" and the frozen copy a rollout might pin.
+  # The binary the updater "builds", and a frozen copy of the checkout a
+  # rollout might pin (binary + a same-named wrapper).
   printf '#!/bin/sh\n' > "$TMP/work/target/release/augmentagent"
-  mkdir -p "$TMP/frozen"
-  printf '#!/bin/sh\n' > "$TMP/frozen/augmentagent"
+  mkdir -p "$TMP/frozen/scripts" "$TMP/frozen/target/release"
+  printf '#!/bin/sh\n' > "$TMP/frozen/target/release/augmentagent"
+  printf '#!/bin/sh\n' > "$TMP/frozen/scripts/run-rs.sh"
+  printf '#!/bin/sh\n' > "$TMP/frozen/run-phone.sh"
+  # Drop-in files: one that overrides ExecStart, one that only sets env.
+  DROPIN_DIR="$TMP/.config/systemd/user/augmentagent.service.d"
+  mkdir -p "$DROPIN_DIR"
+  printf '[Service]\nExecStart=\nExecStart=%s/frozen/run-phone.sh\n' "$TMP" > "$DROPIN_DIR/phone-rollout.conf"
+  printf '[Service]\nEnvironment=AUGMENTAGENT_DISCORD_CREDS=/x/creds.json\n' > "$DROPIN_DIR/10-discord.conf"
 
   mkdir -p "$TMP/bin" "$TMP/state/augmentagent" "$TMP/proc"
   cat > "$TMP/bin/cargo" <<'STUB'
@@ -56,7 +69,8 @@ exit 0
 STUB
   # systemctl answers `show -p <prop> --value` per property. ExecStart and
   # DropInPaths come from files the case writes; MainPID advances on every
-  # restart and a fake /proc/<pid>/exe points at whatever `exe_target` says.
+  # restart and a fake /proc/<pid>/exe points at whatever `exe_target` says —
+  # via `exe_launching` first, when the case wants a launcher mid-exec.
   cat > "$TMP/bin/systemctl" <<'STUB'
 #!/usr/bin/env bash
 d="$STUB_DIR"
@@ -73,7 +87,12 @@ pidfile="$d/mainpid"
 spawn() {
   pid=$1
   mkdir -p "$d/proc/$pid"
-  ln -sfn "$(cat "$d/exe_target")" "$d/proc/$pid/exe"
+  if [ -s "$d/exe_launching" ]; then
+    ln -sfn "$(cat "$d/exe_launching")" "$d/proc/$pid/exe"
+    ( sleep 0.4; ln -sfn "$(cat "$d/exe_target")" "$d/proc/$pid/exe" ) &
+  else
+    ln -sfn "$(cat "$d/exe_target")" "$d/proc/$pid/exe"
+  fi
 }
 case "${mode:-}" in
   cat)     exit 1 ;;
@@ -82,7 +101,7 @@ case "${mode:-}" in
     case "$prop" in
       MainPID)     cat "$pidfile" ;;
       ExecStart)   cat "$d/execstart" ;;
-      DropInPaths) cat "$d/dropins" 2>/dev/null || true ;;
+      DropInPaths) [ -e "$d/dropins_fail" ] && exit 1; cat "$d/dropins" 2>/dev/null || true ;;
       *)           cat "$pidfile" ;;
     esac
     exit 0 ;;
@@ -115,19 +134,19 @@ STUB
   : > "$TMP/dropins"
 }
 
-canonical_exec() {
-  printf '{ path=%s/work/scripts/run-rs.sh ; argv[]=%s/work/scripts/run-rs.sh --wiki-dir ./wiki serve --dry-run false ; ignore_errors=no }\n' "$TMP" "$TMP" > "$TMP/execstart"
-}
+exec_line() { printf '{ path=%s ; argv[]=%s --wiki-dir ./wiki serve --dry-run false ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n' "$1" "$1" > "$TMP/execstart"; }
+canonical_exec() { exec_line "$TMP/work/scripts/run-rs.sh"; }
 pinned_exec() {
-  printf '{ path=%s/frozen/run-phone.sh ; argv[]=%s/frozen/run-phone.sh ; ignore_errors=no }\n' "$TMP" "$TMP" > "$TMP/execstart"
-  printf '%s/.config/systemd/user/augmentagent.service.d/phone-rollout.conf\n' "$TMP" > "$TMP/dropins"
-  printf '%s\n' "$TMP/frozen/augmentagent" > "$TMP/exe_target"
+  exec_line "$TMP/frozen/run-phone.sh"
+  printf '%s %s\n' "$DROPIN_DIR/10-discord.conf" "$DROPIN_DIR/phone-rollout.conf" > "$TMP/dropins"
+  printf '%s\n' "$TMP/frozen/target/release/augmentagent" > "$TMP/exe_target"
 }
 
 run_updater() {
   ( cd "$TMP/work" \
     && PATH="$TMP/bin:$PATH" XDG_STATE_HOME="$TMP/state" HOME="$TMP" \
        AUGMENTAGENT_MEMINFO_PATH="$MEMINFO" AUGMENTAGENT_PROC_ROOT="$TMP/proc" \
+       AUGMENTAGENT_EXE_SETTLE_SECS=2 AUGMENTAGENT_RESTART_POLL_SECS=0.1 \
        AUGMENTAGENT_RESTART_FORCE=1 DISCORD_WEBHOOK_URL="https://discord.invalid/hook" \
        ./scripts/check-for-updates.sh >/dev/null 2>&1 )
 }
@@ -137,6 +156,7 @@ count()     { local n; n=$(grep -c "$1" "$2" 2>/dev/null); printf '%s' "${n:-0}"
 restarts()  { count "augmentagent.service" "$TMP/restart.calls"; }
 alerts()    { count . "$TMP/curl.calls"; }
 pinned_log(){ count "DEPLOY PINNED" "$LOG_FILE"; }
+last_pinned(){ grep "DEPLOY PINNED" "$LOG_FILE" | tail -1; }
 
 echo "check-for-updates.sh pinned-deploy detection (#1571):"
 
@@ -149,21 +169,26 @@ run_updater; rc=$?
                      || ok "override: withholds the build stamp"
 [ "$rc" -ne 0 ] && ok "override: exits non-zero like every withheld stamp" \
                 || bad "override: exits non-zero like every withheld stamp" "exit was 0"
-grep -q "DEPLOY PINNED: augmentagent.service has ExecStart overridden away from scripts/run-rs.sh" "$LOG_FILE" \
-  && ok "override: logs DEPLOY PINNED with the cause" \
-  || bad "override: logs DEPLOY PINNED with the cause" "$(tail -3 "$LOG_FILE")"
-grep -q "phone-rollout.conf" "$LOG_FILE" && ok "override: names the drop-in" \
-                                          || bad "override: names the drop-in" "$(grep 'DEPLOY PINNED' "$LOG_FILE" | tail -1)"
-grep -q "daemon-reload" "$LOG_FILE" && ok "override: says how to retire it" \
-                                     || bad "override: says how to retire it" "$(grep 'DEPLOY PINNED' "$LOG_FILE" | tail -1)"
+grep -q "DEPLOY PINNED: augmentagent.service has ExecStart overridden to $TMP/frozen/run-phone.sh instead of $TMP/work/scripts/run-rs.sh" "$LOG_FILE" \
+  && ok "override: logs DEPLOY PINNED with both paths" \
+  || bad "override: logs DEPLOY PINNED with both paths" "$(last_pinned)"
+grep -q "ExecStart drop-ins: $DROPIN_DIR/phone-rollout.conf\." "$LOG_FILE" \
+  && ok "override: names the drop-in that overrides ExecStart" \
+  || bad "override: names the drop-in that overrides ExecStart" "$(last_pinned)"
+grep -q "10-discord.conf" "$LOG_FILE" && bad "override: does not name the Environment= drop-in" "$(last_pinned)" \
+                                      || ok "override: does not name the Environment= drop-in"
+grep -q "daemon-reload" "$LOG_FILE" && ok "override: says how to retire it" || bad "override: says how to retire it" "$(last_pinned)"
 [ "$(alerts)" = 1 ] && ok "override: alerts the owner once" || bad "override: alerts the owner once" "alerts: $(alerts)"
 grep -q "DEPLOY PINNED" "$TMP/curl.calls" && ok "override: the alert carries the diagnosis" \
                                             || bad "override: the alert carries the diagnosis" "$(cat "$TMP/curl.calls")"
-# Second tick, same cause: logged again, NOT alerted again.
+# Second tick, same cause, but the frozen daemon crashed and systemd
+# relaunched it: ExecStart's pid/status fields changed. Logged again, NOT
+# alerted again.
+sed -i.bak 's/pid=0 ; code=(null) ; status=0\/0/pid=540081 ; code=killed ; status=9\/KILL/' "$TMP/execstart"
 run_updater
 [ "$(pinned_log)" = 2 ] && ok "override: every tick logs it" || bad "override: every tick logs it" "logged $(pinned_log) times"
-[ "$(alerts)" = 1 ] && ok "override: the same cause is not re-alerted every 5 minutes" \
-                    || bad "override: the same cause is not re-alerted every 5 minutes" "alerts: $(alerts)"
+[ "$(alerts)" = 1 ] && ok "override: volatile pid/status fields do not re-alert" \
+                    || bad "override: volatile pid/status fields do not re-alert" "alerts: $(alerts)"
 [ "$(restarts)" = 0 ] && ok "override: still no restart" || bad "override: still no restart" "restarts: $(restarts)"
 # Override retired → the next tick deploys through the stamp-mismatch path.
 canonical_exec; : > "$TMP/dropins"; printf '%s\n' "$TMP/work/target/release/augmentagent" > "$TMP/exe_target"
@@ -176,19 +201,57 @@ run_updater; rc=$?
 [ "$(alerts)" = 1 ] && ok "retired: recovery sends no extra message" || bad "retired: recovery sends no extra message" "alerts: $(alerts)"
 rm -rf "$TMP"
 
+# --- a frozen copy of the whole checkout: its wrapper is also run-rs.sh ----
+make_case
+exec_line "$TMP/frozen/scripts/run-rs.sh"
+printf '%s\n' "$DROPIN_DIR/phone-rollout.conf" > "$TMP/dropins"
+printf '%s\n' "$TMP/frozen/target/release/augmentagent" > "$TMP/exe_target"
+run_updater; rc=$?
+[ "$(restarts)" = 0 ] && ok "frozen tree: a same-named launcher elsewhere is still a pin" \
+                      || bad "frozen tree: a same-named launcher elsewhere is still a pin" "restarts: $(restarts)"
+grep -q "overridden to $TMP/frozen/scripts/run-rs.sh" "$LOG_FILE" && ok "frozen tree: reported before any restart" \
+                                                                   || bad "frozen tree: reported before any restart" "$(last_pinned)"
+rm -rf "$TMP"
+
 # --- canonical ExecStart, but the unit comes back on another executable ------
 make_case
-printf '%s\n' "$TMP/frozen/augmentagent" > "$TMP/exe_target"
+printf '%s\n' "$TMP/frozen/target/release/augmentagent" > "$TMP/exe_target"
+touch "$TMP/dropins_fail"   # DropInPaths unreadable this tick: must not abort the script
 run_updater; rc=$?
-[ "$(restarts)" = 1 ] && ok "wrong exe: the restart itself happens" || bad "wrong exe: the restart itself happens" "restarts: $(restarts)"
-grep -q "DEPLOY PINNED: augmentagent.service came back running $TMP/frozen/augmentagent instead of target/release/augmentagent" "$LOG_FILE" \
+[ "$(restarts)" = 1 ] && ok "wrong exe: the first restart happens (nothing to see before it)" \
+                      || bad "wrong exe: the first restart happens (nothing to see before it)" "restarts: $(restarts)"
+grep -q "DEPLOY PINNED: augmentagent.service came back running $TMP/frozen/target/release/augmentagent instead of $TMP/work/target/release/augmentagent" "$LOG_FILE" \
   && ok "wrong exe: reports what the unit is actually running" \
-  || bad "wrong exe: reports what the unit is actually running" "$(grep 'DEPLOY PINNED' "$LOG_FILE" | tail -1)"
+  || bad "wrong exe: reports what the unit is actually running" "$(last_pinned)"
+grep -q "ExecStart drop-ins: none" "$LOG_FILE" && ok "wrong exe: an unreadable DropInPaths reads as none, not a crash" \
+                                                 || bad "wrong exe: an unreadable DropInPaths reads as none, not a crash" "$(last_pinned)"
 [ -s "$STAMP_FILE" ] && bad "wrong exe: withholds the build stamp" "stamp written" || ok "wrong exe: withholds the build stamp"
 [ "$rc" -ne 0 ] && ok "wrong exe: exits non-zero" || bad "wrong exe: exits non-zero" "exit was 0"
 [ "$(alerts)" = 1 ] && ok "wrong exe: alerts the owner once" || bad "wrong exe: alerts the owner once" "alerts: $(alerts)"
+[ "$(count . "$TMP/state/augmentagent/restart-history")" = "0" ] \
+  && ok "wrong exe: a bounce onto the wrong binary is not a recorded restart" \
+  || bad "wrong exe: a bounce onto the wrong binary is not a recorded restart" "history: $(cat "$TMP/state/augmentagent/restart-history" 2>/dev/null)"
+rm -f "$TMP/dropins_fail"
 run_updater
-[ "$(alerts)" = 1 ] && ok "wrong exe: not re-alerted on the next tick" || bad "wrong exe: not re-alerted on the next tick" "alerts: $(alerts)"
+[ "$(restarts)" = 1 ] && ok "wrong exe: the next tick does NOT restart again (the pin is latched by the running exe)" \
+                      || bad "wrong exe: the next tick does NOT restart again (the pin is latched by the running exe)" "restarts: $(restarts)"
+grep -q "is running $TMP/frozen/target/release/augmentagent instead of" "$LOG_FILE" \
+  && ok "wrong exe: the next tick reports from the running process" \
+  || bad "wrong exe: the next tick reports from the running process" "$(last_pinned)"
+[ "$(alerts)" = 2 ] && ok "wrong exe: the pre-restart diagnosis is a distinct cause, alerted once" \
+                    || bad "wrong exe: the pre-restart diagnosis is a distinct cause, alerted once" "alerts: $(alerts)"
+run_updater
+[ "$(alerts)" = 2 ] && ok "wrong exe: …and not again on the tick after" || bad "wrong exe: …and not again on the tick after" "alerts: $(alerts)"
+rm -rf "$TMP"
+
+# --- a launcher mid-exec: MainPID is bash for a moment, then the daemon -----
+make_case
+printf '/usr/bin/bash\n' > "$TMP/exe_launching"
+run_updater; rc=$?
+[ "$(pinned_log)" = 0 ] && ok "launching: a launcher still mid-exec is not a pinned deploy" \
+                        || bad "launching: a launcher still mid-exec is not a pinned deploy" "$(last_pinned)"
+[ -s "$STAMP_FILE" ] && ok "launching: writes the stamp once the exe settles" || bad "launching: writes the stamp once the exe settles" "stamp absent"
+[ "$rc" -eq 0 ] && ok "launching: exits zero" || bad "launching: exits zero" "exit was $rc"
 rm -rf "$TMP"
 
 # --- a rebuilt binary under a running process is a pending restart, not a pin
@@ -196,26 +259,28 @@ make_case
 printf '%s (deleted)\n' "$TMP/work/target/release/augmentagent" > "$TMP/exe_target"
 run_updater; rc=$?
 [ "$(pinned_log)" = 0 ] && ok "deleted suffix: a replaced-on-disk binary is not a pinned deploy" \
-                        || bad "deleted suffix: a replaced-on-disk binary is not a pinned deploy" "$(grep 'DEPLOY PINNED' "$LOG_FILE")"
+                        || bad "deleted suffix: a replaced-on-disk binary is not a pinned deploy" "$(last_pinned)"
 [ -s "$STAMP_FILE" ] && ok "deleted suffix: writes the stamp" || bad "deleted suffix: writes the stamp" "stamp absent"
 rm -rf "$TMP"
 
-# --- no evidence (empty or malformed ExecStart) fails open -------------------
+# --- no evidence (empty or malformed ExecStart, no /proc entry) fails open --
 make_case
 printf '100\n' > "$TMP/execstart"
 run_updater; rc=$?
-[ "$(pinned_log)" = 0 ] && ok "no evidence: an unreadable ExecStart is not a pin" \
-                        || bad "no evidence: an unreadable ExecStart is not a pin" "$(grep 'DEPLOY PINNED' "$LOG_FILE")"
+[ "$(pinned_log)" = 0 ] && ok "no evidence: a malformed ExecStart is not a pin" \
+                        || bad "no evidence: a malformed ExecStart is not a pin" "$(last_pinned)"
 [ -s "$STAMP_FILE" ] && ok "no evidence: deploys normally" || bad "no evidence: deploys normally" "stamp absent"
 rm -rf "$TMP"
 
 # --- healthy deploy: nothing pinned, no alert, stamp written ----------------
 make_case
 run_updater; rc=$?
-[ "$(pinned_log)" = 0 ] && ok "healthy: no pinned-deploy report" || bad "healthy: no pinned-deploy report" "$(grep 'DEPLOY PINNED' "$LOG_FILE")"
+[ "$(pinned_log)" = 0 ] && ok "healthy: no pinned-deploy report" || bad "healthy: no pinned-deploy report" "$(last_pinned)"
 [ "$(alerts)" = 0 ] && ok "healthy: no owner alert" || bad "healthy: no owner alert" "alerts: $(alerts)"
 [ -s "$STAMP_FILE" ] && ok "healthy: writes the stamp" || bad "healthy: writes the stamp" "stamp absent"
 [ "$rc" -eq 0 ] && ok "healthy: exits zero" || bad "healthy: exits zero" "exit was $rc"
+[ "$(grep -c . "$TMP/state/augmentagent/restart-history" 2>/dev/null)" = "1" ] && ok "healthy: records the restart" \
+  || bad "healthy: records the restart" "history: $(cat "$TMP/state/augmentagent/restart-history" 2>/dev/null)"
 rm -rf "$TMP"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

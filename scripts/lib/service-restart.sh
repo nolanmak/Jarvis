@@ -59,9 +59,12 @@ unit_main_pid() {
   printf '%s' "${pid:-0}"
 }
 
-# Restart `$1` and verify it actually bounced. 0 only on proof.
+# Restart `$1` and verify it actually bounced. 0 only on proof. With `$2`
+# (#1571) the proof also requires the new main process to be running that
+# binary: a bounce onto a frozen copy is a failed restart, not a deploy.
 restart_unit() {
-  local unit="$1" before after
+  local unit="$1" expected="${2:-}" before after
+  SR_LAST_EXE=""
   unit_is_registered "$unit" || return 1
 
   before=$(unit_main_pid "$unit")
@@ -82,6 +85,11 @@ restart_unit() {
 
   if ! systemctl --user is-active --quiet "$unit"; then
     _sr_log "unit $unit is not active after restart"
+    return 1
+  fi
+
+  if [ -n "$expected" ] && ! unit_runs_binary "$unit" "$expected"; then
+    _sr_log "restart of $unit came back running $SR_LAST_EXE, not $expected"
     return 1
   fi
 
@@ -147,38 +155,59 @@ restart_agent() {
 # signal was "restart could not be verified" every five minutes for four days,
 # while each forced restart killed whatever the auto-PR loop was building.
 #
-# Two checks, both fail-OPEN when the evidence cannot be read (launchd, no
-# /proc, systemd unreachable): a missing answer is not a pinned deploy.
-#   unit_exec_pinned  — BEFORE a restart: ExecStart no longer runs the repo's
-#                       launcher. Restarting is pointless (the same frozen
-#                       binary comes back) and costs the loop its build.
-#   unit_runs_binary  — AFTER a verified bounce: the new MainPID's executable
-#                       is not the binary we just built.
+# Every reader here fails OPEN when the evidence cannot be read (launchd, no
+# /proc, systemd unreachable, a stub): a missing answer is not a pinned
+# deploy. Under `set -e` none of them may fail either, so each pipeline
+# swallows its own systemctl error.
+#   unit_exec_pinned  — ExecStart's `path=` is not the repo launcher.
+#   unit_runs_binary  — the main process's executable is not the binary we
+#                       built. A Type=simple unit's MainPID is the launcher
+#                       shell until it execs the daemon (run-rs.sh mounts the
+#                       vault and runs a PDF preflight first), so a fresh
+#                       restart is polled until it settles before it is judged.
 
 # Effective ExecStart of `$1` as systemd prints it: `{ path=/x ; argv[]=… }`.
 unit_exec_start() {
-  systemctl --user show "$1" -p ExecStart --value 2>/dev/null | head -n1
+  { systemctl --user show "$1" -p ExecStart --value 2>/dev/null || true; } | head -n1
 }
 
 # Drop-ins layered on `$1`, space-separated; empty when there are none.
 unit_dropins() {
-  systemctl --user show "$1" -p DropInPaths --value 2>/dev/null | head -n1
+  { systemctl --user show "$1" -p DropInPaths --value 2>/dev/null || true; } | head -n1
 }
 
-# 0 when `$1`'s ExecStart verifiably does not run `$2` (the repo launcher).
+# Only the drop-ins on `$1` that override ExecStart. An `Environment=` file
+# (Discord credentials, say) is legitimate and must not be named for removal.
+unit_exec_dropins() {
+  local f out=""
+  for f in $(unit_dropins "$1"); do
+    grep -q '^ExecStart=' "$f" 2>/dev/null && out="$out${out:+ }$f"
+  done
+  printf '%s' "$out"
+}
+
+# The resolved `path=` of `$1`'s effective ExecStart; empty when unreadable.
+# Only a real `{ path=… ; … }` answer counts — anything else is no evidence.
+unit_exec_path() {
+  local line p
+  line=$(unit_exec_start "$1")
+  case "$line" in *path=*) ;; *) return 0 ;; esac
+  p=${line#*path=}
+  p=${p%% ;*}
+  p=${p%% \}*}
+  [ -n "$p" ] || return 0
+  readlink -f "$p" 2>/dev/null || printf '%s' "$p"
+}
+
+# 0 when `$1`'s ExecStart verifiably does not run the launcher `$2` (compared
+# as resolved paths, so a frozen copy of the whole checkout — whose wrapper
+# is also called scripts/run-rs.sh — still reads as pinned).
 unit_exec_pinned() {
-  local unit="$1" launcher="$2" exec_line
-  exec_line=$(unit_exec_start "$unit")
-  # Only a real `{ path=… ; argv[]=… }` answer is evidence; anything else
-  # (empty, an error, a stub) fails open.
-  case "$exec_line" in
-    *path=*) ;;
-    *) return 1 ;;
-  esac
-  case "$exec_line" in
-    *"$launcher"*) return 1 ;;
-  esac
-  return 0
+  local got want
+  got=$(unit_exec_path "$1")
+  [ -n "$got" ] || return 1
+  want=$(readlink -f "$2" 2>/dev/null) || want="$2"
+  [ "$got" != "$want" ]
 }
 
 # Resolved executable of `$1`'s MainPID, or empty when it cannot be read.
@@ -193,14 +222,25 @@ unit_exe_path() {
   printf '%s' "${exe% (deleted)}"
 }
 
-# 0 when `$1` is running `$2`, or when the answer cannot be read; 1 when it
-# is verifiably running something else.
+# Does `$1`'s main process run `$2`? 0 = yes, or the answer cannot be read;
+# 1 = it verifiably runs something else, which is left in SR_LAST_EXE for the
+# caller's report (empty on every other outcome). Polls for up to
+# AUGMENTAGENT_EXE_SETTLE_SECS so a launcher mid-exec is not misjudged.
+SR_LAST_EXE=""
 unit_runs_binary() {
-  local unit="$1" expected="$2" exe want
-  exe=$(unit_exe_path "$unit")
-  [ -n "$exe" ] || return 0
+  local unit="$1" expected="$2" exe want deadline
+  SR_LAST_EXE=""
   want=$(readlink -f "$expected" 2>/dev/null) || want="$expected"
-  [ "$exe" = "$want" ]
+  deadline=$(( $(date +%s) + ${AUGMENTAGENT_EXE_SETTLE_SECS:-15} ))
+  while :; do
+    exe=$(unit_exe_path "$unit")
+    [ -n "$exe" ] || return 0
+    [ "$exe" = "$want" ] && return 0
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "${AUGMENTAGENT_RESTART_POLL_SECS:-0.5}"
+  done
+  SR_LAST_EXE="$exe"
+  return 1
 }
 
 # May the build stamp be advanced? Only when no required restart failed.

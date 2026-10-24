@@ -90,7 +90,8 @@ pub struct HealthInputs {
     /// builds)`, both resolved. `None` when either cannot be read (launchd,
     /// no `/proc`, unit down): absence never fires the rule.
     pub running_binary: Option<(PathBuf, PathBuf)>,
-    /// #1571 — drop-ins layered on the unit, for the fix text.
+    /// #1571 — the drop-ins on the unit that override `ExecStart`, for the
+    /// fix text. An `Environment=` drop-in is legitimate and is not listed.
     pub unit_dropins: Vec<String>,
     pub free_gb_root: Option<f64>,
     pub free_gb_gate: Option<f64>,
@@ -817,8 +818,25 @@ fn strip_deleted(exe: PathBuf) -> PathBuf {
     }
 }
 
+/// #1571 — the drop-ins among `paths` that override `ExecStart`. Only those
+/// are worth naming: an `Environment=` drop-in is legitimate configuration.
+fn exec_override_dropins(paths: &str) -> Vec<String> {
+    paths
+        .split_whitespace()
+        .filter(|p| {
+            std::fs::read_to_string(p)
+                .map(|body| body.lines().any(|l| l.trim_start().starts_with("ExecStart=")))
+                .unwrap_or(false)
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 /// #1571 — what `augmentagent.service` is executing versus what the updater
-/// builds, plus the drop-ins layered on the unit. systemd + `/proc` only;
+/// builds, plus the drop-ins that override its `ExecStart`. The expected
+/// binary is resolved against the UNIT's working directory (the deploy
+/// checkout), not the caller's: `autopr-health` run from a worktree with its
+/// own build must not call the deploy pinned. systemd + `/proc` only;
 /// anything unreadable is `None`, never a finding.
 fn running_binary(repo_root: &Path) -> (Option<(PathBuf, PathBuf)>, Vec<String>) {
     if crate::platform::ServiceManager::detect().is_launchd() {
@@ -833,13 +851,17 @@ fn running_binary(repo_root: &Path) -> (Option<(PathBuf, PathBuf)>, Vec<String>)
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
     };
-    let dropins: Vec<String> = show("DropInPaths")
-        .map(|s| s.split_whitespace().map(str::to_string).collect())
+    let dropins = show("DropInPaths")
+        .map(|s| exec_override_dropins(&s))
         .unwrap_or_default();
     let pair = (|| {
         let pid: u32 = show("MainPID")?.parse().ok().filter(|p| *p > 0)?;
         let running = strip_deleted(std::fs::read_link(format!("/proc/{pid}/exe")).ok()?);
-        let built = repo_root.join("target/release/augmentagent").canonicalize().ok()?;
+        let deploy_root = show("WorkingDirectory")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| repo_root.to_path_buf());
+        let built = deploy_root.join("target/release/augmentagent").canonicalize().ok()?;
         Some((running, built))
     })();
     (pair, dropins)
@@ -1262,6 +1284,18 @@ mod tests {
             ..healthy()
         };
         assert_eq!(codes(&analyze(&stalled, &Thresholds::default())), vec!["updater-stalled"]);
+    }
+
+    #[test]
+    fn only_dropins_that_override_execstart_are_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = dir.path().join("10-discord.conf");
+        let pin = dir.path().join("phone-rollout.conf");
+        std::fs::write(&env, "[Service]\nEnvironment=AUGMENTAGENT_DISCORD_CREDS=/x\n").unwrap();
+        std::fs::write(&pin, "[Service]\nExecStart=\nExecStart=/frozen/run-phone.sh\n").unwrap();
+        let listed = format!("{} {} {}", env.display(), pin.display(), dir.path().join("gone.conf").display());
+        assert_eq!(exec_override_dropins(&listed), vec![pin.display().to_string()]);
+        assert!(exec_override_dropins("").is_empty());
     }
 
     #[test]

@@ -71,18 +71,20 @@ notify_owner() {
 # overrides ExecStart (2026-10-20: a rollout pinned a frozen copy of the
 # daemon) turns every tick into pull + rebuild + a verified bounce back onto
 # the OLD binary. Say exactly that, once per distinct cause (the tick is five
-# minutes), and count it as a restart failure so the stamp stays honest.
-# While ExecStart is pinned the restart itself is skipped: it only relaunches
-# the frozen binary and kills whatever the auto-PR loop was building.
-DAEMON_LAUNCHER="scripts/run-rs.sh"
+# minutes; the key holds only stable facts, never systemd's pid/status
+# fields), count it as a restart failure so the stamp stays honest, and do
+# NOT restart while it holds: the bounce only relaunches the frozen binary
+# and kills whatever the auto-PR loop was building. Checked before the
+# deferral gates — it is a read-only `systemctl show`, safe under a live build.
+DAEMON_LAUNCHER="$REPO_ROOT/scripts/run-rs.sh"
 DAEMON_BINARY="$REPO_ROOT/target/release/augmentagent"
 PINNED_ALERT_STAMP="$LOG_DIR/deploy-pinned-alerted"
 report_pinned_deploy() {
   local cause="$1" dropins msg
-  dropins=$(unit_dropins "$SYSTEMD_UNIT")
-  msg="DEPLOY PINNED: $SYSTEMD_UNIT $cause. Drop-ins: ${dropins:-none}. Merges \
-to main are built but never run until the override is retired: move the \
-drop-in out of ~/.config/systemd/user/$SYSTEMD_UNIT.d/, then \
+  dropins=$(unit_exec_dropins "$SYSTEMD_UNIT") || dropins=""
+  msg="DEPLOY PINNED: $SYSTEMD_UNIT $cause. ExecStart drop-ins: ${dropins:-none}. \
+Merges to main are built but never run until the override is retired: move \
+the drop-in out of ~/.config/systemd/user/$SYSTEMD_UNIT.d/, then \
 systemctl --user daemon-reload && systemctl --user restart $SYSTEMD_UNIT (#1571)."
   log "$msg"
   if [ "$(cat "$PINNED_ALERT_STAMP" 2>/dev/null)" != "$cause|$dropins" ]; then
@@ -90,12 +92,22 @@ systemctl --user daemon-reload && systemctl --user restart $SYSTEMD_UNIT (#1571)
     notify_owner "$msg"
   fi
 }
-# 0 = ExecStart is overridden away from the repo launcher; reported, do not restart.
+# 0 = the unit will not come back on our binary; reported, do not restart.
 deploy_pinned_elsewhere() {
-  unit_exec_pinned "$SYSTEMD_UNIT" "$DAEMON_LAUNCHER" || return 1
-  report_pinned_deploy "has ExecStart overridden away from $DAEMON_LAUNCHER \
-($(unit_exec_start "$SYSTEMD_UNIT")); not restarting"
-  return 0
+  if unit_exec_pinned "$SYSTEMD_UNIT" "$DAEMON_LAUNCHER"; then
+    report_pinned_deploy "has ExecStart overridden to $(unit_exec_path "$SYSTEMD_UNIT") \
+instead of $DAEMON_LAUNCHER; not restarting"
+    return 0
+  fi
+  # A canonical ExecStart whose process still is not our binary (a launcher
+  # that execs elsewhere, a relinked target/) is just as deterministic: the
+  # last bounce proved it, restarting again proves it again at the loop's cost.
+  if ! unit_runs_binary "$SYSTEMD_UNIT" "$DAEMON_BINARY"; then
+    report_pinned_deploy "is running $SR_LAST_EXE instead of $DAEMON_BINARY; \
+not restarting"
+    return 0
+  fi
+  return 1
 }
 
 # Rebuild the side(s) flagged by NEEDS_REBUILD / NEEDS_DASHBOARD_REBUILD, then
@@ -254,27 +266,24 @@ apply_update() {
         # restart kills it unrecorded. Deferring counts as a restart failure,
         # so the stamp is withheld (#826) and the next tick retries — the
         # binary is already built, so the retry is cheap.
-        if maybe_defer_restart; then
+        if deploy_pinned_elsewhere; then
+          # #1571 — reported above; a restart would relaunch the frozen binary.
+          RESTART_FAILURES=$((RESTART_FAILURES + 1))
+        elif maybe_defer_restart; then
           RESTART_FAILURES=$((RESTART_FAILURES + 1))
         elif ! memory_pressure_ok || ! restart_budget_ok; then
           # #903 — same deferral semantics as #844: counts as a restart
           # failure so the stamp is withheld and the next tick retries.
           RESTART_FAILURES=$((RESTART_FAILURES + 1))
-        elif deploy_pinned_elsewhere; then
-          # #1571 — reported above; a restart would relaunch the frozen binary.
-          RESTART_FAILURES=$((RESTART_FAILURES + 1))
         else
           log "restarting daemon via systemctl --user restart $SYSTEMD_UNIT"
-          if restart_unit "$SYSTEMD_UNIT"; then
+          # #1571 — proof now includes "and it is running the binary we
+          # built"; a bounce onto anything else is a pinned deploy.
+          if restart_unit "$SYSTEMD_UNIT" "$DAEMON_BINARY"; then
             record_restart
-            # #1571 — a bounce proves the process came back, not that it is
-            # the binary we built.
-            if ! unit_runs_binary "$SYSTEMD_UNIT" "$DAEMON_BINARY"; then
-              report_pinned_deploy "came back running $(unit_exe_path "$SYSTEMD_UNIT") \
-instead of target/release/augmentagent"
-              RESTART_FAILURES=$((RESTART_FAILURES + 1))
-            fi
           else
+            [ -n "$SR_LAST_EXE" ] && report_pinned_deploy "came back running \
+$SR_LAST_EXE instead of $DAEMON_BINARY"
             RESTART_FAILURES=$((RESTART_FAILURES + 1))
           fi
         fi
