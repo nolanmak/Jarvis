@@ -495,3 +495,43 @@ column's `samples` can be smaller than the turn count. The live acceptance
 criteria (AC5, AC8 and the epic gate) require pasting this output with the
 commit SHA after a real owner call; the offline suites only prove the record
 shape, the ±5 ms paused-clock fixture and the hand-computed percentiles.
+
+## Terminal and recoverable relay conditions (#1549)
+
+Once a relay socket is authenticated and claimed, only seven conditions end it.
+`ingress::EndReason` enumerates them and a wildcard-free test keeps the set
+exact: `peer_closed` (the provider closed the WebSocket, or sent an error code
+Twilio documents as session-terminating: 64104, 64105, 64108), `transport_error`
+(a socket read or write failed), `owner_hangup` (the call left the connected
+state or a stop was requested, including an `end` we sent), `revoked` (call
+authority can no longer be verified; an unreadable call record fails closed the
+same way), `duration_limit`, `worker_failed` (the agent worker stopped before
+the connection did) and `invalid_frame_limit`. The TwiML is `<Connect>` followed
+by `<Hangup/>`, so any other exit would hang up on the owner.
+
+Everything else is recoverable and the loop continues:
+
+- A full turn queue (four waiting turns behind the one in progress) evicts the
+  oldest waiting turn, which receives one fixed final line, "Sorry, say that
+  again?". The newest turn stays queued and is answered.
+- Malformed JSON, unknown message types and other rejected text frames
+  (`invalid_protocol_frame`) and binary frames (`unsupported_frame`) are
+  counted per session. Any accepted frame resets the run. Ten consecutive
+  invalid frames, matching the provider's own bound, send one `end` message
+  and close with `invalid_frame_limit`. Control frames neither count nor reset.
+- Provider `error` frames are logged by numeric code and ignored, except the
+  three session-terminating codes above, after which the socket is gone.
+- An agent utterance that violates the speech contract (`invalid_speech_output`)
+  drops that output only.
+
+Each recoverable condition emits one structured diagnostic with a fixed
+`category`, the per-session `count` for that category, the current
+`consecutive_invalid` run and an optional numeric `provider_code`. Diagnostics
+never carry frame content, numbers, signatures or speech; a unit test feeds
+marked frames through the classifier and asserts nothing leaks.
+
+Offline regressions cover each recoverable condition followed by an answered
+prompt, oldest-turn eviction, the ten-frame limit and its reset, the exact
+terminal set and diagnostic redaction. A live owner call that ends only on
+hangup with Twilio status `completed` must still be recorded separately.
+

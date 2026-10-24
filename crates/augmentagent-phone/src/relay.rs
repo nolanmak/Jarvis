@@ -102,6 +102,9 @@ struct TurnOutput {
     /// whole streamed answer, never an individual chunk.
     streamed: String,
 }
+/// Twilio closes a ConversationRelay socket after ten consecutive malformed
+/// messages; incoming frames are held to the same bound (#1549).
+pub const INVALID_FRAME_LIMIT: u32 = 10;
 pub struct RelaySession {
     call_id: String,
     account_sid: String,
@@ -112,6 +115,7 @@ pub struct RelaySession {
     generation: u64,
     outputs: HashMap<String, TurnOutput>,
     heard_until_interrupt: Option<String>,
+    consecutive_invalid: u32,
     debug_events: bool,
     invalid_frames: u64,
     played_event: Option<tokio::time::Instant>,
@@ -128,6 +132,7 @@ impl RelaySession {
             generation: 0,
             outputs: HashMap::new(),
             heard_until_interrupt: None,
+            consecutive_invalid: 0,
             debug_events: false,
             invalid_frames: 0,
             played_event: None,
@@ -139,7 +144,7 @@ impl RelaySession {
         self.debug_events = enabled;
         self
     }
-    /// Frames rejected as malformed, unauthorized or unsupported.
+    /// Frames rejected as malformed, unauthorized or unsupported (session total).
     pub fn invalid_frames(&self) -> u64 {
         self.invalid_frames
     }
@@ -147,12 +152,31 @@ impl RelaySession {
     pub fn take_played_event(&mut self) -> Option<tokio::time::Instant> {
         self.played_event.take()
     }
+    /// Any accepted frame resets the consecutive invalid run; a rejected
+    /// frame extends it. Control frames are not messages and change nothing.
     pub fn receive(&mut self, frame: &str) -> Result<RelayInput, Error> {
         let result = self.receive_frame(frame);
-        if result.is_err() {
-            self.invalid_frames += 1;
+        match result {
+            Ok(_) => self.consecutive_invalid = 0,
+            Err(_) => {
+                self.invalid_frames += 1;
+                self.consecutive_invalid = self.consecutive_invalid.saturating_add(1);
+            }
         }
         result
+    }
+    /// A binary or otherwise unsupported frame counts like a malformed message.
+    pub fn note_unsupported_frame(&mut self) -> u32 {
+        self.invalid_frames += 1;
+        self.consecutive_invalid = self.consecutive_invalid.saturating_add(1);
+        self.consecutive_invalid
+    }
+    pub fn consecutive_invalid_frames(&self) -> u32 {
+        self.consecutive_invalid
+    }
+    /// Provider `end` message: the relay terminates and TwiML continues.
+    pub fn end(&self) -> Value {
+        json!({"type":"end"})
     }
     fn receive_frame(&mut self, frame: &str) -> Result<RelayInput, Error> {
         if frame.len() > 32_768 {
