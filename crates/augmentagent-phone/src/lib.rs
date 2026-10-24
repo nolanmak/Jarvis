@@ -179,8 +179,8 @@ impl PhoneConfig {
         self.voice = voice;
         self
     }
-    /// Optional hook for a stored owner profile's first name, used only as a
-    /// recognition hint. No store exposes a profile yet, so runtime passes None.
+    /// Owner first name, used only as a recognition hint. `config::Settings::build`
+    /// supplies the stored `first_name` profile fact (#1552) at startup.
     pub fn with_owner_first_name(mut self, first_name: Option<String>) -> Self {
         self.owner_first_name = first_name;
         self
@@ -747,5 +747,7 @@ pub mod recovery;
 pub mod metrics;
 
 pub mod fast;
+
+pub mod memory;
 /// Preemptive generation on interim transcripts (#1555).
 pub mod speculation;

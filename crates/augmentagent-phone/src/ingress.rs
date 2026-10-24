@@ -67,6 +67,16 @@ pub trait ConversationAgent: Send + Sync {
         drop(speculation);
         self.answer(call, turn_id, text, speech, cancel).await
     }
+    /// Post-call memory (#1552): run the heavy agent once, with exactly the
+    /// request's tools (none), over the transcript mirrored into the call's
+    /// originating chat. Adapters without a heavy agent leave the default.
+    async fn summarize_call(
+        &self,
+        _call: &PhoneCall,
+        _request: &crate::memory::SummaryRequest,
+    ) -> Result<crate::memory::SummaryDraft, AgentError> {
+        Err(AgentError)
+    }
 }
 /// One queued speech item for the relay loop. `Utterance` carries an
 /// agent-identified receipt (MCP `speak`); `Token` is one streamed chunk,

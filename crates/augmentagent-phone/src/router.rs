@@ -101,4 +101,11 @@ impl ConversationAgent for AgentRouter {
             .answer_speculated(call, turn_id, text, speech, cancel, speculation)
             .await
     }
+    async fn summarize_call(
+        &self,
+        call: &PhoneCall,
+        request: &crate::memory::SummaryRequest,
+    ) -> Result<crate::memory::SummaryDraft, AgentError> {
+        self.adapter(call)?.summarize_call(call, request).await
+    }
 }
