@@ -140,6 +140,8 @@ pub async fn cleanup_without_runtime(
             public_base: String::new(),
             verification_key: Vec::new(),
             links: Vec::new(),
+            voice: crate::voice::VoiceConfig::default(),
+            owner_first_name: None,
             debug_events: false,
             fast: None,
         },

@@ -36,3 +36,4 @@ tracing-subscriber = { workspace = true }
 mockito = "1"
 tokio-tungstenite = "0.29"
 proptest = "1"
+roxmltree = "0.20"
