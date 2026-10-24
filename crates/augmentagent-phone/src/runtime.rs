@@ -147,6 +147,7 @@ pub async fn cleanup_without_runtime(
             debug_events: false,
             barge_in: crate::relay::BargeIn::default(),
             fast: None,
+            preemptive: false,
             proposals: crate::proposals::ProposalPolicy::default(),
             silence: crate::silence::SilencePolicy::default(),
         },

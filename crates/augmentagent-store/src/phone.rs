@@ -8,6 +8,30 @@ use thiserror::Error;
 
 pub(crate) fn migrate(conn: &Connection) -> StoreResult<()> {
     conn.execute_batch(include_str!("phone.sql"))?;
+    // #1555 speculation fields, added in place to existing metrics tables.
+    for (column, definition) in [
+        ("speculated", "INTEGER NOT NULL DEFAULT 0 CHECK(speculated IN (0,1))"),
+        (
+            "speculation_committed",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(speculation_committed IN (0,1))",
+        ),
+        (
+            "speculation_saved_ms",
+            "INTEGER CHECK(speculation_saved_ms IS NULL OR speculation_saved_ms >= 0)",
+        ),
+    ] {
+        let present: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('phone_turn_metrics') WHERE name = ?1",
+            [column],
+            |row| row.get(0),
+        )?;
+        if !present {
+            conn.execute(
+                &format!("ALTER TABLE phone_turn_metrics ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
     allow_silence_end_reason(conn)?;
     Ok(())
 }
@@ -996,9 +1020,15 @@ pub struct PhoneTurnMetrics {
     pub t_last_played_ms: Option<i64>,
     pub audible_delta_ms: Option<i64>,
     pub commit_sha: Option<String>,
+    /// #1555: a speculation was started on an interim transcript.
+    pub speculated: bool,
+    /// #1555: the final transcript committed that speculation's answer.
+    pub speculation_committed: bool,
+    /// #1555: final-prompt time minus speculation start, when committed.
+    pub speculation_saved_ms: Option<i64>,
 }
 /// Percentile columns, in CLI display order.
-pub const PHONE_TURN_METRIC_FIELDS: [&str; 8] = [
+pub const PHONE_TURN_METRIC_FIELDS: [&str; 9] = [
     "queue_wait_ms",
     "t_first_token_ms",
     "t_first_speech_ms",
@@ -1007,6 +1037,7 @@ pub const PHONE_TURN_METRIC_FIELDS: [&str; 8] = [
     "t_first_played_ms",
     "t_last_played_ms",
     "audible_delta_ms",
+    "speculation_saved_ms",
 ];
 impl PhoneTurnMetrics {
     pub fn field(&self, name: &str) -> Option<Option<i64>> {
@@ -1019,6 +1050,7 @@ impl PhoneTurnMetrics {
             "t_first_played_ms" => self.t_first_played_ms,
             "t_last_played_ms" => self.t_last_played_ms,
             "audible_delta_ms" => self.audible_delta_ms,
+            "speculation_saved_ms" => self.speculation_saved_ms,
             _ => return None,
         })
     }
@@ -1044,7 +1076,7 @@ pub fn nearest_rank_percentile(sorted: &[i64], percent: u32) -> Option<i64> {
     let rank = (sorted.len() as u64 * u64::from(percent)).div_ceil(100).max(1) as usize;
     sorted.get(rank.min(sorted.len()) - 1).copied()
 }
-const METRIC_COLUMNS: &str = "call_id,turn_id,recorded_ms,provider,outcome,queue_wait_ms,t_first_token_ms,t_first_speech_ms,t_last_speech_ms,tool_ms,t_first_played_ms,t_last_played_ms,audible_delta_ms,commit_sha";
+const METRIC_COLUMNS: &str = "call_id,turn_id,recorded_ms,provider,outcome,queue_wait_ms,t_first_token_ms,t_first_speech_ms,t_last_speech_ms,tool_ms,t_first_played_ms,t_last_played_ms,audible_delta_ms,commit_sha,speculated,speculation_committed,speculation_saved_ms";
 fn read_metrics(row: &rusqlite::Row<'_>) -> rusqlite::Result<PhoneTurnMetrics> {
     Ok(PhoneTurnMetrics {
         call_id: row.get(0)?,
@@ -1061,6 +1093,9 @@ fn read_metrics(row: &rusqlite::Row<'_>) -> rusqlite::Result<PhoneTurnMetrics> {
         t_last_played_ms: row.get(11)?,
         audible_delta_ms: row.get(12)?,
         commit_sha: row.get(13)?,
+        speculated: row.get(14)?,
+        speculation_committed: row.get(15)?,
+        speculation_saved_ms: row.get(16)?,
     })
 }
 impl Store {
@@ -1080,14 +1115,20 @@ impl Store {
                 return Err(PhoneError::InvalidInput);
             }
         }
+        // A committed speculation was started; only a committed one saved time.
+        if (m.speculation_committed && !m.speculated)
+            || m.speculation_saved_ms.is_some() != m.speculation_committed
+        {
+            return Err(PhoneError::InvalidInput);
+        }
         if let Some(sha) = &m.commit_sha {
             if !(7..=40).contains(&sha.len()) || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err(PhoneError::InvalidInput);
             }
         }
         Ok(self.with_conn(|c| c.execute(
-            &format!("INSERT INTO phone_turn_metrics({METRIC_COLUMNS}) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) ON CONFLICT(call_id,turn_id) DO NOTHING"),
-            params![m.call_id, m.turn_id, m.recorded_ms, m.provider.as_str(), m.outcome.as_str(), m.queue_wait_ms, m.t_first_token_ms, m.t_first_speech_ms, m.t_last_speech_ms, m.tool_ms, m.t_first_played_ms, m.t_last_played_ms, m.audible_delta_ms, m.commit_sha]))? == 1)
+            &format!("INSERT INTO phone_turn_metrics({METRIC_COLUMNS}) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17) ON CONFLICT(call_id,turn_id) DO NOTHING"),
+            params![m.call_id, m.turn_id, m.recorded_ms, m.provider.as_str(), m.outcome.as_str(), m.queue_wait_ms, m.t_first_token_ms, m.t_first_speech_ms, m.t_last_speech_ms, m.tool_ms, m.t_first_played_ms, m.t_last_played_ms, m.audible_delta_ms, m.commit_sha, m.speculated, m.speculation_committed, m.speculation_saved_ms]))? == 1)
     }
     pub fn phone_turn_metrics(&self, call_id: &str) -> PhoneResult<Vec<PhoneTurnMetrics>> {
         Ok(self.with_conn(|conn| {

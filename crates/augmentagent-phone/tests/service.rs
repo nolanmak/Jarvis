@@ -2241,6 +2241,48 @@ fn ac06_twiml_debug_attribute_present_iff_debug_events_enabled() {
     }
 }
 
+// #1555 AC1: partialPrompts is "true" only with preemptive generation on the
+// fast layer; every other combination keeps the existing "false" (XML-parsed).
+#[test]
+fn preemptive_twiml_requests_partial_prompts_only_on_the_fast_layer() {
+    use augmentagent_phone::{fast::FastLayerConfig, webhook::WebhookAuth};
+    for (fast, preemptive, expected) in [
+        (false, false, "false"),
+        (false, true, "false"),
+        (true, false, "false"),
+        (true, true, "true"),
+    ] {
+        let f = fixture("discord", true, true, false);
+        let config = PhoneConfig::new(
+            true,
+            "https://phone.example.test",
+            "test-secret-for-verification-32bytes",
+            vec![OwnerLink {
+                surface_owner: f.owner.clone(),
+                owner_id: "canonical-owner".into(),
+            }],
+        )
+        .unwrap()
+        .with_fast_layer(fast.then(FastLayerConfig::default))
+        .with_preemptive(preemptive);
+        let service = PhoneService::new(f.store.clone(), f.provider.clone(), f.clock.clone(), config);
+        assert_eq!(service.preemptive(), expected == "true");
+        let grant = service.authorize(&f.owner, &f.conversation).unwrap();
+        let call = futures::executor::block_on(service.tool(&grant, "call_owner", json!({"request_id":"partial"}))).unwrap();
+        let id = call["id"].as_str().unwrap();
+        let fields = vec![
+            ("AccountSid".into(), "AC-test".into()),
+            ("CallSid".into(), "CA-test".into()),
+        ];
+        let auth = WebhookAuth::new("AC-test", "secret");
+        let sig = signed("secret", &format!("https://phone.example.test/phone/start/{id}"), &fields);
+        let reply = service.start_callback(&auth, id, &fields, &sig).unwrap();
+        let relay = relay_attributes(&reply);
+        assert_eq!(relay["partialPrompts"], expected, "fast={fast} preemptive={preemptive}");
+        assert_eq!(relay["interruptible"], "any");
+    }
+}
+
 /// Captures every tracing event so #1551 tests can count `phone.turn` records
 /// and prove raw debug frame bodies never reach the logs.
 mod capture {
@@ -2832,6 +2874,203 @@ async fn ac04_real_websocket_interrupt_silences_the_stale_stream_until_the_next_
     }
     assert_eq!(tokens.concat(), "First sentence here. Second one with a link. Third and last");
     assert!(next_frame(&mut socket, std::time::Duration::from_millis(300)).await.is_none());
+    server.abort();
+}
+
+/// #1555 agent: speculations echo their interim text; normal answers echo the
+/// final text, so the wire shows which path produced the words.
+#[derive(Default)]
+struct SpeculatingAgent {
+    speculations: std::sync::atomic::AtomicUsize,
+    committed: std::sync::atomic::AtomicUsize,
+}
+#[async_trait::async_trait]
+impl augmentagent_phone::ingress::ConversationAgent for SpeculatingAgent {
+    async fn answer(
+        &self,
+        _: &augmentagent_store::phone::PhoneCall,
+        _: &str,
+        text: &str,
+        _: augmentagent_phone::ingress::SpeechSender,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<String, augmentagent_phone::ingress::AgentError> {
+        Ok(format!("Answer to: {text}"))
+    }
+    async fn interrupted(
+        &self,
+        _: &augmentagent_store::phone::PhoneCall,
+        _: &str,
+    ) -> Result<(), augmentagent_phone::ingress::AgentError> {
+        Ok(())
+    }
+    fn speculate(
+        &self,
+        _: &augmentagent_store::phone::PhoneCall,
+        text: &str,
+    ) -> Option<augmentagent_phone::speculation::Speculative> {
+        self.speculations.fetch_add(1, Ordering::SeqCst);
+        let reply = format!("Speculated: {text}");
+        Some(augmentagent_phone::speculation::Speculative::spawn(
+            text,
+            move |sink| async move {
+                sink.token(reply).await;
+            },
+        ))
+    }
+    async fn answer_speculated(
+        &self,
+        _: &augmentagent_store::phone::PhoneCall,
+        _: &str,
+        _: &str,
+        speech: augmentagent_phone::ingress::SpeechSender,
+        _: tokio_util::sync::CancellationToken,
+        mut speculation: augmentagent_phone::speculation::Speculative,
+    ) -> Result<String, augmentagent_phone::ingress::AgentError> {
+        self.committed.fetch_add(1, Ordering::SeqCst);
+        let mut said = String::new();
+        while let Some(token) = speculation.next_token().await {
+            speech.speak_partial(&token).await?;
+            said.push_str(&token);
+        }
+        speech.finish().await?;
+        Ok(said)
+    }
+}
+
+// #1555 AC3 + AC6 over a real WebSocket: interim prompts start a speculation
+// whose words never reach the wire before the final prompt; a matching final
+// speaks them, a mismatched one is answered normally; each turn's metrics row
+// carries the speculation fields.
+#[tokio::test]
+async fn preemptive_real_websocket_commits_matching_finals_and_cancels_others() {
+    use augmentagent_store::phone::CallState;
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+    let agent = Arc::new(SpeculatingAgent::default());
+    let f = fixture("discord", true, true, false);
+    let config = PhoneConfig::new(
+        true,
+        "https://phone.example.test",
+        "test-secret-for-verification-32bytes",
+        vec![OwnerLink {
+            surface_owner: f.owner.clone(),
+            owner_id: "canonical-owner".into(),
+        }],
+    )
+    .unwrap()
+    .with_fast_layer(Some(augmentagent_phone::fast::FastLayerConfig::default()))
+    .with_preemptive(true);
+    let service = Arc::new(PhoneService::new(
+        f.store.clone(),
+        f.provider.clone(),
+        f.clock.clone(),
+        config,
+    ));
+    let grant = service.authorize(&f.owner, &f.conversation).unwrap();
+    let call = service
+        .tool(&grant, "call_owner", json!({"request_id":"preemptive"}))
+        .await
+        .unwrap();
+    let id = call["id"].as_str().unwrap().to_string();
+    f.store
+        .phone_provider_event(&id, "CA-test", CallState::AwaitingAcceptance, 100)
+        .unwrap();
+    f.store.phone_accept(&id, "CA-test", 101).unwrap();
+    let router = augmentagent_phone::ingress::router(
+        service,
+        Arc::new(augmentagent_phone::webhook::WebhookAuth::new(
+            "AC-test",
+            "callback-secret",
+        )),
+        agent.clone(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let mut request = format!("ws://{addr}/phone/relay/{id}")
+        .into_client_request()
+        .unwrap();
+    let signature = signed(
+        "callback-secret",
+        &format!("wss://phone.example.test/phone/relay/{id}"),
+        &[],
+    );
+    request
+        .headers_mut()
+        .insert("x-twilio-signature", signature.parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    socket.send(Message::Text(json!({"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX-test"}).to_string().into())).await.unwrap();
+    let prompt = |text: &str, last: bool| {
+        Message::Text(json!({"type":"prompt","voicePrompt":text,"last":last}).to_string().into())
+    };
+    async fn talk_cycle<S>(socket: &mut S) -> String
+    where
+        S: futures::Stream<
+                Item = Result<
+                    tokio_tungstenite::tungstenite::Message,
+                    tokio_tungstenite::tungstenite::Error,
+                >,
+            > + Unpin,
+    {
+        let mut spoken = String::new();
+        loop {
+            let frame = next_frame(socket, std::time::Duration::from_secs(3))
+                .await
+                .expect("talk cycle frame");
+            spoken.push_str(frame["token"].as_str().unwrap());
+            if frame["last"] == true {
+                return spoken;
+            }
+        }
+    }
+
+    // Utterance 1: speculation on the interim text, committed by the final.
+    socket.send(prompt("what's on my", false)).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+    socket.send(prompt("what's on my calendar tomorrow", false)).await.unwrap();
+    assert!(
+        next_frame(&mut socket, std::time::Duration::from_millis(400)).await.is_none(),
+        "speculative words reached the wire before commit"
+    );
+    assert_eq!(agent.speculations.load(Ordering::SeqCst), 1);
+    socket.send(prompt("What's on my calendar tomorrow?", true)).await.unwrap();
+    assert_eq!(
+        talk_cycle(&mut socket).await,
+        "Speculated: what's on my calendar tomorrow"
+    );
+    assert_eq!(agent.committed.load(Ordering::SeqCst), 1);
+
+    // Utterance 2: the final changes a word; the speculation is dropped.
+    socket.send(prompt("remind me", false)).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+    socket.send(prompt("remind me to call the plumber", false)).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(agent.speculations.load(Ordering::SeqCst), 2);
+    socket.send(prompt("remind me to email the plumber", true)).await.unwrap();
+    assert_eq!(
+        talk_cycle(&mut socket).await,
+        "Answer to: remind me to email the plumber"
+    );
+    assert_eq!(agent.committed.load(Ordering::SeqCst), 1);
+    assert!(next_frame(&mut socket, std::time::Duration::from_millis(300)).await.is_none());
+
+    // Closing the socket records both turns.
+    socket.close(None).await.unwrap();
+    let rows = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let rows = f.store.phone_turn_metrics(&id).unwrap();
+            if rows.len() == 2 {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("two metrics rows");
+    assert!(rows[0].speculated && rows[0].speculation_committed);
+    assert!(rows[0].speculation_saved_ms.is_some_and(|ms| ms >= 100), "{:?}", rows[0]);
+    assert!(rows[1].speculated && !rows[1].speculation_committed);
+    assert_eq!(rows[1].speculation_saved_ms, None);
     server.abort();
 }
 
