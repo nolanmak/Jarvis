@@ -3,7 +3,10 @@
 use crate::{
     providers::ProviderKind,
     reasoner::{ClaudeCliReasoner, Reasoner, ReasonerOpts},
-    surface_turn::{run_surface_turn_with_history, SurfaceTurnOutcome, SurfaceTurnRequest},
+    surface_turn::{
+        run_surface_turn_waiting, run_surface_turn_with_history, QueueWait, SurfaceTurnOutcome,
+        SurfaceTurnRequest,
+    },
 };
 use async_trait::async_trait;
 use augmentagent_approval_discord::{AuditCtx, QueryHandler};
@@ -21,8 +24,16 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tokio_util::sync::CancellationToken;
+
+/// A native phone turn still waiting for the shared conversation queue
+/// after this long hears [`QUEUE_NOTICE`] (#1548)...
+pub const QUEUE_NOTICE_AFTER: Duration = Duration::from_secs(3);
+/// ...and again every this long while it keeps waiting.
+pub const QUEUE_NOTICE_EVERY: Duration = Duration::from_secs(15);
+pub const QUEUE_NOTICE: &str = "I'm still finishing something, one moment.";
 
 #[async_trait]
 pub trait ConversationIo: Send + Sync {
@@ -153,10 +164,31 @@ impl PhoneAgent {
         let ctx = self.io.audit_context(&origin, turn_id);
         let cwd = self.cwd.to_string_lossy();
         let execution_origin = origin.clone();
+        // Behind a long text turn the owner would hear only silence (#1548):
+        // say so after a few seconds, then periodically, and keep waiting.
+        let notices = std::sync::atomic::AtomicU32::new(0);
+        let notice = || {
+            if let Some(speech) = &speech {
+                let n = notices.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                tracing::info!(call_id = %call.id, notice = n, "phone turn waiting for the shared conversation queue");
+                speech.notice(&format!("queue_wait_{n}"), QUEUE_NOTICE);
+            }
+        };
+        let entered = |waited: Duration| {
+            if let Some(speech) = &speech {
+                speech.note_queue_wait(waited);
+            }
+        };
+        let wait = speech.as_ref().map(|_| QueueWait {
+            notice_after: QUEUE_NOTICE_AFTER,
+            repeat: QUEUE_NOTICE_EVERY,
+            notice: &notice,
+            entered: &entered,
+        });
         let outcome = augmentagent_phone::context::scope(
             origin.clone(),
             speech.clone(),
-            run_surface_turn_with_history(
+            run_surface_turn_waiting(
                 &self.store,
                 SurfaceTurnRequest {
                     turn: &turn,
@@ -192,6 +224,7 @@ impl PhoneAgent {
                     self.service.authorize_call(&call.id)?;
                     self.io.history(&origin).await
                 },
+                wait,
             ),
         )
         .await?;

@@ -39,6 +39,25 @@ pub trait GmailApi: Send + Sync {
     /// Fetch unread emails for an entity. Returns up to `limit` messages.
     async fn fetch_unread(&self, entity_id: &str, limit: u32) -> Result<Vec<Email>, GmailError>;
 
+    /// Fetch unread emails that arrived at or after `since_ms` (epoch ms,
+    /// `None` = no lower bound). This is the poller's entry point: with a
+    /// cursor it only pages through mail newer than the previous successful
+    /// tick, so a mailbox carrying hundreds of old unread messages no longer
+    /// costs the full `limit / PAGE_SIZE` fetch calls every cycle.
+    ///
+    /// Default impl ignores the cursor and delegates to [`fetch_unread`] so
+    /// test fakes keep compiling; `ComposioClient` overrides it with an
+    /// `is:unread after:<epoch secs>` query (see [`unread_query`]).
+    async fn fetch_unread_since(
+        &self,
+        entity_id: &str,
+        since_ms: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<Email>, GmailError> {
+        let _ = since_ms;
+        self.fetch_unread(entity_id, limit).await
+    }
+
     /// Fetch emails matching a Gmail search query (e.g. `from:jeremy@acme.example.com`,
     /// `subject:deadline after:2026/04/01`). Returns up to `limit` messages.
     async fn fetch_with_query(
@@ -853,6 +872,26 @@ impl ComposioClient {
     }
 }
 
+/// Slack subtracted from the inbound cursor before it becomes a Gmail
+/// `after:` bound. Gmail matches `after:` against the message's internal
+/// date, which can trail our wall-clock by delivery latency, and the cursor
+/// itself is stamped *after* the fetch returns; an hour covers both with
+/// margin while keeping each tick's page count proportional to one hour of
+/// mail rather than the whole unread backlog.
+pub(crate) const UNREAD_CURSOR_SLACK_MS: i64 = 60 * 60 * 1000;
+
+/// Build the inbound poll query. `after:` accepts epoch *seconds*, which is
+/// second-granular (unlike the `YYYY/MM/DD` form the sent-mail observer uses).
+pub(crate) fn unread_query(since_ms: Option<i64>) -> String {
+    match since_ms {
+        Some(ms) => {
+            let secs = (ms - UNREAD_CURSOR_SLACK_MS).max(0) / 1000;
+            format!("is:unread after:{secs}")
+        }
+        None => "is:unread".to_string(),
+    }
+}
+
 fn is_transient_reqwest(e: &reqwest::Error) -> bool {
     e.is_timeout() || e.is_connect() || e.is_request()
 }
@@ -1109,6 +1148,17 @@ mod tests {
     fn normalize_subject_keeps_words_that_merely_start_with_re() {
         assert_eq!(normalize_subject("Regarding x"), "regarding x");
         assert_eq!(normalize_subject("Reply to this"), "reply to this");
+    }
+
+    #[test]
+    fn unread_query_bounds_by_cursor_with_slack() {
+        assert_eq!(unread_query(None), "is:unread");
+        // 2026-10-24T14:00:00Z = 1_792_850_400_000 ms; minus one hour of
+        // slack and converted to whole seconds.
+        let q = unread_query(Some(1_792_850_400_000));
+        assert_eq!(q, "is:unread after:1792846800");
+        // A cursor inside the slack window clamps at the epoch, never negative.
+        assert_eq!(unread_query(Some(1_000)), "is:unread after:0");
     }
 
     #[test]
@@ -2793,6 +2843,16 @@ impl GmailApi for ComposioClient {
     ) -> Result<Vec<Email>, GmailError> {
         self.fetch_with_query(entity_id, "is:unread", max_total)
             .await
+    }
+
+    async fn fetch_unread_since(
+        &self,
+        entity_id: &str,
+        since_ms: Option<i64>,
+        max_total: u32,
+    ) -> Result<Vec<Email>, GmailError> {
+        let query = unread_query(since_ms);
+        self.fetch_with_query(entity_id, &query, max_total).await
     }
 
     async fn fetch_with_query(

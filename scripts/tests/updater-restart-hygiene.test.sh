@@ -83,7 +83,7 @@ spend_budget() { local now; now=$(date +%s); printf '%s\n%s\n%s\n' "$((now-600))
 # run_updater — extra env for a case comes from the caller's environment.
 run_updater() {
   ( cd "$TMP/work" \
-    && PATH="$TMP/bin:$PATH" XDG_STATE_HOME="$TMP/state" HOME="$TMP" \
+    && PATH="$TMP/bin:$PATH" XDG_STATE_HOME="$TMP/state" HOME="$TMP" AUGMENTAGENT_PROC_ROOT="$TMP/proc" \
        AUGMENTAGENT_MEMINFO_PATH="$MEMINFO" \
        ./scripts/check-for-updates.sh >/dev/null 2>&1 )
 }

@@ -192,7 +192,9 @@ enum Cmd {
     },
     /// Run the poll loop as a daemon.
     Serve {
-        #[arg(long, default_value_t = 120)]
+        /// Gmail inbound poll cadence. Env `AUGMENTAGENT_GMAIL_POLL_SECS`
+        /// overrides the default; the flag overrides both.
+        #[arg(long, default_value_t = default_gmail_poll_secs())]
         interval_secs: u64,
         /// Dry-run (default true). Flip with `--dry-run false` after Phase 2 cutover.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -8368,6 +8370,17 @@ fn auto_expire_days_from_env() -> Option<i64> {
 /// `AUGMENTAGENT_APPROVAL_AUTO_EXPIRE_INTERVAL_SECS`; defaults to one
 /// hour. Clamped to a minimum of 1s so a fat-fingered `0` can't busy-loop
 /// the sweeper.
+/// `AUGMENTAGENT_GMAIL_POLL_SECS`, falling back to the channel default.
+/// Non-numeric or zero values fall back too — a typo must not turn the
+/// poller into a busy loop.
+fn default_gmail_poll_secs() -> u64 {
+    std::env::var("AUGMENTAGENT_GMAIL_POLL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(augmentagent_channel_email::DEFAULT_POLL_SECS)
+}
+
 fn auto_expire_interval_secs_from_env() -> u64 {
     std::env::var("AUGMENTAGENT_APPROVAL_AUTO_EXPIRE_INTERVAL_SECS")
         .ok()

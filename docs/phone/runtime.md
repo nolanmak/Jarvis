@@ -58,6 +58,10 @@ limits and duplicate-call protections still apply. Private DM entry is optional.
 | Variable | Meaning |
 | --- | --- |
 | `AUGMENTAGENT_PHONE_ENABLED` | `1` enables configuration; absent or `0` defaults off. Other values fail configuration. |
+| `AUGMENTAGENT_PHONE_BARGE_MIN_WORDS` | Barge-in filter (#1550): speech after an `interrupt` with fewer words than this that matches a backchannel phrase does not cancel the answer. Default `3`, range 1–10; `1` disables the filter so every interrupt invalidates immediately. |
+| `AUGMENTAGENT_PHONE_BACKCHANNEL_PHRASES` | Comma-separated backchannel phrases, compared case-insensitively with punctuation and hyphens ignored (`Mm-hmm.` matches `mm hmm`). Default `ok, okay, yeah, yes, mm, mhm, mm hm, mm hmm, uh huh, right, sure, got it`; 1–64 phrases. |
+| `AUGMENTAGENT_PHONE_FALSE_INTERRUPT_MS` | How long after an `interrupt` with no following prompt the interruption is treated as false. Default `2000`; values outside 500–5000 fail configuration with `InvalidSetting`. |
+| `AUGMENTAGENT_PHONE_RESUME_FALSE_INTERRUPT` | `1` (default) resumes a falsely interrupted answer from its unspoken remainder; `0` drops the remainder and waits for the next prompt. Other values fail configuration. |
 | `TWILIO_ACCOUNT_SID` | Twilio account SID. |
 | `TWILIO_AUTH_TOKEN` | Twilio API authentication and callback-signature secret. |
 | `TWILIO_PHONE_NUMBER` | Operator's voice-capable Twilio caller number, in E.164 format. This is **not** the owner's destination. |
@@ -452,8 +456,37 @@ progress notice after 10 seconds. These are server enqueue timings, not claims
 about audible latency. A final answer or interruption removes pending notices.
 After 120 seconds the agent receives cancellation, with up to five seconds to
 clean up, then a spoken failure allows the next request without redialing or
-replaying tools. Interrupted audio is invalidated immediately; chat persistence
-runs separately and cannot close the socket on a slow/failing mirror.
+replaying tools. Chat persistence of an interruption runs separately and cannot
+close the socket on a slow/failing mirror.
+
+## Barge-in and false interruptions (#1550)
+
+TwiML keeps `interruptible="any"` (the provider stops audio as soon as the
+owner speaks) and `reportInputDuringAgentSpeech="any"` (the speech that caused
+the interruption still arrives as a `prompt`, which the filter needs). An
+`interrupt` while Jarvis is speaking does not invalidate the answer at once;
+nothing new is spoken until one of these decides it:
+
+- The next final `prompt` is a backchannel (fewer than
+  `AUGMENTAGENT_PHONE_BARGE_MIN_WORDS` words and in the phrase list): a false
+  interruption. No turn is created.
+- Any other `prompt`: a real interruption. The generation advances, stale
+  output is dropped, the heard prefix is persisted, the cut turn is recorded
+  as `interrupted`, and the prompt becomes a new turn.
+- No prompt within `AUGMENTAGENT_PHONE_FALSE_INTERRUPT_MS`: a false
+  interruption.
+
+A false interruption resumes with one `text` frame carrying the unspoken
+remainder: the answer text after `utteranceUntilInterrupt` when that is an
+exact prefix of the latest talk cycle (a cut inside a word restarts the word),
+otherwise from the next sentence boundary after the position implied by
+`durationUntilInterruptMs` at a nominal 15 characters per second. The turn is
+not recorded as `interrupted`. With
+`AUGMENTAGENT_PHONE_RESUME_FALSE_INTERRUPT=0` the remainder is dropped instead
+and the turn is recorded as `interrupted`, without a new generation.
+
+The filter applies only after an `interrupt`. A prompt while Jarvis is silent
+is always a new turn, even a single word such as "yes".
 
 Phone turns use the selected native Claude/Codex session directly, bypassing the
 optional model gateway. Text routing, session identity and approval policy are
@@ -476,8 +509,8 @@ originating chat (bounded) and task updates from this call. Tokens are spoken
 at sentence boundaries as they stream. The runtime acknowledgment (#1526)
 becomes a fallback after 1.5 s without speech instead of 250 ms.
 
-The model has exactly two tools, `dispatch_task(description)` and
-`lookup_fast(query)`. Call authority (`authorize_call`) is re-checked before
+The model has exactly three tools, `dispatch_task(description)`,
+`lookup_fast(query)` and `end_call(reason, goodbye)` (#1557, below). Call authority (`authorize_call`) is re-checked before
 every tool; any other tool name, a revoked call or a fourth call in one
 utterance gets a typed refusal and the turn still ends with `last:true`.
 
@@ -499,20 +532,78 @@ work records outcome `dispatched`; tool time is added to `tool_ms`. Logs carry
 only fixed category codes (for example `http_4xx`, `scripted_failure`), never
 model text, tool arguments, chat text or keys.
 
+### Ending the call from the agent (#1557)
+
+`end_call(reason, goodbye)` takes `reason` ∈ `owner_goodbye`, `task_complete`,
+`owner_request` (anything else is a typed `invalid_arguments` refusal) and a
+goodbye cut to 120 characters (an empty one becomes a fixed line). The turn
+stops there: any buffered text is flushed, the goodbye is sent as the turn's
+single final `text` frame (`last:true`), and the relay sends one
+`{"type":"end","handoffData":"{\"reason\":…,\"call_id\":…}"}` as soon as a
+`tokensPlayed` debug event with `last:true` arrives, or 4 s after the goodbye
+was written, whichever is first. Without `AUGMENTAGENT_PHONE_DEBUG_EVENTS` the
+4 s bound always applies. After the goodbye, owner prompts and queued speech
+are dropped. The socket then ends with the internal reason `agent_end`
+(distinct from `peer_closed`/owner hang-up) and the usual stop and cleanup run.
+
+Goodbye shortcut: a final prompt that, lowercased with punctuation dropped,
+is exactly `bye`, `goodbye`, `bye bye`, `talk later`, `that's all`,
+`that's it thanks`, `hang up` or `end the call` ends the call as
+`owner_goodbye` with a fixed goodbye and no model call. Longer utterances
+("goodbye for now, one more thing") go to the model as usual. While a
+dispatched task is in flight the shortcut is off; if the model then calls
+`end_call`, "I'll text you the result." is spoken before its goodbye and the
+task's result still goes to chat exactly once.
+
+`end_call` exists only in the fast layer. The native phone MCP tools and the
+post-call summary run (#1552, `FORBIDDEN_SUMMARY_TOOLS`) never expose it.
+
+Twilio returns `handoffData` as `HandoffData` on the signed `relay-ended`
+callback. A well-formed `{reason, call_id}` for this call is stored once in the
+additive table `phone_call_end_reasons`; anything else (bad JSON, unknown
+reason, extra fields, another call's ID, a duplicated field) is stored as
+`relay_ended_unknown` and logged only as `category=handoff_data_invalid`,
+never with its content. A call that ended without `handoffData` gets no row.
+A replayed callback never changes the stored reason.
+
+## Shared conversation queue (#1548)
+
+Text turns and native phone turns on one conversation take turns through a
+per-conversation queue (`surface_turn::conversation_queue`), so they continue
+one native session. The CLI gate (`AUGMENTAGENT_REASONER_MAX_INFLIGHT`) is a
+separate process-wide limit on CLI reasoner processes.
+
+- **Fast layer on** (`AUGMENTAGENT_PHONE_FAST_LAYER=1`): a phone utterance
+  never enters the conversation queue and never asks the CLI gate for a
+  permit. It is answered while a long text turn is still running. Only work
+  handed off with `dispatch_task` runs as a native turn and waits in the queue
+  like a text turn.
+- **Fast layer off** (legacy native path): the phone turn waits in the queue.
+  If it does not get the queue within 3 s, the call hears "I'm still finishing
+  something, one moment." It hears the line again every 15 s while it keeps
+  waiting. The socket stays open, and the answer is spoken once the earlier
+  turn releases the queue. The notice is a separate spoken frame, not part of
+  the answer. It is never mirrored to chat and never counts as the answer's
+  first speech.
+- `queue_wait_ms` adds the wait for the conversation queue to the agent
+  worker's pickup time. Fast-layer turns have no queue wait, so for them the
+  field is only the pickup time, normally 0.
+
 ## Per-turn latency metrics (#1551)
 
 Every accepted turn (answered, interrupted, failed or dispatched) produces one
 `tracing` event with target `phone.turn` and one row in the additive SQLite
 table `phone_turn_metrics`. Fields are millisecond offsets from receipt of the
 final `prompt` frame: `queue_wait_ms` (until the agent worker picked the turn
-up), `t_first_token_ms` (first agent output), `t_first_speech_ms` (first
+up, plus any wait for the shared conversation queue; see below), `t_first_token_ms` (first agent output), `t_first_speech_ms` (first
 agent speech frame written to the socket; automatic "Got it" acknowledgments are
 not counted), `t_last_speech_ms` (frame with `last:true` written), `tool_ms`
 (sum reported through `SpeechSender::note_tool_time`; null when nothing was
 reported), plus `provider` (`fast`|`native`, currently always `native`),
 `outcome` and the build's Git commit SHA. A turn is recorded when the next
 prompt arrives, on interruption, or when the connection ends, so a finished
-answer that the owner talks over is stored as `interrupted`; a turn still pending
+answer that the owner talks over is stored as `interrupted` (a backchannel that
+resumes the answer is not an interruption, see #1550 above); a turn still pending
 when the socket closes is stored as `failed`. The record contains no speech text,
 numbers or identifiers beyond `call_id`/`turn_id`.
 

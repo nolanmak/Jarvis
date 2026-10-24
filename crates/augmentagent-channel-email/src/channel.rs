@@ -38,6 +38,12 @@ use crate::gmail::{extract_bare_email, split_recipients, GmailApi};
 use crate::outbound::parse_rfc2822_or_ms;
 use crate::sigextract::{is_cc_only_bystander, is_event_blast, is_human_sender, is_meeting_invite};
 
+/// Default inbound poll cadence. Was 120s; raised to 300s in the Composio
+/// call-volume cleanup — with the per-account `after:` cursor a tick is
+/// cheap, but every tick still costs one fetch per connected mailbox, and
+/// five minutes is well inside the triage SLA.
+pub const DEFAULT_POLL_SECS: u64 = 300;
+
 #[derive(Clone, Debug)]
 pub struct GmailChannelConfig {
     pub poll_interval: Duration,
@@ -68,7 +74,7 @@ pub struct GmailChannelConfig {
 impl Default for GmailChannelConfig {
     fn default() -> Self {
         Self {
-            poll_interval: Duration::from_secs(120),
+            poll_interval: Duration::from_secs(DEFAULT_POLL_SECS),
             per_account_limit: 100,
             skill_dir: PathBuf::from("skills/email-triage"),
             dry_run: true,
@@ -349,9 +355,13 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         let learned = skill.load_learned();
 
         for account in accounts {
+            let since_ms = self
+                .store
+                .gmail_inbound_cursor_ms(&account.entity_id)
+                .unwrap_or(None);
             match self
                 .gmail
-                .fetch_unread(&account.entity_id, self.config.per_account_limit)
+                .fetch_unread_since(&account.entity_id, since_ms, self.config.per_account_limit)
                 .await
             {
                 Ok(emails) => {

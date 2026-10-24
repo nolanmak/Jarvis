@@ -81,7 +81,7 @@ STUB
 
 run_updater() {
   ( cd "$TMP/work" \
-    && PATH="$TMP/bin:$PATH" XDG_STATE_HOME="$TMP/state" HOME="$TMP" BOUNCES="$1" \
+    && PATH="$TMP/bin:$PATH" XDG_STATE_HOME="$TMP/state" HOME="$TMP" AUGMENTAGENT_PROC_ROOT="$TMP/proc" BOUNCES="$1" \
        ./scripts/check-for-updates.sh >/dev/null 2>&1 )
 }
 

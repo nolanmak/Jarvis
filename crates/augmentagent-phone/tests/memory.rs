@@ -547,3 +547,143 @@ async fn profile_listing_is_bounded_in_bytes() {
     assert!(listed.contains("more not shown"), "{listed}");
     assert!(listed.contains("profile forget <key>"));
 }
+
+// ---------- #1557 end_call surfaces and relay-ended handoffData ----------
+
+// TDD 5 / AC5: end_call is a fast-layer tool only. The summarization job and
+// the native phone MCP surface (with or without speech) never expose it.
+#[test]
+fn end_call_is_absent_from_summary_and_native_tool_sets() {
+    assert!(memory::FORBIDDEN_SUMMARY_TOOLS.contains(&"end_call"));
+    assert!(!memory::SUMMARY_TOOLS.contains(&"end_call"));
+    assert!(!SummaryRequest::new()
+        .allowed_tools
+        .iter()
+        .any(|t| t.contains("end_call")));
+    for speech in [false, true] {
+        let names: std::collections::BTreeSet<String> = augmentagent_phone::tools::schemas(speech)
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(!names.contains("end_call"), "speech={speech}: {names:?}");
+        assert!(!names.iter().any(|n| n.contains("end_call")));
+    }
+    assert!(augmentagent_phone::fast::TOOL_NAMES.contains(&"end_call"));
+}
+
+#[derive(Clone, Default)]
+struct Logs(Arc<Mutex<Vec<u8>>>);
+impl std::io::Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+    type Writer = Logs;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+fn relay_ended_with(f: &Fixture, id: &str, handoff: Option<&str>) -> String {
+    let auth = WebhookAuth::new("AC-test", "secret");
+    let mut fields = vec![
+        ("AccountSid".to_string(), "AC-test".to_string()),
+        ("CallSid".into(), sid(f, id)),
+        ("SessionStatus".into(), "completed".into()),
+    ];
+    if let Some(handoff) = handoff {
+        fields.push(("HandoffData".into(), handoff.into()));
+    }
+    let sig = signed(
+        "secret",
+        &format!("https://phone.example.test/phone/relay-ended/{id}"),
+        &fields,
+    );
+    let twiml = f
+        .service
+        .relay_ended_callback(&auth, id, &fields, &sig)
+        .unwrap();
+    // Free the owner's single active-call slot for the next case.
+    status_completed(f, id);
+    twiml
+}
+
+// relay-ended persists the reason from a well-formed handoffData once; a call
+// that ended without one records nothing; a replay cannot change it.
+#[tokio::test]
+async fn relay_ended_persists_the_handoff_reason_once() {
+    let f = fixture();
+    let quiet = relayed_call(&f, "quiet").await;
+    relay_ended_with(&f, &quiet, None);
+    assert_eq!(f.store.phone_end_reason(&quiet).unwrap(), None);
+    let mut ids = Vec::new();
+    for reason in ["owner_goodbye", "task_complete", "owner_request"] {
+        f.clock.0.fetch_add(86_400_000, Ordering::SeqCst);
+        let id = relayed_call(&f, reason).await;
+        let data = json!({"reason": reason, "call_id": id}).to_string();
+        assert!(relay_ended_with(&f, &id, Some(&data)).contains("<Hangup/>"));
+        assert_eq!(f.store.phone_end_reason(&id).unwrap().as_deref(), Some(reason));
+        ids.push(id);
+    }
+    // Replay with a different reason: first write wins.
+    let replay = json!({"reason":"task_complete","call_id": ids[0]}).to_string();
+    relay_ended_with(&f, &ids[0], Some(&replay));
+    assert_eq!(
+        f.store.phone_end_reason(&ids[0]).unwrap().as_deref(),
+        Some("owner_goodbye")
+    );
+    assert!(f.store.phone_record_end_reason(&ids[0], "made_up", 0).is_err());
+}
+
+// TDD 6 / AC5: malformed handoffData never panics, is stored as
+// relay_ended_unknown, and its raw content is never logged.
+#[tokio::test]
+async fn relay_ended_with_malformed_handoff_is_categorized_without_the_payload() {
+    let logs = Logs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let f = fixture();
+    let mut ids = Vec::new();
+    let other_call = "00000000-0000-4000-8000-000000000000";
+    for (n, data) in [
+        "not json raw-handoff-marker".to_string(),
+        r#"{"reason":"raw-handoff-marker","call_id":"x"}"#.to_string(),
+        json!({"reason":"owner_goodbye"}).to_string(),
+        json!({"reason":"owner_goodbye","call_id": other_call,"note":"raw-handoff-marker"}).to_string(),
+        "[\"raw-handoff-marker\"]".to_string(),
+        "".to_string(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        f.clock.0.fetch_add(86_400_000, Ordering::SeqCst);
+        let id = relayed_call(&f, &format!("bad-{n}")).await;
+        assert!(relay_ended_with(&f, &id, Some(&data)).contains("<Hangup/>"));
+        assert_eq!(
+            f.store.phone_end_reason(&id).unwrap().as_deref(),
+            Some("relay_ended_unknown"),
+            "case {n}"
+        );
+        ids.push(id);
+    }
+    // A handoff naming another call is not trusted for this one.
+    let foreign = json!({"reason":"task_complete","call_id": other_call}).to_string();
+    f.clock.0.fetch_add(86_400_000, Ordering::SeqCst);
+    let fresh = relayed_call(&f, "foreign").await;
+    relay_ended_with(&f, &fresh, Some(&foreign));
+    assert_eq!(
+        f.store.phone_end_reason(&fresh).unwrap().as_deref(),
+        Some("relay_ended_unknown")
+    );
+    let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(text.contains("handoff_data_invalid"), "categorized: {text}");
+    assert!(!text.contains("raw-handoff-marker"), "{text}");
+}
