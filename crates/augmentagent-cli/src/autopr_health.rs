@@ -18,6 +18,7 @@
 //! | `red-main-stuck` | 2026-09-07: red verdict held behind a gave-up issue  |
 //! | `refusal-loop`   | 2026-09-13/14: PR #987 re-refused daily on Cargo.lock|
 //! | `updater-stalled`| 2026-09-14: diverged checkout, updater quietly stopped|
+//! | `deploy-pinned`  | 2026-10-20→24: a drop-in pinned the unit to a frozen binary; 4 days of merges never ran (#1571) |
 //! | `no-progress`    | the catch-all: nothing merged in N days             |
 //! | `draft-stale`    | a draft nobody will ever finish                     |
 //! | `review-held`    | #1037: a draft held, unbilled, waiting on a reviewer (was billed daily) |
@@ -85,6 +86,13 @@ pub struct HealthInputs {
     /// How long the deployed build has been behind `origin/main`, measured
     /// from that commit's own timestamp.
     pub deploy_lag_mins: Option<i64>,
+    /// #1571 — `(what the unit's main process is executing, what the updater
+    /// builds)`, both resolved. `None` when either cannot be read (launchd,
+    /// no `/proc`, unit down): absence never fires the rule.
+    pub running_binary: Option<(PathBuf, PathBuf)>,
+    /// #1571 — the drop-ins on the unit that override `ExecStart`, for the
+    /// fix text. An `Environment=` drop-in is legitimate and is not listed.
+    pub unit_dropins: Vec<String>,
     pub free_gb_root: Option<f64>,
     pub free_gb_gate: Option<f64>,
     /// #1409 — every OTHER filesystem that holds build output or state
@@ -329,7 +337,35 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         }
     }
 
-    if i.deployed_is_current == Some(false) {
+    // #1571 — the unit is not running what the updater builds. A systemd
+    // drop-in that overrides ExecStart turns every deploy into a verified
+    // bounce back onto the old binary; the stamp is withheld, so this also
+    // EXPLAINS `updater-stalled` and must not be reported next to it.
+    let pinned = i.running_binary.as_ref().filter(|(running, built)| running != built);
+    if let Some((running, built)) = pinned {
+        let overrides = if i.unit_dropins.is_empty() {
+            "no drop-in is listed, so check the unit's ExecStart and its launcher".to_string()
+        } else {
+            format!("retire {}", i.unit_dropins.join(", "))
+        };
+        out.push(Finding {
+            severity: Severity::Alert,
+            code: "deploy-pinned",
+            detail: format!(
+                "augmentagent.service is executing {} instead of the binary the updater \
+                 builds ({}); every merge since is built and never run",
+                running.display(),
+                built.display()
+            ),
+            fix: format!(
+                "{overrides}, then `systemctl --user daemon-reload && systemctl --user \
+                 restart augmentagent.service`, and confirm /proc/<MainPID>/exe is the \
+                 target/release binary (#1571)."
+            ),
+        });
+    }
+
+    if i.deployed_is_current == Some(false) && pinned.is_none() {
         if let Some(lag) = i.deploy_lag_mins.filter(|l| *l >= t.deploy_lag_mins) {
             out.push(Finding {
                 severity: Severity::Alert,
@@ -772,6 +808,65 @@ fn last_merge(repo_root: &Path) -> Option<DateTime<Utc>> {
         .map(|d| d.with_timezone(&Utc))
 }
 
+/// #1571 — a binary rebuilt under a running process reads as
+/// `/path (deleted)`; that is a pending restart, not a different binary.
+fn strip_deleted(exe: PathBuf) -> PathBuf {
+    let s = exe.to_string_lossy();
+    match s.strip_suffix(" (deleted)") {
+        Some(base) => PathBuf::from(base),
+        None => exe,
+    }
+}
+
+/// #1571 — the drop-ins among `paths` that override `ExecStart`. Only those
+/// are worth naming: an `Environment=` drop-in is legitimate configuration.
+fn exec_override_dropins(paths: &str) -> Vec<String> {
+    paths
+        .split_whitespace()
+        .filter(|p| {
+            std::fs::read_to_string(p)
+                .map(|body| body.lines().any(|l| l.trim_start().starts_with("ExecStart=")))
+                .unwrap_or(false)
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// #1571 — what `augmentagent.service` is executing versus what the updater
+/// builds, plus the drop-ins that override its `ExecStart`. The expected
+/// binary is resolved against the UNIT's working directory (the deploy
+/// checkout), not the caller's: `autopr-health` run from a worktree with its
+/// own build must not call the deploy pinned. systemd + `/proc` only;
+/// anything unreadable is `None`, never a finding.
+fn running_binary(repo_root: &Path) -> (Option<(PathBuf, PathBuf)>, Vec<String>) {
+    if crate::platform::ServiceManager::detect().is_launchd() {
+        return (None, Vec::new());
+    }
+    let show = |prop: &str| {
+        std::process::Command::new("systemctl")
+            .args(["--user", "show", "augmentagent.service", "-p", prop, "--value"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let dropins = show("DropInPaths")
+        .map(|s| exec_override_dropins(&s))
+        .unwrap_or_default();
+    let pair = (|| {
+        let pid: u32 = show("MainPID")?.parse().ok().filter(|p| *p > 0)?;
+        let running = strip_deleted(std::fs::read_link(format!("/proc/{pid}/exe")).ok()?);
+        let deploy_root = show("WorkingDirectory")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| repo_root.to_path_buf());
+        let built = deploy_root.join("target/release/augmentagent").canonicalize().ok()?;
+        Some((running, built))
+    })();
+    (pair, dropins)
+}
+
 /// Gather everything the rules need from this box.
 pub fn collect(repo_root: &Path) -> HealthInputs {
     let now = Utc::now();
@@ -789,6 +884,7 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
         });
 
     let deploy = deploy_state(repo_root, &dir);
+    let (running_binary, unit_dropins) = running_binary(repo_root);
     // #1409 — everything beyond `/` and the gate cache, de-duplicated by
     // mount, plus how fast each is shrinking since the last check.
     let filesystems = crate::disk::read_filesystems(repo_root);
@@ -817,6 +913,8 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
         last_merge: last_merge(repo_root),
         deployed_is_current: deploy.0,
         deploy_lag_mins: deploy.1,
+        running_binary,
+        unit_dropins,
         free_gb_root: free_gb(Path::new("/")),
         free_gb_elsewhere,
         disk_drops,
@@ -956,6 +1054,8 @@ mod tests {
             last_merge: Some(t0() - Duration::hours(20)),
             deployed_is_current: Some(true),
             deploy_lag_mins: Some(0),
+            running_binary: None,
+            unit_dropins: vec![],
             free_gb_root: Some(70.0),
             free_gb_gate: Some(53.0),
             free_gb_elsewhere: vec![("the debug target".into(), 51.0)],
@@ -1134,6 +1234,80 @@ mod tests {
             ..healthy()
         };
         assert!(analyze(&unknown, &Thresholds::default()).is_empty());
+    }
+
+    /// 2026-10-20 → 10-24 (#1571): a phone-rollout drop-in replaced ExecStart
+    /// with a wrapper exec'ing a frozen copy of the daemon. The updater
+    /// rebuilt and verifiably bounced the unit on every merge for four days
+    /// and the unit came back on the copy each time.
+    #[test]
+    fn catches_a_unit_pinned_to_a_binary_the_updater_did_not_build() {
+        let frozen = PathBuf::from("/state/phone-rollout-673e7311/augmentagent");
+        let built = PathBuf::from("/repo/target/release/augmentagent");
+        let i = HealthInputs {
+            running_binary: Some((frozen.clone(), built.clone())),
+            unit_dropins: vec!["/u/augmentagent.service.d/phone-rollout.conf".into()],
+            // The stamp was withheld for four days: exactly the stall shape.
+            deployed_is_current: Some(false),
+            deploy_lag_mins: Some(4 * 24 * 60),
+            ..healthy()
+        };
+        let f = analyze(&i, &Thresholds::default());
+        assert_eq!(codes(&f), vec!["deploy-pinned"], "the pin explains the stall; no pile-on");
+        assert_eq!(f[0].severity, Severity::Alert);
+        assert!(f[0].detail.contains(&frozen.display().to_string()), "{:?}", f[0]);
+        assert!(f[0].detail.contains(&built.display().to_string()), "{:?}", f[0]);
+        assert!(f[0].fix.contains("phone-rollout.conf"), "names the drop-in: {:?}", f[0]);
+        assert!(f[0].fix.contains("daemon-reload"), "{:?}", f[0]);
+
+        // Pinned by something other than a drop-in (an edited unit, a
+        // launcher that execs elsewhere): still an alert, fix says where to look.
+        let bare = HealthInputs {
+            running_binary: Some((frozen.clone(), built.clone())),
+            ..healthy()
+        };
+        let f = analyze(&bare, &Thresholds::default());
+        assert_eq!(codes(&f), vec!["deploy-pinned"]);
+        assert!(f[0].fix.contains("ExecStart"), "{:?}", f[0]);
+
+        // The same binary on both sides is the healthy case, and a stall
+        // without a pin is still reported as the updater's.
+        let same = HealthInputs {
+            running_binary: Some((built.clone(), built.clone())),
+            ..healthy()
+        };
+        assert!(analyze(&same, &Thresholds::default()).is_empty());
+        let stalled = HealthInputs {
+            running_binary: Some((built.clone(), built)),
+            deployed_is_current: Some(false),
+            deploy_lag_mins: Some(6 * 60),
+            ..healthy()
+        };
+        assert_eq!(codes(&analyze(&stalled, &Thresholds::default())), vec!["updater-stalled"]);
+    }
+
+    #[test]
+    fn only_dropins_that_override_execstart_are_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = dir.path().join("10-discord.conf");
+        let pin = dir.path().join("phone-rollout.conf");
+        std::fs::write(&env, "[Service]\nEnvironment=AUGMENTAGENT_DISCORD_CREDS=/x\n").unwrap();
+        std::fs::write(&pin, "[Service]\nExecStart=\nExecStart=/frozen/run-phone.sh\n").unwrap();
+        let listed = format!("{} {} {}", env.display(), pin.display(), dir.path().join("gone.conf").display());
+        assert_eq!(exec_override_dropins(&listed), vec![pin.display().to_string()]);
+        assert!(exec_override_dropins("").is_empty());
+    }
+
+    #[test]
+    fn a_binary_replaced_on_disk_is_a_pending_restart_not_a_pin() {
+        assert_eq!(
+            strip_deleted(PathBuf::from("/repo/target/release/augmentagent (deleted)")),
+            PathBuf::from("/repo/target/release/augmentagent")
+        );
+        assert_eq!(
+            strip_deleted(PathBuf::from("/repo/target/release/augmentagent")),
+            PathBuf::from("/repo/target/release/augmentagent")
+        );
     }
 
     #[test]
