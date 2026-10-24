@@ -145,6 +145,7 @@ pub async fn cleanup_without_runtime(
             owner_first_name: None,
             debug_events: false,
             fast: None,
+            proposals: crate::proposals::ProposalPolicy::default(),
         },
     ));
     let initial = service.cleanup_due(true)?;
@@ -153,11 +154,13 @@ pub async fn cleanup_without_runtime(
     watchdog(service, initial, stop).await
 }
 
-/// How often the post-call summary queue (#1552) is checked.
+/// How often the post-call summary queue (#1552) and due call proposals
+/// (#1553; delivered within seconds of quiet hours ending) are checked.
 const MEMORY_INTERVAL: Duration = Duration::from_secs(5);
-/// Drain durable post-call summary jobs. Failures are retried by the store's
-/// bounded lease and never stop the runtime; shutdown drops an in-flight run,
-/// whose lease then expires and replays it after restart.
+/// Drain durable post-call summary jobs and post due call proposals. Failures
+/// are retried by the store's bounded lease and never stop the runtime;
+/// shutdown drops an in-flight run, whose lease then expires and replays it
+/// after restart. Proposal delivery never dials.
 async fn memory_worker(
     service: Arc<PhoneService>,
     agent: Arc<dyn ConversationAgent>,
@@ -175,6 +178,14 @@ async fn memory_worker(
             result = service.run_call_summaries(agent.as_ref()) => {
                 if result.is_err() {
                     tracing::warn!(target: "phone.memory", "phone call summary queue could not be read; retrying");
+                }
+            }
+        }
+        tokio::select! {
+            _ = stop.cancelled() => return Ok(()),
+            result = service.deliver_call_proposals(agent.as_ref()) => {
+                if result.is_err() {
+                    tracing::warn!(target: "phone.proposals", "call proposals could not be read; retrying");
                 }
             }
         }

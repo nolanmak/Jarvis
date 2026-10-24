@@ -3655,13 +3655,22 @@ async fn main() -> Result<()> {
                 let suppression = std::sync::Arc::new(
                     augmentagent_proactive::TableSuppression::new(Arc::clone(&store)),
                 );
-                let runner = augmentagent_proactive::runner::ProactiveRunner::new(
+                let mut runner = augmentagent_proactive::runner::ProactiveRunner::new(
                     Arc::clone(&store),
                     Arc::clone(&broker),
                     wiki_root,
                     augmentagent_proactive::rules::default_scans(),
                 )
                 .with_suppression(suppression);
+                // #1553 — opt-in: dispatched follow-ups may become a call
+                // proposal in the owner's private chat. Only the owner's
+                // `yes` there dials.
+                if std::env::var("AUGMENTAGENT_PHONE_PROPOSE_CALLS").as_deref() == Ok("1") {
+                    match phone.as_ref().and_then(|e| phone_runtime::PhoneCallProposer::new(e.service.clone())) {
+                        Some(proposer) => runner = runner.with_call_proposer(Arc::new(proposer)),
+                        None => warn!("AUGMENTAGENT_PHONE_PROPOSE_CALLS=1 ignored: phone calling is not running for a single owner"),
+                    }
+                }
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { runner.run(sd).await }));
             } else {

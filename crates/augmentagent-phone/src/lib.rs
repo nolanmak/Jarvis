@@ -130,6 +130,7 @@ pub struct PhoneConfig {
     owner_first_name: Option<String>,
     debug_events: bool,
     fast: Option<fast::FastLayerConfig>,
+    proposals: proposals::ProposalPolicy,
 }
 impl PhoneConfig {
     pub fn new(
@@ -170,7 +171,13 @@ impl PhoneConfig {
             owner_first_name: None,
             debug_events: false,
             fast: None,
+            proposals: proposals::ProposalPolicy::default(),
         })
+    }
+    /// Quiet hours and owner time zone for agent-proposed calls (#1553).
+    pub fn with_proposals(mut self, proposals: proposals::ProposalPolicy) -> Self {
+        self.proposals = proposals;
+        self
     }
     /// Operator-validated speech providers. Only startup configuration may call this.
     pub fn with_voice(mut self, voice: voice::VoiceConfig) -> Self {
@@ -211,6 +218,13 @@ pub struct PhoneService {
     config: PhoneConfig,
     stopping: std::sync::atomic::AtomicBool,
     cleanup_inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Whether this service holds an open call-proposal answer window (#1553).
+    consent_window: std::sync::atomic::AtomicBool,
+}
+impl Drop for PhoneService {
+    fn drop(&mut self) {
+        self.set_consent_window(false);
+    }
 }
 impl PhoneService {
     pub fn new(
@@ -226,6 +240,7 @@ impl PhoneService {
             config,
             stopping: std::sync::atomic::AtomicBool::new(false),
             cleanup_inflight: Arc::new(std::sync::Mutex::new(Default::default())),
+            consent_window: std::sync::atomic::AtomicBool::new(false),
         }
     }
     /// Explicit operator-configured identities, for installing transport adapters
@@ -736,3 +751,5 @@ pub mod metrics;
 pub mod fast;
 
 pub mod memory;
+
+pub mod proposals;

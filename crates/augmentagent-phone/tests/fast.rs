@@ -110,6 +110,7 @@ struct FakeBackend {
     lookup_delay: Mutex<Duration>,
     on_dispatch: Mutex<Option<DispatchHook>>,
     chat_summary: String,
+    agenda: Option<String>,
 }
 #[async_trait]
 impl FastBackend for FakeBackend {
@@ -125,6 +126,7 @@ impl FastBackend for FakeBackend {
         Ok(FastContext {
             owner_profile: None,
             chat_summary: self.chat_summary.clone(),
+            agenda: self.agenda.clone(),
         })
     }
     async fn mirror(&self, _: &PhoneCall, key: &str, text: &str) -> Result<(), AgentError> {
@@ -1222,4 +1224,32 @@ async fn ac11_thinking_sound_frame_is_preemptible_and_sent_once() {
     assert_eq!(frames[0]["type"], "play");
     assert_eq!(spoken(&frames), "Dentist at nine.");
     live.server.abort();
+}
+
+// #1553 AC5: an accepted proposal's agenda is in the first turn's prompt,
+// with the instruction to open with it.
+#[tokio::test]
+async fn proposal_agenda_is_in_the_first_turn_prompt() {
+    let model = ScriptedModel::new(vec![vec![Step::Token("I called about the venue.")]]);
+    let backend = Arc::new(FakeBackend {
+        agenda: Some("Reason: Two follow-ups are due\n- Reply to the venue\n- Confirm Friday dinner".into()),
+        ..Default::default()
+    });
+    let fast = agent(model.clone(), backend, FastLayerConfig::default());
+    let mut relay = Relay::new();
+    let (turn_id, speech) = relay.turn("hey");
+    fast.answer(&call(), &turn_id, "hey", speech, CancellationToken::new())
+        .await
+        .unwrap();
+    let system = model.requests()[0].system.clone();
+    assert!(system.contains(augmentagent_phone::proposals::AGENDA_INSTRUCTION), "{system}");
+    assert!(system.contains("- Reply to the venue\n- Confirm Friday dinner"), "{system}");
+    // Without a proposal there is no agenda section.
+    let plain = ScriptedModel::new(vec![vec![Step::Token("Hi.")]]);
+    let fast = agent(plain.clone(), Arc::new(FakeBackend::default()), FastLayerConfig::default());
+    let (turn_id, speech) = relay.turn("hey");
+    fast.answer(&call(), &turn_id, "hey", speech, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(!plain.requests()[0].system.contains("Agenda"));
 }

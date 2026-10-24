@@ -56,6 +56,17 @@ pub trait ConversationAgent: Send + Sync {
     ) -> Result<crate::memory::SummaryDraft, AgentError> {
         Err(AgentError)
     }
+    /// Post an owner notice (#1553: a call proposal) to `origin`'s chat
+    /// through the adapter's durable, idempotent outbox under `key`. Adapters
+    /// without an outbox leave the default and nothing is posted.
+    async fn notify_owner(
+        &self,
+        _origin: &augmentagent_store::phone::PhoneOrigin,
+        _key: &str,
+        _text: &str,
+    ) -> Result<(), AgentError> {
+        Err(AgentError)
+    }
 }
 /// One queued speech item for the relay loop. `Utterance` carries an
 /// agent-identified receipt (MCP `speak`); `Token` is one streamed chunk,

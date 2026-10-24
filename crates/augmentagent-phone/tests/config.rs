@@ -336,3 +336,28 @@ fn thinking_sound_url_must_be_on_the_operator_origin() {
         assert!(load(bad).is_err(), "{bad}");
     }
 }
+
+// #1553: quiet hours for agent-proposed calls are explicit and fail closed.
+#[test]
+fn proposal_quiet_hours_and_time_zone_fail_closed_on_junk() {
+    for (key, value) in [
+        ("AUGMENTAGENT_PHONE_QUIET_HOURS", "22:00-08:00"),
+        ("AUGMENTAGENT_PHONE_QUIET_HOURS", "off"),
+        ("AUGMENTAGENT_PHONE_QUIET_HOURS", "21:30-07:15"),
+        ("AUGMENTAGENT_TIMEZONE", "America/New_York"),
+    ] {
+        let mut env = values();
+        env.insert(key, value.into());
+        assert!(Settings::from_lookup(|k| env.get(k).cloned()).is_ok(), "{key}={value}");
+    }
+    for (key, value) in [
+        ("AUGMENTAGENT_PHONE_QUIET_HOURS", "nightly"),
+        ("AUGMENTAGENT_PHONE_QUIET_HOURS", "22:00-22:00"),
+        ("AUGMENTAGENT_PHONE_QUIET_HOURS", "24:00-08:00"),
+        ("AUGMENTAGENT_TIMEZONE", "Mars/Base"),
+    ] {
+        let mut env = values();
+        env.insert(key, value.into());
+        assert!(Settings::from_lookup(|k| env.get(k).cloned()).is_err(), "{key}={value}");
+    }
+}

@@ -21,6 +21,7 @@ use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::call_proposal::{CallProposal, CallProposer};
 use crate::scan::{ProactiveSignal, ScanCtx, ScheduledScan, Urgency};
 use crate::store_ext::{now_ms, ProactiveGateStore, ProactiveStore};
 
@@ -55,6 +56,9 @@ pub struct ProactiveRunner {
     require_opt_in: bool,
     /// #57 — max heads-up cards dispatched per rolling 24h. 0 = unlimited.
     daily_dispatch_cap: i64,
+    /// #1553 — optional: turn a pass's dispatched follow-ups into one call
+    /// proposal. The proposer only asks the owner; it cannot dial.
+    call_proposer: Option<Arc<dyn CallProposer>>,
 }
 
 /// Outcome of a single full scan pass — surfaced by the CLI `scan-once`.
@@ -64,6 +68,8 @@ pub struct ScanReport {
     pub persisted: usize,
     pub dispatched: usize,
     pub suppressed: usize,
+    /// #1553 — a call proposal was accepted by the proposer this pass.
+    pub call_proposed: bool,
 }
 
 impl ProactiveRunner {
@@ -82,7 +88,14 @@ impl ProactiveRunner {
             tick: DEFAULT_TICK,
             require_opt_in: true,
             daily_dispatch_cap: 5,
+            call_proposer: None,
         }
+    }
+
+    /// #1553 — propose a call covering each pass's dispatched follow-ups.
+    pub fn with_call_proposer(mut self, proposer: Arc<dyn CallProposer>) -> Self {
+        self.call_proposer = Some(proposer);
+        self
     }
 
     /// Override the opt-in requirement (tests / `scan-once --force`).
@@ -126,6 +139,7 @@ impl ProactiveRunner {
             (self.daily_dispatch_cap - dispatched_today).max(0)
         };
 
+        let mut headlines = Vec::new();
         for scan in &self.scans {
             let ctx = ScanCtx::new(Arc::clone(&self.store), self.wiki_root.clone(), now);
             let signals = match scan.scan(&ctx).await {
@@ -180,6 +194,21 @@ impl ProactiveRunner {
                 let _ = self.store.mark_signal_dispatched(&id, now);
                 report.dispatched += 1;
                 budget -= 1;
+                headlines.push(sig.headline.clone());
+            }
+        }
+
+        // #1553 — one question per pass; the phone service applies quiet
+        // hours and rate limits, so a refusal here is routine.
+        if let (Some(proposer), Some(proposal)) =
+            (&self.call_proposer, CallProposal::from_headlines(&headlines))
+        {
+            match proposer.propose_call(proposal).await {
+                Ok(outcome) => {
+                    report.call_proposed = true;
+                    info!(deferred = outcome.deferred, "proactive: call proposed");
+                }
+                Err(e) => debug!("proactive: call not proposed: {e}"),
             }
         }
 
@@ -337,5 +366,65 @@ mod tests {
         assert!(r.emitted >= 1);
         assert_eq!(r.persisted, 0);
         assert!(r.suppressed >= 1);
+    }
+
+    // #1553: dispatched follow-ups may become one call proposal. The runner
+    // only asks; the phone service decides delivery and never dials here.
+    #[derive(Default)]
+    struct SpyProposer(std::sync::Mutex<Vec<crate::call_proposal::CallProposal>>);
+    #[async_trait]
+    impl crate::call_proposal::CallProposer for SpyProposer {
+        async fn propose_call(
+            &self,
+            proposal: crate::call_proposal::CallProposal,
+        ) -> Result<crate::call_proposal::ProposalOutcome, crate::call_proposal::ProposalError> {
+            self.0.lock().unwrap().push(proposal);
+            Ok(crate::call_proposal::ProposalOutcome { deliver_at_ms: 0, deferred: false })
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatched_signals_become_one_call_proposal() {
+        let (_dbd, store) = crate::testutil::test_store();
+        let (_wd, root) = seed_wiki();
+        let proposer = Arc::new(SpyProposer::default());
+        let runner = ProactiveRunner::new(Arc::clone(&store), Arc::new(NoopBroker), root, default_scans())
+            .with_opt_in_required(false)
+            .with_call_proposer(proposer.clone());
+        let r1 = runner.run_once(true).await;
+        assert!(r1.dispatched >= 1);
+        assert!(r1.call_proposed);
+        {
+            let proposals = proposer.0.lock().unwrap();
+            assert_eq!(proposals.len(), 1);
+            assert!(!proposals[0].agenda.is_empty() && proposals[0].agenda.len() <= 5);
+            assert!(proposals[0].agenda.iter().any(|item| item.contains("Jane")), "{:?}", proposals[0].agenda);
+        }
+        // Nothing new dispatched: no new proposal.
+        let r2 = runner.run_once(true).await;
+        assert!(!r2.call_proposed);
+        assert_eq!(proposer.0.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dry_run_and_unconfigured_runners_never_propose() {
+        let (_dbd, store) = crate::testutil::test_store();
+        let (_wd, root) = seed_wiki();
+        let proposer = Arc::new(SpyProposer::default());
+        let runner = ProactiveRunner::new(store, Arc::new(NoopBroker), root, default_scans())
+            .with_opt_in_required(false)
+            .with_call_proposer(proposer.clone());
+        assert!(!runner.run_once(false).await.call_proposed);
+        assert!(proposer.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn agenda_is_bounded_to_five_single_line_items() {
+        let headlines: Vec<String> = (1..=8).map(|n| format!("Item {n}\nsecond line")).collect();
+        let proposal = crate::call_proposal::CallProposal::from_headlines(&headlines).unwrap();
+        assert_eq!(proposal.agenda.len(), 5);
+        assert_eq!(proposal.agenda[0], "Item 1 second line");
+        assert_eq!(proposal.reason, "8 follow-ups need your attention");
+        assert!(crate::call_proposal::CallProposal::from_headlines(&[]).is_none());
     }
 }

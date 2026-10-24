@@ -2,6 +2,7 @@
 //! sqlite, emit `ProactiveSignal`s, and the runner persists + dispatches them
 //! through the existing `ApprovalBroker`. See issue #81.
 
+pub mod call_proposal;
 pub mod drafts;
 pub mod person;
 pub mod rules;

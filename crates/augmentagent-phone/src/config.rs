@@ -96,7 +96,8 @@ impl Settings {
         )?
         .with_voice(voice.clone())
         .with_debug_events(debug_events)
-        .with_fast_layer(fast);
+        .with_fast_layer(fast)
+        .with_proposals(crate::proposals::ProposalPolicy::from_lookup(&get)?);
         let account = required("TWILIO_ACCOUNT_SID")?;
         let token = required("TWILIO_AUTH_TOKEN")?;
         let provider = Arc::new(TwilioClient::new(

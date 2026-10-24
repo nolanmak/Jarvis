@@ -91,4 +91,22 @@ impl ConversationAgent for AgentRouter {
     ) -> Result<crate::memory::SummaryDraft, AgentError> {
         self.adapter(call)?.summarize_call(call, request).await
     }
+    async fn notify_owner(
+        &self,
+        origin: &augmentagent_store::phone::PhoneOrigin,
+        key: &str,
+        text: &str,
+    ) -> Result<(), AgentError> {
+        if origin.owner.account() != origin.conversation.account() {
+            return Err(AgentError);
+        }
+        let adapter = self
+            .adapters
+            .read()
+            .map_err(|_| AgentError)?
+            .get(origin.owner.account().platform().as_str())
+            .cloned()
+            .ok_or(AgentError)?;
+        adapter.notify_owner(origin, key, text).await
+    }
 }
