@@ -1927,6 +1927,13 @@ fn lock_opened_prs(lock_path: &Path) -> Option<std::fs::File> {
 /// both be here at once. Without the flock, two read-modify-write cycles drop
 /// one lane's record, and a missing head-bound verdict stalls the merge sweep
 /// for that PR forever.
+///
+/// The only writer of the map: the build lane (after publishing) and the resume
+/// lane (after recording a verdict) both come through here, and nothing else
+/// serializes it — `the_locking_recorder_is_the_codebases_only_writer_of_the_map`
+/// fails if a new one appears. Readers go through `read_opened_prs`, whose
+/// outcomes are unchanged (only its warnings are new); the approval predicates
+/// above and both call sites' arguments are untouched.
 fn record_opened_pr(
     path: &Path,
     issue: u64,
@@ -1996,6 +2003,9 @@ fn read_opened_prs(path: &Path) -> std::collections::BTreeMap<String, OpenedPr> 
             return Default::default();
         }
     };
+    // A damaged map reads as empty, exactly as it did before #1533: serde
+    // decodes the object as a whole, so there are no per-record survivors to
+    // salvage, and the next pass re-records what each lane still owns.
     match serde_json::from_slice(&bytes) {
         Ok(map) => map,
         Err(e) => {
@@ -14903,6 +14913,19 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             .map(|i| body_start + i)
             .expect("the serialize")];
         assert!(body.contains("lock_opened_prs("), "the writer locks before it reads");
+
+        // And the call-site inventory Codex asked for: the build lane and the
+        // resume lane, nothing else.
+        assert_eq!(
+            production.matches("record_opened_pr(&opened_prs_path()").count(),
+            2,
+            "the recorder's production call sites are the build and resume lanes"
+        );
+        assert_eq!(
+            production.matches("record_opened_pr(").count(),
+            3,
+            "an extra reference to the recorder: declaration plus the two lanes"
+        );
     }
 
     /// Codex: an extraction that is supposed to change nothing has to change
