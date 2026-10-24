@@ -244,3 +244,95 @@ fn debug_events_flag_is_explicit_and_fails_closed_on_junk() {
         .unwrap();
     assert_eq!(configured.service.debug_events(), cfg!(debug_assertions));
 }
+
+// #1546: the fast layer is off unless explicitly enabled; its settings are
+// validated at load and fail closed.
+#[test]
+fn fast_layer_flags_default_off_and_fail_closed_on_junk() {
+    use augmentagent_phone::fast::{FastLayerConfig, FastProvider};
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        std::sync::Arc::new(augmentagent_store::Store::open(dir.path().join("db")).unwrap());
+    let load = |pairs: &[(&'static str, &str)]| {
+        let mut env = values();
+        for (k, v) in pairs {
+            env.insert(k, (*v).into());
+        }
+        Settings::from_lookup(|k| env.get(k).cloned())
+    };
+    let fast = |pairs: &[(&'static str, &str)]| {
+        load(pairs)
+            .unwrap()
+            .unwrap()
+            .build(store.clone())
+            .unwrap()
+            .service
+            .fast_layer()
+            .cloned()
+    };
+    assert_eq!(fast(&[]), None);
+    assert_eq!(fast(&[("AUGMENTAGENT_PHONE_FAST_LAYER", "0")]), None);
+    // Settings for a disabled layer are ignored, not half-applied.
+    assert_eq!(
+        fast(&[("AUGMENTAGENT_PHONE_FAST_PROVIDER", "cerebras")]),
+        None
+    );
+    assert_eq!(
+        fast(&[("AUGMENTAGENT_PHONE_FAST_LAYER", "1")]),
+        Some(FastLayerConfig::default())
+    );
+    assert_eq!(
+        fast(&[
+            ("AUGMENTAGENT_PHONE_FAST_LAYER", "1"),
+            ("AUGMENTAGENT_PHONE_FAST_PROVIDER", "cerebras"),
+            ("AUGMENTAGENT_PHONE_MAX_TOOL_STEPS", "5"),
+        ]),
+        Some(FastLayerConfig {
+            provider: FastProvider::Cerebras,
+            max_tool_steps: 5,
+            thinking_sound_url: None,
+        })
+    );
+    for bad in [
+        [("AUGMENTAGENT_PHONE_FAST_LAYER", "yes"), ("AUGMENTAGENT_PHONE_FAST_PROVIDER", "anthropic")],
+        [("AUGMENTAGENT_PHONE_FAST_LAYER", "1"), ("AUGMENTAGENT_PHONE_FAST_PROVIDER", "openai")],
+        [("AUGMENTAGENT_PHONE_FAST_LAYER", "1"), ("AUGMENTAGENT_PHONE_MAX_TOOL_STEPS", "0")],
+        [("AUGMENTAGENT_PHONE_FAST_LAYER", "1"), ("AUGMENTAGENT_PHONE_MAX_TOOL_STEPS", "9")],
+        [("AUGMENTAGENT_PHONE_FAST_LAYER", "1"), ("AUGMENTAGENT_PHONE_MAX_TOOL_STEPS", "three")],
+    ] {
+        assert!(load(&bad).is_err(), "{bad:?}");
+    }
+}
+
+// AC11: the thinking sound must be https on the operator's own public origin.
+#[test]
+fn thinking_sound_url_must_be_on_the_operator_origin() {
+    let load = |url: &str| {
+        let mut env = values();
+        env.insert("AUGMENTAGENT_PHONE_FAST_LAYER", "1".into());
+        env.insert("AUGMENTAGENT_PHONE_THINKING_SOUND_URL", url.into());
+        Settings::from_lookup(|k| env.get(k).cloned())
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        std::sync::Arc::new(augmentagent_store::Store::open(dir.path().join("db")).unwrap());
+    let configured = load("https://phone.example.test/sounds/thinking.mp3")
+        .unwrap()
+        .unwrap()
+        .build(store)
+        .unwrap();
+    assert_eq!(
+        configured.service.fast_layer().unwrap().thinking_sound_url.as_deref(),
+        Some("https://phone.example.test/sounds/thinking.mp3")
+    );
+    for bad in [
+        "https://evil.example/sounds/thinking.mp3",
+        "http://phone.example.test/sounds/thinking.mp3",
+        "https://phone.example.test:8443/thinking.mp3",
+        "https://user:pw@phone.example.test/thinking.mp3",
+        "https://phone.example.test.evil.example/thinking.mp3",
+        "not a url",
+    ] {
+        assert!(load(bad).is_err(), "{bad}");
+    }
+}

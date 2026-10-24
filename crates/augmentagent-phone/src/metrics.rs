@@ -18,6 +18,8 @@ struct Marks {
     first_played: Option<Instant>,
     last_played: Option<Instant>,
     tool: Duration,
+    fast: bool,
+    dispatched: bool,
 }
 pub struct TurnTimer {
     started: Instant,
@@ -66,6 +68,30 @@ impl TurnTimer {
             m.first_played.get_or_insert(at);
             m.last_played = Some(m.last_played.map_or(at, |old| old.max(at)));
         });
+    }
+    /// The fast layer (#1546) answered this turn.
+    pub fn mark_fast(&self) {
+        self.update(|m| m.fast = true);
+    }
+    /// This turn handed work off with `dispatch_task` (#1546).
+    pub fn mark_dispatched(&self) {
+        self.update(|m| m.dispatched = true);
+    }
+    /// Provider for the record: fast when the fast layer answered.
+    pub fn provider(&self) -> TurnProvider {
+        if self.marks.lock().unwrap_or_else(|p| p.into_inner()).fast {
+            TurnProvider::Fast
+        } else {
+            TurnProvider::Native
+        }
+    }
+    /// An answered turn that dispatched work is recorded as `dispatched`.
+    pub fn outcome(&self, outcome: TurnOutcome) -> TurnOutcome {
+        let dispatched = self.marks.lock().unwrap_or_else(|p| p.into_inner()).dispatched;
+        match outcome {
+            TurnOutcome::Answered if dispatched => TurnOutcome::Dispatched,
+            other => other,
+        }
     }
     pub fn add_tool_time(&self, duration: Duration) {
         self.update(|m| m.tool = m.tool.saturating_add(duration));

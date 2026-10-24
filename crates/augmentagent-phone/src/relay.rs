@@ -335,6 +335,35 @@ impl RelaySession {
         }
         Ok(Some(text_frame(text, last)))
     }
+    /// One complete fast-layer announcement outside any owner turn (#1546).
+    /// It opens and closes its own talk cycle with `last:true`.
+    pub fn system_speech(&mut self, text: &str) -> Result<Option<Value>, Error> {
+        if text.len() > 12_000 {
+            return Err(Error::InvalidArguments);
+        }
+        let spoken = crate::speech::SpeechTextTransform::apply(text);
+        if spoken.trim().is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(text_frame(&spoken, true)))
+    }
+    /// Preemptible thinking sound for a turn still waiting on a tool. Nothing
+    /// is sent for a stale generation or a turn whose answer has closed.
+    pub fn play(&mut self, turn: &RelayTurn, source: &str) -> Result<Option<Value>, Error> {
+        if turn.generation != self.generation {
+            return Ok(None);
+        }
+        if source.len() > 2_048 {
+            return Err(Error::InvalidArguments);
+        }
+        let output = self.outputs.get(&turn.id).ok_or(Error::Unauthorized)?;
+        if output.final_spoken {
+            return Ok(None);
+        }
+        Ok(Some(
+            json!({"type":"play","source":source,"loop":1,"preemptible":true}),
+        ))
+    }
     pub fn finish(&mut self, turn: &RelayTurn, text: &str) -> Result<Option<Value>, Error> {
         if text.is_empty() || self.outputs.get(&turn.id).is_some_and(|o| o.final_spoken) {
             return Ok(None);

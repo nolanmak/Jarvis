@@ -129,6 +129,7 @@ pub struct PhoneConfig {
     voice: voice::VoiceConfig,
     owner_first_name: Option<String>,
     debug_events: bool,
+    fast: Option<fast::FastLayerConfig>,
 }
 impl PhoneConfig {
     pub fn new(
@@ -168,6 +169,7 @@ impl PhoneConfig {
             voice: voice::VoiceConfig::default(),
             owner_first_name: None,
             debug_events: false,
+            fast: None,
         })
     }
     /// Operator-validated speech providers. Only startup configuration may call this.
@@ -185,6 +187,11 @@ impl PhoneConfig {
     /// so #1551 can measure audible latency. Off unless explicitly enabled.
     pub fn with_debug_events(mut self, enabled: bool) -> Self {
         self.debug_events = enabled;
+        self
+    }
+    /// Answer utterances with the fast conversational layer (#1546).
+    pub fn with_fast_layer(mut self, fast: Option<fast::FastLayerConfig>) -> Self {
+        self.fast = fast;
         self
     }
 }
@@ -225,6 +232,10 @@ impl PhoneService {
     /// before the first private control conversation has been provisioned.
     pub fn debug_events(&self) -> bool {
         self.config.debug_events
+    }
+    /// Fast-layer settings when `AUGMENTAGENT_PHONE_FAST_LAYER=1` (#1546).
+    pub fn fast_layer(&self) -> Option<&fast::FastLayerConfig> {
+        self.config.fast.as_ref()
     }
     pub fn linked_surface_owners(&self) -> Vec<SurfaceOwnerRef> {
         self.config
@@ -668,7 +679,9 @@ impl PhoneService {
         self.authorize_call_origin(&call)
     }
 
-    pub(crate) fn authorize_call_origin(&self, call: &PhoneCall) -> Result<Grant, Error> {
+    /// Owner authority for the call's origin, without requiring the call to
+    /// still be connected. Dispatched work (#1546) outlives its call.
+    pub fn authorize_call_origin(&self, call: &PhoneCall) -> Result<Grant, Error> {
         let origin = self.store.phone_origin(&call.id)?;
         let grant = self.authorize(&origin.owner, &origin.conversation)?;
         if grant.owner_id != call.owner
@@ -719,3 +732,5 @@ pub mod router;
 pub mod recovery;
 
 pub mod metrics;
+
+pub mod fast;
