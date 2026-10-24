@@ -736,3 +736,4 @@ pub mod metrics;
 pub mod fast;
 
 pub mod memory;
+pub mod end_call;

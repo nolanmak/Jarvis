@@ -345,10 +345,10 @@ async fn step3_authorize_call_runs_before_every_tool_and_blocks_revoked_calls() 
         FastMessage::ToolResult { content, is_error: true, .. } if content.contains("unauthorized"))));
 }
 
-// Step 4 / AC4: the model sees exactly two tools; any other name gets a typed
-// refusal and the turn still completes.
+// Step 4 / AC4: the model sees exactly three tools (#1557 adds end_call); any
+// other name gets a typed refusal and the turn still completes.
 #[tokio::test]
-async fn step4_tool_surface_is_exactly_two_and_unknown_tools_are_refused() {
+async fn step4_tool_surface_is_exactly_three_and_unknown_tools_are_refused() {
     let model = ScriptedModel::new(vec![
         vec![Step::Tool("send_email", json!({"to":"someone"}))],
         vec![Step::Token("I can't send email from the call.")],
@@ -371,7 +371,7 @@ async fn step4_tool_surface_is_exactly_two_and_unknown_tools_are_refused() {
     let requests = model.requests();
     assert_eq!(requests.len(), 2);
     for request in requests.iter() {
-        assert_eq!(request.tools, ["dispatch_task", "lookup_fast"]);
+        assert_eq!(request.tools, ["dispatch_task", "lookup_fast", "end_call"]);
         // #1547 sentence marker: the chunker splits on it and strips it.
         assert!(request.system.contains("Put • between sentences."));
     }
@@ -380,8 +380,8 @@ async fn step4_tool_surface_is_exactly_two_and_unknown_tools_are_refused() {
     assert!(backend.dispatches.lock().unwrap().is_empty());
     assert!(tokens(&relay.drain()).last().unwrap().1);
     assert_eq!(
-        augmentagent_phone::fast::TOOL_NAMES,
-        ["dispatch_task", "lookup_fast"]
+        augmentagent_phone::fast::TOOL_NAMES[..],
+        ["dispatch_task", "lookup_fast", "end_call"]
     );
 }
 
@@ -446,6 +446,7 @@ async fn lookup_fast_returns_results_and_is_bounded_to_one_and_a_half_seconds() 
 struct Live {
     _dir: tempfile::TempDir,
     store: Arc<augmentagent_store::Store>,
+    service: Arc<augmentagent_phone::PhoneService>,
     call_id: String,
     server: tokio::task::JoinHandle<()>,
     socket: tokio_tungstenite::WebSocketStream<
@@ -480,6 +481,14 @@ impl augmentagent_phone::Clock for Clock100 {
 }
 /// A connected call with an accepted relay socket answered by `agent`.
 async fn live(agent: Arc<dyn ConversationAgent>, fast: Option<FastLayerConfig>) -> Live {
+    live_with(agent, fast, false).await
+}
+/// [`live`] with Relay debug events (tokens-played) optionally requested.
+async fn live_with(
+    agent: Arc<dyn ConversationAgent>,
+    fast: Option<FastLayerConfig>,
+    debug_events: bool,
+) -> Live {
     use augmentagent_store::{
         owner::ControlConversationKind, Store, SurfaceAccountRef, SurfaceConversationRef,
         SurfaceOwnerRef, SurfacePlatform,
@@ -512,7 +521,8 @@ async fn live(agent: Arc<dyn ConversationAgent>, fast: Option<FastLayerConfig>) 
             }],
         )
         .unwrap()
-        .with_fast_layer(fast),
+        .with_fast_layer(fast)
+        .with_debug_events(debug_events),
     ));
     let grant = service.authorize(&owner, &chat).unwrap();
     let receipt = service
@@ -525,7 +535,7 @@ async fn live(agent: Arc<dyn ConversationAgent>, fast: Option<FastLayerConfig>) 
         .unwrap();
     store.phone_accept(&call_id, "CA-test", 100).unwrap();
     let router = augmentagent_phone::ingress::router(
-        service,
+        service.clone(),
         Arc::new(augmentagent_phone::webhook::WebhookAuth::new(
             "AC-test",
             "callback-secret",
@@ -561,6 +571,7 @@ async fn live(agent: Arc<dyn ConversationAgent>, fast: Option<FastLayerConfig>) 
     Live {
         _dir: dir,
         store,
+        service,
         call_id,
         server,
         socket,
@@ -1222,4 +1233,326 @@ async fn ac11_thinking_sound_frame_is_preemptible_and_sent_once() {
     assert_eq!(frames[0]["type"], "play");
     assert_eq!(spoken(&frames), "Dentist at nine.");
     live.server.abort();
+}
+
+// ---------- #1557 agent-initiated end_call ----------
+
+/// Sign a form callback the way Twilio does: URL followed by sorted fields.
+fn signed_form(token: &str, url: &str, fields: &[(String, String)]) -> String {
+    let mut payload = url.to_string();
+    let mut fields = fields.to_vec();
+    fields.sort();
+    for (k, v) in fields {
+        payload.push_str(&k);
+        payload.push_str(&v);
+    }
+    signed(token, &payload)
+}
+impl Live {
+    /// The signed `<Connect action>` callback Twilio sends after `end`.
+    fn relay_ended(&self, handoff: Option<&str>) -> String {
+        let mut fields = vec![
+            ("AccountSid".to_string(), "AC-test".to_string()),
+            ("CallSid".into(), "CA-test".into()),
+            ("SessionStatus".into(), "completed".into()),
+        ];
+        if let Some(handoff) = handoff {
+            fields.push(("HandoffData".into(), handoff.into()));
+        }
+        let url = format!(
+            "https://phone.example.test/phone/relay-ended/{}",
+            self.call_id
+        );
+        let auth = augmentagent_phone::webhook::WebhookAuth::new("AC-test", "callback-secret");
+        self.service
+            .relay_ended_callback(
+                &auth,
+                &self.call_id,
+                &fields,
+                &signed_form("callback-secret", &url, &fields),
+            )
+            .unwrap()
+    }
+    async fn played(&mut self) {
+        use futures::SinkExt;
+        self.socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"type":"info","name":"tokensPlayed","value":"x","last":true})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+    }
+}
+fn end_script(reason: &str, goodbye: &str) -> Arc<ScriptedModel> {
+    let input = json!({"reason": reason, "goodbye": goodbye});
+    ScriptedModel::new(vec![vec![Step::Tool(
+        "end_call",
+        input,
+    )]])
+}
+/// Parsed `handoffData` of an `end` frame; panics on anything else.
+fn handoff(frame: &Value) -> Value {
+    assert_eq!(frame["type"], "end", "{frame}");
+    let data = frame["handoffData"].as_str().expect("handoffData is a string");
+    serde_json::from_str(data).expect("handoffData is JSON")
+}
+
+// TDD 1 / AC1: end_call(task_complete) produces one goodbye text frame with
+// last:true, then exactly one `end` frame carrying {reason, call_id}; the
+// relay-ended callback persists end_reason = task_complete.
+#[tokio::test]
+async fn end_call_step1_goodbye_then_one_end_frame_and_reason_is_persisted() {
+    let model = end_script("task_complete", "All set. Talk soon!");
+    let backend = Arc::new(FakeBackend::default());
+    let fast = agent(model.clone(), backend.clone(), FastLayerConfig::default());
+    let mut live = live_with(fast, Some(FastLayerConfig::default()), true).await;
+    live.prompt("great, that covers everything").await;
+    let goodbye = live.talk_cycle().await;
+    assert_eq!(goodbye.len(), 1, "exactly one goodbye frame: {goodbye:?}");
+    assert_eq!(goodbye[0]["token"], "All set. Talk soon!");
+    assert_eq!(goodbye[0]["last"], true);
+    live.played().await;
+    let end = live
+        .frame(Duration::from_secs(3))
+        .await
+        .expect("end frame after the goodbye was played");
+    assert_eq!(
+        handoff(&end),
+        json!({"reason":"task_complete","call_id": live.call_id})
+    );
+    assert!(
+        live.frame(Duration::from_millis(300)).await.is_none(),
+        "nothing after end"
+    );
+    assert_eq!(model.requests().len(), 1);
+    let data = end["handoffData"].as_str().unwrap().to_owned();
+    assert!(live.relay_ended(Some(&data)).contains("<Hangup/>"));
+    assert_eq!(
+        live.store.phone_end_reason(&live.call_id).unwrap().as_deref(),
+        Some("task_complete")
+    );
+    // The goodbye is part of the mirrored transcript.
+    assert!(backend
+        .mirrors
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, text)| text == "Phone — Jarvis: All set. Talk soon!"));
+    live.server.abort();
+}
+
+// TDD 2 / AC2: `end` follows the goodbye at 4,000 ms ±50 when no tokens-played
+// event arrives, and as soon as one arrives when it is earlier. Real clock: a
+// paused clock auto-advances while loopback socket reads are pending, which
+// skews client-side timing by whole timer periods.
+#[tokio::test]
+async fn end_call_step2_end_waits_for_tokens_played_or_four_seconds() {
+    for played_after in [None, Some(Duration::from_millis(1_200))] {
+        let model = end_script("owner_request", "Okay, hanging up now. Bye!");
+        let fast = agent(
+            model,
+            Arc::new(FakeBackend::default()),
+            FastLayerConfig::default(),
+        );
+        let mut live = live_with(fast, Some(FastLayerConfig::default()), true).await;
+        live.prompt("please hang up on me now").await;
+        let goodbye = live.talk_cycle().await;
+        assert_eq!(goodbye.len(), 1);
+        let sent = tokio::time::Instant::now();
+        if let Some(after) = played_after {
+            tokio::time::sleep(after).await;
+            live.played().await;
+        }
+        let end = live
+            .frame(Duration::from_secs(10))
+            .await
+            .expect("end frame");
+        let waited = sent.elapsed();
+        assert_eq!(handoff(&end)["reason"], "owner_request");
+        match played_after {
+            None => assert!(
+                waited >= Duration::from_millis(3_950) && waited <= Duration::from_millis(4_050),
+                "fallback end after {waited:?}"
+            ),
+            Some(after) => assert!(
+                waited >= after && waited < after + Duration::from_millis(50),
+                "played-event end after {waited:?}"
+            ),
+        }
+        live.server.abort();
+    }
+}
+
+/// The `End` request queued for the relay loop, if any.
+fn end_events(events: &[SpeechEvent]) -> Vec<(String, String)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            SpeechEvent::End {
+                goodbye, reason, ..
+            } => Some((goodbye.clone(), reason.as_str().to_owned())),
+            _ => None,
+        })
+        .collect()
+}
+
+// TDD 3 / AC3: each fixed goodbye phrase, as the whole final prompt, ends the
+// call as owner_goodbye with zero model calls; near misses go to the model.
+#[tokio::test]
+async fn end_call_step3_goodbye_phrases_end_without_a_model_call() {
+    let phrases = [
+        "Bye.",
+        "Goodbye!",
+        "bye bye",
+        "Talk later.",
+        "That's all.",
+        "That’s it, thanks.",
+        "Hang up",
+        "End the call.",
+    ];
+    assert_eq!(
+        augmentagent_phone::end_call::GOODBYE_PHRASES.len(),
+        phrases.len()
+    );
+    for phrase in phrases {
+        let model = ScriptedModel::new(vec![]);
+        let backend = Arc::new(FakeBackend::default());
+        let fast = agent(model.clone(), backend.clone(), FastLayerConfig::default());
+        let mut relay = Relay::new();
+        let (turn_id, speech) = relay.turn(phrase);
+        fast.answer(&call(), &turn_id, phrase, speech, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(model.requests().len(), 0, "{phrase}: no model call");
+        let ends = end_events(&relay.drain());
+        assert_eq!(ends.len(), 1, "{phrase}");
+        assert_eq!(ends[0].1, "owner_goodbye", "{phrase}");
+        assert!(!ends[0].0.is_empty() && ends[0].0.chars().count() <= 120);
+    }
+    for near_miss in [
+        "goodbye for now, one more thing",
+        "don't hang up yet",
+        "that's all for the first item",
+        "bye the way, what's next",
+        "can you end the call summary with a list",
+    ] {
+        let model = ScriptedModel::new(vec![vec![Step::Token("Sure.")]]);
+        let fast = agent(
+            model.clone(),
+            Arc::new(FakeBackend::default()),
+            FastLayerConfig::default(),
+        );
+        let mut relay = Relay::new();
+        let (turn_id, speech) = relay.turn(near_miss);
+        fast.answer(&call(), &turn_id, near_miss, speech, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(model.requests().len(), 1, "{near_miss}: answered by the model");
+        assert!(end_events(&relay.drain()).is_empty(), "{near_miss}");
+    }
+}
+
+// TDD 4 / AC4: with a dispatched task in flight a goodbye phrase is not a
+// shortcut; the model's end_call speaks the fixed hand-off line first, `end`
+// follows, and the heavy result still reaches the chat outbox exactly once.
+#[tokio::test]
+async fn end_call_step4_in_flight_task_gets_the_handoff_line_and_one_chat_result() {
+    let release = Arc::new(Notify::new());
+    let spoken_flags = Arc::new(Mutex::new(Vec::new()));
+    let backend = completing_backend(release.clone(), spoken_flags.clone());
+    let model = ScriptedModel::new(vec![
+        vec![Step::Tool(
+            "dispatch_task",
+            json!({"description":"draft the reply"}),
+        )],
+        vec![Step::Token("On it.")],
+        vec![Step::Tool(
+            "end_call",
+            json!({"reason":"owner_goodbye","goodbye":"Bye for now!"}),
+        )],
+    ]);
+    let fast = agent(model.clone(), backend.clone(), FastLayerConfig::default());
+    let mut live = live_with(fast, Some(FastLayerConfig::default()), true).await;
+    live.prompt("draft a reply to the last Linear comment").await;
+    assert_eq!(spoken(&live.talk_cycle().await), "On it.");
+    live.prompt("bye").await;
+    let goodbye = live.talk_cycle().await;
+    assert_eq!(goodbye.len(), 1, "{goodbye:?}");
+    let text = goodbye[0]["token"].as_str().unwrap();
+    assert!(
+        text.starts_with("I'll text you the result."),
+        "hand-off line first: {text}"
+    );
+    assert_eq!(model.requests().len(), 3, "the in-flight guard skips the shortcut");
+    live.played().await;
+    let end = live.frame(Duration::from_secs(3)).await.expect("end frame");
+    assert_eq!(handoff(&end)["reason"], "owner_goodbye");
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while spoken_flags.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let task_id = backend.dispatches.lock().unwrap()[0].0.clone();
+    let results = backend
+        .mirrors
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(k, _)| *k == task_id)
+        .count();
+    assert_eq!(results, 1, "one outbox result");
+    assert_eq!(*spoken_flags.lock().unwrap(), [false], "not spoken after end");
+    live.server.abort();
+}
+
+// end_call arguments are validated: an unknown reason is a typed refusal and
+// the turn completes in words; an over-long goodbye is cut to 120 chars.
+#[tokio::test]
+async fn end_call_rejects_unknown_reasons_and_bounds_the_goodbye() {
+    let model = ScriptedModel::new(vec![
+        vec![Step::Tool(
+            "end_call",
+            json!({"reason":"because","goodbye":"Bye."}),
+        )],
+        vec![Step::Token("Still here.")],
+    ]);
+    let fast = agent(
+        model.clone(),
+        Arc::new(FakeBackend::default()),
+        FastLayerConfig::default(),
+    );
+    let mut relay = Relay::new();
+    let (turn_id, speech) = relay.turn("you can go");
+    let answer = fast
+        .answer(&call(), &turn_id, "you can go", speech, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(answer, "Still here.");
+    assert!(end_events(&relay.drain()).is_empty());
+    assert!(model.requests()[1].messages.iter().any(|m| matches!(m,
+        FastMessage::ToolResult { content, is_error: true, .. } if content.contains("invalid_arguments"))));
+
+    let long = "Thanks so much for the chat today. ".repeat(10);
+    let model = ScriptedModel::new(vec![vec![Step::Tool(
+        "end_call",
+        json!({"reason":"owner_goodbye","goodbye": long}),
+    )]]);
+    let fast = agent(
+        model,
+        Arc::new(FakeBackend::default()),
+        FastLayerConfig::default(),
+    );
+    let (turn_id, speech) = relay.turn("ok we're done");
+    fast.answer(&call(), &turn_id, "ok we're done", speech, CancellationToken::new())
+        .await
+        .unwrap();
+    let ends = end_events(&relay.drain());
+    assert_eq!(ends.len(), 1);
+    assert!(ends[0].0.chars().count() <= 120, "{}", ends[0].0);
+    assert!(ends[0].0.starts_with("Thanks so much for the chat today."));
 }
