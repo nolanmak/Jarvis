@@ -28,8 +28,10 @@ tokio-util.workspace = true
 serde_urlencoded = "0.7"
 
 tempfile = "3"
+unicode-general-category = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 mockito = "1"
 tokio-tungstenite = "0.29"
+proptest = "1"

@@ -514,6 +514,7 @@ pub mod twilio;
 pub mod webhook;
 
 pub mod relay;
+pub mod speech;
 
 impl PhoneService {
     /// Snapshot and claim due cleanup without waiting for provider HTTP. The
