@@ -70,3 +70,146 @@ fn ac01_configuration_defaults_off_and_requires_complete_explicit_setup() {
     assert!(configured.service.authorize(&owner, &chat).is_err());
     assert!(store.phone_active_calls().unwrap().is_empty());
 }
+
+#[test]
+fn ac03_voice_providers_default_to_deepgram_and_elevenlabs_and_fail_closed_on_bad_values() {
+    use augmentagent_phone::voice::{SttProvider, TtsProvider, VoiceConfig, VoiceConfigError};
+    use augmentagent_phone::Error;
+    let env = values();
+    let settings = Settings::from_lookup(|k| env.get(k).cloned())
+        .unwrap()
+        .unwrap();
+    let voice = settings.voice();
+    assert_eq!(voice.stt_provider(), SttProvider::Deepgram);
+    assert_eq!(voice.stt_model(), "nova-3-general");
+    assert_eq!(voice.tts_provider(), TtsProvider::ElevenLabs);
+    assert_eq!(voice.tts_voice(), "UgBBYS2sOqTuMpoF3BR0-flash_v2_5");
+    assert_eq!(*voice, VoiceConfig::default());
+
+    let mut env = values();
+    env.insert("AUGMENTAGENT_PHONE_STT_PROVIDER", "Google".into());
+    env.insert("AUGMENTAGENT_PHONE_STT_MODEL", "telephony".into());
+    env.insert("AUGMENTAGENT_PHONE_TTS_PROVIDER", "Amazon".into());
+    env.insert("AUGMENTAGENT_PHONE_TTS_VOICE", "Joanna".into());
+    let voice = Settings::from_lookup(|k| env.get(k).cloned())
+        .unwrap()
+        .unwrap()
+        .voice()
+        .clone();
+    assert_eq!(voice.stt_provider(), SttProvider::Google);
+    assert_eq!(voice.stt_model(), "telephony");
+    assert_eq!(voice.tts_provider(), TtsProvider::Amazon);
+    assert_eq!(voice.tts_voice(), "Joanna");
+
+    // Provider names are an exact, case-sensitive allow list. Voice and model
+    // strings are ^[A-Za-z0-9._-]{1,96}$: a quote or angle bracket could
+    // otherwise break out of the TwiML attribute.
+    let long = "a".repeat(97);
+    for (key, bad, expected) in [
+        (
+            "AUGMENTAGENT_PHONE_STT_PROVIDER",
+            "Whisper",
+            VoiceConfigError::UnknownSttProvider,
+        ),
+        (
+            "AUGMENTAGENT_PHONE_STT_PROVIDER",
+            "deepgram",
+            VoiceConfigError::UnknownSttProvider,
+        ),
+        (
+            "AUGMENTAGENT_PHONE_TTS_PROVIDER",
+            "OpenAI",
+            VoiceConfigError::UnknownTtsProvider,
+        ),
+        (
+            "AUGMENTAGENT_PHONE_TTS_PROVIDER",
+            "elevenlabs",
+            VoiceConfigError::UnknownTtsProvider,
+        ),
+        (
+            "AUGMENTAGENT_PHONE_TTS_VOICE",
+            "Joanna\" welcomeGreeting=\"pwned",
+            VoiceConfigError::InvalidVoice,
+        ),
+        (
+            "AUGMENTAGENT_PHONE_TTS_VOICE",
+            "<Joanna>",
+            VoiceConfigError::InvalidVoice,
+        ),
+        (
+            "AUGMENTAGENT_PHONE_TTS_VOICE",
+            "Joanna Neural",
+            VoiceConfigError::InvalidVoice,
+        ),
+        (
+            "AUGMENTAGENT_PHONE_TTS_VOICE",
+            long.as_str(),
+            VoiceConfigError::InvalidVoice,
+        ),
+        (
+            "AUGMENTAGENT_PHONE_STT_MODEL",
+            "nova 3",
+            VoiceConfigError::InvalidSttModel,
+        ),
+        (
+            "AUGMENTAGENT_PHONE_STT_MODEL",
+            "nova-3&x=1",
+            VoiceConfigError::InvalidSttModel,
+        ),
+    ] {
+        let mut env = values();
+        env.insert(key, bad.into());
+        match Settings::from_lookup(|k| env.get(k).cloned()) {
+            Err(Error::Voice(error)) => assert_eq!(error, expected, "{key}={bad:?}"),
+            Err(other) => panic!("{key}={bad:?}: unexpected error {other:?}"),
+            Ok(_) => panic!("{key}={bad:?}: accepted"),
+        }
+    }
+    // An empty value behaves like an unset variable, as in env files.
+    let mut env = values();
+    env.insert("AUGMENTAGENT_PHONE_TTS_VOICE", "".into());
+    env.insert("AUGMENTAGENT_PHONE_STT_PROVIDER", " ".into());
+    assert_eq!(
+        *Settings::from_lookup(|k| env.get(k).cloned())
+            .unwrap()
+            .unwrap()
+            .voice(),
+        VoiceConfig::default()
+    );
+    // Google TTS has no vetted default voice here: it must be explicit.
+    let mut env = values();
+    env.insert("AUGMENTAGENT_PHONE_TTS_PROVIDER", "Google".into());
+    assert!(matches!(
+        Settings::from_lookup(|k| env.get(k).cloned()),
+        Err(Error::Voice(VoiceConfigError::VoiceRequired))
+    ));
+    env.insert("AUGMENTAGENT_PHONE_TTS_VOICE", "en-US-Chirp3-HD-Aoede".into());
+    let voice = Settings::from_lookup(|k| env.get(k).cloned())
+        .unwrap()
+        .unwrap()
+        .voice()
+        .clone();
+    assert_eq!(voice.tts_provider(), TtsProvider::Google);
+    assert_eq!(voice.tts_voice(), "en-US-Chirp3-HD-Aoede");
+    // Switching only the TTS provider to Amazon keeps the proven Joanna default.
+    let mut env = values();
+    env.insert("AUGMENTAGENT_PHONE_TTS_PROVIDER", "Amazon".into());
+    assert_eq!(
+        Settings::from_lookup(|k| env.get(k).cloned())
+            .unwrap()
+            .unwrap()
+            .voice()
+            .tts_voice(),
+        "Joanna"
+    );
+    let mut env = values();
+    env.insert("AUGMENTAGENT_PHONE_STT_PROVIDER", "Google".into());
+    assert_eq!(
+        Settings::from_lookup(|k| env.get(k).cloned())
+            .unwrap()
+            .unwrap()
+            .voice()
+            .stt_model(),
+        "telephony"
+    );
+}

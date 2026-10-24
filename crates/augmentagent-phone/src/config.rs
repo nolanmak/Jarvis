@@ -1,8 +1,8 @@
 //! Explicit operator configuration. Destination numbers belong to the verified
 //! owner settings store, never this environment configuration.
 use crate::{
-    twilio::TwilioClient, webhook::WebhookAuth, Error, OwnerLink, PhoneConfig, PhoneService,
-    SystemClock,
+    twilio::TwilioClient, voice::VoiceConfig, webhook::WebhookAuth, Error, OwnerLink, PhoneConfig,
+    PhoneService, SystemClock,
 };
 use augmentagent_store::{Store, SurfaceAccountRef, SurfaceOwnerRef, SurfacePlatform};
 use serde::Deserialize;
@@ -14,6 +14,7 @@ pub struct Settings {
     phone: PhoneConfig,
     provider: Arc<TwilioClient>,
     auth: Arc<WebhookAuth>,
+    voice: VoiceConfig,
 }
 pub struct ConfiguredPhone {
     pub bind: SocketAddr,
@@ -76,12 +77,14 @@ impl Settings {
                 })
             })
             .collect::<Result<Vec<_>, Error>>()?;
+        let voice = VoiceConfig::from_lookup(&get)?;
         let phone = PhoneConfig::new(
             true,
             &required("AUGMENTAGENT_PHONE_PUBLIC_URL")?,
             &required("AUGMENTAGENT_PHONE_VERIFICATION_KEY")?,
             links,
-        )?;
+        )?
+        .with_voice(voice.clone());
         let account = required("TWILIO_ACCOUNT_SID")?;
         let token = required("TWILIO_AUTH_TOKEN")?;
         let provider = Arc::new(TwilioClient::new(
@@ -95,7 +98,12 @@ impl Settings {
             phone,
             provider,
             auth,
+            voice,
         }))
+    }
+    /// Validated speech providers as they will be emitted in TwiML.
+    pub fn voice(&self) -> &VoiceConfig {
+        &self.voice
     }
     pub fn build(self, store: Arc<Store>) -> Result<ConfiguredPhone, Error> {
         Ok(ConfiguredPhone {
