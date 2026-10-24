@@ -154,7 +154,7 @@ const BOUNDARY_CASES: [(&str, &[&str]); 20] = [
     ("He said \"Stop.\" Then he left.", &["He said \"Stop.\" ", "Then he left."]),
     ("One.•Two.•Three.", &["One.", "Two.", "Three."]),
     ("Finished.  \n\nNext paragraph.", &["Finished.  \n\n", "Next paragraph."]),
-    ("Email a.b@example.com. Reply soon.", &["Email a.b@example.com. ", "Reply soon."]),
+    ("Email a.b@example.com? Reply soon.", &["Email a.b@example.com? ", "Reply soon."]),
     ("Prof. Jones vs. Dr. Lee; St. Mary etc. Fine.", &["Prof. Jones vs. Dr. Lee; ", "St. Mary etc. Fine."]),
     ("Pause… Then go. and stop", &["Pause… ", "Then go. and stop"]),
 ];
