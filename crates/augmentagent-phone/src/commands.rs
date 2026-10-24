@@ -75,6 +75,9 @@ fn profile_command(text: &str) -> Option<ProfileCommand> {
         _ => None,
     }
 }
+/// Upper bound of a `profile` reply, inside every adapter's single-message
+/// limit (Discord's 2,000 characters is the smallest).
+pub const PROFILE_REPLY_MAX_BYTES: usize = 1_800;
 /// Same authority as `phone number …`: the stored owner, in the stored
 /// private control conversation only.
 fn profile_reply(
@@ -89,16 +92,37 @@ fn profile_reply(
             if facts.is_empty() {
                 return Ok("No profile facts yet. Jarvis learns them from your phone calls.".into());
             }
-            let lines = facts
-                .iter()
-                .map(|f| format!("- {}: {}", f.key, f.value))
-                .collect::<Vec<_>>()
-                .join("\n");
-            Ok(format!("Profile facts from your calls, most recent first:\n{lines}\nRemove one with `profile forget <key>`."))
+            const HEADER: &str = "Profile facts from your calls, most recent first:";
+            const FOOTER: &str = "Remove one with `profile forget <key>`.";
+            // Room for the header, footer and an "N more" line.
+            let budget = PROFILE_REPLY_MAX_BYTES - HEADER.len() - FOOTER.len() - 40;
+            let mut reply = String::from(HEADER);
+            let mut used = 0;
+            let mut shown = 0;
+            for fact in &facts {
+                let line = format!("\n- {}: {}", fact.key, fact.value);
+                if used + line.len() > budget {
+                    break;
+                }
+                used += line.len();
+                shown += 1;
+                reply.push_str(&line);
+            }
+            if shown < facts.len() {
+                reply.push_str(&format!("\n…and {} more not shown.", facts.len() - shown));
+            }
+            reply.push('\n');
+            reply.push_str(FOOTER);
+            Ok(reply)
         }
         ProfileCommand::Forget(key) => {
             if service.store.phone_forget_profile_fact(&grant.owner_id, &key)? {
-                Ok(format!("Forgot profile fact `{key}`. It will not be used on future calls."))
+                let hint = if key == augmentagent_store::phone::PHONE_PROFILE_FIRST_NAME {
+                    " The speech-recognition hint keeps the name until the next daemon restart."
+                } else {
+                    ""
+                };
+                Ok(format!("Forgot profile fact `{key}`. Future call prompts will not include it.{hint}"))
             } else {
                 Ok(format!("No profile fact named `{key}`. Send `profile` to list them."))
             }

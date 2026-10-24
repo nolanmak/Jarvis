@@ -261,13 +261,14 @@ impl PhoneService {
         Ok((!parts.is_empty()).then(|| parts.join("\n\n")))
     }
 
-    /// The stored first-name fact, else the operator-configured fallback.
+    /// The stored first-name fact only, so `profile forget first_name` takes
+    /// effect on the next prompt. (The startup copy in the configuration
+    /// feeds recognition hints alone.)
     pub fn owner_first_name(&self, owner: &str) -> Option<String> {
         self.store
             .phone_owner_first_name(owner)
             .ok()
             .flatten()
-            .or_else(|| self.config.owner_first_name.clone())
             .as_deref()
             .and_then(clean_name)
     }

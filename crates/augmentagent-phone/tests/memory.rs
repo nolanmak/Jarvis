@@ -492,3 +492,58 @@ async fn stored_first_name_reaches_next_call_relay_hints_after_startup() {
         .unwrap();
     assert!(twiml.contains("hints=\"Zorblatx, "), "{twiml}");
 }
+
+// Review follow-up: a forgotten first name is gone from the next context even
+// though the startup hint copy is kept until restart.
+#[tokio::test]
+async fn forgotten_first_name_leaves_the_context_without_a_restart() {
+    use augmentagent_phone::commands::execute;
+    let f = fixture();
+    let id = relayed_call(&f, "r1").await;
+    relay_ended(&f, &id);
+    let wiki = tempfile::tempdir().unwrap();
+    let agent = summarizer(
+        wiki.path(),
+        json!({"summary":"Call.","facts":[{"key":"first_name","value":"Zorblat","confidence":1.0}]}),
+    );
+    f.service.run_call_summaries(&agent).await.unwrap();
+    // As after a restart: the startup copy of the stored name is configured.
+    let config = PhoneConfig::new(
+        true,
+        "https://phone.example.test",
+        "test-secret-for-verification-32bytes",
+        vec![OwnerLink { surface_owner: f.owner.clone(), owner_id: "canonical-owner".into() }],
+    )
+    .unwrap()
+    .with_owner_first_name(Some("Zorblat".into()));
+    let restarted = PhoneService::new(f.store.clone(), Arc::new(FakeProvider::default()), f.clock.clone(), config);
+    assert!(restarted.owner_context("canonical-owner").unwrap().unwrap().contains("Zorblat"));
+    let reply = execute(&restarted, &f.owner, &f.conversation, "e1", "profile forget first_name").await.unwrap();
+    assert!(reply.contains("restart"), "{reply}");
+    let context = restarted.owner_context("canonical-owner").unwrap().unwrap();
+    assert!(!context.contains("Zorblat") && !context.contains("first name"), "{context}");
+}
+
+// Review follow-up: `profile` replies stay within one chat message however
+// many calls have added facts.
+#[tokio::test]
+async fn profile_listing_is_bounded_in_bytes() {
+    use augmentagent_phone::commands::{execute, PROFILE_REPLY_MAX_BYTES};
+    let f = fixture();
+    let wiki = tempfile::tempdir().unwrap();
+    for call in 0..3 {
+        f.clock.0.fetch_add(3_600_000, Ordering::SeqCst);
+        let id = relayed_call(&f, &format!("r{call}")).await;
+        relay_ended(&f, &id);
+        status_completed(&f, &id);
+        let facts: Vec<_> = (0..10)
+            .map(|i| json!({"key": format!("{}_{call}_{i}", "k".repeat(50)), "value": "é".repeat(200), "confidence": 0.5}))
+            .collect();
+        let agent = summarizer(wiki.path(), json!({"summary":"Call.","facts":facts}));
+        assert_eq!(f.service.run_call_summaries(&agent).await.unwrap(), 1);
+    }
+    let listed = execute(&f.service, &f.owner, &f.conversation, "e1", "profile").await.unwrap();
+    assert!(listed.len() <= PROFILE_REPLY_MAX_BYTES, "{}", listed.len());
+    assert!(listed.contains("more not shown"), "{listed}");
+    assert!(listed.contains("profile forget <key>"));
+}

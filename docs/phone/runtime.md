@@ -573,6 +573,9 @@ Facts are owner-visible and deletable from the owner's **private control
 chat** (same authorization as `phone number …`; other chats are refused, and
 the text never reaches history or the model):
 
-- `profile` (or `profile show`) lists the stored facts;
+- `profile` (or `profile show`) lists the stored facts, most recent first,
+  within 1,800 bytes (one message on every surface; the rest is counted);
 - `profile forget <key>` deletes one; the next assembled prompt omits it.
+  Forgetting `first_name` also removes it from prompts at once; only the
+  recognition `hints` keep the startup copy until the next restart.
 
