@@ -450,6 +450,18 @@ impl ConversationAgent for PhoneAgent {
             wiki_root: self.cwd.clone(),
         })
     }
+    async fn call_ended(&self, call: &PhoneCall, key: &str, text: &str) -> Result<(), AgentError> {
+        // #1556: the owner must still hold authority over the originating chat;
+        // the outbox rejects a replayed key, so retries never post twice.
+        self.service
+            .authorize_call_origin(call)
+            .map_err(|_| AgentError)?;
+        let origin = self.store.phone_origin(&call.id).map_err(|_| AgentError)?;
+        if call.conversation != origin.conversation.storage_key() {
+            return Err(AgentError);
+        }
+        self.io.mirror(&origin, key, text).await.map_err(|_| AgentError)
+    }
     async fn interrupted(&self, call: &PhoneCall, heard: &str) -> Result<(), AgentError> {
         if let Some(fast) = &self.fast {
             return fast.interrupted(call, heard).await;

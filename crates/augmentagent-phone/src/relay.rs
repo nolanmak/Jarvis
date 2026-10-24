@@ -115,6 +115,7 @@ pub struct RelaySession {
     debug_events: bool,
     invalid_frames: u64,
     played_event: Option<tokio::time::Instant>,
+    owner_activity: bool,
 }
 impl RelaySession {
     pub fn new(call_id: &str, account_sid: &str, call_sid: &str) -> Self {
@@ -131,6 +132,7 @@ impl RelaySession {
             debug_events: false,
             invalid_frames: 0,
             played_event: None,
+            owner_activity: false,
         }
     }
     /// With Relay debug events requested in TwiML, unknown frame types are
@@ -142,6 +144,11 @@ impl RelaySession {
     /// Frames rejected as malformed, unauthorized or unsupported.
     pub fn invalid_frames(&self) -> u64 {
         self.invalid_frames
+    }
+    /// Whether the owner spoke (any `prompt`, partial or final, or an
+    /// `interrupt`) since the last call. Restarts the silence clock (#1556).
+    pub fn take_owner_activity(&mut self) -> bool {
+        std::mem::take(&mut self.owner_activity)
     }
     /// Receipt time of the latest tokens-played debug event, consumed once.
     pub fn take_played_event(&mut self) -> Option<tokio::time::Instant> {
@@ -181,6 +188,7 @@ impl RelaySession {
                 if text.len() > 12_000 {
                     return Err(Error::InvalidArguments);
                 }
+                self.owner_activity = true;
                 // TwiML pins partialPrompts=false. Defensive handling never
                 // submits interim recognition to the agent.
                 if !last || text.trim().is_empty() {
@@ -211,6 +219,7 @@ impl RelaySession {
                     return Err(Error::InvalidArguments);
                 }
                 self.generation += 1;
+                self.owner_activity = true;
                 self.heard_until_interrupt = Some(heard);
                 Ok(RelayInput::Interrupted)
             }
@@ -345,6 +354,22 @@ impl RelaySession {
             return Ok(None);
         }
         self.speech(turn, "final", text, true)
+    }
+}
+impl RelaySession {
+    /// Silence check-in (#1556): its own talk cycle; the owner may talk over
+    /// it and any later speech replaces it.
+    pub fn check_in(&self, text: &str) -> Value {
+        json!({"type":"text","token":text,"last":true,"interruptible":true,"preemptible":true})
+    }
+    /// Fixed goodbye spoken just before `end`; nothing may cut it short.
+    pub fn goodbye(&self, text: &str) -> Value {
+        json!({"type":"text","token":text,"last":true,"interruptible":false,"preemptible":false})
+    }
+    /// End the session. Twilio forwards `handoffData` (a JSON string) to the
+    /// relay-ended action URL.
+    pub fn end_with_handoff(&self, handoff: &Value) -> Value {
+        json!({"type":"end","handoffData":handoff.to_string()})
     }
 }
 fn text_frame(token: &str, last: bool) -> Value {

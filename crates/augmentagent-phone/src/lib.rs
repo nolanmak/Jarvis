@@ -89,6 +89,8 @@ pub enum Error {
     Provider(#[from] ProviderError),
     #[error("phone voice configuration is invalid: {0}")]
     Voice(#[from] voice::VoiceConfigError),
+    #[error("phone silence policy is invalid: {0}")]
+    Silence(#[from] silence::SilenceConfigError),
 }
 impl Error {
     pub fn code(&self) -> &'static str {
@@ -110,7 +112,7 @@ impl Error {
             Self::Store(_) => "storage_error",
             Self::Provider(ProviderError::Rejected) => "provider_rejected",
             Self::Provider(ProviderError::Uncertain) => "provider_uncertain",
-            Self::Voice(_) => "not_configured",
+            Self::Voice(_) | Self::Silence(_) => "not_configured",
         }
     }
 }
@@ -130,6 +132,7 @@ pub struct PhoneConfig {
     owner_first_name: Option<String>,
     debug_events: bool,
     fast: Option<fast::FastLayerConfig>,
+    silence: silence::SilencePolicy,
 }
 impl PhoneConfig {
     pub fn new(
@@ -170,6 +173,7 @@ impl PhoneConfig {
             owner_first_name: None,
             debug_events: false,
             fast: None,
+            silence: silence::SilencePolicy::default(),
         })
     }
     /// Operator-validated speech providers. Only startup configuration may call this.
@@ -187,6 +191,11 @@ impl PhoneConfig {
     /// so #1551 can measure audible latency. Off unless explicitly enabled.
     pub fn with_debug_events(mut self, enabled: bool) -> Self {
         self.debug_events = enabled;
+        self
+    }
+    /// Silence check-in and automatic-end thresholds (#1556).
+    pub fn with_silence(mut self, silence: silence::SilencePolicy) -> Self {
+        self.silence = silence;
         self
     }
     /// Answer utterances with the fast conversational layer (#1546).
@@ -236,6 +245,10 @@ impl PhoneService {
     /// Fast-layer settings when `AUGMENTAGENT_PHONE_FAST_LAYER=1` (#1546).
     pub fn fast_layer(&self) -> Option<&fast::FastLayerConfig> {
         self.config.fast.as_ref()
+    }
+    /// Silence check-in and automatic-end thresholds (#1556).
+    pub fn silence_policy(&self) -> silence::SilencePolicy {
+        self.config.silence
     }
     pub fn linked_surface_owners(&self) -> Vec<SurfaceOwnerRef> {
         self.config
@@ -736,3 +749,4 @@ pub mod metrics;
 pub mod fast;
 
 pub mod memory;
+pub mod silence;

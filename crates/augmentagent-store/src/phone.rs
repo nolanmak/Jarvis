@@ -1324,3 +1324,94 @@ impl Store {
         })?)
     }
 }
+
+/// First retry delay for an end notice; doubles per attempt.
+const END_NOTICE_LEASE_MS: i64 = 60_000;
+/// A runtime-chosen end reason is a short lowercase category code.
+fn valid_end_reason(reason: &str) -> bool {
+    !reason.is_empty()
+        && reason.len() <= 32
+        && reason.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+}
+
+impl Store {
+    /// Persist why the runtime ended a relayed call itself (#1556), once, and
+    /// queue its chat notice in the same transaction. Returns whether this
+    /// call recorded it; a replay keeps the first reason.
+    pub fn phone_record_end_reason(&self, call_id: &str, reason: &str, now_ms: i64) -> PhoneResult<bool> {
+        if !valid_end_reason(reason) {
+            return Err(PhoneError::InvalidInput);
+        }
+        transaction(self, |tx| {
+            call_by_id(tx, call_id)?;
+            Ok(tx.execute(
+                "INSERT OR IGNORE INTO phone_call_end_reasons(call_id,reason,recorded_ms) VALUES(?1,?2,?3)",
+                params![call_id, reason, now_ms],
+            )? == 1)
+        })
+    }
+    /// The recorded end reason, if the runtime ended the call itself.
+    pub fn phone_end_reason(&self, call_id: &str) -> PhoneResult<Option<String>> {
+        Ok(self.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT reason FROM phone_call_end_reasons WHERE call_id=?1",
+                    [call_id],
+                    |r| r.get(0),
+                )
+                .optional()?)
+        })?)
+    }
+    /// Calls whose end notice is pending and not leased by an earlier attempt.
+    pub fn phone_end_notices_due(&self, now_ms: i64) -> PhoneResult<Vec<(PhoneCall, String)>> {
+        Ok(self.with_conn(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {}, e.reason FROM phone_calls c JOIN phone_call_end_reasons e ON e.call_id=c.id
+                 WHERE e.notice='pending' AND e.attempts<3 AND e.next_ms<=?1
+                 ORDER BY e.recorded_ms, c.id LIMIT 8",
+                CALL_COLUMNS
+                    .split(',')
+                    .map(|c| format!("c.{c}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ))?;
+            let due = stmt
+                .query_map([now_ms], |row| Ok((read_call(row)?, row.get(12)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(due)
+        })?)
+    }
+    /// Lease one delivery attempt. False when the notice was delivered, is out
+    /// of attempts, or is still leased by an earlier attempt.
+    pub fn phone_claim_end_notice(&self, call_id: &str, now_ms: i64) -> PhoneResult<bool> {
+        transaction(self, |tx| {
+            let notice: Option<(String, i64, i64)> = tx
+                .query_row(
+                    "SELECT notice,attempts,next_ms FROM phone_call_end_reasons WHERE call_id=?1",
+                    [call_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            let Some((state, attempts, next)) = notice else {
+                return Ok(false);
+            };
+            if state != "pending" || attempts >= 3 || now_ms < next {
+                return Ok(false);
+            }
+            tx.execute(
+                "UPDATE phone_call_end_reasons SET attempts=attempts+1,next_ms=?2 WHERE call_id=?1",
+                params![call_id, now_ms.saturating_add(END_NOTICE_LEASE_MS << attempts)],
+            )?;
+            Ok(true)
+        })
+    }
+    /// The notice reached the durable outbox. Returns false if already done.
+    pub fn phone_complete_end_notice(&self, call_id: &str, now_ms: i64) -> PhoneResult<bool> {
+        transaction(self, |tx| {
+            Ok(tx.execute(
+                "UPDATE phone_call_end_reasons SET notice='done',notified_ms=?2 WHERE call_id=?1 AND notice='pending'",
+                params![call_id, now_ms],
+            )? == 1)
+        })
+    }
+}

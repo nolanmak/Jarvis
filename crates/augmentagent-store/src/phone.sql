@@ -121,3 +121,17 @@ CREATE TABLE IF NOT EXISTS owner_profile (
     PRIMARY KEY(owner, key)
 );
 CREATE INDEX IF NOT EXISTS owner_profile_recent ON owner_profile(owner, updated_ms);
+
+-- #1556 why the runtime ended a relayed call itself (a short category code),
+-- plus the durable one-shot chat notice for it. The notice is a lease
+-- (attempts + next_ms) so a restart replays an unfinished delivery once,
+-- under the same outbox idempotency key.
+CREATE TABLE IF NOT EXISTS phone_call_end_reasons (
+    call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
+    reason TEXT NOT NULL CHECK(length(reason) BETWEEN 1 AND 32),
+    recorded_ms INTEGER NOT NULL,
+    notice TEXT NOT NULL DEFAULT 'pending' CHECK(notice IN ('pending','done')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 3),
+    next_ms INTEGER NOT NULL DEFAULT 0,
+    notified_ms INTEGER
+);

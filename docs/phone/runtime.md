@@ -74,6 +74,9 @@ limits and duplicate-call protections still apply. Private DM entry is optional.
 | `AUGMENTAGENT_PHONE_FAST_PROVIDER` | Fast model provider when the layer is on: `anthropic` (default, `claude-haiku-5-5`, key `ANTHROPIC_API_KEY`) or `cerebras` (fast-tier Cerebras model, key `CEREBRAS_API_KEY`). Keys load per request from the service keyring, then the service environment. Other values fail configuration. |
 | `AUGMENTAGENT_PHONE_MAX_TOOL_STEPS` | Tool calls the fast model may make per owner utterance, `1`–`8`, default `3`. Further calls get a typed refusal. Other values fail configuration. |
 | `AUGMENTAGENT_PHONE_THINKING_SOUND_URL` | Optional audio played while a fast-layer tool runs longer than 700 ms with nothing spoken. Must be `https` on the same origin as `AUGMENTAGENT_PHONE_PUBLIC_URL`, without credentials; anything else fails configuration, even while the layer is off. Unset (default) never plays a sound. |
+| `AUGMENTAGENT_PHONE_SILENCE_CHECKIN_1_SECS` | Seconds of silence before the first check-in ("Still there?"), default `12` (#1556). |
+| `AUGMENTAGENT_PHONE_SILENCE_CHECKIN_2_SECS` | Seconds of silence before the second check-in ("I'll hang up in a bit if you're done."), default `25`. |
+| `AUGMENTAGENT_PHONE_SILENCE_END_SECS` | Seconds of silence before the goodbye line and `end`, default `45`. Each of the three silence values must be a whole number in 5–300 and they must be strictly increasing; otherwise configuration fails with a typed `Silence` error naming the variable (never its value). |
 
 Synthetic link example (replace identifiers with actual authenticated bindings):
 
@@ -579,3 +582,32 @@ the text never reaches history or the model):
   Forgetting `first_name` also removes it from prompts at once; only the
   recognition `hints` keep the startup copy until the next restart.
 
+## Silence and idle policy (#1556)
+
+A connected call with nobody talking no longer runs to the provider time
+limit. The relay keeps a silence clock that starts at the latest of: any owner
+`prompt` (partial or final) or `interrupt`, a closing `text` frame
+(`last:true`) written by Jarvis, and a tokens-played event for that speech
+(with debug events on). With the defaults:
+
+| Silence | Frame |
+| --- | --- |
+| 12 s | `text` "Still there?" (`interruptible:true`, `preemptible:true`) |
+| 25 s | `text` "I'll hang up in a bit if you're done." (same flags) |
+| 45 s | fixed goodbye `text`, then `{"type":"end","handoffData":"{\"reason\":\"silence\"}"}` |
+
+Check-ins and the goodbye never restart the clock, and neither does a
+tokens-played event for a check-in. While an owner turn is still being
+answered the clock is held. A spoken progress line of a dispatched task (#1546)
+suspends silence handling for 15 s; the task's spoken result (or failure
+notice) releases it and restarts the clock, and an expired hold restarts the
+clock where it lapsed. Owner speech over a check-in is handled by the normal
+interruption rules and restarts the clock.
+
+When the relay ends for silence it persists `end_reason = silence`
+(`phone_call_end_reasons`) before requesting the stop, then enqueues one
+message in the originating chat ("Phone call ended after 45 seconds of
+silence.") under the idempotency key `{call_id}:silence_end`. Delivery is a
+leased job (three attempts, 60 s doubling lease) that the runtime's memory
+worker retries after a failure or restart; the outbox rejects a replayed key,
+so the message is never duplicated.
