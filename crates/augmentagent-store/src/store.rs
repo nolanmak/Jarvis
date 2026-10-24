@@ -2587,6 +2587,8 @@ impl Store {
         // #1101 — handle → person cache derived from the wiki identity index
         // (rebuildable any time via `augmentagent messages resolve-people`),
         // plus a participants view joining it onto the message index.
+        // `message_person_links` mirrors `household:` front matter (#1539),
+        // both directions, so a two-name query can narrow to a documented pair.
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS message_people (\
                  handle     TEXT PRIMARY KEY,\
@@ -2599,6 +2601,11 @@ impl Store {
                  PRIMARY KEY (person_key, name)\
              );\
              CREATE INDEX IF NOT EXISTS idx_message_person_names_name ON message_person_names(name);\
+             CREATE TABLE IF NOT EXISTS message_person_links (\
+                 person_key TEXT NOT NULL,\
+                 other_key  TEXT NOT NULL,\
+                 PRIMARY KEY (person_key, other_key)\
+             );\
              CREATE TABLE IF NOT EXISTS message_people_meta (\
                  key   TEXT PRIMARY KEY,\
                  value TEXT NOT NULL\

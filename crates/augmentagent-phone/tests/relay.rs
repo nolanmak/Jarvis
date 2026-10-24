@@ -136,3 +136,63 @@ fn consecutive_invalid_frames_count_toward_the_limit_and_reset_on_any_valid_fram
     assert_eq!(end["type"], "end");
     assert_eq!(end.as_object().unwrap().len(), 1);
 }
+
+#[test]
+fn ac07_debug_frames_are_categorized_timestamped_and_never_counted_invalid() {
+    let mut session = RelaySession::new("call-1", "AC-test", "CA-test").with_debug_events(true);
+    session.receive(&setup()).unwrap();
+    assert!(session.take_played_event().is_none());
+    // Documented tokens-played shape: an info frame naming the event.
+    assert!(matches!(
+        session
+            .receive(r#"{"type":"info","name":"tokensPlayed","value":"raw-debug-marker 2025550123","last":false}"#)
+            .unwrap(),
+        RelayInput::Ignore
+    ));
+    assert!(session.take_played_event().is_some());
+    assert!(session.take_played_event().is_none());
+    // Speaker events are categorized but carry no played timestamp.
+    assert!(matches!(
+        session
+            .receive(r#"{"type":"info","name":"speakerEvent","value":"agentSpeaking"}"#)
+            .unwrap(),
+        RelayInput::Ignore
+    ));
+    assert!(session.take_played_event().is_none());
+    // Unknown frame types while debugging are ignored, never protocol errors.
+    assert!(matches!(
+        session
+            .receive(r#"{"type":"futureDebugFrame","payload":{"nested":"raw-debug-marker"}}"#)
+            .unwrap(),
+        RelayInput::Ignore
+    ));
+    assert_eq!(session.invalid_frames(), 0);
+    assert!(session.receive("not json").is_err());
+    assert_eq!(session.invalid_frames(), 1);
+    // The session still accepts real turns after debug traffic.
+    assert!(matches!(
+        session
+            .receive(&json!({"type":"prompt","voicePrompt":"hello","last":true}).to_string())
+            .unwrap(),
+        RelayInput::Turn(_)
+    ));
+}
+
+#[test]
+fn unknown_frame_types_still_fail_closed_without_debug_events() {
+    let mut session = RelaySession::new("call-1", "AC-test", "CA-test");
+    session.receive(&setup()).unwrap();
+    assert!(session
+        .receive(r#"{"type":"futureDebugFrame","payload":1}"#)
+        .is_err());
+    assert_eq!(session.invalid_frames(), 1);
+    // Info frames are harmless in either mode.
+    assert!(matches!(
+        session
+            .receive(r#"{"type":"info","name":"tokensPlayed","value":"x","last":true}"#)
+            .unwrap(),
+        RelayInput::Ignore
+    ));
+    assert_eq!(session.invalid_frames(), 1);
+    assert!(session.take_played_event().is_none());
+}

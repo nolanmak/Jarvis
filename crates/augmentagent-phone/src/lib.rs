@@ -123,6 +123,7 @@ pub struct PhoneConfig {
     public_base: String,
     verification_key: Vec<u8>,
     links: Vec<OwnerLink>,
+    debug_events: bool,
 }
 impl PhoneConfig {
     pub fn new(
@@ -159,7 +160,14 @@ impl PhoneConfig {
             public_base: url.origin().ascii_serialization(),
             verification_key: verification_key.as_bytes().into(),
             links,
+            debug_events: false,
         })
+    }
+    /// Request ConversationRelay debug events (tokens played, speaker events)
+    /// so #1551 can measure audible latency. Off unless explicitly enabled.
+    pub fn with_debug_events(mut self, enabled: bool) -> Self {
+        self.debug_events = enabled;
+        self
     }
 }
 /// Only the server can construct a capability, after checking stored authority.
@@ -197,6 +205,9 @@ impl PhoneService {
     }
     /// Explicit operator-configured identities, for installing transport adapters
     /// before the first private control conversation has been provisioned.
+    pub fn debug_events(&self) -> bool {
+        self.config.debug_events
+    }
     pub fn linked_surface_owners(&self) -> Vec<SurfaceOwnerRef> {
         self.config
             .links
@@ -686,3 +697,5 @@ pub mod config;
 pub mod router;
 
 pub mod recovery;
+
+pub mod metrics;

@@ -47,6 +47,12 @@ enum Incoming {
     Dtmf { digit: String },
     #[serde(rename = "error")]
     Error { code: Option<u32> },
+    /// Relay debug/event traffic (`debug`/`events` TwiML attributes). Only the
+    /// event name is read; values are never logged or stored.
+    #[serde(rename = "info")]
+    Info { name: Option<String> },
+    #[serde(other)]
+    Unknown,
 }
 struct TurnOutput {
     sent: HashMap<String, ([u8; 32], bool)>,
@@ -65,6 +71,9 @@ pub struct RelaySession {
     outputs: HashMap<String, TurnOutput>,
     heard_until_interrupt: Option<String>,
     consecutive_invalid: u32,
+    debug_events: bool,
+    invalid_frames: u64,
+    played_event: Option<tokio::time::Instant>,
 }
 impl RelaySession {
     pub fn new(call_id: &str, account_sid: &str, call_sid: &str) -> Self {
@@ -78,20 +87,41 @@ impl RelaySession {
             outputs: HashMap::new(),
             heard_until_interrupt: None,
             consecutive_invalid: 0,
+            debug_events: false,
+            invalid_frames: 0,
+            played_event: None,
         }
+    }
+    /// With Relay debug events requested in TwiML, unknown frame types are
+    /// categorized and ignored instead of ending the session.
+    pub fn with_debug_events(mut self, enabled: bool) -> Self {
+        self.debug_events = enabled;
+        self
+    }
+    /// Frames rejected as malformed, unauthorized or unsupported (session total).
+    pub fn invalid_frames(&self) -> u64 {
+        self.invalid_frames
+    }
+    /// Receipt time of the latest tokens-played debug event, consumed once.
+    pub fn take_played_event(&mut self) -> Option<tokio::time::Instant> {
+        self.played_event.take()
     }
     /// Any accepted frame resets the consecutive invalid run; a rejected
     /// frame extends it. Control frames are not messages and change nothing.
     pub fn receive(&mut self, frame: &str) -> Result<RelayInput, Error> {
-        let result = self.decode(frame);
+        let result = self.receive_frame(frame);
         match result {
             Ok(_) => self.consecutive_invalid = 0,
-            Err(_) => self.consecutive_invalid = self.consecutive_invalid.saturating_add(1),
+            Err(_) => {
+                self.invalid_frames += 1;
+                self.consecutive_invalid = self.consecutive_invalid.saturating_add(1);
+            }
         }
         result
     }
     /// A binary or otherwise unsupported frame counts like a malformed message.
     pub fn note_unsupported_frame(&mut self) -> u32 {
+        self.invalid_frames += 1;
         self.consecutive_invalid = self.consecutive_invalid.saturating_add(1);
         self.consecutive_invalid
     }
@@ -102,7 +132,7 @@ impl RelaySession {
     pub fn end(&self) -> Value {
         json!({"type":"end"})
     }
-    fn decode(&mut self, frame: &str) -> Result<RelayInput, Error> {
+    fn receive_frame(&mut self, frame: &str) -> Result<RelayInput, Error> {
         if frame.len() > 32_768 {
             return Err(Error::InvalidArguments);
         }
@@ -161,6 +191,14 @@ impl RelaySession {
                 Ok(RelayInput::Interrupted)
             }
             Incoming::Error { code: Some(code) } => Ok(RelayInput::ProviderError(code)),
+            Incoming::Info { name } => {
+                // Without debug events requested, nothing is attributed.
+                if self.debug_events && name.as_deref() == Some("tokensPlayed") {
+                    self.played_event = Some(tokio::time::Instant::now());
+                }
+                Ok(RelayInput::Ignore)
+            }
+            Incoming::Unknown if self.debug_events => Ok(RelayInput::Ignore),
             Incoming::Dtmf { digit } if digit.len() == 1 && "0123456789*#".contains(&digit) => {
                 Ok(RelayInput::Ignore)
             }

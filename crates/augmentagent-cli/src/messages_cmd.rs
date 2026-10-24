@@ -335,7 +335,9 @@ pub async fn drain_loop(store: Arc<Store>, shutdown: CancellationToken) {
 }
 
 /// Daemon loop: refresh the handle → person cache from the wiki. Cheap (a
-/// walk of person pages); a stale cache only delays new identities.
+/// walk of person pages); a stale cache only delays new identities. The first
+/// `interval` tick completes immediately, so an upgraded deployment rebuilds
+/// every derived row (aliases, `household:` links, #1539) at daemon start.
 pub async fn people_loop(
     store: Arc<Store>,
     wiki_root: std::path::PathBuf,

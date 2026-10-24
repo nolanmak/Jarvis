@@ -1943,6 +1943,362 @@ async fn slow_work_acknowledges_and_slow_interruption_mirror_does_not_hang_up() 
     server.abort();
 }
 
+#[test]
+fn ac06_twiml_debug_attribute_present_iff_debug_events_enabled() {
+    use augmentagent_phone::webhook::WebhookAuth;
+    for debug in [false, true] {
+        let f = fixture("discord", true, true, false);
+        let config = PhoneConfig::new(
+            true,
+            "https://phone.example.test",
+            "test-secret-for-verification-32bytes",
+            vec![OwnerLink {
+                surface_owner: f.owner.clone(),
+                owner_id: "canonical-owner".into(),
+            }],
+        )
+        .unwrap()
+        .with_debug_events(debug);
+        let service = PhoneService::new(f.store.clone(), f.provider.clone(), f.clock.clone(), config);
+        assert_eq!(service.debug_events(), debug);
+        let grant = service.authorize(&f.owner, &f.conversation).unwrap();
+        let call = futures::executor::block_on(service.tool(&grant, "call_owner", json!({"request_id":"debug"}))).unwrap();
+        let id = call["id"].as_str().unwrap();
+        let fields = vec![
+            ("AccountSid".into(), "AC-test".into()),
+            ("CallSid".into(), "CA-test".into()),
+        ];
+        let auth = WebhookAuth::new("AC-test", "secret");
+        let sig = signed("secret", &format!("https://phone.example.test/phone/start/{id}"), &fields);
+        let reply = service.start_callback(&auth, id, &fields, &sig).unwrap();
+        assert!(reply.contains("<ConversationRelay "), "{reply}");
+        assert_eq!(
+            reply.contains(r#" debug="debugging tokens-played speaker-events""#),
+            debug,
+            "{reply}"
+        );
+    }
+}
+
+/// Captures every tracing event so #1551 tests can count `phone.turn` records
+/// and prove raw debug frame bodies never reach the logs.
+mod capture {
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex, OnceLock},
+    };
+    use tracing_subscriber::layer::SubscriberExt;
+    #[derive(Default)]
+    pub struct Captured {
+        pub events: Mutex<Vec<(String, BTreeMap<String, String>)>>,
+    }
+    struct Layer(Arc<Captured>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Layer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Fields(BTreeMap<String, String>);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                    self.0.insert(field.name().into(), format!("{value:?}"));
+                }
+            }
+            let mut fields = Fields(BTreeMap::new());
+            event.record(&mut fields);
+            self.0
+                .events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((event.metadata().target().into(), fields.0));
+        }
+    }
+    static CAPTURED: OnceLock<Arc<Captured>> = OnceLock::new();
+    pub fn install() -> Arc<Captured> {
+        CAPTURED
+            .get_or_init(|| {
+                let captured = Arc::new(Captured::default());
+                tracing::subscriber::set_global_default(
+                    tracing_subscriber::registry().with(Layer(captured.clone())),
+                )
+                .expect("only this module installs a global subscriber");
+                captured
+            })
+            .clone()
+    }
+}
+
+struct MixedOutcomeAgent {
+    release: tokio::sync::Semaphore,
+}
+#[async_trait]
+impl augmentagent_phone::ingress::ConversationAgent for MixedOutcomeAgent {
+    async fn answer(
+        &self,
+        _: &augmentagent_store::phone::PhoneCall,
+        _: &str,
+        text: &str,
+        speech: augmentagent_phone::ingress::SpeechSender,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<String, augmentagent_phone::ingress::AgentError> {
+        match text {
+            "fail please" => Err(augmentagent_phone::ingress::AgentError),
+            "slow lookup" => tokio::select! {
+                _ = cancel.cancelled() => Err(augmentagent_phone::ingress::AgentError),
+                permit = self.release.acquire() => { permit.unwrap().forget(); Ok("Late result.".into()) }
+            },
+            _ => {
+                speech.note_tool_time(std::time::Duration::from_millis(40));
+                Ok(format!("Answer to: {text}"))
+            }
+        }
+    }
+    async fn interrupted(
+        &self,
+        _: &augmentagent_store::phone::PhoneCall,
+        _: &str,
+    ) -> Result<(), augmentagent_phone::ingress::AgentError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn ac01_every_turn_records_one_metrics_row_and_event_with_debug_played_timing() {
+    use augmentagent_store::phone::{CallState, TurnOutcome};
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+    let captured = capture::install();
+    let agent = Arc::new(MixedOutcomeAgent {
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let f = fixture("discord", true, true, false);
+    let config = PhoneConfig::new(
+        true,
+        "https://phone.example.test",
+        "test-secret-for-verification-32bytes",
+        vec![OwnerLink {
+            surface_owner: f.owner.clone(),
+            owner_id: "canonical-owner".into(),
+        }],
+    )
+    .unwrap()
+    .with_debug_events(true);
+    let service = Arc::new(PhoneService::new(
+        f.store.clone(),
+        f.provider.clone(),
+        f.clock.clone(),
+        config,
+    ));
+    let grant = service.authorize(&f.owner, &f.conversation).unwrap();
+    let call = service
+        .tool(&grant, "call_owner", json!({"request_id":"metrics"}))
+        .await
+        .unwrap();
+    let id = call["id"].as_str().unwrap().to_string();
+    f.store
+        .phone_provider_event(&id, "CA-test", CallState::AwaitingAcceptance, 100)
+        .unwrap();
+    f.store.phone_accept(&id, "CA-test", 101).unwrap();
+    let router = augmentagent_phone::ingress::router(
+        service,
+        Arc::new(augmentagent_phone::webhook::WebhookAuth::new(
+            "AC-test",
+            "callback-secret",
+        )),
+        agent.clone(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let mut request = format!("ws://{addr}/phone/relay/{id}")
+        .into_client_request()
+        .unwrap();
+    let signature = signed(
+        "callback-secret",
+        &format!("wss://phone.example.test/phone/relay/{id}"),
+        &[],
+    );
+    request
+        .headers_mut()
+        .insert("x-twilio-signature", signature.parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    socket.send(Message::Text(json!({"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX-test"}).to_string().into())).await.unwrap();
+    async fn next_text(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+            .await
+            .expect("reply")
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap()
+            .to_string()
+    }
+    // Turn 1: answered, then provider reports tokens played (debug events).
+    socket.send(Message::Text(json!({"type":"prompt","voicePrompt":"hello","last":true}).to_string().into())).await.unwrap();
+    assert!(next_text(&mut socket).await.contains("Answer to: hello"));
+    socket.send(Message::Text(json!({"type":"info","name":"tokensPlayed","value":"raw-debug-marker-one","last":false}).to_string().into())).await.unwrap();
+    socket.send(Message::Text(json!({"type":"info","name":"tokensPlayed","value":"raw-debug-marker-two","last":true}).to_string().into())).await.unwrap();
+    socket.send(Message::Text(json!({"type":"info","name":"speakerEvent","value":"raw-debug-marker-three"}).to_string().into())).await.unwrap();
+    socket.send(Message::Text(json!({"type":"unknownFutureFrame","body":"raw-debug-marker-four"}).to_string().into())).await.unwrap();
+    // Turn 2: the agent fails; the spoken failure notice closes the turn.
+    socket.send(Message::Text(json!({"type":"prompt","voicePrompt":"fail please","last":true}).to_string().into())).await.unwrap();
+    assert!(next_text(&mut socket).await.contains("Sorry"));
+    // Turn 3: interrupted while the agent is still working (after the ack).
+    socket.send(Message::Text(json!({"type":"prompt","voicePrompt":"slow lookup","last":true}).to_string().into())).await.unwrap();
+    assert!(next_text(&mut socket).await.contains("Got it"));
+    socket.send(Message::Text(json!({"type":"interrupt","utteranceUntilInterrupt":"Got it","durationUntilInterruptMs":100}).to_string().into())).await.unwrap();
+    // Turn 4: answered after the stalled turn releases.
+    socket.send(Message::Text(json!({"type":"prompt","voicePrompt":"hello again","last":true}).to_string().into())).await.unwrap();
+    // The ack proves the interrupt and new prompt were processed before the
+    // stalled turn is released; its late output is suppressed, not spoken.
+    assert!(next_text(&mut socket).await.contains("Got it"));
+    agent.release.add_permits(1);
+    let reply = next_text(&mut socket).await;
+    assert!(reply.contains("Answer to: hello again"), "{reply}");
+    socket.close(None).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if f.store.phone_call("canonical-owner", &id).unwrap().state.terminal() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    server.abort();
+
+    let rows = f.store.phone_turn_metrics(&id).unwrap();
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    let outcomes: Vec<_> = rows.iter().map(|r| r.outcome).collect();
+    assert_eq!(
+        outcomes,
+        [
+            TurnOutcome::Answered,
+            TurnOutcome::Failed,
+            TurnOutcome::Interrupted,
+            TurnOutcome::Answered
+        ]
+    );
+    assert!(rows.iter().all(|r| r.turn_id.starts_with(&format!("phone:{id}:"))));
+    // Debug on: the played turn carries audible timing; others have speech only.
+    let first = &rows[0];
+    assert!(first.t_first_speech_ms.is_some() && first.t_last_speech_ms.is_some());
+    assert!(first.t_first_played_ms.is_some(), "{first:?}");
+    assert!(first.t_last_played_ms >= first.t_first_played_ms);
+    assert_eq!(
+        first.audible_delta_ms,
+        Some(first.t_first_played_ms.unwrap() - first.t_first_speech_ms.unwrap())
+    );
+    assert_eq!(first.tool_ms, Some(40));
+    assert!(first.queue_wait_ms.is_some() && first.t_first_token_ms.is_some());
+    assert!(rows[1].t_first_speech_ms.is_some() && rows[1].t_first_played_ms.is_none());
+    assert!(rows[2].t_first_speech_ms.is_none(), "{:?}", rows[2]);
+    assert!(rows[3].t_first_speech_ms.is_some());
+    assert!(rows[3].queue_wait_ms.unwrap() >= rows[0].queue_wait_ms.unwrap());
+    // Exactly one structured event per turn, and no raw debug bodies anywhere.
+    let events = captured
+        .events
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let turn_events: Vec<_> = events
+        .iter()
+        .filter(|(target, fields)| target == "phone.turn" && fields.get("call_id").is_some_and(|c| c.contains(&id)))
+        .collect();
+    assert_eq!(turn_events.len(), 4, "{turn_events:?}");
+    for (_, fields) in &turn_events {
+        assert!(fields.contains_key("outcome") && fields.contains_key("turn_id"), "{fields:?}");
+    }
+    // Absent (null) fields are omitted by tracing; the played turn carries all of them.
+    let played = &turn_events[0].1;
+    for key in ["t_first_speech_ms", "t_last_speech_ms", "t_first_played_ms", "audible_delta_ms", "tool_ms", "queue_wait_ms"] {
+        assert!(played.contains_key(key), "{key} missing from {played:?}");
+    }
+    let everything = format!("{events:?}");
+    for private in ["raw-debug-marker", "hello again", "fail please", "voicePrompt"] {
+        assert!(!everything.contains(private), "{private} leaked into logs");
+    }
+}
+
+#[tokio::test]
+async fn ac06_without_debug_events_played_fields_are_null_and_others_unchanged() {
+    use augmentagent_store::phone::{CallState, TurnOutcome};
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+    let f = fixture("discord", true, true, false);
+    let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
+    let call = f
+        .service
+        .tool(&grant, "call_owner", json!({"request_id":"metrics-off"}))
+        .await
+        .unwrap();
+    let id = call["id"].as_str().unwrap().to_string();
+    f.store
+        .phone_provider_event(&id, "CA-test", CallState::AwaitingAcceptance, 100)
+        .unwrap();
+    f.store.phone_accept(&id, "CA-test", 101).unwrap();
+    assert!(!f.service.debug_events());
+    let router = augmentagent_phone::ingress::router(
+        Arc::new(f.service),
+        Arc::new(augmentagent_phone::webhook::WebhookAuth::new(
+            "AC-test",
+            "callback-secret",
+        )),
+        Arc::new(ScriptedAgent),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let mut request = format!("ws://{addr}/phone/relay/{id}")
+        .into_client_request()
+        .unwrap();
+    let signature = signed(
+        "callback-secret",
+        &format!("wss://phone.example.test/phone/relay/{id}"),
+        &[],
+    );
+    request
+        .headers_mut()
+        .insert("x-twilio-signature", signature.parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    socket.send(Message::Text(json!({"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX-test"}).to_string().into())).await.unwrap();
+    socket.send(Message::Text(json!({"type":"prompt","voicePrompt":"hello","last":true}).to_string().into())).await.unwrap();
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(reply.into_text().unwrap().contains("Answer to: hello"));
+    // Info frames are tolerated but attach no played timing when debug is off.
+    socket.send(Message::Text(json!({"type":"info","name":"tokensPlayed","value":"x","last":true}).to_string().into())).await.unwrap();
+    socket.close(None).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if f.store.phone_call("canonical-owner", &id).unwrap().state.terminal() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    server.abort();
+    let rows = f.store.phone_turn_metrics(&id).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].outcome, TurnOutcome::Answered);
+    assert!(rows[0].t_first_speech_ms.is_some() && rows[0].t_last_speech_ms.is_some());
+    assert!(rows[0].queue_wait_ms.is_some() && rows[0].t_first_token_ms.is_some());
+    assert_eq!(rows[0].t_first_played_ms, None);
+    assert_eq!(rows[0].t_last_played_ms, None);
+    assert_eq!(rows[0].audible_delta_ms, None);
+}
+
 // ---- #1549: recoverable conditions never close the relay socket ----
 
 /// Answers `Answer to: <text>` once a permit is available, so turns can be

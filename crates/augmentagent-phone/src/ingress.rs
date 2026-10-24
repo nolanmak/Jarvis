@@ -1,12 +1,13 @@
 //! Dedicated phone ingress. The caller owns TLS termination and binds the
 //! listener; this router has no agent-tool, credential or arbitrary-proxy route.
 use crate::{
+    metrics::TurnTimer,
     relay::{RelayInput, RelaySession, RelayTurn, INVALID_FRAME_LIMIT},
     webhook::WebhookAuth,
     Error, PhoneService,
 };
 use async_trait::async_trait;
-use augmentagent_store::phone::{CallState, PhoneCall};
+use augmentagent_store::phone::{CallState, PhoneCall, TurnOutcome, TurnProvider};
 use axum::{
     body::Bytes,
     extract::{
@@ -52,13 +53,20 @@ struct SpeechOutput {
     text: String,
     final_output: bool,
     automatic: bool,
+    failed: bool,
 }
 #[derive(Clone)]
 pub struct SpeechSender {
     sender: mpsc::Sender<SpeechOutput>,
     turn: Arc<RelayTurn>,
+    timer: Arc<TurnTimer>,
 }
 impl SpeechSender {
+    /// Add tool execution time to this turn's latency record (#1551). Only the
+    /// duration is kept; tool names, arguments and results are never recorded.
+    pub fn note_tool_time(&self, duration: Duration) {
+        self.timer.add_tool_time(duration);
+    }
     /// A successful return means queued, not audibly played. Only send intended
     /// user-facing text. Receipts are deduplicated by turn plus utterance ID.
     pub async fn speak(
@@ -70,6 +78,7 @@ impl SpeechSender {
         if text.len() > 12_000 || utterance_id.is_empty() || utterance_id.len() > 64 {
             return Err(AgentError);
         }
+        self.timer.first_token();
         self.sender
             .send(SpeechOutput {
                 turn: self.turn.clone(),
@@ -77,6 +86,7 @@ impl SpeechSender {
                 text: text.into(),
                 final_output,
                 automatic: false,
+                failed: false,
             })
             .await
             .map_err(|_| AgentError)
@@ -479,11 +489,12 @@ fn classify(
 /// evicts the oldest waiting turn instead of ending the call.
 #[derive(Default)]
 struct TurnQueue {
-    turns: Mutex<VecDeque<Arc<RelayTurn>>>,
+    turns: Mutex<VecDeque<QueuedTurn>>,
     ready: Notify,
 }
+type QueuedTurn = (Arc<RelayTurn>, Arc<TurnTimer>);
 impl TurnQueue {
-    fn push(&self, turn: Arc<RelayTurn>) -> Option<Arc<RelayTurn>> {
+    fn push(&self, turn: QueuedTurn) -> Option<QueuedTurn> {
         let mut turns = self.turns.lock().unwrap_or_else(|e| e.into_inner());
         turns.push_back(turn);
         let dropped = if turns.len() > TURN_QUEUE_CAPACITY {
@@ -495,7 +506,7 @@ impl TurnQueue {
         self.ready.notify_one();
         dropped
     }
-    fn pop(&self) -> Option<Arc<RelayTurn>> {
+    fn pop(&self) -> Option<QueuedTurn> {
         self.turns
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -519,7 +530,8 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
     let Some(sid) = call.provider_sid.as_deref() else {
         return;
     };
-    let mut session = RelaySession::new(&call.id, state.auth.account(), sid);
+    let mut session = RelaySession::new(&call.id, state.auth.account(), sid)
+        .with_debug_events(state.service.config.debug_events);
     let setup_ok = match receive_setup(&mut socket, &mut session).await {
         Ok(control_frames) => {
             tracing::info!(call_id = %call.id, control_frames, "phone relay setup accepted");
@@ -575,18 +587,20 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
     });
     let mut worker = tokio::spawn(async move {
         loop {
-            let turn = loop {
-                if let Some(turn) = worker_queue.pop() {
-                    break turn;
+            let (turn, timer) = loop {
+                if let Some(entry) = worker_queue.pop() {
+                    break entry;
                 }
                 tokio::select! { _=worker_cancel.cancelled()=>return, _=worker_queue.ready.notified()=>{} }
             };
             if worker_service.authorize_call(&worker_call.id).is_err() {
                 break;
             }
+            timer.dequeued();
             let speech = SpeechSender {
                 sender: speech_tx.clone(),
                 turn: turn.clone(),
+                timer: timer.clone(),
             };
             let turn_cancel = worker_cancel.child_token();
             let result = bounded_answer(
@@ -603,6 +617,8 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
             if worker_cancel.is_cancelled() {
                 break;
             }
+            timer.first_token();
+            let failed = result.is_err();
             let text = result.unwrap_or_else(|_| {
                 "Sorry, I couldn’t complete that request. You can try another question or continue in chat.".into()
             });
@@ -613,6 +629,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                     text,
                     final_output: true,
                     automatic: true,
+                    failed,
                 })
                 .await
                 .is_err()
@@ -623,6 +640,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
     });
     let mut feedback = HashMap::<String, TurnFeedback>::new();
     let mut diagnostics = Diagnostics::default();
+    let mut metrics = TurnMetricsLedger::new(&state.service, &call);
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let end_reason = 'connection: loop {
         tokio::select! {
@@ -632,25 +650,31 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                     Classified::Turn(turn)=>{
                         let turn=Arc::new(turn);
                         feedback.insert(turn.id.clone(), TurnFeedback::new(turn.clone()));
-                        if let Some(dropped)=queue.push(turn) {
+                        let timer = metrics.begin(&turn.id);
+                        if let Some((dropped, _))=queue.push((turn, timer)) {
                             feedback.remove(&dropped.id);
                             log_recoverable(&call, diagnostics.note("turn_queue_full", None, session.consecutive_invalid_frames()));
                             // The evicted turn gets one fixed final line; dedup and
-                            // interruption rules apply like any other speech.
+                            // interruption rules apply like any other speech. It is
+                            // recorded as a failed turn, not an answered one.
                             if let Ok(Some(frame))=session.finish(&dropped, QUEUE_FULL_RECOVERY_LINE) {
                                 if !write_frame(&mut socket, frame).await {break EndReason::TransportError;}
+                                metrics.spoken(&dropped.id, true, true);
                             }
                         }
                     },
                     Classified::Interrupted=>{
                         feedback.clear();
+                        metrics.interrupted();
                         if let Some(heard)=session.take_interrupted_prefix() {
                             if interrupt_tx.try_send(heard).is_err() {
                                 tracing::warn!("phone interruption persistence queue full; stale audio already invalidated");
                             }
                         }
                     },
-                    Classified::Ignore=>{},
+                    Classified::Ignore=>{
+                        if let Some(at) = session.take_played_event() { metrics.played(at); }
+                    },
                     Classified::Recoverable{category,provider_code}=>{
                         let consecutive=session.consecutive_invalid_frames();
                         log_recoverable(&call, diagnostics.note(category, provider_code, consecutive));
@@ -675,7 +699,10 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                 if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
                 let result=if output.automatic {session.finish(&output.turn,&output.text)} else {session.speech(&output.turn,&output.utterance_id,&output.text,output.final_output)};
                 match result {
-                    Ok(Some(frame))=>if !write_frame(&mut socket, frame).await {break EndReason::TransportError;},
+                    Ok(Some(frame))=>{
+                        if !write_frame(&mut socket, frame).await {break EndReason::TransportError;}
+                        metrics.spoken(&output.turn.id, output.final_output, output.failed);
+                    },
                     Ok(None)=>{},
                     // An agent-side utterance violation drops that output only.
                     Err(_)=>log_recoverable(&call, diagnostics.note("invalid_speech_output", None, session.consecutive_invalid_frames())),
@@ -699,6 +726,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
         }
     };
     tracing::info!(call_id = %call.id, reason = end_reason.as_str(), "phone relay ending");
+    metrics.finish();
     cancel.cancel();
     drop(interrupt_tx);
     let _ = interrupt_worker.await;
@@ -862,6 +890,121 @@ mod deadline_tests {
             .unwrap(),
             "next answer"
         );
+    }
+}
+
+/// Per-connection #1551 bookkeeping. A turn is recorded once: when the next
+/// prompt arrives, on interruption, or when the connection ends, so that
+/// played-token events arriving after the final frame are still attributed.
+struct TurnMetricsLedger<'a> {
+    service: &'a PhoneService,
+    call: &'a PhoneCall,
+    /// Insertion order is turn order; `completed` holds the provisional outcome
+    /// once the final frame has been written.
+    turns: Vec<TrackedTurn>,
+    speaking: Option<String>,
+}
+struct TrackedTurn {
+    id: String,
+    timer: Arc<TurnTimer>,
+    completed: Option<TurnOutcome>,
+}
+impl<'a> TurnMetricsLedger<'a> {
+    fn new(service: &'a PhoneService, call: &'a PhoneCall) -> Self {
+        Self {
+            service,
+            call,
+            turns: Vec::new(),
+            speaking: None,
+        }
+    }
+    /// Final prompt received: earlier finished turns are flushed as-is.
+    fn begin(&mut self, turn_id: &str) -> Arc<TurnTimer> {
+        self.flush(|completed| completed);
+        let timer = Arc::new(TurnTimer::start());
+        self.turns.push(TrackedTurn {
+            id: turn_id.into(),
+            timer: timer.clone(),
+            completed: None,
+        });
+        timer
+    }
+    fn spoken(&mut self, turn_id: &str, final_output: bool, failed: bool) {
+        let Some(turn) = self.turns.iter_mut().find(|t| t.id == turn_id) else {
+            return;
+        };
+        turn.timer.speech_written(final_output);
+        self.speaking = Some(turn_id.into());
+        if final_output {
+            turn.completed = Some(if failed {
+                TurnOutcome::Failed
+            } else {
+                TurnOutcome::Answered
+            });
+        }
+    }
+    fn played(&mut self, at: tokio::time::Instant) {
+        if let Some(turn) = self
+            .speaking
+            .as_deref()
+            .and_then(|id| self.turns.iter().find(|t| t.id == id))
+        {
+            turn.timer.played(at);
+        }
+    }
+    /// The owner spoke over playback: pending and just-answered turns were cut.
+    fn interrupted(&mut self) {
+        self.flush(|completed| match completed {
+            Some(TurnOutcome::Failed) => Some(TurnOutcome::Failed),
+            _ => Some(TurnOutcome::Interrupted),
+        });
+    }
+    /// Connection ending: unfinished turns never reached the owner.
+    fn finish(&mut self) {
+        self.flush(|completed| completed.or(Some(TurnOutcome::Failed)));
+    }
+    fn flush(&mut self, outcome: impl Fn(Option<TurnOutcome>) -> Option<TurnOutcome>) {
+        let mut kept = Vec::new();
+        for turn in std::mem::take(&mut self.turns) {
+            match outcome(turn.completed) {
+                Some(outcome) => self.record(&turn, outcome),
+                None => kept.push(turn),
+            }
+        }
+        self.turns = kept;
+        if !self.turns.iter().any(|t| Some(t.id.as_str()) == self.speaking.as_deref()) {
+            self.speaking = None;
+        }
+    }
+    fn record(&self, turn: &TrackedTurn, outcome: TurnOutcome) {
+        let record = turn.timer.record(
+            &self.call.id,
+            &turn.id,
+            TurnProvider::Native,
+            outcome,
+            self.service.clock.now_ms(),
+            crate::metrics::build_commit(),
+        );
+        tracing::info!(
+            target: "phone.turn",
+            call_id = %record.call_id,
+            turn_id = %record.turn_id,
+            provider = record.provider.as_str(),
+            outcome = record.outcome.as_str(),
+            queue_wait_ms = record.queue_wait_ms,
+            t_first_token_ms = record.t_first_token_ms,
+            t_first_speech_ms = record.t_first_speech_ms,
+            t_last_speech_ms = record.t_last_speech_ms,
+            tool_ms = record.tool_ms,
+            t_first_played_ms = record.t_first_played_ms,
+            t_last_played_ms = record.t_last_played_ms,
+            audible_delta_ms = record.audible_delta_ms,
+            commit_sha = record.commit_sha.as_deref(),
+            "phone turn metrics"
+        );
+        if let Err(error) = self.service.store.phone_record_turn_metrics(&record) {
+            tracing::warn!(call_id = %record.call_id, error = %error, "phone turn metrics not persisted");
+        }
     }
 }
 

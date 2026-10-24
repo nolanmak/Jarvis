@@ -74,3 +74,24 @@ CREATE TABLE IF NOT EXISTS phone_number_receipts (
     should_call INTEGER NOT NULL,
     PRIMARY KEY(owner, event_id)
 );
+
+-- #1551 per-turn latency record. Offsets are milliseconds relative to the final
+-- prompt frame. No speech text, numbers or identifiers beyond call/turn IDs.
+CREATE TABLE IF NOT EXISTS phone_turn_metrics (
+    call_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    recorded_ms INTEGER NOT NULL CHECK(recorded_ms >= 0),
+    provider TEXT NOT NULL CHECK(provider IN ('fast','native')),
+    outcome TEXT NOT NULL CHECK(outcome IN ('answered','interrupted','failed','dispatched')),
+    queue_wait_ms INTEGER CHECK(queue_wait_ms IS NULL OR queue_wait_ms >= 0),
+    t_first_token_ms INTEGER CHECK(t_first_token_ms IS NULL OR t_first_token_ms >= 0),
+    t_first_speech_ms INTEGER CHECK(t_first_speech_ms IS NULL OR t_first_speech_ms >= 0),
+    t_last_speech_ms INTEGER CHECK(t_last_speech_ms IS NULL OR t_last_speech_ms >= 0),
+    tool_ms INTEGER CHECK(tool_ms IS NULL OR tool_ms >= 0),
+    t_first_played_ms INTEGER CHECK(t_first_played_ms IS NULL OR t_first_played_ms >= 0),
+    t_last_played_ms INTEGER CHECK(t_last_played_ms IS NULL OR t_last_played_ms >= 0),
+    audible_delta_ms INTEGER,
+    commit_sha TEXT CHECK(commit_sha IS NULL OR length(commit_sha) BETWEEN 7 AND 40),
+    PRIMARY KEY(call_id, turn_id)
+);
+CREATE INDEX IF NOT EXISTS phone_turn_metrics_recorded ON phone_turn_metrics(call_id, recorded_ms);
