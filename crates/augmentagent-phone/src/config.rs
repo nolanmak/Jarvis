@@ -123,6 +123,7 @@ impl Settings {
             Some("0") => false,
             _ => return Err(Error::NotConfigured),
         };
+        let silence = crate::silence::SilencePolicy::from_lookup(&get)?;
         let public_url = required("AUGMENTAGENT_PHONE_PUBLIC_URL")?;
         let fast = crate::fast::FastLayerConfig::from_lookup(&get, &public_url)?;
         let phone = PhoneConfig::new(
@@ -133,6 +134,7 @@ impl Settings {
         )?
         .with_voice(voice.clone())
         .with_debug_events(debug_events)
+        .with_silence(silence)
         .with_barge_in(barge_in(&get)?)
         .with_fast_layer(fast);
         let account = required("TWILIO_ACCOUNT_SID")?;
@@ -150,6 +152,10 @@ impl Settings {
             auth,
             voice,
         }))
+    }
+    /// Validated silence thresholds (#1556).
+    pub fn silence(&self) -> crate::silence::SilencePolicy {
+        self.phone.silence
     }
     /// Validated speech providers as they will be emitted in TwiML.
     pub fn voice(&self) -> &VoiceConfig {

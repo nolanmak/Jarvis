@@ -972,7 +972,7 @@ mod fast {
         assert_eq!(all.iter().filter(|s| s.idempotency_key == key).count(), 1);
         let mut announced = Vec::new();
         while let Ok(event) = rx.try_recv() {
-            if let SpeechEvent::System { text } = event {
+            if let SpeechEvent::System { text, .. } = event {
                 announced.push(text);
             }
         }

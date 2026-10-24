@@ -328,6 +328,7 @@ pub struct RelaySession {
     debug_events: bool,
     invalid_frames: u64,
     played_event: Option<tokio::time::Instant>,
+    owner_activity: bool,
     barge: BargeIn,
     /// Turn that most recently wrote speech: what an `interrupt` cut off.
     speaking: Option<String>,
@@ -352,6 +353,7 @@ impl RelaySession {
             debug_events: false,
             invalid_frames: 0,
             played_event: None,
+            owner_activity: false,
             barge: BargeIn::default(),
             speaking: None,
             pending: None,
@@ -404,6 +406,11 @@ impl RelaySession {
     /// Frames rejected as malformed, unauthorized or unsupported.
     pub fn invalid_frames(&self) -> u64 {
         self.invalid_frames
+    }
+    /// Whether the owner spoke (any `prompt`, partial or final, or an
+    /// `interrupt`) since the last call. Restarts the silence clock (#1556).
+    pub fn take_owner_activity(&mut self) -> bool {
+        std::mem::take(&mut self.owner_activity)
     }
     /// Receipt time of the latest tokens-played debug event, consumed once.
     pub fn take_played_event(&mut self) -> Option<tokio::time::Instant> {
@@ -468,6 +475,7 @@ impl RelaySession {
                 if text.len() > 12_000 {
                     return Err(Error::InvalidArguments);
                 }
+                self.owner_activity = true;
                 // TwiML pins partialPrompts=false. Defensive handling never
                 // submits interim recognition to the agent.
                 if !last || text.trim().is_empty() {
@@ -506,6 +514,7 @@ impl RelaySession {
                 if heard.len() > 12_000 || duration > 900_000 {
                     return Err(Error::InvalidArguments);
                 }
+                self.owner_activity = true;
                 // Min words 1 leaves no speech short enough to be a backchannel.
                 if let Some(turn_id) = self.speaking.clone().filter(|_| self.barge.min_words > 1) {
                     self.pending = Some(PendingInterrupt {
@@ -661,6 +670,9 @@ impl RelaySession {
         if spoken.trim().is_empty() {
             return Ok(None);
         }
+        // An announcement is not an answer: an interrupt over it has nothing
+        // to resume (#1550).
+        self.speaking = None;
         Ok(Some(text_frame(&spoken, true)))
     }
     /// Preemptible thinking sound for a turn still waiting on a tool. Nothing
@@ -719,6 +731,32 @@ impl RelaySession {
             return Ok(None);
         }
         self.speech(turn, "final", text, true)
+    }
+}
+impl RelaySession {
+    /// Silence check-in (#1556): its own talk cycle; the owner may talk over
+    /// it and any later speech replaces it.
+    pub fn check_in(&mut self, text: &str) -> Value {
+        // What plays now is not an answer: an interrupt over it has nothing
+        // to resume (#1550).
+        self.speaking = None;
+        json!({"type":"text","token":text,"last":true,"interruptible":true,"preemptible":true})
+    }
+    /// Fixed silence goodbye spoken just before `end`; nothing may cut it short.
+    pub fn silence_goodbye(&mut self, text: &str) -> Value {
+        self.speaking = None;
+        json!({"type":"text","token":text,"last":true,"interruptible":false,"preemptible":false})
+    }
+    /// `end` for a silence hangup (#1556), at most once per session, with the
+    /// same `{reason, call_id}` handoff as an agent-initiated end (#1557).
+    pub fn end_for_silence(&mut self) -> Option<Value> {
+        if std::mem::replace(&mut self.ended, true) {
+            return None;
+        }
+        Some(json!({
+            "type": "end",
+            "handoffData": json!({"reason": crate::silence::END_REASON, "call_id": self.call_id}).to_string(),
+        }))
     }
 }
 fn text_frame(token: &str, last: bool) -> Value {
