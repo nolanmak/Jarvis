@@ -8,6 +8,35 @@ use thiserror::Error;
 
 pub(crate) fn migrate(conn: &Connection) -> StoreResult<()> {
     conn.execute_batch(include_str!("phone.sql"))?;
+    allow_silence_end_reason(conn)?;
+    Ok(())
+}
+/// #1556: a `phone_call_end_reasons` table created by #1557 rejects
+/// 'silence' in its CHECK. SQLite cannot alter a CHECK, so the table is
+/// rebuilt once with its rows kept. A no-op on any later open.
+fn allow_silence_end_reason(conn: &Connection) -> StoreResult<()> {
+    let sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='phone_call_end_reasons'",
+        [],
+        |r| r.get(0),
+    )?;
+    if sql.contains("'silence'") {
+        return Ok(());
+    }
+    // Rolled back on any error, so a failed rebuild leaves the old table.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE phone_call_end_reasons RENAME TO phone_call_end_reasons_1557;
+         CREATE TABLE phone_call_end_reasons (
+             call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
+             reason TEXT NOT NULL CHECK(reason IN ('owner_goodbye','task_complete','owner_request','relay_ended_unknown','silence')),
+             recorded_ms INTEGER NOT NULL
+         );
+         INSERT INTO phone_call_end_reasons(call_id,reason,recorded_ms)
+             SELECT call_id,reason,recorded_ms FROM phone_call_end_reasons_1557;
+         DROP TABLE phone_call_end_reasons_1557;",
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -1326,11 +1355,13 @@ impl Store {
 }
 
 /// Why a relayed call ended, as recorded from the relay-ended callback (#1557).
-pub const PHONE_END_REASONS: [&str; 4] = [
+pub const PHONE_END_REASONS: [&str; 5] = [
     "owner_goodbye",
     "task_complete",
     "owner_request",
     "relay_ended_unknown",
+    // #1556: recorded by the relay itself, with a chat notice.
+    "silence",
 ];
 impl Store {
     /// Record a call's end reason. First write wins, so a replayed callback
@@ -1651,5 +1682,92 @@ impl Store {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })?)
+    }
+}
+/// First retry delay for an end notice (#1556); doubles per attempt.
+const END_NOTICE_LEASE_MS: i64 = 60_000;
+impl Store {
+    /// Record an end the runtime chose itself (#1556) and queue its one chat
+    /// notice in the same transaction. First write wins: returns false, and
+    /// queues nothing, when the call already has an end reason.
+    pub fn phone_record_end_with_notice(
+        &self,
+        call_id: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> PhoneResult<bool> {
+        if !PHONE_END_REASONS.contains(&reason) {
+            return Err(PhoneError::InvalidInput);
+        }
+        transaction(self, |tx| {
+            call_by_id(tx, call_id)?;
+            if tx.execute(
+                "INSERT OR IGNORE INTO phone_call_end_reasons(call_id,reason,recorded_ms) VALUES(?1,?2,?3)",
+                params![call_id, reason, now_ms],
+            )? == 0
+            {
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO phone_call_end_notices(call_id,created_ms) VALUES(?1,?2)",
+                params![call_id, now_ms],
+            )?;
+            Ok(true)
+        })
+    }
+    /// Calls with a pending end notice not leased by an earlier attempt,
+    /// with their end reason.
+    pub fn phone_end_notices_due(&self, now_ms: i64) -> PhoneResult<Vec<(PhoneCall, String)>> {
+        let columns = CALL_COLUMNS
+            .split(',')
+            .map(|c| format!("c.{c}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        Ok(self.with_conn(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {columns}, r.reason FROM phone_call_end_notices n
+                 JOIN phone_call_end_reasons r ON r.call_id=n.call_id
+                 JOIN phone_calls c ON c.id=n.call_id
+                 WHERE n.state='pending' AND n.attempts<3 AND n.next_ms<=?1
+                 ORDER BY n.created_ms, c.id LIMIT 8"
+            ))?;
+            let due = stmt
+                .query_map([now_ms], |row| Ok((read_call(row)?, row.get(12)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(due)
+        })?)
+    }
+    /// Lease one delivery attempt. False when the notice was delivered, is
+    /// out of attempts, or is still leased by an earlier attempt.
+    pub fn phone_claim_end_notice(&self, call_id: &str, now_ms: i64) -> PhoneResult<bool> {
+        transaction(self, |tx| {
+            let notice: Option<(String, i64, i64)> = tx
+                .query_row(
+                    "SELECT state,attempts,next_ms FROM phone_call_end_notices WHERE call_id=?1",
+                    [call_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            let Some((state, attempts, next)) = notice else {
+                return Ok(false);
+            };
+            if state != "pending" || attempts >= 3 || now_ms < next {
+                return Ok(false);
+            }
+            tx.execute(
+                "UPDATE phone_call_end_notices SET attempts=attempts+1,next_ms=?2 WHERE call_id=?1",
+                params![call_id, now_ms.saturating_add(END_NOTICE_LEASE_MS << attempts)],
+            )?;
+            Ok(true)
+        })
+    }
+    /// The notice reached the durable outbox. False if it was already done.
+    pub fn phone_complete_end_notice(&self, call_id: &str, now_ms: i64) -> PhoneResult<bool> {
+        transaction(self, |tx| {
+            Ok(tx.execute(
+                "UPDATE phone_call_end_notices SET state='done',done_ms=?2 WHERE call_id=?1 AND state='pending'",
+                params![call_id, now_ms],
+            )? == 1)
+        })
     }
 }
