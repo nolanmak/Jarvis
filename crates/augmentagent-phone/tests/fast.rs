@@ -375,6 +375,8 @@ async fn step4_tool_surface_is_exactly_two_and_unknown_tools_are_refused() {
     assert_eq!(requests.len(), 2);
     for request in requests.iter() {
         assert_eq!(request.tools, ["dispatch_task", "lookup_fast"]);
+        // #1547 sentence marker: the chunker splits on it and strips it.
+        assert!(request.system.contains("Put • between sentences."));
     }
     assert!(requests[1].messages.iter().any(|m| matches!(m,
         FastMessage::ToolResult { content, is_error: true, .. } if content.contains("tool_not_allowed"))));
