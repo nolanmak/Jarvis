@@ -130,6 +130,7 @@ pub struct PhoneConfig {
     owner_first_name: Option<String>,
     debug_events: bool,
     fast: Option<fast::FastLayerConfig>,
+    preemptive: bool,
 }
 impl PhoneConfig {
     pub fn new(
@@ -170,6 +171,7 @@ impl PhoneConfig {
             owner_first_name: None,
             debug_events: false,
             fast: None,
+            preemptive: false,
         })
     }
     /// Operator-validated speech providers. Only startup configuration may call this.
@@ -192,6 +194,12 @@ impl PhoneConfig {
     /// Answer utterances with the fast conversational layer (#1546).
     pub fn with_fast_layer(mut self, fast: Option<fast::FastLayerConfig>) -> Self {
         self.fast = fast;
+        self
+    }
+    /// Preemptive generation on interim transcripts (#1555). Takes effect only
+    /// together with the fast layer.
+    pub fn with_preemptive(mut self, enabled: bool) -> Self {
+        self.preemptive = enabled;
         self
     }
 }
@@ -236,6 +244,11 @@ impl PhoneService {
     /// Fast-layer settings when `AUGMENTAGENT_PHONE_FAST_LAYER=1` (#1546).
     pub fn fast_layer(&self) -> Option<&fast::FastLayerConfig> {
         self.config.fast.as_ref()
+    }
+    /// `AUGMENTAGENT_PHONE_PREEMPTIVE=1` on the fast layer (#1555): TwiML
+    /// requests interim prompts and the relay may speculate on them.
+    pub fn preemptive(&self) -> bool {
+        self.config.preemptive && self.config.fast.is_some()
     }
     pub fn linked_surface_owners(&self) -> Vec<SurfaceOwnerRef> {
         self.config
@@ -734,3 +747,5 @@ pub mod recovery;
 pub mod metrics;
 
 pub mod fast;
+/// Preemptive generation on interim transcripts (#1555).
+pub mod speculation;

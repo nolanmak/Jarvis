@@ -4,7 +4,7 @@
 //! arguments and never appear in errors or logs.
 use augmentagent_phone::fast::{
     FastEvent, FastMessage, FastModel, FastModelError, FastProvider, FastRequest, FastStream,
-    ToolCall,
+    ToolCall, ToolChoice,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -58,14 +58,18 @@ pub fn anthropic_body(request: &FastRequest) -> Value {
         .iter()
         .map(|t| json!({"name":t.name,"description":t.description,"input_schema":t.input_schema}))
         .collect();
-    json!({
+    let mut body = json!({
         "model": ANTHROPIC_FAST_MODEL,
         "max_tokens": 400,
         "stream": true,
         "system": request.system,
         "messages": messages,
         "tools": tools,
-    })
+    });
+    if request.tool_choice == ToolChoice::None {
+        body["tool_choice"] = json!({"type":"none"});
+    }
+    body
 }
 
 pub fn cerebras_body(request: &FastRequest, model: &str) -> Value {
@@ -93,13 +97,17 @@ pub fn cerebras_body(request: &FastRequest, model: &str) -> Value {
         .iter()
         .map(|t| json!({"type":"function","function":{"name":t.name,"description":t.description,"parameters":t.input_schema}}))
         .collect();
-    json!({
+    let mut body = json!({
         "model": model,
         "max_tokens": 400,
         "stream": true,
         "messages": messages,
         "tools": tools,
-    })
+    });
+    if request.tool_choice == ToolChoice::None {
+        body["tool_choice"] = json!("none");
+    }
+    body
 }
 
 /// Complete `data:` payloads from a server-sent event buffer.
@@ -459,6 +467,7 @@ mod phone_fast_tests {
                 },
             ],
             tools: tool_specs(),
+            tool_choice: ToolChoice::Auto,
         }
     }
     fn names(events: &[FastEvent]) -> Vec<String> {
@@ -490,6 +499,24 @@ mod phone_fast_tests {
         assert_eq!(messages[2]["role"], "user");
         assert_eq!(messages[2]["content"][0]["type"], "tool_result");
         assert_eq!(messages[2]["content"][0]["tool_use_id"], "t1");
+    }
+
+    // #1555: speculative requests list the tools but forbid calling them;
+    // normal requests leave the provider default untouched.
+    #[test]
+    fn phone_fast_speculative_bodies_set_tool_choice_none() {
+        assert!(anthropic_body(&request()).get("tool_choice").is_none());
+        assert!(cerebras_body(&request(), "m").get("tool_choice").is_none());
+        let speculative = FastRequest {
+            tool_choice: ToolChoice::None,
+            ..request()
+        };
+        let anthropic = anthropic_body(&speculative);
+        assert_eq!(anthropic["tool_choice"], json!({"type":"none"}));
+        assert_eq!(anthropic["tools"].as_array().unwrap().len(), 2);
+        let cerebras = cerebras_body(&speculative, "m");
+        assert_eq!(cerebras["tool_choice"], "none");
+        assert_eq!(cerebras["tools"].as_array().unwrap().len(), 2);
     }
 
     #[test]

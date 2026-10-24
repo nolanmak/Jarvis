@@ -144,6 +144,7 @@ pub async fn cleanup_without_runtime(
             owner_first_name: None,
             debug_events: false,
             fast: None,
+            preemptive: false,
         },
     ));
     let initial = service.cleanup_due(true)?;

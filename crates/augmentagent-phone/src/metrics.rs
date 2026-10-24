@@ -20,6 +20,8 @@ struct Marks {
     tool: Duration,
     fast: bool,
     dispatched: bool,
+    speculated: bool,
+    speculation_saved: Option<Duration>,
 }
 pub struct TurnTimer {
     started: Instant,
@@ -77,6 +79,19 @@ impl TurnTimer {
     pub fn mark_dispatched(&self) {
         self.update(|m| m.dispatched = true);
     }
+    /// Preemptive generation (#1555): whether this utterance started a
+    /// speculation, and the time saved when it was committed.
+    pub fn speculation(&self, speculated: bool, saved: Option<Duration>) {
+        self.update(|m| {
+            m.speculated = speculated;
+            m.speculation_saved = saved;
+        });
+    }
+    /// The committed speculation could not stand as the answer (it wanted a
+    /// tool or failed before speaking): the turn re-planned from scratch.
+    pub fn speculation_discarded(&self) {
+        self.update(|m| m.speculation_saved = None);
+    }
     /// Provider for the record: fast when the fast layer answered.
     pub fn provider(&self) -> TurnProvider {
         if self.marks.lock().unwrap_or_else(|p| p.into_inner()).fast {
@@ -131,6 +146,11 @@ impl TurnTimer {
             t_last_played_ms: offset(self.started, marks.last_played),
             audible_delta_ms: t_first_played_ms.zip(t_first_speech_ms).map(|(p, s)| p - s),
             commit_sha: commit_sha.map(str::to_owned),
+            speculated: marks.speculated,
+            speculation_committed: marks.speculation_saved.is_some(),
+            speculation_saved_ms: marks
+                .speculation_saved
+                .map(|saved| i64::try_from(saved.as_millis()).unwrap_or(i64::MAX)),
         }
     }
 }

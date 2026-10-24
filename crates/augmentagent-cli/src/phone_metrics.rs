@@ -52,6 +52,9 @@ mod tests {
             t_last_played_ms: Some(first_speech + 1_500),
             audible_delta_ms: Some(290),
             commit_sha: None,
+            speculated: false,
+            speculation_committed: false,
+            speculation_saved_ms: None,
         }
     }
 
@@ -75,7 +78,7 @@ mod tests {
         assert_eq!(*delta, "audible_delta_ms           3    290    290");
         let tool = lines.iter().find(|l| l.starts_with("tool_ms")).unwrap();
         assert_eq!(*tool, "tool_ms                    0      -      -");
-        assert_eq!(lines.len(), 2 + 8);
+        assert_eq!(lines.len(), 2 + 9);
     }
 
     #[test]

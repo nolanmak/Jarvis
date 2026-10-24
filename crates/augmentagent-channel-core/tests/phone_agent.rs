@@ -924,6 +924,36 @@ mod fast {
         assert!(fast.uses_fast_layer());
     }
 
+    // #1555: only the fast layer speculates. The native bridge never starts
+    // one; a committed speculation is answered through the fast layer without
+    // a second model request.
+    #[tokio::test]
+    async fn preemptive_speculation_runs_only_on_the_fast_layer() {
+        let f = connected().await;
+        let plain = PhoneAgent::new(
+            f.store.clone(),
+            f.service.clone(),
+            Arc::new(MarkdownAgent),
+            Arc::new(OutboxIo { store: f.store.clone() }),
+            "/fixture".into(),
+            Arc::new(|_| Ok(Some(ProviderKind::Claude))),
+        );
+        assert!(plain.speculate(&f.call, "what's on my calendar tomorrow").is_none());
+        let model = Scripted::new(vec![vec![token("You're free tomorrow.")]]);
+        let bridge = bridge(&f, Arc::new(MarkdownAgent), model.clone());
+        let speculation = bridge
+            .speculate(&f.call, "what's on my calendar tomorrow")
+            .expect("the fast layer speculates");
+        let final_text = "what's on my calendar tomorrow?";
+        let (turn_id, speech, _rx) = speech_for(&f.call.id, final_text);
+        let answer = bridge
+            .answer_speculated(&f.call, &turn_id, final_text, speech, CancellationToken::new(), speculation)
+            .await
+            .unwrap();
+        assert_eq!(answer, "You're free tomorrow.");
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+    }
+
     /// Heavy agent that reports progress from inside the dispatched turn.
     struct ProgressHeavy {
         accepted: Mutex<Vec<bool>>,

@@ -74,6 +74,7 @@ limits and duplicate-call protections still apply. Private DM entry is optional.
 | `AUGMENTAGENT_PHONE_FAST_PROVIDER` | Fast model provider when the layer is on: `anthropic` (default, `claude-haiku-5-5`, key `ANTHROPIC_API_KEY`) or `cerebras` (fast-tier Cerebras model, key `CEREBRAS_API_KEY`). Keys load per request from the service keyring, then the service environment. Other values fail configuration. |
 | `AUGMENTAGENT_PHONE_MAX_TOOL_STEPS` | Tool calls the fast model may make per owner utterance, `1`–`8`, default `3`. Further calls get a typed refusal. Other values fail configuration. |
 | `AUGMENTAGENT_PHONE_THINKING_SOUND_URL` | Optional audio played while a fast-layer tool runs longer than 700 ms with nothing spoken. Must be `https` on the same origin as `AUGMENTAGENT_PHONE_PUBLIC_URL`, without credentials; anything else fails configuration, even while the layer is off. Unset (default) never plays a sound. |
+| `AUGMENTAGENT_PHONE_PREEMPTIVE` | `1` starts fast-layer answers on interim transcripts and commits them when the final transcript matches (#1555); TwiML then requests `partialPrompts="true"`. Absent or `0` (default) keeps `partialPrompts="false"` and every turn unchanged. Without `AUGMENTAGENT_PHONE_FAST_LAYER=1` it has no effect: native turns never speculate. Other values fail configuration. |
 
 Synthetic link example (replace identifiers with actual authenticated bindings):
 
@@ -495,6 +496,32 @@ work records outcome `dispatched`; tool time is added to `tool_ms`. Logs carry
 only fixed category codes (for example `http_4xx`, `scripted_failure`), never
 model text, tool arguments, chat text or keys.
 
+### Preemptive generation (#1555)
+
+With `AUGMENTAGENT_PHONE_PREEMPTIVE=1` on the fast layer, ConversationRelay
+sends interim `prompt` frames (`last:false`). While no turn is queued or being
+answered, the relay keeps at most one speculative fast-model answer per call:
+
+- A speculation starts when an interim transcript has at least 4 words and at
+  least 400 ms passed since the previous interim transcript that changed the
+  text. An interim transcript that does not extend the speculated words
+  cancels it. Each utterance gets at most one cancellation-and-restart (two
+  starts in total).
+- On the final `prompt`, words are lowercased and stripped of surrounding
+  punctuation. If the speculated words are a prefix of the final words and the
+  final adds at most 2 words, the speculation is committed: its buffered tokens
+  are spoken in order and generation continues. Otherwise it is cancelled and
+  the final is answered normally. Speculative output never reaches the socket
+  before commit.
+- The speculative request lists the tools with `tool_choice` set to none, and
+  speculation has no side effects: nothing is mirrored to chat and no tool runs.
+  If the model still asks for a tool, the speculation stops; once committed the
+  turn re-plans with tools enabled (and records the speculation as not
+  committed). A tool requested after committed words were already spoken is
+  not run.
+- An interruption, or an interim transcript while a turn is busy, drops the
+  speculation.
+
 ## Per-turn latency metrics (#1551)
 
 Every accepted turn (answered, interrupted, failed or dispatched) produces one
@@ -506,7 +533,11 @@ agent speech frame written to the socket; automatic "Got it" acknowledgments are
 not counted), `t_last_speech_ms` (frame with `last:true` written), `tool_ms`
 (sum reported through `SpeechSender::note_tool_time`; null when nothing was
 reported), plus `provider` (`fast`|`native`, currently always `native`),
-`outcome` and the build's Git commit SHA. A turn is recorded when the next
+`outcome` and the build's Git commit SHA. Preemptive generation (#1555) adds
+`speculated` (a speculation started for this utterance), `speculation_committed`
+(its answer was spoken) and `speculation_saved_ms` (final-prompt time minus
+speculation start, only when committed); existing databases gain these columns
+in place. A turn is recorded when the next
 prompt arrives, on interruption, or when the connection ends, so a finished
 answer that the owner talks over is stored as `interrupted`; a turn still pending
 when the socket closes is stored as `failed`. The record contains no speech text,

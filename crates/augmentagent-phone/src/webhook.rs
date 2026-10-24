@@ -220,13 +220,19 @@ impl PhoneService {
         } else {
             ""
         };
+        // #1555: interim recognition only when the fast layer may speculate.
+        let partial = if self.config.preemptive && self.config.fast.is_some() {
+            "true"
+        } else {
+            "false"
+        };
         let voice = &self.config.voice;
         let normalization = match voice.tts_provider() {
             TtsProvider::ElevenLabs => " elevenlabsTextNormalization=\"on\"",
             TtsProvider::Amazon | TtsProvider::Google => "",
         };
         format!(
-            "<Response><Connect action=\"{}/phone/relay-ended/{id}\" method=\"POST\"><ConversationRelay url=\"{}/phone/relay/{id}\" transcriptionProvider=\"{}\" speechModel=\"{}\" ttsProvider=\"{}\" voice=\"{}\" language=\"en-US\"{normalization} hints=\"{}\" interruptible=\"any\" reportInputDuringAgentSpeech=\"any\" partialPrompts=\"false\" welcomeGreeting=\"Hi, I'm here. What can I help you with?\"{debug} /></Connect><Hangup/></Response>",
+            "<Response><Connect action=\"{}/phone/relay-ended/{id}\" method=\"POST\"><ConversationRelay url=\"{}/phone/relay/{id}\" transcriptionProvider=\"{}\" speechModel=\"{}\" ttsProvider=\"{}\" voice=\"{}\" language=\"en-US\"{normalization} hints=\"{}\" interruptible=\"any\" reportInputDuringAgentSpeech=\"any\" partialPrompts=\"{partial}\" welcomeGreeting=\"Hi, I'm here. What can I help you with?\"{debug} /></Connect><Hangup/></Response>",
             xml(&self.config.public_base),
             xml(&ws),
             voice.stt_provider().as_str(),

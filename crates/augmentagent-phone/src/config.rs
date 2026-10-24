@@ -86,6 +86,12 @@ impl Settings {
             Some("0") => false,
             _ => return Err(Error::NotConfigured),
         };
+        // #1555: explicit on/off, default off; inert without the fast layer.
+        let preemptive = match get("AUGMENTAGENT_PHONE_PREEMPTIVE").as_deref() {
+            None | Some("0") => false,
+            Some("1") => true,
+            _ => return Err(Error::NotConfigured),
+        };
         let public_url = required("AUGMENTAGENT_PHONE_PUBLIC_URL")?;
         let fast = crate::fast::FastLayerConfig::from_lookup(&get, &public_url)?;
         let phone = PhoneConfig::new(
@@ -96,7 +102,8 @@ impl Settings {
         )?
         .with_voice(voice.clone())
         .with_debug_events(debug_events)
-        .with_fast_layer(fast);
+        .with_fast_layer(fast)
+        .with_preemptive(preemptive);
         let account = required("TWILIO_ACCOUNT_SID")?;
         let token = required("TWILIO_AUTH_TOKEN")?;
         let provider = Arc::new(TwilioClient::new(
