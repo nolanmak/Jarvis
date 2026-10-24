@@ -1324,3 +1324,43 @@ impl Store {
         })?)
     }
 }
+
+/// Why a relayed call ended, as recorded from the relay-ended callback (#1557).
+pub const PHONE_END_REASONS: [&str; 4] = [
+    "owner_goodbye",
+    "task_complete",
+    "owner_request",
+    "relay_ended_unknown",
+];
+impl Store {
+    /// Record a call's end reason. First write wins, so a replayed callback
+    /// never changes it. Returns whether a row was written.
+    pub fn phone_record_end_reason(
+        &self,
+        call_id: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> PhoneResult<bool> {
+        if !PHONE_END_REASONS.contains(&reason) {
+            return Err(PhoneError::InvalidInput);
+        }
+        transaction(self, |tx| {
+            call_by_id(tx, call_id)?;
+            Ok(tx.execute(
+                "INSERT OR IGNORE INTO phone_call_end_reasons(call_id,reason,recorded_ms) VALUES(?1,?2,?3)",
+                params![call_id, reason, now_ms],
+            )? == 1)
+        })
+    }
+    /// The recorded end reason; `None` when the call ended without one.
+    pub fn phone_end_reason(&self, call_id: &str) -> PhoneResult<Option<String>> {
+        Ok(self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT reason FROM phone_call_end_reasons WHERE call_id=?1",
+                [call_id],
+                |r| r.get(0),
+            )
+            .optional()
+        })?)
+    }
+}

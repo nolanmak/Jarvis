@@ -17,9 +17,10 @@ use std::{path::Path, time::Duration};
 /// dispatch; the wiki write is done here, after validation.
 pub const SUMMARY_TOOLS: [&str; 0] = [];
 /// Name fragments that must never appear in the summarization tool set.
-pub const FORBIDDEN_SUMMARY_TOOLS: [&str; 8] = [
+pub const FORBIDDEN_SUMMARY_TOOLS: [&str; 9] = [
     "dispatch_task",
     "lookup_fast",
+    "end_call",
     "mcp__phone",
     "call_owner",
     "phone_",

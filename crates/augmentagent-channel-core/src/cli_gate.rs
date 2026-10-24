@@ -65,6 +65,8 @@ pub struct CliGate {
     held: Mutex<HashMap<u64, Held>>,
     next_id: AtomicU64,
     waiting: AtomicUsize,
+    /// Every `acquire_timed` call, granted or not (#1548 spy).
+    acquires: AtomicU64,
     last_warn_ms: AtomicU64,
     /// A field, not the const, so tests can compress a minute to milliseconds.
     warn_every: Duration,
@@ -85,6 +87,7 @@ impl CliGate {
             held: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
             waiting: AtomicUsize::new(0),
+            acquires: AtomicU64::new(0),
             last_warn_ms: AtomicU64::new(0),
             warn_every: QUEUED_WARN_EVERY,
             queued_warnings: AtomicU64::new(0),
@@ -129,6 +132,12 @@ impl CliGate {
         self.waiting.load(Ordering::SeqCst)
     }
 
+    /// Permit requests so far, granted or not. Lets a caller prove it never
+    /// asked for one (#1548: fast-layer phone turns).
+    pub fn acquire_calls(&self) -> u64 {
+        self.acquires.load(Ordering::Relaxed)
+    }
+
     /// Test visibility for what otherwise only reaches the log.
     pub fn queued_warnings(&self) -> u64 {
         self.queued_warnings.load(Ordering::Relaxed)
@@ -143,6 +152,7 @@ impl CliGate {
         caller: &str,
         max_wait: Duration,
     ) -> Result<CliPermit, GateWaitTimeout> {
+        self.acquires.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
         let deadline = started + max_wait;
         let queued = WaitGuard::enter(self);
@@ -430,6 +440,19 @@ mod tests {
         assert_eq!(gate.sem.available_permits(), 0, "naming a hold must not widen the gate");
         drop(leaked);
         gate.acquire_timed("claude", "triage", budget).await.expect("gate is usable again");
+    }
+
+    /// #1548 spy: every request for a permit is counted, granted or not, so a
+    /// caller can prove it never asked.
+    #[tokio::test(start_paused = true)]
+    async fn acquire_calls_counts_every_request_granted_or_not() {
+        let gate = Arc::new(CliGate::new(1));
+        assert_eq!(gate.acquire_calls(), 0);
+        let held = gate.acquire_timed("t", "triage", BUDGET).await.unwrap();
+        let refused = gate.acquire_timed("t", "triage", Duration::from_millis(50)).await;
+        assert!(refused.is_err());
+        assert_eq!(gate.acquire_calls(), 2);
+        drop(held);
     }
 
     #[test]

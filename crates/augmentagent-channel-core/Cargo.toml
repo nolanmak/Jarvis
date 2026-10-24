@@ -50,6 +50,8 @@ reqwest = { workspace = true }
 futures = { workspace = true }
 
 [dev-dependencies]
+# #1548 — paused-clock timing tests for the phone queue notices.
+tokio = { workspace = true, features = ["test-util"] }
 augmentagent-messages = { path = "../augmentagent-messages" }
 syn = { version = "2", features = ["full", "visit"] }
 # #501 — timeparse DST fixture tests pin America/New_York (chrono::Local

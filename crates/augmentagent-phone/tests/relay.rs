@@ -309,7 +309,7 @@ fn consecutive_invalid_frames_count_toward_the_limit_and_reset_on_any_valid_fram
         RelayInput::ProviderError(64107)
     ));
     assert_eq!(session.consecutive_invalid_frames(), 0);
-    let end = session.end();
+    let end = session.end_frame();
     assert_eq!(end["type"], "end");
     assert_eq!(end.as_object().unwrap().len(), 1);
 }
