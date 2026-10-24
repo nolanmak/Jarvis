@@ -1220,6 +1220,7 @@ dependencies = [
  "tokio-tungstenite 0.29.0",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

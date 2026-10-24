@@ -216,3 +216,31 @@ fn ac03_voice_providers_default_to_deepgram_and_elevenlabs_and_fail_closed_on_ba
         "telephony"
     );
 }
+
+#[test]
+fn debug_events_flag_is_explicit_and_fails_closed_on_junk() {
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        std::sync::Arc::new(augmentagent_store::Store::open(dir.path().join("db")).unwrap());
+    for (value, expected) in [("1", true), ("0", false)] {
+        let mut env = values();
+        env.insert("AUGMENTAGENT_PHONE_DEBUG_EVENTS", value.into());
+        let configured = Settings::from_lookup(|k| env.get(k).cloned())
+            .unwrap()
+            .unwrap()
+            .build(store.clone())
+            .unwrap();
+        assert_eq!(configured.service.debug_events(), expected, "{value}");
+    }
+    let mut env = values();
+    env.insert("AUGMENTAGENT_PHONE_DEBUG_EVENTS", "yes".into());
+    assert!(Settings::from_lookup(|k| env.get(k).cloned()).is_err());
+    // Absent: on for non-production (debug) builds only.
+    let env = values();
+    let configured = Settings::from_lookup(|k| env.get(k).cloned())
+        .unwrap()
+        .unwrap()
+        .build(store)
+        .unwrap();
+    assert_eq!(configured.service.debug_events(), cfg!(debug_assertions));
+}

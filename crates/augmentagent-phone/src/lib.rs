@@ -128,6 +128,7 @@ pub struct PhoneConfig {
     links: Vec<OwnerLink>,
     voice: voice::VoiceConfig,
     owner_first_name: Option<String>,
+    debug_events: bool,
 }
 impl PhoneConfig {
     pub fn new(
@@ -166,6 +167,7 @@ impl PhoneConfig {
             links,
             voice: voice::VoiceConfig::default(),
             owner_first_name: None,
+            debug_events: false,
         })
     }
     /// Operator-validated speech providers. Only startup configuration may call this.
@@ -177,6 +179,12 @@ impl PhoneConfig {
     /// recognition hint. No store exposes a profile yet, so runtime passes None.
     pub fn with_owner_first_name(mut self, first_name: Option<String>) -> Self {
         self.owner_first_name = first_name;
+        self
+    }
+    /// Request ConversationRelay debug events (tokens played, speaker events)
+    /// so #1551 can measure audible latency. Off unless explicitly enabled.
+    pub fn with_debug_events(mut self, enabled: bool) -> Self {
+        self.debug_events = enabled;
         self
     }
 }
@@ -215,6 +223,9 @@ impl PhoneService {
     }
     /// Explicit operator-configured identities, for installing transport adapters
     /// before the first private control conversation has been provisioned.
+    pub fn debug_events(&self) -> bool {
+        self.config.debug_events
+    }
     pub fn linked_surface_owners(&self) -> Vec<SurfaceOwnerRef> {
         self.config
             .links
@@ -705,3 +716,5 @@ pub mod config;
 pub mod router;
 
 pub mod recovery;
+
+pub mod metrics;

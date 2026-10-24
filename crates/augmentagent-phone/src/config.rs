@@ -78,13 +78,22 @@ impl Settings {
             })
             .collect::<Result<Vec<_>, Error>>()?;
         let voice = VoiceConfig::from_lookup(&get)?;
+        // Relay debug events (#1551): explicit on/off; absent defaults on for
+        // non-production (debug) builds only.
+        let debug_events = match get("AUGMENTAGENT_PHONE_DEBUG_EVENTS").as_deref() {
+            None => cfg!(debug_assertions),
+            Some("1") => true,
+            Some("0") => false,
+            _ => return Err(Error::NotConfigured),
+        };
         let phone = PhoneConfig::new(
             true,
             &required("AUGMENTAGENT_PHONE_PUBLIC_URL")?,
             &required("AUGMENTAGENT_PHONE_VERIFICATION_KEY")?,
             links,
         )?
-        .with_voice(voice.clone());
+        .with_voice(voice.clone())
+        .with_debug_events(debug_events);
         let account = required("TWILIO_ACCOUNT_SID")?;
         let token = required("TWILIO_AUTH_TOKEN")?;
         let provider = Arc::new(TwilioClient::new(

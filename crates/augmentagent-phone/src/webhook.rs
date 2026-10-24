@@ -214,13 +214,19 @@ impl PhoneService {
         // attribute-safe alphabet, or a constant. Nothing from the call, the
         // provider callback or the agent is read.
         let ws = self.config.public_base.replacen("https://", "wss://", 1);
+        // #1551: tokens-played/speaker events measure what the owner hears.
+        let debug = if self.config.debug_events {
+            " debug=\"debugging tokens-played speaker-events\""
+        } else {
+            ""
+        };
         let voice = &self.config.voice;
         let normalization = match voice.tts_provider() {
             TtsProvider::ElevenLabs => " elevenlabsTextNormalization=\"on\"",
             TtsProvider::Amazon | TtsProvider::Google => "",
         };
         format!(
-            "<Response><Connect action=\"{}/phone/relay-ended/{id}\" method=\"POST\"><ConversationRelay url=\"{}/phone/relay/{id}\" transcriptionProvider=\"{}\" speechModel=\"{}\" ttsProvider=\"{}\" voice=\"{}\" language=\"en-US\"{normalization} hints=\"{}\" interruptible=\"any\" reportInputDuringAgentSpeech=\"any\" partialPrompts=\"false\" welcomeGreeting=\"Hi, I'm here. What can I help you with?\" /></Connect><Hangup/></Response>",
+            "<Response><Connect action=\"{}/phone/relay-ended/{id}\" method=\"POST\"><ConversationRelay url=\"{}/phone/relay/{id}\" transcriptionProvider=\"{}\" speechModel=\"{}\" ttsProvider=\"{}\" voice=\"{}\" language=\"en-US\"{normalization} hints=\"{}\" interruptible=\"any\" reportInputDuringAgentSpeech=\"any\" partialPrompts=\"false\" welcomeGreeting=\"Hi, I'm here. What can I help you with?\"{debug} /></Connect><Hangup/></Response>",
             xml(&self.config.public_base),
             xml(&ws),
             voice.stt_provider().as_str(),

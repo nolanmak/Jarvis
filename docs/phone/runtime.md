@@ -69,6 +69,7 @@ limits and duplicate-call protections still apply. Private DM entry is optional.
 | `AUGMENTAGENT_PHONE_STT_MODEL` | ConversationRelay `speechModel`. Default `nova-3-general` for Deepgram, `telephony` for Google. Must match `^[A-Za-z0-9._-]{1,96}$`. |
 | `AUGMENTAGENT_PHONE_TTS_PROVIDER` | ConversationRelay `ttsProvider`: `ElevenLabs` (default), `Amazon` or `Google`. Exact, case-sensitive; anything else fails configuration. |
 | `AUGMENTAGENT_PHONE_TTS_VOICE` | ConversationRelay `voice`. Default `UgBBYS2sOqTuMpoF3BR0-flash_v2_5` for ElevenLabs (voice ID with model suffix; a `-<speed>_<stability>_<similarity>` suffix is allowed), `Joanna` for Amazon; required for Google. Must match `^[A-Za-z0-9._-]{1,96}$`. |
+| `AUGMENTAGENT_PHONE_DEBUG_EVENTS` | `1` adds `debug="debugging tokens-played speaker-events"` to the ConversationRelay TwiML so #1551 can record when tokens were actually played; `0` disables it. Absent defaults to on for debug (non-production) builds and off for release builds. Other values fail configuration. |
 
 Synthetic link example (replace identifiers with actual authenticated bindings):
 
@@ -457,3 +458,40 @@ slow interruption persistence, stale audio suppression, bounded cancellation,
 recoverable provider errors and scoped native routing. Live audible greeting,
 lookup completion and interruption behavior must be recorded separately; passing
 these tests does not establish those live results.
+
+## Per-turn latency metrics (#1551)
+
+Every accepted turn (answered, interrupted, failed or dispatched) produces one
+`tracing` event with target `phone.turn` and one row in the additive SQLite
+table `phone_turn_metrics`. Fields are millisecond offsets from receipt of the
+final `prompt` frame: `queue_wait_ms` (until the agent worker picked the turn
+up), `t_first_token_ms` (first agent output), `t_first_speech_ms` (first
+agent speech frame written to the socket; automatic "Got it" acknowledgments are
+not counted), `t_last_speech_ms` (frame with `last:true` written), `tool_ms`
+(sum reported through `SpeechSender::note_tool_time`; null when nothing was
+reported), plus `provider` (`fast`|`native`, currently always `native`),
+`outcome` and the build's Git commit SHA. A turn is recorded when the next
+prompt arrives, on interruption, or when the connection ends, so a finished
+answer that the owner talks over is stored as `interrupted`; a turn still pending
+when the socket closes is stored as `failed`. The record contains no speech text,
+numbers or identifiers beyond `call_id`/`turn_id`.
+
+With `AUGMENTAGENT_PHONE_DEBUG_EVENTS=1` the relay also parses Twilio `info`
+frames: a `tokensPlayed` event stamps `t_first_played_ms`/`t_last_played_ms`
+for the turn currently being spoken and `audible_delta_ms =
+t_first_played_ms − t_first_speech_ms`. Other `info` names and unknown frame
+types are categorized as ignorable while debugging; they never count as invalid
+frames and their bodies are never logged. With debug off those three fields are
+null and every other field is unchanged. Twilio does not publish the exact
+`info` payload schema; only the `name` field is read.
+
+```sh
+augmentagent --db /path/to/daemon.db phone metrics --last 10
+```
+
+prints nearest-rank p50/p95 per field over the last N calls (N most recently
+recorded `call_id`s). Null fields are excluded from their sample set, so a
+column's `samples` can be smaller than the turn count. The live acceptance
+criteria (AC5, AC8 and the epic gate) require pasting this output with the
+commit SHA after a real owner call; the offline suites only prove the record
+shape, the ±5 ms paused-clock fixture and the hand-computed percentiles.
