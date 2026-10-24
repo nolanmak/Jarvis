@@ -143,6 +143,7 @@ pub async fn cleanup_without_runtime(
             voice: crate::voice::VoiceConfig::default(),
             owner_first_name: None,
             debug_events: false,
+            fast: None,
         },
     ));
     let initial = service.cleanup_due(true)?;

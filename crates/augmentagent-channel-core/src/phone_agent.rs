@@ -7,6 +7,7 @@ use crate::{
 use async_trait::async_trait;
 use augmentagent_approval_discord::{AuditCtx, QueryHandler};
 use augmentagent_phone::{
+    fast::{FastBackend, FastContext, FastLayerConfig, FastModel, TaskEvents, VoiceConversationAgent},
     ingress::{AgentError, ConversationAgent, SpeechSender},
     PhoneService,
 };
@@ -40,6 +41,7 @@ pub struct PhoneAgent {
     cwd: PathBuf,
     selection: Selection,
     interrupted: Mutex<HashMap<String, String>>,
+    fast: Option<Arc<VoiceConversationAgent>>,
 }
 impl PhoneAgent {
     pub fn new(
@@ -50,7 +52,10 @@ impl PhoneAgent {
         cwd: PathBuf,
         selection: Selection,
     ) -> Self {
-        Self {
+        // AUGMENTAGENT_PHONE_FAST_LAYER (#1546), validated with the rest of
+        // the phone configuration. Off: the unchanged native path.
+        let fast = service.fast_layer().cloned();
+        let bridge = Self {
             store,
             service,
             agent,
@@ -58,7 +63,33 @@ impl PhoneAgent {
             cwd,
             selection,
             interrupted: Mutex::new(HashMap::new()),
+            fast: None,
+        };
+        match fast {
+            Some(config) => {
+                let model = Arc::new(crate::phone_fast::HttpFastModel::new(config.provider));
+                bridge.with_fast_layer(model, config)
+            }
+            None => bridge,
         }
+    }
+    /// Whether utterances go to the fast conversational layer (#1546).
+    pub fn uses_fast_layer(&self) -> bool {
+        self.fast.is_some()
+    }
+    /// Answer utterances with the fast conversational layer (#1546). Heavy
+    /// work still runs through this bridge's native surface-turn path.
+    pub fn with_fast_layer(mut self, model: Arc<dyn FastModel>, config: FastLayerConfig) -> Self {
+        let backend = Arc::new(FastBridge {
+            store: self.store.clone(),
+            service: self.service.clone(),
+            agent: self.agent.clone(),
+            io: self.io.clone(),
+            cwd: self.cwd.clone(),
+            selection: self.selection.clone(),
+        });
+        self.fast = Some(Arc::new(VoiceConversationAgent::new(model, backend, config)));
+        self
     }
     pub async fn run(
         &self,
@@ -94,22 +125,7 @@ impl PhoneAgent {
                     current: &current,
                     cwd: &cwd,
                 },
-                || {
-                    if self
-                        .store
-                        .surface_conversation(&origin.conversation)?
-                        .is_some()
-                    {
-                        return Ok(None);
-                    }
-                    let selected = (self.selection)(&origin.conversation)?;
-                    if selected
-                        .is_some_and(|p| !matches!(p, ProviderKind::Claude | ProviderKind::Codex))
-                    {
-                        anyhow::bail!("Phone requires a Claude or Codex native session");
-                    }
-                    Ok(selected)
-                },
+                || native_selection(&self.store, &self.selection, &origin.conversation),
                 Some(&cancel),
                 |prompt| async move {
                     // The queue may have waited behind a long text turn. Check
@@ -166,6 +182,179 @@ impl PhoneAgent {
         }
     }
 }
+/// A bound conversation keeps its provider; a new one must select a native
+/// Claude or Codex session.
+fn native_selection(
+    store: &Store,
+    selection: &Selection,
+    conversation: &SurfaceConversationRef,
+) -> anyhow::Result<Option<ProviderKind>> {
+    if store.surface_conversation(conversation)?.is_some() {
+        return Ok(None);
+    }
+    let selected = selection(conversation)?;
+    if selected.is_some_and(|p| !matches!(p, ProviderKind::Claude | ProviderKind::Codex)) {
+        anyhow::bail!("Phone requires a Claude or Codex native session");
+    }
+    Ok(selected)
+}
+
+/// Originating-conversation services for the fast layer (#1546): the same
+/// store, owner authorization, native agent and durable outbox as
+/// [`PhoneAgent::run`].
+#[derive(Clone)]
+struct FastBridge {
+    store: Arc<Store>,
+    service: Arc<PhoneService>,
+    agent: Arc<dyn QueryHandler>,
+    io: Arc<dyn ConversationIo>,
+    cwd: PathBuf,
+    selection: Selection,
+}
+impl FastBridge {
+    fn origin(&self, call: &PhoneCall) -> anyhow::Result<PhoneOrigin> {
+        let origin = self.store.phone_origin(&call.id)?;
+        if call.conversation != origin.conversation.storage_key() {
+            anyhow::bail!("phone origin mismatch");
+        }
+        Ok(origin)
+    }
+    /// One native turn on the originating conversation, through the existing
+    /// session runner, approvals and phone MCP grant (without call speech).
+    async fn run_dispatched(
+        &self,
+        call: &PhoneCall,
+        origin: &PhoneOrigin,
+        description: &str,
+        events: &TaskEvents,
+    ) -> anyhow::Result<String> {
+        let task_id = events.task_id();
+        let turn = SurfaceTurnRef::new(origin.conversation.clone(), task_id)?;
+        let current = format!("[Dispatched by voice from a live phone call. Do this work, then reply here with the result.]\n\n{description}");
+        let ctx = self.io.audit_context(origin, task_id);
+        let cwd = self.cwd.to_string_lossy();
+        let outcome = augmentagent_phone::context::scope(
+            origin.clone(),
+            None,
+            augmentagent_phone::fast::progress_scope(events.clone(), run_surface_turn_with_history(
+                &self.store,
+                SurfaceTurnRequest {
+                    turn: &turn,
+                    history: "",
+                    current: &current,
+                    cwd: &cwd,
+                },
+                || native_selection(&self.store, &self.selection, &origin.conversation),
+                None,
+                |prompt| async move {
+                    // The call may have ended; the owner's authority over the
+                    // originating conversation must still hold.
+                    self.service.authorize_call_origin(call)?;
+                    let private = self
+                        .store
+                        .surface_owner_binding(origin.owner.account())?
+                        .and_then(|b| b.direct_conversation().cloned())
+                        .is_some_and(|c| c.conversation_id() == origin.conversation.conversation_id());
+                    augmentagent_approval_discord::interaction::owner_history(
+                        private,
+                        native_phone_turn(self.agent.answer(&ctx, &prompt)),
+                    )
+                    .await
+                },
+                || async {
+                    self.service.authorize_call_origin(call)?;
+                    self.io.history(origin).await
+                },
+            )),
+        )
+        .await?;
+        match outcome {
+            SurfaceTurnOutcome::Answered(answer) => Ok(answer),
+            SurfaceTurnOutcome::Cancelled => anyhow::bail!("dispatched turn cancelled"),
+        }
+    }
+}
+/// The last `count` non-empty lines, at most `max` bytes.
+fn recent_lines(history: &str, count: usize, max: usize) -> String {
+    let lines: Vec<&str> = history.lines().filter(|l| !l.trim().is_empty()).collect();
+    let mut recent = lines[lines.len().saturating_sub(count)..].join("\n");
+    if recent.len() > max {
+        let mut start = recent.len() - max;
+        while !recent.is_char_boundary(start) {
+            start += 1;
+        }
+        recent = recent[start..].to_owned();
+    }
+    recent
+}
+#[async_trait]
+impl FastBackend for FastBridge {
+    fn authorize_call(&self, call: &PhoneCall) -> Result<(), AgentError> {
+        self.service
+            .authorize_call(&call.id)
+            .map(|_| ())
+            .map_err(|_| AgentError)
+    }
+    async fn context(&self, call: &PhoneCall) -> Result<FastContext, AgentError> {
+        let origin = self.origin(call).map_err(|_| AgentError)?;
+        let history = self.io.history(&origin).await.map_err(|_| AgentError)?;
+        Ok(FastContext {
+            owner_profile: None,
+            chat_summary: recent_lines(&history, 10, 4_000),
+        })
+    }
+    async fn mirror(&self, call: &PhoneCall, key: &str, text: &str) -> Result<(), AgentError> {
+        let origin = self.origin(call).map_err(|_| AgentError)?;
+        self.io.mirror(&origin, key, text).await.map_err(|_| AgentError)
+    }
+    async fn dispatch(
+        &self,
+        call: &PhoneCall,
+        description: &str,
+        events: TaskEvents,
+    ) -> Result<(), AgentError> {
+        self.authorize_call(call)?;
+        let origin = self.origin(call).map_err(|_| AgentError)?;
+        let bridge = self.clone();
+        let call = call.clone();
+        let description = description.to_owned();
+        tokio::spawn(async move {
+            let key = events.task_id().to_owned();
+            let result = bridge
+                .run_dispatched(&call, &origin, &description, &events)
+                .await;
+            // Delivered once under the task key; the durable outbox rejects a
+            // replayed key, so a restart cannot post the result twice.
+            let delivered = match &result {
+                Ok(answer) => format!("Phone task — Jarvis: {answer}"),
+                Err(_) => "Phone task could not be completed. Ask again in chat if it is still needed.".to_owned(),
+            };
+            let mirrored = bridge.service.authorize_call_origin(&call).is_ok()
+                && bridge.io.mirror(&origin, &key, &delivered).await.is_ok();
+            match result {
+                Ok(answer) if mirrored => {
+                    events.completed(&answer);
+                }
+                _ => {
+                    tracing::warn!(target: "phone.fast", "dispatched phone task did not complete");
+                    events.failed();
+                }
+            }
+        });
+        Ok(())
+    }
+    async fn lookup(&self, call: &PhoneCall, query: &str) -> Result<String, AgentError> {
+        self.origin(call).map_err(|_| AgentError)?;
+        let root = self.cwd.clone();
+        let query = query.to_owned();
+        // Read-only wiki scan; the fast layer also cuts it off at 1.5 s.
+        tokio::task::spawn_blocking(move || {
+            crate::phone_fast::wiki_lookup(&root, &query, std::time::Duration::from_millis(1_300))
+        })
+        .await
+        .map_err(|_| AgentError)
+    }
+}
 #[async_trait]
 impl ConversationAgent for PhoneAgent {
     async fn answer(
@@ -176,11 +365,17 @@ impl ConversationAgent for PhoneAgent {
         speech: SpeechSender,
         cancel: CancellationToken,
     ) -> Result<String, AgentError> {
+        if let Some(fast) = &self.fast {
+            return fast.answer(call, turn_id, text, speech, cancel).await;
+        }
         self.run(call, turn_id, text, Some(speech), cancel)
             .await
             .map_err(|_| AgentError)
     }
     async fn interrupted(&self, call: &PhoneCall, heard: &str) -> Result<(), AgentError> {
+        if let Some(fast) = &self.fast {
+            return fast.interrupted(call, heard).await;
+        }
         self.service
             .authorize_call(&call.id)
             .map_err(|_| AgentError)?;
