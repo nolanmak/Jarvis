@@ -14881,8 +14881,15 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
                         .iter()
                         .any(|needle| src.contains(needle))
                     {
-                        mentions
-                            .push(p.strip_prefix(&crates).unwrap().to_string_lossy().into_owned());
+                        let rel = p.strip_prefix(&crates).unwrap().to_string_lossy().into_owned();
+                        if rel != "augmentagent-cli/src/self_improve.rs" {
+                            assert!(
+                                !src.contains("to_vec_pretty"),
+                                "{rel} serializes a map beside the opened-PR map: check it is not \
+                                 writing that map outside record_opened_pr"
+                            );
+                        }
+                        mentions.push(rel);
                     }
                 }
             }
@@ -14915,11 +14922,21 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(body.contains("lock_opened_prs("), "the writer locks before it reads");
 
         // And the call-site inventory Codex asked for: the build lane and the
-        // resume lane, nothing else.
-        assert_eq!(
-            production.matches("record_opened_pr(&opened_prs_path()").count(),
-            2,
-            "the recorder's production call sites are the build and resume lanes"
+        // resume lane, nothing else, each still passing the arguments it passed
+        // before #1533 — the serialization is entirely inside the recorder, so
+        // neither lane's call changed.
+        assert!(
+            production.contains(
+                "record_opened_pr(&opened_prs_path(), issue.number, pr, reviewed_head, \
+                 independent.recorded_verdict());"
+            ),
+            "the resume lane's arguments changed"
+        );
+        assert!(
+            production.contains(
+                "record_opened_pr(&opened_prs_path(), issue.number, n, published_head, verdict);"
+            ),
+            "the build lane's arguments changed"
         );
         assert_eq!(
             production.matches("record_opened_pr(").count(),
