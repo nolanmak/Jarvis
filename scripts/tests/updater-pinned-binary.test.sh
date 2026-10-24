@@ -30,7 +30,9 @@ bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n     %s\n' "$1" "${2:-}"; }
 # Same shape as updater-restart-hygiene.test.sh: a repo one commit behind its
 # origin, the change touching crates/ so a rebuild + restart are required.
 make_case() {
-  TMP=$(mktemp -d); export TMP
+  # pwd -P: macOS mktemp returns /var/... (a symlink to /private/var), while
+  # the updater compares canonical paths, as Linux /proc/*/exe reports them.
+  TMP=$(cd "$(mktemp -d)" && pwd -P); export TMP
   git init -q --bare "$TMP/origin.git"
   git clone -q "$TMP/origin.git" "$TMP/work" 2>/dev/null
   mkdir -p "$TMP/work/scripts/lib" "$TMP/work/crates" "$TMP/work/target/release"
