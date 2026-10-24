@@ -697,6 +697,8 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
         }
     };
     tracing::info!(call_id = %call.id, reason = end_reason, "phone relay ending");
+    // Nothing more can be spoken: late announcements fail immediately.
+    speech_rx.close();
     metrics.finish();
     cancel.cancel();
     drop(interrupt_tx);
