@@ -898,3 +898,219 @@ pub struct PhoneMaintenanceStatus {
     pub usage_attempts: i64,
     pub final_usage_recorded: bool,
 }
+
+/// Which model layer answered the turn (#1546 adds the fast layer).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnProvider {
+    Fast,
+    Native,
+}
+impl TurnProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Native => "native",
+        }
+    }
+    fn parse(s: &str) -> rusqlite::Result<Self> {
+        Ok(match s {
+            "fast" => Self::Fast,
+            "native" => Self::Native,
+            _ => return Err(rusqlite::Error::InvalidQuery),
+        })
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOutcome {
+    Answered,
+    Interrupted,
+    Failed,
+    Dispatched,
+}
+impl TurnOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Answered => "answered",
+            Self::Interrupted => "interrupted",
+            Self::Failed => "failed",
+            Self::Dispatched => "dispatched",
+        }
+    }
+    fn parse(s: &str) -> rusqlite::Result<Self> {
+        Ok(match s {
+            "answered" => Self::Answered,
+            "interrupted" => Self::Interrupted,
+            "failed" => Self::Failed,
+            "dispatched" => Self::Dispatched,
+            _ => return Err(rusqlite::Error::InvalidQuery),
+        })
+    }
+}
+/// One turn's latency record (#1551). Millisecond offsets are relative to the
+/// receipt of the final prompt frame. The only strings are call/turn IDs,
+/// closed enums and a Git commit SHA; speech text is never stored here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PhoneTurnMetrics {
+    pub call_id: String,
+    pub turn_id: String,
+    pub recorded_ms: i64,
+    pub provider: TurnProvider,
+    pub outcome: TurnOutcome,
+    pub queue_wait_ms: Option<i64>,
+    pub t_first_token_ms: Option<i64>,
+    pub t_first_speech_ms: Option<i64>,
+    pub t_last_speech_ms: Option<i64>,
+    pub tool_ms: Option<i64>,
+    pub t_first_played_ms: Option<i64>,
+    pub t_last_played_ms: Option<i64>,
+    pub audible_delta_ms: Option<i64>,
+    pub commit_sha: Option<String>,
+}
+/// Percentile columns, in CLI display order.
+pub const PHONE_TURN_METRIC_FIELDS: [&str; 8] = [
+    "queue_wait_ms",
+    "t_first_token_ms",
+    "t_first_speech_ms",
+    "t_last_speech_ms",
+    "tool_ms",
+    "t_first_played_ms",
+    "t_last_played_ms",
+    "audible_delta_ms",
+];
+impl PhoneTurnMetrics {
+    pub fn field(&self, name: &str) -> Option<Option<i64>> {
+        Some(match name {
+            "queue_wait_ms" => self.queue_wait_ms,
+            "t_first_token_ms" => self.t_first_token_ms,
+            "t_first_speech_ms" => self.t_first_speech_ms,
+            "t_last_speech_ms" => self.t_last_speech_ms,
+            "tool_ms" => self.tool_ms,
+            "t_first_played_ms" => self.t_first_played_ms,
+            "t_last_played_ms" => self.t_last_played_ms,
+            "audible_delta_ms" => self.audible_delta_ms,
+            _ => return None,
+        })
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PhoneMetricPercentiles {
+    pub field: &'static str,
+    pub samples: usize,
+    pub p50: Option<i64>,
+    pub p95: Option<i64>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PhoneMetricsSummary {
+    pub calls: usize,
+    pub turns: usize,
+    pub fields: Vec<PhoneMetricPercentiles>,
+}
+/// Nearest-rank percentile: the ceil(p/100 * n)-th smallest sample.
+pub fn nearest_rank_percentile(sorted: &[i64], percent: u32) -> Option<i64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let rank = (sorted.len() as u64 * u64::from(percent)).div_ceil(100).max(1) as usize;
+    sorted.get(rank.min(sorted.len()) - 1).copied()
+}
+const METRIC_COLUMNS: &str = "call_id,turn_id,recorded_ms,provider,outcome,queue_wait_ms,t_first_token_ms,t_first_speech_ms,t_last_speech_ms,tool_ms,t_first_played_ms,t_last_played_ms,audible_delta_ms,commit_sha";
+fn read_metrics(row: &rusqlite::Row<'_>) -> rusqlite::Result<PhoneTurnMetrics> {
+    Ok(PhoneTurnMetrics {
+        call_id: row.get(0)?,
+        turn_id: row.get(1)?,
+        recorded_ms: row.get(2)?,
+        provider: TurnProvider::parse(&row.get::<_, String>(3)?)?,
+        outcome: TurnOutcome::parse(&row.get::<_, String>(4)?)?,
+        queue_wait_ms: row.get(5)?,
+        t_first_token_ms: row.get(6)?,
+        t_first_speech_ms: row.get(7)?,
+        t_last_speech_ms: row.get(8)?,
+        tool_ms: row.get(9)?,
+        t_first_played_ms: row.get(10)?,
+        t_last_played_ms: row.get(11)?,
+        audible_delta_ms: row.get(12)?,
+        commit_sha: row.get(13)?,
+    })
+}
+impl Store {
+    /// Insert one latency record. Returns false when the turn already has one;
+    /// a replayed turn never produces a second row.
+    pub fn phone_record_turn_metrics(&self, m: &PhoneTurnMetrics) -> PhoneResult<bool> {
+        identifier(&m.call_id)?;
+        identifier(&m.turn_id)?;
+        if m.recorded_ms < 0
+            || m.turn_id.chars().any(char::is_whitespace)
+            || m.call_id.chars().any(char::is_whitespace)
+        {
+            return Err(PhoneError::InvalidInput);
+        }
+        for name in PHONE_TURN_METRIC_FIELDS {
+            if name != "audible_delta_ms" && m.field(name).flatten().is_some_and(|v| v < 0) {
+                return Err(PhoneError::InvalidInput);
+            }
+        }
+        if let Some(sha) = &m.commit_sha {
+            if !(7..=40).contains(&sha.len()) || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(PhoneError::InvalidInput);
+            }
+        }
+        Ok(self.with_conn(|c| c.execute(
+            &format!("INSERT INTO phone_turn_metrics({METRIC_COLUMNS}) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) ON CONFLICT(call_id,turn_id) DO NOTHING"),
+            params![m.call_id, m.turn_id, m.recorded_ms, m.provider.as_str(), m.outcome.as_str(), m.queue_wait_ms, m.t_first_token_ms, m.t_first_speech_ms, m.t_last_speech_ms, m.tool_ms, m.t_first_played_ms, m.t_last_played_ms, m.audible_delta_ms, m.commit_sha]))? == 1)
+    }
+    pub fn phone_turn_metrics(&self, call_id: &str) -> PhoneResult<Vec<PhoneTurnMetrics>> {
+        Ok(self.with_conn(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {METRIC_COLUMNS} FROM phone_turn_metrics WHERE call_id=?1 ORDER BY recorded_ms,turn_id"
+            ))?;
+            let rows = stmt
+                .query_map([call_id], read_metrics)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })?)
+    }
+    /// Nearest-rank p50/p95 per field over the turns of the `last_calls` most
+    /// recently recorded calls. Null fields are excluded from their sample set.
+    pub fn phone_turn_metrics_summary(&self, last_calls: usize) -> PhoneResult<PhoneMetricsSummary> {
+        let records = self.with_conn(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {METRIC_COLUMNS} FROM phone_turn_metrics WHERE call_id IN (
+                    SELECT call_id FROM phone_turn_metrics GROUP BY call_id
+                    ORDER BY MAX(recorded_ms) DESC, call_id DESC LIMIT ?1)
+                 ORDER BY recorded_ms,turn_id"
+            ))?;
+            let rows = stmt
+                .query_map([i64::try_from(last_calls).unwrap_or(i64::MAX)], read_metrics)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })?;
+        let calls = records
+            .iter()
+            .map(|r| r.call_id.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let fields = PHONE_TURN_METRIC_FIELDS
+            .iter()
+            .map(|field| {
+                let mut samples: Vec<i64> = records
+                    .iter()
+                    .filter_map(|r| r.field(field).flatten())
+                    .collect();
+                samples.sort_unstable();
+                PhoneMetricPercentiles {
+                    field,
+                    samples: samples.len(),
+                    p50: nearest_rank_percentile(&samples, 50),
+                    p95: nearest_rank_percentile(&samples, 95),
+                }
+            })
+            .collect();
+        Ok(PhoneMetricsSummary {
+            calls,
+            turns: records.len(),
+            fields,
+        })
+    }
+}
