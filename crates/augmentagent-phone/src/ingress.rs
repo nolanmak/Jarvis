@@ -676,6 +676,10 @@ fn log_recoverable(call: &PhoneCall, diagnostic: Recoverable) {
 enum Classified {
     Turn(RelayTurn),
     Interrupted,
+    /// A possible barge-in awaiting the next prompt or the timeout (#1550).
+    InterruptPending,
+    /// A false interruption resolved; the remainder may be resumed.
+    Resumed(Option<crate::relay::Resume>),
     Ignore,
     Recoverable {
         category: &'static str,
@@ -696,6 +700,8 @@ fn classify(
         Some(Ok(Message::Text(frame))) => match session.receive(&frame) {
             Ok(RelayInput::Turn(turn)) => Classified::Turn(turn),
             Ok(RelayInput::Interrupted) => Classified::Interrupted,
+            Ok(RelayInput::InterruptPending) => Classified::InterruptPending,
+            Ok(RelayInput::Resumed(resume)) => Classified::Resumed(resume),
             Ok(RelayInput::Ignore | RelayInput::Ready) => Classified::Ignore,
             Ok(RelayInput::SetupProviderRejected) => Classified::ProviderRejectedSetup,
             Ok(RelayInput::ProviderError(code)) if TERMINAL_PROVIDER_CODES.contains(&code) => {
@@ -768,7 +774,8 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
         return;
     };
     let mut session = RelaySession::new(&call.id, state.auth.account(), sid)
-        .with_debug_events(state.service.config.debug_events);
+        .with_debug_events(state.service.config.debug_events)
+        .with_barge_in(state.service.config.barge_in.clone());
     let setup_ok = match receive_setup(&mut socket, &mut session).await {
         Ok(control_frames) => {
             tracing::info!(call_id = %call.id, control_frames, "phone relay setup accepted");
@@ -878,11 +885,16 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
     // event or PLAYBACK_WAIT, whichever is first.
     let mut ending: Option<(tokio::time::Instant, serde_json::Value)> = None;
     let end_reason = 'connection: loop {
+        // While an interruption is undecided (#1550) nothing new is spoken:
+        // speech stays queued until the next prompt or the timeout decides.
+        let undecided = session.false_interrupt_deadline();
         let end_at = ending.as_ref().map(|(at, _)| *at);
         tokio::select! {
             incoming=socket.recv()=>{
                 if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
-                match classify(&mut session, incoming) {
+                let classified = classify(&mut session, incoming);
+                settle_interruption(&mut session, &mut feedback, &mut metrics, &interrupt_tx);
+                match classified {
                     // The goodbye is out: later owner speech is not answered.
                     Classified::Turn(_) if ending.is_some() => {},
                     Classified::Turn(turn)=>{
@@ -901,14 +913,13 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                             }
                         }
                     },
-                    Classified::Interrupted=>{
-                        feedback.clear();
-                        metrics.interrupted();
-                        if let Some(heard)=session.take_interrupted_prefix() {
-                            if interrupt_tx.try_send(heard).is_err() {
-                                tracing::warn!("phone interruption persistence queue full; stale audio already invalidated");
-                            }
-                        }
+                    // Settled above: stale audio is already invalidated.
+                    Classified::Interrupted=>{},
+                    Classified::InterruptPending=>{
+                        tracing::info!(call_id = %call.id, "phone barge-in pending");
+                    },
+                    Classified::Resumed(resume)=>{
+                        if !write_resume(&mut socket, &mut metrics, resume).await {break EndReason::TransportError;}
                     },
                     Classified::Ignore=>{
                         if let Some(at) = session.take_played_event() { metrics.played(at); }
@@ -936,7 +947,15 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                     Classified::Terminal(reason)=>break reason,
                 }
             },
-            output=speech_rx.recv()=>{
+            _=tokio::time::sleep_until(undecided.unwrap_or_else(tokio::time::Instant::now)), if undecided.is_some()=>{
+                if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
+                let decided = session.poll_false_interrupt();
+                settle_interruption(&mut session, &mut feedback, &mut metrics, &interrupt_tx);
+                if let Some(RelayInput::Resumed(resume)) = decided {
+                    if !write_resume(&mut socket, &mut metrics, resume).await {break EndReason::TransportError;}
+                }
+            },
+            output=speech_rx.recv(), if undecided.is_none()=>{
                 let Some(output)=output else {
                     break call_end_reason(&state.service, &call).unwrap_or(EndReason::WorkerFailed);
                 };
@@ -1022,6 +1041,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
             },
             _=tick.tick()=>{
                 if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
+                if undecided.is_some() {continue;}
                 for pending in feedback.values_mut() {
                     let elapsed = pending.started.elapsed();
                     let notice = pending.notice();
@@ -1061,6 +1081,48 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
         let _ = worker.await;
     }
     let _ = state.service.maintenance(false).await;
+}
+
+/// Bookkeeping for a confirmed interruption: pending notices are dropped, cut
+/// turns are recorded as interrupted and the heard prefix is persisted.
+fn settle_interruption(
+    session: &mut RelaySession,
+    feedback: &mut std::collections::HashMap<String, TurnFeedback>,
+    metrics: &mut TurnMetricsLedger<'_>,
+    interrupt_tx: &mpsc::Sender<String>,
+) {
+    let Some(heard) = session.take_interrupted_prefix() else {
+        return;
+    };
+    feedback.clear();
+    metrics.interrupted();
+    if interrupt_tx.try_send(heard).is_err() {
+        tracing::warn!("phone interruption persistence queue full; stale audio already invalidated");
+    }
+}
+
+/// Write a resumed remainder. A resume never changes the turn's outcome: it
+/// was not interrupted, and its final frame was already counted. Returns false
+/// when the socket write failed.
+async fn write_resume(
+    socket: &mut WebSocket,
+    metrics: &mut TurnMetricsLedger<'_>,
+    resume: Option<crate::relay::Resume>,
+) -> bool {
+    tracing::info!(remainder = resume.is_some(), "phone false interruption resumed");
+    let Some(resume) = resume else {
+        return true;
+    };
+    let sent = tokio::time::timeout(
+        Duration::from_secs(2),
+        socket.send(Message::Text(resume.frame.to_string().into())),
+    )
+    .await;
+    if !matches!(sent, Ok(Ok(()))) {
+        return false;
+    }
+    metrics.spoken(&resume.turn_id, false, false);
+    true
 }
 
 #[cfg(test)]
