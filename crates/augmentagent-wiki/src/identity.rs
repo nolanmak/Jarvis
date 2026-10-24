@@ -133,6 +133,16 @@ struct FrontMatter {
     /// ingest never writes this.
     #[serde(default)]
     close: bool,
+    /// Extra names this person answers to (#1539) — a nickname, a mononym,
+    /// a maiden name. Fed to the message-search person resolver as exact
+    /// names, so a name claimed by two pages still stays ambiguous.
+    #[serde(default, deserialize_with = "one_or_many")]
+    aliases: Vec<String>,
+    /// Slugs of the people this person shares a household with (#1539):
+    /// roommates, a partner. Naming two housemates in one message query
+    /// narrows otherwise-ambiguous first names to that documented pair.
+    #[serde(default, deserialize_with = "one_or_many")]
+    household: Vec<String>,
 }
 
 /// One `people/<slug>.md` page + its parsed identities.
@@ -144,6 +154,11 @@ pub struct PersonPage {
     /// `close: true` front-matter marker (#13). Drives LinkedIn feed-
     /// engagement opt-in.
     pub close: bool,
+    /// `aliases:` front-matter (#1539), verbatim.
+    pub aliases: Vec<String>,
+    /// `household:` front-matter (#1539), as bare slugs: `[[sam-doe]]` and
+    /// `sam-doe.md` are both written by hand and both name `sam-doe`.
+    pub household: Vec<String>,
 }
 
 /// In-memory index of every `people/*.md` page's identity block. Rebuild on
@@ -178,8 +193,12 @@ impl IdentityIndex {
             };
 
             match parse_front_matter(&path) {
-                Ok((identities, close)) => {
-                    people.push(PersonPage { slug, path, identities, close })
+                Ok(fm) => {
+                    let household = fm.household.iter().map(|s| page_slug(s)).collect();
+                    people.push(PersonPage {
+                        slug, path, identities: fm.identities, close: fm.close,
+                        aliases: fm.aliases, household,
+                    })
                 }
                 Err(e) => warn!(path = %path.display(), error = %e, "skipping page with bad front-matter"),
             }
@@ -221,17 +240,22 @@ impl IdentityIndex {
     }
 }
 
+/// A `household:` entry as written by hand: `sam-doe`, `[[sam-doe]]` and
+/// `people/sam-doe.md` all name the same page.
+fn page_slug(raw: &str) -> String {
+    let s = raw.trim().trim_start_matches("[[").trim_end_matches("]]").trim();
+    s.trim_end_matches(".md").rsplit('/').next().unwrap_or_default().to_string()
+}
+
 /// Extract the YAML front-matter from a markdown file and deserialize it.
-/// Accepts files without front-matter (returns `(Identities::default(),
-/// false)`). Returns `(identities, close)`.
-fn parse_front_matter(path: &Path) -> anyhow::Result<(Identities, bool)> {
+/// Accepts files without front-matter (returns the default front matter).
+fn parse_front_matter(path: &Path) -> anyhow::Result<FrontMatter> {
     let raw = fs::read_to_string(path)?;
     let yaml = match extract_yaml_block(&raw) {
         Some(y) => y,
-        None => return Ok((Identities::default(), false)),
+        None => return Ok(FrontMatter::default()),
     };
-    let fm: FrontMatter = serde_yaml_ng::from_str(yaml)?;
-    Ok((fm.identities, fm.close))
+    Ok(serde_yaml_ng::from_str(yaml)?)
 }
 
 /// Pull the YAML between the opening `---\n` and the next `\n---` line.
@@ -457,6 +481,23 @@ mod tests {
             index.lookup("whatsapp", "15550001111").map(|p| p.slug.as_str()),
             Some("w2")
         );
+    }
+
+    #[test]
+    fn aliases_and_household_accept_list_and_scalar_and_default_empty() {
+        let (_d, layout) = layout_with_pages(&[
+            ("alex-rivera", "kind: person\naliases: [Alex, \"Lex\"]\nhousehold:\n  - \"[[sam-doe]]\"\n  - people/kai-doe.md"),
+            ("sam-doe", "kind: person\naliases: Sam\nhousehold: alex-rivera"),
+            ("pat-lee", "kind: person\nkey: pat-lee"),
+        ]);
+        let index = IdentityIndex::build(&layout).unwrap();
+        let page = |s: &str| index.pages().iter().find(|p| p.slug == s).expect("indexed");
+        // Wiki-link and `.md` forms both name a bare slug; scalars parse too.
+        assert_eq!(page("alex-rivera").aliases, ["Alex", "Lex"]);
+        assert_eq!(page("alex-rivera").household, ["sam-doe", "kai-doe"]);
+        assert_eq!(page("sam-doe").aliases, ["Sam"]);
+        assert_eq!(page("sam-doe").household, ["alex-rivera"]);
+        assert!(page("pat-lee").aliases.is_empty() && page("pat-lee").household.is_empty());
     }
 
     #[test]

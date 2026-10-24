@@ -1,13 +1,14 @@
 //! Dedicated phone ingress. The caller owns TLS termination and binds the
 //! listener; this router has no agent-tool, credential or arbitrary-proxy route.
 use crate::{
+    metrics::TurnTimer,
     relay::{RelayInput, RelaySession, RelayTurn},
     speech::SpeechStream,
     webhook::WebhookAuth,
     Error, PhoneService,
 };
 use async_trait::async_trait;
-use augmentagent_store::phone::{CallState, PhoneCall};
+use augmentagent_store::phone::{CallState, PhoneCall, TurnOutcome, TurnProvider};
 use axum::{
     body::Bytes,
     extract::{
@@ -47,7 +48,8 @@ pub trait ConversationAgent: Send + Sync {
     async fn interrupted(&self, call: &PhoneCall, heard: &str) -> Result<(), AgentError>;
 }
 /// One queued speech item for the relay loop. `Utterance` carries an
-/// agent-identified receipt (MCP `speak`); `Token` is one streamed chunk.
+/// agent-identified receipt (MCP `speak`); `Token` is one streamed chunk,
+/// `failed` marking a fallback answer for the turn's metrics record.
 #[derive(Debug)]
 pub enum SpeechEvent {
     Utterance {
@@ -60,6 +62,7 @@ pub enum SpeechEvent {
         turn: Arc<RelayTurn>,
         text: String,
         last: bool,
+        failed: bool,
     },
 }
 struct StreamState {
@@ -72,18 +75,33 @@ struct StreamState {
 pub struct SpeechSender {
     sender: mpsc::Sender<SpeechEvent>,
     turn: Arc<RelayTurn>,
+    timer: Arc<TurnTimer>,
     stream: Arc<Mutex<StreamState>>,
 }
 impl SpeechSender {
+    /// A sender with its own latency timer, for harnesses and tests.
     pub fn new(sender: mpsc::Sender<SpeechEvent>, turn: Arc<RelayTurn>) -> Self {
+        Self::with_timer(sender, turn, Arc::new(TurnTimer::start()))
+    }
+    fn with_timer(
+        sender: mpsc::Sender<SpeechEvent>,
+        turn: Arc<RelayTurn>,
+        timer: Arc<TurnTimer>,
+    ) -> Self {
         Self {
             sender,
             turn,
+            timer,
             stream: Arc::new(Mutex::new(StreamState {
                 pipeline: SpeechStream::new(),
                 finished: false,
             })),
         }
+    }
+    /// Add tool execution time to this turn's latency record (#1551). Only the
+    /// duration is kept; tool names, arguments and results are never recorded.
+    pub fn note_tool_time(&self, duration: Duration) {
+        self.timer.add_tool_time(duration);
     }
     /// A successful return means queued, not audibly played. Only send intended
     /// user-facing text. Receipts are deduplicated by turn plus utterance ID.
@@ -96,6 +114,7 @@ impl SpeechSender {
         if text.len() > 12_000 || utterance_id.is_empty() || utterance_id.len() > 64 {
             return Err(AgentError);
         }
+        self.timer.first_token();
         self.sender
             .send(SpeechEvent::Utterance {
                 turn: self.turn.clone(),
@@ -120,13 +139,19 @@ impl SpeechSender {
             }
             state.pipeline.push(text)
         };
+        if !text.is_empty() {
+            self.timer.first_token();
+        }
         for chunk in chunks {
-            self.token(chunk, false).await?;
+            self.token(chunk, false, false).await?;
         }
         Ok(())
     }
     /// Flush the pipeline and close the talk cycle with `last:true`. Idempotent.
     pub async fn finish(&self) -> Result<(), AgentError> {
+        self.finish_outcome(false).await
+    }
+    async fn finish_outcome(&self, failed: bool) -> Result<(), AgentError> {
         let chunks = {
             let mut state = self.stream.lock().map_err(|_| AgentError)?;
             if state.finished {
@@ -135,21 +160,23 @@ impl SpeechSender {
             state.finished = true;
             state.pipeline.flush()
         };
+        self.timer.first_token();
         if chunks.is_empty() {
-            return self.token(String::new(), true).await;
+            return self.token(String::new(), true, failed).await;
         }
         let last = chunks.len() - 1;
         for (index, chunk) in chunks.into_iter().enumerate() {
-            self.token(chunk, index == last).await?;
+            self.token(chunk, index == last, failed).await?;
         }
         Ok(())
     }
-    async fn token(&self, text: String, last: bool) -> Result<(), AgentError> {
+    async fn token(&self, text: String, last: bool, failed: bool) -> Result<(), AgentError> {
         self.sender
             .send(SpeechEvent::Token {
                 turn: self.turn.clone(),
                 text,
                 last,
+                failed,
             })
             .await
             .map_err(|_| AgentError)
@@ -417,7 +444,8 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
     let Some(sid) = call.provider_sid.as_deref() else {
         return;
     };
-    let mut session = RelaySession::new(&call.id, state.auth.account(), sid);
+    let mut session = RelaySession::new(&call.id, state.auth.account(), sid)
+        .with_debug_events(state.service.config.debug_events);
     let setup_ok = match receive_setup(&mut socket, &mut session).await {
         Ok(control_frames) => {
             tracing::info!(call_id = %call.id, control_frames, "phone relay setup accepted");
@@ -448,7 +476,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
         let _ = tokio::time::timeout(Duration::from_secs(2), socket.close()).await;
         return;
     }
-    let (turn_tx, mut turn_rx) = mpsc::channel::<Arc<RelayTurn>>(4);
+    let (turn_tx, mut turn_rx) = mpsc::channel::<(Arc<RelayTurn>, Arc<TurnTimer>)>(4);
     let (speech_tx, mut speech_rx) = mpsc::channel::<SpeechEvent>(32);
     let cancel = CancellationToken::new();
     let worker_cancel = cancel.clone();
@@ -472,11 +500,12 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
     });
     let mut worker = tokio::spawn(async move {
         loop {
-            let turn = tokio::select! { _=worker_cancel.cancelled()=>break, t=turn_rx.recv()=>match t {Some(t)=>t,None=>break} };
+            let (turn, timer) = tokio::select! { _=worker_cancel.cancelled()=>break, t=turn_rx.recv()=>match t {Some(t)=>t,None=>break} };
             if worker_service.authorize_call(&worker_call.id).is_err() {
                 break;
             }
-            let speech = SpeechSender::new(speech_tx.clone(), turn.clone());
+            timer.dequeued();
+            let speech = SpeechSender::with_timer(speech_tx.clone(), turn.clone(), timer.clone());
             let turn_cancel = worker_cancel.child_token();
             let result = bounded_answer(
                 agent.answer(
@@ -492,18 +521,20 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
             if worker_cancel.is_cancelled() {
                 break;
             }
+            let failed = result.is_err();
             let text = result.unwrap_or_else(|_| {
                 "Sorry, I couldn’t complete that request. You can try another question or continue in chat.".into()
             });
             // Agents that already streamed and finished make this a no-op; an
             // agent-spoken `final` utterance suppresses it in the relay.
             let _ = speech.speak_partial(&text).await;
-            if speech.finish().await.is_err() {
+            if speech.finish_outcome(failed).await.is_err() {
                 break;
             }
         }
     });
     let mut feedback = std::collections::HashMap::<String, TurnFeedback>::new();
+    let mut metrics = TurnMetricsLedger::new(&state.service, &call);
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let end_reason = 'connection: loop {
         tokio::select! {
@@ -514,17 +545,21 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                         Ok(RelayInput::Turn(turn))=>{
                             let turn=Arc::new(turn);
                             feedback.insert(turn.id.clone(), TurnFeedback::new(turn.clone()));
-                            if turn_tx.try_send(turn).is_err() {break "turn_queue_full";}
+                            let timer = metrics.begin(&turn.id);
+                            if turn_tx.try_send((turn, timer)).is_err() {break "turn_queue_full";}
                         },
                         Ok(RelayInput::Interrupted)=>{
                             feedback.clear();
+                            metrics.interrupted();
                             if let Some(heard)=session.take_interrupted_prefix() {
                                 if interrupt_tx.try_send(heard).is_err() {
                                     tracing::warn!("phone interruption persistence queue full; stale audio already invalidated");
                                 }
                             }
                         },
-                        Ok(RelayInput::Ignore)=>{},
+                        Ok(RelayInput::Ignore)=>{
+                            if let Some(at) = session.take_played_event() { metrics.played(at); }
+                        },
                         Ok(RelayInput::ProviderError(code))=>{
                             tracing::warn!(call_id = %call.id, provider_code = code, "phone provider error");
                             if code != 64107 { break "provider_error"; }
@@ -539,20 +574,23 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
             },
             output=speech_rx.recv()=>{
                 let Some(output)=output else {break "speech_worker_closed"};
-                let (turn, closes) = match &output {
-                    SpeechEvent::Utterance { turn, final_output, .. } => (turn, *final_output),
-                    SpeechEvent::Token { turn, last, .. } => (turn, *last),
+                let (turn, closes, failed) = match &output {
+                    SpeechEvent::Utterance { turn, final_output, .. } => (turn, *final_output, false),
+                    SpeechEvent::Token { turn, last, failed, .. } => (turn, *last, *failed),
                 };
                 if closes { feedback.remove(&turn.id); }
                 else if let Some(pending) = feedback.get_mut(&turn.id) { pending.acked = true; }
                 if let Some(reason) = call_end_reason(&state.service, &call) {break reason;}
                 let result = match &output {
                     SpeechEvent::Utterance { turn, utterance_id, text, final_output } => session.speech(turn, utterance_id, text, *final_output),
-                    SpeechEvent::Token { turn, text, last: false } => session.speak_partial(turn, text),
-                    SpeechEvent::Token { turn, text, last: true } => session.finish_stream(turn, text),
+                    SpeechEvent::Token { turn, text, last: false, .. } => session.speak_partial(turn, text),
+                    SpeechEvent::Token { turn, text, last: true, .. } => session.finish_stream(turn, text),
                 };
                 match result {
-                    Ok(Some(frame))=>if !matches!(tokio::time::timeout(Duration::from_secs(2),socket.send(Message::Text(frame.to_string().into()))).await,Ok(Ok(()))) {break "speech_write_failed";},
+                    Ok(Some(frame))=>{
+                        if !matches!(tokio::time::timeout(Duration::from_secs(2),socket.send(Message::Text(frame.to_string().into()))).await,Ok(Ok(()))) {break "speech_write_failed";}
+                        metrics.spoken(&turn.id, closes, failed);
+                    },
                     Ok(None)=>{},Err(_)=>break "invalid_speech_output",
                 }
             },
@@ -574,6 +612,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
         }
     };
     tracing::info!(call_id = %call.id, reason = end_reason, "phone relay ending");
+    metrics.finish();
     cancel.cancel();
     drop(interrupt_tx);
     let _ = interrupt_worker.await;
@@ -677,6 +716,121 @@ mod deadline_tests {
             .unwrap(),
             "next answer"
         );
+    }
+}
+
+/// Per-connection #1551 bookkeeping. A turn is recorded once: when the next
+/// prompt arrives, on interruption, or when the connection ends, so that
+/// played-token events arriving after the final frame are still attributed.
+struct TurnMetricsLedger<'a> {
+    service: &'a PhoneService,
+    call: &'a PhoneCall,
+    /// Insertion order is turn order; `completed` holds the provisional outcome
+    /// once the final frame has been written.
+    turns: Vec<TrackedTurn>,
+    speaking: Option<String>,
+}
+struct TrackedTurn {
+    id: String,
+    timer: Arc<TurnTimer>,
+    completed: Option<TurnOutcome>,
+}
+impl<'a> TurnMetricsLedger<'a> {
+    fn new(service: &'a PhoneService, call: &'a PhoneCall) -> Self {
+        Self {
+            service,
+            call,
+            turns: Vec::new(),
+            speaking: None,
+        }
+    }
+    /// Final prompt received: earlier finished turns are flushed as-is.
+    fn begin(&mut self, turn_id: &str) -> Arc<TurnTimer> {
+        self.flush(|completed| completed);
+        let timer = Arc::new(TurnTimer::start());
+        self.turns.push(TrackedTurn {
+            id: turn_id.into(),
+            timer: timer.clone(),
+            completed: None,
+        });
+        timer
+    }
+    fn spoken(&mut self, turn_id: &str, final_output: bool, failed: bool) {
+        let Some(turn) = self.turns.iter_mut().find(|t| t.id == turn_id) else {
+            return;
+        };
+        turn.timer.speech_written(final_output);
+        self.speaking = Some(turn_id.into());
+        if final_output {
+            turn.completed = Some(if failed {
+                TurnOutcome::Failed
+            } else {
+                TurnOutcome::Answered
+            });
+        }
+    }
+    fn played(&mut self, at: tokio::time::Instant) {
+        if let Some(turn) = self
+            .speaking
+            .as_deref()
+            .and_then(|id| self.turns.iter().find(|t| t.id == id))
+        {
+            turn.timer.played(at);
+        }
+    }
+    /// The owner spoke over playback: pending and just-answered turns were cut.
+    fn interrupted(&mut self) {
+        self.flush(|completed| match completed {
+            Some(TurnOutcome::Failed) => Some(TurnOutcome::Failed),
+            _ => Some(TurnOutcome::Interrupted),
+        });
+    }
+    /// Connection ending: unfinished turns never reached the owner.
+    fn finish(&mut self) {
+        self.flush(|completed| completed.or(Some(TurnOutcome::Failed)));
+    }
+    fn flush(&mut self, outcome: impl Fn(Option<TurnOutcome>) -> Option<TurnOutcome>) {
+        let mut kept = Vec::new();
+        for turn in std::mem::take(&mut self.turns) {
+            match outcome(turn.completed) {
+                Some(outcome) => self.record(&turn, outcome),
+                None => kept.push(turn),
+            }
+        }
+        self.turns = kept;
+        if !self.turns.iter().any(|t| Some(t.id.as_str()) == self.speaking.as_deref()) {
+            self.speaking = None;
+        }
+    }
+    fn record(&self, turn: &TrackedTurn, outcome: TurnOutcome) {
+        let record = turn.timer.record(
+            &self.call.id,
+            &turn.id,
+            TurnProvider::Native,
+            outcome,
+            self.service.clock.now_ms(),
+            crate::metrics::build_commit(),
+        );
+        tracing::info!(
+            target: "phone.turn",
+            call_id = %record.call_id,
+            turn_id = %record.turn_id,
+            provider = record.provider.as_str(),
+            outcome = record.outcome.as_str(),
+            queue_wait_ms = record.queue_wait_ms,
+            t_first_token_ms = record.t_first_token_ms,
+            t_first_speech_ms = record.t_first_speech_ms,
+            t_last_speech_ms = record.t_last_speech_ms,
+            tool_ms = record.tool_ms,
+            t_first_played_ms = record.t_first_played_ms,
+            t_last_played_ms = record.t_last_played_ms,
+            audible_delta_ms = record.audible_delta_ms,
+            commit_sha = record.commit_sha.as_deref(),
+            "phone turn metrics"
+        );
+        if let Err(error) = self.service.store.phone_record_turn_metrics(&record) {
+            tracing::warn!(call_id = %record.call_id, error = %error, "phone turn metrics not persisted");
+        }
     }
 }
 

@@ -207,6 +207,12 @@ impl PhoneService {
     }
     fn relay_twiml(&self, id: &str) -> String {
         let ws = self.config.public_base.replacen("https://", "wss://", 1);
-        format!("<Response><Connect action=\"{}/phone/relay-ended/{id}\" method=\"POST\"><ConversationRelay url=\"{}/phone/relay/{id}\" ttsProvider=\"Amazon\" voice=\"Joanna\" language=\"en-US\" interruptible=\"any\" reportInputDuringAgentSpeech=\"any\" partialPrompts=\"false\" welcomeGreeting=\"Hi, I'm here. What can I help you with?\" /></Connect><Hangup/></Response>",xml(&self.config.public_base),xml(&ws))
+        // #1551: tokens-played/speaker events measure what the owner hears.
+        let debug = if self.config.debug_events {
+            " debug=\"debugging tokens-played speaker-events\""
+        } else {
+            ""
+        };
+        format!("<Response><Connect action=\"{}/phone/relay-ended/{id}\" method=\"POST\"><ConversationRelay url=\"{}/phone/relay/{id}\" ttsProvider=\"Amazon\" voice=\"Joanna\" language=\"en-US\" interruptible=\"any\" reportInputDuringAgentSpeech=\"any\" partialPrompts=\"false\" welcomeGreeting=\"Hi, I'm here. What can I help you with?\"{debug} /></Connect><Hangup/></Response>",xml(&self.config.public_base),xml(&ws))
     }
 }
