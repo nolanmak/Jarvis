@@ -3550,7 +3550,37 @@ async fn find_resumable_draft(
     }
 
     let ledger = AttemptLedger::load(&attempt_ledger_path());
-    resumable_from(&prs, &ledger, utc_day_now(), &gave_up, only, owner.as_deref())
+    let select = |cursor| {
+        resumable_from(&prs, &ledger, utc_day_now(), &gave_up, only, owner.as_deref(), cursor)
+    };
+    // #1532 — a pinned red-main fix neither consults nor moves the rotation,
+    // and a dry run reserves nothing.
+    if only.is_some() || dry_run {
+        return select(FairSched::load(&fair_sched_path()).resume_cursor);
+    }
+    reserve_next_draft(&fair_sched_path(), select)
+}
+
+/// #1532 — hand out the next draft and reserve it in ONE locked
+/// read-modify-write, so the cursor the choice is made from is the same inode
+/// the choice advances. A plain load-then-select-then-advance let the resume
+/// and combined lanes (separate processes, separate flocks — see [`Lane`])
+/// both read the same stale cursor and resume the same draft twice.
+///
+/// The reservation lands at SELECTION time, not on success: a resume that
+/// later wedges must not pin the cursor to itself forever.
+fn reserve_next_draft(
+    path: &Path,
+    select: impl FnOnce(u64) -> Option<(u64, u64, String)>,
+) -> Option<(u64, u64, String)> {
+    let mut chosen = None;
+    FairSched::update_persist(path, |f| {
+        chosen = select(f.resume_cursor);
+        if let Some((pr, _, _)) = &chosen {
+            f.advance(*pr);
+        }
+    });
+    chosen
 }
 
 /// Is this PR's head branch in THIS repository, rather than a fork?
@@ -3595,6 +3625,11 @@ fn agent_pr_exists(prs: &serde_json::Value, owner: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+/// Which draft to resume next. `cursor` is the last PR number handed out
+/// (#1532): selection prefers the lowest eligible number ABOVE it and wraps
+/// to the overall lowest when none is, so a backlog bigger than the daily cap
+/// rotates instead of re-serving the same lowest-numbered drafts every day.
+/// A pinned `only` ignores the cursor — red-main's fix PR is not negotiable.
 fn resumable_from(
     prs: &serde_json::Value,
     ledger: &AttemptLedger,
@@ -3602,8 +3637,10 @@ fn resumable_from(
     gave_up: &std::collections::HashSet<u64>,
     only: Option<u64>,
     owner: Option<&str>,
+    cursor: u64,
 ) -> Option<(u64, u64, String)> {
-    prs.as_array()?
+    let eligible = prs
+        .as_array()?
         .iter()
         .filter_map(|pr| {
             let number = pr.get("number")?.as_u64()?;
@@ -3620,7 +3657,16 @@ fn resumable_from(
             (wanted && !ledger.attempted_today(today, issue) && !gave_up.contains(&issue))
                 .then(|| (number, issue, branch.to_string()))
         })
+        .collect::<Vec<_>>();
+    if only.is_some() {
+        return eligible.into_iter().min_by_key(|(number, _, _)| *number);
+    }
+    eligible
+        .iter()
+        .filter(|(number, _, _)| *number > cursor)
         .min_by_key(|(number, _, _)| *number)
+        .or_else(|| eligible.iter().min_by_key(|(number, _, _)| *number))
+        .cloned()
 }
 
 /// Outcome of the independent stage (#828).
@@ -7298,6 +7344,9 @@ pub struct RunReport {
     /// #931 — idle-class with a reason: the tick ends here, unbilled, and
     /// the loop does not spin through its triage burst.
     held: bool,
+    /// #1532 — this run resumed a sitting draft rather than building a new
+    /// issue, so the fair-scheduling debt counter can tell them apart.
+    resumed: bool,
 }
 
 impl RunReport {
@@ -7306,6 +7355,7 @@ impl RunReport {
             message: IDLE_MSG.to_string(),
             billed: false,
             held: true,
+            resumed: false,
         }
     }
     fn triage(message: String) -> Self {
@@ -7313,6 +7363,7 @@ impl RunReport {
             message,
             billed: false,
             held: false,
+            resumed: false,
         }
     }
     fn built(message: String) -> Self {
@@ -7320,6 +7371,7 @@ impl RunReport {
             message,
             billed: true,
             held: false,
+            resumed: false,
         }
     }
     /// Nothing was spent and nothing more should be this tick — `main` is
@@ -7329,6 +7381,7 @@ impl RunReport {
             message,
             billed: false,
             held: true,
+            resumed: false,
         }
     }
     fn is_idle(&self) -> bool {
@@ -7433,11 +7486,33 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // #871 — lanes: the resume lane does ONLY this (idling when no draft is
     // eligible), the build lane skips it entirely, and the default combined
     // lane keeps resume-first (still flippable via the knob).
-    if red_main_issue.is_none() && lane != Lane::Build && resume_first_enabled() {
+    // #1532 — but not absolutely: after `resume_per_build()` billed resumes
+    // the combined lane reserves this slot for a new issue. Without it, more
+    // non-converging drafts than the daily cap starved every new issue
+    // forever, because review rejections stay retryable and both day-keyed
+    // files reset at midnight.
+    // An unlocked read is enough HERE, unlike the cursor reservation above:
+    // only the combined lane acts on the debt, and it holds the #816 run lock
+    // that the build lane shares, so the sole concurrent writer is the resume
+    // lane. Reading its increment a tick late costs one extra resume, never a
+    // starved build — the debt only grows until a build clears it, and every
+    // tick re-reads it from disk.
+    let fair = FairSched::load(&fair_sched_path());
+    let prefer_build = prefer_build_now(
+        lane,
+        resume_first_enabled(),
+        &fair,
+        resume_per_build(),
+    );
+    if red_main_issue.is_none() && lane != Lane::Build && resume_first_enabled() && !prefer_build {
         if let Some((pr, issue_no, resume_branch)) = find_resumable_draft(repo_root, None, dry_run).await {
             let reasoner = build_reasoner();
             return resume_draft_pr(repo_root, &reasoner, pr, issue_no, &resume_branch, dry_run)
-                .await;
+                .await
+                .map(|mut r| {
+                    r.resumed = true;
+                    r
+                });
         }
     }
     if lane == Lane::Resume {
@@ -7446,12 +7521,34 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
 
     let issue = match red_main_issue {
         Some(issue) => issue,
-        None => {
-            let Some(issue) = pick_issue(repo_root, dry_run).await? else {
+        None => match pick_issue(repo_root, dry_run).await? {
+            Some(issue) => issue,
+            None => {
+                // #1532 — a slot reserved for a build with nothing to build
+                // is spent on a waiting draft, never on idling.
+                if prefer_build {
+                    if let Some((pr, issue_no, resume_branch)) =
+                        find_resumable_draft(repo_root, None, dry_run).await
+                    {
+                        let reasoner = build_reasoner();
+                        return resume_draft_pr(
+                            repo_root,
+                            &reasoner,
+                            pr,
+                            issue_no,
+                            &resume_branch,
+                            dry_run,
+                        )
+                        .await
+                        .map(|mut r| {
+                            r.resumed = true;
+                            r
+                        });
+                    }
+                }
                 return Ok(RunReport::idle());
-            };
-            issue
-        }
+            }
+        },
     };
     note_current_issue(issue.number);
     info!(issue = issue.number, title = %issue.title, "selected issue");
@@ -10361,6 +10458,9 @@ pub struct AutoPrLoop {
     /// Where the daily counter persists (#814); injectable so a loop test
     /// never touches the owner's state.
     counter_path: PathBuf,
+    /// Where the fair-scheduling state persists (#1532); injectable for the
+    /// same reason as `counter_path`.
+    fair_path: PathBuf,
     /// The provider cooldown latch the quota brake reads (#1215).
     latch: augmentagent_channel_core::CooldownLatch,
     /// Wall clock, injectable so a whole UTC day can be scripted (#1215).
@@ -10558,6 +10658,139 @@ impl AttemptLedger {
             Err(e) => warn!("could not serialize attempt ledger: {e}"),
         }
     }
+}
+
+/// #1532 — fair scheduling across UTC days: where the draft rotation stands,
+/// and how much a run of resumes owes the new-issue lane.
+///
+/// Deliberately NOT keyed by day, unlike [`DailyCounter`] and
+/// [`AttemptLedger`] — that is the whole point. Review rejections park a
+/// draft for retry indefinitely, `resumable_from` served the lowest PR number
+/// first, and both day-keyed files reset at midnight: with more
+/// non-converging drafts than the daily cap, the same lowest-numbered drafts
+/// consumed every billed slot every day and nothing else was ever reached.
+/// Carrying the cursor and the debt counter across the rollover is what makes
+/// the backlog rotate and guarantees new issues a share of the budget.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct FairSched {
+    /// Last draft PR number handed to a resume.
+    #[serde(default)]
+    resume_cursor: u64,
+    /// Billed resumes since the last billed new-issue build.
+    #[serde(default)]
+    resumes_since_build: u32,
+}
+
+impl FairSched {
+    /// Defaults on a missing or corrupt file, mirroring [`DailyCounter::load`]:
+    /// no state means lowest-first resume-first, which is where we already
+    /// were.
+    fn load(path: &Path) -> Self {
+        std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
+            .unwrap_or_default()
+    }
+
+    fn advance(&mut self, pr: u64) {
+        self.resume_cursor = pr;
+    }
+
+    /// One billed run: a resume adds to the debt, a build clears it.
+    fn record_billed(&mut self, resumed: bool) {
+        self.resumes_since_build = if resumed {
+            self.resumes_since_build.saturating_add(1)
+        } else {
+            0
+        };
+    }
+
+    /// Atomically read-modify-write under an exclusive flock, for the same
+    /// reason as [`AttemptLedger::mark_persist`] (#871): the resume and build
+    /// lanes are separate processes racing this one file.
+    fn update_persist(path: &Path, edit: impl FnOnce(&mut Self)) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let mut file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(path = %path.display(), "fair-scheduling state open failed: {e}");
+                return;
+            }
+        };
+        // SAFETY: `file` owns the fd; flock neither reads nor writes it.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            warn!("fair-scheduling state flock failed; updating without it");
+        }
+        // Read AND write the very inode this flock covers, never re-opening
+        // by path: two lanes must not end up locking different inodes while
+        // both believe they hold the state.
+        let mut state = Self::read_from(&mut file).unwrap_or_default();
+        edit(&mut state);
+        if let Err(e) = state.write_into(&mut file) {
+            warn!(path = %path.display(), "could not persist fair-scheduling state: {e}");
+        }
+        // Lock released when `file` drops.
+    }
+
+    /// Defaults on anything unreadable or corrupt, exactly like [`Self::load`].
+    fn read_from(file: &mut std::fs::File) -> Option<Self> {
+        use std::io::{Read, Seek};
+        let mut buf = Vec::new();
+        file.rewind().ok()?;
+        file.read_to_end(&mut buf).ok()?;
+        serde_json::from_slice(&buf).ok()
+    }
+
+    /// Best-effort persist, like [`DailyCounter::save`]: losing this state
+    /// costs the rotation its memory, not the run.
+    fn write_into(&self, file: &mut std::fs::File) -> std::io::Result<()> {
+        use std::io::{Seek, Write};
+        let bytes = serde_json::to_vec(self)?;
+        file.rewind()?;
+        file.set_len(0)?;
+        file.write_all(&bytes)
+    }
+}
+
+/// Fair-scheduling state path: `AUGMENTAGENT_AUTOPR_FAIR_FILE` override
+/// (tests), else the daemon state dir next to the attempt ledger.
+fn fair_sched_path() -> PathBuf {
+    if let Ok(p) = std::env::var("AUGMENTAGENT_AUTOPR_FAIR_FILE") {
+        if !p.trim().is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    augmentagent_channel_core::state_dir::state_dir()
+        .map(|dir| dir.join("autopr-fair.json"))
+        .unwrap_or_else(|| PathBuf::from("autopr-fair.json"))
+}
+
+/// #1532 — billed resumes the combined lane may spend before it reserves a
+/// slot for a new issue. Default 2, so owner directive #866 ("sitting drafts
+/// outrank new work") survives as a 2:1 bias rather than as the absolute
+/// priority that starved every new issue.
+fn resume_per_build() -> u32 {
+    std::env::var("AUGMENTAGENT_AUTOPR_RESUME_PER_BUILD")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(2)
+        .max(1)
+}
+
+/// #1532 — is this billed slot reserved for a new-issue build? Only the
+/// combined lane interleaves: the explicit lanes keep their single purpose,
+/// and with resume-first off there is nothing to interleave against.
+fn prefer_build_now(lane: Lane, resume_first: bool, fair: &FairSched, per_build: u32) -> bool {
+    lane == Lane::Combined && resume_first && fair.resumes_since_build >= per_build
 }
 
 /// Ledger path: `AUGMENTAGENT_AUTOPR_ATTEMPTED_FILE` override (tests), else
@@ -11170,6 +11403,7 @@ impl AutoPrLoop {
             interval: std::time::Duration::from_secs(interval),
             daily_cap: Self::cap_from(daily_cap),
             counter_path: daily_counter_path(),
+            fair_path: fair_sched_path(),
             latch: augmentagent_channel_core::CooldownLatch::system(),
             clock: Arc::new(chrono::Utc::now),
         })
@@ -11193,6 +11427,7 @@ impl AutoPrLoop {
             interval: std::time::Duration::from_secs(Self::DEFAULT_INTERVAL_SECS),
             daily_cap,
             counter_path: state.join("autopr-daily-runs.json"),
+            fair_path: state.join("autopr-fair.json"),
             latch: augmentagent_channel_core::CooldownLatch::at(state.join("reasoner-cooldowns.json")),
             clock: Arc::new(chrono::Utc::now),
         }
@@ -11288,6 +11523,12 @@ impl AutoPrLoop {
                     Ok(r) if r.is_idle() => break,
                     Ok(r) if r.billed => {
                         counter.record(today);
+                        // #1532 — the single debt-accounting site, next to the
+                        // one that spends the budget: a billed resume owes the
+                        // new-issue lane a slot, a billed build settles up.
+                        // Persisted, so it survives the post-merge daemon
+                        // restart exactly as the run count does (#814).
+                        FairSched::update_persist(&self.fair_path, |f| f.record_billed(r.resumed));
                         // #1215 — spread the rest of today's runs over the
                         // rest of the day. This replaces #851's same-tick
                         // continuation, which spent every run back to back
@@ -11611,6 +11852,7 @@ for tool, arguments in [
                 COUNTER_FILE_ENV,
                 "AUGMENTAGENT_AUTOPR_BASELINE_FILE",
                 "AUGMENTAGENT_AUTOPR_ATTEMPTED_FILE",
+                "AUGMENTAGENT_AUTOPR_FAIR_FILE",
                 "AUGMENTAGENT_AUTOPR_HISTORY_FILE",
                 "AUGMENTAGENT_AUTOPR_OPENED_FILE",
                 "AUGMENTAGENT_COOLDOWN_FILE",
@@ -11628,6 +11870,7 @@ for tool, arguments in [
         assert_eq!(attempt_ledger_path(), state.join("autopr-attempted.json"));
         assert_eq!(attempt_history_path(), state.join("autopr-attempt-history.json"));
         assert_eq!(daily_counter_path(), state.join("autopr-daily-runs.json"));
+        assert_eq!(fair_sched_path(), state.join("autopr-fair.json"));
         assert_eq!(opened_prs_path(), state.join("autopr-opened-prs.json"));
         assert_eq!(run_lock_path().parent(), Some(state.as_path()));
         assert_eq!(augmentagent_channel_core::CooldownLatch::system().path(), state.join("reasoner-cooldowns.json"));
@@ -13149,6 +13392,146 @@ CODEX-REVIEW: lgtm").0);
             Some(v) => std::env::set_var("AUGMENTAGENT_AUTOPR_RESUME_FIRST", v),
             None => std::env::remove_var("AUGMENTAGENT_AUTOPR_RESUME_FIRST"),
         }
+    }
+
+    /// #1532 — the fair-scheduling state: durable, lock-safe, and NOT reset by
+    /// the UTC-day rollover, which is what makes the interleave survive to the
+    /// next day. A missing or corrupt file reproduces today's behaviour
+    /// (cursor 0 = lowest-first, debt 0 = resume-first).
+    #[test]
+    fn fair_scheduling_state_outlives_the_day_and_reserves_build_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autopr-fair.json");
+        let junk = dir.path().join("junk.json");
+        std::fs::write(&junk, b"{ nope").unwrap();
+        for fallback in [FairSched::load(&path), FairSched::load(&junk)] {
+            assert_eq!((fallback.resume_cursor, fallback.resumes_since_build), (0, 0));
+            assert!(!prefer_build_now(Lane::Combined, true, &fallback, 2));
+        }
+
+        // Two resumes are the #866 bias; the third slot is the new issue's.
+        let mut fair = FairSched::default();
+        assert!(!prefer_build_now(Lane::Combined, true, &fair, 2));
+        fair.record_billed(true);
+        assert!(!prefer_build_now(Lane::Combined, true, &fair, 2));
+        fair.record_billed(true);
+        assert!(prefer_build_now(Lane::Combined, true, &fair, 2));
+        // Only the combined lane interleaves, and only with resume-first on.
+        assert!(!prefer_build_now(Lane::Resume, true, &fair, 2));
+        assert!(!prefer_build_now(Lane::Build, true, &fair, 2));
+        assert!(!prefer_build_now(Lane::Combined, false, &fair, 2));
+        // A billed build settles up.
+        fair.record_billed(false);
+        assert!(!prefer_build_now(Lane::Combined, true, &fair, 2));
+
+        // Persisted across the rollover: at one resume per build the lane
+        // alternates ACROSS days, which a day-keyed quota cannot do.
+        FairSched::update_persist(&path, |f| {
+            f.advance(104);
+            f.record_billed(true);
+        });
+        let tomorrow = FairSched::load(&path);
+        assert_eq!((tomorrow.resume_cursor, tomorrow.resumes_since_build), (104, 1));
+        assert!(prefer_build_now(Lane::Combined, true, &tomorrow, 1),
+            "yesterday's resume still owes today's build");
+
+        // #871's hazard — two lane processes on one file — is covered by
+        // `concurrent_reservations_never_hand_the_same_draft_out_twice`.
+        // An in-place rewrite must leave no tail of the longer old record.
+        FairSched::update_persist(&path, |f| *f = FairSched::default());
+        assert_eq!(std::fs::read(&path).unwrap(), serde_json::to_vec(&FairSched::default()).unwrap());
+    }
+
+    /// #1532 — the resume and combined lanes are separate processes with
+    /// separate flocks, so reading the cursor, selecting, and advancing must
+    /// be ONE locked step: done separately, both lanes read the same cursor
+    /// and resume the same draft twice. Ten reservations over the issue's
+    /// five-draft backlog rotate through it exactly twice, with no draft
+    /// handed out a third time and none skipped.
+    #[test]
+    fn concurrent_reservations_never_hand_the_same_draft_out_twice() {
+        const POOL: [u64; 5] = [100, 101, 102, 103, 104];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autopr-fair.json");
+        let lanes: Vec<_> = (0..2)
+            .map(|_| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    (0..5)
+                        .map(|_| {
+                            reserve_next_draft(&p, |cursor| {
+                                let pr = *POOL.iter().find(|n| **n > cursor).unwrap_or(&POOL[0]);
+                                Some((pr, pr - 90, format!("agent-fix/issue-{}", pr - 90)))
+                            })
+                            .expect("a draft is always eligible")
+                            .0
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut handed_out: Vec<u64> =
+            lanes.into_iter().flat_map(|l| l.join().unwrap()).collect();
+        handed_out.sort_unstable();
+        assert_eq!(handed_out, vec![100, 100, 101, 101, 102, 102, 103, 103, 104, 104],
+            "{handed_out:?}");
+        assert_eq!(FairSched::load(&path).resume_cursor, 104);
+    }
+
+    #[test]
+    fn resume_per_build_defaults_to_two_and_never_zero() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("AUGMENTAGENT_AUTOPR_RESUME_PER_BUILD").ok();
+
+        std::env::remove_var("AUGMENTAGENT_AUTOPR_RESUME_PER_BUILD");
+        assert_eq!(resume_per_build(), 2);
+        std::env::set_var("AUGMENTAGENT_AUTOPR_RESUME_PER_BUILD", "4");
+        assert_eq!(resume_per_build(), 4);
+        // A zero would reserve every slot for builds and never resume.
+        std::env::set_var("AUGMENTAGENT_AUTOPR_RESUME_PER_BUILD", "0");
+        assert_eq!(resume_per_build(), 1);
+        std::env::set_var("AUGMENTAGENT_AUTOPR_RESUME_PER_BUILD", "nonsense");
+        assert_eq!(resume_per_build(), 2);
+
+        match prev {
+            Some(v) => std::env::set_var("AUGMENTAGENT_AUTOPR_RESUME_PER_BUILD", v),
+            None => std::env::remove_var("AUGMENTAGENT_AUTOPR_RESUME_PER_BUILD"),
+        }
+    }
+
+    /// #1532, structural: the two halves of the interleave in `run_once` —
+    /// the resume-first block yields its slot when a build is owed, and the
+    /// reserved slot falls back to a resume rather than idling. Plus: the
+    /// debt is accounted exactly once, where the budget is spent.
+    #[test]
+    fn the_reserved_build_slot_yields_to_a_waiting_draft_before_idling() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("pub async fn run_once(").expect("run_once");
+        let end = start + src[start..].find("\n}\n").expect("end of run_once");
+        let body = &src[start..end];
+        let resume_first = body
+            .find("lane != Lane::Build && resume_first_enabled() && !prefer_build")
+            .expect("the resume-first block yields a reserved slot");
+        let pick = body.find("match pick_issue(repo_root, dry_run).await?").expect("the picker");
+        assert!(resume_first < pick, "resume-first still precedes the picker");
+        let none_arm = &body[pick..];
+        let fallback = none_arm.find("if prefer_build {").expect("the reserved-slot fallback");
+        let resume = none_arm.find("find_resumable_draft(repo_root, None, dry_run)").expect("fallback resume");
+        let idle = none_arm.find("return Ok(RunReport::idle());").expect("the idle exit");
+        assert!(fallback < resume && resume < idle, "fall back to a draft, then idle");
+
+        // One debt-accounting site, in the loop's billed arm.
+        let production = &src[..src.find("mod tests {").unwrap()];
+        assert_eq!(production.matches("f.record_billed(").count(), 1);
+        let loop_start = production.find("async fn run_with<F, T>(").expect("run_with");
+        let billed = production[loop_start..].find("Ok(r) if r.billed =>").expect("billed arm");
+        let record = production[loop_start..].find("f.record_billed(r.resumed)").expect("debt update");
+        assert!(billed < record, "the debt update follows the billed arm");
+        assert!(
+            !production[loop_start + billed + 1..loop_start + record].contains("Ok(r)"),
+            "the debt update sits inside the billed arm, not a later one"
+        );
     }
 
     #[test]
@@ -15691,21 +16074,50 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let gave_up: std::collections::HashSet<u64> = [12u64].into_iter().collect();
         // Unpinned: oldest eligible draft.
         assert_eq!(
-            resumable_from(&prs, &ledger, 100, &gave_up, None, Some("nolanmak")),
+            resumable_from(&prs, &ledger, 100, &gave_up, None, Some("nolanmak"), 0),
             Some((100, 10, "agent-fix/issue-10".to_string()))
         );
         // Pinned to the red-main issue: that draft even though it is newer.
         assert_eq!(
-            resumable_from(&prs, &ledger, 100, &gave_up, Some(11), Some("nolanmak")),
+            resumable_from(&prs, &ledger, 100, &gave_up, Some(11), Some("nolanmak"), 0),
             Some((101, 11, "agent-fix/issue-11".to_string()))
         );
+        // #1532 — and a pinned draft ignores the rotation cursor entirely,
+        // in both directions: red-main's fix PR is not negotiable.
+        for cursor in [0, 100, 101, 999] {
+            assert_eq!(
+                resumable_from(&prs, &ledger, 100, &gave_up, Some(11), Some("nolanmak"), cursor),
+                Some((101, 11, "agent-fix/issue-11".to_string())),
+                "cursor {cursor}"
+            );
+        }
         // Pinned to an issue without an eligible draft: nothing, never a
         // fallback to some other PR.
-        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(12), Some("nolanmak")), None);
-        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(99), Some("nolanmak")), None);
+        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(12), Some("nolanmak"), 0), None);
+        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(99), Some("nolanmak"), 0), None);
         // The daily ledger still applies to the pinned draft.
         ledger.mark(100, 11);
-        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(11), Some("nolanmak")), None);
+        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(11), Some("nolanmak"), 0), None);
+    }
+
+    /// #1532, structural: the finder advances the persisted rotation cursor
+    /// only for an UNPINNED selection on a real run — and it advances at
+    /// selection time, so a resume that wedges cannot pin the rotation.
+    #[test]
+    fn only_an_unpinned_resume_moves_the_rotation_cursor() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn find_resumable_draft(").expect("finder");
+        let end = start + src[start..].find("\n}\n").expect("finder end");
+        let body = &src[start..end];
+        let bypass = body.find("if only.is_some() || dry_run {").expect("pinned bypass");
+        let reserve = body.find("reserve_next_draft(&fair_sched_path(), select)").expect("reservation");
+        assert!(bypass < reserve, "a pinned or dry run returns before reserving");
+        let r = src.find("fn reserve_next_draft(").expect("reserve_next_draft");
+        let reserver = &src[r..r + src[r..].find("\n}\n").expect("reserver end")];
+        let lock = reserver.find("FairSched::update_persist(").expect("locked");
+        let choose = reserver.find("select(f.resume_cursor)").expect("choice");
+        let advance = reserver.find("f.advance(*pr)").expect("cursor advance");
+        assert!(lock < choose && choose < advance, "read, choose and advance under one lock");
     }
 
     // --- #933 auto-rebase: the builder resolves a draft's merge conflict ---
@@ -17662,7 +18074,7 @@ else:
         for unknown in [None, Some(""), Some("   ")] {
             assert_eq!(head_is_ours(&ours, unknown), None, "{unknown:?}");
             assert_eq!(
-                resumable_from(&serde_json::json!([ours, fork]), &ledger, 100, &gave_up, None, unknown),
+                resumable_from(&serde_json::json!([ours, fork]), &ledger, 100, &gave_up, None, unknown, 0),
                 None,
                 "resume must fail closed on no evidence ({unknown:?})"
             );
@@ -17677,7 +18089,7 @@ else:
         let ours_flagged = pr_json_full(100, "agent-fix/issue-10", true, None, Some(false));
         let fork_flagged = pr_json_full(99, "agent-fix/issue-9", true, None, Some(true));
         assert_eq!(
-            resumable_from(&serde_json::json!([fork_flagged, ours_flagged]), &ledger, 100, &gave_up, None, None),
+            resumable_from(&serde_json::json!([fork_flagged, ours_flagged]), &ledger, 100, &gave_up, None, None, 0),
             Some((100, 10, "agent-fix/issue-10".to_string())),
             "the flag alone must skip the fork and still reach our draft"
         );
@@ -17699,16 +18111,16 @@ else:
         let ledger = AttemptLedger::default();
         let gave_up = std::collections::HashSet::new();
         assert_eq!(
-            resumable_from(&prs, &ledger, 100, &gave_up, None, Some("nolanmak")),
+            resumable_from(&prs, &ledger, 100, &gave_up, None, Some("nolanmak"), 0),
             Some((101, 11, "agent-fix/issue-11".to_string())),
             "the lower-numbered fork PR must not win the queue"
         );
         // Pinning to the fork's issue finds nothing rather than falling back.
-        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(10), Some("nolanmak")), None);
+        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(10), Some("nolanmak"), 0), None);
         // With no fork in play, selection is unchanged.
         let ours = serde_json::json!([pr_json(100, "agent-fix/issue-10", true, Some("nolanmak"))]);
         assert_eq!(
-            resumable_from(&ours, &ledger, 100, &gave_up, None, Some("nolanmak")),
+            resumable_from(&ours, &ledger, 100, &gave_up, None, Some("nolanmak"), 0),
             Some((100, 10, "agent-fix/issue-10".to_string()))
         );
     }

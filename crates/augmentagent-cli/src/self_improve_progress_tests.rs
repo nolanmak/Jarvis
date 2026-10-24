@@ -59,10 +59,137 @@ fn ready_managed_prs_are_resumable_but_forks_and_unmanaged_prs_are_not() {
     ]);
     let mut ledger = AttemptLedger::default();
     let gave_up = std::collections::HashSet::new();
-    assert_eq!(resumable_from(&prs, &ledger, 1, &gave_up, None, None),
+    assert_eq!(resumable_from(&prs, &ledger, 1, &gave_up, None, None, 0),
         Some((3, 3, "agent-fix/issue-3".into())));
     ledger.mark(1, 3);
-    assert_eq!(resumable_from(&prs, &ledger, 1, &gave_up, None, None), None);
+    assert_eq!(resumable_from(&prs, &ledger, 1, &gave_up, None, None, 0), None);
+}
+
+/// #1532 — the starvation axis: with more eligible drafts than the daily cap,
+/// a persisted cursor that is NOT reset by the UTC-day rollover must give
+/// every draft a turn before any draft gets a second one. On `main` the
+/// lowest-numbered drafts were re-served every single day and 102-104 never
+/// ran at all.
+#[test]
+fn fair_rotation_covers_backlog_larger_than_daily_cap_across_days() {
+    let prs = serde_json::Value::Array(
+        (100..105u64)
+            .map(|pr| serde_json::json!({
+                "number": pr,
+                "headRefName": format!("agent-fix/issue-{}", pr - 90),
+                "isDraft": true,
+                "isCrossRepository": false,
+            }))
+            .collect(),
+    );
+    let gave_up = std::collections::HashSet::new();
+    let mut fair = FairSched::default();
+    let mut order = Vec::new();
+    for day in 1..=3u64 {
+        // A fresh ledger per simulated day: the within-day exclusion resets,
+        // the rotation does not.
+        let mut ledger = AttemptLedger::default();
+        for _ in 0..2 {
+            let (pr, issue, _) =
+                resumable_from(&prs, &ledger, day, &gave_up, None, None, fair.resume_cursor)
+                    .expect("a draft is always eligible");
+            fair.advance(pr);
+            ledger.mark(day, issue);
+            order.push(pr);
+        }
+    }
+    assert_eq!(order, vec![100, 101, 102, 103, 104, 100],
+        "every draft gets a turn before any draft gets a second one");
+}
+
+/// #1532 — the other starvation axis, and the fallbacks. Three simulated days
+/// of three billed slots each against five non-converging drafts and two new
+/// issues: every draft is resumed and BOTH new issues are built, none of
+/// which happens when sitting drafts outrank new work absolutely.
+#[test]
+fn a_combined_lane_day_spends_slots_on_both_drafts_and_new_issues() {
+    let prs = serde_json::Value::Array(
+        (100..105u64)
+            .map(|pr| serde_json::json!({
+                "number": pr,
+                "headRefName": format!("agent-fix/issue-{}", pr - 90),
+                "isDraft": true,
+                "isCrossRepository": false,
+            }))
+            .collect(),
+    );
+    let gave_up = std::collections::HashSet::new();
+    const CAP: u32 = 3;
+    const PER_BUILD: u32 = 2;
+    let mut fair = FairSched::default();
+    let mut pickable = vec![20u64, 21];
+    let (mut resumed, mut built) = (Vec::new(), Vec::new());
+    // `run_once`'s order of operations, as one selection both the day loop and
+    // the fallback cases below drive: the preference decides which kind is
+    // tried first, the other kind is the fallback.
+    type Slot = Option<Result<(u64, u64, String), u64>>;
+    let select = |fair: &FairSched, draft: Option<(u64, u64, String)>, pick: Option<u64>| {
+        let prefer_build = prefer_build_now(Lane::Combined, true, fair, PER_BUILD);
+        let slot: Slot = if prefer_build {
+            pick.map(Err).or_else(|| draft.map(Ok))
+        } else {
+            draft.map(Ok).or_else(|| pick.map(Err))
+        };
+        (prefer_build, slot)
+    };
+    let mut reserved_slots_spent_on_drafts = 0;
+    for day in 1..=3u64 {
+        let mut ledger = AttemptLedger::default();
+        let mut billed = 0;
+        while billed < CAP {
+            let draft = resumable_from(&prs, &ledger, day, &gave_up, None, None, fair.resume_cursor);
+            let pick = pickable.iter().copied().find(|i| !ledger.attempted_today(day, *i));
+            let (prefer_build, slot) = select(&fair, draft, pick);
+            match slot {
+                Some(Ok((pr, issue, _))) => {
+                    fair.advance(pr);
+                    ledger.mark(day, issue);
+                    resumed.push(pr);
+                    fair.record_billed(true);
+                    reserved_slots_spent_on_drafts += u32::from(prefer_build);
+                }
+                Some(Err(issue)) => {
+                    ledger.mark(day, issue);
+                    built.push(issue);
+                    pickable.retain(|i| *i != issue);
+                    fair.record_billed(false);
+                }
+                None => break,
+            }
+            billed += 1;
+        }
+        assert!(billed <= CAP, "day {day} must not exceed the shared daily budget");
+    }
+    assert_eq!(built, vec![20, 21], "new issues are not starved by the draft backlog");
+    let mut distinct = resumed.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct, vec![100, 101, 102, 103, 104], "{resumed:?}");
+    assert!(reserved_slots_spent_on_drafts > 0, "a reserved slot with no issue left resumed");
+
+    // Fallback, explicitly, through that same selection. A slot that prefers a
+    // resume but has no eligible draft left buys a build...
+    let mut spent = AttemptLedger::default();
+    for issue in 10..15u64 {
+        spent.mark(4, issue);
+    }
+    let fresh = FairSched::default();
+    let draft = resumable_from(&prs, &spent, 4, &gave_up, None, None, fresh.resume_cursor);
+    assert_eq!(draft, None, "every draft was already attempted today");
+    assert_eq!(select(&fresh, draft, Some(22)), (false, Some(Err(22))));
+
+    // ...and a slot reserved for a build with nothing to build resumes,
+    // rather than idling the tick away.
+    let owing = FairSched { resume_cursor: 0, resumes_since_build: PER_BUILD };
+    let draft = resumable_from(&prs, &AttemptLedger::default(), 5, &gave_up, None, None, 0);
+    let (prefer_build, slot) = select(&owing, draft, None);
+    assert!(prefer_build);
+    assert_eq!(slot.map(|s| s.map(|(pr, _, _)| pr)), Some(Ok(100)));
 }
 
 #[test]
