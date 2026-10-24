@@ -84,4 +84,11 @@ impl ConversationAgent for AgentRouter {
     async fn interrupted(&self, call: &PhoneCall, heard: &str) -> Result<(), AgentError> {
         self.adapter(call)?.interrupted(call, heard).await
     }
+    async fn summarize_call(
+        &self,
+        call: &PhoneCall,
+        request: &crate::memory::SummaryRequest,
+    ) -> Result<crate::memory::SummaryDraft, AgentError> {
+        self.adapter(call)?.summarize_call(call, request).await
+    }
 }

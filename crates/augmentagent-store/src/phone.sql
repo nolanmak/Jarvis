@@ -95,3 +95,29 @@ CREATE TABLE IF NOT EXISTS phone_turn_metrics (
     PRIMARY KEY(call_id, turn_id)
 );
 CREATE INDEX IF NOT EXISTS phone_turn_metrics_recorded ON phone_turn_metrics(call_id, recorded_ms);
+
+-- #1552 post-call memory. One durable summary job per relayed call; a claim is
+-- a lease (attempts + next_ms) so a restart replays unfinished work once.
+CREATE TABLE IF NOT EXISTS phone_call_summary_jobs (
+    call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
+    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','done')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 3),
+    next_ms INTEGER NOT NULL DEFAULT 0,
+    created_ms INTEGER NOT NULL,
+    done_ms INTEGER,
+    summary TEXT CHECK(summary IS NULL OR length(summary) <= 800),
+    wiki_path TEXT
+);
+-- Owner-visible, owner-deletable facts learned from calls. No numbers or
+-- credentials: values are short model-extracted statements.
+CREATE TABLE IF NOT EXISTS owner_profile (
+    owner TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+    source_call_id TEXT NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    seq INTEGER NOT NULL,
+    PRIMARY KEY(owner, key)
+);
+CREATE INDEX IF NOT EXISTS owner_profile_recent ON owner_profile(owner, updated_ms);
