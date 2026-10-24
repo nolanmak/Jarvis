@@ -2384,19 +2384,27 @@ async fn ac01_every_turn_records_one_metrics_row_and_event_with_debug_played_tim
         .insert("x-twilio-signature", signature.parse().unwrap());
     let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
     socket.send(Message::Text(json!({"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX-test"}).to_string().into())).await.unwrap();
+    // One talk cycle: streamed tokens up to and including the last:true frame.
     async fn next_text(
         socket: &mut tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
     ) -> String {
-        tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
-            .await
-            .expect("reply")
-            .unwrap()
-            .unwrap()
-            .into_text()
-            .unwrap()
-            .to_string()
+        let mut spoken = String::new();
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+                .await
+                .expect("reply")
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap();
+            let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            spoken.push_str(frame["token"].as_str().unwrap());
+            if frame["last"] == true {
+                return spoken;
+            }
+        }
     }
     // Turn 1: answered, then provider reports tokens played (debug events).
     socket.send(Message::Text(json!({"type":"prompt","voicePrompt":"hello","last":true}).to_string().into())).await.unwrap();
@@ -2557,6 +2565,244 @@ async fn ac06_without_debug_events_played_fields_are_null_and_others_unchanged()
     assert_eq!(rows[0].t_first_played_ms, None);
     assert_eq!(rows[0].t_last_played_ms, None);
     assert_eq!(rows[0].audible_delta_ms, None);
+}
+
+/// Streams sentences on a schedule; `gate` permits release later sentences.
+struct StreamingAgent {
+    gate: tokio::sync::Semaphore,
+    first_after: std::time::Duration,
+    finish_after: std::time::Duration,
+    completed: std::sync::atomic::AtomicBool,
+    interrupted: tokio::sync::Notify,
+}
+#[async_trait]
+impl augmentagent_phone::ingress::ConversationAgent for StreamingAgent {
+    async fn answer(
+        &self,
+        _: &augmentagent_store::phone::PhoneCall,
+        _: &str,
+        _: &str,
+        speech: augmentagent_phone::ingress::SpeechSender,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<String, augmentagent_phone::ingress::AgentError> {
+        let started = tokio::time::Instant::now();
+        tokio::time::sleep(self.first_after).await;
+        speech.speak_partial("First sentence here. ").await?;
+        let permit = tokio::select! {
+            _ = cancel.cancelled() => return Err(augmentagent_phone::ingress::AgentError),
+            permit = self.gate.acquire() => permit.unwrap(),
+        };
+        permit.forget();
+        speech.speak_partial("**Second** one with [a link](https://example.com/x). ").await?;
+        tokio::select! {
+            _ = cancel.cancelled() => return Err(augmentagent_phone::ingress::AgentError),
+            _ = tokio::time::sleep_until(started + self.finish_after) => {}
+        }
+        speech.speak_partial("Third and last").await?;
+        speech.finish().await?;
+        self.completed.store(true, Ordering::SeqCst);
+        Ok("First sentence here. Second one with a link. Third and last".into())
+    }
+    async fn interrupted(
+        &self,
+        _: &augmentagent_store::phone::PhoneCall,
+        _: &str,
+    ) -> Result<(), augmentagent_phone::ingress::AgentError> {
+        self.interrupted.notify_one();
+        Ok(())
+    }
+}
+
+async fn streaming_socket(
+    agent: Arc<StreamingAgent>,
+) -> (
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use augmentagent_store::phone::CallState;
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+    let f = fixture("discord", true, true, false);
+    let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
+    let call = f
+        .service
+        .tool(&grant, "call_owner", json!({"request_id":"r1"}))
+        .await
+        .unwrap();
+    let id = call["id"].as_str().unwrap().to_string();
+    f.store
+        .phone_provider_event(&id, "CA-test", CallState::AwaitingAcceptance, 100)
+        .unwrap();
+    f.store.phone_accept(&id, "CA-test", 101).unwrap();
+    let router = augmentagent_phone::ingress::router(
+        Arc::new(f.service),
+        Arc::new(augmentagent_phone::webhook::WebhookAuth::new(
+            "AC-test",
+            "callback-secret",
+        )),
+        agent,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _keep = f._dir;
+        axum::serve(listener, router).await.unwrap()
+    });
+    let mut request = format!("ws://{addr}/phone/relay/{id}")
+        .into_client_request()
+        .unwrap();
+    let signature = signed(
+        "callback-secret",
+        &format!("wss://phone.example.test/phone/relay/{id}"),
+        &[],
+    );
+    request
+        .headers_mut()
+        .insert("x-twilio-signature", signature.parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    socket.send(Message::Text(json!({"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX-test"}).to_string().into())).await.unwrap();
+    (socket, server)
+}
+
+async fn next_frame<S>(socket: &mut S, within: std::time::Duration) -> Option<serde_json::Value>
+where
+    S: futures::Stream<
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + Unpin,
+{
+    use futures::StreamExt;
+    let frame = tokio::time::timeout(within, socket.next()).await.ok()??.ok()?;
+    serde_json::from_str(frame.to_text().ok()?).ok()
+}
+
+// AC1 + AC5 over a real WebSocket: the first sentence (t=100 ms) is on the
+// wire before t=200 ms and long before the agent future completes (t=5 s);
+// frames arrive in order with increasing timestamps; exactly one last:true.
+#[tokio::test]
+async fn ac05_real_websocket_streams_first_sentence_before_the_agent_completes() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let agent = Arc::new(StreamingAgent {
+        gate: tokio::sync::Semaphore::new(1),
+        first_after: std::time::Duration::from_millis(100),
+        finish_after: std::time::Duration::from_secs(5),
+        completed: std::sync::atomic::AtomicBool::new(false),
+        interrupted: tokio::sync::Notify::new(),
+    });
+    let (mut socket, server) = streaming_socket(agent.clone()).await;
+    let sent = tokio::time::Instant::now();
+    socket
+        .send(Message::Text(
+            json!({"type":"prompt","voicePrompt":"tell me","last":true})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let mut frames = Vec::new();
+    loop {
+        let frame = next_frame(&mut socket, std::time::Duration::from_secs(7))
+            .await
+            .expect("stream frame");
+        let last = frame["last"].as_bool().unwrap();
+        frames.push((tokio::time::Instant::now(), frame));
+        if last {
+            break;
+        }
+    }
+    let first_at = frames[0].0 - sent;
+    assert!(
+        first_at < std::time::Duration::from_millis(200),
+        "first frame after {first_at:?}"
+    );
+    assert_eq!(frames[0].1["token"], "First sentence here. ");
+    assert!(
+        !agent.completed.load(Ordering::SeqCst) || frames[0].0 - sent < std::time::Duration::from_secs(5),
+        "first frame must not wait for the agent future"
+    );
+    assert!(frames.windows(2).all(|w| w[0].0 <= w[1].0));
+    let last_at = frames.last().unwrap().0 - sent;
+    assert!(last_at >= std::time::Duration::from_secs(5), "finish at t=5 s, got {last_at:?}");
+    assert!(agent.completed.load(Ordering::SeqCst));
+    let flags: Vec<bool> = frames.iter().map(|(_, f)| f["last"].as_bool().unwrap()).collect();
+    assert_eq!(flags.iter().filter(|l| **l).count(), 1);
+    assert!(!flags[..flags.len() - 1].iter().any(|l| *l));
+    assert!(frames.iter().all(|(_, f)| f["type"] == "text" && f["interruptible"] == true));
+    let spoken: String = frames.iter().map(|(_, f)| f["token"].as_str().unwrap()).collect();
+    assert_eq!(spoken, "First sentence here. Second one with a link. Third and last");
+    // The automatic final answer was suppressed: nothing else arrives.
+    assert!(next_frame(&mut socket, std::time::Duration::from_millis(300)).await.is_none());
+    server.abort();
+}
+
+// AC4 over a real WebSocket: after `interrupt`, the stale generation's
+// remaining partials and finish produce no frames within 500 ms; the next
+// prompt streams normally.
+#[tokio::test]
+async fn ac04_real_websocket_interrupt_silences_the_stale_stream_until_the_next_turn() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let agent = Arc::new(StreamingAgent {
+        gate: tokio::sync::Semaphore::new(0),
+        first_after: std::time::Duration::from_millis(10),
+        finish_after: std::time::Duration::from_millis(20),
+        completed: std::sync::atomic::AtomicBool::new(false),
+        interrupted: tokio::sync::Notify::new(),
+    });
+    let (mut socket, server) = streaming_socket(agent.clone()).await;
+    socket
+        .send(Message::Text(
+            json!({"type":"prompt","voicePrompt":"first question","last":true})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let first = next_frame(&mut socket, std::time::Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_eq!(first["token"], "First sentence here. ");
+    socket.send(Message::Text(json!({"type":"interrupt","utteranceUntilInterrupt":"First","durationUntilInterruptMs":300}).to_string().into())).await.unwrap();
+    // The relay has bumped its generation once the interruption mirror runs.
+    tokio::time::timeout(std::time::Duration::from_secs(2), agent.interrupted.notified())
+        .await
+        .unwrap();
+    agent.gate.add_permits(1);
+    assert!(
+        next_frame(&mut socket, std::time::Duration::from_millis(500)).await.is_none(),
+        "interrupted generation emitted a frame"
+    );
+    assert!(agent.completed.load(Ordering::SeqCst));
+    socket
+        .send(Message::Text(
+            json!({"type":"prompt","voicePrompt":"second question","last":true})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let fresh = next_frame(&mut socket, std::time::Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_eq!(fresh["token"], "First sentence here. ");
+    assert_eq!(fresh["last"], false);
+    agent.gate.add_permits(1);
+    let mut tokens = vec![fresh["token"].as_str().unwrap().to_string()];
+    loop {
+        let frame = next_frame(&mut socket, std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        tokens.push(frame["token"].as_str().unwrap().to_string());
+        if frame["last"] == true {
+            break;
+        }
+    }
+    assert_eq!(tokens.concat(), "First sentence here. Second one with a link. Third and last");
+    assert!(next_frame(&mut socket, std::time::Duration::from_millis(300)).await.is_none());
+    server.abort();
 }
 
 // ---- #1549: recoverable conditions never close the relay socket ----

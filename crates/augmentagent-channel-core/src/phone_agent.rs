@@ -85,7 +85,7 @@ impl PhoneAgent {
         let execution_origin = origin.clone();
         let outcome = augmentagent_phone::context::scope(
             origin.clone(),
-            speech,
+            speech.clone(),
             run_surface_turn_with_history(
                 &self.store,
                 SurfaceTurnRequest {
@@ -153,6 +153,13 @@ impl PhoneAgent {
                     )
                     .await?;
                 self.service.authorize_call(&call.id)?;
+                // The native harness only yields a complete answer: stream it
+                // as one chunk and close the talk cycle. The relay then
+                // suppresses the ingress fallback for this turn.
+                if let Some(speech) = speech {
+                    let _ = speech.speak_partial(&answer).await;
+                    let _ = speech.finish().await;
+                }
                 Ok(answer)
             }
             SurfaceTurnOutcome::Cancelled => anyhow::bail!("phone turn cancelled"),

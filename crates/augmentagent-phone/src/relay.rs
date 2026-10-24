@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
+#[derive(Debug)]
 pub struct RelayTurn {
     pub id: String,
     pub text: String,
@@ -97,6 +98,9 @@ enum Incoming {
 struct TurnOutput {
     sent: HashMap<String, ([u8; 32], bool)>,
     final_spoken: bool,
+    /// Concatenation of every streamed token so far. Deduplication covers the
+    /// whole streamed answer, never an individual chunk.
+    streamed: String,
 }
 /// Twilio closes a ConversationRelay socket after ten consecutive malformed
 /// messages; incoming frames are held to the same bound (#1549).
@@ -217,6 +221,7 @@ impl RelaySession {
                     TurnOutput {
                         sent: HashMap::new(),
                         final_spoken: false,
+                        streamed: String::new(),
                     },
                 );
                 Ok(RelayInput::Turn(RelayTurn {
@@ -292,9 +297,43 @@ impl RelaySession {
             .sent
             .insert(utterance_id.into(), (hash, final_output));
         output.final_spoken = final_output;
-        Ok(Some(
-            json!({"type":"text","token":text,"last":true,"interruptible":true,"preemptible":false}),
-        ))
+        // Agent-authored utterances may carry Markdown; receipts are keyed on
+        // the raw text, the provider hears the sanitized form.
+        Ok(Some(text_frame(
+            &crate::speech::SpeechTextTransform::apply(text),
+            true,
+        )))
+    }
+    /// One streamed token with `last:false`. Tokens are forwarded untrimmed
+    /// so spacing survives concatenation on the provider side. Nothing is sent
+    /// for a stale generation, a closed talk cycle, or an empty token.
+    pub fn speak_partial(&mut self, turn: &RelayTurn, text: &str) -> Result<Option<Value>, Error> {
+        self.stream(turn, text, false)
+    }
+    /// Closes the talk cycle: the final token (possibly empty) carries
+    /// `last:true`. Afterwards the automatic final answer and any late partial
+    /// for this turn are suppressed.
+    pub fn finish_stream(&mut self, turn: &RelayTurn, text: &str) -> Result<Option<Value>, Error> {
+        self.stream(turn, text, true)
+    }
+    fn stream(&mut self, turn: &RelayTurn, text: &str, last: bool) -> Result<Option<Value>, Error> {
+        if turn.generation != self.generation {
+            return Ok(None);
+        }
+        if text.len() > 12_000 {
+            return Err(Error::InvalidArguments);
+        }
+        let output = self.outputs.get_mut(&turn.id).ok_or(Error::Unauthorized)?;
+        if output.final_spoken || (!last && text.is_empty()) {
+            return Ok(None);
+        }
+        output.streamed.push_str(text);
+        if last {
+            let hash: [u8; 32] = Sha256::digest(output.streamed.as_bytes()).into();
+            output.sent.insert("final".into(), (hash, true));
+            output.final_spoken = true;
+        }
+        Ok(Some(text_frame(text, last)))
     }
     pub fn finish(&mut self, turn: &RelayTurn, text: &str) -> Result<Option<Value>, Error> {
         if text.is_empty() || self.outputs.get(&turn.id).is_some_and(|o| o.final_spoken) {
@@ -302,4 +341,7 @@ impl RelaySession {
         }
         self.speech(turn, "final", text, true)
     }
+}
+fn text_frame(token: &str, last: bool) -> Value {
+    json!({"type":"text","token":token,"last":last,"interruptible":true,"preemptible":false})
 }
