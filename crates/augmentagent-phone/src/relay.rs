@@ -30,6 +30,9 @@ pub enum RelayInput {
     /// prompt whose description names the provider, model or voice: the
     /// configured STT/TTS selection was rejected. The description is dropped.
     SetupProviderRejected,
+    /// Interim recognition (`prompt` with `last:false`), surfaced only when
+    /// preemptive generation (#1555) requested `partialPrompts="true"`.
+    Partial(String),
     Turn(RelayTurn),
 }
 /// Manual Debug: caller speech and provider descriptions never appear.
@@ -47,6 +50,7 @@ impl std::fmt::Debug for RelayInput {
             ),
             Self::ProviderError(code) => write!(f, "ProviderError({code})"),
             Self::SetupProviderRejected => f.write_str("SetupProviderRejected"),
+            Self::Partial(_) => f.write_str("Partial"),
             Self::Turn(turn) => write!(f, "Turn({})", turn.id),
         }
     }
@@ -328,6 +332,7 @@ pub struct RelaySession {
     debug_events: bool,
     invalid_frames: u64,
     played_event: Option<tokio::time::Instant>,
+    partial_prompts: bool,
     owner_activity: bool,
     barge: BargeIn,
     /// Turn that most recently wrote speech: what an `interrupt` cut off.
@@ -353,6 +358,7 @@ impl RelaySession {
             debug_events: false,
             invalid_frames: 0,
             played_event: None,
+            partial_prompts: false,
             owner_activity: false,
             barge: BargeIn::default(),
             speaking: None,
@@ -360,6 +366,12 @@ impl RelaySession {
             played_final: false,
             ended: false,
         }
+    }
+    /// Surface interim recognition as [`RelayInput::Partial`] (#1555). Only
+    /// set when the TwiML requested `partialPrompts="true"`.
+    pub fn with_partial_prompts(mut self, enabled: bool) -> Self {
+        self.partial_prompts = enabled;
+        self
     }
     /// With Relay debug events requested in TwiML, unknown frame types are
     /// categorized and ignored instead of ending the session.
@@ -476,10 +488,18 @@ impl RelaySession {
                     return Err(Error::InvalidArguments);
                 }
                 self.owner_activity = true;
-                // TwiML pins partialPrompts=false. Defensive handling never
-                // submits interim recognition to the agent.
-                if !last || text.trim().is_empty() {
+                if text.trim().is_empty() {
                     return Ok(RelayInput::Ignore);
+                }
+                // Interim recognition never opens a turn. Without preemptive
+                // generation the TwiML pins partialPrompts=false and any
+                // stray interim prompt is ignored.
+                if !last {
+                    return Ok(if self.partial_prompts {
+                        RelayInput::Partial(text)
+                    } else {
+                        RelayInput::Ignore
+                    });
                 }
                 if self.pending.is_some() && self.barge.is_backchannel(&text) {
                     return Ok(self.false_interruption());

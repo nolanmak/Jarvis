@@ -123,6 +123,12 @@ impl Settings {
             Some("0") => false,
             _ => return Err(Error::NotConfigured),
         };
+        // #1555: explicit on/off, default off; inert without the fast layer.
+        let preemptive = match get("AUGMENTAGENT_PHONE_PREEMPTIVE").as_deref() {
+            None | Some("0") => false,
+            Some("1") => true,
+            _ => return Err(Error::NotConfigured),
+        };
         let silence = crate::silence::SilencePolicy::from_lookup(&get)?;
         let public_url = required("AUGMENTAGENT_PHONE_PUBLIC_URL")?;
         let fast = crate::fast::FastLayerConfig::from_lookup(&get, &public_url)?;
@@ -137,6 +143,7 @@ impl Settings {
         .with_silence(silence)
         .with_barge_in(barge_in(&get)?)
         .with_fast_layer(fast)
+        .with_preemptive(preemptive)
         .with_proposals(crate::proposals::ProposalPolicy::from_lookup(&get)?);
         let account = required("TWILIO_ACCOUNT_SID")?;
         let token = required("TWILIO_AUTH_TOKEN")?;

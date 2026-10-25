@@ -376,6 +376,38 @@ fn unknown_frame_types_still_fail_closed_without_debug_events() {
     assert!(session.take_played_event().is_none());
 }
 
+// #1555 step 1: with preemptive generation on, interim recognition becomes
+// `Partial`; with it off, interim prompts stay ignored exactly as before.
+#[test]
+fn preemptive_interim_prompts_become_partials_only_when_enabled() {
+    let interim = json!({"type":"prompt","voicePrompt":"what's on my","last":false}).to_string();
+    let mut off = RelaySession::new("call-1", "AC-test", "CA-test");
+    off.receive(&setup()).unwrap();
+    assert!(matches!(off.receive(&interim).unwrap(), RelayInput::Ignore));
+
+    let mut on = RelaySession::new("call-1", "AC-test", "CA-test").with_partial_prompts(true);
+    assert!(on.receive(&interim).is_err(), "no partial before setup");
+    on.receive(&setup()).unwrap();
+    let RelayInput::Partial(text) = on.receive(&interim).unwrap() else {
+        panic!("interim prompt must surface as a partial")
+    };
+    assert_eq!(text, "what's on my");
+    let debug = format!("{:?}", RelayInput::Partial(text));
+    assert!(!debug.contains("what's"), "caller speech never appears in Debug");
+    let blank = json!({"type":"prompt","voicePrompt":"  ","last":false}).to_string();
+    assert!(matches!(on.receive(&blank).unwrap(), RelayInput::Ignore));
+    // Partials never consume a turn sequence number.
+    let RelayInput::Turn(turn) = on
+        .receive(&json!({"type":"prompt","voicePrompt":"what's on my calendar","last":true}).to_string())
+        .unwrap()
+    else {
+        panic!("final prompt opens a turn")
+    };
+    assert_eq!(turn.id, "phone:call-1:1");
+    let oversized = json!({"type":"prompt","voicePrompt":"a".repeat(12_001),"last":false}).to_string();
+    assert!(on.receive(&oversized).is_err());
+}
+
 // ---- #1550 barge-in filter ----
 
 const ANSWER: &str = "Tomorrow you have a dentist appointment at 3. Then lunch with Sam.";

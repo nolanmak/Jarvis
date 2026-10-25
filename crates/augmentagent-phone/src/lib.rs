@@ -137,6 +137,7 @@ pub struct PhoneConfig {
     debug_events: bool,
     barge_in: relay::BargeIn,
     fast: Option<fast::FastLayerConfig>,
+    preemptive: bool,
     proposals: proposals::ProposalPolicy,
     silence: silence::SilencePolicy,
 }
@@ -180,6 +181,7 @@ impl PhoneConfig {
             debug_events: false,
             barge_in: relay::BargeIn::default(),
             fast: None,
+            preemptive: false,
             proposals: proposals::ProposalPolicy::default(),
             silence: silence::SilencePolicy::default(),
         })
@@ -219,6 +221,12 @@ impl PhoneConfig {
     /// Answer utterances with the fast conversational layer (#1546).
     pub fn with_fast_layer(mut self, fast: Option<fast::FastLayerConfig>) -> Self {
         self.fast = fast;
+        self
+    }
+    /// Preemptive generation on interim transcripts (#1555). Takes effect only
+    /// together with the fast layer.
+    pub fn with_preemptive(mut self, enabled: bool) -> Self {
+        self.preemptive = enabled;
         self
     }
 }
@@ -274,6 +282,11 @@ impl PhoneService {
     /// Fast-layer settings when `AUGMENTAGENT_PHONE_FAST_LAYER=1` (#1546).
     pub fn fast_layer(&self) -> Option<&fast::FastLayerConfig> {
         self.config.fast.as_ref()
+    }
+    /// `AUGMENTAGENT_PHONE_PREEMPTIVE=1` on the fast layer (#1555): TwiML
+    /// requests interim prompts and the relay may speculate on them.
+    pub fn preemptive(&self) -> bool {
+        self.config.preemptive && self.config.fast.is_some()
     }
     /// Silence check-in and automatic-end thresholds (#1556).
     pub fn silence_policy(&self) -> silence::SilencePolicy {
@@ -779,6 +792,8 @@ pub mod fast;
 
 pub mod memory;
 pub mod end_call;
+/// Preemptive generation on interim transcripts (#1555).
+pub mod speculation;
 
 pub mod proposals;
 pub mod silence;

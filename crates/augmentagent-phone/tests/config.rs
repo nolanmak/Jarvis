@@ -410,6 +410,49 @@ fn thinking_sound_url_must_be_on_the_operator_origin() {
     }
 }
 
+// #1555: preemptive generation is off unless explicitly enabled, applies only
+// on the fast layer, and junk fails closed.
+#[test]
+fn preemptive_flag_defaults_off_needs_the_fast_layer_and_fails_closed_on_junk() {
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        std::sync::Arc::new(augmentagent_store::Store::open(dir.path().join("db")).unwrap());
+    let load = |pairs: &[(&'static str, &str)]| {
+        let mut env = values();
+        for (k, v) in pairs {
+            env.insert(k, (*v).into());
+        }
+        Settings::from_lookup(|k| env.get(k).cloned())
+    };
+    let preemptive = |pairs: &[(&'static str, &str)]| {
+        load(pairs)
+            .unwrap()
+            .unwrap()
+            .build(store.clone())
+            .unwrap()
+            .service
+            .preemptive()
+    };
+    assert!(!preemptive(&[]));
+    assert!(!preemptive(&[("AUGMENTAGENT_PHONE_FAST_LAYER", "1")]));
+    assert!(!preemptive(&[("AUGMENTAGENT_PHONE_PREEMPTIVE", "1")]), "native turns never speculate");
+    assert!(!preemptive(&[
+        ("AUGMENTAGENT_PHONE_FAST_LAYER", "1"),
+        ("AUGMENTAGENT_PHONE_PREEMPTIVE", "0"),
+    ]));
+    assert!(preemptive(&[
+        ("AUGMENTAGENT_PHONE_FAST_LAYER", "1"),
+        ("AUGMENTAGENT_PHONE_PREEMPTIVE", "1"),
+    ]));
+    for bad in ["yes", "true", "", "2"] {
+        assert!(load(&[("AUGMENTAGENT_PHONE_PREEMPTIVE", bad)]).is_err(), "{bad:?}");
+        assert!(
+            load(&[("AUGMENTAGENT_PHONE_FAST_LAYER", "1"), ("AUGMENTAGENT_PHONE_PREEMPTIVE", bad)]).is_err(),
+            "{bad:?}"
+        );
+    }
+}
+
 // #1553: quiet hours for agent-proposed calls are explicit and fail closed.
 #[test]
 fn proposal_quiet_hours_and_time_zone_fail_closed_on_junk() {

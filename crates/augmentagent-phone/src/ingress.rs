@@ -4,6 +4,7 @@ use crate::{
     metrics::TurnTimer,
     silence::{SilenceAction, SilenceMonitor},
     relay::{RelayInput, RelaySession, RelayTurn, INVALID_FRAME_LIMIT},
+    speculation::{Speculative, Speculator},
     speech::SpeechStream,
     webhook::WebhookAuth,
     Error, PhoneService,
@@ -48,6 +49,26 @@ pub trait ConversationAgent: Send + Sync {
     /// Persist a distinct interrupted-playback marker; do not claim generated
     /// text was fully heard, and do not undo completed tools.
     async fn interrupted(&self, call: &PhoneCall, heard: &str) -> Result<(), AgentError>;
+    /// Start a speculative answer for an interim transcript (#1555). Its
+    /// output stays buffered until committed. Only the fast layer speculates;
+    /// by default nothing is started.
+    fn speculate(&self, _call: &PhoneCall, _text: &str) -> Option<Speculative> {
+        None
+    }
+    /// Answer a final prompt whose speculation was committed. By default the
+    /// speculation is dropped and the prompt answered normally.
+    async fn answer_speculated(
+        &self,
+        call: &PhoneCall,
+        turn_id: &str,
+        text: &str,
+        speech: SpeechSender,
+        cancel: CancellationToken,
+        speculation: Speculative,
+    ) -> Result<String, AgentError> {
+        drop(speculation);
+        self.answer(call, turn_id, text, speech, cancel).await
+    }
     /// Post-call memory (#1552): run the heavy agent once, with exactly the
     /// request's tools (none), over the transcript mirrored into the call's
     /// originating chat. Adapters without a heavy agent leave the default.
@@ -202,6 +223,10 @@ impl SpeechSender {
     /// Mark this turn as answered by the fast layer (#1546) for metrics.
     pub fn mark_fast(&self) {
         self.timer.mark_fast();
+    }
+    /// The committed speculation was discarded and the turn re-planned (#1555).
+    pub fn speculation_discarded(&self) {
+        self.timer.speculation_discarded();
     }
     /// Mark this turn as having handed work off (#1546) for metrics.
     pub fn mark_dispatched(&self) {
@@ -719,6 +744,8 @@ fn log_recoverable(call: &PhoneCall, diagnostic: Recoverable) {
 }
 enum Classified {
     Turn(RelayTurn),
+    /// Interim recognition for preemptive generation (#1555).
+    Partial(String),
     Interrupted,
     /// A possible barge-in awaiting the next prompt or the timeout (#1550).
     InterruptPending,
@@ -743,6 +770,7 @@ fn classify(
     match incoming {
         Some(Ok(Message::Text(frame))) => match session.receive(&frame) {
             Ok(RelayInput::Turn(turn)) => Classified::Turn(turn),
+            Ok(RelayInput::Partial(text)) => Classified::Partial(text),
             Ok(RelayInput::Interrupted) => Classified::Interrupted,
             Ok(RelayInput::InterruptPending) => Classified::InterruptPending,
             Ok(RelayInput::Resumed(resume)) => Classified::Resumed(resume),
@@ -779,7 +807,8 @@ struct TurnQueue {
     turns: Mutex<VecDeque<QueuedTurn>>,
     ready: Notify,
 }
-type QueuedTurn = (Arc<RelayTurn>, Arc<TurnTimer>);
+/// A turn, its latency record and, when committed (#1555), its speculation.
+type QueuedTurn = (Arc<RelayTurn>, Arc<TurnTimer>, Option<Speculative>);
 impl TurnQueue {
     fn push(&self, turn: QueuedTurn) -> Option<QueuedTurn> {
         let mut turns = self.turns.lock().unwrap_or_else(|e| e.into_inner());
@@ -819,7 +848,8 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
     };
     let mut session = RelaySession::new(&call.id, state.auth.account(), sid)
         .with_debug_events(state.service.config.debug_events)
-        .with_barge_in(state.service.config.barge_in.clone());
+        .with_barge_in(state.service.config.barge_in.clone())
+        .with_partial_prompts(state.service.preemptive());
     let setup_ok = match receive_setup(&mut socket, &mut session).await {
         Ok(control_frames) => {
             tracing::info!(call_id = %call.id, control_frames, "phone relay setup accepted");
@@ -852,6 +882,10 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
     }
     let queue = Arc::new(TurnQueue::default());
     let worker_queue = queue.clone();
+    // Turns queued or being answered. Speculation (#1555) runs only while
+    // this is zero, so it always sees the call's complete history.
+    let busy = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let worker_busy = busy.clone();
     let (speech_tx, mut speech_rx) = mpsc::channel::<SpeechEvent>(32);
     let cancel = CancellationToken::new();
     let worker_cancel = cancel.clone();
@@ -875,7 +909,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
     });
     let mut worker = tokio::spawn(async move {
         loop {
-            let (turn, timer) = loop {
+            let (turn, timer, speculation) = loop {
                 if let Some(entry) = worker_queue.pop() {
                     break entry;
                 }
@@ -887,17 +921,34 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
             timer.dequeued();
             let speech = SpeechSender::with_timer(speech_tx.clone(), turn.clone(), timer.clone());
             let turn_cancel = worker_cancel.child_token();
-            let result = bounded_answer(
-                agent.answer(
-                    &worker_call,
-                    &turn.id,
-                    &turn.text,
-                    speech.clone(),
-                    turn_cancel.clone(),
-                ),
-                &turn_cancel,
-            )
-            .await;
+            let answer = async {
+                match speculation {
+                    Some(speculation) => {
+                        agent
+                            .answer_speculated(
+                                &worker_call,
+                                &turn.id,
+                                &turn.text,
+                                speech.clone(),
+                                turn_cancel.clone(),
+                                speculation,
+                            )
+                            .await
+                    }
+                    None => {
+                        agent
+                            .answer(
+                                &worker_call,
+                                &turn.id,
+                                &turn.text,
+                                speech.clone(),
+                                turn_cancel.clone(),
+                            )
+                            .await
+                    }
+                }
+            };
+            let result = bounded_answer(answer, &turn_cancel).await;
             if worker_cancel.is_cancelled() {
                 break;
             }
@@ -911,6 +962,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
             if speech.finish_outcome(failed).await.is_err() {
                 break;
             }
+            worker_busy.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
     });
     let mut feedback = HashMap::<String, TurnFeedback>::new();
@@ -925,6 +977,7 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
         Duration::from_millis(250)
     };
     let mut metrics = TurnMetricsLedger::new(&state.service, &call);
+    let mut speculator = Speculator::default();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     // #1557: after the agent's goodbye, `end` waits for its tokens-played
     // event or PLAYBACK_WAIT, whichever is first.
@@ -951,8 +1004,13 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                     Classified::Turn(turn)=>{
                         let turn=Arc::new(turn);
                         feedback.insert(turn.id.clone(), TurnFeedback::new(turn.clone()).with_ack_after(ack_after));
+                        let finalized = speculator.finalize(&turn.text);
                         let timer = metrics.begin(&turn.id);
-                        if let Some((dropped, _))=queue.push((turn, timer)) {
+                        timer.speculation(finalized.speculated, finalized.saved);
+                        busy.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if let Some((dropped, _, _))=queue.push((turn, timer, finalized.speculation)) {
+                            // The evicted turn never runs; its speculation is dropped.
+                            busy.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                             feedback.remove(&dropped.id);
                             log_recoverable(&call, diagnostics.note("turn_queue_full", None, session.consecutive_invalid_frames()));
                             // The evicted turn gets one fixed final line; dedup and
@@ -965,9 +1023,25 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
                         }
                     },
                     // Settled above: stale audio is already invalidated.
-                    Classified::Interrupted=>{},
+                    // After the goodbye nothing new starts (#1557).
+                    Classified::Partial(_) if ending.is_some() => {},
+                    Classified::Partial(text)=>{
+                        // Only while idle: a turn still answering would leave
+                        // the speculation without that turn's history. Also not
+                        // while a barge-in is undecided (#1550): the interruption
+                        // marker is not yet in the history.
+                        if busy.load(std::sync::atomic::Ordering::SeqCst) == 0
+                            && session.false_interrupt_deadline().is_none()
+                        {
+                            speculator.partial(&text, |text| state.agent.speculate(&call, text));
+                        } else {
+                            speculator.reset();
+                        }
+                    },
+                    Classified::Interrupted=>{ speculator.reset(); },
                     Classified::InterruptPending=>{
                         tracing::info!(call_id = %call.id, "phone barge-in pending");
+                        speculator.reset();
                     },
                     Classified::Resumed(resume)=>{
                         if !write_resume(&mut socket, &mut metrics, resume).await {break EndReason::TransportError;}
@@ -1477,6 +1551,9 @@ impl<'a> TurnMetricsLedger<'a> {
             t_last_played_ms = record.t_last_played_ms,
             audible_delta_ms = record.audible_delta_ms,
             commit_sha = record.commit_sha.as_deref(),
+            speculated = record.speculated,
+            speculation_committed = record.speculation_committed,
+            speculation_saved_ms = record.speculation_saved_ms,
             "phone turn metrics"
         );
         if let Err(error) = self.service.store.phone_record_turn_metrics(&record) {

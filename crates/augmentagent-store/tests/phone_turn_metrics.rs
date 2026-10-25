@@ -20,6 +20,9 @@ fn record(call: &str, turn: u64, recorded_ms: i64, first_speech: i64) -> PhoneTu
         t_last_played_ms: None,
         audible_delta_ms: None,
         commit_sha: Some("0123456789abcdef0123456789abcdef01234567".into()),
+        speculated: false,
+        speculation_committed: false,
+        speculation_saved_ms: None,
     }
 }
 
@@ -94,4 +97,69 @@ fn ac04_records_reject_identifiers_that_could_carry_private_text() {
     bad.t_first_speech_ms = Some(-5);
     assert!(store.phone_record_turn_metrics(&bad).is_err());
     assert!(store.phone_turn_metrics("call-a").unwrap().is_empty());
+}
+
+// #1555 AC6: the three speculation fields round-trip, are validated, feed the
+// percentile summary, and are added in place to a pre-#1555 table.
+#[test]
+fn speculation_fields_round_trip_validate_and_upgrade_an_existing_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("metrics.db");
+    {
+        // A #1551-era table without the speculation columns, holding one row.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE phone_turn_metrics (
+                call_id TEXT NOT NULL, turn_id TEXT NOT NULL,
+                recorded_ms INTEGER NOT NULL, provider TEXT NOT NULL, outcome TEXT NOT NULL,
+                queue_wait_ms INTEGER, t_first_token_ms INTEGER, t_first_speech_ms INTEGER,
+                t_last_speech_ms INTEGER, tool_ms INTEGER, t_first_played_ms INTEGER,
+                t_last_played_ms INTEGER, audible_delta_ms INTEGER, commit_sha TEXT,
+                PRIMARY KEY(call_id, turn_id));
+             INSERT INTO phone_turn_metrics(call_id,turn_id,recorded_ms,provider,outcome)
+             VALUES('call-old','phone:call-old:1',500,'native','answered');",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    let old = &store.phone_turn_metrics("call-old").unwrap()[0];
+    assert!(!old.speculated && !old.speculation_committed);
+    assert_eq!(old.speculation_saved_ms, None);
+
+    let mut committed = record("call-a", 1, 1_000, 300);
+    committed.speculated = true;
+    committed.speculation_committed = true;
+    committed.speculation_saved_ms = Some(450);
+    assert!(store.phone_record_turn_metrics(&committed).unwrap());
+    let mut cancelled = record("call-a", 2, 2_000, 900);
+    cancelled.speculated = true;
+    assert!(store.phone_record_turn_metrics(&cancelled).unwrap());
+    let rows = store.phone_turn_metrics("call-a").unwrap();
+    assert_eq!(rows[0], committed);
+    assert_eq!(rows[1], cancelled);
+
+    // Inconsistent or negative speculation fields are rejected.
+    for (speculated, committed, saved) in [
+        (false, true, Some(10)),
+        (true, true, None),
+        (true, false, Some(10)),
+        (true, true, Some(-1)),
+    ] {
+        let mut bad = record("call-b", 1, 3_000, 300);
+        bad.speculated = speculated;
+        bad.speculation_committed = committed;
+        bad.speculation_saved_ms = saved;
+        assert!(store.phone_record_turn_metrics(&bad).is_err(), "{bad:?}");
+    }
+    let saved = store
+        .phone_turn_metrics_summary(10)
+        .unwrap()
+        .fields
+        .into_iter()
+        .find(|f| f.field == "speculation_saved_ms")
+        .unwrap();
+    assert_eq!((saved.samples, saved.p50), (1, Some(450)));
+    // Reopening never re-adds the columns.
+    drop(store);
+    assert_eq!(Store::open(&path).unwrap().phone_turn_metrics("call-a").unwrap().len(), 2);
 }

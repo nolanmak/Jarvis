@@ -13,6 +13,7 @@ use augmentagent_approval_discord::{AuditCtx, QueryHandler};
 use augmentagent_phone::{
     fast::{FastBackend, FastContext, FastLayerConfig, FastModel, TaskEvents, VoiceConversationAgent},
     ingress::{AgentError, ConversationAgent, SpeechSender},
+    speculation::Speculative,
     memory::{SummaryDraft, SummaryRequest},
     PhoneService,
 };
@@ -474,6 +475,39 @@ impl ConversationAgent for PhoneAgent {
         self.run(call, turn_id, text, Some(speech), cancel)
             .await
             .map_err(|_| AgentError)
+    }
+    /// Preemptive generation (#1555) belongs to the fast layer only; native
+    /// turns never speculate.
+    fn speculate(&self, call: &PhoneCall, text: &str) -> Option<Speculative> {
+        self.fast.as_ref()?.speculate(call, text)
+    }
+    async fn answer_speculated(
+        &self,
+        call: &PhoneCall,
+        turn_id: &str,
+        text: &str,
+        speech: SpeechSender,
+        cancel: CancellationToken,
+        speculation: Speculative,
+    ) -> Result<String, AgentError> {
+        match &self.fast {
+            Some(fast) => {
+                ConversationAgent::answer_speculated(
+                    fast.as_ref(),
+                    call,
+                    turn_id,
+                    text,
+                    speech,
+                    cancel,
+                    speculation,
+                )
+                .await
+            }
+            None => {
+                drop(speculation);
+                self.answer(call, turn_id, text, speech, cancel).await
+            }
+        }
     }
     async fn summarize_call(
         &self,

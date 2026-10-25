@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use augmentagent_phone::{
     fast::{
         FastBackend, FastContext, FastEvent, FastLayerConfig, FastMessage, FastModel,
-        FastModelError, FastRequest, FastStream, TaskEvents, ToolCall, VoiceConversationAgent,
+        FastModelError, FastRequest, FastStream, TaskEvents, ToolCall, ToolChoice,
+        VoiceConversationAgent,
     },
     ingress::{AgentError, ConversationAgent, SpeechEvent, SpeechSender},
     relay::{RelayInput, RelaySession},
@@ -40,6 +41,7 @@ struct RecordedRequest {
     system: String,
     messages: Vec<FastMessage>,
     tools: Vec<String>,
+    tool_choice: ToolChoice,
 }
 impl ScriptedModel {
     fn new(rounds: Vec<Vec<Step>>) -> Arc<Self> {
@@ -59,6 +61,7 @@ impl FastModel for ScriptedModel {
             system: request.system,
             messages: request.messages,
             tools: request.tools.iter().map(|t| t.name.to_string()).collect(),
+            tool_choice: request.tool_choice,
         });
         let round = self
             .rounds
@@ -1627,6 +1630,497 @@ async fn queue_wait_notice_is_spoken_on_the_socket_and_wait_is_recorded() {
         "the notice is not the answer's first speech: {record:?}"
     );
     live.server.abort();
+}
+
+// ---------- #1555 preemptive generation ----------
+
+mod preemptive {
+    use super::*;
+    use augmentagent_phone::{
+        metrics::TurnTimer,
+        speculation::{Finalized, Speculator},
+    };
+    use augmentagent_store::phone::{TurnOutcome, TurnProvider};
+
+    /// Relay session that surfaces interim prompts, plus a per-turn timer.
+    pub(super) struct PreemptiveRelay {
+        pub relay: Relay,
+    }
+    impl PreemptiveRelay {
+        pub fn new() -> Self {
+            let mut relay = Relay::new();
+            relay.session = RelaySession::new("call-1", "AC-test", "CA-test")
+                .with_partial_prompts(true);
+            relay
+                .session
+                .receive(
+                    r#"{"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX"}"#,
+                )
+                .unwrap();
+            Self { relay }
+        }
+        /// Interim prompt through the relay protocol.
+        pub fn partial(&mut self, text: &str) -> String {
+            let frame = json!({"type":"prompt","voicePrompt":text,"last":false}).to_string();
+            let RelayInput::Partial(text) = self.relay.session.receive(&frame).unwrap() else {
+                panic!("interim prompt must surface as a partial")
+            };
+            text
+        }
+        /// Final prompt: a turn whose speech carries `timer`.
+        pub fn turn(&mut self, text: &str, timer: Arc<TurnTimer>) -> (String, SpeechSender) {
+            let frame = json!({"type":"prompt","voicePrompt":text,"last":true}).to_string();
+            let RelayInput::Turn(turn) = self.relay.session.receive(&frame).unwrap() else {
+                panic!("prompt must open a turn")
+            };
+            let id = turn.id.clone();
+            (
+                id,
+                SpeechSender::with_timer(self.relay.tx.clone(), Arc::new(turn), timer),
+            )
+        }
+    }
+    pub(super) async fn advance(ms: u64) {
+        tokio::time::advance(Duration::from_millis(ms)).await;
+        // Let spawned speculative work observe the new time.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+    pub(super) fn feed(
+        speculator: &mut Speculator,
+        fast: &Arc<VoiceConversationAgent>,
+        relay: &mut PreemptiveRelay,
+        text: &str,
+    ) {
+        let text = relay.partial(text);
+        speculator.partial(&text, |t| fast.speculate(&call(), t));
+    }
+    pub(super) fn record(timer: &TurnTimer) -> augmentagent_store::phone::PhoneTurnMetrics {
+        timer.record(
+            "call-1",
+            "phone:call-1:1",
+            TurnProvider::Fast,
+            TurnOutcome::Answered,
+            1_000,
+            None,
+        )
+    }
+
+    // Step 2 / AC2 / AC3 / AC6: partials at 0/300/900 ms start exactly one
+    // speculation at 900 ms; the matching final commits it; buffered tokens are
+    // flushed in order only after commit; saved_ms is the measured gap.
+    #[tokio::test(start_paused = true)]
+    async fn step2_one_speculation_starts_at_900ms_and_a_prefix_final_commits() {
+        let model = ScriptedModel::new(vec![vec![
+            Step::Token("You have "),
+            Step::Token("a dentist visit at nine. "),
+            Step::Token("Nothing else."),
+        ]]);
+        let backend = Arc::new(FakeBackend::default());
+        let fast = agent(model.clone(), backend.clone(), FastLayerConfig::default());
+        let mut relay = PreemptiveRelay::new();
+        let mut speculator = Speculator::default();
+
+        feed(&mut speculator, &fast, &mut relay, "what's");
+        advance(300).await;
+        feed(&mut speculator, &fast, &mut relay, "what's on my");
+        assert!(!speculator.is_active(), "3 words never speculate");
+        advance(600).await;
+        let started = tokio::time::Instant::now();
+        feed(&mut speculator, &fast, &mut relay, "what's on my calendar tomorrow");
+        assert!(speculator.is_active(), "≥4 words after a 600 ms gap");
+        assert_eq!(speculator.starts(), 1);
+        advance(450).await;
+        // The speculation ran to completion, yet nothing reached the relay.
+        assert_eq!(model.requests().len(), 1);
+        assert!(relay.relay.drain().is_empty(), "no frames before commit");
+        assert!(backend.mirrors.lock().unwrap().is_empty(), "no side effects before commit");
+
+        let final_text = "What's on my calendar tomorrow?";
+        let timer = Arc::new(TurnTimer::start());
+        let Finalized {
+            speculated,
+            saved,
+            speculation,
+        } = speculator.finalize(final_text);
+        assert!(speculated);
+        assert_eq!(saved, Some(started.elapsed()));
+        timer.speculation(speculated, saved);
+        let (turn_id, speech) = relay.turn(final_text, timer.clone());
+        let answer = fast
+            .answer_speculated(
+                &call(),
+                &turn_id,
+                final_text,
+                speech,
+                CancellationToken::new(),
+                speculation.expect("committed speculation"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer, "You have a dentist visit at nine. Nothing else.");
+        let spoken = tokens(&relay.relay.drain());
+        let text: String = spoken.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(text, answer, "flushed in order");
+        assert!(spoken.last().unwrap().1, "talk cycle closes");
+        assert_eq!(spoken.iter().filter(|(_, last)| *last).count(), 1);
+        // One model request: the speculation itself, on the interim text.
+        let requests = model.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(
+            requests[0].messages.last(),
+            Some(FastMessage::User(text)) if text == "what's on my calendar tomorrow"
+        ));
+        drop(requests);
+        // The chat transcript carries the final words, not the interim ones.
+        let mirrors = backend.mirrors.lock().unwrap();
+        assert_eq!(mirrors[0].1, format!("Phone — you: {final_text}"));
+        let record = record(&timer);
+        assert!(record.speculated);
+        assert!(record.speculation_committed);
+        assert!(
+            record.speculation_saved_ms.is_some_and(|ms| (ms - 450).abs() <= 5),
+            "{record:?}"
+        );
+    }
+    // Step 3 / AC3: a final that differs from the speculated text cancels the
+    // speculation; none of its output is spoken and a normal turn answers.
+    #[tokio::test(start_paused = true)]
+    async fn step3_mismatched_final_cancels_and_a_normal_turn_answers() {
+        let model = ScriptedModel::new(vec![
+            vec![Step::Token("Tomorrow you have a dentist visit.")],
+            vec![Step::Token("Friday is free.")],
+        ]);
+        let backend = Arc::new(FakeBackend::default());
+        let fast = agent(model.clone(), backend.clone(), FastLayerConfig::default());
+        let mut relay = PreemptiveRelay::new();
+        let mut speculator = Speculator::default();
+        feed(&mut speculator, &fast, &mut relay, "what's on my");
+        advance(500).await;
+        feed(&mut speculator, &fast, &mut relay, "what's on my calendar tomorrow");
+        assert!(speculator.is_active());
+        advance(300).await;
+        assert_eq!(model.requests().len(), 1, "speculation generated");
+        assert!(relay.relay.drain().is_empty());
+
+        let final_text = "what's on my calendar Friday";
+        let finalized = speculator.finalize(final_text);
+        assert!(finalized.speculated);
+        assert_eq!(finalized.saved, None);
+        assert!(finalized.speculation.is_none(), "mismatch is cancelled");
+        let timer = Arc::new(TurnTimer::start());
+        timer.speculation(finalized.speculated, finalized.saved);
+        let (turn_id, speech) = relay.turn(final_text, timer.clone());
+        let answer = fast
+            .answer(&call(), &turn_id, final_text, speech, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(answer, "Friday is free.");
+        let spoken: String = tokens(&relay.relay.drain())
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect();
+        assert_eq!(spoken, "Friday is free.", "zero speculative frames");
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(
+            requests[1].messages.last(),
+            Some(FastMessage::User(text)) if text == final_text
+        ));
+        drop(requests);
+        let record = record(&timer);
+        assert!(record.speculated);
+        assert!(!record.speculation_committed);
+        assert_eq!(record.speculation_saved_ms, None);
+    }
+
+    // Step 4 / AC4: the commit rule is a normalized word prefix plus at most
+    // two added words. Eight-case table, then the same rule through finalize.
+    #[test]
+    fn step4_commit_rule_table() {
+        use augmentagent_phone::speculation::commits;
+        let cases = [
+            // (speculated, final, commits)
+            ("what's on my calendar", "what's on my calendar", true),
+            ("what's on my calendar", "What's  on my   CALENDAR?", true),
+            ("what's on my calendar", "what's on my calendar tomorrow", true),
+            ("what's on my calendar", "what's on my calendar for tomorrow", true),
+            ("what's on my calendar", "what's on my calendar for tomorrow morning", false),
+            ("what's on my calendar tomorrow", "what's on my calendar Friday", false),
+            ("what's on my cal", "what's on my calendar", false),
+            ("what's on my calendar", "what's on my", false),
+        ];
+        for (speculated, final_text, expected) in cases {
+            assert_eq!(
+                commits(speculated, final_text),
+                expected,
+                "{speculated:?} -> {final_text:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn step4_two_word_extension_commits_and_three_word_extension_cancels() {
+        for (final_text, commits) in [
+            ("remind me about the dentist at nine", true),
+            ("remind me about the dentist at nine tomorrow", false),
+        ] {
+            let model = ScriptedModel::new(vec![
+                vec![Step::Token("Speculative answer.")],
+                vec![Step::Token("Fresh answer.")],
+            ]);
+            let backend = Arc::new(FakeBackend::default());
+            let fast = agent(model.clone(), backend, FastLayerConfig::default());
+            let mut relay = PreemptiveRelay::new();
+            let mut speculator = Speculator::default();
+            feed(&mut speculator, &fast, &mut relay, "remind me about");
+            advance(400).await;
+            feed(&mut speculator, &fast, &mut relay, "remind me about the dentist");
+            assert!(speculator.is_active(), "exactly 400 ms is enough");
+            advance(200).await;
+            let finalized = speculator.finalize(final_text);
+            assert_eq!(finalized.speculation.is_some(), commits, "{final_text}");
+            let (turn_id, speech) = relay.turn(final_text, Arc::new(TurnTimer::start()));
+            let answer = match finalized.speculation {
+                Some(s) => {
+                    fast.answer_speculated(&call(), &turn_id, final_text, speech, CancellationToken::new(), s)
+                        .await
+                }
+                None => {
+                    fast.answer(&call(), &turn_id, final_text, speech, CancellationToken::new())
+                        .await
+                }
+            }
+            .unwrap();
+            let expected = if commits { "Speculative answer." } else { "Fresh answer." };
+            assert_eq!(answer, expected);
+            let spoken: String = tokens(&relay.relay.drain())
+                .iter()
+                .map(|(t, _)| t.as_str())
+                .collect();
+            assert_eq!(spoken, expected);
+        }
+    }
+
+    // AC2: start only when the partial has ≥4 words AND ≥400 ms passed since
+    // the previous partial that changed the text. Six sequences.
+    #[tokio::test(start_paused = true)]
+    async fn ac2_start_threshold_matrix() {
+        use augmentagent_phone::speculation::SpeculationPolicy;
+        /// Partials as (ms since the previous partial, text).
+        type Partials<'a> = &'a [(u64, &'a str)];
+        // (partials, index of the partial expected to start a speculation)
+        let matrix: [(Partials, Option<usize>); 6] = [
+            // The issue's fixture: starts on the third partial at 900 ms.
+            (&[(0, "what's"), (300, "what's on my"), (600, "what's on my calendar tomorrow")], Some(2)),
+            // Four words but only 399 ms since the last change.
+            (&[(0, "what's on"), (399, "what's on my calendar")], None),
+            // Long gap but three words.
+            (&[(0, "what's"), (2_000, "what's on my")], None),
+            // A first partial has no previous change to measure from.
+            (&[(0, "what's on my calendar today")], None),
+            // Rapid changes, then the same text repeated after a 400 ms pause.
+            (&[(0, "what's on"), (100, "what's on my calendar"), (400, "what's on my calendar")], Some(2)),
+            // Repeats do not reset the clock: 250 + 250 ms since the change.
+            (&[(0, "set a timer"), (100, "set a timer for ten"), (250, "set a timer for ten"), (250, "set a timer for ten minutes")], Some(3)),
+        ];
+        for (n, (partials, expected)) in matrix.iter().enumerate() {
+            let mut policy = SpeculationPolicy::default();
+            let mut started = None;
+            for (i, (gap, text)) in partials.iter().enumerate() {
+                tokio::time::advance(Duration::from_millis(*gap)).await;
+                if let Some(start) = policy.partial(text).start {
+                    assert!(started.is_none(), "case {n}: more than one start");
+                    assert_eq!(start, *text);
+                    started = Some(i);
+                }
+            }
+            assert_eq!(started, *expected, "case {n}");
+        }
+    }
+
+    // Step 6: a newer partial that does not extend the speculated text cancels
+    // it. At most one cancellation and one restart per utterance.
+    #[tokio::test(start_paused = true)]
+    async fn step6_non_extending_partial_cancels_with_at_most_one_restart() {
+        let model = ScriptedModel::new(vec![
+            vec![Step::Sleep(Duration::from_secs(5)), Step::Token("never heard")],
+            vec![Step::Token("Restarted answer.")],
+        ]);
+        let backend = Arc::new(FakeBackend::default());
+        let fast = agent(model.clone(), backend, FastLayerConfig::default());
+        let mut relay = PreemptiveRelay::new();
+        let mut speculator = Speculator::default();
+        feed(&mut speculator, &fast, &mut relay, "send a note");
+        advance(500).await;
+        feed(&mut speculator, &fast, &mut relay, "send a note to the team");
+        assert_eq!((speculator.starts(), speculator.cancellations()), (1, 0));
+        advance(100).await;
+        // Extension keeps it.
+        feed(&mut speculator, &fast, &mut relay, "send a note to the team today");
+        assert!(speculator.is_active());
+        assert_eq!(speculator.cancellations(), 0);
+        // Recognition revised an earlier word: cancelled, and with only 100 ms
+        // since the last change it does not restart yet.
+        advance(100).await;
+        feed(&mut speculator, &fast, &mut relay, "send a quote to the team today");
+        assert!(!speculator.is_active());
+        assert_eq!((speculator.starts(), speculator.cancellations()), (1, 1));
+        advance(500).await;
+        feed(&mut speculator, &fast, &mut relay, "send a quote to the team today");
+        assert!(speculator.is_active(), "one restart");
+        assert_eq!(speculator.starts(), 2);
+        advance(100).await;
+        // A second revision cancels again; no third start however long the pause.
+        feed(&mut speculator, &fast, &mut relay, "send the quote to the team");
+        advance(1_000).await;
+        feed(&mut speculator, &fast, &mut relay, "send the quote to the team");
+        assert!(!speculator.is_active());
+        assert_eq!((speculator.starts(), speculator.cancellations()), (2, 2));
+        advance(6_000).await;
+        assert!(relay.relay.drain().is_empty(), "cancelled output never spoken");
+        let finalized = speculator.finalize("send the quote to the team");
+        assert!(finalized.speculated && finalized.speculation.is_none());
+        // The next utterance starts fresh.
+        assert_eq!(speculator.starts(), 0);
+    }
+    // Step 5 / AC5: the speculative request runs with tool_choice=none; a tool
+    // it asks for anyway is never executed. After commit the turn re-plans
+    // with tools and may dispatch once. Spies see zero tools before commit.
+    #[tokio::test(start_paused = true)]
+    async fn step5_speculation_never_runs_tools_and_the_committed_turn_replans() {
+        let model = ScriptedModel::new(vec![
+            vec![
+                Step::Token("Sure, "),
+                Step::Tool("dispatch_task", json!({"description":"email the team"})),
+            ],
+            vec![Step::Tool("dispatch_task", json!({"description":"email the team"}))],
+            vec![Step::Token("Started it; the result will land in chat.")],
+        ]);
+        let backend = Arc::new(FakeBackend::default());
+        let fast = agent(model.clone(), backend.clone(), FastLayerConfig::default());
+        let mut relay = PreemptiveRelay::new();
+        let mut speculator = Speculator::default();
+        feed(&mut speculator, &fast, &mut relay, "email the");
+        advance(500).await;
+        feed(&mut speculator, &fast, &mut relay, "email the team about lunch");
+        advance(300).await;
+        assert_eq!(model.requests().len(), 1);
+        assert_eq!(model.requests()[0].tool_choice, ToolChoice::None);
+        assert_eq!(backend.dispatches.lock().unwrap().len(), 0, "no tool before commit");
+        assert!(backend.lookups.lock().unwrap().is_empty());
+        assert!(relay.relay.drain().is_empty());
+
+        let final_text = "email the team about lunch";
+        let finalized = speculator.finalize(final_text);
+        let timer = Arc::new(TurnTimer::start());
+        timer.speculation(finalized.speculated, finalized.saved);
+        let (turn_id, speech) = relay.turn(final_text, timer.clone());
+        let answer = fast
+            .answer_speculated(
+                &call(),
+                &turn_id,
+                final_text,
+                speech,
+                CancellationToken::new(),
+                finalized.speculation.expect("prefix match commits"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer, "Started it; the result will land in chat.");
+        let spoken: String = tokens(&relay.relay.drain())
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect();
+        assert_eq!(spoken, answer, "the speculation's words were discarded");
+        assert_eq!(backend.dispatches.lock().unwrap().len(), 1, "re-plan dispatched once");
+        let choices: Vec<ToolChoice> = model.requests().iter().map(|r| r.tool_choice).collect();
+        assert_eq!(choices, [ToolChoice::None, ToolChoice::Auto, ToolChoice::Auto]);
+        // A discarded speculation saved nothing.
+        let record = record(&timer);
+        assert!(record.speculated && !record.speculation_committed);
+        assert_eq!(record.speculation_saved_ms, None);
+    }
+
+    // AC5, late case: a speculation still generating at commit has already
+    // spoken words when it asks for a tool; the tool is still never run.
+    #[tokio::test(start_paused = true)]
+    async fn step5_late_tool_request_after_commit_is_not_executed() {
+        let gate = Arc::new(Notify::new());
+        let model = ScriptedModel::new(vec![vec![
+            Step::Token("Lunch is at noon. "),
+            Step::Wait(gate.clone()),
+            Step::Tool("lookup_fast", json!({"query":"lunch"})),
+        ]]);
+        let backend = Arc::new(FakeBackend::default());
+        let fast = agent(model.clone(), backend.clone(), FastLayerConfig::default());
+        let mut relay = PreemptiveRelay::new();
+        let mut speculator = Speculator::default();
+        feed(&mut speculator, &fast, &mut relay, "when is");
+        advance(500).await;
+        feed(&mut speculator, &fast, &mut relay, "when is lunch today");
+        advance(100).await;
+        let final_text = "when is lunch today";
+        let finalized = speculator.finalize(final_text);
+        let timer = Arc::new(TurnTimer::start());
+        timer.speculation(finalized.speculated, finalized.saved);
+        let (turn_id, speech) = relay.turn(final_text, timer.clone());
+        let task = {
+            let fast = fast.clone();
+            let speculation = finalized.speculation.unwrap();
+            tokio::spawn(async move {
+                fast.answer_speculated(&call(), &turn_id, final_text, speech, CancellationToken::new(), speculation)
+                    .await
+            })
+        };
+        advance(50).await;
+        gate.notify_one();
+        let answer = task.await.unwrap().unwrap();
+        assert_eq!(answer, "Lunch is at noon. ");
+        assert!(backend.lookups.lock().unwrap().is_empty());
+        assert!(backend.dispatches.lock().unwrap().is_empty());
+        assert_eq!(model.requests().len(), 1, "no re-plan once words were spoken");
+        assert!(record(&timer).speculation_committed);
+    }
+    // #1557 x #1555: the goodbye shortcut runs on final prompts only. Interim
+    // goodbyes never start a speculation, never end the call and never send
+    // `end`; a speculation whose model asks for end_call ends nothing either.
+    #[tokio::test(start_paused = true)]
+    async fn goodbye_partials_and_speculative_end_call_never_end_the_call() {
+        let model = ScriptedModel::new(vec![vec![Step::Tool(
+            "end_call",
+            json!({"reason":"owner_goodbye","goodbye":"Bye!"}),
+        )]]);
+        let backend = Arc::new(FakeBackend::default());
+        let fast = agent(model.clone(), backend.clone(), FastLayerConfig::default());
+        let mut relay = PreemptiveRelay::new();
+        let mut speculator = Speculator::default();
+        for text in ["goodbye", "goodbye", "bye bye", "end the call", "that's it thanks"] {
+            feed(&mut speculator, &fast, &mut relay, text);
+            advance(500).await;
+        }
+        assert_eq!(speculator.starts(), 0, "goodbye phrases are too short to speculate");
+        assert!(model.requests().is_empty());
+        // A longer partial speculates; its model asks to end the call.
+        feed(&mut speculator, &fast, &mut relay, "okay that is all for today");
+        assert!(speculator.is_active());
+        advance(500).await;
+        assert_eq!(model.requests().len(), 1);
+        assert_eq!(model.requests()[0].tool_choice, ToolChoice::None);
+        let events = relay.relay.drain();
+        assert!(
+            !events.iter().any(|e| matches!(e, SpeechEvent::End { .. })),
+            "no end before a final prompt"
+        );
+        assert!(events.is_empty(), "nothing at all reaches the relay");
+        assert!(backend.mirrors.lock().unwrap().is_empty());
+        // The final differs, so the speculation (and its end_call) is dropped.
+        let finalized = speculator.finalize("okay that is all for today thanks a lot");
+        assert!(finalized.speculation.is_none());
+        advance(5_000).await;
+        assert!(relay.relay.drain().is_empty());
+    }
 }
 
 // #1553 AC5: an accepted proposal's agenda is in the first turn's prompt,
