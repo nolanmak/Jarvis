@@ -1695,19 +1695,36 @@ async fn speak_silence_action(
 /// this, and only when nothing else explains the close.
 const PEER_CLOSE_RECHECK: Duration = Duration::from_millis(1_000);
 const PEER_CLOSE_RECHECK_STEP: Duration = Duration::from_millis(50);
+/// How many socket closes may hold a blocking store read at once. A timed-out
+/// caller abandons its read, which stays parked for as long as the store does,
+/// so admission — not the caller's timeout — is what bounds the blocking tasks
+/// a stalled store can accumulate across concurrent closes.
+const PEER_CLOSE_RECHECK_SLOTS: usize = 4;
+static PEER_CLOSE_RECHECKS: Semaphore = Semaphore::const_new(PEER_CLOSE_RECHECK_SLOTS);
+
+/// A slot to run one close recheck in, or `None` when the slots are all held.
+/// The permit lives until the blocking read returns, not until its caller
+/// stops waiting.
+fn admit_peer_close_recheck() -> Option<tokio::sync::SemaphorePermit<'static>> {
+    PEER_CLOSE_RECHECKS.try_acquire().ok()
+}
 
 /// Whether a provider socket close was really the owner hanging up (#1549).
 /// Twilio closes the relay socket before its status callback lands, so the
 /// stored state is still `Connected` at the moment of the close. Only positive
 /// evidence within [`PEER_CLOSE_RECHECK`] upgrades the reason; a store that
-/// cannot be read, or cannot answer inside the window, keeps the close as it
-/// was classified. The read is synchronous, so the whole bounded retry runs in
-/// a single blocking task: a stalled store must not hold teardown open, and a
-/// close must not leave one abandoned blocking read per step queued in the
-/// shared pool. At most one read per close is ever abandoned.
+/// cannot be read, cannot answer inside the window, or has no recheck slot
+/// free, keeps the close as it was classified. The read is synchronous, so the
+/// whole bounded retry runs in a single blocking task: a stalled store must not
+/// hold teardown open, and a close must not leave one abandoned blocking read
+/// per step queued in the shared pool.
 async fn reclassify_peer_close(service: &PhoneService, call: &PhoneCall) -> EndReason {
+    let Some(slot) = admit_peer_close_recheck() else {
+        return EndReason::PeerClosed;
+    };
     let (store, id) = (service.store.clone(), call.id.clone());
     let recheck = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
         let deadline = std::time::Instant::now() + PEER_CLOSE_RECHECK;
         loop {
             if let Ok(current) = store.phone_provider_call(&id) {
@@ -1747,4 +1764,21 @@ fn call_end_reason(service: &PhoneService, original: &PhoneCall) -> Option<EndRe
         .authorize_call(&original.id)
         .err()
         .map(|_| EndReason::Revoked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// A store that never answers must not park one blocking read per
+    /// concurrent close: once the slots are held, further closes skip the
+    /// recheck instead of queueing a read they will abandon.
+    #[test]
+    fn peer_close_rechecks_are_bounded() {
+        let held: Vec<_> = (0..PEER_CLOSE_RECHECK_SLOTS)
+            .map(|_| admit_peer_close_recheck().expect("slot"))
+            .collect();
+        assert!(admit_peer_close_recheck().is_none());
+        drop(held);
+        assert!(admit_peer_close_recheck().is_some());
+    }
 }
