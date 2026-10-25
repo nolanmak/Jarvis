@@ -92,6 +92,8 @@ copies, the binary, and the final free-space floor. The storage budget
 the uncompressed input plus binary. The newest `AUGMENTAGENT_DEPLOY_KEEP`
 snapshots (default two) and snapshots younger than 48 hours are retained. If
 protected data exhausts the budget, creation refuses rather than growing it.
+Retention orders snapshots by the manifest creation date; pinning or unpinning
+does not change which rollback points count as newest.
 
 ```sh
 augmentagent deploy pin SNAPSHOT --reason 'current rollback point'
@@ -112,7 +114,9 @@ augmentagent deploy adopt-rollout --path /private/state/augmentagent/rollout-NAM
 ```
 
 Adoption starts pinned. Check its rollback and credential dependencies before
-unpinning. This command neither copies nor deletes the original. Future rollouts
+unpinning. This command neither copies nor deletes the original. Adopted folders
+use their most recent pre-adoption write as their retention age, with the
+enrollment date recorded separately. Future rollouts
 should use compressed `deploy snapshot` instead. `deploy list` includes owned
 external data in its storage accounting and identifies pins.
 

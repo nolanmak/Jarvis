@@ -468,6 +468,9 @@ pub fn build_procs() -> Option<Vec<BuildProc>> {
                 .unwrap_or_default()
         };
         if std::fs::read(dir.join("environ")).is_err() || std::fs::read(dir.join("cmdline")).is_err() {
+            // Registered external targets are not necessarily owner-private.
+            // Another uid (especially root) may write them, so uid alone
+            // cannot turn unreadable build evidence into proof of idleness.
             if dir.exists() { return None; } else { continue; }
         }
         out.push(BuildProc {

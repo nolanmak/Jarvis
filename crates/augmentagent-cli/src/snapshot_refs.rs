@@ -10,10 +10,13 @@ pub struct References {
 }
 impl References {
     pub fn protects(&self, path: &Path) -> bool {
+        let canonical = std::fs::canonicalize(path).ok();
+        let matches = |candidate: &Path| self.paths.iter().any(|p| p == candidate || p.starts_with(candidate))
+            || self.config.contains(candidate.to_string_lossy().as_ref());
         !self.reliable
             || path.join(".pin").exists()
-            || self.paths.iter().any(|p| p == path || p.starts_with(path))
-            || self.config.contains(path.to_string_lossy().as_ref())
+            || matches(path)
+            || canonical.as_deref().is_some_and(matches)
     }
 }
 
@@ -144,6 +147,22 @@ fn read_config_tree(path: &Path, out: &mut References) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_process_references_protect_symlinked_and_relative_candidates() {
+        use std::os::unix::fs::symlink;
+        let t = tempfile::tempdir().unwrap();
+        let snapshot = t.path().join("snapshot");
+        std::fs::create_dir(&snapshot).unwrap();
+        symlink(&snapshot, t.path().join("alias")).unwrap();
+        let canonical = std::fs::canonicalize(&snapshot).unwrap();
+        let refs = References { reliable: true, paths: vec![canonical.join("held.db")], ..Default::default() };
+        assert!(refs.protects(&t.path().join("alias")));
+        let mut relative = PathBuf::new();
+        for _ in std::env::current_dir().unwrap().components().skip(1) { relative.push(".."); }
+        relative.push(canonical.strip_prefix("/").unwrap());
+        assert!(refs.protects(&relative));
+    }
 
     #[test]
     fn symlinked_units_and_dropins_preserve_rollback_references_without_following_directory_loops()

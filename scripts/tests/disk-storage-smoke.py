@@ -5,6 +5,7 @@ Usage: python3 scripts/tests/disk-storage-smoke.py /absolute/path/to/augmentagen
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -237,6 +238,16 @@ pathlib.Path(exitfile).write_text(str(result.returncode))
     assert selected.startswith(str(base / "session-parent"))
     subprocess.run(["bash", str(wrapper), "check"], cwd=repo, env=wrapper_env, check=True, capture_output=True)
     assert selected == target_report.read_text()
+    portable_bin = base / "portable-bin"
+    portable_bin.mkdir()
+    for name in ("git", "dirname", "basename", "cut", "shasum"):
+        executable = shutil.which(name)
+        assert executable, name
+        (portable_bin / name).symlink_to(executable)
+    (portable_bin / "cargo").symlink_to(shim)
+    portable_env = dict(wrapper_env, PATH=str(portable_bin))
+    subprocess.run(["/bin/bash", str(wrapper), "check"], cwd=repo, env=portable_env, check=True, capture_output=True)
+    assert selected == target_report.read_text(), "portable hash changed the stable worktree key"
     command("disk", "build", "--target-dir", selected, "--", "env",
             "PATH=" + wrapper_env["PATH"], "AUGMENTAGENT_STORAGE_BIN=" + CLI,
             "FIXTURE_TARGET_REPORT=" + str(target_report), "bash", wrapper, "check")

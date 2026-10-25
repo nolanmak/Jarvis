@@ -16,7 +16,11 @@ if [ -z "${CARGO_TARGET_DIR:-}" ]; then
     default_parent=/mnt/build/augmentagent-session-targets
   fi
   parent="${AUGMENTAGENT_BUILD_PARENT:-$default_parent}"
-  worktree_key=$(printf '%s' "$repo_root" | sha256sum | cut -c1-16)
+  hash_command=(shasum -a 256)
+  if command -v sha256sum >/dev/null 2>&1; then
+    hash_command=(sha256sum)
+  fi
+  worktree_key=$(printf '%s' "$repo_root" | "${hash_command[@]}" | cut -c1-16)
   "$cli" disk manage-parent --root "$parent"
   CARGO_TARGET_DIR="$parent/$(basename "$repo_root")-$worktree_key"
 fi
