@@ -193,19 +193,13 @@ pub async fn run_gmail_get_attachment(
         .map(str::to_string)
         .unwrap_or_else(|| format!("attachment-{idx}"));
 
-    let file = gmail
-        .get_attachment_file(&entity_id, &message_id, att_id, &filename)
-        .await
-        .with_context(|| format!("stage attachment {filename:?} for download"))?;
-    let (bytes, content_type) = gmail
-        .download_url(&file.s3url)
+    // Composio stages the file and hands back a URL; a Google-connected
+    // mailbox returns the bytes inline (#1573). Either way one call.
+    let (bytes, provider_mime) = gmail
+        .fetch_attachment_bytes(&entity_id, &message_id, att_id, &filename)
         .await
         .with_context(|| format!("download attachment {filename:?}"))?;
-    let mime = [
-        Some(file.mimetype.as_str()),
-        meta.mime_type.as_deref(),
-        content_type.as_deref(),
-    ]
+    let mime = [provider_mime.as_deref(), meta.mime_type.as_deref()]
     .into_iter()
     .flatten()
     .map(str::trim)

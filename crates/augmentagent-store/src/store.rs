@@ -3392,6 +3392,53 @@ impl Store {
         Ok(row.flatten())
     }
 
+    /// #1573 — register (or re-activate) a mailbox connected through the
+    /// operator's own Google OAuth client. Keyed by address, so a reconnect
+    /// is idempotent. Any OTHER active row for the same address — a Composio
+    /// connection to the same inbox — is deactivated so exactly one
+    /// transport polls it. Returns the `google:<address>` entity id.
+    pub fn upsert_google_gmail_account(&self, email: &str) -> StoreResult<String> {
+        let email = email.trim().to_ascii_lowercase();
+        let entity_id = format!("google:{email}");
+        let id = format!("google-{email}");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE gmail_accounts SET active = 0 \
+             WHERE lower(email) = ?1 AND entityId <> ?2 AND active = 1",
+            params![email, entity_id],
+        )?;
+        let updated = tx.execute(
+            "UPDATE gmail_accounts SET active = 1, email = ?2, connectionId = 'google-oauth' \
+             WHERE entityId = ?1",
+            params![entity_id, email],
+        )?;
+        if updated == 0 {
+            tx.execute(
+                "INSERT INTO gmail_accounts (id, connectionId, email, label, entityId, active, createdAt) \
+                 VALUES (?1, 'google-oauth', ?2, ?2, ?3, 1, ?4)",
+                params![id, email, entity_id, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(entity_id)
+    }
+
+    /// #1573 — stop polling a mailbox (Disconnect). The row stays for the
+    /// ledgers that reference it; returns whether it was active.
+    pub fn deactivate_gmail_account(&self, entity_id: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE gmail_accounts SET active = 0 WHERE entityId = ?1 AND active = 1",
+            params![entity_id],
+        )?;
+        Ok(n > 0)
+    }
+
     /// #797 — persist Composio's per-entity Gmail fetch cooldown so polling,
     /// background observers, and one-shot CLI processes share one boundary.
     pub fn set_gmail_fetch_cooldown(
@@ -9196,6 +9243,57 @@ mod tests {
 
         store.set_gmail_account_poll_outcome("acct-a", true, 3_000).unwrap();
         assert_eq!(store.gmail_inbound_cursor_ms("acct-a").unwrap(), Some(3_000));
+    }
+
+    /// #1573 — connecting a mailbox through Google registers one active row
+    /// per address, retires a Composio row for the same inbox, and is
+    /// idempotent across reconnects.
+    #[test]
+    fn google_gmail_account_upsert_dedupes_by_address_and_retires_the_composio_row() {
+        let (store, _file) = fresh_store();
+        let sql = |q: &str| store.conn.lock().unwrap().execute(q, []).unwrap();
+        sql("INSERT INTO gmail_accounts (id, connectionId, email, entityId, active, createdAt) \
+             VALUES ('g1', 'c1', 'Owner@Example.com', 'augmentagent-1', 1, 0)");
+        sql("INSERT INTO gmail_accounts (id, connectionId, email, entityId, active, createdAt) \
+             VALUES ('g2', 'c2', 'other@example.com', 'augmentagent-2', 1, 0)");
+
+        let entity = store.upsert_google_gmail_account("Owner@Example.com").unwrap();
+        assert_eq!(entity, "google:owner@example.com");
+        let active: Vec<(String, String)> = store
+            .get_active_gmail_accounts()
+            .unwrap()
+            .into_iter()
+            .map(|a| (a.entity_id, a.email))
+            .collect();
+        assert!(active.contains(&("google:owner@example.com".into(), "owner@example.com".into())));
+        assert!(active.contains(&("augmentagent-2".into(), "other@example.com".into())));
+        assert!(
+            !active.iter().any(|(e, _)| e == "augmentagent-1"),
+            "the Composio row for the same inbox must stop polling: {active:?}"
+        );
+
+        // Reconnect: same row, still exactly one active row for the address.
+        assert_eq!(store.upsert_google_gmail_account("owner@example.com").unwrap(), entity);
+        let n: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM gmail_accounts WHERE lower(email) = 'owner@example.com' AND active = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+
+        // Disconnect stops polling but keeps the row; a second call is a no-op.
+        assert!(store.deactivate_gmail_account(&entity).unwrap());
+        assert!(!store.deactivate_gmail_account(&entity).unwrap());
+        assert!(!store
+            .get_active_gmail_accounts()
+            .unwrap()
+            .iter()
+            .any(|a| a.entity_id == entity));
     }
 
     /// Round-trip plus the two things the read path depends on: rows outside

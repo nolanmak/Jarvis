@@ -12,6 +12,9 @@ augmentagent-store = { path = "../augmentagent-store" }
 augmentagent-channel-core = { path = "../augmentagent-channel-core" }
 augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
 augmentagent-wiki = { path = "../augmentagent-wiki" }
+# #1573 — the direct Google client keeps each mailbox's refresh token in the
+# same credential store every other channel uses.
+augmentagent-auth = { path = "../augmentagent-auth" }
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -24,6 +27,10 @@ serde_json = { workspace = true }
 reqwest = { workspace = true }
 md-5 = "0.10"
 chrono = { workspace = true }
+# #1573 — Gmail REST bodies and `raw` drafts are base64url; message gets fan
+# out with a bounded concurrency.
+base64 = "0.22"
+futures = { workspace = true }
 
 # Dangercat git dep deferred: repo is private; see root Cargo.toml note.
 

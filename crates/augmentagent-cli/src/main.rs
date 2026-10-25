@@ -110,6 +110,7 @@ mod storage_leases;
 mod doctor;
 mod env_cfg;
 mod gmail_attach;
+mod google_cmd;
 mod gdrive_query;
 mod repo_docs;
 mod finance;
@@ -295,6 +296,12 @@ enum Cmd {
     Gmail {
         #[command(subcommand)]
         op: GmailOp,
+    },
+    /// Connect Gmail mailboxes through your own Google OAuth client instead
+    /// of Composio (#1573): consent URL, code exchange, disconnect, status.
+    Google {
+        #[command(subcommand)]
+        op: google_cmd::GoogleOp,
     },
     /// Document text extraction (#939): pdftotext/pandoc first, then Mistral
     /// OCR for scanned (image-only) PDFs when MISTRAL_API_KEY is set. Same
@@ -4410,6 +4417,7 @@ async fn main() -> Result<()> {
         Cmd::Deploy { .. } => unreachable!("handled before database initialization"),
         Cmd::LogRotate { .. } => unreachable!("handled before database initialization"),
         Cmd::OpsArchive { .. } => unreachable!("handled before database initialization"),
+        Cmd::Google { ref op } => google_cmd::run(store, op.clone()).await,
         Cmd::Gmail { ref op } => match op {
             GmailOp::Search { query, limit, full, account } => {
                 run_gmail_search(store, query.clone(), *limit, *full, account.clone()).await
