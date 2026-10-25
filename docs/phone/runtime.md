@@ -58,6 +58,10 @@ limits and duplicate-call protections still apply. Private DM entry is optional.
 | Variable | Meaning |
 | --- | --- |
 | `AUGMENTAGENT_PHONE_ENABLED` | `1` enables configuration; absent or `0` defaults off. Other values fail configuration. |
+| `AUGMENTAGENT_PHONE_BARGE_MIN_WORDS` | Barge-in filter (#1550): speech after an `interrupt` with fewer words than this that matches a backchannel phrase does not cancel the answer. Default `3`, range 1–10; `1` disables the filter so every interrupt invalidates immediately. |
+| `AUGMENTAGENT_PHONE_BACKCHANNEL_PHRASES` | Comma-separated backchannel phrases, compared case-insensitively with punctuation and hyphens ignored (`Mm-hmm.` matches `mm hmm`). Default `ok, okay, yeah, yes, mm, mhm, mm hm, mm hmm, uh huh, right, sure, got it`; 1–64 phrases. |
+| `AUGMENTAGENT_PHONE_FALSE_INTERRUPT_MS` | How long after an `interrupt` with no following prompt the interruption is treated as false. Default `2000`; values outside 500–5000 fail configuration with `InvalidSetting`. |
+| `AUGMENTAGENT_PHONE_RESUME_FALSE_INTERRUPT` | `1` (default) resumes a falsely interrupted answer from its unspoken remainder; `0` drops the remainder and waits for the next prompt. Other values fail configuration. |
 | `TWILIO_ACCOUNT_SID` | Twilio account SID. |
 | `TWILIO_AUTH_TOKEN` | Twilio API authentication and callback-signature secret. |
 | `TWILIO_PHONE_NUMBER` | Operator's voice-capable Twilio caller number, in E.164 format. This is **not** the owner's destination. |
@@ -65,6 +69,22 @@ limits and duplicate-call protections still apply. Private DM entry is optional.
 | `AUGMENTAGENT_PHONE_BIND` | Local proxy upstream, default `127.0.0.1:8878`; must be a loopback IP with a nonzero port. |
 | `AUGMENTAGENT_PHONE_VERIFICATION_KEY` | Separate secret of at least 32 bytes, used for keyed verification-code hashes. Keep stable across restarts; rotation invalidates outstanding challenges. |
 | `AUGMENTAGENT_PHONE_OWNER_LINKS` | JSON array mapping authenticated surface identities to a canonical owner; 1–64 explicit links, at most 32 KiB. |
+| `AUGMENTAGENT_PHONE_STT_PROVIDER` | ConversationRelay `transcriptionProvider`: `Deepgram` (default) or `Google`. Exact, case-sensitive; anything else fails configuration. |
+| `AUGMENTAGENT_PHONE_STT_MODEL` | ConversationRelay `speechModel`. Default `nova-3-general` for Deepgram, `telephony` for Google. Must match `^[A-Za-z0-9._-]{1,96}$`. |
+| `AUGMENTAGENT_PHONE_TTS_PROVIDER` | ConversationRelay `ttsProvider`: `ElevenLabs` (default), `Amazon` or `Google`. Exact, case-sensitive; anything else fails configuration. |
+| `AUGMENTAGENT_PHONE_TTS_VOICE` | ConversationRelay `voice`. Default `UgBBYS2sOqTuMpoF3BR0-flash_v2_5` for ElevenLabs (voice ID with model suffix; a `-<speed>_<stability>_<similarity>` suffix is allowed), `Joanna` for Amazon; required for Google. Must match `^[A-Za-z0-9._-]{1,96}$`. |
+| `AUGMENTAGENT_PHONE_DEBUG_EVENTS` | `1` adds `debug="debugging tokens-played speaker-events"` to the ConversationRelay TwiML so #1551 can record when tokens were actually played; `0` disables it. Absent defaults to on for debug (non-production) builds and off for release builds. Other values fail configuration. |
+| `AUGMENTAGENT_PHONE_FAST_LAYER` | `1` answers call utterances with the fast conversational layer (#1546); absent or `0` (default) keeps the native agent answering every utterance unchanged. Other values fail configuration. |
+| `AUGMENTAGENT_PHONE_FAST_PROVIDER` | Fast model provider when the layer is on: `anthropic` (default, `claude-haiku-5-5`, key `ANTHROPIC_API_KEY`) or `cerebras` (fast-tier Cerebras model, key `CEREBRAS_API_KEY`). Keys load per request from the service keyring, then the service environment. Other values fail configuration. |
+| `AUGMENTAGENT_PHONE_MAX_TOOL_STEPS` | Tool calls the fast model may make per owner utterance, `1`–`8`, default `3`. Further calls get a typed refusal. Other values fail configuration. |
+| `AUGMENTAGENT_PHONE_THINKING_SOUND_URL` | Optional audio played while a fast-layer tool runs longer than 700 ms with nothing spoken. Must be `https` on the same origin as `AUGMENTAGENT_PHONE_PUBLIC_URL`, without credentials; anything else fails configuration, even while the layer is off. Unset (default) never plays a sound. |
+| `AUGMENTAGENT_PHONE_PREEMPTIVE` | `1` starts fast-layer answers on interim transcripts and commits them when the final transcript matches (#1555); TwiML then requests `partialPrompts="true"`. Absent or `0` (default) keeps `partialPrompts="false"` and every turn unchanged. Without `AUGMENTAGENT_PHONE_FAST_LAYER=1` it has no effect: native turns never speculate. Other values fail configuration. |
+| `AUGMENTAGENT_PHONE_QUIET_HOURS` | Owner-local window, `HH:MM-HH:MM` (24-hour, may wrap midnight), during which agent-proposed calls (#1553) are deferred to the window's end, never dropped. Default `22:00-08:00`; `off` disables it. Equal start and end or any other value fails configuration. |
+| `AUGMENTAGENT_TIMEZONE` | IANA zone for the quiet hours (shared with other owner-local schedules). Unset uses the host's local time; an unknown zone fails configuration. |
+| `AUGMENTAGENT_PHONE_PROPOSE_CALLS` | `1` lets the proactive runner turn each pass's dispatched follow-ups into one call proposal (#1553). Needs phone calling running with links that name a single owner. Absent (default) or anything else: no proposals. Read by the daemon, not the phone configuration. |
+| `AUGMENTAGENT_PHONE_SILENCE_CHECKIN_1_SECS` | Seconds of silence before the first check-in ("Still there?"), default `12` (#1556). |
+| `AUGMENTAGENT_PHONE_SILENCE_CHECKIN_2_SECS` | Seconds of silence before the second check-in ("I'll hang up in a bit if you're done."), default `25`. |
+| `AUGMENTAGENT_PHONE_SILENCE_END_SECS` | Seconds of silence before the goodbye line and `end`, default `45`. Each of the three silence values must be a whole number in 5–300 and they must be strictly increasing; otherwise configuration fails with a typed `Silence` error naming the variable (never its value). |
 
 Synthetic link example (replace identifiers with actual authenticated bindings):
 
@@ -406,8 +426,33 @@ It does not test installer/service rollback or authorize legacy voice removal.
 ## Conversational pickup and response recovery (#1526, #1527)
 
 An owner-requested call now connects on the signed answer callback without a
-keypress. ConversationRelay explicitly selects Amazon Joanna (`en-US`); failure
-announcements use Polly.Joanna. Optional number-verification calls remain separate.
+keypress. Failure announcements use Polly.Joanna via plain `<Say>`. Optional
+number-verification calls remain separate.
+
+### Speech providers (#1545)
+
+ConversationRelay TwiML pins the speech providers explicitly instead of relying
+on Twilio account defaults. With no overrides it emits
+`transcriptionProvider="Deepgram" speechModel="nova-3-general"
+ttsProvider="ElevenLabs" voice="UgBBYS2sOqTuMpoF3BR0-flash_v2_5"
+language="en-US" elevenlabsTextNormalization="on"`; the normalization attribute
+is only present for ElevenLabs. The four `AUGMENTAGENT_PHONE_STT_*` /
+`AUGMENTAGENT_PHONE_TTS_*` variables above are read once at startup and
+validated to a conservative alphabet, so no value can break out of an attribute.
+Chat text, tool arguments and model output never reach these attributes; a
+source-level test holds `relay_twiml` to startup configuration only.
+
+`hints` biases recognition toward the owner's first name (the stored
+`first_name` profile fact, read by `Settings::build` at daemon startup; see
+post-call memory below) and the fixed nouns `Jarvis,
+Discord, WhatsApp, Slack, Linear, Notion`, XML-escaped and capped at 500
+characters.
+
+If Twilio rejects the provider, model or voice combination it sends an `error`
+frame before the first prompt and closes the socket. The relay records that as
+diagnostic category `setup_provider_rejected` (with the numeric code when one
+is present) without logging the description, which can include the rejected
+value, and no agent turn is created.
 
 For a final transcript whose agent answer is still pending, the relay queues a
 short acknowledgment after 250 ms (100 ms polling; tested within 500 ms) and one
@@ -415,8 +460,37 @@ progress notice after 10 seconds. These are server enqueue timings, not claims
 about audible latency. A final answer or interruption removes pending notices.
 After 120 seconds the agent receives cancellation, with up to five seconds to
 clean up, then a spoken failure allows the next request without redialing or
-replaying tools. Interrupted audio is invalidated immediately; chat persistence
-runs separately and cannot close the socket on a slow/failing mirror.
+replaying tools. Chat persistence of an interruption runs separately and cannot
+close the socket on a slow/failing mirror.
+
+## Barge-in and false interruptions (#1550)
+
+TwiML keeps `interruptible="any"` (the provider stops audio as soon as the
+owner speaks) and `reportInputDuringAgentSpeech="any"` (the speech that caused
+the interruption still arrives as a `prompt`, which the filter needs). An
+`interrupt` while Jarvis is speaking does not invalidate the answer at once;
+nothing new is spoken until one of these decides it:
+
+- The next final `prompt` is a backchannel (fewer than
+  `AUGMENTAGENT_PHONE_BARGE_MIN_WORDS` words and in the phrase list): a false
+  interruption. No turn is created.
+- Any other `prompt`: a real interruption. The generation advances, stale
+  output is dropped, the heard prefix is persisted, the cut turn is recorded
+  as `interrupted`, and the prompt becomes a new turn.
+- No prompt within `AUGMENTAGENT_PHONE_FALSE_INTERRUPT_MS`: a false
+  interruption.
+
+A false interruption resumes with one `text` frame carrying the unspoken
+remainder: the answer text after `utteranceUntilInterrupt` when that is an
+exact prefix of the latest talk cycle (a cut inside a word restarts the word),
+otherwise from the next sentence boundary after the position implied by
+`durationUntilInterruptMs` at a nominal 15 characters per second. The turn is
+not recorded as `interrupted`. With
+`AUGMENTAGENT_PHONE_RESUME_FALSE_INTERRUPT=0` the remainder is dropped instead
+and the turn is recorded as `interrupted`, without a new generation.
+
+The filter applies only after an `interrupt`. A prompt while Jarvis is silent
+is always a new turn, even a single word such as "yes".
 
 Phone turns use the selected native Claude/Codex session directly, bypassing the
 optional model gateway. Text routing, session identity and approval policy are
@@ -429,3 +503,343 @@ slow interruption persistence, stale audio suppression, bounded cancellation,
 recoverable provider errors and scoped native routing. Live audible greeting,
 lookup completion and interruption behavior must be recorded separately; passing
 these tests does not establish those live results.
+
+## Fast conversational layer (#1546)
+
+With `AUGMENTAGENT_PHONE_FAST_LAYER=1`, each final `prompt` is answered by a
+small streaming model instead of a full native turn. It receives a fixed
+persona prompt, the last 20 phone turns of this call, the last 10 lines of the
+originating chat (bounded) and task updates from this call. Tokens are spoken
+at sentence boundaries as they stream. The runtime acknowledgment (#1526)
+becomes a fallback after 1.5 s without speech instead of 250 ms.
+
+The model has exactly three tools, `dispatch_task(description)`,
+`lookup_fast(query)` and `end_call(reason, goodbye)` (#1557, below). Call authority (`authorize_call`) is re-checked before
+every tool; any other tool name, a revoked call or a fourth call in one
+utterance gets a typed refusal and the turn still ends with `last:true`.
+
+- `dispatch_task` returns at once with a `task_id` (`{turn_id}:dispatch`). The
+  work runs as a native surface turn on the originating conversation, with the
+  same session, approvals and phone MCP grant (without call speech) as a text
+  turn. Its result is queued once to the chat outbox under the task key; a
+  replay after restart is refused by the durable turn claim and the outbox
+  key. If the call is still live and idle, a short summary is also spoken as a
+  system turn; after hangup nothing is spoken.
+- A dispatched turn may report progress (`augmentagent_phone::fast::report_progress`):
+  at most one event per 5 s and 6 per task, 140 characters each. The call
+  speaks at most one progress line per 15 s. Progress is never posted to chat.
+- `lookup_fast` scans the wiki's Markdown files read-only and is cut off at
+  1.5 s.
+
+Fast-layer turns are recorded with `provider = fast`; a turn that dispatched
+work records outcome `dispatched`; tool time is added to `tool_ms`. Logs carry
+only fixed category codes (for example `http_4xx`, `scripted_failure`), never
+model text, tool arguments, chat text or keys.
+
+### Preemptive generation (#1555)
+
+With `AUGMENTAGENT_PHONE_PREEMPTIVE=1` on the fast layer, ConversationRelay
+sends interim `prompt` frames (`last:false`). While no turn is queued or being
+answered, the relay keeps at most one speculative fast-model answer per call:
+
+- A speculation starts when an interim transcript has at least 4 words and at
+  least 400 ms passed since the previous interim transcript that changed the
+  text. An interim transcript that does not extend the speculated words
+  cancels it. Each utterance gets at most one cancellation-and-restart (two
+  starts in total).
+- On the final `prompt`, words are lowercased and stripped of surrounding
+  punctuation. If the speculated words are a prefix of the final words and the
+  final adds at most 2 words, the speculation is committed: its buffered tokens
+  are spoken in order and generation continues. Otherwise it is cancelled and
+  the final is answered normally. Speculative output never reaches the socket
+  before commit.
+- The speculative request lists the tools with `tool_choice` set to none, and
+  speculation has no side effects: nothing is mirrored to chat and no tool runs.
+  If the model still asks for a tool, the speculation stops; once committed the
+  turn re-plans with tools enabled (and records the speculation as not
+  committed). A tool requested after committed words were already spoken is
+  not run.
+- An interruption, or an interim transcript while a turn is busy, drops the
+  speculation.
+
+### Ending the call from the agent (#1557)
+
+`end_call(reason, goodbye)` takes `reason` ∈ `owner_goodbye`, `task_complete`,
+`owner_request` (anything else is a typed `invalid_arguments` refusal) and a
+goodbye cut to 120 characters (an empty one becomes a fixed line). The turn
+stops there: any buffered text is flushed, the goodbye is sent as the turn's
+single final `text` frame (`last:true`), and the relay sends one
+`{"type":"end","handoffData":"{\"reason\":…,\"call_id\":…}"}` as soon as a
+`tokensPlayed` debug event with `last:true` arrives, or 4 s after the goodbye
+was written, whichever is first. Without `AUGMENTAGENT_PHONE_DEBUG_EVENTS` the
+4 s bound always applies. After the goodbye, owner prompts and queued speech
+are dropped. The socket then ends with the internal reason `agent_end`
+(distinct from `peer_closed`/owner hang-up) and the usual stop and cleanup run.
+
+Goodbye shortcut: a final prompt that, lowercased with punctuation dropped,
+is exactly `bye`, `goodbye`, `bye bye`, `talk later`, `that's all`,
+`that's it thanks`, `hang up` or `end the call` ends the call as
+`owner_goodbye` with a fixed goodbye and no model call. Longer utterances
+("goodbye for now, one more thing") go to the model as usual. While a
+dispatched task is in flight the shortcut is off; if the model then calls
+`end_call`, "I'll text you the result." is spoken before its goodbye and the
+task's result still goes to chat exactly once.
+
+`end_call` exists only in the fast layer. The native phone MCP tools and the
+post-call summary run (#1552, `FORBIDDEN_SUMMARY_TOOLS`) never expose it.
+
+Twilio returns `handoffData` as `HandoffData` on the signed `relay-ended`
+callback. A well-formed `{reason, call_id}` for this call is stored once in the
+additive table `phone_call_end_reasons`; anything else (bad JSON, unknown
+reason, extra fields, another call's ID, a duplicated field) is stored as
+`relay_ended_unknown` and logged only as `category=handoff_data_invalid`,
+never with its content. A call that ended without `handoffData` gets no row.
+A replayed callback never changes the stored reason.
+
+## Shared conversation queue (#1548)
+
+Text turns and native phone turns on one conversation take turns through a
+per-conversation queue (`surface_turn::conversation_queue`), so they continue
+one native session. The CLI gate (`AUGMENTAGENT_REASONER_MAX_INFLIGHT`) is a
+separate process-wide limit on CLI reasoner processes.
+
+- **Fast layer on** (`AUGMENTAGENT_PHONE_FAST_LAYER=1`): a phone utterance
+  never enters the conversation queue and never asks the CLI gate for a
+  permit. It is answered while a long text turn is still running. Only work
+  handed off with `dispatch_task` runs as a native turn and waits in the queue
+  like a text turn.
+- **Fast layer off** (legacy native path): the phone turn waits in the queue.
+  If it does not get the queue within 3 s, the call hears "I'm still finishing
+  something, one moment." It hears the line again every 15 s while it keeps
+  waiting. The socket stays open, and the answer is spoken once the earlier
+  turn releases the queue. The notice is a separate spoken frame, not part of
+  the answer. It is never mirrored to chat and never counts as the answer's
+  first speech.
+- `queue_wait_ms` adds the wait for the conversation queue to the agent
+  worker's pickup time. Fast-layer turns have no queue wait, so for them the
+  field is only the pickup time, normally 0.
+
+## Per-turn latency metrics (#1551)
+
+Every accepted turn (answered, interrupted, failed or dispatched) produces one
+`tracing` event with target `phone.turn` and one row in the additive SQLite
+table `phone_turn_metrics`. Fields are millisecond offsets from receipt of the
+final `prompt` frame: `queue_wait_ms` (until the agent worker picked the turn
+up, plus any wait for the shared conversation queue; see below), `t_first_token_ms` (first agent output), `t_first_speech_ms` (first
+agent speech frame written to the socket; automatic "Got it" acknowledgments are
+not counted), `t_last_speech_ms` (frame with `last:true` written), `tool_ms`
+(sum reported through `SpeechSender::note_tool_time`; null when nothing was
+reported), plus `provider` (`fast`|`native`, currently always `native`),
+`outcome` and the build's Git commit SHA. Preemptive generation (#1555) adds
+`speculated` (a speculation started for this utterance), `speculation_committed`
+(its answer was spoken) and `speculation_saved_ms` (final-prompt time minus
+speculation start, only when committed); existing databases gain these columns
+in place. A turn is recorded when the next
+prompt arrives, on interruption, or when the connection ends, so a finished
+answer that the owner talks over is stored as `interrupted` (a backchannel that
+resumes the answer is not an interruption, see #1550 above); a turn still pending
+when the socket closes is stored as `failed`. The record contains no speech text,
+numbers or identifiers beyond `call_id`/`turn_id`.
+
+With `AUGMENTAGENT_PHONE_DEBUG_EVENTS=1` the relay also parses Twilio `info`
+frames: a `tokensPlayed` event stamps `t_first_played_ms`/`t_last_played_ms`
+for the turn currently being spoken and `audible_delta_ms =
+t_first_played_ms − t_first_speech_ms`. Other `info` names and unknown frame
+types are categorized as ignorable while debugging; they never count as invalid
+frames and their bodies are never logged. With debug off those three fields are
+null and every other field is unchanged. Twilio does not publish the exact
+`info` payload schema; only the `name` field is read.
+
+```sh
+augmentagent --db /path/to/daemon.db phone metrics --last 10
+```
+
+prints nearest-rank p50/p95 per field over the last N calls (N most recently
+recorded `call_id`s). Null fields are excluded from their sample set, so a
+column's `samples` can be smaller than the turn count. The live acceptance
+criteria (AC5, AC8 and the epic gate) require pasting this output with the
+commit SHA after a real owner call; the offline suites only prove the record
+shape, the ±5 ms paused-clock fixture and the hand-computed percentiles.
+
+## Post-call memory (#1552)
+
+When a call that reached a ConversationRelay session ends (signed
+`relay-ended` callback, or a terminal status callback if that never arrives),
+one durable job is queued in the additive table `phone_call_summary_jobs`,
+keyed by call ID. Duplicate callbacks and restarts never add a second job;
+calls that never reached the relay and verification calls get none.
+
+The phone runtime checks the queue every 5 s. Each attempt takes a lease in
+the store first (10 min, doubling; at most 3 attempts), so a crash mid-run
+replays the job once after restart and a finished job is never rerun. One
+attempt runs the originating conversation's heavy agent once (Claude CLI,
+quality tier, 5 min limit) over that chat's bounded history, which already
+contains the call's mirrored `Phone — you:` / `Phone — Jarvis:` lines. The run
+has **no tools**: no allowed tools, a strict empty MCP configuration (host MCP
+servers are not loaded), built-in tools denied and no phone grant, so it
+cannot dial, message, dispatch or read files. It returns JSON; the phone crate
+validates it and then:
+
+- writes a summary note (at most 800 characters) to
+  `<wiki>/phone/calls/<YYYY-MM-DD>-<first 8 of call ID>.md` (write then rename);
+- upserts at most 10 facts (`key`, `value`, `confidence`, `source_call_id`)
+  into the additive `owner_profile` table, keeping the agent's order;
+- marks the job done in the same transaction as the facts.
+
+Output that does not parse leaves the job pending for its next bounded attempt.
+Logs carry only category codes, never summary or fact text.
+
+Phone prompts then carry the owner context (data, not instructions): the
+owner's first name, at most 1,200 characters of profile facts (most recently
+learned first, cut only between whole facts; absent when there are none) and
+the first line of each of the last 3 call summaries. The fast layer gets it in
+its system prompt every turn; the native path prepends it to the first turn of
+each call. A new first name reaches the recognition `hints` after the next
+daemon restart.
+
+Facts are owner-visible and deletable from the owner's **private control
+chat** (same authorization as `phone number …`; other chats are refused, and
+the text never reaches history or the model):
+
+- `profile` (or `profile show`) lists the stored facts, most recent first,
+  within 1,800 bytes (one message on every surface; the rest is counted);
+- `profile forget <key>` deletes one; the next assembled prompt omits it.
+  Forgetting `first_name` also removes it from prompts at once; only the
+  recognition `hints` keep the startup copy until the next restart.
+
+## Terminal and recoverable relay conditions (#1549)
+
+Once a relay socket is authenticated and claimed, only nine conditions end it.
+`ingress::EndReason` enumerates them and a wildcard-free test keeps the set
+exact: `peer_closed` (the provider closed the WebSocket, or sent an error code
+Twilio documents as session-terminating: 64104, 64105, 64108), `transport_error`
+(a socket read or write failed), `owner_hangup` (the call left the connected
+state or a stop was requested, including an `end` we sent), `revoked` (call
+authority can no longer be verified; an unreadable call record fails closed the
+same way), `duration_limit`, `worker_failed` (the agent worker stopped before
+the connection did), `invalid_frame_limit`, `agent_end` (Jarvis said goodbye and
+sent `end` itself, #1557) and `silence` (nobody spoke through both check-ins,
+#1556). The TwiML is `<Connect>` followed
+by `<Hangup/>`, so any other exit would hang up on the owner.
+
+Everything else is recoverable and the loop continues:
+
+- A full turn queue (four waiting turns behind the one in progress) evicts the
+  oldest waiting turn, which receives one fixed final line, "Sorry, say that
+  again?". The newest turn stays queued and is answered.
+- Malformed JSON, unknown message types and other rejected text frames
+  (`invalid_protocol_frame`) and binary frames (`unsupported_frame`) are
+  counted per session. Any accepted frame resets the run. Ten consecutive
+  invalid frames, matching the provider's own bound, send one `end` message
+  and close with `invalid_frame_limit`. Control frames neither count nor reset.
+- Provider `error` frames are logged by numeric code and ignored, except the
+  three session-terminating codes above, after which the socket is gone.
+- An agent utterance that violates the speech contract (`invalid_speech_output`)
+  drops that output only.
+
+Each recoverable condition emits one structured diagnostic with a fixed
+`category`, the per-session `count` for that category, the current
+`consecutive_invalid` run and an optional numeric `provider_code`. Diagnostics
+never carry frame content, numbers, signatures or speech; a unit test feeds
+marked frames through the classifier and asserts nothing leaks.
+
+Offline regressions cover each recoverable condition followed by an answered
+prompt, oldest-turn eviction, the ten-frame limit and its reset, the exact
+terminal set and diagnostic redaction. A live owner call that ends only on
+hangup with Twilio status `completed` must still be recorded separately.
+
+## Agent-proposed calls (#1553)
+
+A proactive loop can **ask** for a call; it cannot place one. With
+`AUGMENTAGENT_PHONE_PROPOSE_CALLS=1`, each proactive pass that dispatches
+follow-ups hands one proposal (a reason and at most 5 one-line agenda items,
+the dispatched headlines) to `PhoneService::propose_call`. The
+`augmentagent-proactive` crate sees only its own `CallProposer` trait; it has
+no dependency on `augmentagent-phone` and no crate it depends on re-exports
+the `Telephony` trait (`crates/augmentagent-proactive/tests/no_dial_path.rs`
+checks both with `cargo metadata`).
+
+`propose_call` never dials and never posts by itself. It records the proposal
+in the additive table `phone_call_proposals` after the limits:
+
+- at most one proposal per owner within 4 hours of another, and at most 3 in
+  any rolling 24 hours (declined and expired ones count; refused ones are not
+  recorded);
+- inside the quiet hours (`AUGMENTAGENT_PHONE_QUIET_HOURS`, owner-local) its
+  delivery time moves to the quiet-hours end. Deferred, never dropped.
+
+The phone runtime checks due proposals every 5 s in its own worker,
+independent of post-call summaries (so a deferred one arrives
+within seconds of the quiet hours ending) and posts each once through the
+owner's **private control chat** outbox (idempotency key
+`call-proposal:<id>`):
+
+> I have N things to go over, call now? (yes/no, expires in 15 min)
+> Reason: …
+> - item
+
+The owner's answer is a bare `yes` (`y`, `yes please`, `call now`) or `no`
+(`n`, `no thanks`, `not now`). While a question is open, and for 15 minutes
+after it closes, adapters route these replies to the phone service like other
+phone commands; once the owner has answered, routing stops 15 minutes after
+that answer. The rest of the time a bare `yes` is ordinary chat text.
+Only an authenticated owner reply in the chat the question was posted in
+counts:
+
+- `yes` within 15 minutes of posting accepts the proposal once and dials
+  through the existing `call_owner` path (same grant checks, budget and rate
+  limits as `call me`; request ID `proposal:<id>`). Duplicate `yes` replies
+  get "already requested" with the call's current state and never dial
+  again (they retry the same request ID, so a reservation refused before it
+  was created gets its first attempt).
+- `yes` from another conversation (even another control channel) gets a fixed
+  reply and is ignored; from an unauthorized sender or chat, the usual
+  authorization reply.
+- `yes` after expiry gets a fixed "expired" reply. `no`, or no answer within
+  15 minutes, records a decline.
+- A proposal that could not be posted within an hour of its delivery time
+  expires instead of arriving late.
+
+The accepted proposal's reason and agenda go into the **first phone turn's
+prompt** (fast layer: its system prompt, which every turn of that call keeps;
+native path: the first turn of the call only), with an instruction to open
+with them. They never appear in TwiML,
+the provider dial request or the welcome greeting.
+
+## Silence and idle policy (#1556)
+
+A connected call with nobody talking no longer runs to the provider time
+limit. The relay keeps a silence clock that starts at the latest of: any owner
+`prompt` (partial or final) or `interrupt`, a closing `text` frame
+(`last:true`) written by Jarvis, and a tokens-played event for that speech
+(with debug events on). With the defaults:
+
+| Silence | Frame |
+| --- | --- |
+| 12 s | `text` "Still there?" (`interruptible:true`, `preemptible:true`) |
+| 25 s | `text` "I'll hang up in a bit if you're done." (same flags) |
+| 45 s | fixed goodbye `text` (not interruptible), then `end` with `handoffData` `{"reason":"silence","call_id":"…"}` |
+
+As for an agent-initiated end (#1557), `end` is sent once the goodbye's
+tokens-played event arrives, or after `PLAYBACK_WAIT` (4 s) without one, so
+the goodbye is not cut off. The relay-ended callback recognizes the `silence`
+handoff.
+
+Check-ins and the goodbye never restart the clock, and neither does a
+tokens-played event for a check-in. While an owner turn is still being
+answered the clock is held. A spoken progress line of a dispatched task (#1546)
+suspends silence handling for 15 s; the task's spoken result (or failure
+notice) releases it and restarts the clock, and an expired hold restarts the
+clock where it lapsed. Owner speech over a check-in is handled by the normal
+interruption rules and restarts the clock.
+
+When the relay ends for silence it persists `end_reason = silence` in
+#1557's `phone_call_end_reasons` (first write wins; a database created before
+`silence` was allowed is rebuilt once on open, keeping its rows), requests the
+stop, then enqueues one message in the originating chat ("Phone call ended
+after 45 seconds of silence.") under the idempotency key
+`{call_id}:silence_end`. Delivery is a leased job (`phone_call_end_notices`:
+three attempts, 60 s doubling lease) that the runtime's memory worker retries
+after a failure or restart; the outbox rejects a replayed key, so the message
+is never duplicated.
+

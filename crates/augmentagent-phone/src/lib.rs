@@ -75,6 +75,10 @@ pub enum Error {
     Disabled,
     #[error("phone configuration is incomplete or invalid")]
     NotConfigured,
+    /// A named operator setting is out of range or malformed. Carries only the
+    /// variable name, never its value.
+    #[error("phone setting {0} is invalid")]
+    InvalidSetting(&'static str),
     #[error("owner authorization required")]
     Unauthorized,
     #[error("phone capability has expired")]
@@ -87,12 +91,16 @@ pub enum Error {
     Store(#[from] PhoneError),
     #[error(transparent)]
     Provider(#[from] ProviderError),
+    #[error("phone voice configuration is invalid: {0}")]
+    Voice(#[from] voice::VoiceConfigError),
+    #[error("phone silence policy is invalid: {0}")]
+    Silence(#[from] silence::SilenceConfigError),
 }
 impl Error {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
-            Self::NotConfigured => "not_configured",
+            Self::NotConfigured | Self::InvalidSetting(_) => "not_configured",
             Self::Unauthorized => "unauthorized",
             Self::Expired => "expired",
             Self::PrivateSetupRequired => "private_setup_required",
@@ -108,6 +116,7 @@ impl Error {
             Self::Store(_) => "storage_error",
             Self::Provider(ProviderError::Rejected) => "provider_rejected",
             Self::Provider(ProviderError::Uncertain) => "provider_uncertain",
+            Self::Voice(_) | Self::Silence(_) => "not_configured",
         }
     }
 }
@@ -123,6 +132,14 @@ pub struct PhoneConfig {
     public_base: String,
     verification_key: Vec<u8>,
     links: Vec<OwnerLink>,
+    voice: voice::VoiceConfig,
+    owner_first_name: Option<String>,
+    debug_events: bool,
+    barge_in: relay::BargeIn,
+    fast: Option<fast::FastLayerConfig>,
+    preemptive: bool,
+    proposals: proposals::ProposalPolicy,
+    silence: silence::SilencePolicy,
 }
 impl PhoneConfig {
     pub fn new(
@@ -159,7 +176,58 @@ impl PhoneConfig {
             public_base: url.origin().ascii_serialization(),
             verification_key: verification_key.as_bytes().into(),
             links,
+            voice: voice::VoiceConfig::default(),
+            owner_first_name: None,
+            debug_events: false,
+            barge_in: relay::BargeIn::default(),
+            fast: None,
+            preemptive: false,
+            proposals: proposals::ProposalPolicy::default(),
+            silence: silence::SilencePolicy::default(),
         })
+    }
+    /// Quiet hours and owner time zone for agent-proposed calls (#1553).
+    pub fn with_proposals(mut self, proposals: proposals::ProposalPolicy) -> Self {
+        self.proposals = proposals;
+        self
+    }
+    /// Operator-validated speech providers. Only startup configuration may call this.
+    pub fn with_voice(mut self, voice: voice::VoiceConfig) -> Self {
+        self.voice = voice;
+        self
+    }
+    /// Owner first name, used only as a recognition hint. `config::Settings::build`
+    /// supplies the stored `first_name` profile fact (#1552) at startup.
+    pub fn with_owner_first_name(mut self, first_name: Option<String>) -> Self {
+        self.owner_first_name = first_name;
+        self
+    }
+    /// Request ConversationRelay debug events (tokens played, speaker events)
+    /// so #1551 can measure audible latency. Off unless explicitly enabled.
+    pub fn with_debug_events(mut self, enabled: bool) -> Self {
+        self.debug_events = enabled;
+        self
+    }
+    /// Silence check-in and automatic-end thresholds (#1556).
+    pub fn with_silence(mut self, silence: silence::SilencePolicy) -> Self {
+        self.silence = silence;
+        self
+    }
+    /// Backchannel filter and false-interruption handling (#1550).
+    pub fn with_barge_in(mut self, barge_in: relay::BargeIn) -> Self {
+        self.barge_in = barge_in;
+        self
+    }
+    /// Answer utterances with the fast conversational layer (#1546).
+    pub fn with_fast_layer(mut self, fast: Option<fast::FastLayerConfig>) -> Self {
+        self.fast = fast;
+        self
+    }
+    /// Preemptive generation on interim transcripts (#1555). Takes effect only
+    /// together with the fast layer.
+    pub fn with_preemptive(mut self, enabled: bool) -> Self {
+        self.preemptive = enabled;
+        self
     }
 }
 /// Only the server can construct a capability, after checking stored authority.
@@ -178,6 +246,13 @@ pub struct PhoneService {
     config: PhoneConfig,
     stopping: std::sync::atomic::AtomicBool,
     cleanup_inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Whether this service holds an open call-proposal answer window (#1553).
+    consent_window: std::sync::atomic::AtomicBool,
+}
+impl Drop for PhoneService {
+    fn drop(&mut self) {
+        self.set_consent_window(false);
+    }
 }
 impl PhoneService {
     pub fn new(
@@ -193,10 +268,30 @@ impl PhoneService {
             config,
             stopping: std::sync::atomic::AtomicBool::new(false),
             cleanup_inflight: Arc::new(std::sync::Mutex::new(Default::default())),
+            consent_window: std::sync::atomic::AtomicBool::new(false),
         }
     }
     /// Explicit operator-configured identities, for installing transport adapters
     /// before the first private control conversation has been provisioned.
+    pub fn barge_in(&self) -> &relay::BargeIn {
+        &self.config.barge_in
+    }
+    pub fn debug_events(&self) -> bool {
+        self.config.debug_events
+    }
+    /// Fast-layer settings when `AUGMENTAGENT_PHONE_FAST_LAYER=1` (#1546).
+    pub fn fast_layer(&self) -> Option<&fast::FastLayerConfig> {
+        self.config.fast.as_ref()
+    }
+    /// `AUGMENTAGENT_PHONE_PREEMPTIVE=1` on the fast layer (#1555): TwiML
+    /// requests interim prompts and the relay may speculate on them.
+    pub fn preemptive(&self) -> bool {
+        self.config.preemptive && self.config.fast.is_some()
+    }
+    /// Silence check-in and automatic-end thresholds (#1556).
+    pub fn silence_policy(&self) -> silence::SilencePolicy {
+        self.config.silence
+    }
     pub fn linked_surface_owners(&self) -> Vec<SurfaceOwnerRef> {
         self.config
             .links
@@ -514,6 +609,8 @@ pub mod twilio;
 pub mod webhook;
 
 pub mod relay;
+pub mod speech;
+pub mod voice;
 
 impl PhoneService {
     /// Snapshot and claim due cleanup without waiting for provider HTTP. The
@@ -637,7 +734,9 @@ impl PhoneService {
         self.authorize_call_origin(&call)
     }
 
-    pub(crate) fn authorize_call_origin(&self, call: &PhoneCall) -> Result<Grant, Error> {
+    /// Owner authority for the call's origin, without requiring the call to
+    /// still be connected. Dispatched work (#1546) outlives its call.
+    pub fn authorize_call_origin(&self, call: &PhoneCall) -> Result<Grant, Error> {
         let origin = self.store.phone_origin(&call.id)?;
         let grant = self.authorize(&origin.owner, &origin.conversation)?;
         if grant.owner_id != call.owner
@@ -686,3 +785,15 @@ pub mod config;
 pub mod router;
 
 pub mod recovery;
+
+pub mod metrics;
+
+pub mod fast;
+
+pub mod memory;
+pub mod end_call;
+/// Preemptive generation on interim transcripts (#1555).
+pub mod speculation;
+
+pub mod proposals;
+pub mod silence;

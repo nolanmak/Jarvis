@@ -147,6 +147,10 @@ pub enum Route {
     DiscordTransport,
     /// Posts to Discord only, on purpose, with the reason.
     DiscordOnly(&'static str),
+    /// Call proposals (#1553): a yes/no question in the owner's private
+    /// control chat, through that chat adapter's durable phone outbox. The
+    /// answer must come back in the same chat, so it is never fanned out.
+    PhoneControlChat,
 }
 
 /// One registered posting site: `sites` occurrences of `marker` in `file`.
@@ -278,6 +282,9 @@ pub static PRODUCERS: &[Producer] = &[
     p("voice_bridge", "crates/augmentagent-approval-discord/src/voice_bridge.rs", "send_message(&", 6, REPLY, "Discord voice transcripts in the voice channel"),
     p("voice_bridge", "crates/augmentagent-approval-discord/src/voice_bridge.rs", "CreateMessage::new(", 7, REPLY, "Discord voice transcripts in the voice channel"),
     p("cli_discord_posts", CLI, "send_message(&", 7, Route::DiscordOnly("explicit `--post` Discord commands (compose/propose cards, wiki ask --post) and Discord loop output"), "one-shot Discord posts"),
+    // -- Phone call proposals (#1553) ---------------------------------------
+    act(p("phone_call_proposal", "crates/augmentagent-phone/src/proposals.rs", "notify_owner(", 1, Route::PhoneControlChat, "agent-proposed call questions (yes/no) in the owner's private control chat")),
+    act(p("phone_call_proposal", "crates/augmentagent-phone/src/router.rs", "notify_owner(", 1, Route::PhoneControlChat, "per-platform routing of call proposal questions")),
     p("cli_discord_posts", CLI, "CreateMessage::new(", 4, Route::DiscordOnly("explicit `--post` Discord commands and Discord loop output"), "one-shot Discord posts"),
 ];
 // producer-scan: on

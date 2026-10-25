@@ -1639,6 +1639,18 @@ impl Store {
                 [],
             )?;
         }
+        // Inbound fetch cursor: the wall-clock of the last *successful*
+        // unread fetch for the entity. `lastPolledAt` is overwritten by
+        // failed polls too, so it can't serve as a cursor. The poller turns
+        // this into a Gmail `after:` filter so each tick only pages through
+        // mail that arrived since the previous tick instead of re-reading
+        // the whole unread backlog every cycle.
+        if !column_exists(conn, "gmail_accounts", "lastOkPolledAt")? {
+            conn.execute(
+                "ALTER TABLE gmail_accounts ADD COLUMN lastOkPolledAt INTEGER",
+                [],
+            )?;
+        }
 
         // #797 — Composio returns Gmail user rate limits in an HTTP-success
         // envelope. This is intentionally separate from account liveness: a
@@ -2587,6 +2599,8 @@ impl Store {
         // #1101 — handle → person cache derived from the wiki identity index
         // (rebuildable any time via `augmentagent messages resolve-people`),
         // plus a participants view joining it onto the message index.
+        // `message_person_links` mirrors `household:` front matter (#1539),
+        // both directions, so a two-name query can narrow to a documented pair.
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS message_people (\
                  handle     TEXT PRIMARY KEY,\
@@ -2599,6 +2613,11 @@ impl Store {
                  PRIMARY KEY (person_key, name)\
              );\
              CREATE INDEX IF NOT EXISTS idx_message_person_names_name ON message_person_names(name);\
+             CREATE TABLE IF NOT EXISTS message_person_links (\
+                 person_key TEXT NOT NULL,\
+                 other_key  TEXT NOT NULL,\
+                 PRIMARY KEY (person_key, other_key)\
+             );\
              CREATE TABLE IF NOT EXISTS message_people_meta (\
                  key   TEXT PRIMARY KEY,\
                  value TEXT NOT NULL\
@@ -3340,12 +3359,37 @@ impl Store {
         at_ms: i64,
     ) -> StoreResult<()> {
         let guard = self.conn.lock().expect("store mutex poisoned");
-        guard.execute(
-            "UPDATE gmail_accounts SET lastPolledAt = ?1, lastPollOk = ?2 \
-             WHERE entityId = ?3",
-            rusqlite::params![at_ms, if ok { 1 } else { 0 }, entity_id],
-        )?;
+        if ok {
+            guard.execute(
+                "UPDATE gmail_accounts SET lastPolledAt = ?1, lastPollOk = 1, \
+                 lastOkPolledAt = ?1 WHERE entityId = ?2",
+                rusqlite::params![at_ms, entity_id],
+            )?;
+        } else {
+            guard.execute(
+                "UPDATE gmail_accounts SET lastPolledAt = ?1, lastPollOk = 0 \
+                 WHERE entityId = ?2",
+                rusqlite::params![at_ms, entity_id],
+            )?;
+        }
         Ok(())
+    }
+
+    /// Wall-clock (epoch ms) of the last successful unread fetch for a Gmail
+    /// entity, or `None` when it has never completed one (fresh connection,
+    /// or a store predating the column). The inbound poller uses it to bound
+    /// the `is:unread` query so a mailbox with hundreds of old unread
+    /// messages costs one small page per tick, not the full backlog.
+    pub fn gmail_inbound_cursor_ms(&self, entity_id: &str) -> StoreResult<Option<i64>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row: Option<Option<i64>> = guard
+            .query_row(
+                "SELECT lastOkPolledAt FROM gmail_accounts WHERE entityId = ?1",
+                params![entity_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?;
+        Ok(row.flatten())
     }
 
     /// #797 — persist Composio's per-entity Gmail fetch cooldown so polling,
@@ -9115,6 +9159,43 @@ mod tests {
             None,
             "expired cooldowns must stop blocking requests"
         );
+    }
+
+    /// The inbound cursor only moves on a *successful* fetch, so a run of
+    /// rate-limited ticks can never advance it past mail we have not read.
+    #[test]
+    fn gmail_inbound_cursor_tracks_only_successful_polls() {
+        let (store, _file) = fresh_store();
+        let sql = |q: &str| store.conn.lock().unwrap().execute(q, []).unwrap();
+        sql("INSERT INTO gmail_accounts (id, connectionId, email, entityId, active, createdAt) \
+             VALUES ('g1', 'c1', 'owner@example.com', 'acct-a', 1, 0)");
+
+        assert_eq!(store.gmail_inbound_cursor_ms("acct-a").unwrap(), None);
+        assert_eq!(store.gmail_inbound_cursor_ms("unknown").unwrap(), None);
+
+        store.set_gmail_account_poll_outcome("acct-a", true, 1_000).unwrap();
+        assert_eq!(store.gmail_inbound_cursor_ms("acct-a").unwrap(), Some(1_000));
+
+        store.set_gmail_account_poll_outcome("acct-a", false, 2_000).unwrap();
+        assert_eq!(
+            store.gmail_inbound_cursor_ms("acct-a").unwrap(),
+            Some(1_000),
+            "a failed poll must not advance the cursor"
+        );
+        let (polled, ok): (i64, i64) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT lastPolledAt, lastPollOk FROM gmail_accounts WHERE entityId = 'acct-a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((polled, ok), (2_000, 0), "liveness columns still track every poll");
+
+        store.set_gmail_account_poll_outcome("acct-a", true, 3_000).unwrap();
+        assert_eq!(store.gmail_inbound_cursor_ms("acct-a").unwrap(), Some(3_000));
     }
 
     /// Round-trip plus the two things the read path depends on: rows outside

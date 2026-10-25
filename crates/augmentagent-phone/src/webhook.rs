@@ -1,6 +1,10 @@
 //! Signed provider callbacks. HTTP adapters must pass every decoded form field,
 //! with no trimming, and reject non-form content types and oversized requests.
-use crate::{twilio::validate_signature, xml, Error, PhoneService};
+use crate::{
+    twilio::validate_signature,
+    voice::{hints, TtsProvider},
+    xml, Error, PhoneService,
+};
 use augmentagent_store::phone::{CallState, PhoneCall, PhoneError, ProviderUsage};
 
 pub struct WebhookAuth {
@@ -54,6 +58,10 @@ impl PhoneService {
         signature: &str,
     ) -> Result<String, Error> {
         self.callback_call(auth, "relay-ended", id, fields, signature)?;
+        // #1557: first, so a summary-queue failure cannot drop the reason.
+        self.record_end_reason(id, fields);
+        // #1552: the conversation is over; queue its summary exactly once.
+        self.store.phone_enqueue_call_summary(id, self.clock.now_ms())?;
         let failed = field(fields, "SessionStatus")? == "failed";
         if failed {
             // Never log provider error text: it can include URLs and caller data.
@@ -65,6 +73,35 @@ impl PhoneService {
             return Ok("<Response><Say voice=\"Polly.Joanna\" language=\"en-US\">Sorry, Jarvis could not connect the voice conversation. The connection error has been recorded.</Say><Hangup/></Response>".into());
         }
         Ok(HANGUP.into())
+    }
+    /// #1557: an agent-initiated `end` carries `handoffData`; record why the
+    /// call ended. Absent means the agent did not end it. Malformed data is
+    /// categorized, never logged.
+    fn record_end_reason(&self, id: &str, fields: &[(String, String)]) {
+        let mut handoff = fields.iter().filter(|(k, _)| k == "HandoffData");
+        let Some((_, data)) = handoff.next() else {
+            return;
+        };
+        let reason = if handoff.next().is_some() {
+            crate::end_call::UNKNOWN_END_REASON
+        } else {
+            crate::end_call::end_reason_from_handoff(data, id)
+        };
+        if reason == crate::end_call::UNKNOWN_END_REASON {
+            tracing::warn!(call_id = id, category = "handoff_data_invalid", "phone relay-ended handoff data not recognized");
+        }
+        match self
+            .store
+            .phone_record_end_reason(id, reason, self.clock.now_ms())
+        {
+            Ok(true) => {
+                tracing::info!(call_id = id, end_reason = reason, "phone call end reason recorded")
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(call_id = id, error = %error, "phone call end reason not persisted")
+            }
+        }
     }
     fn callback_call(
         &self,
@@ -137,6 +174,11 @@ impl PhoneService {
         };
         self.store
             .phone_provider_event_with_usage(id, &sid, state, self.clock.now_ms(), usage)?;
+        if state.terminal() {
+            // #1552: also covers a relay-ended callback that never arrived.
+            // Calls that never reached the relay are not enqueued.
+            self.store.phone_enqueue_call_summary(id, self.clock.now_ms())?;
+        }
         Ok(())
     }
     pub fn start_callback(
@@ -206,7 +248,36 @@ impl PhoneService {
         Ok(self.relay_twiml(id))
     }
     fn relay_twiml(&self, id: &str) -> String {
+        // Every attribute value here is startup configuration validated to an
+        // attribute-safe alphabet, or a constant. Nothing from the call, the
+        // provider callback or the agent is read.
         let ws = self.config.public_base.replacen("https://", "wss://", 1);
-        format!("<Response><Connect action=\"{}/phone/relay-ended/{id}\" method=\"POST\"><ConversationRelay url=\"{}/phone/relay/{id}\" ttsProvider=\"Amazon\" voice=\"Joanna\" language=\"en-US\" interruptible=\"any\" reportInputDuringAgentSpeech=\"any\" partialPrompts=\"false\" welcomeGreeting=\"Hi, I'm here. What can I help you with?\" /></Connect><Hangup/></Response>",xml(&self.config.public_base),xml(&ws))
+        // #1551: tokens-played/speaker events measure what the owner hears.
+        let debug = if self.config.debug_events {
+            " debug=\"debugging tokens-played speaker-events\""
+        } else {
+            ""
+        };
+        // #1555: interim recognition only when the fast layer may speculate.
+        let partial = if self.config.preemptive && self.config.fast.is_some() {
+            "true"
+        } else {
+            "false"
+        };
+        let voice = &self.config.voice;
+        let normalization = match voice.tts_provider() {
+            TtsProvider::ElevenLabs => " elevenlabsTextNormalization=\"on\"",
+            TtsProvider::Amazon | TtsProvider::Google => "",
+        };
+        format!(
+            "<Response><Connect action=\"{}/phone/relay-ended/{id}\" method=\"POST\"><ConversationRelay url=\"{}/phone/relay/{id}\" transcriptionProvider=\"{}\" speechModel=\"{}\" ttsProvider=\"{}\" voice=\"{}\" language=\"en-US\"{normalization} hints=\"{}\" interruptible=\"any\" reportInputDuringAgentSpeech=\"any\" partialPrompts=\"{partial}\" welcomeGreeting=\"Hi, I'm here. What can I help you with?\"{debug} /></Connect><Hangup/></Response>",
+            xml(&self.config.public_base),
+            xml(&ws),
+            voice.stt_provider().as_str(),
+            xml(voice.stt_model()),
+            voice.tts_provider().as_str(),
+            xml(voice.tts_voice()),
+            xml(&hints(self.config.owner_first_name.as_deref())),
+        )
     }
 }

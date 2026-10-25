@@ -732,6 +732,30 @@ fn unknown_recipients_fail_closed() {
     assert!(fx.store.oldest_pending_actions(10).unwrap().is_empty());
 }
 
+/// #1539 — `aliases:` and `household:` front matter widen the message-search
+/// resolver only. This path reads `PeopleSnapshot::names` and nothing else, so
+/// an alias must never become a send target and a documented household pair
+/// must not change who a first name reaches.
+#[test]
+fn aliases_and_household_links_do_not_widen_send_resolution() {
+    let fx = fx();
+    std::fs::write(
+        fx.wiki.join("people").join("alice-example.md"),
+        "---\nkind: person\naliases: [Ally, Lex]\nhousehold: [\"[[alex-one]]\"]\n\
+         identities:\n  slack: U0000000A\n---\n# Alice Example\n",
+    )
+    .unwrap();
+    let r = |q| resolve_recipient(&fx.store, Some(&fx.wiki), TEAM, q);
+    for q in ["Ally", "Lex"] {
+        assert!(matches!(r(q), Resolution::Unknown { .. }), "{q}");
+    }
+    match r("Alice Example") {
+        Resolution::One(Recipient::Person { user_id, .. }) => assert_eq!(user_id, "U0000000A"),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(r("Alex"), Resolution::Ambiguous { .. }));
+}
+
 #[test]
 fn a_channel_resolves_through_the_workspace_subscriptions() {
     let fx = fx();

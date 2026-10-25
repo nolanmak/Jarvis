@@ -8,6 +8,7 @@ mod model_tool;
 mod composio_auth_tool;
 mod voice_tool;
 mod phone_runtime;
+mod phone_metrics;
 mod local_phone_transport;
 mod local_phone;
 mod discord_phone;
@@ -191,7 +192,9 @@ enum Cmd {
     },
     /// Run the poll loop as a daemon.
     Serve {
-        #[arg(long, default_value_t = 120)]
+        /// Gmail inbound poll cadence. Env `AUGMENTAGENT_GMAIL_POLL_SECS`
+        /// overrides the default; the flag overrides both.
+        #[arg(long, default_value_t = default_gmail_poll_secs())]
         interval_secs: u64,
         /// Dry-run (default true). Flip with `--dry-run false` after Phase 2 cutover.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -718,6 +721,11 @@ enum Cmd {
     /// Internal owner-bound phone MCP facade.
     #[command(hide = true)]
     PhoneTool,
+    /// Owner phone call diagnostics (#1551 latency metrics).
+    Phone {
+        #[command(subcommand)]
+        op: PhoneOp,
+    },
     /// Reconcile one known phone call from provider evidence; never dials.
     PhoneReconcile {
         #[arg(long)]
@@ -995,6 +1003,15 @@ enum DiskOp {
         /// Machine-readable output.
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+}
+#[derive(Subcommand)]
+enum PhoneOp {
+    /// Print nearest-rank p50/p95 per latency field for the last N calls.
+    /// Reads stored `phone_turn_metrics` only; no provider requests.
+    Metrics {
+        #[arg(long, default_value_t = 10)]
+        last: usize,
     },
 }
 #[derive(Subcommand)]
@@ -3640,13 +3657,22 @@ async fn main() -> Result<()> {
                 let suppression = std::sync::Arc::new(
                     augmentagent_proactive::TableSuppression::new(Arc::clone(&store)),
                 );
-                let runner = augmentagent_proactive::runner::ProactiveRunner::new(
+                let mut runner = augmentagent_proactive::runner::ProactiveRunner::new(
                     Arc::clone(&store),
                     Arc::clone(&broker),
                     wiki_root,
                     augmentagent_proactive::rules::default_scans(),
                 )
                 .with_suppression(suppression);
+                // #1553 — opt-in: dispatched follow-ups may become a call
+                // proposal in the owner's private chat. Only the owner's
+                // `yes` there dials.
+                if std::env::var("AUGMENTAGENT_PHONE_PROPOSE_CALLS").as_deref() == Ok("1") {
+                    match phone.as_ref().and_then(|e| phone_runtime::PhoneCallProposer::new(e.service.clone())) {
+                        Some(proposer) => runner = runner.with_call_proposer(Arc::new(proposer)),
+                        None => warn!("AUGMENTAGENT_PHONE_PROPOSE_CALLS=1 ignored: phone calling is not running for a single owner"),
+                    }
+                }
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { runner.run(sd).await }));
             } else {
@@ -5356,6 +5382,7 @@ async fn main() -> Result<()> {
         Cmd::ComposioAuthTool => composio_auth_tool::serve().await,
         Cmd::VoiceTool => voice_tool::serve(),
         Cmd::PhoneTool => Ok(augmentagent_phone::mcp::serve()?),
+        Cmd::Phone { op: PhoneOp::Metrics { last } } => phone_metrics::run(&store, last),
         Cmd::PhoneReconcile { ref call_id, ref provider_id } => phone_runtime::reconcile_local(&store, call_id, provider_id.as_deref()).await,
         Cmd::ComputeTool => compute_tool::serve(),
         Cmd::ReasonerSelftest { ref prompt, ref profile, tool_probe } =>
@@ -8343,6 +8370,17 @@ fn auto_expire_days_from_env() -> Option<i64> {
 /// `AUGMENTAGENT_APPROVAL_AUTO_EXPIRE_INTERVAL_SECS`; defaults to one
 /// hour. Clamped to a minimum of 1s so a fat-fingered `0` can't busy-loop
 /// the sweeper.
+/// `AUGMENTAGENT_GMAIL_POLL_SECS`, falling back to the channel default.
+/// Non-numeric or zero values fall back too — a typo must not turn the
+/// poller into a busy loop.
+fn default_gmail_poll_secs() -> u64 {
+    std::env::var("AUGMENTAGENT_GMAIL_POLL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(augmentagent_channel_email::DEFAULT_POLL_SECS)
+}
+
 fn auto_expire_interval_secs_from_env() -> u64 {
     std::env::var("AUGMENTAGENT_APPROVAL_AUTO_EXPIRE_INTERVAL_SECS")
         .ok()
