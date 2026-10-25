@@ -3679,5 +3679,47 @@
     "test_plan": "Run npm test on native Linux and macOS; record OS, architecture and result.",
     "status": "unverified",
     "evidence": null
+  },
+  {
+    "id": "cli:google",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux exposes augmentagent google for direct Google OAuth configuration and account authorization.",
+    "macos_target": "Mac exposes the same direct Google OAuth command and authorization guards.",
+    "prerequisites": [
+      "Rust CLI",
+      "selected feature credentials or synthetic fixtures"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1258",
+    "test_plan": "Run augmentagent google --help on both hosts and exercise synthetic configuration, scope and authorization guards.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/oauth/google/callback",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /oauth/google/callback with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /oauth/google/callback with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /oauth/google/callback in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "route:dashboard:GET:/oauth/google/start",
+    "source": "src/dashboard.ts",
+    "linux_baseline": "Linux dashboard serves GET /oauth/google/start with its current auth and response contract.",
+    "macos_target": "Mac dashboard serves GET /oauth/google/start with equivalent auth and response contract.",
+    "prerequisites": [
+      "Node dashboard",
+      "synthetic session and database"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
+    "test_plan": "Exercise GET /oauth/google/start in a native Mac and Linux dashboard fixture, including unauthorized access.",
+    "status": "unverified",
+    "evidence": null
   }
 ]
