@@ -14861,36 +14861,38 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         );
     }
 
-    /// Codex asked how we know no writer bypasses the lock. Nothing can write
-    /// this map without naming either the record type or the path helper, so
-    /// the inventory is every source file mentioning one of those: all reads,
-    /// plus the single locking recorder here.
+    /// Codex asked for a repository-wide inventory, not a scan keyed on the
+    /// identifiers this module happens to use: a bypass writer naming none of
+    /// them would be invisible. The map lives at exactly one path, so any
+    /// writer at all — in any crate, any language, a shell script — has to name
+    /// either the file literal or the env override that relocates it. Scanning
+    /// every text file in the repository for those two strings therefore bounds
+    /// the set of possible writers, and that set is pinned here.
     #[test]
     fn the_locking_recorder_is_the_codebases_only_writer_of_the_map() {
-        let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
-        let mut pending = vec![crates.clone()];
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().to_path_buf();
+        let mut pending = vec![repo.clone()];
         let mut mentions = Vec::new();
         while let Some(dir) = pending.pop() {
             for entry in std::fs::read_dir(&dir).unwrap() {
                 let p = entry.unwrap().path();
                 if p.is_dir() {
-                    pending.push(p);
-                } else if p.extension().is_some_and(|e| e == "rs") {
-                    let src = std::fs::read_to_string(&p).unwrap();
-                    if ["OpenedPr", "opened_prs_path", "AUGMENTAGENT_AUTOPR_OPENED_FILE"]
-                        .iter()
-                        .any(|needle| src.contains(needle))
-                    {
-                        let rel = p.strip_prefix(&crates).unwrap().to_string_lossy().into_owned();
-                        if rel != "augmentagent-cli/src/self_improve.rs" {
-                            assert!(
-                                !src.contains("to_vec_pretty"),
-                                "{rel} serializes a map beside the opened-PR map: check it is not \
-                                 writing that map outside record_opened_pr"
-                            );
-                        }
-                        mentions.push(rel);
+                    // Build output, vendored deps, and the nested checkouts the
+                    // loop leaves behind (each has its own `.git`) are not this
+                    // repository's source.
+                    let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    let nested_checkout = p.join(".git").exists();
+                    if !nested_checkout && !matches!(name.as_str(), "target" | "node_modules") {
+                        pending.push(p);
                     }
+                    continue;
+                }
+                // Not every file is text; a binary cannot name a path either.
+                let Ok(src) = std::fs::read_to_string(&p) else { continue };
+                if src.contains("autopr-opened-prs.json")
+                    || src.contains("AUGMENTAGENT_AUTOPR_OPENED_FILE")
+                {
+                    mentions.push(p.strip_prefix(&repo).unwrap().to_string_lossy().into_owned());
                 }
             }
         }
@@ -14898,17 +14900,34 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert_eq!(
             mentions,
             vec![
-                "augmentagent-cli/src/autopr_eval.rs",
-                "augmentagent-cli/src/self_improve.rs",
-                "augmentagent-cli/src/self_improve_lifecycle_tests.rs",
-                "augmentagent-cli/src/self_improve_progress_tests.rs",
+                // Sets the override for a child process; writes nothing itself.
+                "crates/augmentagent-cli/src/autopr_eval.rs",
+                "crates/augmentagent-cli/src/self_improve.rs",
+                // Test harnesses pointing the loop at a scratch file.
+                "crates/augmentagent-cli/src/self_improve_lifecycle_tests.rs",
+                "crates/augmentagent-cli/src/self_improve_progress_tests.rs",
+                "docs/CODEX-FALLBACK.md",
             ],
-            "a new file touches the opened-PR map: check it writes via record_opened_pr"
+            "something new can reach the opened-PR map: it must go through record_opened_pr"
         );
 
-        // Of those, only this file serializes the map, and it locks first.
+        // Of those, only this file resolves the path, and the resolver is
+        // private, so every production holder of it is one of the sites below:
+        // the sweep (which only reads, via `opened_pr_for`) and the two lanes
+        // that record. Nothing else can hand the path to a writer.
         let src = include_str!("self_improve.rs");
         let production = &src[..src.find("\nmod tests {").expect("the test module")];
+        assert!(production.contains("fn opened_prs_path() -> PathBuf {"), "the resolver moved");
+        assert_eq!(
+            production.matches("opened_prs_path()").count(),
+            4,
+            "a new holder of the opened-PR map path: it must write via record_opened_pr"
+        );
+        assert_eq!(
+            production.matches("opened_pr_for(&opened, issue)").count(),
+            1,
+            "the sweep's use of the path changed: it must stay read-only"
+        );
         assert_eq!(
             production.matches("to_vec_pretty(&map)").count(),
             1,
