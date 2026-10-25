@@ -1,4 +1,5 @@
 import { createComposioAuthRouter } from "./composioAuthRoutes";
+import { createGoogleAuthFlow } from "./googleAuthRoutes";
 import { Router, Request } from "express";
 import { exec, execSync, spawn } from "child_process";
 import crypto from "crypto";
@@ -814,6 +815,13 @@ router.use("/api/composio/auth", createComposioAuthRouter({
   getClient: getComposioClient,
   getAuthConfig: getOrCreateAuthConfig,
   getConfig, setConfig, getActiveGmailAccounts,
+  // Arrow wrappers: `googleAuth` is declared further down with the Google
+  // OAuth routes; these are only invoked per request.
+  google: {
+    configured: () => googleAuth.configured(),
+    start: () => googleAuth.start(),
+    status: (id: string) => googleAuth.status(id),
+  },
   persist: async (provider, connectionId, entityId, account) => {
     const email = (account as any).member_email || (account as any).email;
     if (provider === "gmail") {
@@ -982,9 +990,6 @@ router.get("/oauth/gmail/callback", async (req, res) => {
 // token storage and account registration are done by the Rust CLI
 // (`augmentagent google connect`) so the daemon that polls the mailbox owns
 // the credential; this router only carries the browser and the CSRF state.
-const GOOGLE_OAUTH_STATE_KEY = "google_oauth_state";
-const GOOGLE_OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
-
 function googleOauthConfigured(): boolean {
   return !!(
     process.env.GOOGLE_OAUTH_CLIENT_ID?.trim() && process.env.GOOGLE_OAUTH_CLIENT_SECRET?.trim()
@@ -992,8 +997,14 @@ function googleOauthConfigured(): boolean {
 }
 
 function googleRedirectUri(): string {
-  const port = process.env.DASHBOARD_PORT || "3000";
   // Must match a redirect URI registered on the OAuth client byte for byte.
+  // With AUGMENTAGENT_PUBLIC_URL set (an https origin that reaches this
+  // dashboard — a Tailscale Serve hostname, a reverse proxy) the consent can
+  // be approved from any device that reaches that origin; otherwise Google
+  // sends the browser back to localhost, i.e. the dashboard host itself.
+  const publicUrl = process.env.AUGMENTAGENT_PUBLIC_URL?.trim().replace(/\/+$/, "");
+  if (publicUrl) return `${publicUrl}/oauth/google/callback`;
+  const port = process.env.DASHBOARD_PORT || "3000";
   return `http://localhost:${port}/oauth/google/callback`;
 }
 
@@ -1032,6 +1043,16 @@ function runAgentCli(
   });
 }
 
+const googleAuth = createGoogleAuthFlow({
+  configured: googleOauthConfigured,
+  redirectUri: googleRedirectUri,
+  getConfig,
+  setConfig,
+  deleteConfig,
+  randomId: () => crypto.randomUUID(),
+  runCli: runAgentCli,
+});
+
 function oauthErrorPage(res: import("express").Response, msg: string): void {
   res.status(500).send(`
     <div class="p-4 bg-gray-950 text-gray-100 min-h-screen">
@@ -1051,70 +1072,32 @@ router.get("/oauth/google/start", async (_req, res) => {
       .send("GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET are not set; see .env.example.");
     return;
   }
-  const state = crypto.randomBytes(16).toString("hex");
-  setConfig(GOOGLE_OAUTH_STATE_KEY, JSON.stringify({ state, createdAt: Date.now() }));
-  const out = await runAgentCli(
-    ["google", "auth-url", "--redirect-uri", googleRedirectUri(), "--state", state],
-  );
-  const url = out.stdout.trim();
-  if (out.code !== 0 || !url.startsWith("https://accounts.google.com/")) {
-    console.error("[oauth] google auth-url failed:", out.stderr.trim());
-    oauthErrorPage(res, out.stderr.trim() || "could not build the consent URL");
-    return;
+  try {
+    const started = await googleAuth.start();
+    console.log("[oauth] Google consent started");
+    res.redirect(started.auth_url);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[oauth] google auth-url failed:", msg);
+    oauthErrorPage(res, msg);
   }
-  console.log("[oauth] Google consent started");
-  res.redirect(url);
 });
 
 router.get("/oauth/google/callback", async (req, res) => {
-  const pending = (() => {
-    try {
-      return JSON.parse(getConfig(GOOGLE_OAUTH_STATE_KEY) || "null") as
-        | { state: string; createdAt: number }
-        | null;
-    } catch {
-      return null;
-    }
-  })();
-  deleteConfig(GOOGLE_OAUTH_STATE_KEY);
-
   const state = typeof req.query.state === "string" ? req.query.state : "";
   const code = typeof req.query.code === "string" ? req.query.code : "";
   const providerError = typeof req.query.error === "string" ? req.query.error : "";
-
-  if (
-    !pending ||
-    !state ||
-    pending.state !== state ||
-    Date.now() - pending.createdAt > GOOGLE_OAUTH_STATE_TTL_MS
-  ) {
-    console.warn("[oauth] Google callback with missing/stale/mismatched state");
-    oauthErrorPage(res, "This connect attempt expired or did not originate here. Start again from Settings.");
+  const result = await googleAuth.finish(state, code, providerError);
+  if (!result.ok) {
+    if (result.attempt && result.attempt.error && providerError) {
+      console.warn("[oauth] Google consent declined:", providerError);
+      res.redirect("/settings?gmail=error");
+      return;
+    }
+    oauthErrorPage(res, result.message);
     return;
   }
-  if (providerError || !code) {
-    console.warn("[oauth] Google consent declined:", providerError || "no code");
-    res.redirect("/settings?gmail=error");
-    return;
-  }
-
-  // The code goes over stdin, never argv (argv is visible in `ps`).
-  const out = await runAgentCli(
-    ["google", "connect", "--redirect-uri", googleRedirectUri(), "--json"],
-    code,
-    120_000,
-  );
-  if (out.code !== 0) {
-    console.error("[oauth] google connect failed:", out.stderr.trim());
-    oauthErrorPage(res, out.stderr.trim() || "the code exchange failed");
-    return;
-  }
-  try {
-    const parsed = JSON.parse(out.stdout.trim()) as { email?: string; entity_id?: string };
-    console.log(`[oauth] Google mailbox connected: ${parsed.email} (${parsed.entity_id})`);
-  } catch {
-    console.log("[oauth] Google mailbox connected");
-  }
+  console.log(`[oauth] Google mailbox connected: ${result.attempt?.email ?? "?"} (${result.attempt?.entity_id ?? "?"})`);
   res.redirect("/settings?gmail=connected");
 });
 

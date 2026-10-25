@@ -61,9 +61,43 @@ to allow the app once (Admin console → Security → API controls).
 - **Remove** on a Google mailbox revokes the grant at Google and deletes the
   stored token.
 
+## Connecting without the Settings page
+
+The same attempt flow is reachable from the terminal and from the agent:
+
+- **CLI:** `augmentagent google connect-start` asks the running dashboard for
+  a consent URL, prints it (and opens it when a display is available), then
+  waits until the browser callback has saved the mailbox.
+- **Discord / chat:** ask the agent to connect a Gmail account. It calls the
+  owner-only auth tool, which returns the Google consent URL; open it, approve,
+  and the mailbox is saved when the callback lands. Asking the agent to check
+  reports connected once it has.
+
+Either way the consent finishes by Google redirecting the browser to the
+dashboard's callback. Out of the box that is `http://localhost:<port>/…`, so
+the approve click has to happen on the dashboard host. To approve from a
+phone or another computer, give the dashboard an https origin those devices
+can reach and tell both sides about it:
+
+1. Expose the dashboard on an https hostname you control. Any reverse proxy
+   with a valid certificate works: a Cloudflare Tunnel ingress rule
+   `hostname: <your host>` → `service: http://127.0.0.1:<DASHBOARD_PORT>`
+   plus a DNS route for that hostname, or Tailscale Serve on the host
+   (`tailscale serve --bg --https=443 http://127.0.0.1:<DASHBOARD_PORT>`)
+   when the approving devices are on your tailnet. The dashboard's login
+   stays in front of everything except the OAuth callback itself.
+2. Add `https://<that hostname>/oauth/google/callback` as a second authorized
+   redirect URI on the OAuth client in Google Cloud. Google rejects any URI
+   that is not registered byte for byte.
+3. Set `AUGMENTAGENT_PUBLIC_URL=https://<that hostname>` in `.env` and
+   restart the dashboard. New consents now redirect there; the callback is
+   reachable without a dashboard login, and the saved mailbox shows up for
+   the CLI, the agent and Settings alike.
+
 ## CLI
 
 ```
+augmentagent google connect-start       # start a connect from the terminal
 augmentagent google accounts            # Google-connected mailboxes + grant state
 augmentagent google check --account me@example.com
 augmentagent google disconnect --account me@example.com
