@@ -1493,11 +1493,6 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
         return 0;
     };
     let owner = repo_owner_from_remote(repo_root).await;
-    // This box's own record of the PRs it opened. The half of provenance that
-    // cannot be produced from GitHub, and the half that binds to a specific
-    // pull request rather than to a shape.
-    let opened = opened_prs_path();
-    // Resolved the same way the fresh path resolves it, override included.
     let policy_owner = merge_policy_owner(repo_root).await;
     let mut merged = 0usize;
 
@@ -1533,8 +1528,10 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
             .map(str::to_string);
         // #1076 — the verdict the loop RECORDED when it opened this PR at this
         // head, through the predicate the lanes use. Never the body: it carries
-        // model output, and a model can write any approval line it likes.
-        let record = opened_pr_for(&opened, issue);
+        // model output, and a model can write any approval line it likes. This
+        // box's own record is the half of provenance GitHub cannot produce, and
+        // the half that binds to a specific pull request rather than a shape.
+        let record = opened_prs::get(issue);
         let approval = recorded_approval(record.as_ref(), pr, head_sha.as_deref());
         // The two gates the fresh path computes from real state.
         let (issue_body, author) = issue_facts(repo_root, issue).await;
@@ -1802,25 +1799,6 @@ async fn merge_policy_owner(repo_root: &Path) -> Option<String> {
         .or(repo_owner_from_remote(repo_root).await)
 }
 
-/// #1029 — where this box records the pull requests the loop itself opened.
-///
-/// Codex, correctly, across three rounds: a body marker is forgeable and an
-/// attempt record only proves the daemon WORKED an issue, not that it opened a
-/// given PR. A prior failed attempt plus a hand-made `agent-fix/issue-N` draft
-/// carrying the marker would have satisfied both.
-///
-/// This binds the record to the artefact: the loop writes the PR number when
-/// it creates one, so the sweep can ask "did I open exactly this PR?" rather
-/// than "does this look like something I would open?".
-fn opened_prs_path() -> PathBuf {
-    if let Ok(p) = std::env::var("AUGMENTAGENT_AUTOPR_OPENED_FILE") {
-        if !p.trim().is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    augmentagent_channel_core::state_dir::state_dir_or(".").join("autopr-opened-prs.json")
-}
-
 /// What the loop recorded when it opened a PR: which PR, and the head its
 /// independent reviews actually covered.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1886,139 +1864,217 @@ fn recorded_approval(record: Option<&OpenedPr>, pr: u64, head: Option<&str>) -> 
     approval_of(reviewed_here.and_then(|r| r.verdict.as_ref()))
 }
 
-/// The mutex for the opened-PR map (#1533): a stable sibling of the data
-/// file, never the rename target. Flocking the data file itself would not
-/// exclude anything, because the rename below swaps the inode out from under
-/// whoever holds that lock.
-fn opened_prs_lock_path(path: &Path) -> PathBuf {
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    path.with_file_name(format!("{name}.lock"))
-}
-
-/// Hold the opened-PR mutex, or `None` if it cannot be held at all. A signal
-/// interrupting `flock` is not a failure — it is retried, since giving up there
-/// would leave the caller writing unserialized.
-fn lock_opened_prs(lock_path: &Path) -> Option<std::fs::File> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(lock_path)
-        .map_err(|e| warn!(path = %lock_path.display(), "opened-PR lock open failed: {e}"))
-        .ok()?;
-    loop {
-        // SAFETY: `file` owns the fd; flock neither reads nor writes it.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-            return Some(file);
-        }
-        let e = std::io::Error::last_os_error();
-        if e.kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        warn!(path = %lock_path.display(), "opened-PR lock flock failed: {e}");
-        return None;
-    }
-}
-
-/// Record that the loop opened `pr` for `issue`, at reviewed head `head`.
+/// The opened-PR map and everything that can touch it.
 ///
 /// #1533 — the build and resume lanes hold *different* run locks, so they can
-/// both be here at once. Without the flock, two read-modify-write cycles drop
-/// one lane's record, and a missing head-bound verdict stalls the merge sweep
-/// for that PR forever.
+/// both record at once. Two unserialized read-modify-write cycles drop one
+/// lane's record, and a missing head-bound verdict stalls the merge sweep for
+/// that PR forever. [`record`] closes that by holding a flock on a stable
+/// sibling of the map across its whole read-modify-write.
 ///
-/// The only writer of the map: the build lane (after publishing) and the resume
-/// lane (after recording a verdict) both come through here, and nothing else
-/// serializes it — `the_locking_recorder_is_the_codebases_only_writer_of_the_map`
-/// fails if a new one appears. Readers go through `read_opened_prs`, whose
-/// outcomes are unchanged (only its warnings are new); the approval predicates
-/// above and both call sites' arguments are untouched.
-fn record_opened_pr(
-    path: &Path,
-    issue: u64,
-    pr: u64,
-    head: &str,
-    verdict: Option<RecordedVerdict>,
-) {
-    if let Some(dir) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            warn!(path = %path.display(), "opened-PR map dir create failed: {e}");
+/// That only holds if nothing writes the map any other way, which is why this
+/// is a module rather than a group of functions: the path resolver, the
+/// serializer and the path-taking entry points are all private here, so the
+/// compiler — not a source scan — guarantees the rest of the crate cannot
+/// reach the file at all. The only ways in are [`record`] and [`get`], neither
+/// of which names a path.
+mod opened_prs {
+    use std::os::unix::io::AsRawFd;
+    use std::path::{Path, PathBuf};
+
+    use tracing::warn;
+
+    use super::{OpenedPr, RecordedVerdict};
+
+    /// #1029 — where this box records the pull requests the loop itself opened.
+    ///
+    /// Codex, correctly, across three rounds: a body marker is forgeable and an
+    /// attempt record only proves the daemon WORKED an issue, not that it opened
+    /// a given PR. A prior failed attempt plus a hand-made `agent-fix/issue-N`
+    /// draft carrying the marker would have satisfied both.
+    ///
+    /// This binds the record to the artefact: the loop writes the PR number when
+    /// it creates one, so the sweep can ask "did I open exactly this PR?" rather
+    /// than "does this look like something I would open?".
+    fn path() -> PathBuf {
+        if let Ok(p) = std::env::var("AUGMENTAGENT_AUTOPR_OPENED_FILE") {
+            if !p.trim().is_empty() {
+                return PathBuf::from(p);
+            }
+        }
+        augmentagent_channel_core::state_dir::state_dir_or(".").join("autopr-opened-prs.json")
+    }
+
+    /// Record that the loop opened `pr` for `issue`, at reviewed head `head`.
+    /// The sole writer, and the sole production caller of [`path`].
+    pub(super) fn record(issue: u64, pr: u64, head: &str, verdict: Option<RecordedVerdict>) {
+        record_at(&path(), issue, pr, head, verdict);
+    }
+
+    /// What this box opened for `issue`, if anything.
+    pub(super) fn get(issue: u64) -> Option<OpenedPr> {
+        get_at(&path(), issue)
+    }
+
+    /// The path-taking forms, so tests can drive a scratch map. They exist only
+    /// in a test build, so no amount of new production code can bypass the
+    /// serialization above with a path of its own.
+    #[cfg(test)]
+    pub(super) mod testing {
+        use std::path::{Path, PathBuf};
+
+        use crate::self_improve::{OpenedPr, RecordedVerdict};
+
+        pub fn record_at(
+            path: &Path,
+            issue: u64,
+            pr: u64,
+            head: &str,
+            verdict: Option<RecordedVerdict>,
+        ) {
+            super::record_at(path, issue, pr, head, verdict);
+        }
+
+        pub fn get_at(path: &Path, issue: u64) -> Option<OpenedPr> {
+            super::get_at(path, issue)
+        }
+
+        pub fn read(path: &Path) -> std::collections::BTreeMap<String, OpenedPr> {
+            super::read(path)
+        }
+
+        pub fn lock_path(path: &Path) -> PathBuf {
+            super::lock_path(path)
+        }
+
+        pub fn resolved_path() -> PathBuf {
+            super::path()
         }
     }
-    // Fail closed: an unlocked read-modify-write can rename a stale map over a
-    // sibling lane's record, which is the stall this guards against. Our own
-    // record is recoverable (the next pass re-records it); a clobbered sibling
-    // is not visible to anyone.
-    let _lock = match lock_opened_prs(&opened_prs_lock_path(path)) {
-        Some(f) => f,
-        None => return,
-    };
 
-    let mut map = read_opened_prs(path);
-    map.insert(issue.to_string(), OpenedPr { pr, head: head.to_string(), verdict });
-    let json = match serde_json::to_vec_pretty(&map) {
-        Ok(j) => j,
-        Err(e) => {
-            warn!(path = %path.display(), "opened-PR map serialize failed: {e}");
+    /// The mutex for the map: a stable sibling of the data file, never the
+    /// rename target. Flocking the data file itself would not exclude
+    /// anything, because the rename below swaps the inode out from under
+    /// whoever holds that lock.
+    fn lock_path(path: &Path) -> PathBuf {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        path.with_file_name(format!("{name}.lock"))
+    }
+
+    /// Hold the mutex, or `None` if it cannot be held at all. A signal
+    /// interrupting `flock` is not a failure — it is retried, since giving up
+    /// there would leave the caller writing unserialized.
+    fn lock(lock_path: &Path) -> Option<std::fs::File> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .map_err(|e| warn!(path = %lock_path.display(), "opened-PR lock open failed: {e}"))
+            .ok()?;
+        loop {
+            // SAFETY: `file` owns the fd; flock neither reads nor writes it.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Some(file);
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            warn!(path = %lock_path.display(), "opened-PR lock flock failed: {e}");
+            return None;
+        }
+    }
+
+    fn record_at(path: &Path, issue: u64, pr: u64, head: &str, verdict: Option<RecordedVerdict>) {
+        if let Some(dir) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                warn!(path = %path.display(), "opened-PR map dir create failed: {e}");
+            }
+        }
+        // Fail closed: an unlocked read-modify-write can rename a stale map over
+        // a sibling lane's record, which is the stall this guards against. Our
+        // own record is recoverable (the next pass re-records it); a clobbered
+        // sibling is not visible to anyone.
+        let _lock = match lock(&lock_path(path)) {
+            Some(f) => f,
+            None => return,
+        };
+
+        let mut map = read(path);
+        map.insert(issue.to_string(), OpenedPr { pr, head: head.to_string(), verdict });
+        let json = match serde_json::to_vec_pretty(&map) {
+            Ok(j) => j,
+            Err(e) => {
+                warn!(path = %path.display(), "opened-PR map serialize failed: {e}");
+                return;
+            }
+        };
+        // Per-writer temp name: the fixed `.tmp` sibling let one lane rename the
+        // other's partial bytes into place.
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let tmp = path.with_file_name(format!("{name}.tmp.{}.{seq}", std::process::id()));
+        if let Err(e) = std::fs::write(&tmp, &json) {
+            warn!(path = %tmp.display(), "opened-PR map write failed: {e}");
+            remove_stale_tmp(&tmp);
             return;
         }
-    };
-    // Per-writer temp name: the fixed `.tmp` sibling let one lane rename the
-    // other's partial bytes into place.
-    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = path.with_file_name(format!("{name}.tmp.{}.{seq}", std::process::id()));
-    if let Err(e) = std::fs::write(&tmp, &json) {
-        warn!(path = %tmp.display(), "opened-PR map write failed: {e}");
-        remove_stale_tmp(&tmp);
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        warn!(path = %path.display(), "opened-PR map rename failed: {e}");
-        remove_stale_tmp(&tmp);
-    }
-    // Lock released when `_lock` drops.
-}
-
-/// Drop a staging file a failed write or rename left behind, reporting what
-/// stops us: an orphan `.tmp.<pid>.<seq>` sibling is never picked up again, so
-/// a silent failure here would accumulate junk beside the map.
-fn remove_stale_tmp(tmp: &Path) {
-    match std::fs::remove_file(tmp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => warn!(path = %tmp.display(), "opened-PR map temp cleanup failed: {e}"),
-    }
-}
-
-fn read_opened_prs(path: &Path) -> std::collections::BTreeMap<String, OpenedPr> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        // Nothing recorded yet is the common case, not a fault.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Default::default(),
-        Err(e) => {
-            warn!(path = %path.display(), "opened-PR map read failed: {e}");
-            return Default::default();
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            warn!(path = %path.display(), "opened-PR map rename failed: {e}");
+            remove_stale_tmp(&tmp);
         }
-    };
-    // A damaged map reads as empty, exactly as it did before #1533: serde
-    // decodes the object as a whole, so there are no per-record survivors to
-    // salvage, and the next pass re-records what each lane still owns.
-    match serde_json::from_slice(&bytes) {
-        Ok(map) => map,
-        Err(e) => {
-            warn!(path = %path.display(), "opened-PR map parse failed: {e}");
-            Default::default()
+        // Lock released when `_lock` drops.
+    }
+
+    /// Drop a staging file a failed write or rename left behind, reporting what
+    /// stops us: an orphan `.tmp.<pid>.<seq>` sibling is never picked up again,
+    /// so a silent failure here would accumulate junk beside the map.
+    fn remove_stale_tmp(tmp: &Path) {
+        match std::fs::remove_file(tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(path = %tmp.display(), "opened-PR map temp cleanup failed: {e}"),
         }
     }
+
+    fn read(path: &Path) -> std::collections::BTreeMap<String, OpenedPr> {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            // Nothing recorded yet is the common case, not a fault.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Default::default(),
+            Err(e) => {
+                warn!(path = %path.display(), "opened-PR map read failed: {e}");
+                return Default::default();
+            }
+        };
+        // A damaged map reads as empty, exactly as it did before #1533: serde
+        // decodes the object as a whole, so there are no per-record survivors to
+        // salvage, and the next pass re-records what each lane still owns.
+        match serde_json::from_slice(&bytes) {
+            Ok(map) => map,
+            Err(e) => {
+                warn!(path = %path.display(), "opened-PR map parse failed: {e}");
+                Default::default()
+            }
+        }
+    }
+
+    fn get_at(path: &Path, issue: u64) -> Option<OpenedPr> {
+        read(path).get(&issue.to_string()).cloned()
+    }
 }
 
-/// What this box opened for `issue`, if anything.
-fn opened_pr_for(path: &Path, issue: u64) -> Option<OpenedPr> {
-    read_opened_prs(path).get(&issue.to_string()).cloned()
-}
+/// The map's path-taking entry points under their historic names, for tests
+/// only: production code cannot name them, because `opened_prs` keeps them
+/// private outside a test build.
+#[cfg(test)]
+use opened_prs::testing::{
+    get_at as opened_pr_for, lock_path as opened_prs_lock_path, read as read_opened_prs,
+    record_at as record_opened_pr, resolved_path as opened_prs_path,
+};
 
 /// #1029 — the loop's own signature on a PR body, and the only evidence that
 /// the loop actually opened a pull request.
@@ -7008,7 +7064,7 @@ async fn resume_draft_pr(
                 bail!("resume: push failed: {e}");
             }
             // A pending check or failed merge must not discard this LGTM.
-            record_opened_pr(&opened_prs_path(), issue.number, pr, reviewed_head, independent.recorded_verdict());
+            opened_prs::record(issue.number, pr, reviewed_head, independent.recorded_verdict());
             let _ = run(
                 &gh,
                 &["pr", "comment", &pr.to_string(), "--body",
@@ -8975,7 +9031,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         } else {
             None
         };
-        record_opened_pr(&opened_prs_path(), issue.number, n, published_head, verdict);
+        opened_prs::record(issue.number, n, published_head, verdict);
     }
     if independent.available && !independent.notes.is_empty() {
         let _ = run(&gh, &["pr", "comment", &pr_url, "--body",
@@ -14658,7 +14714,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let run_start = src.find("pub async fn run_once(").expect("run_once");
         let run_body = &src[run_start..run_start + src[run_start..].find("\n}\n").expect("end")];
         assert!(
-            run_body.contains("record_opened_pr("),
+            run_body.contains("opened_prs::record("),
             "opening a PR must record it, or the sweep can never recognise it"
         );
     }
@@ -14861,13 +14917,16 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         );
     }
 
-    /// Codex asked for a repository-wide inventory, not a scan keyed on the
-    /// identifiers this module happens to use: a bypass writer naming none of
-    /// them would be invisible. The map lives at exactly one path, so any
-    /// writer at all — in any crate, any language, a shell script — has to name
-    /// either the file literal or the env override that relocates it. Scanning
-    /// every text file in the repository for those two strings therefore bounds
-    /// the set of possible writers, and that set is pinned here.
+    /// Codex, twice: a scan for the identifiers this module happens to use
+    /// cannot prove a bypass writer does not exist, because such a writer
+    /// would name none of them. So the enforcement is no longer textual — the
+    /// `opened_prs` module keeps the path resolver, the serializer and the
+    /// path-taking entry points private, and the crate fails to COMPILE if
+    /// anything outside tries to reach the file. What is left for a test is
+    /// the inventory of the module's two public doors (asserted below from the
+    /// pre-compilation source, so an added caller is named rather than merely
+    /// compiled) and the one thing privacy cannot express: that the writer
+    /// takes the lock before it reads.
     #[test]
     fn the_locking_recorder_is_the_codebases_only_writer_of_the_map() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().to_path_buf();
@@ -14908,59 +14967,51 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
                 "crates/augmentagent-cli/src/self_improve_progress_tests.rs",
                 "docs/CODEX-FALLBACK.md",
             ],
-            "something new can reach the opened-PR map: it must go through record_opened_pr"
+            "something outside this crate names the opened-PR map: it must go through opened_prs"
         );
 
-        // Of those, only this file resolves the path, and the resolver is
-        // private, so every production holder of it is one of the sites below:
-        // the sweep (which only reads, via `opened_pr_for`) and the two lanes
-        // that record. Nothing else can hand the path to a writer.
         let src = include_str!("self_improve.rs");
         let production = &src[..src.find("\nmod tests {").expect("the test module")];
-        assert!(production.contains("fn opened_prs_path() -> PathBuf {"), "the resolver moved");
-        assert_eq!(
-            production.matches("opened_prs_path()").count(),
-            4,
-            "a new holder of the opened-PR map path: it must write via record_opened_pr"
-        );
-        assert_eq!(
-            production.matches("opened_pr_for(&opened, issue)").count(),
-            1,
-            "the sweep's use of the path changed: it must stay read-only"
-        );
+        // The whole surface, and it is private: the resolver, the serializer and
+        // the path-taking forms (the last only compiled under `cfg(test)`).
+        let store_start = production.find("\nmod opened_prs {").expect("the store module");
+        let store = &production[store_start..];
+        assert!(store.contains("    fn path() -> PathBuf {"), "the resolver must stay private");
         assert_eq!(
             production.matches("to_vec_pretty(&map)").count(),
             1,
             "a second serializer of the opened-PR map would write it unserialized"
         );
-        let body_start = production.find("fn record_opened_pr(").expect("the recorder");
-        let body = &production[body_start..production[body_start..]
-            .find("to_vec_pretty(&map)")
-            .map(|i| body_start + i)
-            .expect("the serialize")];
-        assert!(body.contains("lock_opened_prs("), "the writer locks before it reads");
+        let writer = store.find("fn record_at(").expect("the recorder");
+        let reads_at = store.find("let mut map = read(path);").expect("the read");
+        assert!(
+            store[writer..reads_at].contains("lock(&lock_path(path))"),
+            "the writer must take the lock before it reads"
+        );
 
-        // And the call-site inventory Codex asked for: the build lane and the
-        // resume lane, nothing else, each still passing the arguments it passed
-        // before #1533 — the serialization is entirely inside the recorder, so
-        // neither lane's call changed.
+        // And the call-site inventory: the two lanes that record, the sweep that
+        // reads, nothing else. Neither lane's arguments changed for #1533 — the
+        // serialization is entirely inside the store.
         assert!(
             production.contains(
-                "record_opened_pr(&opened_prs_path(), issue.number, pr, reviewed_head, \
+                "opened_prs::record(issue.number, pr, reviewed_head, \
                  independent.recorded_verdict());"
             ),
             "the resume lane's arguments changed"
         );
         assert!(
-            production.contains(
-                "record_opened_pr(&opened_prs_path(), issue.number, n, published_head, verdict);"
-            ),
+            production.contains("opened_prs::record(issue.number, n, published_head, verdict);"),
             "the build lane's arguments changed"
         );
         assert_eq!(
-            production.matches("record_opened_pr(").count(),
-            3,
-            "an extra reference to the recorder: declaration plus the two lanes"
+            production.matches("opened_prs::record(").count(),
+            2,
+            "a third writer of the opened-PR map appeared"
+        );
+        assert_eq!(
+            production.matches("opened_prs::get(").count(),
+            1,
+            "the sweep's read of the opened-PR map changed"
         );
     }
 
