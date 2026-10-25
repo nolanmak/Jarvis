@@ -892,4 +892,30 @@ mod tests {
         assert!(text.contains("freed 0 MB; 0 MB more would be freed"), "{text}");
     }
 
+    #[test]
+    fn failed_snapshot_removal_preserves_data_and_claims_no_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root can bypass the directory's write permission. CI and ordinary
+        // agent sessions run unprivileged and exercise the actual failure.
+        if unsafe { libc::geteuid() } == 0 { return; }
+        let t = tempfile::tempdir().unwrap();
+        for (name, age) in [("old", 200.0), ("new", 1.0)] {
+            let p = t.path().join(name);
+            std::fs::create_dir(&p).unwrap();
+            std::fs::write(p.join(DB_NAME), b"snapshot data").unwrap();
+            std::fs::write(p.join(MANIFEST_NAME), br#"{"created_at":"2026-01-01T00:00:00Z","db_bytes":13}"#).unwrap();
+            aged(&p, age);
+        }
+        let old = t.path().join("old");
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let refs = crate::snapshot_refs::References { reliable: true, ..Default::default() };
+        let records = prune_locked(t.path(), None, &[], &PruneOptions { keep: 1, ..Default::default() }, SystemTime::now(), &refs);
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(!records[0].removed);
+        assert!(records[0].reason.starts_with("failed to remove"));
+        assert_eq!(std::fs::read(old.join(DB_NAME)).unwrap(), b"snapshot data");
+        assert!(t.path().join("new").exists());
+    }
+
 }
