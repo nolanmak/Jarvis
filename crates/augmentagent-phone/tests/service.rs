@@ -3574,8 +3574,10 @@ async fn a_close_followed_by_the_completed_status_is_recorded_as_owner_hangup() 
         }
         if completed {
             // The status callback lands after the close, as it does live: the
-            // relay loop has already left its frame loop by now.
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            // relay loop has already left its frame loop by now. Well under the
+            // recheck window, so a slow host (a sluggish store write, a busy
+            // blocking pool) still has most of that second to answer.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             relay
                 .store
                 .phone_provider_event(&relay.id, "CA-test", CallState::Completed, 200)

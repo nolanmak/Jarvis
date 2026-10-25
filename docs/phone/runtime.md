@@ -440,13 +440,18 @@ is only present for ElevenLabs. The four `AUGMENTAGENT_PHONE_STT_*` /
 `AUGMENTAGENT_PHONE_TTS_*` variables above are read once at startup and
 validated to a conservative alphabet, so no value can break out of an attribute.
 Chat text, tool arguments and model output never reach these attributes; a
-source-level test holds `relay_twiml` to startup configuration only.
+source-level test holds `relay_twiml` to startup configuration, the call ID and
+the owner name its caller sanitizes.
 
 `hints` biases recognition toward the owner's first name (the stored
-`first_name` profile fact, read by `Settings::build` at daemon startup; see
-post-call memory below) and the fixed nouns `Jarvis,
+`first_name` profile fact, read per call, so a name learned since startup needs
+no restart; see post-call memory below) and the fixed nouns `Jarvis,
 Discord, WhatsApp, Slack, Linear, Notion`, XML-escaped and capped at 500
-characters.
+characters. `welcomeGreeting` names the owner when the same name is known
+(`Hi <name>, I'm here. What can I help you with?`, else `Hi, …`). Both reduce
+the name to letters, digits, spaces, apostrophes and hyphens, drop it beyond 64
+characters, and XML-escape what is left, so a stored name cannot reach the
+attribute as markup or as a second attribute.
 
 If Twilio rejects the provider, model or voice combination it sends an `error`
 frame before the first prompt and closes the socket. The relay records that as
@@ -578,8 +583,8 @@ are dropped. The socket then ends with the internal reason `agent_end`
 
 Goodbye shortcut: a final prompt that, lowercased with punctuation dropped,
 is exactly `bye`, `goodbye`, `bye bye`, `talk later`, `that's all`,
-`that's it thanks`, `hang up` or `end the call` ends the call as
-`owner_goodbye` with a fixed goodbye and no model call. Longer utterances
+`that's all thanks`, `that's it thanks`, `hang up` or `end the call` ends the
+call as `owner_goodbye` with a fixed goodbye and no model call. Longer utterances
 ("goodbye for now, one more thing") go to the model as usual. While a
 dispatched task is in flight the shortcut is off; if the model then calls
 `end_call`, "I'll text you the result." is spoken before its goodbye and the
@@ -694,8 +699,8 @@ owner's first name, at most 1,200 characters of profile facts (most recently
 learned first, cut only between whole facts; absent when there are none) and
 the first line of each of the last 3 call summaries. The fast layer gets it in
 its system prompt every turn; the native path prepends it to the first turn of
-each call. A new first name reaches the recognition `hints` after the next
-daemon restart.
+each call. A new first name reaches the greeting and the recognition `hints` on
+the next call, with no daemon restart.
 
 Facts are owner-visible and deletable from the owner's **private control
 chat** (same authorization as `phone number …`; other chats are refused, and
@@ -704,8 +709,9 @@ the text never reaches history or the model):
 - `profile` (or `profile show`) lists the stored facts, most recent first,
   within 1,800 bytes (one message on every surface; the rest is counted);
 - `profile forget <key>` deletes one; the next assembled prompt omits it.
-  Forgetting `first_name` also removes it from prompts at once; only the
-  recognition `hints` keep the startup copy until the next restart.
+  Forgetting `first_name` removes it from prompts, the greeting and the
+  recognition `hints` at once; the next call falls back to the configured name
+  when one is set.
 
 ## Terminal and recoverable relay conditions (#1549)
 
@@ -721,6 +727,14 @@ the connection did), `invalid_frame_limit`, `agent_end` (Jarvis said goodbye and
 sent `end` itself, #1557) and `silence` (nobody spoke through both check-ins,
 #1556). The TwiML is `<Connect>` followed
 by `<Hangup/>`, so any other exit would hang up on the owner.
+
+An owner hang-up reaches the relay as a socket close (or a session-terminating
+error frame) before Twilio's status callback records the call leaving the
+connected state, so a close alone does not settle the reason: it is rechecked
+against the stored call for up to one second, and only positive evidence
+(`stop_requested`, or a state other than connected) upgrades it to
+`owner_hangup`. A store that cannot be read, or that does not answer inside the
+window, keeps `peer_closed`; teardown is delayed by at most that second.
 
 Everything else is recoverable and the loop continues:
 
