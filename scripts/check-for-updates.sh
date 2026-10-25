@@ -144,11 +144,13 @@ apply_update() {
     # `grep -rn "target/release/" crates/*/src/*.rs` lists what is expected.
     # Once available, the deployed binary coordinates release builds with
     # gates/pruning too. Bootstrap installs still build directly.
-    local build_driver=()
+    # Keep this array nonempty: macOS Bash 3.2 treats expansion of an empty
+    # array as an unbound variable under set -u.
+    local build_driver=(cargo)
     if "$DAEMON_BINARY" disk build --help >/dev/null 2>&1; then
-      build_driver=("$DAEMON_BINARY" disk build --target-dir "$REPO_ROOT/target" --)
+      build_driver=("$DAEMON_BINARY" disk build --target-dir "$REPO_ROOT/target" -- cargo)
     fi
-    if ! "${build_driver[@]}" cargo build --release -p augmentagent-cli -p augmentagent-mcp-memory >> "$LOG" 2>&1; then
+    if ! "${build_driver[@]}" build --release -p augmentagent-cli -p augmentagent-mcp-memory >> "$LOG" 2>&1; then
       log "RUST BUILD FAILED — not restarting; daemon stays on previous binary"
       exit 1
     fi
