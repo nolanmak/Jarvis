@@ -40,9 +40,6 @@ jobs:
         if: runner.os == 'Linux'
         env:
           AUGMENTAGENT_GH_DISABLE: '1'
-          # Tiny snapshot fixtures need not reserve a production-sized 15 GiB
-          # on the runner. The allocation guard has explicit budget tests.
-          AUGMENTAGENT_GATE_MIN_FREE_GB: '0'
         run: |
           cargo test -p augmentagent-cli --bin augmentagent -- disk:: build_storage:: deploy_snapshot:: snapshot_refs:: storage_leases:: autopr_health::
           python3 scripts/tests/disk-storage-smoke.py target/debug/augmentagent

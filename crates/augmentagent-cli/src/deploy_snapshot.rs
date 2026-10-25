@@ -157,11 +157,19 @@ pub fn snapshot(
     git_sha: Option<&str>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<PathBuf> {
-    snapshot_budgeted(db, binary, root, label, git_sha, now, budget_bytes())
+    snapshot_budgeted(db, binary, root, label, git_sha, now, SnapshotLimits {
+        budget_bytes: budget_bytes(), reserve_gb: crate::disk::gate_min_free_gb(),
+    })
+}
+
+struct SnapshotLimits {
+    budget_bytes: u64,
+    reserve_gb: f64,
 }
 
 fn snapshot_budgeted(db: &Path, binary: Option<&Path>, root: &Path, label: &str,
-    git_sha: Option<&str>, now: chrono::DateTime<chrono::Utc>, budget: u64) -> Result<PathBuf> {
+    git_sha: Option<&str>, now: chrono::DateTime<chrono::Utc>, limits: SnapshotLimits) -> Result<PathBuf> {
+    let SnapshotLimits { budget_bytes: budget, reserve_gb } = limits;
     if !db.is_file() {
         bail!("no database at {}", db.display());
     }
@@ -179,7 +187,7 @@ fn snapshot_budgeted(db: &Path, binary: Option<&Path>, root: &Path, label: &str,
     std::fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
     // Plain and gzip copies coexist during compression. Include the binary,
     // compression overhead, and final free-space reserve before allocating.
-    ensure_snapshot_space(crate::disk::available_bytes(root), db_bytes, binary_bytes, crate::disk::gate_min_free_gb())
+    ensure_snapshot_space(crate::disk::available_bytes(root), db_bytes, binary_bytes, reserve_gb)
         .with_context(|| format!("snapshot filesystem under {}", root.display()))?;
     let name = format!("{}-{}", now.format("%Y%m%dT%H%M%SZ"), sanitize_label(label));
     let dir = root.join(&name);
@@ -554,6 +562,12 @@ mod tests {
         }
     }
 
+    // Snapshot correctness fixtures should not require 15 GiB of host space.
+    // Reserve behavior is tested separately with explicit limits.
+    fn fixture_limits() -> SnapshotLimits {
+        SnapshotLimits { budget_bytes: u64::MAX, reserve_gb: 0.0 }
+    }
+
     fn now() -> chrono::DateTime<chrono::Utc> {
         chrono::Utc::now()
     }
@@ -570,7 +584,7 @@ mod tests {
         std::fs::write(&bin, b"binary").unwrap();
 
         let root = tmp.path().join("snaps");
-        let dir = snapshot(&db, Some(&bin), &root, "Pre 1410", Some("abc123"), now()).unwrap();
+        let dir = snapshot_budgeted(&db, Some(&bin), &root, "Pre 1410", Some("abc123"), now(), fixture_limits()).unwrap();
         assert!(dir.file_name().unwrap().to_str().unwrap().ends_with("-pre-1410"));
         assert!(dir.join(DB_NAME).is_file());
         assert!(!dir.join("data.db.tmp").exists(), "the uncompressed copy is not kept");
@@ -597,7 +611,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("data.db");
         seeded_db(&db, 3);
-        let dir = snapshot(&db, None, &tmp.path().join("snaps"), "x", None, now()).unwrap();
+        let dir = snapshot_budgeted(&db, None, &tmp.path().join("snaps"), "x", None, now(), fixture_limits()).unwrap();
         assert!(!dir.join(BINARY_NAME).exists());
         let err = restore_db(&dir, &db, false).unwrap_err().to_string();
         assert!(err.contains("--force"), "{err}");
@@ -610,9 +624,9 @@ mod tests {
         let not_a_db = tmp.path().join("data.db");
         std::fs::write(&not_a_db, b"this is not sqlite, just bytes long enough to be read").unwrap();
         let root = tmp.path().join("snaps");
-        assert!(snapshot(&not_a_db, None, &root, "x", None, now()).is_err());
+        assert!(snapshot_budgeted(&not_a_db, None, &root, "x", None, now(), fixture_limits()).is_err());
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
-        assert!(snapshot(&tmp.path().join("missing.db"), None, &root, "x", None, now()).is_err());
+        assert!(snapshot_budgeted(&tmp.path().join("missing.db"), None, &root, "x", None, now(), fixture_limits()).is_err());
     }
 
     fn aged(path: &Path, hours: f64) {
@@ -732,7 +746,7 @@ mod tests {
     fn snapshot_budget_refuses_before_growing_protected_storage() {
         let t = tempfile::tempdir().unwrap(); let db = t.path().join("data.db"); seeded_db(&db, 3);
         let root = t.path().join("snaps");
-        let err = snapshot_budgeted(&db, None, &root, "budget", None, now(), 1).unwrap_err();
+        let err = snapshot_budgeted(&db, None, &root, "budget", None, now(), SnapshotLimits { budget_bytes: 1, reserve_gb: 0.0 }).unwrap_err();
         assert!(err.to_string().contains("budget"));
         assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
     }
@@ -789,6 +803,19 @@ mod tests {
         assert!(ensure_snapshot_space(Some(3 * M), M, 0, 0.0).is_ok());
         assert!(ensure_snapshot_space(Some(3 * M), M, 0, reserve_gb).is_err());
         assert!(ensure_snapshot_space(None, M, 0, 0.0).is_err());
+    }
+
+    #[test]
+    fn snapshot_creation_honors_its_reserve_before_allocating_a_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("data.db");
+        seeded_db(&db, 1);
+        let root = tmp.path().join("snapshots");
+        let limits = SnapshotLimits { budget_bytes: u64::MAX, reserve_gb: f64::MAX };
+        let error = snapshot_budgeted(&db, None, &root, "reserve", None, now(), limits).unwrap_err();
+        assert!(format!("{error:#}").contains("not enough room for a snapshot"));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        assert!(db.exists());
     }
 
 }
