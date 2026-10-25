@@ -90,7 +90,9 @@ export function createComposioAuthRouter(deps: Dependencies): Router {
             expires_at: started.expires_at,
             // Google redirects to the dashboard's registered callback, so the
             // consent must finish in a browser that can reach it.
-            note: "Open auth_url in a browser on the dashboard host (or one that reaches it). The mailbox is saved automatically when the callback lands; poll auth_status until connected.",
+            note: process.env.AUGMENTAGENT_PUBLIC_URL?.trim()
+              ? "Open auth_url on any device that can reach the dashboard's public URL (e.g. one on the same tailnet). The mailbox is saved automatically when the callback lands; poll auth_status until connected."
+              : "Open auth_url in a browser on the dashboard host (no public URL is configured, so Google redirects to localhost). The mailbox is saved automatically when the callback lands; poll auth_status until connected.",
           });
           return;
         }

@@ -122,7 +122,9 @@ async fn connect_start(open_browser: bool, timeout_secs: u64, json: bool) -> Res
     } else {
         println!("Open this URL and approve access ({transport}):\n\n  {auth_url}\n");
         if transport == "google" {
-            println!("The consent must finish in a browser that can reach the dashboard's callback (normally this machine).");
+            if let Some(note) = started["note"].as_str() {
+                println!("{note}");
+            }
         }
     }
     if open_browser && std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty()) {

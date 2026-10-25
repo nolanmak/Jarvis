@@ -997,8 +997,14 @@ function googleOauthConfigured(): boolean {
 }
 
 function googleRedirectUri(): string {
-  const port = process.env.DASHBOARD_PORT || "3000";
   // Must match a redirect URI registered on the OAuth client byte for byte.
+  // With AUGMENTAGENT_PUBLIC_URL set (an https origin that reaches this
+  // dashboard — a Tailscale Serve hostname, a reverse proxy) the consent can
+  // be approved from any device that reaches that origin; otherwise Google
+  // sends the browser back to localhost, i.e. the dashboard host itself.
+  const publicUrl = process.env.AUGMENTAGENT_PUBLIC_URL?.trim().replace(/\/+$/, "");
+  if (publicUrl) return `${publicUrl}/oauth/google/callback`;
+  const port = process.env.DASHBOARD_PORT || "3000";
   return `http://localhost:${port}/oauth/google/callback`;
 }
 

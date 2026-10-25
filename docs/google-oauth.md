@@ -73,10 +73,23 @@ The same attempt flow is reachable from the terminal and from the agent:
   and the mailbox is saved when the callback lands. Asking the agent to check
   reports connected once it has.
 
-Either way the consent has to finish in a browser that can reach the
-dashboard's registered callback (normally the dashboard host itself). To
-approve from a phone, register a public hostname as an additional redirect URI
-on the OAuth client and open the dashboard through it.
+Either way the consent finishes by Google redirecting the browser to the
+dashboard's callback. Out of the box that is `http://localhost:<port>/…`, so
+the approve click has to happen on the dashboard host. To approve from a
+phone or another computer, give the dashboard an https origin those devices
+can reach and tell both sides about it:
+
+1. Expose the dashboard, for example with Tailscale Serve on the host:
+   `tailscale serve --bg --https=443 http://127.0.0.1:<DASHBOARD_PORT>`
+   (your tailnet's HTTPS certificates must be enabled). Any reverse proxy
+   with a valid certificate works the same way.
+2. Add `https://<that hostname>/oauth/google/callback` as a second authorized
+   redirect URI on the OAuth client in Google Cloud. Google rejects any URI
+   that is not registered byte for byte.
+3. Set `AUGMENTAGENT_PUBLIC_URL=https://<that hostname>` in `.env` and
+   restart the dashboard. New consents now redirect there; the callback is
+   reachable without a dashboard login, and the saved mailbox shows up for
+   the CLI, the agent and Settings alike.
 
 ## CLI
 
