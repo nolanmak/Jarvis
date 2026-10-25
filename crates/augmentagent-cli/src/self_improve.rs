@@ -4286,6 +4286,8 @@ fn fix_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
             "Write".into(),
             "Edit".into(),
             "Bash(cargo *)".into(),
+            "Bash(./scripts/cargo-managed.sh *)".into(),
+            "Bash(scripts/cargo-managed.sh *)".into(),
             "Bash(npm *)".into(),
             "Bash(git diff*)".into(),
             "Bash(git status*)".into(),
