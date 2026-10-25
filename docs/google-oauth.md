@@ -61,9 +61,27 @@ to allow the app once (Admin console → Security → API controls).
 - **Remove** on a Google mailbox revokes the grant at Google and deletes the
   stored token.
 
+## Connecting without the Settings page
+
+The same attempt flow is reachable from the terminal and from the agent:
+
+- **CLI:** `augmentagent google connect-start` asks the running dashboard for
+  a consent URL, prints it (and opens it when a display is available), then
+  waits until the browser callback has saved the mailbox.
+- **Discord / chat:** ask the agent to connect a Gmail account. It calls the
+  owner-only auth tool, which returns the Google consent URL; open it, approve,
+  and the mailbox is saved when the callback lands. Asking the agent to check
+  reports connected once it has.
+
+Either way the consent has to finish in a browser that can reach the
+dashboard's registered callback (normally the dashboard host itself). To
+approve from a phone, register a public hostname as an additional redirect URI
+on the OAuth client and open the dashboard through it.
+
 ## CLI
 
 ```
+augmentagent google connect-start       # start a connect from the terminal
 augmentagent google accounts            # Google-connected mailboxes + grant state
 augmentagent google check --account me@example.com
 augmentagent google disconnect --account me@example.com

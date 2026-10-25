@@ -62,11 +62,11 @@ pub fn configure(
         opts.allowed_tools
             .push(format!("mcp__composio_auth__{tool}"));
     }
-    opts.system_prompt.push_str("\nComposio authentication: when the owner asks to connect Gmail, Google Calendar, Google Drive, or Slack, call mcp__composio_auth__start_auth. Return auth_url verbatim and ask the owner to finish consent and tell you when done. Keep attempt_id for follow-up. Calendar selects the only Gmail entity automatically; if ambiguous, ask which account using the returned entity_id choices. After consent, call auth_status with attempt_id; if ACTIVE, call complete_auth with attempt_id to save the integration. Only claim it is connected when complete_auth returns connected=true. Status checks are live; do not repeat start_auth to check progress. Consent works on another device without a local callback.\n");
+    opts.system_prompt.push_str("\nComposio authentication: when the owner asks to connect Gmail, Google Calendar, Google Drive, or Slack, call mcp__composio_auth__start_auth. Return auth_url verbatim and ask the owner to finish consent and tell you when done. Keep attempt_id for follow-up. Calendar selects the only Gmail entity automatically; if ambiguous, ask which account using the returned entity_id choices. After consent, call auth_status with attempt_id; if ACTIVE, call complete_auth with attempt_id to save the integration. Only claim it is connected when complete_auth returns connected=true. Status checks are live; do not repeat start_auth to check progress. When the response carries transport=google (Gmail on the operator's own Google OAuth client) the consent must finish in a browser that can reach the dashboard's callback (normally the dashboard host itself), the mailbox is saved automatically when it does, and complete_auth simply reports connected; relay the response's note. Otherwise consent works on another device without a local callback.\n");
     Ok(())
 }
 
-fn dashboard_port() -> u16 {
+pub(crate) fn dashboard_port() -> u16 {
     std::env::var("DASHBOARD_PORT")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -76,7 +76,7 @@ fn dashboard_port() -> u16 {
 // The dashboard may generate its API key on first run and persist it instead
 // of receiving AUGMENTAGENT_API_KEY. Read that local daemon secret only in the
 // MCP child; it never enters a model argument or a tool response.
-fn dashboard_api_key() -> Result<String> {
+pub(crate) fn dashboard_api_key() -> Result<String> {
     if let Ok(key) = std::env::var("AUGMENTAGENT_API_KEY") {
         if !key.is_empty() {
             return Ok(key);
@@ -130,7 +130,7 @@ fn validate_args(operation: &str, args: &Value) -> Result<()> {
     Ok(())
 }
 
-async fn call_dashboard(operation: &str, args: &Value, port: u16, key: &str) -> Result<Value> {
+pub(crate) async fn call_dashboard(operation: &str, args: &Value, port: u16, key: &str) -> Result<Value> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -178,7 +178,7 @@ async fn dispatch(req: &Value) -> Value {
         "tools/list" => {
             let attempt_schema = json!({"type":"object","properties":{"attempt_id":{"type":"string","description":"The attempt_id returned by start_auth."}},"required":["attempt_id"],"additionalProperties":false});
             json!({"tools":[
-                {"name":"start_auth","description":"Create hosted consent for Gmail, Calendar, Drive or Slack; return auth_url to the owner. Consent alone does not save the integration.","inputSchema":{"type":"object","properties":{"provider":{"type":"string","enum":["gmail","calendar","googledrive","slack"]},"entity_id":{"type":"string","description":"Calendar only: select an existing Gmail entity when ambiguous."}},"required":["provider"],"additionalProperties":false}},
+                {"name":"start_auth","description":"Create consent for Gmail, Calendar, Drive or Slack; return auth_url to the owner. Gmail uses the operator's own Google OAuth client when configured (transport=google: saved automatically once the browser callback lands); otherwise Composio hosted consent, where consent alone does not save the integration.","inputSchema":{"type":"object","properties":{"provider":{"type":"string","enum":["gmail","calendar","googledrive","slack"]},"entity_id":{"type":"string","description":"Calendar only: select an existing Gmail entity when ambiguous."}},"required":["provider"],"additionalProperties":false}},
                 {"name":"auth_status","description":"Read current consent status for an attempt. If ACTIVE, call complete_auth to save it.","inputSchema":attempt_schema},
                 {"name":"complete_auth","description":"Verify active consent and save the integration. Safe to retry; never completes inactive consent.","inputSchema":attempt_schema}
             ]})

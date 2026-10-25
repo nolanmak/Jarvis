@@ -27,6 +27,20 @@ pub enum GoogleOp {
         #[arg(long)]
         state: String,
     },
+    /// Start a connect from the terminal: asks the running dashboard for a
+    /// consent URL, prints it (and opens it when a display is available),
+    /// then waits until the browser callback saves the mailbox. Uses the
+    /// same attempt flow the Discord agent uses.
+    ConnectStart {
+        /// Open the consent URL with xdg-open when $DISPLAY is set.
+        #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        open_browser: bool,
+        /// How long to wait for the consent to finish.
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        json: bool,
+    },
     /// Finish a consent. Reads the authorization code from STDIN (never
     /// argv), exchanges it, stores the refresh token under the mailbox
     /// address and registers the mailbox for polling. Any other active row
@@ -70,9 +84,91 @@ pub async fn run(store: Arc<Store>, op: GoogleOp) -> Result<()> {
             Ok(())
         }
         GoogleOp::Connect { redirect_uri, json } => connect(store, &redirect_uri, json).await,
+        GoogleOp::ConnectStart {
+            open_browser,
+            timeout_secs,
+            json,
+        } => connect_start(open_browser, timeout_secs, json).await,
         GoogleOp::Disconnect { account } => disconnect(store, &account).await,
         GoogleOp::Accounts { json } => accounts(store, json),
         GoogleOp::Check { account } => check(&account).await,
+    }
+}
+
+/// Drive one connect through the dashboard's attempt API: start → print /
+/// open the consent URL → poll status until the callback saved the mailbox.
+/// Works for whichever transport the dashboard picks (Google direct when the
+/// operator's client is configured, Composio otherwise).
+async fn connect_start(open_browser: bool, timeout_secs: u64, json: bool) -> Result<()> {
+    use crate::composio_auth_tool::{call_dashboard, dashboard_api_key, dashboard_port};
+
+    let port = dashboard_port();
+    let key = dashboard_api_key()?;
+    let started = call_dashboard("start", &serde_json::json!({"provider": "gmail"}), port, &key)
+        .await
+        .context("start a Gmail connect through the dashboard (is it running?)")?;
+    let attempt_id = started["attempt_id"]
+        .as_str()
+        .context("dashboard returned no attempt_id")?
+        .to_string();
+    let auth_url = started["auth_url"]
+        .as_str()
+        .context("dashboard returned no auth_url")?
+        .to_string();
+    let transport = started["transport"].as_str().unwrap_or("composio").to_string();
+
+    if json {
+        println!("{}", serde_json::json!({"event": "started", "attempt_id": attempt_id, "transport": transport, "auth_url": auth_url}));
+    } else {
+        println!("Open this URL and approve access ({transport}):\n\n  {auth_url}\n");
+        if transport == "google" {
+            println!("The consent must finish in a browser that can reach the dashboard's callback (normally this machine).");
+        }
+    }
+    if open_browser && std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty()) {
+        let _ = tokio::process::Command::new("xdg-open")
+            .arg(&auth_url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let status = call_dashboard("status", &serde_json::json!({"attempt_id": attempt_id}), port, &key).await?;
+        let state = status["status"].as_str().unwrap_or("").to_string();
+        let connected = status["connected"].as_bool().unwrap_or(false);
+        if connected {
+            if json {
+                println!("{status}");
+            } else {
+                println!(
+                    "connected {} ({})",
+                    status["email"].as_str().unwrap_or("mailbox"),
+                    status["entity_id"].as_str().unwrap_or("-")
+                );
+            }
+            return Ok(());
+        }
+        if state == "ACTIVE" && transport != "google" {
+            // Composio: consent is done but the integration is saved only by
+            // an explicit complete.
+            let done = call_dashboard("complete", &serde_json::json!({"attempt_id": attempt_id}), port, &key).await?;
+            if done["connected"].as_bool().unwrap_or(false) {
+                println!("{}", if json { done.to_string() } else { "connected".to_string() });
+                return Ok(());
+            }
+        }
+        if state == "FAILED" {
+            anyhow::bail!(
+                "connect failed: {}",
+                status["error"].as_str().unwrap_or("consent was not granted")
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("timed out after {timeout_secs}s waiting for the consent to finish (attempt {attempt_id})");
+        }
     }
 }
 
