@@ -437,11 +437,37 @@ async fn summary_request_exposes_no_phone_dispatch_or_messaging_tools() {
     assert!(request.instructions.contains("JSON"));
 }
 
-// #1545 AC5 integration: at startup, the stored first-name fact is wired into
-// `PhoneConfig::with_owner_first_name`, so the next call's ConversationRelay
-// recognition hints carry it, reduced to name characters.
+/// Dials one more call, returns the TwiML of its signed start callback and
+/// leaves the call completed so the next dial is allowed.
+async fn start_twiml(f: &Fixture, request: &str) -> String {
+    f.clock.0.fetch_add(3_600_000, Ordering::SeqCst);
+    let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
+    let call = f
+        .service
+        .tool(&grant, "call_owner", json!({ "request_id": request }))
+        .await
+        .unwrap();
+    let id = call["id"].as_str().unwrap().to_string();
+    let auth = WebhookAuth::new("AC-test", "secret");
+    let fields = vec![
+        ("AccountSid".to_string(), "AC-test".to_string()),
+        ("CallSid".into(), sid(f, &id)),
+    ];
+    let sig = signed(
+        "secret",
+        &format!("https://phone.example.test/phone/start/{id}"),
+        &fields,
+    );
+    let twiml = f.service.start_callback(&auth, &id, &fields, &sig).unwrap();
+    status_completed(f, &id);
+    twiml
+}
+
+// #1545 AC5 / #1552 AC6 integration (#1580): the stored first-name fact reaches
+// the next call's greeting and recognition hints, reduced to name characters,
+// without a daemon restart — and a rebuilt configuration behaves the same.
 #[tokio::test]
-async fn stored_first_name_reaches_next_call_relay_hints_after_startup() {
+async fn stored_first_name_reaches_the_next_call_greeting_and_hints_without_a_restart() {
     let f = fixture();
     let id = relayed_call(&f, "r1").await;
     relay_ended(&f, &id);
@@ -452,6 +478,10 @@ async fn stored_first_name_reaches_next_call_relay_hints_after_startup() {
         json!({"summary":"Call.","facts":[{"key":"first_name","value":"Zorblat\",<x>","confidence":1.0}]}),
     );
     assert_eq!(f.service.run_call_summaries(&agent).await.unwrap(), 1);
+    // The running daemon, with no restart in between.
+    let live = start_twiml(&f, "live").await;
+    assert!(live.contains("hints=\"Zorblatx, "), "{live}");
+    assert!(live.contains("welcomeGreeting=\"Hi Zorblatx, "), "{live}");
     f.clock.0.fetch_add(3_600_000, Ordering::SeqCst);
     let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
     let next = f
@@ -491,10 +521,21 @@ async fn stored_first_name_reaches_next_call_relay_hints_after_startup() {
         .start_callback(&configured.auth, &next, &fields, &sig)
         .unwrap();
     assert!(twiml.contains("hints=\"Zorblatx, "), "{twiml}");
+    // Forgetting the fact takes the name out of the next call's TwiML too.
+    status_completed(&f, &next);
+    augmentagent_phone::commands::execute(&f.service, &f.owner, &f.conversation, "e1", "profile forget first_name")
+        .await
+        .unwrap();
+    let forgotten = start_twiml(&f, "forgotten").await;
+    assert!(!forgotten.contains("Zorblatx"), "{forgotten}");
+    assert!(
+        forgotten.contains("welcomeGreeting=\"Hi, I&apos;m here."),
+        "{forgotten}"
+    );
 }
 
 // Review follow-up: a forgotten first name is gone from the next context even
-// though the startup hint copy is kept until restart.
+// though a configured name is kept.
 #[tokio::test]
 async fn forgotten_first_name_leaves_the_context_without_a_restart() {
     use augmentagent_phone::commands::execute;
@@ -518,8 +559,7 @@ async fn forgotten_first_name_leaves_the_context_without_a_restart() {
     .with_owner_first_name(Some("Zorblat".into()));
     let restarted = PhoneService::new(f.store.clone(), Arc::new(FakeProvider::default()), f.clock.clone(), config);
     assert!(restarted.owner_context("canonical-owner").unwrap().unwrap().contains("Zorblat"));
-    let reply = execute(&restarted, &f.owner, &f.conversation, "e1", "profile forget first_name").await.unwrap();
-    assert!(reply.contains("restart"), "{reply}");
+    execute(&restarted, &f.owner, &f.conversation, "e1", "profile forget first_name").await.unwrap();
     let context = restarted.owner_context("canonical-owner").unwrap().unwrap();
     assert!(!context.contains("Zorblat") && !context.contains("first name"), "{context}");
 }

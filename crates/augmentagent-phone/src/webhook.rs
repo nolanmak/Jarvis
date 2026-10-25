@@ -2,7 +2,7 @@
 //! with no trimming, and reject non-form content types and oversized requests.
 use crate::{
     twilio::validate_signature,
-    voice::{hints, TtsProvider},
+    voice::{hints, spoken_name, TtsProvider},
     xml, Error, PhoneService,
 };
 use augmentagent_store::phone::{CallState, PhoneCall, PhoneError, ProviderUsage};
@@ -49,6 +49,8 @@ fn field<'a>(fields: &'a [(String, String)], name: &str) -> Result<&'a str, Erro
     Ok(value)
 }
 const HANGUP: &str = "<Response><Hangup/></Response>";
+/// Spoken first on every call, after the owner's name when one is known (#1552).
+const GREETING: &str = "I'm here. What can I help you with?";
 impl PhoneService {
     pub fn relay_ended_callback(
         &self,
@@ -215,7 +217,7 @@ impl PhoneService {
         // The authenticated chat request already authorizes this owner call.
         // The signed answer callback connects it; no second DTMF consent step.
         match self.store.phone_accept(id, &sid, self.clock.now_ms()) {
-            Ok(_) => Ok(self.relay_twiml(id)),
+            Ok(_) => Ok(self.relay_twiml(id, self.relay_owner_name(&call.owner).as_deref())),
             Err(PhoneError::AcceptanceExpired | PhoneError::Conflict) => Ok(HANGUP.into()),
             Err(error) => Err(error.into()),
         }
@@ -245,12 +247,20 @@ impl PhoneService {
             Err(PhoneError::AcceptanceExpired | PhoneError::Conflict) => return Ok(HANGUP.into()),
             Err(e) => return Err(e.into()),
         }
-        Ok(self.relay_twiml(id))
+        Ok(self.relay_twiml(id, self.relay_owner_name(&call.owner).as_deref()))
     }
-    fn relay_twiml(&self, id: &str) -> String {
+    /// The owner's first name for this call: the stored profile fact (#1552),
+    /// read per call so a name learned since startup needs no restart, else the
+    /// configured startup value.
+    fn relay_owner_name(&self, owner: &str) -> Option<String> {
+        self.owner_first_name(owner)
+            .or_else(|| self.config.owner_first_name.clone())
+    }
+    fn relay_twiml(&self, id: &str, owner_first_name: Option<&str>) -> String {
         // Every attribute value here is startup configuration validated to an
-        // attribute-safe alphabet, or a constant. Nothing from the call, the
-        // provider callback or the agent is read.
+        // attribute-safe alphabet, a constant, or the caller's owner name
+        // reduced to name characters. Nothing from the provider callback or the
+        // agent is read.
         let ws = self.config.public_base.replacen("https://", "wss://", 1);
         // #1551: tokens-played/speaker events measure what the owner hears.
         let debug = if self.config.debug_events {
@@ -264,20 +274,26 @@ impl PhoneService {
         } else {
             "false"
         };
+        // #1552: the greeting names the owner when a profile fact provides one.
+        let greeting = match spoken_name(owner_first_name) {
+            Some(name) => format!("Hi {name}, {GREETING}"),
+            None => format!("Hi, {GREETING}"),
+        };
         let voice = &self.config.voice;
         let normalization = match voice.tts_provider() {
             TtsProvider::ElevenLabs => " elevenlabsTextNormalization=\"on\"",
             TtsProvider::Amazon | TtsProvider::Google => "",
         };
         format!(
-            "<Response><Connect action=\"{}/phone/relay-ended/{id}\" method=\"POST\"><ConversationRelay url=\"{}/phone/relay/{id}\" transcriptionProvider=\"{}\" speechModel=\"{}\" ttsProvider=\"{}\" voice=\"{}\" language=\"en-US\"{normalization} hints=\"{}\" interruptible=\"any\" reportInputDuringAgentSpeech=\"any\" partialPrompts=\"{partial}\" welcomeGreeting=\"Hi, I'm here. What can I help you with?\"{debug} /></Connect><Hangup/></Response>",
+            "<Response><Connect action=\"{}/phone/relay-ended/{id}\" method=\"POST\"><ConversationRelay url=\"{}/phone/relay/{id}\" transcriptionProvider=\"{}\" speechModel=\"{}\" ttsProvider=\"{}\" voice=\"{}\" language=\"en-US\"{normalization} hints=\"{}\" interruptible=\"any\" reportInputDuringAgentSpeech=\"any\" partialPrompts=\"{partial}\" welcomeGreeting=\"{}\"{debug} /></Connect><Hangup/></Response>",
             xml(&self.config.public_base),
             xml(&ws),
             voice.stt_provider().as_str(),
             xml(voice.stt_model()),
             voice.tts_provider().as_str(),
             xml(voice.tts_voice()),
-            xml(&hints(self.config.owner_first_name.as_deref())),
+            xml(&hints(owner_first_name)),
+            xml(&greeting),
         )
     }
 }

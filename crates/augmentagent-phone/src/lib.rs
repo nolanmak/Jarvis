@@ -196,8 +196,8 @@ impl PhoneConfig {
         self.voice = voice;
         self
     }
-    /// Owner first name, used only as a recognition hint. `config::Settings::build`
-    /// supplies the stored `first_name` profile fact (#1552) at startup.
+    /// Configured owner first name for the greeting and the recognition hints,
+    /// used only when no `first_name` profile fact is stored (#1552).
     pub fn with_owner_first_name(mut self, first_name: Option<String>) -> Self {
         self.owner_first_name = first_name;
         self

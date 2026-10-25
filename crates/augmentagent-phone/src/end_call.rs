@@ -48,12 +48,13 @@ pub const HANDOFF_LINE: &str = "I'll text you the result.";
 pub const DEFAULT_GOODBYE: &str = "Okay, talk soon. Bye!";
 /// A final prompt that is exactly one of these, after [`normalize`], ends the
 /// call without a model round-trip (unless a dispatched task is in flight).
-pub const GOODBYE_PHRASES: [&str; 8] = [
+pub const GOODBYE_PHRASES: [&str; 9] = [
     "bye",
     "goodbye",
     "bye bye",
     "talk later",
     "that's all",
+    "that's all thanks",
     "that's it thanks",
     "hang up",
     "end the call",
@@ -135,6 +136,10 @@ mod tests {
         assert_eq!(normalize("Bye-bye."), "bye bye");
         assert!(is_goodbye_phrase("End the call."));
         assert!(!is_goodbye_phrase("end the call later"));
+        // #1580: the live gate's sign-off phrase ends the call without the
+        // model having to choose `end_call`.
+        assert!(is_goodbye_phrase("That's all, thanks."));
+        assert!(is_goodbye_phrase("that’s all thanks"));
     }
     #[test]
     fn handoff_round_trips_and_rejects_everything_else() {

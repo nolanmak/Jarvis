@@ -1971,16 +1971,17 @@ async fn ac02_each_provider_variable_changes_only_its_own_attribute() {
 
 #[test]
 fn ac04_relay_twiml_reads_only_startup_configuration() {
-    // Source-level guard: the TwiML builder may read `self.config` and the
-    // call ID only. Chat text, provider fields, tool arguments and model output
-    // never reach it, so no attribute can be influenced by them.
+    // Source-level guard: the TwiML builder may read `self.config`, the call ID
+    // and the owner name its caller sanitizes (#1552) only. Chat text, provider
+    // fields, tool arguments and model output never reach it, so no attribute
+    // can be influenced by them.
     let source = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/src/webhook.rs"
     ))
     .unwrap();
     let start = source
-        .find("fn relay_twiml(&self, id: &str) -> String {")
+        .find("fn relay_twiml(&self, id: &str, owner_first_name: Option<&str>) -> String {")
         .expect("relay_twiml signature unchanged");
     let body = &source[start..];
     let end = body.find("\n    }\n").expect("end of relay_twiml") + 7;
@@ -2011,9 +2012,15 @@ fn ac04_relay_twiml_reads_only_startup_configuration() {
         cursor = &cursor[i + 5..];
     }
     assert!(reads >= 4, "expected provider reads through self.config");
-    // The only other binding read is the call identifier parameter.
-    let other_user = source.contains("fn relay_twiml(&self, id: &str)");
-    assert!(other_user);
+    // Both dynamic values reach the attributes through the name whitelist and
+    // XML escaping, and every caller sanitizes the stored name it passes in.
+    assert!(body.contains("spoken_name(owner_first_name)") && body.contains("xml(&greeting)"));
+    assert!(body.contains("xml(&hints(owner_first_name))"));
+    assert_eq!(
+        source.matches("self.relay_twiml(id, self.relay_owner_name(").count(),
+        2,
+        "every caller supplies the owner name read at call time"
+    );
 }
 
 #[tokio::test]
@@ -2073,6 +2080,31 @@ async fn ac05_hints_include_stored_first_name_only_when_present_and_are_escaped_
     );
     assert!(augmentagent_phone::voice::hints(Some(&"N".repeat(64))).chars().count() <= 500);
     const { assert!(augmentagent_phone::voice::HINTS_MAX_CHARS == 500) };
+}
+
+// #1552 AC6 (#1580): the welcome greeting names the owner when a name is known,
+// through the same whitelist and escaping as the hints, and is the fixed line
+// otherwise.
+#[tokio::test]
+async fn ac06_welcome_greeting_names_the_owner_when_one_is_known() {
+    const FIXED: &str = "Hi, I'm here. What can I help you with?";
+    let voice = augmentagent_phone::voice::VoiceConfig::default();
+    for (stored, expected) in [
+        (None, FIXED.to_owned()),
+        (Some("   "), FIXED.to_owned()),
+        (Some("Zorblat"), "Hi Zorblat, I'm here. What can I help you with?".to_owned()),
+        (Some("D'Arcy"), "Hi D'Arcy, I'm here. What can I help you with?".to_owned()),
+        (
+            Some("Zorblat\" welcomeGreeting=\"pwned"),
+            "Hi Zorblat welcomeGreetingpwned, I'm here. What can I help you with?".to_owned(),
+        ),
+    ] {
+        let f = fixture_with_voice("discord", true, true, false, voice.clone(), stored);
+        let (_, reply) = start_owner_call(&f).await;
+        let relay = relay_attributes(&reply);
+        assert_eq!(relay["welcomeGreeting"], expected, "{stored:?}");
+        assert!(!reply.contains("welcomeGreeting=\"pwned"), "{reply}");
+    }
 }
 
 struct SlowPhoneAgent {
@@ -3509,6 +3541,89 @@ async fn ac03_ten_consecutive_invalid_frames_send_end_then_close_and_a_valid_fra
             .stop_requested
     );
     relay.server.abort();
+}
+
+// #1549: the provider closes the relay socket before the status callback that
+// records the hang-up, so a close alone must not settle the end reason. Epic
+// #1554 gate G1 expects `owner_hangup` on the ending log line.
+#[tokio::test]
+async fn a_close_followed_by_the_completed_status_is_recorded_as_owner_hangup() {
+    use augmentagent_store::phone::CallState;
+    use futures::SinkExt;
+    let captured = capture::install();
+    // #1580: a hang-up can also surface as the provider's own terminal error
+    // frame, which ends the session as `peer_closed` too, so that path takes
+    // the same recheck.
+    let terminal_error = tokio_tungstenite::tungstenite::Message::Text(
+        json!({"type":"error","code":64104,"description":"session ended"})
+            .to_string()
+            .into(),
+    );
+    for (how, completed, expected) in [
+        ("close", true, "owner_hangup"),
+        ("close", false, "peer_closed"),
+        ("provider_terminated", true, "owner_hangup"),
+    ] {
+        let mut relay = connect_relay(Arc::new(ScriptedAgent)).await;
+        relay.socket.send(prompt("hello")).await.unwrap();
+        read_until_answer(&mut relay.socket, "Answer to: hello", "hangup").await;
+        if how == "close" {
+            relay.socket.close(None).await.unwrap();
+        } else {
+            relay.socket.send(terminal_error.clone()).await.unwrap();
+        }
+        if completed {
+            // The status callback lands after the close, as it does live: the
+            // relay loop has already left its frame loop by now.
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            relay
+                .store
+                .phone_provider_event(&relay.id, "CA-test", CallState::Completed, 200)
+                .unwrap();
+        }
+        let reason = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let events = captured
+                    .events
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                let ending = events.iter().rev().find(|(_, fields)| {
+                    fields.get("message").is_some_and(|m| m.contains("phone relay ending"))
+                        && fields.get("call_id").is_some_and(|c| c.contains(&relay.id))
+                });
+                if let Some(reason) = ending.and_then(|(_, fields)| fields.get("reason").cloned()) {
+                    return reason;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("ending log line");
+        assert!(reason.contains(expected), "{how}/completed={completed}: {reason}");
+        relay.server.abort();
+    }
+}
+
+// #1580: the recheck's store read is synchronous, so its one-second bound only
+// holds if the read runs off the runtime under that same deadline. The retry
+// must live inside that one blocking task, too: a per-step spawn would leave a
+// stalled store with an abandoned blocking read per step, starving the shared
+// pool. Source-level guard — the pool pressure itself is not observable from a
+// test.
+#[test]
+fn the_peer_close_recheck_bounds_its_store_read() {
+    let source =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ingress.rs")).unwrap();
+    let start = source
+        .find("async fn reclassify_peer_close(")
+        .expect("peer-close recheck present");
+    let body = &source[start..];
+    let body = &body[..body.find("\n}\n").expect("end of recheck")];
+    assert_eq!(body.matches("spawn_blocking").count(), 1, "{body}");
+    assert!(body.contains("tokio::time::timeout("), "{body}");
+    let spawn = body.find("spawn_blocking").unwrap();
+    assert!(body[spawn..].contains("loop {"), "retry inside the blocking task: {body}");
 }
 
 #[test]

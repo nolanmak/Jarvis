@@ -142,11 +142,11 @@ impl VoiceConfig {
         &self.tts_voice
     }
 }
-/// Comma-separated recognition hints: the owner's first name (when a stored
-/// profile provides one) followed by the fixed product nouns. The name is
-/// reduced to letters, digits, spaces, apostrophes and hyphens so it cannot
-/// smuggle separators; the caller XML-escapes the result for the attribute.
-pub fn hints(owner_first_name: Option<&str>) -> String {
+/// The owner's first name as it may appear in a TwiML attribute: letters,
+/// digits, spaces, apostrophes and hyphens only, so it cannot smuggle
+/// separators or markup, and short enough that no attribute grows unexpectedly.
+/// The caller XML-escapes the result. `None` when nothing usable is left.
+pub fn spoken_name(owner_first_name: Option<&str>) -> Option<String> {
     let name: String = owner_first_name
         .unwrap_or_default()
         .chars()
@@ -154,9 +154,18 @@ pub fn hints(owner_first_name: Option<&str>) -> String {
         .collect::<String>()
         .trim()
         .to_owned();
+    (!name.is_empty() && name.chars().count() <= 64).then_some(name)
+}
+
+/// Comma-separated recognition hints: the owner's first name (when a stored
+/// profile provides one) followed by the fixed product nouns. The name is
+/// reduced to letters, digits, spaces, apostrophes and hyphens so it cannot
+/// smuggle separators; the caller XML-escapes the result for the attribute.
+pub fn hints(owner_first_name: Option<&str>) -> String {
+    let name = spoken_name(owner_first_name);
     let mut parts: Vec<&str> = Vec::with_capacity(HINT_NOUNS.len() + 1);
-    if !name.is_empty() && name.chars().count() <= 64 {
-        parts.push(&name);
+    if let Some(name) = &name {
+        parts.push(name);
     }
     parts.extend(HINT_NOUNS);
     let joined = parts.join(", ");

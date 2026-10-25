@@ -117,12 +117,7 @@ fn profile_reply(
         }
         ProfileCommand::Forget(key) => {
             if service.store.phone_forget_profile_fact(&grant.owner_id, &key)? {
-                let hint = if key == augmentagent_store::phone::PHONE_PROFILE_FIRST_NAME {
-                    " The speech-recognition hint keeps the name until the next daemon restart."
-                } else {
-                    ""
-                };
-                Ok(format!("Forgot profile fact `{key}`. Future call prompts will not include it.{hint}"))
+                Ok(format!("Forgot profile fact `{key}`. Future call prompts will not include it."))
             } else {
                 Ok(format!("No profile fact named `{key}`. Send `profile` to list them."))
             }

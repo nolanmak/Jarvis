@@ -1203,6 +1203,16 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
         }
     };
     let end_reason = if silence_ending && end_reason == EndReason::AgentEnd { EndReason::Silence } else { end_reason };
+    // #1549: an owner hang-up reaches us as a socket close first; the status
+    // callback that leaves the connected state follows. Every close goes
+    // through the recheck, including a provider-reported session end, because
+    // the provider's own error frame is how some hang-ups arrive. Reclassify
+    // before the teardown below requests a stop of its own.
+    let end_reason = if end_reason == EndReason::PeerClosed {
+        reclassify_peer_close(&state.service, &call).await
+    } else {
+        end_reason
+    };
     tracing::info!(call_id = %call.id, reason = end_reason.as_str(), "phone relay ending");
     // #1556: persist a runtime-chosen end before anything else can fail.
     let ended_by_silence = end_reason == EndReason::Silence
@@ -1677,6 +1687,43 @@ async fn speak_silence_action(
             let _ = session.take_played_final();
             Ok(session.end_for_silence())
         }
+    }
+}
+
+/// How long a socket close waits for the provider's status callback to record
+/// the call leaving the connected state (#1549). Teardown is delayed by at most
+/// this, and only when nothing else explains the close.
+const PEER_CLOSE_RECHECK: Duration = Duration::from_millis(1_000);
+const PEER_CLOSE_RECHECK_STEP: Duration = Duration::from_millis(50);
+
+/// Whether a provider socket close was really the owner hanging up (#1549).
+/// Twilio closes the relay socket before its status callback lands, so the
+/// stored state is still `Connected` at the moment of the close. Only positive
+/// evidence within [`PEER_CLOSE_RECHECK`] upgrades the reason; a store that
+/// cannot be read, or cannot answer inside the window, keeps the close as it
+/// was classified. The read is synchronous, so the whole bounded retry runs in
+/// a single blocking task: a stalled store must not hold teardown open, and a
+/// close must not leave one abandoned blocking read per step queued in the
+/// shared pool. At most one read per close is ever abandoned.
+async fn reclassify_peer_close(service: &PhoneService, call: &PhoneCall) -> EndReason {
+    let (store, id) = (service.store.clone(), call.id.clone());
+    let recheck = tokio::task::spawn_blocking(move || {
+        let deadline = std::time::Instant::now() + PEER_CLOSE_RECHECK;
+        loop {
+            if let Ok(current) = store.phone_provider_call(&id) {
+                if current.stop_requested || current.state != CallState::Connected {
+                    return true;
+                }
+            }
+            if std::time::Instant::now() + PEER_CLOSE_RECHECK_STEP > deadline {
+                return false;
+            }
+            std::thread::sleep(PEER_CLOSE_RECHECK_STEP);
+        }
+    });
+    match tokio::time::timeout(PEER_CLOSE_RECHECK + PEER_CLOSE_RECHECK_STEP, recheck).await {
+        Ok(Ok(true)) => EndReason::OwnerHangup,
+        _ => EndReason::PeerClosed,
     }
 }
 
