@@ -24,6 +24,15 @@ dev/test debuginfo to zero and strips provider secrets
 from build subprocesses using the gate policy. It also finds the deployed
 binary from the shared Git directory when invoked in a worktree.
 
+On Linux, nested wrapper calls inside a managed command or auto-PR builder
+reuse the ancestor's lease for the same target. The CLI verifies the live
+ancestor's held state and physical target locks; an environment flag alone
+cannot bypass admission. Nested commands preserve live scratch and stop if
+that protection disappears. A different target requires a separate admission
+after the enclosing build finishes. On other platforms, use Cargo directly
+with the inherited target inside an already managed command; native evidence
+for nested lease reuse is unavailable.
+
 For ad hoc session names, opt a dedicated build parent into discovery once:
 
 ```sh

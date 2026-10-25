@@ -51,6 +51,20 @@ fn lock_directory() -> Result<PathBuf> {
 }
 
 impl TargetLeases {
+    pub fn directory_fd(&self, root: &Path) -> Result<i32> {
+        let metadata = std::fs::metadata(root)?;
+        self.0
+            .iter()
+            .find(|held| held.identity == Some((metadata.dev(), metadata.ino())))
+            .map(|held| held.file.as_raw_fd())
+            .context("target is not protected by this lease")
+    }
+
+    pub fn directory_lock_path(root: &Path) -> Result<PathBuf> {
+        let metadata = std::fs::metadata(root)?;
+        Ok(lock_directory()?.join(format!("inode-{}-{}.lock", metadata.dev(), metadata.ino())))
+    }
+
     pub fn owns_directory(&self, root: &Path) -> bool {
         std::fs::metadata(root).is_ok_and(|m| {
             self.0

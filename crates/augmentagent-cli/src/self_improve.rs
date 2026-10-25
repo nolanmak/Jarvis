@@ -4251,12 +4251,16 @@ impl StorageCalls for augmentagent_channel_core::FallbackReasoner {
     async fn call_with_storage(&self, opts: &augmentagent_channel_core::ReasonerOpts, prompt: &str) -> Result<String> {
         let cwd = opts.cwd.as_deref().context("builder has no working directory")?;
         let _storage = crate::build_storage::admit(cwd, Path::new(&gate_target_dir())).await?;
-        crate::build_storage::watch_reserve(Path::new(&gate_target_dir()), self.call(opts, prompt)).await
+        let mut opts = opts.clone();
+        opts.env.push((crate::build_storage::PARENT_LEASE_ENV.into(), _storage.parent_proof(Path::new(&gate_target_dir()))?));
+        crate::build_storage::watch_reserve(Path::new(&gate_target_dir()), self.call(&opts, prompt)).await
     }
     async fn call_revision_with_storage(&self, opts: &augmentagent_channel_core::ReasonerOpts, prompt: &str) -> Result<String> {
         let cwd = opts.cwd.as_deref().context("builder has no working directory")?;
         let _storage = crate::build_storage::admit(cwd, Path::new(&gate_target_dir())).await?;
-        crate::build_storage::watch_reserve(Path::new(&gate_target_dir()), self.call_revision(opts, prompt)).await
+        let mut opts = opts.clone();
+        opts.env.push((crate::build_storage::PARENT_LEASE_ENV.into(), _storage.parent_proof(Path::new(&gate_target_dir()))?));
+        crate::build_storage::watch_reserve(Path::new(&gate_target_dir()), self.call_revision(&opts, prompt)).await
     }
 }
 
@@ -4416,7 +4420,8 @@ fn changed_crates(paths: &str) -> Option<Vec<String>> {
 async fn verification_gate_targeted(worktree: &Path, crates: &[String]) -> Result<()> {
     gate_disk_guard()?;
     let _storage = crate::build_storage::admit(worktree, &crate::build_storage::effective_target(worktree)).await?;
-    let env = gate_env();
+    let mut env = gate_env();
+    env.push((crate::build_storage::PARENT_LEASE_ENV.into(), _storage.parent_proof(&crate::build_storage::effective_target(worktree))?));
     let pkgs: String = crates
         .iter()
         .map(|c| format!("-p {c}"))
@@ -4465,7 +4470,8 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
     // build`/`npm run build` execute `build.rs`/proc-macros/`npm
     // postinstall`, which the issue body could influence; none need
     // provider keys, so this is behavior-preserving for honest fixes.
-    let env = gate_env();
+    let mut env = gate_env();
+    env.push((crate::build_storage::PARENT_LEASE_ENV.into(), _storage.parent_proof(&crate::build_storage::effective_target(worktree))?));
     info!("verification gate: cargo build (sandboxed env)");
     let (ok, _o, e) = run_sandboxed(
         "bash",
@@ -4814,7 +4820,8 @@ async fn baseline_failures(
     let filters = tests.join(" ");
     info!(%pkg_args, %filters, "baseline check: cargo test on origin/main (sandboxed env)");
     let _storage = crate::build_storage::admit(&worktree, &crate::build_storage::effective_target(&worktree)).await?;
-    let env = gate_env();
+    let mut env = gate_env();
+    env.push((crate::build_storage::PARENT_LEASE_ENV.into(), _storage.parent_proof(&crate::build_storage::effective_target(&worktree))?));
     let result = run_sandboxed(
         "bash",
         &["-lc", &gate_sh(&format!(
@@ -10012,7 +10019,8 @@ async fn verification_gate_for_repo(workspace: &Path, repo: &AgentRepo) -> Resul
     // `build_cmd` runs attacker-influenceable build scripts and must not
     // inherit provider keys.
     let _storage = crate::build_storage::admit(workspace, &crate::build_storage::effective_target(workspace)).await?;
-    let env = gate_env();
+    let mut env = gate_env();
+    env.push((crate::build_storage::PARENT_LEASE_ENV.into(), _storage.parent_proof(&crate::build_storage::effective_target(workspace))?));
     let (ok, _o, e) = run_sandboxed("bash", &["-lc", &wrapped], workspace, &env).await?;
     if !ok {
         bail!("build_cmd `{cmd}` failed:\n{}", truncate(&e, 1500));

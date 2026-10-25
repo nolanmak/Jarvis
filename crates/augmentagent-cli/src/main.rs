@@ -3055,8 +3055,9 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             DiskOp::Build { target_dir, command } => {
-                let _lease = build_storage::admit_session(&repo_root, target_dir).await?;
-                build_storage::run_command(target_dir, command).await
+                let lease = if build_storage::inherited_lease(target_dir)? { None }
+                    else { Some(build_storage::admit_session(&repo_root, target_dir).await?) };
+                build_storage::run_command(target_dir, command, lease.as_ref()).await
             }
             DiskOp::Prune { dry_run, json, root, cap_mb, stale_days } => disk::run_prune(
                 &repo_root,

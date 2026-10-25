@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 
 const MARKER: &str = ".augmentagent-target.json";
 const CACHE_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n";
+pub const PARENT_LEASE_ENV: &str = "AUGMENTAGENT_BUILD_PARENT_LEASE";
 
 pub fn state_dir() -> Result<PathBuf> {
     augmentagent_channel_core::state_dir::state_dir()
@@ -24,6 +25,15 @@ pub struct Lease {
     targets: crate::storage_leases::TargetLeases,
 }
 impl Lease {
+    pub fn parent_proof(&self, target: &Path) -> Result<String> {
+        Ok(format!(
+            "{}:{}:{}",
+            std::process::id(),
+            self.file.as_raw_fd(),
+            self.targets.directory_fd(target)?
+        ))
+    }
+
     pub fn try_at(state: &Path) -> Result<Option<Self>> {
         std::fs::create_dir_all(state)?;
         let f = std::fs::OpenOptions::new()
@@ -538,10 +548,80 @@ async fn watch_with<T>(
     }
 }
 
-pub async fn run_command(target: &Path, command: &[String]) -> Result<()> {
+/// Nested session wrappers may reuse their ancestor's protection, but an
+/// environment variable alone is never authority to skip admission.
+pub fn inherited_lease(target: &Path) -> Result<bool> {
+    let Some(proof) = std::env::var_os(PARENT_LEASE_ENV) else {
+        return Ok(false);
+    };
+    verify_parent_lease(target, &proof.to_string_lossy())?;
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_parent_lease(target: &Path, proof: &str) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let fields: Vec<u32> = proof
+        .split(':')
+        .map(str::parse)
+        .collect::<std::result::Result<_, _>>()?;
+    anyhow::ensure!(fields.len() == 3, "invalid parent storage lease");
+    let owner = fields[0];
+    let mut ancestor = std::process::id();
+    let mut found = false;
+    for _ in 0..128 {
+        let status = std::fs::read_to_string(format!("/proc/{ancestor}/status"))?;
+        ancestor = status
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:"))
+            .context("missing parent process evidence")?
+            .trim()
+            .parse()?;
+        if ancestor == owner {
+            found = true;
+            break;
+        }
+        if ancestor <= 1 {
+            break;
+        }
+    }
+    anyhow::ensure!(found, "storage lease owner is not a live ancestor");
+    let expected = [
+        state_dir()?.join("disk-build.lock"),
+        crate::storage_leases::TargetLeases::directory_lock_path(target)?,
+    ];
+    for (fd, expected) in fields[1..].iter().zip(expected) {
+        let descriptor = std::fs::metadata(format!("/proc/{owner}/fd/{fd}"))?;
+        let expected = std::fs::metadata(expected)?;
+        anyhow::ensure!(
+            (descriptor.dev(), descriptor.ino()) == (expected.dev(), expected.ino()),
+            "parent storage lease does not protect this state and target"
+        );
+        let info = std::fs::read_to_string(format!("/proc/{owner}/fdinfo/{fd}"))?;
+        let locked = info
+            .lines()
+            .filter(|line| line.starts_with("lock:"))
+            .any(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                fields.get(2) == Some(&"FLOCK")
+                    && fields.get(4) == Some(&"WRITE")
+                    && fields.get(5).and_then(|p| p.parse::<u32>().ok()) == Some(owner)
+            });
+        anyhow::ensure!(locked, "parent storage lease is no longer held");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_parent_lease(_target: &Path, _proof: &str) -> Result<()> {
+    bail!("nested managed builds require native parent-lease evidence; use cargo directly inside the enclosing managed build")
+}
+
+pub async fn run_command(target: &Path, command: &[String], lease: Option<&Lease>) -> Result<()> {
     let scratch = std::fs::canonicalize(target)?.join("tmp");
     std::fs::create_dir_all(&scratch)?;
-    let mut child = tokio::process::Command::new(&command[0])
+    let mut process = tokio::process::Command::new(&command[0]);
+    process
         .args(&command[1..])
         .env_clear()
         .envs(std::env::vars().filter(|(key, _)| !crate::self_improve::env_name_is_secret(key)))
@@ -550,8 +630,11 @@ pub async fn run_command(target: &Path, command: &[String]) -> Result<()> {
         .env("CARGO_PROFILE_DEV_DEBUG", "0")
         .env("CARGO_PROFILE_TEST_DEBUG", "0")
         .kill_on_drop(true)
-        .process_group(0)
-        .spawn()?;
+        .process_group(0);
+    if let Some(lease) = lease {
+        process.env(PARENT_LEASE_ENV, lease.parent_proof(target)?);
+    }
+    let mut child = process.spawn()?;
     struct Group(u32);
     impl Drop for Group {
         fn drop(&mut self) {
@@ -560,9 +643,18 @@ pub async fn run_command(target: &Path, command: &[String]) -> Result<()> {
     }
     let _group = Group(child.id().context("managed build has no pid")?);
     let result = watch_reserve(target, async {
+        let parent_alive = async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                inherited_lease(target)?;
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
+        };
         tokio::select! {
             result = child.wait() => Ok(result?),
             _ = tokio::signal::ctrl_c() => bail!("managed build interrupted"),
+            result = parent_alive => { result?; bail!("parent storage lease lost") },
         }
     })
     .await?;
@@ -1001,7 +1093,7 @@ mod tests {
         let target = t.path().to_path_buf();
         let task = tokio::spawn(async move {
             let _lease = lease;
-            run_command(&target, &command).await
+            run_command(&target, &command, None).await
         });
         for _ in 0..100 {
             if pid_file.exists() {

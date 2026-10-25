@@ -24,9 +24,13 @@ with tempfile.TemporaryDirectory(prefix="jarvis-disk-smoke-") as temporary:
                AUGMENTAGENT_DEPLOY_SNAPSHOT_DIR=str(base / "snapshots"),
                AUGMENTAGENT_PRUNE_TARGET_DIRS="")
 
+    env.pop("AUGMENTAGENT_BUILD_PARENT_LEASE", None)  # Fixture state is independent of an enclosing gate.
+
     def command(*args):
-        return subprocess.run([CLI, *map(str, args)], cwd=repo, env=env,
-                              capture_output=True, text=True, check=True).stdout
+        result = subprocess.run([CLI, *map(str, args)], cwd=repo, env=env,
+                                capture_output=True, text=True)
+        assert result.returncode == 0, (args, result.stdout, result.stderr)
+        return result.stdout
 
     def cache(path):
         (path / "debug" / "deps").mkdir(parents=True)
@@ -162,6 +166,59 @@ with tempfile.TemporaryDirectory(prefix="jarvis-disk-smoke-") as temporary:
             "from pathlib import Path; import os; assert not Path(os.environ['TMPDIR'], 'leftover').exists()")
     print("ok: builds/snapshots serialize; contained scratch is reclaimed on the next admission")
 
+    # A builder already owns admission. Its nested CLI must prove that its
+    # ancestor holds both locks, reuse them without cleanup, and reject a
+    # forged proof or a different target rather than bypassing protection.
+    nested_script = """
+import os, pathlib, subprocess, sys
+cli, other = sys.argv[1:]
+target = os.environ['CARGO_TARGET_DIR']
+keep = pathlib.Path(os.environ['TMPDIR'], 'nested-live-data')
+keep.touch()
+child = [cli, 'disk', 'build', '--target-dir', target, '--', sys.executable, '-c',
+         'import os,pathlib; assert pathlib.Path(os.environ["TMPDIR"], "nested-live-data").exists()']
+subprocess.run(child, check=True, capture_output=True, timeout=8)
+assert keep.exists()
+bad = child.copy()
+bad[4] = other
+assert subprocess.run(bad, capture_output=True, timeout=8).returncode != 0
+spoof = dict(os.environ, AUGMENTAGENT_BUILD_PARENT_LEASE='1:2:3')
+assert subprocess.run(child, env=spoof, capture_output=True, timeout=8).returncode != 0
+"""
+    (base / "wrong-nested-target").mkdir()
+    command("disk", "build", "--target-dir", base / "nested-target", "--", sys.executable,
+            "-c", nested_script, CLI, base / "wrong-nested-target")
+    print("ok: nested builder commands reuse proven ancestor leases; forged/different-target proofs fail")
+
+    nested_pid = base / "nested-child-pid"
+    nested_exit = base / "nested-child-exit"
+    death_script = """
+import os, pathlib, subprocess, sys
+cli, pidfile, exitfile = sys.argv[1:]
+code = 'import os,pathlib,sys,time; pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)'
+result = subprocess.run([cli, 'disk', 'build', '--target-dir', os.environ['CARGO_TARGET_DIR'],
+                         '--', sys.executable, '-c', code, pidfile])
+pathlib.Path(exitfile).write_text(str(result.returncode))
+"""
+    owner = subprocess.Popen([CLI, "disk", "build", "--target-dir", str(base / "parent-death-target"),
+                              "--", sys.executable, "-c", death_script, CLI, str(nested_pid), str(nested_exit)],
+                             cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        deadline = time.monotonic() + 10
+        while not nested_pid.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert nested_pid.exists(), "nested child did not start"
+        owner.kill()
+        owner.communicate(timeout=8)
+        assert nested_exit.exists() and nested_exit.read_text() != "0", "nested build survived loss of its protecting owner"
+        status = Path('/proc') / nested_pid.read_text() / 'stat'
+        assert not status.exists() or status.read_text().rsplit(')', 1)[1].split()[0] == 'Z'
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+            owner.communicate(timeout=8)
+    print("ok: losing the parent lease stops the nested build's subprocess group")
+
     # The session wrapper chooses and registers a stable target without an
     # operator remembering CARGO_TARGET_DIR.
     shim_dir = base / "bin"
@@ -180,6 +237,9 @@ with tempfile.TemporaryDirectory(prefix="jarvis-disk-smoke-") as temporary:
     assert selected.startswith(str(base / "session-parent"))
     subprocess.run(["bash", str(wrapper), "check"], cwd=repo, env=wrapper_env, check=True, capture_output=True)
     assert selected == target_report.read_text()
+    command("disk", "build", "--target-dir", selected, "--", "env",
+            "PATH=" + wrapper_env["PATH"], "AUGMENTAGENT_STORAGE_BIN=" + CLI,
+            "FIXTURE_TARGET_REPORT=" + str(target_report), "bash", wrapper, "check")
     print("ok: session wrapper automatically registers and reuses its target")
 
     snapshot = Path(command("--db", database, "deploy", "snapshot", "--label", "smoke").strip().splitlines()[-1])
