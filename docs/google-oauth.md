@@ -89,8 +89,8 @@ can reach and tell both sides about it:
 2. Add `https://<that hostname>/oauth/google/callback` as a second authorized
    redirect URI on the OAuth client in Google Cloud. Google rejects any URI
    that is not registered byte for byte.
-3. Set `AUGMENTAGENT_PUBLIC_URL=https://<that hostname>` in `.env` and
-   restart the dashboard. New consents now redirect there; the callback is
+3. Set `AUGMENTAGENT_PUBLIC_URL=https://<that hostname>` in `.env` (or pin
+   the full URI with `GOOGLE_OAUTH_REDIRECT_URI=`) and restart the dashboard. New consents now redirect there; the callback is
    reachable without a dashboard login, and the saved mailbox shows up for
    the CLI, the agent and Settings alike.
 
