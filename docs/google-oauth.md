@@ -79,10 +79,13 @@ the approve click has to happen on the dashboard host. To approve from a
 phone or another computer, give the dashboard an https origin those devices
 can reach and tell both sides about it:
 
-1. Expose the dashboard, for example with Tailscale Serve on the host:
-   `tailscale serve --bg --https=443 http://127.0.0.1:<DASHBOARD_PORT>`
-   (your tailnet's HTTPS certificates must be enabled). Any reverse proxy
-   with a valid certificate works the same way.
+1. Expose the dashboard on an https hostname you control. Any reverse proxy
+   with a valid certificate works: a Cloudflare Tunnel ingress rule
+   `hostname: <your host>` → `service: http://127.0.0.1:<DASHBOARD_PORT>`
+   plus a DNS route for that hostname, or Tailscale Serve on the host
+   (`tailscale serve --bg --https=443 http://127.0.0.1:<DASHBOARD_PORT>`)
+   when the approving devices are on your tailnet. The dashboard's login
+   stays in front of everything except the OAuth callback itself.
 2. Add `https://<that hostname>/oauth/google/callback` as a second authorized
    redirect URI on the OAuth client in Google Cloud. Google rejects any URI
    that is not registered byte for byte.
