@@ -6,6 +6,7 @@
 //! `augmentagent-channel-core`; this crate owns only Gmail-specific transport.
 
 pub mod gmail;
+pub mod google;
 pub mod inbound;
 pub mod outbound;
 pub mod owner_alerts;

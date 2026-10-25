@@ -22,6 +22,9 @@ pub enum GmailError {
     Http(#[from] reqwest::Error),
     #[error("composio: {message}")]
     Composio { message: String },
+    /// A Gmail REST / Google OAuth failure on the direct client (#1573).
+    #[error("google: {message}")]
+    Google { message: String },
     #[error("decode: {0}")]
     Decode(String),
     #[error("invalid input: {0}")]
@@ -196,6 +199,12 @@ pub struct ComposioClient {
     api_key: String,
     rate_limit_store: Option<Arc<augmentagent_store::Store>>,
     call_origin: &'static str,
+    /// #1573 — the direct Google client, built on first use from
+    /// `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET`. Every method
+    /// on this type routes `google:<address>` entities here and leaves
+    /// Composio entities on the Composio path, so callers keep one client
+    /// type while mailboxes migrate one reconnect at a time.
+    google: std::sync::OnceLock<Result<Arc<crate::google::GoogleGmail>, String>>,
 }
 
 impl ComposioClient {
@@ -206,7 +215,37 @@ impl ComposioClient {
             api_key,
             rate_limit_store: None,
             call_origin: "unknown",
+            google: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Serve Google-connected entities through `google` instead of building
+    /// one from the environment (tests, or an embedding that already holds
+    /// a client).
+    pub fn with_google(self, google: Arc<crate::google::GoogleGmail>) -> Self {
+        let _ = self.google.set(Ok(google));
+        self
+    }
+
+    /// The direct client for `entity_id`, when it is a Google-connected
+    /// mailbox: `None` for a Composio entity, `Some(Err)` when the entity is
+    /// Google's but the operator's OAuth client is not configured.
+    fn google_route(
+        &self,
+        entity_id: &str,
+    ) -> Option<Result<(Arc<crate::google::GoogleGmail>, String), GmailError>> {
+        let email = crate::google::email_of(entity_id)?;
+        let built = self.google.get_or_init(|| {
+            crate::google::GoogleGmail::from_env()
+                .map(Arc::new)
+                .map_err(|e| e.to_string())
+        });
+        Some(match built {
+            Ok(g) => Ok((Arc::clone(g), email.to_string())),
+            Err(msg) => Err(GmailError::Invalid(format!(
+                "{entity_id} is a Google-connected mailbox but the direct client is unavailable: {msg}"
+            ))),
+        })
     }
 
     pub fn with_base_url(mut self, base_url: String) -> Self {
@@ -391,6 +430,10 @@ impl ComposioClient {
     /// lands at `data.response_data.emailAddress`; `find_string_field` walks
     /// to it regardless of the exact nesting.
     pub async fn get_profile_email(&self, entity_id: &str) -> Result<String, GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g.profile_email(&email).await;
+        }
         let v = self
             .execute("GMAIL_GET_PROFILE", entity_id, serde_json::json!({}))
             .await?;
@@ -425,6 +468,10 @@ impl ComposioClient {
         entity_id: &str,
         message_id: &str,
     ) -> Result<Vec<AttachmentMeta>, GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g.list_attachments(&email, message_id).await;
+        }
         // No inline `user_id` (see resolve_thread_id): account routing is the
         // execute() envelope's job.
         let args = serde_json::json!({
@@ -455,6 +502,33 @@ impl ComposioClient {
         });
         let v = self.execute("GMAIL_GET_ATTACHMENT", entity_id, args).await?;
         parse_attachment_file(&v)
+    }
+
+    /// The bytes of one attachment plus the MIME type the provider reported,
+    /// whichever transport the mailbox is on: Composio stages the file and
+    /// hands back a presigned URL to download; Google returns the bytes
+    /// inline from `messages.attachments.get` (#1573). `file_name` is only
+    /// needed by Composio, which names the staged object after it.
+    pub async fn fetch_attachment_bytes(
+        &self,
+        entity_id: &str,
+        message_id: &str,
+        attachment_id: &str,
+        file_name: &str,
+    ) -> Result<(Vec<u8>, Option<String>), GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            let bytes = g.attachment_bytes(&email, message_id, attachment_id).await?;
+            return Ok((bytes, None));
+        }
+        let file = self
+            .get_attachment_file(entity_id, message_id, attachment_id, file_name)
+            .await?;
+        let (bytes, content_type) = self.download_url(&file.s3url).await?;
+        let mime = Some(file.mimetype)
+            .filter(|m| !m.trim().is_empty())
+            .or(content_type);
+        Ok((bytes, mime))
     }
 
     /// GET a presigned URL (no Composio auth header — the signature IS the
@@ -490,6 +564,10 @@ impl ComposioClient {
         entity_id: &str,
         id: &str,
     ) -> Result<String, GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g.resolve_thread_id(&email, id).await;
+        }
         // NOTE: no inline `user_id` in the arguments. The Gmail tools forward
         // it as the Gmail API `users/<user_id>/…` path segment, where only
         // 'me' or an email address is valid — a Composio entity id 403s with
@@ -529,6 +607,10 @@ impl ComposioClient {
         entity_id: &str,
         draft_id: &str,
     ) -> Result<Option<String>, GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g.draft_thread_id(&email, draft_id).await;
+        }
         const MAX_PAGES: u32 = 5;
         let mut page_token: Option<String> = None;
         for _ in 0..MAX_PAGES {
@@ -590,17 +672,50 @@ impl ComposioClient {
         tool_slug: &str,
         path: &std::path::Path,
     ) -> Result<Attachment, GmailError> {
-        use md5::{Digest, Md5};
-
-        let bytes = std::fs::read(path).map_err(|e| {
+        // Validate the file now (the operator gets the error before any
+        // draft exists) but defer the Composio upload to draft time, when the
+        // target mailbox — and therefore the transport — is known (#1573).
+        let meta = std::fs::metadata(path).map_err(|e| {
             GmailError::Decode(format!("read attachment {}: {e}", path.display()))
         })?;
+        if !meta.is_file() {
+            return Err(GmailError::Invalid(format!(
+                "attachment {} is not a regular file",
+                path.display()
+            )));
+        }
         let name = path
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("attachment")
             .to_string();
         let mimetype = guess_mimetype(&name).to_string();
+        Ok(Attachment {
+            name,
+            mimetype,
+            s3key: String::new(),
+            path: Some(path.to_path_buf()),
+            tool_slug: tool_slug.to_string(),
+        })
+    }
+
+    /// Composio-path half of the attachment flow: upload the file behind
+    /// `att` into Composio's object store unless that already happened.
+    async fn ensure_uploaded(&self, att: &Attachment) -> Result<Attachment, GmailError> {
+        use md5::{Digest, Md5};
+
+        if !att.s3key.is_empty() {
+            return Ok(att.clone());
+        }
+        let path = att.path.as_deref().ok_or_else(|| {
+            GmailError::Invalid(format!("attachment {} has neither an upload key nor a source path", att.name))
+        })?;
+        let tool_slug = att.tool_slug.as_str();
+        let bytes = std::fs::read(path).map_err(|e| {
+            GmailError::Decode(format!("read attachment {}: {e}", path.display()))
+        })?;
+        let name = att.name.clone();
+        let mimetype = att.mimetype.clone();
         let md5_hex = format!("{:x}", Md5::digest(&bytes));
 
         let url = format!("{}/api/v3/files/upload/request", self.base_url);
@@ -657,6 +772,8 @@ impl ComposioClient {
             name,
             mimetype,
             s3key: key,
+            path: att.path.clone(),
+            tool_slug: att.tool_slug.clone(),
         })
     }
 
@@ -683,6 +800,27 @@ impl ComposioClient {
         cc: &[String],
         bcc: &[String],
     ) -> Result<String, GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            let local = match attachment {
+                Some(att) => Some(local_attachment(att)?),
+                None => None,
+            };
+            return g
+                .create_draft(
+                    &email,
+                    crate::google::DraftSpec {
+                        to,
+                        cc,
+                        bcc,
+                        subject,
+                        body,
+                        thread_id,
+                        attachment: local.as_ref(),
+                    },
+                )
+                .await;
+        }
         let recipients = split_recipients(to);
         let (first, rest) = recipients
             .split_first()
@@ -707,6 +845,7 @@ impl ComposioClient {
             args["thread_id"] = serde_json::Value::String(t.to_string());
         }
         if let Some(att) = attachment {
+            let att = self.ensure_uploaded(att).await?;
             args["attachment"] = serde_json::json!({
                 "name": att.name,
                 "mimetype": att.mimetype,
@@ -740,6 +879,28 @@ impl ComposioClient {
         cc: &[String],
         bcc: &[String],
     ) -> Result<String, GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            let local = match attachment {
+                Some(att) => Some(local_attachment(att)?),
+                None => None,
+            };
+            return g
+                .update_draft(
+                    &email,
+                    draft_id,
+                    crate::google::DraftSpec {
+                        to,
+                        cc,
+                        bcc,
+                        subject,
+                        body,
+                        thread_id,
+                        attachment: local.as_ref(),
+                    },
+                )
+                .await;
+        }
         let new_id = self
             .create_draft_with_attachment(
                 entity_id, to, subject, body, thread_id, attachment, cc, bcc,
@@ -902,7 +1063,29 @@ fn is_transient_reqwest(e: &reqwest::Error) -> bool {
 pub struct Attachment {
     pub name: String,
     pub mimetype: String,
+    /// Composio object key. Empty until [`ComposioClient::ensure_uploaded`]
+    /// runs — the upload is deferred to draft time so a Google-connected
+    /// mailbox (#1573), which sends the bytes inline, never touches
+    /// Composio's object store.
     pub s3key: String,
+    /// Local source file, read at draft time.
+    pub path: Option<std::path::PathBuf>,
+    /// Composio tool the upload is bound to (`GMAIL_CREATE_EMAIL_DRAFT`).
+    pub tool_slug: String,
+}
+
+/// The inline form of a staged attachment for the direct Google client.
+fn local_attachment(att: &Attachment) -> Result<crate::google::LocalAttachment, GmailError> {
+    let path = att.path.as_deref().ok_or_else(|| {
+        GmailError::Invalid(format!(
+            "attachment {} was staged for Composio only and has no local source to send through Google",
+            att.name
+        ))
+    })?;
+    let mut local = crate::google::LocalAttachment::read(path)?;
+    local.name = att.name.clone();
+    local.mimetype = att.mimetype.clone();
+    Ok(local)
 }
 
 /// Best-effort mimetype from the filename extension. Composio requires one
@@ -2143,8 +2326,14 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".pdf").unwrap();
         std::fs::write(tmp.path(), b"%PDF-1.4 fake resume bytes").unwrap();
 
-        let att = client
+        let staged = client
             .upload_attachment("GMAIL_CREATE_EMAIL_DRAFT", tmp.path())
+            .await
+            .expect("staging should succeed");
+        // #1573 — staging is local; the Composio upload runs at draft time.
+        assert!(staged.s3key.is_empty());
+        let att = client
+            .ensure_uploaded(&staged)
             .await
             .expect("upload should succeed");
         assert!(att.name.ends_with(".pdf"));
@@ -2198,7 +2387,8 @@ mod tests {
         pdf.extend_from_slice(b"\n%%EOF\n");
         std::fs::write(&file, &pdf).unwrap();
 
-        client.upload_attachment("GMAIL_CREATE_EMAIL_DRAFT", &file).await.unwrap();
+        let staged = client.upload_attachment("GMAIL_CREATE_EMAIL_DRAFT", &file).await.unwrap();
+        client.ensure_uploaded(&staged).await.unwrap();
         let request: serde_json::Value = serde_json::from_slice(&req_body.await.unwrap()).unwrap();
         assert_eq!(request["md5"], format!("{:x}", Md5::digest(&pdf)));
         assert_eq!(request["filename"], "letter-signed.pdf");
@@ -2216,8 +2406,12 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
         std::fs::write(tmp.path(), b"hello").unwrap();
 
-        let att = client
+        let staged = client
             .upload_attachment("GMAIL_CREATE_EMAIL_DRAFT", tmp.path())
+            .await
+            .unwrap();
+        let att = client
+            .ensure_uploaded(&staged)
             .await
             .expect("existing object should be reused");
         assert_eq!(att.s3key, "existing/key/xyz");
@@ -2861,6 +3055,10 @@ impl GmailApi for ComposioClient {
         query: &str,
         max_total: u32,
     ) -> Result<Vec<Email>, GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g.search(&email, query, max_total).await;
+        }
         // Composio caps response payload size (seen 413 above ~40 KB of bodies),
         // so `fetch_paged` walks 20-email pages up to `max_total`. 10-page
         // safety cap, no inter-page delay for the interactive path.
@@ -2878,6 +3076,10 @@ impl GmailApi for ComposioClient {
         if let Some(d) = since_iso {
             query.push_str(" after:");
             query.push_str(d);
+        }
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g.search(&email, &query, max_total).await;
         }
         // Higher page cap (25 = 500/20) so the backfill can pull ~500 messages
         // in one shot; a 200ms inter-page sleep stays under the observed
@@ -2898,6 +3100,10 @@ impl GmailApi for ComposioClient {
         thread_id: &str,
         max: u32,
     ) -> Result<Vec<Email>, GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g.thread_messages(&email, thread_id, max).await;
+        }
         // Composio's GMAIL_FETCH_MESSAGE_BY_THREAD_ID returns every message in
         // the thread in one shot (a thread is small relative to the inbox, so
         // no pagination is needed). We trim to the last `max` here and let the
@@ -2963,6 +3169,10 @@ impl GmailApi for ComposioClient {
         entity_id: &str,
         draft_id: &str,
     ) -> Result<Option<String>, GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g.send_draft(&email, draft_id).await;
+        }
         let args = serde_json::json!({ "draft_id": draft_id });
         let v = self.execute("GMAIL_SEND_DRAFT", entity_id, args).await?;
         // Gmail's drafts.send returns the resulting Message resource, so `id`
@@ -2984,8 +3194,29 @@ impl GmailApi for ComposioClient {
     }
 
     async fn delete_draft(&self, entity_id: &str, draft_id: &str) -> Result<(), GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g.delete_draft(&email, draft_id).await;
+        }
         let args = serde_json::json!({ "draft_id": draft_id });
         self.execute("GMAIL_DELETE_DRAFT", entity_id, args).await?;
         Ok(())
+    }
+
+    async fn update_draft(
+        &self,
+        entity_id: &str,
+        draft_id: &str,
+        to: &str,
+        subject: &str,
+        body: &str,
+        thread_id: Option<&str>,
+    ) -> Result<String, GmailError> {
+        // Google has a real `drafts.update`; Composio keeps the trait's
+        // create-then-delete default. Both land in the inherent variant.
+        self.update_draft_with_attachment(
+            entity_id, draft_id, to, subject, body, thread_id, None, &[], &[],
+        )
+        .await
     }
 }

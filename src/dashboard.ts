@@ -220,6 +220,9 @@ async function getConfigStatus() {
     groqKey: !!(getConfig("groq_api_key") || process.env.GROQ_API_KEY),
     cerebrasKey: !!(getConfig("cerebras_api_key") || process.env.CEREBRAS_API_KEY),
     composioKey: !!(getConfig("composio_api_key") || process.env.COMPOSIO_API_KEY),
+    // #1573 — with the operator's own Google OAuth client configured, "Add
+    // Gmail" goes straight to Google and skips Composio for that mailbox.
+    googleOauth: googleOauthConfigured(),
     gmailAccounts,
     gmailConnected,
     // Entity ids with an ACTIVE googlecalendar connection (#398/#400) —
@@ -972,6 +975,149 @@ router.get("/oauth/gmail/callback", async (req, res) => {
   }
 });
 
+// --- Google OAuth, direct (#1573) ---
+//
+// Same browser flow as the Composio link (Google account chooser → consent →
+// back here), but on the operator's own OAuth client. The code exchange,
+// token storage and account registration are done by the Rust CLI
+// (`augmentagent google connect`) so the daemon that polls the mailbox owns
+// the credential; this router only carries the browser and the CSRF state.
+const GOOGLE_OAUTH_STATE_KEY = "google_oauth_state";
+const GOOGLE_OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+
+function googleOauthConfigured(): boolean {
+  return !!(
+    process.env.GOOGLE_OAUTH_CLIENT_ID?.trim() && process.env.GOOGLE_OAUTH_CLIENT_SECRET?.trim()
+  );
+}
+
+function googleRedirectUri(): string {
+  const port = process.env.DASHBOARD_PORT || "3000";
+  // Must match a redirect URI registered on the OAuth client byte for byte.
+  return `http://localhost:${port}/oauth/google/callback`;
+}
+
+function agentCliPath(): string {
+  return (
+    process.env.AUGMENTAGENT_BIN || path.resolve(process.cwd(), "target/release/augmentagent")
+  );
+}
+
+/** Run the agent CLI with optional stdin; resolves with exit code + output. */
+function runAgentCli(
+  args: string[],
+  stdin?: string,
+  timeoutMs = 60_000,
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(agentCliPath(), args, {
+      cwd: process.cwd(),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => (stdout += d.toString()));
+    child.stderr.on("data", (d) => (stderr += d.toString()));
+    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      resolve({ code: null, stdout, stderr: `${stderr}\nspawn failed: ${err.message}` });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout, stderr });
+    });
+    if (stdin !== undefined) child.stdin.end(stdin);
+    else child.stdin.end();
+  });
+}
+
+function oauthErrorPage(res: import("express").Response, msg: string): void {
+  res.status(500).send(`
+    <div class="p-4 bg-gray-950 text-gray-100 min-h-screen">
+      <h2 class="text-lg font-semibold text-red-400 mb-2">Google OAuth Error</h2>
+      <pre class="text-sm text-gray-300 mb-4 whitespace-pre-wrap">${msg
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")}</pre>
+      <a href="/settings" class="text-blue-400 hover:underline">Back to Settings</a>
+    </div>
+  `);
+}
+
+router.get("/oauth/google/start", async (_req, res) => {
+  if (!googleOauthConfigured()) {
+    res
+      .status(400)
+      .send("GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET are not set; see .env.example.");
+    return;
+  }
+  const state = crypto.randomBytes(16).toString("hex");
+  setConfig(GOOGLE_OAUTH_STATE_KEY, JSON.stringify({ state, createdAt: Date.now() }));
+  const out = await runAgentCli(
+    ["google", "auth-url", "--redirect-uri", googleRedirectUri(), "--state", state],
+  );
+  const url = out.stdout.trim();
+  if (out.code !== 0 || !url.startsWith("https://accounts.google.com/")) {
+    console.error("[oauth] google auth-url failed:", out.stderr.trim());
+    oauthErrorPage(res, out.stderr.trim() || "could not build the consent URL");
+    return;
+  }
+  console.log("[oauth] Google consent started");
+  res.redirect(url);
+});
+
+router.get("/oauth/google/callback", async (req, res) => {
+  const pending = (() => {
+    try {
+      return JSON.parse(getConfig(GOOGLE_OAUTH_STATE_KEY) || "null") as
+        | { state: string; createdAt: number }
+        | null;
+    } catch {
+      return null;
+    }
+  })();
+  deleteConfig(GOOGLE_OAUTH_STATE_KEY);
+
+  const state = typeof req.query.state === "string" ? req.query.state : "";
+  const code = typeof req.query.code === "string" ? req.query.code : "";
+  const providerError = typeof req.query.error === "string" ? req.query.error : "";
+
+  if (
+    !pending ||
+    !state ||
+    pending.state !== state ||
+    Date.now() - pending.createdAt > GOOGLE_OAUTH_STATE_TTL_MS
+  ) {
+    console.warn("[oauth] Google callback with missing/stale/mismatched state");
+    oauthErrorPage(res, "This connect attempt expired or did not originate here. Start again from Settings.");
+    return;
+  }
+  if (providerError || !code) {
+    console.warn("[oauth] Google consent declined:", providerError || "no code");
+    res.redirect("/settings?gmail=error");
+    return;
+  }
+
+  // The code goes over stdin, never argv (argv is visible in `ps`).
+  const out = await runAgentCli(
+    ["google", "connect", "--redirect-uri", googleRedirectUri(), "--json"],
+    code,
+    120_000,
+  );
+  if (out.code !== 0) {
+    console.error("[oauth] google connect failed:", out.stderr.trim());
+    oauthErrorPage(res, out.stderr.trim() || "the code exchange failed");
+    return;
+  }
+  try {
+    const parsed = JSON.parse(out.stdout.trim()) as { email?: string; entity_id?: string };
+    console.log(`[oauth] Google mailbox connected: ${parsed.email} (${parsed.entity_id})`);
+  } catch {
+    console.log("[oauth] Google mailbox connected");
+  }
+  res.redirect("/settings?gmail=connected");
+});
+
 // Poll endpoint for frontend to check connection status
 router.get("/api/oauth/gmail/status", (_req, res) => {
   const accounts = getActiveGmailAccounts();
@@ -992,7 +1138,14 @@ router.delete("/api/oauth/gmail/:id", async (req, res) => {
     const accounts = getGmailAccounts();
     const account = accounts.find((a) => a.id === req.params.id);
 
-    if (account && client) {
+    if (account && account.entityId.startsWith("google:")) {
+      // #1573 — revoke the grant at Google and drop the stored token; the
+      // CLI also deactivates the row, which the delete below then removes.
+      const out = await runAgentCli(["google", "disconnect", "--account", account.entityId]);
+      if (out.code !== 0) {
+        console.warn("[oauth] google disconnect reported:", out.stderr.trim());
+      }
+    } else if (account && client) {
       try {
         await client.connectedAccounts.delete(account.connectionId);
       } catch {

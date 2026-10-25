@@ -49,7 +49,16 @@ impl<C: CalendarApi + 'static> Trigger for CalendarTrigger<C> {
         &self,
         _cancel: &CancellationToken,
     ) -> anyhow::Result<Vec<WorkItem>> {
-        let accounts = self.store.get_active_gmail_accounts()?;
+        // #1573 — `google:<address>` entities are connected through the
+        // operator's own OAuth client and have no Composio connection to
+        // call Calendar with. They are skipped here (not errored per tick)
+        // until the direct Calendar client reuses that grant.
+        let accounts: Vec<_> = self
+            .store
+            .get_active_gmail_accounts()?
+            .into_iter()
+            .filter(|a| !a.entity_id.starts_with("google:"))
+            .collect();
         if accounts.is_empty() {
             return Ok(Vec::new());
         }
