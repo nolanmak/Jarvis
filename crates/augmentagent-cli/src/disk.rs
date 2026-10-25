@@ -321,7 +321,9 @@ pub fn profile_dirs(target_root: &Path) -> Vec<PathBuf> {
     let is_profile = |p: &Path| p.join("deps").is_dir() || p.join("incremental").is_dir();
     let mut out = Vec::new();
     for child in read_dir_paths(target_root) {
-        if !child.is_dir() {
+        // The gate owns tmp/ as scratch. Its test fixtures are not profiles,
+        // and following their links could discover an unrelated target.
+        if child.file_name().is_some_and(|name| name == "tmp") || !child.is_dir() {
             continue;
         }
         if is_profile(&child) {
@@ -338,6 +340,14 @@ fn read_dir_paths(dir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(dir)
         .map(|rd| rd.flatten().map(|e| e.path()).collect())
         .unwrap_or_default()
+}
+
+/// Never descend through a linked artifact directory. Removing one of its
+/// lexical children would otherwise unlink a file outside the owned profile.
+fn artifact_children(dir: &Path) -> Vec<PathBuf> {
+    if std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink()) {
+        read_dir_paths(dir)
+    } else { Vec::new() }
 }
 
 /// Bytes actually allocated under `path` (not following symlinks).
@@ -371,7 +381,7 @@ fn last_touch_shallow(dir: &Path) -> Option<SystemTime> {
 /// fingerprint records did not resolve and artifacts were left out.
 pub fn scan_profile(profile: &Path, now: SystemTime) -> (Vec<Candidate>, bool) {
     let mut out = Vec::new();
-    for session in read_dir_paths(&profile.join("incremental")) {
+    for session in artifact_children(&profile.join("incremental")) {
         // Cargo rewrites a session dir on every compile of its crate.
         if let Some(t) = last_touch_shallow(&session) {
             out.push(Candidate {
@@ -383,7 +393,7 @@ pub fn scan_profile(profile: &Path, now: SystemTime) -> (Vec<Candidate>, bool) {
         }
     }
 
-    let fingerprints = read_dir_paths(&profile.join(".fingerprint"));
+    let fingerprints = artifact_children(&profile.join(".fingerprint"));
     let units: Vec<UnitRecord> = fingerprints.iter().filter_map(|d| read_unit(d, now)).collect();
     let Some(needed) = last_needed_days(&units) else {
         return (out, false);
@@ -391,8 +401,8 @@ pub fn scan_profile(profile: &Path, now: SystemTime) -> (Vec<Candidate>, bool) {
 
     let artifacts = fingerprints
         .into_iter()
-        .chain(read_dir_paths(&profile.join("deps")))
-        .chain(read_dir_paths(&profile.join("build")));
+        .chain(artifact_children(&profile.join("deps")))
+        .chain(artifact_children(&profile.join("build")));
     for path in artifacts {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
         // Cargo names a few outputs without a unit hash (a cdylib's
@@ -639,6 +649,7 @@ pub fn discover_roots(repo_root: &Path, extra: &[PathBuf]) -> Vec<Root> {
     let mut seen_profiles: Vec<PathBuf> = Vec::new();
     let mut add = |label: String, path: &Path, gate: bool, orphan: bool| {
         let Ok(canon) = std::fs::canonicalize(path) else { return };
+        if gate && !crate::build_storage::known_cargo_layout(&canon) { return; }
         if roots.iter().any(|r| r.path == canon) {
             return;
         }
@@ -715,7 +726,17 @@ pub fn watched_paths(repo_root: &Path) -> Vec<(String, PathBuf)> {
         out.push(("the state dir".into(), dir));
     }
     out.push(("the temp dir".into(), std::env::temp_dir()));
-    out.push(("the gate target".into(), resolved(gate_target_dir())));
+    let gate = resolved(gate_target_dir());
+    out.push(("the gate target".into(), gate.clone()));
+    let mut gate_devices: Vec<u64> = device_id(&gate).into_iter().collect();
+    for path in crate::build_storage::monitored_paths(&gate).into_iter().skip(1) {
+        if let Some(dev) = device_id(&path) {
+            if !gate_devices.contains(&dev) {
+                gate_devices.push(dev);
+                out.push(("relocated gate build output".into(), path));
+            }
+        }
+    }
     out.push(("the debug target".into(), resolved(repo_root.join("target/debug"))));
     out.push(("the release target".into(), resolved(repo_root.join("target/release"))));
     let extra = extra_roots_from(&std::env::var("AUGMENTAGENT_PRUNE_TARGET_DIRS").unwrap_or_default());
@@ -724,7 +745,12 @@ pub fn watched_paths(repo_root: &Path) -> Vec<(String, PathBuf)> {
     }
     if let Ok(state) = crate::build_storage::state_dir() {
         for target in crate::build_storage::registered(repo_root, &state) {
-            out.push(("a registered build target".into(), target.path));
+            let mut devices = Vec::new();
+            for path in crate::build_storage::monitored_paths(&target.path) {
+                if let Some(dev) = device_id(&path) {
+                    if !devices.contains(&dev) { devices.push(dev); out.push(("registered build output".into(), path)); }
+                }
+            }
         }
     }
     out
@@ -1085,6 +1111,11 @@ pub fn prune_root(
         understood &= ok;
     }
 
+    let scratch = root.path.join("tmp");
+    if let Some(last_write) = crate::build_storage::newest_write(&scratch) {
+        cands.push(Candidate { bytes: disk_bytes(&scratch), idle_days: idle_days(now, last_write),
+            kind: Kind::Incremental, path: scratch });
+    }
     let picked = match opts.cap_mb {
         Some(cap_mb) => {
             let total = root.bytes();
@@ -1097,6 +1128,14 @@ pub fn prune_root(
     };
     if report.full_drop {
         let mut failed = false;
+        // Whole-profile removal supersedes their individual candidates;
+        // scratch outside those profiles still has to be reclaimed too.
+        for candidate in picked.iter().filter(|c| !profiles.iter().any(|p| c.path.starts_with(p))) {
+            if opts.dry_run || remove(&candidate.path) {
+                report.freed_bytes += candidate.bytes;
+                report.removed += 1;
+            } else { failed = true; }
+        }
         for p in profiles {
             let bytes = disk_bytes(p);
             if opts.dry_run || remove(p) {
@@ -1169,6 +1208,11 @@ pub fn run_prune(repo_root: &Path, opts: &Options, out: &mut dyn Write) -> Resul
 /// Caller holds the shared storage lease. Admission may run inside its own
 /// lane lock; other upgraded writers cannot start until this lease drops.
 pub fn run_prune_locked(repo_root: &Path, opts: &Options, out: &mut dyn Write, admission: bool) -> Result<()> {
+    run_prune_with_leases(repo_root, opts, out, admission, None)
+}
+
+pub fn run_prune_with_leases(repo_root: &Path, opts: &Options, out: &mut dyn Write, admission: bool,
+    held: Option<&crate::storage_leases::TargetLeases>) -> Result<()> {
     let roots: Vec<Root> = if opts.roots.is_empty() {
         let extra = extra_roots_from(
             &std::env::var("AUGMENTAGENT_PRUNE_TARGET_DIRS").unwrap_or_default(),
@@ -1194,7 +1238,13 @@ pub fn run_prune_locked(repo_root: &Path, opts: &Options, out: &mut dyn Write, a
 
     let mut reports = Vec::new();
     for root in &roots {
-        let busy = if root.gate && lane_busy && !admission {
+        let target_lease = crate::storage_leases::TargetLeases::try_cache_roots(std::slice::from_ref(&root.path), held);
+        let lease_error = target_lease.as_ref().err().map(|error| format!("cannot verify target lease: {error:#}"));
+        let busy = if lease_error.is_some() {
+            lease_error.as_deref()
+        } else if matches!(target_lease, Ok(None)) {
+            Some("a managed build owns this target lease")
+        } else if root.gate && lane_busy && (!admission || !held.is_some_and(|leases| leases.owns_directory(&root.path))) {
             Some("an auto-PR lane is building")
         } else {
             match &procs {
@@ -1210,8 +1260,8 @@ pub fn run_prune_locked(repo_root: &Path, opts: &Options, out: &mut dyn Write, a
         if root.gate && root_opts.cap_mb.is_none() {
             let cap = crate::build_storage::cache_cap_mb().saturating_mul(1024 * 1024);
             let free = available_bytes(&root.path).unwrap_or(0);
-            let reserve = (gate_min_free_gb() * GIB) as u64;
-            root_opts.cap_mb = Some(cap.min(root.bytes().saturating_sub(reserve.saturating_sub(free))) / (1024 * 1024));
+            let reserve = (crate::build_storage::admission_floor_gb() * GIB) as u64;
+            root_opts.cap_mb = Some(crate::build_storage::cap_for_free_space(root.bytes(), cap, free, reserve) / (1024 * 1024));
         }
         reports.push(prune_root(root, busy, &root_opts, &policy, now));
     }
@@ -1780,7 +1830,8 @@ mod tests {
         let r = prune_root(&root, None, &opts, &Policy::default(), SystemTime::now());
         assert!(r.full_drop);
         assert!(!profile.exists());
-        assert!(tmp.path().join("tmp").exists(), "the gate's TMPDIR parent survives");
+        assert!(tmp.path().exists(), "the cache root survives");
+        assert!(!tmp.path().join("tmp").exists(), "scratch is reclaimed and recreated at the next admission");
     }
 
     #[test]
@@ -1831,6 +1882,41 @@ mod tests {
         std::fs::set_permissions(t.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(report.freed_bytes, 0); assert_eq!(report.removed, 0);
         assert!(report.outcome.contains("failed"), "{report:?}");
+    }
+
+    #[test]
+    fn linked_artifact_directories_never_authorize_deleting_foreign_files() {
+        use std::os::unix::fs::symlink;
+        let t = tempfile::tempdir().unwrap(); let target = t.path().join("target");
+        let foreign = t.path().join("other-project"); std::fs::create_dir(&foreign).unwrap();
+        let artifact = foreign.join("libforeign-0123456789abcdef.rlib");
+        std::fs::write(&artifact, b"foreign warm data").unwrap(); age(&artifact, 30.0);
+        std::fs::create_dir_all(target.join("debug/.fingerprint")).unwrap();
+        symlink(&foreign, target.join("debug/deps")).unwrap();
+        let root = Root::at("linked-artifacts", &target);
+        prune_root(&root, None, &Options::default(), &Policy::default(), SystemTime::now());
+        assert!(artifact.exists(), "age pruning followed an artifact-directory symlink");
+        prune_root(&root, None, &Options { cap_mb: Some(0), ..Default::default() }, &Policy::default(), SystemTime::now());
+        assert!(artifact.exists(), "whole-profile cleanup followed an artifact-directory symlink");
+    }
+
+    #[test]
+    fn gate_scratch_is_reclaimed_before_warm_artifacts_and_also_during_a_full_drop() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(t.path().join("debug/deps")).unwrap();
+        let warm = t.path().join("debug/deps/warm"); std::fs::write(&warm, vec![1; 128 * 1024]).unwrap();
+        std::fs::create_dir(t.path().join("tmp")).unwrap();
+        std::fs::write(t.path().join("tmp/leaked-test-data"), vec![2; 3 * 1024 * 1024]).unwrap();
+        let root = Root { gate: true, ..Root::at("gate", t.path()) };
+        let opts = Options { cap_mb: Some(1), ..Default::default() };
+        let dry = prune_root(&root, None, &Options { dry_run: true, ..opts.clone() }, &Policy::default(), SystemTime::now());
+        assert!(!dry.full_drop); assert!(warm.exists()); assert!(t.path().join("tmp").exists());
+        let done = prune_root(&root, None, &opts, &Policy::default(), SystemTime::now());
+        assert!(!done.full_drop); assert!(warm.exists()); assert!(!t.path().join("tmp").exists());
+        std::fs::create_dir(t.path().join("tmp")).unwrap();
+        std::fs::write(t.path().join("tmp/another-leak"), vec![2; 3 * 1024 * 1024]).unwrap();
+        let drop_all = prune_root(&root, None, &Options { cap_mb: Some(0), ..Default::default() }, &Policy::default(), SystemTime::now());
+        assert!(drop_all.full_drop); assert!(!t.path().join("debug").exists()); assert!(!t.path().join("tmp").exists());
     }
 
 }

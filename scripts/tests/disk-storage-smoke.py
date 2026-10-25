@@ -58,29 +58,75 @@ with tempfile.TemporaryDirectory(prefix="jarvis-disk-smoke-") as temporary:
     command("disk", "register", "--root", explicit, "--worktree", worktree)
     worktree.rmdir()
     age_tree(explicit)
+    abandoned = base / "abandoned-without-worktree"
+    cache(abandoned)
+    command("disk", "register", "--root", abandoned, "--abandoned")
+    age_tree(abandoned)
     dry = json.loads(command("disk", "prune", "--dry-run", "--json"))
     assert any(r.get("path") == str(owned) and r["full_drop"] for r in dry), dry
     assert any(r.get("path") == str(explicit) and r["full_drop"] for r in dry), dry
-    assert owned.exists() and explicit.exists()
+    assert owned.exists() and explicit.exists() and abandoned.exists()
     command("disk", "prune", "--json")
-    assert not owned.exists() and not explicit.exists()
+    assert not owned.exists() and not explicit.exists() and not abandoned.exists()
     assert outside.exists() and source.exists() and (parent / "symlink-escape").is_symlink()
     print("ok: discovery, removed-worktree retention, dry-run, and ownership boundaries")
+
+    # Moved legacy gate profiles can lack CACHEDIR.TAG. Configuration owns
+    # the shared gate already; using it from another repository must neither
+    # require a tag nor change an existing ownership record.
+    gate = base / "gate"
+    (gate / "debug" / "deps").mkdir(parents=True)
+    (gate / "debug" / ".fingerprint").mkdir()
+    (gate / ".rustc_info.json").write_text(json.dumps({"rustc_fingerprint": 123, "outputs": {}}))
+    warm_gate_artifact = gate / "debug" / "deps" / "warm-artifact"
+    warm_gate_artifact.write_bytes(b"warm gate cache")
+    command("disk", "build", "--target-dir", gate, "--", sys.executable, "-c", "pass")
+    assert warm_gate_artifact.exists(), "under-budget gate was wiped during admission"
+    command("disk", "register", "--root", gate, "--persistent")
+    marker = (gate / ".augmentagent-target.json").read_bytes()
+    secondary = base / "secondary-repo"
+    subprocess.run(["git", "init", "-q", str(secondary)], check=True)
+    subprocess.run([CLI, "disk", "build", "--target-dir", str(gate), "--", sys.executable, "-c", "pass"],
+                   cwd=secondary, env=env, check=True, capture_output=True)
+    assert marker == (gate / ".augmentagent-target.json").read_bytes(), "shared gate ownership was reassigned"
+    assert warm_gate_artifact.exists(), "secondary admission wiped the shared warm cache"
+    print("ok: tagless legacy gate admission and shared-cache reuse by another repository")
+
+    database = base / "fixture.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("create table fixture(value text)")
+        connection.execute("insert into fixture values ('synthetic')")
 
     first_started = base / "first-started"
     release_first = base / "release-first"
     second_started = base / "second-started"
-    first_code = "from pathlib import Path; import sys,time; Path(sys.argv[1]).touch(); " \
+    first_code = "from pathlib import Path; import sys,time,os; " \
+                 "assert Path(os.environ['TMPDIR']).parent == Path(os.environ['CARGO_TARGET_DIR']); " \
+                 "Path(os.environ['TMPDIR'], 'leftover').write_bytes(b'scratch'); Path(sys.argv[1]).touch(); " \
                  "exec('while not Path(sys.argv[2]).exists(): time.sleep(0.05)')"
     first = subprocess.Popen([CLI, "disk", "build", "--target-dir", str(base / "first-target"),
                               "--", sys.executable, "-c", first_code, str(first_started), str(release_first)],
                              cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    snapshot_waiter = None
     try:
         deadline = time.monotonic() + 15
         while not first_started.exists():
             assert first.poll() is None, first.communicate()
             assert time.monotonic() < deadline, "first managed build did not start"
             time.sleep(0.05)
+        # QA invocations may isolate XDG state while sharing a target. The
+        # target lease must still exclude their pruning, even while the live
+        # writer is a Python/test process rather than cargo itself.
+        isolated_env = dict(env, XDG_STATE_HOME=str(base / "isolated-state"))
+        isolated = subprocess.run([CLI, "disk", "prune", "--root", str(base / "first-target"), "--cap-mb", "0", "--json"],
+                                  cwd=repo, env=isolated_env, capture_output=True, text=True, check=True)
+        isolated_report = json.loads(isolated.stdout)
+        assert "lease" in isolated_report[0]["outcome"], isolated_report
+        assert (base / "first-target" / "tmp" / "leftover").exists(), "isolated state pruned a live writer"
+        snapshot_waiter = subprocess.Popen([CLI, "--db", str(database), "deploy", "snapshot", "--label", "waiting-build"],
+                                           cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(0.25)
+        assert not (base / "snapshots").exists(), "snapshot allocation overlapped a managed build"
         deferred = json.loads(command("disk", "prune", "--json"))
         assert "deferred" in deferred[0]["outcome"], deferred
         second = subprocess.Popen([CLI, "disk", "build", "--target-dir", str(base / "second-target"),
@@ -96,6 +142,9 @@ with tempfile.TemporaryDirectory(prefix="jarvis-disk-smoke-") as temporary:
             assert first.returncode == 0, first_out
             assert second.returncode == 0, second_out
             assert second_started.exists()
+            snapshot_out = snapshot_waiter.communicate(timeout=15)
+            assert snapshot_waiter.returncode == 0, snapshot_out
+            assert (base / "snapshots").is_dir()
         finally:
             if second.poll() is None:
                 second.terminate()
@@ -104,9 +153,14 @@ with tempfile.TemporaryDirectory(prefix="jarvis-disk-smoke-") as temporary:
         release_first.touch()
         if first.poll() is None:
             first.communicate(timeout=15)
+        if snapshot_waiter is not None and snapshot_waiter.poll() is None:
+            snapshot_waiter.terminate()
+            snapshot_waiter.communicate(timeout=10)
     report = json.loads((base / "state" / "augmentagent" / "disk-reconcile.json").read_text())
     assert "after_free_bytes" in report
-    print("ok: competing build admissions serialize, prune defers, next admission retries cleanup")
+    command("disk", "build", "--target-dir", base / "first-target", "--", sys.executable, "-c",
+            "from pathlib import Path; import os; assert not Path(os.environ['TMPDIR'], 'leftover').exists()")
+    print("ok: builds/snapshots serialize; contained scratch is reclaimed on the next admission")
 
     # The session wrapper chooses and registers a stable target without an
     # operator remembering CARGO_TARGET_DIR.
@@ -128,10 +182,6 @@ with tempfile.TemporaryDirectory(prefix="jarvis-disk-smoke-") as temporary:
     assert selected == target_report.read_text()
     print("ok: session wrapper automatically registers and reuses its target")
 
-    database = base / "fixture.db"
-    with sqlite3.connect(database) as connection:
-        connection.execute("create table fixture(value text)")
-        connection.execute("insert into fixture values ('synthetic')")
     snapshot = Path(command("--db", database, "deploy", "snapshot", "--label", "smoke").strip().splitlines()[-1])
     command("deploy", "pin", snapshot.name, "--reason", "synthetic rollback")
     assert (snapshot / ".pin").exists()

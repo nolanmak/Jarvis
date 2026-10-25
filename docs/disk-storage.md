@@ -18,7 +18,9 @@ Set `AUGMENTAGENT_BUILD_PARENT` to place that
 parent on a build volume, `CARGO_TARGET_DIR` for a specific cache, or
 `AUGMENTAGENT_STORAGE_BIN` for a supporting binary during bootstrap.
 Do not start an external `CARGO_TARGET_DIR=... cargo ...` build outside this
-wrapper. The wrapper defaults dev/test debuginfo to zero and strips provider secrets
+wrapper. The wrapper contains test temporary files under the target's `tmp/` on the
+measured filesystem and reclaims scratch before its next admission. It defaults
+dev/test debuginfo to zero and strips provider secrets
 from build subprocesses using the gate policy. It also finds the deployed
 binary from the shared Git directory when invoked in a worktree.
 
@@ -39,12 +41,17 @@ An existing target can be explicitly adopted:
 ```sh
 augmentagent disk register --root /path/to/cache --worktree /path/to/owning-worktree
 augmentagent disk register --root /path/to/shared-cache --persistent
+augmentagent disk register --root /path/to/verified-abandoned-cache --abandoned
 ```
 
-A Cargo cache tag alone does not grant cleanup permission. Both the durable
-registration and the matching target marker must be valid. Removed worktrees
-remain discoverable through the registration. Their targets expire after three
-quiet days; live worktrees use the ordinary artifact retention. Symlink
+A Cargo cache tag alone does not grant cleanup permission. External targets need
+both a durable registration and matching target marker. Explicit registration can
+repair a missing tag only when a compiler record and real Cargo profile layout
+verify that it is a legacy cache; unknown nonempty folders are rejected.
+The configured gate remains explicitly owned independently of registration and
+can be shared across repositories without changing its owner. Removed worktrees
+remain discoverable through the registration. Their targets, and explicitly adopted abandoned caches with unknown worktree
+names, expire after three quiet days; live worktrees use the ordinary artifact retention. Symlink
 replacement, missing evidence, recent writes, and running builds prevent whole
 root deletion. Registration records contain paths, not source or credentials.
 
@@ -69,7 +76,9 @@ supports it, and never falls back to deleting a cache outside the pruner's lease
 
 Use `augmentagent deploy snapshot --label rollout-NAME` for future rollouts.
 The helper creates a consistent compressed SQLite copy, optional release binary,
-and ownership manifest. It runs retention around creation. The storage budget
+and ownership manifest. It runs retention around creation. Snapshot allocation
+shares the build lease and reserves space for simultaneous plain/compressed
+copies, the binary, and the final free-space floor. The storage budget
 `AUGMENTAGENT_DEPLOY_MAX_GB` defaults to 8 GiB; admission conservatively reserves
 the uncompressed input plus binary. The newest `AUGMENTAGENT_DEPLOY_KEEP`
 snapshots (default two) and snapshots younger than 48 hours are retained. If

@@ -32,13 +32,11 @@ const DB_NAME: &str = "data.db.gz";
 const BINARY_NAME: &str = "augmentagent";
 const MANIFEST_NAME: &str = "manifest.json";
 
-fn retention_lease(root: &Path) -> Result<Option<crate::build_storage::Lease>> {
-    use sha2::{Digest, Sha256};
-    let root = std::fs::canonicalize(root).unwrap_or_else(|_| {
-        if root.is_absolute() { root.to_path_buf() } else { std::env::current_dir().unwrap_or_default().join(root) }
-    });
-    let key = format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes()));
-    crate::build_storage::Lease::try_at(&crate::build_storage::state_dir()?.join("snapshot-locks").join(key))
+fn retention_lease(root: &Path) -> Result<Option<crate::storage_leases::TargetLeases>> {
+    // A missing root only reaches this path during dry-run; nothing there
+    // may be deleted. Real creation/pruning prepares the directory first.
+    if !root.exists() { return Ok(Some(Default::default())); }
+    crate::storage_leases::TargetLeases::try_directory(root)
 }
 
 pub fn keep_from_env() -> usize {
@@ -179,19 +177,10 @@ fn snapshot_budgeted(db: &Path, binary: Option<&Path>, root: &Path, label: &str,
         bail!("snapshot storage budget exhausted (including protected snapshots); prune, unpin obsolete rollbacks, or increase AUGMENTAGENT_DEPLOY_MAX_GB");
     }
     std::fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
-    // `VACUUM INTO` writes a full copy before it is compressed.
-    if let Some(free) = crate::disk::available_bytes(root) {
-        let need = db_bytes + db_bytes / 4;
-        if free < need {
-            bail!(
-                "not enough room for a snapshot: {:.1} GB free under {}, {:.1} GB needed. \
-                 Run `augmentagent deploy prune` or free space first.",
-                free as f64 / GIB,
-                root.display(),
-                need as f64 / GIB
-            );
-        }
-    }
+    // Plain and gzip copies coexist during compression. Include the binary,
+    // compression overhead, and final free-space reserve before allocating.
+    ensure_snapshot_space(crate::disk::available_bytes(root), db_bytes, binary_bytes, crate::disk::gate_min_free_gb())
+        .with_context(|| format!("snapshot filesystem under {}", root.display()))?;
     let name = format!("{}-{}", now.format("%Y%m%dT%H%M%SZ"), sanitize_label(label));
     let dir = root.join(&name);
     if dir.exists() {
@@ -249,6 +238,18 @@ fn snapshot_budgeted(db: &Path, binary: Option<&Path>, root: &Path, label: &str,
     }
     prune_locked(root, None, &[], &PruneOptions { keep: keep_from_env(), ..Default::default() }, SystemTime::now(), &refs);
     Ok(dir)
+}
+
+fn ensure_snapshot_space(free: Option<u64>, db_bytes: u64, binary_bytes: u64, reserve_gb: f64) -> Result<()> {
+    let free = free.context("cannot determine snapshot filesystem headroom")?;
+    let reserve = (reserve_gb * GIB) as u64;
+    let need = db_bytes.saturating_mul(2).saturating_add(db_bytes / 10)
+        .saturating_add(binary_bytes).saturating_add(reserve);
+    if free < need {
+        bail!("not enough room for a snapshot: {:.1} GB free, {:.1} GB needed for raw/compressed copies, the rollback binary, and free-space reserve; prune or free space first",
+            free as f64 / GIB, need as f64 / GIB);
+    }
+    Ok(())
 }
 
 /// The database holds mail; a snapshot is as private as the original.
@@ -773,6 +774,21 @@ mod tests {
         assert!(records.iter().any(|r| r.kind == "rollback binary" && r.path.ends_with("augmentagent.old")));
         assert!(!root.exists(), "dry-run must not create the snapshot root");
         assert!(release.join("augmentagent.old").exists());
+    }
+
+    #[test]
+    fn snapshot_space_guard_accounts_for_peak_copies_binary_and_final_reserve() {
+        const M: u64 = 1024 * 1024;
+        let reserve_gb = 4.0 / 1024.0;
+        // Enough for the old 1.25x estimate, insufficient for simultaneous
+        // plain/gzip copies plus the binary and reserve.
+        assert!(ensure_snapshot_space(Some(5 * M), M, M, reserve_gb).is_err());
+        assert!(ensure_snapshot_space(Some(8 * M), M, M, reserve_gb).is_ok());
+        assert!(ensure_snapshot_space(Some(7 * M), M, 0, reserve_gb).is_ok());
+        assert!(ensure_snapshot_space(Some(7 * M), M, 2 * M, reserve_gb).is_err());
+        assert!(ensure_snapshot_space(Some(3 * M), M, 0, 0.0).is_ok());
+        assert!(ensure_snapshot_space(Some(3 * M), M, 0, reserve_gb).is_err());
+        assert!(ensure_snapshot_space(None, M, 0, 0.0).is_err());
     }
 
 }

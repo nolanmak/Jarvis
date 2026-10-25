@@ -685,14 +685,13 @@ async fn run_sandboxed(
         fn drop(&mut self) { unsafe { libc::kill(-(self.0 as i32), libc::SIGKILL) }; }
     }
     let _group = Group(child.id().context("spawned gate has no pid")?);
-    let target = env.iter().find(|(k, _)| k == "CARGO_TARGET_DIR")
-        .map(|(_, p)| { let p = PathBuf::from(p); if p.is_absolute() { p } else { cwd.join(p) } });
+    let env_path = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, value)| {
+        let path = PathBuf::from(value); if path.is_absolute() { path } else { cwd.join(path) }
+    });
+    let target = env_path("CARGO_TARGET_DIR");
+    let temp = env_path("TMPDIR");
     let output = async { Ok::<_, anyhow::Error>(child.wait_with_output().await?) };
-    let out = if let Some(target) = target {
-        crate::build_storage::watch_reserve(&target, output).await?
-    } else {
-        output.await?
-    };
+    let out = crate::build_storage::watch_reserve_roots(target.as_deref(), temp.as_deref(), output).await?;
     Ok((
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),

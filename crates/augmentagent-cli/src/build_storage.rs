@@ -19,7 +19,10 @@ pub fn state_dir() -> Result<PathBuf> {
 
 /// Kept open across the entire build, including builder subprocesses. Never
 /// unlink the lock file: a second inode would permit concurrent writers.
-pub struct Lease(std::fs::File);
+pub struct Lease {
+    file: std::fs::File,
+    targets: crate::storage_leases::TargetLeases,
+}
 impl Lease {
     pub fn try_at(state: &Path) -> Result<Option<Self>> {
         std::fs::create_dir_all(state)?;
@@ -30,7 +33,10 @@ impl Lease {
             .write(true)
             .open(state.join("disk-build.lock"))?;
         if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            Ok(Some(Self(f)))
+            Ok(Some(Self {
+                file: f,
+                targets: Default::default(),
+            }))
         } else {
             let e = std::io::Error::last_os_error();
             if e.kind() == std::io::ErrorKind::WouldBlock {
@@ -41,9 +47,31 @@ impl Lease {
         }
     }
 }
+impl Lease {
+    pub async fn protect_targets(&mut self, roots: &[PathBuf]) -> Result<()> {
+        let until = tokio::time::Instant::now() + Duration::from_secs(300);
+        loop {
+            if let Some(targets) =
+                crate::storage_leases::TargetLeases::try_cache_roots(roots, None)?
+            {
+                self.targets = targets;
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= until {
+                bail!(
+                    "{}: target lease busy; retry after the active writer exits",
+                    crate::disk::LOW_DISK_REFUSAL
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+}
+
 impl Drop for Lease {
     fn drop(&mut self) {
-        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        self.targets = Default::default();
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -73,6 +101,9 @@ pub struct Target {
     pub worktree: Option<PathBuf>,
     #[serde(default)]
     pub ephemeral: bool,
+    /// App-wide gate caches survive the repository clone that first used them.
+    #[serde(default)]
+    pub shared: bool,
 }
 
 fn repo_id(repo: &Path) -> Result<PathBuf> {
@@ -113,6 +144,25 @@ pub fn register(
     worktree: Option<&Path>,
     state: &Path,
 ) -> Result<Target> {
+    register_target(repo, target, worktree, state, false, false)
+}
+
+pub fn register_abandoned(repo: &Path, target: &Path, state: &Path) -> Result<Target> {
+    register_target(repo, target, None, state, true, false)
+}
+
+fn register_shared_gate(repo: &Path, target: &Path, state: &Path) -> Result<Target> {
+    register_target(repo, target, None, state, false, true)
+}
+
+fn register_target(
+    repo: &Path,
+    target: &Path,
+    worktree: Option<&Path>,
+    state: &Path,
+    abandoned: bool,
+    shared: bool,
+) -> Result<Target> {
     let repo = repo_id(repo)?;
     std::fs::create_dir_all(target)?;
     let path = std::fs::canonicalize(target)?;
@@ -125,17 +175,20 @@ pub fn register(
     {
         bail!("refusing to manage a source, state, home, or filesystem root");
     }
-    if crate::disk::profile_dirs(&path)
-        .iter()
-        .any(|p| std::fs::canonicalize(p).map_or(true, |p| !p.starts_with(&path)))
+    if !shared
+        && crate::disk::profile_dirs(&path)
+            .iter()
+            .any(|p| std::fs::canonicalize(p).map_or(true, |p| !p.starts_with(&path)))
     {
         bail!("refusing external profile symlinks in a registered target");
     }
     if !path.join("CACHEDIR.TAG").exists() {
-        // Only an empty new target can acquire a tag implicitly.
-        if std::fs::read_dir(&path)?.next().is_some() {
+        // Explicit registration may adopt pre-existing targets that lost
+        // their tag when profiles were moved. Unknown nonempty data stays
+        // outside ownership; a Cargo compiler record and profile are required.
+        if std::fs::read_dir(&path)?.next().is_some() && !legacy_cargo_layout(&path) {
             bail!(
-                "existing target lacks Cargo CACHEDIR.TAG: {}",
+                "existing target has neither a Cargo tag nor a verified legacy Cargo layout: {}",
                 path.display()
             );
         }
@@ -151,17 +204,23 @@ pub fn register(
             std::env::current_dir().unwrap_or_default().join(w)
         }
     });
-    let record = Target {
+    let mut record = Target {
         version: 1,
         path: path.clone(),
         repo,
         worktree,
-        ephemeral: false,
+        ephemeral: abandoned,
+        shared,
     };
     if let Ok(bytes) = std::fs::read(path.join(MARKER)) {
         let old: Target = serde_json::from_slice(&bytes)?;
-        if old.repo != record.repo || old.path != path {
+        if old.path != path || (old.repo != record.repo && !old.shared && !shared) {
             bail!("target belongs to another repository");
+        }
+        if shared {
+            record.repo = old.repo;
+        } else if old.shared && record.worktree.is_none() && !abandoned {
+            record = old;
         }
     }
     let records = state.join("build-targets");
@@ -169,6 +228,33 @@ pub fn register(
     atomic_json(&path.join(MARKER), &record)?;
     atomic_json(&records.join(key(&path)), &record)?;
     Ok(record)
+}
+
+fn legacy_cargo_layout(path: &Path) -> bool {
+    let info = path.join(".rustc_info.json");
+    if std::fs::symlink_metadata(&info).map_or(true, |m| !m.is_file() || m.file_type().is_symlink())
+    {
+        return false;
+    }
+    let compiler_record = std::fs::read(&info)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|v| v.get("rustc_fingerprint").is_some() && v.get("outputs").is_some());
+    compiler_record
+        && crate::disk::profile_dirs(path).iter().any(|profile| {
+            [profile.join("deps"), profile.join(".fingerprint")]
+                .iter()
+                .all(|p| {
+                    std::fs::symlink_metadata(p)
+                        .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+                })
+        })
+}
+
+pub fn known_cargo_layout(path: &Path) -> bool {
+    !path.join("Cargo.toml").exists()
+        && !path.join(".git").exists()
+        && (valid_tag(path) || legacy_cargo_layout(path))
 }
 
 fn valid_tag(path: &Path) -> bool {
@@ -275,6 +361,7 @@ fn parent_targets(repo: &Path, state: &Path) -> Vec<Target> {
                 repo: repo.to_path_buf(),
                 worktree: None,
                 ephemeral: true,
+                shared: false,
             });
         }
     }
@@ -294,7 +381,7 @@ pub fn registered(repo: &Path, state: &Path) -> Vec<Target> {
         .filter_map(|e| {
             let record: Target = serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok()?;
             if record.version != 1
-                || record.repo != repo
+                || (record.repo != repo && !record.shared)
                 || !valid_tag(&record.path)
                 || std::fs::canonicalize(&record.path).ok().as_ref() != Some(&record.path)
             {
@@ -344,6 +431,18 @@ pub fn cache_cap_mb() -> u64 {
         .unwrap_or(20_000)
 }
 
+/// A healthy filesystem keeps the configured budget. Tighten it only for
+/// a real reserve shortfall, never to the current size (MiB rounding could
+/// otherwise make even a tiny warm cache appear over budget).
+pub fn cap_for_free_space(total: u64, configured: u64, free: u64, reserve: u64) -> u64 {
+    let shortfall = reserve.saturating_sub(free);
+    if shortfall == 0 {
+        configured
+    } else {
+        configured.min(total.saturating_sub(shortfall))
+    }
+}
+
 pub fn admission_floor_gb() -> f64 {
     let growth = std::env::var("AUGMENTAGENT_BUILD_GROWTH_GB")
         .ok()
@@ -365,6 +464,27 @@ pub fn effective_target(repo: &Path) -> PathBuf {
     }
 }
 
+/// Known output locations, resolving profile links onto the filesystem
+/// actually receiving writes. Include empty default profiles before Cargo
+/// has populated their dependency directories.
+pub fn monitored_paths(target: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for path in std::iter::once(target.to_path_buf())
+        .chain([
+            target.join("debug"),
+            target.join("release"),
+            target.join("tmp"),
+        ])
+        .chain(crate::disk::profile_dirs(target))
+    {
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
 /// Dropping provider futures invokes their existing descendant supervisor
 /// before the caller releases its lease. Applies the same in-flight floor to
 /// builders and explicit session builds as to verification gates.
@@ -372,15 +492,33 @@ pub async fn watch_reserve<T>(
     target: &Path,
     future: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
+    watch_reserve_roots(Some(target), None, future).await
+}
+
+pub async fn watch_reserve_roots<T>(
+    target: Option<&Path>,
+    temp: Option<&Path>,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
     watch_with(future, || {
-        let bytes = crate::disk::available_bytes(target).with_context(|| {
-            format!(
-                "{}: cannot monitor build filesystem",
-                crate::disk::LOW_DISK_REFUSAL
-            )
-        })?;
-        if let Some(why) = crate::disk::floor_refusal(bytes, crate::disk::gate_min_free_gb()) {
-            bail!("{why}; stopped managed build before exhausting its reserve");
+        let mut paths = target.map(monitored_paths).unwrap_or_default();
+        if let Some(temp) = temp {
+            paths.push(temp.to_path_buf());
+        }
+        for path in paths {
+            let bytes = crate::disk::available_bytes(&path).with_context(|| {
+                format!(
+                    "{}: cannot monitor build filesystem for {}",
+                    crate::disk::LOW_DISK_REFUSAL,
+                    path.display()
+                )
+            })?;
+            if let Some(why) = crate::disk::floor_refusal(bytes, crate::disk::gate_min_free_gb()) {
+                bail!(
+                    "{why}; stopped managed build before exhausting its reserve at {}",
+                    path.display()
+                );
+            }
         }
         Ok(())
     })
@@ -401,11 +539,14 @@ async fn watch_with<T>(
 }
 
 pub async fn run_command(target: &Path, command: &[String]) -> Result<()> {
+    let scratch = std::fs::canonicalize(target)?.join("tmp");
+    std::fs::create_dir_all(&scratch)?;
     let mut child = tokio::process::Command::new(&command[0])
         .args(&command[1..])
         .env_clear()
         .envs(std::env::vars().filter(|(key, _)| !crate::self_improve::env_name_is_secret(key)))
         .env("CARGO_TARGET_DIR", std::fs::canonicalize(target)?)
+        .env("TMPDIR", &scratch)
         .env("CARGO_PROFILE_DEV_DEBUG", "0")
         .env("CARGO_PROFILE_TEST_DEBUG", "0")
         .kill_on_drop(true)
@@ -431,62 +572,13 @@ pub async fn run_command(target: &Path, command: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Every new admission performs reconciliation itself, so a continuous queue
-/// cannot starve it. Serializing writers also prevents two lanes from each
-/// spending the same measured free-space reserve.
-pub async fn admit(repo: &Path, target: &Path) -> Result<Lease> {
-    admit_owned(repo, target, None).await
-}
-
-pub async fn admit_session(repo: &Path, target: &Path) -> Result<Lease> {
-    admit_owned(repo, target, Some(repo)).await
-}
-
-async fn admit_owned(repo: &Path, target: &Path, owner: Option<&Path>) -> Result<Lease> {
-    let lease = acquire().await.with_context(|| {
-        format!(
-            "{}: storage lease unavailable",
-            crate::disk::LOW_DISK_REFUSAL
-        )
-    })?;
-    let mut cleanup = Vec::new();
-    crate::disk::run_prune_locked(repo, &crate::disk::Options::default(), &mut cleanup, true)
-        .with_context(|| {
-            format!(
-                "{}: storage reconciliation failed",
-                crate::disk::LOW_DISK_REFUSAL
-            )
-        })?;
-    tracing::info!(cleanup = %String::from_utf8_lossy(&cleanup), "abandoned build storage reconciliation");
-    reconcile(
-        repo,
-        target,
-        &state_dir()?,
-        admission_floor_gb(),
-        cache_cap_mb(),
-        owner,
-        &crate::disk::available_bytes,
-    )
-    .with_context(|| {
-        format!(
-            "{}: admission cleanup failed",
-            crate::disk::LOW_DISK_REFUSAL
-        )
-    })?;
-    Ok(lease)
-}
-
-fn reconcile(
-    repo: &Path,
-    target: &Path,
-    state: &Path,
-    floor_gb: f64,
-    cap_mb: u64,
-    owner: Option<&Path>,
-    free_bytes: &dyn Fn(&Path) -> Option<u64>,
-) -> Result<()> {
-    std::fs::create_dir_all(target)?;
-    let canonical = std::fs::canonicalize(target)?;
+#[cfg(target_os = "linux")]
+fn ensure_idle_target(target: &Path) -> Result<()> {
+    let canonical = match std::fs::canonicalize(target) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
     let procs = crate::disk::build_procs().context("cannot prove build target is idle")?;
     let resolve = |p: &Path| std::fs::canonicalize(p).ok();
     if crate::disk::root_in_use(&canonical, &procs, &resolve)
@@ -499,20 +591,203 @@ fn reconcile(
             crate::disk::LOW_DISK_REFUSAL
         );
     }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn clear_scratch(target: &Path) -> Result<u64> {
+    let scratch = target.join("tmp");
+    let metadata = match std::fs::symlink_metadata(&scratch) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    let bytes = crate::disk::disk_bytes(&scratch);
+    if metadata.is_dir() {
+        std::fs::remove_dir_all(&scratch)?;
+    } else {
+        std::fs::remove_file(&scratch)?;
+    }
+    Ok(bytes)
+}
+
+/// Every new admission performs reconciliation itself, so a continuous queue
+/// cannot starve it. Serializing writers also prevents two lanes from each
+/// spending the same measured free-space reserve.
+pub async fn admit(repo: &Path, target: &Path) -> Result<Lease> {
+    admit_owned(repo, target, None).await
+}
+
+pub async fn admit_session(repo: &Path, target: &Path) -> Result<Lease> {
+    admit_owned(repo, target, Some(repo)).await
+}
+
+async fn admit_owned(repo: &Path, target: &Path, owner: Option<&Path>) -> Result<Lease> {
+    let mut lease = acquire().await.with_context(|| {
+        format!(
+            "{}: storage lease unavailable",
+            crate::disk::LOW_DISK_REFUSAL
+        )
+    })?;
+    let state = state_dir()?;
+    let state_canonical = std::fs::canonicalize(&state)?;
+    let home = std::env::var_os("HOME").and_then(|h| std::fs::canonicalize(h).ok());
+    // Validate configuration before even the discovering cleanup pass. An
+    // already configured shared gate may be tagless, but never source/state.
+    for path in [target.to_path_buf(), crate::disk::gate_target_dir()] {
+        if let Ok(path) = std::fs::canonicalize(path) {
+            if path.parent().is_none()
+                || path.join("Cargo.toml").exists()
+                || path.join(".git").exists()
+                || path == state_canonical
+                || home.as_ref() == Some(&path)
+            {
+                bail!(
+                    "{}: source, home, state, or filesystem root cannot be a build cache",
+                    crate::disk::LOW_DISK_REFUSAL
+                );
+            }
+        }
+    }
+    std::fs::create_dir_all(target)?;
+    let mut protected_roots = vec![target.to_path_buf()];
+    if owner.is_none() {
+        let gate = crate::disk::gate_target_dir();
+        std::fs::create_dir_all(&gate)?;
+        if !protected_roots.contains(&gate) {
+            protected_roots.push(gate);
+        }
+    }
+    lease.protect_targets(&protected_roots).await?;
+    let gate = crate::disk::gate_target_dir();
+    if owner.is_none() || std::fs::canonicalize(&gate).ok() == std::fs::canonicalize(target).ok() {
+        register_shared_gate(repo, &gate, &state)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Preserve existing builds on hosts without /proc. The shared lease
+        // and space guard still apply, but unknown process evidence never
+        // authorizes destructive cleanup.
+        let mut readings = Vec::new();
+        for path in monitored_paths(target) {
+            let free =
+                crate::disk::available_bytes(&path).context("cannot read build filesystem")?;
+            if let Some(why) = crate::disk::floor_refusal(free, admission_floor_gb()) {
+                bail!("{why}");
+            }
+            readings.push((path, free));
+        }
+        std::fs::create_dir_all(target.join("tmp"))?;
+        atomic_json(
+            &state.join("disk-reconcile.json"),
+            &serde_json::json!({
+                "at": chrono::Utc::now(), "target": target, "worktree": owner, "admitted": true,
+                "filesystem_free_bytes": readings,
+                "cleanup": "deferred: native build-process evidence unavailable; existing cache preserved"
+            }),
+        )?;
+        return Ok(lease);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let canonical = std::fs::canonicalize(target)?;
+        let gate = crate::disk::gate_target_dir();
+        let configured_gate = std::fs::canonicalize(&gate).ok();
+        let checkout_target = std::fs::canonicalize(repo.join("target")).ok();
+        if configured_gate.as_ref() != Some(&canonical)
+            && checkout_target.as_ref() != Some(&canonical)
+        {
+            register(repo, target, owner, &state)?;
+        }
+        let scratch_targets = if owner.is_some() {
+            vec![canonical]
+        } else {
+            vec![configured_gate.unwrap_or(gate)]
+        };
+        for scratch_target in &scratch_targets {
+            ensure_idle_target(scratch_target).with_context(|| {
+                format!(
+                    "{}: cannot safely reclaim scratch",
+                    crate::disk::LOW_DISK_REFUSAL
+                )
+            })?;
+            let freed = clear_scratch(scratch_target).with_context(|| {
+                format!("{}: scratch cleanup failed", crate::disk::LOW_DISK_REFUSAL)
+            })?;
+            tracing::info!(target = %scratch_target.display(), freed_bytes = freed, "reclaimed idle build scratch before admission");
+        }
+        let mut cleanup = Vec::new();
+        crate::disk::run_prune_with_leases(
+            repo,
+            &crate::disk::Options::default(),
+            &mut cleanup,
+            true,
+            Some(&lease.targets),
+        )
+        .with_context(|| {
+            format!(
+                "{}: storage reconciliation failed",
+                crate::disk::LOW_DISK_REFUSAL
+            )
+        })?;
+        tracing::info!(cleanup = %String::from_utf8_lossy(&cleanup), "abandoned build storage reconciliation");
+        reconcile(
+            repo,
+            target,
+            &state_dir()?,
+            admission_floor_gb(),
+            cache_cap_mb(),
+            Some(&lease.targets),
+            &crate::disk::available_bytes,
+        )
+        .with_context(|| {
+            format!(
+                "{}: admission cleanup failed",
+                crate::disk::LOW_DISK_REFUSAL
+            )
+        })?;
+        // Pruning may have removed tmp/ even when it kept the cache root.
+        // Builder subprocesses receive TMPDIR before Cargo has run, so its
+        // parent must exist at the point we hand over the lease.
+        for scratch_target in scratch_targets {
+            std::fs::create_dir_all(scratch_target.join("tmp"))?;
+        }
+        Ok(lease)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn reconcile(
+    repo: &Path,
+    target: &Path,
+    state: &Path,
+    floor_gb: f64,
+    cap_mb: u64,
+    held: Option<&crate::storage_leases::TargetLeases>,
+    free_bytes: &dyn Fn(&Path) -> Option<u64>,
+) -> Result<()> {
+    std::fs::create_dir_all(target)?;
+    ensure_idle_target(target)?;
     let checkout_target =
         std::fs::canonicalize(repo.join("target")).ok() == std::fs::canonicalize(target).ok();
-    if !checkout_target {
-        register(repo, target, owner, state)?;
-    }
     let mut log = Vec::new();
     // Only the effective target is trimmed, using the same budget as the updater.
     let free = free_bytes(target).context("cannot read build filesystem")?;
     let reserve = (floor_gb * 1024.0_f64.powi(3)) as u64;
     let total = crate::disk::disk_bytes(target);
-    let cap = (cap_mb.saturating_mul(1024 * 1024))
-        .min(total.saturating_sub(reserve.saturating_sub(free)));
+    let mut minimum_free = free;
+    for path in monitored_paths(target).into_iter().skip(1) {
+        minimum_free =
+            minimum_free.min(free_bytes(&path).context("cannot read build profile filesystem")?);
+    }
+    let cap = cap_for_free_space(
+        total,
+        cap_mb.saturating_mul(1024 * 1024),
+        minimum_free,
+        reserve,
+    );
     if !checkout_target {
-        crate::disk::run_prune_locked(
+        crate::disk::run_prune_with_leases(
             repo,
             &crate::disk::Options {
                 roots: vec![target.to_path_buf()],
@@ -521,18 +796,36 @@ fn reconcile(
             },
             &mut log,
             true,
+            held,
         )?;
     }
-    let after = free_bytes(target).context("cannot re-read build filesystem")?;
+    let mut readings = Vec::new();
+    for path in monitored_paths(target) {
+        let bytes = free_bytes(&path).context("cannot re-read build filesystem")?;
+        readings.push((path, bytes));
+    }
+    let after = readings[0].1;
+    let refusal = readings.iter().find_map(|(path, bytes)| {
+        crate::disk::floor_refusal(*bytes, floor_gb)
+            .map(|why| format!("{why} [filesystem for {}]", path.display()))
+    });
+    let remaining = crate::disk::disk_bytes(target);
+    // Retain the root's small Cargo/ownership records even for an explicit
+    // zero cap. Larger unprunable files must not silently defeat the budget.
+    let over_cap = !checkout_target && remaining > cap.saturating_add(1024 * 1024);
     let report = serde_json::json!({"at": chrono::Utc::now(), "target": target,
             "before_free_bytes": free, "after_free_bytes": after,
-            "required_free_bytes": reserve, "admitted": after >= reserve,
-            "configured_cap_mb": cap_mb, "target_bytes": crate::disk::disk_bytes(target),
+            "required_free_bytes": reserve, "admitted": refusal.is_none() && !over_cap,
+            "filesystem_free_bytes": readings,
+            "configured_cap_mb": cap_mb, "target_bytes": remaining,
             "cleanup": String::from_utf8_lossy(&log)});
     atomic_json(&state.join("disk-reconcile.json"), &report)?;
     tracing::info!(report = %report, "build storage reconciled before admission");
-    if let Some(why) = crate::disk::floor_refusal(after, floor_gb) {
+    if let Some(why) = refusal {
         bail!("{why}");
+    }
+    if over_cap {
+        bail!("{}: cache remains over its budget after cleanup; inspect skipped or unprunable files under {}", crate::disk::LOW_DISK_REFUSAL, target.display());
     }
     Ok(())
 }
@@ -606,7 +899,7 @@ mod tests {
             Some(if n == 0 { 0 } else { 30 << 30 })
         };
         reconcile(&r, &target, &state, 25.0, 0, None, &free).unwrap();
-        assert_eq!(calls.get(), 2, "must measure again after cleanup");
+        assert!(calls.get() >= 2, "must measure again after cleanup");
         assert!(
             !target.join("debug").exists(),
             "cap cleanup ran before admission"
@@ -736,5 +1029,122 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("background writer survived cancellation");
+    }
+    #[test]
+    fn explicit_registration_adopts_a_tagless_legacy_cargo_cache_but_not_unknown_data() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path().join("repo");
+        repo(&r);
+        let target = t.path().join("legacy-cache");
+        let state = t.path().join("state");
+        std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+        std::fs::create_dir(target.join("debug/.fingerprint")).unwrap();
+        std::fs::write(
+            target.join(".rustc_info.json"),
+            br#"{"rustc_fingerprint":123,"outputs":{},"successes":{}}"#,
+        )
+        .unwrap();
+        register(&r, &target, None, &state).unwrap();
+        assert!(valid_tag(&target));
+        assert_eq!(registered(&r, &state).len(), 1);
+        let unknown = t.path().join("unknown-data");
+        std::fs::create_dir(&unknown).unwrap();
+        std::fs::write(unknown.join("data.db"), b"not a cache").unwrap();
+        assert!(register(&r, &unknown, None, &state).is_err());
+        assert!(!unknown.join("CACHEDIR.TAG").exists());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn under_budget_warm_profiles_survive_repeated_admissions() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path().join("repo");
+        repo(&r);
+        let target = t.path().join("cache");
+        let state = t.path().join("state");
+        let _lease = Lease::try_at(&state).unwrap().unwrap();
+        register(&r, &target, None, &state).unwrap();
+        std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+        let artifact = target.join("debug/deps/warm-artifact");
+        std::fs::write(&artifact, b"warm working set below budget").unwrap();
+        for _ in 0..2 {
+            reconcile(&r, &target, &state, 25.0, 20_000, None, &|_| Some(30 << 30)).unwrap();
+            assert!(
+                artifact.exists(),
+                "an under-budget warm cache was trimmed despite ample free space"
+            );
+        }
+    }
+    #[test]
+    fn explicit_abandoned_cache_adoption_needs_no_invented_worktree_owner() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path().join("repo");
+        repo(&r);
+        let target = t.path().join("cache");
+        let state = t.path().join("state");
+        register_abandoned(&r, &target, &state).unwrap();
+        let records = registered(&r, &state);
+        assert_eq!(records.len(), 1);
+        assert!(records[0].ephemeral);
+        assert!(records[0].worktree.is_none());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreclaimable_cache_bytes_refuse_admission_without_deleting_unknown_files() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path().join("repo");
+        repo(&r);
+        let target = t.path().join("cache");
+        let state = t.path().join("state");
+        let _lease = Lease::try_at(&state).unwrap().unwrap();
+        register(&r, &target, None, &state).unwrap();
+        let unknown = target.join("unknown-large-file");
+        std::fs::write(&unknown, vec![1; 2 * 1024 * 1024]).unwrap();
+        let error = reconcile(&r, &target, &state, 0.0, 0, None, &|_| Some(30 << 30)).unwrap_err();
+        assert!(error.to_string().contains("cache remains over its budget"));
+        assert!(unknown.exists());
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(state.join("disk-reconcile.json")).unwrap())
+                .unwrap();
+        assert_eq!(report["admitted"], false);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_relocated_checkout_profile_cannot_spend_free_space_from_the_root_volume() {
+        use std::os::unix::fs::symlink;
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path().join("repo");
+        repo(&r);
+        let target = r.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let relocated = t.path().join("relocated-debug");
+        std::fs::create_dir(&relocated).unwrap();
+        symlink(&relocated, target.join("debug")).unwrap();
+        let state = t.path().join("state");
+        let _lease = Lease::try_at(&state).unwrap().unwrap();
+        let free = |path: &Path| Some(if path == relocated { 1 << 30 } else { 40 << 30 });
+        let error = reconcile(&r, &target, &state, 25.0, 20_000, None, &free).unwrap_err();
+        assert!(error.to_string().contains(crate::disk::LOW_DISK_REFUSAL));
+        assert!(error.to_string().contains("relocated-debug"));
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(state.join("disk-reconcile.json")).unwrap())
+                .unwrap();
+        assert_eq!(report["admitted"], false);
+    }
+    #[test]
+    fn shared_gate_discovery_survives_its_first_repository_and_preserves_its_owner() {
+        let t = tempfile::tempdir().unwrap();
+        let first = t.path().join("first");
+        repo(&first);
+        let other = t.path().join("other");
+        repo(&other);
+        let target = t.path().join("gate");
+        let state = t.path().join("state");
+        let original = register_shared_gate(&first, &target, &state).unwrap();
+        let reused = register_shared_gate(&other, &target, &state).unwrap();
+        assert_eq!(reused.repo, original.repo);
+        assert!(reused.shared);
+        std::fs::remove_dir_all(&first).unwrap();
+        assert_eq!(registered(&other, &state).len(), 1);
+        assert!(register(&other, &target, None, &state).unwrap().shared);
     }
 }

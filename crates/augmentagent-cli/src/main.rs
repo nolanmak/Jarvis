@@ -106,6 +106,7 @@ mod deploy_snapshot;
 mod snapshot_refs;
 mod disk;
 mod build_storage;
+mod storage_leases;
 mod doctor;
 mod env_cfg;
 mod gmail_attach;
@@ -997,6 +998,9 @@ enum DiskOp {
         /// Shared cache: apply retention without deleting the whole root.
         #[arg(long)]
         persistent: bool,
+        /// Explicitly adopt an abandoned cache whose worktree is unknown.
+        #[arg(long, conflicts_with_all = ["persistent", "worktree"])]
+        abandoned: bool,
     },
     /// Run a build with automatic cleanup, reserved headroom, and exclusion.
     Build {
@@ -2979,6 +2983,9 @@ async fn main() -> Result<()> {
         let mut out = std::io::stdout().lock();
         return match op {
             DeployOp::Snapshot { label } => {
+                // Snapshot allocation and builds must not spend the same
+                // measured filesystem reserve concurrently.
+                let _storage = build_storage::acquire().await?;
                 let db = cli
                     .db
                     .clone()
@@ -3031,13 +3038,19 @@ async fn main() -> Result<()> {
         let repo_root = std::env::current_dir().context("current_dir")?;
         return match op {
             DiskOp::ManageParent { root } => {
-                let _lease = build_storage::acquire().await?;
+                let mut lease = build_storage::acquire().await?;
+                std::fs::create_dir_all(root)?;
+                lease.protect_targets(std::slice::from_ref(root)).await?;
                 build_storage::manage_parent(&repo_root, root, &build_storage::state_dir()?)
             }
-            DiskOp::Register { root, worktree, persistent } => {
-                let _lease = build_storage::acquire().await?;
+            DiskOp::Register { root, worktree, persistent, abandoned } => {
+                let mut lease = build_storage::acquire().await?;
+                std::fs::create_dir_all(root)?;
+                lease.protect_targets(std::slice::from_ref(root)).await?;
                 let owner = if *persistent { None } else { Some(worktree.as_deref().unwrap_or(&repo_root)) };
-                let record = build_storage::register(&repo_root, root, owner, &build_storage::state_dir()?)?;
+                let record = if *abandoned {
+                    build_storage::register_abandoned(&repo_root, root, &build_storage::state_dir()?)?
+                } else { build_storage::register(&repo_root, root, owner, &build_storage::state_dir()?)? };
                 println!("{}", serde_json::to_string_pretty(&record)?);
                 Ok(())
             }
