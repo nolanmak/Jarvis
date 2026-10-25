@@ -1501,6 +1501,24 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             ));
         }
 
+        // #1579 — the drafter is shown internal context it must never repeat:
+        // the #1060 notes hint naming the owner's private note titles, the
+        // wiki-hint preamble, the thread/tone/asks boundary tags. One echo of
+        // it was delivered to an external recipient. Scrubbing here, before
+        // anything persists, is what makes the sqlite `draftBody`, the Discord
+        // card and the Gmail draft all carry the same clean text — including on
+        // the retry rail, which re-enters with the stored body.
+        let scrub = augmentagent_channel_core::outbound_scrub::scrub_internal_context(&initial_draft);
+        if !scrub.is_clean() {
+            warn!(
+                markers = %scrub.marker_summary(),
+                dropped_lines = scrub.dropped_lines,
+                "draft echoed internal prompt context; dropped those lines"
+            );
+        }
+        let draft_has_nothing_to_send = scrub.is_empty();
+        let initial_draft = scrub.body;
+
         let (action_id, existing_draft_id) = match existing_action_id {
             Some(id) => {
                 self.store.update_action_status(
@@ -1531,6 +1549,21 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 None,
             ),
         };
+
+        // Nothing survived the scrub — the whole draft was internal context,
+        // or the drafter produced only whitespace in the first place. Either
+        // way there is no reply to send, so error out instead of creating a
+        // blank Gmail draft and carding it. The reason stays generic:
+        // `actions.errorMessage` renders on the Discord card.
+        if draft_has_nothing_to_send {
+            self.store.update_action_status(
+                &action_id,
+                ActionStatus::Error,
+                None,
+                Some("draft had no sendable text"),
+            )?;
+            anyhow::bail!("draft had no sendable text");
+        }
 
         // #629 — replies default to reply-all: sender on To, every other
         // thread participant on Cc. The envelope is computed once per action
@@ -3244,6 +3277,141 @@ Where: Microsoft Teams
             human.contains("[cc: will@example.com"),
             "cc marker lost from card body: {}",
             bodies[0]
+        );
+    }
+
+    fn scrub_fixture() -> (
+        Arc<Store>,
+        tempfile::NamedTempFile,
+        Arc<ThreadedGmail>,
+        Arc<BodyRecordingBroker>,
+    ) {
+        let (store, f) = tmp_store();
+        let gmail = Arc::new(ThreadedGmail {
+            emails: vec![threaded_inbound()],
+            thread: vec![threaded_inbound()],
+            thread_fetch_fails: false,
+            recorded_cc: std::sync::Mutex::new(None),
+            recorded_body: std::sync::Mutex::new(None),
+        });
+        (store, f, gmail, Arc::new(BodyRecordingBroker::default()))
+    }
+
+    fn scrub_channel(
+        store: Arc<Store>,
+        gmail: Arc<ThreadedGmail>,
+        broker: Arc<BodyRecordingBroker>,
+    ) -> GmailChannel<ThreadedGmail, ScriptedReasoner> {
+        GmailChannel::new(
+            store,
+            gmail,
+            Arc::new(ScriptedReasoner::new([])),
+            broker,
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// #1579 — the drafter is shown the owner's own note titles so it can
+    /// weight the topic; one draft repeated that sentence verbatim and it was
+    /// delivered. Neither Gmail nor the card may ever see it, and the rest of
+    /// the reply still ships.
+    #[tokio::test]
+    async fn an_echoed_notes_hint_reaches_neither_the_gmail_body_nor_the_card() {
+        let (store, _f, gmail, broker) = scrub_fixture();
+        let hint = augmentagent_channel_core::prompt::notes_hint(&["Venue shortlist".into()]);
+        let out = scrub_channel(store, gmail.clone(), broker.clone())
+            .dispatch_reply(
+                "acc1",
+                threaded_inbound(),
+                format!("The 14th works.\n{hint}\n"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(out, Some(DispatchOutcome::AwaitingApproval)));
+        assert_eq!(
+            gmail.recorded_body.lock().unwrap().clone().unwrap(),
+            "The 14th works.\n",
+            "the hint leaked into the Gmail body"
+        );
+        let bodies = broker.bodies.lock().unwrap();
+        assert!(
+            !bodies[0].contains("notes of their own") && !bodies[0].contains("Venue shortlist"),
+            "the hint leaked onto the card: {}",
+            bodies[0]
+        );
+        assert!(bodies[0].contains("The 14th works."), "{}", bodies[0]);
+    }
+
+    #[tokio::test]
+    async fn a_marker_free_draft_still_reaches_gmail_byte_identical() {
+        let (store, _f, gmail, broker) = scrub_fixture();
+        let draft = "The 14th works.\r\n\r\nBest,\r\nNolan\r\n";
+        scrub_channel(store, gmail.clone(), broker)
+            .dispatch_reply("acc1", threaded_inbound(), draft.to_string(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            gmail.recorded_body.lock().unwrap().clone().unwrap(),
+            draft,
+            "a clean draft must pass through untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_draft_that_is_nothing_but_internal_context_errors_without_a_draft() {
+        dispatch_refuses_a_textless_draft(augmentagent_channel_core::prompt::notes_hint(&[
+            "Venue shortlist".into(),
+        ]))
+        .await;
+    }
+
+    /// A draft of pure whitespace never matches a marker, so the scrub leaves
+    /// it as-is — it still has no message in it and must not become a blank
+    /// Gmail draft on a card the owner could approve.
+    #[tokio::test]
+    async fn a_whitespace_only_draft_errors_without_a_draft() {
+        dispatch_refuses_a_textless_draft(" \n".into()).await;
+    }
+
+    async fn dispatch_refuses_a_textless_draft(draft: String) {
+        let (store, _f, gmail, broker) = scrub_fixture();
+        let inbound = threaded_inbound();
+        // Enter on the retry rail so the row under assertion is addressable —
+        // and because that rail is where a pre-fix leaked draft comes back.
+        let action_id = store
+            .log_action(
+                &inbound.message_id,
+                inbound.thread_id.as_deref(),
+                &inbound.from,
+                &inbound.subject,
+                Some(&inbound.body),
+                Some(&draft),
+                ActionStatus::Error,
+            )
+            .unwrap();
+        assert!(scrub_channel(store.clone(), gmail.clone(), broker)
+            .dispatch_reply("acc1", inbound, draft, Some(action_id.clone()))
+            .await
+            .is_err());
+        assert!(
+            gmail.recorded_body.lock().unwrap().is_none(),
+            "no draft may be created"
+        );
+        let row = store.get_action_with_email(&action_id).unwrap().unwrap();
+        assert_eq!(row.action.status, "error");
+        assert!(
+            row.action.draft_body.unwrap_or_default().trim().is_empty(),
+            "the leaked body must not survive in sqlite"
+        );
+        let message = row.action.error_message.unwrap_or_default();
+        assert!(
+            !message.contains("Venue shortlist") && !message.contains("notes of their own"),
+            "the error message must not quote the dropped text: {message}"
         );
     }
 

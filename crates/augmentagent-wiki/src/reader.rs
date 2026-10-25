@@ -11,6 +11,13 @@ use augmentagent_store::Email;
 
 use crate::layout::WikiLayout;
 
+/// Opening line of [`WikiReader::draft_hint`]. A constant so an outbound
+/// guard can recognise an echo of the hint in a generated body without a
+/// retyped copy that could drift from the generator (#1579).
+pub const DRAFT_HINT_PREAMBLE: &str = "Relevant wiki pages (you MAY open these with the Read tool; you may also Grep/Glob the wiki for additional context):";
+/// Closing instruction of [`WikiReader::draft_hint`]. See [`DRAFT_HINT_PREAMBLE`].
+pub const DRAFT_HINT_PREFER_WIKI: &str = "Always prefer wiki facts over assumptions.";
+
 pub struct WikiReader<'a> {
     pub layout: &'a WikiLayout,
 }
@@ -49,7 +56,7 @@ impl<'a> WikiReader<'a> {
         }
 
         format!(
-            "Relevant wiki pages (you MAY open these with the Read tool; you may also Grep/Glob the wiki for additional context):\n{}\n\nAlways prefer wiki facts over assumptions. If the wiki contradicts the email, trust the email and flag the contradiction in your reasoning.",
+            "{DRAFT_HINT_PREAMBLE}\n{}\n\n{DRAFT_HINT_PREFER_WIKI} If the wiki contradicts the email, trust the email and flag the contradiction in your reasoning.",
             lines.join("\n")
         )
     }
