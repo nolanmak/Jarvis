@@ -103,7 +103,10 @@ mod compute_tool;
 mod doc_cmd;
 mod db_compact;
 mod deploy_snapshot;
+mod snapshot_refs;
 mod disk;
+mod build_storage;
+mod storage_leases;
 mod doctor;
 mod env_cfg;
 mod gmail_attach;
@@ -930,6 +933,17 @@ enum DbOp {
 
 #[derive(Subcommand, Debug)]
 enum DeployOp {
+    /// Explicitly register a historical rollout directory. Initially pinned.
+    AdoptRollout {
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long, default_value = "rollout")]
+        label: String,
+    },
+    /// Protect a snapshot until explicitly unpinned.
+    Pin { name: String, #[arg(long)] reason: String },
+    /// Allow normal retention again after checking rollback dependencies.
+    Unpin { name: String },
     /// Snapshot the database (consistent while the daemon runs, compressed)
     /// and the release binary into one dated dir. Prints the dir.
     Snapshot {
@@ -972,6 +986,29 @@ enum DeployOp {
 
 #[derive(Subcommand, Debug)]
 enum DiskOp {
+    /// Opt a dedicated parent into discovery of future Cargo cache children.
+    ManageParent { #[arg(long)] root: PathBuf },
+    /// Register an external Cargo target for automatic housekeeping.
+    Register {
+        #[arg(long)]
+        root: PathBuf,
+        /// Worktree that owns this cache; may name a removed worktree.
+        #[arg(long, conflicts_with = "persistent")]
+        worktree: Option<PathBuf>,
+        /// Shared cache: apply retention without deleting the whole root.
+        #[arg(long)]
+        persistent: bool,
+        /// Explicitly adopt an abandoned cache whose worktree is unknown.
+        #[arg(long, conflicts_with_all = ["persistent", "worktree"])]
+        abandoned: bool,
+    },
+    /// Run a build with automatic cleanup, reserved headroom, and exclusion.
+    Build {
+        #[arg(long)]
+        target_dir: PathBuf,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
     /// Remove cold build output: `incremental/` sessions idle 2 days,
     /// artifacts whose cargo unit has not been used for 7 (14 where the
     /// filesystem records no access times), and the whole `target/` of a
@@ -2946,6 +2983,9 @@ async fn main() -> Result<()> {
         let mut out = std::io::stdout().lock();
         return match op {
             DeployOp::Snapshot { label } => {
+                // Snapshot allocation and builds must not spend the same
+                // measured filesystem reserve concurrently.
+                let _storage = build_storage::acquire().await?;
                 let db = cli
                     .db
                     .clone()
@@ -2969,6 +3009,12 @@ async fn main() -> Result<()> {
                 writeln!(out, "{}", dir.display())?;
                 Ok(())
             }
+            DeployOp::AdoptRollout { path, label } => {
+                println!("{}", deploy_snapshot::adopt_rollout(&root, path, label)?.display());
+                Ok(())
+            }
+            DeployOp::Pin { name, reason } => deploy_snapshot::set_pin(&root, name, Some(reason)),
+            DeployOp::Unpin { name } => deploy_snapshot::set_pin(&root, name, None),
             DeployOp::List => deploy_snapshot::run_list(&root, &mut out),
             DeployOp::Prune { dry_run, strays, yes, json } => deploy_snapshot::run_prune(
                 &root,
@@ -2991,6 +3037,28 @@ async fn main() -> Result<()> {
     if let Cmd::Disk { ref op } = cli.cmd {
         let repo_root = std::env::current_dir().context("current_dir")?;
         return match op {
+            DiskOp::ManageParent { root } => {
+                let mut lease = build_storage::acquire().await?;
+                std::fs::create_dir_all(root)?;
+                lease.protect_targets(std::slice::from_ref(root)).await?;
+                build_storage::manage_parent(&repo_root, root, &build_storage::state_dir()?)
+            }
+            DiskOp::Register { root, worktree, persistent, abandoned } => {
+                let mut lease = build_storage::acquire().await?;
+                std::fs::create_dir_all(root)?;
+                lease.protect_targets(std::slice::from_ref(root)).await?;
+                let owner = if *persistent { None } else { Some(worktree.as_deref().unwrap_or(&repo_root)) };
+                let record = if *abandoned {
+                    build_storage::register_abandoned(&repo_root, root, &build_storage::state_dir()?)?
+                } else { build_storage::register(&repo_root, root, owner, &build_storage::state_dir()?)? };
+                println!("{}", serde_json::to_string_pretty(&record)?);
+                Ok(())
+            }
+            DiskOp::Build { target_dir, command } => {
+                let lease = if build_storage::inherited_lease(target_dir)? { None }
+                    else { Some(build_storage::admit_session(&repo_root, target_dir).await?) };
+                build_storage::run_command(target_dir, command, lease.as_ref()).await
+            }
             DiskOp::Prune { dry_run, json, root, cap_mb, stale_days } => disk::run_prune(
                 &repo_root,
                 &disk::Options {

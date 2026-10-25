@@ -36,6 +36,14 @@ jobs:
           key: platform
       - name: Build the CLI
         run: cargo build -p augmentagent-cli --bin augmentagent
+      - name: Build storage admission and rollback retention (Linux)
+        if: runner.os == 'Linux'
+        env:
+          AUGMENTAGENT_GH_DISABLE: '1'
+        run: |
+          cargo test -p augmentagent-cli --bin augmentagent -- disk:: build_storage:: deploy_snapshot:: snapshot_refs:: storage_leases:: autopr_health::
+          python3 scripts/tests/disk-storage-smoke.py target/debug/augmentagent
+          bash scripts/tests/service-restart.test.sh
       # Every workflow here builds a per-crate SUBSET, so a crate that nothing
       # in CI compiles can break `main` while every check stays green. That is
       # not hypothetical: `augmentagent-channel-whatsapp` was left uncompilable

@@ -276,8 +276,8 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
                          test build needs",
                         t.free_gb_floor
                     ),
-                    fix: "Free space before the gate runs again — a gate that fails \
-                          on a full disk gets cached as a red `main`."
+                    fix: "Automatic cleanup could not restore build headroom. Inspect \
+                          `augmentagent disk prune --dry-run` for busy or unmanaged targets."
                         .into(),
                 });
             }
@@ -941,8 +941,25 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
 /// Entry point for the `autopr-health` subcommand. Exit code 0 when healthy
 /// or only warnings, 1 when anything is an alert, so a timer/CI can gate on it.
 pub async fn run(repo_root: &Path, notify: bool, json: bool) -> anyhow::Result<i32> {
+    // Cleanup is best effort and uses the same exclusion as builds. Busy
+    // storage remains visible in the findings and is retried next health tick.
+    let thresholds = Thresholds { free_gb_floor: crate::build_storage::admission_floor_gb(), ..Default::default() };
+    let before = crate::disk::read_filesystems(repo_root);
+    let mut cleanup_detail = String::new();
+    if before.iter().any(|r| r.free_gb < thresholds.free_gb_floor) {
+        let mut cleanup = Vec::new();
+        let result = crate::disk::run_prune(repo_root, &crate::disk::Options::default(), &mut cleanup);
+        cleanup_detail = String::from_utf8_lossy(&cleanup).into_owned();
+        if let Err(error) = &result { cleanup_detail.push_str(&format!("cleanup failed: {error:#}")); }
+        tracing::info!(result = ?result, cleanup = %cleanup_detail, "disk pressure reconciliation");
+    }
     let inputs = collect(repo_root);
-    let findings = analyze(&inputs, &Thresholds::default());
+    let mut findings = analyze(&inputs, &thresholds);
+    for finding in findings.iter_mut().filter(|f| f.code == "disk-low") {
+        if !cleanup_detail.is_empty() {
+            finding.fix.push_str(&format!(" Cleanup result: {}", cleanup_detail.chars().take(800).collect::<String>()));
+        }
+    }
 
     if json {
         let payload: Vec<_> = findings
