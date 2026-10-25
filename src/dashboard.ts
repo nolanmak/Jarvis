@@ -998,10 +998,14 @@ function googleOauthConfigured(): boolean {
 
 function googleRedirectUri(): string {
   // Must match a redirect URI registered on the OAuth client byte for byte.
-  // With AUGMENTAGENT_PUBLIC_URL set (an https origin that reaches this
-  // dashboard — a Tailscale Serve hostname, a reverse proxy) the consent can
-  // be approved from any device that reaches that origin; otherwise Google
-  // sends the browser back to localhost, i.e. the dashboard host itself.
+  // GOOGLE_OAUTH_REDIRECT_URI pins it verbatim (used for both the consent URL
+  // and the code exchange, which the CLI receives from here). Otherwise, with
+  // AUGMENTAGENT_PUBLIC_URL set (an https origin that reaches this dashboard
+  // — a tunnel hostname, a reverse proxy) the consent can be approved from
+  // any device that reaches that origin; otherwise Google sends the browser
+  // back to localhost, i.e. the dashboard host itself.
+  const pinned = process.env.GOOGLE_OAUTH_REDIRECT_URI?.trim();
+  if (pinned) return pinned;
   const publicUrl = process.env.AUGMENTAGENT_PUBLIC_URL?.trim().replace(/\/+$/, "");
   if (publicUrl) return `${publicUrl}/oauth/google/callback`;
   const port = process.env.DASHBOARD_PORT || "3000";
