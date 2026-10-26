@@ -19,7 +19,9 @@ only their recorded transport scope. They do not prove full guarded MCP executio
 or issue-to-main behavior. At preparation, full-pipeline proof was still pending;
 replace that status only with its terminal artifact, never an in-progress handle.
 Real credential rotation followed by a fresh, distinct native conversation also
-remains required before claiming durable refresh support. Read-only credentials
+remains required before claiming durable refresh support. See the
+[version-pinned Codex refresh protocol](provider-refresh-protocol.md) for request
+and optional-response-field semantics; source evidence is not a live proof. Read-only credentials
 must remain unchanged. Enabling `--allow-auth-refresh` is an explicit additional
 service-token grant and does not waive rotation/serialization/failed-refresh
 recovery acceptance. Do not describe read-only continuation as a refresh proof.
