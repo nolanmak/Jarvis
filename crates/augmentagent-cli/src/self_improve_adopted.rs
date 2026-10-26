@@ -6,10 +6,16 @@ use crate::autoship_workflow::{OperationKind, Stage, WorkflowStore};
 
 async fn discover(repo: &Path, dry_run: bool) -> Result<Vec<adoption::AdoptedPr>> {
     let repository = workflow::canonical_repository(repo).await?;
-    let (ok, raw, error) = run(&gh_bin(), &["pr", "list", "--state", "open", "--limit", "1000",
-        "--search", "sort:created-asc", "--json",
-        "number,isDraft,headRefName,headRefOid,baseRefName,isCrossRepository,author,title,body,closingIssuesReferences"], repo).await?;
-    anyhow::ensure!(ok, "cannot discover adopted PRs: {error}");
+    let raw = complete_labelled_inventory(|limit| {
+        let gh=gh_bin();
+        async move {
+            let bound=limit.to_string();
+            let (ok,raw,error)=run(&gh,&["pr","list","--state","open","--limit",&bound,
+                "--search","sort:created-asc","--json","number,isDraft,headRefName,headRefOid,baseRefName,isCrossRepository,author,title,body,closingIssuesReferences"],repo).await?;
+            anyhow::ensure!(ok,"cannot discover adopted PRs: {error}");
+            Ok(raw)
+        }
+    }).await.context("source-less PR inventory must be complete before fair selection")?;
     let mut allowed = trusted_authors(repo).await;
     if let Some(owner) = repository.split('/').next() {
         allowed.push(owner.into());
