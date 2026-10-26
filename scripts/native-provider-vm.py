@@ -6,6 +6,7 @@ This launcher streams framed guest output, delegates tool calls to the original
 host policy bridge, and services only the declared provider gateway protocol.
 """
 import base64
+import contextlib
 import hashlib
 import fcntl
 import uuid
@@ -115,6 +116,25 @@ def safe_relative(raw):
             or '\0' in raw or len(raw) > 1024 or len(path.parts) > 16):
         raise ValueError('invalid native runtime export path')
     return path
+
+
+@contextlib.contextmanager
+def short_channel_endpoint():
+    """Socket only: AF_UNIX names cannot inherit arbitrarily long state roots.
+
+    All durable artifacts remain in the registered session. This private,
+    ephemeral directory contains only the live transport socket and is removed
+    after QEMU cleanup, including startup failure.
+    """
+    with tempfile.TemporaryDirectory(prefix='jv-', dir='/tmp') as directory:
+        root = Path(directory)
+        metadata = root.stat()
+        if root.is_symlink() or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+            raise ValueError('native channel directory is not private')
+        endpoint = root / 'channel'
+        if len(os.fsencode(endpoint)) > 107:
+            raise ValueError('native channel path exceeds AF_UNIX bound')
+        yield endpoint
 
 
 class Channel:
@@ -381,7 +401,7 @@ def main(spec_path):
             atomic(Path(ready).with_name('vm-startup-failure.json'), b'{"phase":"native_credential_in_use"}')
         raise RuntimeError('native credential is in use; retry after capacity is available') from None
     seed, original_auth = runtime_seed(state, spec.get('auth_file'), spec['auth_relative'])
-    with tempfile.TemporaryDirectory(prefix='native-vm-launch-', dir=state) as temporary:
+    with tempfile.TemporaryDirectory(prefix='native-vm-launch-', dir=state) as temporary, short_channel_endpoint() as endpoint:
         private = Path(temporary)
         binary = private / 'provider'
         binary.mkdir()
@@ -423,7 +443,6 @@ def main(spec_path):
         image.write_bytes(vm.initrd(entries))
         command = vm.qemu_command(config, image, [('runtime', Path(spec['guest_runtime']), True), ('provider', binary, True)], None)
         command[command.index('-serial') + 1] = 'null'
-        endpoint = private / 'channel.sock'
         command.extend(['-device', 'virtio-serial-pci', '-chardev',
                         f'socket,id=native,path={endpoint},server=on,wait=off', '-device',
                         'virtserialport,chardev=native,name=org.jarvis.native.control'])

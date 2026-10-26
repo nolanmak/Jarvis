@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -41,6 +42,27 @@ ready.with_name('actual-model-dispatch').write_text('called')
                'JARVIS_SUPERVISOR_ADMISSION': '1'}
         return subprocess.Popen([sys.executable, '-I', str(HERE / 'provider-supervisor.py'),
                                  str(root / 'cleanup-complete'), sys.executable, str(worker)], env=env)
+
+    def test_long_state_root_uses_private_short_socket_without_moving_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / ('registered-' + 'x' * 90) / ('session-' + 'y' * 90)
+            state.mkdir(parents=True)
+            artifact = state / 'durable-evidence.json'
+            artifact.write_text('{"retained":true}')
+            self.assertGreater(len(os.fsencode(state / 'native-vm-launch-12345678/channel.sock')), 107)
+            with vm.short_channel_endpoint() as endpoint:
+                self.assertLessEqual(len(os.fsencode(endpoint)), 107)
+                self.assertEqual(endpoint.parent.stat().st_mode & 0o777, 0o700)
+                with socket.socket(socket.AF_UNIX) as server, socket.socket(socket.AF_UNIX) as client:
+                    server.bind(str(endpoint));server.listen(1)
+                    client.connect(str(endpoint))
+                    accepted, _ = server.accept()
+                    with accepted:
+                        client.sendall(b'private-control')
+                        self.assertEqual(accepted.recv(64), b'private-control')
+                parent = endpoint.parent
+            self.assertFalse(parent.exists())
+            self.assertEqual(artifact.read_text(), '{"retained":true}')
 
     def test_preflight_ready_does_not_dispatch_without_controller_admission(self):
         with tempfile.TemporaryDirectory() as name:
