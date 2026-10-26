@@ -198,6 +198,8 @@ impl WorkflowStore {
                 progress_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
                 wall_ms INTEGER NOT NULL DEFAULT 0, model_calls INTEGER NOT NULL DEFAULT 0,
                 tokens INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS fresh_review_origin (
+                receipt TEXT PRIMARY KEY, workflow TEXT NOT NULL REFERENCES workflow(id), binding TEXT NOT NULL, created_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS imported_origin (
                 receipt TEXT PRIMARY KEY, repository TEXT NOT NULL, pr INTEGER NOT NULL,
                 source_head TEXT NOT NULL, candidate_head TEXT NOT NULL, created_at INTEGER NOT NULL);
@@ -235,6 +237,61 @@ impl WorkflowStore {
                 generation INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, at_ms INTEGER NOT NULL);
             COMMIT;")?;
         Ok(Self { conn })
+    }
+
+    pub fn issue_fresh_review_origin(
+        &mut self,
+        lease: &Lease,
+        binding: &Binding,
+        now: i64,
+    ) -> Result<String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx, lease, binding, now)?;
+        let receipt = uuid::Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO fresh_review_origin VALUES(?1,?2,?3,?4)",
+            params![
+                receipt,
+                lease.workflow,
+                serde_json::to_string(binding)?,
+                now
+            ],
+        )?;
+        event(
+            &tx,
+            &lease.workflow,
+            lease.generation,
+            "fresh_review_authorized",
+            &receipt,
+            now,
+        )?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    pub fn verify_fresh_review_origin(
+        &self,
+        workflow: &str,
+        binding: &Binding,
+        receipt: &str,
+    ) -> Result<bool> {
+        let Some(current) = self.snapshot(workflow)? else {
+            return Ok(false);
+        };
+        if current.checkpoint.binding != *binding {
+            return Ok(false);
+        }
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM fresh_review_origin WHERE receipt=?1 AND workflow=?2 AND binding=?3",
+                params![receipt, workflow, serde_json::to_string(binding)?],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     pub fn issue_imported_origin(
@@ -839,24 +896,59 @@ impl WorkflowStore {
 
     /// Fenced, idempotent convergence accounting. Full observations remain in
     /// the journal; only the bounded best-candidate controller state is folded.
-    pub fn observe_episode(&mut self, lease:&Lease, observation:&crate::autoship_episode::Observation, now_ms:i64) -> Result<crate::autoship_episode::Decision> {
-        use crate::autoship_episode::{Episode,Decision};
-        let raw=serde_json::to_string(observation)?;
-        ensure!(raw.len()<=32*1024, "episode observation exceeds bounded context");
-        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_binding(&tx,lease,&observation.candidate.binding,now_ms)?;
+    pub fn observe_episode(
+        &mut self,
+        lease: &Lease,
+        observation: &crate::autoship_episode::Observation,
+        now_ms: i64,
+    ) -> Result<crate::autoship_episode::Decision> {
+        use crate::autoship_episode::{Decision, Episode};
+        let raw = serde_json::to_string(observation)?;
+        ensure!(
+            raw.len() <= 32 * 1024,
+            "episode observation exceeds bounded context"
+        );
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx, lease, &observation.candidate.binding, now_ms)?;
         let prior:Option<(String,String)>=tx.query_row("SELECT observation,decision FROM episode_observation WHERE workflow=?1 AND receipt=?2",params![lease.workflow,observation.receipt],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-        if let Some((old,decision))=prior {
-            ensure!(old==raw,"episode receipt cannot be rewritten");
+        if let Some((old, decision)) = prior {
+            ensure!(old == raw, "episode receipt cannot be rewritten");
             return Ok(serde_json::from_str::<Decision>(&decision)?);
         }
-        let state:Option<String>=tx.query_row("SELECT state FROM episode_state WHERE workflow=?1",[&lease.workflow],|r|r.get(0)).optional()?;
-        let mut state:Episode=state.map(|raw|serde_json::from_str(&raw)).transpose()?.unwrap_or_default();
-        let decision=state.observe(observation)?;
+        let state: Option<String> = tx
+            .query_row(
+                "SELECT state FROM episode_state WHERE workflow=?1",
+                [&lease.workflow],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let mut state: Episode = state
+            .map(|raw| serde_json::from_str(&raw))
+            .transpose()?
+            .unwrap_or_default();
+        let decision = state.observe(observation)?;
         tx.execute("INSERT INTO episode_state VALUES(?1,?2) ON CONFLICT(workflow) DO UPDATE SET state=excluded.state",params![lease.workflow,serde_json::to_string(&state)?])?;
-        tx.execute("INSERT INTO episode_observation VALUES(?1,?2,?3,?4)",params![lease.workflow,observation.receipt,raw,serde_json::to_string(&decision)?])?;
-        event(&tx,&lease.workflow,lease.generation,"episode_observed",&raw,now_ms)?;
-        tx.commit()?;Ok(decision)
+        tx.execute(
+            "INSERT INTO episode_observation VALUES(?1,?2,?3,?4)",
+            params![
+                lease.workflow,
+                observation.receipt,
+                raw,
+                serde_json::to_string(&decision)?
+            ],
+        )?;
+        event(
+            &tx,
+            &lease.workflow,
+            lease.generation,
+            "episode_observed",
+            &raw,
+            now_ms,
+        )?;
+        tx.commit()?;
+        Ok(decision)
     }
 
     pub fn events(&self, workflow: &str) -> Result<Vec<(i64, String, String, i64)>> {

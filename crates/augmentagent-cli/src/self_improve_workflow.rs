@@ -454,6 +454,14 @@ impl WorkflowGuard {
         }))
     }
 
+    pub(super) fn fresh_review_origin_receipt(&self) -> Result<String> {
+        self.validate_before_side_effect()?;
+        self.store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
+            .issue_fresh_review_origin(&self.lease, &self.binding, millis())
+    }
+
     pub(super) fn repository(&self) -> &str {
         &self.repository
     }
