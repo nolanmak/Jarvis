@@ -93,6 +93,8 @@ pub enum Error {
     Provider(#[from] ProviderError),
     #[error("phone voice configuration is invalid: {0}")]
     Voice(#[from] voice::VoiceConfigError),
+    #[error("phone Live provider: {0}")]
+    Live(#[from] live_session::LiveError),
     #[error("phone silence policy is invalid: {0}")]
     Silence(#[from] silence::SilenceConfigError),
 }
@@ -117,6 +119,8 @@ impl Error {
             Self::Provider(ProviderError::Rejected) => "provider_rejected",
             Self::Provider(ProviderError::Uncertain) => "provider_uncertain",
             Self::Voice(_) | Self::Silence(_) => "not_configured",
+            Self::Live(live_session::LiveError::Authentication | live_session::LiveError::Access | live_session::LiveError::Configuration) => "not_configured",
+            Self::Live(_) => "provider_unavailable",
         }
     }
 }
@@ -514,6 +518,17 @@ impl PhoneService {
                 },
                 grant.binding_revision,
             )?;
+            if let Some(live) = &self.config.live {
+                if let Err(error) = live.preflight().await {
+                    self.store.phone_create_rejected(&reserved.call.id, self.clock.now_ms())?;
+                    return Err(error.into());
+                }
+                // Authorization can change while the readiness probe is in flight.
+                if let Err(error) = self.check(grant, false) {
+                    self.store.phone_create_rejected(&reserved.call.id, self.clock.now_ms())?;
+                    return Err(error);
+                }
+            }
             self.dial(&reserved.call, twiml).await?;
         }
         Ok(self.store.phone_call(&grant.owner_id, &reserved.call.id)?)

@@ -33,6 +33,14 @@ impl LiveConnection {
     pub async fn connect(key: &str, instructions: &str) -> Result<Self, LiveError> {
         Self::connect_to(ENDPOINT, key, instructions).await
     }
+    #[cfg(test)]
+    pub(crate) async fn connect_test(
+        endpoint: &str,
+        key: &str,
+        instructions: &str,
+    ) -> Result<Self, LiveError> {
+        Self::connect_to(endpoint, key, instructions).await
+    }
     async fn connect_to(endpoint: &str, key: &str, instructions: &str) -> Result<Self, LiveError> {
         if key.is_empty()
             || key.len() > 8192
