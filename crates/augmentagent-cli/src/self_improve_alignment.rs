@@ -9,6 +9,8 @@ use anyhow::ensure;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+#[path = "self_improve_constraint_exception.rs"]
+mod exceptions;
 #[path = "self_improve_constraint_learning.rs"]
 mod learning;
 
@@ -60,6 +62,8 @@ struct Artifact {
     supplied_request_hashes: Vec<String>,
     hunks: Vec<ChangedHunk>,
     mappings: Vec<Mapping>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    constraint_exception: Option<exceptions::Exception>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -547,19 +551,6 @@ pub(super) async fn gate_for(
     let (rules, policy_hash) = policy(control)?;
     let evidence = hunks(root, &base, &head).await?;
     let actual: Vec<_> = evidence.iter().map(|e| e.hunk.clone()).collect();
-    let paths = actual.iter().map(|h| h.path.clone()).collect::<Vec<_>>();
-    let added = evidence
-        .iter()
-        .flat_map(|h| h.patch.lines())
-        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
-        .map(|line| line[1..].to_owned())
-        .collect::<Vec<_>>();
-    let failures = contract::constraint_failures(&rules, &paths, &added)?;
-    ensure!(
-        failures.is_empty(),
-        "promoted_constraint_failed: {}",
-        failures.join(",")
-    );
     for hunk in &actual {
         ensure!(
             prepared
@@ -691,6 +682,18 @@ pub(super) async fn gate_for(
         "alignment lacks an observed fresh native session"
     );
     assess(prepared, &actual, &mappings)?;
+    let constraint_exception = exceptions::resolve(
+        builder,
+        root,
+        prepared,
+        workflow,
+        &rules,
+        &evidence,
+        &mappings,
+        &head,
+        &policy_hash,
+    )
+    .await?;
     let artifact = Artifact {
         version: 1,
         source,
@@ -704,6 +707,7 @@ pub(super) async fn gate_for(
         supplied_request_hashes,
         hunks: actual,
         mappings,
+        constraint_exception,
     };
     let bytes = serde_json::to_vec(&artifact)?;
     let artifact_sha256 = hash(&bytes);
@@ -761,7 +765,23 @@ pub(super) async fn assert_current(
         .1 == reference.policy_hash,
         "alignment promoted constraints changed"
     );
-    assess(prepared, &artifact.hunks, &artifact.mappings)
+    assess(prepared, &artifact.hunks, &artifact.mappings)?;
+    let evidence = hunks(root, &reference.base, &reference.head).await?;
+    let (rules, _) = policy(
+        reference
+            .artifact
+            .parent()
+            .context("alignment control missing")?,
+    )?;
+    exceptions::assert_current(
+        &rules,
+        &evidence,
+        &artifact.mappings,
+        &reference.head,
+        &reference.contract_hash,
+        &reference.policy_hash,
+        artifact.constraint_exception.as_ref(),
+    )
 }
 
 #[cfg(test)]

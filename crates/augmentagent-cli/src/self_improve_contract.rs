@@ -1572,6 +1572,8 @@ pub(super) async fn verify_with_repair_for(
                     || detail.contains("admission")
                     || detail.contains("alignment reviewer unavailable")
                     || detail.contains("alignment transport")
+                    || detail.contains("constraint authority unavailable")
+                    || detail.contains("constraint authority invalid structured response")
                     || detail.contains("alignment invalid structured response");
                 if infrastructure {
                     workflow

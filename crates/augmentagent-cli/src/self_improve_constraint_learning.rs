@@ -44,7 +44,7 @@ fn json<T: serde::de::DeserializeOwned>(raw: &str) -> Result<T> {
         .unwrap_or(raw);
     Ok(serde_json::from_str(raw)?)
 }
-async fn isolated(
+pub(super) async fn isolated(
     builder: &FallbackReasoner,
     root: &Path,
     workflow: &workflow::WorkflowGuard,
@@ -442,7 +442,7 @@ mod tests {
             version: 1,
             rules: vec![Constraint::ForbiddenAddedText {
                 id: "R1".into(),
-                source: "review-1".into(),
+                source: "https://github.com/o/r/pull/1#discussion_r1".into(),
                 literal: "specific_bad_call()".into(),
             }],
             replay: vec![
