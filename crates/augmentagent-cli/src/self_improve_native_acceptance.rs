@@ -88,10 +88,16 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
         author_trusted: true,
         research_filed: false,
     };
+    // The isolated launcher supplies a read-only GitHub fixture for remote-main
+    // identity. Readiness, source selection and specification use real models.
+    let grounded_readiness = match acceptance::readiness::assess(&root, &issue, &mut guard).await? {
+        acceptance::readiness::Decision::Ready(evidence) => evidence,
+        acceptance::readiness::Decision::Dependency(reason) => anyhow::bail!("routine arithmetic fixture incorrectly requires an external decision: {reason}"),
+    };
     // Production scoper selects actual immutable source, then independently
     // authors the contract and verifier. No scripted reviewer stands in here.
     let scope=acceptance::scope_original(&root,&repository,&guard,&format!(
-        "Scope issue #840: {requirement} Preserve this criterion verbatim. The only implementation change needed is arithmetic.py. Declare arithmetic.py and rules.rs as allowed FILE paths (rules.rs is reserved for a later diagnostic and must not change in this repair). Supply a pinned Python behavior adapter that prints JSON results for mixed-sign and zero integer inputs; put expected results only in the controller black_box oracle, never child assertions. Do not request Rust builds: Rust files are supporting fixture evidence only.\n{}",acceptance::CONTRACT_PROMPT)).await?;
+        "Scope issue #840: {requirement} Preserve this criterion verbatim. The only implementation change needed is arithmetic.py. Declare arithmetic.py and rules.rs as allowed FILE paths (rules.rs is reserved for a later diagnostic and must not change in this repair). Supply a pinned Python behavior adapter that prints JSON results for mixed-sign and zero integer inputs; put expected results only in the controller black_box oracle, never child assertions. Do not request Rust builds: Rust files are supporting fixture evidence only.\nGrounded readiness evidence:\n{grounded_readiness}\n{}",acceptance::CONTRACT_PROMPT)).await?;
     let builder =
         augmentagent_channel_core::build_pinned(Codex).context("native Codex unavailable")?;
     // Match fresh production dispatch: native-session observation does not
