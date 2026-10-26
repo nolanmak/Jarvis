@@ -331,7 +331,7 @@
       "passed": 2,
       "failed": 0
     },
-    "latest_rust_admission": "Managed CLI no-run last succeeded at3c876779. Retry69789 terminated storage-busy while daemon workspace tests continue. Checkpoint13ea9f26 pushed to draft1603 for hosted CI; current final-head build and native probes remain unproven.",
+    "latest_rust_admission": "Local93700 terminated storage-busy. Read-only process/lock audit confirms active production issue1593 revision after completed workspace verification; conversation-wide storage lease is a concrete contention gap under implementation. Hosted Rust passed e8970eb2; finalhead11115c45 CI pending. No native final-head or deployment proof.",
     "github_main_rules": {
       "observed": "2026-10-26",
       "rules": [
@@ -676,6 +676,47 @@
       "log": "/tmp/autoship-1598-provider-gateway-tests.log",
       "command": "python3 scripts/test-native-provider-gateway.py",
       "scope": "Local real HTTP/TLS, SSE and WebSocket transport plus route/redirect/framing/capacity denial. Not native provider auth/inference or VM wiring proof."
+    },
+    "hosted_rust_checkpoint_9b0da846": {
+      "revision": "9b0da846",
+      "run_id": 40343335999,
+      "conclusion": "success",
+      "cli_passed": 1247,
+      "cli_failed": 0,
+      "cli_ignored": 21,
+      "log": "/tmp/autoship-1598-ci-9b0da846.log",
+      "scope": "Before VM launcher and executable NeedEvidence loop integration."
+    },
+    "hosted_rust_checkpoint_e8970eb2": {
+      "revision": "e8970eb2",
+      "run_id": 40344875731,
+      "conclusion": "success",
+      "cli_passed": 1249,
+      "cli_failed": 0,
+      "cli_ignored": 21,
+      "log": "/tmp/autoship-1598-ci-e8970eb2-rust.log",
+      "scope": "Includes initial VM launcher, ContractScope and NeedEvidence loop. Later minimal runtime, atomic admission, cached routing and refresh changes need separate validation. PDF workflow at this revision failed four missing embedded-helper rebuild triggers; corrected in055f2671, not a claim all CI passed."
+    },
+    "selector_capability_inventory": {
+      "revision": "9b0da846",
+      "passed": 1,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-selector-capability-inventory.log",
+      "scope": "Runtime source/manifest inventory using existing managed integration test binary; fixes actual13ea9f26 hosted inventory failure."
+    },
+    "native_vm_unit_refresh": {
+      "revision": "11115c45",
+      "passed": 7,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-native-vm-refresh-tests.log",
+      "scope": "Local schema/admission/runtime/credential fixtures; no authenticated provider or real refresh proof."
+    },
+    "native_vm_pipe_quiescence": {
+      "revision": "f8f18e27",
+      "passed": 5,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-native-io-tests.log",
+      "scope": "Real local pipe backpressure and synthetic process-list cleanup fixtures; no real guest descendant proof."
     }
   },
   "remaining_cross_cutting_acceptance": [
